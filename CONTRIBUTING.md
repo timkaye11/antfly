@@ -9,7 +9,6 @@ zig/e2e/             Zig runtime end-to-end suites
 go/pkg/
   antflylite/         Go binding for embedded Antfly Lite
   sdk/               Go SDK
-  libaf/             Shared library (JSON, embeddings, reranking, logging, S3)
   docsaf/            Content ingestion (filesystem, web crawl, git, S3)
   evalaf/            LLM/RAG evaluation framework
   genkit/            Firebase Genkit plugins (antfly, openrouter)
@@ -34,7 +33,7 @@ docs/                Hand-written documentation (synced to docs site at build ti
 
 - **Zig 0.16** — required for the server runtime
 - **Go 1.26+** — required for retained Go SDKs and tools
-- **Node.js 18+** and **pnpm** — for TypeScript SDK, React components, and Antfarm dashboard
+- **Node.js and pnpm versions pinned in `ts/package.json`** — for reproducible TypeScript SDK and Antfarm artifacts; `make generate` uses Volta automatically when available
 
 ## Makefile Targets
 
@@ -43,7 +42,7 @@ Run `make help` for the full list. Key targets:
 | Target | Description |
 |--------|-------------|
 | `make build` | Build the `antfly` binary (includes Antfarm frontend and code generation) |
-| `make generate` | Regenerate OpenAPI types and Go/TS/Python SDKs |
+| `make generate` | Regenerate OpenAPI types, Go/TS/Python SDKs, and the embedded Antfarm dashboard |
 | `make lint` | Run linters across retained Go modules and TypeScript |
 | `make tidy` | Run `go mod tidy` across retained Go modules |
 | `make tidy-check` | Verify retained Go modules are tidy |
@@ -96,7 +95,6 @@ The repository contains multiple independent Go modules (no `go.work`). Each mus
 | Operator | `go/pkg/operator/` |
 | Antfly proxy | `go/pkg/proxy/antfly/` |
 | Inference proxy | `go/pkg/proxy/inference/` |
-| libaf | `go/pkg/libaf/` |
 | docsaf | `go/pkg/docsaf/` |
 | evalaf | `go/pkg/evalaf/` |
 | evalaf antfly plugin | `go/pkg/evalaf/plugins/antfly/` |
@@ -170,6 +168,7 @@ This runs:
 3. `go generate ./...` across retained Go modules (oapi-codegen)
 4. TypeScript SDK generation (`@antfly/sdk`)
 5. Python SDK generation
+6. Antfarm dashboard generation with the pinned Node and pnpm toolchain
 
 Look for `cfg.yaml` next to any `openapi.yaml` for oapi-codegen settings. Key convention: optional fields use `omitzero` instead of pointers.
 

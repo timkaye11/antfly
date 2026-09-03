@@ -271,18 +271,38 @@ pub fn grpoLoss(
     advantages: []const f32,
     config: GRPOConfig,
 ) !GRPOLossResult {
+    if (!std.math.isFinite(config.kl_coef) or config.kl_coef < 0.0) {
+        return error.InvalidGrpoKlCoefficient;
+    }
     var total_tokens: usize = 0;
     var active_tokens: usize = 0;
     for (completions) |c| {
         if (c.tokens.len == 0) return error.EmptyCompletion;
-        total_tokens += c.tokens.len;
+        if (c.old_logps.len != c.tokens.len or c.ref_logps.len != c.tokens.len) {
+            return error.LogpLenMismatch;
+        }
+        for (c.old_logps) |logp| {
+            if (!std.math.isFinite(logp)) return error.NonFiniteGrpoLogprob;
+        }
+        for (c.ref_logps) |logp| {
+            if (!std.math.isFinite(logp)) return error.NonFiniteGrpoLogprob;
+        }
+        total_tokens = std.math.add(usize, total_tokens, c.tokens.len) catch
+            return error.TokenCountOverflow;
         if (!config.mask_truncated_completions or !c.truncated) {
-            active_tokens += c.tokens.len;
+            active_tokens = std.math.add(usize, active_tokens, c.tokens.len) catch
+                return error.TokenCountOverflow;
         }
     }
 
     if (new_logps.len != total_tokens) return error.LogpLenMismatch;
     if (advantages.len != completions.len) return error.AdvLenMismatch;
+    for (new_logps) |logp| {
+        if (!std.math.isFinite(logp)) return error.NonFiniteGrpoLogprob;
+    }
+    for (advantages) |advantage| {
+        if (!std.math.isFinite(advantage)) return error.NonFiniteGrpoAdvantage;
+    }
 
     const grad = try allocator.alloc(f32, total_tokens);
     errdefer allocator.free(grad);
@@ -339,10 +359,16 @@ pub fn grpoLoss(
             const old_lp = c.old_logps[t];
             const ref_lp = c.ref_logps[t];
 
-            const ratio = @exp(new_lp - old_lp);
+            const policy_log_ratio = new_lp - old_lp;
+            if (!std.math.isFinite(policy_log_ratio)) return error.GrpoPolicyLogRatioOutOfRange;
+            const ratio = @exp(policy_log_ratio);
+            if (!std.math.isFinite(ratio)) return error.GrpoPolicyLogRatioOutOfRange;
             const pg_1 = ratio * adv;
             const clipped_ratio = std.math.clamp(ratio, 1.0 - eps_low, 1.0 + eps_high);
             const pg_2 = clipped_ratio * adv;
+            if (!std.math.isFinite(pg_1) or !std.math.isFinite(pg_2)) {
+                return error.NonFiniteGrpoComputation;
+            }
 
             // -min(pg_1, pg_2)
             const chosen = if (pg_1 < pg_2) pg_1 else pg_2;
@@ -359,7 +385,7 @@ pub fn grpoLoss(
             if (!std.math.isFinite(expm1_diff)) return error.GrpoKlLogRatioOutOfRange;
             const k3 = @max(expm1_diff - diff, 0.0);
             raw_kl_sum += k3;
-            kl_sum += @as(f64, kl * k3) * @as(f64, token_weight);
+            kl_sum += @as(f64, kl) * @as(f64, k3) * @as(f64, token_weight);
 
             // Gradient w.r.t. new_lp.
             //
@@ -382,16 +408,31 @@ pub fn grpoLoss(
             //                   = 1 - exp(ref - new)
             //   Loss contribution is +kl_coef * k3, so grad is +kl_coef * (1 - exp_diff).
             const g_kl: f32 = -kl * expm1_diff;
+            if (!std.math.isFinite(g_pg) or !std.math.isFinite(g_kl)) {
+                return error.NonFiniteGrpoComputation;
+            }
 
-            grad[off + t] = (g_pg + g_kl) * token_weight;
+            const token_gradient = (g_pg + g_kl) * token_weight;
+            if (!std.math.isFinite(token_gradient)) return error.NonFiniteGrpoComputation;
+            grad[off + t] = token_gradient;
         }
         off += c.tokens.len;
     }
 
+    const f32_max: f64 = std.math.floatMax(f32);
+    const loss_sum = pg_sum + kl_sum;
+    if (!std.math.isFinite(pg_sum) or !std.math.isFinite(kl_sum) or
+        !std.math.isFinite(raw_kl_sum) or @abs(pg_sum) > f32_max or
+        @abs(kl_sum) > f32_max or !std.math.isFinite(loss_sum) or
+        @abs(loss_sum) > f32_max or
+        raw_kl_sum > f32_max * @as(f64, n_f))
+    {
+        return error.NonFiniteGrpoComputation;
+    }
     const pg_loss: f32 = @floatCast(pg_sum);
     const kl_loss: f32 = @floatCast(kl_sum);
     const mean_kl: f32 = @floatCast(raw_kl_sum / @as(f64, n_f));
-    const loss: f32 = pg_loss + kl_loss;
+    const loss: f32 = @floatCast(loss_sum);
     const clip_fraction: f32 = @as(f32, @floatFromInt(clipped_count)) / n_f;
 
     return GRPOLossResult{
@@ -593,6 +634,103 @@ test "grpoLoss zero when ratio=1, adv=0, ref=new" {
     try testing.expectApproxEqAbs(@as(f32, 0), res.mean_kl, 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 0), res.clip_fraction, 1e-6);
     for (res.grad_new_logps) |g| try testing.expectApproxEqAbs(@as(f32, 0), g, 1e-6);
+}
+
+test "grpoLoss rejects completion logprob length mismatches" {
+    const tokens = [_]i32{ 1, 2 };
+    const short_logps = [_]f32{-0.3};
+    const full_logps = [_]f32{ -0.3, -0.7 };
+    const new_logps = [_]f32{ -0.3, -0.7 };
+    const advantages = [_]f32{0.0};
+
+    const short_old = [_]Completion{.{
+        .prompt_idx = 0,
+        .tokens = &tokens,
+        .old_logps = &short_logps,
+        .ref_logps = &full_logps,
+    }};
+    try testing.expectError(
+        error.LogpLenMismatch,
+        grpoLoss(testing.allocator, &short_old, &new_logps, &advantages, .{}),
+    );
+
+    const short_reference = [_]Completion{.{
+        .prompt_idx = 0,
+        .tokens = &tokens,
+        .old_logps = &full_logps,
+        .ref_logps = &short_logps,
+    }};
+    try testing.expectError(
+        error.LogpLenMismatch,
+        grpoLoss(testing.allocator, &short_reference, &new_logps, &advantages, .{}),
+    );
+}
+
+test "grpoLoss rejects invalid coefficients and non-finite inputs" {
+    const tokens = [_]i32{1};
+    const finite_logps = [_]f32{-0.3};
+    const finite_advantages = [_]f32{1.0};
+    const completions = [_]Completion{.{
+        .prompt_idx = 0,
+        .tokens = &tokens,
+        .old_logps = &finite_logps,
+        .ref_logps = &finite_logps,
+    }};
+
+    try testing.expectError(
+        error.InvalidGrpoKlCoefficient,
+        grpoLoss(testing.allocator, &completions, &finite_logps, &finite_advantages, .{ .kl_coef = -0.1 }),
+    );
+    try testing.expectError(
+        error.InvalidGrpoKlCoefficient,
+        grpoLoss(testing.allocator, &completions, &finite_logps, &finite_advantages, .{ .kl_coef = std.math.nan(f32) }),
+    );
+
+    const non_finite = [_]f32{std.math.nan(f32)};
+    try testing.expectError(
+        error.NonFiniteGrpoLogprob,
+        grpoLoss(testing.allocator, &completions, &non_finite, &finite_advantages, .{}),
+    );
+    try testing.expectError(
+        error.NonFiniteGrpoAdvantage,
+        grpoLoss(testing.allocator, &completions, &finite_logps, &non_finite, .{}),
+    );
+
+    const overflowing_new = [_]f32{std.math.floatMax(f32)};
+    const overflowing_old = [_]f32{-std.math.floatMax(f32)};
+    const overflowing_completions = [_]Completion{.{
+        .prompt_idx = 0,
+        .tokens = &tokens,
+        .old_logps = &overflowing_old,
+        .ref_logps = &finite_logps,
+    }};
+    try testing.expectError(
+        error.GrpoPolicyLogRatioOutOfRange,
+        grpoLoss(testing.allocator, &overflowing_completions, &overflowing_new, &finite_advantages, .{}),
+    );
+
+    // Each component fits in f32 and the opposing gradient terms remain
+    // finite, but their positive loss sum does not. Reject before the final
+    // f32 conversion rather than returning +inf to the training loop.
+    const zero_logps = [_]f32{0.0};
+    const positive_reference = [_]f32{@log(@as(f32, 2.0))};
+    const combined_overflow_completions = [_]Completion{.{
+        .prompt_idx = 0,
+        .tokens = &tokens,
+        .old_logps = &zero_logps,
+        .ref_logps = &positive_reference,
+    }};
+    const large_negative_advantage = [_]f32{-2.5e38};
+    try testing.expectError(
+        error.NonFiniteGrpoComputation,
+        grpoLoss(
+            testing.allocator,
+            &combined_overflow_completions,
+            &zero_logps,
+            &large_negative_advantage,
+            .{ .kl_coef = 3.3e38 },
+        ),
+    );
 }
 
 test "grpoLoss exposes unweighted stable mean K3 when beta is zero" {

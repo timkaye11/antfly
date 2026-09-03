@@ -17,6 +17,7 @@ const build_options = @import("build_options");
 const manifest_mod = @import("../models/manifest.zig");
 const c_file = @import("../util/c_file.zig");
 const kernel_jit_mod = @import("../graph/kernel_jit.zig");
+const backend_contracts = @import("../graph/backend_contracts.zig");
 const graph_runtime_mod = @import("../graph/runtime.zig");
 const backend_runtime_mod = @import("backend_runtime.zig");
 
@@ -82,6 +83,10 @@ pub const BackendType = enum {
         };
     }
 
+    pub fn supportsA4bSession(self: BackendType) bool {
+        return self == .metal or self == .cuda;
+    }
+
     /// Whether SessionManager.loadModel can create a Session directly for this backend.
     pub fn supportsDirectSessionLoad(self: BackendType) bool {
         return switch (self) {
@@ -120,13 +125,23 @@ test "backend runtime classifies external ONNX CUDA as GPU hosted" {
 
 const backend_order_capacity = std.meta.fields(BackendType).len;
 
+const RequiredBackendConfig = struct {
+    backend: ?BackendType = null,
+    invalid: bool = false,
+};
+
 /// SessionManager selects the best available backend and creates sessions.
 pub const SessionManager = struct {
     allocator: std.mem.Allocator,
     preferred_backends: []const BackendType,
+    required_backend: ?BackendType = null,
+    required_backend_invalid: bool = false,
     graph_runtime_strategy: ?graph_runtime_mod.Strategy = null,
     kernel_jit: kernel_jit_mod.Config = .{},
     kernel_jit_load_context: kernel_jit_mod.LoadContext = .dynamic,
+    /// Load-time A4B policy. It is copied into the created session and is
+    /// never consulted as mutable process-global state during inference.
+    a4b_inference_request: ?backend_contracts.A4bInferenceRequest = null,
     /// Provider preference for the external ONNX Runtime backend. Automatic is
     /// resolved before admission; candidate SessionManagers then carry only
     /// the resolved CPU/CUDA value through construction.
@@ -140,16 +155,22 @@ pub const SessionManager = struct {
     io: ?std.Io = null,
 
     pub fn init(allocator: std.mem.Allocator) SessionManager {
+        const required = requiredBackendFromEnv();
         return .{
             .allocator = allocator,
             .preferred_backends = configuredPreferredBackends(),
+            .required_backend = required.backend,
+            .required_backend_invalid = required.invalid,
         };
     }
 
     pub fn initWithIo(allocator: std.mem.Allocator, io: std.Io) SessionManager {
+        const required = requiredBackendFromEnv();
         return .{
             .allocator = allocator,
             .preferred_backends = configuredPreferredBackends(),
+            .required_backend = required.backend,
+            .required_backend_invalid = required.invalid,
             .io = io,
         };
     }
@@ -165,6 +186,18 @@ pub const SessionManager = struct {
         return copy;
     }
 
+    /// Validate the process-level required backend before a server publishes
+    /// readiness or an artifact path begins execution. Required backends must
+    /// be compiled into this binary and support the direct session-loading
+    /// contract used by the inference runtime. PJRT is intentionally rejected
+    /// until the runtime has a consistent compiled-only loading path.
+    pub fn validateRequiredBackendPolicy(self: *const SessionManager) !void {
+        if (self.required_backend_invalid) return error.InvalidRequiredBackend;
+        const backend = self.required_backend orelse return;
+        if (!backend.available() or !backend.supportsDirectSessionLoad())
+            return error.RequiredBackendUnavailable;
+    }
+
     pub fn loadModel(self: *SessionManager, model_path: []const u8) !Session {
         return self.loadModelWithImportedOnnxContext(model_path, null);
     }
@@ -177,12 +210,34 @@ pub const SessionManager = struct {
         var manifest = manifest_mod.loadFromDir(self.allocator, model_path) catch null;
         defer if (manifest) |*m| m.deinit();
         var effective_buf: [backend_order_capacity]BackendType = undefined;
-        const effective_backends = effectiveBackendOrder(
+        const fallback_backends = effectiveBackendOrder(
             self.allocator,
             &effective_buf,
             self.preferred_backends,
             if (manifest) |m| m else null,
         );
+        var required_buf: [1]BackendType = undefined;
+        const effective_backends = try self.requiredBackendCandidates(
+            fallback_backends,
+            &required_buf,
+        );
+        const fail_closed_cuda_a4b = self.a4b_inference_request == null and
+            backendOrderSelectsCudaBeforeCpu(effective_backends) and
+            if (manifest) |m|
+                ((session_factory.resolveCudaA4bInferenceConfigForModelListing(
+                    self.allocator,
+                    model_path,
+                    m,
+                    null,
+                ) catch |err| blk: {
+                    std.log.warn(
+                        "CUDA A4B auto-policy inspection failed for {s}: {s}",
+                        .{ model_path, @errorName(err) },
+                    );
+                    break :blk null;
+                }) != null)
+            else
+                false;
 
         // Every backend below logs its failure and moves on, so without this the caller
         // only ever sees a blanket NoBackendAvailable. The actionable cause -- a GGUF
@@ -191,6 +246,27 @@ pub const SessionManager = struct {
         var first_err: ?anyerror = null;
 
         for (effective_backends) |backend| {
+            if (fail_closed_cuda_a4b and !backend.supportsA4bSession()) {
+                std.log.err(
+                    "qualified CUDA A4B model {s} rejected CPU fallback after GPU admission failure",
+                    .{model_path},
+                );
+                return first_err orelse error.A4bCudaAutoFallbackForbidden;
+            }
+            if (!backendAcceptsA4bRequest(backend, self.a4b_inference_request)) {
+                first_err = first_err orelse error.A4bRequiresGpu;
+                continue;
+            }
+            // The imported-ONNX graph runtime has no A4B residency contract.
+            // Reject the artifact at the route boundary instead of silently
+            // dropping the caller's memory envelope. Metal uses model_path
+            // directly, so this check does not depend on manifest fallback.
+            if (self.a4b_inference_request != null and
+                backend == .metal and
+                self.shouldUseImportedOnnxGraphRuntime(model_path))
+            {
+                return error.A4bUnsupportedArtifact;
+            }
             if (!backend.available()) continue;
             if (!backend.supportsDirectSessionLoad()) {
                 std.log.err(
@@ -237,11 +313,12 @@ pub const SessionManager = struct {
                         continue;
                     }
                 else if (build_options.enable_metal)
-                    session_factory.createMetalSessionWithKernelJitAndLoadContext(
+                    session_factory.createMetalSessionWithKernelJitAndLoadContextAndA4bRequest(
                         self.allocator,
                         model_path,
                         self.kernel_jit,
                         self.kernel_jit_load_context,
+                        self.a4b_inference_request,
                     ) catch |err| {
                         std.log.err("Metal session create failed for {s}: {s}", .{ model_path, @errorName(err) });
                         if (self.kernel_jit.qualified_profile_path != null or self.kernel_jit.profile_capture_only) return err;
@@ -258,11 +335,12 @@ pub const SessionManager = struct {
                         continue;
                     }
                 else if (build_options.enable_cuda)
-                    session_factory.createCudaSessionWithKernelJitAndLoadContext(
+                    session_factory.createCudaSessionWithKernelJitAndLoadContextAndA4bRequest(
                         self.allocator,
                         model_path,
                         self.kernel_jit,
                         self.kernel_jit_load_context,
+                        self.a4b_inference_request,
                     ) catch |err| {
                         std.log.err("CUDA session create failed for {s}: {s}", .{ model_path, @errorName(err) });
                         if (kernel_jit_mod.isRequiredFailure(self.kernel_jit.mode, err)) return err;
@@ -315,10 +393,45 @@ pub const SessionManager = struct {
             std.log.info("selected backend {s} for {s}", .{ @tagName(backend), model_path });
             return session;
         }
+        if (self.required_backend != null) return backendLoadFailure(self.required_backend, first_err);
         if (self.kernel_jit.qualified_profile_path != null or self.kernel_jit.profile_capture_only) return error.KernelJitProfileRequiresMetalBackend;
         if (self.kernel_jit.mode.failClosed()) return error.KernelJitRequiredBackendUnavailable;
         // NoBackendAvailable only when no backend produced a real error.
-        return first_err orelse error.NoBackendAvailable;
+        return backendLoadFailure(null, first_err);
+    }
+
+    /// Apply the process-level fail-closed backend policy before callers make
+    /// backend-specific artifact, compatibility, or resource-admission choices.
+    pub fn requiredBackendCandidates(
+        self: *const SessionManager,
+        fallback_backends: []const BackendType,
+        required_buf: *[1]BackendType,
+    ) ![]const BackendType {
+        if (self.required_backend_invalid) return error.InvalidRequiredBackend;
+        if (self.required_backend) |backend| {
+            if (!backend.supportsDirectSessionLoad())
+                return error.RequiredBackendUnavailable;
+        }
+        return enforceRequiredBackend(self.required_backend, fallback_backends, required_buf);
+    }
+
+    /// Whether a backend-specific fast path may bypass normal session loading.
+    /// Invalid or unsupported required policies still fail closed, while a
+    /// different valid required backend makes the fast path ineligible.
+    pub fn allowsDirectBackend(self: *const SessionManager, backend: BackendType) !bool {
+        if (self.required_backend_invalid) return error.InvalidRequiredBackend;
+        if (self.required_backend) |required| {
+            if (!required.supportsDirectSessionLoad()) return error.RequiredBackendUnavailable;
+        }
+        return self.allowsBackend(backend);
+    }
+
+    /// Whether a backend-specific execution path is compatible with the
+    /// process-level required backend, including compiled artifact runtimes.
+    pub fn allowsBackend(self: *const SessionManager, backend: BackendType) !bool {
+        if (self.required_backend_invalid) return error.InvalidRequiredBackend;
+        const required = self.required_backend orelse return true;
+        return required == backend;
     }
 
     fn createImportedOnnxSession(
@@ -345,6 +458,10 @@ pub const SessionManager = struct {
     }
 
     pub fn bestAvailable(self: *const SessionManager) ?BackendType {
+        if (self.required_backend_invalid) return null;
+        if (self.required_backend) |backend| {
+            return if (backend.available() and backend.supportsDirectSessionLoad()) backend else null;
+        }
         if (self.kernel_jit.mode.failClosed()) return self.bestKernelJitBackend();
         for (self.preferred_backends) |backend| {
             if (backend.available() and backend.supportsDirectSessionLoad()) return backend;
@@ -353,6 +470,11 @@ pub const SessionManager = struct {
     }
 
     pub fn bestKernelJitBackend(self: *const SessionManager) ?BackendType {
+        if (self.required_backend_invalid) return null;
+        if (self.required_backend) |backend| {
+            return if (backend.supportsKernelJitSession() and backend.available() and
+                backend.supportsDirectSessionLoad()) backend else null;
+        }
         for (self.preferred_backends) |backend| {
             if (backend.supportsKernelJitSession() and backend.available() and
                 backend.supportsDirectSessionLoad()) return backend;
@@ -408,6 +530,22 @@ fn backendAcceptsQualifiedProfile(backend: BackendType, model_path: []const u8) 
     return backend == .metal and !isOnnxFilePath(model_path);
 }
 
+fn backendAcceptsA4bRequest(
+    backend: BackendType,
+    request: ?backend_contracts.A4bInferenceRequest,
+) bool {
+    return request == null or backend == .metal or backend == .cuda;
+}
+
+pub fn backendOrderSelectsCudaBeforeCpu(order: []const BackendType) bool {
+    var saw_cuda = false;
+    for (order) |backend| {
+        if (backend == .cuda) saw_cuda = true;
+        if (!backend.supportsA4bSession()) return saw_cuda;
+    }
+    return false;
+}
+
 test "onnx artifact routes graph execution for direct compute backends" {
     try std.testing.expect(isOnnxFilePath("model.onnx"));
     try std.testing.expect(!isOnnxFilePath("model.gguf"));
@@ -417,6 +555,20 @@ test "qualified workload profiles select direct Metal sessions only" {
     try std.testing.expect(backendAcceptsQualifiedProfile(.metal, "model.gguf"));
     try std.testing.expect(!backendAcceptsQualifiedProfile(.metal, "model.onnx"));
     try std.testing.expect(!backendAcceptsQualifiedProfile(.cuda, "model.gguf"));
+}
+
+test "explicit A4B requests select GPU backends without generic fallback" {
+    try std.testing.expect(backendAcceptsA4bRequest(.metal, .{}));
+    try std.testing.expect(backendAcceptsA4bRequest(.cuda, .{}));
+    try std.testing.expect(!backendAcceptsA4bRequest(.native, .{}));
+    try std.testing.expect(backendAcceptsA4bRequest(.native, null));
+}
+
+test "CUDA-first automatic backend order is fail-closed before CPU" {
+    try std.testing.expect(backendOrderSelectsCudaBeforeCpu(&.{ .cuda, .native }));
+    try std.testing.expect(backendOrderSelectsCudaBeforeCpu(&.{ .cuda, .onnx, .native }));
+    try std.testing.expect(!backendOrderSelectsCudaBeforeCpu(&.{ .native, .cuda }));
+    try std.testing.expect(!backendOrderSelectsCudaBeforeCpu(&.{ .metal, .native }));
 }
 
 test "onnx backend availability follows linked onnx runtime" {
@@ -447,6 +599,13 @@ test "explicit graph runtime is independent from onnx runtime backend availabili
     try std.testing.expect(!manager.shouldUseExternalOnnxRuntime("model.gguf"));
 }
 
+test "A4B request rejects imported ONNX Metal artifact before session creation" {
+    var manager = SessionManager.init(std.testing.allocator);
+    manager.preferred_backends = &.{.metal};
+    manager.a4b_inference_request = .{ .residency_mode = .streamed, .memory_budget_mb = 2048 };
+    try std.testing.expectError(error.A4bUnsupportedArtifact, manager.loadModel("model.onnx"));
+}
+
 test "session manager defaults runtime kernel JIT off" {
     const manager = SessionManager.init(std.testing.allocator);
     try std.testing.expectEqual(kernel_jit_mod.Mode.off, manager.kernel_jit.mode);
@@ -475,6 +634,7 @@ test "session manager preferred-backend clone preserves runtime kernel JIT" {
         .preload_budget_ms = 120_000,
     };
     source.kernel_jit_load_context = .startup_preload;
+    source.a4b_inference_request = .{ .residency_mode = .streamed, .memory_budget_mb = 4096 };
     const preferred = [_]BackendType{.onnx};
 
     const cloned = source.withPreferredBackends(std.testing.allocator, &preferred);
@@ -485,6 +645,7 @@ test "session manager preferred-backend clone preserves runtime kernel JIT" {
     try std.testing.expectEqual(source.kernel_jit.max_cache_bytes_mb, cloned.kernel_jit.max_cache_bytes_mb);
     try std.testing.expectEqual(source.kernel_jit.preload_budget_ms, cloned.kernel_jit.preload_budget_ms);
     try std.testing.expectEqual(source.kernel_jit_load_context, cloned.kernel_jit_load_context);
+    try std.testing.expectEqual(source.a4b_inference_request, cloned.a4b_inference_request);
     try std.testing.expectEqualSlices(BackendType, &preferred, cloned.preferred_backends);
 }
 
@@ -500,14 +661,153 @@ fn preferredBackendOverride() ?BackendType {
     const value = std.c.getenv("ANTFLY_INFERENCE_PREFERRED_BACKEND") orelse
         std.c.getenv("TERMITE_PREFERRED_BACKEND") orelse
         return null;
-    const slice = std.mem.span(value);
-    if (std.ascii.eqlIgnoreCase(slice, "auto")) return null;
-    if (std.ascii.eqlIgnoreCase(slice, "onnx")) return .onnx;
-    if (std.ascii.eqlIgnoreCase(slice, "metal")) return .metal;
-    if (std.ascii.eqlIgnoreCase(slice, "pjrt")) return .pjrt;
-    if (std.ascii.eqlIgnoreCase(slice, "cuda")) return .cuda;
-    if (std.ascii.eqlIgnoreCase(slice, "native")) return .native;
+    const backend = parseBackendName(std.mem.span(value), true) orelse return null;
+    return if (backend == .wasm) null else backend;
+}
+
+fn requiredBackendFromEnv() RequiredBackendConfig {
+    if (build_options.enable_wasm or !build_options.link_libc) return .{};
+    const value = std.c.getenv("ANTFLY_INFERENCE_REQUIRED_BACKEND") orelse return .{};
+    return requiredBackendConfigForValue(std.mem.span(value));
+}
+
+fn requiredBackendConfigForValue(value: []const u8) RequiredBackendConfig {
+    return if (parseBackendName(value, false)) |backend|
+        .{ .backend = backend }
+    else
+        .{ .invalid = true };
+}
+
+fn parseBackendName(value: []const u8, allow_auto: bool) ?BackendType {
+    if (allow_auto and std.ascii.eqlIgnoreCase(value, "auto")) return null;
+    if (std.ascii.eqlIgnoreCase(value, "onnx")) return .onnx;
+    if (std.ascii.eqlIgnoreCase(value, "metal")) return .metal;
+    if (std.ascii.eqlIgnoreCase(value, "pjrt")) return .pjrt;
+    if (std.ascii.eqlIgnoreCase(value, "cuda")) return .cuda;
+    if (std.ascii.eqlIgnoreCase(value, "native")) return .native;
+    if (std.ascii.eqlIgnoreCase(value, "wasm")) return .wasm;
     return null;
+}
+
+fn enforceRequiredBackend(
+    required_backend: ?BackendType,
+    fallback_backends: []const BackendType,
+    required_buf: *[1]BackendType,
+) []const BackendType {
+    const backend = required_backend orelse return fallback_backends;
+    required_buf[0] = backend;
+    return required_buf;
+}
+
+fn backendLoadFailure(required_backend: ?BackendType, first_err: ?anyerror) anyerror {
+    if (required_backend != null) return first_err orelse error.RequiredBackendUnavailable;
+    return first_err orelse error.NoBackendAvailable;
+}
+
+test "required backend parser rejects auto and invalid values" {
+    try std.testing.expectEqual(BackendType.cuda, requiredBackendConfigForValue("cuda").backend.?);
+    try std.testing.expectEqual(BackendType.pjrt, requiredBackendConfigForValue("pjrt").backend.?);
+    try std.testing.expectEqual(BackendType.wasm, requiredBackendConfigForValue("wasm").backend.?);
+    try std.testing.expect(requiredBackendConfigForValue("auto").invalid);
+    try std.testing.expect(requiredBackendConfigForValue("bogus").invalid);
+}
+
+test "session manager reads required backend policy from environment" {
+    const expected = requiredBackendFromEnv();
+    const manager = SessionManager.init(std.testing.allocator);
+    try std.testing.expectEqual(expected.backend, manager.required_backend);
+    try std.testing.expectEqual(expected.invalid, manager.required_backend_invalid);
+}
+
+test "required backend replaces every fallback candidate" {
+    var manager = SessionManager.init(std.testing.allocator);
+    manager.required_backend = .cuda;
+    manager.required_backend_invalid = false;
+    var required_buf: [1]BackendType = undefined;
+    const fallback = [_]BackendType{ .native, .onnx, .metal };
+    try std.testing.expectEqualSlices(
+        BackendType,
+        &.{.cuda},
+        try manager.requiredBackendCandidates(&fallback, &required_buf),
+    );
+    manager.required_backend = null;
+    try std.testing.expectEqualSlices(
+        BackendType,
+        &fallback,
+        try manager.requiredBackendCandidates(&fallback, &required_buf),
+    );
+}
+
+test "required backend gates backend-specific fast paths" {
+    var manager = SessionManager.init(std.testing.allocator);
+    manager.required_backend = .cuda;
+    manager.required_backend_invalid = false;
+    try std.testing.expect(try manager.allowsDirectBackend(.cuda));
+    try std.testing.expect(!try manager.allowsDirectBackend(.onnx));
+    try std.testing.expect(try manager.allowsBackend(.cuda));
+    try std.testing.expect(!try manager.allowsBackend(.onnx));
+
+    manager.required_backend = null;
+    try std.testing.expect(try manager.allowsDirectBackend(.onnx));
+
+    manager.required_backend_invalid = true;
+    try std.testing.expectError(error.InvalidRequiredBackend, manager.allowsDirectBackend(.onnx));
+}
+
+test "required backend policy rejects unavailable and compiled-only backends" {
+    var manager = SessionManager.init(std.testing.allocator);
+    manager.required_backend = null;
+    manager.required_backend_invalid = false;
+    try manager.validateRequiredBackendPolicy();
+
+    manager.required_backend_invalid = true;
+    try std.testing.expectError(
+        error.InvalidRequiredBackend,
+        manager.validateRequiredBackendPolicy(),
+    );
+
+    manager.required_backend_invalid = false;
+    manager.required_backend = .pjrt;
+    try std.testing.expectError(
+        error.RequiredBackendUnavailable,
+        manager.validateRequiredBackendPolicy(),
+    );
+
+    manager.required_backend = .native;
+    if (BackendType.native.available()) {
+        try manager.validateRequiredBackendPolicy();
+    } else {
+        try std.testing.expectError(
+            error.RequiredBackendUnavailable,
+            manager.validateRequiredBackendPolicy(),
+        );
+    }
+}
+
+test "invalid required backend fails before model loading" {
+    var manager = SessionManager.init(std.testing.allocator);
+    manager.required_backend = null;
+    manager.required_backend_invalid = true;
+    try std.testing.expectError(error.InvalidRequiredBackend, manager.loadModel("/nonexistent/model"));
+}
+
+test "unavailable required backend does not fall back" {
+    var manager = SessionManager.init(std.testing.allocator);
+    manager.required_backend = .pjrt;
+    manager.required_backend_invalid = false;
+    manager.preferred_backends = &.{.native};
+    try std.testing.expectError(error.RequiredBackendUnavailable, manager.loadModel("/nonexistent/model"));
+}
+
+test "failing required backend preserves its load error" {
+    try std.testing.expectEqual(
+        error.NoTensorStoreFound,
+        backendLoadFailure(.native, error.NoTensorStoreFound),
+    );
+    try std.testing.expectEqual(
+        error.RequiredBackendUnavailable,
+        backendLoadFailure(.cuda, null),
+    );
 }
 
 fn gpuEagerDenseMaxBytes() u64 {

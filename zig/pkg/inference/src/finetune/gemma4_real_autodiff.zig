@@ -184,6 +184,11 @@ pub const GemmaAutodiffCtx = struct {
     /// bounded CCE primitive; native/reference callers remain null so their
     /// decomposed loss stays an independent correctness control.
     enable_fused_linear_cross_entropy: ?bool = null,
+    /// Require sparse logits reads to use the strict compiled Metal output
+    /// session. Numerical-oracle capture enables this temporarily so its
+    /// pre-update probes exercise the same graph executor as training instead
+    /// of silently falling back to the eager interpreter.
+    require_compiled_logits_output: bool = false,
     built: ?gemma_graph.GemmaGraph = null,
     lm_logits: ?NodeId = null,
     /// Non-null only for the compiled DPO pair graph. The graph runs chosen
@@ -688,6 +693,7 @@ const max_sparse_loss_chunk_rows: u32 = 512;
 const default_sparse_loss_chunk_rows: u32 = max_sparse_loss_chunk_rows;
 const weighted_logprob_target_top_k: usize = 8;
 const weighted_logprob_target_columns: usize = 1 + 2 * weighted_logprob_target_top_k;
+pub const max_single_token_completion_group_size: usize = 16;
 
 fn parseSparseLossChunkRows(raw: []const u8) ?u32 {
     const parsed = std.fmt.parseInt(u32, raw, 10) catch return null;
@@ -1112,6 +1118,9 @@ pub fn makeTrainerInputForSingleTokenCandidatesLogprobGrads(
     if (completion_token_ids.len == 0 or completion_token_ids.len != logprob_grads.len) {
         return error.GradientShapeMismatch;
     }
+    if (completion_token_ids.len > max_single_token_completion_group_size) {
+        return error.TooManyDistinctCompletionTokens;
+    }
     if (representative_example.num_supervised_tokens != 1) return error.ExpectedSingleSupervisedToken;
 
     const rows: usize = @intCast(seq_len);
@@ -1140,8 +1149,8 @@ pub fn makeTrainerInputForSingleTokenCandidatesLogprobGrads(
     const row = predictor_row orelse return error.ExpectedSingleSupervisedToken;
     if (row >= rows) return error.PreparedExampleExceedsSequenceLength;
 
-    var distinct_token_ids: [weighted_logprob_target_top_k]i32 = @splat(0);
-    var token_weights: [weighted_logprob_target_top_k]f32 = @splat(0.0);
+    var distinct_token_ids: [max_single_token_completion_group_size]i32 = @splat(0);
+    var token_weights: [max_single_token_completion_group_size]f32 = @splat(0.0);
     var distinct_count: usize = 0;
     for (completion_token_ids, logprob_grads) |token_id, grad| {
         if (token_id < 0 or @as(usize, @intCast(token_id)) >= vocab_size) return error.InputTokenOutOfRange;
@@ -1154,7 +1163,9 @@ pub fn makeTrainerInputForSingleTokenCandidatesLogprobGrads(
             }
         }
         if (slot == null) {
-            if (distinct_count == weighted_logprob_target_top_k) return error.TooManyDistinctCompletionTokens;
+            if (distinct_count == max_single_token_completion_group_size) {
+                return error.TooManyDistinctCompletionTokens;
+            }
             slot = distinct_count;
             distinct_token_ids[distinct_count] = token_id;
             distinct_count += 1;
@@ -1162,13 +1173,21 @@ pub fn makeTrainerInputForSingleTokenCandidatesLogprobGrads(
         token_weights[slot.?] += -grad;
     }
 
-    const targets = try allocator.alloc(f32, weighted_logprob_target_columns);
+    // Preserve the established 17-column graph whenever the sampled group
+    // coalesces to at most eight unique tokens. Only groups that genuinely
+    // need the expanded capacity compile/use the 33-column variant.
+    const target_capacity = if (distinct_count <= weighted_logprob_target_top_k)
+        weighted_logprob_target_top_k
+    else
+        max_single_token_completion_group_size;
+    const target_columns = 1 + 2 * target_capacity;
+    const targets = try allocator.alloc(f32, target_columns);
     errdefer allocator.free(targets);
     @memset(targets, 0.0);
     targets[0] = @floatFromInt(row);
-    for (0..weighted_logprob_target_top_k) |idx| {
+    for (0..target_capacity) |idx| {
         targets[1 + idx] = @floatFromInt(distinct_token_ids[idx]);
-        targets[1 + weighted_logprob_target_top_k + idx] = token_weights[idx];
+        targets[1 + target_capacity + idx] = token_weights[idx];
     }
 
     return .{
@@ -1183,7 +1202,7 @@ pub fn makeTrainerInputForSingleTokenCandidatesLogprobGrads(
             .input_ids = input_ids,
             .attention_mask = attention_mask,
             .targets = targets,
-            .targets_shape = Shape.init(.f32, &.{ 1, weighted_logprob_target_columns }),
+            .targets_shape = Shape.init(.f32, &.{ 1, @as(i64, @intCast(target_columns)) }),
             .batch = 1,
             .seq_len = seq_len,
             .bind_arch_inputs = null,
@@ -2160,6 +2179,23 @@ pub fn deriveGrpoSamplingGroupSeed(
 
 pub fn deriveGrpoCompletionSamplingSeed(group_seed: u64, completion_index: usize) u64 {
     return mixGrpoSamplingSeed(group_seed ^ @as(u64, @intCast(completion_index)));
+}
+
+/// Derive the independent PRNG stream used to permute one complete GRPO
+/// prompt epoch. The dataset size is part of the derivation so extending or
+/// truncating a dataset cannot silently reuse the prefix of an older order.
+/// Callers rebuild the permutation directly from the logical epoch, which
+/// keeps epoch-boundary checkpoint resume independent of process-local RNG
+/// state.
+pub fn deriveGrpoEpochPromptOrderSeed(
+    run_seed: u64,
+    domain: u64,
+    epoch_index: usize,
+    prompt_count: usize,
+) u64 {
+    var seed = mixGrpoSamplingSeed(run_seed ^ domain);
+    seed = mixGrpoSamplingSeed(seed ^ @as(u64, @intCast(epoch_index)));
+    return mixGrpoSamplingSeed(seed ^ @as(u64, @intCast(prompt_count)));
 }
 
 /// Exactness-first GRPO rollout sampler. One candidate performs the canonical
@@ -3359,6 +3395,31 @@ pub const PreparedMicrostepObservation = struct {
     explicit_device_sync: bool,
 };
 
+pub const SupervisedLogitProbe = struct {
+    predictor_position: usize,
+    target_token_id: i32,
+    token_ids: []i32,
+    values: []f32,
+    logsumexp: f32,
+
+    fn deinit(self: *SupervisedLogitProbe, allocator: std.mem.Allocator) void {
+        allocator.free(self.token_ids);
+        allocator.free(self.values);
+        self.* = undefined;
+    }
+};
+
+pub const SupervisedLogitProbes = struct {
+    allocator: std.mem.Allocator,
+    rows: []SupervisedLogitProbe,
+
+    pub fn deinit(self: *SupervisedLogitProbes) void {
+        for (self.rows) |*row| row.deinit(self.allocator);
+        self.allocator.free(self.rows);
+        self.* = undefined;
+    }
+};
+
 pub const PreparedMicrostepObserver = *const fn (
     context: *anyopaque,
     observation: PreparedMicrostepObservation,
@@ -4060,6 +4121,160 @@ fn executeLogitsForInputIdsConfigured(
     );
 }
 
+/// Capture the deterministic, compact logit surface required by the Gemma4
+/// external numerical oracle. One probe is emitted for every causal
+/// supervised label. Large responses are projected in bounded chunks, so the
+/// capture never retains a full [sequence, vocabulary] activation.
+pub fn captureSupervisedLogitProbes(
+    allocator: std.mem.Allocator,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    ctx: *GemmaAutodiffCtx,
+    example: *const gemma4.PreparedExampleInput,
+    seq_len: u32,
+    seed: u64,
+) !SupervisedLogitProbes {
+    const rows: usize = @intCast(seq_len);
+    const vocab_size: usize = @intCast(ctx.graph_config.vocab_size);
+    const supervised_count = try validatePreparedExample(example, rows, vocab_size);
+    if (supervised_count == 0) return error.NoSupervisedTokens;
+
+    const probes = try allocator.alloc(SupervisedLogitProbe, supervised_count);
+    var initialized: usize = 0;
+    errdefer {
+        for (probes[0..initialized]) |*probe| probe.deinit(allocator);
+        allocator.free(probes);
+    }
+
+    const predictor_positions = try allocator.alloc(usize, supervised_count);
+    defer allocator.free(predictor_positions);
+    const target_token_ids = try allocator.alloc(i32, supervised_count);
+    defer allocator.free(target_token_ids);
+    var supervised_index: usize = 0;
+    for (example.labels[0..example.num_input_tokens], 0..) |label, label_position| {
+        if (label == -100) continue;
+        if (label_position == 0) return error.InvalidCausalLabel;
+        predictor_positions[supervised_index] = label_position - 1;
+        target_token_ids[supervised_index] = label;
+        supervised_index += 1;
+    }
+    if (supervised_index != supervised_count) return error.SupervisedTokenCountMismatch;
+
+    const previous_compiled_requirement = ctx.require_compiled_logits_output;
+    ctx.require_compiled_logits_output = trainer.compute_backend.kind() == .metal;
+    defer ctx.require_compiled_logits_output = previous_compiled_requirement;
+
+    const chunk_rows: usize = sparseLossChunkRows();
+    var start: usize = 0;
+    while (start < supervised_count) {
+        const end = @min(start + chunk_rows, supervised_count);
+        {
+            const logits = try executeSparseLogitsForInputIdsAtRows(
+                allocator,
+                trainer,
+                ctx,
+                example.input_ids[0..example.num_input_tokens],
+                seq_len,
+                predictor_positions[start..end],
+                null,
+            );
+            defer allocator.free(logits);
+            if (logits.len != (end - start) * vocab_size) return error.InvalidTrainerLogits;
+
+            for (start..end) |index| {
+                const local_index = index - start;
+                const row_logits = logits[local_index * vocab_size ..][0..vocab_size];
+                const target_token_id = target_token_ids[index];
+                var candidates: [9]i32 = undefined;
+                const candidate_count = stableOracleProbeTokenIds(
+                    &candidates,
+                    target_token_id,
+                    vocab_size,
+                    predictor_positions[index],
+                    seed,
+                );
+                const token_ids = try allocator.dupe(i32, candidates[0..candidate_count]);
+                errdefer allocator.free(token_ids);
+                const values = try allocator.alloc(f32, candidate_count);
+                errdefer allocator.free(values);
+                for (token_ids, values) |token_id, *value| {
+                    value.* = row_logits[@intCast(token_id)];
+                    if (!std.math.isFinite(value.*)) return error.NonFiniteOracleLogits;
+                }
+                probes[index] = .{
+                    .predictor_position = predictor_positions[index],
+                    .target_token_id = target_token_id,
+                    .token_ids = token_ids,
+                    .values = values,
+                    .logsumexp = try stableLogSumExp(row_logits),
+                };
+                initialized += 1;
+            }
+        }
+        start = end;
+    }
+    return .{ .allocator = allocator, .rows = probes };
+}
+
+fn stableOracleProbeTokenIds(
+    out: *[9]i32,
+    target_token_id: i32,
+    vocab_size: usize,
+    predictor_position: usize,
+    seed: u64,
+) usize {
+    std.debug.assert(vocab_size >= 3);
+    std.debug.assert(target_token_id >= 0 and @as(usize, @intCast(target_token_id)) < vocab_size);
+    out[0] = 0;
+    out[1] = 1;
+    out[2] = 2;
+    out[3] = target_token_id;
+    out[4] = @intCast(vocab_size - 1);
+    const mixed_position: u32 = @truncate(@as(u64, @intCast(predictor_position)) *% 0x9E37_79B1);
+    var state: u32 = @truncate(seed ^ mixed_position);
+    for (5..9) |index| {
+        state = state *% 1_664_525 +% 1_013_904_223;
+        out[index] = @intCast(@as(usize, state) % vocab_size);
+    }
+    std.mem.sort(i32, out, {}, std.sort.asc(i32));
+    var unique_count: usize = 0;
+    for (out.*) |candidate| {
+        if (unique_count == 0 or out[unique_count - 1] != candidate) {
+            out[unique_count] = candidate;
+            unique_count += 1;
+        }
+    }
+    return unique_count;
+}
+
+fn stableLogSumExp(values: []const f32) !f32 {
+    if (values.len == 0) return error.EmptyOracleLogits;
+    var maximum = -std.math.inf(f32);
+    for (values) |value| {
+        if (!std.math.isFinite(value)) return error.NonFiniteOracleLogits;
+        maximum = @max(maximum, value);
+    }
+    var sum: f64 = 0;
+    for (values) |value| sum += @exp(@as(f64, value - maximum));
+    const result: f32 = @floatCast(@as(f64, maximum) + @log(sum));
+    if (!std.math.isFinite(result)) return error.NonFiniteOracleLogits;
+    return result;
+}
+
+test "Gemma4 oracle probes mirror the locked token selection and stable logsumexp" {
+    var ids: [9]i32 = undefined;
+    const count = stableOracleProbeTokenIds(&ids, 3, 17, 2, 42);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 1, 2, 3, 10, 12, 14, 15, 16 }, ids[0..count]);
+
+    const duplicate_count = stableOracleProbeTokenIds(&ids, 2, 3, 1, 42);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 1, 2 }, ids[0..duplicate_count]);
+    try std.testing.expectApproxEqAbs(
+        @as(f32, @floatCast(2 + @log(@exp(@as(f64, -2)) + @exp(@as(f64, -1)) + 1))),
+        try stableLogSumExp(&.{ 0, 1, 2 }),
+        1e-6,
+    );
+    try std.testing.expectError(error.NonFiniteOracleLogits, stableLogSumExp(&.{std.math.nan(f32)}));
+}
+
 fn executeSparseLogitsForInputIdBatchAtRows(
     allocator: std.mem.Allocator,
     trainer: *real_autodiff.RealAutodiffTrainer,
@@ -4209,7 +4424,11 @@ fn executeLogitsForInputIdBatchesConfigured(
     const compiled_sampling = !force_eager_policy and
         frozen_lora == null and
         trainer.compute_backend.kind() == .metal and
-        platform.env.getenvBoolDefault("ANTFLY_GEMMA4_GRPO_COMPILED_SAMPLING", false);
+        (ctx.require_compiled_logits_output or
+            platform.env.getenvBoolDefault("ANTFLY_GEMMA4_GRPO_COMPILED_SAMPLING", false));
+    if (ctx.require_compiled_logits_output and !compiled_sampling) {
+        return error.StrictMetalCompiledLogitsUnavailable;
+    }
     if (compiled_sampling) {
         _ = try trainer.ensureCompiledOutputSessionBuilt(logits_node);
         var result = try trainer.compiled_output_session.?.executePrimaryOutput(
@@ -4394,20 +4613,32 @@ pub fn sampleGrpoTokenFromLogits(
         token_id: usize,
         logit: f32,
     };
-    const candidates = try allocator.alloc(Candidate, logits.len);
+    const candidate_count = if (options.top_k == 0)
+        logits.len
+    else
+        @min(options.top_k, logits.len);
+    const candidates = try allocator.alloc(Candidate, candidate_count);
     defer allocator.free(candidates);
-    for (logits, 0..) |logit, token_id| {
-        candidates[token_id] = .{ .token_id = token_id, .logit = logit };
-    }
-    std.mem.sort(Candidate, candidates, {}, struct {
-        fn lessThan(_: void, lhs: Candidate, rhs: Candidate) bool {
-            if (lhs.logit != rhs.logit) return lhs.logit > rhs.logit;
-            return lhs.token_id < rhs.token_id;
+    if (options.top_k == 0) {
+        for (logits, 0..) |logit, token_id| {
+            candidates[token_id] = .{ .token_id = token_id, .logit = logit };
         }
-    }.lessThan);
+        std.mem.sort(Candidate, candidates, {}, struct {
+            fn lessThan(_: void, lhs: Candidate, rhs: Candidate) bool {
+                if (lhs.logit != rhs.logit) return lhs.logit > rhs.logit;
+                return lhs.token_id < rhs.token_id;
+            }
+        }.lessThan);
+    } else {
+        const ranked_token_ids = try allocator.alloc(usize, candidate_count);
+        defer allocator.free(ranked_token_ids);
+        try selectTopRankedTokens(allocator, logits, ranked_token_ids);
+        for (ranked_token_ids, 0..) |token_id, index| {
+            candidates[index] = .{ .token_id = token_id, .logit = logits[token_id] };
+        }
+    }
 
-    const top_k_count = if (options.top_k == 0) candidates.len else @min(options.top_k, candidates.len);
-    const filtered = candidates[0..top_k_count];
+    const filtered = candidates;
     const max_logit = filtered[0].logit;
     var filtered_total: f64 = 0.0;
     for (filtered) |candidate| {
@@ -4532,7 +4763,7 @@ fn writeAndPublishGemmaBundle(
     };
 }
 
-fn mapTrainerSlotNameToGemmaAdapterTensor(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+pub fn mapTrainerSlotNameToGemmaAdapterTensor(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
     if (try mapUseSiteTrainerSlotNameToLoopTensor(allocator, name)) |mapped| return mapped;
     if (std.mem.endsWith(u8, name, ".lora_A")) {
         return std.fmt.allocPrint(allocator, "{s}.weight", .{name});
@@ -5403,6 +5634,17 @@ test "gemma4 GRPO categorical sampling is seeded filtered and finite" {
         try std.testing.expect(first_token < 3);
     }
 
+    const unsorted_logits = [_]f32{ 0.0, 3.0, 1.0, 2.0 };
+    for ([_]f64{ 0.0, 0.25, 0.5, 0.75, 0.999999 }) |draw| {
+        const selected = try sampleGrpoTokenFromLogits(
+            std.testing.allocator,
+            &unsorted_logits,
+            .{ .seed = 0, .top_k = 2 },
+            draw,
+        );
+        try std.testing.expect(selected == 1 or selected == 3);
+    }
+
     try std.testing.expectEqual(
         @as(usize, 0),
         try sampleGrpoTokenFromLogits(std.testing.allocator, &logits, .{
@@ -5436,6 +5678,19 @@ test "gemma4 GRPO group seeds bind logical resume position" {
     try std.testing.expect(
         deriveGrpoCompletionSamplingSeed(seed, 0) != deriveGrpoCompletionSamplingSeed(seed, 1),
     );
+}
+
+test "gemma4 GRPO epoch-order seeds bind epoch and dataset size" {
+    const run_seed: u64 = 42;
+    const domain: u64 = 0x4752504f4f524452;
+    const seed = deriveGrpoEpochPromptOrderSeed(run_seed, domain, 3, 128);
+    try std.testing.expectEqual(
+        seed,
+        deriveGrpoEpochPromptOrderSeed(run_seed, domain, 3, 128),
+    );
+    try std.testing.expect(seed != deriveGrpoEpochPromptOrderSeed(run_seed, domain, 4, 128));
+    try std.testing.expect(seed != deriveGrpoEpochPromptOrderSeed(run_seed, domain, 3, 129));
+    try std.testing.expect(seed != deriveGrpoEpochPromptOrderSeed(run_seed + 1, domain, 3, 128));
 }
 
 test "gemma4 multi-token GRPO predictor rows preserve flattened batch ownership" {
@@ -5547,7 +5802,7 @@ test "gemma4 single-token GRPO group coalesces weighted targets on one predictor
         .num_key_value_heads = 2,
         .attention_head_dim = 4,
         .intermediate_size = 32,
-        .vocab_size = 16,
+        .vocab_size = 32,
         .position_encoding = .rope,
         .norm_type = .rms_norm,
         .activation = .gelu_new,
@@ -5587,6 +5842,56 @@ test "gemma4 single-token GRPO group coalesces weighted targets on one predictor
     try std.testing.expectEqual(@as(f32, 7.0), owned.targets[2]);
     try std.testing.expectApproxEqAbs(@as(f32, -1.75), owned.targets[9], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), owned.targets[10], 1e-6);
+
+    var group_token_ids: [max_single_token_completion_group_size]i32 = undefined;
+    var group_logprob_grads: [max_single_token_completion_group_size]f32 = undefined;
+    for (&group_token_ids, &group_logprob_grads, 0..) |*token_id, *grad, idx| {
+        token_id.* = @intCast(idx);
+        grad.* = @as(f32, @floatFromInt(idx + 1)) / 32.0;
+    }
+    var group_owned = try makeTrainerInputForSingleTokenCompletionGroupLogprobGrads(
+        allocator,
+        &ctx,
+        &example,
+        6,
+        &group_token_ids,
+        &group_logprob_grads,
+    );
+    defer group_owned.deinit(allocator);
+    try std.testing.expectEqual(@as(i64, 33), group_owned.trainer_input.targets_shape.dim(1));
+    try std.testing.expectEqual(@as(f32, 15.0), group_owned.targets[16]);
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0 / 32.0), group_owned.targets[17], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.5), group_owned.targets[32], 1e-6);
+
+    const duplicate_group_token_ids: [max_single_token_completion_group_size]i32 = @splat(7);
+    const duplicate_group_logprob_grads: [max_single_token_completion_group_size]f32 = @splat(0.25);
+    var duplicate_group_owned = try makeTrainerInputForSingleTokenCompletionGroupLogprobGrads(
+        allocator,
+        &ctx,
+        &example,
+        6,
+        &duplicate_group_token_ids,
+        &duplicate_group_logprob_grads,
+    );
+    defer duplicate_group_owned.deinit(allocator);
+    try std.testing.expectEqual(@as(i64, 17), duplicate_group_owned.trainer_input.targets_shape.dim(1));
+    try std.testing.expectEqual(@as(f32, 7.0), duplicate_group_owned.targets[1]);
+    try std.testing.expectApproxEqAbs(@as(f32, -4.0), duplicate_group_owned.targets[9], 1e-6);
+
+    var too_many_token_ids: [max_single_token_completion_group_size + 1]i32 = undefined;
+    const too_many_logprob_grads: [max_single_token_completion_group_size + 1]f32 = @splat(0.0);
+    for (&too_many_token_ids, 0..) |*token_id, idx| token_id.* = @intCast(idx);
+    try std.testing.expectError(
+        error.TooManyDistinctCompletionTokens,
+        makeTrainerInputForSingleTokenCompletionGroupLogprobGrads(
+            allocator,
+            &ctx,
+            &example,
+            6,
+            &too_many_token_ids,
+            &too_many_logprob_grads,
+        ),
+    );
 }
 
 test "gemma4 single-token DPO pair coalesces opposing logprob gradients" {

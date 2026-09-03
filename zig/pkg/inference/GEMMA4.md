@@ -588,7 +588,7 @@ also supported for local smoke coverage, but acceptance-rate conclusions should
 prefer official target+assistant pairs and the proper Gemma 4 chat template.
 
 The repo smoke wrapper is
-`scripts/test_metal_gemma4_assistant_speculative.sh`. It uses `--backend auto`
+`scripts/gemma4/test_metal_gemma4_assistant_speculative.sh`. It uses `--backend auto`
 by default so the normal backend selector can pick Metal when available; set
 `ANTFLY_INFERENCE_GEMMA4_ASSISTANT_BACKEND=metal` to force Metal for crash/debug runs.
 The official target currently needs the wrapper's default
@@ -674,7 +674,7 @@ MLX streams/providers for the `.mlx` backend. The repaired smoke
 ### Phase 3: Performance Work
 
 Baseline, no-MTP prefill/decode optimization is tracked separately in
-[GEMMA4_METAL_PERFORMANCE.md](./GEMMA4_METAL_PERFORMANCE.md). That roadmap owns
+[GEMMA4_PERF_PLAN.md](./GEMMA4_PERF_PLAN.md). That roadmap owns
 the pinned llama.cpp comparison, current experiment ledger, promotion gates,
 and ordered Metal kernel/runtime tranches. MTP speedups are additive and must
 not be used to qualify the baseline model path.

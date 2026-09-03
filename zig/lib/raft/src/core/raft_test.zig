@@ -235,6 +235,107 @@ test "raft normalizes zero no-limit defaults" {
     try std.testing.expectEqual(std.math.maxInt(usize), raft.cfg.max_inflight_bytes);
 }
 
+test "duplicate read context ignores a delayed heartbeat for an earlier request" {
+    var storage = storage_mod.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var voters = [_]types.NodeId{ 1, 2, 3 };
+    try storage.applySnapshot(.{
+        .metadata = .{
+            .index = 11,
+            .term = 11,
+            .conf_state = .{ .voters = voters[0..] },
+        },
+        .data = &.{},
+    });
+    storage.setHardState(.{ .current_term = 11, .commit_index = 11 });
+
+    var raft = try raft_mod.Raft.init(std.testing.allocator, .{
+        .id = 1,
+        .group_id = 1,
+        .peers = &.{ 1, 2, 3 },
+        .election_tick = 10,
+        .heartbeat_tick = 1,
+        .check_quorum = false,
+        .pre_vote = false,
+    }, storage.storage());
+    defer raft.deinit();
+
+    try raft.campaign();
+    clearMessages(&raft);
+    try raft.step(.{
+        .msg_type = .request_vote_response,
+        .from = 2,
+        .to = 1,
+        .term = 12,
+    });
+    clearMessages(&raft);
+    try std.testing.expectEqual(types.StateRole.leader, raft.soft_state.role);
+
+    // Confirm the original request via node 2, leaving node 3's response delayed.
+    try raft.readIndex("retry-context");
+    try std.testing.expectEqual(@as(usize, 2), raft.messages.items.len);
+    const original_heartbeat_ctx = try std.testing.allocator.dupe(u8, raft.messages.items[0].context);
+    defer std.testing.allocator.free(original_heartbeat_ctx);
+    try std.testing.expect(!std.mem.eql(u8, "retry-context", original_heartbeat_ctx));
+    clearMessages(&raft);
+    try raft.step(.{
+        .msg_type = .heartbeat_response,
+        .from = 2,
+        .to = 1,
+        .term = 12,
+        .context = original_heartbeat_ctx,
+    });
+    try std.testing.expectEqual(@as(usize, 0), raft.pending_reads.items.len);
+    try std.testing.expectEqual(@as(usize, 1), raft.read_states.items.len);
+    for (raft.read_states.items) |*read_state| read_state.deinit(std.testing.allocator);
+    raft.read_states.clearRetainingCapacity();
+
+    // Queue an unrelated read, followed by a retry using the original caller context.
+    try raft.readIndex("unrelated-context");
+    clearMessages(&raft);
+    try raft.readIndex("retry-context");
+    try std.testing.expectEqual(@as(usize, 2), raft.pending_reads.items.len);
+    try std.testing.expectEqual(@as(usize, 2), raft.messages.items.len);
+    const retry_heartbeat_ctx = try std.testing.allocator.dupe(u8, raft.messages.items[0].context);
+    defer std.testing.allocator.free(retry_heartbeat_ctx);
+    try std.testing.expect(!std.mem.eql(u8, original_heartbeat_ctx, retry_heartbeat_ctx));
+    clearMessages(&raft);
+
+    // Periodic heartbeats retry the newest outstanding read token rather than
+    // dropping the context and leaving the read dependent on caller retries.
+    raft.tick();
+    try std.testing.expectEqual(@as(usize, 2), raft.messages.items.len);
+    try std.testing.expectEqualSlices(u8, retry_heartbeat_ctx, raft.messages.items[0].context);
+    try std.testing.expectEqualSlices(u8, retry_heartbeat_ctx, raft.messages.items[1].context);
+    clearMessages(&raft);
+
+    // Node 3's delayed response to the original request must not acknowledge the
+    // retry or release the unrelated read that precedes it.
+    try raft.step(.{
+        .msg_type = .heartbeat_response,
+        .from = 3,
+        .to = 1,
+        .term = 12,
+        .context = original_heartbeat_ctx,
+    });
+    try std.testing.expectEqual(@as(usize, 2), raft.pending_reads.items.len);
+    try std.testing.expectEqual(@as(usize, 0), raft.read_states.items.len);
+
+    // A response to the retry's own heartbeat safely confirms both queued reads.
+    try raft.step(.{
+        .msg_type = .heartbeat_response,
+        .from = 2,
+        .to = 1,
+        .term = 12,
+        .context = retry_heartbeat_ctx,
+    });
+    try std.testing.expectEqual(@as(usize, 0), raft.pending_reads.items.len);
+    try std.testing.expectEqual(@as(usize, 2), raft.read_states.items.len);
+    try std.testing.expectEqualStrings("unrelated-context", raft.read_states.items[0].request_ctx);
+    try std.testing.expectEqualStrings("retry-context", raft.read_states.items[1].request_ctx);
+}
+
 test "raft applied restart index suppresses already-applied committed entries" {
     var storage = storage_mod.MemoryStorage.init(std.testing.allocator);
     defer storage.deinit();
@@ -261,6 +362,154 @@ test "raft applied restart index suppresses already-applied committed entries" {
     const rd = raw.ready();
     try std.testing.expectEqual(@as(usize, 1), rd.committed_entries.len);
     try std.testing.expectEqual(@as(types.Index, 2), rd.committed_entries[0].index);
+}
+
+test "raft restart restores persisted voters missing from configured peers" {
+    var storage = storage_mod.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var voters = [_]types.NodeId{ 1, 2, 3 };
+    try storage.applySnapshot(.{
+        .metadata = .{
+            .index = 8,
+            .term = 1,
+            .conf_state = .{ .voters = voters[0..] },
+        },
+        .data = &.{},
+    });
+    storage.setHardState(.{
+        .current_term = 1,
+        .commit_index = 8,
+    });
+
+    var raft = try raft_mod.Raft.init(std.testing.allocator, .{
+        .id = 1,
+        .group_id = 1,
+        .peers = &.{1},
+        .election_tick = 10,
+        .heartbeat_tick = 1,
+        .check_quorum = true,
+        .pre_vote = true,
+    }, storage.storage());
+    defer raft.deinit();
+
+    try raft.campaign();
+
+    const status = raft.status();
+    try std.testing.expectEqual(types.StateRole.pre_candidate, status.soft.role);
+    try std.testing.expectEqual(@as(usize, 1), status.votes_granted);
+    try std.testing.expectEqual(@as(usize, 2), status.votes_unknown);
+    try std.testing.expectEqual(@as(usize, 2), raft.messages.items.len);
+    try std.testing.expectEqual(@as(types.NodeId, 2), raft.messages.items[0].to);
+    try std.testing.expectEqual(@as(types.NodeId, 3), raft.messages.items[1].to);
+
+    clearMessages(&raft);
+    try raft.step(.{
+        .msg_type = .pre_vote_response,
+        .from = 2,
+        .to = 1,
+        .term = 2,
+    });
+    try std.testing.expectEqual(types.StateRole.candidate, raft.status().soft.role);
+
+    clearMessages(&raft);
+    try raft.step(.{
+        .msg_type = .request_vote_response,
+        .from = 2,
+        .to = 1,
+        .term = 2,
+    });
+    try std.testing.expectEqual(types.StateRole.leader, raft.status().soft.role);
+}
+
+test "raft restart restores every persisted membership role into peers" {
+    var storage = storage_mod.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var voters = [_]types.NodeId{ 1, 2 };
+    var voters_outgoing = [_]types.NodeId{ 1, 2, 5 };
+    var learners = [_]types.NodeId{4};
+    var learners_next = [_]types.NodeId{5};
+    try storage.applySnapshot(.{
+        .metadata = .{
+            .index = 8,
+            .term = 1,
+            .conf_state = .{
+                .voters = voters[0..],
+                .voters_outgoing = voters_outgoing[0..],
+                .learners = learners[0..],
+                .learners_next = learners_next[0..],
+            },
+        },
+        .data = &.{},
+    });
+    storage.setHardState(.{
+        .current_term = 1,
+        .commit_index = 8,
+    });
+
+    var raft = try raft_mod.Raft.init(std.testing.allocator, .{
+        .id = 1,
+        .group_id = 1,
+        .peers = &.{1},
+        .election_tick = 10,
+        .heartbeat_tick = 1,
+        .check_quorum = true,
+        .pre_vote = true,
+    }, storage.storage());
+    defer raft.deinit();
+
+    try raft.campaign();
+
+    const status = raft.status();
+    try std.testing.expectEqual(@as(usize, 3), status.votes_unknown);
+    try std.testing.expectEqual(@as(usize, 2), raft.messages.items.len);
+    try std.testing.expectEqual(@as(types.NodeId, 2), raft.messages.items[0].to);
+    try std.testing.expectEqual(@as(types.NodeId, 5), raft.messages.items[1].to);
+}
+
+test "raft restart restores peers added by committed configuration replay" {
+    var storage = storage_mod.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var voters = [_]types.NodeId{1};
+    try storage.seedConfState(.{ .voters = voters[0..] });
+    var change = types.ConfChangeV2{
+        .changes = try std.testing.allocator.dupe(types.ConfChangeSingle, &.{.{
+            .change_type = .add_node,
+            .node_id = 2,
+        }}),
+    };
+    defer change.deinit(std.testing.allocator);
+    const encoded = try change.encode(std.testing.allocator);
+    defer std.testing.allocator.free(encoded);
+    try storage.append(&.{.{
+        .index = 1,
+        .term = 1,
+        .entry_type = .conf_change_v2,
+        .data = encoded,
+    }});
+    storage.setHardState(.{
+        .current_term = 1,
+        .commit_index = 1,
+    });
+
+    var raft = try raft_mod.Raft.init(std.testing.allocator, .{
+        .id = 1,
+        .group_id = 1,
+        .peers = &.{1},
+        .election_tick = 10,
+        .heartbeat_tick = 1,
+        .check_quorum = false,
+        .pre_vote = false,
+    }, storage.storage());
+    defer raft.deinit();
+
+    try raft.campaign();
+
+    try std.testing.expectEqual(@as(usize, 1), raft.status().votes_unknown);
+    try std.testing.expectEqual(@as(usize, 1), raft.messages.items.len);
+    try std.testing.expectEqual(@as(types.NodeId, 2), raft.messages.items[0].to);
 }
 
 test "raft rejects applied restart index past committed" {

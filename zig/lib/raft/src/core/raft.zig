@@ -34,10 +34,18 @@ const VoteState = enum {
     rejected,
 };
 
+const ReadContext = struct {
+    term: types.Term,
+    sequence: u64,
+};
+
+const encoded_read_context_len = @sizeOf(types.Term) + @sizeOf(u64);
+
 const PendingRead = struct {
     index: types.Index,
     requester: types.NodeId,
     context: []u8,
+    read_context: ReadContext,
     acks: []bool,
 
     fn deinit(self: *PendingRead, alloc: std.mem.Allocator) void {
@@ -98,6 +106,7 @@ pub const Raft = struct {
     pending_snapshot: ?types.Snapshot = null,
     snapshot_in_progress: bool = false,
     uncommitted_size: usize = 0,
+    read_sequence: u64 = 0,
     pending_reads: std.ArrayListUnmanaged(PendingRead) = .empty,
     read_states: std.ArrayListUnmanaged(types.ReadState) = .empty,
     messages: std.ArrayListUnmanaged(message.Message) = .empty,
@@ -130,21 +139,9 @@ pub const Raft = struct {
             return error.LeaseBasedReadRequiresCheckQuorum;
         }
 
-        const peers = try alloc.dupe(types.NodeId, normalized_cfg.peers);
+        var peers = try alloc.dupe(types.NodeId, normalized_cfg.peers);
         errdefer alloc.free(peers);
         if (peerIndex(peers, normalized_cfg.id) == null) return error.LocalNodeNotInPeerSet;
-
-        const votes = try alloc.alloc(VoteState, peers.len);
-        errdefer alloc.free(votes);
-        @memset(votes, .unknown);
-
-        const progress = try alloc.alloc(types.Progress, peers.len);
-        errdefer alloc.free(progress);
-        @memset(progress, .{});
-
-        const inflights = try alloc.alloc(std.ArrayListUnmanaged(Inflight), peers.len);
-        errdefer alloc.free(inflights);
-        for (inflights) |*queue| queue.* = .empty;
 
         var raft_log = try log_mod.RaftLog.init(alloc, storage);
         errdefer raft_log.deinit();
@@ -201,6 +198,35 @@ pub const Raft = struct {
                 }
             }
         }
+
+        const persisted_targets = [_][]const types.NodeId{
+            conf_state.voters,
+            conf_state.voters_outgoing,
+            conf_state.learners,
+            conf_state.learners_next,
+        };
+        for (persisted_targets) |targets| {
+            for (targets) |node_id| {
+                if (peerIndex(peers, node_id) != null) continue;
+                const expanded = try alloc.alloc(types.NodeId, peers.len + 1);
+                @memcpy(expanded[0..peers.len], peers);
+                expanded[peers.len] = node_id;
+                alloc.free(peers);
+                peers = expanded;
+            }
+        }
+
+        const votes = try alloc.alloc(VoteState, peers.len);
+        errdefer alloc.free(votes);
+        @memset(votes, .unknown);
+
+        const progress = try alloc.alloc(types.Progress, peers.len);
+        errdefer alloc.free(progress);
+        @memset(progress, .{});
+
+        const inflights = try alloc.alloc(std.ArrayListUnmanaged(Inflight), peers.len);
+        errdefer alloc.free(inflights);
+        for (inflights) |*queue| queue.* = .empty;
 
         if (normalized_cfg.applied > raft_log.applied and normalized_cfg.applied > hard_state.commit_index) {
             return error.InvalidApplied;
@@ -474,10 +500,16 @@ pub const Raft = struct {
             return;
         }
 
+        self.read_sequence +%= 1;
+        const read_context = ReadContext{
+            .term = self.hard_state.current_term,
+            .sequence = self.read_sequence,
+        };
         var pending = PendingRead{
             .index = self.log.committed,
             .requester = requester,
             .context = try self.alloc.dupe(u8, rctx),
+            .read_context = read_context,
             .acks = try self.alloc.alloc(bool, self.peers.len),
         };
         errdefer pending.deinit(self.alloc);
@@ -485,7 +517,9 @@ pub const Raft = struct {
         if (peerIndex(self.peers, self.cfg.id)) |self_idx| pending.acks[self_idx] = true;
 
         try self.pending_reads.append(self.alloc, pending);
-        try self.bcastHeartbeatWithContext(rctx);
+        var encoded_context: [encoded_read_context_len]u8 = undefined;
+        encodeReadContext(&encoded_context, read_context);
+        try self.bcastHeartbeatWithContext(&encoded_context);
     }
 
     pub fn proposeConfChange(self: *Raft, conf_change: types.ConfChange) !void {
@@ -1168,6 +1202,12 @@ pub const Raft = struct {
     }
 
     fn bcastHeartbeat(self: *Raft) !void {
+        if (self.pending_reads.items.len > 0) {
+            var encoded_context: [encoded_read_context_len]u8 = undefined;
+            encodeReadContext(&encoded_context, self.pending_reads.items[self.pending_reads.items.len - 1].read_context);
+            try self.bcastHeartbeatWithContext(&encoded_context);
+            return;
+        }
         try self.bcastHeartbeatWithContext(&.{});
     }
 
@@ -1560,8 +1600,11 @@ pub const Raft = struct {
     }
 
     fn handleReadAck(self: *Raft, from: types.NodeId, context: []const u8) !void {
+        const read_context = decodeReadContext(context) orelse return;
+        if (read_context.term != self.hard_state.current_term) return;
         for (self.pending_reads.items, 0..) |*pending_read, i| {
-            if (!std.mem.eql(u8, pending_read.context, context)) continue;
+            if (pending_read.read_context.term != read_context.term or
+                pending_read.read_context.sequence != read_context.sequence) continue;
             if (peerIndex(self.peers, from)) |peer_idx| pending_read.acks[peer_idx] = true;
             if (!self.readAckedQuorum(pending_read.acks)) return;
 
@@ -1813,6 +1856,19 @@ pub const Raft = struct {
         }
     }
 };
+
+fn encodeReadContext(out: *[encoded_read_context_len]u8, context: ReadContext) void {
+    std.mem.writeInt(types.Term, out[0..@sizeOf(types.Term)], context.term, .little);
+    std.mem.writeInt(u64, out[@sizeOf(types.Term)..encoded_read_context_len], context.sequence, .little);
+}
+
+fn decodeReadContext(encoded: []const u8) ?ReadContext {
+    if (encoded.len != encoded_read_context_len) return null;
+    return .{
+        .term = std.mem.readInt(types.Term, encoded[0..@sizeOf(types.Term)], .little),
+        .sequence = std.mem.readInt(u64, encoded[@sizeOf(types.Term)..encoded_read_context_len], .little),
+    };
+}
 
 fn peerIndex(peers: []const types.NodeId, id: types.NodeId) ?usize {
     for (peers, 0..) |peer, i| {

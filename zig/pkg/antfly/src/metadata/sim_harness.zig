@@ -66,13 +66,15 @@ const casbin = @import("antfly_casbin");
 
 const LeanSimAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 // Public API simulations can open DBs and hosted indexes from the listener
-// request thread; keep enough stack for that Linux CI path.
-const lean_sim_thread_stack_size = 4 * 1024 * 1024;
+// request thread. Debug x86_64 index construction exceeds the partitioned
+// runtime's 4 MiB floor, so match the production HTTP request stack instead
+// of intermittently entering the guard page while opening query-only DBs.
+const lean_sim_thread_stack_size = 8 * 1024 * 1024;
 fn leanSimHttpAllocator() std.mem.Allocator {
     return std.heap.smp_allocator;
 }
 
-const SimSplitRuntime = struct {
+pub const SimSplitRuntime = struct {
     const Entry = struct {
         transition_id: u64,
         attempt_epoch: u64,
@@ -96,13 +98,13 @@ const SimSplitRuntime = struct {
     len: usize = 0,
     replica_root_dir: ?[]const u8 = null,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         for (self.entries[0..self.len]) |*entry| self.releaseCoordinator(entry);
         self.len = 0;
         self.replica_root_dir = null;
     }
 
-    fn iface(self: *@This()) transition_runtime.SplitRuntime {
+    pub fn iface(self: *@This()) transition_runtime.SplitRuntime {
         return .{
             .ptr = self,
             .vtable = &.{
@@ -595,7 +597,7 @@ fn runtimeDocIdentityStatusReportFromStats(
     };
 }
 
-fn reportRuntimeDocIdentityForActiveReplicas(
+pub fn reportRuntimeDocIdentityForActiveReplicas(
     cluster: *MetadataHttpClusterSimulation,
     node: anytype,
     replica_root_dirs: []const []const u8,
@@ -659,6 +661,9 @@ fn reportRuntimeDocIdentityForActiveReplicas(
                 .disk_bytes = 1,
                 .created_at_millis = now_ms,
                 .index_count = stats.index_count,
+                .enrichment = .{
+                    .projection_checkpoint_status = try alloc.dupe(u8, "clean"),
+                },
                 .doc_identity = runtimeDocIdentityStatusReportFromStats(stats.doc_identity),
             });
         }
@@ -938,7 +943,7 @@ fn waitForMedianKeyEquals(
     return try cluster.runUntil(max_rounds, &ctx, medianKeyEqualsProgressPredicate);
 }
 
-fn mirrorGroupBatchToActiveReplicas(
+pub fn mirrorGroupBatchToActiveReplicas(
     cluster: *MetadataHttpClusterSimulation,
     client: *api_http_client.ApiHttpClient,
     api_base_uris: []const []const u8,
@@ -2243,10 +2248,11 @@ fn projectedTableFieldContainsOnNode(
     return (std.mem.indexOf(u8, haystack, needle) != null) == expected_present;
 }
 
-const SimMergeRuntime = struct {
+pub const SimMergeRuntime = struct {
     const Entry = struct {
         donor_group_id: u64,
         receiver_group_id: u64,
+        coord: ?*transition_runtime.MergeCoordinatorRuntime = null,
         status: data_mod.MergeTransitionStatus = .{
             .phase = .prepare,
             .donor_group_id = 0,
@@ -2264,8 +2270,15 @@ const SimMergeRuntime = struct {
 
     entries: [16]Entry = undefined,
     len: usize = 0,
+    replica_root_dir: ?[]const u8 = null,
 
-    fn iface(self: *@This()) transition_runtime.MergeRuntime {
+    pub fn deinit(self: *@This()) void {
+        for (self.entries[0..self.len]) |*entry| self.releaseCoordinator(entry);
+        self.len = 0;
+        self.replica_root_dir = null;
+    }
+
+    pub fn iface(self: *@This()) transition_runtime.MergeRuntime {
         return .{
             .ptr = self,
             .vtable = &.{
@@ -2305,19 +2318,63 @@ const SimMergeRuntime = struct {
         return &self.entries[self.len - 1];
     }
 
+    fn releaseCoordinator(self: *@This(), entry: *Entry) void {
+        _ = self;
+        if (entry.coord) |coord| {
+            coord.deinit();
+            std.heap.page_allocator.destroy(coord);
+            entry.coord = null;
+        }
+    }
+
+    fn withCoordinator(self: *@This(), donor_group_id: u64, receiver_group_id: u64) !*transition_runtime.MergeCoordinatorRuntime {
+        const entry = self.entryFor(donor_group_id, receiver_group_id);
+        if (entry.coord == null) {
+            const alloc = std.heap.page_allocator;
+            const replica_root_dir = self.replica_root_dir orelse return error.UnsupportedOperation;
+            const donor_root_dir = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, donor_group_id);
+            defer alloc.free(donor_root_dir);
+            const receiver_root_dir = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, receiver_group_id);
+            defer alloc.free(receiver_root_dir);
+
+            try SimSplitRuntime.ensureSourceApplyStoreSeeded(alloc, donor_root_dir, donor_group_id);
+
+            const coord = try alloc.create(transition_runtime.MergeCoordinatorRuntime);
+            errdefer alloc.destroy(coord);
+            coord.* = try transition_runtime.MergeCoordinatorRuntime.init(alloc, .{
+                .donor_root_dir = donor_root_dir,
+                .receiver_root_dir = receiver_root_dir,
+                .donor_group_id = donor_group_id,
+                .receiver_group_id = receiver_group_id,
+                .receiver = .{ .root_dir = receiver_root_dir },
+            });
+            entry.coord = coord;
+        }
+        return entry.coord.?;
+    }
+
     fn observeStatus(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !data_mod.MergeTransitionStatus {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.replica_root_dir != null) {
+            return try (try self.withCoordinator(donor_group_id, receiver_group_id)).runtime().observeStatus(donor_group_id, receiver_group_id);
+        }
         return self.entryFor(donor_group_id, receiver_group_id).status;
     }
 
     fn recordDocIdentityReassignment(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.replica_root_dir != null) {
+            return try (try self.withCoordinator(donor_group_id, receiver_group_id)).runtime().recordDocIdentityReassignment(donor_group_id, receiver_group_id);
+        }
         const entry = self.entryFor(donor_group_id, receiver_group_id);
         entry.status.allow_doc_identity_reassignment = true;
     }
 
     fn acceptReceiver(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.replica_root_dir != null) {
+            return try (try self.withCoordinator(donor_group_id, receiver_group_id)).runtime().acceptReceiver(donor_group_id, receiver_group_id);
+        }
         const entry = self.entryFor(donor_group_id, receiver_group_id);
         entry.status.phase = .bootstrap_peer;
         entry.status.receiver_accepts_donor_range = true;
@@ -2325,6 +2382,9 @@ const SimMergeRuntime = struct {
 
     fn catchUpReceiver(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !usize {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.replica_root_dir != null) {
+            return try (try self.withCoordinator(donor_group_id, receiver_group_id)).runtime().catchUpReceiver(donor_group_id, receiver_group_id);
+        }
         const entry = self.entryFor(donor_group_id, receiver_group_id);
         entry.status.phase = .cutover_ready;
         entry.status.bootstrapped = true;
@@ -2339,6 +2399,11 @@ const SimMergeRuntime = struct {
 
     fn finalizeMerge(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !bool {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.replica_root_dir != null) {
+            const finalized = try (try self.withCoordinator(donor_group_id, receiver_group_id)).runtime().finalizeMerge(donor_group_id, receiver_group_id);
+            if (finalized) self.releaseCoordinator(self.entryFor(donor_group_id, receiver_group_id));
+            return finalized;
+        }
         const entry = self.entryFor(donor_group_id, receiver_group_id);
         entry.status.phase = .finalized;
         entry.status.replay_required = false;
@@ -2347,6 +2412,11 @@ const SimMergeRuntime = struct {
 
     fn rollbackMerge(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !bool {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.replica_root_dir != null) {
+            const rolled_back = try (try self.withCoordinator(donor_group_id, receiver_group_id)).runtime().rollbackMerge(donor_group_id, receiver_group_id);
+            if (rolled_back) self.releaseCoordinator(self.entryFor(donor_group_id, receiver_group_id));
+            return rolled_back;
+        }
         const entry = self.entryFor(donor_group_id, receiver_group_id);
         entry.status.phase = .rolled_back;
         entry.status.receiver_accepts_donor_range = false;
@@ -3229,7 +3299,10 @@ pub const MetadataHttpClusterSimulation = struct {
             alloc.free(backend_runtimes);
         }
         for (backend_runtimes) |*runtime| {
-            runtime.* = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+            runtime.* = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{
+                .backend = .manual,
+                .filesystem_io = std.testing.io,
+            });
             backend_runtime_count += 1;
         }
         for (configs, 0..) |cfg, i| {
@@ -3859,7 +3932,7 @@ fn metadataMergeTransitionFinalizedProgressPredicate(cluster: *MetadataHttpClust
     return observation.receiver.phase == .finalized;
 }
 
-fn waitForSplitTransitionFinalized(
+pub fn waitForSplitTransitionFinalized(
     cluster: *MetadataHttpClusterSimulation,
     transition_id: u64,
     observer_index: ?usize,
@@ -4301,12 +4374,12 @@ fn reconcileUntilNodeGroupStatus(
     return false;
 }
 
-const SplitRetirementSummary = struct {
+pub const SplitRetirementSummary = struct {
     terminal: metadata_control_loop.ReconcileSummary,
     removal: metadata_control_loop.ReconcileSummary,
 };
 
-fn retireFinalizedSplitTransition(
+pub fn retireFinalizedSplitTransition(
     node: MetadataHttpNodeSimulation,
     loop: *metadata_control_loop.MetadataControlLoop,
 ) !SplitRetirementSummary {
@@ -4325,12 +4398,12 @@ fn retireFinalizedSplitTransition(
     return .{ .terminal = terminal, .removal = removal };
 }
 
-const MergeRetirementSummary = struct {
+pub const MergeRetirementSummary = struct {
     terminal: metadata_control_loop.ReconcileSummary,
     removal: metadata_control_loop.ReconcileSummary,
 };
 
-fn retireFinalizedMergeTransition(
+pub fn retireFinalizedMergeTransition(
     node: MetadataHttpNodeSimulation,
     loop: *metadata_control_loop.MetadataControlLoop,
 ) !MergeRetirementSummary {
@@ -4947,6 +5020,8 @@ const SimAuthManager = struct {
     }
 };
 
+const sim_internal_service_secret = "metadata-simulation-internal-service-secret";
+
 fn encodeBasicAuthorization(alloc: std.mem.Allocator, username: []const u8, password: []const u8) ![]u8 {
     const raw = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ username, password });
     defer alloc.free(raw);
@@ -5000,17 +5075,24 @@ fn startPublicApiServers(
             forward_executor.executor(),
         );
         _ = read_sources[i].withIo(shared_io);
+        _ = read_sources[i].withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
         write_sources[i] = api_table_writes.HostedProvisionedTableWriteSource.init(
             roots[i],
             catalog_sources[i].iface(),
             routers[i].iface(),
             forward_executor.executor(),
         );
+        _ = write_sources[i].withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
         const server_config: api_http_server.ApiHttpServerConfig = if (options.auth_managers) |auth_managers| .{
             .auth_enabled = true,
             .user_manager = &auth_managers[i].manager,
-        } else .{};
+            .internal_service_secret = sim_internal_service_secret,
+            .internal_service_issuer = "metadata-sim",
+        } else .{
+            .internal_service_secret = sim_internal_service_secret,
+            .internal_service_issuer = "metadata-sim",
+        };
         servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(
             alloc,
             http_alloc,
@@ -5159,6 +5241,7 @@ fn PublicApiTestRig(comptime N: usize) type {
             errdefer self.client_executor.deinit();
 
             self.client = api_http_client.ApiHttpClient.init(std.heap.page_allocator, self.client_executor.executor());
+            _ = self.client.withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
             self.metadata_client = metadata_http_client.MetadataHttpClient.init(std.heap.page_allocator, self.client_executor.executor());
 
             for (0..N) |i| try cluster.node(i).runRound();
@@ -6327,6 +6410,7 @@ test "metadata http cluster simulation forwards public split flow from a non-hos
     client_executor.initSharedInPlace(std.heap.page_allocator, .{}, &http_io);
     defer client_executor.deinit();
     var client = api_http_client.ApiHttpClient.init(std.heap.page_allocator, client_executor.executor());
+    _ = client.withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
     var metadata_client = metadata_http_client.MetadataHttpClient.init(std.heap.page_allocator, client_executor.executor());
 
     const create_body = try test_contract_helpers.encodeCreateTableRequest(std.heap.page_allocator, "split public docs");
@@ -6527,6 +6611,7 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
     client_executor.initSharedInPlace(std.heap.page_allocator, .{}, &http_io);
     defer client_executor.deinit();
     var client = api_http_client.ApiHttpClient.init(std.heap.page_allocator, client_executor.executor());
+    _ = client.withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
     var metadata_client = metadata_http_client.MetadataHttpClient.init(std.heap.page_allocator, client_executor.executor());
 
     const create_body = try test_contract_helpers.encodeCreateTableRequest(std.heap.page_allocator, "merge public docs");
@@ -9898,17 +9983,19 @@ test "metadata http cluster simulation forwards public table io from a non-host 
             forward_executor.executor(),
         );
         _ = read_sources[i].withIo(&http_io);
+        _ = read_sources[i].withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
         write_sources[i] = api_table_writes.HostedProvisionedTableWriteSource.init(
             roots[i],
             catalog_sources[i].iface(),
             routers[i].iface(),
             forward_executor.executor(),
         );
+        _ = write_sources[i].withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
         servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(
             std.testing.allocator,
             http_alloc,
-            .{},
+            .{ .internal_service_secret = sim_internal_service_secret, .internal_service_issuer = "metadata-sim" },
             status_sources[i].iface(),
             read_sources[i].source(),
             write_sources[i].source(),
@@ -9923,6 +10010,7 @@ test "metadata http cluster simulation forwards public table io from a non-host 
     client_executor.initSharedInPlace(std.heap.page_allocator, .{}, &http_io);
     defer client_executor.deinit();
     var client = api_http_client.ApiHttpClient.init(std.heap.page_allocator, client_executor.executor());
+    _ = client.withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
     const client_base = api_base_uris[client_index];
 
     var batch = try client.fetchBatch(client_base, "docs",
@@ -10181,14 +10269,16 @@ test "metadata http cluster simulation forwards public table io across split ran
             forward_executor.executor(),
         );
         _ = read_sources[i].withIo(&http_io);
+        _ = read_sources[i].withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
         write_sources[i] = api_table_writes.HostedProvisionedTableWriteSource.init(
             roots[i],
             catalog_sources[i].iface(),
             routers[i].iface(),
             forward_executor.executor(),
         );
+        _ = write_sources[i].withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
-        servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(std.testing.allocator, http_alloc, .{}, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
+        servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(std.testing.allocator, http_alloc, .{ .internal_service_secret = sim_internal_service_secret, .internal_service_issuer = "metadata-sim" }, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
         listeners[i] = try api_http_test_runtime.Runtime.startShared(http_alloc, &http_io, &servers[i]);
     }
     for (0..3) |i| api_base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
@@ -10203,6 +10293,7 @@ test "metadata http cluster simulation forwards public table io across split ran
     client_executor.initSharedInPlace(std.heap.page_allocator, .{}, &http_io);
     defer client_executor.deinit();
     var client = api_http_client.ApiHttpClient.init(std.heap.page_allocator, client_executor.executor());
+    _ = client.withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
     const client_base = api_base_uris[client_index];
 
     var batch = try client.fetchBatch(client_base, "docs",
@@ -10464,14 +10555,16 @@ test "metadata http cluster simulation forwards public table io after merge fina
             forward_executor.executor(),
         );
         _ = read_sources[i].withIo(&http_io);
+        _ = read_sources[i].withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
         write_sources[i] = api_table_writes.HostedProvisionedTableWriteSource.init(
             roots[i],
             catalog_sources[i].iface(),
             routers[i].iface(),
             forward_executor.executor(),
         );
+        _ = write_sources[i].withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
-        servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(std.testing.allocator, http_alloc, .{}, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
+        servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(std.testing.allocator, http_alloc, .{ .internal_service_secret = sim_internal_service_secret, .internal_service_issuer = "metadata-sim" }, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
         listeners[i] = try api_http_test_runtime.Runtime.startShared(http_alloc, &http_io, &servers[i]);
     }
     for (0..3) |i| api_base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
@@ -10484,6 +10577,7 @@ test "metadata http cluster simulation forwards public table io after merge fina
     client_executor.initSharedInPlace(std.heap.page_allocator, .{}, &http_io);
     defer client_executor.deinit();
     var client = api_http_client.ApiHttpClient.init(std.heap.page_allocator, client_executor.executor());
+    _ = client.withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
     const client_base = api_base_uris[client_index];
 
     var batch = try client.fetchBatch(client_base, "docs",
@@ -11546,6 +11640,7 @@ test "metadata http cluster simulation load balanced backup retries a real elect
     client_executor.initSharedInPlace(std.heap.page_allocator, .{}, &http_io);
     defer client_executor.deinit();
     var client = api_http_client.ApiHttpClient.init(std.heap.page_allocator, client_executor.executor());
+    _ = client.withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
 
     const initial_leader_node_id = cluster.cluster.configs[initial_leader].host.http.host.local_node_id;
     try cluster.virtual_network.partitionNode(initial_leader_node_id);

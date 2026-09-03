@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const decode_control = @import("decode_control.zig");
 
 pub const native_port_available = true;
 
@@ -94,6 +95,11 @@ pub fn inverse53LevelInPlace(allocator: std.mem.Allocator, data: []i32, width: u
 }
 
 pub fn inverse53LevelInPlacePhase(allocator: std.mem.Allocator, data: []i32, width: usize, height: usize, phase_x: u1, phase_y: u1) !void {
+    return inverse53LevelInPlacePhaseWithCancellation(allocator, data, width, height, phase_x, phase_y, .{});
+}
+
+pub fn inverse53LevelInPlacePhaseWithCancellation(allocator: std.mem.Allocator, data: []i32, width: usize, height: usize, phase_x: u1, phase_y: u1, cancellation: decode_control.CancellationProbe) !void {
+    try cancellation.check();
     if (data.len != width * height or width == 0 or height == 0) return error.InvalidWaveletBufferShape;
 
     const low_w = if (phase_x == 0) (width + 1) / 2 else width / 2;
@@ -118,12 +124,14 @@ pub fn inverse53LevelInPlacePhase(allocator: std.mem.Allocator, data: []i32, wid
     const line_even_scratch = try allocator.alloc(i32, @max(low_w, low_h));
     defer allocator.free(line_even_scratch);
 
+    var work_since_cancellation_check: usize = 0;
     var y: usize = 0;
     while (y < height) : (y += 1) {
         @memcpy(low_row, data[y * width .. y * width + low_w]);
         @memcpy(high_row, data[y * width + low_w .. y * width + width]);
         try inverse53LineIntoPhaseScratch(out_row, low_row, high_row, phase_x, line_even_scratch);
         @memcpy(temp[y * width .. y * width + width], out_row);
+        try cancellation.checkAfterWork(&work_since_cancellation_check, width);
     }
 
     var x: usize = 0;
@@ -135,6 +143,7 @@ pub fn inverse53LevelInPlacePhase(allocator: std.mem.Allocator, data: []i32, wid
         try inverse53LineIntoPhaseScratch(out_col, low_col, high_col, phase_y, line_even_scratch);
         y = 0;
         while (y < height) : (y += 1) data[y * width + x] = out_col[y];
+        try cancellation.checkAfterWork(&work_since_cancellation_check, height);
     }
 }
 
@@ -315,18 +324,93 @@ pub fn inverse97LevelInPlacePhaseOpenJpeg(allocator: std.mem.Allocator, data: []
 }
 
 fn inverse97LevelInPlacePhaseWithScaling(allocator: std.mem.Allocator, data: []f32, width: usize, height: usize, phase_x: u1, phase_y: u1, openjpeg_highpass_scaling: bool) !void {
-    if (data.len != width * height or width == 0 or height == 0) return error.InvalidWaveletBufferShape;
+    return inverse97LevelInPlaceStridedPhaseWithScaling(
+        allocator,
+        data,
+        width,
+        height,
+        width,
+        phase_x,
+        phase_y,
+        openjpeg_highpass_scaling,
+        .{},
+    );
+}
+
+pub fn inverse97LevelInPlaceStridedPhase(
+    allocator: std.mem.Allocator,
+    data: []f32,
+    width: usize,
+    height: usize,
+    stride: usize,
+    phase_x: u1,
+    phase_y: u1,
+) !void {
+    return inverse97LevelInPlaceStridedPhaseWithScaling(allocator, data, width, height, stride, phase_x, phase_y, false, .{});
+}
+
+pub fn inverse97LevelInPlaceStridedPhaseWithCancellation(
+    allocator: std.mem.Allocator,
+    data: []f32,
+    width: usize,
+    height: usize,
+    stride: usize,
+    phase_x: u1,
+    phase_y: u1,
+    cancellation: decode_control.CancellationProbe,
+) !void {
+    return inverse97LevelInPlaceStridedPhaseWithScaling(allocator, data, width, height, stride, phase_x, phase_y, false, cancellation);
+}
+
+pub fn inverse97LevelInPlaceStridedPhaseOpenJpeg(
+    allocator: std.mem.Allocator,
+    data: []f32,
+    width: usize,
+    height: usize,
+    stride: usize,
+    phase_x: u1,
+    phase_y: u1,
+) !void {
+    return inverse97LevelInPlaceStridedPhaseWithScaling(allocator, data, width, height, stride, phase_x, phase_y, true, .{});
+}
+
+pub fn inverse97LevelInPlaceStridedPhaseOpenJpegWithCancellation(
+    allocator: std.mem.Allocator,
+    data: []f32,
+    width: usize,
+    height: usize,
+    stride: usize,
+    phase_x: u1,
+    phase_y: u1,
+    cancellation: decode_control.CancellationProbe,
+) !void {
+    return inverse97LevelInPlaceStridedPhaseWithScaling(allocator, data, width, height, stride, phase_x, phase_y, true, cancellation);
+}
+
+fn inverse97LevelInPlaceStridedPhaseWithScaling(
+    allocator: std.mem.Allocator,
+    data: []f32,
+    width: usize,
+    height: usize,
+    stride: usize,
+    phase_x: u1,
+    phase_y: u1,
+    openjpeg_highpass_scaling: bool,
+    cancellation: decode_control.CancellationProbe,
+) !void {
+    try cancellation.check();
+    if (width == 0 or height == 0 or stride < width) return error.InvalidWaveletBufferShape;
+    const required_len = std.math.mul(usize, stride, height) catch return error.InvalidWaveletBufferShape;
+    if (data.len < required_len) return error.InvalidWaveletBufferShape;
 
     const low_w = if (phase_x == 0) (width + 1) / 2 else width / 2;
     const high_w = width - low_w;
     const low_h = if (phase_y == 0) (height + 1) / 2 else height / 2;
     const high_h = height - low_h;
 
-    var temp = try allocator.alloc(f32, data.len);
-    defer allocator.free(temp);
-    var low_col = try allocator.alloc(f32, low_h);
+    const low_col = try allocator.alloc(f32, low_h);
     defer allocator.free(low_col);
-    var high_col = try allocator.alloc(f32, high_h);
+    const high_col = try allocator.alloc(f32, high_h);
     defer allocator.free(high_col);
     const out_col = try allocator.alloc(f32, height);
     defer allocator.free(out_col);
@@ -341,10 +425,12 @@ fn inverse97LevelInPlacePhaseWithScaling(allocator: std.mem.Allocator, data: []f
     const line_odd_scratch = try allocator.alloc(f32, @max(high_w, high_h));
     defer allocator.free(line_odd_scratch);
 
+    var work_since_cancellation_check: usize = 0;
     var y: usize = 0;
     while (y < height) : (y += 1) {
-        @memcpy(low_row, data[y * width .. y * width + low_w]);
-        @memcpy(high_row, data[y * width + low_w .. y * width + width]);
+        const row = data[y * stride ..][0..width];
+        @memcpy(low_row, row[0..low_w]);
+        @memcpy(high_row, row[low_w..width]);
         try inverse97LineIntoPhaseWithScalingScratch(
             out_row,
             low_row,
@@ -354,15 +440,16 @@ fn inverse97LevelInPlacePhaseWithScaling(allocator: std.mem.Allocator, data: []f
             line_even_scratch,
             line_odd_scratch,
         );
-        @memcpy(temp[y * width .. y * width + width], out_row);
+        @memcpy(row, out_row);
+        try cancellation.checkAfterWork(&work_since_cancellation_check, width);
     }
 
     var x: usize = 0;
     while (x < width) : (x += 1) {
         y = 0;
-        while (y < low_h) : (y += 1) low_col[y] = temp[y * width + x];
+        while (y < low_h) : (y += 1) low_col[y] = data[y * stride + x];
         y = 0;
-        while (y < high_h) : (y += 1) high_col[y] = temp[(low_h + y) * width + x];
+        while (y < high_h) : (y += 1) high_col[y] = data[(low_h + y) * stride + x];
         try inverse97LineIntoPhaseWithScalingScratch(
             out_col,
             low_col,
@@ -373,7 +460,8 @@ fn inverse97LevelInPlacePhaseWithScaling(allocator: std.mem.Allocator, data: []f
             line_odd_scratch,
         );
         y = 0;
-        while (y < height) : (y += 1) data[y * width + x] = out_col[y];
+        while (y < height) : (y += 1) data[y * stride + x] = out_col[y];
+        try cancellation.checkAfterWork(&work_since_cancellation_check, height);
     }
 }
 
@@ -783,4 +871,33 @@ test "inverse 9/7 level in place round trips 4x4 input" {
     for (source, data) |expected, actual| {
         try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
     }
+}
+
+test "inverse wavelet cancellation is observed between reconstruction rows" {
+    const ProbeState = struct {
+        checks: usize = 0,
+        cancel_after: usize,
+
+        fn isCancelled(context: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(context.?)));
+            self.checks += 1;
+            return self.checks >= self.cancel_after;
+        }
+    };
+
+    var data = [_]i32{0} ** (64 * 64);
+    var probe_state = ProbeState{ .cancel_after = 2 };
+    try std.testing.expectError(
+        error.Canceled,
+        inverse53LevelInPlacePhaseWithCancellation(
+            std.testing.allocator,
+            &data,
+            64,
+            64,
+            0,
+            0,
+            .{ .context = &probe_state, .is_cancelled_fn = ProbeState.isCancelled },
+        ),
+    );
+    try std.testing.expectEqual(probe_state.cancel_after, probe_state.checks);
 }

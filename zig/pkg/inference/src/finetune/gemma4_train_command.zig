@@ -77,6 +77,11 @@ pub const TrainOptions = struct {
     /// present together; normal typed callers leave them null.
     benchmark_request_path: ?[]const u8 = null,
     benchmark_telemetry_out_path: ?[]const u8 = null,
+    /// Optional fail-closed numerical-oracle capture contract. Both paths
+    /// must be supplied together; the capture directory is immutable and is
+    /// intentionally separate from the candidate adapter bundle.
+    oracle_request_path: ?[]const u8 = null,
+    oracle_capture_out_dir: ?[]const u8 = null,
 };
 
 pub const EvalOptions = struct {
@@ -203,6 +208,8 @@ const CliOptions = struct {
     resume_from_checkpoint: bool = false,
     benchmark_request_path: ?[]const u8 = null,
     benchmark_telemetry_out_path: ?[]const u8 = null,
+    oracle_request_path: ?[]const u8 = null,
+    oracle_capture_out_dir: ?[]const u8 = null,
 
     fn effectiveEvalMaxExamples(self: CliOptions) usize {
         return if (self.eval_max_examples > 0) self.eval_max_examples else self.max_examples;
@@ -258,6 +265,8 @@ const ReportContext = struct {
 
 const benchmark_request_schema_v1 = "antfly_gemma4_lora_benchmark_request/v2";
 const benchmark_telemetry_schema_v1 = "antfly_gemma4_lora_benchmark_telemetry/v4";
+const oracle_request_schema_v1 = "antfly_gemma4_lora_zig_oracle_request/v1";
+const oracle_capture_schema_v1 = "antfly_gemma4_lora_zig_oracle_capture/v1";
 const benchmark_timed_unit_v1 = "optimizer-step-including-grad-accumulation";
 const benchmark_sync_point_v1 = "after-optimizer-update-before-timer-stop-every-window";
 const benchmark_peak_memory_source_v1 = "darwin-proc-pid-rusage-v4-lifetime-max-phys-footprint";
@@ -362,6 +371,217 @@ const BenchmarkAdmission = struct {
     fn request(self: *const BenchmarkAdmission) *const BenchmarkRequestV1 {
         return &self.parsed.value;
     }
+};
+
+const OracleImplementationV1 = struct {
+    version: []const u8,
+    executable_sha256: []const u8,
+    source_revision: []const u8,
+    backend: []const u8,
+    metal_device: ?[]const u8 = null,
+};
+
+const OracleBindingsV1 = struct {
+    oracle_lock_sha256: []const u8,
+    model_key: []const u8,
+    model_revision: []const u8,
+    local_artifact_sha256: []const u8,
+    base_model_sha256: []const u8,
+    initial_adapter_sha256: []const u8,
+    train_prepared_sha256: []const u8,
+    source_dataset_sha256: []const u8,
+    example_index: usize,
+    target_preset: []const u8,
+    rank: usize,
+    alpha: f64,
+    target_count: usize,
+};
+
+const OracleTrainingV1 = struct {
+    optimizer: []const u8,
+    seed: u64,
+    steps: usize,
+    learning_rate: f64,
+    betas: [2]f64,
+    eps: f64,
+    weight_decay: f64,
+    max_grad_norm: f64,
+    grad_accum_steps: u32,
+    supervised_token_normalization: []const u8,
+    dropout: f64,
+    use_cache: bool,
+};
+
+const OracleRequestV1 = struct {
+    schema_version: []const u8,
+    implementation: OracleImplementationV1,
+    bindings: OracleBindingsV1,
+    training: OracleTrainingV1,
+};
+
+const OracleAdmission = struct {
+    parsed: std.json.Parsed(OracleRequestV1),
+    capture_out_dir: []const u8,
+    request_sha256: []const u8,
+
+    fn deinit(self: *OracleAdmission, allocator: std.mem.Allocator) void {
+        self.parsed.deinit();
+        allocator.free(self.request_sha256);
+        self.* = undefined;
+    }
+
+    fn request(self: *const OracleAdmission) *const OracleRequestV1 {
+        return &self.parsed.value;
+    }
+};
+
+const CapturedOracleGradient = struct {
+    name: []u8,
+    values: []f32,
+};
+
+const OracleExecutionEvidence = struct {
+    optimizer_steps: u64 = 0,
+    micro_batch_steps: u64 = 0,
+    metal_optimizer_steps: u64 = 0,
+    graph_executor_steps: u64 = 0,
+    graph_executor_fallback_steps: u64 = 0,
+    graph_executor_native_partitions: u64 = 0,
+    graph_executor_unsupported_ops: u64 = 0,
+    graph_executor_interpreter_fallbacks: u64 = 0,
+    graph_executor_true_host_outputs: u64 = 0,
+};
+
+const OracleCapture = struct {
+    allocator: std.mem.Allocator,
+    expected_steps: usize,
+    gradient_hook_calls: usize = 0,
+    gradients: std.ArrayListUnmanaged(CapturedOracleGradient) = .empty,
+    loss_history: std.ArrayListUnmanaged(f64) = .empty,
+    probes: ?gemma4_real.SupervisedLogitProbes = null,
+    execution: OracleExecutionEvidence = .{},
+
+    fn deinit(self: *OracleCapture) void {
+        for (self.gradients.items) |gradient| {
+            self.allocator.free(gradient.name);
+            self.allocator.free(gradient.values);
+        }
+        self.gradients.deinit(self.allocator);
+        self.loss_history.deinit(self.allocator);
+        if (self.probes) |*probes| probes.deinit();
+        self.* = undefined;
+    }
+
+    fn reduce(context: *anyopaque, blocks: []const real_autodiff.GradBlock) anyerror!void {
+        const self: *OracleCapture = @ptrCast(@alignCast(context));
+        if (blocks.len == 0) return error.InvalidOracleGradientCapture;
+        for (blocks) |block| {
+            for (block.data) |value| if (!std.math.isFinite(value)) return error.NonFiniteOracleGradient;
+        }
+        if (!try self.beginGradientHook()) return;
+        try self.gradients.ensureTotalCapacity(self.allocator, blocks.len);
+        for (blocks) |block| {
+            const name = try self.allocator.dupe(u8, block.name);
+            errdefer self.allocator.free(name);
+            const values = try self.allocator.dupe(f32, block.data);
+            errdefer self.allocator.free(values);
+            self.gradients.appendAssumeCapacity(.{ .name = name, .values = values });
+        }
+    }
+
+    /// Metal keeps the normal direct-device AdamW trajectory and pays a
+    /// single bounded D2H readback only for the final raw-gradient surface.
+    /// Earlier hooks are deliberately no-ops; merely installing this hook
+    /// must not materialize every trajectory step on the host.
+    fn observeDirectDevice(
+        context: *anyopaque,
+        compute_backend: *const ComputeBackend,
+        blocks: []const real_autodiff.DeviceGradBlock,
+    ) anyerror!void {
+        const self: *OracleCapture = @ptrCast(@alignCast(context));
+        if (blocks.len == 0) return error.InvalidOracleGradientCapture;
+        if (!try self.beginGradientHook()) return;
+        try self.gradients.ensureTotalCapacity(self.allocator, blocks.len);
+        for (blocks) |block| {
+            const values = try compute_backend.toFloat32(block.data, self.allocator);
+            errdefer self.allocator.free(values);
+            if (values.len != block.elem_count) return error.InvalidOracleGradientCapture;
+            for (values) |value| if (!std.math.isFinite(value)) return error.NonFiniteOracleGradient;
+            const name = try self.allocator.dupe(u8, block.name);
+            errdefer self.allocator.free(name);
+            self.gradients.appendAssumeCapacity(.{ .name = name, .values = values });
+        }
+    }
+
+    fn beginGradientHook(self: *OracleCapture) !bool {
+        self.gradient_hook_calls = try std.math.add(usize, self.gradient_hook_calls, 1);
+        if (self.gradient_hook_calls > self.expected_steps) return error.OracleGradientHookCallOverflow;
+        if (self.gradient_hook_calls != self.expected_steps) return false;
+        if (self.gradients.items.len != 0) return error.InvalidOracleGradientCapture;
+        return true;
+    }
+
+    fn recordStep(self: *OracleCapture, metrics: gemma4_real.CausalLmMetrics) !void {
+        if (metrics.examples_seen != 1 or metrics.optimizer_steps != 1 or
+            metrics.supervised_tokens_seen == 0 or !std.math.isFinite(metrics.average_loss))
+        {
+            return error.InvalidOracleTrainingStep;
+        }
+        try self.loss_history.append(self.allocator, metrics.average_loss);
+        self.execution.optimizer_steps = try std.math.add(u64, self.execution.optimizer_steps, metrics.optimizer_steps);
+        self.execution.micro_batch_steps = try std.math.add(u64, self.execution.micro_batch_steps, metrics.examples_seen);
+        self.execution.metal_optimizer_steps = try std.math.add(u64, self.execution.metal_optimizer_steps, metrics.metal_optimizer_steps);
+        self.execution.graph_executor_steps = try std.math.add(u64, self.execution.graph_executor_steps, metrics.graph_executor_steps);
+        self.execution.graph_executor_fallback_steps = try std.math.add(u64, self.execution.graph_executor_fallback_steps, metrics.graph_executor_fallback_steps);
+        self.execution.graph_executor_native_partitions = try std.math.add(u64, self.execution.graph_executor_native_partitions, metrics.graph_executor_native_partitions);
+        self.execution.graph_executor_unsupported_ops = try std.math.add(u64, self.execution.graph_executor_unsupported_ops, metrics.graph_executor_unsupported_ops);
+        self.execution.graph_executor_interpreter_fallbacks = try std.math.add(u64, self.execution.graph_executor_interpreter_fallbacks, metrics.graph_executor_interpreter_fallbacks);
+        self.execution.graph_executor_true_host_outputs = try std.math.add(u64, self.execution.graph_executor_true_host_outputs, metrics.graph_executor_true_host_outputs);
+    }
+
+    fn validateComplete(self: *const OracleCapture, backend_kind: BackendKind, target_count: usize) !void {
+        if (self.gradient_hook_calls != self.expected_steps or
+            self.loss_history.items.len != self.expected_steps or
+            self.gradients.items.len != target_count * 2 or
+            self.probes == null or self.probes.?.rows.len == 0 or
+            self.execution.optimizer_steps != self.expected_steps or
+            self.execution.micro_batch_steps != self.expected_steps)
+        {
+            return error.IncompleteOracleCapture;
+        }
+        if (backend_kind == .metal and
+            (self.execution.metal_optimizer_steps != self.expected_steps or
+                self.execution.graph_executor_steps != self.expected_steps or
+                self.execution.graph_executor_fallback_steps != 0 or
+                self.execution.graph_executor_native_partitions != 0 or
+                self.execution.graph_executor_unsupported_ops != 0 or
+                self.execution.graph_executor_interpreter_fallbacks != 0 or
+                self.execution.graph_executor_true_host_outputs != 0))
+        {
+            return error.InvalidOracleStrictMetalEvidence;
+        }
+    }
+};
+
+const OracleCaptureArtifactV1 = struct {
+    path: []const u8,
+    sha256: []const u8,
+    size_bytes: u64,
+};
+
+const OracleCandidateAdapterArtifactV1 = struct {
+    sha256: []const u8,
+    size_bytes: u64,
+};
+
+const OracleCapturedTargetV1 = struct {
+    source_name: []const u8,
+    trainer_slot_name: []const u8,
+    shape: []const usize,
+    gradient_storage_key: []const u8,
+    checkpoint_weight_storage_key: []const u8,
+    checkpoint_m_storage_key: []const u8,
+    checkpoint_v_storage_key: []const u8,
 };
 
 const BenchmarkStrictMetalEvidence = struct {
@@ -1136,6 +1356,14 @@ pub fn parseTrainArgs(argv: []const []const u8) !TrainOptions {
             i += 1;
             if (i >= argv.len or opts.benchmark_telemetry_out_path != null) return usageError();
             opts.benchmark_telemetry_out_path = argv[i];
+        } else if (std.mem.eql(u8, arg, "--oracle-request")) {
+            i += 1;
+            if (i >= argv.len or opts.oracle_request_path != null) return usageError();
+            opts.oracle_request_path = argv[i];
+        } else if (std.mem.eql(u8, arg, "--oracle-capture-out")) {
+            i += 1;
+            if (i >= argv.len or opts.oracle_capture_out_dir != null) return usageError();
+            opts.oracle_capture_out_dir = argv[i];
         } else if (std.mem.eql(u8, arg, "--llrd-decay")) {
             i += 1;
             if (i >= argv.len) return usageError();
@@ -1218,6 +1446,8 @@ pub fn parseTrainArgs(argv: []const []const u8) !TrainOptions {
         .backend_kind = opts.backend_kind.?,
         .benchmark_request_path = opts.benchmark_request_path,
         .benchmark_telemetry_out_path = opts.benchmark_telemetry_out_path,
+        .oracle_request_path = opts.oracle_request_path,
+        .oracle_capture_out_dir = opts.oracle_capture_out_dir,
     };
 }
 
@@ -1229,6 +1459,8 @@ fn trainWithSummary(allocator: std.mem.Allocator, io: std.Io, options: TrainOpti
     try validateTrainOptions(options);
     var benchmark_admission = try loadBenchmarkAdmission(allocator, io, options);
     defer if (benchmark_admission) |*admission| admission.deinit(allocator);
+    var oracle_admission = try loadOracleAdmission(allocator, io, options);
+    defer if (oracle_admission) |*admission| admission.deinit(allocator);
     var graph_executor_scope = try acquireMetalGraphExecutorScope(options.backend_kind);
     defer if (graph_executor_scope) |*scope| scope.deinit();
     try validateAutodiffBaseArtifact(allocator, options.base_model_dir, options.backend_kind);
@@ -1300,8 +1532,11 @@ fn trainWithSummary(allocator: std.mem.Allocator, io: std.Io, options: TrainOpti
             .backend_kind = options.backend_kind,
             .benchmark_request_path = options.benchmark_request_path,
             .benchmark_telemetry_out_path = options.benchmark_telemetry_out_path,
+            .oracle_request_path = options.oracle_request_path,
+            .oracle_capture_out_dir = options.oracle_capture_out_dir,
         },
         if (benchmark_admission) |*admission| admission else null,
+        if (oracle_admission) |*admission| admission else null,
         emit_summary,
     );
 }
@@ -1317,6 +1552,10 @@ fn validateTrainOptions(options: TrainOptions) !void {
         options.graph_cache_capacity,
     );
     try validateBenchmarkOptionPair(options.benchmark_request_path, options.benchmark_telemetry_out_path);
+    try validateOracleOptionPair(options.oracle_request_path, options.oracle_capture_out_dir);
+    if (options.benchmark_request_path != null and options.oracle_request_path != null) {
+        return error.IncompatibleEvidenceModes;
+    }
     try validateCheckpointOptions(options.checkpoint_path, options.checkpoint_every_epochs, options.resume_from_checkpoint, options.epochs);
 }
 
@@ -1356,6 +1595,35 @@ fn validateBenchmarkOptionPair(request_path: ?[]const u8, telemetry_path: ?[]con
     if ((request_path == null) != (telemetry_path == null)) return error.IncompleteBenchmarkOptions;
     if (request_path) |path| if (path.len == 0) return error.InvalidBenchmarkRequestPath;
     if (telemetry_path) |path| if (path.len == 0) return error.InvalidBenchmarkTelemetryPath;
+}
+
+fn validateOracleOptionPair(request_path: ?[]const u8, capture_out_dir: ?[]const u8) !void {
+    if ((request_path == null) != (capture_out_dir == null)) return error.IncompleteOracleOptions;
+    if (request_path) |path| if (path.len == 0) return error.InvalidOracleRequestPath;
+    if (capture_out_dir) |path| if (path.len == 0) return error.InvalidOracleCapturePath;
+}
+
+test "gemma4 oracle CLI options are paired and exclusive with benchmark mode" {
+    try validateOracleOptionPair(null, null);
+    try validateOracleOptionPair("request.json", "capture");
+    try std.testing.expectError(error.IncompleteOracleOptions, validateOracleOptionPair("request.json", null));
+    try std.testing.expectError(error.IncompleteOracleOptions, validateOracleOptionPair(null, "capture"));
+    try std.testing.expectError(error.InvalidOracleRequestPath, validateOracleOptionPair("", "capture"));
+    try std.testing.expectError(error.InvalidOracleCapturePath, validateOracleOptionPair("request.json", ""));
+
+    var options = TrainOptions{
+        .base_model_dir = "model",
+        .adapter_model_dir = "adapter",
+        .train_prepared_inputs_path = "train.json",
+        .eval_prepared_inputs_path = "eval.json",
+        .out_dir = "out",
+        .backend_kind = .native,
+    };
+    options.benchmark_request_path = "benchmark.json";
+    options.benchmark_telemetry_out_path = "benchmark-out.json";
+    options.oracle_request_path = "oracle.json";
+    options.oracle_capture_out_dir = "oracle-out";
+    try std.testing.expectError(error.IncompatibleEvidenceModes, validateTrainOptions(options));
 }
 
 test "gemma4 benchmark CLI options are paired" {
@@ -1428,6 +1696,269 @@ fn loadBenchmarkAdmission(
         .control_signal_fd = control_signal_fd,
         .control_ack_fd = control_ack_fd,
     };
+}
+
+fn validateEmbeddedOracleIdentity(
+    embedded_version: []const u8,
+    embedded_source_revision: []const u8,
+    requested_version: []const u8,
+    requested_source_revision: []const u8,
+) !void {
+    if (!isLowerHex(embedded_source_revision, 40)) return error.OracleSourceRevisionNotEmbedded;
+    if (!std.mem.eql(u8, requested_version, embedded_version)) return error.OracleEmbeddedVersionMismatch;
+    if (!std.mem.eql(u8, requested_source_revision, embedded_source_revision)) {
+        return error.OracleEmbeddedSourceRevisionMismatch;
+    }
+}
+
+fn loadOracleAdmission(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: TrainOptions,
+) !?OracleAdmission {
+    const request_path = options.oracle_request_path orelse return null;
+    const capture_out_dir = options.oracle_capture_out_dir orelse return error.IncompleteOracleOptions;
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.OracleRequiresDarwinArm64;
+
+    const raw = try readFileAtPathLimited(io, allocator, request_path, 64 * 1024);
+    defer allocator.free(raw);
+    var parsed = try std.json.parseFromSlice(OracleRequestV1, allocator, raw, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = false,
+    });
+    errdefer parsed.deinit();
+    try validateOracleRequestStatic(parsed.value, options);
+    try validateOraclePathIsolation(allocator, io, request_path, capture_out_dir, options);
+
+    const executable_path = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(executable_path);
+    var executable_fingerprint = try finetune.fingerprintProjectorFile(allocator, executable_path);
+    defer finetune.freeProjectorFingerprint(allocator, &executable_fingerprint);
+    if (!matchesPrefixedSha256(parsed.value.implementation.executable_sha256, executable_fingerprint.sha256)) {
+        return error.OracleExecutableFingerprintMismatch;
+    }
+    try validateEmbeddedOracleIdentity(
+        build_options.inference_version,
+        build_options.benchmark_source_revision,
+        parsed.value.implementation.version,
+        parsed.value.implementation.source_revision,
+    );
+
+    const request_sha256 = try sha256PrefixedAlloc(allocator, raw);
+    errdefer allocator.free(request_sha256);
+    return .{
+        .parsed = parsed,
+        .capture_out_dir = capture_out_dir,
+        .request_sha256 = request_sha256,
+    };
+}
+
+fn validateOracleRequestStatic(request: OracleRequestV1, options: TrainOptions) !void {
+    if (!std.mem.eql(u8, request.schema_version, oracle_request_schema_v1)) {
+        return error.UnsupportedOracleRequestVersion;
+    }
+    const metal_device_valid = if (request.implementation.metal_device) |device|
+        device.len > 0 and std.unicode.utf8ValidateSlice(device) and
+            std.mem.indexOfAny(u8, device, "\r\n\x00") == null
+    else
+        false;
+    if (!isPrefixedSha256(request.implementation.executable_sha256) or
+        !isLowerHex(request.implementation.source_revision, 40) or
+        request.implementation.version.len == 0 or
+        !std.unicode.utf8ValidateSlice(request.implementation.version) or
+        std.mem.indexOfAny(u8, request.implementation.version, "\r\n\x00") != null or
+        !std.mem.eql(u8, request.implementation.backend, options.backend_kind.label()) or
+        (options.backend_kind == .metal and !metal_device_valid) or
+        (options.backend_kind != .metal and request.implementation.metal_device != null))
+    {
+        return error.InvalidOracleImplementation;
+    }
+    inline for (.{
+        request.bindings.oracle_lock_sha256,
+        request.bindings.local_artifact_sha256,
+        request.bindings.initial_adapter_sha256,
+        request.bindings.train_prepared_sha256,
+    }) |digest| if (!isPrefixedSha256(digest)) return error.InvalidOracleArtifactFingerprint;
+    if ((!std.mem.eql(u8, request.bindings.model_key, "gemma-4-E2B-it") and
+        !std.mem.eql(u8, request.bindings.model_key, "gemma-4-E4B-it")) or
+        !isLowerHex(request.bindings.model_revision, 40) or
+        !isLowerHex(request.bindings.base_model_sha256, 64) or
+        !isLowerHex(request.bindings.source_dataset_sha256, 64) or
+        finetune.parseGemma4LoRATargetPreset(request.bindings.target_preset) == null or
+        request.bindings.rank == 0 or request.bindings.target_count == 0 or
+        !std.math.isFinite(request.bindings.alpha) or request.bindings.alpha <= 0)
+    {
+        return error.InvalidOracleBindings;
+    }
+    const training = request.training;
+    if (!std.mem.eql(u8, training.optimizer, "adamw") or
+        training.seed != 42 or
+        (training.steps != 1 and training.steps != 2 and training.steps != 8) or
+        training.learning_rate != 0.001 or
+        training.betas[0] != 0.9 or training.betas[1] != 0.999 or
+        training.eps != 1e-8 or training.weight_decay != 0.01 or
+        training.max_grad_norm != 1.0 or training.grad_accum_steps != 1 or
+        !std.mem.eql(u8, training.supervised_token_normalization, "mean") or
+        training.dropout != 0.0 or training.use_cache)
+    {
+        return error.InvalidOracleTrainingContract;
+    }
+    if (options.learning_rate != @as(f32, @floatCast(training.learning_rate)) or
+        options.max_examples != 1 or options.eval_max_examples != 1 or
+        options.epochs != training.steps or options.max_grad_norm != @as(f32, @floatCast(training.max_grad_norm)) or
+        options.grad_accum_steps != training.grad_accum_steps or options.seed != training.seed or
+        options.activation_checkpoint_interval != 0 or options.sequence_length_bucket_quantum != 0 or
+        options.sequence_length_bucket_min != 0 or options.graph_cache_capacity != 0 or
+        options.checkpoint_path != null or options.checkpoint_every_epochs != 0 or
+        options.resume_from_checkpoint or options.benchmark_request_path != null)
+    {
+        return error.OracleCommandContractMismatch;
+    }
+}
+
+fn oracleTestOptions(backend_kind: BackendKind) TrainOptions {
+    return .{
+        .base_model_dir = "model",
+        .adapter_model_dir = "adapter",
+        .train_prepared_inputs_path = "train.json",
+        .eval_prepared_inputs_path = "train.json",
+        .out_dir = "out",
+        .learning_rate = 0.001,
+        .max_examples = 1,
+        .eval_max_examples = 1,
+        .epochs = 2,
+        .max_grad_norm = 1.0,
+        .grad_accum_steps = 1,
+        .seed = 42,
+        .backend_kind = backend_kind,
+        .oracle_request_path = "request.json",
+        .oracle_capture_out_dir = "capture",
+    };
+}
+
+fn oracleTestRequest(backend: []const u8, metal_device: ?[]const u8) OracleRequestV1 {
+    return .{
+        .schema_version = oracle_request_schema_v1,
+        .implementation = .{
+            .version = "1.2.3",
+            .executable_sha256 = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            .source_revision = "0123456789abcdef0123456789abcdef01234567",
+            .backend = backend,
+            .metal_device = metal_device,
+        },
+        .bindings = .{
+            .oracle_lock_sha256 = "sha256:1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            .model_key = "gemma-4-E2B-it",
+            .model_revision = "1123456789abcdef0123456789abcdef01234567",
+            .local_artifact_sha256 = "sha256:2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            .base_model_sha256 = "3123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            .initial_adapter_sha256 = "sha256:4123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            .train_prepared_sha256 = "sha256:5123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            .source_dataset_sha256 = "6123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            .example_index = 0,
+            .target_preset = "text-all-linear",
+            .rank = 16,
+            .alpha = 32,
+            .target_count = 11,
+        },
+        .training = .{
+            .optimizer = "adamw",
+            .seed = 42,
+            .steps = 2,
+            .learning_rate = 0.001,
+            .betas = .{ 0.9, 0.999 },
+            .eps = 1e-8,
+            .weight_decay = 0.01,
+            .max_grad_norm = 1.0,
+            .grad_accum_steps = 1,
+            .supervised_token_normalization = "mean",
+            .dropout = 0,
+            .use_cache = false,
+        },
+    };
+}
+
+test "gemma4 oracle request pins implementation artifacts and optimizer trajectory" {
+    const native_options = oracleTestOptions(.native);
+    try validateOracleRequestStatic(oracleTestRequest("native", null), native_options);
+
+    var invalid = oracleTestRequest("native", null);
+    invalid.training.steps = 3;
+    try std.testing.expectError(error.InvalidOracleTrainingContract, validateOracleRequestStatic(invalid, native_options));
+    invalid = oracleTestRequest("native", null);
+    invalid.bindings.train_prepared_sha256 = "not-a-digest";
+    try std.testing.expectError(error.InvalidOracleArtifactFingerprint, validateOracleRequestStatic(invalid, native_options));
+    invalid = oracleTestRequest("metal", "Apple M-series");
+    try std.testing.expectError(error.InvalidOracleImplementation, validateOracleRequestStatic(invalid, native_options));
+    invalid = oracleTestRequest("native", "unexpected");
+    try std.testing.expectError(error.InvalidOracleImplementation, validateOracleRequestStatic(invalid, native_options));
+
+    var metal_options = oracleTestOptions(.metal);
+    try validateOracleRequestStatic(oracleTestRequest("metal", "Apple M-series"), metal_options);
+    try std.testing.expectError(
+        error.InvalidOracleImplementation,
+        validateOracleRequestStatic(oracleTestRequest("metal", null), metal_options),
+    );
+    metal_options.epochs = 1;
+    try std.testing.expectError(
+        error.OracleCommandContractMismatch,
+        validateOracleRequestStatic(oracleTestRequest("metal", "Apple M-series"), metal_options),
+    );
+}
+
+test "gemma4 oracle host reducer retains only the final raw gradient surface" {
+    var capture = OracleCapture{ .allocator = std.testing.allocator, .expected_steps = 2 };
+    defer capture.deinit();
+    var first = [_]f32{ 1, 2 };
+    var second = [_]f32{ 3, 4 };
+    const blocks = [_]real_autodiff.GradBlock{
+        .{ .name = "weight.a.lora_A", .data = &first },
+        .{ .name = "weight.a.lora_B", .data = &second },
+    };
+    try OracleCapture.reduce(@ptrCast(&capture), &blocks);
+    try std.testing.expectEqual(@as(usize, 0), capture.gradients.items.len);
+    first = .{ 5, 6 };
+    second = .{ 7, 8 };
+    try OracleCapture.reduce(@ptrCast(&capture), &blocks);
+    try std.testing.expectEqual(@as(usize, 2), capture.gradients.items.len);
+    try std.testing.expectEqualSlices(f32, &.{ 5, 6 }, capture.gradients.items[0].values);
+    try std.testing.expectEqualSlices(f32, &.{ 7, 8 }, capture.gradients.items[1].values);
+    try std.testing.expectError(error.OracleGradientHookCallOverflow, OracleCapture.reduce(@ptrCast(&capture), &blocks));
+}
+
+fn validateOraclePathIsolation(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    request_path: []const u8,
+    capture_out_dir: []const u8,
+    options: TrainOptions,
+) !void {
+    const request_resolved = try std.Io.Dir.cwd().realPathFileAlloc(io, request_path, allocator);
+    defer allocator.free(request_resolved);
+    const capture_resolved = try path_isolation.resolveRequestedPath(allocator, io, capture_out_dir);
+    defer allocator.free(capture_resolved);
+    const output_resolved = try path_isolation.resolveRequestedPath(allocator, io, options.out_dir);
+    defer allocator.free(output_resolved);
+    if (path_isolation.pathsOverlap(request_resolved, capture_resolved) or
+        path_isolation.pathsOverlap(request_resolved, output_resolved) or
+        path_isolation.pathsOverlap(capture_resolved, output_resolved))
+    {
+        return error.OracleOutputPathOverlap;
+    }
+    for ([_][]const u8{
+        options.base_model_dir,
+        options.adapter_model_dir,
+        options.train_prepared_inputs_path,
+        options.eval_prepared_inputs_path,
+    }) |immutable_input| {
+        const input_resolved = try std.Io.Dir.cwd().realPathFileAlloc(io, immutable_input, allocator);
+        defer allocator.free(input_resolved);
+        if (path_isolation.pathsOverlap(input_resolved, capture_resolved) or
+            path_isolation.pathsOverlap(input_resolved, output_resolved))
+        {
+            return error.OracleOutputOverlapsImmutableInput;
+        }
+    }
 }
 
 fn validateBenchmarkRequestStatic(request: BenchmarkRequestV1, options: TrainOptions) !void {
@@ -2064,6 +2595,56 @@ fn validateBenchmarkArtifactBindings(
     const target_preset = adapter_inspect.target_preset orelse return error.MissingAdapterTargetPreset;
     if (!std.mem.eql(u8, target_preset, request.bindings.target_preset)) {
         return error.BenchmarkAdapterConfigMismatch;
+    }
+}
+
+fn validateOracleArtifactBindings(
+    allocator: std.mem.Allocator,
+    admission: *const OracleAdmission,
+    adapter_inspect: finetune.InspectionSummary,
+    validated_adapter: ValidatedAdapterConfig,
+    prepared_inputs_path: []const u8,
+    prepared: finetune.PreparedInputsSummary,
+    provenance: finetune.ModelProvenance,
+) !void {
+    const request = admission.request();
+    if (!std.mem.eql(u8, prepared.schema_version, finetune.prepared_schema_v6) or
+        request.bindings.example_index >= prepared.examples.len or
+        !std.mem.eql(u8, request.bindings.source_dataset_sha256, prepared.source_dataset_sha256 orelse return error.PreparedInputsProvenanceRequired))
+    {
+        return error.OraclePreparedArtifactMismatch;
+    }
+    const example = prepared.examples[request.bindings.example_index];
+    if (example.num_input_tokens == 0 or example.num_supervised_tokens == 0 or
+        example.teacher_top_k != 0 or example.teacher_top_k_token_ids.len != 0 or
+        example.teacher_top_k_probs.len != 0 or example.image_paths.len != 0 or
+        example.audio_paths.len != 0)
+    {
+        return error.OraclePreparedExampleNotAdmitted;
+    }
+    var prepared_fingerprint = try finetune.fingerprintProjectorFile(allocator, prepared_inputs_path);
+    defer finetune.freeProjectorFingerprint(allocator, &prepared_fingerprint);
+    if (!matchesPrefixedSha256(request.bindings.train_prepared_sha256, prepared_fingerprint.sha256)) {
+        return error.OraclePreparedArtifactMismatch;
+    }
+    if (!std.mem.eql(u8, request.bindings.base_model_sha256, provenance.base_model_sha256)) {
+        return error.OracleModelArtifactMismatch;
+    }
+    const checkpoint_path = adapter_inspect.adapter_checkpoint_path orelse return error.MissingAdapterCheckpoint;
+    var adapter_fingerprint = try finetune.fingerprintProjectorFile(allocator, checkpoint_path);
+    defer finetune.freeProjectorFingerprint(allocator, &adapter_fingerprint);
+    if (!matchesPrefixedSha256(request.bindings.initial_adapter_sha256, adapter_fingerprint.sha256)) {
+        return error.OracleInitialAdapterMismatch;
+    }
+    if (validated_adapter.rank != request.bindings.rank or
+        @as(f64, @floatCast(validated_adapter.alpha)) != request.bindings.alpha or
+        adapter_inspect.target_module_count != request.bindings.target_count)
+    {
+        return error.OracleAdapterConfigMismatch;
+    }
+    const target_preset = adapter_inspect.target_preset orelse return error.MissingAdapterTargetPreset;
+    if (!std.mem.eql(u8, target_preset, request.bindings.target_preset)) {
+        return error.OracleAdapterConfigMismatch;
     }
 }
 
@@ -3347,6 +3928,7 @@ fn runAutodiff(
     eval_prepared: finetune.PreparedInputsSummary,
     opts: CliOptions,
     benchmark_admission: ?*BenchmarkAdmission,
+    oracle_admission: ?*OracleAdmission,
     emit_summary: bool,
 ) !void {
     const operation_started_ns = monotonicNowNs();
@@ -3367,7 +3949,9 @@ fn runAutodiff(
     try finetune.validatePreparedVocabularyAdmission(eval_prepared, graph_config.vocab_size);
     try finetune.validatePreparedSourceDatasetProvenance(allocator, prepared);
     try finetune.validatePreparedSourceDatasetProvenance(allocator, eval_prepared);
-    try finetune.validatePreparedEvalDisjoint(allocator, prepared.examples, eval_prepared.examples);
+    if (oracle_admission == null) {
+        try finetune.validatePreparedEvalDisjoint(allocator, prepared.examples, eval_prepared.examples);
+    }
     var provenance = try finetune.fingerprintGemma4Model(allocator, base_model_dir);
     defer provenance.deinit(allocator);
     try finetune.validatePreparedModelProvenance(prepared, provenance);
@@ -3385,11 +3969,31 @@ fn runAutodiff(
             prepared,
         );
     }
+    if (oracle_admission) |admission| {
+        try validateOracleArtifactBindings(
+            allocator,
+            admission,
+            adapter_inspect,
+            validated_adapter,
+            prepared_inputs_path,
+            prepared,
+            provenance,
+        );
+    }
 
     var publication = try ImmutableRunPublication.init(allocator, io, out_dir);
     defer publication.deinit();
+    var oracle_publication: ?ImmutableRunPublication = if (oracle_admission) |admission|
+        try ImmutableRunPublication.init(allocator, io, admission.capture_out_dir)
+    else
+        null;
+    defer if (oracle_publication) |*capture_publication| capture_publication.deinit();
+    if (oracle_publication) |*capture_publication| try capture_publication.createStaging();
 
-    const bootstrap = gemma4_real.findFirstSupervisedExample(prepared.examples) orelse return error.NoTrainingData;
+    const bootstrap = if (oracle_admission) |admission|
+        &prepared.examples[admission.request().bindings.example_index]
+    else
+        gemma4_real.findFirstSupervisedExample(prepared.examples) orelse return error.NoTrainingData;
     const is_multimodal = prepared.examples_with_images > 0 or prepared.examples_with_audio > 0;
     const eval_is_multimodal = eval_prepared.examples_with_images > 0 or eval_prepared.examples_with_audio > 0;
     if ((is_multimodal or eval_is_multimodal) and opts.gguf_projector_path == null) return error.MissingGgufProjector;
@@ -3480,13 +4084,23 @@ fn runAutodiff(
         .control_ack_fd = admission.control_ack_fd,
     } else null;
     defer if (benchmark_capture) |*capture| capture.deinit();
+    var oracle_capture: ?OracleCapture = if (oracle_admission) |admission| .{
+        .allocator = allocator,
+        .expected_steps = admission.request().training.steps,
+    } else null;
+    defer if (oracle_capture) |*capture| capture.deinit();
     const benchmark_load_started_ns = if (benchmark_capture != null) monotonicNowNs() else 0;
     var backend = try gemma4_real.loadBackendForModelDir(allocator, base_model_dir, backend_kind);
     defer backend.deinit();
 
     var trainer = try real_autodiff.RealAutodiffTrainer.init(allocator, backend.backendPtr(), .{
         .lora = lora_config,
-        .optimizer = .{},
+        .optimizer = if (oracle_admission) |admission| .{
+            .beta1 = @floatCast(admission.request().training.betas[0]),
+            .beta2 = @floatCast(admission.request().training.betas[1]),
+            .eps = @floatCast(admission.request().training.eps),
+            .weight_decay = @floatCast(admission.request().training.weight_decay),
+        } else .{},
         .lr_schedule = .{ .constant = opts.learning_rate },
         .max_grad_norm = opts.max_grad_norm,
         .grad_accum_steps = opts.grad_accum_steps,
@@ -3497,6 +4111,16 @@ fn runAutodiff(
         .compiled_required = execution_policy.compiled_required,
         .strict_metal_execution = execution_policy.strict_metal_execution,
         .graph_cache_capacity = graph_cache_capacity,
+        .reduce_grads = if (oracle_capture != null and backend_kind != .metal) &OracleCapture.reduce else null,
+        .reduce_grads_ctx = if (oracle_capture != null and backend_kind != .metal)
+            @ptrCast(&oracle_capture.?)
+        else
+            null,
+        .observe_direct_device_grads = if (oracle_capture != null and backend_kind == .metal) &OracleCapture.observeDirectDevice else null,
+        .observe_direct_device_grads_ctx = if (oracle_capture != null and backend_kind == .metal)
+            @ptrCast(&oracle_capture.?)
+        else
+            null,
         .checkpoint_config = if (opts.activation_checkpoint_interval > 0) .{
             .strategy = .every_n_layers,
             .layer_interval = opts.activation_checkpoint_interval,
@@ -3505,7 +4129,10 @@ fn runAutodiff(
     defer trainer.deinit();
     var maybe_text_ctx: ?gemma4_real.GemmaAutodiffCtx = null;
     var maybe_mm_ctx: ?gemma4_mm_real.MultimodalCtx = null;
-    const training_max_seq_len: u32 = @intCast(prepared.max_seq_len);
+    const training_max_seq_len: u32 = if (oracle_admission) |admission|
+        @intCast(prepared.examples[admission.request().bindings.example_index].num_input_tokens)
+    else
+        @intCast(prepared.max_seq_len);
     const bootstrap_seq_len = try gemma4_real.sequenceLengthForExample(
         bootstrap.num_input_tokens,
         training_max_seq_len,
@@ -3576,7 +4203,7 @@ fn runAutodiff(
     // process's first graph execution, matching the MLX reference protocol.
     var before: gemma4_real.CausalLmMetrics = .{};
     var initial_evaluation_wall_time_ns: u64 = 0;
-    if (initialEvaluationPlacement(benchmark_admission != null) == .before_training) {
+    if (oracle_admission == null and initialEvaluationPlacement(benchmark_admission != null) == .before_training) {
         const initial_evaluation_started_ns = monotonicNowNs();
         before = if (is_multimodal)
             try gemma4_mm_real.evaluatePreparedExamples(
@@ -3621,6 +4248,21 @@ fn runAutodiff(
     for (start_epoch..opts.epochs, 0..) |epoch_idx, history_idx| {
         const prior_examples_seen = trainer.trainingProgress().examples_seen;
         trainer.setTrainingProgress(trainingProgressForEpoch(opts.seed, epoch_idx, prior_examples_seen));
+        if (oracle_admission) |admission| {
+            if (epoch_idx + 1 == opts.epochs) {
+                const capture = &oracle_capture.?;
+                if (capture.probes != null) return error.DuplicateOracleLogitCapture;
+                const example = &prepared.examples[admission.request().bindings.example_index];
+                capture.probes = try gemma4_real.captureSupervisedLogitProbes(
+                    allocator,
+                    &trainer,
+                    &maybe_text_ctx.?,
+                    example,
+                    training_max_seq_len,
+                    opts.seed,
+                );
+            }
+        }
         const graph_cache_before = trainer.graphCacheStats();
         const epoch_started_ns = monotonicNowNs();
         const metrics = if (is_multimodal)
@@ -3646,6 +4288,18 @@ fn runAutodiff(
                     .benchmark_observer = &BenchmarkCapture.observe,
                 },
             )).metrics
+        else if (oracle_admission) |admission|
+            (try gemma4_real.trainPreparedExamplesRange(
+                allocator,
+                &trainer,
+                &maybe_text_ctx.?,
+                prepared.examples[admission.request().bindings.example_index .. admission.request().bindings.example_index + 1],
+                .{
+                    .max_examples = 1,
+                    .seq_len = training_max_seq_len,
+                    .flush_at_end = true,
+                },
+            )).metrics
         else
             (try gemma4_real.trainPreparedExamplesRange(
                 allocator,
@@ -3664,6 +4318,7 @@ fn runAutodiff(
         const graph_cache_delta = summarizeEpochGraphCacheDelta(graph_cache_before, trainer.graphCacheStats());
         training_epochs_wall_time_ns +|= epoch_timing.wall_time_ns;
         try validateAutodiffEpoch(metrics);
+        if (oracle_capture) |*capture| try capture.recordStep(metrics);
         epoch_history[history_idx] = .{
             .epoch = epoch_idx + 1,
             .timing = epoch_timing,
@@ -3738,8 +4393,17 @@ fn runAutodiff(
             return error.BenchmarkColdStepDidNotMutateOptimizerState;
         }
     }
+    if (oracle_capture) |*capture| {
+        try capture.validateComplete(backend_kind, oracle_admission.?.request().bindings.target_count);
+        if (trainer.optimizerSteps() != oracle_admission.?.request().training.steps or
+            trainer.microBatchSteps() != oracle_admission.?.request().training.steps or
+            trainer.accumulatedMicroBatches() != 0)
+        {
+            return error.OracleTrainerCounterMismatch;
+        }
+    }
 
-    if (initialEvaluationPlacement(benchmark_admission != null) == .after_benchmark_training) {
+    if (oracle_admission == null and initialEvaluationPlacement(benchmark_admission != null) == .after_benchmark_training) {
         const initial_evaluation_started_ns = monotonicNowNs();
         before = try evaluateAutodiff(
             allocator,
@@ -3764,21 +4428,24 @@ fn runAutodiff(
     publication.claimStaging();
     const adapter_save_wall_time_ns = monotonicElapsedNs(adapter_save_started_ns, monotonicNowNs());
     const final_evaluation_started_ns = monotonicNowNs();
-    const after = try evaluateAutodiff(
-        allocator,
-        base_model_dir,
-        publication.staging_dir,
-        eval_prepared.examples,
-        opts.effectiveEvalMaxExamples(),
-        graph_config,
-        lora_config,
-        backend_kind,
-        opts.max_grad_norm,
-        length_buckets,
-        graph_cache_capacity,
-        opts.gguf_projector_path,
-        if (maybe_projector_fingerprint) |fp| fp.sha256 else null,
-    );
+    const after = if (oracle_admission == null)
+        try evaluateAutodiff(
+            allocator,
+            base_model_dir,
+            publication.staging_dir,
+            eval_prepared.examples,
+            opts.effectiveEvalMaxExamples(),
+            graph_config,
+            lora_config,
+            backend_kind,
+            opts.max_grad_norm,
+            length_buckets,
+            graph_cache_capacity,
+            opts.gguf_projector_path,
+            if (maybe_projector_fingerprint) |fp| fp.sha256 else null,
+        )
+    else
+        gemma4_real.CausalLmMetrics{};
     const final_evaluation_finished_ns = monotonicNowNs();
     const final_evaluation_wall_time_ns = monotonicElapsedNs(final_evaluation_started_ns, final_evaluation_finished_ns);
 
@@ -3795,6 +4462,11 @@ fn runAutodiff(
             .start_epoch = start_epoch,
             .checkpoint_path = opts.checkpoint_path,
             .checkpoint_every_epochs = opts.checkpoint_every_epochs,
+        },
+        .numerical_oracle_capture = .{
+            .enabled = oracle_admission != null,
+            .request_sha256 = if (oracle_admission) |admission| admission.request_sha256 else null,
+            .capture_schema_version = if (oracle_admission != null) oracle_capture_schema_v1 else null,
         },
         .learning_rate = opts.learning_rate,
         .max_examples = opts.max_examples,
@@ -3912,7 +4584,23 @@ fn runAutodiff(
         .run_fingerprint = run_fingerprint_hex,
     }, emit_summary);
     try writeRunCompletionManifest(io, allocator, publication.staging_dir);
+    if (oracle_admission) |admission| {
+        const capture_publication = &oracle_publication.?;
+        try writeOracleCapture(
+            allocator,
+            io,
+            admission,
+            &oracle_capture.?,
+            &trainer,
+            publication.staging_dir,
+            capture_publication.staging_dir,
+            backend_kind,
+            prepared,
+        );
+        try writeRunCompletionManifest(io, allocator, capture_publication.staging_dir);
+    }
     try publication.publish();
+    if (oracle_publication) |*capture_publication| try capture_publication.publish();
     if (benchmark_admission) |admission| {
         try publishBenchmarkTelemetry(allocator, io, admission, &benchmark_capture.?);
     }
@@ -3973,6 +4661,159 @@ fn publishBenchmarkTelemetry(
     const rendered = try std.json.Stringify.valueAlloc(allocator, payload, .{ .whitespace = .indent_2 });
     defer allocator.free(rendered);
     try artifact_publication.writeFileImmutable(allocator, io, admission.telemetry_out_path, rendered);
+}
+
+fn writeOracleCapture(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    admission: *const OracleAdmission,
+    capture: *const OracleCapture,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    candidate_adapter_dir: []const u8,
+    capture_staging_dir: []const u8,
+    backend_kind: BackendKind,
+    prepared: finetune.PreparedInputsSummary,
+) !void {
+    const request = admission.request();
+    try capture.validateComplete(backend_kind, request.bindings.target_count);
+    if (trainer.lora_params.items.len != capture.gradients.items.len) {
+        return error.OracleTargetInventoryMismatch;
+    }
+
+    const gradient_file_name = "raw_gradients.safetensors";
+    const checkpoint_file_name = "trainer_checkpoint.safetensors";
+    const capture_file_name = "capture.json";
+    const gradient_path = try std.fs.path.join(allocator, &.{ capture_staging_dir, gradient_file_name });
+    defer allocator.free(gradient_path);
+    const checkpoint_path = try std.fs.path.join(allocator, &.{ capture_staging_dir, checkpoint_file_name });
+    defer allocator.free(checkpoint_path);
+    const capture_path = try std.fs.path.join(allocator, &.{ capture_staging_dir, capture_file_name });
+    defer allocator.free(capture_path);
+
+    const named_gradients = try allocator.alloc(safetensors_checkpoint.NamedTensor, capture.gradients.items.len);
+    defer allocator.free(named_gradients);
+    const targets = try allocator.alloc(OracleCapturedTargetV1, capture.gradients.items.len);
+    defer allocator.free(targets);
+    var owned_names = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_names.items) |name| allocator.free(name);
+        owned_names.deinit(allocator);
+    }
+    var owned_shapes = std.ArrayListUnmanaged([]usize).empty;
+    defer {
+        for (owned_shapes.items) |shape| allocator.free(shape);
+        owned_shapes.deinit(allocator);
+    }
+    try owned_names.ensureTotalCapacity(allocator, capture.gradients.items.len * 5);
+    try owned_shapes.ensureTotalCapacity(allocator, capture.gradients.items.len);
+
+    var gradient_sq: f64 = 0;
+    for (capture.gradients.items, trainer.lora_params.items, 0..) |gradient, slot, index| {
+        if (!std.mem.eql(u8, gradient.name, slot.name) or gradient.values.len != slot.weights.len) {
+            return error.OracleTargetInventoryMismatch;
+        }
+        const source_name = try gemma4_real.mapTrainerSlotNameToGemmaAdapterTensor(allocator, slot.name);
+        errdefer allocator.free(source_name);
+        const gradient_key = try std.fmt.allocPrint(allocator, "gradient::{s}", .{slot.name});
+        errdefer allocator.free(gradient_key);
+        const checkpoint_weight_key = try std.fmt.allocPrint(allocator, "weight::{s}", .{slot.name});
+        errdefer allocator.free(checkpoint_weight_key);
+        const checkpoint_m_key = try std.fmt.allocPrint(allocator, "adam_m::{s}", .{slot.name});
+        errdefer allocator.free(checkpoint_m_key);
+        const checkpoint_v_key = try std.fmt.allocPrint(allocator, "adam_v::{s}", .{slot.name});
+        errdefer allocator.free(checkpoint_v_key);
+        const shape = try dimsToUsize(allocator, slot.dims);
+        errdefer allocator.free(shape);
+        owned_names.appendAssumeCapacity(source_name);
+        owned_names.appendAssumeCapacity(gradient_key);
+        owned_names.appendAssumeCapacity(checkpoint_weight_key);
+        owned_names.appendAssumeCapacity(checkpoint_m_key);
+        owned_names.appendAssumeCapacity(checkpoint_v_key);
+        try owned_shapes.append(allocator, shape);
+        named_gradients[index] = .{
+            .name = gradient_key,
+            .data = gradient.values,
+            .shape = shape,
+        };
+        targets[index] = .{
+            .source_name = source_name,
+            .trainer_slot_name = slot.name,
+            .shape = shape,
+            .gradient_storage_key = gradient_key,
+            .checkpoint_weight_storage_key = checkpoint_weight_key,
+            .checkpoint_m_storage_key = checkpoint_m_key,
+            .checkpoint_v_storage_key = checkpoint_v_key,
+        };
+        for (gradient.values) |value| {
+            const widened: f64 = value;
+            gradient_sq += widened * widened;
+        }
+    }
+    const raw_gradient_norm = @sqrt(gradient_sq);
+    if (!std.math.isFinite(raw_gradient_norm) or raw_gradient_norm <= 0) {
+        return error.InvalidOracleGradientNorm;
+    }
+
+    try safetensors_checkpoint.save(allocator, gradient_path, named_gradients);
+    try trainer.saveTrainingCheckpoint(checkpoint_path, null, null);
+    var gradient_fingerprint = try finetune.fingerprintProjectorFile(allocator, gradient_path);
+    defer finetune.freeProjectorFingerprint(allocator, &gradient_fingerprint);
+    var checkpoint_fingerprint = try finetune.fingerprintProjectorFile(allocator, checkpoint_path);
+    defer finetune.freeProjectorFingerprint(allocator, &checkpoint_fingerprint);
+    const candidate_adapter_path = try std.fs.path.join(allocator, &.{ candidate_adapter_dir, finetune.adapter_checkpoint_file_name });
+    defer allocator.free(candidate_adapter_path);
+    var candidate_adapter_fingerprint = try finetune.fingerprintProjectorFile(allocator, candidate_adapter_path);
+    defer finetune.freeProjectorFingerprint(allocator, &candidate_adapter_fingerprint);
+    const gradient_sha256 = try std.fmt.allocPrint(allocator, "sha256:{s}", .{gradient_fingerprint.sha256});
+    defer allocator.free(gradient_sha256);
+    const checkpoint_sha256 = try std.fmt.allocPrint(allocator, "sha256:{s}", .{checkpoint_fingerprint.sha256});
+    defer allocator.free(checkpoint_sha256);
+    const candidate_adapter_sha256 = try std.fmt.allocPrint(allocator, "sha256:{s}", .{candidate_adapter_fingerprint.sha256});
+    defer allocator.free(candidate_adapter_sha256);
+
+    const example = prepared.examples[request.bindings.example_index];
+    try artifact_writer.writeJsonFile(allocator, capture_path, .{
+        .schema_version = oracle_capture_schema_v1,
+        .request_sha256 = admission.request_sha256,
+        .implementation = request.implementation,
+        .bindings = request.bindings,
+        .training = request.training,
+        .result = .{
+            .loss_history = capture.loss_history.items,
+            .raw_gradient_norm = raw_gradient_norm,
+            .supervised_tokens = example.num_supervised_tokens,
+            .logit_probes = capture.probes.?.rows,
+            .targets = targets,
+            .execution = capture.execution,
+        },
+        .artifacts = .{
+            .raw_gradients = OracleCaptureArtifactV1{
+                .path = gradient_file_name,
+                .sha256 = gradient_sha256,
+                .size_bytes = gradient_fingerprint.size_bytes,
+            },
+            .trainer_checkpoint = OracleCaptureArtifactV1{
+                .path = checkpoint_file_name,
+                .sha256 = checkpoint_sha256,
+                .size_bytes = checkpoint_fingerprint.size_bytes,
+            },
+            .candidate_adapter_model = OracleCandidateAdapterArtifactV1{
+                .sha256 = candidate_adapter_sha256,
+                .size_bytes = candidate_adapter_fingerprint.size_bytes,
+            },
+        },
+    });
+    _ = io;
+}
+
+fn dimsToUsize(allocator: std.mem.Allocator, dims: []const i32) ![]usize {
+    const shape = try allocator.alloc(usize, dims.len);
+    errdefer allocator.free(shape);
+    for (dims, shape) |dim, *value| {
+        if (dim <= 0) return error.InvalidOracleTensorShape;
+        value.* = @intCast(dim);
+    }
+    return shape;
 }
 
 fn validateAutodiffEpoch(metrics: gemma4_real.CausalLmMetrics) !void {
@@ -4574,6 +5415,8 @@ pub fn printTrainUsage() void {
         \\  --resume                            Resume the bound run from --checkpoint-path
         \\  --benchmark-request <json>          Internal locked benchmark contract (paired flag)
         \\  --benchmark-telemetry-out <json>    Internal no-replace benchmark telemetry (paired flag)
+        \\  --oracle-request <json>             Internal locked numerical-oracle contract (paired flag)
+        \\  --oracle-capture-out <dir>          Immutable raw oracle capture directory (paired flag)
         \\  --backend native|metal               Required compute backend; no implicit fallback
         \\
         \\Gemma4 production finetuning is text-only BF16 LoRA. Surrogate, media, DoRA,

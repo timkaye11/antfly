@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -72,6 +73,43 @@ CLIPCLAP_GGUF_FILES = (
     "termite_variants.json",
 )
 ALLOW_REAL_MODEL_DOWNLOAD_ENV = "ANTFLY_E2E_ALLOW_REAL_MODEL_DOWNLOAD"
+
+# Distributed binaries fail fast without an isolated internal RPC identity.
+# Every subprocess launched by this pytest tree inherits this test-only key;
+# production deployments must provision their own random credential as
+# documented in docs/secrets.md.
+os.environ.setdefault(
+    "ANTFLY_INTERNAL_SERVICE_SECRET",
+    "antfly-e2e-dedicated-internal-service-secret-v1",
+)
+os.environ.setdefault("ANTFLY_INTERNAL_SERVICE_ISSUER", "antfly-e2e")
+
+
+def internal_service_headers() -> dict[str, str]:
+    now = int(time.time())
+    header = {"alg": "HS256", "typ": "JWT"}
+    payload = {
+        "iss": os.environ["ANTFLY_INTERNAL_SERVICE_ISSUER"],
+        "sub": "antfly-e2e-client",
+        "aud": "antfly-internal-v1",
+        "principal_kind": "service",
+        "admin": True,
+        "iat": now,
+        "exp": now + 60,
+    }
+
+    def encode(value: dict[str, object]) -> str:
+        raw = json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+    signing_input = f"{encode(header)}.{encode(payload)}"
+    signature = hmac.new(
+        os.environ["ANTFLY_INTERNAL_SERVICE_SECRET"].encode(),
+        signing_input.encode(),
+        hashlib.sha256,
+    ).digest()
+    encoded_signature = base64.urlsafe_b64encode(signature).rstrip(b"=").decode()
+    return {"X-Antfly-Trusted-Principal": f"{signing_input}.{encoded_signature}"}
 
 
 def resolve_binary_path(binary: str) -> str:
@@ -288,7 +326,8 @@ def ready_index_status(
         return None
     if status.get("rebuilding", status.get("backfill_active", False)):
         return None
-    if status.get("backfill_state") == "failed":
+    backfill_state = status.get("backfill_state")
+    if backfill_state is not None and backfill_state != "ready":
         return None
     if isinstance(status.get("repair"), dict):
         return None
@@ -1392,10 +1431,20 @@ class PdfOcrE2EServer:
 
 
 class OpenAiEmbeddingServer:
-    def __init__(self, host: str = "127.0.0.1", response_delay_s: float = 0.0):
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        response_delay_s: float = 0.0,
+        rate_limit_after_requests: int | None = None,
+    ):
         port = find_free_port()
         self.url = f"http://{host}:{port}"
         self.response_delay_s = response_delay_s
+        self.rate_limit_after_requests = rate_limit_after_requests
+        self.rate_limit_input_substring: str | None = None
+        self._request_count = 0
+        self._request_lock = threading.Lock()
+        self._allow_rate_limited_requests = threading.Event()
 
         outer = self
 
@@ -1411,6 +1460,39 @@ class OpenAiEmbeddingServer:
                 inputs = payload.get("input", [])
                 if isinstance(inputs, str):
                     inputs = [inputs]
+
+                with outer._request_lock:
+                    outer._request_count += 1
+                    request_number = outer._request_count
+                    rate_limit_after_requests = outer.rate_limit_after_requests
+                    rate_limit_input_substring = outer.rate_limit_input_substring
+                should_rate_limit = (
+                    rate_limit_after_requests is not None
+                    and request_number > rate_limit_after_requests
+                    and not outer._allow_rate_limited_requests.is_set()
+                    and (
+                        rate_limit_input_substring is None
+                        or any(
+                            rate_limit_input_substring in str(value)
+                            for value in inputs
+                        )
+                    )
+                )
+                if should_rate_limit:
+                    body = json.dumps(
+                        {
+                            "error": {
+                                "message": "rate limit exceeded in test fixture",
+                                "type": "rate_limit_exceeded",
+                            }
+                        }
+                    ).encode("utf-8")
+                    self.send_response(429)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
 
                 if outer.response_delay_s > 0:
                     time.sleep(outer.response_delay_s)
@@ -1457,15 +1539,32 @@ class OpenAiEmbeddingServer:
     @staticmethod
     def _vector_for_text(text: str) -> list[float]:
         lowered = text.lower()
-        if "alpha" in lowered or "concept" in lowered:
+        # Keep named concepts distinct even when both inputs contain the
+        # generic word "concept".  Returning the alpha vector for
+        # "beta concept" makes ranking a nondeterministic exact tie.
+        if "alpha" in lowered:
             return [1.0, 0.0, 0.0]
         if "beta" in lowered:
             return [0.0, 1.0, 0.0]
+        if "concept" in lowered:
+            return [1.0, 0.0, 0.0]
         if "retrieval" in lowered or "semantic" in lowered:
             return [0.8, 0.2, 0.0]
         return [0.0, 0.0, 1.0]
 
+    def rate_limit_after_next_requests(
+        self, count: int, *, input_substring: str | None = None
+    ) -> None:
+        with self._request_lock:
+            self.rate_limit_after_requests = self._request_count + count
+            self.rate_limit_input_substring = input_substring
+            self._allow_rate_limited_requests.clear()
+
+    def allow_rate_limited_requests(self) -> None:
+        self._allow_rate_limited_requests.set()
+
     def stop(self) -> None:
+        self.allow_rate_limited_requests()
         self._server.shutdown()
         self._server.server_close()
         self._thread.join(timeout=5)
@@ -2145,6 +2244,14 @@ def slow_openai_embedder():
 
 
 @pytest.fixture(scope="function")
+def progressive_openai_embedder():
+    """Throttle the second write after its first durable page is embedded."""
+    server = OpenAiEmbeddingServer()
+    yield server
+    server.stop()
+
+
+@pytest.fixture(scope="function")
 def rate_limited_openai_embedder():
     server = RateLimitedOpenAiEmbeddingServer()
     yield server
@@ -2393,6 +2500,7 @@ def stateful_api(request: pytest.FixtureRequest):
                     self._check(
                         self.s.post(
                             internal_url,
+                            headers=internal_service_headers(),
                             json={
                                 "doc_key": doc_key,
                                 "index_name": index_name,
@@ -2549,17 +2657,25 @@ def stateful_api(request: pytest.FixtureRequest):
             return self.post(f"/tables/{table_name}/merge", payload)
 
         def backup_table(
-            self, table_name: str, *, backup_id: str, location: str
+            self,
+            table_name: str,
+            *,
+            backup_id: str,
+            location: str,
+            backup_format: str | None = None,
         ) -> dict:
             try:
+                payload: dict[str, object] = {
+                    "backup_id": backup_id,
+                    "location": location,
+                    "connection": E2E_BACKUP_CONNECTION,
+                }
+                if backup_format is not None:
+                    payload["format"] = backup_format
                 with self._request_lock:
                     response = self.s.post(
                         f"{self.url}/tables/{table_name}/backup",
-                        json={
-                            "backup_id": backup_id,
-                            "location": location,
-                            "connection": E2E_BACKUP_CONNECTION,
-                        },
+                        json=payload,
                         timeout=120,
                     )
                 return self._check(response)
@@ -3166,17 +3282,25 @@ def backup_api(request: pytest.FixtureRequest):
             return self.delete(f"/tables/{table_name}/indexes/{index_name}")
 
         def backup_table(
-            self, table_name: str, *, backup_id: str, location: str
+            self,
+            table_name: str,
+            *,
+            backup_id: str,
+            location: str,
+            backup_format: str | None = None,
         ) -> dict:
             try:
+                payload: dict[str, object] = {
+                    "backup_id": backup_id,
+                    "location": location,
+                    "connection": E2E_BACKUP_CONNECTION,
+                }
+                if backup_format is not None:
+                    payload["format"] = backup_format
                 with self._request_lock:
                     response = self.s.post(
                         f"{self.url}/tables/{table_name}/backup",
-                        json={
-                            "backup_id": backup_id,
-                            "location": location,
-                            "connection": E2E_BACKUP_CONNECTION,
-                        },
+                        json=payload,
                         timeout=120,
                     )
                 return self._check(response)

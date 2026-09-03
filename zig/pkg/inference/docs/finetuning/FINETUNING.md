@@ -292,7 +292,7 @@ quality is instead gated statistically on held-out metrics. Python is the
 pinned oracle and timing baseline, not a production runtime dependency:
 
 ```sh
-scripts/run_gliner2_lora_production_readiness.sh \
+scripts/gliner2/run_gliner2_lora_production_readiness.sh \
   --model-dir /models/gliner2 \
   --python-model /models/gliner2 \
   --release-adapter-dir /runs/gliner2-release-adapter \
@@ -401,7 +401,7 @@ Parity review notes (vs the frozen fastino-ai/GLiNER2 oracle
 
 - The oracle environment is frozen as well as its source: Python 3.12 / Unicode
   15 plus every direct numerical/runtime dependency in
-  `scripts/requirements-gliner2-oracle.txt`. Generated trainers, held-out
+  `scripts/gliner2/requirements-gliner2-oracle.txt`. Generated trainers, held-out
   evaluation, repeated performance summaries, convergence evidence, and the
   final readiness report all reject a missing or mismatched package version.
 
@@ -544,8 +544,8 @@ that can participate as the second half of canonical composition; U+2581 and
 U+FFFD; leading, trailing, or repeated ASCII spaces; and emoji sequences
 containing marks or joiners fail closed. Regenerate and exhaustively verify the
 scalar/category/context tables with
-`python3.12 scripts/generate_gliner2_unicode_tables.py --write` and verify with
-`python3.12 scripts/generate_gliner2_unicode_tables.py --check`.
+`python3.12 scripts/gliner2/generate_gliner2_unicode_tables.py --write` and verify with
+`python3.12 scripts/gliner2/generate_gliner2_unicode_tables.py --check`.
 With the pinned model available, add
 `--tokenizer-json <model_dir>/tokenizer.json` to verify the normalizer shape,
 charsmap fingerprint, and every admitted scalar against the real tokenizer.
@@ -620,7 +620,7 @@ Every non-dry run also writes:
 
 Direct DPO and GRPO adapters also write `artifacts.report_path`, or `<artifacts.root>/dpo_report.json` / `<artifacts.root>/grpo_report.json` when no explicit report path is provided.
 Their report schemas are `antfly_inference_finetune_dpo_report/v7` and
-`antfly_inference_finetune_grpo_report/v7`; both bind the resolved
+`antfly_inference_finetune_grpo_report/v8`; both bind the resolved
 `execution_mode` and `dataset_format`. Training reports additionally name the
 published adapter directory, while score reports leave it null. The normalized
 training report fingerprints both the bootstrap and trained adapter trees for
@@ -633,6 +633,11 @@ DPO and GRPO evaluation schemas are
 evaluator uses the live post-update policy and the immutable zero-LoRA
 same-graph reference. Evaluation failure remains visible in the normalized
 failed run report but prevents `adapter-trained` publication.
+Baseline-relative DPO/GRPO rejection also writes the typed task report before
+returning the gate error, leaves `trained_adapter_dir` null, and publishes no
+adapter. The multi-seed quality wrapper preserves only allowlisted JSON summary
+fields (with a 16 MiB parse ceiling) plus paths, sizes, and SHA-256 identities
+for the complete failed-run evidence set.
 The trained-adapter target must not exist when a Gemma4 preference run starts,
 so a stale bundle from an older failed or successful run cannot be mistaken for
 the current job's publication.
@@ -640,7 +645,8 @@ Optimizer-backed Gemma4 reports include the actual policy backend plus optimizer
 and micro-batch step counts. GRPO reports also include reward mean and standard
 deviation, raw mean K3, weighted KL loss, frozen-reference mode and scoring
 time, initial ranked token IDs and policy/reference logprobs, sampling/rescore
-parity, and KL-controller telemetry, so a mechanically healthy but
+parity, the seed-bound per-epoch Fisher-Yates prompt-order contract, and
+KL-controller telemetry, so a mechanically healthy but
 reward-degenerate, reference-drifted, or KL-unsafe run is visible. Every train
 attempt atomically writes `grpo_kl_control_trace.jsonl`; a raw-KL budget breach
 is recorded there and rejects the group before optimizer mutation.
@@ -704,7 +710,7 @@ both private-buffer reuse tiers disabled. The report attests
 A training step after this boundary is rejected.
 
 The real process-kill qualifier is
-`scripts/qualify_gemma4_preference_resume.py` (qualification schema v2). It
+`scripts/gemma4/qualify_gemma4_preference_resume.py` (qualification schema v2). It
 requires byte-identical final adapters and training checkpoints, exact
 content-addressed sidecars, exact training metrics, exact
 completion/reward/KL-control traces, exact discrete held-out behavior, and an
@@ -813,13 +819,13 @@ numbers remain bounded diagnostic evidence, not E4B or broad release-campaign
 qualification.
 
 For real multi-token DPO parity, use
-`scripts/materialize_gemma4_dpo_hf_parity.py` to create a provenance-bound
+`scripts/gemma4/materialize_gemma4_dpo_hf_parity.py` to create a provenance-bound
 Antfly JSONL plus an exact-token MLX case. Its `--bucket-occurrence 1` mode
 creates a deterministic disjoint holdout from the same pinned source. Run the
-matched MLX training side with `scripts/run_gemma4_dpo_mlx_benchmark.py` and a
+matched MLX training side with `scripts/gemma4/run_gemma4_dpo_mlx_benchmark.py` and a
 strict `--mlx-build-attestation` produced by
-`scripts/build_and_attest_gemma4_mlx.py`, then score the Antfly and MLX adapters
-under one runtime with `scripts/evaluate_gemma4_dpo_adapters_mlx.py`. Pass the
+`scripts/gemma4/build_and_attest_gemma4_mlx.py`, then score the Antfly and MLX adapters
+under one runtime with `scripts/gemma4/evaluate_gemma4_dpo_adapters_mlx.py`. Pass the
 same attestation to both commands. The bounded 2026-08-17
 UltraFeedback result achieved identical five-row holdout decisions and equal
 `0.6` accuracy. The first uniform-loss route compiled the live policy's
@@ -970,7 +976,7 @@ each group plus measured median and mean duration. The checked-in workload is
 `testdata/gemma4_grpo_e2b_seq128_benchmark.json`, with the corresponding
 single-row CLI dataset in
 `testdata/gemma4_grpo_e2b_seq128_benchmark.jsonl`. The pinned MLX-LM side is
-`scripts/run_gemma4_grpo_mlx_benchmark.py`.
+`scripts/gemma4/run_gemma4_grpo_mlx_benchmark.py`.
 
 The optimized 2026-08-17 same-Mac E2B rank-16 Q/V diagnostic measured a
 five-run median-of-medians of `0.773689 s` per group for Antfly and `0.629479 s`
@@ -1811,7 +1817,7 @@ The earlier cached probe-surrogate bundle route
 (`train-eval-gliner2-lora-bundle`, MSE against deterministic probe targets)
 was removed — it was a smoke fixture, not real GLiNER2 training. Python↔Zig
 loss parity is gated by
-`scripts/compare_gliner2_lora_python_zig.py --strict` (see
+`scripts/gliner2/compare_gliner2_lora_python_zig.py --strict` (see
 `zig/e2e/inference/test_gliner2_lora_parity.py`).
 
 Adapters are saved in PEFT-compatible format

@@ -51,7 +51,10 @@ test "inference module compiles" {
 }
 
 test "bedrock provider request helpers" {
+    try bedrock.testBedrockSigningClockUsesUnixWallTime();
+    try bedrock.testBedrockSigningDatesUseCalendarMonthNumbers();
     try bedrock.testTitanMultimodalBodyOmitsEmptyInputText();
+    try bedrock.testTitanMultimodalTextBodyUsesEmbeddingConfig();
     try bedrock.testTitanMultimodalBodyCombinesTextAndRejectsMultipleImages();
     try bedrock.testTitanMultimodalBodyAcceptsDataUriAndRejectsRemoteUrl();
     try bedrock.testCohereV4BodyUsesBedrockImageUrlDataUri();
@@ -60,10 +63,13 @@ test "bedrock provider request helpers" {
     try bedrock.testMetadataCredentialParsers();
     try bedrock.testCredentialUrlEncoding();
     try bedrock.testRequestShapeBatchesByProviderRequest();
+    try bedrock.testBedrockRequestFormatResolution();
     try bedrock.testBedrockInvokePathEscapesModelId();
+    try bedrock.testBedrockCanonicalUriDoubleEncodesEscapedModelId();
     try bedrock.testBedrockSignerUsesBedrockServiceScope();
     try bedrock.testBedrockSignerSignsGetRequests();
     try bedrock.testEndpointHostIncludesExplicitPort();
+    try managed_embedder.testBedrockRequestFormatConfiguration();
 }
 
 test "managed embedder resolves file-backed api key rotation at request time" {
@@ -92,6 +98,11 @@ test "managed embedder rejects malformed provider vectors" {
 
 test "managed embedder artifact backed embedding translation" {
     try managed_embedder.testArtifactBackedEmbeddingTranslation();
+    try managed_embedder.testArtifactBackedSparseEmbeddingTranslation();
+}
+
+test "managed embedder multi-source embedding contracts" {
+    try managed_embedder.testMultiSourceEmbeddingContracts();
 }
 
 test "managed embedder sends antfly media parts when local provider is configured" {

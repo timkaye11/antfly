@@ -29,6 +29,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -42,6 +43,7 @@ import (
 	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
+	ctrlbuilder "sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -69,6 +71,7 @@ type AntflyClusterReconciler struct {
 	Recorder              events.EventRecorder
 	ManageInferencePools  bool
 	DefaultInferenceImage string
+	ClusterDomain         string
 	Now                   func() time.Time
 	// MonotonicNow is a test hook for process-local HA watchdog barriers. In
 	// production it is nil and time.Now retains its monotonic clock reading.
@@ -100,16 +103,39 @@ const maxHASeededSlotActivationReceiptBytes = 64 * 1024
 // reconciliation promptly without consuming the error rate limiter.
 const haStatusCheckpointRequeueAfter = 5 * time.Millisecond
 
+// Runtime-admin observations can wait on independent tenant networks. Keep
+// those waits from head-of-line blocking Lease-backed failover for every other
+// AntflyCluster while retaining a fixed upper bound on operator concurrency.
+const antflyClusterMaxConcurrentReconciles = 16
+
+const haStartupGateObservationRequeueAfter = 5 * time.Second
+
+// Runtime LSN, replication health, and failure-detector evidence do not emit
+// Kubernetes events. Keep their observation clock independent from the
+// higher-frequency Lease-renewal controller so writes and failover decisions
+// never depend on unrelated object churn.
+const haRuntimeStatusObservationRequeueAfter = 5 * time.Second
+
 const (
 	antflyRuntimeUID int64 = 10001
 	antflyRuntimeGID int64 = 10001
 
-	antflySecretStoreVolumeName           = "secret-store"
-	antflySecretStoreDefaultKey           = "secrets.json"
-	antflySecretStoreDefaultPath          = "/run/antfly/secrets/secrets.json" // #nosec G101 -- file path, not a credential
-	antflySecretStoreEnvVar               = "ANTFLY_SECRET_STORE_PATH"         // #nosec G101 -- environment variable name, not a credential
-	antflyExtensionPackageStoreEnvVar     = "ANTFLY_EXTENSION_PACKAGE_STORE"
-	antflyStandaloneExtensionPackageStore = "/antflydb/extensions"
+	antflySecretStoreVolumeName                   = "secret-store"
+	antflySecretStoreDefaultKey                   = "secrets.json"
+	antflySecretStoreDefaultPath                  = "/run/antfly/secrets/secrets.json" // #nosec G101 -- file path, not a credential
+	antflySecretStoreEnvVar                       = "ANTFLY_SECRET_STORE_PATH"         // #nosec G101 -- environment variable name, not a credential
+	antflyExtensionPackageStoreEnvVar             = "ANTFLY_EXTENSION_PACKAGE_STORE"
+	antflyStandaloneExtensionPackageStore         = "/antflydb/extensions"
+	antflyInternalServiceSecretEnvVar             = "ANTFLY_INTERNAL_SERVICE_SECRET"              // #nosec G101 -- environment variable name, not a credential
+	antflyInternalServiceVerificationSecretEnvVar = "ANTFLY_INTERNAL_SERVICE_VERIFICATION_SECRET" // #nosec G101 -- environment variable name, not a credential
+	antflyInternalServiceIssuerEnvVar             = "ANTFLY_INTERNAL_SERVICE_ISSUER"              // #nosec G101 -- environment variable name, not a credential
+	antflyInternalServiceRolloutEnvVar            = "ANTFLY_INTERNAL_SERVICE_ROLLOUT_MODE"
+	internalServiceAuthRolloutAnnotation          = "antfly.io/internal-service-auth-rollout-mode"
+	internalServiceAuthKeyRolloutAnnotation       = "antfly.io/internal-service-auth-key-rollout"
+	internalServiceAuthKeyTargetAnnotation        = "antfly.io/internal-service-auth-key-target"
+	internalServiceAuthCapabilityHeader           = "X-Antfly-Internal-Service-Auth"
+	internalServiceAuthCapabilityVersion          = "v1"
+	internalServiceAuthRolloutInterval            = 10 * time.Second
 
 	haPrimaryRouteTargetAnnotation          = "antfly.io/ha-primary-route-target"
 	haPrimaryRouteFenceAuthorityAnnotation  = "antfly.io/ha-primary-route-fence-authority"
@@ -141,9 +167,15 @@ const (
 	haSeedTargetPVCNameAnnotation           = "antfly.io/ha-seed-target-pvc-name"
 	haSeedTargetPVCUIDAnnotation            = "antfly.io/ha-seed-target-pvc-uid"
 	haSeedCheckpointLSNAnnotation           = "antfly.io/ha-seed-checkpoint-lsn"
-	haSeedGenerationVolumeName              = "ha-seed-generation"
 	haSeedLiveDataPath                      = "/antflydb/data"
+	haSeedLiveMetadataPath                  = "/antflydb/metadata"
+	haSeedLiveExtensionsPath                = "/antflydb/extensions"
 	haSeedActivationRelativeRoot            = ".antfly-ha/active"
+	cloudHAPromotionReceiptAnnotation       = "cloud.antfly.io/ha-promotion-receipt"
+	cloudHATopologyGenerationAnnotation     = "cloud.antfly.io/ha-topology-generation"
+	haPromotedProcessBindingAnnotation      = "antfly.io/ha-promoted-process-binding"
+	cloudHARoleLabel                        = "cloud.antfly.io/ha-role"
+	cloudHAStandbyRole                      = "standby"
 
 	haAdminJobPhaseWaitingDependency   = "WaitingDependency"
 	haAdminJobPhaseWaitingPrerequisite = "WaitingPrerequisite"
@@ -162,15 +194,16 @@ const (
 //+kubebuilder:rbac:groups=antfly.io,resources=antflyclusters/finalizers,verbs=update
 //+kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
 //+kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;update
+//+kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;update;delete
 //+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;delete
 //+kubebuilder:rbac:groups="",resources=pods/log,verbs=get
 //+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 //+kubebuilder:rbac:groups=metrics.k8s.io,resources=pods,verbs=get;list
 //+kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update
+//+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update;delete
 //+kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
 //+kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
@@ -210,6 +243,74 @@ func secretStoreEnv(store *antflyv1.SecretStoreSpec) []corev1.EnvVar {
 	}}
 }
 
+type internalServiceAuthRolloutMode string
+
+type internalServiceAuthKeyRolloutMode string
+
+const (
+	internalServiceAuthRolloutEnforce           internalServiceAuthRolloutMode    = "enforce"
+	internalServiceAuthRolloutMigration         internalServiceAuthRolloutMode    = "migration"
+	internalServiceAuthKeyRolloutSteady         internalServiceAuthKeyRolloutMode = "steady"
+	internalServiceAuthKeyRolloutPrepare        internalServiceAuthKeyRolloutMode = "prepare"
+	internalServiceAuthKeyRolloutSwitch         internalServiceAuthKeyRolloutMode = "switch"
+	internalServiceAuthPublicBoundaryLabel                                        = "antfly.io/internal-service-auth-boundary"
+	internalServiceAuthPublicBoundaryAnnotation                                   = "antfly.io/internal-service-auth-public-boundary"
+)
+
+func internalServiceAuthIssuer(cluster *antflyv1.AntflyCluster) string {
+	// UID prevents a deleted/recreated cluster with the same namespace/name from
+	// sharing an issuer. The fallback is used only by unit tests and pre-create
+	// rendering; reconciled Kubernetes objects always have a UID.
+	identity := strings.TrimSpace(string(cluster.UID))
+	if identity == "" {
+		identity = cluster.Namespace + ":" + cluster.Name
+	}
+	return "antfly-cluster:" + identity
+}
+
+func requiredSecretKeyEnv(name string, selector corev1.SecretKeySelector) corev1.EnvVar {
+	secretRef := selector.DeepCopy()
+	optional := false
+	secretRef.Optional = &optional
+	return corev1.EnvVar{Name: name, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: secretRef}}
+}
+
+func internalServiceAuthEnv(cluster *antflyv1.AntflyCluster, mode internalServiceAuthRolloutMode, keyMode internalServiceAuthKeyRolloutMode) []corev1.EnvVar {
+	if cluster == nil || cluster.Spec.InternalServiceAuth == nil {
+		return nil
+	}
+	auth := cluster.Spec.InternalServiceAuth
+	signing := auth.SecretKeyRef
+	var verification *corev1.SecretKeySelector
+	if auth.NextSecretKeyRef != nil {
+		if keyMode == internalServiceAuthKeyRolloutSwitch {
+			signing = *auth.NextSecretKeyRef
+			old := auth.SecretKeyRef
+			verification = &old
+		} else {
+			next := *auth.NextSecretKeyRef
+			verification = &next
+		}
+	}
+	env := []corev1.EnvVar{
+		requiredSecretKeyEnv(antflyInternalServiceSecretEnvVar, signing),
+		{Name: antflyInternalServiceIssuerEnvVar, Value: internalServiceAuthIssuer(cluster)},
+		{Name: antflyInternalServiceRolloutEnvVar, Value: string(mode)},
+	}
+	if verification != nil {
+		env = append(env, requiredSecretKeyEnv(antflyInternalServiceVerificationSecretEnvVar, *verification))
+	}
+	return env
+}
+
+func internalServiceAuthKeyTarget(auth *antflyv1.InternalServiceAuthSpec) string {
+	if auth == nil || auth.NextSecretKeyRef == nil {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(auth.NextSecretKeyRef.Name + "\x00" + auth.NextSecretKeyRef.Key))
+	return hex.EncodeToString(sum[:8])
+}
+
 func haRuntimeAdminTokenEnv(ha *antflyv1.HighAvailabilitySpec) []corev1.EnvVar {
 	if ha == nil || ha.Runtime == nil || ha.Runtime.AdminTokenSecretRef == nil {
 		return nil
@@ -241,6 +342,14 @@ func haRuntimeStartupGate(cluster *antflyv1.AntflyCluster) *antflyv1.HAStartupGa
 		return nil
 	}
 	return cluster.Spec.HighAvailability.Runtime.StartupGate
+}
+
+func haManagementDisabled(cluster *antflyv1.AntflyCluster) bool {
+	if cluster == nil || cluster.Spec.HighAvailability == nil {
+		return true
+	}
+	mode := cluster.Spec.HighAvailability.Mode
+	return mode == "" || mode == antflyv1.HAModeDisabled
 }
 
 func (r *AntflyClusterReconciler) reconcileHAStartupTargetPVC(ctx context.Context, cluster *antflyv1.AntflyCluster, storageSize string) (*corev1.PersistentVolumeClaim, error) {
@@ -366,18 +475,50 @@ func haStartupGateRuntimeEligible(cluster *antflyv1.AntflyCluster, pvc *corev1.P
 	if !gate.RuntimeEligible {
 		return false, "DeclarativelySuspended"
 	}
+	if cluster.Status.HAStatus == nil || cluster.Status.HAStatus.StartupGate == nil ||
+		cluster.Status.HAStatus.StartupGate.ActivationReceipt == nil {
+		return false, "ActivationReceiptNotObserved"
+	}
+	return haStartupGateActivationReceiptMatches(cluster, pvc, cluster.Status.HAStatus.StartupGate.ActivationReceipt)
+}
+
+// Physical isolation is an irreversible writer fence, not a permanent process
+// tombstone. Release its availability hold only after Colony has rewritten the
+// former primary as a standby and both the declarative and observed startup
+// gates prove the exact activated generation on the exact retained PVC.
+func haFormerPrimaryIsolationReleasedByActivatedStandby(cluster *antflyv1.AntflyCluster, pvc *corev1.PersistentVolumeClaim) bool {
+	if cluster == nil || cluster.Spec.HighAvailability == nil || cluster.Spec.HighAvailability.Runtime == nil ||
+		cluster.Spec.HighAvailability.Runtime.Role != antflyv1.HARuntimeRoleStandby {
+		return false
+	}
+	gate := haRuntimeStartupGate(cluster)
+	if gate == nil || gate.Policy != antflyv1.HAStartupGatePolicyRequireActivatedSeed ||
+		gate.ReceiptMatchPolicy != antflyv1.HAReceiptMatchPolicyExact || gate.RequiredReceipt == nil {
+		return false
+	}
+	eligible, _ := haStartupGateRuntimeEligible(cluster, pvc)
+	return eligible
+}
+
+func haStartupGateActivationReceiptMatches(
+	cluster *antflyv1.AntflyCluster,
+	pvc *corev1.PersistentVolumeClaim,
+	receipt *antflyv1.HASeedActivationReceiptStatus,
+) (bool, string) {
+	gate := haRuntimeStartupGate(cluster)
+	if gate == nil {
+		return false, "NotConfigured"
+	}
 	if gate.Policy != antflyv1.HAStartupGatePolicyRequireActivatedSeed || gate.ReceiptMatchPolicy != antflyv1.HAReceiptMatchPolicyExact || gate.RequiredReceipt == nil {
 		return false, "UnsupportedPolicy"
 	}
 	if pvc == nil || strings.TrimSpace(string(pvc.UID)) == "" {
 		return false, "TargetPVCNotObserved"
 	}
-	if cluster.Status.HAStatus == nil || cluster.Status.HAStatus.StartupGate == nil ||
-		!cluster.Status.HAStatus.StartupGate.RuntimeEligible || cluster.Status.HAStatus.StartupGate.ActivationReceipt == nil {
+	if receipt == nil {
 		return false, "ActivationReceiptNotObserved"
 	}
 	required := *gate.RequiredReceipt
-	receipt := cluster.Status.HAStatus.StartupGate.ActivationReceipt
 	if receipt.TopologyID != required.TopologyID || receipt.NodeID != required.NodeID ||
 		receipt.SlotName != required.SlotName || receipt.Generation != required.Generation ||
 		receipt.TargetPVCName != required.TargetPVCName || receipt.TargetPVCUID != string(pvc.UID) ||
@@ -405,7 +546,35 @@ func haStartupGateRuntimeEligible(cluster *antflyv1.AntflyCluster, pvc *corev1.P
 		(required.TargetReplicaID != 0 && receipt.TargetReplicaID != required.TargetReplicaID) {
 		return false, "ActivationReceiptDigestMismatch"
 	}
+	if !haSeedReceiptMatchesRuntimeLineage(cluster, receipt.ClusterID, receipt.ShardID, receipt.TableID, receipt.TimelineID, receipt.Epoch) {
+		return false, "ActivationReceiptReplicationIdentityMismatch"
+	}
 	return true, "ExactActivationReceiptMatched"
+}
+
+// haSeedReceiptMatchesRuntimeLineage distinguishes standby startup authority
+// from promoted-primary storage provenance. A standby may only start from a
+// receipt on its exact current replication boundary. Once that same runtime is
+// promoted, its materialized receipt necessarily belongs to the predecessor
+// boundary; accept it only when the database identity is unchanged and the new
+// authority boundary is monotonically later (never equal, incomparable, or in
+// the future).
+func haSeedReceiptMatchesRuntimeLineage(
+	cluster *antflyv1.AntflyCluster,
+	clusterID, shardID, tableID, timelineID, epoch uint64,
+) bool {
+	if cluster == nil || cluster.Spec.HighAvailability == nil || cluster.Spec.HighAvailability.Runtime == nil {
+		return false
+	}
+	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
+	if identity == nil || clusterID != identity.ClusterID || shardID != identity.ShardID || tableID != identity.TableID {
+		return false
+	}
+	if cluster.Spec.HighAvailability.Runtime.Role != antflyv1.HARuntimeRolePrimary {
+		return timelineID == identity.TimelineID && epoch == identity.Epoch
+	}
+	return timelineID <= identity.TimelineID && epoch <= identity.Epoch &&
+		(timelineID < identity.TimelineID || epoch < identity.Epoch)
 }
 
 func haStartupGateReceiptHash(cluster *antflyv1.AntflyCluster, pvc *corev1.PersistentVolumeClaim) string {
@@ -445,7 +614,107 @@ func haStandaloneRuntimeSeedIdentityAnnotations(cluster *antflyv1.AntflyCluster)
 	return annotations
 }
 
-func standaloneHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
+type activatedStandaloneStorageBinding struct {
+	claimName   string
+	generation  string
+	annotations map[string]string
+}
+
+// existingActivatedStandaloneStorageBinding recognizes only the complete
+// storage shape emitted after an exact seed activation. It deliberately reads
+// the admitted StatefulSet rather than mutable AntflyCluster annotations: HA
+// disable may remove the startup receipt from the spec/status, but it cannot
+// safely change where the already-running database is mounted.
+func existingActivatedStandaloneStorageBinding(statefulSet *appsv1.StatefulSet, storageVolumeName string) *activatedStandaloneStorageBinding {
+	if statefulSet == nil || strings.TrimSpace(storageVolumeName) == "" {
+		return nil
+	}
+	annotations := statefulSet.Spec.Template.Annotations
+	claimName := strings.TrimSpace(annotations[haSeedTargetPVCNameAnnotation])
+	claimUID := strings.TrimSpace(annotations[haSeedTargetPVCUIDAnnotation])
+	generation := strings.TrimSpace(annotations[haSeedGenerationAnnotation])
+	if claimName == "" || claimUID == "" || generation == "" || generation == "." || generation == ".." || path.Base(generation) != generation ||
+		!isLowerHexDigest(strings.TrimSpace(annotations[haStartupGateReceiptHashAnnotation])) {
+		return nil
+	}
+
+	storageVolumes := 0
+	for i := range statefulSet.Spec.Template.Spec.Volumes {
+		volume := &statefulSet.Spec.Template.Spec.Volumes[i]
+		if volume.Name != storageVolumeName {
+			continue
+		}
+		storageVolumes++
+		if volume.PersistentVolumeClaim == nil || strings.TrimSpace(volume.PersistentVolumeClaim.ClaimName) != claimName {
+			return nil
+		}
+	}
+	if storageVolumes != 1 {
+		return nil
+	}
+	for i := range statefulSet.Spec.VolumeClaimTemplates {
+		if statefulSet.Spec.VolumeClaimTemplates[i].Name == storageVolumeName {
+			return nil
+		}
+	}
+
+	var runtime *corev1.Container
+	for i := range statefulSet.Spec.Template.Spec.Containers {
+		if statefulSet.Spec.Template.Spec.Containers[i].Name == "antfly" {
+			runtime = &statefulSet.Spec.Template.Spec.Containers[i]
+			break
+		}
+	}
+	if runtime == nil {
+		return nil
+	}
+	generationRoot := path.Join(haSeedActivationRelativeRoot, "live-generations", generation)
+	expectedMounts := map[string]string{
+		haSeedLiveDataPath:       path.Join(generationRoot, "data"),
+		haSeedLiveMetadataPath:   path.Join(generationRoot, "metadata"),
+		haSeedLiveExtensionsPath: path.Join(generationRoot, "extensions"),
+	}
+	for mountPath, subPath := range expectedMounts {
+		matches := 0
+		for i := range runtime.VolumeMounts {
+			mount := &runtime.VolumeMounts[i]
+			if mount.MountPath == mountPath {
+				matches++
+				if mount.Name != storageVolumeName || mount.SubPath != subPath {
+					return nil
+				}
+			}
+		}
+		if matches != 1 {
+			return nil
+		}
+	}
+
+	preservedAnnotations := map[string]string{
+		haStartupGateReceiptHashAnnotation: annotations[haStartupGateReceiptHashAnnotation],
+	}
+	for _, key := range haSeedIdentityAnnotationKeys {
+		setHASeedIdentityAnnotation(preservedAnnotations, key, annotations[key])
+	}
+	return &activatedStandaloneStorageBinding{
+		claimName: claimName, generation: generation, annotations: preservedAnnotations,
+	}
+}
+
+func hasExplicitStandaloneStoragePVC(statefulSet *appsv1.StatefulSet, storageVolumeName string) bool {
+	if statefulSet == nil {
+		return false
+	}
+	for i := range statefulSet.Spec.Template.Spec.Volumes {
+		volume := &statefulSet.Spec.Template.Spec.Volumes[i]
+		if volume.Name == storageVolumeName && volume.PersistentVolumeClaim != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func standaloneHAArgs(ha *antflyv1.HighAvailabilitySpec, startupGeneration string) string {
 	if ha == nil || ha.Mode == antflyv1.HAModeDisabled || ha.Runtime == nil || ha.Identity == nil {
 		return ""
 	}
@@ -515,6 +784,15 @@ func standaloneHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
 		standby := runtime.Standby
 		logPath := defaultHAStandbyLogPath
 		progressPath := defaultHAStandbyProgressPath
+		// A materialized seed snapshot supersedes all receive/apply state from
+		// prior topologies. Keep operator-default standby WALs generation-scoped
+		// so an exact reseed starts from its validated checkpoint while ordinary
+		// restarts of that same generation retain their progress.
+		if generation := strings.TrimSpace(startupGeneration); generation != "" {
+			generationRoot := path.Join("/antflydb/ha/standby-generations", generation)
+			logPath = path.Join(generationRoot, "receive.wal")
+			progressPath = path.Join(generationRoot, "progress.wal")
+		}
 		if standby != nil {
 			if value := strings.TrimSpace(standby.LogPath); value != "" {
 				logPath = value
@@ -558,6 +836,19 @@ func standaloneHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
 	return args.String()
 }
 
+func standaloneHAStartupGeneration(cluster *antflyv1.AntflyCluster) string {
+	if cluster == nil {
+		return ""
+	}
+	gate := haRuntimeStartupGate(cluster)
+	if gate == nil || gate.Policy != antflyv1.HAStartupGatePolicyRequireActivatedSeed ||
+		cluster.Status.HAStatus == nil || cluster.Status.HAStatus.StartupGate == nil ||
+		!cluster.Status.HAStatus.StartupGate.RuntimeEligible || cluster.Status.HAStatus.StartupGate.ActivationReceipt == nil {
+		return ""
+	}
+	return strings.TrimSpace(cluster.Status.HAStatus.StartupGate.ActivationReceipt.Generation)
+}
+
 func standaloneHAStartupArgs(cluster *antflyv1.AntflyCluster) string {
 	gate := haRuntimeStartupGate(cluster)
 	if gate == nil || gate.Policy != antflyv1.HAStartupGatePolicyRequireActivatedSeed ||
@@ -577,6 +868,9 @@ func standaloneHAStartupArgs(cluster *antflyv1.AntflyCluster) string {
 	appendArg("--ha-startup-topology-id", receipt.TopologyID)
 	appendArg("--ha-startup-topology-generation", strconv.FormatInt(receipt.TopologyGeneration, 10))
 	appendArg("--ha-startup-generation", receipt.Generation)
+	appendArg("--ha-startup-slot-name", receipt.SlotName)
+	appendArg("--ha-startup-timeline-id", strconv.FormatUint(receipt.TimelineID, 10))
+	appendArg("--ha-startup-epoch", strconv.FormatUint(receipt.Epoch, 10))
 	appendArg("--ha-startup-target-pvc-name", receipt.TargetPVCName)
 	appendArg("--ha-startup-target-pvc-uid", receipt.TargetPVCUID)
 	if receipt.ManifestSHA256 != "" {
@@ -1648,6 +1942,7 @@ type metadataRuntimeTopologyStatus struct {
 	MetadataRaftVoterSetFingerprint *string `json:"metadata_raft_voter_set_fingerprint"`
 	MetadataRaftJointConsensus      *bool   `json:"metadata_raft_joint_consensus"`
 	MetadataRaftLearnerCount        *int32  `json:"metadata_raft_learner_count"`
+	InternalServiceAuthCapability   string  `json:"-"`
 }
 
 const (
@@ -1957,8 +2252,9 @@ func (r *AntflyClusterReconciler) fetchMetadataRuntimeTopology(ctx context.Conte
 	// steady-state monitoring must not clone the projected catalog.
 	paths := [...]string{metadataRuntimeTopologyPath, metadataRuntimeStatusPath}
 	for pathIndex, requestPath := range paths {
-		url := fmt.Sprintf("http://%s-metadata-%d.%s-metadata.%s.svc.cluster.local:%d%s",
-			cluster.Name, ordinal, cluster.Name, cluster.Namespace, cluster.Spec.MetadataNodes.MetadataAPI.Port, requestPath)
+		podName := fmt.Sprintf("%s-metadata-%d", cluster.Name, ordinal)
+		host := statefulPodDNSName(podName, cluster.Name+"-metadata", cluster.Namespace, r.ClusterDomain)
+		url := fmt.Sprintf("http://%s:%d%s", host, cluster.Spec.MetadataNodes.MetadataAPI.Port, requestPath)
 		req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, url, nil)
 		if err != nil {
 			return nil, fmt.Errorf("create metadata topology request: %w", err)
@@ -1999,9 +2295,60 @@ func (r *AntflyClusterReconciler) fetchMetadataRuntimeTopology(ctx context.Conte
 		if err := json.Unmarshal(body, &status); err != nil {
 			return nil, fmt.Errorf("decode metadata topology: %w", err)
 		}
+		status.InternalServiceAuthCapability = strings.TrimSpace(resp.Header.Get(internalServiceAuthCapabilityHeader))
 		return &status, nil
 	}
 	return nil, fmt.Errorf("metadata runtime topology route is unavailable")
+}
+
+func (r *AntflyClusterReconciler) fetchDataRuntimeAuthCapability(ctx context.Context, cluster *antflyv1.AntflyCluster, ordinal int32) (string, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, metadataRuntimeTopologyProbeTimeout)
+	defer cancel()
+	url := fmt.Sprintf("http://%s-data-%d.%s-data.%s.svc.cluster.local:%d/healthz",
+		cluster.Name, ordinal, cluster.Name, cluster.Namespace, cluster.Spec.DataNodes.API.Port)
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", fmt.Errorf("create data capability request: %w", err)
+	}
+	resp, err := r.httpClient().Do(req) //nolint:gosec // URL is a deterministic cluster-internal pod address.
+	if err != nil {
+		return "", fmt.Errorf("request data capability: %w", err)
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	_ = resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return "", fmt.Errorf("data capability returned HTTP %d", resp.StatusCode)
+	}
+	return strings.TrimSpace(resp.Header.Get(internalServiceAuthCapabilityHeader)), nil
+}
+
+func internalServiceAuthCapability(mode internalServiceAuthRolloutMode, additionalVerifier bool) string {
+	value := internalServiceAuthCapabilityVersion + "; mode=" + string(mode)
+	if additionalVerifier {
+		value += "; verification=additional"
+	}
+	return value
+}
+
+func (r *AntflyClusterReconciler) everyInternalServiceRuntimeAcknowledges(ctx context.Context, cluster *antflyv1.AntflyCluster, mode internalServiceAuthRolloutMode, additionalVerifier bool) bool {
+	want := internalServiceAuthCapability(mode, additionalVerifier)
+	for ordinal := int32(0); ordinal < effectiveMetadataNodeReplicas(cluster); ordinal++ {
+		status, err := r.fetchMetadataRuntimeTopology(ctx, cluster, ordinal)
+		if err != nil || status.InternalServiceAuthCapability != want {
+			return false
+		}
+	}
+	dataReplicas := effectiveDataNodeReplicas(cluster)
+	if cluster.Spec.DataNodes.Suspend {
+		dataReplicas = 0
+	}
+	for ordinal := int32(0); ordinal < dataReplicas; ordinal++ {
+		capability, err := r.fetchDataRuntimeAuthCapability(ctx, cluster, ordinal)
+		if err != nil || capability != want {
+			return false
+		}
+	}
+	return true
 }
 
 func validMetadataIncarnation(value string) bool {
@@ -2080,6 +2427,203 @@ func metadataMembershipCapabilityRolloutComplete(statefulSet *appsv1.StatefulSet
 		statefulSet.Status.ReadyReplicas >= expectedReplicas &&
 		statefulSet.Status.CurrentRevision != "" &&
 		statefulSet.Status.CurrentRevision == statefulSet.Status.UpdateRevision
+}
+
+func statefulSetRolloutComplete(statefulSet *appsv1.StatefulSet, expectedReplicas int32) bool {
+	if statefulSet == nil || statefulSet.Name == "" || statefulSet.Status.ObservedGeneration < statefulSet.Generation {
+		return false
+	}
+	if statefulSet.Status.UpdatedReplicas < expectedReplicas || statefulSet.Status.ReadyReplicas < expectedReplicas {
+		return false
+	}
+	return statefulSet.Status.CurrentRevision != "" && statefulSet.Status.CurrentRevision == statefulSet.Status.UpdateRevision
+}
+
+func statefulSetInternalServiceAuthMode(statefulSet *appsv1.StatefulSet) internalServiceAuthRolloutMode {
+	if statefulSet == nil {
+		return ""
+	}
+	return internalServiceAuthRolloutMode(statefulSet.Spec.Template.Annotations[internalServiceAuthRolloutAnnotation])
+}
+
+// desiredInternalServiceAuthRolloutMode makes upgrades from runtimes that sent
+// unsigned internal RPC a durable two-rollout transition. It never reads the
+// signing key: capability is proven by a non-secret response header emitted by
+// every upgraded metadata process after it has started in migration mode.
+func (r *AntflyClusterReconciler) desiredInternalServiceAuthRolloutMode(ctx context.Context, cluster *antflyv1.AntflyCluster) (internalServiceAuthRolloutMode, bool, error) {
+	metadataStatefulSet := &appsv1.StatefulSet{}
+	metadataKey := types.NamespacedName{Name: cluster.Name + "-metadata", Namespace: cluster.Namespace}
+	metadataErr := r.Get(ctx, metadataKey, metadataStatefulSet)
+	if metadataErr != nil && !errors.IsNotFound(metadataErr) {
+		return "", false, fmt.Errorf("read metadata StatefulSet for internal-service auth rollout: %w", metadataErr)
+	}
+	dataStatefulSet := &appsv1.StatefulSet{}
+	dataKey := types.NamespacedName{Name: cluster.Name + "-data", Namespace: cluster.Namespace}
+	dataErr := r.Get(ctx, dataKey, dataStatefulSet)
+	if dataErr != nil && !errors.IsNotFound(dataErr) {
+		return "", false, fmt.Errorf("read data StatefulSet for internal-service auth rollout: %w", dataErr)
+	}
+
+	metadataExists := metadataErr == nil
+	dataExists := dataErr == nil
+	if !metadataExists && !dataExists {
+		// A brand-new cluster has no legacy peers and starts fail-closed.
+		return internalServiceAuthRolloutEnforce, false, nil
+	}
+	metadataMode := statefulSetInternalServiceAuthMode(metadataStatefulSet)
+	dataMode := statefulSetInternalServiceAuthMode(dataStatefulSet)
+	if metadataMode == internalServiceAuthRolloutEnforce || dataMode == internalServiceAuthRolloutEnforce {
+		// Once enforcement begins, never regress to accepting unsigned traffic.
+		return internalServiceAuthRolloutEnforce, false, nil
+	}
+	if !metadataExists || !dataExists || metadataMode != internalServiceAuthRolloutMigration || dataMode != internalServiceAuthRolloutMigration {
+		return internalServiceAuthRolloutMigration, true, nil
+	}
+
+	metadataReplicas := effectiveMetadataNodeReplicas(cluster)
+	dataReplicas := effectiveDataNodeReplicas(cluster)
+	if cluster.Spec.DataNodes.Suspend {
+		dataReplicas = 0
+	}
+	if !statefulSetRolloutComplete(metadataStatefulSet, metadataReplicas) || !statefulSetRolloutComplete(dataStatefulSet, dataReplicas) {
+		return internalServiceAuthRolloutMigration, true, nil
+	}
+
+	additionalVerifier := cluster.Spec.InternalServiceAuth != nil && cluster.Spec.InternalServiceAuth.NextSecretKeyRef != nil
+	if !r.everyInternalServiceRuntimeAcknowledges(ctx, cluster, internalServiceAuthRolloutMigration, additionalVerifier) {
+		// An old runtime can be Ready while ignoring the injected environment.
+		// Keep migration active until every metadata and data member proves support.
+		return internalServiceAuthRolloutMigration, true, nil
+	}
+	return internalServiceAuthRolloutEnforce, false, nil
+}
+
+func statefulSetInternalServiceAuthKeyRollout(statefulSet *appsv1.StatefulSet) (internalServiceAuthKeyRolloutMode, string) {
+	if statefulSet == nil {
+		return "", ""
+	}
+	return internalServiceAuthKeyRolloutMode(statefulSet.Spec.Template.Annotations[internalServiceAuthKeyRolloutAnnotation]),
+		statefulSet.Spec.Template.Annotations[internalServiceAuthKeyTargetAnnotation]
+}
+
+func (r *AntflyClusterReconciler) desiredInternalServiceAuthKeyRollout(ctx context.Context, cluster *antflyv1.AntflyCluster, authMode internalServiceAuthRolloutMode) (internalServiceAuthKeyRolloutMode, bool, antflyv1.InternalServiceAuthRotationPhase, error) {
+	if cluster.Spec.InternalServiceAuth == nil || cluster.Spec.InternalServiceAuth.NextSecretKeyRef == nil {
+		return internalServiceAuthKeyRolloutSteady, false, "", nil
+	}
+	target := internalServiceAuthKeyTarget(cluster.Spec.InternalServiceAuth)
+	metadata := &appsv1.StatefulSet{}
+	metadataErr := r.Get(ctx, types.NamespacedName{Name: cluster.Name + "-metadata", Namespace: cluster.Namespace}, metadata)
+	if metadataErr != nil && !errors.IsNotFound(metadataErr) {
+		return "", false, "", metadataErr
+	}
+	data := &appsv1.StatefulSet{}
+	dataErr := r.Get(ctx, types.NamespacedName{Name: cluster.Name + "-data", Namespace: cluster.Namespace}, data)
+	if dataErr != nil && !errors.IsNotFound(dataErr) {
+		return "", false, "", dataErr
+	}
+	if errors.IsNotFound(metadataErr) && errors.IsNotFound(dataErr) {
+		return internalServiceAuthKeyRolloutSwitch, false, antflyv1.InternalServiceAuthRotationSwitched, nil
+	}
+	metadataMode, metadataTarget := statefulSetInternalServiceAuthKeyRollout(metadata)
+	dataMode, dataTarget := statefulSetInternalServiceAuthKeyRollout(data)
+	if (metadataMode == internalServiceAuthKeyRolloutSwitch && metadataTarget == target) ||
+		(dataMode == internalServiceAuthKeyRolloutSwitch && dataTarget == target) {
+		metadataComplete := metadataErr == nil && statefulSetRolloutComplete(metadata, effectiveMetadataNodeReplicas(cluster))
+		dataReplicas := effectiveDataNodeReplicas(cluster)
+		if cluster.Spec.DataNodes.Suspend {
+			dataReplicas = 0
+		}
+		dataComplete := (dataReplicas == 0 && errors.IsNotFound(dataErr)) || (dataErr == nil && statefulSetRolloutComplete(data, dataReplicas))
+		ready := metadataComplete && dataComplete && r.everyInternalServiceRuntimeAcknowledges(ctx, cluster, authMode, true)
+		if ready {
+			return internalServiceAuthKeyRolloutSwitch, false, antflyv1.InternalServiceAuthRotationSwitched, nil
+		}
+		return internalServiceAuthKeyRolloutSwitch, true, antflyv1.InternalServiceAuthRotationSwitching, nil
+	}
+	metadataPrepared := metadataErr == nil && metadataMode == internalServiceAuthKeyRolloutPrepare && metadataTarget == target &&
+		statefulSetRolloutComplete(metadata, effectiveMetadataNodeReplicas(cluster))
+	dataReplicas := effectiveDataNodeReplicas(cluster)
+	if cluster.Spec.DataNodes.Suspend {
+		dataReplicas = 0
+	}
+	dataPrepared := (dataReplicas == 0 && errors.IsNotFound(dataErr)) || (dataErr == nil && dataMode == internalServiceAuthKeyRolloutPrepare && dataTarget == target && statefulSetRolloutComplete(data, dataReplicas))
+	if authMode == internalServiceAuthRolloutEnforce && metadataPrepared && dataPrepared &&
+		r.everyInternalServiceRuntimeAcknowledges(ctx, cluster, authMode, true) {
+		return internalServiceAuthKeyRolloutSwitch, true, antflyv1.InternalServiceAuthRotationSwitching, nil
+	}
+	return internalServiceAuthKeyRolloutPrepare, true, antflyv1.InternalServiceAuthRotationPreparing, nil
+}
+
+// internalServiceAuthPublicBoundaryReady keeps the externally addressable
+// Service drained until every workload normally selected by it is running in
+// enforce mode. Migration necessarily accepts unsigned legacy peers on the
+// shared listener; withdrawing its endpoints turns that compatibility window
+// into an explicit maintenance boundary instead of reopening /internal/v1 to
+// the Internet. The headless node Services remain available for the rollout.
+func (r *AntflyClusterReconciler) internalServiceAuthPublicBoundaryReady(ctx context.Context, cluster *antflyv1.AntflyCluster) (bool, error) {
+	boundaryEstablished := false
+	publicService := &corev1.Service{}
+	publicKey := types.NamespacedName{Name: cluster.Name + "-public-api", Namespace: cluster.Namespace}
+	if err := r.Get(ctx, publicKey, publicService); err == nil {
+		boundaryEstablished = publicService.Annotations[internalServiceAuthPublicBoundaryAnnotation] == "enforced"
+	} else if !errors.IsNotFound(err) {
+		return false, fmt.Errorf("read public Service internal-service boundary: %w", err)
+	}
+
+	metadataStatefulSet := &appsv1.StatefulSet{}
+	metadataKey := types.NamespacedName{Name: cluster.Name + "-metadata", Namespace: cluster.Namespace}
+	if err := r.Get(ctx, metadataKey, metadataStatefulSet); err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read metadata StatefulSet for public internal-service boundary: %w", err)
+	}
+	metadataReplicas := effectiveMetadataNodeReplicas(cluster)
+	if statefulSetInternalServiceAuthMode(metadataStatefulSet) != internalServiceAuthRolloutEnforce ||
+		(!boundaryEstablished && !statefulSetRolloutComplete(metadataStatefulSet, metadataReplicas)) {
+		return false, nil
+	}
+
+	dataReplicas := effectiveDataNodeReplicas(cluster)
+	if cluster.Spec.DataNodes.Suspend {
+		dataReplicas = 0
+	}
+	dataStatefulSet := &appsv1.StatefulSet{}
+	dataKey := types.NamespacedName{Name: cluster.Name + "-data", Namespace: cluster.Namespace}
+	if err := r.Get(ctx, dataKey, dataStatefulSet); err != nil {
+		if errors.IsNotFound(err) && dataReplicas == 0 {
+			return true, nil
+		}
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read data StatefulSet for public internal-service boundary: %w", err)
+	}
+	return statefulSetInternalServiceAuthMode(dataStatefulSet) == internalServiceAuthRolloutEnforce &&
+		(boundaryEstablished || statefulSetRolloutComplete(dataStatefulSet, dataReplicas)), nil
+}
+
+func (r *AntflyClusterReconciler) internalServiceAuthPublicBoundaryDrained(ctx context.Context, cluster *antflyv1.AntflyCluster) (bool, error) {
+	if cluster.Spec.PublicAPI == nil || cluster.Spec.PublicAPI.Enabled == nil || !*cluster.Spec.PublicAPI.Enabled {
+		return true, nil
+	}
+	var slices discoveryv1.EndpointSliceList
+	if err := r.haBoundaryReader().List(
+		ctx,
+		&slices,
+		client.InNamespace(cluster.Namespace),
+		client.MatchingLabels{discoveryv1.LabelServiceName: cluster.Name + "-public-api"},
+	); err != nil {
+		return false, fmt.Errorf("list public API EndpointSlices for internal-service boundary: %w", err)
+	}
+	for i := range slices.Items {
+		for _, endpoint := range slices.Items[i].Endpoints {
+			if len(endpoint.Addresses) > 0 {
+				return false, nil
+			}
+		}
+	}
+	return true, nil
 }
 
 func (state metadataMembershipCapabilityRolloutState) requeueAfter() time.Duration {
@@ -2468,6 +3012,24 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, nil
 	}
 
+	// HA disable is an authority revocation boundary. Cancel exact-owned Jobs
+	// before validation or workload reconciliation so a malformed/unavailable
+	// workload cannot leave a previously authorized storage mutation running or
+	// keep its PVC pinned by a completed Job Pod.
+	if haManagementDisabled(&antflyCluster) {
+		if err := r.deleteDisabledHAAdminJobs(ctx, &antflyCluster); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	// Colony's deprovisioner persists an immutable, digest-bound request on the
+	// current primary before Namespace deletion. Reconcile it ahead of ordinary
+	// cluster validation so cleanup cannot deadlock behind unrelated runtime
+	// readiness or a transient topology handoff.
+	if result, handled, err := r.reconcileHASeedPrefixCleanup(ctx, &antflyCluster); handled {
+		return result, err
+	}
+
 	// Ensure finalizer is present when WhenDeleted=Delete.
 	// The finalizer is only removed inside the deletion handler (above) after
 	// cleanup completes. Removing it here on policy change would race with
@@ -2513,6 +3075,14 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// StatefulSet so a new fail-closed runtime image cannot roll out without a
 	// bearer-token source and silently stop replication/admin control.
 	if !needsValidation && haRuntimeNeedsAdminTokenMigration(&antflyCluster) {
+		needsValidation = true
+	}
+	// Existing distributed clusters may have a successful validation checkpoint
+	// from an operator version that predated internal-service authentication.
+	// Revalidate before touching either StatefulSet so the new fail-closed image
+	// cannot roll until the deployment controller has provisioned and referenced
+	// the dedicated credential.
+	if !needsValidation && distributedRuntimeNeedsInternalServiceAuthMigration(&antflyCluster) {
 		needsValidation = true
 	}
 	// Seed the durable metadata topology record for clusters created by older
@@ -2591,7 +3161,7 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if err := r.reconcileConfigMap(ctx, workingCluster); err != nil {
 			return ctrl.Result{}, err
 		}
-		if err := r.reconcileServices(ctx, workingCluster); err != nil {
+		if err := r.reconcileServices(ctx, workingCluster, false); err != nil {
 			return ctrl.Result{}, err
 		}
 		component := standaloneComponent(workingCluster)
@@ -2639,13 +3209,49 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	// Create Services
-	if err := r.reconcileServices(ctx, workingCluster); err != nil {
+	internalServiceAuthMode, internalServiceAuthRolloutPending, err := r.desiredInternalServiceAuthRolloutMode(ctx, workingCluster)
+	if err != nil {
 		return ctrl.Result{}, err
+	}
+	internalServiceAuthKeyMode, internalServiceAuthKeyRolloutPending, rotationPhase, err := r.desiredInternalServiceAuthKeyRollout(ctx, workingCluster, internalServiceAuthMode)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if workingCluster.Spec.InternalServiceAuth != nil && workingCluster.Spec.InternalServiceAuth.NextSecretKeyRef != nil {
+		workingCluster.Status.InternalServiceAuthRotation = &antflyv1.InternalServiceAuthRotationStatus{
+			Phase:            rotationPhase,
+			TargetSecretName: workingCluster.Spec.InternalServiceAuth.NextSecretKeyRef.Name,
+			TargetSecretKey:  workingCluster.Spec.InternalServiceAuth.NextSecretKeyRef.Key,
+		}
+	} else {
+		workingCluster.Status.InternalServiceAuthRotation = nil
+	}
+	publicBoundaryReady, err := r.internalServiceAuthPublicBoundaryReady(ctx, workingCluster)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	// The internal headless Services stay present throughout the two-phase
+	// rollout, while the optional externally addressable Service is restored
+	// only after every selected pod proves enforcement.
+	if err := r.reconcileServices(ctx, workingCluster, !publicBoundaryReady); err != nil {
+		return ctrl.Result{}, err
+	}
+	if !publicBoundaryReady {
+		drained, err := r.internalServiceAuthPublicBoundaryDrained(ctx, workingCluster)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !drained {
+			log.Info("Waiting for public API endpoints to drain before starting internal-service migration")
+			return ctrl.Result{RequeueAfter: time.Second}, nil
+		}
+	}
+	if internalServiceAuthRolloutPending || internalServiceAuthKeyRolloutPending {
+		log.Info("Internal-service authentication rollout is in progress", "mode", internalServiceAuthMode, "keyMode", internalServiceAuthKeyMode)
 	}
 
 	// Create Metadata StatefulSet
-	if err := r.reconcileMetadataStatefulSet(ctx, efCache, workingCluster); err != nil {
+	if err := r.reconcileMetadataStatefulSet(ctx, efCache, workingCluster, internalServiceAuthMode, internalServiceAuthKeyMode); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -2852,7 +3458,7 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	workingCluster.Spec.Storage.DataStorage = r.reconcileStorageAutoGrow(ctx, workingCluster, "data", "data-storage", workingCluster.Name+"-data", effectiveDataStorageSize(workingCluster), maxDataAutoGrowSize(workingCluster))
 
 	// Create Data StatefulSet
-	if err := r.reconcileDataStatefulSet(ctx, efCache, workingCluster); err != nil {
+	if err := r.reconcileDataStatefulSet(ctx, efCache, workingCluster, internalServiceAuthMode, internalServiceAuthKeyMode); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -2885,7 +3491,7 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	r.checkPVCTopologyHealth(ctx, workingCluster)
 
 	// Update status
-	if err := r.updateStatus(ctx, workingCluster); err != nil {
+	if err := r.updateStatusIfChanged(ctx, workingCluster, &antflyCluster.Status); err != nil {
 		if stderrors.Is(err, errHAStatusCheckpointed) {
 			return ctrl.Result{RequeueAfter: haStatusCheckpointRequeueAfter}, nil
 		}
@@ -2893,8 +3499,13 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	if requeueAfter := minPositiveDuration(
-		periodicRequeueAfter(workingCluster),
-		r.metadataTopologyObservationRequeueAfter(workingCluster),
+		minPositiveDuration(periodicRequeueAfter(workingCluster), r.metadataTopologyObservationRequeueAfter(workingCluster)),
+		func() time.Duration {
+			if internalServiceAuthRolloutPending || internalServiceAuthKeyRolloutPending {
+				return internalServiceAuthRolloutInterval
+			}
+			return 0
+		}(),
 	); requeueAfter > 0 {
 		return ctrl.Result{RequeueAfter: requeueAfter}, nil
 	}
@@ -2910,6 +3521,10 @@ func haRuntimeNeedsAdminTokenMigration(cluster *antflyv1.AntflyCluster) bool {
 	return ha.Mode != "" && ha.Mode != antflyv1.HAModeDisabled && strings.TrimSpace(ha.Runtime.AdminTokenEnvVar) == ""
 }
 
+func distributedRuntimeNeedsInternalServiceAuthMigration(cluster *antflyv1.AntflyCluster) bool {
+	return cluster != nil && effectiveTopologyMode(cluster) == topologyModeDistributed && cluster.Spec.InternalServiceAuth == nil
+}
+
 func periodicRequeueAfter(cluster *antflyv1.AntflyCluster) time.Duration {
 	return periodicRequeueAfterAt(cluster, time.Now())
 }
@@ -2923,8 +3538,26 @@ func periodicRequeueAfterAt(cluster *antflyv1.AntflyCluster, now time.Time) time
 	if effectiveTopologyMode(cluster) == topologyModeDistributed && cluster.Status.MetadataTopologyReplicas > 0 {
 		requeueAfter = minPositiveDuration(requeueAfter, 30*time.Second)
 	}
-	if haKubernetesLeaseRenewalEnabled(cluster) {
-		requeueAfter = minPositiveDuration(requeueAfter, haFencingLeaseRenewalRequeueAfter(cluster))
+	// Kubernetes Lease renewal has its own narrow controller and fixed cadence.
+	// Putting that clock on the full reconciler turns every renewal into an
+	// expensive status/seed observation cycle and can starve the very watchdog
+	// proof that keeps the primary authoritative.
+	// Runtime status itself is not event-driven: WAL and replication progress,
+	// admin reachability, and the automatic-failover detector must still be
+	// sampled at a bounded cadence. This clock is intentionally fixed rather
+	// than derived from Lease duration or watchdog grace.
+	if ha := cluster.Spec.HighAvailability; ha != nil && ha.Mode != "" && ha.Mode != antflyv1.HAModeDisabled {
+		requeueAfter = minPositiveDuration(requeueAfter, haRuntimeStatusObservationRequeueAfter)
+	}
+	// A suspended seeded runtime has no Pod, Job, or Lease event of its own
+	// after the primary checkpoints the final receipt. Re-observe peer status
+	// until Colony accepts that exact receipt and opens the declarative gate;
+	// otherwise a missed cross-CR event can leave a correctly seeded standby
+	// suspended forever. This bounded cadence stops as soon as eligibility is
+	// declared and avoids enqueueing every HA peer on every status write.
+	if gate := haRuntimeStartupGate(cluster); gate != nil &&
+		gate.Policy == antflyv1.HAStartupGatePolicyRequireActivatedSeed && !gate.RuntimeEligible {
+		requeueAfter = minPositiveDuration(requeueAfter, haStartupGateObservationRequeueAfter)
 	}
 	if retryAfter := haDirectAdminRetryRequeueAfter(cluster, now); retryAfter > 0 {
 		requeueAfter = minPositiveDuration(requeueAfter, retryAfter)
@@ -3157,7 +3790,7 @@ func managedInferencePoolName(cluster *antflyv1.AntflyCluster, managed antflyv1.
 	return fmt.Sprintf("%s-inference-%d", cluster.Name, index)
 }
 
-func configuredInferenceAPIURL(cluster *antflyv1.AntflyCluster) string {
+func (r *AntflyClusterReconciler) configuredInferenceAPIURL(cluster *antflyv1.AntflyCluster) string {
 	if cluster.Spec.Inference == nil {
 		return ""
 	}
@@ -3167,7 +3800,7 @@ func configuredInferenceAPIURL(cluster *antflyv1.AntflyCluster) string {
 		for i, managed := range inference.ManagedPools {
 			name := managedInferencePoolName(cluster, managed, len(inference.ManagedPools), i)
 			if strings.TrimSpace(name) != "" {
-				return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", name, cluster.Namespace, defaultManagedInferenceAPIPort)
+				return fmt.Sprintf("http://%s:%d", serviceDNSName(name, cluster.Namespace, r.ClusterDomain), defaultManagedInferenceAPIPort)
 			}
 		}
 	case antflyv1.AntflyInferenceModeSharedRef:
@@ -3399,8 +4032,9 @@ func (r *AntflyClusterReconciler) generateDistributedConfig(cluster *antflyv1.An
 
 	orchestrationURLs := make(map[string]string, metadataReplicas)
 	for i := uint64(1); i <= uint64(max(metadataReplicas, 0)); i++ { //nolint:gosec // G115: metadataReplicas is a small positive Kubernetes replica count
-		url := fmt.Sprintf("http://%s-metadata-%d.%s-metadata.%s.svc.cluster.local:%d",
-			cluster.Name, i-1, cluster.Name, cluster.Namespace, cluster.Spec.MetadataNodes.MetadataAPI.Port)
+		podName := fmt.Sprintf("%s-metadata-%d", cluster.Name, i-1)
+		host := statefulPodDNSName(podName, cluster.Name+"-metadata", cluster.Namespace, r.ClusterDomain)
+		url := fmt.Sprintf("http://%s:%d", host, cluster.Spec.MetadataNodes.MetadataAPI.Port)
 		s := strconv.FormatUint(i, 16)
 		orchestrationURLs[s] = url
 	}
@@ -3440,7 +4074,7 @@ func (r *AntflyClusterReconciler) generateDistributedConfig(cluster *antflyv1.An
 		},
 	}
 	completeConfig["storage"] = storageConfig
-	if apiURL := configuredInferenceAPIURL(cluster); apiURL != "" {
+	if apiURL := r.configuredInferenceAPIURL(cluster); apiURL != "" {
 		ensureInferenceAPIURL(completeConfig, apiURL)
 	}
 
@@ -3486,7 +4120,7 @@ func (r *AntflyClusterReconciler) generateStandaloneConfig(cluster *antflyv1.Ant
 	}
 
 	orchestrationURLs := map[string]string{
-		strconv.FormatInt(int64(standalone.NodeID), 16): fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", standaloneStatefulSetName(cluster), cluster.Namespace, standalone.MetadataAPI.Port),
+		strconv.FormatInt(int64(standalone.NodeID), 16): fmt.Sprintf("http://%s:%d", serviceDNSName(standaloneStatefulSetName(cluster), cluster.Namespace, r.ClusterDomain), standalone.MetadataAPI.Port),
 	}
 
 	completeConfig := map[string]any{
@@ -3553,7 +4187,7 @@ func standaloneRuntimeStorageConfig(cluster *antflyv1.AntflyCluster) map[string]
 	}
 }
 
-func (r *AntflyClusterReconciler) reconcileServices(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+func (r *AntflyClusterReconciler) reconcileServices(ctx context.Context, cluster *antflyv1.AntflyCluster, suspendPublicAPI bool) error {
 	mode := effectiveTopologyMode(cluster)
 
 	// Build list of services to reconcile
@@ -3562,6 +4196,22 @@ func (r *AntflyClusterReconciler) reconcileServices(ctx context.Context, cluster
 	// Only add public API service if enabled
 	publicAPIService := r.createPublicAPIService(cluster, mode == topologyModeStandalone)
 	if publicAPIService != nil {
+		if mode != topologyModeStandalone && cluster.Spec.InternalServiceAuth != nil {
+			if publicAPIService.Annotations == nil {
+				publicAPIService.Annotations = make(map[string]string)
+			}
+			publicAPIService.Annotations[internalServiceAuthPublicBoundaryAnnotation] = "enforced"
+		}
+		if suspendPublicAPI {
+			// Preserve the Service object, ClusterIP, and cloud load-balancer address
+			// while publishing zero endpoints during the legacy compatibility
+			// window. No operator-managed pod carries this quarantine label.
+			publicAPIService.Spec.Selector[internalServiceAuthPublicBoundaryLabel] = "enforce-ready"
+			if publicAPIService.Annotations == nil {
+				publicAPIService.Annotations = make(map[string]string)
+			}
+			publicAPIService.Annotations[internalServiceAuthPublicBoundaryAnnotation] = "suspended"
+		}
 		serviceDefs = append(serviceDefs, publicAPIService)
 	}
 
@@ -3621,6 +4271,11 @@ func (r *AntflyClusterReconciler) reconcileServices(ctx context.Context, cluster
 			service.Spec.Selector = serviceDef.Spec.Selector
 			if serviceDef.Name == cluster.Name+"-public-api" {
 				syncHAPrimaryRouteServiceAnnotations(service, serviceDef.Annotations)
+				if value, ok := serviceDef.Annotations[internalServiceAuthPublicBoundaryAnnotation]; ok {
+					service.Annotations[internalServiceAuthPublicBoundaryAnnotation] = value
+				} else {
+					delete(service.Annotations, internalServiceAuthPublicBoundaryAnnotation)
+				}
 			}
 
 			// Copy ports, handling NodePort specially
@@ -3685,6 +4340,11 @@ func (r *AntflyClusterReconciler) createPublicAPIService(cluster *antflyv1.Antfl
 
 	selector := serviceSelectorLabels(cluster.Name, component)
 	var annotations map[string]string
+	// Keep the single, explicitly selected HA route reachable while its Pod is
+	// degraded. The runtime remains the authority boundary: it serves safe reads
+	// and typed fencing responses, while rejecting mutations without authority.
+	publishNotReadyAddresses := cluster.Spec.HighAvailability != nil &&
+		cluster.Spec.HighAvailability.Mode == antflyv1.HAModeHotStandby
 	if haPrimaryRouteManaged(cluster) {
 		target := haCurrentPrimaryRouteTarget(cluster)
 		routeSelectorApplied := false
@@ -3704,9 +4364,10 @@ func (r *AntflyClusterReconciler) createPublicAPIService(cluster *antflyv1.Antfl
 			Annotations: annotations,
 		},
 		Spec: corev1.ServiceSpec{
-			Type:     serviceType,
-			Selector: selector,
-			Ports:    []corev1.ServicePort{servicePort},
+			Type:                     serviceType,
+			Selector:                 selector,
+			Ports:                    []corev1.ServicePort{servicePort},
+			PublishNotReadyAddresses: publishNotReadyAddresses,
 		},
 	}
 }
@@ -3827,13 +4488,6 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 	if replicas == 0 {
 		replicas = 1
 	}
-	if haFormerPrimaryIsolationActive(cluster) {
-		// A completed Kubernetes physical fence remains an availability hold
-		// until Colony rewrites this runtime as a standby with an exact startup
-		// gate. Never let ordinary StatefulSet reconciliation resurrect the old
-		// writer after ownership has moved to another Lease holder.
-		replicas = 0
-	}
 	storageSize := chooseStandaloneStorageSize(cluster)
 	startupGate := haRuntimeStartupGate(cluster)
 	activatedSeedGate := startupGate != nil && startupGate.Policy == antflyv1.HAStartupGatePolicyRequireActivatedSeed && startupGate.RequiredReceipt != nil
@@ -3862,6 +4516,12 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 				return nil
 			}
 		}
+	}
+	if haFormerPrimaryIsolationActive(cluster) && !haFormerPrimaryIsolationReleasedByActivatedStandby(cluster, startupPVC) {
+		// Never let ordinary StatefulSet reconciliation resurrect the old writer
+		// after ownership has moved. The only release path is the exact, PVC-bound
+		// standby activation proof above.
+		replicas = 0
 	}
 
 	var storageClassName *string
@@ -3913,6 +4573,18 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 	}
 
 	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, statefulSet, func() error {
+		// Neither removing nor later re-enabling HA may reinterpret a seeded
+		// runtime's disk as a fresh volumeClaimTemplate. Its database, metadata,
+		// and extensions live in one activated generation on an explicitly bound
+		// PVC. Preserve that exact, already-admitted topology across every later
+		// authority transition.
+		var preservedSeedStorage *activatedStandaloneStorageBinding
+		if !activatedSeedGate {
+			preservedSeedStorage = existingActivatedStandaloneStorageBinding(statefulSet, storageVolumeName)
+			if preservedSeedStorage == nil && hasExplicitStandaloneStoragePVC(statefulSet, storageVolumeName) {
+				return fmt.Errorf("existing StatefulSet %s has an explicit standalone storage PVC without a complete activated-seed binding; refusing to reinterpret its on-disk layout", statefulSet.Name)
+			}
+		}
 		if err := validateAndSetStandaloneStorageIdentity(statefulSet, cluster); err != nil {
 			return err
 		}
@@ -3922,6 +4594,28 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 
 		statefulSet.Spec.Replicas = &replicas
 		statefulSet.Spec.PersistentVolumeClaimRetentionPolicy = buildPVCRetentionPolicy(cluster.Spec.Storage.PVCRetentionPolicy)
+		deferPromotionRollout, err := r.shouldDeferPromotedStandaloneRollout(ctx, cluster, statefulSet)
+		if err != nil {
+			return err
+		}
+		if deferPromotionRollout {
+			// The runtime promotion API has already converted this exact live
+			// standby process into the Lease-authorized primary. Keep its open
+			// connections and in-memory promotion handoff while publishing the
+			// restart-safe primary template. StatefulSet OnDelete creates any
+			// replacement from that new template without killing the live writer.
+			statefulSet.Spec.UpdateStrategy = appsv1.StatefulSetUpdateStrategy{
+				Type: appsv1.OnDeleteStatefulSetStrategyType,
+			}
+		} else {
+			zero := int32(0)
+			statefulSet.Spec.UpdateStrategy = appsv1.StatefulSetUpdateStrategy{
+				Type: appsv1.RollingUpdateStatefulSetStrategyType,
+				RollingUpdate: &appsv1.RollingUpdateStatefulSetStrategy{
+					Partition: &zero,
+				},
+			}
+		}
 		podAnnotations := r.buildPodAnnotations(ctx, cache, cluster, envFromSources)
 		if activatedSeedGate {
 			podAnnotations = maps.Clone(podAnnotations)
@@ -3932,6 +4626,8 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 				podAnnotations[haStartupGateReceiptHashAnnotation] = hash
 				maps.Copy(podAnnotations, haStandaloneRuntimeSeedIdentityAnnotations(cluster))
 			}
+		} else if preservedSeedStorage != nil {
+			maps.Copy(podAnnotations, preservedSeedStorage.annotations)
 		}
 		volumeMounts := []corev1.VolumeMount{
 			{Name: storageVolumeName, MountPath: "/antflydb"},
@@ -3945,16 +4641,35 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 				}},
 			},
 		}
-		if activatedSeedGate {
-			required := *startupGate.RequiredReceipt
+		if activatedSeedGate || preservedSeedStorage != nil {
+			claimName := ""
+			generation := ""
+			if activatedSeedGate {
+				required := *startupGate.RequiredReceipt
+				claimName = required.TargetPVCName
+				generation = required.Generation
+			} else {
+				claimName = preservedSeedStorage.claimName
+				generation = preservedSeedStorage.generation
+			}
 			volumes = append(volumes,
-				corev1.Volume{Name: storageVolumeName, VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: required.TargetPVCName}}},
-				corev1.Volume{Name: haSeedGenerationVolumeName, VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: required.TargetPVCName}}},
+				corev1.Volume{Name: storageVolumeName, VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claimName}}},
 			)
-			volumeMounts = append(volumeMounts, corev1.VolumeMount{
-				Name: haSeedGenerationVolumeName, MountPath: haSeedLiveDataPath,
-				SubPath: path.Join(haSeedActivationRelativeRoot, "live-generations", required.Generation),
-			})
+			generationRoot := path.Join(haSeedActivationRelativeRoot, "live-generations", generation)
+			volumeMounts = append(volumeMounts,
+				corev1.VolumeMount{
+					Name: storageVolumeName, MountPath: haSeedLiveDataPath,
+					SubPath: path.Join(generationRoot, "data"),
+				},
+				corev1.VolumeMount{
+					Name: storageVolumeName, MountPath: haSeedLiveMetadataPath,
+					SubPath: path.Join(generationRoot, "metadata"),
+				},
+				corev1.VolumeMount{
+					Name: storageVolumeName, MountPath: haSeedLiveExtensionsPath,
+					SubPath: path.Join(generationRoot, "extensions"),
+				},
+			)
 		}
 		statefulSet.Spec.Template = corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
@@ -4020,7 +4735,7 @@ exec /antfly standalone --id %d --config /config/config.json \
 								standalone.MetadataAPI.Port,
 								standalone.Health.Port,
 								secretStoreArg(cluster.Spec.SecretStore),
-								standaloneHAArgs(cluster.Spec.HighAvailability),
+								standaloneHAArgs(cluster.Spec.HighAvailability, standaloneHAStartupGeneration(cluster)),
 								standaloneHAStartupArgs(cluster),
 							),
 						},
@@ -4073,6 +4788,98 @@ exec /antfly standalone --id %d --config /config/config.json \
 	return err
 }
 
+func (r *AntflyClusterReconciler) shouldDeferPromotedStandaloneRollout(ctx context.Context, cluster *antflyv1.AntflyCluster, statefulSet *appsv1.StatefulSet) (bool, error) {
+	ha := cluster.Spec.HighAvailability
+	if ha == nil || ha.Runtime == nil || ha.Runtime.Role != antflyv1.HARuntimeRolePrimary {
+		return false, nil
+	}
+
+	pod := &corev1.Pod{}
+	key := types.NamespacedName{Name: statefulSet.Name + "-0", Namespace: statefulSet.Namespace}
+	if err := r.Get(ctx, key, pod); err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("observe promoted standalone Pod before rollout: %w", err)
+	}
+	if pod.UID == "" || pod.DeletionTimestamp != nil ||
+		!isPodControlledByExactStatefulSet(pod, statefulSet) ||
+		pod.Annotations[haNodeIDAnnotation] != strings.TrimSpace(ha.Runtime.NodeID) {
+		return false, nil
+	}
+
+	// Colony publishes the promoted primary spec and its exact promotion receipt
+	// in separate control-plane reconciliations. A StatefulSet controller can act
+	// on the new primary template before the receipt reaches this CR. Recognize
+	// the immutable command shape of the still-running standby process and switch
+	// to OnDelete immediately; otherwise a rollout already queued in that window
+	// cannot be cancelled when the receipt/Pod-UID binding arrives. This is only
+	// a rollout hold, never promotion authority: the route and Lease paths still
+	// require the exact receipt and generation below.
+	runningPromotedProcess := podRunsHAStandbyCommand(pod)
+	promotionReceipt := strings.TrimSpace(cluster.Annotations[cloudHAPromotionReceiptAnnotation])
+	topologyGeneration, generationErr := strconv.ParseUint(strings.TrimSpace(cluster.Annotations[cloudHATopologyGenerationAnnotation]), 10, 64)
+	receiptReady := isLowerHexDigest(promotionReceipt) && generationErr == nil && topologyGeneration >= 2
+	if !receiptReady {
+		return runningPromotedProcess, nil
+	}
+	binding := promotionReceipt + ":" + string(pod.UID)
+	if hasExactPromotedProcessBinding(cluster, statefulSet, pod) {
+		return true, nil
+	}
+	if !runningPromotedProcess {
+		return false, nil
+	}
+	if statefulSet.Annotations == nil {
+		statefulSet.Annotations = map[string]string{}
+	}
+	statefulSet.Annotations[haPromotedProcessBindingAnnotation] = binding
+	return true, nil
+}
+
+func podRunsHAStandbyCommand(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	for i := range pod.Spec.Containers {
+		container := &pod.Spec.Containers[i]
+		if container.Name != "antfly" {
+			continue
+		}
+		args := strings.Join(container.Args, "\n")
+		return strings.Contains(args, "--ha-standby-log") && !strings.Contains(args, "--ha-primary-log")
+	}
+	return false
+}
+
+// hasExactPromotedProcessBinding identifies the one live process that adopted
+// the current promotion receipt. The binding deliberately combines the
+// receipt with Kubernetes' immutable Pod UID so a replacement Pod can never
+// inherit authority from mutable labels, names, or StatefulSet annotations.
+func hasExactPromotedProcessBinding(cluster *antflyv1.AntflyCluster, statefulSet *appsv1.StatefulSet, pod *corev1.Pod) bool {
+	if cluster == nil || statefulSet == nil || pod == nil || pod.UID == "" || pod.DeletionTimestamp != nil {
+		return false
+	}
+	ha := cluster.Spec.HighAvailability
+	if ha == nil || ha.Runtime == nil || ha.Runtime.Role != antflyv1.HARuntimeRolePrimary {
+		return false
+	}
+	promotionReceipt := strings.TrimSpace(cluster.Annotations[cloudHAPromotionReceiptAnnotation])
+	if !isLowerHexDigest(promotionReceipt) {
+		return false
+	}
+	topologyGeneration, err := strconv.ParseUint(strings.TrimSpace(cluster.Annotations[cloudHATopologyGenerationAnnotation]), 10, 64)
+	if err != nil || topologyGeneration < 2 {
+		return false
+	}
+	if !isPodControlledByExactStatefulSet(pod, statefulSet) ||
+		strings.TrimSpace(pod.Annotations[haNodeIDAnnotation]) != strings.TrimSpace(ha.Runtime.NodeID) {
+		return false
+	}
+	want := promotionReceipt + ":" + string(pod.UID)
+	return strings.TrimSpace(statefulSet.Annotations[haPromotedProcessBindingAnnotation]) == want
+}
+
 const generatedConfigHashAnnotation = "antfly.io/config-hash"
 const compatibilityRolloutGenerationAnnotation = "cloud.antfly.io/compatibility-rollout-generation"
 const metadataTopologyReplicasAnnotation = "antfly.io/metadata-topology-replicas"
@@ -4121,7 +4928,7 @@ func (r *AntflyClusterReconciler) buildPodAnnotations(ctx context.Context, cache
 	return annotations
 }
 
-func (r *AntflyClusterReconciler) reconcileMetadataStatefulSet(ctx context.Context, cache *envFromCache, cluster *antflyv1.AntflyCluster) error {
+func (r *AntflyClusterReconciler) reconcileMetadataStatefulSet(ctx context.Context, cache *envFromCache, cluster *antflyv1.AntflyCluster, authMode internalServiceAuthRolloutMode, keyMode internalServiceAuthKeyRolloutMode) error {
 	replicas := int32(3)
 	if cluster.Spec.MetadataNodes.Replicas > 0 {
 		replicas = cluster.Spec.MetadataNodes.Replicas
@@ -4212,7 +5019,7 @@ func (r *AntflyClusterReconciler) reconcileMetadataStatefulSet(ctx context.Conte
 						Image:           cluster.Spec.Image,
 						ImagePullPolicy: corev1.PullPolicy(cluster.Spec.ImagePullPolicy),
 						EnvFrom:         cluster.Spec.MetadataNodes.EnvFrom,
-						Env:             secretStoreEnv(cluster.Spec.SecretStore),
+						Env:             append(secretStoreEnv(cluster.Spec.SecretStore), internalServiceAuthEnv(cluster, authMode, keyMode)...),
 						Ports: []corev1.ContainerPort{
 							{
 								Name:          "metadata-api",
@@ -4304,6 +5111,9 @@ exec /antfly metadata --id $ID --config /config/config.json \
 			statefulSet.Spec.Template.Annotations = make(map[string]string)
 		}
 		statefulSet.Spec.Template.Annotations[metadataMembershipStatusCapabilityAnnotation] = metadataMembershipStatusCapabilityVersion
+		statefulSet.Spec.Template.Annotations[internalServiceAuthRolloutAnnotation] = string(authMode)
+		statefulSet.Spec.Template.Annotations[internalServiceAuthKeyRolloutAnnotation] = string(keyMode)
+		statefulSet.Spec.Template.Annotations[internalServiceAuthKeyTargetAnnotation] = internalServiceAuthKeyTarget(cluster.Spec.InternalServiceAuth)
 
 		// Apply user-specified scheduling constraints first
 		applySchedulingConstraints(&statefulSet.Spec.Template,
@@ -4379,20 +5189,23 @@ func (r *AntflyClusterReconciler) buildMetadataClusterConfig(cluster *antflyv1.A
 		if i > 1 {
 			config.WriteString(", ")
 		}
+		podName := fmt.Sprintf("%s-metadata-%d", cluster.Name, i-1)
+		host := statefulPodDNSName(podName, cluster.Name+"-metadata", cluster.Namespace, r.ClusterDomain)
 		fmt.Fprintf(
 			&config,
-			`"%d": {"raft_url":"http://%s-metadata-%d.%s-metadata.%s.svc.cluster.local:%d","orchestration_url":"http://%s-metadata-%d.%s-metadata.%s.svc.cluster.local:%d"}`,
+			`"%d": {"raft_url":"http://%s:%d","orchestration_url":"http://%s:%d"}`,
 			i,
-			cluster.Name, i-1, cluster.Name, cluster.Namespace, cluster.Spec.MetadataNodes.MetadataRaft.Port,
-			cluster.Name, i-1, cluster.Name, cluster.Namespace, cluster.Spec.MetadataNodes.MetadataAPI.Port,
+			host, cluster.Spec.MetadataNodes.MetadataRaft.Port,
+			host, cluster.Spec.MetadataNodes.MetadataAPI.Port,
 		)
 	}
 	config.WriteString(" }")
 	return config.String()
 }
 
-func (r *AntflyClusterReconciler) reconcileDataStatefulSet(ctx context.Context, cache *envFromCache, cluster *antflyv1.AntflyCluster) error {
+func (r *AntflyClusterReconciler) reconcileDataStatefulSet(ctx context.Context, cache *envFromCache, cluster *antflyv1.AntflyCluster, authMode internalServiceAuthRolloutMode, keyMode internalServiceAuthKeyRolloutMode) error {
 	replicas := effectiveDataNodeReplicas(cluster)
+	dataAdvertiseHost := "${HOSTNAME}." + serviceDNSName(cluster.Name+"-data", cluster.Namespace, r.ClusterDomain)
 
 	storageSize := "1Gi"
 	if cluster.Spec.Storage.DataStorage != "" {
@@ -4498,7 +5311,7 @@ func (r *AntflyClusterReconciler) reconcileDataStatefulSet(ctx context.Context, 
 								MountPath: "/config",
 							},
 						}, secretStoreVolumeMounts(cluster.Spec.SecretStore)...),
-						Env: append(append([]corev1.EnvVar{
+						Env: append(append(append([]corev1.EnvVar{
 							{
 								Name: "POD_IP",
 								ValueFrom: &corev1.EnvVarSource{
@@ -4507,7 +5320,7 @@ func (r *AntflyClusterReconciler) reconcileDataStatefulSet(ctx context.Context, 
 									},
 								},
 							},
-						}, secretStoreEnv(cluster.Spec.SecretStore)...), haPodUIDEnv()...),
+						}, secretStoreEnv(cluster.Spec.SecretStore)...), haPodUIDEnv()...), internalServiceAuthEnv(cluster, authMode, keyMode)...),
 						Command: []string{"/bin/sh", "-c"},
 						Args: []string{
 							fmt.Sprintf(`
@@ -4516,11 +5329,17 @@ ID=$((ORDINAL + 1))
 exec /antfly data --node-id $ID --store-id $ID --config /config/config.json \
   --api-host ${POD_IP} \
   --api-port %d \
+  --api-advertise-url http://%s:%d \
   --raft-host ${POD_IP} \
   --raft-port %d \
+  --raft-advertise-url http://%s:%d \
   --health-port %d%s
 								`,
 								cluster.Spec.DataNodes.API.Port,
+								dataAdvertiseHost,
+								cluster.Spec.DataNodes.API.Port,
+								cluster.Spec.DataNodes.Raft.Port,
+								dataAdvertiseHost,
 								cluster.Spec.DataNodes.Raft.Port,
 								cluster.Spec.DataNodes.Health.Port,
 								secretStoreArg(cluster.Spec.SecretStore),
@@ -4566,6 +5385,12 @@ exec /antfly data --node-id $ID --store-id $ID --config /config/config.json \
 				}, secretStoreVolumes(cluster.Spec.SecretStore)...),
 			},
 		}
+		if statefulSet.Spec.Template.Annotations == nil {
+			statefulSet.Spec.Template.Annotations = make(map[string]string)
+		}
+		statefulSet.Spec.Template.Annotations[internalServiceAuthRolloutAnnotation] = string(authMode)
+		statefulSet.Spec.Template.Annotations[internalServiceAuthKeyRolloutAnnotation] = string(keyMode)
+		statefulSet.Spec.Template.Annotations[internalServiceAuthKeyTargetAnnotation] = internalServiceAuthKeyTarget(cluster.Spec.InternalServiceAuth)
 
 		// Apply user-specified scheduling constraints first
 		applySchedulingConstraints(&statefulSet.Spec.Template,
@@ -4888,6 +5713,28 @@ func (r *AntflyClusterReconciler) reconcileServiceMeshStatus(ctx context.Context
 }
 
 func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	return r.updateStatusFrom(ctx, cluster, nil)
+}
+
+func (r *AntflyClusterReconciler) updateStatusIfChanged(
+	ctx context.Context,
+	cluster *antflyv1.AntflyCluster,
+	previous *antflyv1.AntflyClusterStatus,
+) error {
+	return r.updateStatusFrom(ctx, cluster, previous)
+}
+
+func (r *AntflyClusterReconciler) updateStatusFrom(
+	ctx context.Context,
+	cluster *antflyv1.AntflyCluster,
+	previous *antflyv1.AntflyClusterStatus,
+) error {
+	persist := func() error {
+		if previous != nil && reflect.DeepEqual(previous, &cluster.Status) {
+			return nil
+		}
+		return r.Status().Update(ctx, cluster)
+	}
 	originalConditions := append([]metav1.Condition(nil), cluster.Status.Conditions...)
 	originalPhase := cluster.Status.Phase
 	mode := effectiveTopologyMode(cluster)
@@ -4986,7 +5833,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 		if err := r.observeHAPrimaryRouteStatus(ctx, cluster); err != nil {
 			return err
 		}
-		haAdminStatusErr := r.observeHAPrimaryAdminStatus(ctx, cluster)
+		haAdminStatusErr := r.observeHAPrimaryAdminStatusForReconcile(ctx, cluster)
 		if standbyErr := r.observeHAStandbyAdminStatuses(ctx, cluster); standbyErr != nil && haAdminStatusErr == nil {
 			haAdminStatusErr = standbyErr
 		}
@@ -4997,6 +5844,11 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 			return err
 		}
 		r.observeHAFormerPrimaryFenceStatus(ctx, cluster)
+		// Runtime observation cannot carry operator-owned typed action results.
+		// Restore a completed assessment before planning so a promoted runtime's
+		// honest FormerPrimaryNotObserved view cannot repeatedly replan Demote
+		// and strand the subsequent rewind/reseed disposition.
+		r.updateHAFormerPrimaryFromAdminJobs(ctx, cluster)
 		r.updateHAStatusAndConditions(cluster)
 		if haAdminStatusErr != nil {
 			setHACondition(
@@ -5030,7 +5882,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 		}
 		r.updateHAAdminJobExecutionCondition(cluster)
 		r.updateServiceMeshReadyCondition(cluster)
-		return r.Status().Update(ctx, cluster)
+		return persist()
 	}
 
 	// Get current status of StatefulSets and Deployment
@@ -5135,7 +5987,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 	if err := r.observeHAPrimaryRouteStatus(ctx, cluster); err != nil {
 		return err
 	}
-	haAdminStatusErr := r.observeHAPrimaryAdminStatus(ctx, cluster)
+	haAdminStatusErr := r.observeHAPrimaryAdminStatusForReconcile(ctx, cluster)
 	if standbyErr := r.observeHAStandbyAdminStatuses(ctx, cluster); standbyErr != nil && haAdminStatusErr == nil {
 		haAdminStatusErr = standbyErr
 	}
@@ -5146,6 +5998,9 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 		return err
 	}
 	r.observeHAFormerPrimaryFenceStatus(ctx, cluster)
+	// Preserve operator-owned rejoin assessment authority across the primary
+	// runtime observation merge before deriving the next action plan.
+	r.updateHAFormerPrimaryFromAdminJobs(ctx, cluster)
 	r.updateHAStatusAndConditions(cluster)
 	if haAdminStatusErr != nil {
 		setHACondition(
@@ -5180,7 +6035,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 	// Update ServiceMeshReady condition
 	r.updateServiceMeshReadyCondition(cluster)
 
-	return r.Status().Update(ctx, cluster)
+	return persist()
 }
 
 func preserveConditionDuringMetadataTopologyObservation(
@@ -5234,9 +6089,10 @@ func (r *AntflyClusterReconciler) persistHAActionPlanBarrier(ctx context.Context
 
 func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
 	ha := cluster.Spec.HighAvailability
-	if ha == nil || ha.Admin == nil || !ha.Admin.ExecutePlannedActions ||
-		ha.Mode == "" || ha.Mode == antflyv1.HAModeDisabled ||
-		cluster.Status.HAStatus == nil {
+	if haManagementDisabled(cluster) {
+		return r.deleteDisabledHAAdminJobs(ctx, cluster)
+	}
+	if ha.Admin == nil || !ha.Admin.ExecutePlannedActions || cluster.Status.HAStatus == nil {
 		return nil
 	}
 	// Dependency evidence can freeze payload fields (notably the former-primary
@@ -5316,6 +6172,18 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 			}
 			continue
 		}
+		if haActionKind(action.Kind) == haActionPromoteStandby &&
+			action.FenceAuthority == antflyv1.HAFencingAuthorityKubernetesLease &&
+			haRuntimeLeaseWatchdogEnabled(cluster) {
+			ready, err := r.haCurrentLeaseAuthorizesPromotionBoundary(ctx, cluster, *action)
+			if err != nil {
+				return err
+			}
+			if !ready {
+				action.AdminJobPhase = haAdminJobPhaseWaitingDependency
+				continue
+			}
+		}
 		now := r.haNow()
 		if action.Executor != string(haActionExecutorCLIJob) && haPlannedActionSupportsDirectAdminAPI(haActionKind(action.Kind)) {
 			reserved, checkpointed, err := r.reserveHADirectAdminAttempt(ctx, cluster, ha.Admin, action, now)
@@ -5368,6 +6236,78 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 
 		if err := r.reconcileHAAdminJob(ctx, cluster, ha.Admin, action); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// deleteDisabledHAAdminJobs cancels every Job-backed HA side effect owned by
+// this exact AntflyCluster incarnation once HA is disabled. Besides preventing
+// an already-running artifact action from mutating storage after the disable
+// boundary, this releases target PVCs promptly: completed Job Pods still count
+// as PVC consumers, so retaining them for their diagnostic TTL can otherwise
+// deadlock replacement-PVC deletion behind the pvc-protection finalizer. Pods
+// are deleted explicitly before their Jobs: some Kubernetes installations
+// orphan completed Job Pods during controller deletion, and an orphan that
+// still references a target PVC is an unbounded storage leak.
+func (r *AntflyClusterReconciler) deleteDisabledHAAdminJobs(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	if r == nil || r.Client == nil || cluster == nil || cluster.UID == "" || cluster.Status.HAStatus == nil {
+		return nil
+	}
+	jobNames := map[string]struct{}{}
+	for i := range cluster.Status.HAStatus.PlannedActions {
+		name := strings.TrimSpace(cluster.Status.HAStatus.PlannedActions[i].AdminJobName)
+		if name != "" && name != haAdminDirectAPIName {
+			jobNames[name] = struct{}{}
+		}
+	}
+	candidatePods := &corev1.PodList{}
+	if len(jobNames) > 0 {
+		if err := r.List(ctx, candidatePods,
+			client.InNamespace(cluster.Namespace),
+			client.MatchingLabels{
+				"app.kubernetes.io/component": "ha-admin",
+				"app.kubernetes.io/instance":  cluster.Name,
+			},
+		); err != nil {
+			return fmt.Errorf("list disabled HA admin Job Pods in %s: %w", cluster.Namespace, err)
+		}
+	}
+	for name := range jobNames {
+		job := &batchv1.Job{}
+		if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: cluster.Namespace}, job); err != nil {
+			if errors.IsNotFound(err) {
+				continue
+			}
+			return fmt.Errorf("get disabled HA admin Job %s/%s: %w", cluster.Namespace, name, err)
+		}
+		if !metav1.IsControlledBy(job, cluster) {
+			continue
+		}
+		zero := int64(0)
+		for i := range candidatePods.Items {
+			pod := &candidatePods.Items[i]
+			if !metav1.IsControlledBy(pod, job) {
+				continue
+			}
+			uid := pod.UID
+			resourceVersion := pod.ResourceVersion
+			if err := r.Delete(ctx, pod, &client.DeleteOptions{
+				GracePeriodSeconds: &zero,
+				Preconditions: &metav1.Preconditions{
+					UID: &uid, ResourceVersion: &resourceVersion,
+				},
+			}); err != nil && !errors.IsNotFound(err) {
+				return fmt.Errorf("delete Pod %s/%s for disabled HA admin Job: %w", pod.Namespace, pod.Name, err)
+			}
+		}
+		uid := job.UID
+		resourceVersion := job.ResourceVersion
+		foreground := metav1.DeletePropagationForeground
+		if err := r.Delete(ctx, job, &client.DeleteOptions{Preconditions: &metav1.Preconditions{
+			UID: &uid, ResourceVersion: &resourceVersion,
+		}, PropagationPolicy: &foreground}); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("delete disabled HA admin Job %s/%s: %w", job.Namespace, job.Name, err)
 		}
 	}
 	return nil
@@ -5436,7 +6376,10 @@ func (r *AntflyClusterReconciler) requirePersistedHADirectActionPlan(ctx context
 	}
 	latest := &antflyv1.AntflyCluster{}
 	key := types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}
-	if err := r.Get(ctx, key, latest); err != nil {
+	// Direct-action execution is a read-after-write protocol. The controller
+	// cache is allowed to lag a just-persisted reservation, so use the uncached
+	// boundary reader before deciding which exact attempt may execute.
+	if err := r.haBoundaryReader().Get(ctx, key, latest); err != nil {
 		return fmt.Errorf("read persisted HA action plan: %w", err)
 	}
 	if latest.Generation != cluster.Generation {
@@ -5503,6 +6446,10 @@ func (r *AntflyClusterReconciler) updateHAStartupGateStatus(ctx context.Context,
 		}
 		return
 	}
+	var previousReceipt *antflyv1.HASeedActivationReceiptStatus
+	if cluster.Status.HAStatus.StartupGate != nil && cluster.Status.HAStatus.StartupGate.ActivationReceipt != nil {
+		previousReceipt = cluster.Status.HAStatus.StartupGate.ActivationReceipt.DeepCopy()
+	}
 	status := &antflyv1.HAStartupGateStatus{Reason: "ActivationReceiptNotObserved"}
 	cluster.Status.HAStatus.StartupGate = status
 	if gate.Policy != antflyv1.HAStartupGatePolicyRequireActivatedSeed || gate.RequiredReceipt == nil {
@@ -5552,11 +6499,10 @@ func (r *AntflyClusterReconciler) updateHAStartupGateStatus(ctx context.Context,
 				continue
 			}
 			receipt := action.SeedArtifactReceipt
-			if receipt.ClusterID != identity.ClusterID || receipt.ShardID != identity.ShardID ||
-				receipt.TableID != identity.TableID || receipt.TimelineID != identity.TimelineID || receipt.Epoch != identity.Epoch {
+			if !haSeedReceiptMatchesRuntimeLineage(cluster, receipt.ClusterID, receipt.ShardID, receipt.TableID, receipt.TimelineID, receipt.Epoch) {
 				continue
 			}
-			status.ActivationReceipt = &antflyv1.HASeedActivationReceiptStatus{
+			activationReceipt := &antflyv1.HASeedActivationReceiptStatus{
 				TopologyID:                  receipt.TopologyID,
 				TopologyGeneration:          receipt.TopologyGeneration,
 				NodeID:                      receipt.NodeID,
@@ -5583,6 +6529,7 @@ func (r *AntflyClusterReconciler) updateHAStartupGateStatus(ctx context.Context,
 				GenerationPath:              receipt.GenerationPath,
 				RawGenerationPath:           receipt.RawGenerationPath,
 			}
+			targetGenerationGCObserved := false
 			for j := range actions {
 				gc := actions[j]
 				if haActionKind(gc.Kind) != haActionGCTargetSeedGenerations ||
@@ -5590,12 +6537,23 @@ func (r *AntflyClusterReconciler) updateHAStartupGateStatus(ctx context.Context,
 					strings.TrimSpace(gc.SeedArtifactGeneration) != strings.TrimSpace(required.Generation) {
 					continue
 				}
+				targetGenerationGCObserved = true
 				if !haAdminActionSucceededWithEvidence(gc) {
 					status.Reason = "TargetGenerationGCNotObserved"
 					return
 				}
 				break
 			}
+			if !targetGenerationGCObserved {
+				// The action chain is planned incrementally. Publishing the activation
+				// receipt before target GC exists lets Colony open the runtime gate;
+				// the resulting live PVC consumer then prevents the mandatory GC Job
+				// from ever starting. Withhold handoff authority until that exact
+				// cleanup action is both present and durably successful.
+				status.Reason = "TargetGenerationGCNotObserved"
+				return
+			}
+			status.ActivationReceipt = activationReceipt
 			// Seed the status as eligible only for the exact matcher invocation;
 			// declarative suspension and every configured evidence mismatch still win.
 			status.RuntimeEligible = true
@@ -5604,6 +6562,22 @@ func (r *AntflyClusterReconciler) updateHAStartupGateStatus(ctx context.Context,
 			status.Reason = reason
 			return
 		}
+	}
+	// Once the operator has validated a materialized receipt, keep that exact
+	// receipt available after the primary's bounded action history advances.
+	// Revalidate it against the current declarative identity and live PVC on
+	// every pass; a topology, digest, or PVC-incarnation change still closes the
+	// gate. Without this monotonic handoff, the standby can start, lose its peer
+	// receipt on the next observation, and be suspended again indefinitely.
+	if eligible, reason := haStartupGateActivationReceiptMatches(cluster, pvc, previousReceipt); eligible {
+		status.ActivationReceipt = previousReceipt
+		status.RuntimeEligible = gate.RuntimeEligible
+		if gate.RuntimeEligible {
+			status.Reason = reason
+		} else {
+			status.Reason = "DeclarativelySuspended"
+		}
+		return
 	}
 	if !gate.RuntimeEligible {
 		status.Reason = "DeclarativelySuspended"
@@ -5666,7 +6640,12 @@ func (r *AntflyClusterReconciler) mutatePersistedHADirectAction(
 	checkpointed := false
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		latest := &antflyv1.AntflyCluster{}
-		if err := r.Get(ctx, key, latest); err != nil {
+		// Reservations and results are consecutive durable checkpoints around an
+		// external side effect. Bypass the informer cache to guarantee read-your-
+		// writes semantics; otherwise a fast Admin API response can arrive before
+		// the reservation is visible through the cache and be replayed after the
+		// reservation expires.
+		if err := r.haBoundaryReader().Get(ctx, key, latest); err != nil {
 			return fmt.Errorf("get latest AntflyCluster: %w", err)
 		}
 		statusBase := latest.DeepCopy()
@@ -6192,14 +7171,23 @@ func (r *AntflyClusterReconciler) haPortableArtifactJobAction(ctx context.Contex
 			return action, false, fmt.Errorf("HA %s startup gate omits its exact receipt contract", action.Kind)
 		}
 		required := gate.RequiredReceipt
-		if action.TopologyID != strings.TrimSpace(required.TopologyID) ||
-			action.TopologyGeneration != required.TopologyGeneration ||
-			action.TopologyNodeID != strings.TrimSpace(required.NodeID) ||
-			action.TargetPVCName != strings.TrimSpace(required.TargetPVCName) ||
-			action.TargetPVCUID != strings.TrimSpace(required.TargetPVCUID) ||
-			action.SlotName != strings.TrimSpace(required.SlotName) ||
-			action.SeedArtifactGeneration != strings.TrimSpace(required.Generation) {
-			return action, false, fmt.Errorf("HA %s topology binding is stale relative to the desired startup gate", action.Kind)
+		gateTargetPVC := strings.TrimSpace(required.TargetPVCName)
+		if gateTargetPVC == "" {
+			return action, false, fmt.Errorf("HA %s startup gate omits its target PVC identity", action.Kind)
+		}
+		// A promoted primary retains the exact gate that binds its own pre-seeded
+		// PVC across restarts. Portable repair for a different target PVC must not
+		// compare against that local boot contract. If the action does target the
+		// gated PVC, retain the full exact-match barrier below.
+		if action.TargetPVCName == gateTargetPVC {
+			if action.TopologyID != strings.TrimSpace(required.TopologyID) ||
+				action.TopologyGeneration != required.TopologyGeneration ||
+				action.TopologyNodeID != strings.TrimSpace(required.NodeID) ||
+				action.TargetPVCUID != strings.TrimSpace(required.TargetPVCUID) ||
+				action.SlotName != strings.TrimSpace(required.SlotName) ||
+				action.SeedArtifactGeneration != strings.TrimSpace(required.Generation) {
+				return action, false, fmt.Errorf("HA %s topology binding is stale relative to the desired startup gate", action.Kind)
+			}
 		}
 	}
 	targetPVC := &corev1.PersistentVolumeClaim{}
@@ -6403,12 +7391,22 @@ func (r *AntflyClusterReconciler) haActivationJobAction(ctx context.Context, clu
 			return action, false, fmt.Errorf("HA target activation conflicts with the configured startup gate")
 		}
 		required := gate.RequiredReceipt
-		if action.TopologyID != strings.TrimSpace(required.TopologyID) || action.TopologyGeneration != required.TopologyGeneration ||
-			action.TopologyNodeID != strings.TrimSpace(required.NodeID) || action.TargetPVCName != strings.TrimSpace(required.TargetPVCName) ||
-			action.TargetPVCUID != strings.TrimSpace(required.TargetPVCUID) ||
-			strings.TrimSpace(action.SlotName) != strings.TrimSpace(required.SlotName) ||
-			strings.TrimSpace(action.SeedArtifactGeneration) != strings.TrimSpace(required.Generation) {
-			return action, false, fmt.Errorf("HA target activation topology binding is stale relative to the startup gate")
+		gateTargetPVC := strings.TrimSpace(required.TargetPVCName)
+		if gateTargetPVC == "" {
+			return action, false, fmt.Errorf("HA target activation startup gate omits its target PVC identity")
+		}
+		// The runtime gate protects the PVC from which this cluster boots. A
+		// promoted primary can also activate a portable seed on a different,
+		// physically isolated PVC. Only compare that action to the boot contract
+		// when both contracts address the same PVC instance.
+		if action.TargetPVCName == gateTargetPVC {
+			if action.TopologyID != strings.TrimSpace(required.TopologyID) || action.TopologyGeneration != required.TopologyGeneration ||
+				action.TopologyNodeID != strings.TrimSpace(required.NodeID) ||
+				action.TargetPVCUID != strings.TrimSpace(required.TargetPVCUID) ||
+				strings.TrimSpace(action.SlotName) != strings.TrimSpace(required.SlotName) ||
+				strings.TrimSpace(action.SeedArtifactGeneration) != strings.TrimSpace(required.Generation) {
+				return action, false, fmt.Errorf("HA target activation topology binding is stale relative to the startup gate")
+			}
 		}
 	}
 	pvc := &corev1.PersistentVolumeClaim{}
@@ -6427,49 +7425,88 @@ func (r *AntflyClusterReconciler) haActivationJobAction(ctx context.Context, clu
 }
 
 func (r *AntflyClusterReconciler) haActivationReceiptMatchesCurrentTarget(ctx context.Context, cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) (bool, error) {
+	receipt := action.SeedArtifactReceipt
 	gate := haRuntimeStartupGate(cluster)
-	if gate == nil || gate.Policy != antflyv1.HAStartupGatePolicyRequireActivatedSeed {
-		return true, nil
+	if gate != nil && gate.Policy == antflyv1.HAStartupGatePolicyRequireActivatedSeed && gate.RequiredReceipt != nil {
+		required := *gate.RequiredReceipt
+		gateTargetPVC := strings.TrimSpace(required.TargetPVCName)
+		actionTargetPVC := strings.TrimSpace(action.TargetPVCName)
+		// Completed actions written before target identity became a required
+		// action field can still authorize their exact local startup gate because
+		// the immutable receipt carries that identity. New portable actions always
+		// carry the target on both the action and receipt.
+		gateApplies := gateTargetPVC != "" &&
+			(actionTargetPVC == gateTargetPVC ||
+				(actionTargetPVC == "" && receipt != nil && strings.TrimSpace(receipt.TargetPVCName) == gateTargetPVC))
+		if gateApplies {
+			pvc := &corev1.PersistentVolumeClaim{}
+			err := r.Get(ctx, types.NamespacedName{Name: gateTargetPVC, Namespace: cluster.Namespace}, pvc)
+			if errors.IsNotFound(err) {
+				return false, nil
+			}
+			if err != nil {
+				return false, err
+			}
+			if receipt == nil || strings.TrimSpace(string(pvc.UID)) == "" ||
+				receipt.TopologyID != required.TopologyID || receipt.NodeID != required.NodeID ||
+				receipt.SlotName != required.SlotName || receipt.Generation != required.Generation ||
+				receipt.TargetPVCName != required.TargetPVCName || receipt.TargetPVCUID != string(pvc.UID) ||
+				receipt.GenerationPath != path.Join("live-generations", required.Generation) ||
+				receipt.RawGenerationPath != path.Join("generations", required.Generation) ||
+				receipt.TargetLocalNodeID == 0 || receipt.TargetReplicaID == 0 ||
+				!isLowerHexDigest(receipt.CaptureReceiptSHA256) ||
+				!isLowerHexDigest(receipt.MaterializedReceiptSHA256) ||
+				!isLowerHexDigest(receipt.MaterializedAggregateSHA256) {
+				return false, nil
+			}
+			if required.TopologyGeneration != 0 && receipt.TopologyGeneration != required.TopologyGeneration {
+				return false, nil
+			}
+			if required.TargetPVCUID != "" && receipt.TargetPVCUID != required.TargetPVCUID {
+				return false, nil
+			}
+			if (required.ManifestSHA256 != "" && receipt.ManifestSHA256 != required.ManifestSHA256) ||
+				(required.AggregateSHA256 != "" && receipt.AggregateSHA256 != required.AggregateSHA256) ||
+				(required.SeedReceiptSHA256 != "" && receipt.SeedReceiptSHA256 != required.SeedReceiptSHA256) ||
+				(required.CaptureReceiptSHA256 != "" && receipt.CaptureReceiptSHA256 != required.CaptureReceiptSHA256) ||
+				(required.MaterializedReceiptSHA256 != "" && receipt.MaterializedReceiptSHA256 != required.MaterializedReceiptSHA256) ||
+				(required.MaterializedAggregateSHA256 != "" && receipt.MaterializedAggregateSHA256 != required.MaterializedAggregateSHA256) ||
+				(required.TargetLocalNodeID != 0 && receipt.TargetLocalNodeID != required.TargetLocalNodeID) ||
+				(required.TargetReplicaID != 0 && receipt.TargetReplicaID != required.TargetReplicaID) {
+				return false, nil
+			}
+			return true, nil
+		}
 	}
-	if gate.RequiredReceipt == nil {
+
+	if strings.TrimSpace(action.TopologyID) == "" || action.TopologyGeneration <= 0 ||
+		strings.TrimSpace(action.TopologyNodeID) == "" || strings.TrimSpace(action.SlotName) == "" ||
+		strings.TrimSpace(action.SeedArtifactGeneration) == "" || strings.TrimSpace(action.TargetPVCName) == "" ||
+		strings.TrimSpace(action.TargetPVCUID) == "" || action.TargetLocalNodeID == 0 || action.TargetReplicaID == 0 {
 		return false, nil
 	}
-	required := *gate.RequiredReceipt
 	pvc := &corev1.PersistentVolumeClaim{}
-	err := r.Get(ctx, types.NamespacedName{Name: required.TargetPVCName, Namespace: cluster.Namespace}, pvc)
+	err := r.Get(ctx, types.NamespacedName{Name: action.TargetPVCName, Namespace: cluster.Namespace}, pvc)
 	if errors.IsNotFound(err) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	receipt := action.SeedArtifactReceipt
 	if receipt == nil || strings.TrimSpace(string(pvc.UID)) == "" ||
-		receipt.TopologyID != required.TopologyID || receipt.NodeID != required.NodeID ||
-		receipt.SlotName != required.SlotName || receipt.Generation != required.Generation ||
-		receipt.TargetPVCName != required.TargetPVCName || receipt.TargetPVCUID != string(pvc.UID) ||
-		receipt.GenerationPath != path.Join("live-generations", required.Generation) ||
-		receipt.RawGenerationPath != path.Join("generations", required.Generation) ||
-		receipt.TargetLocalNodeID == 0 || receipt.TargetReplicaID == 0 ||
+		receipt.TopologyID != action.TopologyID || receipt.TopologyGeneration != action.TopologyGeneration ||
+		receipt.NodeID != action.TopologyNodeID || receipt.SlotName != action.SlotName ||
+		receipt.Generation != action.SeedArtifactGeneration || receipt.TargetPVCName != action.TargetPVCName ||
+		receipt.TargetPVCUID != action.TargetPVCUID || receipt.TargetPVCUID != string(pvc.UID) ||
+		receipt.GenerationPath != path.Join("live-generations", action.SeedArtifactGeneration) ||
+		receipt.RawGenerationPath != path.Join("generations", action.SeedArtifactGeneration) ||
+		receipt.TargetLocalNodeID != action.TargetLocalNodeID || receipt.TargetReplicaID != action.TargetReplicaID ||
 		!isLowerHexDigest(receipt.CaptureReceiptSHA256) ||
 		!isLowerHexDigest(receipt.MaterializedReceiptSHA256) ||
 		!isLowerHexDigest(receipt.MaterializedAggregateSHA256) {
 		return false, nil
 	}
-	if required.TopologyGeneration != 0 && receipt.TopologyGeneration != required.TopologyGeneration {
-		return false, nil
-	}
-	if required.TargetPVCUID != "" && receipt.TargetPVCUID != required.TargetPVCUID {
-		return false, nil
-	}
-	if (required.ManifestSHA256 != "" && receipt.ManifestSHA256 != required.ManifestSHA256) ||
-		(required.AggregateSHA256 != "" && receipt.AggregateSHA256 != required.AggregateSHA256) ||
-		(required.SeedReceiptSHA256 != "" && receipt.SeedReceiptSHA256 != required.SeedReceiptSHA256) ||
-		(required.CaptureReceiptSHA256 != "" && receipt.CaptureReceiptSHA256 != required.CaptureReceiptSHA256) ||
-		(required.MaterializedReceiptSHA256 != "" && receipt.MaterializedReceiptSHA256 != required.MaterializedReceiptSHA256) ||
-		(required.MaterializedAggregateSHA256 != "" && receipt.MaterializedAggregateSHA256 != required.MaterializedAggregateSHA256) ||
-		(required.TargetLocalNodeID != 0 && receipt.TargetLocalNodeID != required.TargetLocalNodeID) ||
-		(required.TargetReplicaID != 0 && receipt.TargetReplicaID != required.TargetReplicaID) {
+	if expected := strings.TrimSpace(action.SeedCaptureReceiptSHA256); expected != "" && receipt.CaptureReceiptSHA256 != expected {
 		return false, nil
 	}
 	return true, nil
@@ -6993,6 +8030,7 @@ func haAdminActionResultFromSeededSlotActivateSDK(response adminsdk.HASeededSlot
 	result.ManifestSHA256 = strings.TrimSpace(response.ManifestSha256)
 	result.AggregateSHA256 = strings.TrimSpace(response.AggregateSha256)
 	result.SeedTimelineID = response.TimelineId
+	result.TimelineID = response.TimelineId
 	return result
 }
 
@@ -7232,6 +8270,7 @@ func haFenceAcquireBody(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlann
 			PromotedNodeId: frozen.FencePromotedNodeID,
 			NewTimelineId:  frozen.FenceNewTimelineID,
 			NewEpoch:       frozen.FenceNewEpoch,
+			Generation:     frozen.FenceGeneration,
 			RequiredLsn:    frozen.FenceRequiredLSN,
 			ObservedLsn:    frozen.FenceObservedLSN,
 			Force:          frozen.FenceForced,
@@ -7248,6 +8287,7 @@ func haFenceAcquireBody(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlann
 		PromotedNodeId: action.StandbyName,
 		NewTimelineId:  identity.TimelineID + 1,
 		NewEpoch:       identity.Epoch + 1,
+		Generation:     action.FenceGeneration,
 		RequiredLsn:    action.TargetLSN,
 		ObservedLsn:    action.TargetLSN,
 		Reason:         reason,
@@ -7281,6 +8321,7 @@ func haFormerPrimaryFenceAcquireBody(cluster *antflyv1.AntflyCluster, action ant
 			PromotedNodeId: promotedNodeID,
 			NewTimelineId:  identity.TimelineID + 1,
 			NewEpoch:       identity.Epoch + 1,
+			Generation:     action.FenceGeneration,
 			RequiredLsn:    action.TargetLSN,
 			ObservedLsn:    action.TargetLSN,
 			Reason:         reason,
@@ -7317,6 +8358,7 @@ func haFormerPrimaryFenceAcquireBody(cluster *antflyv1.AntflyCluster, action ant
 		PromotedNodeId: promotion.PromotedStandbyID,
 		NewTimelineId:  promotion.NewTimelineID,
 		NewEpoch:       promotion.NewEpoch,
+		Generation:     promotion.FenceGeneration,
 		RequiredLsn:    haPromotionRequiredLSN(promotion),
 		ObservedLsn:    haPromotionObservedLSN(promotion),
 		Force:          promotion.Forced,
@@ -7374,13 +8416,24 @@ func haRejoinAssessBody(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlann
 	if identity == nil || strings.TrimSpace(action.StandbyName) == "" {
 		return adminsdk.RejoinAssessRequest{}, false
 	}
+	requestIdentity := haAdminIdentityRequestFromSpec(identity)
+	promotion := haPromotionReceipt(cluster.Status.HAStatus)
+	if promotion != nil {
+		if !haIdentityMatchesPromotionParentOrChild(identity, promotion) {
+			return adminsdk.RejoinAssessRequest{}, false
+		}
+		// The former-primary assessment must describe the immutable parent
+		// branch. The cluster spec may already describe the promoted child.
+		requestIdentity.TimelineId = promotion.ParentTimelineID
+		requestIdentity.Epoch = promotion.ParentEpoch
+	}
 	lastLSN := action.ObservedLSN
 	if lastLSN == 0 {
 		lastLSN = action.TargetLSN
 	}
 	body := adminsdk.RejoinAssessRequest{
 		NodeId:                          action.StandbyName,
-		Identity:                        haAdminIdentityRequestFromSpec(identity),
+		Identity:                        requestIdentity,
 		LastLsn:                         lastLSN,
 		RetainedFromLsn:                 action.RetainedFromLSN,
 		AllowRewindAfterForcedPromotion: false,
@@ -7402,9 +8455,11 @@ func haRejoinFenceReceipt(status *antflyv1.HAStatus, identity *antflyv1.HAReplic
 	if identity == nil {
 		return adminsdk.HAFenceReceipt{}, false
 	}
-	if promotion.OldPrimaryID != identity.CurrentPrimaryID ||
-		promotion.ParentTimelineID != identity.TimelineID ||
-		promotion.ParentEpoch != identity.Epoch {
+	// Colony adopts the promoted topology before former-primary repair. Accept
+	// either exact side of this one promotion receipt so the already-completed
+	// fence remains usable after that declarative identity advance. Unrelated,
+	// stale, and cross-topology identities still fail closed.
+	if !haIdentityMatchesPromotionParentOrChild(identity, promotion) {
 		return adminsdk.HAFenceReceipt{}, false
 	}
 	receiptIdentity := haAdminIdentityRequestFromSpec(identity)
@@ -10505,6 +11560,49 @@ func (r *AntflyClusterReconciler) haCurrentLeaseAuthorizesRoute(ctx context.Cont
 	return ready, nil
 }
 
+func (r *AntflyClusterReconciler) haCurrentLeaseAuthorizesPromotionBoundary(
+	ctx context.Context,
+	cluster *antflyv1.AntflyCluster,
+	action antflyv1.HAPlannedActionStatus,
+) (bool, error) {
+	if cluster == nil || cluster.Spec.HighAvailability == nil || action.TargetLSN == 0 ||
+		strings.TrimSpace(action.FenceHolder) == "" || action.FenceGeneration == 0 {
+		return false, nil
+	}
+	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
+	if identity == nil || strings.TrimSpace(identity.CurrentPrimaryID) == "" {
+		return false, nil
+	}
+	lease := &coordinationv1.Lease{}
+	if err := r.haBoundaryReader().Get(ctx, types.NamespacedName{
+		Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace,
+	}, lease); err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if lease.Spec.HolderIdentity == nil || strings.TrimSpace(*lease.Spec.HolderIdentity) != strings.TrimSpace(action.FenceHolder) ||
+		lease.Spec.LeaseTransitions == nil || *lease.Spec.LeaseTransitions <= 0 ||
+		uint64(*lease.Spec.LeaseTransitions) != action.FenceGeneration ||
+		lease.Annotations[haFencingLeaseAnnotationTopologyID] != haFencingLeaseTopologyID(cluster) ||
+		lease.Annotations[haFencingLeaseAnnotationTransferCommitted] != "true" ||
+		lease.Annotations[haFencingLeaseAnnotationFormerHolder] != strings.TrimSpace(identity.CurrentPrimaryID) ||
+		lease.Annotations[haFencingLeaseAnnotationTransferOriginUID] != string(cluster.UID) ||
+		lease.Annotations[haFencingLeaseAnnotationCommittedTransition] != strconv.FormatUint(action.FenceGeneration, 10) {
+		return false, nil
+	}
+	ready, _ := haLeaseFenceReady(lease, action.FenceGeneration, r.haNow())
+	if !ready {
+		return false, nil
+	}
+	// Exact equality is intentional. A higher boundary is not automatically
+	// safe: the promotion receipt proves the candidate applied TargetLSN, not an
+	// unrelated later value. Identity and the frozen tail advance together.
+	scope := haFencingLeaseScopeForIdentity(identity, action.TargetLSN)
+	return haLeaseFenceScopeMatches(lease, scope), nil
+}
+
 func (r *AntflyClusterReconciler) haPromotedRuntimeWatchdogReady(ctx context.Context, cluster *antflyv1.AntflyCluster, nodeID string, fenceGeneration uint64) (bool, error) {
 	if cluster == nil || cluster.Status.HAStatus == nil || cluster.Status.HAStatus.PrimaryWatchdogProof == nil ||
 		cluster.Spec.HighAvailability == nil || cluster.Spec.HighAvailability.Runtime == nil ||
@@ -10679,8 +11777,16 @@ func firstNonEmptyString(values ...string) string {
 }
 
 func haPlannedActionDependenciesSucceededForStatus(status *antflyv1.HAStatus, actions []antflyv1.HAPlannedActionStatus, index int, clusters ...*antflyv1.AntflyCluster) bool {
-	if !haPlannedActionDependenciesSucceeded(actions, index, clusters...) {
-		return false
+	historySatisfied := haPlannedActionDependenciesSucceeded(actions, index, clusters...)
+	durableSatisfied := false
+	if !historySatisfied {
+		if index < 0 || index >= len(actions) {
+			return false
+		}
+		durableSatisfied = haPlannedActionDependencySatisfiedByDurableStatus(status, actions[index])
+		if !durableSatisfied {
+			return false
+		}
 	}
 	action := actions[index]
 	if action.DependsOn == "" {
@@ -10705,7 +11811,37 @@ func haPlannedActionDependenciesSucceededForStatus(status *antflyv1.HAStatus, ac
 		}
 		return haFormerPrimaryActionSucceededWithPromotionEvidence(status, dependency)
 	}
-	return false
+	return durableSatisfied
+}
+
+// haPlannedActionDependencySatisfiedByDurableStatus prevents a completed
+// promotion from becoming an unsatisfiable dependency after the transient
+// PromoteStandby action is compacted from status. Only DemoteFormerPrimary may
+// cross that compaction boundary, and it must match the exact durable promotion
+// and fencing receipt. Other missing dependencies continue to fail closed.
+func haPlannedActionDependencySatisfiedByDurableStatus(status *antflyv1.HAStatus, action antflyv1.HAPlannedActionStatus) bool {
+	if haActionKind(action.Kind) != haActionDemoteFormerPrimary ||
+		haActionKind(action.DependsOn) != haActionPromoteStandby {
+		return false
+	}
+	promotion := haPromotionReceipt(status)
+	if promotion == nil ||
+		strings.TrimSpace(action.StandbyName) != strings.TrimSpace(promotion.OldPrimaryID) ||
+		strings.TrimSpace(action.AdminNodeID) != strings.TrimSpace(promotion.OldPrimaryID) ||
+		action.FenceAuthority != promotion.FenceAuthority ||
+		action.FenceGeneration != promotion.FenceGeneration ||
+		strings.TrimSpace(action.FenceHolder) != strings.TrimSpace(promotion.PromotedStandbyID) ||
+		action.TargetLSN != haPromotionRequiredLSN(promotion) ||
+		haPromotionObservedLSN(promotion) < haPromotionRequiredLSN(promotion) {
+		return false
+	}
+	if routeFrom := strings.TrimSpace(action.RouteFrom); routeFrom != "" && routeFrom != strings.TrimSpace(promotion.OldPrimaryID) {
+		return false
+	}
+	if routeTo := strings.TrimSpace(action.RouteTo); routeTo != "" && routeTo != strings.TrimSpace(promotion.PromotedStandbyID) {
+		return false
+	}
+	return true
 }
 
 func haPrimaryRouteActionHasPromotionEvidence(status *antflyv1.HAStatus, actions []antflyv1.HAPlannedActionStatus, index int) bool {
@@ -12166,6 +13302,12 @@ func (r *AntflyClusterReconciler) repairBlockedStatefulSetRollout(ctx context.Co
 	if sts == nil || sts.Name == "" || sts.Status.UpdateRevision == "" {
 		return false, nil
 	}
+	if sts.Spec.UpdateStrategy.Type == appsv1.OnDeleteStatefulSetStrategyType {
+		// OnDelete is an explicit instruction to preserve the running stateful
+		// process while publishing a restart-safe template. It is never a blocked
+		// rollout for this automatic repair path.
+		return false, nil
+	}
 
 	replicas := int32(1)
 	if sts.Spec.Replicas != nil {
@@ -12197,6 +13339,17 @@ func (r *AntflyClusterReconciler) repairBlockedStatefulSetRollout(ctx context.Co
 		if pod.DeletionTimestamp != nil {
 			continue
 		}
+		if effectiveTopologyMode(cluster) == topologyModeStandalone &&
+			promotedStandaloneProcessRolloutProtected(cluster, sts, pod) {
+			log.FromContext(ctx).Info(
+				"Preserving exact promoted process during deferred StatefulSet rollout",
+				"statefulset", sts.Name,
+				"pod", pod.Name,
+				"podUID", pod.UID,
+				"component", component,
+			)
+			continue
+		}
 		log.FromContext(ctx).Info(
 			"Deleting stale unhealthy pod to unblock StatefulSet rollout",
 			"statefulset", sts.Name,
@@ -12215,12 +13368,35 @@ func (r *AntflyClusterReconciler) repairBlockedStatefulSetRollout(ctx context.Co
 	return false, nil
 }
 
+func promotedStandaloneProcessRolloutProtected(cluster *antflyv1.AntflyCluster, sts *appsv1.StatefulSet, pod *corev1.Pod) bool {
+	if hasExactPromotedProcessBinding(cluster, sts, pod) {
+		return true
+	}
+	if cluster == nil || sts == nil || pod == nil {
+		return false
+	}
+	ha := cluster.Spec.HighAvailability
+	return ha != nil && ha.Runtime != nil &&
+		ha.Runtime.Role == antflyv1.HARuntimeRolePrimary &&
+		isPodControlledByExactStatefulSet(pod, sts) &&
+		strings.TrimSpace(pod.Annotations[haNodeIDAnnotation]) == strings.TrimSpace(ha.Runtime.NodeID) &&
+		podRunsHAStandbyCommand(pod)
+}
+
 func isPodControlledByStatefulSet(pod *corev1.Pod, statefulSetName string) bool {
 	if pod == nil {
 		return false
 	}
 	controller := metav1.GetControllerOf(pod)
 	return controller != nil && controller.Kind == "StatefulSet" && controller.Name == statefulSetName
+}
+
+func isPodControlledByExactStatefulSet(pod *corev1.Pod, statefulSet *appsv1.StatefulSet) bool {
+	if pod == nil || statefulSet == nil || statefulSet.UID == "" || pod.Namespace != statefulSet.Namespace {
+		return false
+	}
+	controller := metav1.GetControllerOf(pod)
+	return controller != nil && controller.Kind == "StatefulSet" && controller.Name == statefulSet.Name && controller.UID == statefulSet.UID
 }
 
 func isStaleStatefulSetPod(pod *corev1.Pod, updateRevision, desiredImage string) bool {
@@ -13213,15 +14389,19 @@ func hasAnyPrefix(name string, prefixes []string) bool {
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *AntflyClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := normalizeClusterDomainField(&r.ClusterDomain); err != nil {
+		return fmt.Errorf("configure AntflyCluster controller: %w", err)
+	}
 	if err := ctrl.NewControllerManagedBy(mgr).
 		Named("antflycluster-ha-lease-renewal").
-		WithOptions(controller.Options{MaxConcurrentReconciles: 16}).
-		For(&antflyv1.AntflyCluster{}).
+		WithOptions(haLeaseRenewalControllerOptions()).
+		For(&antflyv1.AntflyCluster{}, ctrlbuilder.WithPredicates(haLeaseRenewalEventPredicate())).
 		Complete(&haLeaseRenewalReconciler{parent: r}); err != nil {
 		return err
 	}
 	builder := ctrl.NewControllerManagedBy(mgr).
-		For(&antflyv1.AntflyCluster{}).
+		WithOptions(controller.Options{MaxConcurrentReconciles: antflyClusterMaxConcurrentReconciles}).
+		For(&antflyv1.AntflyCluster{}, ctrlbuilder.WithPredicates(antflyClusterDesiredStateEventPredicate())).
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ConfigMap{}).

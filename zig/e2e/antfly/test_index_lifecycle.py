@@ -227,9 +227,17 @@ def test_ready_index_status_requires_current_coverage_observation():
     rebuilding["status"]["repair"] = {"state": "rebuilding", "action_required": False}
     assert ready_index_status(rebuilding) is None
 
+    for backfill_state in ("running", "retrying", "degraded", "failed"):
+        incomplete = json.loads(json.dumps(ready_status))
+        incomplete["status"]["backfill_state"] = backfill_state
+        assert ready_index_status(incomplete) is None
+
+    complete = json.loads(json.dumps(ready_status))
+    complete["status"]["backfill_state"] = "ready"
+    assert ready_index_status(complete) is complete["status"]
+
     for field, value in (
         ("error", "load failed: UnsupportedVersion"),
-        ("backfill_state", "failed"),
         ("repair_degraded", True),
         ("repair_summary_ready", False),
         ("repair_issue_count", 1),
@@ -1448,6 +1456,10 @@ def test_stateful_managed_embeddings_status_reports_partial_retrying_backfill_af
     assert partial["backfill_state"] == "retrying"
     assert partial["backfill_active"] is True
     assert partial["backfill_progress"] < 1.0
+    readiness = partial["readiness"]
+    assert readiness["state"] != "failed"
+    assert readiness["complete"] is False
+    assert "coverage" in readiness["pending_reasons"]
     # Replay and managed enrichment coverage are independent axes. The write
     # log may be fully consumed while retryable provider work still leaves the
     # derived index partially covered.
@@ -1849,7 +1861,7 @@ def test_table_rejects_non_go_full_text_chunk_config(table_api):
         raise AssertionError("expected public full-text chunk config to be rejected")
 
 
-def test_table_create_table_ignores_user_full_text_index_entries(table_api):
+def test_table_create_table_preserves_user_full_text_index_entries(table_api):
     table_name = f"full_text_create_table_{time.time_ns()}"
 
     payload = {
@@ -1883,7 +1895,7 @@ def test_table_create_table_ignores_user_full_text_index_entries(table_api):
         }
     assert _table_name(created) == table_name
     assert "full_text_index_v0" in created["indexes"]
-    assert "search_idx" not in created["indexes"]
+    assert "search_idx" in created["indexes"]
     assert "embed_idx" in created["indexes"]
 
 

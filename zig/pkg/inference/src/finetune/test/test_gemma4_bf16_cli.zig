@@ -234,15 +234,19 @@ fn expectSavedLoraUpdate(allocator: std.mem.Allocator, checkpoint_path: []const 
 }
 
 test "gemma4 BF16 strict Metal CLI self-enables executor and publishes one real optimizer step" {
+    const required_metal = platform.env.getenvBoolDefault("TERMITE_REQUIRE_METAL_TESTS", false);
     if (comptime !build_options.enable_metal) {
-        if (platform.env.getenvBoolDefault("TERMITE_REQUIRE_METAL_TESTS", false))
+        if (required_metal)
             return error.RequiredMetalBuildDisabled;
         return error.SkipZigTest;
     }
     if (!metal_runtime.metalDeviceAvailable()) {
-        if (platform.env.getenvBoolDefault("TERMITE_REQUIRE_METAL_TESTS", false))
+        if (required_metal)
             return error.RequiredMetalDeviceUnavailable;
         return error.SkipZigTest;
+    }
+    if (required_metal and build_options.benchmark_source_revision.len != 40) {
+        return error.RequiredOracleSourceRevisionNotEmbedded;
     }
 
     const allocator = std.testing.allocator;
@@ -305,11 +309,10 @@ test "gemma4 BF16 strict Metal CLI self-enables executor and publishes one real 
     const eval_record_digest = try finetune.fingerprintGemmaChatSourceRecordAlloc(allocator, eval_source.examples[0]);
     defer allocator.free(eval_record_digest);
 
-    const targets = [_][]const u8{"model.layers.0.self_attn.q_proj"};
     var bootstrap = try finetune.bootstrapLoRABundle(allocator, base_dir, adapter_dir, .{
         .rank = 2,
         .alpha = 2,
-        .target_modules = &targets,
+        .gemma4_target_preset = .peft_qv,
     });
     defer finetune.freeBootstrapSummary(allocator, &bootstrap);
 
@@ -446,4 +449,147 @@ test "gemma4 BF16 strict Metal CLI self-enables executor and publishes one real 
     const published_after = try compat.cwd().readFileAlloc(io, output_adapter_path, allocator, .limited(1024 * 1024));
     defer allocator.free(published_after);
     try std.testing.expectEqualSlices(u8, published_before, published_after);
+
+    // Exercise the private request/capture boundary as an actual compiled
+    // Metal step. The external Python packager independently validates and
+    // converts these files into gemma4_oracle_trace/v1.
+    if (build_options.benchmark_source_revision.len == 40) {
+        const oracle_request_path = try std.fs.path.join(allocator, &.{ root, "oracle-request.json" });
+        defer allocator.free(oracle_request_path);
+        const oracle_out_dir = try std.fs.path.join(allocator, &.{ root, "oracle-out" });
+        defer allocator.free(oracle_out_dir);
+        const oracle_capture_dir = try std.fs.path.join(allocator, &.{ root, "oracle-capture" });
+        defer allocator.free(oracle_capture_dir);
+        const executable_path = try std.process.executablePathAlloc(io, allocator);
+        defer allocator.free(executable_path);
+        var executable_fingerprint = try finetune.fingerprintProjectorFile(allocator, executable_path);
+        defer finetune.freeProjectorFingerprint(allocator, &executable_fingerprint);
+        var prepared_fingerprint = try finetune.fingerprintProjectorFile(allocator, prepared_path);
+        defer finetune.freeProjectorFingerprint(allocator, &prepared_fingerprint);
+        const initial_adapter_path = try std.fs.path.join(allocator, &.{ adapter_dir, finetune.adapter_checkpoint_file_name });
+        defer allocator.free(initial_adapter_path);
+        var initial_adapter_fingerprint = try finetune.fingerprintProjectorFile(allocator, initial_adapter_path);
+        defer finetune.freeProjectorFingerprint(allocator, &initial_adapter_fingerprint);
+        const executable_sha256 = try std.fmt.allocPrint(allocator, "sha256:{s}", .{executable_fingerprint.sha256});
+        defer allocator.free(executable_sha256);
+        const prepared_sha256 = try std.fmt.allocPrint(allocator, "sha256:{s}", .{prepared_fingerprint.sha256});
+        defer allocator.free(prepared_sha256);
+        const adapter_sha256 = try std.fmt.allocPrint(allocator, "sha256:{s}", .{initial_adapter_fingerprint.sha256});
+        defer allocator.free(adapter_sha256);
+        const request_payload = .{
+            .schema_version = "antfly_gemma4_lora_zig_oracle_request/v1",
+            .implementation = .{
+                .version = build_options.inference_version,
+                .executable_sha256 = executable_sha256,
+                .source_revision = build_options.benchmark_source_revision,
+                .backend = "metal",
+                .metal_device = "unit-test-metal-device",
+            },
+            .bindings = .{
+                .oracle_lock_sha256 = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                .model_key = "gemma-4-E2B-it",
+                .model_revision = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                .local_artifact_sha256 = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                .base_model_sha256 = provenance.base_model_sha256,
+                .initial_adapter_sha256 = adapter_sha256,
+                .train_prepared_sha256 = prepared_sha256,
+                .source_dataset_sha256 = train_source_digest,
+                .example_index = @as(usize, 0),
+                .target_preset = "peft-qv",
+                .rank = @as(usize, 2),
+                .alpha = @as(f64, 2),
+                .target_count = @as(usize, 2),
+            },
+            .training = .{
+                .optimizer = "adamw",
+                .seed = @as(u64, 42),
+                .steps = @as(usize, 1),
+                .learning_rate = @as(f64, 0.001),
+                .betas = [_]f64{ 0.9, 0.999 },
+                .eps = @as(f64, 1e-8),
+                .weight_decay = @as(f64, 0.01),
+                .max_grad_norm = @as(f64, 1.0),
+                .grad_accum_steps = @as(u32, 1),
+                .supervised_token_normalization = "mean",
+                .dropout = @as(f64, 0),
+                .use_cache = false,
+            },
+        };
+        const request_json = try std.json.Stringify.valueAlloc(allocator, request_payload, .{});
+        defer allocator.free(request_json);
+        try compat.cwd().writeFile(io, .{ .sub_path = oracle_request_path, .data = request_json });
+        const oracle_args = [_][]const u8{
+            base_dir,
+            adapter_dir,
+            prepared_path,
+            oracle_out_dir,
+            "--trainer",
+            "autodiff",
+            "--backend",
+            "metal",
+            "--lr",
+            "0.001",
+            "--max-examples",
+            "1",
+            "--eval-prepared",
+            prepared_path,
+            "--eval-max-examples",
+            "1",
+            "--epochs",
+            "1",
+            "--grad-accum",
+            "1",
+            "--seed",
+            "42",
+            "--oracle-request",
+            oracle_request_path,
+            "--oracle-capture-out",
+            oracle_capture_dir,
+        };
+        try train_command.runFromArgsWithoutSummary(allocator, io, &oracle_args);
+
+        inline for (.{
+            "capture.json",
+            "raw_gradients.safetensors",
+            "trainer_checkpoint.safetensors",
+            "run_manifest.json",
+        }) |name| {
+            const path = try std.fs.path.join(allocator, &.{ oracle_capture_dir, name });
+            defer allocator.free(path);
+            try compat.cwd().access(io, path, .{});
+        }
+        const capture_path = try std.fs.path.join(allocator, &.{ oracle_capture_dir, "capture.json" });
+        defer allocator.free(capture_path);
+        const capture_bytes = try compat.cwd().readFileAlloc(io, capture_path, allocator, .limited(1024 * 1024));
+        defer allocator.free(capture_bytes);
+        const Captured = struct {
+            schema_version: []const u8,
+            result: struct {
+                loss_history: []const f64,
+                raw_gradient_norm: f64,
+                supervised_tokens: usize,
+                logit_probes: []const std.json.Value,
+                targets: []const std.json.Value,
+                execution: struct {
+                    optimizer_steps: u64,
+                    micro_batch_steps: u64,
+                    metal_optimizer_steps: u64,
+                    graph_executor_steps: u64,
+                },
+            },
+        };
+        const captured = try std.json.parseFromSlice(Captured, allocator, capture_bytes, .{ .ignore_unknown_fields = true });
+        defer captured.deinit();
+        try std.testing.expectEqualStrings("antfly_gemma4_lora_zig_oracle_capture/v1", captured.value.schema_version);
+        try std.testing.expectEqual(@as(usize, 1), captured.value.result.loss_history.len);
+        try std.testing.expect(std.math.isFinite(captured.value.result.loss_history[0]));
+        try std.testing.expect(captured.value.result.raw_gradient_norm > 0);
+        try std.testing.expectEqual(@as(usize, 1), captured.value.result.supervised_tokens);
+        try std.testing.expectEqual(@as(usize, 1), captured.value.result.logit_probes.len);
+        try std.testing.expectEqual(@as(usize, 4), captured.value.result.targets.len);
+        try std.testing.expectEqual(@as(u64, 1), captured.value.result.execution.optimizer_steps);
+        try std.testing.expectEqual(@as(u64, 1), captured.value.result.execution.micro_batch_steps);
+        try std.testing.expectEqual(@as(u64, 1), captured.value.result.execution.metal_optimizer_steps);
+        try std.testing.expectEqual(@as(u64, 1), captured.value.result.execution.graph_executor_steps);
+    }
 }

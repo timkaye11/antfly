@@ -77,12 +77,12 @@ class BatchRequest:
                 Transform operations allow you to modify documents without read-modify-write races:
                 - Operations are applied atomically on the server
                 - Multiple operations per document are applied in sequence
-                - Supports numeric and set-like operations ($inc, $min, $max, $addToSet)
+                - Supports numeric and set-like operations ($inc, $min, $max, $addToSet, $pull)
 
                 Common use cases:
                 - Increment counters (views, likes, votes)
                 - Update timestamps ($set)
-                - Add unique array values ($addToSet)
+                - Add or remove array values ($addToSet, $pull)
                 - Update nested fields without overwriting the entire document
                  Example: [{'key': 'article:123', 'operations': [{'op': '$inc', 'path': '$.views', 'value': 1}, {'op': '$set',
                 'path': '$.lastViewed', 'value': '2026-07-28T12:00:00Z'}]}, {'key': 'user:456', 'operations': [{'op':
@@ -91,7 +91,9 @@ class BatchRequest:
                 - "propose": Wait for Raft proposal acceptance (fastest, default)
                 - "write": Wait for Pebble KV write
                 - "full_text": Wait for full-text index WAL write
-                - "enrichments": Pre-compute enrichments before Raft proposal (synchronous enrichment generation)
+                - "enrichments": Precompute enrichments before committing the document. A synchronous
+                  producer failure rejects the write; post-commit worker failures retain the document
+                  and may return `committed_repair_required`.
                 - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
     """
 

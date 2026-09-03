@@ -1227,6 +1227,62 @@ pub const Client = struct {
     }
 
     fn connectHost(self: *Self, host: []const u8, port: u16) !Socket {
+        const timeout_ms = self.config.timeouts.connect_ms;
+        if (timeout_ms == 0) return self.connectHostDirect(host, port);
+
+        const ConnectResult = anyerror!Socket;
+        const SelectResult = union(enum) {
+            connect: ConnectResult,
+            watchdog: anyerror!RequestWatchdogOutcome,
+        };
+        const Task = struct {
+            fn connectTask(client: *Self, target_host: []const u8, target_port: u16) ConnectResult {
+                return client.connectHostDirect(target_host, target_port);
+            }
+
+            fn watchdogTask(io: Io, stop: *const std.atomic.Value(u32), connect_timeout_ms: u64) anyerror!RequestWatchdogOutcome {
+                return waitForRequestCancellationOrTimeout(io, stop, null, connect_timeout_ms);
+            }
+
+            fn drainLateResult(result: SelectResult) void {
+                switch (result) {
+                    .connect => |connect_result| if (connect_result) |socket_value| {
+                        var socket = socket_value;
+                        socket.close();
+                    } else |_| {},
+                    .watchdog => {},
+                }
+            }
+        };
+
+        var select_buffer: [2]SelectResult = undefined;
+        var select = Io.Select(SelectResult).init(self.io, &select_buffer);
+        var watchdog_stop = std.atomic.Value(u32).init(0);
+        try select.concurrent(.connect, Task.connectTask, .{ self, host, port });
+        select.concurrent(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, timeout_ms }) catch |err| {
+            while (select.cancel()) |late| Task.drainLateResult(late);
+            return err;
+        };
+        errdefer while (select.cancel()) |late| Task.drainLateResult(late);
+
+        const first = try select.await();
+        switch (first) {
+            .connect => |connect_result| {
+                stopRequestWatchdog(self.io, &watchdog_stop);
+                select.cancelDiscard();
+                return try connect_result;
+            },
+            .watchdog => |watchdog_result| {
+                while (select.cancel()) |late| Task.drainLateResult(late);
+                return switch (try watchdog_result) {
+                    .timed_out => error.Timeout,
+                    .cancelled, .stopped => unreachable,
+                };
+            },
+        }
+    }
+
+    fn connectHostDirect(self: *Self, host: []const u8, port: u16) !Socket {
         if (self.config.address_filter != null) {
             const address = try resolveAddressFiltered(self.io, host, port, self.config.address_filter);
             return try Socket.connect(address, self.io);
@@ -3934,21 +3990,23 @@ const python_redirect_writer_server_script =
     "    httpd.serve_forever()\n";
 
 const python_tls_fixed_keepalive_server_script =
+    "import pathlib\n" ++
     "import socket\n" ++
     "import ssl\n" ++
     "import sys\n" ++
     "import time\n" ++
     "\n" ++
-    "port = int(sys.argv[1])\n" ++
-    "cert = sys.argv[2]\n" ++
-    "key = sys.argv[3]\n" ++
+    "cert = sys.argv[1]\n" ++
+    "key = sys.argv[2]\n" ++
+    "port_file = sys.argv[3]\n" ++
     "payload = (b'0123456789abcdef' * 16384)\n" ++
     "listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n" ++
     "listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n" ++
-    "listener.bind(('127.0.0.1', port))\n" ++
+    "listener.bind(('127.0.0.1', 0))\n" ++
     "listener.listen(1)\n" ++
     "ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)\n" ++
     "ctx.load_cert_chain(certfile=cert, keyfile=key)\n" ++
+    "pathlib.Path(port_file).write_text(str(listener.getsockname()[1]))\n" ++
     "while True:\n" ++
     "    conn, _ = listener.accept()\n" ++
     "    with conn:\n" ++
@@ -4528,24 +4586,19 @@ test "HTTPS client streams fixed content-length body with keep-alive to writer" 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    const port = try reserveEphemeralPort(io);
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "cert.pem", .data = test_tls_cert_pem });
     try tmp.dir.writeFile(io, .{ .sub_path = "key.pem", .data = test_tls_key_pem });
     try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_tls_fixed_keepalive_server_script });
 
-    var port_buf: [16]u8 = undefined;
-    const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
-
     var child = std.process.spawn(io, .{
         .argv = &.{
             "python3",
             "server.py",
-            port_arg,
             "cert.pem",
             "key.pem",
+            "port.txt",
         },
         .cwd = .{ .dir = tmp.dir },
         .stdin = .ignore,
@@ -4557,9 +4610,25 @@ test "HTTPS client streams fixed content-length body with keep-alive to writer" 
     };
     defer child.kill(io);
 
-    io.sleep(Io.Duration.fromMilliseconds(500), .awake) catch {};
+    // Python binds port zero and publishes the selected port only after the
+    // TLS context is ready, avoiding both port-reuse and fixed-sleep races.
+    var port: ?u16 = null;
+    var attempt: usize = 0;
+    while (attempt < 100 and port == null) : (attempt += 1) {
+        const raw = tmp.dir.readFileAlloc(io, "port.txt", allocator, .limited(32)) catch |err| switch (err) {
+            error.FileNotFound => {
+                io.sleep(Io.Duration.fromMilliseconds(50), .awake) catch {};
+                continue;
+            },
+            else => return err,
+        };
+        defer allocator.free(raw);
+        port = std.fmt.parseInt(u16, std.mem.trim(u8, raw, " \t\r\n"), 10) catch null;
+        if (port == null) io.sleep(Io.Duration.fromMilliseconds(50), .awake) catch {};
+    }
+    const server_port = port orelse return error.TestExpectedEqual;
 
-    const url = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}/", .{port});
+    const url = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}/", .{server_port});
     defer allocator.free(url);
 
     var client = Client.initWithConfig(allocator, io, .{

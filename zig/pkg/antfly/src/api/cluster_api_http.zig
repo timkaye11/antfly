@@ -47,8 +47,12 @@ pub const ClusterApi = struct {
         NotLeader,
         InvalidRequest,
         BackupRepositoryBusy,
+        RestoreValidationPending,
         BackupManifestTooLarge,
         BackupIntegrityFailure,
+        RestoreDestinationReauthorizationRequired,
+        UnsupportedArtifactIndexSources,
+        ArtifactIndexSourcesTemporarilyUnavailable,
         TableAlreadyExists,
         MethodNotAllowed,
         Cancelled,
@@ -81,6 +85,7 @@ pub const ClusterApi = struct {
             req: backups_api.ClusterRestoreRequest,
             location: *backups_api.BackupLocation,
             restore_mode: []const u8,
+            request: operation.RequestContext,
         ) ExecuteRestoreError!RestoreExecution,
     };
 
@@ -110,8 +115,9 @@ pub const ClusterApi = struct {
         req: backups_api.ClusterRestoreRequest,
         location: *backups_api.BackupLocation,
         restore_mode: []const u8,
+        request: operation.RequestContext,
     ) ExecuteRestoreError!RestoreExecution {
-        return try self.vtable.execute_cluster_restore(self.ptr, alloc, req, location, restore_mode);
+        return try self.vtable.execute_cluster_restore(self.ptr, alloc, req, location, restore_mode, request);
     }
 };
 
@@ -220,6 +226,7 @@ pub fn handleClusterRestore(
     secret_store: ?*common_secrets.FileStore,
     node_config: ?*const common_config.Config,
     io: ?std.Io,
+    request: operation.RequestContext,
 ) !OwnedResponse {
     var req = backups_api.parseClusterRestoreRequest(alloc, body) catch {
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") };
@@ -247,12 +254,25 @@ pub fn handleClusterRestore(
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") };
     };
 
-    const result = api.executeClusterRestore(alloc, req, &location, restore_mode) catch |err| switch (err) {
+    const result = api.executeClusterRestore(alloc, req, &location, restore_mode, request) catch |err| switch (err) {
         error.NotLeader => return err,
         error.InvalidRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") },
         error.BackupRepositoryBusy => return .{ .status = 409, .body = try alloc.dupe(u8, "backup repository is busy; retry later") },
+        error.RestoreValidationPending => return .{ .status = 503, .body = try alloc.dupe(u8, "restore validation is temporarily unavailable; retry later"), .retry_after_seconds = 1 },
         error.BackupManifestTooLarge => return .{ .status = 400, .body = try alloc.dupe(u8, backups_api.manifest_too_large_message) },
         error.BackupIntegrityFailure => return .{ .status = 422, .body = try alloc.dupe(u8, backups_api.integrity_failure_message) },
+        error.RestoreDestinationReauthorizationRequired => return .{ .status = 409, .body = try alloc.dupe(u8, "restore destination authorization is missing or revoked; resubmit with a currently authorized credential") },
+        error.UnsupportedArtifactIndexSources => return .{
+            .status = 400,
+            .body = try alloc.dupe(u8, "{\"error\":\"unsupported_index_capability\",\"message\":\"artifact-backed index sources are not supported by this deployment\",\"retryable\":false}"),
+            .json = true,
+        },
+        error.ArtifactIndexSourcesTemporarilyUnavailable => return .{
+            .status = 503,
+            .body = try alloc.dupe(u8, "{\"error\":\"index_capability_upgrade_pending\",\"message\":\"artifact-backed index sources are temporarily unavailable until every live table-serving store supports them\",\"retryable\":true}"),
+            .json = true,
+            .retry_after_seconds = 1,
+        },
         error.TableAlreadyExists => return .{ .status = 400, .body = try alloc.dupe(u8, "table already exists") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.Cancelled => return .{ .status = 409, .body = try alloc.dupe(u8, "restore cancelled") },
@@ -290,6 +310,7 @@ test "cluster backup APIs require named connections" {
         null,
         null,
         null,
+        .{},
     );
     defer restore.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), restore.status);

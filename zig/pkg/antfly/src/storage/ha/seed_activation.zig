@@ -23,9 +23,11 @@
 //! returned generation path as its data root.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const fs_paths = @import("../../common/fs_paths.zig");
+const db_core = @import("../db/core.zig");
 const backup_manifest = @import("backup_manifest.zig");
 const lifecycle_receipt_ledger = @import("lifecycle_receipt_ledger.zig");
 const local_generation_gc = @import("local_generation_gc.zig");
@@ -214,7 +216,11 @@ pub fn pruneActivatedGenerations(
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    const checkpoint_stat = std.Io.Dir.cwd().statFile(io, request.slot_activation_receipt_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+    // Kubernetes projected ConfigMap volumes expose keys through a symlink to
+    // the current immutable generation. Follow that operator-owned, read-only
+    // projection when validating the checkpoint; rejecting the link itself
+    // makes every production gc-target Job fail before JSON validation.
+    const checkpoint_stat = std.Io.Dir.cwd().statFile(io, request.slot_activation_receipt_path, .{}) catch |err| switch (err) {
         error.FileNotFound => return error.SeedActivationCheckpointMissing,
         else => return err,
     };
@@ -1420,20 +1426,24 @@ fn prepareMaterializedTestStaging(
     const store_target = try std.fs.path.join(alloc, &.{ source_snapshot_root, "store.bin" });
     defer alloc.free(store_target);
     try copyFileDurably(io, store_source, store_target, source_snapshot_root);
-    const journal_source = try std.fs.path.join(alloc, &.{ captured_snapshot_root, "change-journal.bin" });
-    defer alloc.free(journal_source);
-    const journal_target = try std.fs.path.join(alloc, &.{ source_snapshot_root, "change-journal.bin" });
-    defer alloc.free(journal_target);
-    try copyFileDurably(io, journal_source, journal_target, source_snapshot_root);
+    const snapshot_manifest_source = try std.fs.path.join(alloc, &.{ captured_snapshot_root, db_core.logical_snapshot_manifest_file_name });
+    defer alloc.free(snapshot_manifest_source);
+    const snapshot_manifest_target = try std.fs.path.join(alloc, &.{ source_snapshot_root, db_core.logical_snapshot_manifest_file_name });
+    defer alloc.free(snapshot_manifest_target);
+    try copyFileDurably(io, snapshot_manifest_source, snapshot_manifest_target, source_snapshot_root);
 
     const store_bytes = try readFileAlloc(io, alloc, store_target, 16 * 1024 * 1024);
     defer alloc.free(store_bytes);
-    const journal_bytes = try readFileAlloc(io, alloc, journal_target, 16 * 1024 * 1024);
-    defer alloc.free(journal_bytes);
+    const snapshot_manifest_bytes = try readFileAlloc(io, alloc, snapshot_manifest_target, 4096);
+    defer alloc.free(snapshot_manifest_bytes);
     var store_digest: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(store_bytes, &store_digest, .{});
     var store_sha256: [Sha256.digest_length * 2]u8 = undefined;
     encodeHex(&store_sha256, &store_digest);
+    var snapshot_manifest_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(snapshot_manifest_bytes, &snapshot_manifest_digest, .{});
+    var snapshot_manifest_sha256: [Sha256.digest_length * 2]u8 = undefined;
+    encodeHex(&snapshot_manifest_sha256, &snapshot_manifest_digest);
     const topology_json = try std.json.Stringify.valueAlloc(alloc, seed_materialization.Topology{
         .generation = generation,
         .catalog = .{
@@ -1458,6 +1468,7 @@ fn prepareMaterializedTestStaging(
             .table_name = "docs",
             .snapshot_path = "replicas/group-1",
             .logical_sha256 = &store_sha256,
+            .snapshot_manifest_sha256 = &snapshot_manifest_sha256,
             .identity_table_id = identity.table_id,
             .identity_shard_id = identity.shard_id,
             .identity_range_id = 1,
@@ -1477,7 +1488,7 @@ fn prepareMaterializedTestStaging(
     const files = [_]backup_manifest.FileEntry{
         .{ .path = seed_materialization.topology_name, .kind = .manifest, .size_bytes = topology_json.len, .crc32 = backup_manifest.crc32(topology_json) },
         .{ .path = "replicas/group-1/store.bin", .kind = .artifact, .size_bytes = store_bytes.len, .crc32 = backup_manifest.crc32(store_bytes) },
-        .{ .path = "replicas/group-1/change-journal.bin", .kind = .artifact, .size_bytes = journal_bytes.len, .crc32 = backup_manifest.crc32(journal_bytes) },
+        .{ .path = "replicas/group-1/SNAPSHOT.json", .kind = .manifest, .size_bytes = snapshot_manifest_bytes.len, .crc32 = backup_manifest.crc32(snapshot_manifest_bytes) },
     };
     const manifest = try backup_manifest.encodeAlloc(alloc, .{
         .identity = identity,
@@ -1507,7 +1518,7 @@ fn prepareMaterializedTestStaging(
         .end_record_lsn = 12,
         .manifest_sha256 = &manifest_sha256,
         .file_count = files.len,
-        .total_bytes = topology_json.len + store_bytes.len + journal_bytes.len,
+        .total_bytes = topology_json.len + store_bytes.len + snapshot_manifest_bytes.len,
         .topology_id = binding.topology_id,
         .topology_generation = binding.topology_generation,
         .node_id = binding.node_id,
@@ -1673,6 +1684,31 @@ test "storage.ha seed activation gc requires the durable seeded-slot activation 
     defer pruned.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), pruned.deleted_generations);
     try std.Io.Dir.cwd().access(std.testing.io, marker_path, .{});
+
+    // Match Kubernetes' projected ConfigMap layout: the mounted key points at
+    // ..data, which points at one immutable generation directory.
+    if (builtin.os.tag != .windows and builtin.os.tag != .wasi and builtin.os.tag != .freestanding) {
+        const projected_dir = try std.fs.path.join(alloc, &.{ root, "..2026_01" });
+        defer alloc.free(projected_dir);
+        try fs_paths.createDirPathPortable(std.testing.io, projected_dir);
+        const projected_checkpoint_path = try std.fs.path.join(alloc, &.{ projected_dir, "seeded-slot-activation.json" });
+        defer alloc.free(projected_checkpoint_path);
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), checkpoint_path, std.Io.Dir.cwd(), projected_checkpoint_path, std.testing.io);
+        const data_link = try std.fs.path.join(alloc, &.{ root, "..data" });
+        defer alloc.free(data_link);
+        try std.Io.Dir.cwd().symLink(std.testing.io, "..2026_01", data_link, .{ .is_directory = true });
+        try std.Io.Dir.cwd().symLink(std.testing.io, "..data/seeded-slot-activation.json", checkpoint_path, .{});
+        const projected_stat = try std.Io.Dir.cwd().statFile(std.testing.io, checkpoint_path, .{ .follow_symlinks = false });
+        try std.testing.expectEqual(std.Io.File.Kind.sym_link, projected_stat.kind);
+
+        var projected_pruned = try pruneActivatedGenerations(alloc, .{
+            .target_root = target_root,
+            .slot_activation_receipt_path = checkpoint_path,
+            .retain_generations = 1,
+        });
+        defer projected_pruned.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), projected_pruned.deleted_generations);
+    }
 }
 
 test "storage.ha materialized activation gc deletes raw and live generations as one lifecycle pair" {

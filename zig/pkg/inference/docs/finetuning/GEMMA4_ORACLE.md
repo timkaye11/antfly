@@ -25,7 +25,7 @@ and [MLX-LM's LoRA guide](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/
 
 ## Frozen inputs and artifact roles
 
-`scripts/gemma4_oracle.lock.json` is the single checked-in lock. It pins full
+`scripts/gemma4/gemma4_oracle.lock.json` is the single checked-in lock. It pins full
 model revisions and file digests for `google/gemma-4-E2B-it` and
 `google/gemma-4-E4B-it`, exact Python packages, upstream source commits,
 target policies, numerical tolerance profiles, and the performance protocol.
@@ -66,8 +66,12 @@ The other artifacts have distinct roles:
   families. The generator expands these into group-disjoint train/eval/test
   JSONL without runtime randomness.
 - `requirements-gemma4-oracle.txt` and
-  `requirements-gemma4-mlx-reference.txt`: exact package manifests, checked
-  against the JSON lock before a framework is imported.
+  `requirements-gemma4-mlx-reference.txt`: exact framework package manifests,
+  checked against the JSON lock before a framework is imported.
+- `requirements-gemma4-zig-oracle.txt`: the minimal NumPy/Safetensors subset
+  used by the Zig trace packager and macOS contract tests. Lock validation
+  checks its exact versions against the HF oracle package set without pulling
+  the CUDA-only framework stack onto the Metal runner.
 
 Only `gemma4_prepared/v6` is release-admissible. V6 binds causal generation
 tokenization with one literal BOS, no implicit EOS, and all assistant turns.
@@ -110,7 +114,7 @@ loads that output directly with `PeftModel.from_pretrained`, saves it with
 stock PEFT, reloads it, and requires exact tensor and logit equality:
 
 ```sh
-python3 zig/pkg/inference/scripts/verify_gemma4_peft_export_roundtrip.py \
+python3 zig/pkg/inference/scripts/gemma4/verify_gemma4_peft_export_roundtrip.py \
   --antfly /path/to/releasefast/antfly \
   --work-dir /new/evidence/gemma4-peft-roundtrip
 ```
@@ -129,7 +133,7 @@ From the repository root, these commands use only the Python standard library
 and do not fetch dependencies or models:
 
 ```sh
-python3 zig/pkg/inference/scripts/compare_gemma4_lora_hf_zig.py validate-lock
+python3 zig/pkg/inference/scripts/gemma4/compare_gemma4_lora_hf_zig.py validate-lock
 python3 -m unittest discover -v \
   -s zig/pkg/inference/scripts -p 'test_*gemma4*py'
 ```
@@ -139,9 +143,9 @@ that regeneration is byte-identical:
 
 ```sh
 fixture_dir="$(mktemp -d)"
-python3 zig/pkg/inference/scripts/generate_gemma4_oracle_fixture.py \
+python3 zig/pkg/inference/scripts/gemma4/generate_gemma4_oracle_fixture.py \
   --output "$fixture_dir/gemma4-contract.jsonl"
-python3 zig/pkg/inference/scripts/generate_gemma4_oracle_fixture.py \
+python3 zig/pkg/inference/scripts/gemma4/generate_gemma4_oracle_fixture.py \
   --output "$fixture_dir/gemma4-contract.jsonl" --check
 ```
 
@@ -156,9 +160,9 @@ First validate local assets. `--source-dataset` may relocate the immutable raw
 split, but its digest must equal the value recorded by the v6 prepared file.
 
 ```sh
-python3 zig/pkg/inference/scripts/compare_gemma4_lora_hf_zig.py \
+python3 zig/pkg/inference/scripts/gemma4/compare_gemma4_lora_hf_zig.py \
   validate-model --model-key gemma-4-E2B-it --model-dir /models/gemma-4-E2B-it
-python3 zig/pkg/inference/scripts/compare_gemma4_lora_hf_zig.py \
+python3 zig/pkg/inference/scripts/gemma4/compare_gemma4_lora_hf_zig.py \
   validate-prepared --prepared /evidence/prepared-v6.json \
   --source-dataset /datasets/gemma4-contract.jsonl --example-index 0
 ```
@@ -168,7 +172,7 @@ preset is inferred from a valid Antfly sidecar; it is mandatory on the command
 line for a stock PEFT seed adapter.
 
 ```sh
-python3 zig/pkg/inference/scripts/export_gemma4_lora_hf_oracle.py \
+python3 zig/pkg/inference/scripts/gemma4/export_gemma4_lora_hf_oracle.py \
   --model-key gemma-4-E2B-it \
   --model-dir /models/gemma-4-E2B-it \
   --transformers-source /src/transformers-v5.5.2 \
@@ -186,17 +190,52 @@ Both source directories are mandatory, must be clean at the commits in the
 oracle lock, and must be the code actually imported by Python. Exact package
 versions alone do not justify recording an upstream source revision.
 
-A Zig native/Metal trace producer is not implemented yet. Once that producer
-exists, it must emit the shared schema from the same lock, model artifact,
-prepared example, seed, optimizer settings, and target policy; only then can
-the following comparison be run.
+Export the paired Zig trace from a clean Antfly checkout with the exact
+release-built executable. The wrapper verifies the executable hash and embedded
+source revision, re-hashes the locked local model, prepared-v6 artifact, raw
+source split, and provenance-bound Antfly adapter, sanitizes all inherited
+`TERMITE_*` and `ANTFLY_GEMMA4_*` settings plus the experimental GGUF admission
+switch, and refuses to replace an output. `--metal-device` is an auditable
+device label and is required for the Metal producer. Use
+`--backend native` without that flag for the independent CPU implementation.
 
 ```sh
-python3 zig/pkg/inference/scripts/compare_gemma4_lora_hf_zig.py \
+python3 zig/pkg/inference/scripts/gemma4/export_gemma4_lora_zig_oracle.py \
+  --antfly /path/to/releasefast/antfly \
+  --source-root /src/clean-antfly \
+  --model-key gemma-4-E2B-it \
+  --model-dir /models/gemma-4-E2B-it \
+  --adapter /adapters/seed \
+  --prepared /evidence/prepared-v6.json \
+  --source-dataset /datasets/gemma4-contract.jsonl \
+  --example-index 0 --steps 1 \
+  --backend metal --metal-device "Apple M-series" \
+  --output-dir /evidence/zig-metal-e2b-qv-step1
+```
+
+The product CLI's paired `--oracle-request` / `--oracle-capture-out` flags are
+the private producer boundary, not the release workflow. They accept only the
+locked 1-, 2-, or 8-step AdamW trajectory, repeat exactly one selected prepared
+row, skip evaluation, and publish a separate closed capture containing the
+final pre-update supervised-position logit probes, final raw F32 gradients,
+post-update weights and Adam moments, and strict execution counters. A
+read-only observer downloads only the final Metal raw-gradient surface without
+rerouting any step away from the normal direct-device AdamW path. The wrapper
+independently validates the
+request echo, stable probe token projection, complete A/B inventory, checkpoint
+counters and zero accumulation cursor, candidate/checkpoint weight equality,
+all file hashes, and fallback-free Metal evidence. It then publishes the common
+trace, candidate adapter, raw producer capture, child logs, and a final closed
+`COMPLETE.json` ledger.
+
+Once both traces have been produced, run the comparison:
+
+```sh
+python3 zig/pkg/inference/scripts/gemma4/compare_gemma4_lora_hf_zig.py \
   compare --reference /evidence/hf-e2b-qv-step1/trace.json \
   --candidate /evidence/zig-metal-e2b-qv-step1/trace.json \
   --profile hf-zig-bf16
-python3 zig/pkg/inference/scripts/compare_gemma4_lora_hf_zig.py \
+python3 zig/pkg/inference/scripts/gemma4/compare_gemma4_lora_hf_zig.py \
   compare-adapters --reference /evidence/hf-e2b-qv-step1/reference_adapter \
   --model-key gemma-4-E2B-it \
   --reference-target-preset peft-qv \
@@ -228,9 +267,9 @@ diluted into a passing aggregate.
 
 The repository includes two fail-closed framework runners:
 
-- `scripts/run_gemma4_lora_mlx_benchmark.py` runs the pinned MLX-LM source in a
+- `scripts/gemma4/run_gemma4_lora_mlx_benchmark.py` runs the pinned MLX-LM source in a
   fresh child process; and
-- `scripts/run_antfly_gemma4_lora_benchmark.py` runs a purpose-built Antfly
+- `scripts/gemma4/run_antfly_gemma4_lora_benchmark.py` runs a purpose-built Antfly
   executable through the typed Gemma4 benchmark-telemetry contract.
 
 Each process consumes the same prepared-v6 row and byte-equivalent canonical
@@ -342,8 +381,8 @@ contains all 24 locked matrix cells):
       "commands": {
         "antfly-zig-metal": [
           "/usr/bin/python3",
-          "/src/antfly/zig/pkg/inference/scripts/run_antfly_gemma4_lora_benchmark.py",
-          "--lock", "/src/antfly/zig/pkg/inference/scripts/gemma4_oracle.lock.json",
+          "/src/antfly/zig/pkg/inference/scripts/gemma4/run_antfly_gemma4_lora_benchmark.py",
+          "--lock", "/src/antfly/zig/pkg/inference/scripts/gemma4/gemma4_oracle.lock.json",
           "--antfly", "/build/antfly",
           "--source-root", "/src/antfly",
           "--model-key", "gemma-4-E2B-it",
@@ -361,7 +400,7 @@ contains all 24 locked matrix cells):
         ],
         "mlx-lm": [
           "/envs/gemma4-mlx/bin/python3.12",
-          "/src/antfly/zig/pkg/inference/scripts/run_gemma4_lora_mlx_benchmark.py",
+          "/src/antfly/zig/pkg/inference/scripts/gemma4/run_gemma4_lora_mlx_benchmark.py",
           "--model-key", "gemma-4-E2B-it",
           "--model-dir", "/models/gemma-4-E2B-it",
           "--prepared", "/evidence/train-v6.json",
@@ -385,7 +424,7 @@ contains all 24 locked matrix cells):
 Run the plan once into a new evidence directory:
 
 ```sh
-python3 zig/pkg/inference/scripts/run_gemma4_lora_benchmark_campaign.py \
+python3 zig/pkg/inference/scripts/gemma4/run_gemma4_lora_benchmark_campaign.py \
   --plan /evidence/gemma4-release-plan.json \
   --output-dir /evidence/gemma4-release-campaign
 ```
@@ -419,11 +458,11 @@ either clean source tree. Create the bundle with the strict local
 dependency/tool manifest; never substitute an ad hoc digest:
 
 ```sh
-python3 zig/pkg/inference/scripts/build_and_attest_gemma4_mlx.py build \
+python3 zig/pkg/inference/scripts/gemma4/build_and_attest_gemma4_mlx.py build \
   --mlx-source /src/mlx \
   --build-output /src/mlx/build/antfly-gemma4-mlx \
   --inputs /evidence/mlx-native-build-inputs.json
-python3 zig/pkg/inference/scripts/build_and_attest_gemma4_mlx.py verify \
+python3 zig/pkg/inference/scripts/gemma4/build_and_attest_gemma4_mlx.py verify \
   --mlx-source /src/mlx \
   --build-output /src/mlx/build/antfly-gemma4-mlx \
   --inputs /evidence/mlx-native-build-inputs.json
@@ -498,9 +537,9 @@ samples as diagnostic until checked-in policy pins plus signed DSSE/SLSA-style
 provenance and race-resistant staging exist.
 
 ```sh
-python3 zig/pkg/inference/scripts/bench_gemma4_lora_mlx_zig.py \
+python3 zig/pkg/inference/scripts/gemma4/bench_gemma4_lora_mlx_zig.py \
   validate /evidence/sample.json
-python3 zig/pkg/inference/scripts/bench_gemma4_lora_mlx_zig.py \
+python3 zig/pkg/inference/scripts/gemma4/bench_gemma4_lora_mlx_zig.py \
   compare \
   --campaign-manifest /evidence/gemma4-release-campaign/COMPLETE.json \
   /evidence/gemma4-release-campaign/samples/[0-9][0-9][0-9][0-9].json
@@ -664,12 +703,13 @@ synthetic tensors, and fail-closed workload-paired benchmark aggregation. They
 do not prove:
 
 - E2B or E4B can complete the locked HF/Zig native/Zig Metal comparison
-  sequence (only one bounded, non-oracle E2B Zig Metal step has completed);
+  sequence (the producer has a required-device tiny-BF16 integration gate, but
+  no locked real-model Zig trace has been promoted yet);
 - HF/Zig logits, loss, gradients, optimizer moments, and updates meet the
   proposed tolerances at steps 1, 2, and 8;
-- a Zig producer capable of emitting every field in
-  `gemma4_oracle_trace.schema.json` (none exists yet);
-- checkpoint/resume is exact on real artifacts;
+- the locked numerical-oracle checkpoint/resume profile is exact on real
+  artifacts (the preference qualifier separately has real E2B/E4B recovery
+  evidence, including the subset-scale E2B mid-epoch result);
 - the one-way Antfly-to-PEFT translator matches fixed logits or generations on
   the locked E2B/E4B oracle, or that a translated PEFT adapter round-trips back
   into Antfly (a non-oracle full E2B PEFT load/forward smoke has passed);

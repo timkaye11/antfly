@@ -27,6 +27,7 @@ const readers_api = @import("antfly_readers");
 const transcribing_api = @import("antfly_transcribing");
 const extracting_api = @import("antfly_extracting");
 const scraping = @import("antfly_scraping");
+const ant_json = @import("antfly-json");
 const jsonschema = @import("antfly_jsonschema");
 const lib_chunker = @import("inference_chunker");
 const hf_tokenizer_mod = @import("inference_hf_tokenizer");
@@ -66,6 +67,7 @@ const ops = @import("../ops/ops.zig");
 const runtime = @import("../runtime/root.zig");
 const tabular_mod = @import("../tabular/root.zig");
 const c_file = @import("../util/c_file.zig");
+const a4b_prepared_pack = @import("../ops/cuda/a4b_prepared_pack.zig");
 const native_backend_choice = @import("../native_backend_choice.zig");
 const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
     pub const pjrt = struct {
@@ -93,7 +95,7 @@ fn shouldSkipAutoMtpDraftLoad(config: generation.GenerationConfig, draft_cfg: gp
 }
 
 fn requiresNativeChannelProjection(config: gpt_model_mod.Config) bool {
-    return config.family == .gemma and config.hasPle();
+    return config.usesGemma4Channels();
 }
 
 fn generationPipelineSession(pipeline: anytype) ?backends_mod.Session {
@@ -105,6 +107,324 @@ fn generationPipelineSession(pipeline: anytype) ?backends_mod.Session {
     return null;
 }
 
+fn generationPipelineUsesReasoningChannels(pipeline: anytype) bool {
+    const Pipeline = switch (@typeInfo(@TypeOf(pipeline))) {
+        .pointer => |pointer| pointer.child,
+        else => @TypeOf(pipeline),
+    };
+    if (comptime @hasField(Pipeline, "gpt_config")) {
+        return requiresNativeChannelProjection(pipeline.gpt_config);
+    }
+    return false;
+}
+
+fn shouldDeferStreamContentForReasoning(
+    pipeline: anytype,
+    config: generation.GenerationConfig,
+) bool {
+    return generationPipelineUsesReasoningChannels(pipeline) and
+        config.enable_thinking != false and
+        // Grammar-constrained Gemma4 generation rewrites the prompt to open
+        // the public final channel directly, so no private reasoning can
+        // precede its incrementally streamed content.
+        config.grammar == null;
+}
+
+test "channel streaming defers content only when reasoning can precede it" {
+    const Probe = struct { gpt_config: gpt_model_mod.Config };
+    const pipeline = Probe{ .gpt_config = .{
+        .family = .gemma,
+        .gemma4_channel_protocol = true,
+    } };
+    try std.testing.expect(shouldDeferStreamContentForReasoning(&pipeline, .{}));
+    try std.testing.expect(!shouldDeferStreamContentForReasoning(&pipeline, .{ .enable_thinking = false }));
+    try std.testing.expect(!shouldDeferStreamContentForReasoning(&pipeline, .{ .grammar = "json" }));
+    const ordinary = Probe{ .gpt_config = .{ .family = .llama } };
+    try std.testing.expect(!shouldDeferStreamContentForReasoning(&ordinary, .{}));
+}
+
+fn serverA4bTelemetryEnabled() bool {
+    return platform.env.getenvBool("TERMITE_SERVER_A4B_TELEMETRY");
+}
+
+const ServerA4bTelemetry = struct {
+    route_select_attempts: u64 = 0,
+    route_select_successes: u64 = 0,
+    route_select_fallbacks: u64 = 0,
+    cuda_resident_source_bytes: u64 = 0,
+    cuda_resident_source_count: u64 = 0,
+    cuda_route_calls: u64 = 0,
+    cuda_decode_calls: u64 = 0,
+    cuda_prefill_calls: u64 = 0,
+    slot_lookup_attempts: u64 = 0,
+    slot_route_hits: u64 = 0,
+    slot_route_misses: u64 = 0,
+    slot_all_hit_layers: u64 = 0,
+    slot_map_publications: u64 = 0,
+    slot_map_publish_failures: u64 = 0,
+    slot_arena_attempts: u64 = 0,
+    slot_arena_successes: u64 = 0,
+    slot_arena_failures: u64 = 0,
+    selected_page_attempts: u64 = 0,
+    selected_page_successes: u64 = 0,
+    selected_page_failures: u64 = 0,
+    selected_page_logical_bytes: u64 = 0,
+    selected_page_mapped_bytes: u64 = 0,
+    selected_page_allocations: u64 = 0,
+    checkpoint_attempts: u64 = 0,
+    checkpoint_all_hit_tokens: u64 = 0,
+    checkpoint_miss_tokens: u64 = 0,
+    checkpoint_replays: u64 = 0,
+    slot_upload_batches: u64 = 0,
+    slot_uploads: u64 = 0,
+    slot_upload_bytes: u64 = 0,
+    mapped_attempts: u64 = 0,
+    mapped_fallbacks: u64 = 0,
+    mapped_failures: u64 = 0,
+    linear_attempts: u64 = 0,
+    linear_successes: u64 = 0,
+    linear_fallbacks: u64 = 0,
+    pair_attempts: u64 = 0,
+    pair_successes: u64 = 0,
+    pair_fallbacks: u64 = 0,
+    scatter_attempts: u64 = 0,
+    scatter_successes: u64 = 0,
+    scatter_fallbacks: u64 = 0,
+    frame_begins: u64 = 0,
+    frame_submits: u64 = 0,
+    compute_encoders: u64 = 0,
+    blit_encoders: u64 = 0,
+    bootstrap_misses: u64 = 0,
+};
+
+fn serverA4bTelemetrySnapshot(cb: ?*const ops.ComputeBackend) ?ops.NativeQuantTimingStats {
+    if (!serverA4bTelemetryEnabled()) return null;
+    const backend = cb orelse return null;
+    if (backend.kind() != .metal and backend.kind() != .cuda) return null;
+    return backend.debugTimingSnapshot().provider;
+}
+
+fn serverA4bTelemetryDelta(
+    after: ops.NativeQuantTimingStats,
+    before: ops.NativeQuantTimingStats,
+) ServerA4bTelemetry {
+    return .{
+        .route_select_attempts = after.a4b_moe_route_select_attempts -| before.a4b_moe_route_select_attempts,
+        .route_select_successes = after.a4b_moe_route_select_successes -| before.a4b_moe_route_select_successes,
+        .route_select_fallbacks = after.a4b_moe_route_select_fallbacks -| before.a4b_moe_route_select_fallbacks,
+        .cuda_resident_source_bytes = after.a4b_cuda_resident_source_bytes,
+        .cuda_resident_source_count = after.a4b_cuda_resident_source_count,
+        .cuda_route_calls = after.a4b_cuda_route_calls -| before.a4b_cuda_route_calls,
+        .cuda_decode_calls = after.a4b_cuda_decode_calls -| before.a4b_cuda_decode_calls,
+        .cuda_prefill_calls = after.a4b_cuda_prefill_calls -| before.a4b_cuda_prefill_calls,
+        .slot_lookup_attempts = after.a4b_moe_slot_lookup_attempts -| before.a4b_moe_slot_lookup_attempts,
+        .slot_route_hits = after.a4b_moe_slot_route_hits -| before.a4b_moe_slot_route_hits,
+        .slot_route_misses = after.a4b_moe_slot_route_misses -| before.a4b_moe_slot_route_misses,
+        .slot_all_hit_layers = after.a4b_moe_slot_all_hit_layers -| before.a4b_moe_slot_all_hit_layers,
+        .slot_map_publications = after.a4b_moe_slot_map_publications -| before.a4b_moe_slot_map_publications,
+        .slot_map_publish_failures = after.a4b_moe_slot_map_publish_failures -| before.a4b_moe_slot_map_publish_failures,
+        .slot_arena_attempts = after.a4b_moe_slot_arena_attempts -| before.a4b_moe_slot_arena_attempts,
+        .slot_arena_successes = after.a4b_moe_slot_arena_successes -| before.a4b_moe_slot_arena_successes,
+        .slot_arena_failures = after.a4b_moe_slot_arena_failures -| before.a4b_moe_slot_arena_failures,
+        .selected_page_attempts = after.a4b_moe_selected_page_attempts -| before.a4b_moe_selected_page_attempts,
+        .selected_page_successes = after.a4b_moe_selected_page_successes -| before.a4b_moe_selected_page_successes,
+        .selected_page_failures = after.a4b_moe_selected_page_failures -| before.a4b_moe_selected_page_failures,
+        .selected_page_logical_bytes = after.a4b_moe_selected_page_logical_bytes -| before.a4b_moe_selected_page_logical_bytes,
+        .selected_page_mapped_bytes = after.a4b_moe_selected_page_mapped_bytes -| before.a4b_moe_selected_page_mapped_bytes,
+        .selected_page_allocations = after.a4b_moe_selected_page_allocations -| before.a4b_moe_selected_page_allocations,
+        .checkpoint_attempts = after.a4b_moe_checkpoint_attempts -| before.a4b_moe_checkpoint_attempts,
+        .checkpoint_all_hit_tokens = after.a4b_moe_checkpoint_all_hit_tokens -| before.a4b_moe_checkpoint_all_hit_tokens,
+        .checkpoint_miss_tokens = after.a4b_moe_checkpoint_miss_tokens -| before.a4b_moe_checkpoint_miss_tokens,
+        .checkpoint_replays = after.a4b_moe_checkpoint_replays -| before.a4b_moe_checkpoint_replays,
+        .slot_upload_batches = after.a4b_moe_slot_upload_batches -| before.a4b_moe_slot_upload_batches,
+        .slot_uploads = after.a4b_moe_slot_uploads -| before.a4b_moe_slot_uploads,
+        .slot_upload_bytes = after.a4b_moe_slot_upload_bytes -| before.a4b_moe_slot_upload_bytes,
+        .mapped_attempts = after.metal_provider_quantized_runtime_mapped_attempts -| before.metal_provider_quantized_runtime_mapped_attempts,
+        .mapped_fallbacks = after.metal_provider_quantized_runtime_mapped_fallbacks -| before.metal_provider_quantized_runtime_mapped_fallbacks,
+        .mapped_failures = after.metal_provider_quantized_runtime_mapped_failures -| before.metal_provider_quantized_runtime_mapped_failures,
+        .linear_attempts = after.a4b_packed_q4_0_linear_attempts -| before.a4b_packed_q4_0_linear_attempts,
+        .linear_successes = after.a4b_packed_q4_0_linear_successes -| before.a4b_packed_q4_0_linear_successes,
+        .linear_fallbacks = after.a4b_packed_q4_0_linear_fallbacks -| before.a4b_packed_q4_0_linear_fallbacks,
+        .pair_attempts = after.a4b_packed_q4_0_pair_attempts -| before.a4b_packed_q4_0_pair_attempts,
+        .pair_successes = after.a4b_packed_q4_0_pair_successes -| before.a4b_packed_q4_0_pair_successes,
+        .pair_fallbacks = after.a4b_packed_q4_0_pair_fallbacks -| before.a4b_packed_q4_0_pair_fallbacks,
+        .scatter_attempts = after.a4b_moe_scatter_attempts -| before.a4b_moe_scatter_attempts,
+        .scatter_successes = after.a4b_moe_scatter_successes -| before.a4b_moe_scatter_successes,
+        .scatter_fallbacks = after.a4b_moe_scatter_fallbacks -| before.a4b_moe_scatter_fallbacks,
+        .frame_begins = after.decoder_runtime_frame_begins -| before.decoder_runtime_frame_begins,
+        .frame_submits = after.decoder_runtime_frame_submits -| before.decoder_runtime_frame_submits,
+        .compute_encoders = after.metal_runtime_compute_encoder_count -| before.metal_runtime_compute_encoder_count,
+        .blit_encoders = after.metal_runtime_blit_encoder_count -| before.metal_runtime_blit_encoder_count,
+        .bootstrap_misses = after.compressed_block_active_frame_bootstrap_misses -| before.compressed_block_active_frame_bootstrap_misses,
+    };
+}
+
+fn logServerA4bTelemetry(
+    cb: ?*const ops.ComputeBackend,
+    before: ?ops.NativeQuantTimingStats,
+    model_name: []const u8,
+) void {
+    const start = before orelse return;
+    const backend = cb orelse return;
+    const delta = serverA4bTelemetryDelta(backend.debugTimingSnapshot().provider, start);
+    if (backend.kind() == .cuda) {
+        std.log.info(
+            "cuda_a4b_server_request: scope=process_delta model={s} resident_source_bytes={d} resident_source_count={d} route_calls={d} decode_calls={d} prefill_calls={d} route_fallbacks={d}",
+            .{
+                model_name,
+                delta.cuda_resident_source_bytes,
+                delta.cuda_resident_source_count,
+                delta.cuda_route_calls,
+                delta.cuda_decode_calls,
+                delta.cuda_prefill_calls,
+                delta.route_select_fallbacks,
+            },
+        );
+        return;
+    }
+    std.log.info(
+        "metal_a4b_server_request: scope=process_delta model={s} route_select_attempts={d} route_select_successes={d} route_select_fallbacks={d} slot_lookup_attempts={d} slot_route_hits={d} slot_route_misses={d} slot_all_hit_layers={d} slot_map_publications={d} slot_map_publish_failures={d} slot_arena_attempts={d} slot_arena_successes={d} slot_arena_failures={d} slot_upload_batches={d} slot_uploads={d} mapped_attempts={d} mapped_fallbacks={d} mapped_failures={d} linear_attempts={d} linear_successes={d} linear_fallbacks={d} pair_attempts={d} pair_successes={d} pair_fallbacks={d} scatter_attempts={d} scatter_successes={d} scatter_fallbacks={d} frame_begins={d} frame_submits={d} compute_encoders={d} blit_encoders={d} bootstrap_misses={d}",
+        .{
+            model_name,
+            delta.route_select_attempts,
+            delta.route_select_successes,
+            delta.route_select_fallbacks,
+            delta.slot_lookup_attempts,
+            delta.slot_route_hits,
+            delta.slot_route_misses,
+            delta.slot_all_hit_layers,
+            delta.slot_map_publications,
+            delta.slot_map_publish_failures,
+            delta.slot_arena_attempts,
+            delta.slot_arena_successes,
+            delta.slot_arena_failures,
+            delta.slot_upload_batches,
+            delta.slot_uploads,
+            delta.mapped_attempts,
+            delta.mapped_fallbacks,
+            delta.mapped_failures,
+            delta.linear_attempts,
+            delta.linear_successes,
+            delta.linear_fallbacks,
+            delta.pair_attempts,
+            delta.pair_successes,
+            delta.pair_fallbacks,
+            delta.scatter_attempts,
+            delta.scatter_successes,
+            delta.scatter_fallbacks,
+            delta.frame_begins,
+            delta.frame_submits,
+            delta.compute_encoders,
+            delta.blit_encoders,
+            delta.bootstrap_misses,
+        },
+    );
+    std.log.info(
+        "metal_a4b_server_selected_page: scope=process_delta model={s} attempts={d} successes={d} failures={d} logical_bytes={d} mapped_bytes={d} allocations={d}",
+        .{
+            model_name,
+            delta.selected_page_attempts,
+            delta.selected_page_successes,
+            delta.selected_page_failures,
+            delta.selected_page_logical_bytes,
+            delta.selected_page_mapped_bytes,
+            delta.selected_page_allocations,
+        },
+    );
+    std.log.info(
+        "metal_a4b_server_checkpoint: scope=process_delta model={s} attempts={d} all_hit_tokens={d} miss_tokens={d} replays={d}",
+        .{
+            model_name,
+            delta.checkpoint_attempts,
+            delta.checkpoint_all_hit_tokens,
+            delta.checkpoint_miss_tokens,
+            delta.checkpoint_replays,
+        },
+    );
+}
+
+test "server A4B telemetry reports saturating request deltas" {
+    var before = ops.NativeQuantTimingStats{};
+    before.a4b_moe_route_select_attempts = 10;
+    before.a4b_packed_q4_0_linear_attempts = 90;
+    before.decoder_runtime_frame_submits = 20;
+    before.metal_provider_quantized_runtime_mapped_fallbacks = 2;
+
+    var after = before;
+    after.a4b_moe_route_select_attempts = 130;
+    after.a4b_moe_route_select_successes = 120;
+    after.a4b_cuda_resident_source_bytes = 14_000_000_000;
+    after.a4b_cuda_resident_source_count = 60;
+    after.a4b_cuda_route_calls = 120;
+    after.a4b_cuda_decode_calls = 90;
+    after.a4b_cuda_prefill_calls = 30;
+    after.a4b_moe_slot_lookup_attempts = 120;
+    after.a4b_moe_slot_route_hits = 880;
+    after.a4b_moe_slot_route_misses = 80;
+    after.a4b_moe_slot_all_hit_layers = 70;
+    after.a4b_moe_slot_map_publications = 120;
+    after.a4b_moe_slot_arena_attempts = 120;
+    after.a4b_moe_slot_arena_successes = 118;
+    after.a4b_moe_slot_arena_failures = 2;
+    after.a4b_moe_selected_page_attempts = 120;
+    after.a4b_moe_selected_page_successes = 120;
+    after.a4b_moe_selected_page_logical_bytes = 3_211_591_680;
+    after.a4b_moe_selected_page_mapped_bytes = 3_232_235_520;
+    after.a4b_moe_selected_page_allocations = 1_920;
+    after.a4b_moe_checkpoint_attempts = 3;
+    after.a4b_moe_checkpoint_all_hit_tokens = 2;
+    after.a4b_moe_checkpoint_miss_tokens = 1;
+    after.a4b_moe_checkpoint_replays = 1;
+    after.a4b_moe_slot_upload_batches = 10;
+    after.a4b_moe_slot_uploads = 80;
+    after.a4b_moe_slot_upload_bytes = 268_697_600;
+    after.a4b_packed_q4_0_linear_attempts = 810;
+    after.a4b_packed_q4_0_linear_successes = 720;
+    after.a4b_packed_q4_0_pair_attempts = 240;
+    after.a4b_packed_q4_0_pair_successes = 240;
+    after.a4b_moe_scatter_attempts = 240;
+    after.a4b_moe_scatter_successes = 240;
+    after.decoder_runtime_frame_submits = 477;
+    // A runtime counter reset must never wrap to a false giant failure count.
+    after.metal_provider_quantized_runtime_mapped_fallbacks = 0;
+
+    const delta = serverA4bTelemetryDelta(after, before);
+    try std.testing.expectEqual(@as(u64, 120), delta.route_select_attempts);
+    try std.testing.expectEqual(@as(u64, 120), delta.route_select_successes);
+    try std.testing.expectEqual(@as(u64, 14_000_000_000), delta.cuda_resident_source_bytes);
+    try std.testing.expectEqual(@as(u64, 60), delta.cuda_resident_source_count);
+    try std.testing.expectEqual(@as(u64, 120), delta.cuda_route_calls);
+    try std.testing.expectEqual(@as(u64, 90), delta.cuda_decode_calls);
+    try std.testing.expectEqual(@as(u64, 30), delta.cuda_prefill_calls);
+    try std.testing.expectEqual(@as(u64, 120), delta.slot_lookup_attempts);
+    try std.testing.expectEqual(@as(u64, 880), delta.slot_route_hits);
+    try std.testing.expectEqual(@as(u64, 80), delta.slot_route_misses);
+    try std.testing.expectEqual(@as(u64, 70), delta.slot_all_hit_layers);
+    try std.testing.expectEqual(@as(u64, 120), delta.slot_map_publications);
+    try std.testing.expectEqual(@as(u64, 120), delta.slot_arena_attempts);
+    try std.testing.expectEqual(@as(u64, 118), delta.slot_arena_successes);
+    try std.testing.expectEqual(@as(u64, 2), delta.slot_arena_failures);
+    try std.testing.expectEqual(@as(u64, 120), delta.selected_page_attempts);
+    try std.testing.expectEqual(@as(u64, 120), delta.selected_page_successes);
+    try std.testing.expectEqual(@as(u64, 0), delta.selected_page_failures);
+    try std.testing.expectEqual(@as(u64, 3_211_591_680), delta.selected_page_logical_bytes);
+    try std.testing.expectEqual(@as(u64, 3_232_235_520), delta.selected_page_mapped_bytes);
+    try std.testing.expectEqual(@as(u64, 1_920), delta.selected_page_allocations);
+    try std.testing.expectEqual(@as(u64, 3), delta.checkpoint_attempts);
+    try std.testing.expectEqual(@as(u64, 2), delta.checkpoint_all_hit_tokens);
+    try std.testing.expectEqual(@as(u64, 1), delta.checkpoint_miss_tokens);
+    try std.testing.expectEqual(@as(u64, 1), delta.checkpoint_replays);
+    try std.testing.expectEqual(@as(u64, 10), delta.slot_upload_batches);
+    try std.testing.expectEqual(@as(u64, 80), delta.slot_uploads);
+    try std.testing.expectEqual(@as(u64, 268_697_600), delta.slot_upload_bytes);
+    try std.testing.expectEqual(@as(u64, 720), delta.linear_attempts);
+    try std.testing.expectEqual(@as(u64, 720), delta.linear_successes);
+    try std.testing.expectEqual(@as(u64, 240), delta.pair_attempts);
+    try std.testing.expectEqual(@as(u64, 240), delta.scatter_successes);
+    try std.testing.expectEqual(@as(u64, 457), delta.frame_submits);
+    try std.testing.expectEqual(@as(u64, 0), delta.mapped_fallbacks);
+}
+
 fn generationStreamShouldContinue(
     write_failed: bool,
     cancellation: ?*const std.atomic.Value(bool),
@@ -112,6 +432,21 @@ fn generationStreamShouldContinue(
     if (write_failed) return false;
     if (cancellation) |signal| return !signal.load(.acquire);
     return true;
+}
+
+fn generationStreamWriteIsPeerDisconnect(err: anyerror) bool {
+    return switch (err) {
+        error.Canceled,
+        error.Cancelled,
+        error.EndOfStream,
+        error.StreamClosed,
+        error.ConnectionResetByPeer,
+        error.BrokenPipe,
+        error.SendFailed,
+        error.Timeout,
+        => true,
+        else => false,
+    };
 }
 
 test "generation pipeline session lookup is field safe" {
@@ -127,6 +462,14 @@ test "generation stream continuation observes writes and peer cancellation" {
     try std.testing.expect(!generationStreamShouldContinue(true, null));
 }
 
+test "generation stream write classification separates peer disconnects from server faults" {
+    try std.testing.expect(generationStreamWriteIsPeerDisconnect(error.SendFailed));
+    try std.testing.expect(generationStreamWriteIsPeerDisconnect(error.StreamClosed));
+    try std.testing.expect(generationStreamWriteIsPeerDisconnect(error.Canceled));
+    try std.testing.expect(!generationStreamWriteIsPeerDisconnect(error.OutOfMemory));
+    try std.testing.expect(!generationStreamWriteIsPeerDisconnect(error.EventTooLarge));
+}
+
 test "channel-aware Gemma generation stays on projected native backends" {
     try std.testing.expect(!requiresNativeChannelProjection(.{}));
     try std.testing.expect(!requiresNativeChannelProjection(.{ .family = .gemma }));
@@ -134,6 +477,22 @@ test "channel-aware Gemma generation stays on projected native backends" {
         .family = .gemma,
         .ple_hidden_size = 256,
     }));
+    try std.testing.expect(requiresNativeChannelProjection(.{
+        .family = .gemma,
+        .gemma4_channel_protocol = true,
+    }));
+}
+
+test "generate API serializes public content and reasoning separately" {
+    const rendered = try std.json.Stringify.valueAlloc(std.testing.allocator, api.GenerateMessage{
+        .role = .assistant,
+        .content = .{ .value = "Paris" },
+        .reasoning_content = .{ .value = "The capital of France is Paris." },
+    }, .{ .emit_null_optional_fields = false });
+    defer std.testing.allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"content\":\"Paris\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"reasoning_content\":\"The capital of France is Paris.\"") != null);
 }
 
 const GenerateSpeculationOptions = struct {
@@ -257,20 +616,21 @@ fn generateSpeculationErrorMessage(err: anyerror) []const u8 {
 
 fn generateSpeculationStatus(stats: ?generation.SpeculativeDecodeStats) ?api.GenerateSpeculationStatus {
     const value = stats orelse return null;
+    const disabled_reason = value.mtp_disabled_reason orelse switch (value.speculation_policy_decision) {
+        .disabled_off => "speculation_policy_off",
+        .disabled_unavailable => "draft_backend_unavailable",
+        .disabled_uncalibrated => "speculation_calibration_required",
+        .disabled_low_acceptance => "mtp_auto_low_acceptance",
+        .disabled_zero_match => "mtp_auto_zero_match",
+        .disabled_slow => "mtp_auto_cost_probe_slow",
+        .disabled_insufficient_probe => "mtp_auto_insufficient_cost_probe",
+        .inactive, .active, .forced => null,
+    };
     return .{
         .policy = value.speculation_policy.name(),
         .calibration = value.speculation_calibration.name(),
         .decision = value.speculation_policy_decision.name(),
-        .disabled_reason = value.mtp_disabled_reason orelse switch (value.speculation_policy_decision) {
-            .disabled_off => "speculation_policy_off",
-            .disabled_unavailable => "draft_backend_unavailable",
-            .disabled_uncalibrated => "speculation_calibration_required",
-            .disabled_low_acceptance => "mtp_auto_low_acceptance",
-            .disabled_zero_match => "mtp_auto_zero_match",
-            .disabled_slow => "mtp_auto_cost_probe_slow",
-            .disabled_insufficient_probe => "mtp_auto_insufficient_cost_probe",
-            .inactive, .active, .forced => null,
-        },
+        .disabled_reason = if (disabled_reason) |reason| .{ .value = reason } else .absent,
     };
 }
 
@@ -280,6 +640,64 @@ fn shouldResolveDraftModel(policy: generation.SpeculationPolicy) bool {
 
 fn effectiveDraftModelName(requested: ?[]const u8, policy: generation.SpeculationPolicy) ?[]const u8 {
     return if (shouldResolveDraftModel(policy)) requested else null;
+}
+
+fn generationSpeculationRequested(effective_draft: ?[]const u8, auto_discovered_draft: ?[]const u8) bool {
+    return effective_draft != null or auto_discovered_draft != null;
+}
+
+fn qualifyAutoDiscoveredDraftSpeculation(options: *GenerateSpeculationOptions) void {
+    // A client cannot name calibration controls without an explicit drafter at
+    // the HTTP trust boundary. Once the server discovers its own best-effort
+    // MTP companion, AUTO therefore has to opt into the bounded cost probe or
+    // the drafter is loaded and admitted only to be disabled as uncalibrated.
+    if (options.policy == .auto and options.calibration == .none) {
+        options.calibration = .probe;
+    }
+}
+
+/// Opt-in: when a request carries no draft_model and the speculation policy is
+/// auto, discover the Gemma4 MTP assistant artifact sitting next to the target
+/// model dir. Kept fail-closed until Metal auto-MTP qualifies as a default.
+fn gemma4MtpAutoDraftDiscoveryEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_AUTO_DRAFT_DISCOVERY", false);
+}
+
+/// Sibling MTP assistant dir for a Gemma4 QAT gguf artifact
+/// (`...-q4_0-gguf` -> `...-q4_0-unquantized-assistant`), or null when the
+/// model dir has no such sibling on disk. Caller owns the returned path.
+/// The name qualification mirrors registry.gemma4MtpAssistantCompanionRefAlloc
+/// so discovery only ever matches artifacts the companion pull can create.
+fn gemma4MtpAssistantSiblingPath(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model_path: []const u8,
+) ?[]const u8 {
+    const suffix = "-gguf";
+    if (!std.mem.endsWith(u8, model_path, suffix)) return null;
+    const base_name = std.fs.path.basename(model_path);
+    if (std.ascii.indexOfIgnoreCase(base_name, "gemma-4-") == null) return null;
+    if (std.ascii.indexOfIgnoreCase(base_name, "-qat-") == null) return null;
+    const sibling = std.fmt.allocPrint(
+        allocator,
+        "{s}-unquantized-assistant",
+        .{model_path[0 .. model_path.len - suffix.len]},
+    ) catch return null;
+    _ = std.Io.Dir.cwd().statFile(io, sibling, .{}) catch {
+        allocator.free(sibling);
+        return null;
+    };
+    return sibling;
+}
+
+/// A discovered drafter must parse as a model before it may join the request:
+/// stale or partial sibling directories degrade to non-speculative generation
+/// rather than failing generate calls the client never asked to speculate.
+fn validateDiscoveredDraftDir(allocator: std.mem.Allocator, dir: []const u8) bool {
+    var draft_manifest = manifest_mod.loadFromDir(allocator, dir) catch return false;
+    defer draft_manifest.deinit();
+    _ = session_factory.loadGptConfigFromModelDir(allocator, dir, draft_manifest) catch return false;
+    return true;
 }
 
 fn validateQualifiedProfileDraft(
@@ -298,6 +716,16 @@ fn generateAdmissionUnitsForSpeculation(
 ) usize {
     if (!draft_requested or !shouldResolveDraftModel(policy)) return base_units;
     return std.math.add(usize, base_units, base_units) catch std.math.maxInt(usize);
+}
+
+/// Remove only the admission units added for an auto-discovered drafter.
+/// `reserved_units` may have grown independently after media decoding, so
+/// restoring an older base estimate would silently undercharge the request.
+fn takeAutoDraftAdmissionExtra(reserved_units: *usize, auto_draft_extra_units: *usize) usize {
+    const released = @min(reserved_units.*, auto_draft_extra_units.*);
+    reserved_units.* -= released;
+    auto_draft_extra_units.* = 0;
+    return released;
 }
 
 fn generationBackendKind(backend: backends_mod.BackendType) ?runtime.kv.pool.BackendKind {
@@ -808,13 +1236,105 @@ pub const WarmModelKind = enum {
     extractor,
 };
 
+pub const WarmModelStartupStrategy = enum {
+    eager,
+    prefetch,
+};
+
 pub const WarmModel = struct {
     kind: WarmModelKind = .generator,
     name: []const u8,
     backend: ?backends_mod.BackendType = null,
     format: ?[]const u8 = null,
     quantization: ?[]const u8 = null,
+    residency_mode: ?ops.A4bResidencyMode = null,
+    memory_budget_mb: ?u32 = null,
+    load_strategy: ?ops.A4bLoadStrategy = null,
+    load_workers: ?u8 = null,
+    load_staging_mb: ?u32 = null,
+    prepared_pack: ?ops.A4bPreparedPackMode = null,
+    drop_host_cache_after_load: bool = false,
+    startup_strategy: WarmModelStartupStrategy = .eager,
+
+    pub fn a4bRequest(self: WarmModel) ?ops.A4bInferenceRequest {
+        const residency_mode = self.residency_mode orelse .auto;
+        const memory_budget_mb = self.memory_budget_mb orelse 0;
+        const load_strategy = self.load_strategy orelse .auto;
+        const load_workers = self.load_workers orelse 0;
+        const load_staging_mb = self.load_staging_mb orelse 0;
+        const prepared_pack = self.prepared_pack orelse .auto;
+        // The documented wire defaults are policy-neutral. Treating explicit
+        // `auto`/`0` as an A4B request makes an otherwise ordinary generator
+        // fail geometry qualification merely because defaults were serialized.
+        if (residency_mode == .auto and memory_budget_mb == 0 and
+            load_strategy == .auto and load_workers == 0 and load_staging_mb == 0 and
+            prepared_pack == .auto and !self.drop_host_cache_after_load) return null;
+        return .{
+            .residency_mode = residency_mode,
+            .memory_budget_mb = memory_budget_mb,
+            .load_strategy = load_strategy,
+            .load_workers = load_workers,
+            .load_staging_mb = load_staging_mb,
+            .prepared_pack = prepared_pack,
+            .drop_host_cache_after_load = self.drop_host_cache_after_load,
+        };
+    }
 };
+
+fn validatedWarmModelA4bRequest(model: WarmModel) !?ops.A4bInferenceRequest {
+    const request = model.a4bRequest();
+    if (request != null and model.kind != .generator) return error.A4bUnsupportedModelKind;
+    if (request != null and model.backend != null and
+        model.backend.? != .metal and model.backend.? != .cuda)
+        return error.A4bRequiresGpu;
+    return request;
+}
+
+test "warm model A4B controls are GPU generator only" {
+    try std.testing.expect((WarmModel{
+        .name = "ordinary-generator",
+        .residency_mode = .auto,
+        .memory_budget_mb = 0,
+    }).a4bRequest() == null);
+    const request = (try validatedWarmModelA4bRequest(.{
+        .name = "gemma4-a4b",
+        .backend = .metal,
+        .residency_mode = .streamed,
+        .memory_budget_mb = 4096,
+    })).?;
+    try std.testing.expectEqual(ops.A4bResidencyMode.streamed, request.residency_mode);
+    try std.testing.expectEqual(@as(u32, 4096), request.memory_budget_mb);
+    const cuda_request = (try validatedWarmModelA4bRequest(.{
+        .name = "gemma4-a4b-cuda",
+        .backend = .cuda,
+        .residency_mode = .resident,
+        .memory_budget_mb = 16384,
+    })).?;
+    try std.testing.expectEqual(ops.A4bResidencyMode.resident, cuda_request.residency_mode);
+    const prepared_request = (try validatedWarmModelA4bRequest(.{
+        .name = "gemma4-a4b-cuda-pack",
+        .backend = .cuda,
+        .load_strategy = .pipeline,
+        .load_workers = 6,
+        .load_staging_mb = 384,
+        .prepared_pack = .required,
+        .drop_host_cache_after_load = true,
+    })).?;
+    try std.testing.expectEqual(ops.A4bLoadStrategy.pipeline, prepared_request.load_strategy);
+    try std.testing.expectEqual(@as(u8, 6), prepared_request.load_workers);
+    try std.testing.expectEqual(ops.A4bPreparedPackMode.required, prepared_request.prepared_pack);
+    try std.testing.expect(prepared_request.drop_host_cache_after_load);
+    try std.testing.expectError(error.A4bRequiresGpu, validatedWarmModelA4bRequest(.{
+        .name = "gemma4-a4b",
+        .backend = .native,
+        .memory_budget_mb = 4096,
+    }));
+    try std.testing.expectError(error.A4bUnsupportedModelKind, validatedWarmModelA4bRequest(.{
+        .kind = .embedder,
+        .name = "embedder",
+        .residency_mode = .streamed,
+    }));
+}
 
 fn warmModelTaskDir(kind: WarmModelKind) []const u8 {
     return switch (kind) {
@@ -931,6 +1451,7 @@ fn shouldAutoUseMetalWholeModelGenerate(
     metal_executor_supported: bool,
     deepseek_compressed_cache: bool,
     prompt_cache_requested: bool,
+    speculation_requested: bool,
     selection: GenerateBackendSelection,
 ) bool {
     if (!build_options.enable_metal) return false;
@@ -938,6 +1459,14 @@ fn shouldAutoUseMetalWholeModelGenerate(
     // auto-selecting whole-model compiled execution would ignore an explicit
     // prompt_cache_key and make the opt-in cache appear enabled but inert.
     if (prompt_cache_requested) return false;
+    // Gemma4 MTP and ordinary speculative decoding both need model-specific
+    // draft state, while MTP additionally taps the target's final hidden rows.
+    // The whole-model compiled contract currently exposes logits/tokens only;
+    // selecting it here turns an otherwise supported eager request into a
+    // late MissingGraphCacheForCompiledPartitionBackend failure. Keep draft
+    // requests on the qualified eager decoder-runtime route until compiled
+    // speculation has an explicit two-model graph and hidden-output contract.
+    if (speculation_requested) return false;
     if (selection.eager_mode_requested) return false;
     if (selection.compiled_partition_backend != null) return false;
     if (selection.native_choice == .native) return false;
@@ -2595,6 +3124,35 @@ fn classifyExtractionResolutionFailure(err: anyerror) ExtractionResolutionFailur
     };
 }
 
+fn compatibilityBackendsForSessionManager(
+    session_manager: *const backends_mod.SessionManager,
+    required_scratch: *[1]backends_mod.BackendType,
+) ![]const backends_mod.BackendType {
+    return session_manager.requiredBackendCandidates(
+        session_manager.preferred_backends,
+        required_scratch,
+    );
+}
+
+test "compatibility backend candidates honor required policy" {
+    var session_manager = backends_mod.SessionManager.init(std.testing.allocator);
+    session_manager.preferred_backends = &.{ .native, .cuda };
+    session_manager.required_backend = .cuda;
+    session_manager.required_backend_invalid = false;
+    var required_scratch: [1]backends_mod.BackendType = undefined;
+    try std.testing.expectEqualSlices(
+        backends_mod.BackendType,
+        &.{.cuda},
+        try compatibilityBackendsForSessionManager(&session_manager, &required_scratch),
+    );
+
+    session_manager.required_backend = .pjrt;
+    try std.testing.expectError(
+        error.RequiredBackendUnavailable,
+        compatibilityBackendsForSessionManager(&session_manager, &required_scratch),
+    );
+}
+
 pub const Node = struct {
     config: NodeConfig,
     allocator: std.mem.Allocator,
@@ -2712,6 +3270,7 @@ pub const Node = struct {
         try config.kernel_jit.validate();
         try config.prompt_cache.validate();
         var session_manager = backends_mod.SessionManager.init(allocator);
+        try session_manager.validateRequiredBackendPolicy();
         session_manager.kernel_jit = config.kernel_jit;
         try graph_mod.kernel_jit.validateMetalProfileBackend(
             backends_mod.BackendType.metal.available(),
@@ -2871,6 +3430,11 @@ pub const Node = struct {
         allocator: std.mem.Allocator,
         model_path: []const u8,
     ) !CompatibilitySummary {
+        var required_backend_scratch: [1]backends_mod.BackendType = undefined;
+        const compatibility_backends = try compatibilityBackendsForSessionManager(
+            &self.session_manager,
+            &required_backend_scratch,
+        );
         var io_impl: ?std.Io.Threaded = null;
         defer if (io_impl) |*threaded| threaded.deinit();
         const io = self.session_manager.io orelse blk: {
@@ -2929,7 +3493,7 @@ pub const Node = struct {
                 allocator,
                 model_path,
                 &man,
-                self.session_manager.preferred_backends,
+                compatibility_backends,
             );
 
             var verification_manifest = try manifest_mod.loadListingFromDir(
@@ -3207,7 +3771,7 @@ pub const Node = struct {
             };
         }
 
-        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, false, null, false);
+        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, false, null, false, null);
     }
 
     pub fn generateMessagesDirect(
@@ -3216,7 +3780,7 @@ pub const Node = struct {
         model_name: []const u8,
         messages: []const generation.Message,
     ) ![]u8 {
-        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, false, null, false);
+        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, false, null, false, null);
     }
 
     pub fn beginDirectGenerateAdmission(
@@ -3292,6 +3856,7 @@ pub const Node = struct {
             false,
             null,
             false,
+            null,
         );
     }
 
@@ -3350,6 +3915,7 @@ pub const Node = struct {
         cache_default_alias: bool,
         timing: ?*DirectGenerateTiming,
         pin_after_success: bool,
+        a4b_request: ?ops.A4bInferenceRequest,
     ) ![]u8 {
         if (messages.len == 0) return error.InvalidGenerationRequest;
         const preflight = try directGeneratePreflightForMessages(messages);
@@ -3364,6 +3930,7 @@ pub const Node = struct {
             cache_default_alias,
             timing,
             pin_after_success,
+            a4b_request,
         );
     }
 
@@ -3377,6 +3944,7 @@ pub const Node = struct {
         cache_default_alias: bool,
         timing: ?*DirectGenerateTiming,
         pin_after_success: bool,
+        a4b_request: ?ops.A4bInferenceRequest,
     ) ![]u8 {
         if (messages.len == 0) return error.InvalidGenerationRequest;
         const admitted_node = admission.node orelse return error.InvalidGenerationAdmission;
@@ -3395,7 +3963,17 @@ pub const Node = struct {
         };
         defer self.allocator.free(model_path);
         const resolved_at_ns = embedTimingNowNs();
-        var model_handle = if (preferred_backends) |backends|
+        var model_handle = if (a4b_request) |request|
+            if (preferred_backends) |backends|
+                try self.model_manager.acquireFromDirWithPreferredBackendsAndA4bRequest(
+                    model_path,
+                    backends,
+                    cache_default_alias,
+                    request,
+                )
+            else
+                try self.model_manager.acquireFromDirWithA4bRequest(model_path, request)
+        else if (preferred_backends) |backends|
             try self.model_manager.acquireFromDirWithPreferredBackends(model_path, backends, cache_default_alias)
         else
             try self.model_manager.acquireFromDir(model_path);
@@ -3633,6 +4211,14 @@ pub const Node = struct {
             }
             return error.KernelJitRequiredPreloadMissing;
         }
+        if (self.config.kernel_jit.mode.failClosed() or
+            self.config.kernel_jit.qualified_profile_path != null)
+        {
+            for (self.config.preload) |model| {
+                if (model.startup_strategy == .prefetch)
+                    return error.KernelJitRequiredPreloadCannotBePrefetchOnly;
+            }
+        }
         if (self.config.kernel_jit.qualified_profile_path != null and self.config.preload.len != 1) {
             return error.KernelJitQualifiedProfileMultiplePreloadsUnsupported;
         }
@@ -3659,9 +4245,12 @@ pub const Node = struct {
     }
 
     pub fn warmModel(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
+        if (model.startup_strategy == .prefetch)
+            return self.prefetchWarmModel(allocator, model);
+        const a4b_request = try validatedWarmModelA4bRequest(model);
         const materialize_optional_sessions = kernelJitMaterializesOptionalSessions(self.config.kernel_jit.mode);
         switch (model.kind) {
-            .generator => try self.warmGeneratorWithBackend(allocator, model.name, model.backend),
+            .generator => try self.warmGeneratorWithBackend(allocator, model.name, model.backend, a4b_request),
             .embedder => try self.warmEmbedder(allocator, model.name, model.backend, materialize_optional_sessions),
             .reranker => try self.warmReranker(allocator, model.name, model.backend),
             .chunker, .classifier, .rewriter, .reader, .transcriber, .extractor => try self.warmLoadOnlyModel(allocator, model),
@@ -3671,12 +4260,54 @@ pub const Node = struct {
         }
     }
 
+    fn prefetchWarmModel(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
+        if (model.kind != .generator) return error.A4bPrefetchRequiresGenerator;
+        if (model.backend != null and model.backend.? != .cuda)
+            return error.A4bPrefetchRequiresCuda;
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        const model_path = try self.resolveModelPath(io_impl.io(), model.name, warmModelTaskDir(model.kind));
+        defer self.allocator.free(model_path);
+        var manifest = try manifest_mod.loadFromDir(allocator, model_path);
+        defer manifest.deinit();
+        const gguf_path = manifest.gguf_path orelse return error.A4bPrefetchRequiresGguf;
+        const workers = model.load_workers orelse ops.A4bInferenceConfig.default_load_workers;
+        const started_ns = embedTimingNowNs();
+        if ((model.prepared_pack orelse .auto) != .off) {
+            if (try a4b_prepared_pack.prefetchInstalled(allocator, model_path, gguf_path, workers)) |prepared| {
+                std.log.info(
+                    "prefetched A4B prepared pack model={s} shards={d} bytes={d} workers={d} elapsed_ms={d}",
+                    .{ model.name, prepared.shard_count, prepared.bytes, prepared.workers, elapsedMs(started_ns, embedTimingNowNs()) },
+                );
+                return;
+            } else if ((model.prepared_pack orelse .auto) == .required) {
+                return error.A4bPreparedPackRequired;
+            }
+        }
+        const result = try c_file.prefetchFile(allocator, gguf_path, workers);
+        std.log.info(
+            "prefetched inference generator model={s} artifact={s} bytes={d} workers={d} elapsed_ms={d}",
+            .{ model.name, gguf_path, result.bytes, result.workers, elapsedMs(started_ns, embedTimingNowNs()) },
+        );
+    }
+
     fn materializeWarmModelOptionalSessions(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
         var io_impl = std.Io.Threaded.init(allocator, .{});
         defer io_impl.deinit();
         const model_path = try self.resolveModelPath(io_impl.io(), model.name, warmModelTaskDir(model.kind));
         defer self.allocator.free(model_path);
-        var loaded_handle = if (model.backend) |backend|
+        const a4b_request = model.a4bRequest();
+        var loaded_handle = if (a4b_request) |request|
+            if (model.backend) |backend|
+                try self.model_manager.acquireFromDirWithPreferredBackendsAndA4bRequest(
+                    model_path,
+                    singleBackendPreference(backend),
+                    true,
+                    request,
+                )
+            else
+                try self.model_manager.acquireFromDirWithA4bRequest(model_path, request)
+        else if (model.backend) |backend|
             try self.model_manager.acquireFromDirWithPreferredBackends(model_path, singleBackendPreference(backend), true)
         else
             try self.model_manager.acquireFromDir(model_path);
@@ -3692,10 +4323,16 @@ pub const Node = struct {
     }
 
     pub fn warmGenerator(self: *Node, allocator: std.mem.Allocator, model_name: []const u8) !void {
-        try self.warmGeneratorWithBackend(allocator, model_name, null);
+        try self.warmGeneratorWithBackend(allocator, model_name, null, null);
     }
 
-    fn warmGeneratorWithBackend(self: *Node, allocator: std.mem.Allocator, model_name: []const u8, backend: ?backends_mod.BackendType) !void {
+    fn warmGeneratorWithBackend(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        backend: ?backends_mod.BackendType,
+        a4b_request: ?ops.A4bInferenceRequest,
+    ) !void {
         if (model_name.len == 0) return error.InvalidGenerationRequest;
         const started_at_ns = embedTimingNowNs();
         std.log.info("warming inference generator model={s}", .{model_name});
@@ -3705,7 +4342,17 @@ pub const Node = struct {
             .content = "ping",
         }};
         var timing = DirectGenerateTiming{};
-        const text = try self.generateMessagesDirectMaxTokens(allocator, model_name, &messages, 1, preferred_backends, true, &timing, true);
+        const text = try self.generateMessagesDirectMaxTokens(
+            allocator,
+            model_name,
+            &messages,
+            1,
+            preferred_backends,
+            true,
+            &timing,
+            true,
+            a4b_request,
+        );
         defer allocator.free(text);
         const elapsed_ms = elapsedMs(started_at_ns, embedTimingNowNs());
         std.log.info(
@@ -4246,24 +4893,60 @@ pub const Node = struct {
         self.metrics.incRequest(if (admission_owner == .direct) "extract.local" else "extract");
         defer self.metrics.decActive();
 
-        const media_shape = try directExtractionMediaShape(allocator, request.inputs);
-        const media_admission = requestMediaAdmission(self, media_shape);
-        try self.growAdmissionUnits(reserved_units, media_admission.units);
-        reserved_units = media_admission.units;
-
         var schema_parsed = try std.json.parseFromSlice(extraction_api.ExtractionSchema, allocator, request.schema_json, .{
             .allocate = .alloc_always,
             .ignore_unknown_fields = true,
         });
         defer schema_parsed.deinit();
+        const operation = try canonicalExtractionOperation(schema_parsed.value);
+
+        if (operation != .structures) {
+            // Entity, relation, and classification models are text-only. Parse
+            // them with a no-I/O path so a request that will be rejected cannot
+            // trigger remote media fetches or decoding work first.
+            var typed_options = try std.json.parseFromSlice(extraction_api.ExtractionOptions, allocator, if (request.options_json.len > 0) request.options_json else "{}", .{
+                .allocate = .alloc_always,
+                .ignore_unknown_fields = true,
+            });
+            defer typed_options.deinit();
+            var parsed_inputs = try parseDirectTextExtractionInputs(allocator, request.inputs);
+            defer parsed_inputs.deinit();
+            const json = switch (operation) {
+                .entities_relations => try self.extractEntitiesAndRelationsDirectJsonAlloc(
+                    allocator,
+                    model_name,
+                    schema_parsed.value,
+                    typed_options.value,
+                    request.inputs,
+                    parsed_inputs.texts.items,
+                ),
+                .classifications => try self.extractClassificationsDirectJsonAlloc(
+                    allocator,
+                    model_name,
+                    schema_parsed.value,
+                    typed_options.value,
+                    request.inputs,
+                    parsed_inputs.texts.items,
+                ),
+                .structures => unreachable,
+            };
+            return .{ .allocator = allocator, .json = json };
+        }
+
         const schemas = try parseCanonicalStructureSchemas(allocator, schema_parsed.value);
         defer {
             for (schemas) |*schema| schema.deinit(allocator);
             allocator.free(schemas);
         }
 
+        // This parser bounds max_tokens before resolver or media work begins.
         var options = try parseExtractionOptionsJson(allocator, request.options_json);
         defer options.deinit();
+        const media_shape = try directExtractionMediaShape(allocator, request.inputs);
+        if (media_shape.image_count > max_read_batch_images) return error.ReadBatchTooLarge;
+        const media_admission = requestMediaAdmission(self, media_shape);
+        try self.growAdmissionUnits(reserved_units, media_admission.units);
+        reserved_units = media_admission.units;
         const config = extraction_mod.ExtractionConfig{
             .threshold = options.threshold orelse 0.3,
             .flat_ner = options.flat_ner orelse true,
@@ -4288,6 +4971,7 @@ pub const Node = struct {
         var extractor = try extractors_mod.resolve(extractor_ctx, model_name, media_shape.image_count > 0);
         defer extractor.deinit(allocator);
 
+        // Fetch and decode request media only after resolver preflight succeeds.
         var parsed_inputs = try parseDirectExtractionInputs(
             self,
             allocator,
@@ -4297,12 +4981,8 @@ pub const Node = struct {
             media_admission.byte_cap,
         );
         defer parsed_inputs.deinit();
-
         try validateExtractionInputKinds(parsed_inputs.texts.items.len, parsed_inputs.images.items.len);
         if (parsed_inputs.images.items.len > max_read_batch_images) return error.ReadBatchTooLarge;
-        if (parsed_inputs.max_tokens) |max_tokens| {
-            if (max_tokens == 0 or max_tokens > max_read_tokens) return error.InvalidMaxTokens;
-        }
         if (parsed_inputs.images.items.len > 0) {
             var decoded_budget = ReadDecodedImageBudget.init(media_admission, effectiveRequestContentSecurity(self).max_image_dimension);
             for (parsed_inputs.images.items) |image_bytes| try decoded_budget.addImage(image_bytes);
@@ -4330,6 +5010,205 @@ pub const Node = struct {
             .allocator = allocator,
             .json = try extractionResponseJsonAlloc(allocator, model_name, request.inputs, results),
         };
+    }
+
+    fn extractEntitiesAndRelationsDirectJsonAlloc(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        schema: extraction_api.ExtractionSchema,
+        options: extraction_api.ExtractionOptions,
+        inputs: []const extracting_api.Input,
+        texts: []const []const u8,
+    ) ![]u8 {
+        if (schema.entities) |labels| {
+            for (labels) |label| if (!isCanonicalLabelSegment(label)) return error.InvalidEntitySchema;
+        }
+        const relation_schemas = schema.relations orelse &.{};
+        const relation_labels = try canonicalRelationLabels(allocator, relation_schemas);
+        defer freeStringSlice(allocator, relation_labels);
+        const want_relations = relation_labels.len > 0;
+        const input_ids = try allocator.alloc(?[]const u8, inputs.len);
+        defer allocator.free(input_ids);
+        for (inputs, 0..) |input, index| input_ids[index] = input.id;
+        const request = EntityExtractionRequest{
+            .model = model_name,
+            .labels = schema.entities,
+            .relation_labels = if (want_relations) relation_labels else null,
+            .resolver = options.resolver,
+            .threshold = options.threshold,
+            .flat_ner = options.flat_ner,
+            .include_confidence = options.include_confidence orelse false,
+            .include_spans = options.include_spans orelse false,
+            .input_ids = input_ids,
+        };
+
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        const model_path = try self.resolveRequestModelPath(allocator, io_impl.io(), model_name, "extractors");
+        defer allocator.free(model_path);
+        if (rebel_mod.isRebelModel(allocator, model_path)) {
+            try rebel_mod.validateSchemaSupport(request.labels, request.relation_labels);
+            var failure_stage: RebelExtractionFailureStage = .model_layout;
+            return self.extractRebelJsonAlloc(
+                allocator,
+                model_path,
+                request,
+                texts,
+                want_relations,
+                &failure_stage,
+            );
+        }
+
+        var model_handle = try self.model_manager.acquireFromDir(model_path);
+        defer model_handle.release();
+        const model = model_handle.get();
+        try validateTextEntityExtractionManifest(&model.manifest);
+
+        if (model.isGlinerModel()) {
+            var pipeline = model.glinerPipeline(allocator);
+            pipeline.config.threshold = options.threshold orelse pipeline.config.threshold;
+            pipeline.config.flat_ner = options.flat_ner orelse pipeline.config.flat_ner;
+            const labels: ?[]const []const u8 = if (schema.entities) |values|
+                if (values.len > 0) values else null
+            else
+                null;
+
+            if (want_relations) {
+                if (!model.supportsRelationExtraction() or !pipeline.supportsRelationExtraction())
+                    return error.UnsupportedRelationExtraction;
+                const relation_entity_labels = try relationEntityLabelsAlloc(
+                    allocator,
+                    labels,
+                    pipeline.config.default_labels,
+                    relation_labels,
+                );
+                defer if (relation_entity_labels) |values| allocator.free(values);
+                const extracted = try pipeline.extractRelationsBatch(texts, relation_entity_labels, relation_labels);
+                defer {
+                    freeBorrowedLabelEntityBatches(allocator, extracted.entities);
+                    for (extracted.relations) |relations| {
+                        for (relations) |*relation| relation.deinit(allocator);
+                        allocator.free(relations);
+                    }
+                    allocator.free(extracted.relations);
+                }
+                if (options.resolver) |resolver_cfg| {
+                    var resolved = try resolveExtractedOutput(allocator, extracted.entities, extracted.relations, resolver_cfg);
+                    defer resolved.deinit(allocator);
+                    return try entityExtractionResponseJsonAlloc(allocator, request, resolved.entities, resolved.relations, texts);
+                }
+                return try entityExtractionResponseJsonAlloc(allocator, request, extracted.entities, extracted.relations, texts);
+            }
+
+            const all_entities = try pipeline.recognizeBatch(texts, labels);
+            defer freeBorrowedLabelEntityBatches(allocator, all_entities);
+            const cleaned_entities = try applyLearnedCleanupIfPresent(allocator, try model.getCleanupHead(), texts, all_entities);
+            defer if (cleaned_entities) |entities| freeEntityBatches(allocator, entities);
+            const entities_for_response = cleaned_entities orelse all_entities;
+            if (options.resolver) |resolver_cfg| {
+                var resolved = try resolveExtractedOutput(allocator, entities_for_response, null, resolver_cfg);
+                defer resolved.deinit(allocator);
+                return try entityExtractionResponseJsonAlloc(allocator, request, resolved.entities, resolved.relations, texts);
+            }
+            return try entityExtractionResponseJsonAlloc(allocator, request, entities_for_response, null, texts);
+        }
+
+        if (want_relations) return error.UnsupportedRelationExtraction;
+        var pipeline = model.nerPipeline(allocator);
+        pipeline.config.threshold = options.threshold orelse pipeline.config.threshold;
+        const all_entities = try pipeline.recognizeBatch(texts);
+        defer freeBorrowedLabelEntityBatches(allocator, all_entities);
+        const cleaned_entities = try applyLearnedCleanupIfPresent(allocator, try model.getCleanupHead(), texts, all_entities);
+        defer if (cleaned_entities) |entities| freeEntityBatches(allocator, entities);
+        const entities_for_response = cleaned_entities orelse all_entities;
+        if (options.resolver) |resolver_cfg| {
+            var resolved = try resolveExtractedOutput(allocator, entities_for_response, null, resolver_cfg);
+            defer resolved.deinit(allocator);
+            return try entityExtractionResponseJsonAlloc(allocator, request, resolved.entities, resolved.relations, texts);
+        }
+        return try entityExtractionResponseJsonAlloc(allocator, request, entities_for_response, null, texts);
+    }
+
+    fn extractClassificationsDirectJsonAlloc(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        schema: extraction_api.ExtractionSchema,
+        options: extraction_api.ExtractionOptions,
+        inputs: []const extracting_api.Input,
+        texts: []const []const u8,
+    ) ![]u8 {
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        const model_path = try self.resolveClassificationRequestModelPath(allocator, io_impl.io(), model_name);
+        defer allocator.free(model_path);
+        var model_handle = try self.model_manager.acquireFromDir(model_path);
+        defer model_handle.release();
+        const model = model_handle.get();
+        if (!model.supportsClassification()) return error.UnsupportedClassificationExtraction;
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const lists = try alloc.alloc(std.ArrayListUnmanaged(extraction_api.ExtractionClassification), texts.len);
+        for (lists) |*list| list.* = .empty;
+        var prompt_tokens: usize = 0;
+        for (schema.classifications orelse &.{}) |classification_schema| {
+            if (classification_schema.name.len == 0 or classification_schema.labels.len == 0)
+                return error.InvalidClassificationSchema;
+            if (classification_schema.top_k) |top_k| if (top_k < 1) return error.InvalidTopK;
+
+            if (model.isGlinerModel()) {
+                var pipeline = model.glinerPipeline(allocator);
+                const multi_label = classification_schema.multi_label orelse false;
+                const results = try pipeline.classifyBatch(texts, classification_schema.labels, .{
+                    .threshold = options.threshold orelse 0.0,
+                    .multi_label = multi_label,
+                    .top_k = if (multi_label) 0 else @intCast(classification_schema.top_k orelse 1),
+                });
+                defer freeClassificationBatch(allocator, results);
+                try appendExtractionClassificationBatch(alloc, lists, classification_schema, options, results);
+                const schema_prompt_tokens = try std.math.add(
+                    usize,
+                    estimateTextsTokens(texts),
+                    estimateTextsTokens(classification_schema.labels),
+                );
+                prompt_tokens = try std.math.add(usize, prompt_tokens, schema_prompt_tokens);
+                continue;
+            }
+
+            if (!manifestSupportsZeroShotClassification(&model.manifest))
+                return error.UnsupportedClassificationExtraction;
+            var pipeline = model.classificationPipeline(allocator, .{
+                .max_length = model.manifest.max_position_embeddings,
+                .hypothesis_template = classification_schema.hypothesis_template orelse "This example is {}.",
+                .multi_label = classification_schema.multi_label orelse false,
+                .entailment_index = nliEntailmentIndex(model.manifest.id2label),
+            });
+            var schema_prompt_tokens: usize = 0;
+            const results = try pipeline.classifyBatchWithPromptTokens(texts, classification_schema.labels, &schema_prompt_tokens);
+            defer freeClassificationBatch(allocator, results);
+            try appendExtractionClassificationBatch(alloc, lists, classification_schema, options, results);
+            prompt_tokens = try std.math.add(usize, prompt_tokens, schema_prompt_tokens);
+        }
+
+        const data = try alloc.alloc(extraction_api.ExtractionObject, texts.len);
+        for (data, 0..) |*item, index| item.* = .{
+            .id = if (index < inputs.len) inputs[index].id else null,
+            .classifications = lists[index].items,
+        };
+        var usage: std.json.ObjectMap = .empty;
+        try usage.ensureTotalCapacity(alloc, 3);
+        usage.putAssumeCapacity("prompt_tokens", .{ .integer = @intCast(prompt_tokens) });
+        usage.putAssumeCapacity("completion_tokens", .{ .integer = 0 });
+        usage.putAssumeCapacity("total_tokens", .{ .integer = @intCast(prompt_tokens) });
+        return try std.json.Stringify.valueAlloc(allocator, extraction_api.ExtractionResponse{
+            .object = "extraction",
+            .model = model_name,
+            .data = data,
+            .usage = .{ .map = usage },
+        }, .{});
     }
 
     /// Returns a newly allocated canonical path. The caller must free it with
@@ -4363,6 +5242,7 @@ pub const Node = struct {
             .missing => ctx.status(404).json(.{
                 .@"error" = "MODEL_NOT_FOUND",
                 .message = "model not found",
+                .hint = "Run `antfly inference list`; pull the requested model or restart with --models-dir <path>",
             }),
             .internal => ctx.status(500).json(.{
                 .@"error" = "MODEL_RESOLUTION_FAILED",
@@ -4857,6 +5737,21 @@ pub const Node = struct {
         return coordinator.acquire(admission);
     }
 
+    /// Rendered prompt and tokenization retained from an admission estimate so
+    /// the generation pipeline can skip re-rendering and re-encoding. Owns its
+    /// memory; must stay alive until generation for the request completes.
+    const NativePromptEstimate = struct {
+        allocator: std.mem.Allocator,
+        prompt: []const u8,
+        encoded: @import("inference_tokenizer").EncodeResult,
+        prompt_token_limit: usize,
+
+        fn deinit(self: *NativePromptEstimate) void {
+            self.allocator.free(self.prompt);
+            self.encoded.deinit();
+        }
+    };
+
     fn estimateNativePromptTokens(
         self: *Node,
         allocator: std.mem.Allocator,
@@ -4867,13 +5762,15 @@ pub const Node = struct {
         max_tokens: i32,
         speculative_bonus_tokens: usize,
         enable_thinking: ?bool,
+        out_estimate: ?*?NativePromptEstimate,
     ) !usize {
         _ = self;
         const prompt = if (model.chat_tmpl) |ct|
             try ct.applyWithOptions(allocator, messages, .{ .enable_thinking = enable_thinking })
         else
             try generation.formatMessages(allocator, messages);
-        defer allocator.free(prompt);
+        var prompt_owned = true;
+        defer if (prompt_owned) allocator.free(prompt);
         const media_allowance = try generation.nativeGenerationAdmissionMediaTokenAllowance(
             allocator,
             model_dir,
@@ -4896,10 +5793,22 @@ pub const Node = struct {
             model.manifest.add_bos_token,
             model.manifest.bos_token,
         );
-        defer encoded.deinit();
+        var encoded_owned = true;
+        defer if (encoded_owned) encoded.deinit();
         var count: usize = 0;
         while (count < encoded.attention_mask.len and encoded.attention_mask[count] != 0) : (count += 1) {}
-        return std.math.add(usize, count, media_allowance) catch error.PromptTooLong;
+        const total = std.math.add(usize, count, media_allowance) catch return error.PromptTooLong;
+        if (out_estimate) |out| {
+            out.* = .{
+                .allocator = allocator,
+                .prompt = prompt,
+                .encoded = encoded,
+                .prompt_token_limit = prompt_token_limit,
+            };
+            prompt_owned = false;
+            encoded_owned = false;
+        }
+        return total;
     }
 
     pub fn generateEmbeddings(self: *Node, ctx: *httpx.Context) !httpx.Response {
@@ -5466,14 +6375,29 @@ pub const Node = struct {
     pub fn generateContent(self: *Node, ctx: *httpx.Context) !httpx.Response {
         const raw_body = (try ctx.body()) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
-        if (!rawGenerateChatTemplateKwargsAreValid(ctx.allocator, raw_body, false)) {
-            return ctx.status(400).json(.{
-                .@"error" = "INVALID_REQUEST",
-                .message = "chat_template_kwargs accepts only a boolean enable_thinking field",
-            });
+        // Single JSON parse per request: only bodies that can carry
+        // chat_template_kwargs (substring pre-gate, false positives harmless)
+        // are parsed as an untyped Value, which then doubles as the kwargs
+        // validator input and the typed-parse source. Malformed bodies fall
+        // back to the raw typed parse so their errors stay identical.
+        var parsed_body_value: ?std.json.Parsed(std.json.Value) = null;
+        defer if (parsed_body_value) |*owned| owned.deinit();
+        if (std.mem.indexOf(u8, raw_body, "chat_template_kwargs") != null) {
+            parsed_body_value = std.json.parseFromSlice(std.json.Value, ctx.allocator, raw_body, .{}) catch null;
         }
-        var parsed = (try ctx.parseJson(api.GenerateRequest)) orelse
-            return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
+        if (parsed_body_value) |owned| {
+            if (!generateRequestChatTemplateKwargsAreValid(owned.value)) {
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "chat_template_kwargs accepts only a boolean enable_thinking field",
+                });
+            }
+        }
+        var parsed = if (parsed_body_value) |owned|
+            try std.json.parseFromValue(api.GenerateRequest, ctx.allocator, owned.value, .{ .ignore_unknown_fields = true })
+        else
+            (try ctx.parseJson(api.GenerateRequest)) orelse
+                return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
         if (body.prompt_cache_key) |key| {
@@ -5646,7 +6570,7 @@ pub const Node = struct {
                 .message = "draft_model must not be empty",
             });
         }
-        const speculation = parseGenerateSpeculationOptions(
+        var speculation = parseGenerateSpeculationOptions(
             requested_draft_model_name != null,
             body.speculative_k,
             body.speculation_policy,
@@ -5658,9 +6582,63 @@ pub const Node = struct {
             });
         };
         const effective_draft_model_name = effectiveDraftModelName(requested_draft_model_name, speculation.policy);
+        // Auto-discovered MTP drafter, resolved before validation, admission,
+        // and the prompt estimate so they all see the same speculation state
+        // as the pipeline. The sibling's manifest/config are validated here so
+        // a stale or foreign directory degrades to non-speculative generation
+        // instead of failing the request.
+        var auto_draft_sibling: ?[]const u8 = null;
+        defer if (auto_draft_sibling) |path| ctx.allocator.free(path);
+        var auto_draft_extra_units: usize = 0;
+        if (requested_draft_model_name == null and
+            speculation.policy == .auto and
+            gemma4MtpAutoDraftDiscoveryEnabled())
+        {
+            if (gemma4MtpAssistantSiblingPath(ctx.allocator, ctx.io, model_path)) |sibling| {
+                if (validateDiscoveredDraftDir(ctx.allocator, sibling)) {
+                    auto_draft_sibling = sibling;
+                } else {
+                    std.log.warn("ignoring invalid Gemma4 MTP assistant sibling {s}", .{sibling});
+                    ctx.allocator.free(sibling);
+                }
+            }
+        }
+        if (auto_draft_sibling != null) {
+            qualifyAutoDiscoveredDraftSpeculation(&speculation);
+            // The discovered drafter loads a second model backend; reserve the
+            // same speculation admission a client-requested draft would get.
+            // A discovered drafter is an optimization, not a client
+            // requirement: when capacity is unavailable the request degrades
+            // to non-speculative generation instead of a capacity rejection.
+            const speculative_units = generateAdmissionUnitsForSpeculation(admission_units, true, speculation.policy);
+            if (speculative_units > reserved_units) {
+                const extra_units = speculative_units - reserved_units;
+                if (self.reserveAdmissionUnits(extra_units)) {
+                    reserved_units += extra_units;
+                    auto_draft_extra_units = extra_units;
+                } else |_| {
+                    std.log.warn("skipping discovered MTP drafter: insufficient admission capacity", .{});
+                    ctx.allocator.free(auto_draft_sibling.?);
+                    auto_draft_sibling = null;
+                }
+            }
+        }
+        if (auto_draft_sibling != null and
+            effective_draft_model_name == null and
+            self.config.kernel_jit.qualified_profile_path != null)
+        {
+            // Qualified profiles reject a client-requested draft, but automatic
+            // discovery is best-effort and must not turn a plain request into a
+            // 400 response.
+            std.log.warn("skipping discovered MTP drafter: qualified-profile JIT is active", .{});
+            const released = takeAutoDraftAdmissionExtra(&reserved_units, &auto_draft_extra_units);
+            if (released > 0) self.releaseSlotUnits(released);
+            ctx.allocator.free(auto_draft_sibling.?);
+            auto_draft_sibling = null;
+        }
         validateQualifiedProfileDraft(
             self.config.kernel_jit.qualified_profile_path != null,
-            effective_draft_model_name,
+            effective_draft_model_name orelse auto_draft_sibling,
         ) catch {
             return ctx.status(400).json(.{
                 .@"error" = "UNSUPPORTED_FEATURE",
@@ -5714,7 +6692,7 @@ pub const Node = struct {
             .frequency_penalty = sampling.frequency_penalty,
             .presence_penalty = sampling.presence_penalty,
             .speculative_k = speculation.k,
-            .speculation_requested = requested_draft_model_name != null,
+            .speculation_requested = generationSpeculationRequested(effective_draft_model_name, auto_draft_sibling),
             .speculation_policy = speculation.policy,
             .speculation_calibration = speculation.calibration,
             .prefill_chunk_size = 0,
@@ -5733,6 +6711,16 @@ pub const Node = struct {
                 },
             });
         };
+        if (auto_draft_sibling != null and backend_selection.native_choice == .onnx) {
+            // ONNX cannot host the discovered native/Metal drafter. As with all
+            // automatic-discovery incompatibilities, continue without it.
+            std.log.warn("skipping discovered MTP drafter: ONNX backend selected", .{});
+            const released = takeAutoDraftAdmissionExtra(&reserved_units, &auto_draft_extra_units);
+            if (released > 0) self.releaseSlotUnits(released);
+            ctx.allocator.free(auto_draft_sibling.?);
+            auto_draft_sibling = null;
+            config.speculation_requested = false;
+        }
         validatePromptCacheExecutionMode(config.prompt_cache_enabled, backend_selection) catch {
             return ctx.status(400).json(.{
                 .@"error" = "UNSUPPORTED_FEATURE",
@@ -5752,7 +6740,10 @@ pub const Node = struct {
             self.config.allow_unknown_models,
         )) |response|
             return response;
-        const allow_onnx = effective_draft_model_name == null and
+        const required_policy_allows_onnx = self.session_manager.allowsDirectBackend(.onnx) catch |err|
+            return modelLoadFailureResponse(ctx, err);
+        const allow_onnx = required_policy_allows_onnx and
+            effective_draft_model_name == null and
             !backend_selection.graph_mode_requested and
             (body.backend == null or backend_selection.native_choice == .onnx);
 
@@ -5772,7 +6763,7 @@ pub const Node = struct {
                         .message = "response_format.json_schema.schema is required for type=json_schema",
                     });
                 };
-                config.grammar = grammar_mod.buildJsonSchemaGrammar(ctx.allocator, schema) catch |err| {
+                config.grammar = grammar_mod.buildJsonSchemaGrammar(ctx.allocator, .{ .object = schema.map }) catch |err| {
                     return ctx.status(400).json(.{
                         .@"error" = "INVALID_REQUEST",
                         .message = @errorName(err),
@@ -5846,6 +6837,7 @@ pub const Node = struct {
                     ctx,
                     body.model,
                     &pipeline,
+                    null,
                     messages.items,
                     config,
                     if (tool_parser) |*parser| parser else null,
@@ -5891,6 +6883,7 @@ pub const Node = struct {
                 ctx,
                 body.model,
                 response_text,
+                result.reasoning_text,
                 if (parsed_tool_calls != null) "tool_calls" else result.finish_reason,
                 result.prompt_tokens,
                 result.tokens_used,
@@ -5984,6 +6977,7 @@ pub const Node = struct {
                         ctx,
                         body.model,
                         &pipeline,
+                        null,
                         messages.items,
                         config,
                         if (tool_parser) |*parser| parser else null,
@@ -6029,6 +7023,7 @@ pub const Node = struct {
                     ctx,
                     body.model,
                     response_text,
+                    result.reasoning_text,
                     if (parsed_tool_calls != null) "tool_calls" else result.finish_reason,
                     result.prompt_tokens,
                     result.tokens_used,
@@ -6080,12 +7075,17 @@ pub const Node = struct {
             graph_mod.metal_executor.supportsSession(model.session),
             generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config),
             config.prompt_cache_enabled,
+            config.speculation_requested,
             backend_selection,
         );
         const effective_compiled_partition_backend: ?ops.BackendKind = if (auto_metal_whole_model)
             .metal
         else
             backend_selection.compiled_partition_backend;
+        native_backend_choice.validateRequiredCompiledBackend(
+            &self.session_manager,
+            effective_compiled_partition_backend,
+        ) catch |err| return modelLoadFailureResponse(ctx, err);
         const effective_compiled_attachment_target: graph_mod.compiled_backend.AttachmentTarget = if (auto_metal_whole_model)
             .whole_model
         else
@@ -6110,6 +7110,10 @@ pub const Node = struct {
             kv_dtype,
         );
         const prompt_bytes = self.estimateGeneratePromptBytes(messages.items);
+        // Kept alive for the whole request so the pipeline can reuse the
+        // estimate's rendered prompt and token ids instead of redoing both.
+        var prompt_estimate: ?NativePromptEstimate = null;
+        defer if (prompt_estimate) |*estimate| estimate.deinit();
         const prompt_tokens = self.estimateNativePromptTokens(
             ctx.allocator,
             model_path,
@@ -6119,6 +7123,7 @@ pub const Node = struct {
             configured_max_tokens,
             if (config.speculation_requested and config.speculation_policy != .off and config.speculative_k > 0) 1 else 0,
             config.enable_thinking,
+            &prompt_estimate,
         ) catch |err| {
             if (err == error.PromptTooLong) {
                 return ctx.status(400).json(.{
@@ -6138,13 +7143,33 @@ pub const Node = struct {
             if (model.native_generate_coordinator) |coordinator| coordinator.release(lease);
         };
         if (model.native_generate_coordinator) |coordinator| {
-            native_generate_lease = try self.acquireNativeGenerateLease(coordinator, .{
-                .requested_units = admission_units,
+            native_generate_lease = self.acquireNativeGenerateLease(coordinator, .{
+                .requested_units = reserved_units,
                 .prompt_bytes = prompt_bytes,
                 .prompt_tokens = prompt_tokens,
                 .prefill_chunk_limit = if (config.prefill_chunk_size == 0) idle_prefill_ceiling else 0,
                 .max_tokens = configured_max_tokens,
-            });
+            }) catch |err| blk: {
+                // A discovered drafter is an optimization: give back its extra
+                // admission and retry single-model before surfacing capacity
+                // errors the client's own request never earned.
+                if (auto_draft_sibling != null) {
+                    std.log.warn("skipping discovered MTP drafter: insufficient scheduler capacity", .{});
+                    const released = takeAutoDraftAdmissionExtra(&reserved_units, &auto_draft_extra_units);
+                    if (released > 0) self.releaseSlotUnits(released);
+                    ctx.allocator.free(auto_draft_sibling.?);
+                    auto_draft_sibling = null;
+                    config.speculation_requested = false;
+                    break :blk try self.acquireNativeGenerateLease(coordinator, .{
+                        .requested_units = reserved_units,
+                        .prompt_bytes = prompt_bytes,
+                        .prompt_tokens = prompt_tokens,
+                        .prefill_chunk_limit = if (config.prefill_chunk_size == 0) idle_prefill_ceiling else 0,
+                        .max_tokens = configured_max_tokens,
+                    });
+                }
+                return err;
+            };
         }
 
         const tok = model.getTokenizer();
@@ -6172,6 +7197,8 @@ pub const Node = struct {
                 return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         }
 
+        var resolved_draft_model_path: ?[]const u8 = null;
+        var draft_was_discovered = false;
         if (effective_draft_model_name) |draft_model_name| {
             if (shouldResolveDraftModel(config.speculation_policy)) {
                 const draft_model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, draft_model_name, "generators") catch |err|
@@ -6183,67 +7210,148 @@ pub const Node = struct {
                         .message = "draft_model must resolve to a model different from model",
                     });
                 }
-                config.draft_model = draft_model_path;
-                var load_draft_backend = true;
-                if (config.speculation_policy == .auto) {
-                    var draft_manifest = manifest_mod.loadFromDir(ctx.allocator, draft_model_path) catch |err|
-                        return modelLoadFailureResponse(ctx, err);
-                    defer draft_manifest.deinit();
-                    const draft_cfg = session_factory.loadGptConfigFromModelDir(ctx.allocator, draft_model_path, draft_manifest) catch |err|
-                        return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = @errorName(err) });
-                    if (shouldSkipAutoMtpDraftLoad(config, draft_cfg)) {
-                        draft_gpt_config = draft_cfg;
-                        load_draft_backend = false;
+                resolved_draft_model_path = draft_model_path;
+            }
+        } else if (auto_draft_sibling) |sibling| {
+            // Ownership moves to the request-scoped draft path storage;
+            // config.speculation_requested was already set at config build so
+            // admission, the estimate, and scheduler batching stayed
+            // consistent with the pipeline.
+            draft_model_path_storage = sibling;
+            resolved_draft_model_path = sibling;
+            auto_draft_sibling = null;
+            draft_was_discovered = true;
+        }
+        var draft_degraded = false;
+        if (resolved_draft_model_path) |draft_model_path| draft_setup: {
+            config.draft_model = draft_model_path;
+            var load_draft_backend = true;
+            if (config.speculation_policy == .auto) {
+                var draft_manifest = manifest_mod.loadFromDir(ctx.allocator, draft_model_path) catch |err| {
+                    if (draft_was_discovered) {
+                        draft_degraded = true;
+                        break :draft_setup;
                     }
+                    return modelLoadFailureResponse(ctx, err);
+                };
+                defer draft_manifest.deinit();
+                const draft_cfg = session_factory.loadGptConfigFromModelDir(ctx.allocator, draft_model_path, draft_manifest) catch |err| {
+                    if (draft_was_discovered) {
+                        draft_degraded = true;
+                        break :draft_setup;
+                    }
+                    return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = @errorName(err) });
+                };
+                if (shouldSkipAutoMtpDraftLoad(config, draft_cfg)) {
+                    draft_gpt_config = draft_cfg;
+                    load_draft_backend = false;
                 }
-                if (load_draft_backend) {
-                    draft_model_handle = if (backend_selection.native_choice != .auto) blk: {
-                        var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
-                        configureGenerateBackendPreference(&request_session_manager, backend_selection);
-                        break :blk self.model_manager.acquireFromDirWithPreferredBackends(draft_model_path, request_session_manager.preferred_backends, false) catch |err|
-                            return modelLoadFailureResponse(ctx, err);
-                    } else self.model_manager.acquireFromDir(draft_model_path) catch |err|
+            }
+            if (load_draft_backend) {
+                draft_model_handle = if (backend_selection.native_choice != .auto) blk: {
+                    var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
+                    configureGenerateBackendPreference(&request_session_manager, backend_selection);
+                    break :blk self.model_manager.acquireFromDirWithPreferredBackends(draft_model_path, request_session_manager.preferred_backends, false) catch |err| {
+                        if (draft_was_discovered) {
+                            draft_degraded = true;
+                            break :draft_setup;
+                        }
                         return modelLoadFailureResponse(ctx, err);
-                    const draft_model = draft_model_handle.?.get();
-                    const draft_cfg = session_factory.getGptConfig(draft_model.session) orelse
-                        return ctx.status(400).json(.{
-                            .@"error" = "INVALID_MODEL",
-                            .message = "draft_model does not support generation",
-                        });
-                    const draft_tok = draft_model.getTokenizer();
-                    const target_special = tok.specialTokens();
-                    const draft_special = draft_tok.specialTokens();
-                    if (draft_tok.vocabSize() != tok.vocabSize() or
-                        draft_cfg.vocab_size != gpt_config.vocab_size or
-                        draft_special.cls_id != target_special.cls_id or
-                        draft_special.sep_id != target_special.sep_id or
-                        draft_special.pad_id != target_special.pad_id or
-                        draft_special.unk_id != target_special.unk_id)
-                    {
-                        return ctx.status(400).json(.{
-                            .@"error" = "INVALID_REQUEST",
-                            .message = "draft_model tokenizer is incompatible with target model",
-                        });
+                    };
+                } else self.model_manager.acquireFromDir(draft_model_path) catch |err| {
+                    if (draft_was_discovered) {
+                        draft_degraded = true;
+                        break :draft_setup;
                     }
+                    return modelLoadFailureResponse(ctx, err);
+                };
+                const draft_model = draft_model_handle.?.get();
+                const draft_cfg = session_factory.getGptConfig(draft_model.session) orelse {
+                    if (draft_was_discovered) {
+                        draft_degraded = true;
+                        break :draft_setup;
+                    }
+                    return ctx.status(400).json(.{
+                        .@"error" = "INVALID_MODEL",
+                        .message = "draft_model does not support generation",
+                    });
+                };
+                const draft_tok = draft_model.getTokenizer();
+                const target_special = tok.specialTokens();
+                const draft_special = draft_tok.specialTokens();
+                if (draft_tok.vocabSize() != tok.vocabSize() or
+                    draft_cfg.vocab_size != gpt_config.vocab_size or
+                    draft_special.cls_id != target_special.cls_id or
+                    draft_special.sep_id != target_special.sep_id or
+                    draft_special.pad_id != target_special.pad_id or
+                    draft_special.unk_id != target_special.unk_id)
+                {
+                    if (draft_was_discovered) {
+                        draft_degraded = true;
+                        break :draft_setup;
+                    }
+                    return ctx.status(400).json(.{
+                        .@"error" = "INVALID_REQUEST",
+                        .message = "draft_model tokenizer is incompatible with target model",
+                    });
+                }
 
-                    const actual_draft_backend: runtime.kv.pool.BackendKind = switch (draft_model.session.backend()) {
-                        .native => .native,
-                        .metal => .metal,
-                        .cuda => .cuda,
-                        .pjrt, .onnx, .wasm => return ctx.status(400).json(.{
+                const actual_draft_backend: runtime.kv.pool.BackendKind = switch (draft_model.session.backend()) {
+                    .native => .native,
+                    .metal => .metal,
+                    .cuda => .cuda,
+                    .pjrt, .onnx, .wasm => {
+                        if (draft_was_discovered) {
+                            draft_degraded = true;
+                            break :draft_setup;
+                        }
+                        return ctx.status(400).json(.{
                             .@"error" = "INVALID_MODEL",
                             .message = "draft_model does not use a supported generation backend",
-                        }),
-                    };
-                    const actual_draft_kv_dtype = session_factory.recommendedKvDTypeForSession(
-                        draft_model.session,
-                        actual_draft_backend,
-                    );
-                    draft_model_for_generation = draft_model;
-                    draft_backend_kind = actual_draft_backend;
-                    draft_kv_dtype = actual_draft_kv_dtype;
-                    draft_gpt_config = draft_cfg;
-                }
+                        });
+                    },
+                };
+                const actual_draft_kv_dtype = session_factory.recommendedKvDTypeForSession(
+                    draft_model.session,
+                    actual_draft_backend,
+                );
+                draft_model_for_generation = draft_model;
+                draft_backend_kind = actual_draft_backend;
+                draft_kv_dtype = actual_draft_kv_dtype;
+                draft_gpt_config = draft_cfg;
+            }
+        }
+        if (draft_degraded) {
+            // A discovered drafter is best-effort: unwind it and continue as a
+            // plain single-model request instead of failing the generate call.
+            std.log.warn("skipping discovered MTP drafter: draft setup failed", .{});
+            config.draft_model = null;
+            config.speculation_requested = false;
+            if (draft_model_handle) |*handle| handle.release();
+            draft_model_handle = null;
+            draft_model_for_generation = null;
+            draft_backend_kind = null;
+            draft_kv_dtype = null;
+            draft_gpt_config = null;
+        }
+        if (draft_was_discovered and draft_model_for_generation == null and auto_draft_extra_units > 0) {
+            // Setup failures and deliberate AUTO-policy disablement both mean
+            // there is no second backend. Give back its exact slot and
+            // scheduler reservations while preserving any media-driven growth.
+            if (native_generate_lease) |lease| {
+                if (model.native_generate_coordinator) |coordinator| coordinator.release(lease);
+                native_generate_lease = null;
+            }
+            const released = takeAutoDraftAdmissionExtra(&reserved_units, &auto_draft_extra_units);
+            if (released > 0) self.releaseSlotUnits(released);
+            if (model.native_generate_coordinator) |coordinator| {
+                native_generate_lease = try self.acquireNativeGenerateLease(coordinator, .{
+                    .requested_units = reserved_units,
+                    .prompt_bytes = prompt_bytes,
+                    .prompt_tokens = prompt_tokens,
+                    .prefill_chunk_limit = if (config.prefill_chunk_size == 0) idle_prefill_ceiling else 0,
+                    .max_tokens = configured_max_tokens,
+                });
             }
         }
 
@@ -6623,6 +7731,16 @@ pub const Node = struct {
             .add_bos_token = model.manifest.add_bos_token,
             .bos_token = model.manifest.bos_token,
             .chat_template = model.chat_tmpl,
+            // The admission estimate rendered and encoded with the same
+            // template, messages, and enable_thinking (after the final
+            // tool-prompt prepend), so the pipeline may reuse both. The
+            // pipeline revalidates the encode's token limit itself.
+            .preformatted_prompt = if (prompt_estimate) |estimate| estimate.prompt else null,
+            .pre_encoded_prompt = if (prompt_estimate) |estimate| .{
+                .ids = estimate.encoded.ids,
+                .attention_mask = estimate.encoded.attention_mask,
+                .prompt_token_limit = estimate.prompt_token_limit,
+            } else null,
             .print_timing = request_generate_timing,
             .model_dir = model_path,
             .gguf_projector_path = model.manifest.gguf_projector_path,
@@ -6644,6 +7762,7 @@ pub const Node = struct {
                 ctx,
                 body.model,
                 &pipeline,
+                &pipeline.cb,
                 messages.items,
                 config,
                 if (tool_parser) |*parser| parser else null,
@@ -6651,6 +7770,8 @@ pub const Node = struct {
             );
         }
 
+        const server_a4b_telemetry_before = serverA4bTelemetrySnapshot(&pipeline.cb);
+        defer logServerA4bTelemetry(&pipeline.cb, server_a4b_telemetry_before, body.model);
         var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err| {
             if (err == error.MemoryBudgetExceeded)
                 return generationMemoryBudgetResponse(ctx, model.session, &run_budget);
@@ -6697,6 +7818,7 @@ pub const Node = struct {
             ctx,
             body.model,
             response_text,
+            result.reasoning_text,
             if (parsed_tool_calls != null) "tool_calls" else result.finish_reason,
             result.prompt_tokens,
             result.tokens_used,
@@ -7026,7 +8148,7 @@ pub const Node = struct {
             } else if (std.mem.eql(u8, rf.type, "json_schema")) {
                 const schema_cfg = rf.json_schema orelse return error.MissingJsonSchema;
                 const schema = schema_cfg.schema orelse return error.MissingJsonSchema;
-                owned_grammar = try grammar_mod.buildJsonSchemaGrammar(allocator, schema);
+                owned_grammar = try grammar_mod.buildJsonSchemaGrammar(allocator, .{ .object = schema.map });
                 config.grammar = owned_grammar;
             } else if (!std.mem.eql(u8, rf.type, "text")) {
                 return error.UnsupportedResponseFormat;
@@ -7052,6 +8174,7 @@ pub const Node = struct {
         allocator: std.mem.Allocator,
         model_name: []const u8,
         response_text: []const u8,
+        reasoning_text: ?[]const u8,
         finish_reason: []const u8,
         prompt_tokens: usize,
         completion_tokens: usize,
@@ -7062,7 +8185,14 @@ pub const Node = struct {
         const choices = try allocator.alloc(api.GenerateChoice, 1);
         choices[0] = .{
             .index = 0,
-            .message = .{ .role = .assistant, .content = content },
+            .message = .{
+                .role = .assistant,
+                .content = .{ .value = content },
+                .reasoning_content = if (reasoning_text) |reasoning|
+                    .{ .value = try allocator.dupe(u8, reasoning) }
+                else
+                    .absent,
+            },
             .finish_reason = parseFinishReason(finish_reason),
         };
         return .{
@@ -7077,6 +8207,7 @@ pub const Node = struct {
 
     const BatchGenerateTaskResult = struct {
         text: ?[]const u8 = null,
+        reasoning_text: ?[]const u8 = null,
         finish_reason: []const u8 = "length",
         prompt_tokens: usize = 0,
         completion_tokens: usize = 0,
@@ -7096,6 +8227,7 @@ pub const Node = struct {
                 allocator,
                 model_name,
                 text,
+                task_result.reasoning_text,
                 task_result.finish_reason,
                 task_result.prompt_tokens,
                 task_result.completion_tokens,
@@ -7130,7 +8262,7 @@ pub const Node = struct {
                 .code = "MODEL_RESOURCE_BUSY",
                 .message = "insufficient inference capacity is currently available",
                 .retryable = true,
-                .retry_after_ms = transient_capacity_retry_after_ms,
+                .retry_after_ms = .{ .value = transient_capacity_retry_after_ms },
             },
             else => .{
                 .code = "MODEL_LOAD_FAILED",
@@ -7149,7 +8281,10 @@ pub const Node = struct {
             else
                 "request exceeds the configured inference resource budget",
             .retryable = retryable,
-            .retry_after_ms = if (retryable) transient_capacity_retry_after_ms else null,
+            .retry_after_ms = if (retryable)
+                .{ .value = transient_capacity_retry_after_ms }
+            else
+                .absent,
         };
     }
 
@@ -7176,6 +8311,10 @@ pub const Node = struct {
             formatted_response_text = try coerceGenerateResponseFormat(self.allocator, self.response_format, response_text);
             if (formatted_response_text) |text| response_text = text;
             self.out.text = try self.allocator.dupe(u8, response_text);
+            self.out.reasoning_text = if (result.reasoning_text) |reasoning|
+                try self.allocator.dupe(u8, reasoning)
+            else
+                null;
             self.out.finish_reason = result.finish_reason;
             self.out.prompt_tokens = result.prompt_tokens;
             self.out.completion_tokens = result.tokens_used;
@@ -7496,6 +8635,7 @@ pub const Node = struct {
                         configs[pos].max_tokens,
                         if (configs[pos].speculation_requested and configs[pos].speculation_policy != .off and configs[pos].speculative_k > 0) 1 else 0,
                         configs[pos].enable_thinking,
+                        null,
                     ) catch |err| {
                         results[idx].@"error" = if (err == error.PromptTooLong)
                             .{
@@ -8039,20 +9179,23 @@ pub const Node = struct {
         const stream_id = try allocCompletionId(ctx.allocator);
         defer ctx.allocator.free(stream_id);
         const stream_created = completionCreatedTimestamp();
+        var chunk_payload: std.Io.Writer.Allocating = .init(ctx.allocator);
+        defer chunk_payload.deinit();
 
-        emitRoleDelta(&writer, ctx.allocator, stream_id, stream_created, model_name) catch |err| {
+        emitRoleDelta(&writer, &chunk_payload, stream_id, stream_created, model_name) catch |err| {
             writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
             writer.close() catch {};
             return ctx.response.build();
         };
 
         writeStreamCompletion(
-            ctx.allocator,
+            &chunk_payload,
             &writer,
             stream_id,
             stream_created,
             model_name,
             result.text,
+            result.reasoning_text,
             result.finish_reason,
             tool_parser,
             result.speculative,
@@ -8063,7 +9206,7 @@ pub const Node = struct {
         };
         emitTerminalUsageOrDone(
             &writer,
-            ctx.allocator,
+            &chunk_payload,
             stream_id,
             stream_created,
             model_name,
@@ -8206,6 +9349,7 @@ pub const Node = struct {
         ctx: *httpx.Context,
         model_name: []const u8,
         response_text: []const u8,
+        reasoning_text: ?[]const u8,
         finish_reason: []const u8,
         prompt_tokens: usize,
         completion_tokens: usize,
@@ -8221,11 +9365,16 @@ pub const Node = struct {
         const completion_id = try allocCompletionId(alloc);
         const created = completionCreatedTimestamp();
 
-        var message: api.GenerateMessage = .{ .role = .assistant };
+        var message: api.GenerateMessage = .{
+            .role = .assistant,
+            .content = .{ .value = response_text },
+            .reasoning_content = if (reasoning_text) |reasoning|
+                .{ .value = reasoning }
+            else
+                .absent,
+        };
         if (tool_calls) |calls| {
-            if (calls.len == 0) {
-                message.content = response_text;
-            } else {
+            if (calls.len > 0) {
                 const api_calls = try alloc.alloc(generating_api.ToolCall, calls.len);
                 for (calls, 0..) |call, i| {
                     api_calls[i] = .{
@@ -8234,10 +9383,9 @@ pub const Node = struct {
                         .function = .{ .name = call.function.name, .arguments = call.function.arguments },
                     };
                 }
+                message.content = .null_value;
                 message.tool_calls = api_calls;
             }
-        } else {
-            message.content = response_text;
         }
 
         const choices = [_]api.GenerateChoice{.{
@@ -8252,7 +9400,10 @@ pub const Node = struct {
             .model = model_name,
             .choices = &choices,
             .usage = tokenUsageWithCachedPrompt(prompt_tokens, completion_tokens, cached_prompt_tokens),
-            .speculation = generateSpeculationStatus(speculative),
+            .speculation = if (generateSpeculationStatus(speculative)) |status|
+                .{ .value = status }
+            else
+                .absent,
         });
     }
 
@@ -8310,11 +9461,14 @@ pub const Node = struct {
         ctx: *httpx.Context,
         model_name: []const u8,
         pipeline: anytype,
+        telemetry_cb: ?*const ops.ComputeBackend,
         messages: []const @import("../pipelines/generation.zig").Message,
         config: @import("../pipelines/generation.zig").GenerationConfig,
         tool_parser: ?*tool_parser_mod.Parser,
         include_usage: bool,
     ) !httpx.Response {
+        const server_a4b_telemetry_before = serverA4bTelemetrySnapshot(telemetry_cb);
+        defer logServerA4bTelemetry(telemetry_cb, server_a4b_telemetry_before, model_name);
         var writer = ctx.streamResponse(200) catch |err| {
             std.debug.print("streamResponse failed: {}\n", .{err});
             return ctx.status(500).json(.{ .@"error" = "STREAM_INIT_FAILED", .message = internalErrorMessage("STREAM_INIT_FAILED", err) });
@@ -8329,62 +9483,74 @@ pub const Node = struct {
             stream_id: []const u8,
             stream_created: i64,
             model_name: []const u8,
-            allocator: std.mem.Allocator,
+            payload: *std.Io.Writer.Allocating,
             parser: ?*tool_parser_mod.Parser,
             request_context: *const httpx.Context,
-            errored: bool = false,
+            defer_content: bool,
+            write_error: ?anyerror = null,
+            parser_failed: bool = false,
 
             fn shouldContinue(raw_ctx: *anyopaque) bool {
                 const stream: *@This() = @ptrCast(@alignCast(raw_ctx));
-                return !stream.errored and !stream.request_context.isCancellationRequested();
+                return stream.write_error == null and
+                    !stream.parser_failed and
+                    !stream.request_context.isCancellationRequested();
             }
 
             fn onToken(raw_ctx: *anyopaque, token_text: []const u8) bool {
                 const stream: *@This() = @ptrCast(@alignCast(raw_ctx));
+                // Reasoning is projected only once generation completes. For
+                // channel-aware thinking requests, retain protocol order by
+                // emitting the buffered reasoning before the completed public
+                // content below.
+                if (stream.defer_content) return true;
                 if (stream.parser) |parser| {
                     const update = parser.feed(token_text) catch {
-                        stream.errored = true;
+                        stream.parser_failed = true;
                         return false;
                     };
                     if (update.ready_text.len > 0) {
-                        emitContentDelta(stream.writer, stream.allocator, stream.stream_id, stream.stream_created, stream.model_name, update.ready_text) catch {
-                            stream.errored = true;
+                        emitContentDelta(stream.writer, stream.payload, stream.stream_id, stream.stream_created, stream.model_name, update.ready_text) catch |err| {
+                            stream.write_error = err;
                             return false;
                         };
                     }
                     if (!parser.streamsIncrementalToolDeltas() and update.new_calls.len > 0) {
                         for (update.new_calls, 0..) |call, idx| {
-                            emitToolCallDelta(stream.writer, stream.allocator, stream.stream_id, stream.stream_created, stream.model_name, update.call_start_index + idx, call) catch {
-                                stream.errored = true;
+                            emitToolCallDelta(stream.writer, stream.payload, stream.stream_id, stream.stream_created, stream.model_name, update.call_start_index + idx, call) catch |err| {
+                                stream.write_error = err;
                                 return false;
                             };
                         }
                     }
                     if (update.active_tool_delta) |delta| {
-                        emitToolCallDeltaUpdate(stream.writer, stream.allocator, stream.stream_id, stream.stream_created, stream.model_name, delta) catch {
-                            stream.errored = true;
+                        emitToolCallDeltaUpdate(stream.writer, stream.payload, stream.stream_id, stream.stream_created, stream.model_name, delta) catch |err| {
+                            stream.write_error = err;
                             return false;
                         };
                     }
                     return true;
                 }
                 // Build OpenAI-compatible SSE chunk
-                emitContentDelta(stream.writer, stream.allocator, stream.stream_id, stream.stream_created, stream.model_name, token_text) catch {
-                    stream.errored = true;
+                emitContentDelta(stream.writer, stream.payload, stream.stream_id, stream.stream_created, stream.model_name, token_text) catch |err| {
+                    stream.write_error = err;
                     return false;
                 };
                 return true;
             }
         };
 
+        var chunk_payload: std.Io.Writer.Allocating = .init(ctx.allocator);
+        defer chunk_payload.deinit();
         var stream_ctx = StreamCtx{
             .writer = &writer,
             .stream_id = stream_id,
             .stream_created = stream_created,
             .model_name = model_name,
-            .allocator = ctx.allocator,
+            .payload = &chunk_payload,
             .parser = tool_parser,
             .request_context = ctx,
+            .defer_content = shouldDeferStreamContentForReasoning(pipeline, config),
         };
 
         if (comptime @hasField(@TypeOf(pipeline.*), "continue_ctx") and
@@ -8394,7 +9560,7 @@ pub const Node = struct {
             pipeline.continue_fn = StreamCtx.shouldContinue;
         }
 
-        emitRoleDelta(&writer, ctx.allocator, stream_id, stream_created, model_name) catch |err| {
+        emitRoleDelta(&writer, &chunk_payload, stream_id, stream_created, model_name) catch |err| {
             writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
             writer.close() catch {};
             return ctx.response.build();
@@ -8447,8 +9613,23 @@ pub const Node = struct {
             }
         }
 
-        if (stream_ctx.errored) {
-            if (!builtin.is_test) std.log.err("inference request failed code=STREAM_WRITE_FAILED", .{});
+        if (stream_ctx.write_error) |err| {
+            // Generation already stopped through shouldContinue. Classify only
+            // transport/cancellation errors as routine peer abandonment; JSON
+            // formatting, allocation, and other server faults remain errors.
+            const peer_disconnect = generationStreamWriteIsPeerDisconnect(err);
+            if (!builtin.is_test) {
+                if (peer_disconnect)
+                    std.log.info("generation stream closed after client disconnect", .{})
+                else
+                    std.log.err("inference request failed code=STREAM_WRITE_FAILED: {s}", .{@errorName(err)});
+            }
+            if (!peer_disconnect) writer.writeEvent("error", internal_error_message) catch {};
+            writer.close() catch {};
+            return ctx.response.build();
+        }
+        if (stream_ctx.parser_failed) {
+            if (!builtin.is_test) std.log.err("inference request failed code=STREAM_PARSE_FAILED", .{});
             writer.writeEvent("error", internal_error_message) catch {};
             writer.close() catch {};
             return ctx.response.build();
@@ -8462,23 +9643,56 @@ pub const Node = struct {
         );
         recordSpeculationOutcome(&self.metrics, speculative);
 
-        if (tool_parser != null) {
-            flushStreamParserState(ctx.allocator, &writer, stream_id, stream_created, model_name, result.finish_reason, tool_parser.?, speculative) catch |err| {
+        if (stream_ctx.defer_content) {
+            writeStreamCompletion(
+                &chunk_payload,
+                &writer,
+                stream_id,
+                stream_created,
+                model_name,
+                result.text,
+                result.reasoning_text,
+                result.finish_reason,
+                tool_parser,
+                speculative,
+            ) catch |err| {
                 writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
                 writer.close() catch {};
                 return ctx.response.build();
             };
         } else {
-            emitFinishDelta(&writer, ctx.allocator, stream_id, stream_created, model_name, result.finish_reason, speculative) catch |err| {
-                writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
-                writer.close() catch {};
-                return ctx.response.build();
-            };
+            if (result.reasoning_text) |reasoning| {
+                if (reasoning.len > 0) emitReasoningDelta(
+                    &writer,
+                    &chunk_payload,
+                    stream_id,
+                    stream_created,
+                    model_name,
+                    reasoning,
+                ) catch |err| {
+                    writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
+                    writer.close() catch {};
+                    return ctx.response.build();
+                };
+            }
+            if (tool_parser != null) {
+                flushStreamParserState(&chunk_payload, &writer, stream_id, stream_created, model_name, result.finish_reason, tool_parser.?, speculative) catch |err| {
+                    writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
+                    writer.close() catch {};
+                    return ctx.response.build();
+                };
+            } else {
+                emitFinishDelta(&writer, &chunk_payload, stream_id, stream_created, model_name, result.finish_reason, speculative) catch |err| {
+                    writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
+                    writer.close() catch {};
+                    return ctx.response.build();
+                };
+            }
         }
 
         emitTerminalUsageOrDone(
             &writer,
-            ctx.allocator,
+            &chunk_payload,
             stream_id,
             stream_created,
             model_name,
@@ -8497,45 +9711,49 @@ pub const Node = struct {
     }
 
     fn writeStreamCompletion(
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         writer: *httpx.Context.StreamWriter,
         stream_id: []const u8,
         stream_created: i64,
         model_name: []const u8,
         full_text: []const u8,
+        reasoning_text: ?[]const u8,
         default_finish_reason: []const u8,
         tool_parser: ?*tool_parser_mod.Parser,
         speculative: ?generation.SpeculativeDecodeStats,
     ) !void {
+        if (reasoning_text) |reasoning| {
+            if (reasoning.len > 0) try emitReasoningDelta(writer, payload, stream_id, stream_created, model_name, reasoning);
+        }
         if (tool_parser) |parser| {
             parser.reset();
             _ = try parser.feed(full_text);
-            const remaining = try parser.finishText(allocator);
-            defer allocator.free(remaining);
+            const remaining = try parser.finishText(payload.allocator);
+            defer payload.allocator.free(remaining);
             const calls = parser.toolCalls();
-            if (remaining.len > 0) try emitContentDelta(writer, allocator, stream_id, stream_created, model_name, remaining);
+            if (remaining.len > 0) try emitContentDelta(writer, payload, stream_id, stream_created, model_name, remaining);
             if (calls.len > 0) {
-                for (calls, 0..) |call, idx| try emitToolCallDeltaUpdate(writer, allocator, stream_id, stream_created, model_name, .{
+                for (calls, 0..) |call, idx| try emitToolCallDeltaUpdate(writer, payload, stream_id, stream_created, model_name, .{
                     .index = idx,
                     .id = call.id,
                     .type = call.type,
                     .name = call.function.name,
                     .arguments = call.function.arguments,
                 });
-                try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, "tool_calls", speculative);
+                try emitFinishDelta(writer, payload, stream_id, stream_created, model_name, "tool_calls", speculative);
                 return;
             }
-            if (remaining.len == 0 and full_text.len > 0) try emitContentDelta(writer, allocator, stream_id, stream_created, model_name, full_text);
-            try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, default_finish_reason, speculative);
+            if (remaining.len == 0 and full_text.len > 0) try emitContentDelta(writer, payload, stream_id, stream_created, model_name, full_text);
+            try emitFinishDelta(writer, payload, stream_id, stream_created, model_name, default_finish_reason, speculative);
             return;
         }
 
-        if (full_text.len > 0) try emitContentDelta(writer, allocator, stream_id, stream_created, model_name, full_text);
-        try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, default_finish_reason, speculative);
+        if (full_text.len > 0) try emitContentDelta(writer, payload, stream_id, stream_created, model_name, full_text);
+        try emitFinishDelta(writer, payload, stream_id, stream_created, model_name, default_finish_reason, speculative);
     }
 
     fn flushStreamParserState(
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         writer: *httpx.Context.StreamWriter,
         stream_id: []const u8,
         stream_created: i64,
@@ -8544,11 +9762,11 @@ pub const Node = struct {
         parser: *tool_parser_mod.Parser,
         speculative: ?generation.SpeculativeDecodeStats,
     ) !void {
-        const remaining = try parser.finishRemainingText(allocator);
-        defer allocator.free(remaining);
-        if (remaining.len > 0) try emitContentDelta(writer, allocator, stream_id, stream_created, model_name, remaining);
+        const remaining = try parser.finishRemainingText(payload.allocator);
+        defer payload.allocator.free(remaining);
+        if (remaining.len > 0) try emitContentDelta(writer, payload, stream_id, stream_created, model_name, remaining);
         const finish_reason = if (parser.toolCalls().len > 0) "tool_calls" else default_finish_reason;
-        try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, finish_reason, speculative);
+        try emitFinishDelta(writer, payload, stream_id, stream_created, model_name, finish_reason, speculative);
     }
 
     fn parseFinishReason(s: []const u8) api.FinishReason {
@@ -8564,17 +9782,19 @@ pub const Node = struct {
 
     fn writeGenerateChunkEvent(
         writer: anytype,
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         chunk: api.GenerateChunk,
     ) !void {
-        const payload = try std.json.Stringify.valueAlloc(allocator, chunk, .{});
-        defer allocator.free(payload);
-        try writer.writeEvent(null, payload);
+        // Stream-owned buffer, reset per event: streaming emits one chunk per
+        // token and per-token alloc/free churn is measurable overhead.
+        payload.clearRetainingCapacity();
+        std.json.Stringify.value(chunk, .{}, &payload.writer) catch return error.OutOfMemory;
+        try writer.writeEvent(null, payload.written());
     }
 
     fn emitRoleDelta(
         writer: *httpx.Context.StreamWriter,
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         stream_id: []const u8,
         stream_created: i64,
         model_name: []const u8,
@@ -8583,7 +9803,7 @@ pub const Node = struct {
             .index = 0,
             .delta = .{ .role = .assistant },
         }};
-        try writeGenerateChunkEvent(writer, allocator, .{
+        try writeGenerateChunkEvent(writer, payload, .{
             .id = stream_id,
             .object = "chat.completion.chunk",
             .created = stream_created,
@@ -8594,7 +9814,7 @@ pub const Node = struct {
 
     fn emitContentDelta(
         writer: *httpx.Context.StreamWriter,
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         stream_id: []const u8,
         stream_created: i64,
         model_name: []const u8,
@@ -8602,9 +9822,30 @@ pub const Node = struct {
     ) !void {
         const choices = [_]api.GenerateChunkChoice{.{
             .index = 0,
-            .delta = .{ .content = token_text },
+            .delta = .{ .content = .{ .value = token_text } },
         }};
-        try writeGenerateChunkEvent(writer, allocator, .{
+        try writeGenerateChunkEvent(writer, payload, .{
+            .id = stream_id,
+            .object = "chat.completion.chunk",
+            .created = stream_created,
+            .model = model_name,
+            .choices = &choices,
+        });
+    }
+
+    fn emitReasoningDelta(
+        writer: *httpx.Context.StreamWriter,
+        payload: *std.Io.Writer.Allocating,
+        stream_id: []const u8,
+        stream_created: i64,
+        model_name: []const u8,
+        reasoning_text: []const u8,
+    ) !void {
+        const choices = [_]api.GenerateChunkChoice{.{
+            .index = 0,
+            .delta = .{ .reasoning_content = .{ .value = reasoning_text } },
+        }};
+        try writeGenerateChunkEvent(writer, payload, .{
             .id = stream_id,
             .object = "chat.completion.chunk",
             .created = stream_created,
@@ -8615,7 +9856,7 @@ pub const Node = struct {
 
     fn emitToolCallDeltaUpdate(
         writer: *httpx.Context.StreamWriter,
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         stream_id: []const u8,
         stream_created: i64,
         model_name: []const u8,
@@ -8635,7 +9876,7 @@ pub const Node = struct {
             .index = 0,
             .delta = .{ .tool_calls = &tool_calls },
         }};
-        try writeGenerateChunkEvent(writer, allocator, .{
+        try writeGenerateChunkEvent(writer, payload, .{
             .id = stream_id,
             .object = "chat.completion.chunk",
             .created = stream_created,
@@ -8646,14 +9887,14 @@ pub const Node = struct {
 
     fn emitToolCallDelta(
         writer: *httpx.Context.StreamWriter,
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         stream_id: []const u8,
         stream_created: i64,
         model_name: []const u8,
         index: usize,
         call: tool_parser_mod.ToolCall,
     ) !void {
-        try emitToolCallDeltaUpdate(writer, allocator, stream_id, stream_created, model_name, .{
+        try emitToolCallDeltaUpdate(writer, payload, stream_id, stream_created, model_name, .{
             .index = index,
             .id = call.id,
             .type = call.type,
@@ -8664,7 +9905,7 @@ pub const Node = struct {
 
     fn emitFinishDelta(
         writer: anytype,
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         stream_id: []const u8,
         stream_created: i64,
         model_name: []const u8,
@@ -8676,19 +9917,22 @@ pub const Node = struct {
             .delta = .{},
             .finish_reason = parseFinishReason(finish_reason),
         }};
-        try writeGenerateChunkEvent(writer, allocator, .{
+        try writeGenerateChunkEvent(writer, payload, .{
             .id = stream_id,
             .object = "chat.completion.chunk",
             .created = stream_created,
             .model = model_name,
             .choices = &choices,
-            .speculation = generateSpeculationStatus(speculative),
+            .speculation = if (generateSpeculationStatus(speculative)) |status|
+                .{ .value = status }
+            else
+                .absent,
         });
     }
 
     fn emitTerminalUsageAndDone(
         writer: anytype,
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         stream_id: []const u8,
         stream_created: i64,
         model_name: []const u8,
@@ -8696,20 +9940,20 @@ pub const Node = struct {
         completion_tokens: usize,
         cached_prompt_tokens: usize,
     ) !void {
-        try writeGenerateChunkEvent(writer, allocator, .{
+        try writeGenerateChunkEvent(writer, payload, .{
             .id = stream_id,
             .object = "chat.completion.chunk",
             .created = stream_created,
             .model = model_name,
             .choices = &.{},
-            .usage = tokenUsageWithCachedPrompt(prompt_tokens, completion_tokens, cached_prompt_tokens),
+            .usage = .{ .value = tokenUsageWithCachedPrompt(prompt_tokens, completion_tokens, cached_prompt_tokens) },
         });
         try writer.writeEvent(null, "[DONE]");
     }
 
     fn emitTerminalUsageOrDone(
         writer: anytype,
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         stream_id: []const u8,
         stream_created: i64,
         model_name: []const u8,
@@ -8721,7 +9965,7 @@ pub const Node = struct {
         if (include_usage) {
             return emitTerminalUsageAndDone(
                 writer,
-                allocator,
+                payload,
                 stream_id,
                 stream_created,
                 model_name,
@@ -8758,6 +10002,8 @@ pub const Node = struct {
         defer ctx.allocator.free(model_path);
 
         if (rebel_mod.isRebelModel(ctx.allocator, model_path)) {
+            rebel_mod.validateSchemaSupport(body.labels, body.relation_labels) catch |err|
+                return rebelSchemaFailureResponse(ctx, err);
             return self.extractRebel(ctx, model_path, body, texts, want_relations);
         }
 
@@ -8765,6 +10011,16 @@ pub const Node = struct {
             return modelLoadFailureResponse(ctx, err);
         defer model_handle.release();
         const model = model_handle.get();
+        validateTextEntityExtractionManifest(&model.manifest) catch |err| switch (err) {
+            error.InvalidModelForExtraction => return ctx.status(400).json(.{
+                .@"error" = "INVALID_MODEL",
+                .message = "model does not support entity extraction",
+            }),
+            error.UnsupportedInput => return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "model does not support text extraction",
+            }),
+        };
 
         // Use GLiNER pipeline for GLiNER models, standard NER for BIO models
         if (model.isGlinerModel()) {
@@ -8779,13 +10035,7 @@ pub const Node = struct {
         pipeline.config.threshold = body.threshold orelse pipeline.config.threshold;
         const all_entities = pipeline.recognizeBatch(texts) catch |err|
             return inferenceFailureResponse(ctx, err);
-        defer {
-            for (all_entities) |entities| {
-                for (entities) |e| ctx.allocator.free(e.text);
-                ctx.allocator.free(entities);
-            }
-            ctx.allocator.free(all_entities);
-        }
+        defer freeBorrowedLabelEntityBatches(ctx.allocator, all_entities);
 
         const cleaned_entities = try applyLearnedCleanupIfPresent(ctx.allocator, try model.getCleanupHead(), texts, all_entities);
         defer if (cleaned_entities) |entities| freeEntityBatches(ctx.allocator, entities);
@@ -8808,109 +10058,143 @@ pub const Node = struct {
         texts: []const []const u8,
         want_relations: bool,
     ) !httpx.Response {
+        var failure_stage: RebelExtractionFailureStage = .model_layout;
+        const json = self.extractRebelJsonAlloc(
+            ctx.allocator,
+            model_path,
+            body,
+            texts,
+            want_relations,
+            &failure_stage,
+        ) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return switch (failure_stage) {
+                .model_layout => ctx.status(400).json(.{
+                    .@"error" = "INVALID_MODEL",
+                    .message = "model is not a supported encoder-decoder recognizer",
+                }),
+                .tokenizer => ctx.status(500).json(.{
+                    .@"error" = "TOKENIZER_LOAD_FAILED",
+                    .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err),
+                }),
+                .model_load => modelLoadFailureResponse(ctx, err),
+                .inference => inferenceFailureResponse(ctx, err),
+                .response => switch (err) {
+                    error.InvalidExtractionResponse => ctx.status(500).json(.{
+                        .@"error" = "INVALID_EXTRACTION_RESULT",
+                        .message = "model returned an invalid entity or relation response",
+                    }),
+                    else => return err,
+                },
+            };
+        };
+        defer ctx.allocator.free(json);
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.response.body(json);
+        return ctx.response.build();
+    }
+
+    const RebelExtractionFailureStage = enum {
+        model_layout,
+        tokenizer,
+        model_load,
+        inference,
+        response,
+    };
+
+    fn extractRebelJsonAlloc(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        request: EntityExtractionRequest,
+        texts: []const []const u8,
+        want_relations: bool,
+        failure_stage: *RebelExtractionFailureStage,
+    ) ![]u8 {
         const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
-        const hf_tokenizer = @import("inference_hf_tokenizer");
 
-        const paths = enc_dec_mod.findEncoderDecoderPaths(ctx.allocator, model_path) catch
-            return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = "model is not a supported encoder-decoder recognizer" });
-        defer ctx.allocator.free(paths.encoder);
-        defer ctx.allocator.free(paths.decoder);
+        failure_stage.* = .model_layout;
+        const paths = try enc_dec_mod.findEncoderDecoderPaths(allocator, model_path);
+        defer allocator.free(paths.encoder);
+        defer allocator.free(paths.decoder);
 
-        const tok_path = std.fmt.allocPrint(ctx.allocator, "{s}/tokenizer.json", .{model_path}) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err) });
-        defer ctx.allocator.free(tok_path);
+        failure_stage.* = .tokenizer;
+        const tokenizer_path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{model_path});
+        defer allocator.free(tokenizer_path);
+        const tokenizer_bytes = try c_file.readFile(allocator, tokenizer_path);
+        defer allocator.free(tokenizer_bytes);
+        var tokenizer = try hf_tokenizer_mod.HfTokenizer.loadFromBytes(allocator, tokenizer_bytes);
+        defer tokenizer.deinitSelf();
 
-        const tok_bytes = c_file.readFile(ctx.allocator, tok_path) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err) });
-        defer ctx.allocator.free(tok_bytes);
+        failure_stage.* = .model_load;
+        var config = try rebel_mod.loadConfig(allocator, model_path);
+        var config_owned = true;
+        errdefer if (config_owned) config.deinit();
+        const decoder_config = enc_dec_mod.loadDecoderConfig(allocator, model_path) catch enc_dec_mod.DecoderConfig{};
+        if (decoder_config.max_length > 0) config.max_length = decoder_config.max_length;
 
-        var hf_tok = hf_tokenizer.HfTokenizer.loadFromBytes(ctx.allocator, tok_bytes) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err) });
-        defer hf_tok.deinitSelf();
-
-        var config = rebel_mod.loadConfig(ctx.allocator, model_path) catch |err|
-            return modelLoadFailureResponse(ctx, err);
-
-        const dec_config = enc_dec_mod.loadDecoderConfig(ctx.allocator, model_path) catch enc_dec_mod.DecoderConfig{};
-        if (dec_config.max_length > 0) config.max_length = dec_config.max_length;
-
-        var component_loader = self.model_manager.componentLoaderForPaths(
+        var component_loader = try self.model_manager.componentLoaderForPaths(
             model_path,
             self.session_manager.preferred_backends,
             &.{ paths.encoder, paths.decoder },
-        ) catch |err| return modelLoadFailureResponse(ctx, err);
-        var encoder_managed = component_loader.load(paths.encoder) catch |err|
-            return modelLoadFailureResponse(ctx, err);
+        );
+        var encoder_managed = try component_loader.load(paths.encoder);
         defer encoder_managed.deinit();
-        var strict_loader = component_loader.restrictToBackend(encoder_managed.session.backend()) catch |err|
-            return modelLoadFailureResponse(ctx, err);
-        var decoder_managed = strict_loader.load(paths.decoder) catch |err|
-            return modelLoadFailureResponse(ctx, err);
+        var strict_loader = try component_loader.restrictToBackend(encoder_managed.session.backend());
+        var decoder_managed = try strict_loader.load(paths.decoder);
         defer decoder_managed.deinit();
         const encoder_session = encoder_managed.disownSession();
         const decoder_session = decoder_managed.disownSession();
 
         var pipeline = rebel_mod.RebelPipeline{
-            .allocator = ctx.allocator,
+            .allocator = allocator,
             .enc_dec = .{
-                .allocator = ctx.allocator,
+                .allocator = allocator,
                 .encoder = encoder_session,
                 .decoder = decoder_session,
-                .config = dec_config,
+                .config = decoder_config,
             },
-            .tokenizer = hf_tok.tokenizer(),
+            .tokenizer = tokenizer.tokenizer(),
             .config = config,
         };
+        config_owned = false;
         defer pipeline.deinit();
 
+        failure_stage.* = .inference;
         if (want_relations) {
-            const relation_labels = body.relation_labels.?;
-            const extracted = pipeline.extractRelationsBatch(texts, body.labels, relation_labels) catch |err|
-                return inferenceFailureResponse(ctx, err);
+            const relation_labels = request.relation_labels orelse return error.InvalidRelationSchema;
+            const extracted = try pipeline.extractRelationsBatch(texts, request.labels, relation_labels);
             defer {
-                for (extracted.entities) |entities| {
-                    for (entities) |entity| ctx.allocator.free(entity.text);
-                    ctx.allocator.free(entities);
-                }
-                ctx.allocator.free(extracted.entities);
-
+                rebel_mod.deinitEntityBatches(allocator, extracted.entities);
                 for (extracted.relations) |relations| {
-                    for (relations) |*relation| relation.deinit(ctx.allocator);
-                    ctx.allocator.free(relations);
+                    for (relations) |*relation| relation.deinit(allocator);
+                    allocator.free(relations);
                 }
-                ctx.allocator.free(extracted.relations);
+                allocator.free(extracted.relations);
             }
 
-            if (body.resolver) |resolver_cfg| {
-                var resolved = try resolveExtractedOutput(ctx.allocator, extracted.entities, extracted.relations, resolver_cfg);
-                defer resolved.deinit(ctx.allocator);
-                return self.buildEntityExtractionResponse(ctx, body, resolved.entities, resolved.relations, texts);
+            failure_stage.* = .response;
+            if (request.resolver) |resolver_config| {
+                var resolved = try resolveExtractedOutput(allocator, extracted.entities, extracted.relations, resolver_config);
+                defer resolved.deinit(allocator);
+                return entityExtractionResponseJsonAlloc(allocator, request, resolved.entities, resolved.relations, texts);
             }
-
-            return self.buildEntityExtractionResponse(ctx, body, extracted.entities, extracted.relations, texts);
+            return entityExtractionResponseJsonAlloc(allocator, request, extracted.entities, extracted.relations, texts);
         }
 
-        const all_entities = pipeline.recognizeBatch(texts) catch |err|
-            return inferenceFailureResponse(ctx, err);
-        defer {
-            for (all_entities) |entities| {
-                for (entities) |entity| ctx.allocator.free(entity.text);
-                ctx.allocator.free(entities);
-            }
-            ctx.allocator.free(all_entities);
-        }
-
-        const cleaned_entities = try applyLearnedCleanupIfPresent(ctx.allocator, null, texts, all_entities);
-        defer if (cleaned_entities) |entities| freeEntityBatches(ctx.allocator, entities);
+        const all_entities = try pipeline.recognizeBatch(texts);
+        defer rebel_mod.deinitEntityBatches(allocator, all_entities);
+        failure_stage.* = .response;
+        const cleaned_entities = try applyLearnedCleanupIfPresent(allocator, null, texts, all_entities);
+        defer if (cleaned_entities) |entities| freeEntityBatches(allocator, entities);
         const entities_for_response = cleaned_entities orelse all_entities;
 
-        if (body.resolver) |resolver_cfg| {
-            var resolved = try resolveExtractedOutput(ctx.allocator, entities_for_response, null, resolver_cfg);
-            defer resolved.deinit(ctx.allocator);
-            return self.buildEntityExtractionResponse(ctx, body, resolved.entities, resolved.relations, texts);
+        if (request.resolver) |resolver_config| {
+            var resolved = try resolveExtractedOutput(allocator, entities_for_response, null, resolver_config);
+            defer resolved.deinit(allocator);
+            return entityExtractionResponseJsonAlloc(allocator, request, resolved.entities, resolved.relations, texts);
         }
-
-        return self.buildEntityExtractionResponse(ctx, body, entities_for_response, null, texts);
+        return entityExtractionResponseJsonAlloc(allocator, request, entities_for_response, null, texts);
     }
 
     fn extractGliner(
@@ -8939,14 +10223,17 @@ pub const Node = struct {
             }
 
             const relation_labels = body.relation_labels.?;
-            const extracted = pipeline.extractRelationsBatch(texts, labels, relation_labels) catch |err|
+            const relation_entity_labels = try relationEntityLabelsAlloc(
+                ctx.allocator,
+                labels,
+                pipeline.config.default_labels,
+                relation_labels,
+            );
+            defer if (relation_entity_labels) |values| ctx.allocator.free(values);
+            const extracted = pipeline.extractRelationsBatch(texts, relation_entity_labels, relation_labels) catch |err|
                 return inferenceFailureResponse(ctx, err);
             defer {
-                for (extracted.entities) |entities| {
-                    for (entities) |e| ctx.allocator.free(e.text);
-                    ctx.allocator.free(entities);
-                }
-                ctx.allocator.free(extracted.entities);
+                freeBorrowedLabelEntityBatches(ctx.allocator, extracted.entities);
 
                 for (extracted.relations) |relations| {
                     for (relations) |*relation| relation.deinit(ctx.allocator);
@@ -8966,13 +10253,7 @@ pub const Node = struct {
 
         const all_entities = pipeline.recognizeBatch(texts, labels) catch |err|
             return inferenceFailureResponse(ctx, err);
-        defer {
-            for (all_entities) |entities| {
-                for (entities) |e| ctx.allocator.free(e.text);
-                ctx.allocator.free(entities);
-            }
-            ctx.allocator.free(all_entities);
-        }
+        defer freeBorrowedLabelEntityBatches(ctx.allocator, all_entities);
 
         const cleaned_entities = try applyLearnedCleanupIfPresent(ctx.allocator, try model.getCleanupHead(), texts, all_entities);
         defer if (cleaned_entities) |entities| freeEntityBatches(ctx.allocator, entities);
@@ -8995,62 +10276,23 @@ pub const Node = struct {
         all_relations: ?[]const []const gliner_mod.Relation,
         input_texts: []const []const u8,
     ) !httpx.Response {
-        if (all_entities.len != input_texts.len or (all_relations != null and all_relations.?.len != input_texts.len)) {
-            return ctx.status(500).json(.{
+        const json = entityExtractionResponseJsonAlloc(
+            ctx.allocator,
+            request,
+            all_entities,
+            all_relations,
+            input_texts,
+        ) catch |err| switch (err) {
+            error.InvalidExtractionResponse => return ctx.status(500).json(.{
                 .@"error" = "INVALID_EXTRACTION_RESULT",
-                .message = "model returned a different number of result batches than inputs",
-            });
-        }
-        var arena = std.heap.ArenaAllocator.init(ctx.allocator);
-        defer arena.deinit();
-        const alloc = arena.allocator();
-
-        const data = try alloc.alloc(extraction_api.ExtractionObject, all_entities.len);
-        for (all_entities, 0..) |entities, ti| {
-            const entity_objects = try alloc.alloc(extraction_api.ExtractionEntity, entities.len);
-            for (entities, 0..) |e, ei| entity_objects[ei] = toExtractionApiEntity(e, request);
-
-            const relations_inner: ?[]const extraction_api.ExtractionRelation = if (all_relations) |rels_by_text| blk: {
-                const relations = if (ti < rels_by_text.len) rels_by_text[ti] else &.{};
-                const relation_objects = try alloc.alloc(extraction_api.ExtractionRelation, relations.len);
-                for (relations, 0..) |r, ri| {
-                    const source_index = findEntityIndex(entities, r.head) orelse return ctx.status(500).json(.{
-                        .@"error" = "INVALID_EXTRACTION_RESULT",
-                        .message = "relation source is missing from extracted entities",
-                    });
-                    const target_index = findEntityIndex(entities, r.tail) orelse return ctx.status(500).json(.{
-                        .@"error" = "INVALID_EXTRACTION_RESULT",
-                        .message = "relation target is missing from extracted entities",
-                    });
-                    relation_objects[ri] = .{
-                        .type = r.label,
-                        .source = .{ .entity_index = @intCast(source_index) },
-                        .target = .{ .entity_index = @intCast(target_index) },
-                        .score = if (request.include_confidence) r.score else null,
-                    };
-                }
-                break :blk relation_objects;
-            } else null;
-
-            data[ti] = .{
-                .id = if (ti < request.input_ids.len) request.input_ids[ti] else null,
-                .entities = entity_objects,
-                .relations = relations_inner,
-            };
-        }
-
-        const prompt_tokens = estimateTextsTokens(input_texts);
-        var usage: std.json.ObjectMap = .empty;
-        try usage.ensureTotalCapacity(alloc, 3);
-        usage.putAssumeCapacity("prompt_tokens", .{ .integer = @intCast(prompt_tokens) });
-        usage.putAssumeCapacity("completion_tokens", .{ .integer = 0 });
-        usage.putAssumeCapacity("total_tokens", .{ .integer = @intCast(prompt_tokens) });
-        return ctx.json(extraction_api.ExtractionResponse{
-            .object = "extraction",
-            .data = data,
-            .model = request.model,
-            .usage = .{ .object = usage },
-        });
+                .message = "model returned an invalid entity or relation response",
+            }),
+            else => return err,
+        };
+        defer ctx.allocator.free(json);
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.response.body(json);
+        return ctx.response.build();
     }
 
     fn toExtractionApiEntity(entity: @import("../pipelines/ner.zig").Entity, request: EntityExtractionRequest) extraction_api.ExtractionEntity {
@@ -9893,24 +11135,18 @@ pub const Node = struct {
         if (body.inputs.len == 0) {
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "inputs are required" });
         }
-        const has_entities = if (body.schema.entities) |entities| entities.len > 0 else false;
         const has_relations = if (body.schema.relations) |relations| relations.len > 0 else false;
-        const has_classifications = if (body.schema.classifications) |classifications| classifications.len > 0 else false;
-        const has_structures = if (body.schema.structures) |structures| structures.map.count() > 0 else false;
-        const operation_count: usize = @intFromBool(has_entities or has_relations) + @intFromBool(has_classifications) + @intFromBool(has_structures);
-        if (operation_count == 0) {
-            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "schema must request at least one extraction operation" });
-        }
-        if (operation_count > 1) {
-            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "mixed extraction operations are not supported by this model runtime" });
-        }
+        const operation = canonicalExtractionOperation(body.schema) catch |err| switch (err) {
+            error.MissingExtractionOperation => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "schema must request at least one extraction operation" }),
+            error.MixedExtractionOperations => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "mixed extraction operations are not supported by this model runtime" }),
+        };
         if (body.schema.entities) |labels| {
             for (labels) |label| if (!isCanonicalLabelSegment(label)) {
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "entity labels must be non-empty and cannot contain '::'" });
             };
         }
 
-        if (has_structures) {
+        if (operation == .structures) {
             const inputs = try canonicalExtractingInputs(ctx.allocator, body.inputs);
             defer freeCanonicalExtractingInputs(ctx.allocator, inputs);
             const schema_json = try std.json.Stringify.valueAlloc(ctx.allocator, body.schema, .{});
@@ -9931,14 +11167,14 @@ pub const Node = struct {
             return ctx.response.build();
         }
 
-        if (has_classifications) {
-            var classification_inputs = parseCanonicalTextInputs(self, ctx.allocator, body.inputs) catch
+        if (operation == .classifications) {
+            var classification_inputs = parseCanonicalTextInputs(ctx.allocator, body.inputs) catch
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "classification extraction requires text inputs" });
             defer classification_inputs.deinit();
             return self.extractClassifications(ctx, body, classification_inputs.texts.items);
         }
 
-        var direct_inputs = parseCanonicalTextInputs(self, ctx.allocator, body.inputs) catch
+        var direct_inputs = parseCanonicalTextInputs(ctx.allocator, body.inputs) catch
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "entity and relation extraction requires text inputs" });
         defer direct_inputs.deinit();
         if (try self.acquireSlot(ctx)) |resp| return resp;
@@ -10082,7 +11318,7 @@ pub const Node = struct {
             .object = "extraction",
             .model = body.model,
             .data = data,
-            .usage = .{ .object = usage },
+            .usage = .{ .map = usage },
         });
     }
 
@@ -10678,7 +11914,11 @@ pub const Node = struct {
 
     fn readyzHandler(self: *Node, ctx: *httpx.Context) anyerror!httpx.Response {
         const snapshot = self.readiness_inventory.load();
-        const is_ready = snapshot.initialized and snapshot.counts.total() > 0;
+        const required_backend_ready = blk: {
+            self.session_manager.validateRequiredBackendPolicy() catch break :blk false;
+            break :blk true;
+        };
+        const is_ready = required_backend_ready and snapshot.initialized and snapshot.counts.total() > 0;
         const status_text = if (is_ready) "ready" else "not_ready";
         const status_code: u16 = if (is_ready) 200 else 503;
         return ctx.status(status_code).json(.{
@@ -10732,6 +11972,93 @@ fn appendExtractionClassificationBatch(
             appended += 1;
         }
     }
+}
+
+const CanonicalExtractionOperation = enum {
+    entities_relations,
+    classifications,
+    structures,
+};
+
+fn canonicalExtractionOperation(schema: extraction_api.ExtractionSchema) !CanonicalExtractionOperation {
+    const has_entities = if (schema.entities) |entities| entities.len > 0 else false;
+    const has_relations = if (schema.relations) |relations| relations.len > 0 else false;
+    const has_classifications = if (schema.classifications) |classifications| classifications.len > 0 else false;
+    const has_structures = if (schema.structures) |structures| structures.map.count() > 0 else false;
+    const operation_count: usize = @as(usize, @intFromBool(has_entities or has_relations)) +
+        @as(usize, @intFromBool(has_classifications)) + @as(usize, @intFromBool(has_structures));
+    if (operation_count == 0) return error.MissingExtractionOperation;
+    if (operation_count > 1) return error.MixedExtractionOperations;
+    if (has_classifications) return .classifications;
+    if (has_structures) return .structures;
+    return .entities_relations;
+}
+
+/// Entity extraction has two supported loaded-model layouts: GLiNER models
+/// with an extraction-capable head and standard BIO token recognizers. Reject
+/// other model families before constructing a pipeline or running inference.
+fn validateTextEntityExtractionManifest(manifest: *const manifest_mod.ModelManifest) !void {
+    if (manifest.model_type != .recognizer) return error.InvalidModelForExtraction;
+    if (!model_caps.modelAcceptsInput(manifest, "text")) return error.UnsupportedInput;
+    if (manifest.gliner_model_type.len > 0 and !model_caps.modelSupportsCapability(
+        @tagName(manifest.model_type),
+        manifest.gliner_model_type,
+        manifest.capabilities,
+        "extraction",
+    )) return error.InvalidModelForExtraction;
+}
+
+fn entityExtractionResponseJsonAlloc(
+    allocator: std.mem.Allocator,
+    request: Node.EntityExtractionRequest,
+    all_entities: []const []const @import("../pipelines/ner.zig").Entity,
+    all_relations: ?[]const []const gliner_mod.Relation,
+    input_texts: []const []const u8,
+) ![]u8 {
+    if (all_entities.len != input_texts.len or (all_relations != null and all_relations.?.len != input_texts.len))
+        return error.InvalidExtractionResponse;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const data = try alloc.alloc(extraction_api.ExtractionObject, all_entities.len);
+    for (all_entities, 0..) |entities, text_index| {
+        const entity_objects = try alloc.alloc(extraction_api.ExtractionEntity, entities.len);
+        for (entities, 0..) |entity, entity_index|
+            entity_objects[entity_index] = Node.toExtractionApiEntity(entity, request);
+
+        const relation_objects: ?[]const extraction_api.ExtractionRelation = if (all_relations) |relations_by_text| blk: {
+            const relations = relations_by_text[text_index];
+            const objects = try alloc.alloc(extraction_api.ExtractionRelation, relations.len);
+            for (relations, 0..) |relation, relation_index| {
+                const source_index = Node.findEntityIndex(entities, relation.head) orelse return error.InvalidExtractionResponse;
+                const target_index = Node.findEntityIndex(entities, relation.tail) orelse return error.InvalidExtractionResponse;
+                objects[relation_index] = .{
+                    .type = relation.label,
+                    .source = .{ .entity_index = @intCast(source_index) },
+                    .target = .{ .entity_index = @intCast(target_index) },
+                    .score = if (request.include_confidence) relation.score else null,
+                };
+            }
+            break :blk objects;
+        } else null;
+        data[text_index] = .{
+            .id = if (text_index < request.input_ids.len) request.input_ids[text_index] else null,
+            .entities = entity_objects,
+            .relations = relation_objects,
+        };
+    }
+    const prompt_tokens = estimateTextsTokens(input_texts);
+    var usage: std.json.ObjectMap = .empty;
+    try usage.ensureTotalCapacity(alloc, 3);
+    usage.putAssumeCapacity("prompt_tokens", .{ .integer = @intCast(prompt_tokens) });
+    usage.putAssumeCapacity("completion_tokens", .{ .integer = 0 });
+    usage.putAssumeCapacity("total_tokens", .{ .integer = @intCast(prompt_tokens) });
+    return try std.json.Stringify.valueAlloc(allocator, extraction_api.ExtractionResponse{
+        .object = "extraction",
+        .data = data,
+        .model = request.model,
+        .usage = .{ .map = usage },
+    }, .{});
 }
 
 fn predictorTaskFromTabular(task: @import("ml_tabular").ir.TaskType) api.PredictorTask {
@@ -10802,7 +12129,7 @@ fn extractionResponseJsonAlloc(
         }
         data[result_index] = .{
             .id = if (result_index < inputs.len) inputs[result_index].id else null,
-            .structures = .{ .object = structures_map },
+            .structures = .{ .map = structures_map },
         };
     }
 
@@ -11040,18 +12367,10 @@ fn freeCanonicalExtractingInputs(allocator: std.mem.Allocator, inputs: []extract
     allocator.free(inputs);
 }
 
-fn parseCanonicalTextInputs(
-    node: *Node,
-    allocator: std.mem.Allocator,
-    inputs: []const extraction_api.ExtractionInput,
-) !DirectExtractionInputs {
+fn parseCanonicalTextInputs(allocator: std.mem.Allocator, inputs: []const extraction_api.ExtractionInput) !DirectExtractionInputs {
     const direct = try canonicalExtractingInputs(allocator, inputs);
     defer freeCanonicalExtractingInputs(allocator, direct);
-    const media_admission = requestMediaAdmission(node, .{});
-    var parsed = try parseDirectExtractionInputs(node, allocator, direct, null, null, media_admission.byte_cap);
-    errdefer parsed.deinit();
-    if (parsed.images.items.len > 0 or parsed.texts.items.len != inputs.len) return error.UnsupportedInput;
-    return parsed;
+    return parseDirectTextExtractionInputs(allocator, direct);
 }
 
 fn canonicalInputIds(allocator: std.mem.Allocator, inputs: []const extraction_api.ExtractionInput) ![]?[]const u8 {
@@ -11087,6 +12406,52 @@ fn canonicalRelationLabels(
     return labels;
 }
 
+/// Build the entity-label vocabulary needed by GLiNER relation extraction.
+/// Explicit entity labels remain authoritative; otherwise model defaults are
+/// retained. Canonical relation endpoint constraints are always added so a
+/// legal relations-only schema does not depend on those endpoints happening
+/// to exist in a model's default vocabulary.
+fn relationEntityLabelsAlloc(
+    allocator: std.mem.Allocator,
+    requested: ?[]const []const u8,
+    defaults: []const []const u8,
+    canonical_relation_labels: []const []const u8,
+) !?[]const []const u8 {
+    var labels = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer labels.deinit(allocator);
+
+    const seed = if (requested) |values|
+        if (values.len > 0) values else defaults
+    else
+        defaults;
+    for (seed) |label| try appendUniqueLabel(allocator, &labels, label);
+
+    for (canonical_relation_labels) |label| {
+        const first_separator = std.mem.indexOf(u8, label, "::") orelse continue;
+        try appendUniqueLabel(allocator, &labels, label[0..first_separator]);
+        const remainder = label[first_separator + 2 ..];
+        const second_separator = std.mem.indexOf(u8, remainder, "::") orelse continue;
+        try appendUniqueLabel(allocator, &labels, remainder[second_separator + 2 ..]);
+    }
+
+    if (labels.items.len == 0) {
+        labels.deinit(allocator);
+        return null;
+    }
+    return try labels.toOwnedSlice(allocator);
+}
+
+fn appendUniqueLabel(
+    allocator: std.mem.Allocator,
+    labels: *std.ArrayListUnmanaged([]const u8),
+    candidate: []const u8,
+) !void {
+    for (labels.items) |label| {
+        if (std.ascii.eqlIgnoreCase(label, candidate)) return;
+    }
+    try labels.append(allocator, candidate);
+}
+
 fn isCanonicalLabelSegment(value: []const u8) bool {
     return value.len > 0 and std.mem.indexOf(u8, value, "::") == null;
 }
@@ -11105,18 +12470,91 @@ fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Re
             "inference_admission",
         ),
         error.InvalidExtractionConfig,
+        error.InvalidClassificationSchema,
+        error.InvalidEntitySchema,
+        error.InvalidModelForExtraction,
+        error.InvalidRelationSchema,
         error.InvalidStructureField,
+        error.InvalidTopK,
+        error.MissingExtractionOperation,
         error.MissingStructureFields,
         error.MissingStructureSchema,
+        error.MixedExtractionOperations,
+        error.UnsupportedClassificationExtraction,
         error.UnsupportedInput,
+        error.UnsupportedRelationExtraction,
         error.InvalidMaxTokens,
         => ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) }),
+        error.UnsupportedRebelEntityLabels,
+        error.UnsupportedRebelRelationEndpoints,
+        => rebelSchemaFailureResponse(ctx, err),
         error.ReadBatchTooLarge,
         error.StreamTooLong,
         => ctx.status(413).json(.{ .@"error" = "BATCH_TOO_LARGE", .message = @errorName(err) }),
         error.ModelNotFound => ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" }),
         else => inferenceFailureResponse(ctx, err),
     };
+}
+
+fn rebelSchemaFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    return switch (err) {
+        error.UnsupportedRebelEntityLabels => ctx.status(400).json(.{
+            .@"error" = "INVALID_REQUEST",
+            .message = "REBEL supports only the generic entity label 'ENTITY'; use an entity-typing extractor for typed entity schemas",
+        }),
+        error.UnsupportedRebelRelationEndpoints => ctx.status(400).json(.{
+            .@"error" = "INVALID_REQUEST",
+            .message = "REBEL supports relation-type filters, but source and target constraints must use the generic 'ENTITY' label",
+        }),
+        else => return err,
+    };
+}
+
+fn parseDirectTextExtractionInputs(
+    allocator: std.mem.Allocator,
+    inputs: []const extracting_api.Input,
+) !DirectExtractionInputs {
+    var out = DirectExtractionInputs{ .allocator = allocator };
+    errdefer out.deinit();
+    for (inputs) |input| try appendDirectTextExtractionContent(allocator, &out, input.content_json);
+    if (out.texts.items.len != inputs.len or out.texts.items.len == 0) return error.UnsupportedInput;
+    return out;
+}
+
+fn appendDirectTextExtractionContent(
+    allocator: std.mem.Allocator,
+    out: *DirectExtractionInputs,
+    content_json: []const u8,
+) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content_json, .{});
+    defer parsed.deinit();
+
+    const text = switch (parsed.value) {
+        .string => |value| try allocator.dupe(u8, value),
+        .array => |parts| blk: {
+            var text_buf = std.ArrayListUnmanaged(u8).empty;
+            defer text_buf.deinit(allocator);
+            var saw_text = false;
+            for (parts.items) |part| {
+                if (part != .object) continue;
+                const type_value = part.object.get("type") orelse continue;
+                if (type_value != .string) continue;
+                if (std.mem.eql(u8, type_value.string, "image_url") or
+                    std.mem.eql(u8, type_value.string, "media")) return error.UnsupportedInput;
+                if (!std.mem.eql(u8, type_value.string, "text")) continue;
+                const text_value = part.object.get("text") orelse continue;
+                if (text_value != .string) continue;
+                if (saw_text) try text_buf.append(allocator, '\n');
+                try text_buf.appendSlice(allocator, text_value.string);
+                saw_text = true;
+            }
+            if (!saw_text) return error.UnsupportedInput;
+            break :blk try allocator.dupe(u8, text_buf.items);
+        },
+        else => try std.json.Stringify.valueAlloc(allocator, parsed.value, .{}),
+    };
+    errdefer allocator.free(text);
+    try out.texts.append(allocator, text);
 }
 
 fn parseDirectExtractionInputs(
@@ -11335,7 +12773,7 @@ fn resolveExtractedOutput(
     const entity_batches = try allocator.alloc([]@import("../pipelines/ner.zig").Entity, input_count);
     var initialized_entity_batches: usize = 0;
     errdefer {
-        freeEntityBatches(allocator, entity_batches[0..initialized_entity_batches]);
+        freeOwnedEntityBatchContents(allocator, entity_batches[0..initialized_entity_batches]);
         allocator.free(entity_batches);
     }
 
@@ -11352,7 +12790,12 @@ fn resolveExtractedOutput(
 
         for (kg.entities) |entity| {
             if (!resolvedHasTextIndex(entity.text_indices, text_index)) continue;
-            try resolved_for_text.append(allocator, try cloneResolvedEntity(allocator, entity, text_index));
+            const cloned = try cloneResolvedEntity(allocator, entity, text_index);
+            errdefer {
+                allocator.free(cloned.text);
+                allocator.free(cloned.label);
+            }
+            try resolved_for_text.append(allocator, cloned);
         }
 
         entity_batches[text_index] = try resolved_for_text.toOwnedSlice(allocator);
@@ -11383,7 +12826,13 @@ fn resolveExtractedOutput(
 
             for (kg.relations) |relation| {
                 if (!resolvedHasTextIndex(relation.text_indices, text_index)) continue;
-                try resolved_for_text.append(allocator, try cloneResolvedRelation(allocator, kg.entities, relation, text_index));
+                var cloned = try cloneResolvedRelation(allocator, kg.entities, relation, text_index);
+                errdefer {
+                    allocator.free(cloned.head.label);
+                    allocator.free(cloned.tail.label);
+                    cloned.deinit(allocator);
+                }
+                try resolved_for_text.append(allocator, cloned);
             }
 
             batches[text_index] = try resolved_for_text.toOwnedSlice(allocator);
@@ -11517,7 +12966,7 @@ fn applyLearnedCleanupIfPresent(
     const out = try allocator.alloc([]@import("../pipelines/ner.zig").Entity, texts.len);
     var built: usize = 0;
     errdefer {
-        freeEntityBatches(allocator, out[0..built]);
+        freeOwnedEntityBatchContents(allocator, out[0..built]);
         allocator.free(out);
     }
 
@@ -11546,28 +12995,72 @@ fn applyLearnedCleanupIfPresent(
         });
         defer cleaned.deinit(allocator);
 
-        out[idx] = try allocator.alloc(@import("../pipelines/ner.zig").Entity, cleaned.resolved_entities.len);
-        for (cleaned.resolved_entities, 0..) |resolved_entity, entity_idx| {
-            out[idx][entity_idx] = .{
-                .text = try allocator.dupe(u8, resolved_entity.text),
-                .label = try allocator.dupe(u8, resolved_entity.label),
-                .start = resolved_entity.start,
-                .end = resolved_entity.end,
-                .score = resolved_entity.detect_score * resolved_entity.validity_score,
-            };
-        }
+        out[idx] = try cloneCleanedEntityBatch(allocator, cleaned.resolved_entities);
         built += 1;
     }
 
     return out;
 }
 
-fn freeEntityBatches(allocator: std.mem.Allocator, all_entities: []const []@import("../pipelines/ner.zig").Entity) void {
+fn cloneCleanedEntityBatch(
+    allocator: std.mem.Allocator,
+    resolved_entities: []const cleanup_pipeline_mod.ResolvedEntity,
+) ![]@import("../pipelines/ner.zig").Entity {
+    const out = try allocator.alloc(@import("../pipelines/ner.zig").Entity, resolved_entities.len);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |entity| {
+            allocator.free(entity.text);
+            allocator.free(entity.label);
+        }
+        allocator.free(out);
+    }
+
+    for (resolved_entities, 0..) |resolved_entity, idx| {
+        const text = try allocator.dupe(u8, resolved_entity.text);
+        errdefer allocator.free(text);
+        const label = try allocator.dupe(u8, resolved_entity.label);
+        errdefer allocator.free(label);
+        out[idx] = .{
+            .text = text,
+            .label = label,
+            .start = resolved_entity.start,
+            .end = resolved_entity.end,
+            .score = resolved_entity.detect_score * resolved_entity.validity_score,
+        };
+        built += 1;
+    }
+
+    return out;
+}
+
+fn freeOwnedEntityBatchContents(
+    allocator: std.mem.Allocator,
+    all_entities: []const []@import("../pipelines/ner.zig").Entity,
+) void {
     for (all_entities) |entities| {
         for (entities) |entity| {
             allocator.free(entity.text);
             allocator.free(entity.label);
         }
+        allocator.free(entities);
+    }
+}
+
+fn freeEntityBatches(allocator: std.mem.Allocator, all_entities: []const []@import("../pipelines/ner.zig").Entity) void {
+    freeOwnedEntityBatchContents(allocator, all_entities);
+    allocator.free(all_entities);
+}
+
+/// Release raw NER/GLiNER results. Their span text and batch containers are
+/// owned by the caller, while labels borrow model configuration or request
+/// schema storage and must remain untouched.
+fn freeBorrowedLabelEntityBatches(
+    allocator: std.mem.Allocator,
+    all_entities: []const []@import("../pipelines/ner.zig").Entity,
+) void {
+    for (all_entities) |entities| {
+        for (entities) |entity| allocator.free(entity.text);
         allocator.free(entities);
     }
     allocator.free(all_entities);
@@ -12160,11 +13653,25 @@ test "generate speculation options validate the HTTP trust boundary" {
     try std.testing.expectEqual(@as(u32, 4), defaults.k);
     try std.testing.expectEqual(generation.SpeculationPolicy.auto, defaults.policy);
     try std.testing.expectEqual(generation.SpeculationCalibration.none, defaults.calibration);
+    var discovered = defaults;
+    qualifyAutoDiscoveredDraftSpeculation(&discovered);
+    try std.testing.expectEqual(generation.SpeculationCalibration.probe, discovered.calibration);
     const probing = try parseGenerateSpeculationOptions(true, null, null, "probe");
     try std.testing.expectEqual(generation.SpeculationCalibration.probe, probing.calibration);
-    const forced = try parseGenerateSpeculationOptions(true, null, "force", null);
+    var forced = try parseGenerateSpeculationOptions(true, null, "force", null);
+    try std.testing.expectEqual(generation.SpeculationCalibration.none, forced.calibration);
+    qualifyAutoDiscoveredDraftSpeculation(&forced);
     try std.testing.expectEqual(generation.SpeculationCalibration.none, forced.calibration);
     try std.testing.expect(!shouldResolveDraftModel(.off));
+    try std.testing.expect(!generationSpeculationRequested(
+        effectiveDraftModelName("draft", .off),
+        null,
+    ));
+    try std.testing.expect(generationSpeculationRequested(
+        effectiveDraftModelName("draft", .auto),
+        null,
+    ));
+    try std.testing.expect(generationSpeculationRequested(null, "auto-draft"));
     try std.testing.expectEqual(@as(usize, 7), generateAdmissionUnitsForSpeculation(7, false, .auto));
     try std.testing.expectEqual(@as(usize, 7), generateAdmissionUnitsForSpeculation(7, true, .off));
     try std.testing.expectEqual(@as(usize, 14), generateAdmissionUnitsForSpeculation(7, true, .auto));
@@ -12193,6 +13700,24 @@ test "generate admission units conservatively charge active draft requests" {
     var off = parsed.value;
     off.speculation_policy = "off";
     try std.testing.expectEqual(@as(usize, 3), Node.estimateGenerateRequestAdmissionUnits(off, 256));
+}
+
+test "auto draft admission unwind preserves independent request growth" {
+    var reserved_units: usize = 10;
+    var auto_draft_extra_units: usize = 2;
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        takeAutoDraftAdmissionExtra(&reserved_units, &auto_draft_extra_units),
+    );
+    try std.testing.expectEqual(@as(usize, 8), reserved_units);
+    try std.testing.expectEqual(@as(usize, 0), auto_draft_extra_units);
+
+    // Repeated degradation is idempotent and cannot consume media admission.
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        takeAutoDraftAdmissionExtra(&reserved_units, &auto_draft_extra_units),
+    );
+    try std.testing.expectEqual(@as(usize, 8), reserved_units);
 }
 
 test "generate numeric options validate narrowing at the HTTP trust boundary" {
@@ -12232,14 +13757,14 @@ test "generation SSE usage chunk serializes authoritative accounting" {
         .created = 42,
         .model = "gemma-4",
         .choices = &.{},
-        .usage = tokenUsageWithCachedPrompt(2003, 300, 512),
+        .usage = .{ .value = tokenUsageWithCachedPrompt(2003, 300, 512) },
     }, .{});
     defer allocator.free(payload);
 
     var parsed = try std.json.parseFromSlice(api.GenerateChunk, allocator, payload, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 0), parsed.value.choices.len);
-    const usage = parsed.value.usage orelse return error.TestExpectedEqual;
+    const usage = parsed.value.usage.valueOrNull() orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(i64, 2003), usage.prompt_tokens);
     try std.testing.expectEqual(@as(i64, 300), usage.completion_tokens);
     try std.testing.expectEqual(@as(i64, 2303), usage.total_tokens);
@@ -12270,20 +13795,22 @@ test "generation SSE orders finish then usage then done" {
 
     var capture = Capture{ .allocator = allocator };
     defer capture.deinit();
-    try Node.emitFinishDelta(&capture, allocator, "chatcmpl-test", 42, "gemma-4", "length", null);
-    try Node.emitTerminalUsageAndDone(&capture, allocator, "chatcmpl-test", 42, "gemma-4", 2003, 300, 0);
+    var payload: std.Io.Writer.Allocating = .init(allocator);
+    defer payload.deinit();
+    try Node.emitFinishDelta(&capture, &payload, "chatcmpl-test", 42, "gemma-4", "length", null);
+    try Node.emitTerminalUsageAndDone(&capture, &payload, "chatcmpl-test", 42, "gemma-4", 2003, 300, 0);
 
     try std.testing.expectEqual(@as(usize, 3), capture.events.items.len);
     var finish = try std.json.parseFromSlice(api.GenerateChunk, allocator, capture.events.items[0], .{});
     defer finish.deinit();
     try std.testing.expectEqual(@as(usize, 1), finish.value.choices.len);
     try std.testing.expectEqual(api.FinishReason.length, finish.value.choices[0].finish_reason.?);
-    try std.testing.expect(finish.value.usage == null);
+    try std.testing.expect(!finish.value.usage.isPresent());
 
     var usage = try std.json.parseFromSlice(api.GenerateChunk, allocator, capture.events.items[1], .{});
     defer usage.deinit();
     try std.testing.expectEqual(@as(usize, 0), usage.value.choices.len);
-    try std.testing.expectEqual(@as(i64, 300), usage.value.usage.?.completion_tokens);
+    try std.testing.expectEqual(@as(i64, 300), usage.value.usage.valueOrNull().?.completion_tokens);
     try std.testing.expectEqualStrings("[DONE]", capture.events.items[2]);
 }
 
@@ -12308,8 +13835,10 @@ test "generation SSE omits usage unless requested" {
 
     var capture = Capture{ .allocator = allocator };
     defer capture.deinit();
-    try Node.emitFinishDelta(&capture, allocator, "chatcmpl-test", 42, "gemma-4", "length", null);
-    try Node.emitTerminalUsageOrDone(&capture, allocator, "chatcmpl-test", 42, "gemma-4", 2003, 300, 0, false);
+    var payload: std.Io.Writer.Allocating = .init(allocator);
+    defer payload.deinit();
+    try Node.emitFinishDelta(&capture, &payload, "chatcmpl-test", 42, "gemma-4", "length", null);
+    try Node.emitTerminalUsageOrDone(&capture, &payload, "chatcmpl-test", 42, "gemma-4", 2003, 300, 0, false);
 
     try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
     try std.testing.expectEqualStrings("[DONE]", capture.events.items[1]);
@@ -12424,6 +13953,18 @@ test "generate chat template kwargs preserve default and parse explicit thinking
     ,
         false,
     ));
+
+    // The single-parse request path validates the untyped Value and then
+    // builds the typed request from that same Value instead of re-parsing
+    // the raw body.
+    var parsed_value = try std.json.parseFromSlice(std.json.Value, allocator, disabled_json, .{});
+    defer parsed_value.deinit();
+    try std.testing.expect(generateRequestChatTemplateKwargsAreValid(parsed_value.value));
+    var from_value = try std.json.parseFromValue(api.GenerateRequest, allocator, parsed_value.value, .{ .ignore_unknown_fields = true });
+    defer from_value.deinit();
+    try std.testing.expectEqual(@as(?bool, false), from_value.value.chat_template_kwargs.?.enable_thinking);
+    try std.testing.expectEqualStrings("m", from_value.value.model);
+    try std.testing.expectEqual(@as(usize, 1), from_value.value.messages.len);
 }
 
 test "generate speculation status exposes disabled decisions" {
@@ -12436,10 +13977,10 @@ test "generate speculation status exposes disabled decisions" {
     try std.testing.expectEqualStrings("auto", status.policy);
     try std.testing.expectEqualStrings("none", status.calibration);
     try std.testing.expectEqualStrings("disabled_uncalibrated", status.decision);
-    try std.testing.expectEqualStrings("speculation_calibration_required", status.disabled_reason.?);
+    try std.testing.expectEqualStrings("speculation_calibration_required", status.disabled_reason.valueOrNull().?);
 
     const unavailable = generateSpeculationStatus(.{ .speculation_policy_decision = .disabled_unavailable }).?;
-    try std.testing.expectEqualStrings("draft_backend_unavailable", unavailable.disabled_reason.?);
+    try std.testing.expectEqualStrings("draft_backend_unavailable", unavailable.disabled_reason.valueOrNull().?);
 }
 
 test "generate policy off has no effective draft and reports disabled" {
@@ -12893,7 +14434,7 @@ test "generate batch capacity errors include actionable retry metadata" {
     try std.testing.expectEqual(true, busy_load.retryable);
     try std.testing.expectEqual(
         @as(?i64, transient_capacity_retry_after_ms),
-        busy_load.retry_after_ms,
+        busy_load.retry_after_ms.valueOrNull(),
     );
 
     const busy_admission = Node.batchAdmissionError(error.ResourceTemporarilyUnavailable);
@@ -12901,13 +14442,13 @@ test "generate batch capacity errors include actionable retry metadata" {
     try std.testing.expectEqual(true, busy_admission.retryable);
     try std.testing.expectEqual(
         @as(?i64, transient_capacity_retry_after_ms),
-        busy_admission.retry_after_ms,
+        busy_admission.retry_after_ms.valueOrNull(),
     );
 
     const permanent = Node.batchAdmissionError(error.ResourceLimitExceeded);
     try std.testing.expectEqualStrings("MODEL_RESOURCE_LIMIT", permanent.code);
     try std.testing.expectEqual(false, permanent.retryable);
-    try std.testing.expectEqual(@as(?i64, null), permanent.retry_after_ms);
+    try std.testing.expect(!permanent.retry_after_ms.isPresent());
 }
 
 test "read batch downloaded byte accounting enforces aggregate cap" {
@@ -14030,6 +15571,568 @@ test "canonical relation schemas preserve endpoint label constraints" {
     );
 }
 
+test "relation entity labels merge defaults and canonical endpoint constraints" {
+    const defaults = [_][]const u8{ "person", "organization", "location" };
+    const canonical_relations = [_][]const u8{
+        "employee::works_at::company",
+        "company::located_in::location",
+        "knows",
+    };
+
+    const inferred = (try relationEntityLabelsAlloc(
+        std.testing.allocator,
+        null,
+        &defaults,
+        &canonical_relations,
+    )).?;
+    defer std.testing.allocator.free(inferred);
+    const expected_inferred = [_][]const u8{ "person", "organization", "location", "employee", "company" };
+    try std.testing.expectEqual(expected_inferred.len, inferred.len);
+    for (&expected_inferred, inferred) |expected, actual|
+        try std.testing.expectEqualStrings(expected, actual);
+
+    const requested = [_][]const u8{"employee"};
+    const constrained = (try relationEntityLabelsAlloc(
+        std.testing.allocator,
+        &requested,
+        &defaults,
+        &canonical_relations,
+    )).?;
+    defer std.testing.allocator.free(constrained);
+    const expected_constrained = [_][]const u8{ "employee", "company", "location" };
+    try std.testing.expectEqual(expected_constrained.len, constrained.len);
+    for (&expected_constrained, constrained) |expected, actual|
+        try std.testing.expectEqualStrings(expected, actual);
+
+    try std.testing.expect((try relationEntityLabelsAlloc(
+        std.testing.allocator,
+        null,
+        &.{},
+        &.{"knows"},
+    )) == null);
+}
+
+test "canonical extraction operation routes every documented schema family" {
+    const cases = [_]struct { json: []const u8, expected: CanonicalExtractionOperation }{
+        .{ .json = "{\"entities\":[\"person\"]}", .expected = .entities_relations },
+        .{ .json = "{\"relations\":[{\"type\":\"works_for\"}]}", .expected = .entities_relations },
+        .{ .json = "{\"entities\":[\"person\"],\"relations\":[{\"type\":\"works_for\"}]}", .expected = .entities_relations },
+        .{ .json = "{\"classifications\":[{\"name\":\"sentiment\",\"labels\":[\"positive\",\"negative\"]}]}", .expected = .classifications },
+        .{ .json = "{\"structures\":{\"person\":{\"fields\":{\"name\":\"string\"}}}}", .expected = .structures },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(extraction_api.ExtractionSchema, std.testing.allocator, case.json, .{
+            .allocate = .alloc_always,
+        });
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.expected, try canonicalExtractionOperation(parsed.value));
+    }
+}
+
+test "entity extraction model preflight rejects incompatible families and modalities" {
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .recognizer,
+    };
+    try validateTextEntityExtractionManifest(&manifest);
+
+    manifest.model_type = .classifier;
+    try std.testing.expectError(
+        error.InvalidModelForExtraction,
+        validateTextEntityExtractionManifest(&manifest),
+    );
+
+    var image_inputs = [_][]const u8{"image"};
+    manifest.model_type = .recognizer;
+    manifest.inputs = &image_inputs;
+    try std.testing.expectError(
+        error.UnsupportedInput,
+        validateTextEntityExtractionManifest(&manifest),
+    );
+
+    manifest.inputs = &.{};
+    manifest.gliner_model_type = "uniencoder";
+    try std.testing.expectError(
+        error.InvalidModelForExtraction,
+        validateTextEntityExtractionManifest(&manifest),
+    );
+
+    var extraction_capabilities = [_][]const u8{"extraction"};
+    manifest.capabilities = &extraction_capabilities;
+    try validateTextEntityExtractionManifest(&manifest);
+}
+
+test "canonical extraction operation repeatedly rejects empty and mixed schemas without leaking" {
+    var empty = try std.json.parseFromSlice(extraction_api.ExtractionSchema, std.testing.allocator, "{}", .{
+        .allocate = .alloc_always,
+    });
+    defer empty.deinit();
+    const mixed_json = "{\"entities\":[\"person\"],\"structures\":{\"person\":{\"fields\":{\"name\":\"string\"}}}}";
+    var mixed = try std.json.parseFromSlice(
+        extraction_api.ExtractionSchema,
+        std.testing.allocator,
+        mixed_json,
+        .{ .allocate = .alloc_always },
+    );
+    defer mixed.deinit();
+    for (0..64) |_| {
+        try std.testing.expectError(error.MissingExtractionOperation, canonicalExtractionOperation(empty.value));
+        try std.testing.expectError(error.MixedExtractionOperations, canonicalExtractionOperation(mixed.value));
+    }
+
+    var node = try Node.init(std.testing.allocator, .{});
+    defer node.deinit();
+    const inputs = [_]extracting_api.Input{.{ .content_json = "\"Grace Hopper built compilers.\"" }};
+    for (0..64) |_| {
+        try std.testing.expectError(error.MissingExtractionOperation, node.extractDirect(
+            std.testing.allocator,
+            "antflydb/gliner2-base-v1",
+            .{ .inputs = &inputs, .schema_json = "{}" },
+        ));
+        try std.testing.expectError(error.MixedExtractionOperations, node.extractDirect(
+            std.testing.allocator,
+            "antflydb/gliner2-base-v1",
+            .{ .inputs = &inputs, .schema_json = mixed_json },
+        ));
+    }
+}
+
+test "text extraction rejects media before fetch or model resolution" {
+    var node = try Node.init(std.testing.allocator, .{
+        .models_dir = "missing-model-root",
+        .max_concurrent_requests = 1,
+    });
+    defer node.deinit();
+    const inputs = [_]extracting_api.Input{.{
+        .content_json =
+        \\[{"type":"image_url","image_url":{"url":"https://example.com/image.png"}}]
+        ,
+    }};
+
+    resetRequestWorkTestCounters();
+    try std.testing.expectError(error.UnsupportedInput, node.extractDirect(
+        std.testing.allocator,
+        "antflydb/gliner2-base-v1",
+        .{ .inputs = &inputs, .schema_json = "{\"entities\":[\"person\"]}" },
+    ));
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_resolution_attempts);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+
+    var canonical_input = try std.json.parseFromSlice(extraction_api.ExtractionInput, std.testing.allocator,
+        \\{"content":[{"type":"image_url","image_url":{"url":"https://example.com/image.png"}}]}
+    , .{ .allocate = .alloc_always });
+    defer canonical_input.deinit();
+    const canonical_inputs = [_]extraction_api.ExtractionInput{canonical_input.value};
+    try std.testing.expectError(
+        error.UnsupportedInput,
+        parseCanonicalTextInputs(std.testing.allocator, &canonical_inputs),
+    );
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_resolution_attempts);
+}
+
+test "text extraction preserves multipart text as one input" {
+    const inputs = [_]extracting_api.Input{.{
+        .content_json =
+        \\[{"type":"text","text":"Grace Hopper"},{"type":"text","text":"built compilers."}]
+        ,
+    }};
+    var parsed = try parseDirectTextExtractionInputs(std.testing.allocator, &inputs);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.texts.items.len);
+    try std.testing.expectEqualStrings("Grace Hopper\nbuilt compilers.", parsed.texts.items[0]);
+}
+
+test "structured extraction validates generation options before resolver and media work" {
+    var node = try Node.init(std.testing.allocator, .{
+        .models_dir = "missing-model-root",
+        .max_concurrent_requests = 1,
+    });
+    defer node.deinit();
+    // Three images require two admission units. With a one-unit node this
+    // proves invalid options win over capacity checks, not merely over fetch.
+    const inputs = [_]extracting_api.Input{
+        .{ .content_json =
+        \\[{"type":"image_url","image_url":{"url":"https://example.com/one.png"}}]
+        },
+        .{ .content_json =
+        \\[{"type":"image_url","image_url":{"url":"https://example.com/two.png"}}]
+        },
+        .{ .content_json =
+        \\[{"type":"image_url","image_url":{"url":"https://example.com/three.png"}}]
+        },
+    };
+
+    resetRequestWorkTestCounters();
+    try std.testing.expectError(error.InvalidMaxTokens, node.extractDirect(
+        std.testing.allocator,
+        "missing/structured-extractor",
+        .{
+            .inputs = &inputs,
+            .schema_json =
+            \\{"structures":{"person":{"fields":{"name":"string"}}}}
+            ,
+            .options_json = "{\"max_tokens\":0}",
+        },
+    ));
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+
+    try std.testing.expectError(error.MissingStructureFields, node.extractDirect(
+        std.testing.allocator,
+        "missing/structured-extractor",
+        .{
+            .inputs = &inputs,
+            .schema_json =
+            \\{"structures":{"person":{"fields":{}}}}
+            ,
+        },
+    ));
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+}
+
+test "valid direct entity failures release admission and partial model state" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "models/owner/broken-gliner");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/owner/broken-gliner/config.json",
+        .data = "{\"model_type\":\"gliner2\"}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/owner/broken-gliner/gliner_config.json",
+        .data = "{\"model_type\":\"gliner2\",\"default_labels\":[\"person\"]}",
+    });
+    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    defer allocator.free(models_root);
+
+    var node = try Node.init(allocator, .{
+        .models_dir = models_root,
+        .max_concurrent_requests = 1,
+        .allow_unknown_models = true,
+    });
+    defer node.deinit();
+    const inputs = [_]extracting_api.Input{.{ .content_json = "\"Grace Hopper built compilers.\"" }};
+
+    resetRequestWorkTestCounters();
+    for (0..64) |_| {
+        var response = node.extractDirect(
+            allocator,
+            "owner/broken-gliner",
+            .{ .inputs = &inputs, .schema_json = "{\"entities\":[\"person\"]}" },
+        ) catch |err| {
+            try std.testing.expect(err != error.MissingExtractionOperation);
+            try std.testing.expect(err != error.MixedExtractionOperations);
+            try std.testing.expect(err != error.UnsupportedInput);
+            try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+            try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+            continue;
+        };
+        defer response.deinit();
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expectEqual(@as(usize, 64), request_work_test_counters.model_resolution_attempts);
+}
+
+test "direct entity extraction response populates requested canonical fields" {
+    const ner = @import("../pipelines/ner.zig");
+    const entities = [_]ner.Entity{.{
+        .text = "Grace Hopper",
+        .label = "person",
+        .start = 0,
+        .end = 12,
+        .score = 0.889,
+    }};
+    const batches = [_][]const ner.Entity{&entities};
+    const input_ids = [_]?[]const u8{"doc-1"};
+    const request = Node.EntityExtractionRequest{
+        .model = "antflydb/gliner2-base-v1",
+        .include_confidence = true,
+        .include_spans = true,
+        .input_ids = &input_ids,
+    };
+    for (0..64) |_| {
+        const json = try entityExtractionResponseJsonAlloc(
+            std.testing.allocator,
+            request,
+            &batches,
+            null,
+            &.{"Grace Hopper built compilers."},
+        );
+        defer std.testing.allocator.free(json);
+        try ant_json.testing.expectSubsetJsonText(std.testing.allocator,
+            \\{
+            \\  "object": "extraction",
+            \\  "model": "antflydb/gliner2-base-v1",
+            \\  "data": [{
+            \\    "id": "doc-1",
+            \\    "entities": [{
+            \\      "text": "Grace Hopper",
+            \\      "label": "person",
+            \\      "start": 0,
+            \\      "end": 12,
+            \\      "score": 0.8889999985694885
+            \\    }]
+            \\  }]
+            \\}
+        , json);
+    }
+}
+
+test "raw entity cleanup preserves borrowed labels" {
+    const allocator = std.testing.allocator;
+    const ner = @import("../pipelines/ner.zig");
+    const borrowed_label = "person";
+    const batches = try allocator.alloc([]ner.Entity, 1);
+    batches[0] = try allocator.alloc(ner.Entity, 1);
+    batches[0][0] = .{
+        .text = try allocator.dupe(u8, "Grace Hopper"),
+        .label = borrowed_label,
+        .start = 0,
+        .end = 12,
+        .score = 0.889,
+    };
+
+    freeBorrowedLabelEntityBatches(allocator, batches);
+    try std.testing.expectEqualStrings("person", borrowed_label);
+}
+
+test "resolved extraction releases partial entity batches on every allocation failure" {
+    const ner = @import("../pipelines/ner.zig");
+    const first_entities = [_]ner.Entity{ .{
+        .text = "Grace Hopper",
+        .label = "person",
+        .start = 0,
+        .end = 12,
+        .score = 0.95,
+    }, .{
+        .text = "COBOL",
+        .label = "technology",
+        .start = 13,
+        .end = 18,
+        .score = 0.91,
+    } };
+    const second_entities = [_]ner.Entity{ .{
+        .text = "Ada Lovelace",
+        .label = "person",
+        .start = 0,
+        .end = 12,
+        .score = 0.94,
+    }, .{
+        .text = "Analytical Engine",
+        .label = "technology",
+        .start = 13,
+        .end = 30,
+        .score = 0.90,
+    } };
+    const batches = [_][]const ner.Entity{ &first_entities, &second_entities };
+    const relations = [_][]const gliner_mod.Relation{
+        &.{.{
+            .head = first_entities[0],
+            .tail = first_entities[1],
+            .label = "created",
+            .score = 0.89,
+        }},
+        &.{.{
+            .head = second_entities[0],
+            .tail = second_entities[1],
+            .label = "described",
+            .score = 0.88,
+        }},
+    };
+
+    const Runner = struct {
+        fn run(
+            allocator: std.mem.Allocator,
+            source: []const []const ner.Entity,
+            source_relations: []const []const gliner_mod.Relation,
+        ) !void {
+            var resolved = try resolveExtractedOutput(allocator, source, source_relations, .{});
+            defer resolved.deinit(allocator);
+            try std.testing.expectEqual(@as(usize, 2), resolved.entities.len);
+            try std.testing.expectEqual(@as(usize, 2), resolved.relations.?.len);
+        }
+    };
+
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+            .fail_index = fail_index,
+            .resize_fail_index = 0,
+        });
+        Runner.run(failing.allocator(), &batches, &relations) catch |err| switch (err) {
+            error.OutOfMemory => {
+                try std.testing.expect(failing.has_induced_failure);
+                try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+                continue;
+            },
+            else => return err,
+        };
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        break;
+    }
+}
+
+test "learned entity cleanup releases partial batches on every allocation failure" {
+    const ner = @import("../pipelines/ner.zig");
+    var head = try cleanup_model_mod.CleanupHead.init(std.testing.allocator, 32, 4, 8);
+    defer head.deinit();
+
+    const texts = [_][]const u8{
+        "Grace Hopper built compilers.",
+        "COBOL influenced business computing.",
+    };
+    const first_entities = [_]ner.Entity{.{
+        .text = "Grace Hopper",
+        .label = "person",
+        .start = 0,
+        .end = 12,
+        .score = 0.95,
+    }};
+    const second_entities = [_]ner.Entity{.{
+        .text = "COBOL",
+        .label = "technology",
+        .start = 0,
+        .end = 5,
+        .score = 0.91,
+    }};
+    const batches = [_][]const ner.Entity{ &first_entities, &second_entities };
+
+    const Runner = struct {
+        fn run(
+            allocator: std.mem.Allocator,
+            cleanup_head: *const cleanup_model_mod.CleanupHead,
+            source_texts: []const []const u8,
+            source_entities: []const []const ner.Entity,
+        ) !void {
+            const cleaned = (try applyLearnedCleanupIfPresent(
+                allocator,
+                cleanup_head,
+                source_texts,
+                source_entities,
+            )).?;
+            defer freeEntityBatches(allocator, cleaned);
+            try std.testing.expectEqual(source_texts.len, cleaned.len);
+        }
+    };
+
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+            .fail_index = fail_index,
+            .resize_fail_index = 0,
+        });
+        Runner.run(failing.allocator(), &head, &texts, &batches) catch |err| switch (err) {
+            error.OutOfMemory => {
+                try std.testing.expect(failing.has_induced_failure);
+                try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+                continue;
+            },
+            else => return err,
+        };
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        break;
+    }
+}
+
+test "REBEL rejects unsupported typed schemas before model loading" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "models/owner/rebel");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/owner/rebel/config.json",
+        .data = "{}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/owner/rebel/rebel_config.json",
+        .data = "{}",
+    });
+    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    defer allocator.free(models_root);
+
+    var node = try Node.init(allocator, .{
+        .models_dir = models_root,
+        .allow_unknown_models = true,
+    });
+    defer node.deinit();
+    const input_ids = [_]?[]const u8{null};
+    const texts = [_][]const u8{"Grace Hopper served in the Navy."};
+    const direct_inputs = [_]extracting_api.Input{.{ .content_json = "\"Grace Hopper served in the Navy.\"" }};
+
+    resetRequestWorkTestCounters();
+    try std.testing.expectError(
+        error.UnsupportedRebelEntityLabels,
+        node.extractDirect(allocator, "owner/rebel", .{
+            .inputs = &direct_inputs,
+            .schema_json = "{\"entities\":[\"person\"]}",
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 1), request_work_test_counters.model_resolution_attempts);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+
+    const cases = [_]struct {
+        labels: ?[]const []const u8,
+        relation_labels: ?[]const []const u8,
+        want_relations: bool,
+        expected_message: []const u8,
+    }{
+        .{
+            .labels = &.{"person"},
+            .relation_labels = null,
+            .want_relations = false,
+            .expected_message = "REBEL supports only the generic entity label 'ENTITY'",
+        },
+        .{
+            .labels = null,
+            .relation_labels = &.{"person::served in::organization"},
+            .want_relations = true,
+            .expected_message = "source and target constraints must use the generic 'ENTITY' label",
+        },
+    };
+
+    for (cases) |case| {
+        resetRequestWorkTestCounters();
+        var request = try httpx.Request.init(allocator, .POST, "/ai/v1/extract");
+        defer request.deinit();
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+
+        var response = try node.extractEntitiesAndRelations(
+            &ctx,
+            .{
+                .model = "owner/rebel",
+                .labels = case.labels,
+                .relation_labels = case.relation_labels,
+                .input_ids = &input_ids,
+            },
+            &texts,
+            case.want_relations,
+        );
+        defer response.deinit();
+
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        try ant_json.testing.expectSubsetJsonText(
+            allocator,
+            "{\"error\":\"INVALID_REQUEST\"}",
+            response.body.?,
+        );
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, case.expected_message) != null);
+        try std.testing.expectEqual(@as(usize, 1), request_work_test_counters.model_resolution_attempts);
+        try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
+    }
+}
+
 test "canonical structure schemas preserve field types and choices" {
     var parsed = try std.json.parseFromSlice(
         extraction_api.ExtractionSchema,
@@ -14180,6 +16283,19 @@ test "readyz serves only the published inventory snapshot" {
         try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"generators\":2") != null);
         try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"embedders\":1") != null);
     }
+
+    node.session_manager.required_backend_invalid = true;
+    {
+        var request = try httpx.Request.init(allocator, .GET, "/readyz");
+        defer request.deinit();
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+
+        var response = try node.readyzHandler(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 503), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"status\":\"not_ready\"") != null);
+    }
 }
 
 test "failed readiness refresh preserves the last known good inventory" {
@@ -14312,7 +16428,16 @@ test "generation memory exhaustion is an actionable non-retryable capacity error
 
     try std.testing.expectEqual(@as(u16, 507), response.status.code);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"error\":\"MEMORY_BUDGET_EXCEEDED\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "--host-budget-mb") != null);
+    for ([_][]const u8{
+        "--host-budget-mb",
+        "--backend-budget-mb",
+        "--combined-budget-mb",
+        "--kv-budget-mb",
+        "--scratch-budget-mb",
+        "--process-memory-budget-mb",
+    }) |option| {
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, option) != null);
+    }
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"retryable\":false") != null);
 
     const batch_error = batchGenerationError(error.MemoryBudgetExceeded);
@@ -14524,11 +16649,12 @@ test "generate backend selection keeps compiled mode explicit" {
     try std.testing.expect(auto_compiled.graph_mode_requested);
 
     const auto_default = try parseGenerateBackendSelection(null, null, null);
-    try std.testing.expectEqual(build_options.enable_metal, shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.native, true, false, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, false, false, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, true, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, true, auto_default));
+    try std.testing.expectEqual(build_options.enable_metal, shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.native, true, false, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, false, false, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, true, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, true, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, true, auto_default));
     try validatePromptCacheExecutionMode(true, auto_default);
 
     const explicit_compiled = try parseGenerateBackendSelection(null, "compiled", null);
@@ -14541,7 +16667,7 @@ test "generate backend selection keeps compiled mode explicit" {
     if (build_options.enable_metal) {
         const metal_eager = try parseGenerateBackendSelection(.metal, "eager", null);
         try std.testing.expect(metal_eager.eager_mode_requested);
-        try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, metal_eager));
+        try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, false, metal_eager));
     } else {
         try std.testing.expectError(
             error.BackendUnavailable,
@@ -17655,7 +19781,7 @@ const GenerationRequestFailure = struct {
 };
 
 const memory_budget_exceeded_message =
-    "model execution exceeds the configured inference memory budget; increase the relevant budget (for CPU models, --host-budget-mb) or choose a smaller/quantized model";
+    "model execution exceeds the configured inference memory budget; increase the applicable --host-budget-mb, --backend-budget-mb, --combined-budget-mb, --kv-budget-mb, --scratch-budget-mb, or --process-memory-budget-mb, or choose a smaller/quantized model";
 
 fn logMemoryBudgetExceeded(
     session: backends_mod.Session,
@@ -17757,6 +19883,10 @@ fn writeInternalStreamError(
     stage: []const u8,
     err: anyerror,
 ) void {
+    if (std.mem.eql(u8, stage, "STREAM_WRITE_FAILED") and generationStreamWriteIsPeerDisconnect(err)) {
+        if (!builtin.is_test) std.log.info("generation stream closed after client disconnect", .{});
+        return;
+    }
     writer.writeEvent("error", internalErrorMessage(stage, err)) catch {};
 }
 
@@ -18293,7 +20423,7 @@ fn validateGeneratedJsonSchema(
     const schema = schema_cfg.schema orelse return error.MissingJsonSchema;
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_text, .{});
     defer parsed.deinit();
-    try jsonschema.validateJsonSchemaValue(allocator, schema, parsed.value);
+    try jsonschema.validateJsonSchemaValue(allocator, .{ .object = schema.map }, parsed.value);
 }
 
 test "structured output validation fails closed instead of fabricating JSON" {
@@ -18316,7 +20446,7 @@ test "structured output validation fails closed instead of fabricating JSON" {
     );
 
     var parsed_schema = try std.json.parseFromSlice(
-        std.json.Value,
+        std.json.ArrayHashMap(std.json.Value),
         allocator,
         "{\"type\":\"object\",\"required\":[\"answer\"],\"properties\":{\"answer\":{\"type\":\"string\"}}}",
         .{},

@@ -388,6 +388,13 @@ type AntflyClusterSpec struct {
 	// +optional
 	SecretStore *SecretStoreSpec `json:"secretStore,omitempty"`
 
+	// InternalServiceAuth references the dedicated per-cluster signing key used
+	// for metadata/data internal RPC. Kubernetes injects the selected Secret key
+	// directly into runtime pods; the operator never reads the Secret value.
+	// Required for Distributed mode and forbidden for Standalone mode.
+	// +optional
+	InternalServiceAuth *InternalServiceAuthSpec `json:"internalServiceAuth,omitempty"`
+
 	// Storage defines the storage configuration
 	Storage StorageSpec `json:"storage"`
 
@@ -411,6 +418,25 @@ type AntflyClusterSpec struct {
 	// If not specified, the default ServiceAccount for the namespace is used
 	// +optional
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
+}
+
+// InternalServiceAuthSpec selects the Kubernetes Secret key used to authenticate
+// distributed node-to-node RPC. Issuer and rolling-upgrade mode are derived and
+// managed by the operator so every node in one cluster receives identical,
+// non-secret settings.
+type InternalServiceAuthSpec struct {
+	// SecretKeyRef selects a required key in a Secret in the AntflyCluster
+	// namespace. The value must contain at least 32 random bytes and must not be
+	// reused as an API key, trusted-principal key, or another cluster's key.
+	SecretKeyRef corev1.SecretKeySelector `json:"secretKeyRef"`
+
+	// NextSecretKeyRef starts an operator-managed zero-downtime key rotation.
+	// Every node first receives this key as an additional verifier; after all
+	// runtimes acknowledge the overlap, the operator switches signing to it while
+	// retaining SecretKeyRef as the verifier. Promote it to SecretKeyRef only
+	// after status.internalServiceAuthRotation.phase is Switched.
+	// +optional
+	NextSecretKeyRef *corev1.SecretKeySelector `json:"nextSecretKeyRef,omitempty"`
 }
 
 // SecretStoreSpec configures a mounted Antfly secrets.json file.
@@ -867,8 +893,10 @@ type HARuntimeFencingLeaseSpec struct {
 }
 
 // HAStartupGateSpec declares the exact receipt required before a runtime may
-// start. runtimeEligible is a declarative suspension fence: false always keeps
-// replicas at zero, while true remains subject to policy-specific verification.
+// start. A seeded runtime retains its exact activated-volume binding after
+// promotion, where it becomes storage provenance rather than standby authority.
+// runtimeEligible is a declarative suspension fence: false always keeps replicas
+// at zero, while true remains subject to policy-specific verification.
 type HAStartupGateSpec struct {
 	// Policy selects either an unconditional Suspend hold or exact activated-seed startup.
 	// +kubebuilder:validation:Enum=Suspend;RequireActivatedSeed
@@ -959,9 +987,15 @@ type HAStandbyRuntimeSpec struct {
 
 // HAAdminSpec configures operator access to HA admin endpoints.
 type HAAdminSpec struct {
-	// PrimaryURL is the primary HA admin endpoint used for typed status, slot, seed, and fence actions.
+	// PrimaryURL is the routed primary HA admin endpoint used for typed status observations.
 	// +optional
 	PrimaryURL string `json:"primaryURL,omitempty"`
+
+	// PrimaryActionURL is the node-local primary HA admin endpoint used for slot and seed actions
+	// that must remain reachable while the routed primary is intentionally unready. When omitted,
+	// actions use PrimaryURL for backward compatibility.
+	// +optional
+	PrimaryActionURL string `json:"primaryActionURL,omitempty"`
 
 	// ExecutePlannedActions lets the operator execute planned HA actions.
 	// The operator prefers typed /admin/v1/ha calls and uses CLI-backed Kubernetes Jobs for pod-local files, shared backup volumes, or break-glass workflows.
@@ -1722,6 +1756,11 @@ type AntflyClusterStatus struct {
 	// +optional
 	ConfigPublication *ConfigPublicationStatus `json:"configPublication,omitempty"`
 
+	// InternalServiceAuthRotation reports the operator-managed overlap rollout
+	// for spec.internalServiceAuth.nextSecretKeyRef.
+	// +optional
+	InternalServiceAuthRotation *InternalServiceAuthRotationStatus `json:"internalServiceAuthRotation,omitempty"`
+
 	// Conditions represent the current conditions of the cluster
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
@@ -1765,6 +1804,24 @@ type AntflyClusterStatus struct {
 	// ServiceMeshStatus reports service mesh operational state
 	// +optional
 	ServiceMeshStatus *ServiceMeshStatus `json:"serviceMeshStatus,omitempty"`
+}
+
+type InternalServiceAuthRotationPhase string
+
+const (
+	InternalServiceAuthRotationPreparing InternalServiceAuthRotationPhase = "Preparing"
+	InternalServiceAuthRotationSwitching InternalServiceAuthRotationPhase = "Switching"
+	InternalServiceAuthRotationSwitched  InternalServiceAuthRotationPhase = "Switched"
+)
+
+// InternalServiceAuthRotationStatus contains only Secret object identity, never
+// Secret data. It is safe for the operator to publish without Secret RBAC.
+type InternalServiceAuthRotationStatus struct {
+	Phase InternalServiceAuthRotationPhase `json:"phase"`
+
+	TargetSecretName string `json:"targetSecretName"`
+
+	TargetSecretKey string `json:"targetSecretKey"`
 }
 
 // ConfigPublicationStatus identifies an operator-generated config.json image.
@@ -1995,6 +2052,46 @@ type HAStatus struct {
 	// never appears in spec and cannot be self-asserted by a caller.
 	// +optional
 	StartupGate *HAStartupGateStatus `json:"startupGate,omitempty"`
+
+	// SeedPrefixCleanup is the operator-observed result of the immutable,
+	// digest-bound deprovision cleanup request carried by the Colony annotation.
+	// +optional
+	SeedPrefixCleanup *HASeedPrefixCleanupStatus `json:"seedPrefixCleanup,omitempty"`
+}
+
+// HASeedPrefixCleanupStatus binds an operator Job observation to Colony's exact
+// request identity. The snake_case field contract is shared with the runtime
+// receipt and is intentionally distinct from the Kubernetes API's usual style.
+type HASeedPrefixCleanupStatus struct {
+	Phase         string                      `json:"phase"`
+	OperationID   string                      `json:"operation_id"`
+	RetryToken    string                      `json:"retry_token"`
+	RequestSHA256 string                      `json:"request_sha256"`
+	AttemptCount  int32                       `json:"attempt_count"`
+	LastError     string                      `json:"last_error,omitempty"`
+	Receipt       *HASeedPrefixCleanupReceipt `json:"receipt,omitempty"`
+}
+
+// HASeedPrefixCleanupReceipt is the canonical runtime proof that the exact
+// instance-owned HA seed prefix was deleted and independently observed empty.
+type HASeedPrefixCleanupReceipt struct {
+	Version            int32  `json:"version"`
+	Kind               string `json:"kind"`
+	OperationID        string `json:"operation_id"`
+	RetryToken         string `json:"retry_token"`
+	InstanceID         string `json:"instance_id"`
+	TopologyID         string `json:"topology_id"`
+	TopologyGeneration int64  `json:"topology_generation"`
+	Location           string `json:"location"`
+	PrefixSHA256       string `json:"prefix_sha256"`
+	RequestSHA256      string `json:"request_sha256"`
+	DeletedGenerations int64  `json:"deleted_generations"`
+	DeletedObjects     int64  `json:"deleted_objects"`
+	RetainedObjects    int64  `json:"retained_objects"`
+	PrefixEmpty        bool   `json:"prefix_empty"`
+	Complete           bool   `json:"complete"`
+	CompletedAt        string `json:"completed_at"`
+	ReceiptSHA256      string `json:"receipt_sha256"`
 }
 
 // HAWatchdogProofStatus records an authenticated runtime observation. It is not
@@ -2234,7 +2331,10 @@ type HAPhysicalIsolationReceiptStatus struct {
 
 	LeaseScope HAPhysicalIsolationLeaseScope `json:"leaseScope"`
 
-	LeaseTransferTime metav1.Time `json:"leaseTransferTime"`
+	// LeaseTransferTime preserves the coordination Lease acquireTime exactly.
+	// metav1.Time serializes at whole-second precision, which cannot safely bind
+	// a persisted isolation receipt back to the MicroTime Lease authority.
+	LeaseTransferTime metav1.MicroTime `json:"leaseTransferTime"`
 
 	// WatchdogMaxFenceLatencyMS is copied exactly from the authenticated old
 	// runtime proof and must equal the configured runtime watchdog bound.
@@ -2481,9 +2581,11 @@ type HAPlannedActionStatus struct {
 	ExecutionStateVersion int32 `json:"executionStateVersion,omitempty"`
 
 	// RetryGeneration is the explicit recovery nonce captured when this operation
-	// was planned.
+	// was planned. It is always serialized, including generation zero, so API
+	// consumers can distinguish a current bounded-retry action from legacy status
+	// that predates recovery-generation tracking.
 	// +optional
-	RetryGeneration int64 `json:"retryGeneration,omitempty"`
+	RetryGeneration int64 `json:"retryGeneration"`
 
 	// AttemptCount is the durable number of direct requests or Kubernetes Job pod
 	// attempts observed for this exact action identity.
@@ -2571,16 +2673,19 @@ type HASeedArtifactReceiptStatus struct {
 	TotalBytes                  uint64 `json:"totalBytes,omitempty"`
 	FileCount                   int32  `json:"fileCount,omitempty"`
 	RetainedCount               int32  `json:"retainedCount,omitempty"`
-	DeletedCount                int32  `json:"deletedCount,omitempty"`
-	ProtectedCount              int32  `json:"protectedCount,omitempty"`
-	ResumedTombstoneCount       int32  `json:"resumedTombstoneCount,omitempty"`
-	SkippedIneligibleCount      int32  `json:"skippedIneligibleCount,omitempty"`
-	CheckpointSHA256            string `json:"checkpointSHA256,omitempty"`
-	TopologyID                  string `json:"topologyID,omitempty"`
-	TopologyGeneration          int64  `json:"topologyGeneration,omitempty"`
-	NodeID                      string `json:"nodeID,omitempty"`
-	TargetPVCName               string `json:"targetPVCName,omitempty"`
-	TargetPVCUID                string `json:"targetPVCUID,omitempty"`
+	// DeletedCount is serialized even when zero so a successful no-op GC is
+	// distinguishable from missing deletion evidence.
+	// +optional
+	DeletedCount           int32  `json:"deletedCount"`
+	ProtectedCount         int32  `json:"protectedCount,omitempty"`
+	ResumedTombstoneCount  int32  `json:"resumedTombstoneCount,omitempty"`
+	SkippedIneligibleCount int32  `json:"skippedIneligibleCount,omitempty"`
+	CheckpointSHA256       string `json:"checkpointSHA256,omitempty"`
+	TopologyID             string `json:"topologyID,omitempty"`
+	TopologyGeneration     int64  `json:"topologyGeneration,omitempty"`
+	NodeID                 string `json:"nodeID,omitempty"`
+	TargetPVCName          string `json:"targetPVCName,omitempty"`
+	TargetPVCUID           string `json:"targetPVCUID,omitempty"`
 }
 
 // HAAdminActionResultStatus records correlation fields from a typed HA admin action response.
@@ -2672,6 +2777,10 @@ type HAAdminActionResultStatus struct {
 	SeedTableID uint64 `json:"seedTableID,omitempty"`
 	// +optional
 	SeedTimelineID uint64 `json:"seedTimelineID,omitempty"`
+	// TimelineID is the canonical timeline carried by a seeded-slot activation
+	// receipt. SeedTimelineID remains populated for backwards compatibility.
+	// +optional
+	TimelineID uint64 `json:"timelineID,omitempty"`
 	// +optional
 	SeedEpoch uint64 `json:"seedEpoch,omitempty"`
 	// +optional

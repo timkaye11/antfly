@@ -138,13 +138,26 @@ jobs:
             zig/pkg/inference/src/architectures/session_factory.zig \
             ':(glob)zig/pkg/inference/src/backends/metal_*' \
             zig/pkg/inference/src/finetune/artifact_publication.zig \
+            zig/pkg/inference/src/finetune/chat_template.zig \
+            ':(glob)zig/pkg/inference/src/finetune/cli/**' \
             ':(glob)zig/pkg/inference/src/finetune/gemma4*' \
+            zig/pkg/inference/src/finetune/grpo.zig \
+            ':(glob)zig/pkg/inference/src/finetune/lora*' \
+            zig/pkg/inference/src/finetune/path_isolation.zig \
+            ':(glob)zig/pkg/inference/src/finetune/preference*' \
+            ':(glob)zig/pkg/inference/src/finetune/run_gemma4*' \
             ':(glob)zig/pkg/inference/src/finetune/test/test_gemma4*' \
+            ':(glob)zig/pkg/inference/src/finetune/tools/*gemma4*' \
+            ':(glob)zig/pkg/inference/src/finetune/train/*gemma4*' \
             zig/pkg/inference/src/finetune/real_autodiff_trainer.zig \
             zig/pkg/inference/src/finetune/recipe.zig \
             ':(glob)zig/pkg/inference/src/graph/**' \
             ':(glob)zig/pkg/inference/src/gemma*_test_root.zig' \
             ':(glob)zig/pkg/inference/scripts/*gemma4*' \
+            ':(glob)zig/pkg/inference/scripts/gemma4/**' \
+            ':(glob)zig/pkg/inference/testdata/*dpo*' \
+            ':(glob)zig/pkg/inference/testdata/*grpo*' \
+            ':(glob)zig/pkg/inference/testdata/*gemma4*' \
             ':(glob)zig/pkg/inference/testdata/gemma4_oracle/**' \
             zig/pkg/inference/docs/finetuning/GEMMA4.md \
             zig/pkg/inference/docs/finetuning/GEMMA4_ORACLE.md \
@@ -217,6 +230,8 @@ jobs:
           if git diff --quiet "$base" "${{ github.sha }}" -- \
             scripts/install.sh \
             scripts/test_install_download_markers.sh \
+            scripts/test_quickstart_docs.py \
+            docs/guides/quickstart.mdx \
             .github/workflows/cli-publish.yml \
             .github/workflows/zig-tests.yml
           then
@@ -239,6 +254,7 @@ jobs:
       - name: Test release download markers
         run: |
           scripts/test_install_download_markers.sh
+          scripts/test_quickstart_docs.py
           sh -n scripts/install.sh
           bash -n scripts/test_install_download_markers.sh
 
@@ -386,29 +402,31 @@ jobs:
         working-directory: zig/pkg/inference
         run: |
           python3 -m unittest \
-            scripts.test_benchmark_gemma4_long_e2e_server \
-            scripts.test_benchmark_gemma4_cuda_batching \
-            scripts.test_benchmark_gemma4_cuda_matrix \
-            scripts.test_benchmark_metal_gemma4_ab \
-            scripts.test_benchmark_metal_gemma4_long_output \
+            scripts.gemma4.test_benchmark_gemma4_long_e2e_server \
+            scripts.gemma4.test_benchmark_gemma4_cuda_batching \
+            scripts.gemma4.test_benchmark_gemma4_cuda_matrix \
+            scripts.gemma4.test_benchmark_metal_gemma4_ab \
+            scripts.gemma4.test_benchmark_metal_gemma4_long_output \
             scripts.test_content_security_contract \
-            scripts.test_gemma4_cuda_l4_release_gate \
-            scripts.test_gemma4_cuda_production_gate \
-            scripts.test_gemma4_qat_cuda_tuning \
-            scripts.test_gemma4_qat_llamacpp_pair_benchmark \
+            scripts.gemma4.test_gemma4_cuda_l4_release_gate \
+            scripts.gemma4.test_gemma4_cuda_production_gate \
+            scripts.gemma4.test_gemma4_qat_cuda_tuning \
+            scripts.gemma4.test_gemma4_qat_llamacpp_pair_benchmark \
             scripts.test_paired_benchmark \
             scripts.test_regen_cuda_artifacts \
             scripts.test_summarize_cuda_flash_prefill_v2 \
-            scripts.test_validate_gemma4_cuda_candidate \
-            scripts.test_validate_gemma4_cuda_quality_candidate
+            scripts.gemma4.test_validate_gemma4_cuda_candidate \
+            scripts.gemma4.test_validate_gemma4_cuda_quality_candidate
 
       - name: Test reproducible release archive packaging
         run: python3 scripts/packaging/test_reproducible_tar.py
 
-      # ARC exposes the node CPU and memory totals instead of the pod limits.
-      # Keep process affinity aligned with the CPU quota and give Zig's build
-      # scheduler 80% of the cgroup memory budget. The patched 0.16 runner
-      # correctly reserves each ready step's max_rss claim as it wakes it.
+      # ARC may expose the shared node's memory total when the runner cgroup is
+      # unlimited. Cap the aggregate scheduler budget at 20 GiB so concurrent
+      # test runtimes cannot overcommit the runner while still admitting the
+      # largest individual compile step, which reserves 20 GiB. The patched
+      # 0.16 runner correctly reserves each ready step's max_rss claim as it
+      # wakes it.
       - name: Configure bounded parallel unit tests
         if: needs.changes.outputs.zig_tests == 'true'
         id: cpus
@@ -416,7 +434,7 @@ jobs:
           jobs=$(nproc)
           if [ "$jobs" -gt 8 ]; then jobs=8; fi
           echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
-          echo "max_rss=$(python3 zig/tools/run_bounded_zig_build.py --print-max-rss)" >> "$GITHUB_OUTPUT"
+          echo "max_rss=$(python3 zig/tools/run_bounded_zig_build.py --print-max-rss --max-rss-cap 21474836480)" >> "$GITHUB_OUTPUT"
           zig_lib_dir="$(zig env | sed -n 's/^[[:space:]]*\.lib_dir = "\(.*\)",$/\1/p')"
           patched_runner="${RUNNER_TEMP}/zig-build-runner-maxrss.zig"
           python3 zig/tools/patch_zig_0_16_build_runner_maxrss.py \
@@ -534,7 +552,10 @@ jobs:
           ) &
           unit_pid="$!"
           (
-            idle_limit_secs="${ANTFLY_UNIT_WATCHDOG_IDLE_SECS:-900}"
+            # A cold Zig compile can legitimately remain silent for more than
+            # 15 minutes on the x86_64 ARC runner. Keep the idle watchdog below
+            # the independent hard limit without killing an active cold build.
+            idle_limit_secs="${ANTFLY_UNIT_WATCHDOG_IDLE_SECS:-1800}"
             hard_limit_secs="${ANTFLY_UNIT_WATCHDOG_HARD_SECS:-3600}"
             start_epoch="$(date +%s)"
             last_progress_epoch="$start_epoch"
@@ -610,6 +631,7 @@ jobs:
       ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/antfly-gemma4-metal-zig-local
       ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/antfly-gemma4-metal-zig-global
       TERMITE_REQUIRE_METAL_TESTS: "1"
+      ANTFLY_BENCHMARK_SOURCE_REVISION: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -626,22 +648,25 @@ jobs:
           version: 0.16.0
           use-cache: false
 
+      - name: Install Gemma4 Zig-oracle packaging dependencies
+        run: python3 -m pip install --disable-pip-version-check -r zig/pkg/inference/scripts/gemma4/requirements-gemma4-zig-oracle.txt
+
       - name: Verify Metal device
         run: system_profiler SPDisplaysDataType
 
-      - name: Validate Gemma4 oracle contracts
+      - name: Validate Gemma4 Python contracts
         working-directory: zig/pkg/inference
         run: |
           set -euo pipefail
-          python3 scripts/compare_gemma4_lora_hf_zig.py validate-lock
-          python3 -m unittest discover -v -s scripts -p 'test_*gemma4*py'
+          python3 scripts/gemma4/compare_gemma4_lora_hf_zig.py validate-lock
+          python3 -m unittest discover -v -s scripts/gemma4 -p 'test_*.py'
           fixture_dir="$(mktemp -d "${RUNNER_TEMP}/gemma4-oracle-contract.XXXXXX")"
           trap 'rm -rf "$fixture_dir"' EXIT
-          python3 scripts/generate_gemma4_oracle_fixture.py \
+          python3 scripts/gemma4/generate_gemma4_oracle_fixture.py \
             --output "$fixture_dir/fixture.jsonl" \
             --manifest "$fixture_dir/fixture.manifest.json" \
             --train-count 8 --eval-count 4 --test-count 4
-          python3 scripts/generate_gemma4_oracle_fixture.py \
+          python3 scripts/gemma4/generate_gemma4_oracle_fixture.py \
             --output "$fixture_dir/fixture.jsonl" \
             --manifest "$fixture_dir/fixture.manifest.json" \
             --train-count 8 --eval-count 4 --test-count 4 --check
@@ -649,7 +674,7 @@ jobs:
       - name: Run Gemma4 Metal Debug gates
         working-directory: zig/pkg/inference
         run: |
-          zig build test-gemma4-finetune -j1 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=Debug --summary all
+          zig build test-gemma4-finetune -j1 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=Debug -Dbenchmark-source-revision="$ANTFLY_BENCHMARK_SOURCE_REVISION" --summary all
           zig build test-gemma-graph -j1 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=Debug --summary all
           zig build test -j1 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=Debug -Druntime-test-filter=true -- \
             --test-filter "backend deinit destroys only explicitly owned wrappers" \
@@ -663,13 +688,13 @@ jobs:
       - name: Run Gemma4 Metal ReleaseSafe gates
         working-directory: zig/pkg/inference
         run: |
-          zig build test-gemma4-finetune -j1 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=ReleaseSafe --summary all
+          zig build test-gemma4-finetune -j1 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=ReleaseSafe -Dbenchmark-source-revision="$ANTFLY_BENCHMARK_SOURCE_REVISION" --summary all
           zig build test-gemma-graph -j1 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=ReleaseSafe --summary all
 
       - name: Run packaged-optimization Metal lifecycle smoke
         working-directory: zig/pkg/inference
         run: |
-          zig build test-gemma4-finetune -j1 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=ReleaseFast --summary all
+          zig build test-gemma4-finetune -j1 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=ReleaseFast -Dbenchmark-source-revision="$ANTFLY_BENCHMARK_SOURCE_REVISION" --summary all
 
   zig-full-tests:
     name: zig-full / x86_64
@@ -730,7 +755,7 @@ jobs:
           jobs=$(nproc)
           if [ "$jobs" -gt 8 ]; then jobs=8; fi
           echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
-          echo "max_rss=$(python3 zig/tools/run_bounded_zig_build.py --print-max-rss)" >> "$GITHUB_OUTPUT"
+          echo "max_rss=$(python3 zig/tools/run_bounded_zig_build.py --print-max-rss --max-rss-cap 21474836480)" >> "$GITHUB_OUTPUT"
           zig_lib_dir="$(zig env | sed -n 's/^[[:space:]]*\.lib_dir = "\(.*\)",$/\1/p')"
           patched_runner="${RUNNER_TEMP}/zig-build-runner-maxrss.zig"
           python3 zig/tools/patch_zig_0_16_build_runner_maxrss.py \
@@ -954,9 +979,11 @@ jobs:
         run: |
           local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ matrix.suite }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
           global_cache="/mnt/cache/antfly/zig/zig-global"
+          test_tmp="/mnt/cache/antfly/zig/e2e-tmp/${{ github.job }}/${{ matrix.suite }}/${{ github.run_id }}-${{ github.run_attempt }}"
           echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
-          mkdir -p "$local_cache" "$global_cache" "$UV_CACHE_DIR" "$HF_HOME" "$(dirname "$ANTFLY_E2E_DURATION_FILE")"
+          echo "TMPDIR=$test_tmp" >> "$GITHUB_ENV"
+          mkdir -p "$local_cache" "$global_cache" "$test_tmp" "$UV_CACHE_DIR" "$HF_HOME" "$(dirname "$ANTFLY_E2E_DURATION_FILE")"
           mkdir -p "/mnt/cache/antfly/zig/home-cache-${{ matrix.suite }}" "/mnt/cache/antfly/zig/home-antfly-${{ matrix.suite }}"
           rm -rf ~/.cache ~/.antfly
           ln -s "/mnt/cache/antfly/zig/home-cache-${{ matrix.suite }}" ~/.cache
@@ -1111,7 +1138,9 @@ jobs:
 
       - name: Prepare ARC test cache dirs
         run: |
-          mkdir -p "$UV_CACHE_DIR" "$HF_HOME" "$(dirname "$ANTFLY_E2E_DURATION_FILE")"
+          test_tmp="/mnt/cache/antfly/zig/e2e-tmp/${{ github.job }}/${{ matrix.suite }}/${{ github.run_id }}-${{ github.run_attempt }}"
+          echo "TMPDIR=$test_tmp" >> "$GITHUB_ENV"
+          mkdir -p "$test_tmp" "$UV_CACHE_DIR" "$HF_HOME" "$(dirname "$ANTFLY_E2E_DURATION_FILE")"
           mkdir -p "/mnt/cache/antfly/zig/home-cache-full-${{ matrix.suite }}" "/mnt/cache/antfly/zig/home-antfly-full-${{ matrix.suite }}"
           rm -rf ~/.cache ~/.antfly
           ln -s "/mnt/cache/antfly/zig/home-cache-full-${{ matrix.suite }}" ~/.cache

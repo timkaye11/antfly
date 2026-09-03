@@ -809,6 +809,8 @@ spec:
                       jobTimeoutSeconds:
                         format: int64
                         type: integer
+                      primaryActionURL:
+                        type: string
                       primaryURL:
                         type: string
                       retryGeneration:
@@ -2900,6 +2902,37 @@ spec:
                       - name
                       type: object
                     type: array
+                type: object
+              internalServiceAuth:
+                properties:
+                  nextSecretKeyRef:
+                    properties:
+                      key:
+                        type: string
+                      name:
+                        default: ""
+                        type: string
+                      optional:
+                        type: boolean
+                    required:
+                    - key
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  secretKeyRef:
+                    properties:
+                      key:
+                        type: string
+                      name:
+                        default: ""
+                        type: string
+                      optional:
+                        type: boolean
+                    required:
+                    - key
+                    type: object
+                    x-kubernetes-map-type: atomic
+                required:
+                - secretKeyRef
                 type: object
               metadataNodes:
                 properties:
@@ -5371,6 +5404,9 @@ spec:
                             targetTimelineID:
                               format: int64
                               type: integer
+                            timelineID:
+                              format: int64
+                              type: integer
                           type: object
                         adminStatusCode:
                           type: integer
@@ -5892,6 +5928,88 @@ spec:
                         format: int64
                         type: integer
                     type: object
+                  seedPrefixCleanup:
+                    properties:
+                      attempt_count:
+                        format: int32
+                        type: integer
+                      last_error:
+                        type: string
+                      operation_id:
+                        type: string
+                      phase:
+                        type: string
+                      receipt:
+                        properties:
+                          complete:
+                            type: boolean
+                          completed_at:
+                            type: string
+                          deleted_generations:
+                            format: int64
+                            type: integer
+                          deleted_objects:
+                            format: int64
+                            type: integer
+                          instance_id:
+                            type: string
+                          kind:
+                            type: string
+                          location:
+                            type: string
+                          operation_id:
+                            type: string
+                          prefix_empty:
+                            type: boolean
+                          prefix_sha256:
+                            type: string
+                          receipt_sha256:
+                            type: string
+                          request_sha256:
+                            type: string
+                          retained_objects:
+                            format: int64
+                            type: integer
+                          retry_token:
+                            type: string
+                          topology_generation:
+                            format: int64
+                            type: integer
+                          topology_id:
+                            type: string
+                          version:
+                            format: int32
+                            type: integer
+                        required:
+                        - complete
+                        - completed_at
+                        - deleted_generations
+                        - deleted_objects
+                        - instance_id
+                        - kind
+                        - location
+                        - operation_id
+                        - prefix_empty
+                        - prefix_sha256
+                        - receipt_sha256
+                        - request_sha256
+                        - retained_objects
+                        - retry_token
+                        - topology_generation
+                        - topology_id
+                        - version
+                        type: object
+                      request_sha256:
+                        type: string
+                      retry_token:
+                        type: string
+                    required:
+                    - attempt_count
+                    - operation_id
+                    - phase
+                    - request_sha256
+                    - retry_token
+                    type: object
                   standbys:
                     items:
                       properties:
@@ -6111,6 +6229,19 @@ spec:
                   unhealthyStandbyCount:
                     format: int32
                     type: integer
+                type: object
+              internalServiceAuthRotation:
+                properties:
+                  phase:
+                    type: string
+                  targetSecretKey:
+                    type: string
+                  targetSecretName:
+                    type: string
+                required:
+                - phase
+                - targetSecretKey
+                - targetSecretName
                 type: object
               metadataNodesReady:
                 format: int32

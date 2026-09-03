@@ -53,6 +53,8 @@ pub const PreferenceConfig = struct {
     sft_lambda: f32 = 1.0,
     kto_desirable_weight: f32 = 1.0,
     kto_undesirable_weight: f32 = 1.0,
+    /// IPO regularization parameter. The objective target is `1 / (2 * tau)`
+    /// over the policy/reference completion-token mean log-ratio margin.
     ipo_tau: f32 = 0.1,
 };
 
@@ -79,7 +81,12 @@ pub const PreferenceError = error{
     EmptyBatch,
     WrongLossKind,
     InvalidLabelSmoothing,
+    InvalidBeta,
+    InvalidIpoTau,
     InvalidLengths,
+    NonFiniteLogprob,
+    NonFiniteSFTLoss,
+    NonFinitePreferenceComputation,
     OutOfMemory,
 };
 
@@ -151,6 +158,16 @@ fn validatePaired(batch: PairedBatch, config: PreferenceConfig) PreferenceError!
         },
         .kto => return error.WrongLossKind,
     }
+    if ((config.kind == .dpo or config.kind == .simpo) and
+        (!std.math.isFinite(config.beta) or config.beta <= 0.0))
+    {
+        return error.InvalidBeta;
+    }
+    if (config.kind == .ipo and
+        (!std.math.isFinite(config.ipo_tau) or config.ipo_tau <= 0.0))
+    {
+        return error.InvalidIpoTau;
+    }
     if (!std.math.isFinite(config.label_smoothing) or
         config.label_smoothing < 0.0 or
         config.label_smoothing >= 0.5 or
@@ -162,6 +179,20 @@ fn validatePaired(batch: PairedBatch, config: PreferenceConfig) PreferenceError!
         for (batch.chosen_lengths, batch.rejected_lengths) |chosen_len, rejected_len| {
             if (chosen_len == 0 or rejected_len == 0) return error.InvalidLengths;
         }
+    }
+    for (batch.policy_chosen_logps, batch.policy_rejected_logps) |chosen, rejected| {
+        if (!std.math.isFinite(chosen) or !std.math.isFinite(rejected)) {
+            return error.NonFiniteLogprob;
+        }
+    }
+    for (batch.ref_chosen_logps) |logprob| {
+        if (!std.math.isFinite(logprob)) return error.NonFiniteLogprob;
+    }
+    for (batch.ref_rejected_logps) |logprob| {
+        if (!std.math.isFinite(logprob)) return error.NonFiniteLogprob;
+    }
+    for (batch.sft_chosen_loss) |loss| {
+        if (!std.math.isFinite(loss)) return error.NonFiniteSFTLoss;
     }
     return n;
 }
@@ -205,7 +236,6 @@ pub fn pairedPreferenceLoss(
             }
         },
         .ipo => {
-            const beta = config.beta;
             const target = 1.0 / (2.0 * config.ipo_tau);
             var i: usize = 0;
             while (i < n) : (i += 1) {
@@ -215,8 +245,8 @@ pub fn pairedPreferenceLoss(
                 // site shares one auditable aggregation rule.
                 const chosen_len: f32 = @floatFromInt(batch.chosen_lengths[i]);
                 const rejected_len: f32 = @floatFromInt(batch.rejected_lengths[i]);
-                const r_c = beta * ((batch.policy_chosen_logps[i] - batch.ref_chosen_logps[i]) / chosen_len);
-                const r_r = beta * ((batch.policy_rejected_logps[i] - batch.ref_rejected_logps[i]) / rejected_len);
+                const r_c = (batch.policy_chosen_logps[i] - batch.ref_chosen_logps[i]) / chosen_len;
+                const r_r = (batch.policy_rejected_logps[i] - batch.ref_rejected_logps[i]) / rejected_len;
                 const diff = r_c - r_r;
                 const resid = diff - target;
                 total_loss += resid * resid;
@@ -224,8 +254,8 @@ pub fn pairedPreferenceLoss(
                 if (diff > 0.0) correct += 1;
 
                 const d_loss_d_diff = 2.0 * resid;
-                grad_chosen[i] = beta * d_loss_d_diff / (chosen_len * n_f);
-                grad_rejected[i] = -beta * d_loss_d_diff / (rejected_len * n_f);
+                grad_chosen[i] = d_loss_d_diff / (chosen_len * n_f);
+                grad_rejected[i] = -d_loss_d_diff / (rejected_len * n_f);
             }
         },
         .simpo => {
@@ -325,6 +355,15 @@ pub fn pairedPreferenceLoss(
             }
         },
         .kto => unreachable,
+    }
+
+    if (!std.math.isFinite(total_loss) or !std.math.isFinite(total_margin)) {
+        return error.NonFinitePreferenceComputation;
+    }
+    for (grad_chosen, grad_rejected) |chosen, rejected| {
+        if (!std.math.isFinite(chosen) or !std.math.isFinite(rejected)) {
+            return error.NonFinitePreferenceComputation;
+        }
     }
 
     return PreferenceResult{
@@ -511,10 +550,9 @@ test "DPO label smoothing mixes positive and negative preference labels" {
 test "IPO loss zero at diff = 1/(2*tau)" {
     const allocator = testing.allocator;
     const tau: f32 = 0.25;
-    const beta: f32 = 0.5;
-    // Need diff = beta*(pc-rc) - beta*(pr-rr) = 1/(2*tau) = 2.
-    // Pick pc-rc = 4, pr-rr = 0 => diff = 0.5*4 - 0 = 2.
-    var pc = [_]f32{3.0};
+    // Need diff = (pc-rc) - (pr-rr) = 1/(2*tau) = 2.
+    // Pick pc-rc = 2, pr-rr = 0.
+    var pc = [_]f32{1.0};
     var rc = [_]f32{-1.0};
     var pr = [_]f32{-1.0};
     var rr = [_]f32{-1.0};
@@ -529,7 +567,9 @@ test "IPO loss zero at diff = 1/(2*tau)" {
         .rejected_lengths = &lengths,
         .sft_chosen_loss = &.{},
     };
-    const config = PreferenceConfig{ .kind = .ipo, .beta = beta, .ipo_tau = tau };
+    // An independently supplied DPO beta must not scale the IPO margin a
+    // second time; tau alone defines the IPO target.
+    const config = PreferenceConfig{ .kind = .ipo, .beta = 0.5, .ipo_tau = tau };
     var res = try pairedPreferenceLoss(allocator, batch, config);
     defer res.deinit();
     try testing.expect(approxEq(res.loss, 0.0, 1e-5));
@@ -644,6 +684,64 @@ test "Error: missing lengths on SimPO" {
     };
     const config = PreferenceConfig{ .kind = .simpo };
     try testing.expectError(error.MissingLengths, pairedPreferenceLoss(allocator, batch, config));
+}
+
+test "paired preference loss rejects invalid scaling and non-finite inputs" {
+    const finite = [_]f32{-1.0};
+    const non_finite = [_]f32{std.math.nan(f32)};
+    const lengths = [_]u32{1};
+    const batch = PairedBatch{
+        .policy_chosen_logps = &finite,
+        .policy_rejected_logps = &finite,
+        .ref_chosen_logps = &finite,
+        .ref_rejected_logps = &finite,
+        .chosen_lengths = &lengths,
+        .rejected_lengths = &lengths,
+        .sft_chosen_loss = &.{},
+    };
+
+    try testing.expectError(error.InvalidBeta, pairedPreferenceLoss(testing.allocator, batch, .{
+        .kind = .dpo,
+        .beta = std.math.nan(f32),
+    }));
+    try testing.expectError(error.InvalidIpoTau, pairedPreferenceLoss(testing.allocator, batch, .{
+        .kind = .ipo,
+        .ipo_tau = 0.0,
+    }));
+
+    var non_finite_batch = batch;
+    non_finite_batch.policy_chosen_logps = &non_finite;
+    try testing.expectError(
+        error.NonFiniteLogprob,
+        pairedPreferenceLoss(testing.allocator, non_finite_batch, .{ .kind = .dpo }),
+    );
+
+    const positive_extreme = [_]f32{std.math.floatMax(f32)};
+    const negative_extreme = [_]f32{-std.math.floatMax(f32)};
+    const zero = [_]f32{0.0};
+    const overflowing_batch = PairedBatch{
+        .policy_chosen_logps = &positive_extreme,
+        .policy_rejected_logps = &negative_extreme,
+        .ref_chosen_logps = &zero,
+        .ref_rejected_logps = &zero,
+        .chosen_lengths = &lengths,
+        .rejected_lengths = &lengths,
+        .sft_chosen_loss = &.{},
+    };
+    try testing.expectError(
+        error.NonFinitePreferenceComputation,
+        pairedPreferenceLoss(testing.allocator, overflowing_batch, .{
+            .kind = .dpo,
+            .beta = 1.0,
+        }),
+    );
+    try testing.expectError(
+        error.NonFinitePreferenceComputation,
+        pairedPreferenceLoss(testing.allocator, overflowing_batch, .{
+            .kind = .ipo,
+            .ipo_tau = 0.1,
+        }),
+    );
 }
 
 // ---- Finite-difference gradient checks ------------------------------------

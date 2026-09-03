@@ -297,6 +297,24 @@ pub const Detail = enum(c_int) {
     enrichment_wait_canceled,
     enrichment_wait_timeout,
     enrichment_worker_failed,
+    // A locally committed RemoteApply write can cross the independently
+    // generated storage/runtime boundary before its standby acknowledgement
+    // is available. Preserve the exact reason so the public API can return
+    // its explicit pending-durability contract instead of a generic 500.
+    ha_sync_commit_would_block,
+    ha_sync_commit_wait_limit_exceeded,
+    ha_sync_commit_wait_missing_context,
+    ha_sync_commit_wait_standby_not_in_policy,
+    deadline_exceeded,
+    pre_decision_deadline_exceeded,
+    graph_distinct_budget_exceeded,
+    graph_anchor_filter_requires_index,
+    graph_match_operation_limit_exceeded,
+    graph_cross_range_mode_unsupported,
+    graph_work_budget_exceeded,
+    graph_min_weight_domain_violation,
+    graph_max_weight_domain_violation,
+    graph_path_weight_overflow,
 };
 
 pub const Status = extern struct {
@@ -373,6 +391,10 @@ pub fn statusFromError(err: anyerror) Status {
         error.HAReadOnlyStandby => status(.unavailable, .ha_read_only_standby),
         error.HAPromotedStandbyRequiresPrimaryOpen => status(.unavailable, .ha_promoted_standby_requires_primary_open),
         error.HAFencedPrimary => status(.conflict, .ha_fenced_primary),
+        error.HASyncCommitWouldBlock => status(.unavailable, .ha_sync_commit_would_block),
+        error.HASyncCommitWaitLimitExceeded => status(.unavailable, .ha_sync_commit_wait_limit_exceeded),
+        error.HASyncCommitWaitMissingContext => status(.unavailable, .ha_sync_commit_wait_missing_context),
+        error.HASyncCommitWaitStandbyNotInPolicy => status(.unavailable, .ha_sync_commit_wait_standby_not_in_policy),
         error.InternalFailure => status(.internal, .internal_failure),
         error.NotLeader => status(.retryable, .not_leader),
         error.LeaderUnavailable => status(.unavailable, .leader_unavailable),
@@ -394,6 +416,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidTableIndexMetadata => status(.invalid_argument, .invalid_table_index_metadata),
         error.InvalidEnrichmentConfig => status(.invalid_argument, .invalid_enrichment_config),
         error.UnsupportedQueryRequest => status(.unsupported, .unsupported_query_request),
+        error.UnsupportedHierarchyGrouping => status(.unsupported, .unsupported_query_request),
         error.UnsupportedFilterQueryRequest => status(.unsupported, .unsupported_filter_query_request),
         error.UnsupportedExclusionQueryRequest => status(.unsupported, .unsupported_exclusion_query_request),
         error.UnsupportedSyncLevel => status(.unsupported, .unsupported_sync_level),
@@ -401,6 +424,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.UnsupportedVersion => status(.unsupported, .unsupported_version),
         error.UnsupportedPlatform => status(.unsupported, .unsupported_platform),
         error.Timeout => status(.timeout, .timeout),
+        error.DeadlineExceeded => status(.timeout, .deadline_exceeded),
+        error.PreDecisionDeadlineExceeded => status(.timeout, .pre_decision_deadline_exceeded),
         error.ConnectionTimeout => status(.timeout, .connection_timeout),
         error.ConnectionTimedOut => status(.timeout, .connection_timed_out),
         error.Cancelled => status(.cancelled, .cancelled),
@@ -412,6 +437,16 @@ pub fn statusFromError(err: anyerror) Status {
         error.TemporaryNameServerFailure => status(.retryable, .temporary_name_server_failure),
         error.NameServerFailure => status(.unavailable, .name_server_failure),
         error.QueryCandidateBudgetExceeded => status(.unavailable, .query_candidate_budget_exceeded),
+        error.GraphWorkBudgetExceeded => status(.invalid_argument, .graph_work_budget_exceeded),
+        error.GraphMinWeightDomainViolation => status(.invalid_argument, .graph_min_weight_domain_violation),
+        error.GraphMaxWeightDomainViolation => status(.invalid_argument, .graph_max_weight_domain_violation),
+        error.GraphPathWeightOverflow => status(.invalid_argument, .graph_path_weight_overflow),
+        error.GraphDistinctBudgetExceeded => status(.invalid_argument, .graph_distinct_budget_exceeded),
+        error.GraphAnchorFilterRequiresIndex => status(.unsupported, .graph_anchor_filter_requires_index),
+        error.GraphMatchOperationLimitExceeded => status(.invalid_argument, .graph_match_operation_limit_exceeded),
+        // Preserve the append-only runtime detail code while the public error
+        // name reflects that unsupported exact modes are not topology-specific.
+        error.GraphQueryModeUnsupported => status(.unsupported, .graph_cross_range_mode_unsupported),
         error.QueryEmbeddingInputTooLarge => status(.invalid_argument, .query_embedding_input_too_large),
         error.QueryEmbeddingOverloaded => status(.unavailable, .query_embedding_overloaded),
         error.EmbedRateLimited => status(.retryable, .embed_rate_limited),
@@ -882,6 +917,20 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .enrichment_wait_canceled => "EnrichmentWaitCanceled",
         .enrichment_wait_timeout => "EnrichmentWaitTimeout",
         .enrichment_worker_failed => "EnrichmentWorkerFailed",
+        .ha_sync_commit_would_block => "HASyncCommitWouldBlock",
+        .ha_sync_commit_wait_limit_exceeded => "HASyncCommitWaitLimitExceeded",
+        .ha_sync_commit_wait_missing_context => "HASyncCommitWaitMissingContext",
+        .ha_sync_commit_wait_standby_not_in_policy => "HASyncCommitWaitStandbyNotInPolicy",
+        .deadline_exceeded => "DeadlineExceeded",
+        .pre_decision_deadline_exceeded => "PreDecisionDeadlineExceeded",
+        .graph_distinct_budget_exceeded => "GraphDistinctBudgetExceeded",
+        .graph_anchor_filter_requires_index => "GraphAnchorFilterRequiresIndex",
+        .graph_match_operation_limit_exceeded => "GraphMatchOperationLimitExceeded",
+        .graph_cross_range_mode_unsupported => "GraphQueryModeUnsupported",
+        .graph_work_budget_exceeded => "GraphWorkBudgetExceeded",
+        .graph_min_weight_domain_violation => "GraphMinWeightDomainViolation",
+        .graph_max_weight_domain_violation => "GraphMaxWeightDomainViolation",
+        .graph_path_weight_overflow => "GraphPathWeightOverflow",
     };
 }
 
@@ -894,12 +943,15 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, errorFromStatus(statusFromError(error.ResourceTemporarilyUnavailable)));
     try std.testing.expectEqual(error.QueueFull, errorFromStatus(statusFromError(error.QueueFull)));
     try std.testing.expectEqual(error.ResourceLimitExceeded, errorFromStatus(statusFromError(error.ResourceLimitExceeded)));
+    try std.testing.expectEqual(error.GraphQueryModeUnsupported, errorFromStatus(statusFromError(error.GraphQueryModeUnsupported)));
     try std.testing.expectEqual(error.InferenceProviderFailure, errorFromStatus(statusFromError(error.InferenceProviderFailure)));
     try std.testing.expectEqual(error.KernelJitRequiredDynamicLoad, errorFromStatus(statusFromError(error.KernelJitRequiredDynamicLoad)));
     try std.testing.expectEqual(error.UnexpectedToken, errorFromStatus(statusFromError(error.UnexpectedToken)));
     try std.testing.expectEqual(error.EnrichmentWaitCanceled, errorFromStatus(statusFromError(error.EnrichmentWaitCanceled)));
     try std.testing.expectEqual(error.EnrichmentWaitTimeout, errorFromStatus(statusFromError(error.EnrichmentWaitTimeout)));
     try std.testing.expectEqual(error.EnrichmentWorkerFailed, errorFromStatus(statusFromError(error.EnrichmentWorkerFailed)));
+    try std.testing.expectEqual(error.DeadlineExceeded, errorFromStatus(statusFromError(error.DeadlineExceeded)));
+    try std.testing.expectEqual(error.PreDecisionDeadlineExceeded, errorFromStatus(statusFromError(error.PreDecisionDeadlineExceeded)));
     try std.testing.expectEqual(error.UnsupportedPlatform, errorFromStatus(statusFromError(error.UnsupportedPlatform)));
     try std.testing.expectEqual(error.UnsupportedTransformOperation, errorFromStatus(statusFromError(error.UnsupportedTransformOperation)));
     try std.testing.expectEqual(error.HAReadRequiresPrimary, errorFromStatus(statusFromError(error.HAReadRequiresPrimary)));
@@ -907,6 +959,10 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.CommitVisibilityNotSatisfied, errorFromStatus(statusFromError(error.CommitVisibilityNotSatisfied)));
     try std.testing.expectEqual(error.AbortDecisionNotDurable, errorFromStatus(statusFromError(error.AbortDecisionNotDurable)));
     try std.testing.expectEqual(error.LeaderUnavailable, errorFromStatus(statusFromError(error.LeaderUnavailable)));
+    try std.testing.expectEqual(error.HASyncCommitWouldBlock, errorFromStatus(statusFromError(error.HASyncCommitWouldBlock)));
+    try std.testing.expectEqual(error.HASyncCommitWaitLimitExceeded, errorFromStatus(statusFromError(error.HASyncCommitWaitLimitExceeded)));
+    try std.testing.expectEqual(error.HASyncCommitWaitMissingContext, errorFromStatus(statusFromError(error.HASyncCommitWaitMissingContext)));
+    try std.testing.expectEqual(error.HASyncCommitWaitStandbyNotInPolicy, errorFromStatus(statusFromError(error.HASyncCommitWaitStandbyNotInPolicy)));
     try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(statusFromError(error.UnitPrivateError)));
 }
 

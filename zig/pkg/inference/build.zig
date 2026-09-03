@@ -366,6 +366,11 @@ pub fn build(b: *std.Build) void {
     }
 
     const quant_kernel_metal_runtime_check_step = b.step("quant-kernel-metal-runtime-check", "Run dev-only generated Metal quant kernel correctness check");
+    const a4b_metal_id_replay_step = b.step("a4b-metal-id-replay", "Replay exact Gemma4 26B-A4B Q4_0 MUL_MV_ID decode shapes on Metal");
+    const a4b_metal_common_q4_replay_step = b.step("a4b-metal-common-q4-replay", "Replay packed-layout candidates for Gemma4 26B-A4B common Q4_0 decode shapes on Metal");
+    const a4b_metal_route_select_replay_step = b.step("a4b-metal-route-select-replay", "Replay exact Gemma4 26B-A4B serial and SIMD-group route selection on Metal");
+    const a4b_metal_router_projection_replay_step = b.step("a4b-metal-router-projection-replay", "Replay exact Gemma4 26B-A4B scalar and SIMD-group router projection on Metal");
+    const a4b_metal_lm_head_replay_step = b.step("a4b-metal-lm-head-replay", "Replay the Gemma4 26B-A4B Q6_K LM-head odd-tail candidate on Metal");
     const metal_decode_gqa_split_routes_step = b.step("test-metal-decode-gqa-split-routes", "Run only the Metal split-GQA production-route tensor oracle");
     const quant_kernel_metal_v2_conformance_step = b.step("quant-kernel-metal-v2-conformance", "Run rendered v2 Metal quant kernels against the CPU reference on device");
     const quant_kernel_metal_sweep_step = b.step("quant-kernel-metal-sweep", "Sweep rendered Metal quant kernel schedule variants and report per-route winners");
@@ -376,6 +381,76 @@ pub fn build(b: *std.Build) void {
     const quant_kernel_metal_blocker_strict_step = b.step("quant-kernel-metal-blocker-strict-check", "Fail if saved Metal blocker evidence clears and needs promotion review");
     var quant_kernel_metal_production_regression_run_step: ?*std.Build.Step = null;
     if (target.result.os.tag == .macos) {
+        const a4b_metal_id_replay_exe = b.addExecutable(.{
+            .name = "antfly-a4b-metal-id-replay",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/a4b_metal_id_replay.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        configureMetal(b, a4b_metal_id_replay_exe.root_module, target, true);
+        a4b_metal_id_replay_exe.root_module.link_libc = true;
+        const run_a4b_metal_id_replay = b.addRunArtifact(a4b_metal_id_replay_exe);
+        if (b.args) |args| run_a4b_metal_id_replay.addArgs(args);
+        a4b_metal_id_replay_step.dependOn(&run_a4b_metal_id_replay.step);
+
+        const a4b_metal_common_q4_replay_exe = b.addExecutable(.{
+            .name = "antfly-a4b-metal-common-q4-replay",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/a4b_metal_common_q4_replay.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        configureMetal(b, a4b_metal_common_q4_replay_exe.root_module, target, true);
+        a4b_metal_common_q4_replay_exe.root_module.link_libc = true;
+        const run_a4b_metal_common_q4_replay = b.addRunArtifact(a4b_metal_common_q4_replay_exe);
+        if (b.args) |args| run_a4b_metal_common_q4_replay.addArgs(args);
+        a4b_metal_common_q4_replay_step.dependOn(&run_a4b_metal_common_q4_replay.step);
+
+        const a4b_metal_route_select_replay_exe = b.addExecutable(.{
+            .name = "antfly-a4b-metal-route-select-replay",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/a4b_metal_route_select_replay.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        configureMetal(b, a4b_metal_route_select_replay_exe.root_module, target, true);
+        a4b_metal_route_select_replay_exe.root_module.link_libc = true;
+        const run_a4b_metal_route_select_replay = b.addRunArtifact(a4b_metal_route_select_replay_exe);
+        if (b.args) |args| run_a4b_metal_route_select_replay.addArgs(args);
+        a4b_metal_route_select_replay_step.dependOn(&run_a4b_metal_route_select_replay.step);
+
+        const a4b_metal_router_projection_replay_exe = b.addExecutable(.{
+            .name = "antfly-a4b-metal-router-projection-replay",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/a4b_metal_router_projection_replay.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        configureMetal(b, a4b_metal_router_projection_replay_exe.root_module, target, true);
+        a4b_metal_router_projection_replay_exe.root_module.link_libc = true;
+        const run_a4b_metal_router_projection_replay = b.addRunArtifact(a4b_metal_router_projection_replay_exe);
+        if (b.args) |args| run_a4b_metal_router_projection_replay.addArgs(args);
+        a4b_metal_router_projection_replay_step.dependOn(&run_a4b_metal_router_projection_replay.step);
+
+        const a4b_metal_lm_head_replay_exe = b.addExecutable(.{
+            .name = "antfly-a4b-metal-lm-head-replay",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/a4b_metal_lm_head_replay.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        configureMetal(b, a4b_metal_lm_head_replay_exe.root_module, target, true);
+        a4b_metal_lm_head_replay_exe.root_module.link_libc = true;
+        const run_a4b_metal_lm_head_replay = b.addRunArtifact(a4b_metal_lm_head_replay_exe);
+        if (b.args) |args| run_a4b_metal_lm_head_replay.addArgs(args);
+        a4b_metal_lm_head_replay_step.dependOn(&run_a4b_metal_lm_head_replay.step);
+
         const quant_kernel_metal_runtime_check_exe = b.addExecutable(.{
             .name = "antfly-quant-kernel-metal-runtime-check",
             .root_module = b.createModule(.{
@@ -495,6 +570,11 @@ pub fn build(b: *std.Build) void {
         quant_kernel_metal_blocker_strict_step.dependOn(&strict_quant_kernel_metal_blocker_evidence.step);
     } else {
         const metal_unavailable_step = quant_kernel_metal_unavailable_step orelse unreachable;
+        a4b_metal_id_replay_step.dependOn(metal_unavailable_step);
+        a4b_metal_common_q4_replay_step.dependOn(metal_unavailable_step);
+        a4b_metal_route_select_replay_step.dependOn(metal_unavailable_step);
+        a4b_metal_router_projection_replay_step.dependOn(metal_unavailable_step);
+        a4b_metal_lm_head_replay_step.dependOn(metal_unavailable_step);
         quant_kernel_metal_runtime_check_step.dependOn(metal_unavailable_step);
         metal_decode_gqa_split_routes_step.dependOn(metal_unavailable_step);
         quant_kernel_metal_v2_conformance_step.dependOn(metal_unavailable_step);
@@ -698,7 +778,7 @@ pub fn build(b: *std.Build) void {
 
     const metal_gemma4_prefill_frame_script_self_test = b.addSystemCommand(&.{
         "bash",
-        "scripts/test_metal_gemma4_prefill_frame.sh",
+        "scripts/gemma4/test_metal_gemma4_prefill_frame.sh",
         "--self-test",
     });
     const metal_gemma4_prefill_frame_script_self_test_step = b.step(
@@ -726,7 +806,7 @@ pub fn build(b: *std.Build) void {
 
     const metal_gemma4_bench_script_self_test = b.addSystemCommand(&.{
         "bash",
-        "scripts/bench_metal_gemma4_e2b.sh",
+        "scripts/gemma4/bench_metal_gemma4_e2b.sh",
         "--self-test",
     });
     const metal_gemma4_bench_script_self_test_step = b.step(
@@ -740,7 +820,7 @@ pub fn build(b: *std.Build) void {
 
     const metal_gemma4_prefill_frame_test = b.addSystemCommand(&.{
         "bash",
-        "scripts/test_metal_gemma4_prefill_frame.sh",
+        "scripts/gemma4/test_metal_gemma4_prefill_frame.sh",
         "--antfly-bin",
     });
     metal_gemma4_prefill_frame_test.addFileArg(exe.getEmittedBin());
@@ -752,7 +832,7 @@ pub fn build(b: *std.Build) void {
 
     const metal_gemma4_prefill_frame_generated_q8_test = b.addSystemCommand(&.{
         "bash",
-        "scripts/test_metal_gemma4_prefill_frame.sh",
+        "scripts/gemma4/test_metal_gemma4_prefill_frame.sh",
         "--antfly-bin",
     });
     metal_gemma4_prefill_frame_generated_q8_test.addFileArg(exe.getEmittedBin());
@@ -767,7 +847,7 @@ pub fn build(b: *std.Build) void {
 
     const metal_gemma4_prefill_frame_e4b_test = b.addSystemCommand(&.{
         "bash",
-        "scripts/test_metal_gemma4_prefill_frame.sh",
+        "scripts/gemma4/test_metal_gemma4_prefill_frame.sh",
         "--antfly-bin",
     });
     metal_gemma4_prefill_frame_e4b_test.addFileArg(exe.getEmittedBin());
@@ -782,7 +862,7 @@ pub fn build(b: *std.Build) void {
 
     const metal_gemma4_prefill_frame_e4b_generated_q8_test = b.addSystemCommand(&.{
         "bash",
-        "scripts/test_metal_gemma4_prefill_frame.sh",
+        "scripts/gemma4/test_metal_gemma4_prefill_frame.sh",
         "--e4b-smoke",
         "--generated-q8-smoke",
         "--antfly-bin",
@@ -801,7 +881,7 @@ pub fn build(b: *std.Build) void {
         "ANTFLY_INFERENCE_GEMMA4_EXPECTED_GENERATED_TOP_FAMILY=q4_0",
         "ANTFLY_INFERENCE_GEMMA4_MIN_GENERATED_TOP_COUNT=1",
         "bash",
-        "scripts/test_metal_gemma4_prefill_frame.sh",
+        "scripts/gemma4/test_metal_gemma4_prefill_frame.sh",
         "--e4b-smoke",
         "--generated-q8-smoke",
         "--antfly-bin",
@@ -831,7 +911,7 @@ pub fn build(b: *std.Build) void {
 
     const metal_gemma4_prefill_block_parity_test = b.addSystemCommand(&.{
         "bash",
-        "scripts/test_metal_gemma4_prefill_block_parity.sh",
+        "scripts/gemma4/test_metal_gemma4_prefill_block_parity.sh",
     });
     metal_gemma4_prefill_block_parity_test.step.dependOn(b.getInstallStep());
     const metal_gemma4_prefill_block_parity_test_step = b.step(
@@ -842,7 +922,7 @@ pub fn build(b: *std.Build) void {
 
     const metal_gemma4_mtp_long_context_test = b.addSystemCommand(&.{
         "bash",
-        "scripts/test_metal_gemma4_mtp_long_context.sh",
+        "scripts/gemma4/test_metal_gemma4_mtp_long_context.sh",
     });
     metal_gemma4_mtp_long_context_test.step.dependOn(b.getInstallStep());
     const metal_gemma4_mtp_long_context_test_step = b.step(
@@ -856,7 +936,7 @@ pub fn build(b: *std.Build) void {
 
     const metal_gemma4_long_output_benchmark_contract_test = b.addSystemCommand(&.{
         "python3",
-        "scripts/test_benchmark_metal_gemma4_long_output.py",
+        "scripts/gemma4/test_benchmark_metal_gemma4_long_output.py",
     });
     const metal_gemma4_long_output_benchmark_contract_test_step = b.step(
         "test-metal-gemma4-long-output-benchmark",
@@ -866,7 +946,7 @@ pub fn build(b: *std.Build) void {
 
     const metal_gemma4_ab_benchmark_contract_test = b.addSystemCommand(&.{
         "python3",
-        "scripts/test_benchmark_metal_gemma4_ab.py",
+        "scripts/gemma4/test_benchmark_metal_gemma4_ab.py",
     });
     const metal_gemma4_ab_benchmark_contract_test_step = b.step(
         "test-metal-gemma4-ab-benchmark",
@@ -874,16 +954,29 @@ pub fn build(b: *std.Build) void {
     );
     metal_gemma4_ab_benchmark_contract_test_step.dependOn(&metal_gemma4_ab_benchmark_contract_test.step);
 
+    const metal_gemma4_lm_head_repack_quality_contract_test = b.addSystemCommand(&.{
+        "python3",
+        "scripts/gemma4/test_benchmark_metal_gemma4_lm_head_repack_quality.py",
+    });
+    const metal_gemma4_lm_head_repack_quality_contract_test_step = b.step(
+        "test-metal-gemma4-lm-head-repack-quality",
+        "Test the fail-closed Gemma4 Metal LM-head repack quality contract",
+    );
+    metal_gemma4_lm_head_repack_quality_contract_test_step.dependOn(
+        &metal_gemma4_lm_head_repack_quality_contract_test.step,
+    );
+
     const metal_gemma4_benchmark_contracts_test_step = b.step(
         "test-metal-gemma4-benchmark-contracts",
-        "Test the Gemma4 Metal comparator and baseline/candidate benchmark contracts",
+        "Test the Gemma4 Metal comparison, A/B, and LM-head quality contracts",
     );
     metal_gemma4_benchmark_contracts_test_step.dependOn(metal_gemma4_long_output_benchmark_contract_test_step);
     metal_gemma4_benchmark_contracts_test_step.dependOn(metal_gemma4_ab_benchmark_contract_test_step);
+    metal_gemma4_benchmark_contracts_test_step.dependOn(metal_gemma4_lm_head_repack_quality_contract_test_step);
 
     const metal_gemma4_tool_calling_test = b.addSystemCommand(&.{
         "bash",
-        "scripts/test_metal_gemma4_tool_calling.sh",
+        "scripts/gemma4/test_metal_gemma4_tool_calling.sh",
     });
     metal_gemma4_tool_calling_test.step.dependOn(b.getInstallStep());
     const metal_gemma4_tool_calling_test_step = b.step(
@@ -894,7 +987,7 @@ pub fn build(b: *std.Build) void {
 
     const metal_gemma4_cli_tool_calling_test = b.addSystemCommand(&.{
         "bash",
-        "scripts/test_metal_gemma4_cli_tool_calling.sh",
+        "scripts/gemma4/test_metal_gemma4_cli_tool_calling.sh",
     });
     metal_gemma4_cli_tool_calling_test.step.dependOn(b.getInstallStep());
     const metal_gemma4_cli_tool_calling_test_step = b.step(
@@ -905,7 +998,7 @@ pub fn build(b: *std.Build) void {
 
     const metal_gemma4_e2b_bench = b.addSystemCommand(&.{
         "bash",
-        "scripts/bench_metal_gemma4_e2b.sh",
+        "scripts/gemma4/bench_metal_gemma4_e2b.sh",
     });
     metal_gemma4_e2b_bench.step.dependOn(b.getInstallStep());
     const metal_gemma4_e2b_bench_step = b.step(
@@ -916,7 +1009,7 @@ pub fn build(b: *std.Build) void {
 
     const metal_gemma4_e4b_bench = b.addSystemCommand(&.{
         "bash",
-        "scripts/bench_metal_gemma4_e4b.sh",
+        "scripts/gemma4/bench_metal_gemma4_e4b.sh",
     });
     metal_gemma4_e4b_bench.step.dependOn(b.getInstallStep());
     const metal_gemma4_e4b_bench_step = b.step(
@@ -1422,6 +1515,7 @@ pub fn build(b: *std.Build) void {
         .test_runner = runtime_filter_test_runner,
     });
     tests.root_module.addImport("build_options", build_options_mod);
+    tests.root_module.addImport("antfly-json", runtime_graph.json_mod);
     tests.root_module.addImport("httpx", httpx_mod);
     tests.root_module.addImport("inference_api", inference_api_mod);
     tests.root_module.addImport("antfly_generating_openapi", generating_openapi_mod);

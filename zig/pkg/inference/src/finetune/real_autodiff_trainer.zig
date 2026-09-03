@@ -161,6 +161,17 @@ pub const ReduceDeviceGradsFn = *const fn (
     grads: []const DeviceGradBlock,
 ) anyerror!void;
 
+/// Read-only observer for the raw device gradients consumed by the direct
+/// single-microbatch optimizer path. Unlike a reduction hook, installing an
+/// observer does not select the accumulation path or change optimizer input.
+/// The callback may synchronize or download tensors for diagnostics, but it
+/// must not mutate the supplied device storage.
+pub const ObserveDirectDeviceGradsFn = *const fn (
+    ctx: *anyopaque,
+    cb: *const ComputeBackend,
+    grads: []const DeviceGradBlock,
+) anyerror!void;
+
 // ── Config ───────────────────────────────────────────────────────────────────
 
 pub const TrainerConfig = struct {
@@ -209,6 +220,12 @@ pub const TrainerConfig = struct {
     reduce_device_grads: ?ReduceDeviceGradsFn = null,
     /// Opaque context pointer forwarded to `reduce_device_grads`.
     reduce_device_grads_ctx: ?*anyopaque = null,
+    /// Optional read-only observer for the direct device optimizer input.
+    /// It is called immediately before norm/clipping and AdamW, and is only
+    /// valid when `grad_accum_steps == 1` and no reduction hook is installed.
+    observe_direct_device_grads: ?ObserveDirectDeviceGradsFn = null,
+    /// Opaque context pointer forwarded to `observe_direct_device_grads`.
+    observe_direct_device_grads_ctx: ?*anyopaque = null,
     /// Execution engine for the gradient graph. The interpreter preserves
     /// historical behavior. `compiled_device` caches the autodiff graph and
     /// keeps trainable optimizer state on any backend exposing device-training
@@ -916,6 +933,13 @@ pub const RealAutodiffTrainer = struct {
         compute_backend: *const ComputeBackend,
         config: TrainerConfig,
     ) !RealAutodiffTrainer {
+        if (config.observe_direct_device_grads != null and
+            (@max(config.grad_accum_steps, 1) != 1 or
+                config.reduce_device_grads != null or
+                config.reduce_grads != null))
+        {
+            return error.InvalidDirectDeviceGradientObserverConfiguration;
+        }
         return .{
             .allocator = allocator,
             .compute_backend = compute_backend,
@@ -2654,6 +2678,10 @@ pub const RealAutodiffTrainer = struct {
                 // 6. If the accumulation window is full, clip + step the optimizer.
                 if (self.accum_count >= accum_steps) {
                     if (!direct_device_step) try self.reduceAccumulatedGradients(use_device_optimizer);
+                    if (self.config.observe_direct_device_grads != null) {
+                        if (!direct_device_step) return error.DirectDeviceGradientObserverUnavailable;
+                        try self.observeDirectDeviceGradients(&step_result);
+                    }
 
                     learning_rate = self.config.lr_schedule.lr(@intCast(self.optimizer_step_count));
                     grad_norm = if (direct_device_step)
@@ -3435,6 +3463,37 @@ pub const RealAutodiffTrainer = struct {
         }
         const ctx = self.config.reduce_device_grads_ctx orelse @as(*anyopaque, @ptrFromInt(@alignOf(usize)));
         try reduce_fn(ctx, self.compute_backend, blocks);
+    }
+
+    fn observeDirectDeviceGradients(
+        self: *RealAutodiffTrainer,
+        result: *const training.TrainStepResult,
+    ) !void {
+        const observe_fn = self.config.observe_direct_device_grads orelse return;
+        var blocks = try self.allocator.alloc(DeviceGradBlock, self.lora_params.items.len + self.regular_params.items.len);
+        defer self.allocator.free(blocks);
+        var block_idx: usize = 0;
+        for (self.lora_params.items) |*slot| {
+            blocks[block_idx] = .{
+                .name = slot.name,
+                .data = result.device_gradients.get(slot.name) orelse return error.MissingTrainableGradient,
+                .elem_count = slot.weights.len,
+                .dims = slot.dims,
+            };
+            block_idx += 1;
+        }
+        for (self.regular_params.items) |*slot| {
+            blocks[block_idx] = .{
+                .name = slot.name,
+                .data = result.device_gradients.get(slot.name) orelse return error.MissingTrainableGradient,
+                .elem_count = slot.weights.len,
+                .dims = slot.dims,
+            };
+            block_idx += 1;
+        }
+        const ctx = self.config.observe_direct_device_grads_ctx orelse
+            @as(*anyopaque, @ptrFromInt(@alignOf(usize)));
+        try observe_fn(ctx, self.compute_backend, blocks);
     }
 
     fn deviceGlobalGradNorm(self: *RealAutodiffTrainer) !f32 {
@@ -4882,6 +4941,13 @@ fn mockReduceDeviceGrads(ctx_opaque: *anyopaque, cb: *const ComputeBackend, grad
     ctx.last_block_count = grads.len;
 }
 
+fn mockObserveDirectDeviceGrads(ctx_opaque: *anyopaque, cb: *const ComputeBackend, grads: []const DeviceGradBlock) anyerror!void {
+    _ = cb;
+    const ctx: *MockReduceCtx = @ptrCast(@alignCast(ctx_opaque));
+    ctx.call_count += 1;
+    ctx.last_block_count = grads.len;
+}
+
 test "RealAutodiffTrainer: reduce_grads hook type wiring" {
     // Compile-time verification that the hook type + config fields line up,
     // plus a runtime check that a caller-provided hook can be invoked
@@ -4902,6 +4968,8 @@ test "RealAutodiffTrainer: reduce_grads hook type wiring" {
         _ = @TypeOf(C.reduce_grads_ctx);
         _ = @TypeOf(C.reduce_device_grads);
         _ = @TypeOf(C.reduce_device_grads_ctx);
+        _ = @TypeOf(C.observe_direct_device_grads);
+        _ = @TypeOf(C.observe_direct_device_grads_ctx);
     }
 
     var ctx = MockReduceCtx{};
@@ -4969,6 +5037,52 @@ test "RealAutodiffTrainer: reduce_device_grads hook type wiring" {
     var trainer = try RealAutodiffTrainer.init(allocator, dummy_cb, cfg);
     defer trainer.deinit();
     try testing.expect(trainer.config.reduce_device_grads != null);
+}
+
+test "gemma4 RealAutodiffTrainer: direct device gradient observer type wiring" {
+    const allocator = testing.allocator;
+
+    comptime {
+        const F: ?ObserveDirectDeviceGradsFn = mockObserveDirectDeviceGrads;
+        _ = F;
+    }
+
+    var ctx = MockReduceCtx{};
+    const fake_ct: CT = @ptrFromInt(0x1000);
+    const dims = [_]i32{3};
+    const blocks = [_]DeviceGradBlock{
+        .{ .name = "a", .data = fake_ct, .elem_count = 3, .dims = &dims },
+    };
+    const dummy_cb: *const ComputeBackend = @ptrFromInt(@alignOf(ComputeBackend));
+    const observe: ObserveDirectDeviceGradsFn = mockObserveDirectDeviceGrads;
+    try observe(@ptrCast(&ctx), dummy_cb, &blocks);
+    try testing.expectEqual(@as(u32, 1), ctx.call_count);
+    try testing.expectEqual(@as(usize, 1), ctx.last_block_count);
+
+    const cfg = TrainerConfig{
+        .lora = .{ .rank = 2, .alpha = 2.0, .target_patterns = &.{"q_proj"} },
+        .observe_direct_device_grads = mockObserveDirectDeviceGrads,
+        .observe_direct_device_grads_ctx = @ptrCast(&ctx),
+    };
+    try testing.expect(cfg.observe_direct_device_grads != null);
+    try testing.expect(cfg.observe_direct_device_grads_ctx != null);
+
+    var trainer = try RealAutodiffTrainer.init(allocator, dummy_cb, cfg);
+    defer trainer.deinit();
+    try testing.expect(trainer.config.observe_direct_device_grads != null);
+
+    var accumulated = cfg;
+    accumulated.grad_accum_steps = 2;
+    try testing.expectError(
+        error.InvalidDirectDeviceGradientObserverConfiguration,
+        RealAutodiffTrainer.init(allocator, dummy_cb, accumulated),
+    );
+    var reduced = cfg;
+    reduced.reduce_device_grads = mockReduceDeviceGrads;
+    try testing.expectError(
+        error.InvalidDirectDeviceGradientObserverConfiguration,
+        RealAutodiffTrainer.init(allocator, dummy_cb, reduced),
+    );
 }
 
 test "gemma4 partial accumulation renormalization uses the actual micro-batch count" {

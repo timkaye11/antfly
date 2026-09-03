@@ -27,6 +27,7 @@ const transcribing = @import("antfly_transcribing");
 const readers = @import("antfly_readers");
 const synthesizing = @import("antfly_synthesizing");
 const platform = @import("antfly_platform");
+const graph_work_budget = @import("../graph/work_budget.zig");
 
 const default_max_shard_size_bytes: u64 = 64 * 1024 * 1024;
 
@@ -70,6 +71,7 @@ pub const Config = struct {
     tls: ?TlsConfig = null,
     cors: ?CorsConfig = null,
     admission: AdmissionConfig = .{},
+    graph_execution: graph_work_budget.Limits = .{},
     mcp: McpConfig = .{},
     metadata: MetadataConfig = .{},
     storage: StorageConfig = .{},
@@ -95,6 +97,18 @@ pub const Config = struct {
         /// Zero disables the serialized MCP tool-result compatibility guard.
         max_tool_result_bytes: u32 = default_mcp_max_tool_result_bytes,
     };
+
+    fn graphExecutionLimitsFromOpenApi(value: ?common_openapi.GraphExecutionConfig) !graph_work_budget.Limits {
+        const config = value orelse return .{};
+        var limits: graph_work_budget.Limits = .{};
+        inline for (std.meta.fields(graph_work_budget.Limits)) |field| {
+            if (@field(config, field.name)) |configured| {
+                @field(limits, field.name) = std.math.cast(usize, configured) orelse return error.InvalidConfig;
+            }
+        }
+        try limits.validate();
+        return limits;
+    }
 
     pub const MetadataConfig = struct {
         pub const NodeUrl = struct {
@@ -236,11 +250,19 @@ pub const Config = struct {
             ttl_ms: u64 = 300_000,
         };
         pub const WarmModelConfig = struct {
+            pub const ResidencyMode = enum {
+                auto,
+                resident,
+                streamed,
+            };
+
             kind: []u8,
             name: []u8,
             backend: ?[]u8 = null,
             format: ?[]u8 = null,
             quantization: ?[]u8 = null,
+            residency_mode: ?ResidencyMode = null,
+            memory_budget_mb: ?u32 = null,
 
             fn deinit(self: *WarmModelConfig, alloc: std.mem.Allocator) void {
                 alloc.free(self.kind);
@@ -753,6 +775,7 @@ pub const Config = struct {
                     legacy_inference_max_concurrent_requests orelse
                     default_inference_max_concurrent_requests },
             },
+            .graph_execution = try graphExecutionLimitsFromOpenApi(validated.value.graph_execution),
             .mcp = .{ .max_tool_result_bytes = mcp_max_tool_result_bytes },
             .metadata = try parseMetadataConfig(
                 alloc,
@@ -2053,6 +2076,12 @@ fn parseInferencePreloadModels(
             .backend = try optionalStringFieldDup(alloc, model_object, "backend"),
             .format = try optionalStringFieldDup(alloc, model_object, "format"),
             .quantization = try optionalStringFieldDup(alloc, model_object, "quantization"),
+            .residency_mode = try optionalEnumField(
+                Config.InferenceConfig.WarmModelConfig.ResidencyMode,
+                model_object,
+                "residency_mode",
+            ),
+            .memory_budget_mb = try optionalU32Field(model_object, "memory_budget_mb"),
         };
         filled = i + 1;
     }
@@ -2393,7 +2422,7 @@ test "common config parses inference preload" {
         \\  "inference": {
         \\    "api_url": "http://127.0.0.1:8090",
         \\    "preload": [
-        \\      { "kind": "generator", "name": "antflydb/gemma-e2b", "format": "gguf", "quantization": "q8" },
+        \\      { "kind": "generator", "name": "antflydb/gemma-e2b", "format": "gguf", "quantization": "q8", "residency_mode": "streamed", "memory_budget_mb": 4096 },
         \\      { "kind": "reranker", "name": "BAAI/bge-reranker", "backend": "native", "format": "onnx" }
         \\    ]
         \\  }
@@ -2407,6 +2436,11 @@ test "common config parses inference preload" {
     try std.testing.expectEqualStrings("antflydb/gemma-e2b", cfg.inference.preload[0].name);
     try std.testing.expectEqualStrings("gguf", cfg.inference.preload[0].format.?);
     try std.testing.expectEqualStrings("q8", cfg.inference.preload[0].quantization.?);
+    try std.testing.expectEqual(
+        Config.InferenceConfig.WarmModelConfig.ResidencyMode.streamed,
+        cfg.inference.preload[0].residency_mode.?,
+    );
+    try std.testing.expectEqual(@as(?u32, 4096), cfg.inference.preload[0].memory_budget_mb);
     try std.testing.expectEqualStrings("reranker", cfg.inference.preload[1].kind);
     try std.testing.expectEqualStrings("BAAI/bge-reranker", cfg.inference.preload[1].name);
     try std.testing.expectEqualStrings("native", cfg.inference.preload[1].backend.?);
@@ -3143,6 +3177,10 @@ test "common config parses minimal config with admission defaults" {
     try std.testing.expectEqual(default_query_max_concurrent_requests, cfg.admission.query.max_concurrent_requests);
     try std.testing.expectEqual(default_write_max_concurrent_requests, cfg.admission.write.max_concurrent_requests);
     try std.testing.expectEqual(default_inference_max_concurrent_requests, cfg.admission.inference.max_concurrent_requests);
+    try std.testing.expectEqual(graph_work_budget.default_max_explored_nodes, cfg.graph_execution.max_explored_nodes);
+    try std.testing.expectEqual(graph_work_budget.default_max_explored_edges, cfg.graph_execution.max_explored_edges);
+    try std.testing.expectEqual(graph_work_budget.default_max_retained_state_bytes, cfg.graph_execution.max_retained_state_bytes);
+    try std.testing.expectEqual(graph_work_budget.default_max_distinct_identities, cfg.graph_execution.max_distinct_identities);
     try std.testing.expectEqual(default_mcp_max_tool_result_bytes, cfg.mcp.max_tool_result_bytes);
     try std.testing.expectEqual(@as(u32, default_config_shards_per_table), cfg.shard_allocation.default_shards_per_table);
     try std.testing.expectEqual(@as(u64, default_max_shard_size_bytes), cfg.shard_allocation.max_shard_size_bytes);
@@ -3157,6 +3195,22 @@ test "common config parses minimal config with admission defaults" {
     try std.testing.expectEqual(@as(usize, 512), cfg.inference.prompt_cache.max_bytes_mb);
     try std.testing.expectEqual(@as(usize, 64), cfg.inference.prompt_cache.min_tokens);
     try std.testing.expectEqual(@as(u64, 300_000), cfg.inference.prompt_cache.ttl_ms);
+}
+
+test "common config parses operator-owned graph execution ceilings" {
+    var cfg = try Config.parseFromSlice(std.testing.allocator,
+        \\{"graph_execution":{"max_explored_nodes":4096,"max_explored_edges":8192,"max_explored_edge_bytes":1048576,"max_scanned_anchors":2048,"max_intermediate_states":1024,"max_retained_state_bytes":2097152,"max_distinct_identities":512,"max_distinct_state_bytes":524288}}
+    );
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4096), cfg.graph_execution.max_explored_nodes);
+    try std.testing.expectEqual(@as(usize, 8192), cfg.graph_execution.max_explored_edges);
+    try std.testing.expectEqual(@as(usize, 1_048_576), cfg.graph_execution.max_explored_edge_bytes);
+    try std.testing.expectEqual(@as(usize, 2048), cfg.graph_execution.max_scanned_anchors);
+    try std.testing.expectEqual(@as(usize, 1024), cfg.graph_execution.max_intermediate_states);
+    try std.testing.expectEqual(@as(usize, 2_097_152), cfg.graph_execution.max_retained_state_bytes);
+    try std.testing.expectEqual(@as(usize, 512), cfg.graph_execution.max_distinct_identities);
+    try std.testing.expectEqual(@as(usize, 524_288), cfg.graph_execution.max_distinct_state_bytes);
 }
 
 test "common config parses MCP tool result compatibility budget" {

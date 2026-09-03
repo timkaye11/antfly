@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -17,6 +18,14 @@ import (
 )
 
 const haTopologyIDAnnotation = "antfly.io/ha-topology-id"
+
+const (
+	defaultHAPrimaryLogPath      = "/antflydb/ha/primary.wal"
+	defaultHAPrimarySlotsPath    = "/antflydb/ha/slots"
+	defaultHAStandbyLogPath      = "/antflydb/ha/standby.wal"
+	defaultHAStandbyProgressPath = "/antflydb/ha/standby-progress.wal"
+	promotedPrimarySlotsSuffix   = ".promoted-primary-slots"
+)
 
 var (
 	// irsaARNPattern matches AWS IAM Role ARNs including China and GovCloud partitions.
@@ -51,7 +60,76 @@ func (r *AntflyCluster) ValidateUpdate(old runtime.Object) error {
 	if err := r.ValidateImmutability(oldCluster); err != nil {
 		return err
 	}
-	return r.ValidateAntflyCluster()
+	if err := r.ValidateAntflyCluster(); err != nil {
+		return err
+	}
+	return r.validateHAPromotedPrimaryStorageBinding(oldCluster)
+}
+
+// validateHAPromotedPrimaryStorageBinding preserves both pieces of durable
+// storage authority across an in-place standby promotion: the activated PVC
+// binding and the exact WAL/slot paths adopted by the running process.
+func (r *AntflyCluster) validateHAPromotedPrimaryStorageBinding(old *AntflyCluster) error {
+	if old == nil || old.Spec.HighAvailability == nil || old.Spec.HighAvailability.Runtime == nil ||
+		r.Spec.HighAvailability == nil || r.Spec.HighAvailability.Runtime == nil {
+		return nil
+	}
+	oldRuntime := old.Spec.HighAvailability.Runtime
+	newRuntime := r.Spec.HighAvailability.Runtime
+	if oldRuntime.Role == HARuntimeRoleStandby && newRuntime.Role == HARuntimeRolePrimary {
+		oldLogPath, oldProgressPath := effectiveHAStandbyPaths(oldRuntime.Standby)
+		newLogPath, newSlotsPath := effectiveHAPrimaryPaths(newRuntime.Primary)
+		expectedSlotsPath := oldProgressPath + promotedPrimarySlotsSuffix
+		if newLogPath != oldLogPath || newSlotsPath != expectedSlotsPath {
+			return fmt.Errorf(
+				"spec.highAvailability.runtime.primary must reopen the promoted standby storage: logPath=%q and slotsPath=%q",
+				oldLogPath,
+				expectedSlotsPath,
+			)
+		}
+	}
+	oldGate := oldRuntime.StartupGate
+	newGate := newRuntime.StartupGate
+	oldBoundPrimary := oldRuntime.Role == HARuntimeRolePrimary && oldGate != nil && oldGate.Policy == HAStartupGatePolicyRequireActivatedSeed
+	newBoundPrimary := newRuntime.Role == HARuntimeRolePrimary && newGate != nil && newGate.Policy == HAStartupGatePolicyRequireActivatedSeed
+	// A physically fenced primary may subsequently be rewritten as a standby
+	// with a repair/suspension gate. Immutability applies only while entering or
+	// remaining in the Primary role.
+	if newRuntime.Role != HARuntimeRolePrimary || (!oldBoundPrimary && !newBoundPrimary) {
+		return nil
+	}
+	if !reflect.DeepEqual(oldGate, newGate) {
+		return fmt.Errorf("spec.highAvailability.runtime.startupGate activated-volume binding is immutable across and after promotion")
+	}
+	return nil
+}
+
+func effectiveHAStandbyPaths(standby *HAStandbyRuntimeSpec) (string, string) {
+	logPath := defaultHAStandbyLogPath
+	progressPath := defaultHAStandbyProgressPath
+	if standby != nil {
+		if value := strings.TrimSpace(standby.LogPath); value != "" {
+			logPath = value
+		}
+		if value := strings.TrimSpace(standby.ProgressPath); value != "" {
+			progressPath = value
+		}
+	}
+	return logPath, progressPath
+}
+
+func effectiveHAPrimaryPaths(primary *HAPrimaryRuntimeSpec) (string, string) {
+	logPath := defaultHAPrimaryLogPath
+	slotsPath := defaultHAPrimarySlotsPath
+	if primary != nil {
+		if value := strings.TrimSpace(primary.LogPath); value != "" {
+			logPath = value
+		}
+		if value := strings.TrimSpace(primary.SlotsPath); value != "" {
+			slotsPath = value
+		}
+	}
+	return logPath, slotsPath
 }
 
 // Default applies admission defaults to AntflyCluster.
@@ -204,6 +282,10 @@ func (r *AntflyCluster) ValidateAntflyCluster() error {
 		allErrors = append(allErrors, err.Error())
 	}
 
+	if err := r.validateInternalServiceAuth(); err != nil {
+		allErrors = append(allErrors, err.Error())
+	}
+
 	if err := r.validateProductTierMapping(); err != nil {
 		allErrors = append(allErrors, err.Error())
 	}
@@ -218,6 +300,73 @@ func (r *AntflyCluster) ValidateAntflyCluster() error {
 	}
 
 	return nil
+}
+
+func (r *AntflyCluster) validateInternalServiceAuth() error {
+	auth := r.Spec.InternalServiceAuth
+	if r.isStandaloneMode() {
+		if auth != nil {
+			return fmt.Errorf("spec.internalServiceAuth must be omitted in Standalone mode")
+		}
+		return nil
+	}
+	// Kubernetes applies the CRD's Distributed default before admission. Keeping
+	// the zero-value path neutral also preserves direct Go callers and legacy
+	// Swarm objects; the controller normalizes/defaults its working copy before
+	// invoking this fallback validation.
+	if r.Spec.Mode != ClusterModeDistributed {
+		return nil
+	}
+	if auth == nil {
+		return fmt.Errorf("spec.internalServiceAuth is required in Distributed mode")
+	}
+
+	var validationErrors []string
+	validationErrors = append(validationErrors, validateInternalServiceSecretKeySelector(auth.SecretKeyRef, "spec.internalServiceAuth.secretKeyRef")...)
+	if auth.NextSecretKeyRef != nil {
+		validationErrors = append(validationErrors, validateInternalServiceSecretKeySelector(*auth.NextSecretKeyRef, "spec.internalServiceAuth.nextSecretKeyRef")...)
+		if internalServiceSecretKeySelectorEqual(auth.SecretKeyRef, *auth.NextSecretKeyRef) {
+			validationErrors = append(validationErrors, "spec.internalServiceAuth.nextSecretKeyRef must select a different Secret key")
+		}
+	}
+	if len(validationErrors) > 0 {
+		return fmt.Errorf("InternalServiceAuth validation failed:\n  - %s", strings.Join(validationErrors, "\n  - "))
+	}
+	return nil
+}
+
+func validateInternalServiceSecretKeySelector(ref corev1.SecretKeySelector, fieldPath string) []string {
+	var validationErrors []string
+	name := strings.TrimSpace(ref.Name)
+	key := strings.TrimSpace(ref.Key)
+	if name == "" {
+		validationErrors = append(validationErrors, fieldPath+".name is required")
+	} else {
+		if name != ref.Name {
+			validationErrors = append(validationErrors, fieldPath+".name must not have leading or trailing whitespace")
+		}
+		if errs := utilvalidation.IsDNS1123Subdomain(name); len(errs) > 0 {
+			validationErrors = append(validationErrors, fmt.Sprintf("%s.name %q is invalid: %s", fieldPath, name, strings.Join(errs, "; ")))
+		}
+	}
+	if key == "" {
+		validationErrors = append(validationErrors, fieldPath+".key is required")
+	} else {
+		if key != ref.Key {
+			validationErrors = append(validationErrors, fieldPath+".key must not have leading or trailing whitespace")
+		}
+		if errs := utilvalidation.IsConfigMapKey(key); len(errs) > 0 {
+			validationErrors = append(validationErrors, fmt.Sprintf("%s.key %q is invalid: %s", fieldPath, key, strings.Join(errs, "; ")))
+		}
+	}
+	if ref.Optional != nil && *ref.Optional {
+		validationErrors = append(validationErrors, fieldPath+".optional must be false")
+	}
+	return validationErrors
+}
+
+func internalServiceSecretKeySelectorEqual(a, b corev1.SecretKeySelector) bool {
+	return a.Name == b.Name && a.Key == b.Key
 }
 
 func (r *AntflyCluster) validateSecretStore() error {
@@ -895,6 +1044,25 @@ Problem: PVC storage size cannot be reduced. Kubernetes only supports volume exp
 		))
 	}
 
+	if oldAuth, newAuth := old.Spec.InternalServiceAuth, r.Spec.InternalServiceAuth; oldAuth != nil && newAuth != nil {
+		primaryChanged := !internalServiceSecretKeySelectorEqual(oldAuth.SecretKeyRef, newAuth.SecretKeyRef)
+		if oldAuth.NextSecretKeyRef == nil {
+			if primaryChanged {
+				errors = append(errors, "spec.internalServiceAuth.secretKeyRef cannot change directly; set nextSecretKeyRef and wait for the Switched status first")
+			}
+		} else {
+			nextChanged := newAuth.NextSecretKeyRef == nil || !internalServiceSecretKeySelectorEqual(*oldAuth.NextSecretKeyRef, *newAuth.NextSecretKeyRef)
+			if primaryChanged || nextChanged {
+				rotation := old.Status.InternalServiceAuthRotation
+				rotationComplete := rotation != nil && rotation.Phase == InternalServiceAuthRotationSwitched &&
+					rotation.TargetSecretName == oldAuth.NextSecretKeyRef.Name && rotation.TargetSecretKey == oldAuth.NextSecretKeyRef.Key
+				if !rotationComplete || !internalServiceSecretKeySelectorEqual(newAuth.SecretKeyRef, *oldAuth.NextSecretKeyRef) {
+					errors = append(errors, "internal-service key rotation cannot advance until status.internalServiceAuthRotation.phase is Switched; then promote nextSecretKeyRef atomically to secretKeyRef")
+				}
+			}
+		}
+	}
+
 	if len(errors) > 0 {
 		return fmt.Errorf("%s", strings.Join(errors, "\n\n"))
 	}
@@ -1389,6 +1557,7 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 
 	if admin := ha.Admin; admin != nil {
 		errors = append(errors, validateHAAdminURL(admin.PrimaryURL, "spec.highAvailability.admin.primaryURL")...)
+		errors = append(errors, validateHAAdminURL(admin.PrimaryActionURL, "spec.highAvailability.admin.primaryActionURL")...)
 		if strings.TrimSpace(admin.TokenEnvVar) == "" && admin.TokenEnvVar != "" {
 			errors = append(errors, "spec.highAvailability.admin.tokenEnvVar must not be whitespace")
 		}
@@ -1543,7 +1712,9 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		} else if fencingAuthority != HAFencingAuthorityKubernetesLease {
 			errors = append(errors, "spec.highAvailability.automaticFailover.fencingAuthority must be KubernetesLease for operator-managed automatic failover")
 		}
-		if ha.Admin == nil || !ha.Admin.ExecutePlannedActions {
+		stagedStandby := ha.Runtime != nil && ha.Runtime.Role == HARuntimeRoleStandby &&
+			ha.Admin != nil && !ha.Admin.ExecutePlannedActions
+		if ha.Admin == nil || (!ha.Admin.ExecutePlannedActions && !stagedStandby) {
 			errors = append(errors, "spec.highAvailability.automaticFailover requires spec.highAvailability.admin.executePlannedActions=true")
 		}
 		for i, standby := range ha.Standbys {
@@ -1653,10 +1824,10 @@ func (r *AntflyCluster) validateHAStartupGate(ha *HighAvailabilitySpec) []string
 	gate := ha.Runtime.StartupGate
 	fieldPath := "spec.highAvailability.runtime.startupGate"
 	var errors []string
-	if ha.Runtime.Role != HARuntimeRoleStandby {
-		errors = append(errors, fieldPath+" requires runtime.role Standby")
-	}
 	if gate.Policy == HAStartupGatePolicySuspend {
+		if ha.Runtime.Role != HARuntimeRoleStandby {
+			errors = append(errors, fieldPath+".policy Suspend requires runtime.role Standby")
+		}
 		if gate.RuntimeEligible {
 			errors = append(errors, fieldPath+".policy Suspend requires runtimeEligible=false")
 		}
@@ -1670,6 +1841,9 @@ func (r *AntflyCluster) validateHAStartupGate(ha *HighAvailabilitySpec) []string
 	}
 	if gate.Policy != HAStartupGatePolicyRequireActivatedSeed {
 		errors = append(errors, fieldPath+".policy must be Suspend or RequireActivatedSeed")
+	}
+	if ha.Runtime.Role == HARuntimeRolePrimary && !gate.RuntimeEligible {
+		errors = append(errors, fieldPath+" on runtime.role Primary requires runtimeEligible=true")
 	}
 	if gate.ReceiptMatchPolicy != HAReceiptMatchPolicyExact {
 		errors = append(errors, fieldPath+".receiptMatchPolicy must be Exact for RequireActivatedSeed")
@@ -1710,7 +1884,8 @@ func (r *AntflyCluster) validateHAStartupGate(ha *HighAvailabilitySpec) []string
 	if strings.TrimSpace(required.NodeID) != strings.TrimSpace(ha.Runtime.NodeID) {
 		errors = append(errors, fieldPath+".requiredReceipt.nodeID must match runtime.nodeID")
 	}
-	if ha.Runtime.Standby == nil || strings.TrimSpace(required.SlotName) != strings.TrimSpace(ha.Runtime.Standby.SlotName) {
+	if ha.Runtime.Role == HARuntimeRoleStandby &&
+		(ha.Runtime.Standby == nil || strings.TrimSpace(required.SlotName) != strings.TrimSpace(ha.Runtime.Standby.SlotName)) {
 		errors = append(errors, fieldPath+".requiredReceipt.slotName must match runtime.standby.slotName")
 	}
 
@@ -1723,26 +1898,39 @@ func (r *AntflyCluster) validateHAStartupGate(ha *HighAvailabilitySpec) []string
 		errors = append(errors, fmt.Sprintf("%s.requiredReceipt.targetPVCName %q is invalid: %s", fieldPath, targetPVCName, strings.Join(nameErrs, "; ")))
 	}
 
-	var artifact *HASeedArtifactSpec
-	for i := range ha.Standbys {
-		standby := &ha.Standbys[i]
-		slotName := strings.TrimSpace(standby.SlotName)
-		if slotName == "" {
-			slotName = strings.TrimSpace(standby.Name)
+	if ha.Runtime.Role == HARuntimeRolePrimary {
+		// A promoted seeded runtime keeps the exact gate as durable storage
+		// provenance after its standby slot leaves the new primary topology.
+		// Require incarnation-level bindings so it can never fall back to a
+		// newly-created empty claim if that retained volume disappears.
+		if required.TopologyGeneration <= 0 {
+			errors = append(errors, fieldPath+".requiredReceipt.topologyGeneration must be greater than zero for runtime.role Primary")
 		}
-		if slotName == strings.TrimSpace(required.SlotName) {
-			artifact = standby.SeedArtifact
-			break
+		if strings.TrimSpace(required.TargetPVCUID) == "" {
+			errors = append(errors, fieldPath+".requiredReceipt.targetPVCUID is required for runtime.role Primary")
 		}
-	}
-	if artifact == nil {
-		errors = append(errors, fieldPath+".requiredReceipt.slotName must reference a standby with seedArtifact")
 	} else {
-		if strings.TrimSpace(required.Generation) != strings.TrimSpace(artifact.Generation) {
-			errors = append(errors, fieldPath+".requiredReceipt.generation must match seedArtifact.generation")
+		var artifact *HASeedArtifactSpec
+		for i := range ha.Standbys {
+			standby := &ha.Standbys[i]
+			slotName := strings.TrimSpace(standby.SlotName)
+			if slotName == "" {
+				slotName = strings.TrimSpace(standby.Name)
+			}
+			if slotName == strings.TrimSpace(required.SlotName) {
+				artifact = standby.SeedArtifact
+				break
+			}
 		}
-		if artifact.TargetPVC == nil || targetPVCName != strings.TrimSpace(artifact.TargetPVC.ClaimName) {
-			errors = append(errors, fieldPath+".requiredReceipt.targetPVCName must match seedArtifact.targetPVC.claimName")
+		if artifact == nil {
+			errors = append(errors, fieldPath+".requiredReceipt.slotName must reference a standby with seedArtifact")
+		} else {
+			if strings.TrimSpace(required.Generation) != strings.TrimSpace(artifact.Generation) {
+				errors = append(errors, fieldPath+".requiredReceipt.generation must match seedArtifact.generation")
+			}
+			if artifact.TargetPVC == nil || targetPVCName != strings.TrimSpace(artifact.TargetPVC.ClaimName) {
+				errors = append(errors, fieldPath+".requiredReceipt.targetPVCName must match seedArtifact.targetPVC.claimName")
+			}
 		}
 	}
 

@@ -275,6 +275,8 @@ pub const PreferenceConfig = struct {
     label_smoothing: ?f32 = null,
     simpo_gamma: ?f32 = null,
     sft_lambda: ?f32 = null,
+    /// IPO regularization parameter. When omitted, `beta` supplies the
+    /// standard IPO tau value for compatibility with common trainer APIs.
     ipo_tau: ?f32 = null,
 };
 
@@ -326,7 +328,7 @@ fn resolveDpoObjectiveConfig(config: PreferenceConfig) !ResolvedDpoObjectiveConf
 
     const simpo_gamma = config.simpo_gamma orelse 0.5;
     if (!std.math.isFinite(simpo_gamma) or simpo_gamma < 0.0) return error.InvalidSimpoGamma;
-    const ipo_tau = config.ipo_tau orelse 0.1;
+    const ipo_tau = config.ipo_tau orelse beta;
     if (!std.math.isFinite(ipo_tau) or ipo_tau <= 0.0) return error.InvalidIpoTau;
     switch (loss_type) {
         .sigmoid => if (config.simpo_gamma != null or config.ipo_tau != null) {
@@ -651,6 +653,11 @@ pub const EvalConfig = struct {
 
 pub const CheckpointConfig = struct {
     every_epochs: ?u32 = null,
+    /// Mid-epoch durable-checkpoint cadence for Gemma4 preference training,
+    /// counted in optimizer examples (DPO pairs or GRPO prompt groups) within
+    /// each epoch. Requires `every_epochs`, eager sampling, and no
+    /// incremental-KV; every other lane rejects it fail-closed.
+    every_examples: ?u32 = null,
     keep_last: ?u32 = null,
     resume_path: ?[]const u8 = null,
 };
@@ -1147,12 +1154,18 @@ const GrpoSamplingSummary = struct {
     temperature: f32,
     top_p: f32,
     top_k: usize,
-    stream_derivation: []const u8 = "run-seed-domain-epoch-group-completion/v1",
+    stream_derivation: []const u8 = "run-seed-domain-epoch-dataset-prompt-index-completion/v2",
     first_completion_greedy: bool,
 };
 
+const GrpoTrainingOrderSummary = struct {
+    algorithm: []const u8 = "seeded-fisher-yates-per-epoch/v1",
+    stream_derivation: []const u8 = "run-seed-order-domain-epoch-dataset-size/v1",
+    prompt_index_semantics: []const u8 = "original-dataset-index",
+};
+
 const GrpoReport = struct {
-    schema_version: []const u8 = "antfly_inference_finetune_grpo_report/v7",
+    schema_version: []const u8 = "antfly_inference_finetune_grpo_report/v8",
     execution_mode: []const u8,
     dataset_format: []const u8,
     completions: usize,
@@ -1184,6 +1197,7 @@ const GrpoReport = struct {
     policy_backend: ?[]const u8 = null,
     optimizer_steps: ?u64 = null,
     micro_batch_steps: ?u64 = null,
+    training_order: ?GrpoTrainingOrderSummary = null,
     sampling_mode: ?[]const u8 = null,
     sampling: ?GrpoSamplingSummary = null,
     policy_logprob_mode: ?[]const u8 = null,
@@ -1214,11 +1228,16 @@ const GrpoReport = struct {
 const PreferenceCheckpointResumeSummary = struct {
     enabled: bool,
     start_epoch: usize,
+    /// Completed examples (DPO pairs or GRPO groups) inside `start_epoch`
+    /// that the restored checkpoint had already consumed; zero for an
+    /// epoch-boundary resume.
+    start_examples_into_epoch: usize = 0,
     checkpoint_path: ?[]const u8,
     checkpoint_state_path: ?[]const u8,
     checkpoint_state_sha256: ?[]const u8,
     checkpoint_epoch: ?usize,
     checkpoint_every_epochs: ?u32,
+    checkpoint_every_examples: ?u32 = null,
     run_fingerprint_sha256: []const u8,
     restored_micro_batch_steps: u64,
     restored_optimizer_steps: u64,
@@ -1300,11 +1319,18 @@ const GrpoCheckpointAggregates = struct {
     incremental_kv: ?gemma4_real_autodiff.GrpoIncrementalKvTelemetry = null,
 };
 
+const preference_checkpoint_state_schema_v1 = "antfly_gemma4_preference_checkpoint_state/v1";
+const preference_checkpoint_state_schema_v2 = "antfly_gemma4_preference_checkpoint_state/v2";
+
 const PreferenceCheckpointState = struct {
-    schema_version: []const u8 = "antfly_gemma4_preference_checkpoint_state/v1",
+    schema_version: []const u8 = preference_checkpoint_state_schema_v2,
     task: []const u8,
     run_fingerprint_sha256: []const u8,
     epoch_index: usize,
+    /// Completed optimizer examples (DPO pairs or GRPO prompt groups) inside
+    /// the in-progress epoch. Zero means the checkpoint sits on a durable
+    /// epoch boundary; schema v1 sidecars never carry a nonzero cursor.
+    examples_into_epoch: usize = 0,
     micro_batch_steps: u64,
     optimizer_steps: u64,
     accumulation_micro_batches: u32,
@@ -1377,6 +1403,40 @@ const GrpoBaselineRelativeSummary = struct {
     passed: bool,
 };
 
+fn grpoPositiveRewardGroupCount(summary: GrpoEvaluationSummary) ?usize {
+    if (summary.groups == 0 or
+        !std.math.isFinite(summary.positive_reward_group_rate) or
+        summary.positive_reward_group_rate < 0.0 or
+        summary.positive_reward_group_rate > 1.0)
+    {
+        return null;
+    }
+    const scaled = @as(f64, summary.positive_reward_group_rate) *
+        @as(f64, @floatFromInt(summary.groups));
+    const rounded = @round(scaled);
+    if (rounded < 0.0 or rounded > @as(f64, @floatFromInt(summary.groups))) {
+        return null;
+    }
+    return @intFromFloat(rounded);
+}
+
+fn passesGrpoPositiveGroupImprovement(
+    baseline: GrpoEvaluationSummary,
+    evaluation: GrpoEvaluationSummary,
+    required_improvement: f64,
+) bool {
+    const improvement = evaluation.positive_reward_group_rate - baseline.positive_reward_group_rate;
+    if (required_improvement >= 0.0) return improvement >= required_improvement;
+    if (baseline.groups != evaluation.groups) return false;
+    const baseline_groups = grpoPositiveRewardGroupCount(baseline) orelse return false;
+    const evaluation_groups = grpoPositiveRewardGroupCount(evaluation) orelse return false;
+    if (evaluation_groups >= baseline_groups) return true;
+    const requested_regressions = -required_improvement *
+        @as(f64, @floatFromInt(baseline.groups));
+    const permits_one_regression = requested_regressions >= 1.0 - 1e-6;
+    return permits_one_regression and baseline_groups - evaluation_groups == 1;
+}
+
 fn compareGrpoToBaseline(
     baseline: GrpoEvaluationSummary,
     evaluation: GrpoEvaluationSummary,
@@ -1398,7 +1458,11 @@ fn compareGrpoToBaseline(
         .positive_reward_group_rate_requirement_saturated = positive_reward_group_rate_requirement.saturated,
         .passed = mean_reward_improvement >= minimums.min_mean_reward_improvement.? and
             top_rank_mean_reward_improvement >= minimums.min_top_rank_mean_reward_improvement.? and
-            positive_reward_group_rate_improvement >= positive_reward_group_rate_requirement.effective_minimum,
+            passesGrpoPositiveGroupImprovement(
+                baseline,
+                evaluation,
+                positive_reward_group_rate_requirement.effective_minimum,
+            ),
     };
 }
 
@@ -2643,6 +2707,9 @@ fn validateGemma4LoraRecipeContract(recipe: Recipe, adapter: AdapterConfig) !voi
         // checkpoint. Retention/generation policies require a future indexed
         // checkpoint store rather than silently pretending `keep_last` works.
         if (checkpoint.keep_last != null) return error.UnsupportedGemma4CheckpointOption;
+        // Mid-epoch cadence is a preference-training contract; the SFT text
+        // loop only owns epoch-boundary durability.
+        if (checkpoint.every_examples != null) return error.UnsupportedGemma4CheckpointOption;
         if (checkpoint.every_epochs) |every| {
             if (every == 0 or @as(usize, every) > (recipe.optimizer.epochs orelse 1)) {
                 return error.InvalidGemma4CheckpointInterval;
@@ -2878,6 +2945,20 @@ fn validateGemma4PreferenceTrainingRecipeContract(
                 return error.InvalidGemma4CheckpointInterval;
             }
         }
+        if (checkpoint.every_examples) |every| {
+            if (every == 0) return error.InvalidGemma4CheckpointInterval;
+            // Epoch-boundary saves remain the durable baseline; a cadence
+            // that never reaches a boundary would leave the final publication
+            // recovery path unreachable.
+            if (checkpoint.every_epochs == null) return error.CheckpointIntervalRequired;
+            // The qualified mid-epoch surface is eager sampling only. The
+            // incremental-KV sampler rebuilds transient pages from
+            // epoch-boundary telemetry and has no mid-epoch recovery
+            // evidence, so keep the combination fail-closed.
+            if (task == .grpo and gemmaGrpoIncrementalKvEnabled(recipe)) {
+                return error.Gemma4MidEpochCheckpointIncrementalKvNotSupported;
+            }
+        }
         if (checkpoint.resume_path) |path| {
             if (std.mem.trim(u8, path, " \t\r\n").len == 0) return error.InvalidGemma4CheckpointPath;
         } else if (checkpoint.every_epochs == null) {
@@ -2987,6 +3068,12 @@ fn validateGemma4PreferenceTrainingRecipeContract(
             }
             const group_size = recipe.grpo.group_size orelse 2;
             if (group_size < 2) return error.InvalidGrpoGroupSize;
+            const max_completion_tokens = recipe.grpo.max_completion_tokens orelse default_grpo_max_completion_tokens;
+            if (max_completion_tokens == 1 and
+                group_size > gemma4_real_autodiff.max_single_token_completion_group_size)
+            {
+                return error.InvalidGrpoGroupSize;
+            }
             _ = try resolveGrpoObjectiveConfig(
                 recipe.grpo,
                 recipe.optimizer.gradient_accumulation_steps orelse 1,
@@ -3252,11 +3339,20 @@ fn validateGemma4PreferenceEvaluationContract(
                 return error.IncompleteGrpoBaselineRelativeMinimums;
             }
             if (minimums.min_mean_reward_improvement) |value| {
+                const positive_group_improvement = minimums.min_positive_reward_group_rate_improvement.?;
                 if (!std.math.isFinite(value) or value < 0.0 or
                     !std.math.isFinite(minimums.min_top_rank_mean_reward_improvement.?) or minimums.min_top_rank_mean_reward_improvement.? < 0.0 or
-                    !std.math.isFinite(minimums.min_positive_reward_group_rate_improvement.?) or minimums.min_positive_reward_group_rate_improvement.? < 0.0)
+                    !std.math.isFinite(positive_group_improvement))
                 {
                     return error.InvalidGrpoEvaluationMinimums;
+                }
+                if (positive_group_improvement < 0.0) {
+                    const evaluation_groups = evalMaxExamples(recipe) orelse
+                        return error.InvalidGrpoEvaluationMinimums;
+                    const one_group_regression = 1.0 / @as(f64, @floatFromInt(evaluation_groups));
+                    if (positive_group_improvement < -one_group_regression) {
+                        return error.InvalidGrpoEvaluationMinimums;
+                    }
                 }
             }
         },
@@ -5085,10 +5181,11 @@ fn gemmaPreferenceRunFingerprint(
     preferenceHashOptionalU64(&hasher, policy.grpo_backward_batch_size);
     preferenceHashOptionalU64(&hasher, policy.grpo_max_completion_tokens);
     if (task == .grpo) {
-        // This extension intentionally invalidates checkpoints produced by the
-        // former deterministic rank-enumeration sampler without perturbing DPO
-        // v5 identities.
+        // These extensions intentionally invalidate checkpoints produced by
+        // the former rank-enumeration sampler or fixed per-epoch prompt order
+        // without perturbing DPO v5 identities.
         preferenceHashField(&hasher, "stochastic-grpo-sampling/v1");
+        preferenceHashField(&hasher, "deterministic-grpo-epoch-prompt-order/v1");
         preferenceHashOptionalF32(&hasher, policy.grpo_sampling_temperature);
         preferenceHashOptionalF32(&hasher, policy.grpo_sampling_top_p);
         preferenceHashOptionalU64(&hasher, policy.grpo_sampling_top_k);
@@ -5164,11 +5261,14 @@ fn savePreferenceCheckpoint(
     checkpoint_path: []const u8,
     task: PreferenceTask,
     epoch_index: usize,
+    examples_into_epoch: usize,
     examples_seen: usize,
     run_fingerprint: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
     state: PreferenceCheckpointState,
 ) !void {
-    if (state.epoch_index != epoch_index or
+    if (!std.mem.eql(u8, state.schema_version, preference_checkpoint_state_schema_v2) or
+        state.epoch_index != epoch_index or
+        state.examples_into_epoch != examples_into_epoch or
         state.micro_batch_steps != trainer.microBatchSteps() or
         state.optimizer_steps != trainer.optimizerSteps() or
         state.accumulation_micro_batches != trainer.accumulatedMicroBatches())
@@ -5251,7 +5351,10 @@ fn loadPreferenceCheckpointState(
     const expected_fingerprint = try formatSha256DigestAlloc(allocator, run_fingerprint.*);
     defer allocator.free(expected_fingerprint);
     const state = parsed.value;
-    if (!std.mem.eql(u8, state.schema_version, "antfly_gemma4_preference_checkpoint_state/v1") or
+    const schema_v1 = std.mem.eql(u8, state.schema_version, preference_checkpoint_state_schema_v1);
+    const schema_v2 = std.mem.eql(u8, state.schema_version, preference_checkpoint_state_schema_v2);
+    if ((!schema_v1 and !schema_v2) or
+        (schema_v1 and state.examples_into_epoch != 0) or
         !std.mem.eql(u8, state.task, @tagName(task)) or
         !std.ascii.eqlIgnoreCase(state.run_fingerprint_sha256, expected_fingerprint) or
         state.epoch_index != restored.progress.epoch_index or
@@ -7951,6 +8054,27 @@ fn sampleGemmaGrpoCompletionGroup(
 
 const gemma_grpo_training_sampling_domain: u64 = 0x4752504f54524149;
 const gemma_grpo_evaluation_sampling_domain: u64 = 0x4752504f4556414c;
+const gemma_grpo_training_order_domain: u64 = 0x4752504f4f524452;
+
+fn fillGemmaGrpoEpochPromptOrder(
+    order: []usize,
+    training_seed: u64,
+    epoch_index: usize,
+) void {
+    for (order, 0..) |*prompt_index, index| prompt_index.* = index;
+    if (order.len < 2) return;
+
+    var rng = std.Random.DefaultPrng.init(
+        gemma4_real_autodiff.deriveGrpoEpochPromptOrderSeed(
+            training_seed,
+            gemma_grpo_training_order_domain,
+            epoch_index,
+            order.len,
+        ),
+    );
+    var random = rng.random();
+    random.shuffle(usize, order);
+}
 
 /// Replace sampler-local log-probabilities with the authoritative sparse
 /// sequence-wide policy scorer for the same already-selected tokens.  The
@@ -9008,6 +9132,10 @@ fn runOptimizerBackedGemmaDpo(
         }
         initial_adapter_digest = loaded_dpo_state.?.parsed.value.dpo.?.initial_adapter_digest;
     }
+    const resume_examples_into_epoch: usize = if (loaded_dpo_state) |*state|
+        state.parsed.value.examples_into_epoch
+    else
+        0;
     const graph_cache_after_initialization = trainer.graphCacheStats();
 
     // Scope both reuse tiers across the complete DPO workload. The default
@@ -9062,7 +9190,7 @@ fn runOptimizerBackedGemmaDpo(
             @intCast(max_seq_len),
             coalesce_single_token_pairs,
             length_buckets,
-            start_epoch == 0,
+            start_epoch == 0 and resume_examples_into_epoch == 0,
         )
     else
         null;
@@ -9070,9 +9198,21 @@ fn runOptimizerBackedGemmaDpo(
 
     const restored_dpo_aggregates = if (loaded_dpo_state) |*state| state.parsed.value.dpo else null;
     if (restored_dpo_aggregates) |state| {
-        const expected_examples = std.math.mul(usize, start_epoch, chosen_prepared.examples.len) catch
+        if (resume_examples_into_epoch >= chosen_prepared.examples.len and
+            resume_examples_into_epoch != 0)
+        {
+            return error.InvalidPreferenceCheckpointState;
+        }
+        const boundary_examples = std.math.mul(usize, start_epoch, chosen_prepared.examples.len) catch
+            return error.InvalidPreferenceCheckpointState;
+        const expected_examples = std.math.add(usize, boundary_examples, resume_examples_into_epoch) catch
             return error.InvalidPreferenceCheckpointState;
         if (state.examples_seen != expected_examples) return error.InvalidPreferenceCheckpointState;
+        // A cursor inside the final epoch is resumable, but a cursor at or
+        // beyond the requested epoch count has no examples left to replay.
+        if (resume_examples_into_epoch != 0 and start_epoch >= (recipe.optimizer.epochs orelse 1)) {
+            return error.CheckpointBeyondRequestedEpochCount;
+        }
     }
     var total_loss: f64 = if (restored_dpo_aggregates) |state| state.total_loss else 0.0;
     var total_margin: f64 = if (restored_dpo_aggregates) |state| state.total_margin else 0.0;
@@ -9094,9 +9234,62 @@ fn runOptimizerBackedGemmaDpo(
     var single_rl = [_]u32{0};
     var single_sft = [_]f32{0};
 
+    const checkpoint_every_examples: ?u32 = if (recipe.checkpoint) |checkpoint| checkpoint.every_examples else null;
+    var resume_skip_examples: usize = resume_examples_into_epoch;
     var epoch_idx: usize = start_epoch;
     while (epoch_idx < epochs) : (epoch_idx += 1) {
-        for (chosen_prepared.examples, rejected_prepared.examples, samples.samples, 0..) |*chosen_ex, *rejected_ex, sample, sample_idx| {
+        // The prepared pair order is the on-disk order every epoch, so a
+        // mid-epoch resume only needs to skip the already-consumed prefix of
+        // the first restored epoch.
+        const epoch_start_example = resume_skip_examples;
+        resume_skip_examples = 0;
+        for (
+            chosen_prepared.examples[epoch_start_example..],
+            rejected_prepared.examples[epoch_start_example..],
+            samples.samples[epoch_start_example..],
+            epoch_start_example..,
+        ) |*chosen_ex, *rejected_ex, sample, sample_idx| {
+            // Mid-epoch cadence saves before the pair at `sample_idx` so the
+            // durable state always describes exactly `sample_idx` completed
+            // pairs, independent of any skip path inside the pair body. The
+            // resume position itself is not re-saved.
+            if (checkpoint_every_examples) |every| {
+                if (sample_idx != 0 and
+                    sample_idx != epoch_start_example and
+                    sample_idx % @as(usize, every) == 0)
+                {
+                    const path = dpo_checkpoint_path orelse return error.CheckpointPathRequired;
+                    try savePreferenceCheckpoint(
+                        allocator,
+                        io,
+                        &trainer,
+                        path,
+                        .dpo,
+                        epoch_idx,
+                        sample_idx,
+                        examples_seen,
+                        &dpo_run_fingerprint,
+                        .{
+                            .task = @tagName(PreferenceTask.dpo),
+                            .run_fingerprint_sha256 = dpo_run_fingerprint_text,
+                            .epoch_index = epoch_idx,
+                            .examples_into_epoch = sample_idx,
+                            .micro_batch_steps = trainer.microBatchSteps(),
+                            .optimizer_steps = trainer.optimizerSteps(),
+                            .accumulation_micro_batches = trainer.accumulatedMicroBatches(),
+                            .dpo = .{
+                                .initial_adapter_digest = initial_adapter_digest,
+                                .examples_seen = examples_seen,
+                                .total_loss = total_loss,
+                                .total_margin = total_margin,
+                                .total_accuracy = total_accuracy,
+                                .initial_logprob_parity = initial_logprob_parity,
+                                .initial_bucket_signature_parity = initial_bucket_signature_parity,
+                            },
+                        },
+                    );
+                }
+            }
             const update_started_ns = if (benchmark_enabled) platform.time.monotonicNs() else 0;
             const pair_schedule = try gemmaDpoPairSchedule(
                 chosen_ex,
@@ -9396,6 +9589,7 @@ fn runOptimizerBackedGemmaDpo(
                     path,
                     .dpo,
                     completed_epochs,
+                    0,
                     examples_seen,
                     &dpo_run_fingerprint,
                     .{
@@ -9432,6 +9626,7 @@ fn runOptimizerBackedGemmaDpo(
             path,
             .dpo,
             epochs,
+            0,
             examples_seen,
             &dpo_run_fingerprint,
             .{
@@ -9544,12 +9739,14 @@ fn runOptimizerBackedGemmaDpo(
 
     const baseline_relative: ?DpoBaselineRelativeSummary = if (baseline_evaluation) |baseline| relative: {
         const summary = compareDpoToBaseline(baseline, evaluation, dpo_minimums);
-        if (!summary.passed) return error.DpoBaselineRelativeEvaluationGateFailed;
         break :relative summary;
     } else null;
+    const baseline_relative_passed = if (baseline_relative) |summary| summary.passed else true;
 
-    try gemma4_real_autodiff.saveTrainerAsGemmaBundle(allocator, &trainer, base_model_dir, bootstrap_dir, trained_dir);
-    try validatePublishedAdapterChanged(allocator, io, bootstrap_dir, trained_dir);
+    if (baseline_relative_passed) {
+        try gemma4_real_autodiff.saveTrainerAsGemmaBundle(allocator, &trainer, base_model_dir, bootstrap_dir, trained_dir);
+        try validatePublishedAdapterChanged(allocator, io, bootstrap_dir, trained_dir);
+    }
     // Report only completion-published storage. This also guarantees the
     // override can drain/restore the cache at its defer boundary.
     try trainer.compute_backend.decoderRuntimeSubmitAndWaitFrame();
@@ -9664,11 +9861,13 @@ fn runOptimizerBackedGemmaDpo(
         .checkpoint_resume = .{
             .enabled = dpo_resume_enabled,
             .start_epoch = start_epoch,
+            .start_examples_into_epoch = resume_examples_into_epoch,
             .checkpoint_path = dpo_checkpoint_path,
             .checkpoint_state_path = if (dpo_checkpoint_artifact) |artifact| artifact.state_path else null,
             .checkpoint_state_sha256 = if (dpo_checkpoint_artifact) |artifact| artifact.state_sha256 else null,
             .checkpoint_epoch = if (dpo_checkpoint_artifact) |artifact| artifact.epoch else null,
             .checkpoint_every_epochs = if (recipe.checkpoint) |checkpoint| checkpoint.every_epochs else null,
+            .checkpoint_every_examples = if (recipe.checkpoint) |checkpoint| checkpoint.every_examples else null,
             .run_fingerprint_sha256 = dpo_run_fingerprint_text,
             .restored_micro_batch_steps = dpo_restored.micro_batch_steps,
             .restored_optimizer_steps = dpo_restored.optimizer_steps,
@@ -9679,8 +9878,9 @@ fn runOptimizerBackedGemmaDpo(
         .baseline_evaluation = baseline_evaluation,
         .baseline_relative = baseline_relative,
         .evaluation = evaluation,
-        .trained_adapter_dir = trained_dir,
+        .trained_adapter_dir = if (baseline_relative_passed) trained_dir else null,
     });
+    if (!baseline_relative_passed) return error.DpoBaselineRelativeEvaluationGateFailed;
     print("dpo report: {s}\ntrained adapter: {s}\n", .{ report_path, trained_dir });
 }
 
@@ -10224,6 +10424,11 @@ fn runOptimizerBackedGemmaGrpo(
     );
     const training_seed = recipe.optimizer.seed orelse 42;
     if (group_size < 2) return error.InvalidGrpoGroupSize;
+    if (max_completion_tokens == 1 and
+        group_size > gemma4_real_autodiff.max_single_token_completion_group_size)
+    {
+        return error.InvalidGrpoGroupSize;
+    }
     if (max_completion_tokens == 0) return error.InvalidMaxCompletionTokens;
     const coalesce_single_token_groups = max_completion_tokens == 1;
     const batch_single_token_group_scoring = coalesce_single_token_groups and
@@ -10403,6 +10608,17 @@ fn runOptimizerBackedGemmaGrpo(
     if (incremental_kv_enabled and !sparse_multi_token) {
         return error.Gemma4GrpoIncrementalKvRequiresSparseMultiToken;
     }
+    // The qualified mid-epoch checkpoint surface is eager sampling only.
+    // Compiled sampling owns execution-cache retirement semantics at durable
+    // boundaries and the incremental-KV sampler rebuilds transient pages from
+    // epoch-boundary telemetry; neither has mid-epoch recovery evidence.
+    const checkpoint_every_examples: ?u32 = if (recipe.checkpoint) |checkpoint| checkpoint.every_examples else null;
+    if (checkpoint_every_examples != null and compiled_sampling_requested) {
+        return error.Gemma4MidEpochCheckpointCompiledSamplingNotSupported;
+    }
+    if (checkpoint_every_examples != null and incremental_kv_enabled) {
+        return error.Gemma4MidEpochCheckpointIncrementalKvNotSupported;
+    }
     const incremental_kv_requested = incremental_kv_enabled;
     const incremental_kv_batch_active = gemmaGrpoIncrementalKvBatchActiveEnabled(recipe);
     const incremental_kv_clone_prompt_tail = gemmaGrpoIncrementalKvClonePromptTailEnabled(recipe);
@@ -10508,11 +10724,25 @@ fn runOptimizerBackedGemmaGrpo(
             return error.InvalidPreferenceCheckpointState;
         if (start_epoch > epochs) return error.CheckpointBeyondRequestedEpochCount;
         initial_adapter_digest = loaded_grpo_state.?.parsed.value.grpo.?.initial_adapter_digest;
+        if (loaded_grpo_state.?.parsed.value.examples_into_epoch != 0) {
+            // Mid-epoch checkpoints are only admitted back into the eager
+            // path; both restricted samplers were already unable to write one.
+            if (compiled_sampling_requested) {
+                return error.Gemma4MidEpochCheckpointCompiledSamplingNotSupported;
+            }
+            if (incremental_kv_requested) {
+                return error.Gemma4MidEpochCheckpointIncrementalKvNotSupported;
+            }
+        }
         if (compiled_sampling_requested) {
             try trainer.retireExecutionCachesAtCheckpointBoundary();
             compiled_sampling_execution_cache_retired = true;
         }
     }
+    const resume_examples_into_epoch: usize = if (loaded_grpo_state) |*state|
+        state.parsed.value.examples_into_epoch
+    else
+        0;
 
     var incremental_kv_sampler: ?gemma4_real_autodiff.GrpoIncrementalKvSampler = if (incremental_kv_requested)
         try gemma4_real_autodiff.GrpoIncrementalKvSampler.init(
@@ -10529,7 +10759,19 @@ fn runOptimizerBackedGemmaGrpo(
     const current_base_equivalent_policy = gemmaLoraAdapterIsBaseEquivalent(&trainer);
     const restored_grpo_aggregates = if (loaded_grpo_state) |*state| state.parsed.value.grpo else null;
     if (restored_grpo_aggregates) |state| {
-        const expected_groups = std.math.mul(usize, start_epoch, prompt_batch.prompts.len) catch
+        if (resume_examples_into_epoch != 0 and
+            resume_examples_into_epoch >= prompt_batch.prompts.len)
+        {
+            return error.InvalidPreferenceCheckpointState;
+        }
+        // A cursor inside the final epoch is resumable, but a cursor at or
+        // beyond the requested epoch count has no groups left to replay.
+        if (resume_examples_into_epoch != 0 and start_epoch >= epochs) {
+            return error.CheckpointBeyondRequestedEpochCount;
+        }
+        const boundary_groups = std.math.mul(usize, start_epoch, prompt_batch.prompts.len) catch
+            return error.InvalidPreferenceCheckpointState;
+        const expected_groups = std.math.add(usize, boundary_groups, resume_examples_into_epoch) catch
             return error.InvalidPreferenceCheckpointState;
         const expected_completions = std.math.mul(usize, expected_groups, group_size) catch
             return error.InvalidPreferenceCheckpointState;
@@ -10673,9 +10915,96 @@ fn runOptimizerBackedGemmaGrpo(
     var diagnostic_first_token_count: usize = if (restored_grpo_aggregates) |state| state.diagnostic_first_token_count else 0;
 
     const eos_id = tokenizer_view.tokenizer.specialTokens().sep_id;
+    const epoch_prompt_order = try allocator.alloc(usize, prompt_batch.prompts.len);
+    defer allocator.free(epoch_prompt_order);
+    var resume_skip_groups: usize = resume_examples_into_epoch;
     var epoch_idx: usize = start_epoch;
     while (epoch_idx < epochs) : (epoch_idx += 1) {
-        for (prompt_batch.prompts, 0..) |prompt, prompt_idx| {
+        // The epoch prompt order is a pure function of the training seed and
+        // epoch index and each group's sampling seed is derived from
+        // (seed, epoch, prompt), so a mid-epoch resume replays the identical
+        // trajectory by recomputing the order and skipping the consumed
+        // prefix of the first restored epoch.
+        fillGemmaGrpoEpochPromptOrder(epoch_prompt_order, training_seed, epoch_idx);
+        const epoch_start_group = resume_skip_groups;
+        resume_skip_groups = 0;
+        for (epoch_prompt_order[epoch_start_group..], epoch_start_group..) |prompt_idx, order_pos| {
+            // Mid-epoch cadence saves before the group at `order_pos` so the
+            // durable state always describes exactly `order_pos` completed
+            // groups, independent of the zero-variance/truncation/KL skip
+            // paths inside the group body. The resume position itself is not
+            // re-saved.
+            if (checkpoint_every_examples) |every| {
+                if (order_pos != 0 and
+                    order_pos != epoch_start_group and
+                    order_pos % @as(usize, every) == 0)
+                {
+                    const path = grpo_checkpoint_path orelse return error.CheckpointPathRequired;
+                    try savePreferenceCheckpoint(
+                        allocator,
+                        io,
+                        &trainer,
+                        path,
+                        .grpo,
+                        epoch_idx,
+                        order_pos,
+                        total_groups,
+                        &grpo_run_fingerprint,
+                        .{
+                            .task = @tagName(PreferenceTask.grpo),
+                            .run_fingerprint_sha256 = grpo_run_fingerprint_text,
+                            .epoch_index = epoch_idx,
+                            .examples_into_epoch = order_pos,
+                            .micro_batch_steps = trainer.microBatchSteps(),
+                            .optimizer_steps = trainer.optimizerSteps(),
+                            .accumulation_micro_batches = trainer.accumulatedMicroBatches(),
+                            .grpo = .{
+                                .initial_adapter_digest = initial_adapter_digest,
+                                .total_loss = total_loss,
+                                .total_pg_loss = total_pg_loss,
+                                .total_kl_loss = total_kl_loss,
+                                .total_mean_kl = total_mean_kl,
+                                .total_clip_fraction = total_clip_fraction,
+                                .total_groups = total_groups,
+                                .optimizer_groups = optimizer_groups,
+                                .zero_reward_std_groups = zero_reward_std_groups,
+                                .all_truncated_groups = all_truncated_groups,
+                                .kl_rejected_groups = kl_rejected_groups,
+                                .total_completions = total_completions,
+                                .truncated_completions = truncated_completions,
+                                .total_tokens = total_tokens,
+                                .total_reward = total_reward,
+                                .total_reward_squared = total_reward_squared,
+                                .saw_nonzero_reward_advantage = saw_nonzero_reward_advantage,
+                                .saw_nonzero_policy_gradient = saw_nonzero_policy_gradient,
+                                .initial_sampling_rescore_max_abs_error = initial_sampling_rescore_max_abs_error,
+                                .initial_policy_reference_max_abs_error = initial_policy_reference_max_abs_error,
+                                .initial_base_equivalent_policy = initial_base_equivalent_policy,
+                                .captured_initial_logprob_parity = captured_initial_logprob_parity,
+                                .policy_rescore_completions = policy_rescore_completions,
+                                .diagnostic_first_tokens = diagnostic_first_tokens,
+                                .diagnostic_policy_first_token_logps = diagnostic_policy_first_token_logps,
+                                .diagnostic_reference_first_token_logps = diagnostic_reference_first_token_logps,
+                                .diagnostic_first_token_count = diagnostic_first_token_count,
+                                .kl_current_coef = kl_control.current_kl_coef,
+                                .kl_admitted_groups = kl_control.admitted_groups,
+                                .kl_max_observed_mean = kl_control.max_observed_mean_kl,
+                                .kl_trace = kl_control.trace.items,
+                                .reward_call_index = reward_pipeline.call_index,
+                                .reward_external_calls = reward_pipeline.external_calls,
+                                .reward_external_failures = reward_pipeline.external_failures,
+                                .reward_trace = reward_pipeline.trace.items,
+                                .reference_cache = reference_cache.checkpoint(),
+                                // Mid-epoch cadence is rejected for the
+                                // incremental-KV sampler, so no telemetry can
+                                // exist here.
+                                .incremental_kv = null,
+                            },
+                        },
+                    );
+                }
+            }
+            const prompt = prompt_batch.prompts[prompt_idx];
             const group_started_ns = if (benchmark_enabled) platform.time.monotonicNs() else 0;
             var group_sampling_rescore_max_abs_error: f32 = 0.0;
             var group_policy_reference_max_abs_error: f32 = 0.0;
@@ -11162,6 +11491,7 @@ fn runOptimizerBackedGemmaGrpo(
                     path,
                     .grpo,
                     completed_epochs,
+                    0,
                     total_groups,
                     &grpo_run_fingerprint,
                     .{
@@ -11243,6 +11573,7 @@ fn runOptimizerBackedGemmaGrpo(
             path,
             .grpo,
             epochs,
+            0,
             total_groups,
             &grpo_run_fingerprint,
             .{
@@ -11413,12 +11744,14 @@ fn runOptimizerBackedGemmaGrpo(
 
     const baseline_relative: ?GrpoBaselineRelativeSummary = if (baseline_evaluation) |baseline| relative: {
         const summary = compareGrpoToBaseline(baseline, evaluation, grpo_minimums);
-        if (!summary.passed) return error.GrpoBaselineRelativeEvaluationGateFailed;
         break :relative summary;
     } else null;
+    const baseline_relative_passed = if (baseline_relative) |summary| summary.passed else true;
 
-    try gemma4_real_autodiff.saveTrainerAsGemmaBundle(allocator, &trainer, base_model_dir, bootstrap_dir, trained_dir);
-    try validatePublishedAdapterChanged(allocator, io, bootstrap_dir, trained_dir);
+    if (baseline_relative_passed) {
+        try gemma4_real_autodiff.saveTrainerAsGemmaBundle(allocator, &trainer, base_model_dir, bootstrap_dir, trained_dir);
+        try validatePublishedAdapterChanged(allocator, io, bootstrap_dir, trained_dir);
+    }
 
     var grpo_checkpoint_artifact = try preferenceCheckpointArtifactSummary(
         allocator,
@@ -11471,6 +11804,7 @@ fn runOptimizerBackedGemmaGrpo(
         .policy_backend = @tagName(backend_kind),
         .optimizer_steps = trainer.optimizerSteps(),
         .micro_batch_steps = trainer.microBatchSteps(),
+        .training_order = .{},
         .sampling_mode = if (coalesce_single_token_groups)
             "shared-prompt-seeded-categorical-sparse-row"
         else if (incremental_kv_sampler != null)
@@ -11536,11 +11870,13 @@ fn runOptimizerBackedGemmaGrpo(
         .checkpoint_resume = .{
             .enabled = grpo_resume_enabled,
             .start_epoch = start_epoch,
+            .start_examples_into_epoch = resume_examples_into_epoch,
             .checkpoint_path = grpo_checkpoint_path,
             .checkpoint_state_path = if (grpo_checkpoint_artifact) |artifact| artifact.state_path else null,
             .checkpoint_state_sha256 = if (grpo_checkpoint_artifact) |artifact| artifact.state_sha256 else null,
             .checkpoint_epoch = if (grpo_checkpoint_artifact) |artifact| artifact.epoch else null,
             .checkpoint_every_epochs = if (recipe.checkpoint) |checkpoint| checkpoint.every_epochs else null,
+            .checkpoint_every_examples = if (recipe.checkpoint) |checkpoint| checkpoint.every_examples else null,
             .run_fingerprint_sha256 = grpo_run_fingerprint_text,
             .restored_micro_batch_steps = grpo_restored.micro_batch_steps,
             .restored_optimizer_steps = grpo_restored.optimizer_steps,
@@ -11553,8 +11889,9 @@ fn runOptimizerBackedGemmaGrpo(
         .baseline_evaluation = baseline_evaluation,
         .baseline_relative = baseline_relative,
         .evaluation = evaluation,
-        .trained_adapter_dir = trained_dir,
+        .trained_adapter_dir = if (baseline_relative_passed) trained_dir else null,
     });
+    if (!baseline_relative_passed) return error.GrpoBaselineRelativeEvaluationGateFailed;
     print("grpo report: {s}\ntrained adapter: {s}\n", .{ report_path, trained_dir });
 }
 
@@ -13275,6 +13612,53 @@ test "gemma4 preference baseline-relative gates require strict heldout improveme
     try std.testing.expectEqual(@as(f32, 0.0), saturated_grpo.positive_reward_group_rate_required_improvement);
     saturated_grpo_final.positive_reward_group_rate = 0.99;
     try std.testing.expect(!compareGrpoToBaseline(saturated_grpo_baseline, saturated_grpo_final, grpo_minimums).passed);
+
+    var noninferiority_minimums = grpo_minimums;
+    noninferiority_minimums.min_positive_reward_group_rate_improvement = -1.0 / 256.0;
+    var noninferiority_baseline = grpo_baseline;
+    noninferiority_baseline.groups = 256;
+    noninferiority_baseline.completions = 4096;
+    noninferiority_baseline.positive_reward_group_rate = 216.0 / 256.0;
+    var noninferiority_final = grpo_final;
+    noninferiority_final.groups = 256;
+    noninferiority_final.completions = 4096;
+    noninferiority_final.top_rank_mean_reward = 0.25;
+    noninferiority_final.positive_reward_group_rate = 215.0 / 256.0;
+    const one_group_regression = compareGrpoToBaseline(
+        noninferiority_baseline,
+        noninferiority_final,
+        noninferiority_minimums,
+    );
+    try std.testing.expect(one_group_regression.passed);
+    try std.testing.expectEqual(
+        @as(f32, -1.0 / 256.0),
+        one_group_regression.positive_reward_group_rate_required_improvement,
+    );
+    noninferiority_final.positive_reward_group_rate = 214.0 / 256.0;
+    try std.testing.expect(!compareGrpoToBaseline(
+        noninferiority_baseline,
+        noninferiority_final,
+        noninferiority_minimums,
+    ).passed);
+
+    noninferiority_baseline.groups = 254;
+    noninferiority_baseline.completions = 4064;
+    noninferiority_baseline.positive_reward_group_rate = 214.0 / 254.0;
+    noninferiority_final.groups = 254;
+    noninferiority_final.completions = 4064;
+    noninferiority_final.positive_reward_group_rate = 213.0 / 254.0;
+    noninferiority_minimums.min_positive_reward_group_rate_improvement = -1.0 / 254.0;
+    try std.testing.expect(compareGrpoToBaseline(
+        noninferiority_baseline,
+        noninferiority_final,
+        noninferiority_minimums,
+    ).passed);
+    noninferiority_minimums.min_positive_reward_group_rate_improvement = -0.5 / 254.0;
+    try std.testing.expect(!compareGrpoToBaseline(
+        noninferiority_baseline,
+        noninferiority_final,
+        noninferiority_minimums,
+    ).passed);
 }
 
 test "compiled DPO loss inversion recovers reward margin" {
@@ -15214,6 +15598,37 @@ test "gemma4 full sft fails closed while dpo and grpo build runnable plans" {
     const grpo_plan = try buildPlan(std.heap.page_allocator, grpo_recipe);
     defer freePlan(std.heap.page_allocator, grpo_plan);
     try std.testing.expectEqual(StepKind.direct_grpo, grpo_plan.steps[0].kind);
+    var missing_noninferiority_resolution = grpo_recipe;
+    missing_noninferiority_resolution.eval.?.grpo_minimums.?.min_positive_reward_group_rate_improvement = -1.0 / 256.0;
+    try std.testing.expectError(
+        error.InvalidGrpoEvaluationMinimums,
+        buildPlan(std.heap.page_allocator, missing_noninferiority_resolution),
+    );
+    var noninferiority_grpo = grpo_recipe;
+    noninferiority_grpo.eval.?.max_examples = 256;
+    noninferiority_grpo.eval.?.grpo_minimums.?.min_positive_reward_group_rate_improvement = -1.0 / 256.0;
+    const noninferiority_plan = try buildPlan(std.heap.page_allocator, noninferiority_grpo);
+    defer freePlan(std.heap.page_allocator, noninferiority_plan);
+    var non_power_of_two_noninferiority_grpo = grpo_recipe;
+    non_power_of_two_noninferiority_grpo.eval.?.max_examples = 254;
+    non_power_of_two_noninferiority_grpo.eval.?.grpo_minimums.?.min_positive_reward_group_rate_improvement = -1.0 / 254.0;
+    const non_power_of_two_noninferiority_plan = try buildPlan(
+        std.heap.page_allocator,
+        non_power_of_two_noninferiority_grpo,
+    );
+    defer freePlan(std.heap.page_allocator, non_power_of_two_noninferiority_plan);
+    var invalid_non_power_of_two_noninferiority_grpo = non_power_of_two_noninferiority_grpo;
+    invalid_non_power_of_two_noninferiority_grpo.eval.?.grpo_minimums.?.min_positive_reward_group_rate_improvement = -2.0 / 254.0;
+    try std.testing.expectError(
+        error.InvalidGrpoEvaluationMinimums,
+        buildPlan(std.heap.page_allocator, invalid_non_power_of_two_noninferiority_grpo),
+    );
+    var invalid_noninferiority_grpo = noninferiority_grpo;
+    invalid_noninferiority_grpo.eval.?.grpo_minimums.?.min_positive_reward_group_rate_improvement = -2.0 / 256.0;
+    try std.testing.expectError(
+        error.InvalidGrpoEvaluationMinimums,
+        buildPlan(std.heap.page_allocator, invalid_noninferiority_grpo),
+    );
     var incomplete_grpo = grpo_recipe;
     incomplete_grpo.eval.?.grpo_minimums.?.min_top_rank_mean_reward_improvement = null;
     try std.testing.expectError(
@@ -15377,6 +15792,110 @@ test "gemma4 preference training preflight rejects ignored and conflicting optio
     try std.testing.expectError(error.Gemma4BootstrapAndTrainingOutputConflict, buildPlan(std.heap.page_allocator, conflicting_outputs));
 }
 
+test "gemma4 preference mid-epoch checkpoint cadence validates fail-closed" {
+    const valid = Recipe{
+        .recipe = "dpo",
+        .execution = .{ .mode = "train" },
+        .model = .{ .path = "/models/gemma4", .reference_path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/preferences.jsonl", .eval_path = "/data/eval-preferences.jsonl", .format = "text-preference", .max_seq_len = 128 },
+        .adapter = .{ .rank = 8, .alpha = 16 },
+        .optimizer = .{ .learning_rate = 0.0001, .epochs = 2 },
+        .eval = .{ .dpo_minimums = .{ .accuracy = 0.5, .max_loss = 2.0 } },
+        .artifacts = .{ .root = "/tmp/gemma4-dpo-mid-epoch" },
+        .backend = "native",
+    };
+
+    var cadenced = valid;
+    cadenced.checkpoint = .{ .every_epochs = 1, .every_examples = 4 };
+    const cadenced_plan = try buildPlan(std.heap.page_allocator, cadenced);
+    defer freePlan(std.heap.page_allocator, cadenced_plan);
+    try std.testing.expectEqual(StepKind.direct_dpo, cadenced_plan.steps[0].kind);
+
+    var zero_cadence = valid;
+    zero_cadence.checkpoint = .{ .every_epochs = 1, .every_examples = 0 };
+    try std.testing.expectError(
+        error.InvalidGemma4CheckpointInterval,
+        buildPlan(std.heap.page_allocator, zero_cadence),
+    );
+
+    var cadence_without_boundary = valid;
+    cadence_without_boundary.checkpoint = .{ .every_examples = 4 };
+    try std.testing.expectError(
+        error.CheckpointIntervalRequired,
+        buildPlan(std.heap.page_allocator, cadence_without_boundary),
+    );
+
+    var grpo_incremental = Recipe{
+        .recipe = "grpo",
+        .execution = .{ .mode = "train" },
+        .model = .{ .path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/prompts.jsonl", .eval_path = "/data/eval-prompts.jsonl", .format = "text-grpo" },
+        .adapter = .{ .rank = 8, .alpha = 16 },
+        .optimizer = .{ .learning_rate = 0.0001, .epochs = 2 },
+        .eval = .{ .grpo_minimums = .{
+            .mean_reward = 0.25,
+            .top_rank_mean_reward = 0.25,
+            .positive_reward_group_rate = 0.25,
+            .max_kl_loss = 1.0,
+        } },
+        .artifacts = .{ .root = "/tmp/gemma4-grpo-mid-epoch" },
+        .backend = "native",
+    };
+    grpo_incremental.runtime = .{ .grpo_incremental_kv = true };
+    grpo_incremental.checkpoint = .{ .every_epochs = 1, .every_examples = 4 };
+    try std.testing.expectError(
+        error.Gemma4MidEpochCheckpointIncrementalKvNotSupported,
+        buildPlan(std.heap.page_allocator, grpo_incremental),
+    );
+
+    var sft_cadence = Recipe{
+        .recipe = "lora-sft",
+        .model = .{ .path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/train.jsonl", .eval_path = "/data/eval.jsonl" },
+        .optimizer = .{ .epochs = 3 },
+        .artifacts = .{ .root = "/tmp/gemma4-sft-mid-epoch" },
+        .backend = "native",
+    };
+    sft_cadence.checkpoint = .{ .every_epochs = 1, .every_examples = 4 };
+    try std.testing.expectError(
+        error.UnsupportedGemma4CheckpointOption,
+        buildPlan(std.heap.page_allocator, sft_cadence),
+    );
+}
+
+test "gemma4 preference checkpoint sidecar schema carries the mid-epoch cursor" {
+    const allocator = std.testing.allocator;
+
+    const mid_epoch = PreferenceCheckpointState{
+        .task = "grpo",
+        .run_fingerprint_sha256 = "sha256:0000",
+        .epoch_index = 0,
+        .examples_into_epoch = 3,
+        .micro_batch_steps = 3,
+        .optimizer_steps = 3,
+        .accumulation_micro_batches = 0,
+    };
+    const rendered = try std.json.Stringify.valueAlloc(allocator, mid_epoch, .{});
+    defer allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, preference_checkpoint_state_schema_v2) != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"examples_into_epoch\":3") != null);
+
+    // A v1 sidecar has no cursor field; it must parse with an implied
+    // epoch-boundary cursor of zero under the strict unknown-field policy.
+    const v1_sidecar =
+        \\{"schema_version":"antfly_gemma4_preference_checkpoint_state/v1","task":"dpo","run_fingerprint_sha256":"sha256:0000","epoch_index":2,"micro_batch_steps":4,"optimizer_steps":4,"accumulation_micro_batches":0,"dpo":null,"grpo":null}
+    ;
+    var parsed = try std.json.parseFromSlice(
+        PreferenceCheckpointState,
+        allocator,
+        v1_sidecar,
+        .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.examples_into_epoch);
+    try std.testing.expectEqualStrings(preference_checkpoint_state_schema_v1, parsed.value.schema_version);
+}
+
 test "gemma4 DPO objective resolver admits only gradient-complete paired modes" {
     const sigmoid = try resolveDpoObjectiveConfig(.{});
     try std.testing.expectEqual(DpoLossType.sigmoid, sigmoid.loss_type);
@@ -15390,6 +15909,10 @@ test "gemma4 DPO objective resolver admits only gradient-complete paired modes" 
     try std.testing.expectEqual(DpoLossType.ipo, ipo.loss_type);
     try std.testing.expectEqual(preference_loss.PreferenceLoss.ipo, ipo.preference.kind);
     try std.testing.expectEqualStrings("completion-token-mean", ipo.logprobAggregation());
+    try std.testing.expectEqual(@as(f32, 0.2), ipo.preference.ipo_tau);
+
+    const ipo_beta_default = try resolveDpoObjectiveConfig(.{ .loss_type = "ipo", .beta = 0.3 });
+    try std.testing.expectEqual(@as(f32, 0.3), ipo_beta_default.preference.ipo_tau);
 
     const simpo = try resolveDpoObjectiveConfig(.{ .loss_type = "simpo", .simpo_gamma = 0.3 });
     try std.testing.expectEqual(DpoLossType.simpo, simpo.loss_type);
@@ -15485,6 +16008,15 @@ test "gemma4 GRPO reward and group contracts fail during planning" {
     var bad_group = valid;
     bad_group.grpo.group_size = 1;
     try std.testing.expectError(error.InvalidGrpoGroupSize, buildPlan(std.heap.page_allocator, bad_group));
+
+    var oversized_single_token_group = valid;
+    oversized_single_token_group.grpo.group_size =
+        gemma4_real_autodiff.max_single_token_completion_group_size + 1;
+    oversized_single_token_group.grpo.max_completion_tokens = 1;
+    try std.testing.expectError(
+        error.InvalidGrpoGroupSize,
+        buildPlan(std.heap.page_allocator, oversized_single_token_group),
+    );
 
     var stochastic = valid;
     stochastic.grpo.sampling = .{ .temperature = 0.8, .top_p = 0.95, .top_k = 64 };
@@ -15715,6 +16247,32 @@ test "gemma4 GRPO reward and group contracts fail during planning" {
         error.Gemma4MultimodalPreferenceEvaluationNotYetSupported,
         buildPlan(std.heap.page_allocator, bad_multimodal),
     );
+}
+
+test "gemma4 GRPO epoch prompt order is deterministic and complete" {
+    var epoch_three: [32]usize = undefined;
+    var resumed_epoch_three: [32]usize = undefined;
+    var epoch_four: [32]usize = undefined;
+    fillGemmaGrpoEpochPromptOrder(&epoch_three, 17, 3);
+    fillGemmaGrpoEpochPromptOrder(&resumed_epoch_three, 17, 3);
+    fillGemmaGrpoEpochPromptOrder(&epoch_four, 17, 4);
+
+    try std.testing.expectEqualSlices(usize, &epoch_three, &resumed_epoch_three);
+    try std.testing.expect(!std.mem.eql(usize, &epoch_three, &epoch_four));
+
+    var seen: [32]bool = @splat(false);
+    for (epoch_three) |prompt_index| {
+        try std.testing.expect(prompt_index < seen.len);
+        try std.testing.expect(!seen[prompt_index]);
+        seen[prompt_index] = true;
+    }
+    for (seen) |present| try std.testing.expect(present);
+
+    var singleton = [_]usize{99};
+    fillGemmaGrpoEpochPromptOrder(&singleton, 17, 0);
+    try std.testing.expectEqual(@as(usize, 0), singleton[0]);
+    var empty: [0]usize = .{};
+    fillGemmaGrpoEpochPromptOrder(&empty, 17, 0);
 }
 
 test "gemma4 GRPO external reward executable preflight rejects digest drift" {

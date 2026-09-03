@@ -19,6 +19,7 @@ const common_secrets = @import("../common/secrets.zig");
 const metadata_mod = @import("domain.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const metadata_api = @import("api.zig");
+const catalog_projection_reader = @import("catalog_projection_reader.zig");
 const metadata_http_client = @import("http_client.zig");
 const raft_engine = @import("raft_engine");
 const metadata_control_loop = @import("control_loop.zig");
@@ -49,6 +50,7 @@ const api_table_catalog = @import("../api/table_catalog.zig");
 const api_operation = @import("../api/operation.zig");
 const api_table_router = @import("../api/table_router.zig");
 const api_table_writes = @import("../api/table_writes.zig");
+const stored_destination_authorization = @import("../api/stored_destination_authorization.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
 const backfill_state_mod = @import("../storage/db/backfill_state.zig");
@@ -62,6 +64,8 @@ const metadata_run_round_trace_max_phases: usize = 32;
 const linearizable_metadata_read_prefix = "metadata:linearizable-read:";
 const linearizable_metadata_read_timeout_ns: u64 = 5 * std.time.ns_per_s;
 const linearizable_metadata_read_retry_ns: u64 = 50 * std.time.ns_per_ms;
+const metadata_proposal_driver_wait_ns: u64 = std.time.ns_per_ms;
+const metadata_proposal_passive_wait_ns: u64 = 25 * std.time.ns_per_ms;
 const reallocation_protocol_probe_timeout_ns: u64 = 5 * std.time.ns_per_s;
 const runtime_status_protocol_probe_min_backoff_ns: u64 = 5 * std.time.ns_per_s;
 const runtime_status_protocol_probe_max_backoff_ns: u64 = 60 * std.time.ns_per_s;
@@ -80,6 +84,80 @@ pub const AdminSnapshotFence = struct {
     projected_core_epoch: u64 = 0,
     transition_readiness_epoch: u64 = 0,
 };
+
+pub const MetadataProposalReceipt = struct {
+    term: u64,
+    index: u64,
+};
+
+const MetadataProposalApplyObservation = enum {
+    pending,
+    applied,
+    superseded,
+};
+
+fn acceptedMetadataProposalIndex(accepted_index: ?u64, dispatch_error: ?anyerror) !u64 {
+    if (accepted_index) |index| return index;
+    if (dispatch_error) |err| return err;
+    return error.NotLeader;
+}
+
+fn observeMetadataProposalApply(
+    status: ?raft_engine.core.Status,
+    applied_entry_term: ?u64,
+    receipt: MetadataProposalReceipt,
+) MetadataProposalApplyObservation {
+    const raft_status = status orelse return .superseded;
+    if (raft_status.applied_index >= receipt.index) {
+        return if (applied_entry_term != null and applied_entry_term.? == receipt.term)
+            .applied
+        else
+            .superseded;
+    }
+    const still_receipt_leader = raft_status.soft.role == .leader and
+        raft_status.soft.leader_id != null and
+        raft_status.soft.leader_id.? == raft_status.id and
+        raft_status.hard.current_term == receipt.term;
+    return if (still_receipt_leader) .pending else .superseded;
+}
+
+test "metadata proposal receipt requires the accepted term at the applied index" {
+    const receipt: MetadataProposalReceipt = .{ .term = 3, .index = 9 };
+    var status: raft_engine.core.Status = .{
+        .id = 1,
+        .group_id = 1,
+        .soft = .{ .role = .leader, .leader_id = 1 },
+        .hard = .{ .current_term = 3, .commit_index = 9 },
+        .conf_state = .{},
+        .applied_index = 8,
+    };
+
+    try std.testing.expectEqual(.pending, observeMetadataProposalApply(status, null, receipt));
+    status.applied_index = 9;
+    try std.testing.expectEqual(.applied, observeMetadataProposalApply(status, 3, receipt));
+    try std.testing.expectEqual(.superseded, observeMetadataProposalApply(status, 4, receipt));
+    try std.testing.expectEqual(.superseded, observeMetadataProposalApply(status, null, receipt));
+
+    status.applied_index = 8;
+    status.soft = .{ .role = .follower, .leader_id = 2 };
+    status.hard.current_term = 4;
+    try std.testing.expectEqual(.superseded, observeMetadataProposalApply(status, null, receipt));
+}
+
+test "metadata proposal receipt survives a post-acceptance dispatch failure" {
+    try std.testing.expectEqual(
+        @as(u64, 17),
+        try acceptedMetadataProposalIndex(17, error.OutOfMemory),
+    );
+    try std.testing.expectError(
+        error.OutOfMemory,
+        acceptedMetadataProposalIndex(null, error.OutOfMemory),
+    );
+    try std.testing.expectError(
+        error.NotLeader,
+        acceptedMetadataProposalIndex(null, null),
+    );
+}
 
 pub fn sameAdminSnapshotFence(before: AdminSnapshotFence, after: AdminSnapshotFence) bool {
     return before.metadata_group_id == after.metadata_group_id and
@@ -116,6 +194,27 @@ pub fn coherentLinearizableAdminSnapshot(
         svc.freeAdminSnapshot(&snapshot);
     }
     return error.MetadataLinearizableReadTimeout;
+}
+
+/// Return a compact catalog projection captured after a linearizable read
+/// barrier. This is used to confirm negative routing results without paying
+/// the cost of an administrative snapshot.
+pub fn linearizableCatalogRoutingSnapshot(
+    comptime Service: type,
+    svc: *Service,
+    request: api_operation.RequestContext,
+) !metadata_api.CatalogRoutingSnapshot {
+    svc.ensureLinearizableReadWithContext(request) catch |err| switch (err) {
+        error.DeadlineExceeded,
+        error.MetadataLinearizableReadTimeout,
+        => return error.CatalogRoutingSnapshotTimeout,
+        else => return err,
+    };
+    request.ensureActive() catch |err| switch (err) {
+        error.DeadlineExceeded => return error.CatalogRoutingSnapshotTimeout,
+        else => return err,
+    };
+    return try svc.catalogRoutingSnapshot(request.deadline_ns);
 }
 
 fn logMetadataRunRoundPhase(name: []const u8, elapsed_ns: u64) void {
@@ -313,6 +412,61 @@ const MetadataRunRoundTrace = struct {
     }
 };
 
+const MetadataProposalProgressDriver = struct {
+    lane: std.atomic.Mutex = .unlocked,
+    wake_epoch: std.atomic.Value(u32) = .init(0),
+
+    const Lease = struct {
+        driver: *MetadataProposalProgressDriver,
+
+        fn deinit(self: *Lease) void {
+            self.driver.lane.unlock();
+            self.driver.notifyWaiters();
+            self.* = undefined;
+        }
+    };
+
+    fn tryAcquire(self: *MetadataProposalProgressDriver) ?Lease {
+        if (!self.lane.tryLock()) return null;
+        return .{ .driver = self };
+    }
+
+    fn currentEpoch(self: *const MetadataProposalProgressDriver) u32 {
+        return self.wake_epoch.load(.acquire);
+    }
+
+    fn waitForHandoff(self: *MetadataProposalProgressDriver, observed_epoch: u32, timeout_ns: u64) void {
+        if (self.wake_epoch.load(.acquire) != observed_epoch) return;
+        std.Io.futexWaitTimeout(
+            std.Options.debug_io,
+            u32,
+            &self.wake_epoch.raw,
+            observed_epoch,
+            .{ .duration = .{
+                .clock = .awake,
+                .raw = .fromNanoseconds(@intCast(timeout_ns)),
+            } },
+        ) catch return;
+    }
+
+    fn notifyWaiters(self: *MetadataProposalProgressDriver) void {
+        _ = self.wake_epoch.fetchAdd(1, .release);
+        std.Io.futexWake(std.Options.debug_io, u32, &self.wake_epoch.raw, std.math.maxInt(u32));
+    }
+};
+
+test "metadata proposal receipt progress uses a single transferable driver" {
+    var driver = MetadataProposalProgressDriver{};
+    var first = driver.tryAcquire() orelse return error.TestExpectedEqual;
+    try std.testing.expect(driver.tryAcquire() == null);
+    const observed_epoch = driver.currentEpoch();
+    first.deinit();
+    try std.testing.expect(driver.currentEpoch() != observed_epoch);
+
+    var next = driver.tryAcquire() orelse return error.TestExpectedEqual;
+    next.deinit();
+}
+
 const LifecycleSignal = struct {
     alloc: std.mem.Allocator,
     mutex: std.Io.Mutex = .init,
@@ -489,6 +643,9 @@ pub const MetadataServiceConfig = struct {
     observe_local_replica_root: bool = true,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     secret_store: ?*common_secrets.FileStore = null,
+    internal_service_secret: ?[]const u8 = null,
+    internal_service_issuer: ?[]const u8 = null,
+    destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     reallocation_protocol_peers: []const ReallocationProtocolPeer = &.{},
 };
 
@@ -656,6 +813,15 @@ fn storeHasRuntimeRepairStatus(record: metadata_table_manager.StoreRecord) bool 
     return false;
 }
 
+fn storeHasRuntimeArtifactSourceStatus(record: metadata_table_manager.StoreRecord) bool {
+    for (record.runtime_statuses) |runtime_status| {
+        for (runtime_status.indexes) |index_status| {
+            if (index_status.source_replay.len != 0) return true;
+        }
+    }
+    return false;
+}
+
 fn reportsHaveRuntimeRepairStatus(reports: []const metadata_table_manager.StoreStatusReport) bool {
     for (reports) |report| {
         for (report.runtime_statuses) |runtime_status| {
@@ -697,9 +863,24 @@ fn stripRuntimeRepairStatus(record: *metadata_table_manager.StoreRecord) void {
     }
 }
 
+fn stripRuntimeArtifactSourceStatus(
+    alloc: std.mem.Allocator,
+    record: *metadata_table_manager.StoreRecord,
+) void {
+    for (record.runtime_statuses) |*runtime_status| {
+        for (runtime_status.indexes) |*index_status| {
+            for (index_status.source_replay) |source| alloc.free(source.artifact_name);
+            if (index_status.source_replay.len > 0) alloc.free(index_status.source_replay);
+            index_status.source_replay = &.{};
+        }
+    }
+}
+
 fn stripRuntimeReporterFence(record: *metadata_table_manager.StoreRecord) void {
     record.reporter_incarnation = 0;
     record.status_generation = 0;
+    record.artifact_sources_protocol_version = 0;
+    record.native_generation_restore_version = 0;
 }
 
 fn runtimeStatusProtocolSafeCommand(
@@ -707,6 +888,11 @@ fn runtimeStatusProtocolSafeCommand(
     command: metadata_storage.TransitionCommand,
     owned_legacy_store: *?metadata_table_manager.StoreRecord,
 ) !metadata_storage.TransitionCommand {
+    if (transitionCarriesNativeRestoreIdentity(command) and
+        !nativeRestoreIdentityProtocolReady(service))
+    {
+        return error.NativeRestoreIdentityProtocolUnavailable;
+    }
     switch (command) {
         .upsert_store => |record| {
             if (!metadata_table_manager.reporterFenceValid(
@@ -714,14 +900,22 @@ fn runtimeStatusProtocolSafeCommand(
                 record.status_generation,
             )) return error.InvalidStoreReporterFence;
             const needs_current_protocol = storeHasRuntimeRepairStatus(record) or
-                record.reporter_incarnation != 0 or record.status_generation != 0;
+                storeHasRuntimeArtifactSourceStatus(record) or
+                record.reporter_incarnation != 0 or record.status_generation != 0 or
+                record.artifact_sources_protocol_version != 0 or
+                record.native_generation_restore_version != 0;
             if (!needs_current_protocol or service.runtimeStatusRepairProtocolReady()) return command;
             // Unlike registration, an upsert carrying an incarnation may be a
             // clone of already-committed v13 state. Downgrading it would erase
             // causal authority. Retry after readiness can be proven instead.
-            if (record.reporter_incarnation != 0) return error.RuntimeStatusProtocolUnavailable;
+            if (record.reporter_incarnation != 0 or
+                record.native_generation_restore_version != 0)
+            {
+                return error.RuntimeStatusProtocolUnavailable;
+            }
             var legacy_record = try metadata_table_manager.cloneStore(service.alloc, record);
             stripRuntimeRepairStatus(&legacy_record);
+            stripRuntimeArtifactSourceStatus(service.alloc, &legacy_record);
             stripRuntimeReporterFence(&legacy_record);
             owned_legacy_store.* = legacy_record;
             return .{ .upsert_store = legacy_record };
@@ -732,16 +926,43 @@ fn runtimeStatusProtocolSafeCommand(
                 record.status_generation,
             )) return error.InvalidStoreReporterFence;
             const needs_current_protocol = storeHasRuntimeRepairStatus(record) or
-                record.reporter_incarnation != 0 or record.status_generation != 0;
+                storeHasRuntimeArtifactSourceStatus(record) or
+                record.reporter_incarnation != 0 or record.status_generation != 0 or
+                record.artifact_sources_protocol_version != 0 or
+                record.native_generation_restore_version != 0;
             if (!needs_current_protocol or service.runtimeStatusRepairProtocolReady()) return command;
             var legacy_record = try metadata_table_manager.cloneStore(service.alloc, record);
             stripRuntimeRepairStatus(&legacy_record);
+            stripRuntimeArtifactSourceStatus(service.alloc, &legacy_record);
             stripRuntimeReporterFence(&legacy_record);
             owned_legacy_store.* = legacy_record;
             return .{ .register_store = legacy_record };
         },
         else => return command,
     }
+}
+
+fn transitionCarriesNativeRestoreIdentity(command: metadata_storage.TransitionCommand) bool {
+    return switch (command) {
+        .upsert_range => |record| record.restore_native_manifest_size_bytes != 0 or
+            record.restore_native_manifest_sha256.len != 0,
+        .complete_restore_range => |identity| identity.native_manifest_size_bytes != 0 or
+            identity.native_manifest_sha256.len != 0,
+        .upsert_restore_progress => |record| record.native_manifest_size_bytes != 0 or
+            record.native_manifest_sha256.len != 0,
+        .upsert_replica_intent => |replacement| if (replacement.replacement.record.backup_restore_bootstrap) |restore|
+            restore.native_manifest_size_bytes != 0 or restore.native_manifest_sha256.len != 0
+        else
+            false,
+        else => false,
+    };
+}
+
+fn nativeRestoreIdentityProtocolReady(service: anytype) bool {
+    const Service = @TypeOf(service.*);
+    if (comptime @hasDecl(Service, "nativeRestoreIdentityProtocolReady"))
+        return service.nativeRestoreIdentityProtocolReady();
+    return service.runtimeStatusRepairProtocolReady();
 }
 
 pub const MetadataServiceDeps = struct {
@@ -844,9 +1065,98 @@ const LinearizableMetadataReadTracker = struct {
 
 fn projectionSignalChangesCatalog(kind: metadata_storage.raft_apply_store.ProjectionSignalKind) bool {
     return switch (kind) {
-        .table, .range => true,
+        .metadata_incarnation, .table, .range => true,
         else => false,
     };
+}
+
+fn durableCatalogRoutingToken(
+    metadata_group_id: u64,
+    store: ?*metadata_storage.RaftApplyStore,
+) !metadata_api.CatalogRoutingChangeToken {
+    const projected_store = store orelse return .{ .metadata_group_id = metadata_group_id };
+    const cursor = try projected_store.captureCatalogCursor(metadata_group_id);
+    return .{
+        .metadata_group_id = metadata_group_id,
+        .metadata_incarnation = cursor.metadata_incarnation,
+        .revision = cursor.revision,
+    };
+}
+
+fn catalogRoutingDisposition(
+    observed: metadata_api.CatalogRoutingChangeToken,
+    current: metadata_api.CatalogRoutingChangeToken,
+) ?metadata_api.CatalogRoutingChangeResult.Disposition {
+    // A zero group is the rolling-upgrade representation emitted by older
+    // clients; revision comparison remains safe on the server they selected.
+    if (observed.metadata_group_id != 0 and !observed.authorityEql(current)) {
+        return .authority_changed;
+    }
+    if (current.revision > observed.revision) return .advanced;
+    if (current.revision < observed.revision) return .replica_behind;
+    return null;
+}
+
+fn catalogRoutingChangeResult(
+    token: metadata_api.CatalogRoutingChangeToken,
+    disposition: metadata_api.CatalogRoutingChangeResult.Disposition,
+) metadata_api.CatalogRoutingChangeResult {
+    return .{
+        .token = token,
+        .disposition = disposition,
+        .changed = disposition != .unchanged,
+    };
+}
+
+const catalog_routing_confirmation_reserve_ns: u64 = 25 * std.time.ns_per_ms;
+
+fn waitForCatalogRoutingChangeImpl(
+    comptime Service: type,
+    svc: *Service,
+    observed_token: metadata_api.CatalogRoutingChangeToken,
+    deadline_ns: u64,
+    confirm_absence: bool,
+) !metadata_api.CatalogRoutingChangeResult {
+    try svc.ensureLifecycleListenerRegistered();
+    const started_ns = platform_time.monotonicNs();
+    if (started_ns >= deadline_ns) return error.CatalogRoutingSnapshotTimeout;
+    const watch_deadline_ns = if (confirm_absence) blk: {
+        const remaining_ns = deadline_ns - started_ns;
+        const reserve_ns = @min(catalog_routing_confirmation_reserve_ns, @max(@as(u64, 1), remaining_ns / 2));
+        break :blk deadline_ns - reserve_ns;
+    } else deadline_ns;
+
+    while (true) {
+        const current = try svc.catalogRoutingChangeToken();
+        if (catalogRoutingDisposition(observed_token, current)) |disposition| {
+            return catalogRoutingChangeResult(current, disposition);
+        }
+        const now_ns = platform_time.monotonicNs();
+        if (now_ns >= watch_deadline_ns) break;
+        const signal = svc.lifecycle_signal.snapshot(null);
+        const after_capture = try svc.catalogRoutingChangeToken();
+        if (catalogRoutingDisposition(observed_token, after_capture)) |disposition| {
+            return catalogRoutingChangeResult(after_capture, disposition);
+        }
+        const wait_started_ns = platform_time.monotonicNs();
+        if (wait_started_ns >= watch_deadline_ns) break;
+        svc.lifecycle_signal.wait(signal, watch_deadline_ns - wait_started_ns);
+    }
+
+    if (!confirm_absence) {
+        return catalogRoutingChangeResult(try svc.catalogRoutingChangeToken(), .unchanged);
+    }
+    svc.ensureLinearizableReadWithContext(.{ .deadline_ns = deadline_ns }) catch |err| switch (err) {
+        error.DeadlineExceeded,
+        error.MetadataLinearizableReadTimeout,
+        => return error.CatalogRoutingSnapshotTimeout,
+        else => return err,
+    };
+    const authoritative = try svc.catalogRoutingChangeToken();
+    return catalogRoutingChangeResult(
+        authoritative,
+        catalogRoutingDisposition(observed_token, authoritative) orelse .unchanged,
+    );
 }
 
 fn projectionSignalChangesProjectedCore(kind: metadata_storage.raft_apply_store.ProjectionSignalKind) bool {
@@ -864,6 +1174,7 @@ fn projectionSignalChangesTransitionReadiness(kind: metadata_storage.raft_apply_
 }
 
 test "metadata service catalog validation epoch ignores non-catalog projection traffic" {
+    try std.testing.expect(projectionSignalChangesCatalog(.metadata_incarnation));
     try std.testing.expect(projectionSignalChangesCatalog(.table));
     try std.testing.expect(projectionSignalChangesCatalog(.range));
     try std.testing.expect(!projectionSignalChangesCatalog(.store));
@@ -889,6 +1200,34 @@ test "metadata service catalog validation epoch ignores non-catalog projection t
     try std.testing.expect(!projectionSignalChangesProjectedCore(.split_transition));
     try std.testing.expect(!projectionSignalChangesProjectedCore(.merge_transition));
     try std.testing.expect(!projectionSignalChangesProjectedCore(.restore_job));
+}
+
+test "catalog routing disposition is authority scoped and restart stable" {
+    const first_incarnation: metadata_api.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
+    const second_incarnation: metadata_api.MetadataClusterIncarnation = "22222222222222222222222222222222".*;
+    const observed: metadata_api.CatalogRoutingChangeToken = .{
+        .metadata_group_id = 7,
+        .metadata_incarnation = first_incarnation,
+        .revision = 41,
+    };
+
+    try std.testing.expectEqual(
+        @as(?metadata_api.CatalogRoutingChangeResult.Disposition, null),
+        catalogRoutingDisposition(observed, observed),
+    );
+    var advanced = observed;
+    advanced.revision += 1;
+    try std.testing.expectEqual(
+        metadata_api.CatalogRoutingChangeResult.Disposition.advanced,
+        catalogRoutingDisposition(observed, advanced).?,
+    );
+    var restarted = observed;
+    restarted.metadata_incarnation = second_incarnation;
+    restarted.revision = 1;
+    try std.testing.expectEqual(
+        metadata_api.CatalogRoutingChangeResult.Disposition.authority_changed,
+        catalogRoutingDisposition(observed, restarted).?,
+    );
 }
 
 // Backfill marker discovery does not need sub-second polling when the system is
@@ -1053,12 +1392,13 @@ const ProjectedCoreSnapshot = struct {
             if (intent.record.backup_restore_bootstrap) |record| {
                 out.estimated_bytes += record.backup_id.len + record.artifact_backup_id.len +
                     record.location.len + record.snapshot_path.len + record.connection.len +
-                    record.artifact_sha256.len;
+                    record.artifact_sha256.len + record.native_manifest_sha256.len;
             }
         }
         for (self.restore_progresses) |record| {
             out.estimated_bytes += record.backup_id.len + record.artifact_backup_id.len +
                 record.location.len + record.snapshot_path.len + record.artifact_sha256.len +
+                record.native_manifest_sha256.len +
                 record.phase.len + record.last_error.len;
         }
         for (self.replication_source_statuses) |record| {
@@ -1071,50 +1411,6 @@ const ProjectedCoreSnapshot = struct {
         }
         for (self.merge_transitions) |record| out.estimated_bytes += optionalLen(record.rollback_reason);
         return out;
-    }
-};
-
-const CatalogValidationSnapshot = struct {
-    tables: []metadata_table_manager.TableRecord = &.{},
-    ranges: []metadata_table_manager.RangeRecord = &.{},
-    index: metadata_api.CatalogProjectionIndex = .{},
-
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        self.index.deinit(alloc);
-        for (self.tables) |record| metadata_table_manager.freeTable(alloc, record);
-        if (self.tables.len > 0) alloc.free(self.tables);
-        for (self.ranges) |record| metadata_table_manager.freeRange(alloc, record);
-        if (self.ranges.len > 0) alloc.free(self.ranges);
-        self.* = .{};
-    }
-
-    fn addDiagnostics(self: *const @This(), out: *ProjectedCoreSnapshotDiagnostics) void {
-        out.cached = true;
-        out.tables = self.tables.len;
-        out.ranges = self.ranges.len;
-        out.estimated_bytes += @sizeOf(metadata_table_manager.TableRecord) * self.tables.len +
-            @sizeOf(metadata_table_manager.RangeRecord) * self.ranges.len;
-        for (self.tables) |record| {
-            out.estimated_bytes += record.name.len + record.description.len + record.schema_json.len +
-                record.read_schema_json.len + record.indexes_json.len + record.replication_sources_json.len +
-                record.placement_role.len + record.restore_backup_id.len + record.restore_location.len;
-        }
-        for (self.ranges) |record| {
-            out.estimated_bytes += record.start_key.len + optionalLen(record.end_key) +
-                record.restore_backup_id.len + record.restore_artifact_backup_id.len +
-                record.restore_location.len + record.restore_snapshot_path.len +
-                record.restore_connection.len + record.restore_artifact_sha256.len;
-        }
-    }
-};
-
-const CatalogValidationSnapshotCache = struct {
-    catalog_epoch: u64 = 0,
-    snapshot: ?CatalogValidationSnapshot = null,
-
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        if (self.snapshot) |*snapshot| snapshot.deinit(alloc);
-        self.* = .{};
     }
 };
 
@@ -1174,7 +1470,31 @@ const ProjectedCoreSnapshotDiagnostics = struct {
     split_transitions: usize = 0,
     merge_transitions: usize = 0,
     estimated_bytes: usize = 0,
+    catalog_projection_reader: catalog_projection_reader.CatalogProjectionReader.Diagnostics = .{},
 };
+
+fn addCatalogProjectionDiagnostics(
+    snapshot: *const catalog_projection_reader.CatalogProjectionReader.Snapshot,
+    out: *ProjectedCoreSnapshotDiagnostics,
+) void {
+    out.cached = true;
+    out.tables = snapshot.tables.len;
+    out.ranges = snapshot.ranges.len;
+    out.estimated_bytes += @sizeOf(metadata_table_manager.TableRecord) * snapshot.tables.len +
+        @sizeOf(metadata_table_manager.RangeRecord) * snapshot.ranges.len;
+    for (snapshot.tables) |record| {
+        out.estimated_bytes += record.name.len + record.description.len + record.schema_json.len +
+            record.read_schema_json.len + record.indexes_json.len + record.replication_sources_json.len +
+            record.placement_role.len + record.restore_backup_id.len + record.restore_location.len;
+    }
+    for (snapshot.ranges) |record| {
+        out.estimated_bytes += record.start_key.len + optionalLen(record.end_key) +
+            record.restore_backup_id.len + record.restore_artifact_backup_id.len +
+            record.restore_location.len + record.restore_snapshot_path.len +
+            record.restore_connection.len + record.restore_artifact_sha256.len +
+            record.restore_native_manifest_sha256.len;
+    }
+}
 
 pub const JsonResponseDiagnostics = struct {
     calls: u64 = 0,
@@ -1263,8 +1583,8 @@ fn captureLocalProjectionInputs(self: *MetadataHttpService) !LocalProjectionInpu
     errdefer self.alloc.free(group_ids);
     self.lockRuntime();
     defer self.unlockRuntime();
-    self.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
-    defer self.catalog_validation_mutex.unlock(std.Options.debug_io);
+    self.catalog_projection_reader.lock();
+    defer self.catalog_projection_reader.unlock();
     const catalog = try self.catalogValidationSnapshotLocked();
     const core = try self.projectedCoreSnapshotLocked();
     const tables = try cloneProjectedTablesOwned(self.alloc, catalog.tables);
@@ -1755,8 +2075,7 @@ pub const MetadataService = struct {
     local_replica_root_reconcile_permit_hook: ?LocalReplicaRootReconcilePermitHook = null,
     lifecycle_listener_mutex: std.Io.Mutex = .init,
     lifecycle_listener_registered: bool = false,
-    catalog_validation_mutex: std.Io.Mutex = .init,
-    catalog_validation_cache: CatalogValidationSnapshotCache = .{},
+    catalog_projection_reader: catalog_projection_reader.CatalogProjectionReader = .{},
     local_group_status_provider: ?LocalGroupStatusProvider = null,
     local_shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
     routed_shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
@@ -1766,6 +2085,9 @@ pub const MetadataService = struct {
     cdc_backfill_registry: foreign_mod.Registry = .{},
     cdc_next_round_at_ms: u64 = 0,
     secret_store: ?*common_secrets.FileStore = null,
+    internal_service_secret: ?[]const u8 = null,
+    internal_service_issuer: ?[]const u8 = null,
+    destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     json_response_calls: std.atomic.Value(u64) = .init(0),
     json_response_bytes_total: std.atomic.Value(u64) = .init(0),
     json_response_peak_bytes: std.atomic.Value(u64) = .init(0),
@@ -1820,6 +2142,9 @@ pub const MetadataService = struct {
             .lifecycle_signal = LifecycleSignal.init(alloc),
             .backend_runtime = cfg.backend_runtime,
             .secret_store = cfg.secret_store,
+            .internal_service_secret = cfg.internal_service_secret,
+            .internal_service_issuer = cfg.internal_service_issuer,
+            .destination_authorizer = cfg.destination_authorizer,
             .linearizable_read_tracker = read_tracker,
             .raft = try raft_service.ManagedHostService.init(alloc, host_cfg, host_deps, cfg.raft, deps.raft),
         };
@@ -1834,7 +2159,7 @@ pub const MetadataService = struct {
         // Projection listeners retain `self`; stop and drain their Raft apply
         // producer before releasing any callback-owned service state.
         self.raft.deinit();
-        self.catalog_validation_cache.deinit(self.alloc);
+        self.catalog_projection_reader.deinit(self.alloc);
         self.store_status_backfill_marker_cache.deinit(self.alloc);
         self.cdc_backfill_registry.deinit(self.alloc);
         self.lifecycle_signal.deinit();
@@ -1958,6 +2283,21 @@ pub const MetadataService = struct {
         self.lifecycle_signal.wait(observed, timeout_ns);
     }
 
+    pub fn catalogRoutingChangeToken(self: *MetadataService) !metadata_api.CatalogRoutingChangeToken {
+        return try durableCatalogRoutingToken(self.metadata_group_id, self.projectedStore());
+    }
+
+    /// Wait for the durable catalog cursor to advance. The cursor is checked
+    /// on both sides of signal capture to avoid a lost wakeup.
+    pub fn waitForCatalogRoutingChange(
+        self: *MetadataService,
+        observed_token: metadata_api.CatalogRoutingChangeToken,
+        deadline_ns: u64,
+        confirm_absence: bool,
+    ) !metadata_api.CatalogRoutingChangeResult {
+        return try waitForCatalogRoutingChangeImpl(MetadataService, self, observed_token, deadline_ns, confirm_absence);
+    }
+
     pub fn setLifecycleReconcileHook(self: *MetadataService, hook: ?LifecycleReconcileHook) void {
         self.lifecycle_reconcile_hook = hook;
         self.lifecycle_reconcile_requested.store(true, .release);
@@ -2004,6 +2344,35 @@ pub const MetadataService = struct {
             },
         );
         self.lifecycle_listener_registered = true;
+    }
+
+    fn catalogProjectionSource(self: *MetadataService) catalog_projection_reader.CatalogProjectionReader.Source {
+        return .{ .ptr = self, .vtable = &.{
+            .ensure_listener_registered = catalogProjectionEnsureListener,
+            .catalog_epoch = catalogProjectionEpoch,
+            .capture_projection = catalogProjectionCapture,
+        } };
+    }
+
+    fn catalogProjectionEnsureListener(ptr: *anyopaque) !void {
+        const self: *MetadataService = @ptrCast(@alignCast(ptr));
+        try self.ensureLifecycleListenerRegistered();
+    }
+
+    fn catalogProjectionEpoch(ptr: *anyopaque) u64 {
+        const self: *MetadataService = @ptrCast(@alignCast(ptr));
+        return self.catalog_epoch.load(.acquire);
+    }
+
+    fn catalogProjectionCapture(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        metadata_group_id: u64,
+        deadline_ns: ?u64,
+    ) !metadata_storage.raft_apply_store.CatalogProjectionSnapshot {
+        const self: *MetadataService = @ptrCast(@alignCast(ptr));
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.captureCatalogProjection(alloc, metadata_group_id, deadline_ns);
     }
 
     fn metadataServiceProjectionSignal(ptr: *anyopaque, signal: metadata_storage.raft_apply_store.ProjectionSignal) void {
@@ -2125,6 +2494,12 @@ pub const MetadataService = struct {
             }
         }
         return local_member;
+    }
+
+    fn nativeRestoreIdentityProtocolReady(self: *MetadataService) bool {
+        // The in-process service supports only a local metadata membership;
+        // current-protocol readiness proves the complete V14 restore contract.
+        return self.runtimeStatusRepairProtocolReady();
     }
 
     pub fn registerStore(self: *MetadataService, record: metadata_table_manager.StoreRecord) !void {
@@ -2755,6 +3130,31 @@ pub const MetadataService = struct {
         return try metadata_api.captureSnapshot(self.alloc, self);
     }
 
+    /// Capture only the atomically paired table/range projection used for
+    /// routing, without computing the full administrative status projection.
+    pub fn catalogRoutingSnapshot(self: *MetadataService, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        return try self.catalog_projection_reader.routingSnapshot(
+            self.alloc,
+            self.metadata_group_id,
+            self.catalogProjectionSource(),
+            deadline_ns,
+        );
+    }
+
+    pub fn catalogTableRoutingSnapshot(self: *MetadataService, table_name: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        return try self.catalog_projection_reader.tableRoutingSnapshot(
+            self.alloc,
+            self.metadata_group_id,
+            self.catalogProjectionSource(),
+            table_name,
+            deadline_ns,
+        );
+    }
+
+    pub fn freeCatalogRoutingSnapshot(self: *MetadataService, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
+        self.catalog_projection_reader.freeRoutingSnapshot(self.alloc, snapshot);
+    }
+
     pub fn adminSnapshotFence(self: *MetadataService) !AdminSnapshotFence {
         const raft = serviceGroupRaftObservation(self, self.metadata_group_id);
         return .{
@@ -2773,59 +3173,35 @@ pub const MetadataService = struct {
 
     pub fn validatePublication(self: *MetadataService, contract: metadata_api.CatalogPublicationContract) !bool {
         try self.ensureLinearizableRead();
-        self.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
-        defer self.catalog_validation_mutex.unlock(std.Options.debug_io);
         const incarnation = try self.metadataIncarnation();
-        const snapshot = try self.catalogValidationSnapshotLocked();
-        return snapshot.index.matchesPublication(contract, self.metadata_group_id, incarnation, snapshot.tables, snapshot.ranges);
+        return try self.catalog_projection_reader.matchesPublication(
+            self.alloc,
+            self.metadata_group_id,
+            self.catalogProjectionSource(),
+            incarnation,
+            contract,
+        );
     }
 
     pub fn validateTablePublication(self: *MetadataService, contract: metadata_api.CatalogTablePublicationContract) !bool {
         try self.ensureLinearizableRead();
-        self.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
-        defer self.catalog_validation_mutex.unlock(std.Options.debug_io);
         const incarnation = try self.metadataIncarnation();
-        const snapshot = try self.catalogValidationSnapshotLocked();
-        return snapshot.index.matchesTablePublication(contract, self.metadata_group_id, incarnation, snapshot.tables);
+        return try self.catalog_projection_reader.matchesTablePublication(
+            self.alloc,
+            self.metadata_group_id,
+            self.catalogProjectionSource(),
+            incarnation,
+            contract,
+        );
     }
 
-    fn captureCatalogValidationSnapshot(self: *MetadataService) !CatalogValidationSnapshot {
-        const store = self.projectedStore() orelse return error.MissingMetadataStore;
-        var snapshot: CatalogValidationSnapshot = .{};
-        errdefer snapshot.deinit(self.alloc);
-        snapshot.tables = try store.listTables(self.alloc, self.metadata_group_id);
-        snapshot.ranges = try store.listRanges(self.alloc, self.metadata_group_id);
-        snapshot.index = try metadata_api.CatalogProjectionIndex.init(self.alloc, snapshot.tables, snapshot.ranges);
-        return snapshot;
-    }
-
-    fn catalogValidationSnapshotLocked(self: *MetadataService) !*const CatalogValidationSnapshot {
-        try self.ensureLifecycleListenerRegistered();
-        const current_epoch = self.catalog_epoch.load(.acquire);
-        if (self.catalog_validation_cache.snapshot != null and
-            self.catalog_validation_cache.catalog_epoch == current_epoch)
-        {
-            return &(self.catalog_validation_cache.snapshot orelse unreachable);
-        }
-
-        // MetadataService does not own the HTTP runtime lock. Stabilize the
-        // two projected lists against the listener epoch instead, so a table
-        // and its ranges can never come from different applied revisions.
-        var attempts: usize = 0;
-        while (attempts < 4) : (attempts += 1) {
-            const before = self.catalog_epoch.load(.acquire);
-            var fresh = try self.captureCatalogValidationSnapshot();
-            errdefer fresh.deinit(self.alloc);
-            const after = self.catalog_epoch.load(.acquire);
-            if (before != after) {
-                fresh.deinit(self.alloc);
-                continue;
-            }
-            if (self.catalog_validation_cache.snapshot) |*snapshot| snapshot.deinit(self.alloc);
-            self.catalog_validation_cache = .{ .catalog_epoch = after, .snapshot = fresh };
-            return &(self.catalog_validation_cache.snapshot orelse unreachable);
-        }
-        return error.CatalogProjectionUnstable;
+    fn catalogValidationSnapshotLocked(self: *MetadataService) !*const catalog_projection_reader.CatalogProjectionReader.Snapshot {
+        return try self.catalog_projection_reader.validationSnapshotLocked(
+            self.alloc,
+            self.metadata_group_id,
+            self.catalogProjectionSource(),
+            null,
+        );
     }
 
     pub fn freeAdminSnapshot(self: *MetadataService, snapshot: *metadata_api.AdminSnapshot) void {
@@ -3238,6 +3614,7 @@ pub const MetadataService = struct {
             ranges,
             .{
                 .backend_runtime = try self.ensureBackendRuntime(),
+                .destination_authorizer = self.destination_authorizer,
             },
         );
         try self.refreshLocalRestoreProgress(group_ids, tables, ranges);
@@ -3467,6 +3844,7 @@ pub const MetadataService = struct {
         );
         write_source.backend_runtime = runtime;
         _ = write_source.withSecretStore(self.secret_store);
+        _ = write_source.withDestinationAuthorization(self.destination_authorizer);
         var coordinator = metadata_replication_backfill.SnapshotBackfillCoordinator{
             .alloc = self.alloc,
             .runner = .{
@@ -3476,6 +3854,7 @@ pub const MetadataService = struct {
                 .write_source = write_source.source(),
                 .secret_store = self.secret_store,
                 .work_permit = cdcWorkPermit(self),
+                .destination_authorizer = self.destination_authorizer,
             },
         };
         const summary = coordinator.runRound(self) catch |err| {
@@ -3504,6 +3883,7 @@ pub const MetadataService = struct {
                 .write_source = write_source.source(),
                 .secret_store = self.secret_store,
                 .work_permit = cdcWorkPermit(self),
+                .destination_authorizer = self.destination_authorizer,
             },
         };
         const stream_summary = streaming.runRound(self) catch |err| {
@@ -3567,6 +3947,10 @@ pub const MetadataHttpService = struct {
     transition_mutex: std.Io.Mutex = .init,
     transition_metrics_mutex: std.Io.Mutex = .init,
     transition_metrics_snapshot: raft_transition_service.TransitionServiceMetrics = .{},
+    // One request drives low-latency Ready processing for every outstanding
+    // metadata proposal. Other requests sleep on the driver's handoff signal,
+    // avoiding a per-waiter Raft round and false lifecycle epoch changes.
+    proposal_progress_driver: MetadataProposalProgressDriver = .{},
     lifecycle_signal: LifecycleSignal,
     lifecycle_reconcile_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     lifecycle_reconcile_hook: ?LifecycleReconcileHook = null,
@@ -3574,8 +3958,7 @@ pub const MetadataHttpService = struct {
     local_replica_root_reconcile_permit_hook: ?LocalReplicaRootReconcilePermitHook = null,
     lifecycle_listener_mutex: std.Io.Mutex = .init,
     lifecycle_listener_registered: bool = false,
-    catalog_validation_mutex: std.Io.Mutex = .init,
-    catalog_validation_cache: CatalogValidationSnapshotCache = .{},
+    catalog_projection_reader: catalog_projection_reader.CatalogProjectionReader = .{},
     cdc_write_source_override: ?api_table_writes.TableWriteSource = null,
     local_group_status_provider: ?LocalGroupStatusProvider = null,
     local_shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
@@ -3607,6 +3990,9 @@ pub const MetadataHttpService = struct {
     cdc_backfill_registry: foreign_mod.Registry = .{},
     cdc_next_round_at_ms: u64 = 0,
     secret_store: ?*common_secrets.FileStore = null,
+    internal_service_secret: ?[]const u8 = null,
+    internal_service_issuer: ?[]const u8 = null,
+    destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     backend_runtime_mutex: std.Io.Mutex = .init,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
@@ -3666,6 +4052,9 @@ pub const MetadataHttpService = struct {
             .backend_runtime = backend_runtime,
             .owned_backend_runtime = owned_backend_runtime,
             .secret_store = cfg.secret_store,
+            .internal_service_secret = cfg.internal_service_secret,
+            .internal_service_issuer = cfg.internal_service_issuer,
+            .destination_authorizer = cfg.destination_authorizer,
             .linearizable_read_tracker = read_tracker,
             .raft = try raft_service.ManagedHttpHostService.init(alloc, host_cfg, http_deps, cfg.raft, deps.raft),
         };
@@ -3683,7 +4072,7 @@ pub const MetadataHttpService = struct {
         // Projection listeners retain `self`; stop and drain their Raft apply
         // producer before releasing any callback-owned service state.
         self.raft.deinit();
-        self.catalog_validation_cache.deinit(self.alloc);
+        self.catalog_projection_reader.deinit(self.alloc);
         self.projected_core_snapshot_cache.deinit(self.alloc);
         self.transition_readiness_cache.deinit(self.alloc);
         self.store_status_backfill_marker_cache.deinit(self.alloc);
@@ -3726,6 +4115,19 @@ pub const MetadataHttpService = struct {
 
     pub fn waitForLifecycleSignal(self: *MetadataHttpService, observed: LifecycleSignal.Snapshot, timeout_ns: u64) void {
         self.lifecycle_signal.wait(observed, timeout_ns);
+    }
+
+    pub fn catalogRoutingChangeToken(self: *MetadataHttpService) !metadata_api.CatalogRoutingChangeToken {
+        return try durableCatalogRoutingToken(self.metadata_group_id, self.projectedStore());
+    }
+
+    pub fn waitForCatalogRoutingChange(
+        self: *MetadataHttpService,
+        observed_token: metadata_api.CatalogRoutingChangeToken,
+        deadline_ns: u64,
+        confirm_absence: bool,
+    ) !metadata_api.CatalogRoutingChangeResult {
+        return try waitForCatalogRoutingChangeImpl(MetadataHttpService, self, observed_token, deadline_ns, confirm_absence);
     }
 
     pub fn setLifecycleReconcileHook(self: *MetadataHttpService, hook: ?LifecycleReconcileHook) void {
@@ -3780,6 +4182,35 @@ pub const MetadataHttpService = struct {
         self.lifecycle_listener_registered = true;
     }
 
+    fn catalogProjectionSource(self: *MetadataHttpService) catalog_projection_reader.CatalogProjectionReader.Source {
+        return .{ .ptr = self, .vtable = &.{
+            .ensure_listener_registered = catalogProjectionEnsureListener,
+            .catalog_epoch = catalogProjectionEpoch,
+            .capture_projection = catalogProjectionCapture,
+        } };
+    }
+
+    fn catalogProjectionEnsureListener(ptr: *anyopaque) !void {
+        const self: *MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try self.ensureLifecycleListenerRegistered();
+    }
+
+    fn catalogProjectionEpoch(ptr: *anyopaque) u64 {
+        const self: *MetadataHttpService = @ptrCast(@alignCast(ptr));
+        return self.catalog_epoch.load(.acquire);
+    }
+
+    fn catalogProjectionCapture(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        metadata_group_id: u64,
+        deadline_ns: ?u64,
+    ) !metadata_storage.raft_apply_store.CatalogProjectionSnapshot {
+        const self: *MetadataHttpService = @ptrCast(@alignCast(ptr));
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.captureCatalogProjection(alloc, metadata_group_id, deadline_ns);
+    }
+
     fn metadataHttpServiceProjectionSignal(ptr: *anyopaque, signal: metadata_storage.raft_apply_store.ProjectionSignal) void {
         const self: *MetadataHttpService = @ptrCast(@alignCast(ptr));
         if (projectionSignalChangesCatalog(signal.kind)) {
@@ -3792,13 +4223,14 @@ pub const MetadataHttpService = struct {
             _ = self.transition_readiness_epoch.fetchAdd(1, .release);
         }
         switch (signal.kind) {
-            .table, .range, .store, .shuffle_join_lease, .restore_job => _ = self.projection_epoch.fetchAdd(1, .monotonic),
+            .metadata_incarnation, .table, .range, .store, .shuffle_join_lease, .restore_job => _ = self.projection_epoch.fetchAdd(1, .monotonic),
             .schema_progress => _ = self.projection_epoch.fetchAdd(1, .monotonic),
             .restore_progress, .replication_source_status => _ = self.projection_epoch.fetchAdd(1, .monotonic),
             .placement_intent => _ = self.placement_epoch.fetchAdd(1, .monotonic),
             .reconcile_lease => _ = self.reconcile_lease_epoch.fetchAdd(1, .monotonic),
             .split_transition, .merge_transition => _ = self.transition_epoch.fetchAdd(1, .monotonic),
         }
+        self.proposal_progress_driver.notifyWaiters();
         self.lifecycle_signal.notify(signal.table_name);
     }
 
@@ -3810,6 +4242,7 @@ pub const MetadataHttpService = struct {
     fn metadataHttpServiceCommittedKeySignal(ptr: *anyopaque, _: metadata_storage.raft_apply_store.CommittedKeySignal) void {
         const self: *MetadataHttpService = @ptrCast(@alignCast(ptr));
         self.lifecycle_reconcile_requested.store(true, .release);
+        self.proposal_progress_driver.notifyWaiters();
         self.lifecycle_signal.notify(null);
     }
 
@@ -3873,6 +4306,183 @@ pub const MetadataHttpService = struct {
         self.lifecycle_signal.notify(null);
     }
 
+    /// Proposes a metadata transition on the local leader and returns the
+    /// exact Raft log position that accepted it. Unlike a ReadIndex barrier,
+    /// this receipt can be used to prove that this specific mutation applied.
+    pub fn proposeTransitionCommandWithReceipt(
+        self: *MetadataHttpService,
+        command: metadata_storage.TransitionCommand,
+    ) !MetadataProposalReceipt {
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, null);
+    }
+
+    /// Admits a transition only while this node is still leader in the
+    /// caller's captured term. The comparison and Raft admission share the
+    /// runtime lock, closing the check-then-propose window for background work
+    /// that can outlive a leadership change.
+    pub fn proposeTransitionCommandWithReceiptInTerm(
+        self: *MetadataHttpService,
+        command: metadata_storage.TransitionCommand,
+        expected_term: u64,
+    ) !MetadataProposalReceipt {
+        if (expected_term == 0) return error.NotLeader;
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, expected_term);
+    }
+
+    fn proposeTransitionCommandWithReceiptInExpectedTerm(
+        self: *MetadataHttpService,
+        command: metadata_storage.TransitionCommand,
+        expected_term: ?u64,
+    ) !MetadataProposalReceipt {
+        var owned_legacy_store: ?metadata_table_manager.StoreRecord = null;
+        defer if (owned_legacy_store) |record| metadata_table_manager.freeStore(self.alloc, record);
+        const safe_command = try runtimeStatusProtocolSafeCommand(self, command, &owned_legacy_store);
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        try metadata_storage.validateTransitionCommandDataGroupIds(safe_command);
+        const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse
+            return error.NotLeader;
+        if (raft_status.soft.role != .leader or raft_status.soft.leader_id == null or raft_status.soft.leader_id.? != raft_status.id) {
+            return error.NotLeader;
+        }
+        if (expected_term) |term| {
+            if (raft_status.hard.current_term != term) return error.NotLeader;
+        }
+        const encoded = try metadata_storage.encodeTransitionCommand(self.alloc, safe_command);
+        defer self.alloc.free(encoded);
+        // Reserve proof storage before Raft accepts the entry. This keeps the
+        // accepted-but-untrackable state impossible under allocator pressure.
+        try self.raft.host.http_host.host.prepareProposalReceiptTracking(self.metadata_group_id);
+        var accepted_index: ?u64 = null;
+        var dispatch_error: ?anyerror = null;
+        self.raft.host.http_host.proposeWithReceipt(self.metadata_group_id, encoded, &accepted_index) catch |err| {
+            dispatch_error = err;
+        };
+        const index = try acceptedMetadataProposalIndex(accepted_index, dispatch_error);
+        try self.raft.host.http_host.host.trackProposalReceipt(
+            self.metadata_group_id,
+            raft_status.hard.current_term,
+            index,
+        );
+        if (dispatch_error) |err| {
+            // Once the local leader assigned an index the proposal was
+            // accepted. Replication-message construction can still fail after
+            // that point; retain the receipt and let normal Raft progress retry
+            // delivery rather than reporting a false rejection to the caller.
+            std.log.warn(
+                "metadata proposal accepted before dispatch failure group_id={} index={} err={s}",
+                .{ self.metadata_group_id, index, @errorName(err) },
+            );
+        }
+        self.lifecycle_signal.notify(null);
+        return .{ .term = raft_status.hard.current_term, .index = index };
+    }
+
+    pub fn waitForTransitionApplied(
+        self: *MetadataHttpService,
+        receipt: MetadataProposalReceipt,
+    ) !void {
+        return self.waitForTransitionAppliedWithContext(receipt, .{});
+    }
+
+    pub fn waitForTransitionAppliedWithContext(
+        self: *MetadataHttpService,
+        receipt: MetadataProposalReceipt,
+        request: api_operation.RequestContext,
+    ) !void {
+        self.lockRuntime();
+        const tracked_receipt = self.raft.host.http_host.host.acquireProposalReceipt(
+            self.metadata_group_id,
+            receipt.term,
+            receipt.index,
+        );
+        self.unlockRuntime();
+        defer {
+            if (tracked_receipt) {
+                self.lockRuntime();
+                self.raft.host.http_host.host.releaseProposalReceipt(self.metadata_group_id, receipt.term, receipt.index);
+                self.unlockRuntime();
+            }
+        }
+        var progress_driver_lease: ?MetadataProposalProgressDriver.Lease = null;
+        defer if (progress_driver_lease) |*lease| lease.deinit();
+        const local_deadline_ns = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
+        const deadline_ns = if (request.deadline_ns) |caller_deadline_ns|
+            @min(local_deadline_ns, caller_deadline_ns)
+        else
+            local_deadline_ns;
+        while (platform_time.monotonicNs() < deadline_ns) {
+            try request.ensureActive();
+            // Capture before observing Raft so an apply notification between
+            // the observation and wait cannot be lost.
+            const lifecycle_observation = self.lifecycle_signal.snapshot(null);
+            const progress_driver_epoch = self.proposal_progress_driver.currentEpoch();
+            self.lockRuntime();
+            const maybe_raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id);
+            const applied_entry_term = if (maybe_raft_status) |raft_status|
+                if (raft_status.applied_index >= receipt.index)
+                    self.raft.host.http_host.host.raftTermAtTrackedProposalReceipt(
+                        self.metadata_group_id,
+                        receipt.term,
+                        receipt.index,
+                    ) catch null
+                else
+                    null
+            else
+                null;
+            const observation = observeMetadataProposalApply(maybe_raft_status, applied_entry_term, receipt);
+            self.unlockRuntime();
+            switch (observation) {
+                .applied => return,
+                .superseded => return error.NotLeader,
+                .pending => {},
+            }
+            if (progress_driver_lease == null) {
+                progress_driver_lease = self.proposal_progress_driver.tryAcquire();
+            }
+            const now_ns = platform_time.monotonicNs();
+            if (now_ns >= deadline_ns) break;
+            const remaining_ns = deadline_ns - now_ns;
+            if (progress_driver_lease != null) {
+                try self.runRaftProgressOnly();
+                self.lifecycle_signal.wait(
+                    lifecycle_observation,
+                    @min(remaining_ns, metadata_proposal_driver_wait_ns),
+                );
+            } else {
+                // Bound the passive sleep so request cancellation remains
+                // responsive even if the driver stalls without producing a
+                // lifecycle event. Apply and driver handoff wake passive
+                // waiters immediately.
+                self.proposal_progress_driver.waitForHandoff(
+                    progress_driver_epoch,
+                    @min(remaining_ns, metadata_proposal_passive_wait_ns),
+                );
+            }
+        }
+        try request.ensureActive();
+        return error.MetadataProposalApplyTimeout;
+    }
+
+    pub fn proposeTransitionCommandAndWaitApplied(
+        self: *MetadataHttpService,
+        command: metadata_storage.TransitionCommand,
+    ) !MetadataProposalReceipt {
+        const receipt = try self.proposeTransitionCommandWithReceipt(command);
+        try self.waitForTransitionApplied(receipt);
+        return receipt;
+    }
+
+    pub fn proposeTransitionCommandAndWaitAppliedInTerm(
+        self: *MetadataHttpService,
+        command: metadata_storage.TransitionCommand,
+        expected_term: u64,
+    ) !MetadataProposalReceipt {
+        const receipt = try self.proposeTransitionCommandWithReceiptInTerm(command, expected_term);
+        try self.waitForTransitionApplied(receipt);
+        return receipt;
+    }
+
     pub fn upsertNode(self: *MetadataHttpService, record: metadata_table_manager.NodeRecord) !void {
         try self.proposeTransitionCommand(.{ .upsert_node = record });
     }
@@ -3933,13 +4543,32 @@ pub const MetadataHttpService = struct {
 
     fn runtimeStatusProtocolActivationVersion(self: *MetadataHttpService) u16 {
         const cached = self.runtime_status_protocol_activated_version.load(.acquire);
-        if (cached >= metadata_runtime_status_protocol.repair_status_record_version) return cached;
-        const store = self.projectedStore() orelse return 0;
-        const version = store.getRuntimeStatusProtocolActivationVersion(self.metadata_group_id) catch return 0;
-        if (version >= metadata_runtime_status_protocol.repair_status_record_version) {
+        if (cached >= metadata_runtime_status_protocol.current_record_version) return cached;
+        const store = self.projectedStore() orelse return cached;
+        const version = store.getRuntimeStatusProtocolActivationVersion(self.metadata_group_id) catch return cached;
+        if (version > cached) {
             self.runtime_status_protocol_activated_version.store(version, .release);
         }
-        return version;
+        return @max(cached, version);
+    }
+
+    fn nativeRestoreIdentityProtocolReady(self: *MetadataHttpService) bool {
+        if (self.runtimeStatusProtocolActivationVersion() >=
+            metadata_runtime_status_protocol.native_restore_identity_record_version) return true;
+
+        const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse return false;
+        const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
+        if (runtimeStatusProtocolMembershipIsLocalOnly(
+            raft_status.conf_state,
+            self.reallocation_protocol_peers,
+            local_node_id,
+        )) return true;
+
+        // Drive the existing asynchronous all-voter probe. Native identity is
+        // admitted only after a V14 store transition has durably activated the
+        // protocol, never from the process-local probe cache alone.
+        _ = self.runtimeStatusRepairProtocolReady();
+        return false;
     }
 
     fn scheduleRuntimeStatusProtocolProbe(
@@ -4647,6 +5276,19 @@ pub const MetadataHttpService = struct {
         if (raft_diagnostics_snapshot.last_runtime_round) |round| logMetadataRaftRoundDiagnostics(round);
     }
 
+    /// Drains accepted proposals and inbound consensus work without becoming a
+    /// second owner of election and heartbeat time.
+    pub fn runRaftProgressOnly(self: *MetadataHttpService) !void {
+        try self.ensureLifecycleListenerRegistered();
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        if (self.raft.pending_updates.items.len > 0) {
+            _ = try self.raft.syncPendingRaftProgressOnly();
+        } else {
+            try self.raft.runRaftProgressOnly();
+        }
+    }
+
     /// Runs metadata projection and reconciliation without advancing Raft.
     /// Callers must concurrently drive `runRaftRoundOnly` at the configured
     /// tick cadence.
@@ -5294,6 +5936,32 @@ pub const MetadataHttpService = struct {
         return try self.buildAdminSnapshot(true);
     }
 
+    /// Capture only the atomically paired table/range projection used for
+    /// routing. In particular, this avoids computing detailed operator status
+    /// and reconciliation planning on the public request path.
+    pub fn catalogRoutingSnapshot(self: *MetadataHttpService, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        return try self.catalog_projection_reader.routingSnapshot(
+            self.alloc,
+            self.metadata_group_id,
+            self.catalogProjectionSource(),
+            deadline_ns,
+        );
+    }
+
+    pub fn catalogTableRoutingSnapshot(self: *MetadataHttpService, table_name: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        return try self.catalog_projection_reader.tableRoutingSnapshot(
+            self.alloc,
+            self.metadata_group_id,
+            self.catalogProjectionSource(),
+            table_name,
+            deadline_ns,
+        );
+    }
+
+    pub fn freeCatalogRoutingSnapshot(self: *MetadataHttpService, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
+        self.catalog_projection_reader.freeRoutingSnapshot(self.alloc, snapshot);
+    }
+
     pub fn adminSnapshotFence(self: *MetadataHttpService) !AdminSnapshotFence {
         const raft = serviceGroupRaftObservation(self, self.metadata_group_id);
         return .{
@@ -5339,8 +6007,8 @@ pub const MetadataHttpService = struct {
         {
             self.lockRuntime();
             defer self.unlockRuntime();
-            self.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
-            defer self.catalog_validation_mutex.unlock(std.Options.debug_io);
+            self.catalog_projection_reader.lock();
+            defer self.catalog_projection_reader.unlock();
             const catalog = try self.catalogValidationSnapshotLocked();
             const core = try self.projectedCoreSnapshotLocked();
             const store = self.projectedStore() orelse return error.MissingMetadataStore;
@@ -5434,50 +6102,45 @@ pub const MetadataHttpService = struct {
 
     pub fn validatePublication(self: *MetadataHttpService, contract: metadata_api.CatalogPublicationContract) !bool {
         try self.ensureLinearizableRead();
-        self.lockRuntime();
-        defer self.unlockRuntime();
-        self.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
-        defer self.catalog_validation_mutex.unlock(std.Options.debug_io);
-        const store = self.projectedStore() orelse return error.MissingMetadataStore;
-        const incarnation = try store.getMetadataIncarnation(self.metadata_group_id);
-        const snapshot = try self.catalogValidationSnapshotLocked();
-        return snapshot.index.matchesPublication(contract, self.metadata_group_id, incarnation, snapshot.tables, snapshot.ranges);
+        const incarnation = blk: {
+            self.lockRuntime();
+            defer self.unlockRuntime();
+            const store = self.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk try store.getMetadataIncarnation(self.metadata_group_id);
+        };
+        return try self.catalog_projection_reader.matchesPublication(
+            self.alloc,
+            self.metadata_group_id,
+            self.catalogProjectionSource(),
+            incarnation,
+            contract,
+        );
     }
 
     pub fn validateTablePublication(self: *MetadataHttpService, contract: metadata_api.CatalogTablePublicationContract) !bool {
         try self.ensureLinearizableRead();
-        self.lockRuntime();
-        defer self.unlockRuntime();
-        self.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
-        defer self.catalog_validation_mutex.unlock(std.Options.debug_io);
-        const store = self.projectedStore() orelse return error.MissingMetadataStore;
-        const incarnation = try store.getMetadataIncarnation(self.metadata_group_id);
-        const snapshot = try self.catalogValidationSnapshotLocked();
-        return snapshot.index.matchesTablePublication(contract, self.metadata_group_id, incarnation, snapshot.tables);
+        const incarnation = blk: {
+            self.lockRuntime();
+            defer self.unlockRuntime();
+            const store = self.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk try store.getMetadataIncarnation(self.metadata_group_id);
+        };
+        return try self.catalog_projection_reader.matchesTablePublication(
+            self.alloc,
+            self.metadata_group_id,
+            self.catalogProjectionSource(),
+            incarnation,
+            contract,
+        );
     }
 
-    /// Called with both the catalog-validation mutex and the Raft runtime lock
-    /// held. Only catalog records are cloned, and non-catalog projection
-    /// traffic cannot invalidate this cache.
-    fn catalogValidationSnapshotLocked(self: *MetadataHttpService) !*const CatalogValidationSnapshot {
-        try self.ensureLifecycleListenerRegistered();
-        const current_epoch = self.catalog_epoch.load(.acquire);
-        if (self.catalog_validation_cache.snapshot == null or
-            self.catalog_validation_cache.catalog_epoch != current_epoch)
-        {
-            const store = self.projectedStore() orelse return error.MissingMetadataStore;
-            var fresh: CatalogValidationSnapshot = .{};
-            errdefer fresh.deinit(self.alloc);
-            fresh.tables = try store.listTables(self.alloc, self.metadata_group_id);
-            fresh.ranges = try store.listRanges(self.alloc, self.metadata_group_id);
-            fresh.index = try metadata_api.CatalogProjectionIndex.init(self.alloc, fresh.tables, fresh.ranges);
-            if (self.catalog_validation_cache.snapshot) |*snapshot| snapshot.deinit(self.alloc);
-            self.catalog_validation_cache = .{
-                .catalog_epoch = current_epoch,
-                .snapshot = fresh,
-            };
-        }
-        return &(self.catalog_validation_cache.snapshot orelse unreachable);
+    fn catalogValidationSnapshotLocked(self: *MetadataHttpService) !*const catalog_projection_reader.CatalogProjectionReader.Snapshot {
+        return try self.catalog_projection_reader.validationSnapshotLocked(
+            self.alloc,
+            self.metadata_group_id,
+            self.catalogProjectionSource(),
+            null,
+        );
     }
 
     pub fn freeAdminSnapshot(self: *MetadataHttpService, snapshot: *metadata_api.AdminSnapshot) void {
@@ -5608,14 +6271,15 @@ pub const MetadataHttpService = struct {
         };
         self.lockRuntime();
         defer self.unlockRuntime();
-        self.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
-        defer self.catalog_validation_mutex.unlock(std.Options.debug_io);
+        self.catalog_projection_reader.lock();
+        defer self.catalog_projection_reader.unlock();
         if (self.projected_core_snapshot_cache.snapshot) |*snapshot| {
             out.projected_core_snapshot = snapshot.diagnostics();
         }
-        if (self.catalog_validation_cache.snapshot) |*snapshot| {
-            snapshot.addDiagnostics(&out.projected_core_snapshot);
+        if (self.catalog_projection_reader.cachedSnapshotLocked()) |snapshot| {
+            addCatalogProjectionDiagnostics(snapshot, &out.projected_core_snapshot);
         }
+        out.projected_core_snapshot.catalog_projection_reader = self.catalog_projection_reader.diagnostics();
         if (self.projectedStore()) |store| {
             out.projected_store_lsm = lsmRetentionDiagnostics(store.snapshotMaintenanceStats());
         }
@@ -5623,10 +6287,8 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn listProjectedTables(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_table_manager.TableRecord {
-        self.lockRuntime();
-        defer self.unlockRuntime();
-        self.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
-        defer self.catalog_validation_mutex.unlock(std.Options.debug_io);
+        self.catalog_projection_reader.lock();
+        defer self.catalog_projection_reader.unlock();
         const snapshot = try self.catalogValidationSnapshotLocked();
         return try cloneProjectedTablesOwned(alloc, snapshot.tables);
     }
@@ -5743,10 +6405,8 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn listProjectedRanges(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_table_manager.RangeRecord {
-        self.lockRuntime();
-        defer self.unlockRuntime();
-        self.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
-        defer self.catalog_validation_mutex.unlock(std.Options.debug_io);
+        self.catalog_projection_reader.lock();
+        defer self.catalog_projection_reader.unlock();
         const snapshot = try self.catalogValidationSnapshotLocked();
         return try cloneProjectedRangesOwned(alloc, snapshot.ranges);
     }
@@ -6063,6 +6723,7 @@ pub const MetadataHttpService = struct {
             inputs.ranges,
             .{
                 .backend_runtime = try self.ensureBackendRuntime(),
+                .destination_authorizer = self.destination_authorizer,
             },
         );
         try self.refreshLocalRestoreProgress(group_ids, inputs.tables, inputs.ranges, inputs.restore_progresses);
@@ -6311,6 +6972,11 @@ pub const MetadataHttpService = struct {
         );
         _ = hosted_write_source.withBackendRuntime(runtime);
         _ = hosted_write_source.withSecretStore(self.secret_store);
+        _ = hosted_write_source.withInternalServiceAuth(
+            self.internal_service_secret,
+            self.internal_service_issuer,
+        );
+        _ = hosted_write_source.withDestinationAuthorization(self.destination_authorizer);
         const write_source = self.cdc_write_source_override orelse hosted_write_source.source();
         var coordinator = metadata_replication_backfill.SnapshotBackfillCoordinator{
             .alloc = self.alloc,
@@ -6321,6 +6987,7 @@ pub const MetadataHttpService = struct {
                 .write_source = write_source,
                 .secret_store = self.secret_store,
                 .work_permit = cdcWorkPermit(self),
+                .destination_authorizer = self.destination_authorizer,
             },
         };
         const summary = coordinator.runRound(self) catch |err| {
@@ -6352,6 +7019,7 @@ pub const MetadataHttpService = struct {
                 .write_source = write_source,
                 .secret_store = self.secret_store,
                 .work_permit = cdcWorkPermit(self),
+                .destination_authorizer = self.destination_authorizer,
             },
         };
         const stream_summary = streaming.runRound(self) catch |err| {
@@ -6530,6 +7198,7 @@ test "metadata service transition commands downgrade runtime repair status until
         .store_id = 1,
         .node_id = 2,
         .reporter_incarnation = 77,
+        .native_generation_restore_version = metadata_table_manager.native_generation_restore_protocol_version,
         .runtime_statuses = runtime_statuses[0..],
     };
 
@@ -6543,6 +7212,7 @@ test "metadata service transition commands downgrade runtime repair status until
     );
     try std.testing.expect(!storeHasRuntimeRepairStatus(safe_command.register_store));
     try std.testing.expectEqual(@as(u64, 0), safe_command.register_store.reporter_incarnation);
+    try std.testing.expectEqual(@as(u16, 0), safe_command.register_store.native_generation_restore_version);
     try std.testing.expect(storeHasRuntimeRepairStatus(store));
 
     var refused_downgrade: ?metadata_table_manager.StoreRecord = null;
@@ -6556,6 +7226,20 @@ test "metadata service transition commands downgrade runtime repair status until
     );
     try std.testing.expect(refused_downgrade == null);
 
+    const capability_only_store = metadata_table_manager.StoreRecord{
+        .store_id = 3,
+        .node_id = 4,
+        .native_generation_restore_version = metadata_table_manager.native_generation_restore_protocol_version,
+    };
+    try std.testing.expectError(
+        error.RuntimeStatusProtocolUnavailable,
+        runtimeStatusProtocolSafeCommand(
+            &legacy_service,
+            .{ .upsert_store = capability_only_store },
+            &refused_downgrade,
+        ),
+    );
+
     var current_service = FakeService{ .alloc = std.testing.allocator, .ready = true };
     var unexpectedly_owned: ?metadata_table_manager.StoreRecord = null;
     const current_command = try runtimeStatusProtocolSafeCommand(
@@ -6566,6 +7250,44 @@ test "metadata service transition commands downgrade runtime repair status until
     try std.testing.expect(unexpectedly_owned == null);
     try std.testing.expect(storeHasRuntimeRepairStatus(current_command.upsert_store));
     try std.testing.expectEqual(@as(u64, 77), current_command.upsert_store.reporter_incarnation);
+    try std.testing.expectEqual(
+        metadata_table_manager.native_generation_restore_protocol_version,
+        current_command.upsert_store.native_generation_restore_version,
+    );
+}
+
+test "metadata service gates mandatory native restore identity until protocol activation" {
+    const FakeService = struct {
+        alloc: std.mem.Allocator,
+        ready: bool,
+
+        fn runtimeStatusRepairProtocolReady(_: *@This()) bool {
+            return true;
+        }
+
+        fn nativeRestoreIdentityProtocolReady(self: *@This()) bool {
+            return self.ready;
+        }
+    };
+    const command: metadata_storage.TransitionCommand = .{ .upsert_restore_progress = .{
+        .table_id = 7,
+        .node_id = 9,
+        .group_id = 11,
+        .backup_id = "backup",
+        .native_manifest_size_bytes = 42,
+        .native_manifest_sha256 = "manifest-sha256",
+    } };
+    var owned_legacy_store: ?metadata_table_manager.StoreRecord = null;
+    var legacy = FakeService{ .alloc = std.testing.allocator, .ready = false };
+    try std.testing.expectError(
+        error.NativeRestoreIdentityProtocolUnavailable,
+        runtimeStatusProtocolSafeCommand(&legacy, command, &owned_legacy_store),
+    );
+    try std.testing.expect(owned_legacy_store == null);
+
+    var current = FakeService{ .alloc = std.testing.allocator, .ready = true };
+    const admitted = try runtimeStatusProtocolSafeCommand(&current, command, &owned_legacy_store);
+    try std.testing.expectEqual(@as(u64, 42), admitted.upsert_restore_progress.native_manifest_size_bytes);
 }
 
 test "metadata service defers reporter fence transitions while activation is unknown" {
@@ -7111,6 +7833,8 @@ fn restoreProgressEquivalent(a: metadata_table_manager.RestoreProgressRecord, b:
         std.mem.eql(u8, a.location, b.location) and
         std.mem.eql(u8, a.snapshot_path, b.snapshot_path) and
         std.mem.eql(u8, a.artifact_sha256, b.artifact_sha256) and
+        a.native_manifest_size_bytes == b.native_manifest_size_bytes and
+        std.mem.eql(u8, a.native_manifest_sha256, b.native_manifest_sha256) and
         a.primary_restored == b.primary_restored and
         a.runtime_repair_complete == b.runtime_repair_complete and
         std.mem.eql(u8, a.phase, b.phase) and
@@ -7197,6 +7921,8 @@ fn rangeRestoreIntentComplete(
         if (!std.mem.eql(u8, restored.location, restore_location)) return false;
         if (!std.mem.eql(u8, restored.snapshot_path, range.restore_snapshot_path)) return false;
         if (!std.mem.eql(u8, restored.artifact_sha256, range.restore_artifact_sha256)) return false;
+        if (restored.native_manifest_size_bytes != range.restore_native_manifest_size_bytes) return false;
+        if (!std.mem.eql(u8, restored.native_manifest_sha256, range.restore_native_manifest_sha256)) return false;
         if (!restored.primary_restored or !restored.runtime_repair_complete) return false;
     }
     return found_any_placement;
@@ -9515,6 +10241,8 @@ fn projectedProvisioningFingerprint(alloc: std.mem.Allocator, service: anytype) 
         hashProjectedProvisioningBytes(&hasher, range.restore_connection);
         hasher.update(std.mem.asBytes(&range.restore_artifact_size_bytes));
         hashProjectedProvisioningBytes(&hasher, range.restore_artifact_sha256);
+        hasher.update(std.mem.asBytes(&range.restore_native_manifest_size_bytes));
+        hashProjectedProvisioningBytes(&hasher, range.restore_native_manifest_sha256);
         hasher.update(&range.completed_restore_fingerprint);
     }
 
@@ -9541,11 +10269,14 @@ fn projectedProvisioningFingerprint(alloc: std.mem.Allocator, service: anytype) 
         if (intent.record.backup_restore_bootstrap) |restore| {
             hasher.update(&.{1});
             hashProjectedProvisioningBytes(&hasher, restore.backup_id);
+            hashProjectedProvisioningBytes(&hasher, restore.artifact_backup_id);
             hashProjectedProvisioningBytes(&hasher, restore.location);
             hashProjectedProvisioningBytes(&hasher, restore.snapshot_path);
             hashProjectedProvisioningBytes(&hasher, restore.connection);
             hasher.update(std.mem.asBytes(&restore.artifact_size_bytes));
             hashProjectedProvisioningBytes(&hasher, restore.artifact_sha256);
+            hasher.update(std.mem.asBytes(&restore.native_manifest_size_bytes));
+            hashProjectedProvisioningBytes(&hasher, restore.native_manifest_sha256);
         } else {
             hasher.update(&.{0});
         }
@@ -13099,6 +13830,23 @@ test "metadata service admin snapshot captures projected topology and status" {
     try std.testing.expectEqualStrings("lsn:0/16B6A50", snapshot.replication_source_statuses[0].prepared_checkpoint);
     try std.testing.expectEqualStrings("lsn:0/16B6B10", snapshot.replication_source_statuses[0].stream_checkpoint);
     try std.testing.expectEqual(@as(usize, 1), snapshot.status.repair_placement_groups);
+
+    var routing = try svc.catalogRoutingSnapshot(null);
+    defer svc.freeCatalogRoutingSnapshot(&routing);
+    try std.testing.expectEqual(@as(u64, 1973), routing.metadata_group_id);
+    try std.testing.expect(routing.metadata_incarnation != null);
+    try std.testing.expect(routing.catalog_revision > 0);
+    try std.testing.expectEqual(@as(usize, 1), routing.tables.len);
+    try std.testing.expectEqual(@as(usize, 1), routing.ranges.len);
+    try std.testing.expectEqual(@as(u64, 89), routing.tables[0].table_id);
+    try std.testing.expectEqual(@as(u64, 8901), routing.ranges[0].group_id);
+
+    svc.catalog_projection_reader.lock();
+    defer svc.catalog_projection_reader.unlock();
+    try std.testing.expectError(
+        error.CatalogRoutingSnapshotTimeout,
+        svc.catalogRoutingSnapshot(platform_time.monotonicNs() + std.time.ns_per_ms),
+    );
 }
 
 test "metadata service committed metadata changes request lifecycle reconcile hook" {
@@ -13507,8 +14255,61 @@ test "metadata http service catalog cache is independent from volatile projectio
     defer svc.freeProjectedTables(std.testing.allocator, before);
     try std.testing.expectEqual(@as(usize, 0), before.len);
     try std.testing.expectEqual(true, svc.lifecycle_listener_registered);
+
+    // Routing reads the independently published catalog projection and must
+    // not depend on the Raft runtime lock being available.
+    {
+        svc.lockRuntime();
+        defer svc.unlockRuntime();
+        var routing = try svc.catalogRoutingSnapshot(null);
+        defer svc.freeCatalogRoutingSnapshot(&routing);
+        try std.testing.expectEqual(@as(usize, 0), routing.tables.len);
+        try std.testing.expectEqual(@as(usize, 0), routing.ranges.len);
+    }
+
+    // A contended publication mutex observes the caller's routing deadline
+    // instead of extending the outer eventual-resolution timeout forever.
+    {
+        svc.catalog_projection_reader.lock();
+        defer svc.catalog_projection_reader.unlock();
+        try std.testing.expectError(
+            error.CatalogRoutingSnapshotTimeout,
+            svc.catalogRoutingSnapshot(platform_time.monotonicNs() + std.time.ns_per_ms),
+        );
+    }
+
+    const leader_status = svc.raft.host.http_host.host.raftStatus(2900) orelse return error.MissingRaftStatus;
+    try std.testing.expect(leader_status.hard.current_term > 0);
+    const receipt = try svc.proposeTransitionCommandWithReceiptInTerm(.{
+        .upsert_node = .{ .node_id = 77 },
+    }, leader_status.hard.current_term);
+    try std.testing.expectEqual(leader_status.hard.current_term, receipt.term);
+    try std.testing.expect(receipt.index > 0);
+    try svc.waitForTransitionApplied(receipt);
+    const receipt_status = svc.raft.host.http_host.host.raftStatus(2900) orelse return error.MissingRaftStatus;
+    try std.testing.expect(receipt_status.applied_index >= receipt.index);
+    const receipt_nodes = try svc.listProjectedNodes(std.testing.allocator);
+    defer svc.freeProjectedNodes(std.testing.allocator, receipt_nodes);
+    var found_receipt_node = false;
+    for (receipt_nodes) |node| {
+        if (node.node_id == 77) found_receipt_node = true;
+    }
+    try std.testing.expect(found_receipt_node);
+
+    const last_index_before_wrong_term = try store.storage().lastIndex();
+    try std.testing.expectError(error.NotLeader, svc.proposeTransitionCommandWithReceiptInTerm(.{
+        .upsert_node = .{ .node_id = 78 },
+    }, receipt.term + 1));
+    try std.testing.expectEqual(last_index_before_wrong_term, try store.storage().lastIndex());
+    const nodes_after_wrong_term = try svc.listProjectedNodes(std.testing.allocator);
+    defer svc.freeProjectedNodes(std.testing.allocator, nodes_after_wrong_term);
+    try std.testing.expectEqual(receipt_nodes.len, nodes_after_wrong_term.len);
+    for (nodes_after_wrong_term) |node| {
+        try std.testing.expect(node.node_id != 78);
+    }
+
     const catalog_epoch_before = svc.catalog_epoch.load(.acquire);
-    try std.testing.expectEqual(catalog_epoch_before, svc.catalog_validation_cache.catalog_epoch);
+    try std.testing.expectEqual(catalog_epoch_before, svc.catalog_projection_reader.cachedEpochLocked());
     try std.testing.expect(svc.projected_core_snapshot_cache.snapshot == null);
 
     const stores_before = try svc.listProjectedStores(std.testing.allocator);
@@ -13527,12 +14328,12 @@ test "metadata http service catalog cache is independent from volatile projectio
     try std.testing.expect(volatile_epoch_after > volatile_epoch_before);
     try std.testing.expect(core_epoch_after > core_epoch_before);
     try std.testing.expectEqual(catalog_epoch_before, svc.catalog_epoch.load(.acquire));
-    try std.testing.expectEqual(catalog_epoch_before, svc.catalog_validation_cache.catalog_epoch);
+    try std.testing.expectEqual(catalog_epoch_before, svc.catalog_projection_reader.cachedEpochLocked());
 
     const after_store_signal = try svc.listProjectedTables(std.testing.allocator);
     defer svc.freeProjectedTables(std.testing.allocator, after_store_signal);
     try std.testing.expectEqual(@as(usize, 0), after_store_signal.len);
-    try std.testing.expectEqual(catalog_epoch_before, svc.catalog_validation_cache.catalog_epoch);
+    try std.testing.expectEqual(catalog_epoch_before, svc.catalog_projection_reader.cachedEpochLocked());
     try std.testing.expect(svc.projected_core_snapshot_cache.core_epoch < core_epoch_after);
 
     const stores_after = try svc.listProjectedStores(std.testing.allocator);
@@ -13547,14 +14348,14 @@ test "metadata http service catalog cache is independent from volatile projectio
     });
     const catalog_epoch_after = svc.catalog_epoch.load(.acquire);
     try std.testing.expect(catalog_epoch_after > catalog_epoch_before);
-    try std.testing.expect(svc.catalog_validation_cache.catalog_epoch < catalog_epoch_after);
+    try std.testing.expect(svc.catalog_projection_reader.cachedEpochLocked() < catalog_epoch_after);
     try std.testing.expectEqual(core_epoch_after, svc.projected_core_epoch.load(.acquire));
     try std.testing.expectEqual(core_epoch_after, svc.projected_core_snapshot_cache.core_epoch);
 
     const after = try svc.listProjectedTables(std.testing.allocator);
     defer svc.freeProjectedTables(std.testing.allocator, after);
     try std.testing.expectEqual(@as(usize, 0), after.len);
-    try std.testing.expectEqual(catalog_epoch_after, svc.catalog_validation_cache.catalog_epoch);
+    try std.testing.expectEqual(catalog_epoch_after, svc.catalog_projection_reader.cachedEpochLocked());
 
     var incarnation_rounds: usize = 0;
     while (try svc.metadataIncarnation() == null and incarnation_rounds < 32) : (incarnation_rounds += 1) {

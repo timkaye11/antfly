@@ -65,9 +65,12 @@ const export_source_mod = @import("../models/export_source.zig");
 const gguf_mod = @import("../gguf/root.zig");
 const c_file = @import("../util/c_file.zig");
 const runtime = @import("../runtime/root.zig");
+const backend_contracts = @import("../graph/backend_contracts.zig");
+const gemma4_runtime = @import("gemma4_runtime.zig");
 const cuda_load_plan = @import("../ops/cuda/load_plan.zig");
 
 const cuda_compute_mod = if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig") else struct {};
+const a4b_prepared_pack_mod = @import("../ops/cuda/a4b_prepared_pack.zig");
 pub const CudaRuntimeStats = if (build_options.enable_cuda) cuda_compute_mod.RuntimeStats else void;
 const CudaCapabilityProfile = if (build_options.enable_cuda) cuda_compute_mod.CapabilityProfile else enum {
     clipclap,
@@ -454,6 +457,9 @@ pub const GgufInspectionReport = struct {
     missing_required_tensors: [][]const u8 = &.{},
     unmapped_tensor_names: [][]const u8 = &.{},
     packed_moe_expert_tensors: [][]const u8 = &.{},
+    packed_moe_expert_tensor_count: usize = 0,
+    packed_moe_q4_0_tensor_count: usize = 0,
+    a4b_packed_expert_layout_qualified: bool = false,
 
     pub fn deinit(self: *GgufInspectionReport) void {
         self.allocator.free(self.architecture);
@@ -471,6 +477,54 @@ pub const GgufInspectionReport = struct {
         self.allocator.free(self.packed_moe_expert_tensors);
     }
 };
+
+fn qualifiedA4bArtifact(report: GgufInspectionReport) bool {
+    const config = report.gpt_config orelse return false;
+    if (!gemma4_runtime.isQualifiedA4bArchitecture(config)) return false;
+    return report.a4b_packed_expert_layout_qualified and
+        report.packed_moe_expert_tensor_count == report.packed_moe_q4_0_tensor_count and
+        report.missing_required_tensors.len == 0;
+}
+
+pub fn resolveA4bInferenceConfigForModelListing(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    manifest: manifest_mod.ModelManifest,
+    request: ?backend_contracts.A4bInferenceRequest,
+) !?backend_contracts.A4bInferenceConfig {
+    var report_opt = try inspectGgufModelForListing(allocator, model_path, manifest);
+    defer if (report_opt) |*report| report.deinit();
+    const report = report_opt orelse {
+        if (request != null) return error.A4bUnsupportedArtifact;
+        return null;
+    };
+    const config = report.gpt_config orelse {
+        if (request != null) return error.A4bUnsupportedGeometry;
+        return null;
+    };
+    return resolveA4bGptInferenceConfig(config, request, qualifiedA4bArtifact(report));
+}
+
+/// Resolve the qualified CUDA policy once for every caller that must agree on
+/// its resident envelope (resource admission, CLI preflight, and construction).
+pub fn resolveCudaA4bInferenceConfigForModelListing(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    manifest: manifest_mod.ModelManifest,
+    request: ?backend_contracts.A4bInferenceRequest,
+) !?backend_contracts.A4bInferenceConfig {
+    var report_opt = try inspectGgufModelForListing(allocator, model_path, manifest);
+    defer if (report_opt) |*report| report.deinit();
+    const report = report_opt orelse {
+        if (request != null) return error.A4bUnsupportedArtifact;
+        return null;
+    };
+    const config = report.gpt_config orelse {
+        if (request != null) return error.A4bUnsupportedGeometry;
+        return null;
+    };
+    return resolveCudaA4bGptInferenceConfig(config, request, qualifiedA4bArtifact(report));
+}
 
 pub fn inspectGgufModel(allocator: std.mem.Allocator, model_path: []const u8) !?GgufInspectionReport {
     var mf = try manifest_mod.loadFromDir(allocator, model_path);
@@ -494,6 +548,10 @@ pub fn inspectGgufModelForListing(
     const gguf_path = mf.gguf_path.?;
     var mapped = try c_file.MmapRegion.init(allocator, gguf_path);
     defer mapped.deinit();
+    // Listing inspection touches metadata only. Evicting the entire backing
+    // file on close would destroy an intentionally warmed checkpoint before
+    // the production CUDA loader gets to consume it.
+    mapped.preserveFileCacheOnDeinit();
 
     var file = try gguf_mod.format.parseStructure(allocator, mapped.data);
     defer file.deinit(allocator);
@@ -1086,7 +1144,31 @@ pub fn createMetalSessionWithKernelJitAndLoadContext(
     config: kernel_jit.Config,
     load_context: kernel_jit.LoadContext,
 ) !Session {
-    return createMetalSessionWithTaskOverrideAndKernelJitAndLoadContext(allocator, model_path, null, config, load_context);
+    return createMetalSessionWithKernelJitAndLoadContextAndA4bRequest(
+        allocator,
+        model_path,
+        config,
+        load_context,
+        null,
+    );
+}
+
+pub fn createMetalSessionWithKernelJitAndLoadContextAndA4bRequest(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    config: kernel_jit.Config,
+    load_context: kernel_jit.LoadContext,
+    a4b_request: ?backend_contracts.A4bInferenceRequest,
+) !Session {
+    return createGpuHostedSessionWithTaskOverride(
+        allocator,
+        model_path,
+        null,
+        .metal,
+        config,
+        load_context,
+        a4b_request,
+    );
 }
 
 pub fn createMetalSessionWithTaskOverrideAndKernelJit(
@@ -1105,7 +1187,7 @@ pub fn createMetalSessionWithTaskOverrideAndKernelJitAndLoadContext(
     config: kernel_jit.Config,
     load_context: kernel_jit.LoadContext,
 ) !Session {
-    return createGpuHostedSessionWithTaskOverride(allocator, model_path, override, .metal, config, load_context);
+    return createGpuHostedSessionWithTaskOverride(allocator, model_path, override, .metal, config, load_context, null);
 }
 
 pub fn createCudaSession(allocator: std.mem.Allocator, model_path: []const u8) !Session {
@@ -1130,12 +1212,29 @@ pub fn createCudaSessionWithKernelJitAndLoadContext(
     config: kernel_jit.Config,
     load_context: kernel_jit.LoadContext,
 ) !Session {
+    return createCudaSessionWithKernelJitAndLoadContextAndA4bRequest(
+        allocator,
+        model_path,
+        config,
+        load_context,
+        null,
+    );
+}
+
+pub fn createCudaSessionWithKernelJitAndLoadContextAndA4bRequest(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    config: kernel_jit.Config,
+    load_context: kernel_jit.LoadContext,
+    a4b_request: ?backend_contracts.A4bInferenceRequest,
+) !Session {
     return createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
         allocator,
         model_path,
         null,
         config,
         load_context,
+        a4b_request,
     );
 }
 
@@ -1151,7 +1250,61 @@ pub fn createCudaSessionWithTaskOverrideAndKernelJit(
         override,
         config,
         .dynamic,
+        null,
     );
+}
+
+const CudaResidentUpload = struct {
+    key: []const u8,
+    loaded: *const LoadedWeight,
+    mmap_bytes: ?[]const u8,
+    mmap_base: ?usize,
+    mmap_offset: ?usize,
+};
+
+fn loadedWeightMmapSpan(loaded: *const LoadedWeight) ?struct { bytes: []const u8, base: usize, offset: usize } {
+    if (loaded.quantized_storage) |storage| {
+        if (storage.raw_mmap_backed) {
+            if (storage.raw_mmap_source_bytes) |full| {
+                if (c_file.mappedSliceOffset(full, storage.raw_bytes)) |offset| {
+                    return .{ .bytes = storage.raw_bytes, .base = @intFromPtr(full.ptr), .offset = offset };
+                }
+            }
+        }
+    }
+    if (loaded.tensor.mmap_source_bytes) |full| {
+        if (c_file.mappedSliceOffset(full, loaded.tensor.data)) |offset| {
+            return .{ .bytes = loaded.tensor.data, .base = @intFromPtr(full.ptr), .offset = offset };
+        }
+    }
+    return null;
+}
+
+fn cudaResidentUploadLessThan(_: void, lhs: CudaResidentUpload, rhs: CudaResidentUpload) bool {
+    if (lhs.mmap_offset) |lhs_offset| {
+        if (rhs.mmap_offset) |rhs_offset| {
+            const lhs_base = lhs.mmap_base.?;
+            const rhs_base = rhs.mmap_base.?;
+            if (lhs_base != rhs_base) return lhs_base < rhs_base;
+            if (lhs_offset != rhs_offset) return lhs_offset < rhs_offset;
+        } else return true;
+    } else if (rhs.mmap_offset != null) return false;
+    return std.mem.lessThan(u8, lhs.key, rhs.key);
+}
+
+test "CUDA resident uploads follow mmap offsets before heap weights" {
+    var mapped: [64]u8 = @splat(0);
+    var loaded: LoadedWeight = undefined;
+    const base = @intFromPtr(mapped[0..].ptr);
+    var uploads = [_]CudaResidentUpload{
+        .{ .key = "heap", .loaded = &loaded, .mmap_bytes = null, .mmap_base = null, .mmap_offset = null },
+        .{ .key = "later", .loaded = &loaded, .mmap_bytes = mapped[40..48], .mmap_base = base, .mmap_offset = 40 },
+        .{ .key = "earlier", .loaded = &loaded, .mmap_bytes = mapped[8..16], .mmap_base = base, .mmap_offset = 8 },
+    };
+    std.mem.sort(CudaResidentUpload, &uploads, {}, cudaResidentUploadLessThan);
+    try std.testing.expectEqualStrings("earlier", uploads[0].key);
+    try std.testing.expectEqualStrings("later", uploads[1].key);
+    try std.testing.expectEqualStrings("heap", uploads[2].key);
 }
 
 pub fn createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
@@ -1160,11 +1313,58 @@ pub fn createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
     override: ?TaskOverride,
     config: kernel_jit.Config,
     load_context: kernel_jit.LoadContext,
+    a4b_request: ?backend_contracts.A4bInferenceRequest,
 ) !Session {
     if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
     try config.validate();
     if (config.mode.failClosed() and !load_context.allowsQualification()) {
         return error.KernelJitRequiredDynamicLoad;
+    }
+
+    var model_manifest = try manifest_mod.loadFromDir(allocator, model_path);
+    defer model_manifest.deinit();
+    const a4b_inference = try resolveCudaA4bInferenceConfigForModelListing(
+        allocator,
+        model_path,
+        model_manifest,
+        a4b_request,
+    );
+    if (a4b_inference) |a4b| {
+        if (a4b.residency_mode != .resident)
+            return error.A4bCudaStreamingUnsupported;
+
+        // Required, stale, and malformed deployment packs fail before native
+        // session construction or any CUDA allocation. The hot loader later
+        // checks its exact source inventory against the canonical GGUF catalog.
+        if (a4b.prepared_pack != .off) {
+            const source_artifact_path = model_manifest.gguf_path orelse
+                return error.A4bCudaPackedStoreUnavailable;
+            const installed = a4b_prepared_pack_mod.preflightInstalled(
+                allocator,
+                model_path,
+                source_artifact_path,
+                .{
+                    .moe_layer_count = a4b.geometry.moe_layer_count,
+                    .expert_count = a4b.geometry.expert_count,
+                    .top_k = a4b.geometry.top_k,
+                    .hidden_size = a4b.geometry.hidden_size,
+                    .expert_intermediate_size = a4b.geometry.expert_intermediate_size,
+                    .encoded_expert_bytes = a4b.geometry.encoded_expert_bytes,
+                },
+            ) catch |err| switch (a4b.prepared_pack) {
+                .auto => blk: {
+                    std.log.warn(
+                        "cuda_a4b: ignoring unusable optional prepared pack during early preflight error={s}; using canonical GGUF",
+                        .{@errorName(err)},
+                    );
+                    break :blk false;
+                },
+                .required => return err,
+                .off => unreachable,
+            };
+            if (!installed and a4b.prepared_pack == .required)
+                return error.A4bPreparedPackRequired;
+        }
     }
 
     const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
@@ -1174,6 +1374,15 @@ pub fn createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
     if (debug_cuda_session) std.log.info("cuda-session: create native session done path={s}", .{model_path});
     const native_impl: *ArchSession = @ptrCast(@alignCast(native_session.ptr));
     if (native_impl.backend_type != .native) return error.InvalidBackend;
+    if (a4b_inference) |a4b| {
+        try cuda_compute_mod.CudaCompute.preflightA4bPreparedPackInventory(
+            allocator,
+            &native_impl.backend_data.native,
+            a4b,
+            model_path,
+            model_manifest.gguf_path orelse return error.A4bCudaPackedStoreUnavailable,
+        );
+    }
     const cuda_profile = cudaProfileForArch(native_impl.arch_config) orelse return error.UnsupportedCudaArchitecture;
     const jit_scope = cuda_compute_mod.kernelJitRouteScopeForLoadedWeights(
         cuda_profile,
@@ -1193,17 +1402,70 @@ pub fn createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
 
     if (debug_cuda_session) std.log.info("cuda-session: require profile {s}", .{@tagName(cuda_profile)});
     try cuda_compute.requireProfile(cuda_profile);
+    if (a4b_inference != null and
+        (cuda_compute.ctx.info.compute_major != 8 or cuda_compute.ctx.info.compute_minor != 9))
+    {
+        return error.A4bCudaUnsupportedDevice;
+    }
+    cuda_compute.a4b_inference = a4b_inference;
+    var resident_uploads: std.ArrayListUnmanaged(CudaResidentUpload) = .empty;
+    defer resident_uploads.deinit(allocator);
     var it = native_impl.backend_data.native.resident_weights.iterator();
-    var resident_count: usize = 0;
     while (it.next()) |entry| {
-        const owned_key = try allocator.dupe(u8, entry.key_ptr.*);
-        cuda_compute.insertWeightFromLoaded(owned_key, entry.value_ptr) catch |err| {
+        const span = loadedWeightMmapSpan(entry.value_ptr);
+        try resident_uploads.append(allocator, .{
+            .key = entry.key_ptr.*,
+            .loaded = entry.value_ptr,
+            .mmap_bytes = if (span) |mapped| mapped.bytes else null,
+            .mmap_base = if (span) |mapped| mapped.base else null,
+            .mmap_offset = if (span) |mapped| mapped.offset else null,
+        });
+    }
+    std.mem.sort(CudaResidentUpload, resident_uploads.items, {}, cudaResidentUploadLessThan);
+    const dense_upload_start_ns = platform.time.monotonicNs();
+    var dense_mmap_weight_count: usize = 0;
+    if (a4b_inference != null) {
+        for (resident_uploads.items) |upload| {
+            if (upload.mmap_offset != null) dense_mmap_weight_count += 1;
+        }
+        std.log.info("cuda_a4b: dense upload start weights={d} mmap_weights={d} access=offset_sorted_sequential", .{
+            resident_uploads.items.len,
+            dense_mmap_weight_count,
+        });
+    }
+    for (resident_uploads.items) |upload| {
+        if (upload.mmap_bytes) |bytes| c_file.MmapRegion.adviseBytesSequential(bytes);
+        const owned_key = try allocator.dupe(u8, upload.key);
+        cuda_compute.insertWeightFromLoaded(owned_key, upload.loaded) catch |err| {
             allocator.free(owned_key);
             return err;
         };
-        resident_count += 1;
     }
-    if (debug_cuda_session) std.log.info("cuda-session: uploaded resident weights count={d}", .{resident_count});
+    if (a4b_inference != null) {
+        cuda_compute.noteA4bDenseUpload(
+            platform.time.monotonicNs() -| dense_upload_start_ns,
+            resident_uploads.items.len,
+            dense_mmap_weight_count,
+        );
+        std.log.info("cuda_a4b: dense upload complete weights={d} elapsed_ms={d}", .{
+            resident_uploads.items.len,
+            (platform.time.monotonicNs() -| dense_upload_start_ns) / std.time.ns_per_ms,
+        });
+    }
+    if (a4b_inference != null) {
+        try cuda_compute.loadA4bResidentFromHostStore(
+            &native_impl.backend_data.native,
+            model_path,
+            model_manifest.gguf_path orelse return error.A4bCudaPackedStoreUnavailable,
+        );
+        if (!a4b_inference.?.drop_host_cache_after_load) {
+            if (native_impl.backend_data.native.tensor_store) |store| {
+                store.preserveFileCacheOnDeinit();
+                std.log.info("cuda_a4b: retaining clean checkpoint pages for shared-cache reloads", .{});
+            }
+        }
+    }
+    if (debug_cuda_session) std.log.info("cuda-session: uploaded resident weights count={d}", .{resident_uploads.items.len});
     const upload_stats = cuda_compute.snapshotStats();
     if (upload_stats.bf16_mirror_weight_count > 0) {
         // The default-on prefill mirrors trade device memory for cuBLASLt
@@ -1226,6 +1488,78 @@ pub fn createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
     };
     if (debug_cuda_session) std.log.info("cuda-session: return session path={s}", .{model_path});
     return .{ .ptr = impl, .vtable = &arch_vtable };
+}
+
+/// Materialize the immutable, pre-sharded expert payload consumed by the A4B
+/// CUDA admission fast path. This deliberately uses the normal native model
+/// loader to inherit the same catalog normalization and packed-source
+/// validation as production admission; it does not require a CUDA device.
+pub fn writeCudaA4bPreparedPack(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model_path: []const u8,
+    output_path: []const u8,
+    shard_count: u8,
+) !a4b_prepared_pack_mod.WriteReport {
+    if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+    var model_manifest = try manifest_mod.loadFromDir(allocator, model_path);
+    defer model_manifest.deinit();
+    const source_artifact_path = model_manifest.gguf_path orelse return error.A4bCudaPackedStoreUnavailable;
+    const config = (try resolveA4bInferenceConfigForModelListing(
+        allocator,
+        model_path,
+        model_manifest,
+        .{
+            .residency_mode = .resident,
+            .memory_budget_mb = backend_contracts.qualified_cuda_a4b_memory_budget_mb,
+            .prepared_pack = .off,
+        },
+    )) orelse return error.A4bUnsupportedGeometry;
+    var native_session = try createNativeSessionWithTaskOverride(allocator, model_path, null);
+    defer native_session.close();
+    const native_impl: *ArchSession = @ptrCast(@alignCast(native_session.ptr));
+    if (native_impl.backend_type != .native) return error.InvalidBackend;
+    return cuda_compute_mod.CudaCompute.writeA4bPreparedPack(
+        allocator,
+        io,
+        &native_impl.backend_data.native,
+        config,
+        source_artifact_path,
+        output_path,
+        shard_count,
+    );
+}
+
+pub fn verifyCudaA4bPreparedPack(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+) !a4b_prepared_pack_mod.VerifyReport {
+    var model_manifest = try manifest_mod.loadFromDir(allocator, model_path);
+    defer model_manifest.deinit();
+    const source_artifact_path = model_manifest.gguf_path orelse return error.A4bCudaPackedStoreUnavailable;
+    const config = (try resolveA4bInferenceConfigForModelListing(
+        allocator,
+        model_path,
+        model_manifest,
+        .{
+            .residency_mode = .resident,
+            .memory_budget_mb = backend_contracts.qualified_cuda_a4b_memory_budget_mb,
+            .prepared_pack = .off,
+        },
+    )) orelse return error.A4bUnsupportedGeometry;
+    return a4b_prepared_pack_mod.verify(
+        allocator,
+        model_path,
+        source_artifact_path,
+        .{
+            .moe_layer_count = config.geometry.moe_layer_count,
+            .expert_count = config.geometry.expert_count,
+            .top_k = config.geometry.top_k,
+            .hidden_size = config.geometry.hidden_size,
+            .expert_intermediate_size = config.geometry.expert_intermediate_size,
+            .encoded_expert_bytes = config.geometry.encoded_expert_bytes,
+        },
+    );
 }
 
 fn cudaSupportsArch(arch_config: ArchConfig) bool {
@@ -1411,6 +1745,7 @@ fn createGpuHostedSessionWithTaskOverride(
     backend_type: BackendType,
     kernel_jit_config: kernel_jit.Config,
     kernel_jit_load_context: kernel_jit.LoadContext,
+    a4b_request: ?backend_contracts.A4bInferenceRequest,
 ) !Session {
     try kernel_jit_config.validate();
     try metal_runtime.validateMetalJitLoadContext(kernel_jit_config, kernel_jit_load_context);
@@ -1428,6 +1763,7 @@ fn createGpuHostedSessionWithTaskOverride(
     var metal_jit_scope: MetalJitRouteScope = if (build_options.enable_metal)
         metal_runtime.MetalJitRouteScope.none()
     else {};
+    var a4b_artifact_qualified = false;
     if (mf.usesGgufWeights()) {
         var report_opt = try inspectGgufModel(allocator, model_path);
         defer if (report_opt) |*report| report.deinit();
@@ -1435,8 +1771,28 @@ fn createGpuHostedSessionWithTaskOverride(
             try ensureGgufInspectionCompatible(report, mf.gguf_path.?);
             if (backend_type == .metal) {
                 try ensureMetalGgufInspectionCompatible(report, mf.gguf_path.?);
+                a4b_artifact_qualified = qualifiedA4bArtifact(report);
             }
         }
+    }
+
+    const a4b_inference = try resolveA4bInferenceConfig(
+        arch_config,
+        a4b_request,
+        a4b_artifact_qualified,
+    );
+    if (a4b_inference) |config| {
+        std.log.info(
+            "gemma4_a4b_runtime: mode={s} budget_mb={d} kv_mb={d} safety_mb={d} expert_slots={d} model={s}",
+            .{
+                @tagName(config.residency_mode),
+                config.memory_budget_bytes / (1024 * 1024),
+                config.kv_budget_bytes / (1024 * 1024),
+                config.safety_reserve_bytes / (1024 * 1024),
+                config.expert_cache_slots,
+                model_path,
+            },
+        );
     }
 
     var lazy_weights = std.StringHashMapUnmanaged(gpu_hosted_store_mod.LazyWeightEntry){};
@@ -1458,7 +1814,10 @@ fn createGpuHostedSessionWithTaskOverride(
 
     var eager_dense = false;
     const resident_weight_bytes_override: usize = 0;
-    const budget_policy = gpuHostedBudgetPolicy(backend_type, model_weight_bytes, mf, arch_config, quant_mode);
+    const budget_policy = if (a4b_inference) |config|
+        a4bGpuHostedBudgetPolicy(config)
+    else
+        gpuHostedBudgetPolicy(backend_type, model_weight_bytes, mf, arch_config, quant_mode);
     const prefer_f32_dense_tensors = budget_policy.prefer_f32_dense_tensors;
     const budget_floor = budget_policy.budget_floor;
     const shared_cache_floor = budget_policy.shared_cache_floor;
@@ -1557,7 +1916,10 @@ fn createGpuHostedSessionWithTaskOverride(
         else => 0,
     };
     const residency = if (lazy_weights.count() > 0 and moe_num_experts > 0)
-        runtime.moe.residency.SharedResidency.init(allocator, defaultResidentExpertsPerLayer(arch_config))
+        runtime.moe.residency.SharedResidency.init(
+            allocator,
+            if (a4b_inference) |config| config.expert_cache_slots else defaultResidentExpertsPerLayer(arch_config),
+        )
     else
         null;
     const tier_cache = if (lazy_weights.count() > 0) blk: {
@@ -1620,6 +1982,7 @@ fn createGpuHostedSessionWithTaskOverride(
             .lazy_weights = lazy_weights,
             .tensor_store = tensor_store,
             .moe_num_experts = @intCast(moe_num_experts),
+            .a4b_inference = a4b_inference,
             .residency = residency,
             .tier_cache = tier_cache,
             .allow_direct_quant = direct_quant_enabled,
@@ -2188,6 +2551,14 @@ fn buildGgufInspectionReportFromFile(
         normalized_names.deinit(allocator);
     }
     try collectNormalizedGgufNames(allocator, arch_config, file, &normalized_names, &unmapped, &packed_moe);
+    for (file.tensors) |tensor| {
+        if (!isPackedMoeExpertTensor(tensor.name)) continue;
+        report.packed_moe_expert_tensor_count += 1;
+        if (std.meta.eql(tensor.tensor_type, gguf_mod.tensor_types.TensorType{ .known = .Q4_0 })) {
+            report.packed_moe_q4_0_tensor_count += 1;
+        }
+    }
+    report.a4b_packed_expert_layout_qualified = qualifiedA4bPackedExpertLayout(arch_config, file);
 
     switch (arch_config) {
         .gpt => |cfg| try collectMissingRequiredGptWeights(allocator, cfg, &normalized_names, &missing, packed_moe.items.len > 0),
@@ -2550,6 +2921,54 @@ fn isPackedMoeExpertTensor(raw_name: []const u8) bool {
         std.mem.endsWith(u8, raw_name, ".ffn_down_exps.weight") or
         std.mem.endsWith(u8, raw_name, ".ffn_up_exps.weight") or
         std.mem.endsWith(u8, raw_name, ".ffn_gate_up_exps.weight");
+}
+
+/// Require one unambiguous Q4_0 routed-expert layout per A4B layer. GGUF may
+/// encode gate/up as two tensors or as one interleaved gate_up tensor; mixing
+/// both representations in a layer would make lazy weight registration order
+/// dependent and is rejected.
+fn qualifiedA4bPackedExpertLayout(arch_config: ArchConfig, file: *const gguf_mod.format.File) bool {
+    const config = switch (arch_config) {
+        .gpt => |cfg| cfg,
+        else => return false,
+    };
+    if (!gemma4_runtime.isQualifiedA4bArchitecture(config)) return false;
+
+    const layer_count = backend_contracts.qualified_a4b_geometries[0].moe_layer_count;
+    var layer_masks: [layer_count]u8 = @splat(0);
+    for (file.tensors) |tensor| {
+        const packed_tensor = parsePackedMoeTensor(tensor.name) orelse continue;
+        if (packed_tensor.layer >= layer_masks.len) return false;
+        if (!std.meta.eql(tensor.tensor_type, gguf_mod.tensor_types.TensorType{ .known = .Q4_0 })) return false;
+        if (tensor.dimensions.len != 3 or
+            tensor.dimensions[2] != @as(u64, @intCast(config.num_local_experts))) return false;
+        const bit: u8 = if (packed_tensor.fused_gate_up) blk: {
+            if (tensor.dimensions[0] != config.hidden_size or
+                tensor.dimensions[1] != @as(u64, config.expertIntermediateSize()) * 2) return false;
+            break :blk 1 << 3;
+        } else if (std.mem.eql(u8, packed_tensor.proj, "w1")) blk: {
+            if (tensor.dimensions[0] != config.hidden_size or
+                tensor.dimensions[1] != config.expertIntermediateSize()) return false;
+            break :blk 1 << 0;
+        } else if (std.mem.eql(u8, packed_tensor.proj, "w2")) blk: {
+            if (tensor.dimensions[0] != config.expertIntermediateSize() or
+                tensor.dimensions[1] != config.hidden_size) return false;
+            break :blk 1 << 1;
+        } else if (std.mem.eql(u8, packed_tensor.proj, "w3")) blk: {
+            if (tensor.dimensions[0] != config.hidden_size or
+                tensor.dimensions[1] != config.expertIntermediateSize()) return false;
+            break :blk 1 << 2;
+        } else return false;
+        if (layer_masks[packed_tensor.layer] & bit != 0) return false;
+        layer_masks[packed_tensor.layer] |= bit;
+    }
+
+    const separate_gate_up: u8 = (1 << 0) | (1 << 1) | (1 << 2);
+    const fused_gate_up: u8 = (1 << 1) | (1 << 3);
+    for (layer_masks) |mask| {
+        if (mask != separate_gate_up and mask != fused_gate_up) return false;
+    }
+    return true;
 }
 
 fn appendMissingFmt(
@@ -3696,6 +4115,7 @@ test "Metal JIT scope discovers quantized weights in a secondary GGUF store" {
             .loadTensorRef = @ptrCast(&loadTensorRefImpl),
             .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
             .discardTensorFileCache = @ptrCast(&discardTensorFileCacheImpl),
+            .preserveFileCacheOnDeinit = @ptrCast(&preserveFileCacheOnDeinitImpl),
             .ggufFile = @ptrCast(&ggufFileImpl),
             .deinit = @ptrCast(&deinitSelf),
         };
@@ -3746,6 +4166,7 @@ test "Metal JIT scope discovers quantized weights in a secondary GGUF store" {
         }
 
         fn discardTensorFileCacheImpl(_: *@This(), _: []const u8) void {}
+        fn preserveFileCacheOnDeinitImpl(_: *@This()) void {}
 
         fn ggufFileImpl(self: *@This()) ?*const gguf_mod.format.File {
             return &self.encoder_file;
@@ -3878,6 +4299,53 @@ fn defaultResidentExpertsPerLayer(arch_config: ArchConfig) usize {
     };
 }
 
+fn resolveA4bInferenceConfig(
+    arch_config: ArchConfig,
+    request: ?backend_contracts.A4bInferenceRequest,
+    artifact_qualified: bool,
+) !?backend_contracts.A4bInferenceConfig {
+    const gpt_config = switch (arch_config) {
+        .gpt => |config| config,
+        else => {
+            if (request != null) return error.A4bUnsupportedGeometry;
+            return null;
+        },
+    };
+    return resolveA4bGptInferenceConfig(gpt_config, request, artifact_qualified);
+}
+
+fn resolveA4bGptInferenceConfig(
+    gpt_config: gpt_mod.Config,
+    request: ?backend_contracts.A4bInferenceRequest,
+    artifact_qualified: bool,
+) !?backend_contracts.A4bInferenceConfig {
+    if (!gemma4_runtime.isQualifiedA4bArchitecture(gpt_config)) {
+        if (request != null) return error.A4bUnsupportedGeometry;
+        return null;
+    }
+    if (!artifact_qualified) {
+        if (request != null) return error.A4bUnsupportedArtifact;
+        return null;
+    }
+    return try backend_contracts.buildA4bInferenceConfig(
+        request orelse .{},
+        backend_contracts.qualified_a4b_geometries[0],
+    );
+}
+
+fn resolveCudaA4bGptInferenceConfig(
+    gpt_config: gpt_mod.Config,
+    request: ?backend_contracts.A4bInferenceRequest,
+    artifact_qualified: bool,
+) !?backend_contracts.A4bInferenceConfig {
+    const detected = (try resolveA4bGptInferenceConfig(
+        gpt_config,
+        request,
+        artifact_qualified,
+    )) orelse return null;
+    return try backend_contracts.buildCudaA4bInferenceConfig(request, detected.geometry);
+}
+
 fn shouldRetainTensorStore(store_kind: tensor_store_mod.StoreKind, lazy_weight_count: usize) bool {
     // Safetensors stores mmap weights and resident tensors may borrow those
     // buffers directly, so the store must live for the entire session.
@@ -3986,6 +4454,90 @@ test "gpu-hosted Metal availability gate agrees with linked runtime probe" {
     try ensureMetalHostedSessionAvailable();
 }
 
+test "A4B artifact qualification requires the complete Q4_0 expert set" {
+    var report = GgufInspectionReport{
+        .allocator = std.testing.allocator,
+        .architecture = "gemma4",
+        .tensor_count = 90,
+        .metadata_count = 0,
+        .gpt_config = .{
+            .family = .gemma,
+            .hidden_size = 2816,
+            .num_hidden_layers = 30,
+            .num_local_experts = 128,
+            .num_experts_per_tok = 8,
+            .num_shared_experts = 1,
+            .expert_intermediate_size = 704,
+        },
+        .packed_moe_expert_tensor_count = 60,
+        .packed_moe_q4_0_tensor_count = 60,
+        .a4b_packed_expert_layout_qualified = true,
+    };
+    try std.testing.expect(qualifiedA4bArtifact(report));
+    report.packed_moe_q4_0_tensor_count -= 1;
+    try std.testing.expect(!qualifiedA4bArtifact(report));
+}
+
+test "A4B geometry does not opt an unqualified artifact into A4B inference" {
+    const matching_geometry = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 2816,
+        .num_hidden_layers = 30,
+        .num_local_experts = 128,
+        .num_experts_per_tok = 8,
+        .num_shared_experts = 1,
+        .expert_intermediate_size = 704,
+    };
+
+    try std.testing.expect((try resolveA4bGptInferenceConfig(
+        matching_geometry,
+        null,
+        false,
+    )) == null);
+    try std.testing.expectError(error.A4bUnsupportedArtifact, resolveA4bGptInferenceConfig(
+        matching_geometry,
+        .{},
+        false,
+    ));
+    try std.testing.expect((try resolveA4bGptInferenceConfig(
+        matching_geometry,
+        null,
+        true,
+    )) != null);
+
+    const cuda_default = (try resolveCudaA4bGptInferenceConfig(
+        matching_geometry,
+        null,
+        true,
+    )).?;
+    try std.testing.expectEqual(backend_contracts.A4bResidencyMode.resident, cuda_default.residency_mode);
+    try std.testing.expectEqual(
+        @as(u64, backend_contracts.qualified_cuda_a4b_memory_budget_mb) * 1024 * 1024,
+        cuda_default.memory_budget_bytes,
+    );
+}
+
+test "A4B configured GGUF passes metadata-only production qualification" {
+    const model_path = platform.env.getenv("ANTFLY_INFERENCE_GEMMA4_A4B_TEST_MODEL") orelse
+        return error.SkipZigTest;
+    var manifest = try manifest_mod.loadListingFromDir(std.testing.allocator, model_path);
+    defer manifest.deinit();
+
+    const config = try resolveA4bInferenceConfigForModelListing(
+        std.testing.allocator,
+        model_path,
+        manifest,
+        .{
+            .residency_mode = .streamed,
+            .memory_budget_mb = 2048,
+        },
+    );
+    const qualified = config orelse return error.A4bUnsupportedArtifact;
+    try std.testing.expectEqual(backend_contracts.A4bResidencyMode.streamed, qualified.residency_mode);
+    try std.testing.expectEqual(@as(u64, 2 * 1024 * 1024 * 1024), qualified.memory_budget_bytes);
+    try std.testing.expectEqual(@as(u8, 8), qualified.expert_cache_slots);
+}
+
 fn openMetalHostedStream() !GpuHostedStream {
     try ensureMetalHostedSessionAvailable();
     if (comptime false) {
@@ -4000,6 +4552,31 @@ const GpuHostedBudgetPolicy = struct {
     plan_context: runtime.tier.planner.PlanContext,
     prefer_f32_dense_tensors: bool,
 };
+
+fn a4bGpuHostedBudgetPolicy(config: backend_contracts.A4bInferenceConfig) GpuHostedBudgetPolicy {
+    const budget: usize = @intCast(config.memory_budget_bytes);
+    const kv: usize = @intCast(config.kv_budget_bytes);
+    const scratch: usize = @intCast(config.safety_reserve_bytes);
+    const weights = budget -| kv -| scratch;
+    return .{
+        .budget_floor = .{
+            .backend_limit_bytes = budget,
+            .combined_limit_bytes = budget,
+            .kv_limit_bytes = kv,
+            .scratch_limit_bytes = scratch,
+        },
+        .shared_cache_floor = .{
+            .host_limit_bytes = weights,
+            .backend_limit_bytes = weights,
+        },
+        .plan_context = .{
+            .backend = .gpu,
+            .host_budget_bytes = weights,
+            .backend_budget_bytes = weights,
+        },
+        .prefer_f32_dense_tensors = false,
+    };
+}
 
 fn gpuHostedBudgetPolicy(
     backend_type: BackendType,
@@ -4132,6 +4709,7 @@ const GpuHostedBackendInit = struct {
     lazy_weights: std.StringHashMapUnmanaged(gpu_hosted_store_mod.LazyWeightEntry),
     tensor_store: ?tensor_store_mod.TensorStore,
     moe_num_experts: u32,
+    a4b_inference: ?backend_contracts.A4bInferenceConfig,
     residency: ?runtime.moe.residency.SharedResidency,
     tier_cache: ?runtime.tier.cache.SharedCache,
     allow_direct_quant: bool,
@@ -4155,6 +4733,7 @@ fn makeGpuHostedBackendData(
         .lazy_weights = init.lazy_weights,
         .tensor_store = init.tensor_store,
         .moe_num_experts = init.moe_num_experts,
+        .a4b_inference = init.a4b_inference,
         .residency = init.residency,
         .tier_cache = init.tier_cache,
         .allow_direct_quant = init.allow_direct_quant,

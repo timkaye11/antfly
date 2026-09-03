@@ -37,6 +37,9 @@ const wal_mod = @import("lsm_backend/wal.zig");
 const internal_keys = @import("internal_keys.zig");
 const resource_manager_mod = @import("resource_manager.zig");
 const platform_time = @import("antfly_platform").time;
+const fs_paths = @import("../common/fs_paths.zig");
+const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const native_artifact_sink = @import("native_artifact_sink.zig");
 
 const State = state_mod.State;
 const ActiveMemTable = state_mod.ActiveMemTable;
@@ -208,14 +211,61 @@ const RunSnapshotRefRegistry = struct {
 
 var run_snapshot_refs = RunSnapshotRefRegistry{};
 
-pub const MutableSnapshotReason = enum(u8) {
-    bound_read_txn,
-    namespace_read_txn,
-    current_scan,
-    other,
-};
+fn writeCheckpointBytes(io: std.Io, path: []const u8, bytes: []const u8, sink: ?native_artifact_sink.Sink) !u64 {
+    if (std.fs.path.dirname(path)) |parent| try fs_paths.createDirPathPortable(io, parent);
+    var file = try fs_paths.createFilePortable(io, path, .{ .truncate = true });
+    defer file.close(io);
+    var writer_buffer: [16 * 1024]u8 = undefined;
+    var writer = file.writer(io, &writer_buffer);
+    try writer.interface.writeAll(bytes);
+    try writer.end();
+    try file.sync(io);
+    if (sink) |active| {
+        var digest: [native_artifact_sink.Sha256.digest_length]u8 = undefined;
+        native_artifact_sink.Sha256.hash(bytes, &digest, .{});
+        try active.record(path, @intCast(bytes.len), digest);
+    }
+    return @intCast(bytes.len);
+}
 
-pub const mutable_snapshot_reason_count = @typeInfo(MutableSnapshotReason).@"enum".fields.len;
+fn copyCheckpointStorageFile(
+    allocator: Allocator,
+    storage: storage_io.Storage,
+    io: std.Io,
+    source: []const u8,
+    destination: []const u8,
+    cancellation: CancellationToken,
+    sink: ?native_artifact_sink.Sink,
+) !u64 {
+    if (std.fs.path.dirname(destination)) |parent| try fs_paths.createDirPathPortable(io, parent);
+    const size = try storage.fileSize(source);
+    var file = try fs_paths.createFilePortable(io, destination, .{ .truncate = true });
+    defer file.close(io);
+    var buffer: [256 * 1024]u8 = undefined;
+    var hasher = native_artifact_sink.Sha256.init(.{});
+    var offset: u64 = 0;
+    while (offset < size) {
+        try cancellation.check();
+        const len: usize = @intCast(@min(size - offset, buffer.len));
+        try storage.readFileRangeInto(allocator, source, offset, buffer[0..len]);
+        try file.writePositionalAll(io, buffer[0..len], offset);
+        hasher.update(buffer[0..len]);
+        offset += len;
+    }
+    try cancellation.check();
+    if (try storage.fileSize(source) != size) return error.SourceFileChanged;
+    try file.sync(io);
+    if (sink) |active| {
+        var digest: [native_artifact_sink.Sha256.digest_length]u8 = undefined;
+        hasher.final(&digest);
+        try active.record(destination, size, digest);
+    }
+    return size;
+}
+
+pub const MutableSnapshotReason = background_runtime_mod.LsmMutableSnapshotReason;
+
+pub const mutable_snapshot_reason_count = background_runtime_mod.lsm_mutable_snapshot_reason_count;
 
 pub const ReaderPinKind = enum(u8) {
     bound_read_txn,
@@ -245,11 +295,7 @@ fn readerPinKindIndex(kind: ReaderPinKind) usize {
     return @intFromEnum(kind);
 }
 
-pub const MutableSnapshotCloneReasonStats = struct {
-    calls: u64 = 0,
-    bytes_total: u64 = 0,
-    peak_bytes: u64 = 0,
-};
+pub const MutableSnapshotCloneReasonStats = background_runtime_mod.LsmMutableSnapshotCloneReasonStats;
 
 const MutableSnapshotReaderRef = struct {
     state: *State,
@@ -271,6 +317,7 @@ pub fn mutableSnapshotReasonName(reason: MutableSnapshotReason) []const u8 {
         .namespace_read_txn => "namespace_read_txn",
         .current_scan => "current_scan",
         .other => "other",
+        .bulk_current_scan => "bulk_current_scan",
     };
 }
 
@@ -1743,6 +1790,120 @@ pub const Backend = struct {
         return .{};
     }
 
+    pub const NativeCheckpoint = struct {
+        allocator: Allocator,
+        storage: storage_io.Storage,
+        manifest_bytes: []u8,
+        run_ids: []u64,
+        run_paths: [][]u8,
+
+        pub fn deinit(self: *NativeCheckpoint) void {
+            for (self.run_paths) |path| {
+                run_snapshot_refs.release(path);
+                self.allocator.free(path);
+            }
+            self.allocator.free(self.run_paths);
+            self.allocator.free(self.run_ids);
+            self.allocator.free(self.manifest_bytes);
+            self.* = undefined;
+        }
+
+        pub fn materialize(
+            self: *const NativeCheckpoint,
+            io: std.Io,
+            destination_root: []const u8,
+            cancellation: CancellationToken,
+        ) !u64 {
+            return try self.materializeWithSink(io, destination_root, cancellation, null);
+        }
+
+        pub fn materializeWithSink(
+            self: *const NativeCheckpoint,
+            io: std.Io,
+            destination_root: []const u8,
+            cancellation: CancellationToken,
+            sink: ?native_artifact_sink.Sink,
+        ) !u64 {
+            try cancellation.check();
+            try fs_paths.createDirPathPortable(io, destination_root);
+            const manifest_path = try std.fmt.allocPrint(self.allocator, "{s}/manifest.bin", .{destination_root});
+            defer self.allocator.free(manifest_path);
+            var total = try writeCheckpointBytes(io, manifest_path, self.manifest_bytes, sink);
+            for (self.run_paths, self.run_ids) |source, run_id| {
+                try cancellation.check();
+                const destination = try std.fmt.allocPrint(self.allocator, "{s}/runs/{d}.tbl", .{ destination_root, run_id });
+                defer self.allocator.free(destination);
+                total = std.math.add(
+                    u64,
+                    total,
+                    try copyCheckpointStorageFile(
+                        self.allocator,
+                        self.storage,
+                        io,
+                        source,
+                        destination,
+                        cancellation,
+                        sink,
+                    ),
+                ) catch return error.FileTooBig;
+            }
+            if (self.run_paths.len > 0) {
+                const runs_directory = try std.fmt.allocPrint(self.allocator, "{s}/runs", .{destination_root});
+                defer self.allocator.free(runs_directory);
+                try fs_paths.syncDirPortable(io, runs_directory);
+            }
+            try fs_paths.syncDirPortable(io, destination_root);
+            return total;
+        }
+    };
+
+    /// Pins a fully manifested immutable LSM generation. Mutable state is
+    /// flushed while the caller owns the DB revision fence; copying run bytes
+    /// happens later and obsolete-file reclamation observes the snapshot refs.
+    pub fn pinNativeCheckpoint(self: *Backend) !NativeCheckpoint {
+        const root_dir = self.root_dir orelse return error.Unsupported;
+        const storage = self.storage orelse return error.Unsupported;
+        if (self.options.backend.read_only) return error.ReadOnly;
+        const locked = runtime_mod.lockBackend(Backend, self);
+        defer runtime_mod.unlockBackend(Backend, self, locked);
+
+        try self.flushMutable();
+        if (self.manifest_dirty or self.obsolete_manifest_dirty or self.manifest_backing == null) {
+            try self.writeManifestSnapshotLocked(root_dir, self.writeStatsNowNs());
+        }
+        const manifest_path = try repository_mod.manifestPath(self.allocator, root_dir);
+        defer self.allocator.free(manifest_path);
+        const manifest_bytes = try storage.readFileAlloc(self.allocator, manifest_path, 64 * 1024 * 1024);
+        errdefer self.allocator.free(manifest_bytes);
+        const run_ids = try self.allocator.alloc(u64, self.runs.items.len);
+        errdefer self.allocator.free(run_ids);
+        const run_paths = try self.allocator.alloc([]u8, self.runs.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (run_paths[0..initialized]) |path| {
+                run_snapshot_refs.release(path);
+                self.allocator.free(path);
+            }
+            self.allocator.free(run_paths);
+        }
+        for (self.runs.items, 0..) |run, index| {
+            const source = run.path orelse return error.InvalidTableFile;
+            const owned = try self.allocator.dupe(u8, source);
+            errdefer self.allocator.free(owned);
+            try run_snapshot_refs.retain(owned);
+            run_ids[index] = run.id;
+            run_paths[index] = owned;
+            initialized += 1;
+        }
+        return .{
+            .allocator = self.allocator,
+            .storage = storage,
+            .manifest_bytes = manifest_bytes,
+            .run_ids = run_ids,
+            .run_paths = run_paths,
+        };
+    }
+
     pub fn commitProvidesDurability(self: *const Backend) bool {
         return self.root_dir != null and
             !self.options.backend.read_only and
@@ -2681,7 +2842,7 @@ pub const Backend = struct {
             self.bulk_ingest_current_scan_clone_budget_denials +|= 1;
             return null;
         }
-        var snapshot = self.cloneMutableStateWithReason(.other) catch |err| switch (err) {
+        var snapshot = self.cloneMutableStateWithReason(.bulk_current_scan) catch |err| switch (err) {
             error.OutOfMemory => {
                 self.bulk_ingest_current_scan_clone_oom_fallbacks +|= 1;
                 return null;
@@ -13651,6 +13812,115 @@ test "lsm backend bulk current scan clones mutable under memory cap" {
 
     try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
     bulk_active = false;
+}
+
+test "lsm backend replay scan freezes bulk mutable state without cloning it" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1024,
+        .wal_enabled = false,
+        .bulk_ingest_current_scan_clone_max_bytes = 1024 * 1024,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    try backend.beginBulkIngestSession();
+    var bulk_active = true;
+    defer if (bulk_active) backend.abortBulkIngestSession();
+
+    const lane: u8 = 4;
+    const first_key = internal_keys.replayEntryKey(lane, 1);
+    const second_key = internal_keys.replayEntryKey(lane, 2);
+    {
+        var write = try runtime.beginWrite();
+        try write.put(first_key[0..], "first");
+        try write.put(second_key[0..], "second");
+        try write.commit();
+    }
+
+    const before_maintenance = backend.snapshotMaintenanceStats();
+    const before_writes = backend.snapshotWriteStats();
+    const Context = struct {
+        seen: usize = 0,
+
+        fn consume(self: *@This(), sequence: u64, payload: []const u8) !void {
+            self.seen += 1;
+            try std.testing.expectEqual(@as(u64, @intCast(self.seen)), sequence);
+            try std.testing.expectEqualStrings(if (sequence == 1) "first" else "second", payload);
+        }
+    };
+    var context = Context{};
+    const replay = try runtime.forEachReplayLaneFrom(lane, 1, 0, &context, Context.consume);
+
+    const after_maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(usize, 2), context.seen);
+    try std.testing.expectEqual(@as(usize, 2), replay.matched_entries);
+    try std.testing.expectEqual(@as(u64, 2), replay.last_sequence);
+    try std.testing.expectEqual(before_maintenance.mutable_snapshot_clone_calls, after_maintenance.mutable_snapshot_clone_calls);
+    try std.testing.expectEqual(@as(u64, 0), after_maintenance.bulk_ingest_current_scan_clone_active_bytes);
+    try std.testing.expectEqual(before_writes.immutable_rotations + 1, backend.snapshotWriteStats().immutable_rotations);
+
+    try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
+    bulk_active = false;
+}
+
+test "lsm backend replay scan serves run data blocks transiently" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+
+    var backend = try Backend.open(alloc, "/lsm-replay-transient-blocks", .{
+        .storage = backing.storage(),
+        .cache = &cache,
+        .flush_threshold = 1024,
+        .wal_enabled = false,
+    });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+
+    const lane: u8 = 7;
+    const payload = "x" ** 1024;
+    {
+        var write = try runtime.beginWrite();
+        for (1..97) |sequence| {
+            const key = internal_keys.replayEntryKey(lane, @intCast(sequence));
+            try write.put(key[0..], payload);
+        }
+        try write.commit();
+    }
+    try backend.sync(true);
+
+    const before = cache.snapshotStats();
+    const Context = struct {
+        seen: usize = 0,
+
+        fn consume(self: *@This(), _: u64, value: []const u8) !void {
+            self.seen += 1;
+            try std.testing.expectEqual(@as(usize, 1024), value.len);
+        }
+    };
+    var context = Context{};
+    const replay = try runtime.forEachReplayLaneFrom(lane, 1, 0, &context, Context.consume);
+    const after = cache.snapshotStats();
+
+    try std.testing.expectEqual(@as(usize, 96), context.seen);
+    try std.testing.expectEqual(@as(usize, 96), replay.matched_entries);
+    try std.testing.expectEqual(
+        before.run_table_block.inserts + before.run_table_physical_block.inserts,
+        after.run_table_block.inserts + after.run_table_physical_block.inserts,
+    );
+    try std.testing.expect(
+        after.run_table_block.transient_serves + after.run_table_physical_block.transient_serves >
+            before.run_table_block.transient_serves + before.run_table_physical_block.transient_serves,
+    );
+    try std.testing.expect(
+        after.run_table_block.policy_bypasses + after.run_table_physical_block.policy_bypasses >
+            before.run_table_block.policy_bypasses + before.run_table_physical_block.policy_bypasses,
+    );
 }
 
 test "lsm backend bulk current scan rotates mutable above aggregate clone memory cap" {

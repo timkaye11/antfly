@@ -19,6 +19,7 @@ package sdk
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -29,7 +30,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/antflydb/antfly/go/pkg/libaf/json"
 	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 )
 
@@ -137,11 +137,12 @@ func (c *AntflyClient) Query(ctx context.Context, opts ...QueryRequest) (*QueryR
 	e := json.NewEncoder(request)
 	for _, opt := range opts {
 		// Validate options
-		if len(opt.Indexes) > 0 && opt.SemanticSearch == "" {
-			return nil, errors.New("semantic_search required when indexes are specified")
+		hasEmbeddingQuery := opt.SemanticSearch != "" || len(opt.Embeddings) > 0
+		if len(opt.Indexes) > 0 && !hasEmbeddingQuery {
+			return nil, errors.New("semantic_search or embeddings required when indexes are specified")
 		}
-		if len(opt.Indexes) > 0 && opt.Offset > 0 {
-			return nil, errors.New("offset not available when indexes are specified")
+		if hasEmbeddingQuery && opt.Offset > 0 {
+			return nil, errors.New("offset not available for semantic_search or embeddings")
 		}
 
 		// MarshalJSON now handles the conversion to oapi.QueryRequest automatically
@@ -168,6 +169,9 @@ func (c *AntflyClient) Query(ctx context.Context, opts ...QueryRequest) (*QueryR
 	var result QueryResponses
 	if err := json.Unmarshal(respBody, &result); err != nil {
 		return nil, fmt.Errorf("parsing result: %w", err)
+	}
+	if err := validateQueryGraphResponses(opts, &result); err != nil {
+		return nil, fmt.Errorf("validating query response: %w", err)
 	}
 
 	return &result, nil
@@ -301,6 +305,11 @@ type ExecuteLinearMergeResult struct {
 	Batches  int
 }
 
+// LinearMergeRecords is a page of document objects keyed by document ID.
+// The public linear-merge API intentionally excludes scalar and array values:
+// every value must be a JSON object that Antfly can index as a document.
+type LinearMergeRecords map[string]map[string]any
+
 // ExecuteLinearMerge performs a full linear merge by iterating over pages of
 // records, chaining cursors between pages, and running a final cleanup pass
 // to delete orphaned records beyond the last page.
@@ -309,7 +318,7 @@ type ExecuteLinearMergeResult struct {
 // be yielded in ascending document ID order. The caller controls page size
 // and can stream pages from any source (JSON decoder, database cursor, etc.)
 // without loading the entire dataset into memory.
-func (c *AntflyClient) ExecuteLinearMerge(ctx context.Context, tableName string, pages iter.Seq[map[string]any], opts ExecuteLinearMergeOptions) (*ExecuteLinearMergeResult, error) {
+func (c *AntflyClient) ExecuteLinearMerge(ctx context.Context, tableName string, pages iter.Seq[LinearMergeRecords], opts ExecuteLinearMergeOptions) (*ExecuteLinearMergeResult, error) {
 	result := &ExecuteLinearMergeResult{}
 	cursor := ""
 
@@ -348,7 +357,7 @@ func (c *AntflyClient) ExecuteLinearMerge(ctx context.Context, tableName string,
 	// Final cleanup: delete orphaned records beyond the last cursor
 	if cursor != "" && !opts.DryRun {
 		cleanupResult, err := c.LinearMergeWithOptions(ctx, tableName, LinearMergeRequest{
-			Records:      map[string]any{},
+			Records:      LinearMergeRecords{},
 			LastMergedId: cursor,
 			SyncLevel:    opts.SyncLevel,
 		}, opts.WriteOptions)
@@ -379,7 +388,7 @@ type LinearMergePageOptions struct {
 // record-count cap and an encoded request-size cap. It is intended for examples
 // and import tools that hold the input set in memory and want to stay below API
 // payload limits with margin.
-func SortedLinearMergePages(records map[string]any, opts LinearMergePageOptions) ([]map[string]any, error) {
+func SortedLinearMergePages(records LinearMergeRecords, opts LinearMergePageOptions) ([]LinearMergeRecords, error) {
 	if len(records) == 0 {
 		return nil, nil
 	}
@@ -399,8 +408,8 @@ func SortedLinearMergePages(records map[string]any, opts LinearMergePageOptions)
 	}
 	pageCapacity := min(maxRecords, len(records))
 	cursorEstimate := strings.Repeat("x", longestID)
-	pages := make([]map[string]any, 0, (len(records)+maxRecords-1)/maxRecords)
-	page := make(map[string]any, pageCapacity)
+	pages := make([]LinearMergeRecords, 0, (len(records)+maxRecords-1)/maxRecords)
+	page := make(LinearMergeRecords, pageCapacity)
 	sizer, err := newLinearMergeRequestSizer(cursorEstimate, opts.DryRun, opts.SyncLevel)
 	if err != nil {
 		return nil, err
@@ -413,7 +422,7 @@ func SortedLinearMergePages(records map[string]any, opts LinearMergePageOptions)
 				return nil, err
 			}
 			pages = append(pages, page)
-			page = make(map[string]any, pageCapacity)
+			page = make(LinearMergeRecords, pageCapacity)
 			pageRecordBytes = 0
 		}
 
@@ -428,14 +437,14 @@ func SortedLinearMergePages(records map[string]any, opts LinearMergePageOptions)
 					return nil, err
 				}
 				pages = append(pages, page)
-				page = make(map[string]any, pageCapacity)
+				page = make(LinearMergeRecords, pageCapacity)
 				pageRecordBytes = 0
 				candidateSize = sizer.requestSize(0, 0, entrySize)
 			}
 		}
 
 		if opts.MaxRequestBytes > 0 && candidateSize > opts.MaxRequestBytes {
-			size, err := linearMergeRequestSize(map[string]any{id: records[id]}, cursorEstimate, opts.DryRun, opts.SyncLevel)
+			size, err := linearMergeRequestSize(LinearMergeRecords{id: records[id]}, cursorEstimate, opts.DryRun, opts.SyncLevel)
 			if err != nil {
 				return nil, err
 			}
@@ -461,7 +470,7 @@ type linearMergeRequestSizer struct {
 }
 
 func newLinearMergeRequestSizer(lastMergedID string, dryRun bool, syncLevel SyncLevel) (linearMergeRequestSizer, error) {
-	size, err := linearMergeRequestSize(map[string]any{}, lastMergedID, dryRun, syncLevel)
+	size, err := linearMergeRequestSize(LinearMergeRecords{}, lastMergedID, dryRun, syncLevel)
 	if err != nil {
 		return linearMergeRequestSizer{}, err
 	}
@@ -477,7 +486,7 @@ func (s linearMergeRequestSizer) requestSize(existingRecordBytes int64, existing
 	return s.emptyRequestBytes + existingRecordBytes + nextRecordBytes + commaBytes
 }
 
-func linearMergeRecordEntrySize(id string, record any) (int64, error) {
+func linearMergeRecordEntrySize(id string, record map[string]any) (int64, error) {
 	key, err := json.Marshal(id)
 	if err != nil {
 		return 0, err
@@ -489,7 +498,7 @@ func linearMergeRecordEntrySize(id string, record any) (int64, error) {
 	return int64(len(key) + 1 + len(value)), nil
 }
 
-func validateLinearMergePageSize(page map[string]any, lastMergedID string, opts LinearMergePageOptions) error {
+func validateLinearMergePageSize(page LinearMergeRecords, lastMergedID string, opts LinearMergePageOptions) error {
 	if opts.MaxRequestBytes <= 0 {
 		return nil
 	}
@@ -503,7 +512,7 @@ func validateLinearMergePageSize(page map[string]any, lastMergedID string, opts 
 	return nil
 }
 
-func linearMergeRequestSize(records map[string]any, lastMergedID string, dryRun bool, syncLevel SyncLevel) (int64, error) {
+func linearMergeRequestSize(records LinearMergeRecords, lastMergedID string, dryRun bool, syncLevel SyncLevel) (int64, error) {
 	body, err := boundedJSONBody(LinearMergeRequest{
 		Records:      records,
 		LastMergedId: lastMergedID,
@@ -551,22 +560,22 @@ func (c *AntflyClient) WaitForTable(ctx context.Context, tableName string, timeo
 // SortedPages yields pages of batchSize from an in-memory map, with keys in
 // ascending sorted order. This is useful for feeding ExecuteLinearMerge when
 // the full dataset fits in memory.
-func SortedPages(records map[string]any, batchSize int) iter.Seq[map[string]any] {
-	return func(yield func(map[string]any) bool) {
+func SortedPages(records LinearMergeRecords, batchSize int) iter.Seq[LinearMergeRecords] {
+	return func(yield func(LinearMergeRecords) bool) {
 		ids := make([]string, 0, len(records))
 		for id := range records {
 			ids = append(ids, id)
 		}
 		slices.Sort(ids)
 
-		page := make(map[string]any, batchSize)
+		page := make(LinearMergeRecords, batchSize)
 		for _, id := range ids {
 			page[id] = records[id]
 			if len(page) >= batchSize {
 				if !yield(page) {
 					return
 				}
-				page = make(map[string]any, batchSize)
+				page = make(LinearMergeRecords, batchSize)
 			}
 		}
 		if len(page) > 0 {
@@ -740,7 +749,7 @@ func (c *AntflyClient) RetrievalAgent(ctx context.Context, req RetrievalAgentReq
 		case oapi.SSEEventStepStarted:
 			if opt.OnStepStarted != nil {
 				var d SSEStepStarted
-				if json.UnmarshalString(data, &d) == nil {
+				if json.Unmarshal([]byte(data), &d) == nil {
 					if err := opt.OnStepStarted(&d); err != nil {
 						return nil, fmt.Errorf("step_started callback: %w", err)
 					}
@@ -749,7 +758,7 @@ func (c *AntflyClient) RetrievalAgent(ctx context.Context, req RetrievalAgentReq
 		case oapi.SSEEventStepProgress:
 			if opt.OnStepProgress != nil {
 				var d map[string]any
-				if json.UnmarshalString(data, &d) == nil {
+				if json.Unmarshal([]byte(data), &d) == nil {
 					if err := opt.OnStepProgress(d); err != nil {
 						return nil, fmt.Errorf("step_progress callback: %w", err)
 					}
@@ -758,7 +767,7 @@ func (c *AntflyClient) RetrievalAgent(ctx context.Context, req RetrievalAgentReq
 		case oapi.SSEEventStepCompleted:
 			if opt.OnStepCompleted != nil {
 				var step AgentStep
-				if json.UnmarshalString(data, &step) == nil {
+				if json.Unmarshal([]byte(data), &step) == nil {
 					if err := opt.OnStepCompleted(&step); err != nil {
 						return nil, fmt.Errorf("step_completed callback: %w", err)
 					}
@@ -767,7 +776,7 @@ func (c *AntflyClient) RetrievalAgent(ctx context.Context, req RetrievalAgentReq
 		case oapi.SSEEventClassification:
 			if opt.OnClassification != nil {
 				var d ClassificationTransformationResult
-				if json.UnmarshalString(data, &d) == nil {
+				if json.Unmarshal([]byte(data), &d) == nil {
 					if err := opt.OnClassification(&d); err != nil {
 						return nil, fmt.Errorf("classification callback: %w", err)
 					}
@@ -776,7 +785,7 @@ func (c *AntflyClient) RetrievalAgent(ctx context.Context, req RetrievalAgentReq
 		case oapi.SSEEventReasoning:
 			if opt.OnReasoning != nil {
 				var chunk string
-				if json.UnmarshalString(data, &chunk) == nil {
+				if json.Unmarshal([]byte(data), &chunk) == nil {
 					if err := opt.OnReasoning(chunk); err != nil {
 						return nil, fmt.Errorf("reasoning callback: %w", err)
 					}
@@ -785,7 +794,7 @@ func (c *AntflyClient) RetrievalAgent(ctx context.Context, req RetrievalAgentReq
 		case oapi.SSEEventGeneration:
 			if opt.OnGeneration != nil {
 				var chunk string
-				if json.UnmarshalString(data, &chunk) == nil {
+				if json.Unmarshal([]byte(data), &chunk) == nil {
 					if err := opt.OnGeneration(chunk); err != nil {
 						return nil, fmt.Errorf("generation callback: %w", err)
 					}
@@ -794,7 +803,7 @@ func (c *AntflyClient) RetrievalAgent(ctx context.Context, req RetrievalAgentReq
 		case oapi.SSEEventFollowup:
 			if opt.OnFollowup != nil {
 				var question string
-				if json.UnmarshalString(data, &question) == nil {
+				if json.Unmarshal([]byte(data), &question) == nil {
 					if err := opt.OnFollowup(question); err != nil {
 						return nil, fmt.Errorf("followup callback: %w", err)
 					}
@@ -803,7 +812,7 @@ func (c *AntflyClient) RetrievalAgent(ctx context.Context, req RetrievalAgentReq
 		case oapi.SSEEventHit:
 			if opt.OnHit != nil {
 				var hitData Hit
-				if json.UnmarshalString(data, &hitData) == nil {
+				if json.Unmarshal([]byte(data), &hitData) == nil {
 					if err := opt.OnHit(&hitData); err != nil {
 						return nil, fmt.Errorf("hit callback: %w", err)
 					}
@@ -815,7 +824,7 @@ func (c *AntflyClient) RetrievalAgent(ctx context.Context, req RetrievalAgentReq
 					Mode       string `json:"mode"`
 					ToolsCount int    `json:"tools_count"`
 				}
-				if json.UnmarshalString(data, &d) == nil {
+				if json.Unmarshal([]byte(data), &d) == nil {
 					if err := opt.OnToolMode(d.Mode, d.ToolsCount); err != nil {
 						return nil, fmt.Errorf("tool_mode callback: %w", err)
 					}
@@ -824,17 +833,17 @@ func (c *AntflyClient) RetrievalAgent(ctx context.Context, req RetrievalAgentReq
 		case oapi.SSEEventEval:
 			if opt.OnEval != nil {
 				var d map[string]any
-				if json.UnmarshalString(data, &d) == nil {
+				if json.Unmarshal([]byte(data), &d) == nil {
 					if err := opt.OnEval(d); err != nil {
 						return nil, fmt.Errorf("eval callback: %w", err)
 					}
 				}
 			}
 		case oapi.SSEEventDone:
-			_ = json.UnmarshalString(data, result)
+			_ = json.Unmarshal([]byte(data), result)
 		case oapi.SSEEventError:
 			var agentErr RetrievalAgentError
-			if json.UnmarshalString(data, &agentErr) != nil {
+			if json.Unmarshal([]byte(data), &agentErr) != nil {
 				agentErr = RetrievalAgentError{Error: data}
 			}
 			if opt.OnError != nil {

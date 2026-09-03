@@ -4,12 +4,12 @@
 > single-device text-only BF16 LoRA-SFT and sigmoid-DPO lanes. The current
 > algorithm-hardening source changes the GRPO sampling distribution from ranked
 > selection to resume-stable seeded categorical sampling and expands DPO to
-> cDPO, IPO, and SimPO with report schema v7. Those changes intentionally
-> invalidate promotion by inheritance: the current source needs fresh
-> interruption/resume, multi-seed quality, native/Metal/HF-or-MLX correctness,
-> and performance evidence before release. Historical baseline-relative E2B
-> DPO passed three seeds over eight epochs; historical E2B GRPO remained
-> default-off and quality-blocked, and E4B GRPO missed its top-rank floor.
+> cDPO, IPO, and SimPO with report schema v7. A fresh real E2B Metal diagnostic
+> now passes the v7 three-seed, prompt-paired GRPO quality contract. Its separate
+> release holdout remains sealed for a fresh zero-swap host, so this result does
+> not yet promote GRPO. The only archived E4B GRPO campaign still misses its
+> historical top-rank floor and used the older tiny BoolQ recipe; E4B has not
+> yet been rerun on the stronger v7-scale workload.
 > Exact incremental KV reuse remains experimental and slower than rollback.
 > Canonical direct-GGUF SFT/DPO/GRPO remains a research surface, and public
 > QLoRA remains fail-closed. Required hosted CI, a fresh-host zero-paging
@@ -40,9 +40,12 @@ E2B GRPO; E4B GRPO completes healthy optimizer work but fails held-out top-rank
 quality. Those archived results establish bounded data-order robustness only.
 The current qualifier creates a distinct deterministically seeded adapter per
 run and requires held-out improvement over that run's initialized adapter. E2B
-DPO passes that stronger gate. E2B GRPO does not: the final restart-safe binary
-fails closed at seed 17 across the bounded learning-rate sweep documented
-below, and E4B has not been rerun under the stronger contract. Multi-task
+DPO passes that stronger gate. The current E2B GRPO all-linear candidate also
+passes the fresh schema-v7 diagnostic described below: all three seeds improve
+mean and top-completion reward, remain within the exact positive-group
+noninferiority allowance, and pass the aggregate prompt-paired sign test.
+The separate final holdout has not been opened because the diagnostic host was
+paging. E4B has not been rerun under the stronger contract. Multi-task
 convergence, repeated distribution-level performance, and required-CI
 acceptance also remain open. This remains an implementation and qualification
 contract rather than a blanket readiness claim.
@@ -235,7 +238,7 @@ E2B published byte-identical adapter
 exact, with no native/interpreter fallback. Reports are retained at
 `/private/tmp/antfly-gemma4-e2b-resume-acceptance-20260819-v3` and
 `/private/tmp/antfly-gemma4-e4b-resume-acceptance-20260819-v2`. Use
-`scripts/qualify_gemma4_metal_resume.py` to reproduce the gate; a direct GGUF
+`scripts/gemma4/qualify_gemma4_metal_resume.py` to reproduce the gate; a direct GGUF
 requires the explicit `--experimental-gguf-qlora` admission flag.
 
 `--activation-checkpoint-interval N` enables graph activation recomputation at
@@ -464,9 +467,25 @@ contract is epoch-boundary recovery with one mutable checkpoint. Final-binary
 E2B and E4B BF16 Metal qualifications now pass real process-kill/resume with
 byte-identical final adapters and exact post-boundary loss/gradient
 trajectories. The explicitly admitted official E2B Q4_0 GGUF lane passes the
-same gate with its decomposed loss graph. Retained checkpoint generations and
-mid-epoch CLI scheduling remain open; activation checkpointing is
-recomputation and does not close those gates.
+same gate with its decomposed loss graph.
+
+Preference training additionally owns a durable mid-epoch checkpoint cadence.
+`checkpoint.every_examples` counts optimizer examples (DPO pairs or GRPO
+prompt groups) inside each epoch and writes the same atomic trainer
+checkpoint plus content-addressed sidecar immediately before the example at
+each cadence boundary, so the durable state always describes exactly the
+completed prefix regardless of any in-body skip path. The sidecar schema is
+now `antfly_gemma4_preference_checkpoint_state/v2` with an explicit
+`examples_into_epoch` cursor; v1 sidecars remain loadable with an implied
+zero cursor. Resume recomputes the deterministic per-epoch order (on-disk
+pair order for DPO, seeded Fisher-Yates prompt order for GRPO), skips the
+consumed prefix of the restored epoch, and replays the identical trajectory
+because GRPO sampling seeds derive from the run seed, epoch, and original
+prompt index. The cadence requires `every_epochs`, is preference-only, and
+is fail-closed for the SFT lane, compiled GRPO sampling, and incremental-KV
+GRPO. Retained checkpoint generations and mid-epoch SFT CLI scheduling
+remain open; activation checkpointing is recomputation and does not close
+those gates.
 
 ## Reference Oracles and Performance Targets
 
@@ -1302,7 +1321,7 @@ Local results are not substitutes for required CI:
 ```sh
 zig build test-gemma4-finetune
 zig build test-gemma-graph
-python3 scripts/compare_gemma4_lora_hf_zig.py validate-lock
+python3 scripts/gemma4/compare_gemma4_lora_hf_zig.py validate-lock
 python3 -m unittest discover -v -s scripts -p 'test_*gemma4*py'
 ```
 
@@ -1446,7 +1465,7 @@ campaign qualification. The retained comparison artifact is
 ### Real UltraFeedback multi-token DPO parity (2026-08-17)
 
 The general sequence path now also has a provenance-locked real-data result.
-`scripts/materialize_gemma4_dpo_hf_parity.py` consumes
+`scripts/gemma4/materialize_gemma4_dpo_hf_parity.py` consumes
 `HuggingFaceH4/ultrafeedback_binarized` `test_prefs` at revision
 `3949bf5f8c17c394422ccfab0c31ea9c20bdeb85`. The source Parquet SHA-256 is
 `e9dab2789f419d4204d73ec2c860af6d88d466b906e0109e69b96075467eb389`.
@@ -1459,7 +1478,7 @@ The public recipe CLI trained the five-example set for five epochs through 25
 complete DPO updates from the same rank-16, alpha-32 Q/V seed adapter. The
 pinned MLX `0.31.2` / MLX-LM `0.31.3` runner consumed the exact materialized
 token IDs and update order. Both adapters were then loaded and scored by
-`scripts/evaluate_gemma4_dpo_adapters_mlx.py` under one MLX oracle, eliminating
+`scripts/gemma4/evaluate_gemma4_dpo_adapters_mlx.py` under one MLX oracle, eliminating
 base-runtime differences from the result comparison.
 
 | Shared MLX evaluation | Compiled-score Antfly adapter | MLX-trained adapter |
@@ -1952,7 +1971,7 @@ The working tree was intentionally dirty; no commit or push was performed.
 
 ### Real BoolQ GRPO acceptance, MLX parity, and stability boundary (2026-08-20)
 
-`scripts/materialize_gemma4_grpo_boolq.py` pins `google/boolq` at revision
+`scripts/gemma4/materialize_gemma4_grpo_boolq.py` pins `google/boolq` at revision
 `35b264d03638db9f4ce671b711558bf7ff0f80d5`. It verifies the local tokenizer,
 forbids rendered-prompt truncation, requires one-token `yes`/`no` targets, and
 materializes balanced, source-disjoint 64-row train and validation artifacts.
@@ -2671,7 +2690,7 @@ reuse disabled. Reports attest the policy string
 `terminal-device-drained-host-weight-snapshot-fresh-backend-private-buffer-reuse-disabled`;
 any attempted optimizer step after that boundary fails.
 
-`scripts/qualify_gemma4_preference_resume.py` schema v2 runs the same pinned
+`scripts/gemma4/qualify_gemma4_preference_resume.py` schema v2 runs the same pinned
 recipe uninterrupted, kills a second process only after an epoch-1 checkpoint
 and sidecar are durable, then resumes into a new immutable output root. It
 requires byte-identical adapters, exact final sidecars, training metrics,
@@ -3166,11 +3185,13 @@ production review. It is an implementation candidate, not a promoted release:
   comparator must implement the same categorical sampler or use predeclared
   distribution-level gates.
 
-The stable Zig `0.16.0` focused gate selects 300 tests: 298 pass and the same
-two optional local-model fixtures skip. The direct preference-loss suite passes
-analytic and finite-difference checks for cDPO, IPO, and SimPO. The targeted
-Python resume/parity suite passes 66 tests, and the complete offline Gemma4
-Python suite passes 604 tests. The installed
+The stable Zig `0.16.0` focused gate now selects 301 tests: 299 pass and the
+same two optional local-model fixtures skip. The direct preference-loss suite
+passes 17 analytic, finite-difference, and fail-closed checks for DPO/cDPO, IPO,
+and SimPO; the direct GRPO suite passes 14 checks. The current top-level Python
+discovery passes 243 tests. The separate 405-case Gemma4 discovery passed 404
+tests in the restricted sandbox; its sole localhost-bind permission error
+passed when rerun with localhost access. The installed
 `0.16.0-dev.3144+ac6fb0b59` compiler still crashes while compiling the focused
 root and remains rejected as a release toolchain.
 
@@ -3185,13 +3206,497 @@ took approximately `22.17 s`, `3.66 s`, `6.89 s`, and `9.35 s`; held-out
 sampling and reference scoring took `43.68 s` and `13.23 s`. This proves the
 real path executes and learns, not that it is competitive or release-qualified.
 
-This host is currently inadmissible for promotion: the data volume has about
-`0.9 GiB` free and system swap is already allocated (`3072 MiB` total,
-approximately `1512 MiB` used). Do not run E4B, repeated performance, or
-zero-paging release campaigns here. The next release evidence must come from a
-clean immutable source revision on a fresh host with sufficient disk, followed
-by three-seed E2B and E4B DPO/GRPO quality, exact resume, cross-framework
-correctness, and same-workload performance distributions.
+This host remains inadmissible for a fresh-host promotion attestation. At the
+2026-09-01 final merge review the data volume had about `87 GiB` free, but
+encrypted swap was already allocated (`2048 MiB` total, `747.44 MiB` used).
+Do not use this process lifetime for a zero-paging release claim. The next
+release evidence must come from a clean immutable source revision on a fresh
+host, followed by three-seed E2B and E4B DPO/GRPO quality, exact resume,
+cross-framework correctness, and same-workload performance distributions.
+
+## Final Main-Merge Review (2026-09-01)
+
+The merge conflicts are mechanically resolved with no unmerged index entries,
+conflict markers, or diff-whitespace errors, but the merge remains intentionally
+uncommitted. This review found and fixed five integration or fail-closed gaps:
+
+- IPO no longer multiplies the completion-mean policy/reference log-ratio
+  margin by DPO `beta` before comparing it with `1 / (2 * tau)`. When `ipo_tau`
+  is omitted, the recipe maps `beta` to IPO tau rather than applying both.
+- Paired preference loss now rejects invalid DPO/IPO scaling and non-finite
+  log-probabilities. GRPO rejects invalid KL coefficients, non-finite
+  log-probabilities/advantages, overflowing policy ratios, and non-finite loss
+  or gradient intermediates before optimizer mutation.
+- The shared graph LoRA injector rejects zero rank and non-positive or
+  non-finite alpha before cloning or mutating a graph.
+- The secondary GGUF test store implements main's new
+  `preserveFileCacheOnDeinit` VTable contract; the full inference-root lifecycle
+  build exposed this merge omission after the narrower Gemma4 target compiled.
+- The macOS Gemma4 workflow now triggers on the shared DPO/GRPO/LoRA, CLI,
+  tool, script, and fixture surfaces and explicitly discovers the nested
+  `scripts/gemma4/gemma4` Python suite.
+
+Pinned Zig `0.16.0`, `-j1`, strict Metal, and isolated caches pass the final
+301-case focused gate in Debug, ReleaseSafe, and ReleaseFast (`299 passed`, two
+optional-artifact skips in each mode). The Debug and ReleaseSafe graph target
+passes `7/7`; the full ML graph build passes `534/534`; the full inference-root
+ownership/lifecycle filter passes `4/4`; direct preference and GRPO suites pass
+`17/17` and `14/14`; the top-level Python discovery passes `243/243`; the oracle
+lock validates; and the workflow YAML parses. The 405-case nested Python suite
+has the restricted-sandbox/localhost split result described above.
+
+This closes the locally reproducible code and merge-integration findings, not
+the production promotion. This exact source still lacks fresh BF16 E2B/E4B
+multi-seed DPO/GRPO quality, current-algorithm interruption/resume and
+materialized-reload evidence, pinned native/Metal/HF-or-MLX numerical traces,
+repeated matched performance/memory distributions, a fresh-host zero-paging
+attestation, and the hosted required macOS GPU check on an immutable revision.
+The known baseline-relative E2B GRPO and E4B top-rank quality failures also
+remain open. Therefore the branch remains a default-off production candidate,
+not production-ready.
+
+## Production Qualification Refresh (2026-09-01)
+
+The final review used ReleaseFast Metal binary SHA-256
+`b8bee85094859b80e36ab118bf46982d226e32c3bf23fc15749d2daacfd1ad45`.
+The pinned official BF16 model revisions were E2B
+`3e22461f65e89153144f8adb70e3b8c2cc9845a7` and E4B
+`ee0ef6023621cff504d758262d4e04895a5af4a2`; their monolithic model
+SHA-256 values were
+`2db5482b20d746879bb3ef79b5203e9075a2e2b98f54ec7c2f281c1477ddc550`
+and
+`cfbd3d2f1cd71bd471c37fe2bf8546d5028d41e5736f64e1ca6c6b8893125503`.
+Both inventories and the rank-16 / alpha-32 Q/V adapter targets passed the
+pinned oracle lock. The E4B DPO and GRPO recipes passed the public recipe
+dry-run, but no E4B training campaign was admitted after the upstream E2B GRPO
+quality failure and on a host that already had encrypted swap in use.
+
+The current binary passed the real E2B DPO gate for independent initialization
+seeds 17, 42, and 991. Held-out accuracy was `0.6`, `0.8`, and `0.8`; loss was
+`0.6846736073`, `0.6753409505`, and `0.6649171114`; and reward margin was
+`0.0187718216`, `0.0379370116`, and `0.0600500479`. Every metric improved from
+its fresh initialized baseline and every final adapter digest was distinct.
+Campaign report SHA-256 is
+`ee632b74c5d14932908c48fb1e8dec10a3644418d92f38bb90e2d3dae97cdc50`;
+the retained root is
+`/private/tmp/antfly-gemma4-production-evidence/quality-e2b-dpo-b8bee850-r2`.
+
+GRPO did not pass, and the failed gates were not weakened after observation:
+
+- The first compiled 32-prompt/eight-epoch run contained only `7/256` useful
+  reward-variation groups. This exposed a qualification blind spot: nominal
+  horizon length alone did not prove a meaningful optimizer campaign. Report
+  SHA-256 is
+  `11934c8e9a333cb80f555469a2af2eff3fcfc616468d448f29bdace92c087796`.
+- With group size eight, temperature two, and a two-token compiled rollout,
+  seed 17 admitted `135/256` groups, but held-out mean reward fell from
+  `0.5390625` to `0.533203125`; top-rank reward and positive-group rate stayed
+  at `0.71875` and `0.75`. Report SHA-256 is
+  `7bc6c9317430815ea3ae8dc9d8f735df6893bf4f91ad8211d7b54bbee3243aa6`.
+- A broader one-token campaign used 128 balanced training examples and a new
+  128-example validation slice with zero source-ID overlap against the prior
+  64-example holdout. Its v2 materialization manifest SHA-256 is
+  `07055940b1302a371330aca70da4a72c494c95bc766edb41bd9eadf45f2a7851`;
+  train/eval JSONL SHA-256 values are
+  `80f4ce1116f7bdbfccf9b30b7fcd5d6e46fa83378debf8fcff0d7c277715c752`
+  and
+  `8254b2d7712eb6f14ca5b75f200713759f1a2df6e18ceef1a0a666b1f74af2d3`.
+  Under the explicit abort policy, the fourth observation of one repeated
+  prompt reached raw mean KL `0.20524150` at logical group 479, exceeding the
+  unchanged `0.1` hard budget before mutation. Report SHA-256 is
+  `c6945becd3a418b01270391fd16df08b655502979a00fa8577c2cad1de3557e5`.
+- Repeating that exact campaign with the documented safe `skip_group` policy
+  completed training with `310/512` optimizer groups, `201` zero-variance
+  groups, and only `1/512` KL rejection. Final held-out mean reward improved
+  from `0.578125` to `0.58984375`, but top-rank reward remained `0.703125` and
+  positive-group rate regressed from `0.7578125` to `0.75`. Final KL loss
+  `0.0004560637` stayed below `0.004`, but the baseline-relative quality gate
+  correctly failed. No adapter was published and seeds 42/991 did not run.
+  The self-bound failure report and final evaluation SHA-256 values are
+  `18e90ab0d23d7d2f54dd5637a423f4715ccf8df3b613e327eb7d7e5b9c6a96ae`
+  and
+  `06ebe21b1dadb0b693caf92841f78f20b9b1fe16b3eb0a9a76ddc0b8de15d545`.
+
+Qualification is now fail-closed around those observations. GRPO campaigns
+must account for the complete logical horizon, admit at least 25% of groups to
+the optimizer, reject no more than 1% at the train-time KL budget, and match
+KL-controller admissions to realized optimizer groups. CLI overrides may only
+tighten those two production bounds. Both passing and failing reports bind the
+quality qualifier, shared resume qualifier, environment policy, binary, model,
+adapter, recipe, and exact train/evaluation inputs. BoolQ materialization v2 can
+exclude exact source IDs from any number of digest-bound prior manifests; a
+per-label offset alone is not accepted as evidence of holdout rotation when a
+token-budget change alters admission.
+
+After these changes, top-level script discovery passes `261/261`. Nested Gemma4
+discovery passes 439 of 440 cases in the socket-restricted sandbox; the sole
+localhost warm-server case passes independently with localhost access, for an
+effective `440/440`. `git diff --check`, the unmerged-index check, and the
+conflict-marker scan pass. The previously recorded current-source Zig gates
+remain `299/301` focused cases (the same two optional artifact skips) in Debug,
+ReleaseSafe, and ReleaseFast, plus `534/534` ML graph, `7/7` Gemma graph,
+`4/4` lifecycle, `17/17` preference-loss, and `14/14` direct GRPO checks.
+
+This refresh makes the implementation and qualification path safer, but it is
+negative release evidence, not a production promotion. Current blockers are a
+fresh three-seed baseline-relative E2B GRPO quality pass, equivalent current
+E4B DPO/GRPO quality, accepted-adapter resume/materialized-reload and
+HF-or-MLX parity, repeated matched performance/memory evidence, a fresh-host
+zero-paging attestation, and the hosted required macOS GPU check on an immutable
+revision. Do not enable GRPO by default or call this branch production-ready
+until those gates pass.
+
+## Production Qualification Closeout (2026-09-02)
+
+The final source audit closes the remaining local merge, full-target optimizer,
+and failed-campaign evidence gaps. It does **not** promote GRPO: the predeclared
+real E2B all-linear campaign completed healthy optimizer work but failed its
+strict held-out greedy-reward improvement gate. That gate was not weakened or
+reinterpreted after observation, seeds 17 and 991 were not run after seed 42
+failed, and the reserved final holdout remains unspent.
+
+Full `text-all-linear` E2B rank-16 / alpha-32 LoRA contains 276 target modules
+and 552 trainable A/B tensors. The first real GRPO attempt exposed that Metal's
+single-dispatch gradient sum-of-squares bridge accepted at most 256 inputs and
+therefore returned `TooManyTrainingSumSquaresInputs`. The public reduction now
+chunks arbitrarily long input lists into bridge-sized batches, completes each
+temporary result before release, accumulates batch totals in host `f64`, and
+returns the established `f32` result. The focused Metal regression exercises
+552 input tensors (`256 + 256 + 40`) before the AdamW update. The runtime's 256
+input limit is now one shared constant rather than a duplicated magic number.
+
+Baseline-relative DPO and GRPO rejection now preserves the complete typed task
+report before returning the gate error. A failed gate leaves
+`trained_adapter_dir` null and does not save or validate a trained adapter;
+successful runs retain the previous save, validation, report, and print order.
+The outer quality campaign records the active failed seed and hash-addressed
+task, evaluation, baseline, runner, manifest, reward-trace, and KL-trace
+artifacts. JSON summaries copy only allowlisted fields and refuse to parse an
+input larger than 16 MiB; trace payloads remain external and are represented by
+path, size, and SHA-256. This closes the prior observability hole where the
+trainer returned the correct baseline-relative error but the outer campaign
+could preserve only stderr and separately emitted evaluation files.
+
+Pinned Zig `0.16.0`, strict Metal, isolated caches, and `-j1` pass the final
+304-case focused gate in Debug, ReleaseSafe, and ReleaseFast: 302 passed and the
+same two optional-artifact cases skipped in every mode. The new 552-input
+gradient-norm case passes in all three. The clean ReleaseFast focused compile
+took about three minutes at 9 GiB MaxRSS; the standalone server build took about
+four minutes at 13 GiB MaxRSS. Top-level Python discovery passes 265 tests,
+nested Gemma4 discovery passes 440 tests with localhost enabled, the workflow
+YAML parses, and the final formatting, unmerged-index, conflict-marker, and
+whitespace checks pass. The final Zig executable is a 30,396,304-byte Mach-O
+arm64 ReleaseFast binary at
+`/private/tmp/antfly-gemma4-production-build-report-final/install/bin/antfly-inference`
+with SHA-256
+`a653231a375b74a8d7be80a6d9e444adb4f615d1b2cb62c372b60a04802c46e1`.
+Its finetuning help contract loads, and it accepts the reserved final recipe in
+dry-run mode.
+
+The decisive real-model run used official BF16 E2B revision
+`3e22461f65e89153144f8adb70e3b8c2cc9845a7`, model SHA-256
+`2db5482b20d746879bb3ef79b5203e9075a2e2b98f54ec7c2f281c1477ddc5503`,
+and the 552-tensor all-linear adapter. Its exact ReleaseFast training binary was
+SHA-256
+`3391548dd58bdf318508e60d3283322a826f812868204adf1b3ea623f6c57de6`.
+Seed 42 trained for one seeded-shuffle epoch over 1,024 BoolQ prompts with group
+size 16, temperature 2, top-k 32, one completion token, BNPO, and learning rate
+`1e-7`. Of 1,024 logical groups, 357 were optimizer-admitted, 663 had zero
+reward variance, and four were rejected before mutation for exceeding the
+unchanged raw mean-KL budget of 0.1. The optimizer-group rate was 34.86% and the
+KL-rejection rate was 0.391%, so both predeclared training-coverage gates
+passed. Informative groups were balanced across target labels: 183 `no` and
+178 `yes`.
+
+| Held-out metric | Initialized baseline | Trained policy | Decision |
+| --- | ---: | ---: | --- |
+| mean reward | `0.722412109375` | `0.730712890625` | improved |
+| first/greedy completion reward | `0.75` | `0.75` | **failed strict improvement** |
+| positive-reward group rate | `0.83203125` | `0.8359375` | improved |
+| KL loss | `0` | `0.0004473277` | below `0.004` ceiling |
+| mean KL | `0` | `0.0111831930` | diagnostic |
+
+The exact greedy comparison gained one prompt and lost one prompt, producing
+the observed net zero. The trained policy digest was
+`645f57f0a07b0e1aa843dbfcb95f5114b6b088281f73eb6beb6828cab546af3b`.
+The preserved campaign report is
+`/private/tmp/antfly-gemma4-production-evidence/diagnostic-e2b-grpo-all-linear-train1024-observed-eval256-g16-t2-k32-max1-e1-lr1e7-v8-gradnorm552-3391548d/campaign_report.json`
+at SHA-256
+`60eadb4a92b4ff437f697e63d056749a665904effcf6d2869c8d64201f5b8cb5`.
+The final evaluation and KL-control trace SHA-256 values are respectively
+`74c5dd45afd18f763f1b06661cde1e29de93a437b7ea7857e1014c011680c46b`
+and
+`909bf7e4647d05cd0706108a5933d65c2b360962080256485fcf316662176d6b`.
+This run predates the task-report-on-failure hardening above; no trained adapter
+was published, but its outer report necessarily lacks the new bounded
+`failed_run.task_report` entry.
+
+The reserved performance-unobserved final split has 1,024 training rows and 254
+balanced evaluation rows, zero train/evaluation source-ID overlap, and excludes
+448 IDs from every previously observed evaluation manifest. Its manifest,
+train, and evaluation SHA-256 values are
+`6cc421a967769f6e62fe8069f2a6eb5f7aa545531bfc7a1513207cdfa7d0ef43`,
+`14c7df586fb0cc10b5758049f9f4326b274f35927aae9faa3cbe76cd8512046b`,
+and
+`45c48f2e00525859f4de5313e689c190b9ecf8155b50e91e462cebd5cd16b6ea`.
+The predeclared final recipe SHA-256 is
+`b3ef9946a3f483ef53419ed026867d35b32292ca62ed05f9937246ac0a418901`.
+It remains reserved for a principled algorithm or training-contract candidate,
+not another post-hoc learning-rate guess.
+
+That historical result is superseded for candidate selection by the fresh v7
+diagnostic below. It remains useful failure evidence, but it is not the current
+E2B GRPO readiness decision.
+
+## E2B GRPO Quality-Gate Refresh (2026-09-02)
+
+The real E2B all-linear Metal candidate now passes a fresh three-seed
+diagnostic under `antfly_gemma4_preference_quality_campaign/v7`. This is a
+meaningful quality-gate pass, not a release-holdout pass: the final split remains
+sealed until it can be evaluated on a fresh host with zero swap.
+
+Schema v7 makes the statistical unit match the independent evaluation unit.
+For each seed, baseline and trained completions use common random numbers and
+are reduced to one summed reward delta per prompt. Every seed must be
+directionally positive (`wins > losses`), but an individual seed is not also
+required to reach `p <= 0.05`. Once at least three seeds exist, each prompt's
+delta is averaged across seeds and a one-sided exact sign test is applied over
+the 256 independent prompts. This avoids treating the 4,096 correlated
+completions per seed, or the three training seeds themselves, as independent
+quality samples. The gate also requires strict mean-reward improvement and
+non-regressing top-completion reward per seed, no more than one positive-
+reward-group regression, at least 25% optimizer coverage, at most 1% KL
+rejection, and evaluation KL loss at most `0.004`. This campaign's top-
+completion reward improved strictly in all three seeds even though the
+predeclared contract permitted a tie.
+
+The diagnostic used:
+
+- ReleaseFast Metal binary SHA-256
+  `26963fdaa9dcc24fb6cbcb1161dbcca8ee91a955798e9d1b90b620ecef469526`;
+- qualifier source SHA-256
+  `bbe8b0763827d22a14480c7668e897a444a2ed12f6fbbae3f7dc38cdc511938d`;
+- 1,960-row balanced training data SHA-256
+  `c388cf422c4f1cbffb0bd07ebea3ea9f7ac05de5ac36809bfcfb33bd130c5cab`;
+- fresh balanced 256-prompt evaluation data SHA-256
+  `b61f5aa75c37b07ccc1e68098a40fd0eef6bfa659697ed78947379ee10e52beb`;
+  the split excludes all 702 source IDs used by earlier evaluation and the
+  reserved final split; and
+- predeclared diagnostic recipe SHA-256
+  `eb35f8dbb42af2a70c83d4448616d2ac43b942c74f9c30579de66b98c151b654`.
+
+All three seeds passed the per-seed quality and training-health contracts:
+
+| Seed | Mean reward improvement | Top-completion improvement | Positive groups | Prompt wins/losses/ties | Optimizer / KL-reject rate | Evaluation KL loss |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 17 | `+0.01171875` | `+0.01171875` | `208 -> 213` | `46 / 16 / 194` | `36.33% / 0.255%` | `0.0004957861` |
+| 42 | `+0.0048828125` | `+0.01171875` | `209 -> 208` | `23 / 14 / 219` | `35.71% / 0.306%` | `0.0004411542` |
+| 991 | `+0.0068359375` | `+0.01171875` | `211 -> 210` | `36 / 14 / 206` | `35.61% / 0.510%` | `0.0004898956` |
+
+After averaging each prompt's group-reward delta across the three seeds, the
+campaign recorded 73 wins, 30 losses, and 153 ties, with net group reward
+`+32`, mean completion-reward improvement `+0.0078125`, and one-sided exact
+`p = 0.000013588206562850904`. The write-once diagnostic outer report is
+`/private/tmp/antfly-gemma4-production-evidence/diagnostic-confirmation-e2b-grpo-all-linear-train1960-observed-eval256-fresh160-g16-t2-k32-max1-e1-lr5e8-paired-v7-26963fda-hostmetal-r1/campaign_report.json`
+at SHA-256
+`4a5ad06a7075d7ecfd6f4eab7d31deff8ca92a0fb2e7d9bb0f4ab83d87375d98`.
+It binds the recipes, initialized and trained adapters, training/evaluation
+reports, and reward/KL traces for seeds 17, 42, and 991.
+Because the root is under `/private/tmp`, it is retained diagnostic evidence,
+not durable release storage; promotion must archive the complete tree in the
+immutable release artifact store and verify its recorded digests there.
+
+A repeated seed-42 evaluation is a useful numerical caveat. Its trained adapter
+and training reward/KL traces were byte-identical to the immediately preceding
+campaign, while four of 4,096 final completion token IDs differed and the net
+reward differed by one. Both executions used the same recorded strict Metal
+policy. The cause is not proven; the evidence bounds the observed difference
+but does not justify a claim of byte-reproducible fresh-process Metal sampling.
+The prompt-level multi-seed diagnostic remains positive under either result.
+
+The reserved final evaluation remains unopened at SHA-256
+`45c48f2e00525859f4de5313e689c190b9ecf8155b50e91e462cebd5cd16b6ea`.
+Its frozen recipe is SHA-256
+`3cfde8d2c8c6fbfa93a8c9caa48973d94783deb96e35aeb5be4395022b6aa93e`.
+After the diagnostic, the host reported 2,061.19 MiB of encrypted swap, so
+running the final cell here would violate the predeclared zero-paging release
+condition and spend the holdout on non-promotable evidence. Promotion remains
+blocked on that fresh-host final run, current-source E4B quality, accepted-
+adapter interruption/resume, pinned cross-framework numerical parity, repeated
+performance/memory distributions, and required hosted macOS GPU CI on an
+immutable revision. The current-source CLI serving build and loopback gate are
+closed below. GRPO therefore remains default-off despite the diagnostic pass.
+
+## Accepted E2B GRPO Deployment Diagnostic (2026-09-02 through 2026-09-03)
+
+Seed 42 from the passing v7 quality campaign was selected before deployment as
+the canonical default seed, not by choosing the strongest observed seed. Its
+adapter SHA-256 is
+`b17b52dea3de90e35e8d2fad6442448100fa072eb58f7bebb6d8ab0619459f8a`.
+The streaming, dtype-preserving materializer merged all 276 LoRA tensors and
+copied 1,735 base tensors. The resulting 10,246,621,942-byte checkpoint is
+`/private/tmp/antfly-gemma4-production-evidence/deployment-diagnostic-e2b-grpo-seed42-all-linear-v7-26963fda-r1/materialized-model/model.safetensors`
+at SHA-256
+`12b238b351bf7b7377ab2fd4a84383087ed9eba1ec1bca59824bb6749b187448`.
+
+Three fresh processes reloaded that checkpoint through the eager Metal path.
+Every process produced public text `yes`, token ID `4443`, one completion token,
+the `length` finish reason, and zero process swaps, with no runtime command-
+buffer fallback. The write-once reload report is
+`/private/tmp/antfly-gemma4-production-evidence/deployment-diagnostic-e2b-grpo-seed42-all-linear-v7-26963fda-r1/materialized-reload-capture-report-v2.json`
+at SHA-256
+`97937adf70513377d6d734e79bfdfd143f8616d0f55650b2586a5f59a1250f19`.
+
+The first loopback CLI serving attempt exposed a real request-translation
+defect: `inference generate --server --disable-thinking` did not serialize its
+explicit thinking mode. The server therefore returned empty public content and
+private reasoning `The` for the one-token request. A controlled raw-JSON A/B
+probe returned that same split when the field was omitted and returned public
+content `yes` with no private reasoning when
+`chat_template_kwargs.enable_thinking=false` was present. The CLI bridge now
+forwards explicit `false` and `true` values while preserving omission for the
+default, with a three-case serialization regression test.
+
+The corrected raw HTTP diagnostic then passed three serial requests. All three
+returned HTTP 200, exact public content `yes`, no private reasoning, one
+completion token, and identical semantic accounting. The resident server
+selected Metal, emitted the expected three admitted and three executed prefill
+plans plus four generation timing events including warmup, used no runtime
+command-buffer fallback, recorded zero child-process swaps, and did not grow
+host swap. The materialized checkpoint remained byte-identical. The report is
+`/private/tmp/antfly-gemma4-production-evidence/deployment-diagnostic-e2b-grpo-seed42-all-linear-v7-26963fda-r1/http-serving-diagnostic-report-v3.json`
+at SHA-256
+`ed682f60985f6acf3be0001b182a55e9aa9fb3ff4b9789a78c9153aa5276c31f`.
+
+The installed development compiler `0.16.0-dev.3144+ac6fb0b59` terminated
+current-source Debug and ReleaseFast builds with compiler `SIGSEGV`/`SIGBUS`.
+An isolated baseline compile with this serving patch removed failed identically,
+so the crash was not evidence against the patch. The pinned stable Zig `0.16.0`
+toolchain then closed that build blocker: with `-j1`, ReleaseFast, and Metal
+enabled it produced the 30,396,320-byte current-source executable
+`/private/tmp/antfly-gemma4-production-build-e2b-v7-serving-fix-zig0160/install/bin/antfly-inference`
+at SHA-256
+`2ddb7517d954f6688ec7df6ee42ddfe3a9d5a190292ca22c6957fefdccefc502`.
+The explicit-thinking serialization regression passes in Debug and in a fresh
+isolated ReleaseFast Metal test build. The complete post-fix ReleaseFast Metal
+Gemma4 gate also selects 304 cases, passes 302, and skips only the same two
+documented optional-artifact cases.
+
+That current-source executable passed the CLI-facing loopback gate, not just
+the raw-JSON control. Three serial invocations of
+`inference generate --server --disable-thinking` returned exact public content
+`yes`, no private reasoning, one completion token, and `length`; all exited
+zero. The server selected Metal, recorded three admitted and three executed
+prefill plans and four generation-timing events including warmup, used no
+runtime command-buffer fallback, and recorded zero child-process swap delta.
+The executable, source file, and materialized checkpoint remained byte-identical
+before and after the gate. The report is
+`/private/tmp/antfly-gemma4-production-evidence/deployment-diagnostic-e2b-grpo-seed42-all-linear-v7-26963fda-r1/http-serving-diagnostic-report-v4.json`
+at SHA-256
+`4b30d5f5e2279adeea7052b581ced59f0093bdd3c083571a05240909330ca683`.
+
+These are paged-host diagnostics under `/private/tmp`, not immutable release
+evidence. Host swap was unchanged across the current-source serving gate but
+remained 1,909.12 MiB allocated. The current top-level Gemma4 Python discovery
+passes `264/264`; nested Gemma4 discovery passes `440/440` after its sole
+localhost integration case is run with loopback permission; and the focused
+quality/materializer/resume selection passes `60/60`. Keep the final holdout
+sealed until a fresh zero-swap host is available.
+
+The accepted seed-42 quality trajectory itself is one epoch, and the previous
+recovery qualifier required at least two epochs with epoch-boundary-only
+interruption, so no recovery evidence could apply to it. That contract gap is
+now closed in source (2026-09-03): preference training writes durable
+mid-epoch checkpoints on an eager-only `checkpoint.every_examples` cadence,
+and `qualify_gemma4_preference_resume.py` gained `--interrupt-after-examples`
+with lexicographic `(epoch, cursor)` boundary tracking. A real one-epoch E2B
+GRPO qualification then passed on this host with the exact accepted model
+snapshot, seed-42 bootstrap adapter, all-linear preset, and v7
+hyperparameters on a 24-group subset of the accepted training data and the
+pinned fresh 256-prompt evaluation split (16 evaluated groups): SIGTERM at
+the durable `(epoch 0, cursor 8)` v2 sidecar, resume, and byte-identical
+final trainer checkpoint, sidecar, and 105,409,779-byte adapter
+(`sha256:14ef8aa64279298b259...`), with the semantic trajectory exact except
+the pre-declared bounded terminal Metal GRPO KL floats. The report is
+`/private/tmp/antfly-gemma4-midepoch-resume-e2b-r1/qualification_report.json`
+at SHA-256
+`e160ef9347fdc0de7dece5f5a525f4c204972e85bde60455f57529e0551ccd5c`, produced
+by the current-source stable-Zig ReleaseFast Metal binary at SHA-256
+`546761c17e4cce3997f3c52876bca2ae739dbf0f9e2bf490965a3e1629ce1737`. The
+current-source Debug and ReleaseFast Metal Gemma4 gates select 306 cases and
+pass 304 with the same two documented optional-artifact skips, the Gemma4
+Python discovery passes `267/267`, and the resume-qualifier unit suite passes
+`25/25` including stub end-to-end mid-epoch DPO and GRPO cells. This is
+paged-host contract evidence for the mid-epoch recovery surface, not yet
+recovery of the accepted adapter itself: that still requires interrupting and
+resuming the full-length 1,960-group accepted recipe and matching its
+recorded adapter digest, which remains a deliberate scheduled run.
+
+## Final Local PR-Readiness Audit (2026-09-03)
+
+The remaining locally actionable contract gaps are now closed in source. First,
+`qualify_gemma4_preference_resume.py` publishes a v4 report that retains and
+re-hashes the exact interrupted checkpoint plus content-addressed preference
+sidecar after the resumed child finishes, validates the checkpoint's structural
+counters and zero final cursor, and optionally requires the final adapter's
+predeclared SHA-256. The real 24-group E2B run above remains subset-scale
+evidence; the full 1,960-group accepted-recipe digest match is still required.
+
+Second, the Zig numerical-oracle producer is implemented. The typed trainer's
+paired private `--oracle-request` and `--oracle-capture-out` boundary admits
+only the locked one-, two-, or eight-step AdamW trajectory. It captures a
+deterministic logit projection at every supervised causal position, final raw
+F32 gradients, post-update weights and Adam moments, and strict execution
+counters. On Metal, a read-only final-gradient observer preserves the normal
+direct-device AdamW path; it does not select the accumulation/reduction path.
+`export_gemma4_lora_zig_oracle.py` independently binds the clean source
+revision, release executable, lock, model, prepared row and raw source,
+provenance-bound adapter, target inventory, checkpoint counters, capture file
+set, and no-fallback Metal evidence before publishing a closed
+`gemma4_oracle_trace/v1` directory. The required-device tiny-BF16 CLI
+integration exercises that complete producer path.
+
+Third, the v2 BoolQ materialization contract is consumable by both MLX parity
+runners. They retain compatibility with historical v1 manifests, but current
+v2 inputs must pass the exact selection/exclusion contract and their
+self-attested semantic SHA-256 before any dataset or model work begins. This
+closes the handoff that otherwise prevented the full 1,960-group E4B v7-style
+reference rerun from starting. Failed quality campaigns now retain the
+baseline evaluation trace plus child stdout/stderr alongside the already-bound
+candidate evidence, and GRPO loss assembly rejects a finite-component sum that
+would overflow `f32` instead of publishing an infinite loss.
+
+Finally, all Gemma4 LoRA/DPO/GRPO scripts, schemas, locks, requirements, and
+tests now live under `scripts/gemma4/`, matching the family layout introduced
+by `main`. Every internal path identity, workflow command, schema constant,
+testdata lookup, and documentation command was updated with the move; the
+combined family suite exercises the relocated tools together with the merged
+serving and CUDA tooling.
+
+The current local source passes all three revision-bound, required-device
+focused Metal gates with the pinned stable Zig 0.16.0 toolchain and `-j1`:
+Debug, ReleaseSafe, and ReleaseFast each select `311` tests, pass `309`, and
+skip only the same two documented optional model-artifact cases. The embedded
+source revision is now mandatory in required-device mode, so the private
+oracle capture integration cannot silently go unexercised. The separate Debug
+and ReleaseSafe Gemma4 graph targets, ML graph unit suite, and four selected
+Metal lifecycle regressions also pass. Relocated Gemma4 family discovery passes
+`721/721` on the host, including `281/281` feature-specific LoRA/DPO/GRPO
+contract tests; the known localhost integration cell was run with loopback
+access after the restricted sandbox rejected the bind. The focused resume
+qualifier passes `28/28`, and the new Zig-oracle exporter suite passes `7/7`. Relevant
+Python modules compile; the checked-in oracle v3 lock validates at SHA-256
+`c848acb5fa38abda012f52c31cc122927b26775896d4a460e58cc9336cf27383`; and
+`git diff --check` is clean.
+
+This makes the Gemma4 change set **locally PR-ready**, subject to staging the
+remaining intended files and completing the already-open merge on one clean
+revision. It does not promote the feature to production. No locked real-model
+Zig trace can be validly produced from the current dirty/in-progress merge, and
+the paired HF/PEFT trace still needs the pinned CUDA environment and model
+snapshots. The final 2026-09-03 host preflight reports `1,669.12 MiB` swap in use
+and only `31 GiB` available on the data volume, so the sealed E2B holdout, E4B
+v7 campaign, and other zero-paging release cells were deliberately not run.
 
 ## Production Roadmap and Release Gates
 
@@ -3204,11 +3709,16 @@ correctness, and same-workload performance distributions.
 2. **Expand the oracle and real-data preference loops.** The bounded E2B/E4B
    UltraFeedback DPO and BoolQ GRPO comparisons are archived with disjoint
    evaluation and matched MLX evidence. Three-seed/eight-epoch absolute-floor
-   campaigns now pass for E2B/E4B DPO and E2B GRPO; E4B GRPO fails its
-   predeclared top-rank floor. Independent-initialization, baseline-relative
-   E2B DPO passes; the current compiled E2B GRPO sweep fails at seed 17 without
-   held-out reward improvement. Next predeclare a more representative GRPO
-   train/evaluation resolution or longer horizon, diagnose E4B under-learning,
+   campaigns now pass for E2B/E4B DPO and E2B GRPO; the legacy tiny-recipe E4B
+   GRPO campaign fails its predeclared top-rank floor. A follow-up independent
+   MLX-LM diagnostic also remained flat on that legacy workload and produced
+   zero top-rank improvement; because no immutable MLX diagnostic bundle was
+   retained, that narrows the failure away from an Antfly-only defect but is
+   not promotion evidence. Independent-initialization, baseline-relative
+   E2B DPO passes. The current compiled E2B GRPO candidate passes the v7 fresh
+   diagnostic three-seed prompt-level gate, while its separate final holdout
+   remains sealed for a zero-swap host. The Zig trace producer now exists; next
+   run that frozen final cell, rerun E4B on the full 1,960-group v7-style recipe,
    and run pinned HF/PEFT one-, two-, and eight-step traces against Zig native
    and Metal for both target presets.
 3. **Finish optional-lane provenance.** Bind teacher targets to their
@@ -3223,9 +3733,14 @@ correctness, and same-workload performance distributions.
    GRPO KL floats carry the separately attested narrow GPU-evaluation bounds
    above. Checkpointed incremental-KV GRPO also passes E2B/E4B epoch-boundary
    recovery with cumulative telemetry and rebuilt transient pages. Experimental
-   canonical direct-GGUF E2B SFT, DPO, and GRPO have recovery passes. Add
-   retained generations and mid-epoch scheduling only if operational evidence
-   justifies the extra state surface.
+   canonical direct-GGUF E2B SFT, DPO, and GRPO have recovery passes. The
+   accepted one-epoch GRPO adapter justified mid-epoch scheduling: eager
+   preference training now writes durable `every_examples` mid-epoch
+   checkpoints, and a real one-epoch E2B GRPO mid-epoch interruption/resume
+   passes byte-identically on a 24-group subset of the accepted recipe.
+   Compiled-sampling and incremental-KV lanes stay epoch-boundary-only, and
+   add retained generations only if operational evidence justifies the extra
+   state surface.
 6. **Finish production-shape compute.** The gate/up backward-input sum is now a
    qualified default runtime region at rows 64, 128, and 512, and frozen-head
    fused linear cross-entropy now owns the strict-Metal hard-label and uniform
@@ -3249,21 +3764,31 @@ correctness, and same-workload performance distributions.
    pinned host before making a stable performance claim.
 8. **Real E2B acceptance.** Pinned BF16 DPO/GRPO pass bounded historical
    absolute quality floors and exact epoch-boundary recovery. Baseline-relative
-   DPO passes three independently initialized seeds; compiled GRPO remains
-   blocked after the current safe seed-17 sweep. Increase the predeclared
-   disjoint dataset or horizon resolution, then add the remaining
-   native-versus-Metal/HF per-target parity cells before a broad claim.
+   DPO passes three independently initialized seeds. Compiled GRPO now passes
+   three independently initialized seeds on the fresh schema-v7 diagnostic;
+   its frozen final holdout must pass on a fresh zero-swap host. Then add the
+   remaining native-versus-Metal/HF per-target parity cells before a broad
+   claim.
 9. **Real E4B acceptance.** Pinned BF16 DPO passes the bounded multi-seed gate
-   and incremental GRPO recovery is exact, but GRPO misses its predeclared
-   top-rank quality floor. Diagnose that failure, then repeat the broader E2B
-   gates with sequences and target presets that exercise shared KV, PLE, and
-   the larger adapter/optimizer footprint without fallback or unbounded growth.
+   and incremental GRPO recovery is exact, but the archived tiny-recipe GRPO
+   campaign misses its predeclared top-rank quality floor. The same lack of
+   learning reproduced in an independent MLX-LM diagnostic, while E4B was never
+   run on the 1,960-group v7-style recipe that made E2B pass. Run that campaign
+   on a fresh zero-swap host, then repeat the broader E2B gates with sequences
+   and target presets that exercise shared KV, PLE, and the larger
+   adapter/optimizer footprint without fallback or unbounded growth.
 10. **Deployment and materialization.** The streaming, dtype-preserving writer
     now accepts sharded Safetensors and validates its staged output. The
-    restart-qualified E2B GRPO adapter passes streaming merge and three
-    deterministic fresh-process reloads. Repeat the quality, disk/memory, and
-    repeated-generation gates with a baseline-relative quality-accepted GRPO
-    adapter and on E4B; separately design any QAT-Q4/GGUF merge contract.
+    baseline-relative quality-accepted E2B GRPO adapter passes streaming merge,
+    three deterministic fresh-process reloads, three serial raw-HTTP Metal
+    serving requests, and three serial current-source CLI requests through
+    `inference generate --server --disable-thinking`. The mid-epoch recovery
+    contract required for a one-epoch trajectory is implemented and passes a
+    real subset-scale E2B qualification; next interrupt and resume the exact
+    full-length accepted recipe and match its recorded adapter digest, archive
+    the complete accepted evidence tree immutably, and repeat the quality,
+    disk/memory, and repeated-generation gates on E4B. Separately design any
+    QAT-Q4/GGUF merge contract.
 11. **Finish optional direct Q4/QLoRA qualification.** The pinned official E2B
     Q4_0 inventory now passes strict optimizer and process-kill/resume gates for
     canonical SFT/DPO/GRPO without host dequantization. Direct-GGUF GRPO plus

@@ -13,6 +13,7 @@ const distributed_graph = @import("distributed_graph.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
 const metadata_mod = @import("../metadata/domain.zig");
+const metadata_api = @import("../metadata/api.zig");
 const operation = @import("operation.zig");
 const raft_mod = @import("../raft/mod.zig");
 const table_reads = @import("table_reads.zig");
@@ -28,7 +29,12 @@ pub const Error = operation.ApiError || error{
     HierarchyCursorStale,
     DocIdentityNamespaceMismatch,
     StorageReadTemporarilyUnavailable,
+    QueryCandidateBudgetExceeded,
+    GraphExploredEdgesBudgetExceeded,
+    GraphExploredEdgeBytesBudgetExceeded,
     GroupLeaderUnavailable,
+    PreDecisionDeadlineExceeded,
+    TransactionPreDecisionOutcomeUnknown,
     RaftBatchWriteOutcomeUnknown,
     DecisionConflict,
     TransactionConflict,
@@ -49,11 +55,17 @@ pub const RepairCancellationLookup = struct {
     }
 };
 
+pub const RoutedBatchAuthority = union(enum) {
+    catalog: metadata_api.CatalogRouteFence,
+    split_replication,
+};
+
 pub const RoutedRaftBatchWriter = struct {
     ptr: *anyopaque,
     write_fn: *const fn (
         *anyopaque,
         std.mem.Allocator,
+        RoutedBatchAuthority,
         u64,
         []const u8,
         db_mod.types.BatchRequest,
@@ -61,8 +73,8 @@ pub const RoutedRaftBatchWriter = struct {
         CancellationToken,
     ) anyerror!?void,
 
-    fn write(self: @This(), alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, input: db_mod.types.BatchRequest, forwarding: internal_batch_forwarding.Context, cancellation: CancellationToken) !?void {
-        return self.write_fn(self.ptr, alloc, group_id, table_name, input, forwarding, cancellation);
+    fn write(self: @This(), alloc: std.mem.Allocator, authority: RoutedBatchAuthority, group_id: u64, table_name: []const u8, input: db_mod.types.BatchRequest, forwarding: internal_batch_forwarding.Context, cancellation: CancellationToken) !?void {
+        return self.write_fn(self.ptr, alloc, authority, group_id, table_name, input, forwarding, cancellation);
     }
 };
 
@@ -102,6 +114,38 @@ pub const Operations = struct {
     txn_validator: ?TxnValidator = null,
     repair_cancellation_lookup: ?RepairCancellationLookup = null,
     routed_raft_batch_writer: ?RoutedRaftBatchWriter = null,
+
+    fn routedReads(
+        self: Operations,
+        alloc: std.mem.Allocator,
+        request: operation.RequestContext,
+        group_id: u64,
+    ) Error!table_reads.TableReadSource {
+        var reads = self.reads orelse return error.NotFound;
+        reads.bindCatalogRouteFenceJson(alloc, request.catalog_route_fence_json, group_id, request.deadline_ns, request.cancellation) catch |err| switch (err) {
+            error.UnsupportedCatalogRouteFence => return error.Unsupported,
+            else => return error.InvalidArgument,
+        };
+        return reads;
+    }
+
+    fn mapCommonReadError(err: anyerror) ?Error {
+        return switch (err) {
+            error.Timeout,
+            error.DeadlineExceeded,
+            error.CatalogRoutingSnapshotTimeout,
+            => error.DeadlineExceeded,
+            error.Cancelled, error.Canceled => error.Canceled,
+            error.TopologyChanged => error.TopologyChanged,
+            error.IdentityReadGenerationChanged => error.IdentityReadGenerationChanged,
+            error.DocIdentityNamespaceMismatch => error.DocIdentityNamespaceMismatch,
+            error.StorageReadTemporarilyUnavailable => error.StorageReadTemporarilyUnavailable,
+            error.CatalogRoutingUnavailable,
+            error.CatalogProjectionRefreshRequired,
+            => error.Unavailable,
+            else => null,
+        };
+    }
 
     pub fn corruptEmbeddingArtifact(
         self: Operations,
@@ -254,8 +298,43 @@ pub const Operations = struct {
             else => return error.Internal,
         };
         const writer = self.routed_raft_batch_writer orelse return error.Unavailable;
-        _ = (writer.write(alloc, group_id, table_name, input, forwarding, request.cancellation) catch |err| switch (err) {
+        var parsed_fence: ?std.json.Parsed(metadata_api.CatalogRouteFence) = null;
+        defer if (parsed_fence) |*fence| fence.deinit();
+        const authority: RoutedBatchAuthority = if (request.catalog_route_fence_json.len != 0) fence: {
+            parsed_fence = std.json.parseFromSlice(
+                metadata_api.CatalogRouteFence,
+                alloc,
+                request.catalog_route_fence_json,
+                .{ .ignore_unknown_fields = false },
+            ) catch return error.InvalidArgument;
+            parsed_fence.?.value.validate() catch return error.InvalidArgument;
+            if (parsed_fence.?.value.route.group_id != group_id) return error.InvalidArgument;
+            parsed_fence.?.value.admission_deadline_ns = request.deadline_ns;
+            parsed_fence.?.value.admission_cancellation = request.cancellation;
+            break :fence .{ .catalog = parsed_fence.?.value };
+        } else split: {
+            // Publicly routed writes always carry a catalog fence. Split
+            // replication is different: its destination is intentionally not
+            // catalog-visible yet, and the replicated transition identity is
+            // the authority checked by every destination replica. Admit only
+            // that self-identifying internal batch shape without a fence.
+            const split_replication = input.split_replication orelse return error.Unavailable;
+            if (split_replication.transition_id == 0 or
+                split_replication.attempt_epoch == 0 or
+                split_replication.source_group_id == 0 or
+                split_replication.destination_group_id != group_id or
+                split_replication.source_group_id == group_id)
+            {
+                return error.InvalidArgument;
+            }
+            break :split .split_replication;
+        };
+        _ = (writer.write(alloc, authority, group_id, table_name, input, forwarding, request.cancellation) catch |err| switch (err) {
             error.InvalidBatchRequest => return error.InvalidArgument,
+            error.TopologyChanged => return error.TopologyChanged,
+            error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return error.DeadlineExceeded,
+            error.Canceled, error.Cancelled => return error.Canceled,
+            error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired => return error.Unavailable,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.RaftBatchWriteOutcomeUnknown => return error.RaftBatchWriteOutcomeUnknown,
             error.EnrichmentWaitCanceled => return error.EnrichmentWaitCanceled,
@@ -273,33 +352,65 @@ pub const Operations = struct {
     }
 
     pub fn txnBegin(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnBeginRequest) Error!void {
-        try request.ensureActive();
+        try ensurePreDecisionRequestActive(request);
         const writes = self.writes orelse return error.NotFound;
-        _ = (writes.txnBeginGroupLocal(alloc, group_id, table_name, input.txn_id, input.begin_timestamp, input.topology_epoch, input.retain_terminal, input.participants) catch |err| switch (err) {
+        const supports_pre_decision_context =
+            writes.vtable.txn_begin_group_local_with_pre_decision_context != null;
+        _ = (writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, input.txn_id, input.begin_timestamp, input.topology_epoch, input.retain_terminal, input.participants, .{
+            .deadline_ns = request.deadline_ns,
+            .cancellation = request.cancellation,
+        }) catch |err| switch (err) {
             error.InvalidBatchRequest => return error.InvalidArgument,
+            error.Canceled, error.Cancelled => return error.Canceled,
+            error.Timeout, error.DeadlineExceeded => return error.TransactionPreDecisionOutcomeUnknown,
+            error.PreDecisionDeadlineExceeded => {
+                if (!supports_pre_decision_context or request.deadline_ns == null)
+                    return error.TransactionPreDecisionOutcomeUnknown;
+                return error.PreDecisionDeadlineExceeded;
+            },
             error.DecisionConflict => return error.DecisionConflict,
             error.TopologyChanged => return error.TopologyChanged,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.UnsupportedOperation => return error.Unsupported,
             error.UnknownGroup, error.TxnNotFound => return error.NotFound,
+            error.LeaderUnavailable,
+            error.GroupLeaderUnavailable,
+            error.MetadataSnapshotUnavailable,
+            => return error.GroupLeaderUnavailable,
             else => return error.Internal,
         }) orelse return error.NotFound;
     }
 
     pub fn txnPrepare(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnPrepareRequest) Error!void {
-        try request.ensureActive();
+        try ensurePreDecisionRequestActive(request);
         const writes = self.writes orelse return error.NotFound;
+        const supports_pre_decision_context =
+            writes.vtable.txn_prepare_group_local_with_pre_decision_context != null;
         const validator = self.txn_validator orelse return error.Unavailable;
         validator.validate(table_name, input.req.writes) catch |err| switch (err) {
             error.InvalidBatchRequest => return error.InvalidArgument,
             else => return error.Internal,
         };
-        _ = (writes.txnPrepareGroupLocal(alloc, group_id, table_name, input.txn_id, input.topology_epoch, input.req) catch |err| switch (err) {
+        _ = (writes.txnPrepareGroupLocalWithPreDecisionContext(alloc, group_id, table_name, input.txn_id, input.topology_epoch, input.req, .{
+            .deadline_ns = request.deadline_ns,
+            .cancellation = request.cancellation,
+        }) catch |err| switch (err) {
+            error.Canceled, error.Cancelled => return error.Canceled,
+            error.Timeout, error.DeadlineExceeded => return error.TransactionPreDecisionOutcomeUnknown,
+            error.PreDecisionDeadlineExceeded => {
+                if (!supports_pre_decision_context or request.deadline_ns == null)
+                    return error.TransactionPreDecisionOutcomeUnknown;
+                return error.PreDecisionDeadlineExceeded;
+            },
             error.TopologyChanged => return error.TopologyChanged,
             error.VersionConflict, error.IntentConflict => return error.TransactionConflict,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.UnsupportedOperation => return error.Unsupported,
             error.UnknownGroup, error.TxnNotFound => return error.NotFound,
+            error.LeaderUnavailable,
+            error.GroupLeaderUnavailable,
+            error.MetadataSnapshotUnavailable,
+            => return error.GroupLeaderUnavailable,
             else => return error.Internal,
         }) orelse return error.NotFound;
     }
@@ -537,7 +648,7 @@ pub const Operations = struct {
         input: LookupInput,
     ) Error!table_reads.LookupResponse {
         try request.ensureActive();
-        const reads = self.reads orelse return error.NotFound;
+        const reads = try self.routedReads(alloc, request, input.group_id);
         var options = input.options;
         options.execution_deadline_ns = request.deadline_ns;
         options.cancellation = request.cancellation;
@@ -548,15 +659,7 @@ pub const Operations = struct {
             input.key,
             options,
             input.consistency,
-        ) catch |err| switch (err) {
-            error.Timeout => return error.DeadlineExceeded,
-            error.Cancelled, error.Canceled => return error.Canceled,
-            error.TopologyChanged => return error.TopologyChanged,
-            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
-            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
-            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
-            else => return error.Internal,
-        };
+        ) catch |err| return mapCommonReadError(err) orelse error.Internal;
         return result orelse error.NotFound;
     }
 
@@ -572,14 +675,13 @@ pub const Operations = struct {
         artifact_name: []const u8,
     ) Error!db_mod.types.DocumentArtifactManifest {
         try request.ensureActive();
-        const reads = self.reads orelse return error.NotFound;
-        return (reads.documentArtifactManifestGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, .read_index) catch |err| switch (err) {
-            error.TopologyChanged => return error.TopologyChanged,
-            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
-            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
-            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
-            error.UnknownGroup, error.TableNotFound, error.NotFound => return error.NotFound,
-            else => return error.Internal,
+        const reads = try self.routedReads(alloc, request, group_id);
+        return (reads.documentArtifactManifestGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, .read_index) catch |err| {
+            if (mapCommonReadError(err)) |mapped| return mapped;
+            return switch (err) {
+                error.UnknownGroup, error.TableNotFound, error.NotFound => error.NotFound,
+                else => error.Internal,
+            };
         }) orelse error.NotFound;
     }
 
@@ -594,14 +696,13 @@ pub const Operations = struct {
         doc_key: []const u8,
     ) Error!db_mod.types.DocumentArtifactManifestList {
         try request.ensureActive();
-        const reads = self.reads orelse return error.NotFound;
-        return (reads.documentArtifactManifestsGroupLocal(alloc, group_id, table_name, doc_key, .read_index) catch |err| switch (err) {
-            error.TopologyChanged => return error.TopologyChanged,
-            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
-            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
-            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
-            error.UnknownGroup, error.TableNotFound, error.NotFound => return error.NotFound,
-            else => return error.Internal,
+        const reads = try self.routedReads(alloc, request, group_id);
+        return (reads.documentArtifactManifestsGroupLocal(alloc, group_id, table_name, doc_key, .read_index) catch |err| {
+            if (mapCommonReadError(err)) |mapped| return mapped;
+            return switch (err) {
+                error.UnknownGroup, error.TableNotFound, error.NotFound => error.NotFound,
+                else => error.Internal,
+            };
         }) orelse error.NotFound;
     }
 
@@ -617,14 +718,9 @@ pub const Operations = struct {
         options: db_mod.types.ScanOptions,
     ) Error!table_reads.ScanResponse {
         try request.ensureActive();
-        const reads = self.reads orelse return error.NotFound;
-        return (reads.scanGroupLocal(alloc, group_id, table_name, from, to, options, .read_index) catch |err| switch (err) {
-            error.TopologyChanged => return error.TopologyChanged,
-            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
-            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
-            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
-            else => return error.Internal,
-        }) orelse error.NotFound;
+        const reads = try self.routedReads(alloc, request, group_id);
+        return (reads.scanGroupLocal(alloc, group_id, table_name, from, to, options, .read_index) catch |err|
+            return mapCommonReadError(err) orelse error.Internal) orelse error.NotFound;
     }
 
     /// Execute a schema-routed group-local query. The returned response owns
@@ -638,16 +734,15 @@ pub const Operations = struct {
         input: db_mod.types.SearchRequest,
     ) Error!query_api.QueryResponse {
         try request.ensureActive();
-        const reads = self.reads orelse return error.NotFound;
-        return (reads.queryGroupLocal(alloc, group_id, table_name, input, .read_index) catch |err| switch (err) {
-            error.HierarchyCursorStale => return error.HierarchyCursorStale,
-            error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => return error.InvalidArgument,
-            error.TopologyChanged => return error.TopologyChanged,
-            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
-            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
-            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
-            error.UnknownGroup, error.TableNotFound => return error.NotFound,
-            else => return error.Internal,
+        const reads = try self.routedReads(alloc, request, group_id);
+        return (reads.queryGroupLocal(alloc, group_id, table_name, input, .read_index) catch |err| {
+            if (mapCommonReadError(err)) |mapped| return mapped;
+            return switch (err) {
+                error.HierarchyCursorStale => error.HierarchyCursorStale,
+                error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => error.InvalidArgument,
+                error.UnknownGroup, error.TableNotFound => error.NotFound,
+                else => error.Internal,
+            };
         }) orelse error.NotFound;
     }
 
@@ -664,84 +759,80 @@ pub const Operations = struct {
         max_work: u32,
     ) Error!runtime_preflight.RuntimePreflightSummary {
         try request.ensureActive();
-        const reads = self.reads orelse return error.NotFound;
-        return (reads.preflightQueryGroupLocal(alloc, group_id, table_name, input, .read_index, max_work) catch |err| switch (err) {
-            error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => return error.InvalidArgument,
-            error.TopologyChanged => return error.TopologyChanged,
-            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
-            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
-            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
-            error.UnknownGroup, error.TableNotFound => return error.NotFound,
-            else => return error.Internal,
+        const reads = try self.routedReads(alloc, request, group_id);
+        return (reads.preflightQueryGroupLocal(alloc, group_id, table_name, input, .read_index, max_work) catch |err| {
+            if (mapCommonReadError(err)) |mapped| return mapped;
+            return switch (err) {
+                error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => error.InvalidArgument,
+                error.UnknownGroup, error.TableNotFound => error.NotFound,
+                else => error.Internal,
+            };
         }) orelse error.NotFound;
     }
 
     pub fn graphExpand(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_graph.GraphExpandRequest) Error!distributed_graph.GraphExpandResponse {
         try request.ensureActive();
-        const reads = self.reads orelse return error.NotFound;
-        return (reads.graphExpandGroupLocal(alloc, group_id, table_name, input, .read_index) catch |err| switch (err) {
-            error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => return error.InvalidArgument,
-            error.TopologyChanged => return error.TopologyChanged,
-            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
-            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
-            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
-            error.UnknownGroup, error.TableNotFound => return error.NotFound,
-            else => return error.Internal,
+        const reads = try self.routedReads(alloc, request, group_id);
+        return (reads.graphExpandGroupLocal(alloc, group_id, table_name, input, .read_index) catch |err| {
+            if (mapCommonReadError(err)) |mapped| return mapped;
+            return switch (err) {
+                error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => error.InvalidArgument,
+                error.UnknownGroup, error.TableNotFound => error.NotFound,
+                else => error.Internal,
+            };
         }) orelse error.NotFound;
     }
 
     pub fn graphHydrate(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_graph.GraphHydrateRequest) Error!distributed_graph.GraphHydrateResponse {
         try request.ensureActive();
-        const reads = self.reads orelse return error.NotFound;
-        return (reads.graphHydrateGroupLocal(alloc, group_id, table_name, input, .read_index) catch |err| switch (err) {
-            error.TopologyChanged => return error.TopologyChanged,
-            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
-            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
-            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
-            error.UnknownGroup, error.TableNotFound => return error.NotFound,
-            else => return error.Internal,
+        const reads = try self.routedReads(alloc, request, group_id);
+        return (reads.graphHydrateGroupLocal(alloc, group_id, table_name, input, .read_index) catch |err| {
+            if (mapCommonReadError(err)) |mapped| return mapped;
+            return switch (err) {
+                error.UnknownGroup, error.TableNotFound => error.NotFound,
+                else => error.Internal,
+            };
         }) orelse error.NotFound;
     }
 
     pub fn graphEdges(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_graph.GraphEdgesRequest) Error!distributed_graph.GraphEdgesResponse {
         try request.ensureActive();
-        const reads = self.reads orelse return error.NotFound;
-        return (reads.graphEdgesGroupLocal(alloc, group_id, table_name, input, .read_index) catch |err| switch (err) {
-            error.InvalidQueryRequest, error.IndexNotFound => return error.InvalidArgument,
-            error.TopologyChanged => return error.TopologyChanged,
-            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
-            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
-            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
-            error.UnknownGroup, error.TableNotFound => return error.NotFound,
-            else => return error.Internal,
+        const reads = try self.routedReads(alloc, request, group_id);
+        return (reads.graphEdgesGroupLocal(alloc, group_id, table_name, input, .read_index) catch |err| {
+            if (mapCommonReadError(err)) |mapped| return mapped;
+            return switch (err) {
+                error.InvalidQueryRequest, error.IndexNotFound => error.InvalidArgument,
+                error.GraphExploredEdgesBudgetExceeded => error.GraphExploredEdgesBudgetExceeded,
+                error.GraphExploredEdgeBytesBudgetExceeded => error.GraphExploredEdgeBytesBudgetExceeded,
+                error.UnknownGroup, error.TableNotFound => error.NotFound,
+                else => error.Internal,
+            };
         }) orelse error.NotFound;
     }
 
     pub fn textStats(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, body: []const u8) Error!query_api.QueryResponse {
         try request.ensureActive();
-        const reads = self.reads orelse return error.NotFound;
-        return (reads.textStatsGroupLocal(alloc, group_id, table_name, body) catch |err| switch (err) {
-            error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidArgument,
-            error.TableNotFound, error.UnknownGroup => return error.NotFound,
-            error.TopologyChanged => return error.TopologyChanged,
-            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
-            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
-            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
-            else => return error.Internal,
+        const reads = try self.routedReads(alloc, request, group_id);
+        return (reads.textStatsGroupLocal(alloc, group_id, table_name, body) catch |err| {
+            if (mapCommonReadError(err)) |mapped| return mapped;
+            return switch (err) {
+                error.InvalidQueryRequest, error.UnsupportedQueryRequest => error.InvalidArgument,
+                error.TableNotFound, error.UnknownGroup => error.NotFound,
+                else => error.Internal,
+            };
         }) orelse error.NotFound;
     }
 
     pub fn algebraicPartials(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, body: []const u8) Error!query_api.QueryResponse {
         try request.ensureActive();
-        const reads = self.reads orelse return error.NotFound;
-        return (reads.algebraicPartialsGroupLocal(alloc, group_id, table_name, body) catch |err| switch (err) {
-            error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidArgument,
-            error.TableNotFound, error.UnknownGroup => return error.NotFound,
-            error.TopologyChanged => return error.TopologyChanged,
-            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
-            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
-            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
-            else => return error.Internal,
+        const reads = try self.routedReads(alloc, request, group_id);
+        return (reads.algebraicPartialsGroupLocal(alloc, group_id, table_name, body) catch |err| {
+            if (mapCommonReadError(err)) |mapped| return mapped;
+            return switch (err) {
+                error.InvalidQueryRequest, error.UnsupportedQueryRequest => error.InvalidArgument,
+                error.TableNotFound, error.UnknownGroup => error.NotFound,
+                else => error.Internal,
+            };
         }) orelse error.NotFound;
     }
 
@@ -761,6 +852,268 @@ pub const Operations = struct {
         };
     }
 };
+
+fn ensurePreDecisionRequestActive(request: operation.RequestContext) Error!void {
+    request.ensureActive() catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        // This check runs before a participant callback can admit a mutation,
+        // so it is safe to give the deadline failure a stronger identity.
+        error.DeadlineExceeded => return error.PreDecisionDeadlineExceeded,
+        else => return error.Internal,
+    };
+}
+
+test "internal transaction operations preserve pre-decision leader unavailability" {
+    const Source = struct {
+        fn iface() table_writes.TableWriteSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .batch = batch,
+                    .txn_begin_group_local = txnBegin,
+                    .txn_prepare_group_local = txnPrepare,
+                },
+            };
+        }
+
+        fn batch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) anyerror!?void {
+            return null;
+        }
+
+        fn txnBegin(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: u64,
+            _: []const u8,
+            _: db_mod.types.TxnId,
+            _: u64,
+            _: u64,
+            _: bool,
+            _: []const []const u8,
+        ) anyerror!?void {
+            return error.LeaderUnavailable;
+        }
+
+        fn txnPrepare(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: u64,
+            _: []const u8,
+            _: db_mod.types.TxnId,
+            _: u64,
+            _: db_mod.types.TransactionIntentRequest,
+        ) anyerror!?void {
+            return error.MetadataSnapshotUnavailable;
+        }
+    };
+
+    const LegacyDeadlineSource = struct {
+        fn iface() table_writes.TableWriteSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .batch = batch,
+                    .txn_begin_group_local = txnBegin,
+                    .txn_prepare_group_local = txnPrepare,
+                },
+            };
+        }
+
+        fn batch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) anyerror!?void {
+            return null;
+        }
+
+        fn txnBegin(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: u64,
+            _: []const u8,
+            _: db_mod.types.TxnId,
+            _: u64,
+            _: u64,
+            _: bool,
+            _: []const []const u8,
+        ) anyerror!?void {
+            return error.DeadlineExceeded;
+        }
+
+        fn txnPrepare(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: u64,
+            _: []const u8,
+            _: db_mod.types.TxnId,
+            _: u64,
+            _: db_mod.types.TransactionIntentRequest,
+        ) anyerror!?void {
+            return error.Timeout;
+        }
+    };
+
+    const ContextDeadlineSource = struct {
+        failure: anyerror,
+
+        fn iface(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .txn_begin_group_local_with_pre_decision_context = txnBegin,
+                    .txn_prepare_group_local_with_pre_decision_context = txnPrepare,
+                },
+            };
+        }
+
+        fn batch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) anyerror!?void {
+            return null;
+        }
+
+        fn txnBegin(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: u64,
+            _: []const u8,
+            _: db_mod.types.TxnId,
+            _: u64,
+            _: u64,
+            _: bool,
+            _: []const []const u8,
+            _: distributed_txn.PreDecisionContext,
+        ) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.failure;
+        }
+
+        fn txnPrepare(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: u64,
+            _: []const u8,
+            _: db_mod.types.TxnId,
+            _: u64,
+            _: db_mod.types.TransactionIntentRequest,
+            _: distributed_txn.PreDecisionContext,
+        ) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.failure;
+        }
+    };
+
+    const Validator = struct {
+        fn validate(_: *anyopaque, _: []const u8, _: []const db_mod.types.TransactionWrite) anyerror!void {}
+    };
+
+    const operations = Operations{
+        .reads = null,
+        .shard_db_adapter = null,
+        .writes = Source.iface(),
+        .txn_validator = .{ .ptr = undefined, .validate_fn = Validator.validate },
+    };
+    const txn_id = [_]u8{0x42} ** 16;
+    try std.testing.expectError(error.GroupLeaderUnavailable, operations.txnBegin(
+        std.testing.allocator,
+        .{},
+        7,
+        "docs",
+        .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
+    ));
+    try std.testing.expectError(error.GroupLeaderUnavailable, operations.txnPrepare(
+        std.testing.allocator,
+        .{},
+        7,
+        "docs",
+        .{ .txn_id = txn_id, .req = .{} },
+    ));
+
+    const legacy_deadline_operations = Operations{
+        .reads = null,
+        .shard_db_adapter = null,
+        .writes = LegacyDeadlineSource.iface(),
+        .txn_validator = .{ .ptr = undefined, .validate_fn = Validator.validate },
+    };
+    try std.testing.expectError(error.TransactionPreDecisionOutcomeUnknown, legacy_deadline_operations.txnBegin(
+        std.testing.allocator,
+        .{},
+        7,
+        "docs",
+        .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
+    ));
+    try std.testing.expectError(error.TransactionPreDecisionOutcomeUnknown, legacy_deadline_operations.txnPrepare(
+        std.testing.allocator,
+        .{},
+        7,
+        "docs",
+        .{ .txn_id = txn_id, .req = .{} },
+    ));
+
+    var context_deadline_source = ContextDeadlineSource{ .failure = error.Timeout };
+    const context_deadline_operations = Operations{
+        .reads = null,
+        .shard_db_adapter = null,
+        .writes = context_deadline_source.iface(),
+        .txn_validator = .{ .ptr = undefined, .validate_fn = Validator.validate },
+    };
+    const active_deadline = operation.RequestContext{ .deadline_ns = std.math.maxInt(u64) };
+    try std.testing.expectError(error.TransactionPreDecisionOutcomeUnknown, context_deadline_operations.txnBegin(
+        std.testing.allocator,
+        active_deadline,
+        7,
+        "docs",
+        .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
+    ));
+    context_deadline_source.failure = error.DeadlineExceeded;
+    try std.testing.expectError(error.TransactionPreDecisionOutcomeUnknown, context_deadline_operations.txnPrepare(
+        std.testing.allocator,
+        active_deadline,
+        7,
+        "docs",
+        .{ .txn_id = txn_id, .req = .{} },
+    ));
+    context_deadline_source.failure = error.PreDecisionDeadlineExceeded;
+    try std.testing.expectError(error.TransactionPreDecisionOutcomeUnknown, context_deadline_operations.txnBegin(
+        std.testing.allocator,
+        .{},
+        7,
+        "docs",
+        .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
+    ));
+    try std.testing.expectError(error.PreDecisionDeadlineExceeded, context_deadline_operations.txnBegin(
+        std.testing.allocator,
+        active_deadline,
+        7,
+        "docs",
+        .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
+    ));
+    try std.testing.expectError(error.PreDecisionDeadlineExceeded, context_deadline_operations.txnPrepare(
+        std.testing.allocator,
+        active_deadline,
+        7,
+        "docs",
+        .{ .txn_id = txn_id, .req = .{} },
+    ));
+    try std.testing.expectError(error.PreDecisionDeadlineExceeded, operations.txnBegin(
+        std.testing.allocator,
+        .{ .deadline_ns = 1 },
+        7,
+        "docs",
+        .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
+    ));
+}
 
 const RepairCancelProbe = struct {
     alloc: std.mem.Allocator,
@@ -847,6 +1200,7 @@ test "typed routed batch preserves forwarding cancellation and identity conflict
         calls: usize = 0,
         fail_identity: bool = false,
         visibility_error: ?anyerror = null,
+        saw_unfenced_split: bool = false,
 
         fn validate(ptr: *anyopaque, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -858,6 +1212,7 @@ test "typed routed batch preserves forwarding cancellation and identity conflict
         fn write(
             ptr: *anyopaque,
             _: std.mem.Allocator,
+            authority: RoutedBatchAuthority,
             group_id: u64,
             table_name: []const u8,
             _: db_mod.types.BatchRequest,
@@ -867,6 +1222,10 @@ test "typed routed batch preserves forwarding cancellation and identity conflict
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
             try std.testing.expectEqual(@as(u64, 17), group_id);
+            switch (authority) {
+                .catalog => |catalog_fence| try std.testing.expectEqual(group_id, catalog_fence.route.group_id),
+                .split_replication => self.saw_unfenced_split = true,
+            }
             try std.testing.expectEqualStrings("documents", table_name);
             try std.testing.expectEqual(@as(u32, 425), forwarding.remaining_ms);
             try std.testing.expectEqual(@as(u8, 1), forwarding.forwards_remaining);
@@ -894,6 +1253,7 @@ test "typed routed batch preserves forwarding cancellation and identity conflict
     };
     const request: operation.RequestContext = .{
         .cancellation = CancellationToken.fromAtomic(&cancelled),
+        .catalog_route_fence_json = "{\"metadata_group_id\":1,\"catalog_revision\":2,\"table_id\":3,\"topology_epoch\":4,\"route\":{\"group_id\":17,\"range_id\":5,\"identity_namespace\":{\"table_id\":3,\"shard_id\":17,\"range_id\":5}}}",
     };
 
     const result = try operations.routedBatch(
@@ -938,6 +1298,49 @@ test "typed routed batch preserves forwarding cancellation and identity conflict
         forwarding,
     ));
     try std.testing.expectEqual(@as(usize, 4), state.calls);
+
+    const unfenced_request: operation.RequestContext = .{
+        .cancellation = CancellationToken.fromAtomic(&cancelled),
+    };
+    try std.testing.expectError(error.Unavailable, operations.routedBatch(
+        std.testing.allocator,
+        unfenced_request,
+        17,
+        "documents",
+        .{},
+        forwarding,
+    ));
+    try std.testing.expectEqual(@as(usize, 4), state.calls);
+
+    const split_replication: db_mod.types.SplitReplicationContext = .{
+        .transition_id = 91,
+        .attempt_epoch = 2,
+        .source_group_id = 16,
+        .destination_group_id = 17,
+        .identity_namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 17 },
+    };
+    _ = try operations.routedBatch(
+        std.testing.allocator,
+        unfenced_request,
+        17,
+        "documents",
+        .{ .split_replication = split_replication },
+        forwarding,
+    );
+    try std.testing.expectEqual(@as(usize, 5), state.calls);
+    try std.testing.expect(state.saw_unfenced_split);
+
+    var mismatched_split = split_replication;
+    mismatched_split.destination_group_id = 18;
+    try std.testing.expectError(error.InvalidArgument, operations.routedBatch(
+        std.testing.allocator,
+        unfenced_request,
+        17,
+        "documents",
+        .{ .split_replication = mismatched_split },
+        forwarding,
+    ));
+    try std.testing.expectEqual(@as(usize, 5), state.calls);
 }
 
 test "typed internal query workers preserve identity generation validation" {
@@ -1027,6 +1430,14 @@ test "typed internal query workers preserve identity generation validation" {
 
 test "typed internal group reads preserve retryable resident storage failures" {
     const alloc = std.testing.allocator;
+    try std.testing.expectEqual(
+        error.DeadlineExceeded,
+        Operations.mapCommonReadError(error.CatalogRoutingSnapshotTimeout).?,
+    );
+    try std.testing.expectEqual(
+        error.Unavailable,
+        Operations.mapCommonReadError(error.CatalogRoutingUnavailable).?,
+    );
     const FakeReads = struct {
         fn source() table_reads.TableReadSource {
             return .{ .ptr = undefined, .vtable = &.{

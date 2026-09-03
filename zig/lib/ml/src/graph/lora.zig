@@ -120,6 +120,10 @@ pub fn injectLoRA(
     src: *const Graph,
     config: LoRAConfig,
 ) !LoRAResult {
+    if (config.rank == 0) return error.InvalidLoRARank;
+    if (!std.math.isFinite(config.alpha) or config.alpha <= 0.0) {
+        return error.InvalidLoRAAlpha;
+    }
     if (!std.math.isFinite(config.dropout) or config.dropout < 0.0 or config.dropout >= 1.0) {
         return error.InvalidLoRADropout;
     }
@@ -344,6 +348,32 @@ pub fn injectLoRA(
     }
 
     return .{ .graph = g, .adapter = adapter };
+}
+
+test "injectLoRA rejects invalid rank and alpha before graph mutation" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+
+    try std.testing.expectError(error.InvalidLoRARank, injectLoRA(allocator, &g, .{
+        .rank = 0,
+        .target_patterns = &.{"q_proj"},
+    }));
+    try std.testing.expectError(error.InvalidLoRAAlpha, injectLoRA(allocator, &g, .{
+        .rank = 1,
+        .alpha = 0.0,
+        .target_patterns = &.{"q_proj"},
+    }));
+    try std.testing.expectError(error.InvalidLoRAAlpha, injectLoRA(allocator, &g, .{
+        .rank = 1,
+        .alpha = std.math.nan(f32),
+        .target_patterns = &.{"q_proj"},
+    }));
+    try std.testing.expectError(error.InvalidLoRAAlpha, injectLoRA(allocator, &g, .{
+        .rank = 1,
+        .alpha = std.math.inf(f32),
+        .target_patterns = &.{"q_proj"},
+    }));
 }
 
 test "injectLoRA by_use creates separate adapters for shared weight uses" {

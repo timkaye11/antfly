@@ -9,9 +9,11 @@ from attrs import field as _attrs_field
 from ..models.create_embeddings_index_request_type import CreateEmbeddingsIndexRequestType
 from ..models.derived_coverage_policy import DerivedCoveragePolicy
 from ..models.distance_metric import DistanceMetric
+from ..models.index_publication_policy import IndexPublicationPolicy
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.artifact_index_source import ArtifactIndexSource
     from ..models.chunker_config import ChunkerConfig
     from ..models.embedder_config import EmbedderConfig
     from ..models.enrichment_config import EnrichmentConfig
@@ -31,6 +33,9 @@ class CreateEmbeddingsIndexRequest:
         description (str | Unset): Optional description of the index and its purpose
         version (int | Unset): Version of the index implementation. Defaults to 0. Default: 0.
         enrichments (list[EnrichmentConfig] | Unset): Inline managed enrichment definitions required by this index.
+        publication_policy (IndexPublicationPolicy | Unset): Publication behavior for a managed embeddings index.
+            `progressive` makes a safely checkpointed active generation queryable before initial source coverage is
+            complete. `atomic` keeps a new generation unavailable until complete validation and activation.
         coverage_policy (DerivedCoveragePolicy | Unset): How generation-scoped source outcomes determine derived-index
             completeness.
         external (bool | Unset): When true, embeddings are supplied externally via _embeddings and the index does not
@@ -40,10 +45,17 @@ class CreateEmbeddingsIndexRequest:
         dimension (int | Unset): Vector dimension for dense indexes. Required for external dense indexes. Can be omitted
             for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
         field (str | Unset): Field to extract embeddings from (managed indexes only; not allowed when external=true)
-        embedding_name (str | Unset): Generated embedding artifact name consumed by this vector index. Use with a
-            matching embedding enrichment for artifact-backed managed embeddings.
-        source_artifact_name (str | Unset): Artifact stream consumed by the embedding enrichment backing this vector
-            index. This is descriptive public configuration; the matching enrichment defines the materialized source.
+        sources (list[ArtifactIndexSource] | Unset): Embedding artifact streams indexed together. Each artifact record
+            is an independent vector member identified by (artifact name, source key). All sources must use the same dense
+            vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or
+            source_artifact_name. Requires index_capabilities.artifact_sources=true and is rejected by serverless
+            deployments.
+        embedding_name (str | Unset): Released v0.2 single-source alternative request form. Mutually exclusive with
+            sources. Required when source_artifact_name is set. Responses also expose canonical sources while preserving
+            these fields. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
+        source_artifact_name (str | Unset): Deprecated v0.2 descriptive field. When supplied for compatibility,
+            embedding_name is required and this value must exactly match the source_artifact_name on the authoritative
+            embedding enrichment. New clients should declare the relationship only on that enrichment.
         template (str | Unset): Handlebars template for generating prompts (managed indexes only; not allowed when
             external=true). See https://handlebarsjs.com/guide/ for more information. Example: Hello, {{#if (eq Name
             "John")}}Johnathan{{else}}{{Name}}{{/if}}! You are {{Age}} years old..
@@ -240,11 +252,13 @@ class CreateEmbeddingsIndexRequest:
     description: str | Unset = UNSET
     version: int | Unset = 0
     enrichments: list[EnrichmentConfig] | Unset = UNSET
+    publication_policy: IndexPublicationPolicy | Unset = UNSET
     coverage_policy: DerivedCoveragePolicy | Unset = UNSET
     external: bool | Unset = False
     sparse: bool | Unset = False
     dimension: int | Unset = UNSET
     field: str | Unset = UNSET
+    sources: list[ArtifactIndexSource] | Unset = UNSET
     embedding_name: str | Unset = UNSET
     source_artifact_name: str | Unset = UNSET
     template: str | Unset = UNSET
@@ -273,6 +287,10 @@ class CreateEmbeddingsIndexRequest:
                 enrichments_item = enrichments_item_data.to_dict()
                 enrichments.append(enrichments_item)
 
+        publication_policy: str | Unset = UNSET
+        if not isinstance(self.publication_policy, Unset):
+            publication_policy = self.publication_policy.value
+
         coverage_policy: str | Unset = UNSET
         if not isinstance(self.coverage_policy, Unset):
             coverage_policy = self.coverage_policy.value
@@ -284,6 +302,13 @@ class CreateEmbeddingsIndexRequest:
         dimension = self.dimension
 
         field = self.field
+
+        sources: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.sources, Unset):
+            sources = []
+            for sources_item_data in self.sources:
+                sources_item = sources_item_data.to_dict()
+                sources.append(sources_item)
 
         embedding_name = self.embedding_name
 
@@ -332,6 +357,8 @@ class CreateEmbeddingsIndexRequest:
             field_dict["version"] = version
         if enrichments is not UNSET:
             field_dict["enrichments"] = enrichments
+        if publication_policy is not UNSET:
+            field_dict["publication_policy"] = publication_policy
         if coverage_policy is not UNSET:
             field_dict["coverage_policy"] = coverage_policy
         if external is not UNSET:
@@ -342,6 +369,8 @@ class CreateEmbeddingsIndexRequest:
             field_dict["dimension"] = dimension
         if field is not UNSET:
             field_dict["field"] = field
+        if sources is not UNSET:
+            field_dict["sources"] = sources
         if embedding_name is not UNSET:
             field_dict["embedding_name"] = embedding_name
         if source_artifact_name is not UNSET:
@@ -371,6 +400,7 @@ class CreateEmbeddingsIndexRequest:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.artifact_index_source import ArtifactIndexSource
         from ..models.chunker_config import ChunkerConfig
         from ..models.embedder_config import EmbedderConfig
         from ..models.enrichment_config import EnrichmentConfig
@@ -393,6 +423,13 @@ class CreateEmbeddingsIndexRequest:
 
                 enrichments.append(enrichments_item)
 
+        _publication_policy = d.pop("publication_policy", UNSET)
+        publication_policy: IndexPublicationPolicy | Unset
+        if isinstance(_publication_policy, Unset):
+            publication_policy = UNSET
+        else:
+            publication_policy = IndexPublicationPolicy(_publication_policy)
+
         _coverage_policy = d.pop("coverage_policy", UNSET)
         coverage_policy: DerivedCoveragePolicy | Unset
         if isinstance(_coverage_policy, Unset):
@@ -407,6 +444,15 @@ class CreateEmbeddingsIndexRequest:
         dimension = d.pop("dimension", UNSET)
 
         field = d.pop("field", UNSET)
+
+        _sources = d.pop("sources", UNSET)
+        sources: list[ArtifactIndexSource] | Unset = UNSET
+        if _sources is not UNSET:
+            sources = []
+            for sources_item_data in _sources:
+                sources_item = ArtifactIndexSource.from_dict(sources_item_data)
+
+                sources.append(sources_item)
 
         embedding_name = d.pop("embedding_name", UNSET)
 
@@ -462,11 +508,13 @@ class CreateEmbeddingsIndexRequest:
             description=description,
             version=version,
             enrichments=enrichments,
+            publication_policy=publication_policy,
             coverage_policy=coverage_policy,
             external=external,
             sparse=sparse,
             dimension=dimension,
             field=field,
+            sources=sources,
             embedding_name=embedding_name,
             source_artifact_name=source_artifact_name,
             template=template,

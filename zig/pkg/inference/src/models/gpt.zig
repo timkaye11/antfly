@@ -147,6 +147,7 @@ pub const Config = struct {
     deepseek_v4_beta_slow: f32 = 0.0,
 
     // Gemma 4: shared KV cache and per-layer GQA.
+    gemma4_channel_protocol: bool = false,
     num_kv_shared_layers: u32 = 0,
     global_head_dim: u32 = 0,
     num_global_key_value_heads: u32 = 0,
@@ -326,6 +327,10 @@ pub const Config = struct {
 
     pub fn hasPle(self: Config) bool {
         return self.ple_hidden_size > 0;
+    }
+
+    pub fn usesGemma4Channels(self: Config) bool {
+        return self.gemma4_channel_protocol or (self.family == .gemma and self.hasPle());
     }
 
     pub fn layerUsesSlidingAttention(self: Config, layer_index: usize) bool {
@@ -652,6 +657,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
     if (model_obj.get("model_type")) |v| {
         if (v == .string) {
             config.gemma4_mtp_assistant = isGemma4AssistantModelType(v.string);
+            config.gemma4_channel_protocol = isGemma4ModelType(v.string);
             config.family = detectFamily(v.string);
             applyFamilyDefaults(&config);
             if (isGemma4ModelType(v.string)) config.norm_weight_offset = 0.0;
@@ -659,6 +665,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
     } else if (obj.get("model_type")) |v| {
         if (v == .string) {
             config.gemma4_mtp_assistant = isGemma4AssistantModelType(v.string);
+            config.gemma4_channel_protocol = isGemma4ModelType(v.string);
             config.family = detectFamily(v.string);
             applyFamilyDefaults(&config);
             if (isGemma4ModelType(v.string)) config.norm_weight_offset = 0.0;
@@ -1176,6 +1183,7 @@ pub fn parseGgufMetadata(view: gguf_metadata.View) ?Config {
 
     var config = Config{
         .family = detectFamily(arch),
+        .gemma4_channel_protocol = isGemma4ModelType(arch),
         .gemma4_mtp_assistant = std.mem.eql(u8, arch, "gemma4_assistant") or
             std.mem.eql(u8, arch, "gemma4_unified_assistant") or
             std.mem.eql(u8, arch, "gemma4-assistant"),
@@ -1367,6 +1375,19 @@ fn ggufMetadataU32(view: gguf_metadata.View, key: []const u8) ?u32 {
 fn applyGgufTokenizerStopMetadata(view: gguf_metadata.View, config: *Config) void {
     if (ggufTokenId(view, "tokenizer.ggml.eos_token_id")) |token_id| {
         addEosTokenId(config, token_id);
+    }
+
+    // Gemma chat templates terminate assistant turns with <end_of_turn>, but
+    // common GGUF exports advertise only <eos> through eos_token_id. The GGUF
+    // tokenizer may store that special token under its directional `<turn|>`
+    // spelling. Treat either exact terminator as an additional EOS so chat
+    // generation cannot continue into another templated turn.
+    if (config.usesGemma4Channels()) {
+        for ([_][]const u8{ "<end_of_turn>", "<turn|>" }) |token| {
+            if (ggufTokenStringId(view, token)) |token_id| {
+                addEosTokenId(config, token_id);
+            }
+        }
     }
 
     // Some GGUF exports include the special tokens but omit *_token_id
@@ -1976,6 +1997,7 @@ test "parse gemma3 multimodal config" {
     ;
     const config = try parseConfig(allocator, json);
     try std.testing.expectEqual(ModelFamily.gemma, config.family);
+    try std.testing.expect(!config.usesGemma4Channels());
     try std.testing.expectEqual(@as(i32, 262144), config.image_token_index);
     try std.testing.expectEqual(@as(i32, 255999), config.boi_token_index);
     try std.testing.expectEqual(@as(i32, 256000), config.eoi_token_index);
@@ -2032,6 +2054,7 @@ test "parse functiongemma gemma3_text config" {
     ;
     const config = try parseConfig(allocator, json);
     try std.testing.expectEqual(ModelFamily.gemma, config.family);
+    try std.testing.expect(!config.usesGemma4Channels());
     try std.testing.expectEqual(@as(u32, 18), config.num_hidden_layers);
     try std.testing.expectEqual(@as(u32, 4), config.num_attention_heads);
     try std.testing.expectEqual(@as(u32, 1), config.num_key_value_heads);
@@ -2486,6 +2509,7 @@ test "parse gemma4 config with shared kv and per-layer gqa" {
     ;
     const config = try parseConfig(allocator, json);
     try std.testing.expectEqual(ModelFamily.gemma, config.family);
+    try std.testing.expect(config.usesGemma4Channels());
     try std.testing.expectEqual(@as(u32, 3072), config.hidden_size);
     try std.testing.expectEqual(@as(u32, 36), config.num_hidden_layers);
     try std.testing.expectEqual(@as(u32, 12), config.num_kv_shared_layers);
@@ -2534,6 +2558,7 @@ test "parse gemma4 text-only config defaults" {
     ;
     const config = try parseConfig(allocator, json);
     try std.testing.expectEqual(ModelFamily.gemma, config.family);
+    try std.testing.expect(config.usesGemma4Channels());
 
     // No shared KV or per-layer GQA when fields are absent (default 0).
     try std.testing.expectEqual(@as(u32, 0), config.num_kv_shared_layers);
@@ -2710,9 +2735,19 @@ test "parse gemma4 multi eos and generation suppress tokens" {
 }
 
 test "parse GGUF tokenizer eos token metadata" {
+    var token_values = [_]gguf_format.MetadataValue{
+        .{ .string = "<pad>" },
+        .{ .string = "<eos>" },
+        .{ .string = "<end_of_turn>" },
+        .{ .string = "<turn|>" },
+    };
     var metadata = [_]gguf_format.MetadataEntry{
         .{ .key = "general.architecture", .value = .{ .string = "gemma4" } },
         .{ .key = "tokenizer.ggml.eos_token_id", .value = .{ .u32 = 1 } },
+        .{ .key = "tokenizer.ggml.tokens", .value = .{ .array = .{
+            .element_type = .string,
+            .values = token_values[0..],
+        } } },
     };
     var file = gguf_format.File{
         .header = .{ .version = 3, .tensor_count = 0, .metadata_count = metadata.len },
@@ -2723,8 +2758,12 @@ test "parse GGUF tokenizer eos token metadata" {
     };
 
     const config = parseGgufMetadata(gguf_metadata.View.init(&file)).?;
+    try std.testing.expect(config.usesGemma4Channels());
     try std.testing.expectEqual(@as(i32, 1), config.eos_token_id);
     try std.testing.expect(config.isEosToken(1));
+    try std.testing.expect(config.isEosToken(2));
+    try std.testing.expect(config.isEosToken(3));
+    try std.testing.expectEqual(@as(u8, 2), config.extra_eos_token_ids_len);
 }
 
 test "parse GGUF tokenizer eos token from token string fallback" {

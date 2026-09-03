@@ -187,6 +187,31 @@ def _semantic_top_hit(
     return None
 
 
+def _dense_top_hit(
+    stateful_api,
+    table_name: str,
+    vector: list[float],
+    index_name: str,
+    expected_id: str,
+) -> dict | None:
+    try:
+        result = stateful_api.query_table(
+            table_name,
+            {
+                "embeddings": {index_name: vector},
+                "indexes": [index_name],
+                "limit": 5,
+            },
+        )
+    except requests.HTTPError:
+        return None
+    responses = result.get("responses", [])
+    if not responses:
+        return None
+    hits = responses[0].get("hits", {}).get("hits", [])
+    return result if any(hit.get("_id") == expected_id for hit in hits) else None
+
+
 def _chunked_doc(
     stateful_api, table_name: str, key: str, chunk_field: str
 ) -> list[dict] | None:
@@ -265,6 +290,146 @@ def _is_metadata_not_leader_response(response: requests.Response) -> bool:
     return response.headers.get("X-Antfly-Metadata-Not-Leader", "").lower() == "true"
 
 
+def _metadata_quorum_leader_id(
+    statuses: list[dict | None], *, cluster_size: int
+) -> int | None:
+    """Return a self-confirmed leader backed by a same-term voter quorum.
+
+    Followers can legitimately lag an election by a heartbeat, so requiring
+    every reachable node to report one leader turns normal Raft convergence
+    into a false outage. A quorum in one term is the safety boundary; requiring
+    the candidate to report itself as leader avoids routing to a stale hint.
+    """
+    if cluster_size < 1:
+        return None
+
+    quorum = cluster_size // 2 + 1
+    observations: dict[tuple[int, int], int] = {}
+    by_node: dict[int, dict] = {}
+    for status in statuses:
+        if not status:
+            continue
+        try:
+            node_id = int(status["metadata_raft_local_node_id"])
+            term = int(status["metadata_raft_term"])
+            leader_id = int(status["metadata_raft_leader_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (1 <= node_id <= cluster_size and 1 <= leader_id <= cluster_size):
+            continue
+        if node_id in by_node:
+            continue
+        by_node[node_id] = status
+        if status.get("metadata_raft_local_voter", True):
+            key = (term, leader_id)
+            observations[key] = observations.get(key, 0) + 1
+
+    # A majority cannot support two different observations in one term. Sort
+    # by term so a quorum-confirmed newer election wins over stale hints.
+    for (term, leader_id), count in sorted(observations.items(), reverse=True):
+        if count < quorum:
+            continue
+        leader_status = by_node.get(leader_id)
+        if not leader_status:
+            continue
+        try:
+            leader_term = int(leader_status["metadata_raft_term"])
+            self_leader_id = int(leader_status["metadata_raft_leader_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (
+            leader_term == term
+            and self_leader_id == leader_id
+            and leader_status.get("metadata_raft_role") == "leader"
+        ):
+            return leader_id
+    return None
+
+
+def _metadata_status_observations(statuses: list[dict | None]) -> list[dict | None]:
+    """Keep leader-discovery failures compact and operationally useful."""
+    fields = (
+        "metadata_raft_local_node_id",
+        "metadata_raft_role",
+        "metadata_raft_leader_id",
+        "metadata_raft_term",
+        "metadata_raft_commit_index",
+        "metadata_raft_local_voter",
+    )
+    return [
+        {field: status.get(field) for field in fields} if status else None
+        for status in statuses
+    ]
+
+
+def _metadata_status(
+    node_id: int,
+    *,
+    term: int,
+    leader_id: int | None,
+    role: str = "follower",
+    voter: bool = True,
+) -> dict:
+    """Build a focused status fixture for leader-discovery contract tests."""
+    return {
+        "metadata_raft_local_node_id": node_id,
+        "metadata_raft_term": term,
+        "metadata_raft_leader_id": leader_id,
+        "metadata_raft_role": role,
+        "metadata_raft_local_voter": voter,
+    }
+
+
+def test_metadata_quorum_leader_discovery_tolerates_one_stale_follower() -> None:
+    statuses = [
+        _metadata_status(1, term=8, leader_id=2),
+        _metadata_status(2, term=8, leader_id=2, role="leader"),
+        _metadata_status(3, term=7, leader_id=1),
+    ]
+    assert _metadata_quorum_leader_id(statuses, cluster_size=3) == 2
+
+
+def test_metadata_quorum_leader_discovery_keeps_node_ids_truthy() -> None:
+    statuses = [
+        _metadata_status(1, term=8, leader_id=1, role="leader"),
+        _metadata_status(2, term=8, leader_id=1),
+        _metadata_status(3, term=8, leader_id=1),
+    ]
+    # Readiness polling treats falsey values as pending, so carry Raft's
+    # one-based node ID and convert to a zero-based URL index only at the edge.
+    assert _metadata_quorum_leader_id(statuses, cluster_size=3) == 1
+
+
+def test_wait_until_explicit_readiness_accepts_zero() -> None:
+    assert (
+        wait_until(
+            lambda: 0,
+            timeout_s=0.1,
+            interval_s=0.01,
+            ready_when=lambda value: value is not None,
+        )
+        == 0
+    )
+
+
+def test_metadata_quorum_leader_discovery_requires_a_quorum() -> None:
+    statuses = [
+        _metadata_status(1, term=8, leader_id=2),
+        _metadata_status(2, term=8, leader_id=2, role="leader", voter=False),
+        None,
+    ]
+    assert _metadata_quorum_leader_id(statuses, cluster_size=3) is None
+
+
+def test_metadata_quorum_leader_discovery_requires_self_confirmation() -> None:
+    statuses = [
+        _metadata_status(1, term=8, leader_id=2),
+        _metadata_status(2, term=8, leader_id=2),
+        _metadata_status(3, term=7, leader_id=1),
+    ]
+    assert _metadata_quorum_leader_id(statuses, cluster_size=3) is None
+
+
 class MultiMetadataBackupCluster:
     def __init__(self, binary: str):
         self.binary = binary
@@ -305,12 +470,13 @@ class MultiMetadataBackupCluster:
 
             self.metadata_procs: list[subprocess.Popen[str]] = []
             self.data_proc: subprocess.Popen[str] | None = None
+            self.last_metadata_statuses: list[dict | None] = []
             setup.pop_all()
 
         try:
             self._start()
         except BaseException:
-            self.stop()
+            self.stop(test_failed=True)
             raise
 
     def _write_config(self) -> None:
@@ -436,9 +602,12 @@ class MultiMetadataBackupCluster:
                     f"metadata server failed to start at {url}\n{self.debug_logs()}"
                 )
 
-        if self.metadata_stable_leader_index(timeout_s=30.0) is None:
+        if self.metadata_stable_leader_id(timeout_s=30.0) is None:
             raise RuntimeError(
-                f"metadata cluster did not elect a leader\n{self.debug_logs()}"
+                "metadata cluster did not elect a leader; "
+                "last_statuses="
+                f"{_metadata_status_observations(self.last_metadata_statuses)!r}\n"
+                f"{self.debug_logs()}"
             )
 
         data_command = self._data_command()
@@ -481,38 +650,30 @@ class MultiMetadataBackupCluster:
         # election-observation window before healthy peers are considered.
         # Keep one bounded request per node and preserve configured ordering.
         with ThreadPoolExecutor(max_workers=len(self.metadata_admin_urls)) as executor:
-            return list(executor.map(fetch, self.metadata_admin_urls))
+            statuses = list(executor.map(fetch, self.metadata_admin_urls))
+        self.last_metadata_statuses = statuses
+        return statuses
 
-    def metadata_leader_index_once(self, *, request_timeout_s: float) -> int | None:
+    def metadata_leader_id_once(self, *, request_timeout_s: float) -> int | None:
         statuses = self.metadata_statuses(request_timeout_s=request_timeout_s)
-        leader_ids = {
-            int(status["metadata_raft_leader_id"])
-            for status in statuses
-            if status and status.get("metadata_raft_leader_id") is not None
-        }
-        if len(leader_ids) != 1:
-            return None
-        leader_id = leader_ids.pop()
-        if leader_id < 1 or leader_id > len(self.metadata_admin_urls):
-            return None
-        leader_status = statuses[leader_id - 1]
-        if not leader_status:
-            return None
-        if leader_status.get("metadata_raft_role") != "leader":
-            return None
-        if int(leader_status.get("metadata_raft_local_node_id", 0)) != leader_id:
-            return None
-        return leader_id - 1
+        return _metadata_quorum_leader_id(
+            statuses, cluster_size=len(self.metadata_admin_urls)
+        )
 
-    def metadata_leader_index(self, *, timeout_s: float) -> int | None:
+    def metadata_leader_id(self, *, timeout_s: float) -> int | None:
         def current_leader() -> int | None:
-            return self.metadata_leader_index_once(
+            return self.metadata_leader_id_once(
                 request_timeout_s=min(1.0, max(0.05, timeout_s))
             )
 
-        return wait_until(current_leader, timeout_s=timeout_s, interval_s=0.25)
+        return wait_until(
+            current_leader,
+            timeout_s=timeout_s,
+            interval_s=0.25,
+            ready_when=lambda value: value is not None,
+        )
 
-    def metadata_stable_leader_index(
+    def metadata_stable_leader_id(
         self,
         *,
         timeout_s: float,
@@ -524,31 +685,42 @@ class MultiMetadataBackupCluster:
 
         def current_stable_leader() -> int | None:
             nonlocal last_leader, observed
-            leader_index = self.metadata_leader_index_once(
-                request_timeout_s=min(1.0, max(0.05, interval_s))
+            leader_id = self.metadata_leader_id_once(
+                # Poll cadence and per-request latency are independent. A
+                # 250ms status deadline was too aggressive under loaded CI and
+                # amplified transient scheduler delay into a false outage.
+                request_timeout_s=1.0
             )
-            if leader_index is None:
+            if leader_id is None:
                 last_leader = None
                 observed = 0
                 return None
-            if leader_index == last_leader:
+            if leader_id == last_leader:
                 observed += 1
             else:
-                last_leader = leader_index
+                last_leader = leader_id
                 observed = 1
-            return leader_index if observed >= stable_observations else None
+            return leader_id if observed >= stable_observations else None
 
         return wait_until(
-            current_stable_leader, timeout_s=timeout_s, interval_s=interval_s
+            current_stable_leader,
+            timeout_s=timeout_s,
+            interval_s=interval_s,
+            ready_when=lambda value: value is not None,
         )
 
     def metadata_leader_public_url(self, *, timeout_s: float = 30.0) -> str:
-        leader_index = self.metadata_stable_leader_index(timeout_s=timeout_s)
-        if leader_index is None:
-            raise AssertionError(f"metadata leader unavailable\n{self.debug_logs()}")
-        return self.metadata_public_urls[leader_index]
+        leader_id = self.metadata_stable_leader_id(timeout_s=timeout_s)
+        if leader_id is None:
+            raise AssertionError(
+                "metadata leader unavailable; "
+                "last_statuses="
+                f"{_metadata_status_observations(self.last_metadata_statuses)!r}\n"
+                f"{self.debug_logs()}"
+            )
+        return self.metadata_public_urls[leader_id - 1]
 
-    def stop(self) -> None:
+    def stop(self, *, test_failed: bool = False) -> None:
         self.port_reservations.close()
         if self.data_proc is not None and self.data_proc.poll() is None:
             self.data_proc.send_signal(signal.SIGTERM)
@@ -572,12 +744,14 @@ class MultiMetadataBackupCluster:
         for handle in [self.data_log_file, *self.metadata_log_files]:
             if not handle.closed:
                 handle.close()
-        if not maybe_preserve_tempdir(self.tempdir):
+        if not maybe_preserve_tempdir(self.tempdir, failed=test_failed):
             self.tempdir.cleanup()
 
 
 @pytest.fixture
-def multi_metadata_backup_cluster() -> MultiMetadataBackupCluster:
+def multi_metadata_backup_cluster(
+    request: pytest.FixtureRequest,
+) -> MultiMetadataBackupCluster:
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     resolved = Path(binary)
     if resolved.name != "antfly":
@@ -589,7 +763,8 @@ def multi_metadata_backup_cluster() -> MultiMetadataBackupCluster:
     try:
         yield cluster
     finally:
-        cluster.stop()
+        report = getattr(request.node, "rep_call", None)
+        cluster.stop(test_failed=bool(report and report.failed))
 
 
 def test_table_backup_restore_round_trip(backup_api):
@@ -660,16 +835,18 @@ def test_table_backup_restore_round_trip(backup_api):
         )
 
 
+@pytest.mark.parametrize("backup_format", ["portable", "native"])
 def test_table_backup_restore_round_trip_managed_chunked_semantic(
-    backup_api, slow_openai_embedder
+    backup_api, rate_limited_openai_embedder, backup_format: str
 ):
-    table_name = f"backup_chunked_semantic_{time.time_ns()}"
-    backup_id = f"backup-chunked-semantic-{time.time_ns()}"
+    table_name = f"backup_{backup_format}_chunked_semantic_{time.time_ns()}"
+    backup_id = f"backup-{backup_format}-chunked-semantic-{time.time_ns()}"
 
     created = backup_api.create_table(
         table_name, num_shards=1, description="chunked semantic backup docs"
     )
     assert created["name"] == table_name
+    rate_limited_openai_embedder.allow_all_requests()
 
     assert_created_index(
         backup_api.create_index(
@@ -683,7 +860,7 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(
                 "embedder": {
                     "provider": "openai",
                     "model": "text-embedding-3-small",
-                    "url": slow_openai_embedder,
+                    "url": rate_limited_openai_embedder.url,
                 },
                 "chunker": {
                     "provider": "antfly",
@@ -740,6 +917,30 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(
 
     before_chunks = before_scan[0]["_chunks"]["semantic_chunked_idx_chunks"]
     assert len(before_chunks) >= 2
+    backup_api.wait_index_ready(
+        table_name,
+        "semantic_chunked_idx",
+        timeout_s=60.0,
+        interval_s=0.5,
+        require_query_fresh=True,
+    )
+    before_status = backup_api.get_index(table_name, "semantic_chunked_idx")["status"]
+    before_readiness_incarnation = before_status["readiness"]["incarnation"]
+    before_coverage = {
+        key: before_status["coverage"][key]
+        for key in (
+            "config_fingerprint",
+            "source_total",
+            "covered",
+            "produced",
+            "complete",
+            "healthy",
+        )
+    }
+    before_counts = {
+        key: before_status[key]
+        for key in ("total_indexed", "doc_count", "query_visible_doc_count")
+    }
 
     with tempfile.TemporaryDirectory(
         prefix="antfly-backup-chunked-semantic-"
@@ -747,9 +948,15 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(
         location = _file_location(backup_dir)
 
         backup = backup_api.backup_table(
-            table_name, backup_id=backup_id, location=location
+            table_name,
+            backup_id=backup_id,
+            location=location,
+            backup_format=backup_format,
         )
         assert backup["backup"] == "successful"
+        if backup_format == "native":
+            rate_limited_openai_embedder.deny_requests()
+        embedder_before_restore = rate_limited_openai_embedder.stats()
 
         deleted = backup_api.delete_table(table_name)
         assert deleted == {}
@@ -779,40 +986,59 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(
             interval_s=1.0,
             require_query_fresh=True,
         )
+        after_status = backup_api.get_index(table_name, "semantic_chunked_idx")[
+            "status"
+        ]
+        if backup_format == "native":
+            assert (
+                after_status["readiness"]["incarnation"] == before_readiness_incarnation
+            )
+            assert {
+                key: after_status["coverage"].get(key) for key in before_coverage
+            } == before_coverage
+            assert {
+                key: after_status.get(key) for key in before_counts
+            } == before_counts
 
-        semantic_after = wait_until(
-            lambda: _semantic_top_hit(
-                backup_api, table_name, "alpha concept", "semantic_chunked_idx", "doc:a"
-            ),
-            timeout_s=120.0,
-            interval_s=1.0,
-        )
-        if semantic_after is None:
-            after_status = backup_api.get_index(table_name, "semantic_chunked_idx")
-            after_scan = backup_api.scan_keys(
+            semantic_after = _dense_top_hit(
+                backup_api,
                 table_name,
-                {
-                    "from": "doc:a",
-                    "to": "doc:a;",
-                    "inclusive_from": True,
-                    "fields": ["title", "_chunks", "_embeddings"],
-                },
+                [1.0, 0.0, 0.0],
+                "semantic_chunked_idx",
+                "doc:a",
             )
-            after_query = backup_api.query_table(
-                table_name,
-                {
-                    "semantic_search": "alpha concept",
-                    "indexes": ["semantic_chunked_idx"],
-                    "limit": 5,
-                    "fields": ["title", "_chunks", "_embeddings"],
-                },
+            assert semantic_after is not None, {
+                "status": after_status,
+                "logs": backup_api.debug_logs(),
+            }
+            assert rate_limited_openai_embedder.stats() == embedder_before_restore
+        else:
+            semantic_after = wait_until(
+                lambda: _semantic_top_hit(
+                    backup_api,
+                    table_name,
+                    "alpha concept",
+                    "semantic_chunked_idx",
+                    "doc:a",
+                ),
+                timeout_s=120.0,
+                interval_s=1.0,
             )
-            server_logs = backup_api.debug_logs()
-            raise AssertionError(
-                "semantic restore query did not recover; "
-                f"status={after_status}, scan={after_scan}, query={after_query}, logs={server_logs}"
-            )
-        assert semantic_after
+            if semantic_after is None:
+                after_query = backup_api.query_table(
+                    table_name,
+                    {
+                        "semantic_search": "alpha concept",
+                        "indexes": ["semantic_chunked_idx"],
+                        "limit": 5,
+                        "fields": ["title", "_chunks", "_embeddings"],
+                    },
+                )
+                raise AssertionError(
+                    "portable semantic restore query did not recover; "
+                    f"status={after_status}, query={after_query}, "
+                    f"logs={backup_api.debug_logs()}"
+                )
 
         after_scan = wait_until(
             lambda: _chunked_doc(
@@ -1395,9 +1621,11 @@ def test_restore_missing_backup_returns_bad_request(backup_api):
                 "connection": BACKUP_CONNECTION,
             },
         )
-        table_job = _wait_for_terminal_restore_job(backup_api, table_restore)
-        assert table_job["phase"] == "failed"
-        assert table_job["error"] == "TableAlreadyExists"
+        # Table restore must inspect the manifest before it can authorize every
+        # stored destination. A missing manifest is therefore rejected at
+        # admission and never consumes a durable job slot.
+        assert table_restore.status_code == 400
+        assert table_restore.json() == {"error": "invalid backup manifest"}
 
         cluster_restore = backup_api._request(
             "POST",
