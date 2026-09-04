@@ -522,7 +522,10 @@ def adapter_binding(
     root = path.expanduser().resolve(strict=True)
     artifact = inspect_initial_adapter(root, lock, model_key, target_preset, prepared_summary)
     config = artifact.semantics
-    if config["policy_source"] != "antfly-finetune-manifest/v2":
+    if config["policy_source"] not in (
+        "antfly-finetune-manifest/v2",
+        "antfly-finetune-manifest/v3",
+    ):
         raise ContractError("Antfly benchmark requires a provenance-bound Antfly adapter manifest")
     gate = _mapping(lock["performance_gate"], "performance_gate")
     if config["r"] != gate["rank"] or float(config["lora_alpha"]) != float(gate["alpha"]):

@@ -574,6 +574,50 @@ class Gemma4MlxRunnerTest(unittest.TestCase):
             with self.assertRaisesRegex(ContractError, "non-finite"):
                 inspect_initial_adapter(root, lock, "model", "peft-qv", {})
 
+    def test_initial_adapter_inspection_accepts_current_v3_internal_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "adapter_config.json").write_text(
+                json.dumps(
+                    {
+                        "inference_mode": False,
+                        "fan_in_fan_out": False,
+                        "bias": "none",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / "antfly_finetune_manifest.json").write_text("{}", encoding="utf-8")
+            self.write_safetensors(
+                root / "adapter_model.safetensors",
+                [
+                    ("model.layers.0.self_attn.q_proj.weight.lora_A.weight", (2, 3), [1.0] * 6),
+                    ("model.layers.0.self_attn.q_proj.weight.lora_B.weight", (4, 2), [0.0] * 8),
+                ],
+            )
+            semantics = {
+                "policy_source": "antfly-finetune-manifest/v3",
+                "r": 2,
+                "lora_alpha": 4.0,
+                "target_preset": "peft-qv",
+                "target_modules": ["model.layers.0.self_attn.q_proj"],
+                "provenance": None,
+            }
+            lock = {
+                "performance_gate": {"rank": 2, "alpha": 4.0},
+                "target_inventory": {"model": {"peft-qv": {"q_proj": 1}}},
+            }
+            with mock.patch(
+                "run_gemma4_lora_mlx_benchmark.read_adapter_config",
+                return_value=semantics,
+            ):
+                artifact = inspect_initial_adapter(root, lock, "model", "peft-qv", {})
+            self.assertEqual("antfly-finetune-manifest/v3", artifact.semantics["policy_source"])
+            self.assertEqual(
+                {"model.layers.0.self_attn.q_proj"},
+                {module for module, _role in artifact.tensors},
+            )
+
     def test_file_identity_detects_in_run_drift(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "bound"

@@ -3666,6 +3666,11 @@ baseline evaluation trace plus child stdout/stderr alongside the already-bound
 candidate evidence, and GRPO loss assembly rejects a finite-component sum that
 would overflow `f32` instead of publishing an infinite loss.
 
+The Antfly and MLX performance runners accept both historical v2 and current
+v3 provenance-bound internal adapter manifests. Direct regression coverage
+keeps the internal tensor-key layout compatible with v3 while unknown policy
+sources and mismatched layouts remain fail-closed.
+
 Finally, all Gemma4 LoRA/DPO/GRPO scripts, schemas, locks, requirements, and
 tests now live under `scripts/gemma4/`, matching the family layout introduced
 by `main`. Every internal path identity, workflow command, schema constant,
@@ -3681,9 +3686,9 @@ source revision is now mandatory in required-device mode, so the private
 oracle capture integration cannot silently go unexercised. The separate Debug
 and ReleaseSafe Gemma4 graph targets, ML graph unit suite, and four selected
 Metal lifecycle regressions also pass. Relocated Gemma4 family discovery passes
-`721/721` on the host, including `281/281` feature-specific LoRA/DPO/GRPO
-contract tests; the known localhost integration cell was run with loopback
-access after the restricted sandbox rejected the bind. The focused resume
+`723/723` on the host, including the feature-specific LoRA/DPO/GRPO contract
+suites; the known localhost integration cell was run with loopback access after
+the restricted sandbox rejected the bind. The focused resume
 qualifier passes `28/28`, and the new Zig-oracle exporter suite passes `7/7`. Relevant
 Python modules compile; the checked-in oracle v3 lock validates at SHA-256
 `c848acb5fa38abda012f52c31cc122927b26775896d4a460e58cc9336cf27383`; and

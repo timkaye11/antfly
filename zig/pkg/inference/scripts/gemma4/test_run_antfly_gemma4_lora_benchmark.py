@@ -555,6 +555,38 @@ class AntflyGemma4BenchmarkRunnerTest(unittest.TestCase):
             )
 
 
+class AntflyAdapterBindingTest(unittest.TestCase):
+    def test_adapter_binding_accepts_current_v3_internal_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            for filename in (
+                "adapter_config.json",
+                "adapter_model.safetensors",
+                "antfly_finetune_manifest.json",
+            ):
+                (root / filename).write_bytes(b"fixture")
+            module = "model.layers.0.self_attn.q_proj"
+            artifact = SimpleNamespace(
+                semantics={
+                    "policy_source": "antfly-finetune-manifest/v3",
+                    "r": 16,
+                    "lora_alpha": 32.0,
+                    "provenance": {
+                        "base_model_sha256": "a" * 64,
+                        "tokenizer_sha256": "b" * 64,
+                        "chat_template_sha256": "c" * 64,
+                    },
+                },
+                semantic_sha256="sha256:" + "d" * 64,
+                tensors={(module, "lora_A"): object(), (module, "lora_B"): object()},
+            )
+            lock = {"performance_gate": {"rank": 16, "alpha": 32.0}}
+            with mock.patch.object(runner, "inspect_initial_adapter", return_value=artifact):
+                binding = runner.adapter_binding(root, lock, "model", "peft-qv", {})
+            self.assertEqual((module,), binding.canonical_modules)
+            self.assertEqual("sha256:" + "d" * 64, binding.semantic_sha256)
+
+
 class AntflySourceIdentityTest(unittest.TestCase):
     @staticmethod
     def git_result(*, stdout: str = "", returncode: int = 0) -> SimpleNamespace:

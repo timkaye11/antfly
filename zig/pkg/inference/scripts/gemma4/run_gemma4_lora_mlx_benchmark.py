@@ -1025,7 +1025,10 @@ def inspect_initial_adapter(
         expected_start = end
     if expected_start != payload_size:
         raise ContractError("initial adapter has uncommitted trailing tensor payload bytes")
-    manifest_backed = semantics["policy_source"] == "antfly-finetune-manifest/v2"
+    manifest_backed = semantics["policy_source"] in (
+        "antfly-finetune-manifest/v2",
+        "antfly-finetune-manifest/v3",
+    )
     if (manifest_backed and layouts != {"antfly"}) or (not manifest_backed and layouts != {"stock-peft"}):
         raise ContractError("initial adapter tensor key layout conflicts with its policy source")
 
