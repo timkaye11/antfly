@@ -1446,6 +1446,11 @@ pub fn supportsConfig(gpt_config: gpt_mod.Config) bool {
 /// block path cannot accidentally interpret routed experts as a dense FFN.
 fn supportsPreparedDecodeConfig(gpt_config: gpt_mod.Config) bool {
     return supportsConfig(gpt_config) or
+        (gpt_config.family == .qwen3_vl and
+            platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_QWEN3VL_WHOLE_TOKEN_FRAME", false) and
+            platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_QWEN3VL_PREPARED_DECODE_BLOCK", false) and
+            !platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_QWEN3VL_PREPARED_DECODE_BLOCK", false) and
+            !gpt_config.usesMoe() and !gpt_config.hasPle()) or
         gemma4_runtime.supportsPreparedA4bRuntimeConfig(gpt_config);
 }
 

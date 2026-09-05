@@ -1010,6 +1010,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
     var decode_state = generation.NativeDecodeState.initPaged(allocator, &kv_manager, pool_id, model.shared_moe_cache);
     decode_state.kv_storage = &kv_storage;
+    decode_state.configureForGptConfig(gpt_config);
     const created_decode_state_at = std.Io.Timestamp.now(io, .awake);
     defer decode_state.deinit();
     var draft_kv_manager: ?runtime.kv.manager.KvManager = null;
@@ -1353,14 +1354,17 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                 },
             );
             print(
-                "metal_decoder_frame: begins={d} submits={d} wait_ms={d} gpu_ms={d} last_compute_encoders={d} last_blit_encoders={d} total_compute_encoders={d} total_blit_encoders={d}\n",
+                "metal_decoder_frame: begins={d} submits={d} wait_ms={d} gpu_ms={d} encode_cpu_ms={d} last_compute_encoders={d} last_blit_encoders={d} last_planned_scopes={d} last_planned_barriers={d} total_compute_encoders={d} total_blit_encoders={d}\n",
                 .{
                     metal_snapshot.provider.decoder_runtime_frame_begins,
                     metal_snapshot.provider.decoder_runtime_frame_submits,
                     @divTrunc(metal_snapshot.provider.decoder_runtime_frame_wait_nanos, std.time.ns_per_ms),
                     @divTrunc(metal_snapshot.provider.decoder_runtime_frame_gpu_nanos, std.time.ns_per_ms),
+                    @divTrunc(metal_snapshot.provider.decoder_runtime_frame_encode_cpu_nanos, std.time.ns_per_ms),
                     metal_snapshot.provider.metal_runtime_last_frame_compute_encoder_count,
                     metal_snapshot.provider.metal_runtime_last_frame_blit_encoder_count,
+                    metal_snapshot.provider.metal_runtime_last_frame_planned_compute_scope_count,
+                    metal_snapshot.provider.metal_runtime_last_frame_planned_barrier_count,
                     metal_snapshot.provider.metal_runtime_compute_encoder_count,
                     metal_snapshot.provider.metal_runtime_blit_encoder_count,
                 },
@@ -3549,6 +3553,19 @@ fn metalStatsCompactJson(
         \\"direct_fallback":{d},
         \\"backend_fallback":{d},
         \\"runtime_failure":{d}
+        \\}},
+        \\"decoder_frame":{{
+        \\"begins":{d},
+        \\"submits":{d},
+        \\"wait_ns":{d},
+        \\"gpu_ns":{d},
+        \\"encode_cpu_ns":{d},
+        \\"last_compute_encoders":{d},
+        \\"last_blit_encoders":{d},
+        \\"last_planned_scopes":{d},
+        \\"last_planned_barriers":{d},
+        \\"total_compute_encoders":{d},
+        \\"total_blit_encoders":{d}
         \\}}
     ,
         .{
@@ -3568,6 +3585,17 @@ fn metalStatsCompactJson(
             provider.quantized_gated_ffn_direct_fallbacks,
             provider.quantized_gated_ffn_backend_fallbacks,
             provider.quantized_gated_ffn_runtime_failures,
+            provider.decoder_runtime_frame_begins,
+            provider.decoder_runtime_frame_submits,
+            provider.decoder_runtime_frame_wait_nanos,
+            provider.decoder_runtime_frame_gpu_nanos,
+            provider.decoder_runtime_frame_encode_cpu_nanos,
+            provider.metal_runtime_last_frame_compute_encoder_count,
+            provider.metal_runtime_last_frame_blit_encoder_count,
+            provider.metal_runtime_last_frame_planned_compute_scope_count,
+            provider.metal_runtime_last_frame_planned_barrier_count,
+            provider.metal_runtime_compute_encoder_count,
+            provider.metal_runtime_blit_encoder_count,
         },
     );
     try appendFmt(
@@ -6437,6 +6465,7 @@ fn liveWholeModelExecutorRequestedForPreparedA4b(
     opts: *const Options,
     prepared_a4b: bool,
 ) bool {
+    if (opts.raw_decode_bench) return false;
     if (envFlagEnabled("TERMITE_METAL_DISABLE_LIVE_WHOLE_MODEL_EXECUTOR")) return false;
     const explicit_whole_model = opts.mode != null and opts.mode.? == .compiled and
         opts.compiled_target != null and opts.compiled_target.? == .whole_model;
@@ -6874,14 +6903,17 @@ fn tryRunLiveWholeModelExecutorGenerate(
                 },
             );
             print(
-                "metal_decoder_frame: begins={d} submits={d} wait_ms={d} gpu_ms={d} last_compute_encoders={d} last_blit_encoders={d} total_compute_encoders={d} total_blit_encoders={d}\n",
+                "metal_decoder_frame: begins={d} submits={d} wait_ms={d} gpu_ms={d} encode_cpu_ms={d} last_compute_encoders={d} last_blit_encoders={d} last_planned_scopes={d} last_planned_barriers={d} total_compute_encoders={d} total_blit_encoders={d}\n",
                 .{
                     metal_snapshot.provider.decoder_runtime_frame_begins,
                     metal_snapshot.provider.decoder_runtime_frame_submits,
                     @divTrunc(metal_snapshot.provider.decoder_runtime_frame_wait_nanos, std.time.ns_per_ms),
                     @divTrunc(metal_snapshot.provider.decoder_runtime_frame_gpu_nanos, std.time.ns_per_ms),
+                    @divTrunc(metal_snapshot.provider.decoder_runtime_frame_encode_cpu_nanos, std.time.ns_per_ms),
                     metal_snapshot.provider.metal_runtime_last_frame_compute_encoder_count,
                     metal_snapshot.provider.metal_runtime_last_frame_blit_encoder_count,
+                    metal_snapshot.provider.metal_runtime_last_frame_planned_compute_scope_count,
+                    metal_snapshot.provider.metal_runtime_last_frame_planned_barrier_count,
                     metal_snapshot.provider.metal_runtime_compute_encoder_count,
                     metal_snapshot.provider.metal_runtime_blit_encoder_count,
                 },
@@ -8569,6 +8601,17 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     snapshot.provider.quantized_gated_ffn_direct_fallbacks = 3;
     snapshot.provider.quantized_gated_ffn_backend_fallbacks = 4;
     snapshot.provider.quantized_gated_ffn_runtime_failures = 5;
+    snapshot.provider.decoder_runtime_frame_begins = 6;
+    snapshot.provider.decoder_runtime_frame_submits = 7;
+    snapshot.provider.decoder_runtime_frame_wait_nanos = 800;
+    snapshot.provider.decoder_runtime_frame_gpu_nanos = 700;
+    snapshot.provider.decoder_runtime_frame_encode_cpu_nanos = 100;
+    snapshot.provider.metal_runtime_last_frame_compute_encoder_count = 2;
+    snapshot.provider.metal_runtime_last_frame_blit_encoder_count = 1;
+    snapshot.provider.metal_runtime_last_frame_planned_compute_scope_count = 28;
+    snapshot.provider.metal_runtime_last_frame_planned_barrier_count = 0;
+    snapshot.provider.metal_runtime_compute_encoder_count = 14;
+    snapshot.provider.metal_runtime_blit_encoder_count = 7;
     snapshot.provider.metal_stage_timing = .{
         .enabled = 1,
         .supported = 1,
@@ -8667,6 +8710,15 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     try std.testing.expectEqual(@as(i64, 3), prepared_gated_ffn.get("direct_fallback").?.integer);
     try std.testing.expectEqual(@as(i64, 4), prepared_gated_ffn.get("backend_fallback").?.integer);
     try std.testing.expectEqual(@as(i64, 5), prepared_gated_ffn.get("runtime_failure").?.integer);
+    const decoder_frame = root.get("decoder_frame").?.object;
+    try std.testing.expectEqual(@as(i64, 6), decoder_frame.get("begins").?.integer);
+    try std.testing.expectEqual(@as(i64, 7), decoder_frame.get("submits").?.integer);
+    try std.testing.expectEqual(@as(i64, 800), decoder_frame.get("wait_ns").?.integer);
+    try std.testing.expectEqual(@as(i64, 700), decoder_frame.get("gpu_ns").?.integer);
+    try std.testing.expectEqual(@as(i64, 100), decoder_frame.get("encode_cpu_ns").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), decoder_frame.get("last_compute_encoders").?.integer);
+    try std.testing.expectEqual(@as(i64, 28), decoder_frame.get("last_planned_scopes").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), decoder_frame.get("last_planned_barriers").?.integer);
     const stage_timing = root.get("stage_timing_ns").?.object;
     try std.testing.expectEqualStrings("runtime_frame", stage_timing.get("scope").?.string);
     try std.testing.expectEqual(@as(i64, 1), stage_timing.get("complete").?.integer);
@@ -9471,7 +9523,7 @@ test "server model name strips local models dir prefix" {
 }
 
 test "only explicit prepared A4B may route compiled whole model through live executor" {
-    const opts = Options{
+    var opts = Options{
         .model_dir = "/tmp/model",
         .prompt = "hello",
         .backend = .metal,
@@ -9480,6 +9532,8 @@ test "only explicit prepared A4B may route compiled whole model through live exe
     };
     try std.testing.expect(!liveWholeModelExecutorRequestedForPreparedA4b(&opts, false));
     try std.testing.expect(liveWholeModelExecutorRequestedForPreparedA4b(&opts, true));
+    opts.raw_decode_bench = true;
+    try std.testing.expect(!liveWholeModelExecutorRequestedForPreparedA4b(&opts, true));
 }
 
 test "live whole-model route uses the shared KV capacity policy" {

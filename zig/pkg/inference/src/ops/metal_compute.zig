@@ -386,15 +386,17 @@ test "metal donated-slot on-frame attention defaults off" {
 fn activePagedSlotAttentionDeferredPolicy(
     a4b_runtime: bool,
     enable_requested: bool,
+    whole_token_frame_requested: bool,
     disable_requested: bool,
 ) bool {
-    return !disable_requested and (a4b_runtime or enable_requested);
+    return !disable_requested and (a4b_runtime or enable_requested or whole_token_frame_requested);
 }
 
 fn activePagedSlotAttentionDeferredEnabled(a4b_runtime: bool) bool {
     return activePagedSlotAttentionDeferredPolicy(
         a4b_runtime,
         getenvBool("TERMITE_METAL_ENABLE_ACTIVE_PAGED_SLOT_ATTENTION_DEFERRED"),
+        getenvBool("TERMITE_METAL_ENABLE_QWEN3VL_WHOLE_TOKEN_FRAME"),
         getenvBool("TERMITE_METAL_DISABLE_ACTIVE_PAGED_SLOT_ATTENTION_DEFERRED"),
     );
 }
@@ -408,10 +410,11 @@ fn shouldPublishMoeSlotDirectory(repaired_count: usize, already_published: bool)
 }
 
 test "metal active paged-slot attention deferred completion policy" {
-    try std.testing.expect(activePagedSlotAttentionDeferredPolicy(true, false, false));
-    try std.testing.expect(!activePagedSlotAttentionDeferredPolicy(false, false, false));
-    try std.testing.expect(activePagedSlotAttentionDeferredPolicy(false, true, false));
-    try std.testing.expect(!activePagedSlotAttentionDeferredPolicy(true, true, true));
+    try std.testing.expect(activePagedSlotAttentionDeferredPolicy(true, false, false, false));
+    try std.testing.expect(!activePagedSlotAttentionDeferredPolicy(false, false, false, false));
+    try std.testing.expect(activePagedSlotAttentionDeferredPolicy(false, true, false, false));
+    try std.testing.expect(activePagedSlotAttentionDeferredPolicy(false, false, true, false));
+    try std.testing.expect(!activePagedSlotAttentionDeferredPolicy(true, true, true, true));
 }
 
 test "deferred paged-slot attention requires one producer-consumer runtime" {
@@ -1066,6 +1069,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     runtime_frame_submit_baseline: u64 = 0,
     runtime_frame_wait_baseline: u64 = 0,
     runtime_frame_gpu_baseline: u64 = 0,
+    runtime_frame_encode_cpu_baseline: u64 = 0,
     logged_quantized_gated_ffn_unsupported_type: bool = false,
     logged_quantized_gated_ffn_backend_mixed_kind: bool = false,
     logged_quantized_gated_ffn_backend_unsupported_kind: bool = false,
@@ -13456,6 +13460,46 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
     }
 
+    fn linearNoBiasQkvOp(
+        ctx: *anyopaque,
+        input: CT,
+        q_weight: CT,
+        k_weight: CT,
+        v_weight: CT,
+        rows: usize,
+        in_dim: usize,
+        q_out_dim: usize,
+        kv_out_dim: usize,
+    ) anyerror!?ops.LinearNoBiasTripleResult {
+        if (!getenvBool("TERMITE_METAL_ENABLE_QWEN3VL_QKV_FUSION") or
+            getenvBool("TERMITE_METAL_DISABLE_QWEN3VL_QKV_FUSION"))
+        {
+            return null;
+        }
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const input_buf = toBuf(input);
+        if (bufHasAnyQuantizedStorage(input_buf)) return null;
+        const input_metal = if (input_buf.metal_tensor) |*tensor| tensor else return null;
+        if (!deviceTensorMatchesLinearRows(input_metal, rows, in_dim)) return null;
+
+        const q_zero_bias = try self.cachedZeroBiasBuf(q_out_dim);
+        defer freeOp(ctx, q_zero_bias);
+        const kv_zero_bias = try self.cachedZeroBiasBuf(kv_out_dim);
+        defer freeOp(ctx, kv_zero_bias);
+        const q_slot = (try self.ensureDynamicLinearSlot(q_weight, q_zero_bias, in_dim, q_out_dim)) orelse return null;
+        const k_slot = (try self.ensureDynamicLinearSlot(k_weight, kv_zero_bias, in_dim, kv_out_dim)) orelse return null;
+        const v_slot = (try self.ensureDynamicLinearSlot(v_weight, kv_zero_bias, in_dim, kv_out_dim)) orelse return null;
+        return decoderRuntimeApplyLinearQkvOp(ctx, &.{
+            .q_slot = q_slot,
+            .k_slot = k_slot,
+            .v_slot = v_slot,
+            .input = input,
+            .in_dim = in_dim,
+            .q_out_dim = q_out_dim,
+            .kv_out_dim = kv_out_dim,
+        });
+    }
+
     fn concatOp(
         ctx: *anyopaque,
         a: CT,
@@ -13941,10 +13985,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         scale: f32,
     ) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (!a4bHighMemoryFeatureEnabled(
+        const a4b_fusion_enabled = a4bHighMemoryFeatureEnabled(
             "TERMITE_METAL_ENABLE_A4B_HEAD_NORM_ROPE_FUSION",
             "TERMITE_METAL_DISABLE_A4B_HEAD_NORM_ROPE_FUSION",
-        )) return null;
+        );
+        const qwen3vl_text_fusion_enabled =
+            getenvBool("TERMITE_METAL_ENABLE_QWEN3VL_WHOLE_TOKEN_FRAME") and
+            !getenvBool("TERMITE_METAL_DISABLE_QWEN3VL_HEAD_NORM_ROPE_FUSION");
+        if (!a4b_fusion_enabled and !qwen3vl_text_fusion_enabled) return null;
         if (rows == 0 or total_dim == 0 or head_dim == 0 or
             total_dim % head_dim != 0 or rope_dim == 0 or rope_dim > head_dim or
             rope_dim % 2 != 0 or seq_len == 0)
@@ -20969,6 +21017,66 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return denseBuf(self.allocator, output, true, shape_i32);
     }
 
+    fn activationMultiplyOp(
+        ctx: *anyopaque,
+        gate: CT,
+        up: CT,
+        activation: ops.DecoderRuntimeActivationKind,
+    ) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (disableRuntimeElementwise()) return null;
+        const gate_buf = toBuf(gate);
+        const up_buf = toBuf(up);
+        if (bufHasAnyQuantizedStorage(gate_buf) or bufHasAnyQuantizedStorage(up_buf)) return null;
+        const gate_shape = gate_buf.logical_shape orelse return null;
+        const up_shape = up_buf.logical_shape orelse return null;
+        if (gate_shape.len != 2 or !std.mem.eql(i64, gate_shape, up_shape) or
+            gate_shape[0] <= 0 or gate_shape[1] <= 0)
+        {
+            return null;
+        }
+        const rows: usize = @intCast(gate_shape[0]);
+        const dim: usize = @intCast(gate_shape[1]);
+        if (rows > std.math.maxInt(i32) or dim > std.math.maxInt(i32)) return null;
+        const elem_count = std.math.mul(usize, rows, dim) catch return null;
+        if (elem_count == 0 or bufElemCount(gate_buf) != elem_count or bufElemCount(up_buf) != elem_count) {
+            return null;
+        }
+        const gate_metal = if (gate_buf.metal_tensor) |*tensor| tensor else return null;
+        const up_metal = if (up_buf.metal_tensor) |*tensor| tensor else return null;
+        if (!gate_metal.isDevice() or !up_metal.isDevice()) return null;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        var gate_view = try gate_metal.retainedCopy();
+        defer gate_view.deinit();
+        var up_view = try up_metal.retainedCopy();
+        defer up_view.deinit();
+        const shape = [_]i32{ @intCast(rows), @intCast(dim) };
+        var output = try MetalTensor.deviceAllocate(
+            @ptrCast(runtime),
+            std.math.mul(usize, elem_count, @sizeOf(f32)) catch return null,
+            .private,
+            &shape,
+        );
+        errdefer output.deinit();
+        const rc = metal_runtime.termite_metal_decode_runtime_apply_activation_multiply_device(
+            runtime,
+            @intFromEnum(activation),
+            gate_view.deviceHandle(),
+            gate_view.deviceByteOffset(),
+            up_view.deviceHandle(),
+            up_view.deviceByteOffset(),
+            rows,
+            dim,
+            output.deviceHandle(),
+            output.deviceByteOffset(),
+        );
+        if (rc != 0) {
+            output.deinit();
+            return null;
+        }
+        return self.ctFromOwnedMetalTensor(output);
+    }
+
     fn geluOp(ctx: *anyopaque, input: CT) anyerror!CT {
         return applyUnaryActivationOp(ctx, input, .gelu, activations_mod.gelu);
     }
@@ -25766,6 +25874,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self.runtime_frame_submit_baseline = runtime_stats.frame_submit_count;
         self.runtime_frame_wait_baseline = runtime_stats.frame_wait_nanos;
         self.runtime_frame_gpu_baseline = runtime_stats.frame_gpu_nanos;
+        self.runtime_frame_encode_cpu_baseline = runtime_stats.frame_encode_cpu_nanos;
         self.provider_impl.raw_quant_runtime_private_prepare_nanos = 0;
         self.provider_impl.raw_quant_runtime_mapped_prepare_nanos = 0;
         self.provider_impl.raw_quant_runtime_mapped_attempts = 0;
@@ -25887,6 +25996,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.decoder_runtime_frame_submits = runtime_stats.frame_submit_count -| self.runtime_frame_submit_baseline;
         stats.decoder_runtime_frame_wait_nanos = runtime_stats.frame_wait_nanos -| self.runtime_frame_wait_baseline;
         stats.decoder_runtime_frame_gpu_nanos = runtime_stats.frame_gpu_nanos -| self.runtime_frame_gpu_baseline;
+        stats.decoder_runtime_frame_encode_cpu_nanos = runtime_stats.frame_encode_cpu_nanos -| self.runtime_frame_encode_cpu_baseline;
         const raw_stage_timing = metal_runtime.stageTimingSnapshot(self.provider_impl.raw_decode_runtime);
         stats.metal_stage_timing = .{
             .enabled = raw_stage_timing.enabled,
@@ -26277,6 +26387,52 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return if (current_kv_tokens > 0) current_kv_tokens else 1;
     }
 
+    fn qwen3VlPreparedDecodeBlockRequested(gpt_config: @import("../models/gpt.zig").Config) bool {
+        return gpt_config.family == .qwen3_vl and
+            getenvBool("TERMITE_METAL_ENABLE_QWEN3VL_WHOLE_TOKEN_FRAME") and
+            getenvBool("TERMITE_METAL_ENABLE_QWEN3VL_PREPARED_DECODE_BLOCK") and
+            !getenvBool("TERMITE_METAL_DISABLE_QWEN3VL_PREPARED_DECODE_BLOCK");
+    }
+
+    fn reserveQwen3VlPreparedDecodeBlockScratch(
+        self: *MetalCompute,
+        gpt_config: @import("../models/gpt.zig").Config,
+        configured_layer_count: usize,
+    ) bool {
+        if (!qwen3VlPreparedDecodeBlockRequested(gpt_config)) return true;
+        const layer_count = @min(configured_layer_count, @as(usize, @intCast(gpt_config.num_hidden_layers)));
+        for (0..layer_count) |layer| {
+            if (!metal_runtime.decoderRuntimeReservePrefillLayerScratch(
+                self.provider_impl,
+                1,
+                gpt_config.num_attention_heads,
+                gpt_config.effectiveKVHeadsForLayer(layer),
+                gpt_config.effectiveHeadDimForLayer(layer),
+                gpt_config.hidden_size,
+                gpt_config.intermediateSize(layer),
+                0,
+            )) {
+                if (getenvBool("TERMITE_METAL_PREPARE_TRACE")) {
+                    std.debug.print("prepare-trace: qwen3vl-decode-scratch-fail layer={d}\n", .{layer});
+                }
+                return false;
+            }
+        }
+        return true;
+    }
+
+    fn finishDecoderRuntimePrepare(
+        self: *MetalCompute,
+        gpt_config: @import("../models/gpt.zig").Config,
+        configured_layer_count: usize,
+        result: ops.DecoderRuntimePrepareReuseResult,
+    ) ops.DecoderRuntimePrepareReuseResult {
+        if (!result.prepared or reserveQwen3VlPreparedDecodeBlockScratch(self, gpt_config, configured_layer_count)) return result;
+        var failed = result;
+        failed.prepared = false;
+        return failed;
+    }
+
     fn decoderRuntimePrepareOrReuseFamilyOp(
         ctx: *anyopaque,
         allocator: std.mem.Allocator,
@@ -26286,15 +26442,29 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     ) anyerror!ops.DecoderRuntimePrepareReuseResult {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const reserve_kv_tokens = decoderRuntimeReserveKvTokens(gpt_config, current_kv_tokens);
+        // On the qualified Qwen3-VL qlen=1 path, the existing f32
+        // Q4_K gate/up -> Q6_K down route is measurably faster than carrying
+        // f16 activations between the two kernels. Configure the per-model
+        // runtime here, at a frame boundary; other families retain the normal
+        // default and the global kill switch remains authoritative.
+        if (!metal_runtime.configureQ4KQ6KF16Ffn(
+            self.provider_impl,
+            !qwen3VlPreparedDecodeBlockRequested(gpt_config),
+        )) {
+            return .{
+                .prepared = false,
+                .reserve_kv_tokens = reserve_kv_tokens,
+            };
+        }
         if (metal_runtime.decoderRuntimeFamilyPrepared(self.provider_impl) and
             metal_runtime.decoderRuntimePreparedSlotsMatchFamily(self.provider_impl, gpt_config))
         {
             if (reserve_kv_tokens <= metal_runtime.decoderRuntimePreparedKvTokens(self.provider_impl)) {
-                return .{
+                return finishDecoderRuntimePrepare(self, gpt_config, configured_layer_count, .{
                     .prepared = true,
                     .reserve_kv_tokens = reserve_kv_tokens,
                     .fast_hit = true,
-                };
+                });
             }
             const prepared = try decoderRuntimePrepareGreedyOp(ctx, &.{
                 .hidden_size = gpt_config.hidden_size,
@@ -26307,11 +26477,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .kv_tokens = reserve_kv_tokens,
             });
             if (prepared) metal_runtime.noteDecoderRuntimeGreedyPrepared(self.provider_impl, reserve_kv_tokens);
-            return .{
+            return finishDecoderRuntimePrepare(self, gpt_config, configured_layer_count, .{
                 .prepared = prepared,
                 .reserve_kv_tokens = reserve_kv_tokens,
                 .used_greedy = prepared,
-            };
+            });
         }
 
         const cb = self.computeBackend();
@@ -26323,10 +26493,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             configured_layer_count,
         );
         if (prepared) metal_runtime.noteDecoderRuntimeFamilyPrepared(self.provider_impl, reserve_kv_tokens);
-        return .{
+        return finishDecoderRuntimePrepare(self, gpt_config, configured_layer_count, .{
             .prepared = prepared,
             .reserve_kv_tokens = reserve_kv_tokens,
-        };
+        });
     }
 
     fn decoderRuntimePrepareAbsoluteEmbeddingsOp(ctx: *anyopaque, request: *const ops.DecoderRuntimePrepareAbsoluteEmbeddingsRequest) anyerror!bool {
@@ -27766,6 +27936,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.decoderRuntimeArgmaxRowsSuppress = decoderRuntimeArgmaxRowsSuppressOp;
         vt.gemma4MtpVerifyCommit = gemma4MtpVerifyCommitOp;
         vt.linearNoBiasPair = linearNoBiasPairOp;
+        vt.linearNoBiasQkv = linearNoBiasQkvOp;
         vt.mulMatId = mulMatIdOp;
         vt.moeLinearNoBias = mulMatIdOp;
         vt.moeLinearNoBiasPair = moeLinearNoBiasPairOp;
@@ -27798,6 +27969,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.runGatedDecoderBlock = runGatedDecoderBlockOp;
         vt.add = addOp;
         vt.multiply = multiplyOp;
+        vt.activationMultiply = activationMultiplyOp;
         vt.debugTimingSnapshot = debugTimingSnapshotOp;
         vt.directFamilyTimingSnapshot = directFamilyTimingSnapshotOp;
         vt.resetDebugTimingStats = resetDebugTimingStatsOp;

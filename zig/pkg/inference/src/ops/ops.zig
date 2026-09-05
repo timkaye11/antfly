@@ -753,6 +753,7 @@ pub const NativeQuantTimingStats = struct {
     decoder_runtime_frame_submits: u64 = 0,
     decoder_runtime_frame_wait_nanos: u128 = 0,
     decoder_runtime_frame_gpu_nanos: u128 = 0,
+    decoder_runtime_frame_encode_cpu_nanos: u128 = 0,
     metal_stage_timing: MetalStageTimingSnapshot = .{},
     metal_tensor_device_owned_buffers_created: u64 = 0,
     metal_tensor_device_owned_buffers_released: u64 = 0,

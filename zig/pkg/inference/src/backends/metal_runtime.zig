@@ -2110,6 +2110,22 @@ pub fn decoderRuntimePrepareGreedy(self: anytype, request: anytype, stats: anyty
         request.vocab_size,
         request.kv_tokens,
     );
+    if (rc != 0 and getenvBool("TERMITE_METAL_PREPARE_TRACE")) {
+        std.debug.print(
+            "prepare-trace: greedy-reserve-fail rc={d} hidden={d} intermediate={d} layers={d} heads={d} kv_heads={d} head_dim={d} vocab={d} kv_tokens={d}\n",
+            .{
+                rc,
+                request.hidden_size,
+                request.intermediate_size,
+                request.num_layers,
+                request.num_heads,
+                request.num_kv_heads,
+                request.head_dim,
+                request.vocab_size,
+                request.kv_tokens,
+            },
+        );
+    }
     return rc == 0;
 }
 
@@ -10650,6 +10666,7 @@ pub const RawRuntimeMemoryStats = extern struct {
     mapped_moe_residency_request_count: u64 = 0,
     frame_wait_nanos: u64 = 0,
     frame_gpu_nanos: u64 = 0,
+    frame_encode_cpu_nanos: u64 = 0,
     compute_encoder_count: u64 = 0,
     blit_encoder_count: u64 = 0,
     last_frame_compute_encoder_count: u64 = 0,
@@ -16507,6 +16524,7 @@ pub extern fn termite_metal_decode_runtime_push_planned_compute_barrier_suppress
 pub extern fn termite_metal_decode_runtime_pop_planned_compute_barrier_suppression(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_set_concurrent_planned_dispatch(runtime: ?*RawMetalDecodeRuntime, requested: c_int) c_int;
 pub extern fn termite_metal_decode_runtime_concurrent_planned_dispatch_enabled(runtime: ?*const RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_configure_q4_k_q6_k_f16_ffn(runtime: ?*RawMetalDecodeRuntime, requested: c_int) c_int;
 pub extern fn termite_metal_decode_runtime_configure_a4b_dag_scheduler(runtime: ?*RawMetalDecodeRuntime, qualified_a4b_model: c_int) c_int;
 pub extern fn termite_metal_decode_runtime_begin_a4b_concurrent_ffn_scope(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_end_a4b_concurrent_ffn_scope(runtime: ?*RawMetalDecodeRuntime) c_int;
@@ -16900,6 +16918,14 @@ pub fn configureA4bDagScheduler(runtime: ?*RawMetalDecodeRuntime, qualified_a4b_
     return termite_metal_decode_runtime_configure_a4b_dag_scheduler(
         runtime,
         @intFromBool(qualified_a4b_model),
+    ) == 0;
+}
+
+pub fn configureQ4KQ6KF16Ffn(self: anytype, requested: bool) bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    return termite_metal_decode_runtime_configure_q4_k_q6_k_f16_ffn(
+        runtime,
+        @intFromBool(requested),
     ) == 0;
 }
 
@@ -24879,6 +24905,7 @@ pub fn tryApplyQuantizedRuntimeLinearQkv(
     const DirectCase = enum {
         q4_0,
         q4_q4,
+        q4_q4_q6,
         q5_q4,
         q8_0,
     };
@@ -24893,6 +24920,8 @@ pub fn tryApplyQuantizedRuntimeLinearQkv(
         .q4_0
     else if (q_kind == .q4_k and k_kind == .q4_k and v_kind == .q4_k)
         .q4_q4
+    else if (q_kind == .q4_k and k_kind == .q4_k and v_kind == .q6_k)
+        .q4_q4_q6
     else if (q_kind == .q5_k and k_kind == .q4_k and v_kind == .q4_k)
         .q5_q4
     else if (q_kind == .q8_0 and k_kind == .q8_0 and v_kind == .q8_0)
@@ -24965,6 +24994,27 @@ pub fn tryApplyQuantizedRuntimeLinearQkv(
                 @intFromEnum(MetalQuantFormat.q4_k),
                 @intFromEnum(MetalQuantFormat.q4_k),
                 @intFromEnum(MetalQuantFormat.q4_k),
+                q_slot,
+                k_slot,
+                v_slot,
+                input.deviceHandle(),
+                input.deviceByteOffset(),
+                rows,
+                in_dim,
+                q_out_dim,
+                kv_out_dim,
+                q_device.deviceHandle(),
+                q_device.deviceByteOffset(),
+                k_device.deviceHandle(),
+                k_device.deviceByteOffset(),
+                v_device.deviceHandle(),
+                v_device.deviceByteOffset(),
+            ),
+            .q4_q4_q6 => termite_metal_decode_runtime_apply_quantized_linear_qkv_slots_device(
+                runtime,
+                @intFromEnum(MetalQuantFormat.q4_k),
+                @intFromEnum(MetalQuantFormat.q4_k),
+                @intFromEnum(MetalQuantFormat.q6_k),
                 q_slot,
                 k_slot,
                 v_slot,
@@ -25079,6 +25129,7 @@ pub fn tryApplyQuantizedRuntimeLinearQkv(
 
     const host_case = direct_case orelse return null;
     if (host_case == .q8_0) return null;
+    if (host_case == .q4_q4_q6) return null;
     if (frame_active) return null;
 
     var input_mut = input;
@@ -25124,6 +25175,7 @@ pub fn tryApplyQuantizedRuntimeLinearQkv(
             k_out.ptr,
             v_out.ptr,
         ),
+        .q4_q4_q6 => unreachable,
         .q5_q4 => termite_metal_decode_runtime_apply_quantized_q_kv_pair_linear_qkv_slots(
             runtime,
             @intFromEnum(MetalQuantFormat.q5_k),

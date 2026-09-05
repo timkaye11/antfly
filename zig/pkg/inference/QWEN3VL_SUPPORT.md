@@ -243,6 +243,161 @@ free-memory, or swap-growth violations. Run them serially on this 16 GB host;
 if the BF16 MPS lane cannot satisfy the zero-swap envelope, preserve that
 failure report instead of publishing a performance number.
 
+### Text-only Metal decode tuning
+
+The row-one Q4_K_M decode portfolio remains opt-in while it is qualified on
+additional Apple GPU classes:
+
+```sh
+export TERMITE_METAL_ENABLE_QWEN3VL_WHOLE_TOKEN_FRAME=1
+export TERMITE_METAL_ENABLE_QWEN3VL_PREPARED_DECODE_BLOCK=1
+export TERMITE_METAL_Q4_K_MMV_VARIANT=v2
+export TERMITE_METAL_Q4_K_PAIR_MMV_VARIANT=v2
+export TERMITE_METAL_ENABLE_QWEN3VL_QKV_FUSION=1
+```
+
+The QKV kernel is decode-only and requires the managed model's exact
+Q4_K/Q4_K/Q4_K or Q4_K/Q4_K/Q6_K tensor mix and 2:1 query-to-KV width. On the
+qualified 2B Q4_K_M artifact, 14 decoder layers use each portfolio. The mixed
+route reduced each generated token from 452 to 410 Metal dispatches and
+improved two valid interleaved 48-token pairs by 2.1% and 2.9%. Extending the
+same kernel to the homogeneous layers reduced the frame again to 396
+dispatches; a hot ABBA pair measured between flat and 1.5% faster, so that
+marginal throughput change is not claimed as a standalone gain. Every arm
+emitted identical generated token IDs. `TERMITE_METAL_DISABLE_QWEN3VL_QKV_FUSION=1`
+is the complete rollback, while
+`TERMITE_METAL_DISABLE_QWEN3VL_HOMOGENEOUS_QKV_FUSION=1` restores only the
+410-dispatch mixed-only route. Selecting `legacy` for either MMV variant and
+omitting the whole-token-frame flag restore the other control arms.
+
+The prepared-decode flag reuses the fixed output-projection, FFN norm, and FFN
+linear slots after Qwen3-VL's Q/K head normalization and M-RoPE. It is restricted
+to text-only, paged, single-token decode and requires the whole-token frame. On
+the qualified Q4_K_M artifact, the f32 Q4_K gate/up to Q6_K down path is about
+3.3% faster than carrying f16 activations between those kernels, so the profile
+selects f32 per model without changing the default for other families. The
+global `TERMITE_METAL_DISABLE_Q4K_Q6K_F16_FFN=1` switch remains authoritative,
+and `TERMITE_METAL_DISABLE_QWEN3VL_PREPARED_DECODE_BLOCK=1` restores the eager
+block path.
+
+For the row-one FFN gate/up projection, explicitly selecting
+`TERMITE_METAL_Q4_K_PAIR_MMV_VARIANT=v2` also keeps the older fused-activation
+kernel from overriding that selection. The v2 pair matvec followed by the
+ordinary activation dispatch is materially faster at Qwen3-VL's `2048 -> 6144`
+shape. Selecting `legacy` restores the established fused route as a clean
+rollback.
+
+This profile substantially narrows, but does not eliminate, the llama.cpp
+text-generation gap. On an 8-GPU-core M4 with 16 GB unified memory, a guarded
+fresh-process 128-token comparison measured:
+
+| Runtime | Median decode throughput | Measured range |
+| --- | ---: | ---: |
+| Antfly Metal candidate | 65.41 tok/s | 65.11-65.64 tok/s |
+| llama.cpp build 8990 (`660b1b4bd`) | 73.48 tok/s | 71.99-73.72 tok/s |
+
+Antfly therefore reaches 89.0% of llama.cpp throughput, with a 1.12x remaining
+gap. The protocol used the same `Qwen3VL-2B-Instruct-Q4_K_M.gguf`, raw prompt
+(`840 20772 3170 279 12884 7952 6303 304 825 63594 14311 13` in both runtimes),
+greedy sampling, repetition penalty 1, ignored EOS, f16 K/V, one warmup per
+runtime, three thermally interleaved measured runs, and no swap growth. llama.cpp
+used Metal offload, flash attention, `-c 1024 -b 512 -ub 512`, and no context
+shift. Antfly's paged cache grows with the active sequence rather than exposing
+a comparable maximum-context CLI setting; both implementations attended the
+same live 12-to-140-token span. The 48-token Antfly v2 route measured 65.48 tok/s
+(63.75-65.57); forcing `legacy` measured 53.63 tok/s. Both routes emitted the
+same 48 generated token IDs as the eager Antfly path.
+Exclude runs immediately following a full build or other thermally contended
+samples on a fanless host.
+
+The current evidence rules out raw Q4_K/Q6_K dot-product throughput as the sole
+remaining problem. At exact Qwen decode shapes, isolated row-one kernels sustain
+about 90-96 GB/s GPU: the Q4_K gate/up pair (`2048 -> 6144`) takes 0.150 ms,
+Q4_K down (`6144 -> 2048`) 0.074 ms, and Q6_K down 0.115 ms. A dependency chain
+over 28 distinct Q4_K weights takes 0.782 ms GPU and 1.216 ms wall with serial
+planned dispatch. Enabling concurrent planned dispatch produces the same output
+hash but regresses to 0.817 ms GPU and 1.276 ms wall, so it must not be enabled
+for Qwen.
+
+The profiled candidate submitted one Metal frame per decode step. Across 95
+instrumented frames, aggregate GPU time was 1.291 seconds (13.59 ms per step)
+and host encode time was 70.0 ms (0.74 ms per step). A five-frame stage sample,
+which incurs timing-counter overhead, attributed 4.69 ms per frame to attention,
+8.80 ms to FFN, and 3.71 ms to the remaining stages. The remaining throughput
+gap is now dominated by host encoding/submission and scheduler overhead rather
+than raw GPU frame time: 13.59 ms is approximately llama.cpp's measured total
+decode time per token. Antfly's Q4_K v2 implementation already uses the same
+`NR0=2`, `NSG=2` structure as the pinned llama.cpp kernel.
+
+`--print-timing` and `--json-timing` now expose decoder-frame wait, GPU, and host
+encode CPU nanoseconds together with encoder, planned-scope, and barrier counts.
+Use the JSON `metal.decoder_frame` object in the next interleaved sustained run
+to verify that a candidate reduces GPU time rather than moving work into command
+encoding.
+
+Do not retry replacing the diagnostic command-buffer descriptor with the
+lightweight constructor as a throughput fix. The benchmarked llama.cpp commit
+does use lightweight/unretained command buffers, but balanced A/B/B/A and
+B/A/A/B runs on the same 48-token lane averaged 30.87 tok/s for the lightweight
+Antfly experiment versus 31.11 tok/s for the existing constructor. Generated
+text was identical; the measured -0.8% is noise/slightly worse, not an
+explanation for the parity gap.
+
+Do not retry splitting the row-one Q4_K gate/up pair into two ordinary v2
+matvec dispatches. Across an interleaved eight-run sequence, the split route
+averaged 24.61 tok/s versus 25.00 tok/s for the retained pair route (-1.5%),
+with identical generated token IDs. The least thermally drifted quartet was
+effectively flat at -0.3%, so the extra dispatch does not justify replacing
+the paired kernel.
+
+Do not add a standalone paired Q/K head-norm-plus-RoPE kernel solely to remove
+one dispatch per layer. The existing Metal microbenchmark measured one
+Q-shaped dispatch at 0.020 ms GPU time, two at 0.033 ms, and 56 queued
+dispatches at 0.200 ms total. Even assuming the paired kernel retained all of
+that launch saving, its ceiling is only about 0.2-0.4 ms per token (under 2%
+of the measured frame), far short of the remaining llama.cpp gap. Revisit this
+epilogue only as part of a larger QKV/KV-staging fusion that removes weight or
+intermediate traffic too.
+
+### OCR through `/ai/v1/read`
+
+The production-qualified Qwen3-VL generation bundle is also available through
+the reader endpoint. The model stays installed and preloaded as a `generator`;
+`/ai/v1/read` recognizes that exact bundle and reuses the resident native Metal
+generation pipeline rather than copying it into `models/readers` or loading a
+second session.
+
+An omitted or whitespace-only `prompt` selects the qualified transcription
+prompt used by the OCR comparison above. Qwen's document parsing modes are
+available through the existing prompt field: use `qwenvl markdown` for
+reading-order text, tables, and layout expressed as Markdown, or `qwenvl html`
+for HTML. The generated markup is returned verbatim in each result's `text`
+field; Qwen generation does not fabricate `fields` or geometric `regions`.
+
+```sh
+curl -sS http://127.0.0.1:8080/ai/v1/read \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "Qwen/Qwen3-VL-2B-Instruct-GGUF:q4-k-m-bundle-v1",
+    "images": [{"url": "file:///path/allowed/document-page.png"}],
+    "prompt": "qwenvl markdown",
+    "max_tokens": 1024
+  }'
+```
+
+The endpoint keeps the existing 64-image envelope and processes Qwen images
+serially under one weighted request admission because each image is an
+independent document result. The default output limit is 256 tokens and the
+public maximum remains 1024. If Qwen reaches that limit, the request fails with
+`OUTPUT_TRUNCATED` (HTTP 400) instead of returning a silently incomplete
+document. Split long PDFs into page images and submit bounded batches; PDF
+rasterization is not performed by this endpoint.
+
+This route does not widen the Qwen allowlist: only the exact managed 2B Q4_K_M
+decoder plus Q8_0 projector bundle on Metal is production-compatible. The
+reranker bundle, unqualified sizes/quantizations, SafeTensors oracle bundles,
+and non-Metal backends remain blocked by the existing compatibility policy.
+
 ### High-precision and MLX-VLM benchmark lanes
 
 The production Qwen3-VL generation receipt remains the qualified Q4_K_M

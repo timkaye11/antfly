@@ -426,6 +426,17 @@ fn qwen3VlMetalDecodeFrameEnabled() bool {
         !platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_QWEN3VL_DECODE_FRAME", false);
 }
 
+/// Reuse the prepared output-projection, FFN norm, and FFN linear slots after
+/// Qwen3-VL's Q/K head normalization and M-RoPE have already run. Keep this
+/// decode-only candidate coupled to the qualified whole-token frame: the
+/// prepared block writes into frame-owned scratch and must not introduce a
+/// per-layer command-buffer wait.
+fn qwen3VlMetalPreparedDecodeBlockEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_QWEN3VL_WHOLE_TOKEN_FRAME", false) and
+        platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_QWEN3VL_PREPARED_DECODE_BLOCK", false) and
+        !platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_QWEN3VL_PREPARED_DECODE_BLOCK", false);
+}
+
 fn qwen3VlMetalForwardFrameEnabled() bool {
     return qwen3VlMetalPrefillFastPathEnabled() and
         platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_QWEN3VL_FORWARD_FRAME", false) and
@@ -465,10 +476,15 @@ fn maybePrepareMetalQwen3VlDecoderOverrides(
     trace_sink: ?*ActivationTraceSink,
 ) !Layer0DecoderOverrides {
     if (cb.kind() != .metal or config.family != .qwen3_vl) return overrides;
-    if (!qwen3VlMetalPrefillFastPathEnabled() or trace_sink != null) return overrides;
+    if (trace_sink != null) return overrides;
     if (!layer0DecoderOverridesEmpty(overrides)) return overrides;
     const ctx = decode_context orelse return overrides;
-    if (ctx.attention_mode != .paged_prefill or ctx.query_sequence_len <= 1) return overrides;
+    const eligible_prefill = qwen3VlMetalPrefillFastPathEnabled() and
+        ctx.attention_mode == .paged_prefill and ctx.query_sequence_len > 1;
+    const eligible_decode = qwen3VlMetalPreparedDecodeBlockEnabled() and
+        ctx.qwen3vl_text_only and ctx.attention_mode == .paged_decode and
+        ctx.query_sequence_len == 1;
+    if (!eligible_prefill and !eligible_decode) return overrides;
 
     const configured_layer_count: usize = @intCast(config.num_hidden_layers);
     const prepare = try cb.decoderRuntimePrepareOrReuseFamily(
@@ -5831,6 +5847,10 @@ fn decoderBlockImpl(
         break :blk .{ .q = layer0_q_override.?, .k = layer0_k_override.?, .v = layer0_v_override.? };
     } else blk: {
         const q_projection_dim: usize = if (config.family == .qwen3_5 and config.qwen35_attn_output_gate) q_dim * 2 else q_dim;
+        const qwen3vl_qkv_fusion = config.family == .qwen3_vl and cb.kind() == .metal and
+            isDecodeStep(decode_context) and
+            getenvBool("TERMITE_METAL_ENABLE_QWEN3VL_QKV_FUSION") and
+            !getenvBool("TERMITE_METAL_DISABLE_QWEN3VL_QKV_FUSION");
         if (config.family == .gemma and !shares_kv and !config.layerOmitsVProj(layer) and
             q_projection_dim == q_dim and attn_q_slot != null and attn_k_slot != null and attn_v_slot != null)
         {
@@ -5846,7 +5866,9 @@ fn decoderBlockImpl(
                 break :blk .{ .q = qkv.first, .k = qkv.second, .v = qkv.third };
             }
         }
-        if (cb.kind() == .cuda and config.family == .gemma and !shares_kv and !config.layerOmitsVProj(layer) and q_projection_dim == q_dim) {
+        if (((cb.kind() == .cuda and config.family == .gemma) or qwen3vl_qkv_fusion) and
+            !shares_kv and !config.layerOmitsVProj(layer) and q_projection_dim == q_dim)
+        {
             const q_name = std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.q_proj.weight", .{layer}) catch return error.NameTooLong;
             const q_w = try getModelWeight(cb, config, q_name);
             defer cb.free(q_w);
@@ -5997,7 +6019,18 @@ fn decoderBlockImpl(
     var qk_already_roped = false;
     var fused_q_rope: ?CT = null;
     var fused_k_rope: ?CT = null;
-    if (!shares_kv and config.family == .gemma and config.position_encoding == .rope and batch == 1) fused_blk: {
+    // Text-only Qwen3-VL decode supplies [position, position, position] for
+    // M-RoPE. With all three axes equal, its split-half rotation is exactly
+    // ordinary RoPE, so head RMS normalization and rotation can share the
+    // existing fused kernel. Multimodal preparation clears text_only.
+    const qwen3vl_text_rope = config.family == .qwen3_vl and
+        decode_context != null and
+        decode_context.?.qwen3vl_text_only;
+    if (!shares_kv and
+        (config.family == .gemma or qwen3vl_text_rope) and
+        config.position_encoding == .rope and
+        batch == 1)
+    fused_blk: {
         const rope_dim = config.layerRopeActiveDim(layer);
         const rope_theta = config.layerRopeEffectiveTheta(layer);
         const offset = positionOffset(seq_len, total, decode_context);

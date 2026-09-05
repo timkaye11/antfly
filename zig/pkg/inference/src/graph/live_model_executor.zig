@@ -13,9 +13,11 @@
 // limitations under the License.
 
 const std = @import("std");
+const platform = @import("antfly_platform");
 const backends = @import("../backends/backends.zig");
 const cache_mod = @import("cache.zig");
 const decode_state_runtime = @import("decode_state_runtime.zig");
+const debug_timing = @import("../debug_timing.zig");
 const session_factory = @import("../architectures/session_factory.zig");
 const generation = @import("../pipelines/generation.zig");
 const gpt_arch = @import("../architectures/gpt.zig");
@@ -44,9 +46,11 @@ const RuntimeContext = struct {
     cb: ops.ComputeBackend,
     gpt_config: gpt_mod.Config,
     kv_manager: runtime.kv.manager.KvManager,
+    kv_storage: runtime.kv.storage_runtime.KvStorageRuntime,
     pool_id: runtime.kv.block.KvPoolId,
     decode_runtime: decode_state_runtime.DecodeStateRuntime,
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache,
+    qwen3vl_whole_token_frame_enabled: bool,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -73,17 +77,20 @@ const RuntimeContext = struct {
             .wasm => return error.UnexpectedWasmBackend,
         };
         const kv_dtype = kv_dtype_override orelse session_factory.recommendedKvDTypeForSession(session, backend_kind);
-        const sliding_window_size = gpt_config.kvPoolSlidingWindowSize(false);
-
-        const pool_id = try kv_manager.addPool(.{
+        const kv_pool_config: runtime.kv.pool.KvPoolConfig = .{
             .backend = backend_kind,
             .dtype = kv_dtype,
             .page_size_tokens = 16,
             .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
             .num_kv_heads = gpt_config.maxKvHeads(),
             .head_dim = gpt_config.maxHeadDim(),
-            .sliding_window_size = sliding_window_size,
-        });
+            .sliding_window_size = gpt_config.kvPoolSlidingWindowSize(false),
+        };
+        const pool_id = try kv_manager.addPool(kv_pool_config);
+
+        var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, kv_pool_config);
+        errdefer kv_storage.deinit();
+        try cb.provisionKvDeviceWriteHook(&kv_storage);
 
         const ctx = try allocator.create(RuntimeContext);
         ctx.* = .{
@@ -91,9 +98,14 @@ const RuntimeContext = struct {
             .cb = cb,
             .gpt_config = gpt_config,
             .kv_manager = kv_manager,
+            .kv_storage = kv_storage,
             .pool_id = pool_id,
             .decode_runtime = undefined,
             .shared_moe_cache = shared_moe_cache,
+            .qwen3vl_whole_token_frame_enabled = platform.env.getenvBoolDefault(
+                "TERMITE_METAL_ENABLE_QWEN3VL_WHOLE_TOKEN_FRAME",
+                false,
+            ),
         };
         ctx.decode_runtime = decode_state_runtime.DecodeStateRuntime.initPaged(
             allocator,
@@ -101,6 +113,7 @@ const RuntimeContext = struct {
             pool_id,
             shared_moe_cache,
         );
+        ctx.decode_runtime.state.kv_storage = &ctx.kv_storage;
         ctx.decode_runtime.configureForGptConfig(gpt_config);
         return ctx;
     }
@@ -113,11 +126,13 @@ const RuntimeContext = struct {
             self.pool_id,
             self.shared_moe_cache,
         );
+        self.decode_runtime.state.kv_storage = &self.kv_storage;
         self.decode_runtime.configureForGptConfig(self.gpt_config);
     }
 
     fn deinit(self: *RuntimeContext) void {
         self.decode_runtime.deinit();
+        self.kv_storage.deinit();
         self.kv_manager.deinit();
         self.cb.deinit();
         self.allocator.destroy(self);
@@ -192,6 +207,9 @@ const runtime_vtable = model_runtime.ModelRuntime.VTable{
     .decode_greedy = runtimeDecodeGreedy,
     .deinit = runtimeDeinit,
     .reset = runtimeReset,
+    .debug_timing_stats = runtimeDebugTimingStats,
+    .reset_debug_timing_stats = runtimeResetDebugTimingStats,
+    .print_debug_timing = runtimePrintDebugTiming,
 };
 
 const executor_vtable = model_runtime.ModelExecutor.VTable{
@@ -262,6 +280,32 @@ fn runtimeReset(ctx: *anyopaque) !void {
     try runtime_ctx.resetState();
 }
 
+fn runtimeDebugTimingStats(ctx: *anyopaque) model_runtime.RuntimeDebugTimingStats {
+    const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
+    return .{
+        .backend = runtime_ctx.cb.debugTimingSnapshot(),
+        .decoder_runtime_ready = runtime_ctx.cb.decoderRuntimeReady(),
+        .decoder_runtime_absolute_embeddings_prepared = runtime_ctx.cb.decoderRuntimeAbsoluteEmbeddingsPrepared(),
+    };
+}
+
+fn runtimeResetDebugTimingStats(ctx: *anyopaque) void {
+    const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
+    gpt_arch.resetDebugTimingStats();
+    runtime_ctx.cb.resetDebugTimingStats();
+}
+
+fn runtimePrintDebugTiming(ctx: *anyopaque) void {
+    const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
+    const stats = runtimeDebugTimingStats(ctx);
+    debug_timing.printBackendTimingDetails(
+        runtime_ctx.cb.kind(),
+        stats.backend,
+        stats.decoder_runtime_ready,
+        stats.decoder_runtime_absolute_embeddings_prepared,
+    );
+}
+
 fn runtimeDeinit(ctx: *anyopaque) void {
     const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
     runtime_ctx.deinit();
@@ -330,16 +374,50 @@ fn runtimeDecodeGreedy(
     const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
     const step = try runtime_ctx.beginDecodeStep(request.position, request.attention_mode);
     const input_ids = [_]i64{request.token_id};
-    return .{
-        .token_id = @intCast(try gpt_arch.forwardGreedyLastToken(
-            &runtime_ctx.cb,
+    const qwen3vl_prepared_decode_block = runtime_ctx.cb.kind() == .metal and
+        runtime_ctx.gpt_config.family == .qwen3_vl and
+        step.decode_context.qwen3vl_text_only and
+        request.attention_mode == .paged_decode and
+        runtime_ctx.qwen3vl_whole_token_frame_enabled and
+        platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_QWEN3VL_PREPARED_DECODE_BLOCK", false) and
+        !platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_QWEN3VL_PREPARED_DECODE_BLOCK", false);
+    if (qwen3vl_prepared_decode_block) {
+        _ = try runtime_ctx.cb.decoderRuntimePrepareOrReuseFamily(
             allocator,
             runtime_ctx.gpt_config,
-            input_ids[0..],
-            1,
-            step.seq_len,
-            &step.decode_context,
-        )),
+            step.decode_context.kv_sequence_len,
+            runtime_ctx.gpt_config.num_hidden_layers,
+        );
+    }
+    var whole_token_frame_active = false;
+    if (runtime_ctx.cb.kind() == .metal and
+        runtime_ctx.gpt_config.family == .qwen3_vl and
+        step.decode_context.qwen3vl_text_only and
+        request.attention_mode == .paged_decode and
+        runtime_ctx.qwen3vl_whole_token_frame_enabled and
+        !runtime_ctx.cb.decoderRuntimeHasActiveFrame())
+    {
+        whole_token_frame_active = try runtime_ctx.cb.decoderRuntimeBeginFrame();
+        if (whole_token_frame_active) try runtime_ctx.cb.decoderRuntimeSetActiveFrameRegime(.decode);
+    }
+    errdefer if (whole_token_frame_active and runtime_ctx.cb.decoderRuntimeHasActiveFrame())
+        runtime_ctx.cb.decoderRuntimeCancelFrame() catch {};
+
+    const token_id = try gpt_arch.forwardGreedyLastToken(
+        &runtime_ctx.cb,
+        allocator,
+        runtime_ctx.gpt_config,
+        input_ids[0..],
+        1,
+        step.seq_len,
+        &step.decode_context,
+    );
+    if (whole_token_frame_active and runtime_ctx.cb.decoderRuntimeHasActiveFrame()) {
+        try runtime_ctx.cb.decoderRuntimeSubmitAndWaitFrame();
+    }
+    whole_token_frame_active = false;
+    return .{
+        .token_id = @intCast(token_id),
     };
 }
 

@@ -251,12 +251,12 @@ passed. Report both when discussing fanless-host variance; use the passing
 steady-state run above for the thermally stable comparison, not the faster
 transition-state absolute tok/s.
 
-The checked-in raw reports for this final executable are:
-
-- `reports/qwen3_embedding_strict_511_pr.json`
-- `reports/qwen3_embedding_strict_2551_pr.json` (thermal-transition failure)
-- `reports/qwen3_embedding_strict_2551_pr_steady.json` (steady-state pass)
-- `reports/qwen3_embedding_qualification_pr.json` (78/78 gates)
+The raw JSON reports are intentionally not checked in: they contain
+machine-local executable/model paths and environment-specific measurements.
+`benchmark_qwen3_embedding_endpoint.py` and
+`qualify_qwen3_embedding_metal.py` reproduce them into an operator-selected
+output path; this document keeps the stable protocol, artifact hashes, and
+summarized results needed to review the performance claim.
 
 ### Q8_0 matmul work that closed the gap
 
