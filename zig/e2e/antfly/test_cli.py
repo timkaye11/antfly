@@ -605,21 +605,29 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
         assert image_status["status"]["searchable_vectors"] >= 1
 
         # The searchable-artifact threshold proves serving authority, not
-        # convergence authority. Wait separately for an exact target
-        # observation before asserting whole-source completion.
+        # convergence authority. Source coverage can settle before publication
+        # and replay finish, so also wait for the readiness milestone used by
+        # the query preflight before expecting a warning-free query.
         def completed_image_coverage() -> dict | None:
             current = parse_json(
                 cli("index", "get", "--table", table, "--index", "thumbnail").stdout
             )
-            coverage = current["status"]["source_coverage"]
-            if coverage["observation_complete"] and coverage["complete"]:
+            status = current["status"]
+            coverage = status["source_coverage"]
+            if (
+                coverage["observation_complete"]
+                and coverage["complete"]
+                and status["readiness"]["complete"]
+            ):
                 return current
             return None
 
         completed_image_status = wait_until(
             completed_image_coverage, timeout_s=5.0, interval_s=0.025
         )
-        assert completed_image_status is not None, json.dumps(image_status, indent=2)
+        assert completed_image_status is not None, cli(
+            "index", "get", "--table", table, "--index", "thumbnail"
+        ).stdout
         completed_image_coverage_status = completed_image_status["status"][
             "source_coverage"
         ]

@@ -38,10 +38,14 @@ from conftest import (
     resolve_binary_path,
     wait_for_server,
 )
+from e2e_scheduler import e2e_resource
 from helpers import assert_created_index, wait_until
 from port_reservations import LoopbackPortReservations
 
 BACKUP_CONNECTION = "e2e-backups"
+# Match the multi-node scaling fixture. Six processes sharing CI CPUs need
+# enough time to exchange Raft heartbeats while other E2E clusters are running.
+CLUSTER_TICK_MS = "25"
 
 
 def _file_location(path: str | Path) -> str:
@@ -548,9 +552,9 @@ class ThreeByThreeBackupCluster:
             "--health",
             "false",
             "--raft-tick-ms",
-            "5",
+            CLUSTER_TICK_MS,
             "--control-tick-ms",
-            "5",
+            CLUSTER_TICK_MS,
             "--data-dir",
             str(self.root / f"metadata-{node_id}"),
             "--replica-root-dir",
@@ -585,9 +589,9 @@ class ThreeByThreeBackupCluster:
             "--health",
             "false",
             "--raft-tick-ms",
-            "5",
+            CLUSTER_TICK_MS,
             "--control-tick-ms",
-            "5",
+            CLUSTER_TICK_MS,
             "--data-dir",
             str(self.root / f"data-{node_id}"),
             "--replica-root-dir",
@@ -655,6 +659,14 @@ class ThreeByThreeBackupCluster:
         ):
             raise RuntimeError(
                 "data nodes did not register on every metadata node\n"
+                f"{self.debug_logs()}"
+            )
+
+        # Registration can outlive the leader observed before data-node
+        # startup. Wait for the quorum to settle again before public mutations.
+        if self.metadata_stable_leader_id(timeout_s=30.0) is None:
+            raise RuntimeError(
+                "metadata leadership did not stabilize after data-node startup\n"
                 f"{self.debug_logs()}"
             )
 
@@ -1004,6 +1016,7 @@ class ThreeByThreeBackupCluster:
 
 
 @pytest.fixture
+@e2e_resource("antfly_process")
 def three_by_three_backup_cluster(
     request: pytest.FixtureRequest,
 ) -> ThreeByThreeBackupCluster:
