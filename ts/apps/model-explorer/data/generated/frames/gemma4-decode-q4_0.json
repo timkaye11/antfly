@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "id": "decode-q4_0",
+  "modelId": "gemma4-e4b",
+  "title": "Live Q4_0 decode frame",
+  "description": "One decode step as the planner submits it today: a single serial compute encoder, 143 planned scopes, planned_barriers=0 under whole-frame scoped suppression. Scopes below are representative (one layer + tail), not all 143.",
+  "machine": "M4 Pro",
+  "mode": "planned",
+  "stats": { "encoders": 1, "plannedScopes": 143, "plannedBarriers": 0 },
+  "encoderScopes": [
+    {
+      "id": "attn-setup",
+      "kind": "compute",
+      "label": "attention setup (per layer)",
+      "ops": [
+        { "label": "pre-attn rms_norm", "family": "norm_rope", "estBytes": 10240 },
+        { "label": "QKV project", "kernel": "termite_q4_0_linear_1x_reduce", "family": "matvec", "estBytes": 7900000 },
+        { "label": "head-norm ⋄ rope", "kernel": "termite_apply_head_rms_rope", "family": "fusion", "estBytes": 65536 },
+        { "label": "KV append", "kernel": "termite_paged_f16_kv_seed", "family": "kv", "estBytes": 32768 }
+      ]
+    },
+    {
+      "id": "attn",
+      "kind": "compute",
+      "label": "attention",
+      "ops": [
+        { "label": "split-GQA stage", "kernel": "termite_paged_attention_kv_decode_gqa_split_stage", "family": "attention", "estBytes": 4200000 },
+        { "label": "split-GQA reduce", "kernel": "termite_paged_attention_kv_decode_gqa_split_reduce", "family": "attention", "estBytes": 262144 },
+        { "label": "output project", "kernel": "termite_q4_0_linear_1x_reduce", "family": "matvec", "estBytes": 6600000 }
+      ]
+    },
+    {
+      "id": "ffn",
+      "kind": "compute",
+      "label": "gated FFN (per layer)",
+      "ops": [
+        { "label": "post-attn norm+add", "family": "norm_rope", "estBytes": 10240 },
+        { "label": "gate+up pair-fused", "kernel": "termite_q4_0_pair_activation_1x_reduce", "family": "fusion", "estBytes": 29500000 },
+        { "label": "down project", "kernel": "termite_q4_0_linear_1x_reduce", "family": "matvec", "estBytes": 14700000 },
+        { "label": "post-FFN norm+add+PLE", "family": "norm_rope", "estBytes": 20480 }
+      ]
+    },
+    {
+      "id": "tail",
+      "kind": "compute",
+      "label": "tail: LM head + sample",
+      "ops": [
+        { "label": "final norm", "family": "norm_rope", "estBytes": 10240 },
+        { "label": "LM head [2560×262144]", "kernel": "termite_lm_head_q6_k_rescore_top8", "family": "sampling", "estBytes": 550000000 },
+        { "label": "top-8 reduce", "kernel": "termite_lm_head_top8_reduce", "family": "sampling", "estBytes": 1048576 },
+        { "label": "Gumbel-max sample", "kernel": "termite_sample_gumbel_partials", "family": "sampling", "estBytes": 131072 }
+      ]
+    }
+  ],
+  "barriers": [],
+  "pipelining": { "overlapsPrevFrame": true, "tokenHandoff": "device" }
+}

@@ -1,0 +1,922 @@
+{
+ "schemaVersion": 1,
+ "id": "gliner2",
+ "family": "gliner",
+ "displayName": "GLiNER2",
+ "tagline": "Schema-driven entity extraction on a DeBERTa-v3 encoder: disentangled relative attention, one fused Metal kernel forward and backward, and a span head that scores every candidate span against every label at once.",
+ "stats": {
+  "layers": 12,
+  "hidden": 768,
+  "heads": 12,
+  "ffn": 3072,
+  "vocab": 128011,
+  "context": 512,
+  "relBuckets": 256,
+  "maxSpanWidth": 8,
+  "quant": "Q4_K",
+  "tokenizer": "SentencePiece"
+ },
+ "stages": [
+  {
+   "kind": "embedding",
+   "id": "embed",
+   "title": "Token embedding",
+   "spine": "graph",
+   "summary": "SentencePiece ids gather embedding rows; padded positions are zeroed by the embedding mask. No absolute position embeddings are added — position lives entirely inside attention."
+  },
+  {
+   "kind": "encoder",
+   "id": "encoder",
+   "title": "DeBERTa encoder layer",
+   "spine": "graph",
+   "summary": "Bidirectional encoder: no causal mask, no KV cache, no sampling. Attention scores decompose into content-to-content, content-to-position, and position-to-content terms.",
+   "source": {
+    "path": "zig/pkg/inference/src/architectures/deberta_graph.zig",
+    "anchor": "pub fn buildForwardGraph(",
+    "line": 97
+   },
+   "repeat": {
+    "count": 12,
+    "note": "12 identical bidirectional layers (deberta-v3-base backbone)"
+   },
+   "attention": "disentangled_relative"
+  },
+  {
+   "kind": "head",
+   "id": "head",
+   "title": "Span head",
+   "spine": "graph",
+   "summary": "Label embeddings gathered at entity-marker positions, span start/end reps concatenated to [total_spans, 2H], then one matmul scores every span against every label.",
+   "source": {
+    "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig",
+    "anchor": "pub fn buildForwardGraphPrecomputed(",
+    "line": 220
+   },
+   "headType": "span"
+  }
+ ],
+ "graphs": {
+  "decode": {
+   "nodes": [
+    {
+     "id": "embed.tokens",
+     "opKind": "embedding_lookup",
+     "label": "embed + LayerNorm + mask",
+     "stageId": "embed",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "B·T"
+        ],
+        "dtype": "i64"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "B·T",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [
+      "TERMITE_METAL_DISABLE_DEBERTA_FUSED_EMBEDDINGS"
+     ],
+     "backend": "metal",
+     "fusedOps": [
+      "embedding_lookup",
+      "layer_norm",
+      "embedding_mask"
+     ]
+    },
+    {
+     "id": "enc.qkv",
+     "opKind": "linear",
+     "label": "QKV project (shared content/position)",
+     "stageId": "encoder",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "B·T",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "B·T",
+         2304
+        ],
+        "dtype": "f32",
+        "quant": "q4_k"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "the same query_proj/key_proj also project the relative position embeddings (Q_r, K_r)"
+     },
+     "kernelRouteIds": [
+      "q4_k/rows_2_8/bias"
+     ],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "enc.relbucket",
+     "opKind": "gather",
+     "label": "log-bucket rel positions",
+     "stageId": "encoder",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "T",
+         "T"
+        ],
+        "dtype": "i64"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "2·buckets",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "buckets": 256,
+      "maxPositions": 512,
+      "note": "relativePositionBucket: exact buckets near 0, log-spaced further out; rel_embeddings shared across all 12 layers"
+     },
+     "source": {
+      "path": "zig/pkg/inference/src/models/deberta.zig",
+      "anchor": "pub fn relativePositionBucket(",
+      "line": 108
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "enc.relscore",
+     "opKind": "dot_general",
+     "label": "rel-score GEMM (Q_c·K_rᵀ, K_c·Q_rᵀ)",
+     "stageId": "encoder",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "B·h",
+         "T",
+         64
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "B·h",
+         "T",
+         "2·buckets"
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "score-gather strategy: one [T, num_rel] GEMM per side, then a Toeplitz gather qi−ki+S−1 — instead of materializing [S·S, H]"
+     },
+     "kernelRouteIds": [],
+     "kernels": [
+      "termite_deberta_relative_score_gemm_f32"
+     ],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "enc.attn",
+     "opKind": "disentangled_relative_attention",
+     "label": "disentangled attention",
+     "stageId": "encoder",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "B·h",
+         "T",
+         64
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "B·h",
+         "T",
+         "2·buckets"
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "B·h",
+         "T",
+         64
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "scale": "1/√(3·head_dim)",
+      "note": "scores = (C2C + C2P + P2C) / sqrt(3·head_dim); bidirectional — the mask is padding-only, never causal"
+     },
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/deberta_graph.zig",
+      "anchor": "pub fn fusedDisentangledAttentionEnabledForProduction(",
+      "line": 316
+     },
+     "kernelRouteIds": [],
+     "kernels": [
+      "termite_disentangled_relative_attention_f32",
+      "termite_disentangled_relative_attention_f32_flash4"
+     ],
+     "envFlagNames": [
+      "TERMITE_METAL_DISABLE_DEBERTA_FLASH_ATTENTION"
+     ],
+     "backend": "metal",
+     "fusedOps": [
+      "c2c",
+      "c2p",
+      "p2c",
+      "softmax",
+      "context"
+     ]
+    },
+    {
+     "id": "enc.oproj",
+     "opKind": "linear",
+     "label": "output project",
+     "stageId": "encoder",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "B·T",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "B·T",
+         768
+        ],
+        "dtype": "f32",
+        "quant": "q4_k"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [
+      "q4_k/rows_2_8/bias"
+     ],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "enc.norm1",
+     "opKind": "layer_norm",
+     "label": "add + LayerNorm",
+     "stageId": "encoder",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "B·T",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "B·T",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "enc.ffn_up",
+     "opKind": "linear",
+     "label": "FFN up + GELU",
+     "stageId": "encoder",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "B·T",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "B·T",
+         3072
+        ],
+        "dtype": "f32",
+        "quant": "q4_k"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [
+      "q4_k/rows_2_8/bias_gelu"
+     ],
+     "kernels": [],
+     "envFlagNames": [
+      "TERMITE_METAL_DISABLE_GLINER_DEBERTA_DIRECT_FFN"
+     ],
+     "backend": "metal",
+     "fusedOps": [
+      "linear",
+      "gelu"
+     ]
+    },
+    {
+     "id": "enc.ffn_down",
+     "opKind": "linear",
+     "label": "FFN down",
+     "stageId": "encoder",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "B·T",
+         3072
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "B·T",
+         768
+        ],
+        "dtype": "f32",
+        "quant": "q4_k"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [
+      "q4_k/rows_2_8/bias"
+     ],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "enc.norm2",
+     "opKind": "layer_norm",
+     "label": "add + LayerNorm",
+     "stageId": "encoder",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "B·T",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "B·T",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "head.words",
+     "opKind": "gather",
+     "label": "word pool (first sub-token)",
+     "stageId": "head",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "B·T",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "W",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "token_pooling = \"first\": each word is represented by its first sub-token's hidden state"
+     },
+     "kernelRouteIds": [],
+     "kernels": [
+      "termite_gliner_word_embeddings_f32"
+     ],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "head.labels",
+     "opKind": "gather",
+     "label": "label embeddings @ entity markers",
+     "stageId": "head",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "B·T",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "L",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "positions where input_ids == entity_token_id — the schema's label names, encoded in the same pass as the text"
+     },
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig",
+      "anchor": "pub fn gatherLabelEmbeddings(",
+      "line": 350
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "head.startend",
+     "opKind": "linear",
+     "label": "project_start / project_end (MLP2 ×2)",
+     "stageId": "head",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "W",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "W",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig",
+      "anchor": "pub fn spanMarkerForward(",
+      "line": 369
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [
+      "TERMITE_METAL_DISABLE_GLINER_HEAD_CUSTOM_MLP2"
+     ],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "head.concat",
+     "opKind": "concat",
+     "label": "span start ∥ end",
+     "stageId": "head",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "W",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "S",
+         1536
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "every candidate span up to max_width 8 words: gather its start rep and end rep, concat to [total_spans, 2H], ReLU"
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": [
+      "gather_start",
+      "gather_end",
+      "concat"
+     ]
+    },
+    {
+     "id": "head.outproj",
+     "opKind": "linear",
+     "label": "out_project MLP2 → span_rep",
+     "stageId": "head",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "S",
+         1536
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "S",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "head.labelproj",
+     "opKind": "linear",
+     "label": "downscaled label transformer",
+     "stageId": "head",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "L",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "L",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig",
+      "anchor": "pub fn downscaledTransformer(",
+      "line": 534
+     },
+     "kernelRouteIds": [],
+     "kernels": [
+      "termite_gliner_gru_combine_f32"
+     ],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": [
+      "gru_combine",
+      "mini_transformer"
+     ]
+    },
+    {
+     "id": "head.score",
+     "opKind": "dot_general",
+     "label": "span_rep @ label_projᵀ",
+     "stageId": "head",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "S",
+         768
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "L",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "S",
+         "L"
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig",
+      "anchor": "pub fn scoreSpansAgainstLabels(",
+      "line": 333
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "head.sigmoid",
+     "opKind": "sigmoid",
+     "label": "sigmoid → threshold",
+     "stageId": "head",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "S",
+         "L"
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "S",
+         "L"
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    }
+   ],
+   "edges": [
+    {
+     "id": "e.embed.qkv",
+     "from": "embed.tokens",
+     "to": "enc.qkv",
+     "kind": "data"
+    },
+    {
+     "id": "e.embed.norm1",
+     "from": "embed.tokens",
+     "to": "enc.norm1",
+     "kind": "residual"
+    },
+    {
+     "id": "e.qkv.attn",
+     "from": "enc.qkv",
+     "to": "enc.attn",
+     "kind": "data"
+    },
+    {
+     "id": "e.qkv.relscore",
+     "from": "enc.qkv",
+     "to": "enc.relscore",
+     "kind": "data"
+    },
+    {
+     "id": "e.relbucket.relscore",
+     "from": "enc.relbucket",
+     "to": "enc.relscore",
+     "kind": "routing"
+    },
+    {
+     "id": "e.relscore.attn",
+     "from": "enc.relscore",
+     "to": "enc.attn",
+     "kind": "data"
+    },
+    {
+     "id": "e.attn.oproj",
+     "from": "enc.attn",
+     "to": "enc.oproj",
+     "kind": "data"
+    },
+    {
+     "id": "e.oproj.norm1",
+     "from": "enc.oproj",
+     "to": "enc.norm1",
+     "kind": "data"
+    },
+    {
+     "id": "e.norm1.up",
+     "from": "enc.norm1",
+     "to": "enc.ffn_up",
+     "kind": "data"
+    },
+    {
+     "id": "e.norm1.norm2",
+     "from": "enc.norm1",
+     "to": "enc.norm2",
+     "kind": "residual"
+    },
+    {
+     "id": "e.up.down",
+     "from": "enc.ffn_up",
+     "to": "enc.ffn_down",
+     "kind": "data"
+    },
+    {
+     "id": "e.down.norm2",
+     "from": "enc.ffn_down",
+     "to": "enc.norm2",
+     "kind": "data"
+    },
+    {
+     "id": "e.norm2.words",
+     "from": "enc.norm2",
+     "to": "head.words",
+     "kind": "data"
+    },
+    {
+     "id": "e.norm2.labels",
+     "from": "enc.norm2",
+     "to": "head.labels",
+     "kind": "routing"
+    },
+    {
+     "id": "e.words.startend",
+     "from": "head.words",
+     "to": "head.startend",
+     "kind": "data"
+    },
+    {
+     "id": "e.startend.concat",
+     "from": "head.startend",
+     "to": "head.concat",
+     "kind": "data"
+    },
+    {
+     "id": "e.concat.outproj",
+     "from": "head.concat",
+     "to": "head.outproj",
+     "kind": "data"
+    },
+    {
+     "id": "e.labels.labelproj",
+     "from": "head.labels",
+     "to": "head.labelproj",
+     "kind": "data"
+    },
+    {
+     "id": "e.outproj.score",
+     "from": "head.outproj",
+     "to": "head.score",
+     "kind": "data"
+    },
+    {
+     "id": "e.labelproj.score",
+     "from": "head.labelproj",
+     "to": "head.score",
+     "kind": "data"
+    },
+    {
+     "id": "e.score.sigmoid",
+     "from": "head.score",
+     "to": "head.sigmoid",
+     "kind": "data"
+    }
+   ]
+  }
+ },
+ "sources": {
+  "gitCommit": "6f5b642fc86d811840a5b81a5143622cd628c51a",
+  "generatedAt": "2026-09-04T16:16:30.911Z"
+ }
+}

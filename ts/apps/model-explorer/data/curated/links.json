@@ -1,0 +1,294 @@
+{
+  "gpt-forward": {
+    "path": "zig/pkg/inference/src/architectures/gpt.zig",
+    "anchor": "pub fn forward("
+  },
+  "gpt-forward-greedy": {
+    "path": "zig/pkg/inference/src/architectures/gpt.zig",
+    "anchor": "pub fn forwardGreedyLastToken("
+  },
+  "gpt-compute-ple": {
+    "path": "zig/pkg/inference/src/architectures/gpt.zig",
+    "anchor": "pub fn computePleVectors("
+  },
+  "gpt-qk-head-norm": {
+    "path": "zig/pkg/inference/src/architectures/gpt.zig",
+    "anchor": "pub fn maybeApplyQKHeadNormRope("
+  },
+  "config-sliding-pattern": {
+    "path": "zig/pkg/inference/src/models/gpt.zig",
+    "anchor": "sliding_window_pattern: u32 = 6,"
+  },
+  "config-layer-uses-sliding": {
+    "path": "zig/pkg/inference/src/models/gpt.zig",
+    "anchor": "return ((layer_index + 1) % self.sliding_window_pattern) != 0;"
+  },
+  "config-shared-kv": {
+    "path": "zig/pkg/inference/src/models/gpt.zig",
+    "anchor": "return layer_index >= self.num_hidden_layers - self.num_kv_shared_layers;"
+  },
+  "config-global-head-dim": {
+    "path": "zig/pkg/inference/src/models/gpt.zig",
+    "anchor": "if (!self.layerUsesSlidingAttention(layer_index)) return self.global_head_dim;"
+  },
+  "config-ple-hidden": {
+    "path": "zig/pkg/inference/src/models/gpt.zig",
+    "anchor": "ple_hidden_size: u32 = 0,"
+  },
+  "planner-frame-descriptor": {
+    "path": "zig/pkg/inference/src/graph/metal_command_planner.zig",
+    "anchor": "pub const FrameDescriptor = struct {"
+  },
+  "planner-planned-op": {
+    "path": "zig/pkg/inference/src/graph/metal_command_planner.zig",
+    "anchor": "pub const PlannedOp = struct {"
+  },
+  "planner-encoder-scope": {
+    "path": "zig/pkg/inference/src/graph/metal_command_planner.zig",
+    "anchor": "pub const EncoderScope = struct {"
+  },
+  "planner-a4b-forkjoin": {
+    "path": "zig/pkg/inference/src/graph/metal_command_planner.zig",
+    "anchor": "pub const A4bForkJoinCommandLowerer = struct {"
+  },
+  "runtime-begin-frame": {
+    "path": "zig/pkg/inference/src/backends/metal_runtime.zig",
+    "anchor": "pub fn beginFrame(runtime: ?*RawMetalDecodeRuntime) FrameError!void {"
+  },
+  "runtime-submit-frame": {
+    "path": "zig/pkg/inference/src/backends/metal_runtime.zig",
+    "anchor": "pub fn submitFrame(runtime: ?*RawMetalDecodeRuntime) FrameError!void {"
+  },
+  "runtime-wait-frame": {
+    "path": "zig/pkg/inference/src/backends/metal_runtime.zig",
+    "anchor": "pub fn waitFrame(runtime: ?*RawMetalDecodeRuntime) FrameError!void {"
+  },
+  "executor-pipelined-decode": {
+    "path": "zig/pkg/inference/src/graph/metal_executor.zig",
+    "anchor": "fn decodeGreedyPipelined("
+  },
+  "executor-pipelined-gate": {
+    "path": "zig/pkg/inference/src/graph/metal_executor.zig",
+    "anchor": "fn pipelinedDecodeFrameEnabled(gpt_config: gpt_mod.Config) bool {"
+  },
+  "moe-mapped-route": {
+    "path": "zig/pkg/inference/src/ops/metal_compute.zig",
+    "anchor": "const A4bMappedMoeRoute = enum {"
+  },
+  "mtp-draft-request": {
+    "path": "zig/pkg/inference/src/architectures/gemma4_mtp.zig",
+    "anchor": "pub const DraftRequest = struct {"
+  },
+  "mtp-kv-donor": {
+    "path": "zig/pkg/inference/src/architectures/gemma4_mtp.zig",
+    "anchor": "pub fn mtpKvDonorBaseLayer("
+  },
+  "kv-manager": {
+    "path": "zig/pkg/inference/src/runtime/kv/manager.zig",
+    "anchor": "pub const KvManager = struct {"
+  },
+  "kv-pool-config": {
+    "path": "zig/pkg/inference/src/runtime/kv/pool.zig",
+    "anchor": "pub const KvPoolConfig = struct {"
+  },
+  "kv-sliding-window": {
+    "path": "zig/pkg/inference/src/runtime/kv/pool.zig",
+    "anchor": "sliding_window_size: ?u32 = null,"
+  },
+  "kv-prompt-cache": {
+    "path": "zig/pkg/inference/src/runtime/kv/prompt_cache.zig",
+    "anchor": "pub const PromptPrefixCache = struct {"
+  },
+  "kv-turboquant-polar4": {
+    "path": "zig/pkg/inference/src/runtime/kv/turboquant.zig",
+    "anchor": "pub fn encodePolar4Key("
+  },
+  "kernel-gumbel": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "anchor": "kernel void termite_sample_gumbel_partials("
+  },
+  "kernel-head-rms-rope": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "anchor": "kernel void termite_apply_head_rms_rope("
+  },
+  "server-generate": {
+    "path": "zig/pkg/inference/src/server/server.zig",
+    "anchor": "fn generateContent("
+  },
+  "server-embeddings": {
+    "path": "zig/pkg/inference/src/server/server.zig",
+    "anchor": "fn generateEmbeddings("
+  },
+  "server-rerank": {
+    "path": "zig/pkg/inference/src/server/server.zig",
+    "anchor": "fn rerankPrompts("
+  },
+  "server-chat": {
+    "path": "zig/pkg/inference/src/server/server.zig",
+    "anchor": "fn chatCompletions("
+  },
+  "ops-compute-backend": {
+    "path": "zig/pkg/inference/src/ops/ops.zig",
+    "anchor": "pub const ComputeBackend = struct {"
+  },
+  "node-primitive-op": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "anchor": "pub const PrimitiveOp = enum(u8) {"
+  },
+  "node-fused-op": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "anchor": "pub const FusedOp = enum(u8) {"
+  },
+  "compiler-schedules": {
+    "path": "zig/pkg/inference/src/graph/quant_kernel_compiler.zig",
+    "anchor": "pub const metal_production_schedules = [_]MetalRouteSchedule{"
+  },
+  "renderer": {
+    "path": "zig/pkg/inference/src/graph/quant_kernel_metal_renderer.zig",
+    "anchor": "pub fn renderKernel("
+  },
+  "perf-plan-comparison": {
+    "path": "zig/pkg/inference/GEMMA4_PERF_PLAN.md",
+    "anchor": "Circus, E4B Q4_0, single prompt, 64 tokens, temp 0, serial:"
+  },
+  "tokenizer-sentencepiece": {
+    "path": "zig/lib/tokenizer/src/sentencepiece.zig",
+    "anchor": "const std = @import(\"std\");"
+  },
+  "tokenizer-hf": {
+    "path": "zig/lib/tokenizer/src/hf_tokenizer.zig",
+    "anchor": "const std = @import(\"std\");"
+  },
+  "tokenizer-main": {
+    "path": "zig/lib/tokenizer/src/tokenizer.zig",
+    "anchor": "pub const Tokenizer = struct {"
+  },
+  "session-factory": {
+    "path": "zig/pkg/inference/src/architectures/session_factory.zig",
+    "anchor": "const std = @import(\"std\");"
+  },
+  "multi-executor": {
+    "path": "zig/pkg/inference/src/graph/multi_executor.zig",
+    "anchor": "const std = @import(\"std\");"
+  },
+  "generation-config": {
+    "path": "zig/pkg/inference/src/pipelines/generation.zig",
+    "anchor": "pub const GenerationConfig = struct {"
+  },
+  "native-generate-scheduler": {
+    "path": "zig/pkg/inference/src/runtime/scheduler/native_generate.zig",
+    "anchor": "const std = @import(\"std\");"
+  },
+  "gliner-deberta-graph": {
+    "path": "zig/pkg/inference/src/architectures/deberta_graph.zig",
+    "anchor": "pub fn buildForwardGraph("
+  },
+  "gliner-rel-bucket": {
+    "path": "zig/pkg/inference/src/models/deberta.zig",
+    "anchor": "pub fn relativePositionBucket("
+  },
+  "gliner-fused-attn-gate": {
+    "path": "zig/pkg/inference/src/architectures/deberta_graph.zig",
+    "anchor": "pub fn fusedDisentangledAttentionEnabledForProduction("
+  },
+  "gliner-fused-attn-kernel": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "anchor": "kernel void termite_disentangled_relative_attention_f32("
+  },
+  "gliner-fused-attn-bwd-kernel": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "anchor": "kernel void termite_disentangled_relative_attention_bwd_scores_f32("
+  },
+  "gliner-word-embeddings-kernel": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "anchor": "kernel void termite_gliner_word_embeddings_f32("
+  },
+  "gliner-gru-combine-kernel": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "anchor": "kernel void termite_gliner_gru_combine_f32("
+  },
+  "gliner-span-marker": {
+    "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig",
+    "anchor": "pub fn spanMarkerForward("
+  },
+  "gliner-label-gather": {
+    "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig",
+    "anchor": "pub fn gatherLabelEmbeddings("
+  },
+  "gliner-score-spans": {
+    "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig",
+    "anchor": "pub fn scoreSpansAgainstLabels("
+  },
+  "gliner-pipeline": {
+    "path": "zig/pkg/inference/src/pipelines/gliner.zig",
+    "anchor": "pub const GlinerPipeline = struct {"
+  },
+  "qwen3-embed-catalog": {
+    "path": "zig/pkg/inference/src/registry/qwen3_embedding_catalog.zig",
+    "anchor": "qwen3.pooling_type = 3"
+  },
+  "embed-pooling-strategy": {
+    "path": "zig/pkg/inference/src/pipelines/embedding.zig",
+    "anchor": "pub const PoolingStrategy = enum {"
+  },
+  "embed-pipeline": {
+    "path": "zig/pkg/inference/src/pipelines/embedding.zig",
+    "anchor": "pub const EmbeddingPipeline = struct {"
+  },
+  "kernel-q8-mm-sg": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "anchor": "kernel void termite_q8_0_linear_mm_sg("
+  },
+  "kernel-sg-q16-f16kv-gqa2": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "anchor": "kernel void termite_attention_f32_dense_causal_sg_q16_f16kv_gqa2("
+  },
+  "qwen3vl-projector": {
+    "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
+    "anchor": "pub fn encodeProjectedImages("
+  },
+  "qwen3vl-patchify": {
+    "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
+    "anchor": "fn extractPatchesMergeMajor("
+  },
+  "qwen3vl-pos-interp": {
+    "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
+    "anchor": "fn addInterpolatedPositions("
+  },
+  "qwen3vl-merger": {
+    "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
+    "anchor": "fn mergeProjected("
+  },
+  "qwen3vl-deepstack-tap": {
+    "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
+    "anchor": "if (next_tap < cfg.deepstack_len and cfg.deepstack_layers[next_tap] == layer) {"
+  },
+  "qwen3vl-splice": {
+    "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
+    "anchor": "pub fn prepareExpandedPromptEmbeddings("
+  },
+  "qwen3vl-plan": {
+    "path": "zig/pkg/inference/src/architectures/qwen3vl_plan.zig",
+    "anchor": "pub fn buildRequestPlan("
+  },
+  "qwen3vl-mrope-delta": {
+    "path": "zig/pkg/inference/src/architectures/qwen3vl_plan.zig",
+    "anchor": "mrope_position_delta: i64,"
+  },
+  "qwen3vl-mrope-kernel": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "anchor": "kernel void termite_apply_mrope("
+  },
+  "qwen3vl-reranker-score": {
+    "path": "zig/pkg/inference/src/architectures/qwen3vl_reranker.zig",
+    "anchor": "pub fn scoreYesNoLogits("
+  },
+  "qwen3vl-support-doc": {
+    "path": "zig/pkg/inference/QWEN3VL_SUPPORT.md",
+    "anchor": "This document is the operational contract for Qwen3-VL generation and"
+  },
+  "qwen3vl-family-gate": {
+    "path": "zig/pkg/inference/src/models/gpt.zig",
+    "anchor": "return self.family == .qwen3_vl;"
+  }
+}

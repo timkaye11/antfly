@@ -1,0 +1,79 @@
+/* Keep production and CI builds hermetic: Fontsource packages the same
+   variable font locally instead of fetching Google Fonts during `next build`. */
+@import "@fontsource-variable/roboto-mono";
+@import "tailwindcss";
+@import "@antfly/design-system/styles.css";
+@import "@antfly/design-system/charts.css";
+@import "@xyflow/react/dist/style.css";
+
+/* Match the library's class-based dark variant (see playground/globals.css). */
+@custom-variant dark (&:is(.dark *));
+
+/* Scan the library's source so Tailwind picks up utility classes it uses. */
+@source "../../../packages/design-system/src/**/*.{ts,tsx,js,jsx}";
+@source "../app/**/*.{ts,tsx}";
+@source "../components/**/*.{ts,tsx}";
+@source "../content/**/*.{ts,tsx}";
+
+/* ---- Model-explorer visual vocabulary tokens (see /legend) ---- */
+:root {
+  /* dtype/precision ramp: f32 -> f16/bf16 -> q8 -> q4 -> sub-4-bit */
+  --dtype-f32: oklch(0.55 0.16 255);
+  --dtype-f16: oklch(0.68 0.12 245);
+  --dtype-q8: oklch(0.75 0.14 85);
+  --dtype-q4: oklch(0.68 0.17 55);
+  --dtype-sub4: oklch(0.6 0.2 35);
+
+  /* kernel families (7 categorical hues, shared by timeline/kernel table/DAG) */
+  --kfam-matvec: oklch(0.62 0.15 255);
+  --kfam-mmsg: oklch(0.6 0.17 300);
+  --kfam-attention: oklch(0.65 0.16 155);
+  --kfam-fusion: oklch(0.72 0.15 85);
+  --kfam-moe: oklch(0.64 0.18 25);
+  --kfam-sampling: oklch(0.66 0.14 200);
+  --kfam-kv: oklch(0.68 0.12 330);
+
+  --diverge-accent: var(--primary, oklch(0.62 0.15 255));
+}
+
+.dark {
+  --dtype-f32: oklch(0.65 0.14 255);
+  --dtype-f16: oklch(0.74 0.1 245);
+  --dtype-q8: oklch(0.78 0.13 85);
+  --dtype-q4: oklch(0.72 0.16 55);
+  --dtype-sub4: oklch(0.66 0.18 35);
+}
+
+/* Shiki dual-theme: light by default, dark vars under .dark */
+.dark .shiki,
+.dark .shiki span {
+  color: var(--shiki-dark) !important;
+  background-color: var(--shiki-dark-bg) !important;
+}
+
+/* Scrollytelling layout helpers.
+   .scrolly-pane is deliberately an unlayered rule: the design-system's
+   compiled stylesheet ships an unlayered `.hidden`, which would override a
+   Tailwind-layered `lg:block` at every width. */
+.scrolly-pane {
+  display: none;
+}
+
+@media (min-width: 64rem) {
+  .scrolly-pane {
+    display: block;
+  }
+}
+
+.scrolly-graphic {
+  position: sticky;
+  top: 4rem;
+  height: calc(100vh - 5rem);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .scrolly-graphic {
+    position: static;
+    height: auto;
+  }
+}

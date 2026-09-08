@@ -1,0 +1,1115 @@
+{
+ "schemaVersion": 1,
+ "id": "qwen3-vl",
+ "family": "qwen3",
+ "displayName": "Qwen3-VL 2B Instruct",
+ "tagline": "Pixels are tokens too: a 24-block vision tower with two-axis RoPE and DeepStack taps feeds a 28-layer Qwen3 decoder whose positions tick on three clocks (m-RoPE).",
+ "stats": {
+  "layers": 28,
+  "hidden": 2048,
+  "queryHeads": 16,
+  "kvHeads": 8,
+  "headDim": 128,
+  "vocab": 151936,
+  "context": 262144,
+  "visionBlocks": 24,
+  "visionHidden": 1024,
+  "patch": "16×16 ×2 frames",
+  "merge": "2×2",
+  "deepstackTaps": "vision blocks 5 / 11 / 17",
+  "quant": "Q4_K_M + Q8_0 mmproj",
+  "ropeTheta": "5e6 (m-RoPE)"
+ },
+ "stages": [
+  {
+   "kind": "vision",
+   "id": "vision",
+   "title": "Vision tower",
+   "spine": "vision",
+   "summary": "Temporal-split Conv3D patch embed, learned-position interpolation, two-axis vision RoPE, 24 bidirectional attention blocks — with DeepStack feature taps exiting at blocks 5, 11, and 17.",
+   "source": {
+    "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
+    "anchor": "pub fn encodeProjectedImages(",
+    "line": 411
+   },
+   "repeat": {
+    "count": 24,
+    "note": "24 vision blocks; DeepStack taps after blocks 5, 11, 17"
+   },
+   "patch": [
+    16,
+    16
+   ]
+  },
+  {
+   "kind": "projector",
+   "id": "projector",
+   "title": "2×2 merger + DeepStack heads",
+   "spine": "vision",
+   "summary": "Four neighboring patch vectors zip into one token (concat → MLP → text hidden 2048). Each DeepStack tap has its own merger head; their outputs ride into early decoder layers instead of becoming tokens."
+  },
+  {
+   "kind": "embedding",
+   "id": "embed",
+   "title": "Token embedding + splice",
+   "spine": "graph",
+   "summary": "Text ids gather embedding rows; merged visual tokens are spliced in at the <|image_pad|> markers. From here on the decoder sees one interleaved sequence.",
+   "source": {
+    "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
+    "anchor": "pub fn prepareExpandedPromptEmbeddings(",
+    "line": 546
+   }
+  },
+  {
+   "kind": "decoder",
+   "id": "layers",
+   "title": "Decoder layer",
+   "spine": "graph",
+   "summary": "The same gpt.zig runtime that serves Gemma4 and Qwen3 — family qwen3_vl adds 3-axis m-RoPE positions and DeepStack feature injection, nothing else.",
+   "source": {
+    "path": "zig/pkg/inference/src/models/gpt.zig",
+    "anchor": "return self.family == .qwen3_vl;",
+    "line": 296
+   },
+   "repeat": {
+    "count": 28
+   },
+   "attention": "gqa_paged"
+  },
+  {
+   "kind": "kvcache",
+   "id": "kv",
+   "title": "Paged KV cache",
+   "spine": "kv",
+   "summary": "Visual and text tokens land in the same paged KV pools — a 1,000-token image costs exactly what 1,000 text tokens cost."
+  },
+  {
+   "kind": "head",
+   "id": "head",
+   "title": "LM head",
+   "spine": "graph",
+   "summary": "The [2048 × 151,936] vocabulary matvec. The reranker variant reads two rows of it — yes and no — and never samples.",
+   "headType": "lm"
+  },
+  {
+   "kind": "head",
+   "id": "sample",
+   "title": "Sampling",
+   "spine": "sample",
+   "summary": "Greedy/sampled next-token selection; decode positions advance by mrope_position_delta past the visual grid.",
+   "headType": "lm"
+  }
+ ],
+ "graphs": {
+  "decode": {
+   "nodes": [
+    {
+     "id": "v.patch",
+     "opKind": "token_grid_conv2d",
+     "label": "Conv3D patch embed (temporal split)",
+     "stageId": "vision",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         3,
+         2,
+         "H",
+         "W"
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "patches",
+         1024
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "patch": "16×16",
+      "temporalPatch": 2,
+      "note": "still images duplicate their frame to fill the 2-frame temporal patch"
+     },
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
+      "anchor": "fn extractPatchesMergeMajor(",
+      "line": 1059
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "v.pos",
+     "opKind": "gather",
+     "label": "learned-pos interpolation",
+     "stageId": "vision",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         2304,
+         1024
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "patches",
+         1024
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "grid": "48×48 learned table (2,304 positions), bilinearly interpolated to the actual patch grid"
+     },
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
+      "anchor": "fn addInterpolatedPositions(",
+      "line": 1112
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "v.attn",
+     "opKind": "scaled_dot_product_attention",
+     "label": "vision attention + two-axis RoPE",
+     "stageId": "vision",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "patches",
+         16,
+         64
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "patches",
+         16,
+         64
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "bidirectional (no causal mask); Q/K rotate on two axes — patch row and patch column — before SDPA"
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "v.ffn",
+     "opKind": "linear",
+     "label": "vision FFN (GELU)",
+     "stageId": "vision",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "patches",
+         1024
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "patches",
+         1024
+        ],
+        "dtype": "f32",
+        "quant": "q8_0"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "p.merge",
+     "opKind": "concat",
+     "label": "2×2 merger (4-into-1)",
+     "stageId": "projector",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "patches",
+         1024
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "patches/4",
+         4096
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
+      "anchor": "fn mergeProjected(",
+      "line": 946
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": [
+      "concat_2x2",
+      "mlp"
+     ]
+    },
+    {
+     "id": "p.proj",
+     "opKind": "linear",
+     "label": "merger MLP → text hidden",
+     "stageId": "projector",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "patches/4",
+         4096
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "V",
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "p.deepstack",
+     "opKind": "linear",
+     "label": "DeepStack heads (taps @ 5/11/17)",
+     "stageId": "projector",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "patches",
+         1024
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         3,
+         "V",
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "one merger head per tap; outputs are kept separate from tokens and added into the first decoder layers' hidden states at visual positions"
+     },
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
+      "anchor": "if (next_tap < cfg.deepstack_len and cfg.deepstack_layers[next_tap] == layer) {",
+      "line": 759
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "embed.tokens",
+     "opKind": "embedding_lookup",
+     "label": "embed text tokens",
+     "stageId": "embed",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "T"
+        ],
+        "dtype": "i32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "T",
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [
+      "termite_embedding_lookup"
+     ],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "embed.splice",
+     "opKind": "where_select",
+     "label": "splice visual tokens at <|image_pad|>",
+     "stageId": "embed",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "T",
+         2048
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "V",
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "T+V",
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
+      "anchor": "pub fn prepareExpandedPromptEmbeddings(",
+      "line": 546
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "l.norm1",
+     "opKind": "rms_norm",
+     "label": "pre-attn norm",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "l.qkv",
+     "opKind": "linear_no_bias",
+     "label": "QKV project",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1,
+         "Hq+2·Hkv"
+        ],
+        "dtype": "f32",
+        "quant": "q4_k"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [
+      "q4_k/rows_2_8/none"
+     ],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "l.qknorm",
+     "opKind": "rms_norm",
+     "label": "Q/K head RMS norm",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         16,
+         128
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1,
+         16,
+         128
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "l.mrope",
+     "opKind": "rope_per_item",
+     "label": "m-RoPE (3 axes: t / h / w)",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         16,
+         128
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         3,
+         "T+V"
+        ],
+        "dtype": "i32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1,
+         16,
+         128
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "interleaved m-RoPE: head-dim sections rotate on text-time, image-height, and image-width position streams (θ = 5e6)"
+     },
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/qwen3vl_plan.zig",
+      "anchor": "pub fn buildRequestPlan(",
+      "line": 97
+     },
+     "kernelRouteIds": [],
+     "kernels": [
+      "termite_apply_mrope"
+     ],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "l.attn",
+     "opKind": "gqa_paged_attention",
+     "label": "GQA paged attention",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         16,
+         128
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "pages",
+         16,
+         128
+        ],
+        "dtype": "f16"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1,
+         16,
+         128
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "gqa": "16 query / 8 KV heads",
+      "note": "causal over the full interleaved sequence — text attends to image tokens and vice versa"
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [
+      "TERMITE_METAL_DISABLE_QWEN3VL_DECODE_FRAME",
+      "TERMITE_METAL_DISABLE_QWEN3VL_PREFILL_SG_ATTENTION"
+     ],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "l.oproj",
+     "opKind": "linear_no_bias",
+     "label": "output project",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32",
+        "quant": "q4_k"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [
+      "q4_k/rows_2_8/none"
+     ],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "l.norm2",
+     "opKind": "rms_norm",
+     "label": "pre-FFN norm + add",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "l.gateup",
+     "opKind": "linear_no_bias_pair",
+     "label": "gate + up (pair)",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1,
+         6144
+        ],
+        "dtype": "f32",
+        "quant": "q4_k"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [
+      "TERMITE_METAL_DISABLE_QWEN3VL_PREPARED_FFN"
+     ],
+     "backend": "metal",
+     "fusedOps": [
+      "gate",
+      "up",
+      "silu"
+     ]
+    },
+    {
+     "id": "l.down",
+     "opKind": "linear_no_bias",
+     "label": "down project",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         6144
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32",
+        "quant": "q4_k"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [
+      "q4_k/rows_2_8/none"
+     ],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "kv.pages",
+     "opKind": "scatter_add",
+     "label": "append K/V to paged blocks",
+     "stageId": "kv",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         8,
+         128
+        ],
+        "dtype": "f16"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "pages",
+         16,
+         128
+        ],
+        "dtype": "f16"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "h.norm",
+     "opKind": "rms_norm",
+     "label": "final norm",
+     "stageId": "head",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "h.lmhead",
+     "opKind": "linear_no_bias",
+     "label": "LM head [2048 × 151936]",
+     "stageId": "head",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1,
+         151936
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "the reranker variant replaces sampling with sigmoid(logit_yes − logit_no) — two rows of this matrix"
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "s.sample",
+     "opKind": "argmax",
+     "label": "next token",
+     "stageId": "sample",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         151936
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1
+        ],
+        "dtype": "i32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "decode positions continue at tokenCount + mrope_position_delta — all three m-RoPE axes tick together in text"
+     },
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/qwen3vl_plan.zig",
+      "anchor": "pub fn nextDecodePosition(self: RequestPlan) !u32 {",
+      "line": 82
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    }
+   ],
+   "edges": [
+    {
+     "id": "e.patch.pos",
+     "from": "v.patch",
+     "to": "v.pos",
+     "kind": "data"
+    },
+    {
+     "id": "e.pos.vattn",
+     "from": "v.pos",
+     "to": "v.attn",
+     "kind": "data"
+    },
+    {
+     "id": "e.vattn.vffn",
+     "from": "v.attn",
+     "to": "v.ffn",
+     "kind": "data"
+    },
+    {
+     "id": "e.vffn.merge",
+     "from": "v.ffn",
+     "to": "p.merge",
+     "kind": "data"
+    },
+    {
+     "id": "e.vattn.deepstack",
+     "from": "v.attn",
+     "to": "p.deepstack",
+     "kind": "routing"
+    },
+    {
+     "id": "e.merge.proj",
+     "from": "p.merge",
+     "to": "p.proj",
+     "kind": "data"
+    },
+    {
+     "id": "e.proj.splice",
+     "from": "p.proj",
+     "to": "embed.splice",
+     "kind": "data"
+    },
+    {
+     "id": "e.tok.splice",
+     "from": "embed.tokens",
+     "to": "embed.splice",
+     "kind": "data"
+    },
+    {
+     "id": "e.deepstack.layers",
+     "from": "p.deepstack",
+     "to": "l.norm2",
+     "kind": "routing"
+    },
+    {
+     "id": "e.splice.norm1",
+     "from": "embed.splice",
+     "to": "l.norm1",
+     "kind": "residual"
+    },
+    {
+     "id": "e.norm1.qkv",
+     "from": "l.norm1",
+     "to": "l.qkv",
+     "kind": "data"
+    },
+    {
+     "id": "e.qkv.qknorm",
+     "from": "l.qkv",
+     "to": "l.qknorm",
+     "kind": "data"
+    },
+    {
+     "id": "e.qknorm.mrope",
+     "from": "l.qknorm",
+     "to": "l.mrope",
+     "kind": "data"
+    },
+    {
+     "id": "e.mrope.attn",
+     "from": "l.mrope",
+     "to": "l.attn",
+     "kind": "data"
+    },
+    {
+     "id": "e.mrope.kv",
+     "from": "l.mrope",
+     "to": "kv.pages",
+     "kind": "kv"
+    },
+    {
+     "id": "e.kv.attn",
+     "from": "kv.pages",
+     "to": "l.attn",
+     "kind": "kv"
+    },
+    {
+     "id": "e.attn.oproj",
+     "from": "l.attn",
+     "to": "l.oproj",
+     "kind": "data"
+    },
+    {
+     "id": "e.oproj.norm2",
+     "from": "l.oproj",
+     "to": "l.norm2",
+     "kind": "data"
+    },
+    {
+     "id": "e.norm2.gateup",
+     "from": "l.norm2",
+     "to": "l.gateup",
+     "kind": "data"
+    },
+    {
+     "id": "e.gateup.down",
+     "from": "l.gateup",
+     "to": "l.down",
+     "kind": "data"
+    },
+    {
+     "id": "e.down.hnorm",
+     "from": "l.down",
+     "to": "h.norm",
+     "kind": "residual"
+    },
+    {
+     "id": "e.hnorm.lm",
+     "from": "h.norm",
+     "to": "h.lmhead",
+     "kind": "data"
+    },
+    {
+     "id": "e.lm.sample",
+     "from": "h.lmhead",
+     "to": "s.sample",
+     "kind": "data"
+    }
+   ]
+  }
+ },
+ "sources": {
+  "gitCommit": "6f5b642fc86d811840a5b81a5143622cd628c51a",
+  "generatedAt": "2026-09-04T16:16:30.911Z"
+ }
+}
