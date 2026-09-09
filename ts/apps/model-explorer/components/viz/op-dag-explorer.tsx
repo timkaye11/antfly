@@ -3,35 +3,41 @@
 import {
   Badge,
   Button,
-  cn,
   CommandDialog,
   CommandEmpty,
   CommandGroup,
   CommandInput,
   CommandItem,
   CommandList,
+  cn,
   Separator,
-  Tabs,
-  TabsList,
-  TabsTrigger,
 } from "@antfly/design-system";
 import dagre from "@dagrejs/dagre";
 import {
   Background,
   Controls,
   type Edge as FlowEdge,
+  type Node as FlowNode,
   Handle,
   MarkerType,
-  type Node as FlowNode,
   type NodeProps,
   Position,
   ReactFlow,
 } from "@xyflow/react";
 import { Search, X } from "lucide-react";
-import { parseAsString, useQueryState } from "nuqs";
+import { useTheme } from "next-themes";
+import { parseAsString, parseAsStringLiteral, useQueryState } from "nuqs";
 import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { CodeLink } from "@/components/code/code-link";
-import { dtypeColorVar, EnvFlagChip, FusionChip, OpKindBadge, QuantChip, TensorShapeBadge } from "@/components/primitives/chips";
+import {
+  dtypeColorVar,
+  EnvFlagChip,
+  FusionChip,
+  OpKindBadge,
+  QuantChip,
+  TensorShapeBadge,
+} from "@/components/primitives/chips";
+import { ChoiceGroup } from "@/components/primitives/choice-group";
 import type { KernelRoute, ModelSpec, OpNode, PhaseGraph, Stage } from "@/lib/schema";
 
 /* ------------------------------------------------------------------ */
@@ -96,9 +102,11 @@ function OpNodeView({ data }: NodeProps<OpFlowNode>) {
     <div
       className={cn(
         "flex flex-col justify-center border bg-card px-2.5 shadow-sm transition-shadow",
-        isAttention ? "[clip-path:polygon(10%_0,90%_0,100%_50%,90%_100%,10%_100%,0_50%)] px-5" : "rounded-md",
+        isAttention
+          ? "[clip-path:polygon(10%_0,90%_0,100%_50%,90%_100%,10%_100%,0_50%)] px-5"
+          : "rounded-md",
         isNorm ? "h-8" : "h-16",
-        selected && "shadow-[0_0_0_2px_var(--primary)]",
+        selected && "shadow-[0_0_0_2px_var(--primary)]"
       )}
       style={{
         borderColor: color,
@@ -110,13 +118,15 @@ function OpNodeView({ data }: NodeProps<OpFlowNode>) {
       <Handle type="target" position={Position.Left} className="opacity-0!" />
       <div className="flex items-center gap-1.5 overflow-hidden">
         <span className="truncate text-xs font-medium">{op.label ?? op.opKind}</span>
-        {op.fusedOps.length > 0 && <span className="font-mono text-[9px] text-primary">⟨{op.fusedOps.length}⟩</span>}
+        {op.fusedOps.length > 0 && (
+          <span className="font-mono text-[9px] text-primary">⟨{op.fusedOps.length}⟩</span>
+        )}
       </div>
       {!isNorm && (
         <div className="flex items-center gap-1 overflow-hidden font-mono text-[9px] text-muted-foreground">
           <span className="truncate">{op.opKind}</span>
           {op.shapes.out[0] && (
-            <span className="truncate" style={{ color }}>
+            <span className="truncate text-muted-foreground">
               [{op.shapes.out[0].dims.join(",")}]
             </span>
           )}
@@ -145,13 +155,13 @@ function Inspector({
   onClose: () => void;
 }) {
   return (
-    <div className="absolute right-3 top-3 bottom-3 z-10 flex w-80 flex-col overflow-hidden rounded-lg border bg-background/95 shadow-lg backdrop-blur">
+    <div className="absolute right-3 top-3 bottom-3 z-10 flex w-80 max-w-[calc(100%-1.5rem)] flex-col overflow-hidden rounded-lg border bg-background/95 shadow-lg backdrop-blur">
       <div className="flex items-center justify-between border-b px-3 py-2">
         <div className="min-w-0">
           <div className="truncate text-sm font-semibold">{op.label ?? op.opKind}</div>
           <div className="font-mono text-[11px] text-muted-foreground">
             {stage?.title ?? op.stageId}
-            {stage?.repeat && ` · ×${stage.repeat.count}`}
+            {stage?.repeat && ` · ${stage.repeat.count}-layer stage`}
           </div>
         </div>
         <Button variant="ghost" size="icon" onClick={onClose} aria-label="Close inspector">
@@ -159,6 +169,12 @@ function Inspector({
         </Button>
       </div>
       <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-3 text-sm">
+        {(stage?.summary || stage?.repeat?.note) && (
+          <section className="space-y-1 text-xs text-muted-foreground">
+            {stage.summary && <p>{stage.summary}</p>}
+            {stage.repeat?.note && <p>{stage.repeat.note}</p>}
+          </section>
+        )}
         <section>
           <SectionTitle>Identity</SectionTitle>
           <div className="flex flex-wrap items-center gap-1.5">
@@ -173,12 +189,14 @@ function Inspector({
             <SectionTitle>Tensors</SectionTitle>
             <div className="space-y-1">
               {op.shapes.in.map((s, i) => (
+                // biome-ignore lint/suspicious/noArrayIndexKey: tensor input positions are stable slot identities
                 <div key={`in-${i}`} className="flex items-center gap-2">
                   <span className="w-7 font-mono text-[10px] text-muted-foreground">in{i}</span>
                   <TensorShapeBadge shape={s} />
                 </div>
               ))}
               {op.shapes.out.map((s, i) => (
+                // biome-ignore lint/suspicious/noArrayIndexKey: tensor output positions are stable slot identities
                 <div key={`out-${i}`} className="flex items-center gap-2">
                   <span className="w-7 font-mono text-[10px] text-muted-foreground">out{i}</span>
                   <TensorShapeBadge shape={s} />
@@ -188,13 +206,32 @@ function Inspector({
           </section>
         )}
 
+        {Object.keys(op.attrs).length > 0 && (
+          <section>
+            <SectionTitle>Model details</SectionTitle>
+            <dl className="space-y-2 text-xs">
+              {Object.entries(op.attrs).map(([key, value]) => (
+                <div key={key}>
+                  <dt className="font-mono text-muted-foreground">{key}</dt>
+                  <dd className="break-words">
+                    {typeof value === "object" ? JSON.stringify(value) : String(value)}
+                  </dd>
+                </div>
+              ))}
+            </dl>
+          </section>
+        )}
+
         {(op.kernels.length > 0 || routes.length > 0) && (
           <section>
             <SectionTitle>Lowering</SectionTitle>
             <div className="space-y-2">
               {op.kernels.map((k) => (
                 <div key={k}>
-                  <a href={`/systems/kernels?q=${encodeURIComponent(k)}`} className="font-mono text-xs text-primary hover:underline">
+                  <a
+                    href={`/systems/kernels?q=${encodeURIComponent(k)}`}
+                    className="font-mono text-xs text-primary hover:underline"
+                  >
                     {k}
                   </a>
                 </div>
@@ -209,8 +246,9 @@ function Inspector({
                   </div>
                   <div className="font-mono text-[10px] text-muted-foreground">
                     tptg {r.schedule.threadsPerThreadgroup} · cols {r.schedule.colsPerThreadgroup}
-                    {r.schedule.rowsPerThreadgroup !== undefined && ` · rows ${r.schedule.rowsPerThreadgroup}`} ·{" "}
-                    {r.schedule.reduction}
+                    {r.schedule.rowsPerThreadgroup !== undefined &&
+                      ` · rows ${r.schedule.rowsPerThreadgroup}`}{" "}
+                    · {r.schedule.reduction}
                   </div>
                   <div className="mt-1">
                     <CodeLink link={r.source} label="schedule row" />
@@ -275,7 +313,14 @@ export function OpDagExplorer(props: {
   // nuqs reads useSearchParams(), which requires a Suspense boundary under
   // static export.
   return (
-    <Suspense fallback={<div className={props.className} style={{ height: props.height ?? "calc(100vh - 3.5rem)" }} />}>
+    <Suspense
+      fallback={
+        <div
+          className={props.className}
+          style={{ height: props.height ?? "calc(100vh - 3.5rem)" }}
+        />
+      }
+    >
       <OpDagExplorerInner {...props} />
     </Suspense>
   );
@@ -292,12 +337,23 @@ function OpDagExplorerInner({
   className?: string;
   height?: string;
 }) {
-  const [phase, setPhase] = useQueryState("phase", parseAsString.withDefault("decode"));
-  const [colorBy, setColorBy] = useQueryState("colorBy", parseAsString.withDefault("dtype"));
+  const [phase, setPhase] = useQueryState(
+    "phase",
+    parseAsStringLiteral(["decode", "prefill"] as const).withDefault("decode")
+  );
+  const { resolvedTheme } = useTheme();
+  const activePhase = phase === "prefill" && spec.graphs.prefill ? "prefill" : "decode";
+  const forwardOnly = spec.id === "gliner2" || spec.id === "qwen3-embedding";
+  const [colorBy, setColorBy] = useQueryState(
+    "colorBy",
+    parseAsStringLiteral(["dtype", "backend", "kernel"] as const).withDefault("dtype")
+  );
   const [selectedId, setSelectedId] = useQueryState("node", parseAsString);
   const [searchOpen, setSearchOpen] = useState(false);
 
-  const graph = (phase === "prefill" && spec.graphs.prefill ? spec.graphs.prefill : spec.graphs.decode) as PhaseGraph;
+  const graph = (
+    phase === "prefill" && spec.graphs.prefill ? spec.graphs.prefill : spec.graphs.decode
+  ) as PhaseGraph;
   const stageById = useMemo(() => new Map(spec.stages.map((s) => [s.id, s])), [spec.stages]);
   const routesById = useMemo(() => new Map(routes.map((r) => [r.id, r])), [routes]);
 
@@ -315,7 +371,7 @@ function OpDagExplorerInner({
           draggable: false,
         };
       }),
-    [graph, positions, colorBy, selectedId],
+    [graph, positions, colorBy, selectedId]
   );
 
   const flowEdges = useMemo<FlowEdge[]>(
@@ -325,15 +381,25 @@ function OpDagExplorerInner({
         source: e.from,
         target: e.to,
         type: "smoothstep",
-        animated: e.kind === "routing",
+        animated: false,
         style: {
-          stroke: e.kind === "residual" ? "var(--primary)" : e.kind === "kv" ? "var(--kfam-kv)" : "var(--border)",
-          strokeWidth: e.kind === "residual" ? 2.5 : e.tensor?.bytes ? Math.min(4, 1 + Math.log10(e.tensor.bytes) / 3) : 1.5,
+          stroke:
+            e.kind === "residual"
+              ? "var(--primary)"
+              : e.kind === "kv"
+                ? "var(--kfam-kv)"
+                : "var(--border)",
+          strokeWidth:
+            e.kind === "residual"
+              ? 2.5
+              : e.tensor?.bytes
+                ? Math.min(4, 1 + Math.log10(e.tensor.bytes) / 3)
+                : 1.5,
           strokeDasharray: e.kind === "kv" ? "5 4" : undefined,
         },
         markerEnd: { type: MarkerType.ArrowClosed, width: 14, height: 14 },
       })),
-    [graph],
+    [graph]
   );
 
   const selectedOp = graph.nodes.find((n) => n.id === selectedId);
@@ -343,7 +409,7 @@ function OpDagExplorerInner({
 
   const onNodeClick = useCallback(
     (_evt: unknown, node: FlowNode) => setSelectedId(node.id),
-    [setSelectedId],
+    [setSelectedId]
   );
 
   useEffect(() => {
@@ -358,46 +424,55 @@ function OpDagExplorerInner({
   }, []);
 
   return (
-    <div className={cn("relative", className)} style={{ height }}>
-      <ReactFlow
-        nodes={flowNodes}
-        edges={flowEdges}
-        nodeTypes={nodeTypes}
-        onNodeClick={onNodeClick}
-        onPaneClick={() => setSelectedId(null)}
-        fitView
-        minZoom={0.1}
-        proOptions={{ hideAttribution: true }}
-        colorMode="system"
-      >
-        <Background gap={24} />
-        <Controls showInteractive={false} />
-      </ReactFlow>
+    <div className={cn("relative", className)} style={{ height, minHeight: 480 }}>
+      <div className="absolute inset-x-0 bottom-0 top-24 sm:top-16">
+        <ReactFlow
+          key={`${spec.id}:${activePhase}`}
+          nodes={flowNodes}
+          edges={flowEdges}
+          nodeTypes={nodeTypes}
+          onNodeClick={onNodeClick}
+          onPaneClick={() => setSelectedId(null)}
+          fitView
+          minZoom={0.1}
+          proOptions={{ hideAttribution: true }}
+          colorMode={resolvedTheme === "dark" ? "dark" : "light"}
+        >
+          <Background gap={24} />
+          <Controls showInteractive={false} />
+        </ReactFlow>
+      </div>
 
       {/* Toolbar */}
-      <div className="absolute left-3 top-3 z-10 flex items-center gap-2 rounded-lg border bg-background/95 p-1.5 shadow backdrop-blur">
-        <Tabs value={phase} onValueChange={(v) => setPhase(v)}>
-          <TabsList className="h-7">
-            <TabsTrigger value="decode" className="h-6 px-2 text-xs">
-              decode
-            </TabsTrigger>
-            <TabsTrigger value="prefill" className="h-6 px-2 text-xs" disabled={!spec.graphs.prefill}>
-              prefill
-            </TabsTrigger>
-          </TabsList>
-        </Tabs>
+      <div className="absolute left-3 right-3 top-3 z-10 flex flex-wrap items-center gap-2 rounded-lg border bg-background/95 p-1.5 shadow backdrop-blur">
+        <ChoiceGroup
+          label="Inference phase"
+          value={activePhase}
+          onValueChange={setPhase}
+          options={[
+            { value: "decode", label: forwardOnly ? "forward pass" : "decode" },
+            { value: "prefill", label: "prefill", disabled: !spec.graphs.prefill },
+          ]}
+        />
         <Separator orientation="vertical" className="h-5" />
-        <Tabs value={colorBy} onValueChange={(v) => setColorBy(v)}>
-          <TabsList className="h-7">
-            {["dtype", "backend", "kernel"].map((c) => (
-              <TabsTrigger key={c} value={c} className="h-6 px-2 text-xs">
-                {c}
-              </TabsTrigger>
-            ))}
-          </TabsList>
-        </Tabs>
+        <ChoiceGroup
+          label="Color operations by"
+          value={colorBy}
+          onValueChange={setColorBy}
+          options={[
+            { value: "dtype", label: "dtype" },
+            { value: "backend", label: "backend" },
+            { value: "kernel", label: "kernel" },
+          ]}
+        />
         <Separator orientation="vertical" className="h-5" />
-        <Button variant="ghost" size="sm" className="h-7 gap-1.5 text-xs" onClick={() => setSearchOpen(true)}>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-7 gap-1.5 text-xs"
+          aria-label="Search operations"
+          onClick={() => setSearchOpen(true)}
+        >
           <Search className="size-3" /> ⌘K
         </Button>
       </div>
@@ -419,14 +494,16 @@ function OpDagExplorerInner({
             {graph.nodes.map((n) => (
               <CommandItem
                 key={n.id}
-                value={`${n.label ?? ""} ${n.opKind} ${n.id} ${n.kernels.join(" ")}`}
+                value={`${n.label ?? ""} ${n.opKind} ${n.id} ${n.kernels.join(" ")} ${n.source?.path ?? ""} ${n.lowererSource?.path ?? ""}`}
                 onSelect={() => {
                   setSelectedId(n.id);
                   setSearchOpen(false);
                 }}
               >
                 <span className="truncate">{n.label ?? n.opKind}</span>
-                <span className="ml-auto font-mono text-[10px] text-muted-foreground">{n.opKind}</span>
+                <span className="ml-auto font-mono text-[10px] text-muted-foreground">
+                  {n.opKind}
+                </span>
               </CommandItem>
             ))}
           </CommandGroup>

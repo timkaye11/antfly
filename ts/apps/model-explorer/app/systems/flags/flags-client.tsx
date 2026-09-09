@@ -54,9 +54,9 @@ function FlagsInner({ flags, gitCommit, permalinkBase }: { flags: FlagRow[]; git
         <header className="max-w-3xl">
           <h1 className="text-3xl font-bold tracking-tight">Tuning env flags</h1>
           <p className="mt-2 text-muted-foreground">
-            Every kernel route, fusion, and frame behavior in the runtime is gated by an environment flag —{" "}
-            {flags.length} of them, scanned from the Zig source. Most are kill-switches for default-on
-            optimizations (green = enabling, others disable/trace/force).
+            {flags.length} environment-style names found in the Zig source, including comments, tests, and
+            diagnostics. Categories are inferred from names; occurrence counts are textual references.
+            Open the source to check accepted values, defaults, and whether a name is read on your execution path.
           </p>
         </header>
 
@@ -66,6 +66,7 @@ function FlagsInner({ flags, gitCommit, permalinkBase }: { flags: FlagRow[]; git
               key={p}
               type="button"
               onClick={() => setPrefix(p)}
+              aria-pressed={prefix === p}
               className={cn(
                 "rounded-full border px-2.5 py-0.5 font-mono text-xs transition-colors",
                 prefix === p ? "border-primary text-primary" : "text-muted-foreground hover:bg-accent",
@@ -76,16 +77,18 @@ function FlagsInner({ flags, gitCommit, permalinkBase }: { flags: FlagRow[]; git
           ))}
         </div>
         <Input
+          aria-label="Filter environment names"
           value={q}
           onChange={(e) => setQ(e.target.value)}
           placeholder="Filter flags… (e.g. PIPELINED, GQA_SPLIT, MTP)"
           className="max-w-md font-mono text-sm"
         />
 
+        <p role="status" className="text-xs text-muted-foreground">{filtered.length} matching names</p>
         <div className="space-y-0.5">
           {filtered.slice(0, 200).map((f) => (
-            <div key={f.name} className="flex items-center gap-3 rounded border-b px-2 py-1.5 text-sm last:border-0">
-              <span className="min-w-0 flex-1 truncate font-mono text-xs">{f.name}</span>
+            <div key={f.name} className="flex flex-wrap items-center gap-2 rounded border-b px-2 py-1.5 text-sm last:border-0">
+              <span className="min-w-0 basis-full break-all font-mono text-xs sm:flex-1 sm:basis-auto">{f.name}</span>
               <Badge className="shrink-0 text-[9px]">{f.kind}</Badge>
               <span className="w-14 shrink-0 text-right font-mono text-[10px] text-muted-foreground">
                 ×{f.occurrences}

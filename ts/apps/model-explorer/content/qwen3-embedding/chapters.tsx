@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { CodeLink } from "@/components/code/code-link";
 import { EnvFlagChip, QuantChip } from "@/components/primitives/chips";
-import { Divergence, Scene, ScrollyChapter } from "@/components/scrollytelling/scrolly";
+import { Scene, ScrollyChapter } from "@/components/scrollytelling/scrolly";
 import { L } from "@/lib/links";
 import type { ChaptersProps } from "../registry";
 import {
@@ -37,8 +37,10 @@ export function Qwen3EmbeddingChapters({ spec }: ChaptersProps) {
             decoder page on this site simply never starts.
           </p>
           <p>
-            The same <code>gpt.zig</code> runtime serves it; the embedding pipeline just wires{" "}
-            <code>tokenize → encode → pool → normalize</code> around a forward pass.
+            The embedding pipeline wires <code>format task → tokenize → encode → pool → normalize</code>.
+            On the eligible Metal path, a planned dense Qwen3 graph executes the encoder and keeps pooling
+            on the backend; the shared GPT session is also available as a fallback. No persistent paged
+            decode cache is needed. <CodeLink link={L("qwen3-embed-graph")} />
           </p>
           <p>
             <CodeLink link={L("embed-pipeline")} /> <QuantChip format="q8_0" />
@@ -50,22 +52,23 @@ export function Qwen3EmbeddingChapters({ spec }: ChaptersProps) {
       <ScrollyChapter
         id="ch-2"
         number={2}
-        title="BPE, not SentencePiece"
-        intro="Two tokenizer families live in this runtime; embeddings ride the byte-level one."
+        title="Tokenization and the embedding task"
+        intro="The model receives task-formatted text, byte-level BPE tokens and a trailing EOS."
       >
         <Scene id="tok" graphic={<TokenizerContrastFigure />}>
           <p>
             Qwen3 uses byte-level BPE (the <code>gpt2</code>-style vocab with the <code>qwen2</code>{" "}
-            pre-tokenizer): any byte sequence tokenizes, so there is no unknown-token path at all. Gemma, one
-            page over, uses SentencePiece with its ▁-prefixed unigram pieces. Same tokenizer stage in the
-            spine, different machinery behind it.
+            pre-tokenizer). Byte-level vocabulary coverage avoids ordinary out-of-vocabulary words.
+            The figure contrasts representative whitespace conventions, not actual tokenizer output.
           </p>
           <p>
-            One detail that matters here: the tokenizer appends EOS (<code>add_eos_token = 1</code>, no BOS).
-            Chapter 3 explains why that trailing token is the entire point.
+            The managed model profile formats queries as <code>Instruct: …\nQuery:…</code>; documents
+            have an empty prefix. Choose the query or document task consistently when building and
+            searching an index. The bundle declares last-token pooling and normalization, and the
+            pipeline ensures a trailing EOS even when the tokenizer sidecar does not append one.
           </p>
           <p>
-            <CodeLink link={L("tokenizer-hf")} /> · <CodeLink link={L("qwen3-embed-catalog")} />
+            <CodeLink link={L("tokenizer-hf")} /> · <CodeLink link={L("qwen3-embed-catalog")} /> · <CodeLink link={L("embed-eos")} />
           </p>
         </Scene>
       </ScrollyChapter>
@@ -84,30 +87,20 @@ export function Qwen3EmbeddingChapters({ spec }: ChaptersProps) {
         <Scene id="pool" graphic={<LastTokenPoolFigure step={0} />}>
           <p>
             <strong>Why the last token?</strong> In a causal model, only the final position has attended to
-            everything before it — every earlier hidden state is blind to what follows. Mean pooling (the BERT
-            default) would average in those half-informed states; last-token pooling takes the one vector that
-            saw the whole input. That's the appended EOS token doing its job.
+            everything before it — every earlier hidden state is blind to what follows. Mean pooling would mix positions with different visible prefixes; this model
+            was trained for last-token pooling. The pipeline selects the last <em>non-padding</em>
+            position in each row, which is the EOS after task formatting and any configured truncation.
           </p>
-          <Divergence
-            others={
-              <p>
-                encoder embedders mean-pool or CLS-pool, because every bidirectional position sees everything
-                anyway.
-              </p>
-            }
-            antfly={
-              <p>
-                the pooling strategy is data, not code: read from model metadata, dispatched in the embedding
-                pipeline — the same pipeline serves mean-, CLS- and last-token models.
-              </p>
-            }
-            link={<CodeLink link={L("embed-pooling-strategy")} />}
-          />
+          <p>
+            Pooling is part of each model's contract. Antfly resolves it from metadata or the model
+            manifest; the same pipeline also implements mean and CLS pooling for models that request them.
+            <CodeLink link={L("embed-pooling-strategy")} />
+          </p>
         </Scene>
         <Scene id="norm" graphic={<LastTokenPoolFigure step={1} />}>
           <p>
-            The pooled vector is L2-normalized onto the unit sphere. Downstream, cosine similarity degrades
-            into a dot product — which is exactly what a vector index wants to compute millions of times.
+            The pooled vector is L2-normalized onto the unit sphere. Downstream, cosine similarity becomes
+            a dot product — which is exactly what a vector index wants to compute millions of times.
           </p>
         </Scene>
       </ScrollyChapter>
@@ -116,21 +109,22 @@ export function Qwen3EmbeddingChapters({ spec }: ChaptersProps) {
       <ScrollyChapter
         id="ch-4"
         number={4}
-        title="Faithful at 8,192 tokens"
+        title="Verify the vector and its input"
         intro="Quantized inference is only useful if the vectors still point the same way."
       >
         <Scene id="cosine" graphic={<CosineFidelityFigure />}>
           <p>
-            The Q8_0 Metal path was qualified against the reference implementation end-to-end: at the full
-            8,192-token qualification input the embedding cosine is <strong>0.99976</strong>. Getting there
-            surfaced real bugs — the most instructive: the GGUF bundle omits{" "}
-            <code>qwen3.context_length</code>, and a permissive default once <em>silently truncated</em>{" "}
-            every input to 512 tokens. The embedding you got was a valid vector of the wrong text. That
-            failure mode is now fail-loud.
+            A plausible vector can still represent the wrong input. Compare exact model artifacts,
+            task prefixes, token IDs, EOS placement, active sequence length, pooling and normalization
+            before interpreting cosine agreement. The runtime reads <code>qwen3.context_length</code>
+            when present and resolves sequence limits from model configuration; a generic
+            512-token encoder default is not the Qwen3 contract.
           </p>
           <p>
-            Context window: {Number(spec.stats.context).toLocaleString()} tokens; the qualification gate runs
-            at 8,192.
+            The illustrated 0.6B model has a {Number(spec.stats.context).toLocaleString("en-US")}-token architectural
+            context. Serving limits and truncation may be smaller. The dated baseline records an
+            8,192-token truncation gate and other oracle, batch and retrieval checks; those results
+            qualify their recorded artifact and build, not every deployment. <CodeLink link={L("embed-baseline")} />
           </p>
         </Scene>
       </ScrollyChapter>
@@ -139,7 +133,7 @@ export function Qwen3EmbeddingChapters({ spec }: ChaptersProps) {
       <ScrollyChapter
         id="ch-5"
         number={5}
-        title="1,217 tok/s: the batching path"
+        title="The batching path"
         intro={
           <p>
             Embedding is prefill-shaped: all T tokens arrive at once. The perf story is the opposite of
@@ -149,22 +143,23 @@ export function Qwen3EmbeddingChapters({ spec }: ChaptersProps) {
       >
         <Scene id="wins" graphic={<BatchingWinsFigure />}>
           <p>
-            Three levers took the 511-token embed path to 1,217 tok/s on an M4 Pro. First,{" "}
-            <strong>batched FFN</strong>: run the feed-forward as <code>[T × F]</code> simdgroup matmuls (
-            <code>termite_q8_0_linear_mm_sg</code>) instead of T separate matvecs — the largest single win.
-            Second, <strong>simdgroup flash attention</strong>: <code>sg_q16</code> tiles with online softmax,
-            never materializing the <code>[T, T]</code> score matrix. Third, <strong>f16-KV direct load</strong>:
-            the attention kernel reads K/V in f16 natively, halving KV traffic.
+            Several optimizations target this workload. <strong>Batched FFN</strong> runs the feed-forward
+            projections as matrix operations over token rows; fused gate/up kernels reuse activation
+            tiles and can include the SiLU/multiply epilogue. Q8_0 weights use shape-dependent simdgroup
+            matmul routes, including SG-v2 and M64 schedules.
+            <strong>Simdgroup flash attention</strong>: <code>sg_q16</code> tiles with online softmax,
+            never materializing the <code>[T, T]</code> score matrix. <strong>F16-KV direct load</strong>:
+            the attention kernel reads K/V in f16 natively, halving K/V storage bytes relative to f32 when that route is selected.
           </p>
           <p>
-            <CodeLink link={L("kernel-q8-mm-sg")} /> · <CodeLink link={L("kernel-sg-q16-f16kv-gqa2")} />
+            <CodeLink link={L("kernel-q8-mm-sg")} /> · <CodeLink link={L("kernel-sg-q16-f16kv-gqa2")} /> · <CodeLink link={L("embed-baseline")} />
           </p>
           <p>
             <EnvFlagChip name="TERMITE_METAL_DISABLE_DENSE_CAUSAL_SG_ATTENTION_Q16" defaultOn={false} />{" "}
             <EnvFlagChip name="TERMITE_METAL_DISABLE_DENSE_CAUSAL_SG_ATTENTION_F16KV" defaultOn={false} />
           </p>
           <p className="text-xs">
-            This is the same batch-size fork every model here crosses at batch ≥ 8:{" "}
+            Kernel selection depends on matrix rows (batch × token positions), precision and output width:{" "}
             <Link className="text-primary underline" href="/systems/kernels?batch=32">
               the mm_sg kernel family →
             </Link>

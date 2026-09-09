@@ -9,21 +9,21 @@ const MODEL_CARDS = [
     slug: "gemma4-e4b",
     name: "Gemma4 E2B / E4B",
     kind: "Generative LLM · deep dive",
-    hook: "Per-layer embeddings, 5:1 sliding-window attention, MoE expert residency, MTP speculative decode — and the frame pipeline that runs it all on Metal.",
-    badges: ["PLE", "iSWA", "MoE", "MTP", "Q4_0"],
+    hook: "Per-layer embeddings, variant-specific sliding-window attention, shared KV, and Metal decode frames. Related family chapters explain MoE and optional MTP.",
+    badges: ["PLE", "iSWA", "shared KV", "Q4_0"],
   },
   {
     slug: "gliner2",
     name: "GLiNER2",
     kind: "Schema-driven extraction",
-    hook: "A DeBERTa-v3 encoder with disentangled relative attention and a span head that scores entities against your schema — one fused Metal kernel, forward and backward.",
+    hook: "A DeBERTa-v3 encoder with disentangled relative attention and a schema-conditioned head that scores candidate entity spans.",
     badges: ["DeBERTa", "C2P/P2C", "span head"],
   },
   {
     slug: "qwen3-embedding",
     name: "Qwen3 Embedding",
     kind: "Text embeddings",
-    hook: "A decoder that outputs one vector: last-token pooling at 8,192-token context, 0.99976 cosine fidelity vs reference, 1,217 tok/s.",
+    hook: "A causal transformer used as an encoder: query instructions, last-token pooling, and normalized vectors. Follow the 0.6B graph and its configured context limit.",
     badges: ["last-token pool", "8k ctx", "Q8_0"],
   },
   {
@@ -44,8 +44,8 @@ export default function HomePage() {
         </h1>
         <p className="mt-4 text-lg text-muted-foreground">
           An interactive tour of the Zig inference runtime — from an HTTP request to a sampled token,
-          through a structural op graph, planned Metal command frames, and {manifest.counts.kernels} GPU
-          kernels. Every diagram links to the source at commit{" "}
+          with model-specific graph execution and Metal command frames. The source index contains {manifest.counts.kernels} Metal
+          kernel entries. Source links are pinned to commit{" "}
           <code className="font-mono text-sm">{manifest.gitCommit.slice(0, 10)}</code>.
         </p>
         <div className="mt-6 flex justify-center">
@@ -84,7 +84,7 @@ export default function HomePage() {
           { label: "graph op kinds", value: manifest.counts.opKinds, href: "/runtime#graph" },
           { label: "Metal kernels", value: manifest.counts.kernels, href: "/systems/kernels" },
           { label: "compiled kernel routes", value: manifest.counts.routes, href: "/systems/kernels" },
-          { label: "tuning env flags", value: manifest.counts.envFlags, href: "/systems/flags" },
+          { label: "environment-name references", value: manifest.counts.envFlags, href: "/systems/flags" },
         ].map((s) => (
           <Link key={s.label} href={s.href} className="rounded-lg border p-6 transition-colors hover:border-primary/50">
             <div className="text-3xl font-bold tabular-nums">{s.value}</div>

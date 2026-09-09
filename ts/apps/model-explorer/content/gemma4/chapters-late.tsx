@@ -8,6 +8,7 @@ import Link from "next/link";
 import { CodeLink } from "@/components/code/code-link";
 import { QuantChip } from "@/components/primitives/chips";
 import { Divergence, Scene, ScrollyChapter } from "@/components/scrollytelling/scrolly";
+import { kernels } from "@/lib/data";
 import { L } from "@/lib/links";
 import type { ChaptersProps } from "../registry";
 import {
@@ -45,8 +46,8 @@ export function Gemma4LateChapters({ spec, routes }: ChaptersProps) {
         intro={
           <p>
             The matvec kernels that move most of the bytes are not hand-typed Metal. They are
-            rendered at build time from a schedule table — and the build fails if regeneration
-            changes a byte.
+            generated from schedule tables. A dedicated regeneration check detects drift between the
+            tables and checked-in Metal sources.
           </p>
         }
       >
@@ -54,10 +55,10 @@ export function Gemma4LateChapters({ spec, routes }: ChaptersProps) {
           <p>
             One schedule table describes every route as <code>format × row_bucket × epilogue</code>{" "}
             plus tuning knobs; one renderer expands each row through a shared MSL skeleton into a
-            checked-in <code>.metal</code> file — 25 quant-kernel files today, byte-identical on
-            every regen (<code>zig build quant-kernel-codegen -- --check</code>). This is a
-            build-time renderer, not a runtime JIT: at serve time the kernels are as static as
-            anyone else's.
+            checked-in <code>.metal</code> files. The command{" "}
+            <code>zig build quant-kernel-codegen -- --check</code> checks regeneration consistency.
+            This describes the static code-generation path; the repository also has an optional
+            runtime kernel-JIT subsystem with separate mode and qualification controls.
           </p>
           <p>
             <CodeLink link={L("compiler-schedules")} /> · <CodeLink link={L("renderer")} />
@@ -65,36 +66,34 @@ export function Gemma4LateChapters({ spec, routes }: ChaptersProps) {
         </Scene>
         <Scene id="row" graphic={<ScheduleRowFigure route={q4kRoute} />}>
           <p>
-            Here is the row behind chapter 9's LM-head kernel: <QuantChip format="q4_k" />, the
-            2–8-row bucket, no epilogue — 128 threads per threadgroup, 16 columns, 2 rows,
-            simdgroup-tiled reduction. When a sweep finds a better configuration, the fix is an edit
-            to this row and a regenerate, and the diff shows exactly what changed in the emitted
-            Metal.
+            Here is a small-batch schedule example: <QuantChip format="q4_k" />, the 2–8-row bucket,
+            no epilogue — 128 threads per threadgroup, 16 columns, 2 rows, simdgroup-tiled
+            reduction. When a sweep finds a better configuration, the fix is an edit to this row and
+            a regenerate, and the diff shows exactly what changed in the emitted Metal. The
+            single-token LM-head MMV in the next chapter is a different route; this 2–8-row schedule
+            is not its launch configuration.
           </p>
         </Scene>
         <Scene id="census" graphic={<KernelCensusFigure />}>
           <p>
-            The full inventory is 413 kernels. The generated matvec family is the biggest block; the
-            hand-written remainder is where generation hasn't paid for itself yet — attention,
-            fusion epilogues, sampling, KV plumbing.
+            The generated inventory contains {kernels.inventory.length} extracted Metal entry
+            points. This source census includes generated and hand-written kernels across inference,
+            training, and supporting operations; it is not the dispatch count for one model.
           </p>
           <Divergence
             others={
-              <p>
-                llama.cpp hand-maintains a kernel zoo per quant format, tuned by accumulated
-                patches.
-              </p>
+              <p>hand-written kernels express format-specific behavior directly in Metal source.</p>
             }
             antfly={
               <p>
-                one schedule table is the single source of truth; re-tuning a route is a table edit
-                plus regenerate.
+                generated routes keep tuning parameters in a schedule table, while other routes and
+                JIT specializations have their own implementation and qualification paths.
               </p>
             }
             link={<CodeLink link={L("compiler-schedules")} />}
           />
           <p className="text-xs">
-            Browse all 413:{" "}
+            Browse the current generated inventory:{" "}
             <Link className="text-primary underline" href="/systems/kernels">
               the kernel census →
             </Link>
@@ -109,8 +108,8 @@ export function Gemma4LateChapters({ spec, routes }: ChaptersProps) {
         title="The LM head problem (a worked example)"
         intro={
           <p>
-            One tensor, one fifth of all traffic. This is what a perf investigation actually looks
-            like in this codebase: a straggler, a fix, and a refuted branch kept in the record.
+            The vocabulary projection is large enough to be a useful case study in bandwidth,
+            quantization error, and the difference between an experiment and a default.
           </p>
         }
       >
@@ -118,19 +117,24 @@ export function Gemma4LateChapters({ spec, routes }: ChaptersProps) {
           <p>
             Every decode step ends by multiplying the hidden state against all 262,144 vocabulary
             rows — a <code>[{isE4b ? "2560" : "1536"} × 262144]</code> matvec. On E4B that segment
-            is 550 MB per token, 19.5% of all weight traffic, and it ran through an un-tuned{" "}
-            <QuantChip format="q6_k" /> path: the gap analysis priced a proper kernel at +7–12
-            tok/s.
+            is about 550 MB of <QuantChip format="q6_k" /> weights in the recorded artifact,
+            approximately 19.5% of the historical weight-read estimate. That byte calculation does
+            not establish how much latency a different kernel would save.
           </p>
         </Scene>
         <Scene id="paths" graphic={<LmHeadPathsFigure />}>
           <p>
-            <strong>The fix that shipped:</strong> repack the Q6_K head to{" "}
-            <QuantChip format="q4_k" /> in a streaming pass at load, then dispatch the tuned{" "}
-            <KernelChip name="termite_q4_k_linear_1x_reduce_v2" /> MMV. E2B went 52.5→54.3–55.2
-            tok/s and E4B 28.9→30.1 (+4–5%) on the Air, token-identical. The sampler's candidate
-            pass still rescores through <KernelChip name="termite_lm_head_q6_k_rescore_top8" />{" "}
-            where the Q6_K weights apply.
+            <strong>An opt-in greedy optimization:</strong> keep the original Q6_K head and create a{" "}
+            <QuantChip format="q4_k" /> copy in a streaming load-time pass. The tuned{" "}
+            <KernelChip name="termite_q4_k_linear_1x_reduce_v2" /> MMV nominates candidates;
+            <KernelChip name="termite_lm_head_q6_k_rescore_top8" /> rescores them with original
+            weights. Full-logit and sampling callers retain Q6_K. The extra copy uses more resident
+            memory, so <code>TERMITE_METAL_ENABLE_LM_HEAD_Q4_REPACK=q4_k</code> remains opt-in.
+            Historical Air probes improved about 4–5% with matching greedy tokens; candidate
+            truncation is not a proof of equivalence for every prompt.
+          </p>
+          <p>
+            <CodeLink link={L("gemma-lm-head-repack")} />
           </p>
           <p>
             <strong>The branch that didn't:</strong> a <QuantChip format="q4_0" /> head looked like
@@ -145,35 +149,43 @@ export function Gemma4LateChapters({ spec, routes }: ChaptersProps) {
       <ScrollyChapter
         id="ch-10"
         number={10}
-        title="Sampling never leaves the GPU"
+        title="Device-resident sampling, when eligible"
         intro={
           <p>
-            The obvious way to sample: copy a million logit bytes to the CPU and pick there, every
-            token. Antfly doesn't.
+            A supported resident route can select a token without copying the full vocabulary logits
+            to the CPU. The canonical host sampler remains available for unsupported cases.
           </p>
         }
       >
         <Scene id="onchip" graphic={<GpuSamplingFigure />}>
           <p>
-            The whole sampler is dispatches inside the frame: a top-8 candidate rescore over the
-            logits (<KernelChip name="termite_lm_head_top8_reduce" />
-            ), Gumbel-max partials for temperature sampling, and a final argmax (
-            <KernelChip name="termite_argmax_logits_reduce" />) that writes a single token id into a
-            device buffer. Greedy and sampled decoding share the path — the crossed-out arrow is the
-            per-token logits readback that never happens.
+            Greedy selection reduces logits to an argmax. Temperature sampling can use
+            <KernelChip name="termite_sample_gumbel_partials" /> followed by a reduction that writes
+            a token id to a device buffer. Bounded top-k/top-p routes have their own eligibility
+            checks. The Q4_K head's top-8 Q6_K rescore is a separate greedy optimization, not a
+            universal stage before Gumbel sampling.
           </p>
           <p>
             <CodeLink link={L("kernel-gumbel")} />
           </p>
           <Divergence
             others={
-              <p>llama.cpp reads the logits back to the host and samples on the CPU each token.</p>
+              <p>
+                host sampling reads logits and applies the canonical request constraints on the CPU.
+              </p>
             }
             antfly={
-              <p>top-8 rescore + Gumbel-max + argmax run on device; only text ever crosses back.</p>
+              <p>
+                eligible requests select on device; token ids still reach the host for decoding and
+                streaming.
+              </p>
             }
             link={<CodeLink link={L("kernel-gumbel")} />}
           />
+          <p>
+            <CodeLink link={L("gemma-sampling-fallback")} /> Unsupported settings or grammar
+            constraints can require a host path.
+          </p>
         </Scene>
         <Scene id="handoff" graphic={<TokenHandoffFigure />}>
           <p>
@@ -196,9 +208,8 @@ export function Gemma4LateChapters({ spec, routes }: ChaptersProps) {
         title="MTP: a draft model that reads the main model's mind"
         intro={
           <p>
-            Gemma-4 ships an official speculative drafter — a 4-layer, hidden-256 stack with 4
-            attention heads and 1 KV head that doesn't keep its own memory. It borrows the main
-            model's.
+            Gemma-4 ships an official speculative drafter — a 4-layer, hidden-256 stack that does
+            not build an independent target-style KV cache. It borrows the main model's.
           </p>
         }
       >
@@ -209,7 +220,8 @@ export function Gemma4LateChapters({ spec, routes }: ChaptersProps) {
             {isE4b
               ? "layers 22 and 23 on E4B"
               : "sliding donor layer 13 and full-attention donor layer 14 on E2B"}{" "}
-            — with a projection pair bridging its 256-wide stack to the {isE4b ? "2560" : "1536"}
+            (zero-based indices, in the shared-type donor mode) — with a projection pair bridging
+            its 256-wide stack to the {isE4b ? "2560" : "1536"}
             -wide backbone. A draft model that literally reads the target&apos;s working memory.
           </p>
           <p>
@@ -219,19 +231,24 @@ export function Gemma4LateChapters({ spec, routes }: ChaptersProps) {
         <Scene id="verify" graphic={<ProposeVerifyFigure />}>
           <p>
             The loop: the drafter proposes k tokens cheaply, then the main model verifies all k
-            positions in one batched step. Every accepted token is a full decode step the big model
-            skipped; the first mismatch truncates the tail and costs nothing but the draft. Output
-            is exactly what the main model alone would have produced.
+            positions together on eligible verifier routes. Accepted tokens amortize a target pass;
+            a mismatch truncates the tail and requires replacement and KV-state handling. Greedy
+            verification aims to preserve the target token sequence. Drafting, verification, and
+            rejected work all cost time, and batched numerical behavior still needs parity checks.
           </p>
         </Scene>
         <Scene id="board" graphic={<MtpScoreboardFigure />}>
           <p>
-            <strong>And here's the honest part.</strong> On CUDA and in llama.cpp this drafter is
-            worth 2–3×. On Antfly's Metal path it is currently net-slower — E2B measured 75.9 tok/s
-            target-only vs 63.7 with the BF16 draft at 64% acceptance, so the auto-gate disables it:{" "}
-            <em>&quot;MTP correctness/fallback PASS; Metal-auto performance FAIL.&quot;</em> The
-            machinery — dedicated draft runtime, draft frames, device-resident accept path — is
-            built, measured, and default-off. It's the lever that works everywhere but here, yet.
+            <strong>Acceptance alone is not speedup.</strong> An earlier E2B Metal CLI pilot
+            recorded 75.9 tok/s target-only versus 63.7 with the BF16 draft at 64% acceptance. Its
+            output did not record a binary identity, so the performance plan labels this directional
+            evidence. Later server probes exercised the slow-path auto-disable and fallback
+            behavior. Metal automatic MTP requires its explicit enable gate; a forced policy is a
+            separate choice. These records do not predict current performance on other devices or
+            runtimes.
+          </p>
+          <p>
+            <CodeLink link={L("gemma-mtp-ledger")} />
           </p>
         </Scene>
       </ScrollyChapter>

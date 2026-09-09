@@ -44,8 +44,9 @@ export function Gemma4EarlyChapters({ spec }: ChaptersProps) {
         <Scene id="pieces" graphic={<TokenPiecesFigure />}>
           <p>
             The prompt is split by a SentencePiece tokenizer into pieces from a 262,144-entry
-            vocabulary. Common words are single pieces; rarer ones shatter (<code>ants</code> →{" "}
-            <code>▁ant</code> + <code>s</code>). From here on the model only ever sees the ids.
+            vocabulary. Words can span several pieces; the split and ids shown here are
+            illustrative, not the output of a tokenizer run. These chapters follow text decoding;
+            multimodal inputs add projected image or audio features.
           </p>
           <p>
             <CodeLink link={L("tokenizer-sentencepiece")} />
@@ -55,8 +56,9 @@ export function Gemma4EarlyChapters({ spec }: ChaptersProps) {
           <p>
             The HTTP handler hands the request to the session factory, which reads the model
             manifest and resolves it to <code>ModelFamily.gemma</code> — one tag in the unified GPT
-            config. There is no Gemma-specific runtime: iSWA, PLE, and shared KV are all config
-            fields on the same decode loop that serves llama, qwen, and phi.
+            config. The generation pipeline and GPT architecture are shared with other decoder
+            families, while Gemma-specific helpers and Metal lowerers implement PLE, shared KV,
+            channel handling, and prepared decode paths.
           </p>
           <p>
             <CodeLink link={L("server-chat")} /> · <CodeLink link={L("session-factory")} />
@@ -72,23 +74,24 @@ export function Gemma4EarlyChapters({ spec }: ChaptersProps) {
         intro={
           <p>
             Gemma-4 looks its tokens up twice: once for the hidden state, and once for a per-layer
-            embedding lane that most runtimes don't bother to run.
+            embedding lane that supplies a distinct learned input to each layer.
           </p>
         }
       >
         <Scene id="lookup" graphic={<EmbedLookupFigure hidden={hidden} />}>
           <p>
             The ordinary part first: the token id selects one row of the embedding table and becomes
-            a {hidden}-wide hidden state, scaled by <code>√{hidden}</code>-style normalization.
-            Every transformer since 2017 starts this way.
+            a {hidden}-wide hidden state, multiplied by the configured embedding scale (Gemma uses{" "}
+            <code>√{hidden}</code>).
           </p>
         </Scene>
         <Scene id="ple" graphic={<PleRibbonFigure layers={layers} />}>
           <p>
             <strong>Then the second lookup.</strong> Gemma-4's per-layer embeddings (PLE) run a
-            separate projection whose output is sliced per layer: a thin lane that rides alongside
-            all {layers} layers and feeds each one its own gated slice. It's part of the model —
-            skip it and you are running a different network.
+            token lookup alongside a projection of the initial hidden state. The projection is
+            normalized in 256-wide chunks and combined with the scaled token embeddings. The
+            resulting vector is sliced across all {layers} layers, each receiving its own gated
+            slice. It's part of the model — skip it and you are running a different network.
           </p>
           <p>
             <CodeLink link={L("gpt-compute-ple")} /> · <CodeLink link={L("config-ple-hidden")} />
@@ -96,28 +99,25 @@ export function Gemma4EarlyChapters({ spec }: ChaptersProps) {
         </Scene>
         <Scene id="cost" graphic={<PleCostFigure isE4b={isE4b} />}>
           <p>
-            <strong>PLE is not free.</strong> On E4B the <code>per_layer_model_proj</code> matvec
-            streams 55 MB per token in F16 — 86 MB/token for the PLE lane in total. The runtime
-            stages the slot to <QuantChip format="q8_0" /> at load time, default-on:{" "}
+            <strong>PLE is not free.</strong> The <code>per_layer_model_proj</code> matvec has{" "}
+            {isE4b ? "10752×2560" : "8960×1536"} weights. The qualified Metal path stages eligible
+            dense slots to <QuantChip format="q8_0" /> at load time, default-on:{" "}
             {isE4b
-              ? "E4B's 10752×2560 bf16 slot drops ~13 MB/token"
-              : "E2B's slot 351 (8960×1536) was shipping as dense F32 — staging saves ~41 MB/token"}
-            , token-identical, worth +1.10% on the M4 Pro testbed.
+              ? "about 55.1 MB in BF16 becomes 29.2 MB in Q8_0, a 25.8 MB weight-read reduction per matvec"
+              : "about 55.1 MB in F32 becomes 14.6 MB in Q8_0, a 40.4 MB weight-read reduction per matvec"}
+            . These are tensor-size calculations, not measured memory traffic. Historical probes
+            retained identical greedy token ids; quantization does not guarantee that for every
+            prompt.
           </p>
           <p>
             <EnvFlagChip name="TERMITE_METAL_DISABLE_PLE_MODEL_PROJ_Q8" defaultOn={false} />
           </p>
           <Divergence
-            others={
-              <p>
-                no other Metal runtime executes Gemma-4's full PLE path — some llama.cpp builds skip
-                it (open issue #22243), and a build doing less work per token flatters its tok/s.
-              </p>
-            }
+            others={<p>a conventional decoder embedding initializes the hidden state once.</p>}
             antfly={
               <p>
-                the full PLE lane runs every token, with the heavy slot quantized instead of
-                dropped.
+                Gemma adds a per-layer input lane; its model projection can be quantized while
+                preserving the architectural operation.
               </p>
             }
             link={<CodeLink link={L("gpt-compute-ple")} />}
@@ -133,15 +133,16 @@ export function Gemma4EarlyChapters({ spec }: ChaptersProps) {
         intro={
           <p>
             One attention block, taken apart: Gemma-4 puts RMS norms on the Q and K heads
-            themselves, and the runtime fuses that oddity with rope into a single kernel.
+            themselves; eligible Metal routes fuse each head norm with its RoPE operation.
           </p>
         }
       >
         <Scene id="block" graphic={<AttentionBlockFigure isE4b={isE4b} />}>
           <p>
             After the QKV projection, each query and key head is RMS-normalized <em>per head</em> —
-            an unusual placement that stabilizes Gemma's attention logits. Antfly lowers the pair as
-            one fused <code>⟨head_rms ⋄ rope⟩</code> dispatch instead of four small ones.
+            controlling the scale of attention logits. Antfly can lower each norm-plus-RoPE pair as
+            a fused <code>⟨head_rms ⋄ rope⟩</code> dispatch. Q and K are separate calls; this is not
+            one combined Q/K dispatch.
           </p>
           <p>
             <CodeLink link={L("gpt-qk-head-norm")} /> ·{" "}
@@ -153,17 +154,17 @@ export function Gemma4EarlyChapters({ spec }: ChaptersProps) {
           <p>
             <strong>Grouped-query attention.</strong> {spec.displayName} runs 8 query heads against{" "}
             {isE4b ? "2 KV heads" : "a single KV head"} — {isE4b ? "4 queries" : "all 8 queries"}{" "}
-            share each K/V bank. Since decode is memory-bound and the KV read is the hot loop,
-            shrinking the KV side by {isE4b ? "4×" : "8×"} matters far more than the query-side
-            arithmetic.
+            share each K/V bank. Relative to eight distinct KV heads of the same width, that reduces
+            KV elements by {isE4b ? "4×" : "8×"}. Its effect on total latency depends on context
+            length, weight traffic, and the selected attention kernel.
           </p>
         </Scene>
-        <Scene id="mask" graphic={<RangeMaskFigure />}>
+        <Scene id="mask" graphic={<RangeMaskFigure pattern={isE4b ? 6 : 5} />}>
           <p>
             <strong>The two masks.</strong> A sliding layer may only read a fixed trailing window of
-            the sequence; the global layer every sixth slot reads everything. That's the whole
-            difference — the same kernels run both, with different valid ranges and head dims (512
-            global, 256 sliding, from chapter 1).
+            the sequence; every {isE4b ? "sixth" : "fifth"} layer can read the full causal history.
+            The layer types also differ in head dimension and RoPE settings. Attention dispatch
+            depends on those shapes, context length, and route policy.
           </p>
           <p>
             <CodeLink link={L("config-layer-uses-sliding")} />
@@ -178,8 +179,8 @@ export function Gemma4EarlyChapters({ spec }: ChaptersProps) {
         title="The KV cache is a filing system"
         intro={
           <p>
-            K/V tensors live in 16-token pages owned by a pool. Drag the slider: this is a
-            deterministic replay of the allocation rules, not a screenshot.
+            Drag the slider through a schematic of KV ownership and retention. The replay uses
+            16-token blocks and a shortened window; it is not a runtime allocation trace.
           </p>
         }
       >
@@ -192,9 +193,9 @@ export function Gemma4EarlyChapters({ spec }: ChaptersProps) {
           }
         >
           <p>
-            As the sequence grows past each 16-token boundary, every KV-owning layer files a new
-            page (<code>page_size_tokens = 16</code>). Pages, not one monolithic buffer — so memory
-            grows in steps and pages can be reclaimed, shared, or compressed individually.
+            The general KV manager uses <code>page_size_tokens = 16</code>, and pages may pack
+            several layers. This drawing separates logical layer groups to show which ones write
+            K/V. It does not represent the exact number or layout of physical allocations.
           </p>
           <p>
             <CodeLink link={L("kv-pool-config")} />
@@ -209,13 +210,15 @@ export function Gemma4EarlyChapters({ spec }: ChaptersProps) {
           }
         >
           <p>
-            <strong>The SWA lane evicts behind the window.</strong> Sliding layers only ever need
-            the trailing window, so their old pages are marked reusable (hatched) while the global
-            lane keeps growing. Long contexts cost global-layer memory, not whole-model memory.
+            <strong>Sliding and global retention differ.</strong> Eligible Gemma Metal routes use a
+            bounded sliding ring alongside full-history global storage. The general layer-packed
+            pool keeps full history for mixed attention models so global layers retain their
+            context. Eviction in this drawing illustrates the split retention policy.
           </p>
           <p className="text-xs text-muted-foreground">
-            The replay draws a 128-token window so eviction is visible; the pool uses the model's
-            real per-layer window.
+            The replay draws a 128-token window so eviction is visible; model and route
+            configuration determine actual capacity. The displayed byte count is a schematic
+            estimate.
           </p>
         </Scene>
         <Scene
@@ -228,9 +231,9 @@ export function Gemma4EarlyChapters({ spec }: ChaptersProps) {
         >
           <p>
             <strong>The third lane never fills.</strong> The {spec.stats.sharedKv} shared-KV tail
-            layers hold zero pages at every step — they read a donor layer's pages instead of
-            writing their own. An empty lane is the visualization of a predicate that is one
-            comparison in the config.
+            layers produce no new K/V — they read the last non-shared donor of the same attention
+            type. The empty lane represents that logical ownership, not a claim that every backend
+            allocates zero bytes for shared layers.
           </p>
           <p>
             <CodeLink link={L("config-shared-kv")} /> · <CodeLink link={L("kv-manager")} />
@@ -238,23 +241,19 @@ export function Gemma4EarlyChapters({ spec }: ChaptersProps) {
         </Scene>
         <Scene id="extras" graphic={<KvExtrasFigure />}>
           <p>
-            Two more behaviors share this machinery: a prompt-prefix cache re-attaches pages from a
-            previous request instead of re-prefilling them, and TurboQuant's Polar4 codec stores
-            cached keys at ~4 bits.
+            The runtime also has prompt-prefix reuse and selectable KV codecs. Polar4 stores packed
+            4-bit keys with INT8 values and scale overhead; it is not a 4-bit K-and-V cache. These
+            features depend on the selected backend and configuration.
           </p>
           <p>
             <CodeLink link={L("kv-prompt-cache")} /> · <CodeLink link={L("kv-turboquant-polar4")} />
           </p>
           <Divergence
-            others={
-              <p>
-                vLLM invented paged KV to pack thousands of concurrent sequences onto CUDA fleets.
-              </p>
-            }
+            others={<p>contiguous full-history storage reserves space for every retained token.</p>}
             antfly={
               <p>
-                the same idea runs paged + sliding-window + shared-KV + compressed KV in one manager
-                — on a laptop GPU.
+                paging, split sliding/global retention, KV sharing, and compression are distinct
+                mechanisms with separate eligibility checks.
               </p>
             }
             link={<CodeLink link={L("kv-manager")} />}
@@ -277,18 +276,18 @@ export function Gemma4EarlyChapters({ spec }: ChaptersProps) {
       >
         <Scene id="route" graphic={<MoeRoutingFigure />}>
           <p>
-            A4B replaces the FFN in 30 of its layers with 128 experts at hidden size 2816. A router
-            scores the token and activates only the top-k experts (the repo's own docs state both
-            top-8 and top-2 in different sections — the honest summary is &quot;a few of 128&quot;).
-            Most of the 26B parameters sleep through any given token.
+            The qualified A4B architecture has 30 layers, hidden size 2816, and 128 routed experts
+            per layer. Its router selects the top 8 for each token. A shared feed-forward branch
+            also contributes; most routed expert weights are inactive for that token.
           </p>
         </Scene>
         <Scene id="residency" graphic={<MoeResidencyFigure />}>
           <p>
-            <strong>Experts don't all fit on the GPU.</strong> The Metal path picks an{" "}
-            <code>A4bMappedMoeRoute</code>: the explicit high-memory route keeps every mapped expert
-            resident; otherwise expert weights stream from host memory when the router lands on
-            them. A shelf of warm experts, a warehouse behind it.
+            <strong>Residency depends on the memory budget.</strong> The Metal path picks an{" "}
+            <code>A4bMappedMoeRoute</code>: a qualified high-memory route keeps mapped expert
+            weights available to the GPU; streamed routes stage selected weights as needed. Apple
+            Silicon uses unified memory, so this is about mapping, residency, and staging, not
+            separate physical CPU and GPU RAM.
           </p>
           <p>
             <CodeLink link={L("moe-mapped-route")} />{" "}

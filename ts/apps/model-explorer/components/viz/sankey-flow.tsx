@@ -2,7 +2,7 @@
 
 import { cn } from "@antfly/design-system";
 import { sankey, sankeyLinkHorizontal } from "d3-sankey";
-import { useMemo, useState } from "react";
+import { useId, useMemo, useState } from "react";
 import type { SankeySpec } from "@/lib/schema";
 
 interface SankeyNodeDatum {
@@ -39,6 +39,7 @@ export function SankeyFlow({
   highlight?: string[];
   className?: string;
 }) {
+  const descriptionId = useId();
   const [hovered, setHovered] = useState<string | null>(null);
 
   const { nodes, links } = useMemo(() => {
@@ -61,15 +62,19 @@ export function SankeyFlow({
     (!highlight || highlight.includes(id)) && (hovered === null || hovered === id);
 
   return (
-    <svg viewBox={`0 0 ${WIDTH} ${HEIGHT}`} className={cn("w-full", className)} role="img" aria-label="Forward-pass flow">
-      {links.map((link, i) => {
+    <svg viewBox={`0 0 ${WIDTH} ${HEIGHT}`} className={cn("w-full", className)} role="group" aria-label="Forward-pass flow" aria-describedby={descriptionId}>
+      <title>Forward-pass flow</title>
+      <desc id={descriptionId}>
+        Focus a stage to highlight its connections. {spec.links.map((link) => `${spec.nodes.find((n) => n.id === link.source)?.label ?? link.source} to ${spec.nodes.find((n) => n.id === link.target)?.label ?? link.target}${link.label ? `: ${link.label}` : ""}`).join(". ")}
+      </desc>
+      {links.map((link) => {
         const source = link.source as SankeyNodeDatum;
         const target = link.target as SankeyNodeDatum;
         const active =
           hovered === null || hovered === source.id || hovered === target.id;
         return (
           <path
-            key={i}
+            key={`${source.id}:${target.id}:${link.label ?? ""}:${link.value}`}
             d={linkPath(link) ?? undefined}
             fill="none"
             stroke={source.colorVar ?? "var(--muted-foreground)"}
@@ -77,10 +82,7 @@ export function SankeyFlow({
             strokeOpacity={active ? 0.35 : 0.08}
             className="transition-[stroke-opacity]"
           >
-            <title>
-              {source.label} → {target.label}
-              {link.label ? ` · ${link.label}` : ""}
-            </title>
+            <title>{`${source.label} → ${target.label}${link.label ? ` · ${link.label}` : ""}`}</title>
           </path>
         );
       })}
@@ -89,10 +91,21 @@ export function SankeyFlow({
         return (
           <g
             key={node.id}
+            role="button"
+            tabIndex={0}
+            aria-label={`Highlight connections for ${node.label}`}
             onMouseEnter={() => setHovered(node.id)}
             onMouseLeave={() => setHovered(null)}
-            className="cursor-default"
-            opacity={active ? 1 : 0.35}
+            onFocus={() => setHovered(node.id)}
+            onBlur={() => setHovered(null)}
+            onClick={() => setHovered(node.id)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                setHovered(node.id);
+              }
+            }}
+            className="cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-primary"
           >
             <rect
               x={node.x0}
@@ -101,7 +114,7 @@ export function SankeyFlow({
               height={(node.y1 ?? 0) - (node.y0 ?? 0)}
               rx={3}
               fill={node.colorVar ?? "var(--muted-foreground)"}
-              fillOpacity={0.85}
+              fillOpacity={active ? 0.85 : 0.3}
             />
             <text
               x={(node.x0 ?? 0) < WIDTH / 2 ? (node.x1 ?? 0) + 6 : (node.x0 ?? 0) - 6}

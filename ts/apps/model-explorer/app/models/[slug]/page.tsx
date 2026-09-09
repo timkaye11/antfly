@@ -8,6 +8,12 @@ export function generateStaticParams() {
   return modelSlugs().map((slug) => ({ slug }));
 }
 
+export async function generateMetadata({ params }: { params: Promise<{ slug: string }> }) {
+  const { slug } = await params;
+  const spec = getModelSpec(slug);
+  return { title: spec ? `${spec.displayName}` : "Model not found" };
+}
+
 export default async function ModelPage({ params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
   const spec = getModelSpec(slug);

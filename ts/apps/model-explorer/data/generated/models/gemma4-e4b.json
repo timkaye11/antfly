@@ -3,18 +3,20 @@
  "id": "gemma4-e4b",
  "family": "gemma",
  "displayName": "Gemma4 E4B",
- "tagline": "42 layers, hidden 2560 — 56.1 tok/s decode on an M4 Pro, 89% of llama.cpp.",
+ "tagline": "42 layers, hidden 2560; 5:1 sliding/global attention and 18 shared-KV tail layers.",
  "stats": {
   "vocab": 262144,
   "queryHeads": 8,
-  "quant": "Q4_0 (QAT)",
+  "quant": "QAT Q4_0 weights (mixed tensor formats)",
   "tokenizer": "SentencePiece",
   "layers": 42,
   "hidden": 2560,
   "kvOwners": 24,
   "sharedKv": 18,
   "kvHeads": 2,
-  "tokS": "56.1 (M4 Pro)"
+  "tokS": "56.1 tok/s (historical M4 Pro)",
+  "slidingPattern": 6,
+  "pleHidden": 256
  },
  "stages": [
   {
@@ -29,11 +31,11 @@
    "id": "ple",
    "title": "Per-layer embeddings (PLE)",
    "spine": "graph",
-   "summary": "A second embedding lane computes one small vector per layer per token, projected and gated into every layer's FFN output.",
+   "summary": "Scaled per-layer token embeddings combine with a normalized projection of the initial hidden state, then each layer gates and projects its own slice.",
    "source": {
     "path": "zig/pkg/inference/src/architectures/gpt.zig",
     "anchor": "pub fn computePleVectors(",
-    "line": 11079
+    "line": 11135
    }
   },
   {
@@ -41,7 +43,7 @@
    "id": "layers",
    "title": "Decoder layer",
    "spine": "graph",
-   "summary": "5 sliding-window layers for every 1 global layer; the tail layers share KV with earlier donors.",
+   "summary": "5 sliding-window layers for each global layer; final 18 layers reuse same-type donor K/V.",
    "source": {
     "path": "zig/pkg/inference/src/models/gpt.zig",
     "anchor": "return ((layer_index + 1) % self.sliding_window_pattern) != 0;",
@@ -49,7 +51,7 @@
    },
    "repeat": {
     "count": 42,
-    "note": "one representative layer shown per variant kind",
+    "note": "Zero-based model layer indices; graph shows a representative KV-owning layer.",
     "variants": [
      {
       "tag": "SWA · owns KV",
@@ -75,7 +77,7 @@
        21,
        22
       ],
-      "note": "head_dim 256, sliding window"
+      "note": "head_dim 256; computes K/V"
      },
      {
       "tag": "global · owns KV",
@@ -85,7 +87,7 @@
        17,
        23
       ],
-      "note": "head_dim 512, full attention"
+      "note": "head_dim 512; computes K/V"
      },
      {
       "tag": "SWA · shared KV",
@@ -106,7 +108,7 @@
        39,
        40
       ],
-      "note": "skips K/V projection and KV writes; reads a donor layer's blocks"
+      "note": "reads sliding donor 22"
      },
      {
       "tag": "global · shared KV",
@@ -115,7 +117,7 @@
        35,
        41
       ],
-      "note": "full attention over a donor's KV"
+      "note": "reads global donor 23"
      }
     ]
    },
@@ -126,7 +128,7 @@
    "id": "kv",
    "title": "Paged KV cache",
    "spine": "kv",
-   "summary": "16-token pages per pool; sliding-window pools evict behind the window, shared-KV layers hold no pages at all.",
+   "summary": "General pools use 16-token pages, possibly packing many layers. Eligible Metal routes split sliding-ring and full-history global retention; shared layers reuse donor K/V.",
    "source": {
     "path": "zig/pkg/inference/src/runtime/kv/pool.zig",
     "anchor": "pub const KvPoolConfig = struct {",
@@ -139,7 +141,7 @@
    "id": "head",
    "title": "LM head",
    "spine": "graph",
-   "summary": "The [hidden × 262144] vocabulary matvec — 550 MB/token on E4B, 19.5% of all traffic.",
+   "summary": "The [hidden × 262144] vocabulary projection; stored Q6_K in the illustrated QAT artifacts. Weight format is distinct from activation dtype.",
    "headType": "lm"
   },
   {
@@ -147,7 +149,7 @@
    "id": "sample",
    "title": "Device-resident sampling",
    "spine": "sample",
-   "summary": "Logits never leave the GPU: top-8 rescore, Gumbel-max, argmax — the sampled token id feeds the next frame directly.",
+   "summary": "Eligible greedy or sampled routes select a token on-device. Unsupported constraints use the canonical host sampler; Q4_K top-8 refinement is a separate opt-in greedy route.",
    "headType": "lm"
   }
  ],
@@ -176,11 +178,13 @@
          1,
          "H"
         ],
-        "dtype": "f16"
+        "dtype": "float (route-dependent)"
        }
       ]
      },
-     "attrs": {},
+     "attrs": {
+      "note": "One text token; hidden activations can be f32 or f16 according to lowering. Diagram omits casts and some residual/normalization details."
+     },
      "kernelRouteIds": [],
      "kernels": [
       "termite_embedding_lookup"
@@ -208,10 +212,10 @@
       "out": [
        {
         "dims": [
-         "L",
-         "P"
+         1,
+         "L·P"
         ],
-        "dtype": "f16"
+        "dtype": "float (route-dependent)"
        }
       ]
      },
@@ -219,7 +223,7 @@
      "source": {
       "path": "zig/pkg/inference/src/architectures/gpt.zig",
       "anchor": "pub fn computePleVectors(",
-      "line": 11079
+      "line": 11135
      },
      "kernelRouteIds": [],
      "kernels": [
@@ -232,7 +236,7 @@
     {
      "id": "ple.proj",
      "opKind": "linear_no_bias",
-     "label": "per_layer_model_proj",
+     "label": "PLE context project + chunk norm",
      "stageId": "ple",
      "inputs": [],
      "outputs": [],
@@ -243,26 +247,67 @@
          1,
          "H"
         ],
-        "dtype": "f16"
+        "dtype": "float (route-dependent)"
        }
       ],
       "out": [
        {
         "dims": [
-         "L",
-         "P"
+         1,
+         "L·P"
         ],
-        "dtype": "f16",
-        "quant": "q8_0"
+        "dtype": "float (route-dependent)"
        }
       ]
      },
      "attrs": {
-      "note": "55 MB/token in F16 on E4B — staged to Q8_0 by default (~13–41 MB/token saved)"
+      "weightFormat": "q8_0 for eligible staged dense slots",
+      "note": "P=256. Context projection is normalized in P-wide chunks before combining with token embeddings; schematic groups multiple operations."
      },
-     "kernelRouteIds": [
-      "q8_0/rows_2_8/none"
-     ],
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "ple.combine",
+     "opKind": "add",
+     "label": "combine PLE token/context lanes",
+     "stageId": "ple",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         "L·P"
+        ],
+        "dtype": "float"
+       },
+       {
+        "dims": [
+         1,
+         "L·P"
+        ],
+        "dtype": "float"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1,
+         "L·P"
+        ],
+        "dtype": "float"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "Scaled token embedding plus normalized context projection, combined with 1/√2 scaling."
+     },
+     "kernelRouteIds": [],
      "kernels": [],
      "envFlagNames": [],
      "backend": "metal",
@@ -282,7 +327,7 @@
          1,
          "H"
         ],
-        "dtype": "f16"
+        "dtype": "float (route-dependent)"
        }
       ],
       "out": [
@@ -291,7 +336,7 @@
          1,
          "H"
         ],
-        "dtype": "f16"
+        "dtype": "float (route-dependent)"
        }
       ]
      },
@@ -305,7 +350,7 @@
     {
      "id": "l.qkv",
      "opKind": "linear_no_bias",
-     "label": "QKV project",
+     "label": "Q/K/V projections (KV owner)",
      "stageId": "layers",
      "inputs": [],
      "outputs": [],
@@ -316,7 +361,7 @@
          1,
          "H"
         ],
-        "dtype": "f16"
+        "dtype": "float (route-dependent)"
        }
       ],
       "out": [
@@ -325,15 +370,15 @@
          1,
          "Hq+2·Hkv"
         ],
-        "dtype": "f16",
-        "quant": "q4_0"
+        "dtype": "float (route-dependent)"
        }
       ]
      },
-     "attrs": {},
-     "kernelRouteIds": [
-      "q4_0/rows_2_8/none"
-     ],
+     "attrs": {
+      "weightFormat": "q4_0",
+      "note": "Representative KV-owning layer. Shared layers project Q only and read same-type donors. Eligible E4B decode can use split QKV rather than one fused dispatch."
+     },
+     "kernelRouteIds": [],
      "kernels": [
       "termite_q4_0_linear_1x_reduce"
      ],
@@ -344,7 +389,7 @@
     {
      "id": "l.headnorm_rope",
      "opKind": "rope",
-     "label": "head-norm ⋄ RoPE",
+     "label": "Q and K: head norm + RoPE",
      "stageId": "layers",
      "inputs": [],
      "outputs": [],
@@ -370,11 +415,13 @@
        }
       ]
      },
-     "attrs": {},
+     "attrs": {
+      "note": "Q and K are separate fused calls when eligible. Q has 8 heads; K has the model-specific KV head count. V is not a RoPE input."
+     },
      "source": {
       "path": "zig/pkg/inference/src/architectures/gpt.zig",
       "anchor": "pub fn maybeApplyQKHeadNormRope(",
-      "line": 6846
+      "line": 6858
      },
      "kernelRouteIds": [],
      "kernels": [
@@ -428,8 +475,9 @@
       ]
      },
      "attrs": {
-      "window": "5 of 6 layers sliding; head_dim 512 global / 256 SWA",
-      "kvHeads": "2 (E4B) / 1 (E2B)"
+      "window": "4:1 sliding/global on E2B; 5:1 on E4B; head_dim 256 sliding / 512 global",
+      "kvHeads": "1 E2B / 2 E4B",
+      "note": "Split-GQA kernels are eligible route examples, not guaranteed for every context length."
      },
      "kernelRouteIds": [],
      "kernels": [
@@ -457,7 +505,7 @@
          1,
          "Hq"
         ],
-        "dtype": "f16"
+        "dtype": "float (route-dependent)"
        }
       ],
       "out": [
@@ -466,15 +514,14 @@
          1,
          "H"
         ],
-        "dtype": "f16",
-        "quant": "q4_0"
+        "dtype": "float (route-dependent)"
        }
       ]
      },
-     "attrs": {},
-     "kernelRouteIds": [
-      "q4_0/rows_2_8/none"
-     ],
+     "attrs": {
+      "weightFormat": "q4_0"
+     },
+     "kernelRouteIds": [],
      "kernels": [
       "termite_q4_0_linear_1x_reduce"
      ],
@@ -496,7 +543,7 @@
          1,
          "H"
         ],
-        "dtype": "f16"
+        "dtype": "float (route-dependent)"
        }
       ],
       "out": [
@@ -505,7 +552,7 @@
          1,
          "H"
         ],
-        "dtype": "f16"
+        "dtype": "float (route-dependent)"
        }
       ]
      },
@@ -535,7 +582,7 @@
          1,
          "H"
         ],
-        "dtype": "f16"
+        "dtype": "float (route-dependent)"
        }
       ],
       "out": [
@@ -544,7 +591,7 @@
          1,
          "H"
         ],
-        "dtype": "f16"
+        "dtype": "float (route-dependent)"
        }
       ]
      },
@@ -569,7 +616,7 @@
          1,
          "H"
         ],
-        "dtype": "f16"
+        "dtype": "float (route-dependent)"
        }
       ],
       "out": [
@@ -578,17 +625,15 @@
          1,
          "F"
         ],
-        "dtype": "f16",
-        "quant": "q4_0"
+        "dtype": "float (route-dependent)"
        }
       ]
      },
      "attrs": {
-      "note": "one dispatch loads the weight block once for both halves — FFN is 65.7% of bytes/token"
+      "weightFormat": "q4_0",
+      "note": "Eligible pair-activation route computes GELU(gate)·up in one dispatch. Gate and up retain separate weights; fusion shares input work, not weight values."
      },
-     "kernelRouteIds": [
-      "q4_0/rows_2_8/none"
-     ],
+     "kernelRouteIds": [],
      "kernels": [
       "termite_q4_0_pair_activation_1x_reduce"
      ],
@@ -614,7 +659,7 @@
          1,
          "F"
         ],
-        "dtype": "f16"
+        "dtype": "float (route-dependent)"
        }
       ],
       "out": [
@@ -623,15 +668,14 @@
          1,
          "H"
         ],
-        "dtype": "f16",
-        "quant": "q4_0"
+        "dtype": "float (route-dependent)"
        }
       ]
      },
-     "attrs": {},
-     "kernelRouteIds": [
-      "q4_0/rows_2_8/none"
-     ],
+     "attrs": {
+      "weightFormat": "q4_0"
+     },
+     "kernelRouteIds": [],
      "kernels": [
       "termite_q4_0_linear_1x_reduce"
      ],
@@ -642,7 +686,7 @@
     {
      "id": "l.postffn",
      "opKind": "rms_norm",
-     "label": "post-FFN norm + add + PLE gate",
+     "label": "post-FFN norm + residual",
      "stageId": "layers",
      "inputs": [],
      "outputs": [],
@@ -653,14 +697,7 @@
          1,
          "H"
         ],
-        "dtype": "f16"
-       },
-       {
-        "dims": [
-         1,
-         "P"
-        ],
-        "dtype": "f16"
+        "dtype": "float (route-dependent)"
        }
       ],
       "out": [
@@ -669,7 +706,7 @@
          1,
          "H"
         ],
-        "dtype": "f16"
+        "dtype": "float (route-dependent)"
        }
       ]
      },
@@ -680,14 +717,61 @@
      "backend": "metal",
      "fusedOps": [
       "rms_norm",
-      "add",
-      "ple_gate"
+      "add"
      ]
     },
     {
+     "id": "l.ple",
+     "opKind": "linear_no_bias",
+     "label": "PLE gate → project → norm + residual",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         "H"
+        ],
+        "dtype": "float"
+       },
+       {
+        "dims": [
+         1,
+         "P"
+        ],
+        "dtype": "float"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1,
+         "H"
+        ],
+        "dtype": "float"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "Grouped conceptual subgraph: GELU(hidden·gate) multiplies this layer's PLE slice; project to H, RMSNorm, residual add, optional layer output scale."
+     },
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/gpt.zig",
+      "anchor": "pub fn applyPle(",
+      "line": 11344
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
      "id": "kv.pages",
-     "opKind": "scatter_add",
-     "label": "append K/V to paged blocks",
+     "opKind": "gqa_paged_attention",
+     "label": "K/V append (storage side effect)",
      "stageId": "kv",
      "inputs": [],
      "outputs": [],
@@ -713,7 +797,7 @@
       ]
      },
      "attrs": {
-      "note": "shared-KV layers skip this entirely — they read a donor layer's blocks"
+      "note": "Conceptual storage side effect of attention, not scatter-add arithmetic. Appends projected V and normalized/rotated K for owners; tail layers read donor storage."
      },
      "source": {
       "path": "zig/pkg/inference/src/runtime/kv/manager.zig",
@@ -742,7 +826,7 @@
          1,
          "H"
         ],
-        "dtype": "f16"
+        "dtype": "float (route-dependent)"
        }
       ],
       "out": [
@@ -785,27 +869,26 @@
          1,
          262144
         ],
-        "dtype": "f32",
-        "quant": "q6_k"
+        "dtype": "f32"
        }
       ]
      },
      "attrs": {
-      "note": "Q6_K vocab tail; streaming Q4_K repack was the +4–5% fix — the refuted Q4_0 head collapsed to instant-EOT"
+      "weightFormat": "q6_k",
+      "note": "Full-logit path uses original head. Opt-in Q4_K copy nominates greedy candidates, then retained Q6_K weights rescore the top 8; sampling callers retain Q6_K."
      },
      "kernelRouteIds": [],
      "kernels": [
-      "termite_lm_head_q6_k_rescore_top8",
-      "termite_q4_k_linear_1x_reduce_v2"
+      "termite_q6_k_linear_1x_reduce"
      ],
      "envFlagNames": [],
      "backend": "metal",
      "fusedOps": []
     },
     {
-     "id": "s.top8",
+     "id": "s.sample",
      "opKind": "argmax",
-     "label": "top-8 rescore",
+     "label": "eligible greedy / sampled selection",
      "stageId": "sample",
      "inputs": [],
      "outputs": [],
@@ -822,40 +905,6 @@
       "out": [
        {
         "dims": [
-         8
-        ],
-        "dtype": "f32"
-       }
-      ]
-     },
-     "attrs": {},
-     "kernelRouteIds": [],
-     "kernels": [
-      "termite_lm_head_top8_reduce"
-     ],
-     "envFlagNames": [],
-     "backend": "metal",
-     "fusedOps": []
-    },
-    {
-     "id": "s.sample",
-     "opKind": "argmax",
-     "label": "Gumbel-max sample",
-     "stageId": "sample",
-     "inputs": [],
-     "outputs": [],
-     "shapes": {
-      "in": [
-       {
-        "dims": [
-         8
-        ],
-        "dtype": "f32"
-       }
-      ],
-      "out": [
-       {
-        "dims": [
          1
         ],
         "dtype": "i32"
@@ -863,12 +912,12 @@
       ]
      },
      "attrs": {
-      "note": "the sampled token id stays device-resident and seeds the next frame's embed lookup"
+      "note": "Greedy argmax and temperature/Gumbel paths are alternatives, not one serial chain. Applies configured softcap/constraints where required; unsupported requests fall back to host sampling."
      },
      "source": {
       "path": "zig/pkg/inference/src/backends/metal_kernels.m",
       "anchor": "kernel void termite_sample_gumbel_partials(",
-      "line": 8289
+      "line": 8317
      },
      "kernelRouteIds": [],
      "kernels": [
@@ -877,10 +926,7 @@
      ],
      "envFlagNames": [],
      "backend": "metal",
-     "fusedOps": [
-      "gumbel",
-      "argmax"
-     ]
+     "fusedOps": []
     }
    ],
    "edges": [
@@ -899,13 +945,13 @@
     {
      "id": "e.ple.embed",
      "from": "ple.embed",
-     "to": "ple.proj",
+     "to": "ple.combine",
      "kind": "data"
     },
     {
      "id": "e.ple.ribbon",
-     "from": "ple.proj",
-     "to": "l.postffn",
+     "from": "ple.combine",
+     "to": "l.ple",
      "kind": "routing"
     },
     {
@@ -976,7 +1022,7 @@
     },
     {
      "id": "e.postffn.hnorm",
-     "from": "l.postffn",
+     "from": "l.ple",
      "to": "h.norm",
      "kind": "residual"
     },
@@ -987,16 +1033,40 @@
      "kind": "data"
     },
     {
-     "id": "e.lm.top8",
-     "from": "h.lmhead",
-     "to": "s.top8",
+     "id": "e.ple.proj.combine",
+     "from": "ple.proj",
+     "to": "ple.combine",
      "kind": "data"
     },
     {
-     "id": "e.top8.sample",
-     "from": "s.top8",
+     "id": "e.ffn.ple",
+     "from": "l.postffn",
+     "to": "l.ple",
+     "kind": "data"
+    },
+    {
+     "id": "e.lm.sample",
+     "from": "h.lmhead",
      "to": "s.sample",
      "kind": "data"
+    },
+    {
+     "id": "e.v.kv",
+     "from": "l.qkv",
+     "to": "kv.pages",
+     "kind": "kv"
+    },
+    {
+     "id": "e.attn.residual",
+     "from": "embed.tokens",
+     "to": "l.postattn",
+     "kind": "residual"
+    },
+    {
+     "id": "e.ffn.residual",
+     "from": "l.postattn",
+     "to": "l.postffn",
+     "kind": "residual"
     }
    ]
   }
@@ -1005,7 +1075,7 @@
   "nodes": [
    {
     "id": "weights",
-    "label": "GGUF weights",
+    "label": "Historical E4B weights",
     "colorVar": "var(--dtype-q4)"
    },
    {
@@ -1030,7 +1100,7 @@
    },
    {
     "id": "gpu",
-    "label": "GPU / token",
+    "label": "E4B weight-size estimate",
     "colorVar": "var(--dtype-f16)"
    }
   ],
@@ -1082,7 +1152,7 @@
   ]
  },
  "sources": {
-  "gitCommit": "6f5b642fc86d811840a5b81a5143622cd628c51a",
-  "generatedAt": "2026-09-04T16:16:30.911Z"
+  "gitCommit": "26e332ed8c335d75eecd875548c6c36bcb47d183",
+  "generatedAt": "2026-09-09T21:41:47.835Z"
  }
 }

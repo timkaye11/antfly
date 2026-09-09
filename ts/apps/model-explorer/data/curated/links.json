@@ -285,10 +285,54 @@
   },
   "qwen3vl-support-doc": {
     "path": "zig/pkg/inference/QWEN3VL_SUPPORT.md",
-    "anchor": "This document is the operational contract for Qwen3-VL generation and"
+    "anchor": "This document records Qwen3-VL generation and reranking qualification evidence."
   },
   "qwen3vl-family-gate": {
     "path": "zig/pkg/inference/src/models/gpt.zig",
     "anchor": "return self.family == .qwen3_vl;"
+  },
+  "model-compatibility-doc": {
+    "path": "zig/pkg/inference/MODEL_COMPATIBILITY.md",
+    "anchor": "# Model loading and download integrity"
+  },
+  "embed-baseline": {
+    "path": "zig/pkg/inference/scripts/qwen3_embedding/BASELINE.md",
+    "anchor": "# Qwen3-Embedding Baseline Measurement Protocol"
+  },
+  "embed-eos": {
+    "path": "zig/pkg/inference/src/pipelines/embedding.zig",
+    "anchor": "fn ensureTrailingEos("
+  },
+  "qwen3-embed-graph": {
+    "path": "zig/pkg/inference/src/pipelines/embedding.zig",
+    "anchor": "fn tryEmbedTextResidentQwen3Graph("
+  },
+  "gliner-serving-head": {
+    "path": "zig/pkg/inference/src/architectures/gliner_head.zig",
+    "anchor": "fn extractWordEmbeddings("
+  },
+  "gemma-lm-head-repack": {
+    "path": "zig/pkg/inference/src/backends/metal_runtime.zig",
+    "anchor": "fn lmHeadQ4RepackFormat() ?gguf_tensor_types.KnownTensorType {"
+  },
+  "gemma-sampling-fallback": {
+    "path": "zig/pkg/inference/src/pipelines/generation.zig",
+    "anchor": "// Fallback: same fused forward, host-side sampling from the"
+  },
+  "gemma-mtp-ledger": {
+    "path": "zig/pkg/inference/GEMMA4_PERF_PLAN.md",
+    "anchor": "An earlier standalone CLI pilot explains the auto decision;"
+  },
+  "generation-kv-config": {
+    "path": "zig/pkg/inference/src/pipelines/generation.zig",
+    "anchor": "pub fn kvPoolConfig("
+  },
+  "generation-kv-policy": {
+    "path": "zig/pkg/inference/src/pipelines/generation.zig",
+    "anchor": "pub fn generationKvCapacityPolicyForRoute("
+  },
+  "runtime-execution-control": {
+    "path": "zig/pkg/inference/src/execution_control.zig",
+    "anchor": "pub const InferenceExecutionControl"
   }
 }

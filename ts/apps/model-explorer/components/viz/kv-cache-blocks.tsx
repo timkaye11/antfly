@@ -1,8 +1,8 @@
 "use client";
 
-import { Button, cn, Slider } from "@antfly/design-system";
+import { Button, cn } from "@antfly/design-system";
 import { Pause, Play } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { KvBlockGlyph } from "@/components/viz/glyphs";
 import type { KvTrace } from "@/lib/schema";
 
@@ -45,6 +45,7 @@ export function KvCacheBlocks({
   const [step, setStep] = useState(initialStep ?? Math.min(64, maxStep));
   const [playing, setPlaying] = useState(false);
   const raf = useRef<ReturnType<typeof setInterval> | null>(null);
+  const sliderId = useId();
 
   useEffect(() => {
     if (!playing) return;
@@ -77,22 +78,38 @@ export function KvCacheBlocks({
   return (
     <div className={cn("flex h-full flex-col gap-3", className)}>
       <div className="flex items-center gap-3">
-        <Button variant="outline" size="icon" className="size-7" onClick={() => setPlaying((p) => !p)}>
+        <Button
+          variant="outline"
+          size="icon"
+          className="size-7"
+          aria-label={playing ? "Pause KV replay" : "Play KV replay"}
+          onClick={() => {
+            if (!playing && step >= maxStep) setStep(0);
+            setPlaying((p) => !p);
+          }}
+        >
           {playing ? <Pause className="size-3.5" /> : <Play className="size-3.5" />}
         </Button>
-        <Slider
-          value={[step]}
+        <label htmlFor={sliderId} className="sr-only">
+          KV replay position
+        </label>
+        <input
+          id={sliderId}
+          type="range"
+          value={step}
+          aria-valuetext={`${step} tokens, ${(totalBytes / 1024 / 1024).toFixed(1)} MiB estimated KV payload`}
           min={0}
           max={maxStep}
           step={1}
-          onValueChange={([v]) => {
+          disabled={maxStep === 0}
+          onChange={(event) => {
             setPlaying(false);
-            setStep(v);
+            setStep(event.currentTarget.valueAsNumber);
           }}
-          className="flex-1"
+          className="h-5 min-w-0 flex-1 cursor-pointer accent-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background disabled:cursor-not-allowed disabled:opacity-50"
         />
         <div className="w-32 text-right font-mono text-xs text-muted-foreground">
-          t={step} · {(totalBytes / 1024 / 1024).toFixed(1)} MB
+          t={step} · {(totalBytes / 1024 / 1024).toFixed(1)} MiB
         </div>
       </div>
 
@@ -119,7 +136,7 @@ export function KvCacheBlocks({
                 role="img"
                 aria-label={`${lane.label} KV blocks`}
               >
-                {Array.from({ length: rows * PER_ROW }, (_, i) => {
+                {Array.from({ length: rows * PER_ROW }, (_, blockId) => blockId).map((i) => {
                   const state = blocks.get(i) ?? "empty";
                   const x = (i % PER_ROW) * (BLOCK + GAP);
                   const y = Math.floor(i / PER_ROW) * (BLOCK + GAP);
@@ -132,8 +149,8 @@ export function KvCacheBlocks({
       </div>
       {trace.synthesized && (
         <div className="text-[10px] text-muted-foreground">
-          Deterministic replay of the paged-KV allocation rules (block size {trace.config.blockTokens} tokens,{" "}
-          {dtype.label}) — not a captured trace.
+          Illustrative logical KV retention (block size {trace.config.blockTokens} tokens,{" "}
+          {dtype.label}) — estimated payload only, not physical allocation or a captured trace.
         </div>
       )}
     </div>

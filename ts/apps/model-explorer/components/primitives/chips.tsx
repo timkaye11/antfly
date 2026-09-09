@@ -9,10 +9,15 @@ export function dtypeColorVar(dtype: string | undefined): string {
   if (d === "f32") return "var(--dtype-f32)";
   if (d === "f16" || d === "bf16") return "var(--dtype-f16)";
   if (d.startsWith("q8") || d.startsWith("i8")) return "var(--dtype-q8)";
-  if (d.startsWith("q4") || d.startsWith("q5") || d.startsWith("q6") || d.startsWith("iq4") || d.startsWith("mxfp4"))
+  if (d.startsWith("q4") || d.startsWith("q5") || d.startsWith("q6") || d.startsWith("iq4") || d.startsWith("mxfp4") || d === "polar4")
     return "var(--dtype-q4)";
-  if (d) return "var(--dtype-sub4)";
+  if (/^(?:q[123](?:_|$)|iq[123](?:_|$))/.test(d)) return "var(--dtype-sub4)";
   return "var(--muted-foreground)";
+}
+
+/** Text colors use a stronger light-theme contrast than diagram fills. */
+export function dtypeTextColorVar(dtype: string | undefined): string {
+  return dtypeColorVar(dtype).replace("--dtype-", "--dtype-text-");
 }
 
 export function QuantChip({ format, className }: { format: string; className?: string }) {
@@ -22,7 +27,7 @@ export function QuantChip({ format, className }: { format: string; className?: s
         "inline-flex items-center rounded-sm border px-1.5 py-px font-mono text-[10px] font-medium uppercase tracking-wide",
         className,
       )}
-      style={{ borderColor: dtypeColorVar(format), color: dtypeColorVar(format) }}
+      style={{ borderColor: dtypeColorVar(format), color: dtypeTextColorVar(format) }}
     >
       {format}
     </span>
@@ -35,7 +40,7 @@ export function TensorShapeBadge({ shape, className }: { shape: TensorShape; cla
     <span className={cn("inline-flex items-center gap-1 font-mono text-xs text-muted-foreground", className)}>
       {dims}
       {shape.dtype && (
-        <span style={{ color: dtypeColorVar(shape.quant ?? shape.dtype) }}>· {shape.quant ?? shape.dtype}</span>
+        <span style={{ color: dtypeTextColorVar(shape.quant ?? shape.dtype) }}>· {shape.quant ?? shape.dtype}</span>
       )}
     </span>
   );
@@ -68,9 +73,11 @@ export function EnvFlagChip({
     <TooltipProvider>
       <Tooltip>
         <TooltipTrigger asChild>
-          <span
+          <button
+            type="button"
+            aria-label={`${name}${defaultOn === undefined ? "" : ` (${defaultOn ? "default on" : "default off"})`}`}
             className={cn(
-              "inline-flex max-w-full items-center gap-1 rounded-sm border bg-muted/50 px-1.5 py-px font-mono text-[10px]",
+              "inline-flex max-w-full items-center gap-1 rounded-sm border bg-muted/50 px-1.5 py-px font-mono text-[10px] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary",
               className,
             )}
           >
@@ -80,7 +87,7 @@ export function EnvFlagChip({
               />
             )}
             <span className="truncate">{name}</span>
-          </span>
+          </button>
         </TooltipTrigger>
         <TooltipContent className="font-mono text-xs">
           {name}

@@ -1,8 +1,8 @@
 "use client";
 
 import { cn } from "@antfly/design-system";
-import type { ReactNode } from "react";
-import { dtypeColorVar } from "@/components/primitives/chips";
+import { type ReactNode, useId } from "react";
+import { dtypeColorVar, dtypeTextColorVar } from "@/components/primitives/chips";
 
 /**
  * The stable visual vocabulary (see /legend): once a shape means something,
@@ -32,9 +32,47 @@ export interface GlyphProps {
 }
 
 const base = (p: GlyphProps) =>
-  cn("transition-opacity", p.dim ? "opacity-25" : "opacity-100", p.onClick && "cursor-pointer");
+  cn(
+    "transition-opacity",
+    p.onClick &&
+      "cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-primary"
+  );
 
-function GlyphLabel({ x, y, w, label, sublabel }: { x: number; y: number; w: number; label?: string; sublabel?: string }) {
+/** Preserve plain SVG groups for static glyphs and expose real actions to keyboards. */
+function GlyphGroup({ glyph, children }: { glyph: GlyphProps; children: ReactNode }) {
+  if (!glyph.onClick) return <g className={base(glyph)}>{children}</g>;
+  return (
+    <g
+      className={base(glyph)}
+      role="button"
+      tabIndex={0}
+      aria-label={glyph.label ? `Inspect ${glyph.label}` : "Inspect diagram node"}
+      onClick={glyph.onClick}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          glyph.onClick?.();
+        }
+      }}
+    >
+      {children}
+    </g>
+  );
+}
+
+function GlyphLabel({
+  x,
+  y,
+  w,
+  label,
+  sublabel,
+}: {
+  x: number;
+  y: number;
+  w: number;
+  label?: string;
+  sublabel?: string;
+}) {
   if (!label) return null;
   return (
     <>
@@ -49,7 +87,14 @@ function GlyphLabel({ x, y, w, label, sublabel }: { x: number; y: number; w: num
         {label}
       </text>
       {sublabel && (
-        <text x={x + w / 2} y={y + 4} textAnchor="middle" className="fill-muted-foreground font-mono" fontSize={8} dy={-4}>
+        <text
+          x={x + w / 2}
+          y={y + 4}
+          textAnchor="middle"
+          className="fill-muted-foreground font-mono"
+          fontSize={8}
+          dy={-4}
+        >
           {sublabel}
         </text>
       )}
@@ -63,7 +108,9 @@ function strokeProps(p: GlyphProps) {
     stroke: p.highlight ? "var(--primary)" : color,
     strokeWidth: p.highlight ? 2 : 1.25,
     strokeDasharray: p.backend === "native" ? "4 3" : undefined,
-    fill: "color-mix(in oklch, " + color + " 14%, transparent)",
+    fill: `color-mix(in oklch, ${color} 14%, transparent)`,
+    // De-emphasize geometry only; labels must remain readable.
+    opacity: p.dim ? 0.45 : 1,
   };
 }
 
@@ -71,10 +118,10 @@ function strokeProps(p: GlyphProps) {
 export function ActivationGlyph(p: GlyphProps) {
   const { x, y, w = 80, h = 28 } = p;
   return (
-    <g className={base(p)} onClick={p.onClick}>
+    <GlyphGroup glyph={p}>
       <GlyphLabel x={x} y={y} w={w} label={p.label} sublabel={p.sublabel} />
       <rect x={x} y={y} width={w} height={h} rx={8} {...strokeProps(p)} />
-    </g>
+    </GlyphGroup>
   );
 }
 
@@ -83,16 +130,32 @@ export function WeightGlyph(p: GlyphProps & { quant?: string }) {
   const { x, y, w = 80, h = 28 } = p;
   const s = strokeProps({ ...p, dtype: p.quant ?? p.dtype });
   return (
-    <g className={base(p)} onClick={p.onClick}>
+    <GlyphGroup glyph={p}>
       <GlyphLabel x={x} y={y} w={w} label={p.label} sublabel={p.sublabel} />
       <rect x={x} y={y} width={w} height={h} rx={2} {...s} />
-      <line x1={x} y1={y + h} x2={x + w} y2={y + h} stroke={s.stroke} strokeWidth={4} strokeLinecap="round" />
+      <line
+        x1={x}
+        y1={y + h}
+        x2={x + w}
+        y2={y + h}
+        stroke={s.stroke}
+        strokeWidth={4}
+        strokeLinecap="round"
+        opacity={s.opacity}
+      />
       {p.quant && (
-        <text x={x + w - 4} y={y + h - 6} textAnchor="end" fontSize={8} className="font-mono" fill={s.stroke}>
+        <text
+          x={x + w - 4}
+          y={y + h - 6}
+          textAnchor="end"
+          fontSize={8}
+          className="font-mono"
+          fill={dtypeTextColorVar(p.quant)}
+        >
           {p.quant.toUpperCase()}
         </text>
       )}
-    </g>
+    </GlyphGroup>
   );
 }
 
@@ -101,7 +164,7 @@ export function MatmulGlyph(p: GlyphProps & { fused?: string[] }) {
   const { x, y, w = 110, h = 32 } = p;
   const s = strokeProps(p);
   return (
-    <g className={base(p)} onClick={p.onClick}>
+    <GlyphGroup glyph={p}>
       <GlyphLabel x={x} y={y} w={w} label={p.label} sublabel={p.sublabel} />
       <rect
         x={x}
@@ -113,11 +176,18 @@ export function MatmulGlyph(p: GlyphProps & { fused?: string[] }) {
         strokeDasharray={p.fused?.length ? "6 2 2 2" : s.strokeDasharray}
       />
       {p.fused && p.fused.length > 0 && (
-        <text x={x + w / 2} y={y + h / 2} textAnchor="middle" dominantBaseline="central" fontSize={9} className="font-mono fill-primary">
+        <text
+          x={x + w / 2}
+          y={y + h / 2}
+          textAnchor="middle"
+          dominantBaseline="central"
+          fontSize={9}
+          className="font-mono fill-primary"
+        >
           ⟨{p.fused.join(" ⋄ ")}⟩
         </text>
       )}
-    </g>
+    </GlyphGroup>
   );
 }
 
@@ -137,7 +207,7 @@ export function AttentionGlyph(p: GlyphProps & { shutter?: boolean }) {
     .map((pt) => pt.join(","))
     .join(" ");
   return (
-    <g className={base(p)} onClick={p.onClick}>
+    <GlyphGroup glyph={p}>
       <GlyphLabel x={x} y={y} w={w} label={p.label} sublabel={p.sublabel} />
       <polygon points={points} {...s} />
       {p.shutter && (
@@ -147,7 +217,7 @@ export function AttentionGlyph(p: GlyphProps & { shutter?: boolean }) {
           <line x1={x + 20} y1={y + 4} x2={x + 20} y2={y + h - 4} />
         </g>
       )}
-    </g>
+    </GlyphGroup>
   );
 }
 
@@ -156,10 +226,10 @@ export function NormGlyph(p: GlyphProps) {
   const { x, y, w = 70, h = 8 } = p;
   const s = strokeProps(p);
   return (
-    <g className={base(p)} onClick={p.onClick}>
+    <GlyphGroup glyph={p}>
       <GlyphLabel x={x} y={y} w={w} label={p.label} />
       <rect x={x} y={y} width={w} height={h} rx={4} {...s} />
-    </g>
+    </GlyphGroup>
   );
 }
 
@@ -168,10 +238,10 @@ export function ElementwiseGlyph(p: GlyphProps) {
   const { x, y, w = 24 } = p;
   const s = strokeProps(p);
   return (
-    <g className={base(p)} onClick={p.onClick}>
+    <GlyphGroup glyph={p}>
       <GlyphLabel x={x} y={y} w={w} label={p.label} />
       <circle cx={x + w / 2} cy={y + w / 2} r={w / 2} {...s} />
-    </g>
+    </GlyphGroup>
   );
 }
 
@@ -188,10 +258,10 @@ export function EmbeddingGlyph(p: GlyphProps) {
     .map((pt) => pt.join(","))
     .join(" ");
   return (
-    <g className={base(p)} onClick={p.onClick}>
+    <GlyphGroup glyph={p}>
       <GlyphLabel x={x} y={y} w={w} label={p.label} sublabel={p.sublabel} />
       <polygon points={points} {...s} />
-    </g>
+    </GlyphGroup>
   );
 }
 
@@ -202,14 +272,31 @@ export function ForkGlyph(p: GlyphProps & { branches?: number }) {
   const lines = [];
   for (let i = 0; i < branches; i++) {
     const ty = y + (h * (i + 0.5)) / branches;
-    lines.push(<line key={i} x1={x + w * 0.35} y1={y + h / 2} x2={x + w} y2={ty} stroke={s.stroke} strokeWidth={1.5} />);
+    lines.push(
+      <line
+        key={i}
+        x1={x + w * 0.35}
+        y1={y + h / 2}
+        x2={x + w}
+        y2={ty}
+        stroke={s.stroke}
+        strokeWidth={1.5}
+      />
+    );
   }
   return (
-    <g className={base(p)} onClick={p.onClick}>
+    <GlyphGroup glyph={p}>
       <GlyphLabel x={x} y={y} w={w} label={p.label} sublabel={p.sublabel} />
-      <line x1={x} y1={y + h / 2} x2={x + w * 0.35} y2={y + h / 2} stroke={s.stroke} strokeWidth={2} />
+      <line
+        x1={x}
+        y1={y + h / 2}
+        x2={x + w * 0.35}
+        y2={y + h / 2}
+        stroke={s.stroke}
+        strokeWidth={2}
+      />
       {lines}
-    </g>
+    </GlyphGroup>
   );
 }
 
@@ -217,9 +304,11 @@ export function ForkGlyph(p: GlyphProps & { branches?: number }) {
 export function SamplerGlyph(p: GlyphProps) {
   const { x, y, w = 34 } = p;
   const s = strokeProps(p);
-  const pip = (px: number, py: number) => <circle key={`${px}-${py}`} cx={px} cy={py} r={2} fill={s.stroke} />;
+  const pip = (px: number, py: number) => (
+    <circle key={`${px}-${py}`} cx={px} cy={py} r={2} fill={s.stroke} />
+  );
   return (
-    <g className={base(p)} onClick={p.onClick}>
+    <GlyphGroup glyph={p}>
       <GlyphLabel x={x} y={y} w={w} label={p.label} />
       <rect x={x} y={y} width={w} height={w} rx={6} {...s} />
       {pip(x + w * 0.28, y + w * 0.28)}
@@ -227,7 +316,7 @@ export function SamplerGlyph(p: GlyphProps) {
       {pip(x + w * 0.5, y + w * 0.5)}
       {pip(x + w * 0.28, y + w * 0.72)}
       {pip(x + w * 0.72, y + w * 0.72)}
-    </g>
+    </GlyphGroup>
   );
 }
 
@@ -246,22 +335,72 @@ export function KvBlockGlyph({
   color?: string;
 }) {
   if (state === "empty") {
-    return <rect x={x} y={y} width={size} height={size} rx={2} fill="none" stroke="var(--border)" strokeWidth={1} />;
+    return (
+      <rect
+        x={x}
+        y={y}
+        width={size}
+        height={size}
+        rx={2}
+        fill="none"
+        stroke="var(--border)"
+        strokeWidth={1}
+      />
+    );
   }
   if (state === "evicted") {
     return (
       <g>
-        <rect x={x} y={y} width={size} height={size} rx={2} fill="none" stroke={color} strokeWidth={1} opacity={0.5} />
-        <line x1={x + 2} y1={y + size - 2} x2={x + size - 2} y2={y + 2} stroke={color} strokeWidth={1} opacity={0.5} />
-        <line x1={x + 2} y1={y + size / 2} x2={x + size / 2} y2={y + 2} stroke={color} strokeWidth={1} opacity={0.5} />
+        <rect
+          x={x}
+          y={y}
+          width={size}
+          height={size}
+          rx={2}
+          fill="none"
+          stroke={color}
+          strokeWidth={1}
+          opacity={0.5}
+        />
+        <line
+          x1={x + 2}
+          y1={y + size - 2}
+          x2={x + size - 2}
+          y2={y + 2}
+          stroke={color}
+          strokeWidth={1}
+          opacity={0.5}
+        />
+        <line
+          x1={x + 2}
+          y1={y + size / 2}
+          x2={x + size / 2}
+          y2={y + 2}
+          stroke={color}
+          strokeWidth={1}
+          opacity={0.5}
+        />
       </g>
     );
   }
   if (state === "shared") {
     return (
       <g>
-        <rect x={x} y={y} width={size} height={size} rx={2} fill="none" stroke={color} strokeWidth={1} />
-        <path d={`M ${x} ${y + size} L ${x + size} ${y} L ${x + size} ${y + size} Z`} fill={color} opacity={0.55} />
+        <rect
+          x={x}
+          y={y}
+          width={size}
+          height={size}
+          rx={2}
+          fill="none"
+          stroke={color}
+          strokeWidth={1}
+        />
+        <path
+          d={`M ${x} ${y + size} L ${x + size} ${y} L ${x + size} ${y + size} Z`}
+          fill={color}
+          opacity={0.55}
+        />
       </g>
     );
   }
@@ -287,12 +426,13 @@ export function FlowArrow({
   ghost?: boolean;
   label?: string;
 }) {
+  const markerId = useId();
   const midX = (x1 + x2) / 2;
   const midY = (y1 + y2) / 2;
   return (
-    <g opacity={ghost ? 0.4 : 1}>
+    <g>
       <defs>
-        <marker id="arrowhead" markerWidth={7} markerHeight={7} refX={6} refY={3.5} orient="auto">
+        <marker id={markerId} markerWidth={7} markerHeight={7} refX={6} refY={3.5} orient="auto">
           <polygon points="0 0, 7 3.5, 0 7" className="fill-muted-foreground" />
         </marker>
       </defs>
@@ -304,7 +444,8 @@ export function FlowArrow({
         className="stroke-muted-foreground"
         strokeWidth={1.25}
         strokeDasharray={dashed || ghost ? "5 4" : undefined}
-        markerEnd="url(#arrowhead)"
+        markerEnd={`url(#${markerId})`}
+        opacity={ghost ? 0.45 : 1}
       />
       {ghost && (
         <g className="stroke-destructive" strokeWidth={1.5}>
@@ -313,7 +454,13 @@ export function FlowArrow({
         </g>
       )}
       {label && (
-        <text x={midX} y={midY - 6} textAnchor="middle" fontSize={9} className="fill-muted-foreground font-mono">
+        <text
+          x={midX}
+          y={midY - 6}
+          textAnchor="middle"
+          fontSize={9}
+          className="fill-muted-foreground font-mono"
+        >
           {label}
         </text>
       )}
@@ -335,10 +482,22 @@ export function Figure({
   caption?: ReactNode;
   className?: string;
 }) {
+  const titleId = useId();
   return (
     <figure className={cn("flex h-full flex-col", className)}>
-      {title && <div className="mb-2 font-mono text-[11px] uppercase tracking-wider text-muted-foreground">{title}</div>}
-      <svg viewBox={viewBox} className="min-h-0 w-full flex-1" preserveAspectRatio="xMidYMid meet" role="img">
+      {title && (
+        <div className="mb-2 font-mono text-[11px] uppercase tracking-wider text-muted-foreground">
+          {title}
+        </div>
+      )}
+      <svg
+        viewBox={viewBox}
+        className="min-h-0 w-full flex-1"
+        preserveAspectRatio="xMidYMid meet"
+        role="group"
+        aria-labelledby={titleId}
+      >
+        <title id={titleId}>{title ?? "Model mechanism diagram"}</title>
         {children}
       </svg>
       {caption && <figcaption className="mt-2 text-xs text-muted-foreground">{caption}</figcaption>}

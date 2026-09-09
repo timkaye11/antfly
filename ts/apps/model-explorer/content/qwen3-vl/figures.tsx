@@ -29,7 +29,7 @@ export function PixelsToTokensFigure() {
     <Figure
       viewBox="0 0 440 210"
       title="an image enters the token stream"
-      caption="16×16-pixel patches (×2 temporal frames) become patch vectors; after the 2×2 merger, four patches make one visual token. A 768×768 image is 576 tokens — the decoder never knows the difference."
+      caption="16×16-pixel patches (×2 temporal frames) become patch vectors; after the 2×2 merger, four patches make one visual token. A 768×768 resized image is 576 visual tokens. Decoder KV cost is per token; vision processing adds separate work."
     >
       {cells}
       <text x={88} y={22} textAnchor="middle" fontSize={9} className="fill-muted-foreground font-mono">
@@ -40,10 +40,10 @@ export function PixelsToTokensFigure() {
         tower
       </text>
       {/* token stream */}
-      {["The", "chart", "<img>", "<img>", "<img>", "shows", "…"].map((t, i) => {
-        const visual = t === "<img>";
+      {["The", "chart", "<img1>", "<img2>", "<img3>", "shows", "…"].map((t, i) => {
+        const visual = t.startsWith("<img");
         return (
-          <g key={i}>
+          <g key={t}>
             <rect
               x={210 + i * 30}
               y={78}
@@ -157,7 +157,7 @@ export function VisionTowerFigure({ step }: { step: 0 | 1 | 2 }) {
       {step === 2 && (
         <>
           {/* tower blocks */}
-          {Array.from({ length: 12 }, (_, i) => {
+          {Array.from({ length: 12 }, (_, i) => i).map((i) => {
             const tap = i === 2 || i === 5 || i === 8; // blocks 5/11/17 of 24, compressed to 12 rows
             return (
               <g key={i}>
@@ -183,7 +183,7 @@ export function VisionTowerFigure({ step }: { step: 0 | 1 | 2 }) {
             );
           })}
           <text x={120} y={225} textAnchor="middle" fontSize={8.5} className="fill-muted-foreground font-mono">
-            24 vision blocks — taps after 5, 11, 17
+            24 vision blocks · tap indices 5, 11, 17
           </text>
           <rect x={330} y={70} width={90} height={70} rx={5} fill="color-mix(in oklch, var(--kfam-matvec) 12%, transparent)" stroke="var(--kfam-matvec)" strokeWidth={1.25} />
           <text x={375} y={95} textAnchor="middle" fontSize={8} className="fill-foreground font-mono">early decoder</text>
@@ -230,7 +230,7 @@ function Dial({ x, label, value, max, color }: { x: number; label: string; value
       <circle cx={cx} cy={cy} r={r} fill="none" stroke="var(--border)" strokeWidth={1.5} />
       <line x1={cx} y1={cy} x2={cx + r * 0.8 * Math.cos(angle)} y2={cy + r * 0.8 * Math.sin(angle)} stroke={color} strokeWidth={2.5} strokeLinecap="round" />
       <circle cx={cx} cy={cy} r={2.5} fill={color} />
-      <text x={cx} y={cy + r + 14} textAnchor="middle" fontSize={9} fill={color} className="font-mono font-semibold">
+      <text x={cx} y={cy + r + 14} textAnchor="middle" fontSize={9} fill={color.replace("--kfam-", "--kfam-text-").replace("--dtype-", "--dtype-text-")} className="font-mono font-semibold">
         {label}
       </text>
       <text x={cx} y={cy + r + 26} textAnchor="middle" fontSize={9} className="fill-muted-foreground font-mono tabular-nums">
@@ -246,16 +246,17 @@ export function MRopeClocksFigure() {
   const maxAxis = 4 + GRID + 4;
   return (
     <div className="flex h-full flex-col justify-center gap-4">
-      <svg viewBox="0 0 420 100" className="w-full" role="img">
+      <svg viewBox="0 0 420 116" className="w-full" role="img">
         <title>three m-RoPE position dials</title>
-        <Dial x={90} label="text · t" value={t} max={maxAxis} color="var(--dtype-f16)" />
+        <Dial x={90} label="temporal · t" value={t} max={maxAxis} color="var(--dtype-f16)" />
         <Dial x={210} label="image · h" value={h} max={maxAxis} color="var(--kfam-attention)" />
         <Dial x={330} label="image · w" value={w} max={maxAxis} color="var(--kfam-fusion)" />
       </svg>
       {/* token strip */}
-      <svg viewBox="0 0 420 64" className="w-full" role="img">
+      <svg viewBox="0 0 420 64" className="w-full" role="group" aria-label="Choose a sequence token">
         <title>token sequence: text, image grid, text</title>
-        {Array.from({ length: N_TOKENS }, (_, i) => {
+        <g role="radiogroup" aria-label="Sequence token">
+        {Array.from({ length: N_TOKENS }, (_, i) => i).map((i) => {
           const isImg = i >= 4 && i < 4 + GRID * GRID;
           const x = 10 + i * 16.5;
           return (
@@ -269,11 +270,30 @@ export function MRopeClocksFigure() {
               fill={isImg ? "color-mix(in oklch, var(--kfam-attention) 30%, transparent)" : "color-mix(in oklch, var(--dtype-f16) 20%, transparent)"}
               stroke={i === pos ? "var(--primary)" : "none"}
               strokeWidth={1.5}
+              role="radio"
+              aria-label={`Token ${i}, ${isImg ? "visual" : "text"}`}
+              aria-checked={i === pos}
+              data-token={i}
+              tabIndex={i === pos ? 0 : -1}
               onClick={() => setPos(i)}
-              style={{ cursor: "pointer" }}
+              onFocus={() => setPos(i)}
+              onKeyDown={(event) => {
+                const next = event.key === "ArrowRight" || event.key === "ArrowDown"
+                  ? (i + 1) % N_TOKENS
+                  : event.key === "ArrowLeft" || event.key === "ArrowUp"
+                    ? (i + N_TOKENS - 1) % N_TOKENS
+                    : event.key === "Home" ? 0 : event.key === "End" ? N_TOKENS - 1 : i;
+                if (next !== i || event.key === " " || event.key === "Enter") {
+                  event.preventDefault();
+                  setPos(next);
+                  event.currentTarget.ownerSVGElement?.querySelector<SVGRectElement>(`[data-token="${next}"]`)?.focus();
+                }
+              }}
+              className="cursor-pointer focus-visible:outline-2 focus-visible:outline-primary"
             />
           );
         })}
+        </g>
         <text x={10} y={62} fontSize={8} className="fill-muted-foreground font-mono">text</text>
         <text x={10 + 4 * 16.5} y={62} fontSize={8} className="fill-muted-foreground font-mono">4×4 image grid</text>
         <text x={10 + (4 + GRID * GRID) * 16.5} y={62} fontSize={8} className="fill-muted-foreground font-mono">text</text>
@@ -289,8 +309,8 @@ export function MRopeClocksFigure() {
         aria-label="sequence position"
       />
       <p className="text-center font-mono text-[10px] text-muted-foreground">
-        scrub through the sequence — in text all three clocks tick together; inside the image, h and w tick
-        with the grid while t stands still
+        schematic sequence (boundary tokens omitted): text advances all axes; the image advances h/w
+        while t stays fixed. Token {pos}: t={t}, h={h}, w={w}.
       </p>
     </div>
   );
@@ -305,7 +325,7 @@ export function TwoVsThreeAxisFigure() {
     <Figure
       viewBox="0 0 440 220"
       title="two rotations in the tower, three in the decoder"
-      caption="Vision RoPE (left) rotates Q/K on patch row and column — the tower only ever sees one image. Decoder m-RoPE (right) needs a third stream: text time, so 'the second image' and 'the word after it' stay distinguishable."
+      caption="Vision RoPE uses patch row and column within each image. Decoder m-RoPE uses temporal/height/width streams, offset by preceding content. In text all three advance together. This diagram illustrates still-image input, not video support."
     >
       {/* left panel */}
       <rect x={25} y={30} width={180} height={150} rx={6} fill="none" stroke="var(--border)" strokeWidth={1} />
@@ -396,7 +416,7 @@ export function RerankerFigure() {
         score = σ(logit_yes − logit_no)
       </text>
       <text x={265} y={176} textAnchor="middle" fontSize={8} className="fill-muted-foreground font-mono">
-        two rows of the LM head; no sampling, no generation
+        two-row semantic head; no sampling or generation
       </text>
     </Figure>
   );
@@ -408,16 +428,16 @@ export function RerankerFigure() {
 
 export function VlSpineNotesFigure() {
   const rows = [
-    { name: "termite_apply_mrope", note: "3-axis rotary — VL-only" },
+    { name: "termite_apply_mrope", note: "3-axis rotary positions" },
     { name: "vision tower + merger", note: "Conv3D path, per-image" },
     { name: "DeepStack injection", note: "adds features in early layers" },
-    { name: "paged GQA attention", note: "shared with every decoder" },
+    { name: "paged GQA attention", note: "shared decoder primitive" },
     { name: "q4_k matvec routes", note: "shared, compiler-generated" },
   ];
   return (
     <div className="flex h-full flex-col justify-center gap-2.5">
       <div className="font-mono text-[11px] uppercase tracking-wider text-muted-foreground">
-        what's VL-only vs shared
+        Qwen3-VL features and shared operations
       </div>
       {rows.map((r, i) => (
         <div key={r.name} className="flex items-center justify-between rounded-md border px-3 py-2">

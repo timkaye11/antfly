@@ -13,7 +13,6 @@ import {
   ForkGlyph,
   KvBlockGlyph,
   MatmulGlyph,
-  NormGlyph,
   WeightGlyph,
 } from "@/components/viz/glyphs";
 import type { KvTrace } from "@/lib/schema";
@@ -107,7 +106,7 @@ export function TokenPiecesFigure() {
         fontSize={9}
         className="fill-muted-foreground font-mono"
       >
-        7 token ids, i32 — the only thing the model ever sees
+        7 illustrative token ids — text input to the embedding stage
       </text>
     </Figure>
   );
@@ -117,7 +116,7 @@ export function SessionRoutingFigure() {
   const rows = [
     {
       label: "HTTP",
-      detail: "POST /v1/chat/completions → chatCompletions()",
+      detail: "POST /ai/v1/chat/completions → chatCompletions()",
       color: "var(--dtype-f32)",
     },
     {
@@ -132,7 +131,7 @@ export function SessionRoutingFigure() {
     },
     {
       label: "GPT runtime",
-      detail: "the same decode loop llama/qwen/phi use — Gemma is a config, not a codepath",
+      detail: "shared generation loop with Gemma-specific helpers and lowerers",
       color: "var(--kfam-matvec)",
     },
   ];
@@ -147,7 +146,10 @@ export function SessionRoutingFigure() {
             {i < rows.length - 1 ? "↓" : ""}
           </div>
           <div className="flex-1 rounded-md border px-3 py-2" style={{ borderColor: r.color }}>
-            <span className="font-mono text-xs font-semibold" style={{ color: r.color }}>
+            <span
+              className="font-mono text-xs font-semibold"
+              style={{ color: r.color.replace("--kfam-", "--kfam-text-") }}
+            >
               {r.label}
             </span>
             <span className="ml-2 text-xs text-muted-foreground">{r.detail}</span>
@@ -204,7 +206,7 @@ export function PleRibbonFigure({ layers }: { layers: number }) {
     <Figure
       viewBox={`0 0 480 ${H}`}
       title="the second embedding: a per-layer lane"
-      caption={`A second lookup feeds a thin per-layer ribbon that runs beside all ${layers} layers and taps each one — no other Metal runtime executes this full path.`}
+      caption={`A second lookup feeds a thin per-layer ribbon that runs beside all ${layers} layers and taps each one — combined with a normalized projection of the initial hidden state.`}
     >
       {/* main embedding into the stack */}
       <EmbeddingGlyph x={30} y={stackTop - 44} w={100} h={36} label="embed_tokens" dtype="q4_0" />
@@ -301,8 +303,8 @@ export function PleCostFigure({ isE4b }: { isE4b: boolean }) {
       title="what the PLE lane costs per token"
       caption={
         isE4b
-          ? "E4B: the per_layer_model_proj matvec alone streams 55 MB per token in F16 — Q8_0 staging cuts the slot to roughly half."
-          : "E2B: slot 351 (8960×1536) shipped as dense F32 — Q8_0 staging saves ~41 MB per token."
+          ? "E4B: the BF16 projection has 55.1 MB of weights; Q8_0 uses 29.2 MB. Tensor-size estimate, not a traffic capture."
+          : "E2B: an 8960×1536 F32 projection has 55.1 MB of weights; Q8_0 uses 14.6 MB."
       }
     >
       <ActivationGlyph x={30} y={60} w={70} h={28} label="hidden" dtype="f16" />
@@ -332,7 +334,9 @@ export function PleCostFigure({ isE4b }: { isE4b: boolean }) {
         highlight
       />
       <text x={241} y={216} textAnchor="middle" fontSize={10} className="fill-foreground font-mono">
-        {isE4b ? "bf16 → Q8_0 · ~13 MB/token saved" : "F32 → Q8_0 · ~41 MB/token saved"}
+        {isE4b
+          ? "bf16 → Q8_0 · ~25.8 MB fewer weight bytes"
+          : "F32 → Q8_0 · ~40.4 MB fewer weight bytes"}
       </text>
       <text
         x={241}
@@ -341,7 +345,7 @@ export function PleCostFigure({ isE4b }: { isE4b: boolean }) {
         fontSize={9}
         className="fill-muted-foreground font-mono"
       >
-        tokens identical · E2B +1.10% on the M4 Pro testbed
+        eligible dense slots staged by default; rounding error is possible
       </text>
     </Figure>
   );
@@ -355,52 +359,31 @@ export function AttentionBlockFigure({ isE4b }: { isE4b: boolean }) {
   const kvHeads = isE4b ? 2 : 1;
   return (
     <Figure
-      viewBox="0 0 480 290"
-      title="one attention block, exploded"
-      caption={`QKV → per-head Q/K RMS norms (Gemma's unusual placement) → the fused ⟨head_rms ⋄ rope⟩ node → grouped-query attention (8 query heads, ${kvHeads} KV head${kvHeads > 1 ? "s" : ""}).`}
+      viewBox="0 0 480 270"
+      title="one KV-owning attention block"
+      caption={`Q and K each take a separate head-norm + RoPE call when fusion is eligible; V bypasses RoPE. The attention operation consumes all three. Shared-KV layers project only Q.`}
     >
-      <ActivationGlyph x={20} y={120} w={64} h={28} label="hidden" dtype="f16" />
-      <FlowArrow x1={88} y1={134} x2={124} y2={134} />
-      <MatmulGlyph x={128} y={118} w={90} h={32} label="QKV proj" sublabel="q4_0" dtype="q4_0" />
-      {/* Q and K branches into thin norm bars */}
-      <FlowArrow x1={218} y1={126} x2={262} y2={72} label="Q" />
-      <FlowArrow x1={218} y1={142} x2={262} y2={196} label="K" />
-      <NormGlyph x={266} y={64} w={56} label="q_norm" dtype="f32" />
-      <NormGlyph x={266} y={192} w={56} label="k_norm" dtype="f32" />
-      {/* fused zipper node */}
-      <FlowArrow x1={324} y1={70} x2={352} y2={118} />
-      <FlowArrow x1={324} y1={196} x2={352} y2={150} />
-      <MatmulGlyph x={340} y={118} w={110} h={32} fused={["head_rms", "rope"]} dtype="f16" />
-      <text
-        x={395}
-        y={106}
-        textAnchor="middle"
-        fontSize={8}
-        className="fill-muted-foreground font-mono"
-      >
-        one kernel, per head
-      </text>
-      {/* GQA hexagon */}
-      <FlowArrow x1={395} y1={152} x2={395} y2={196} />
-      <AttentionGlyph x={335} y={200} w={120} h={44} label="" dtype="f16" />
-      <text
-        x={395}
-        y={222}
-        textAnchor="middle"
-        dominantBaseline="central"
-        fontSize={9}
-        className="fill-foreground font-mono"
-      >
-        GQA 8q/{kvHeads}kv
-      </text>
+      <ActivationGlyph x={10} y={108} w={55} h={28} label="hidden" dtype="f32" />
+      <FlowArrow x1={68} y1={122} x2={92} y2={122} />
+      <MatmulGlyph x={96} y={101} w={80} h={42} label="Q/K/V" sublabel="projections" dtype="q4_0" />
+      <FlowArrow x1={180} y1={111} x2={218} y2={49} label="Q" />
+      <FlowArrow x1={180} y1={122} x2={218} y2={123} label="K" />
+      <FlowArrow x1={180} y1={133} x2={218} y2={203} label="V" />
+      <MatmulGlyph x={222} y={33} w={102} h={34} label="Q norm + RoPE" dtype="f32" />
+      <MatmulGlyph x={222} y={107} w={102} h={34} label="K norm + RoPE" dtype="f32" />
+      <ActivationGlyph x={222} y={188} w={102} h={28} label="V (no RoPE)" dtype="f32" />
+      <FlowArrow x1={328} y1={50} x2={378} y2={108} />
+      <FlowArrow x1={328} y1={124} x2={378} y2={124} />
+      <FlowArrow x1={328} y1={203} x2={378} y2={140} />
+      <AttentionGlyph x={382} y={101} w={86} h={46} label={`8q/${kvHeads}kv`} dtype="f32" />
       <text
         x={240}
-        y={278}
+        y={255}
         textAnchor="middle"
         fontSize={9}
         className="fill-muted-foreground font-mono"
       >
-        norms are thin bars on purpose — tiny work, load-bearing placement
+        projection packing and activation precision vary by lowering
       </text>
     </Figure>
   );
@@ -494,7 +477,7 @@ export function GqaGroupingFigure({ isE4b }: { isE4b: boolean }) {
 }
 
 /** Honest range-mask view: which past tokens each attention kind may read. */
-export function RangeMaskFigure() {
+export function RangeMaskFigure({ pattern }: { pattern: number }) {
   const N = 20;
   const cur = N - 1;
   const windowTokens = 6; // illustrative window, in cells
@@ -529,10 +512,10 @@ export function RangeMaskFigure() {
     <Figure
       viewBox="0 0 480 200"
       title="what each layer kind may read"
-      caption="A range mask, not attention scores: sliding layers read a fixed trailing window; every 6th layer reads the whole sequence. The bright cell is the current token."
+      caption={`A causal range mask, not attention scores: sliding layers read a trailing window; every ${pattern}th layer reads the full history. The current token is included.`}
     >
-      {row(50, "sliding", (i) => i >= cur - windowTokens && i < cur, "var(--dtype-f16)")}
-      {row(120, "global", (i) => i < cur, "var(--kfam-attention)")}
+      {row(50, "sliding", (i) => i >= cur - windowTokens + 1 && i <= cur, "var(--dtype-f16)")}
+      {row(120, "global", (i) => i <= cur, "var(--kfam-attention)")}
       <text
         x={240}
         y={175}
@@ -553,23 +536,25 @@ export function RangeMaskFigure() {
 /**
  * Synthesized replay of the paged-KV allocation rules for the Gemma4 layer
  * plan: page_size_tokens=16, SWA lanes evict behind the window, shared-KV
- * tail layers never allocate. Window shortened to 128 tokens so eviction is
+ * tail layers have no logical writes (physical pools can still reserve slots).
+ * Window shortened to 128 tokens so eviction is
  * visible inside a 320-token replay.
  */
 export function makeGemmaKvTrace(isE4b: boolean): KvTrace {
-  const globalLayers = isE4b ? 4 : 2;
-  const swaLayers = isE4b ? 20 : 13;
+  const globalLayers = isE4b ? 4 : 3;
+  const swaLayers = isE4b ? 20 : 12;
   const sharedLayers = isE4b ? 18 : 20;
   const windowTokens = 128;
   const steps: KvTrace["steps"] = [];
   for (let t = 0; t <= 320; t++) {
     const events: KvTrace["steps"][number]["events"] = [];
-    if (t > 0 && t % 16 === 0) {
-      const block = t / 16 - 1;
+    if (t > 0 && (t - 1) % 16 === 0) {
+      const block = Math.floor((t - 1) / 16);
       events.push({ kind: "alloc", lane: "global", blockId: block });
       events.push({ kind: "alloc", lane: "swa", blockId: block });
-      const evictBefore = Math.floor((t - windowTokens) / 16) - 1;
-      if (evictBefore >= 0) events.push({ kind: "evict", lane: "swa", blockId: evictBefore });
+    }
+    if (t > windowTokens && (t - windowTokens) % 16 === 0) {
+      events.push({ kind: "evict", lane: "swa", blockId: (t - windowTokens) / 16 - 1 });
     }
     steps.push({ t, events });
   }
@@ -589,7 +574,13 @@ export function makeGemmaKvTrace(isE4b: boolean): KvTrace {
           sharedWith: "donor layers",
         },
       ],
-      dtypes: [{ id: "f16", label: "f16 KV (approx.)", bytesPerTokenLayer: 2048 }],
+      dtypes: [
+        {
+          id: "f16",
+          label: "f16 KV max-width logical estimate",
+          bytesPerTokenLayer: isE4b ? 4096 : 2048,
+        },
+      ],
     },
     steps,
   };
@@ -600,7 +591,7 @@ export function KvExtrasFigure() {
     <Figure
       viewBox="0 0 480 240"
       title="two more tricks in the same manager"
-      caption="Prefix caching re-attaches pages of an earlier prompt instead of re-prefilling them; TurboQuant Polar4 compresses cached keys to ~4 bits."
+      caption="Prefix reuse and KV codecs are separate configurable features. Polar4 uses packed 4-bit keys with INT8 values plus scales; this does not imply every route combines these features."
     >
       {/* prefix cache row */}
       <text x={14} y={40} fontSize={10} className="fill-foreground font-mono">
@@ -670,7 +661,7 @@ export function KvExtrasFigure() {
         fontSize={9}
         className="fill-muted-foreground font-mono"
       >
-        paged + sliding-window + shared-KV + compressed KV — one KvManager
+        paging · shared donors · split retention · selectable codecs
       </text>
     </Figure>
   );
@@ -685,7 +676,7 @@ export function MoeRoutingFigure() {
     <Figure
       viewBox="0 0 480 260"
       title="A4B: routed experts (this page's model is dense)"
-      caption="26B-A4B: 30 MoE layers, 128 experts at hidden 2816. The router picks a few experts per token; the rest of the layer never runs."
+      caption="26B-A4B: 30 layers, hidden 2816, top 8 of 128 routed experts plus a shared branch. Only five experts are drawn; highlighting is schematic."
     >
       <ActivationGlyph x={20} y={110} w={70} h={28} label="hidden" dtype="f16" />
       <FlowArrow x1={94} y1={124} x2={140} y2={124} />
@@ -695,7 +686,7 @@ export function MoeRoutingFigure() {
         w={80}
         h={60}
         label="router"
-        sublabel="top-k"
+        sublabel="top-8 / 128"
         branches={5}
         dtype="f32"
       />
@@ -703,12 +694,13 @@ export function MoeRoutingFigure() {
         const y = 40 + i * 42;
         const active = i === 1 || i === 3;
         return (
-          <g key={y} opacity={active ? 1 : 0.3}>
+          <g key={y}>
             <MatmulGlyph
               x={260}
               y={y}
               w={110}
               h={30}
+              dim={!active}
               label={i === 0 ? "experts" : undefined}
               sublabel={i === 0 ? "128 total" : undefined}
               dtype="q4_0"
@@ -741,7 +733,7 @@ export function MoeResidencyFigure() {
     <Figure
       viewBox="0 0 480 240"
       title="expert residency: resident vs streamed"
-      caption="A4bMappedMoeRoute: the resident route keeps all mapped expert weights on the GPU; otherwise experts stream from host memory on demand — a shelf per expert."
+      caption="Mapped resident and streamed expert routes are chosen by configuration and capacity. Apple Silicon has unified memory; the distinction is mapping and staging, not separate GPU RAM. The highlighted 16 experts are illustrative, not a fixed cache capacity."
     >
       {Array.from({ length: rows * perRow }, (_, i) => {
         const x = 60 + (i % perRow) * 23;
@@ -764,10 +756,10 @@ export function MoeResidencyFigure() {
         );
       })}
       <text x={60} y={222} fontSize={9} className="fill-foreground font-mono">
-        ■ resident on GPU
+        ■ GPU-accessible (illustrative)
       </text>
       <text x={200} y={222} fontSize={9} className="fill-muted-foreground font-mono">
-        ▢ streamed from host when routed to
+        ▢ stage selected weights as needed
       </text>
     </Figure>
   );

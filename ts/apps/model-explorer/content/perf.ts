@@ -3,9 +3,9 @@
  * Deliberately human-owned: these numbers carry caveats and editorial judgment
  * a script shouldn't own. Machine identity is mandatory on every number.
  */
-import type { BytesBreakdownEntry, GapSegment, JourneyEntry, PerfSample } from "@/lib/schema";
+import type { BytesBreakdownEntry, JourneyEntry, PerfSample } from "@/lib/schema";
 
-const PERF_PLAN = "zig/pkg/inference/GEMMA4_PERF_PLAN.md";
+export const PERF_PLAN = "zig/pkg/inference/GEMMA4_PERF_PLAN.md";
 
 /** §1 comparison — E4B Q4_0, single prompt, 64 tokens, temp 0, serial. */
 export const comparisonSamples: PerfSample[] = [
@@ -33,7 +33,7 @@ export const comparisonSamples: PerfSample[] = [
     system: "llama.cpp (Q4_0)",
     machine: "M4 Pro · 273 GB/s",
     context: "13.85 ms/tok · 204 GB/s · 74.8%",
-    caveat: "open issue #22243 claims some builds skip Gemma-4's PLE path — a build doing less work per token flatters its tok/s",
+    caveat: "Historical observation; peer build, feature parity, and timing boundary were not fully reconciled.",
   },
   {
     metric: "tok_s",
@@ -49,9 +49,15 @@ export const comparisonSamples: PerfSample[] = [
     system: "vLLM-Metal (MLX 4-bit)",
     machine: "M4 Pro · 273 GB/s",
     context: "11.55 ms/tok · 227 GB/s on ~7.5% fewer bytes · 83.0%",
-    caveat: "unconfirmed whether this already includes vLLM's Gemma-4 MTP proposer",
+    caveat: "Historical observation with a different weight format and unresolved configuration parity.",
   },
 ];
+
+// Every imported comparison keeps its provenance and limitations attached.
+for (const sample of comparisonSamples) {
+  sample.source ??= comparisonSamples[0].source;
+  sample.caveat ??= "Historical planning-note observation; not a current benchmark or matched ranking.";
+}
 
 export const rooflineCeiling = {
   value: 96,
@@ -61,38 +67,10 @@ export const rooflineCeiling = {
 /** §1 — bytes/token from the actual GGUF tensor table (E4B Q4_0). */
 export const bytesBreakdown: BytesBreakdownEntry[] = [
   { label: "FFN (Q4_0)", mbPerToken: 1858, share: 0.657, note: "gate/up/down across 42 layers — why pair-fusion and batched FFN matter most" },
-  { label: "LM head (Q6_K)", mbPerToken: 550, share: 0.195, note: "the [2560 × 262144] vocab matvec — the un-tuned straggler of chapter 9" },
+  { label: "LM head (Q6_K)", mbPerToken: 550, share: 0.195, note: "the [2560 × 262144] vocab matvec — historical baseline tensor traffic" },
   { label: "attention (Q4_0)", mbPerToken: 330, share: 0.117, note: "QKV + output projections" },
-  { label: "PLE", mbPerToken: 86, share: 0.03, note: "incl. the 55 MB F16 per_layer_model_proj, staged to Q8_0 by default" },
+  { label: "PLE", mbPerToken: 86, share: 0.03, note: "historical baseline includes the 55 MB F16 per_layer_model_proj, before staging savings" },
   { label: "norms / KV", mbPerToken: 7, share: 0.002 },
-];
-
-/** §1 gap decomposition — 5.66 ms/token excess vs roofline (values are range midpoints; exact ranges in notes). */
-export const gapSegments: GapSegment[] = [
-  {
-    label: "tuned Q6_K LM-head kernel",
-    tokS: 9.5,
-    landed: true,
-    note: "2.5–3.5 ms/token → +7–12 tok/s. Landed as the streaming Q4_K repack (§10.1): E4B 28.9→30.1, E2B 52.5→55.2 on the Air.",
-  },
-  {
-    label: "elementwise dispatches + barriers",
-    tokS: 4.5,
-    landed: true,
-    note: "~330 tiny dispatches, ~422 range-driven barriers/frame → +3–6 tok/s. Landed as the barrier reframe (§10.3): planned_barriers=0, 1 compute encoder, 143 planned scopes.",
-  },
-  {
-    label: "submit→wait→encode bubble",
-    tokS: 1.75,
-    landed: true,
-    note: "0.3–0.6 ms/token → +1–2.5 tok/s. Landed as the pipelined decode frame (§9.1): frame N+1 encodes from a device-resident token before frame N's wait.",
-  },
-  {
-    label: "bytes gap to MLX 4-bit",
-    tokS: 8,
-    landed: false,
-    note: "vLLM-Metal moves ~7.5% fewer bytes per token (different 4-bit packing). Closing it means a different weight format, not a faster kernel.",
-  },
 ];
 
 /** §§9–16 journey ledger — E2B on the fanless M4 Air (120 GB/s, 16 GB) worktree. */
@@ -102,14 +80,14 @@ export const journeyE2bAir: JourneyEntry[] = [
     label: "pipelined decode frame",
     value: 51.5,
     delta: "+9–12%",
-    detail: "default-on (M4-qualified): encode frame N+1 from the device-resident token before waiting on N. Token-identical. E4B +5–8%.",
+    detail: "Historical M4-qualified route: encode frame N+1 from the device-resident token before waiting on N. Token-identical. E4B +5–8%.",
     landed: true,
   },
   {
     label: "LM-head Q4_K repack",
     value: 54.8,
     delta: "+4–5%",
-    detail: "streaming Q6_K→Q4_K repack of the vocab matvec (52.5→54.3–55.2). The Q4_0 head variant was refuted — instant-EOT quality collapse.",
+    detail: "opt-in Q6_K→Q4_K candidate repack of the vocab matvec (full logits retain Q6_K) (52.5→54.3–55.2). The Q4_0 head variant was refuted — instant-EOT quality collapse.",
     landed: true,
   },
   {
@@ -124,7 +102,7 @@ export const journeyE2bAir: JourneyEntry[] = [
     value: 56.5,
     delta: "+2.77% / +1.10% (M4 Pro)",
     detail:
-      "pair-activation fusion default-on (−84 dispatches/frame) and PLE model-proj Q8_0 staging (E2B slot 351 was dense F32 — ~41 MB/token saved). Peak E2B 56.2–56.5 (+25% vs branch start).",
+      "historical pair-activation fusion campaign (−84 dispatches/frame) and PLE model-proj Q8_0 staging (E2B slot 351 was dense F32 — ~41 MB/token saved). Peak E2B 56.2–56.5 (roughly 25% vs the reported branch-start range).",
     landed: true,
   },
 ];
@@ -139,8 +117,8 @@ export const refutedLevers = [
 
 /** §16.3 finals on the pinned M4 Pro reference box (Mac16,11, 24 GiB). */
 export const finalsM4Pro = [
-  { model: "E2B", antfly: 80.722, llama: 108.47, pct: "74.4%", context: "short 23+256; long-context 84.5 vs 104.2 (81.1%)" },
-  { model: "E4B", antfly: 56.069, llama: 62.98, pct: "89.0%", context: "short 23+256; long-context 53.6 vs 61.0 (87.9%)" },
+  { model: "E2B", antfly: 80.722, llama: 108.47, pct: "74.4%", context: "§16.3 short 23+256; earlier §14.4 long-context 84.5 vs 104.2 (81.1%)" },
+  { model: "E4B", antfly: 56.069, llama: 62.98, pct: "89.0%", context: "§16.3 short 23+256; earlier §14.4 long-context 53.6 vs 61.0 (87.9%)" },
 ];
 
 /** §16 split-GQA floor retune that produced the finals. */
@@ -151,7 +129,7 @@ export const splitGqaRetune = {
 
 export const censusStory = {
   q8Anchor: { encoders: 41, barriers: 422, plannedScopes: 36, label: "Q8_0 anchor census (METAL.md)" },
-  q4Live: { encoders: 1, plannedScopes: 143, plannedBarriers: 0, label: "live Q4_0 decode frame" },
+  q4Live: { encoders: 1, plannedScopes: 143, plannedBarriers: 0, label: "historical Q4_0 decode census" },
 };
 
 export const machines = {

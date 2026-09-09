@@ -25,7 +25,7 @@ const LABEL_COLORS: Record<string, string> = {
   amount: "var(--kfam-sampling)",
 };
 
-export function SchemaExtractionFigure({ animate = true }: { animate?: boolean }) {
+export function SchemaExtractionFigure({ animate = false }: { animate?: boolean }) {
   const [lit, setLit] = useState(animate ? 0 : 99);
   useEffect(() => {
     if (!animate) return;
@@ -38,14 +38,14 @@ export function SchemaExtractionFigure({ animate = true }: { animate?: boolean }
     <div className="flex h-full flex-col justify-center gap-5">
       <div className="rounded-lg border bg-muted/30 p-4">
         <div className="mb-2 font-mono text-[11px] uppercase tracking-wider text-muted-foreground">
-          schema (not a prompt)
+          illustrative entity schema
         </div>
         <pre className="font-mono text-xs leading-relaxed">
           {`entities:\n`}
           {Object.keys(LABEL_COLORS).map((label) => (
             <span key={label}>
               {"  - "}
-              <span style={{ color: LABEL_COLORS[label] }}>{label}</span>
+              <span style={{ color: LABEL_COLORS[label].replace("--kfam-", "--kfam-text-") }}>{label}</span>
               {"\n"}
             </span>
           ))}
@@ -53,13 +53,13 @@ export function SchemaExtractionFigure({ animate = true }: { animate?: boolean }
       </div>
       <div className="text-center text-muted-foreground">↓ one encoder pass</div>
       <div className="rounded-lg border p-4 text-sm leading-loose">
-        {SAMPLE_TOKENS.map((tok, i) => {
-          if (!tok.label) return <span key={i}>{tok.text}</span>;
+        {SAMPLE_TOKENS.map((tok) => {
+          if (!tok.label) return <span key={tok.text}>{tok.text}</span>;
           const idx = spanIdx++;
           const on = idx < lit;
           return (
             <span
-              key={i}
+              key={tok.text}
               className={cn("rounded px-0.5 transition-all duration-500", on ? "text-foreground" : "")}
               style={{
                 background: on ? `color-mix(in oklch, ${LABEL_COLORS[tok.label]} 22%, transparent)` : undefined,
@@ -68,7 +68,7 @@ export function SchemaExtractionFigure({ animate = true }: { animate?: boolean }
             >
               {tok.text}
               {on && (
-                <sup className="ml-0.5 font-mono text-[9px]" style={{ color: LABEL_COLORS[tok.label] }}>
+                <sup className="ml-0.5 font-mono text-[9px]" style={{ color: LABEL_COLORS[tok.label].replace("--kfam-", "--kfam-text-") }}>
                   {tok.label}
                 </sup>
               )}
@@ -77,7 +77,7 @@ export function SchemaExtractionFigure({ animate = true }: { animate?: boolean }
         })}
       </div>
       <div className="text-center font-mono text-[11px] text-muted-foreground">
-        every span × every label, scored in a single matmul — no generation loop
+        illustrative highlights, not model output · candidate spans × labels score in parallel
       </div>
     </div>
   );
@@ -120,7 +120,7 @@ export function EncoderVsDecoderFigure({ emphasis }: { emphasis: "mask" | "kv" }
       caption={
         emphasis === "mask"
           ? "Left: a GPT decoder masks the upper triangle — token i can never see token i+1. Right: GLiNER2 attends everywhere; an entity's evidence can sit after it in the sentence."
-          : "No causal mask also means nothing to cache: there is no decode loop, so there is no KV cache, no paged pools, no sampler — one forward pass and the answer exists."
+          : "GLiNER2 finishes with a forward pass and span decoding. With no autoregressive loop, it needs no persistent KV cache or token sampler."
       }
     >
       <text x={110} y={30} textAnchor="middle" fontSize={10} className="fill-muted-foreground font-mono">
@@ -173,8 +173,8 @@ function ScoreMatrix({
     for (let c = 0; c < n; c++) {
       let o = 0.55;
       if (mode === "content") o = 0.25 + ((r * 7 + c * 3) % 5) * 0.13;
-      if (mode === "toeplitz") o = 0.85 - Math.abs(r - c) * 0.14;
-      if (mode === "toeplitzT") o = 0.85 - Math.abs(c - r) * 0.14;
+      if (mode === "toeplitz") o = 0.3 + ((r * 7 + Math.abs(r - c) * 3) % 6) * 0.1;
+      if (mode === "toeplitzT") o = 0.25 + ((c * 5 + Math.abs(c - r) * 2) % 6) * 0.1;
       if (mode === "sum") o = 0.35 + ((r * 5 + c * 2) % 4) * 0.1 + (0.5 - Math.abs(r - c) * 0.08);
       cells.push(
         <rect
@@ -191,9 +191,9 @@ function ScoreMatrix({
     }
   }
   return (
-    <g opacity={dim ? 0.3 : 1} className="transition-opacity duration-300">
-      {cells}
-      <text x={x + (n * cs) / 2} y={y - 14} textAnchor="middle" fontSize={10} fill={color} className="font-mono font-semibold">
+    <g>
+      <g opacity={dim ? 0.3 : 1} className="transition-opacity duration-300">{cells}</g>
+      <text x={x + (n * cs) / 2} y={y - 14} textAnchor="middle" fontSize={10} fill={color === "var(--kfam-mmsg)" ? "var(--foreground)" : color.replace("--kfam-", "--kfam-text-").replace("--dtype-", "--dtype-text-")} className="font-mono font-semibold">
         {label}
       </text>
       <text x={x + (n * cs) / 2} y={y - 4} textAnchor="middle" fontSize={7.5} className="fill-muted-foreground font-mono">
@@ -209,7 +209,7 @@ export function DisentangledScoresFigure({ highlight }: { highlight: "all" | "c2
     <Figure
       viewBox="0 0 470 190"
       title="scores = (C2C + C2P + P2C) / √(3·d)"
-      caption="Content-to-content is an ordinary QKᵀ. The two position terms are Toeplitz-structured — every diagonal shares one relative-position bucket — so Antfly computes them as one [T × num_rel] GEMM plus a gather instead of materializing [S·S, H]."
+      caption="Schematic scores, not measured activations. Relative-position indices repeat along diagonals, but C2P/P2C values also depend on content and need not be equal along a diagonal. Each term contributes before scaling, masking and softmax."
     >
       <ScoreMatrix x={20} y={50} color="var(--kfam-attention)" mode="content" label="C2C" sub="Qc · Kcᵀ" dim={hl("c2c")} />
       <text x={110} y={90} fontSize={16} className="fill-muted-foreground">+</text>
@@ -225,13 +225,13 @@ export function DisentangledScoresFigure({ highlight }: { highlight: "all" | "c2
   );
 }
 
-/** Log-bucket step chart: relative distance → bucket index (qualitative). */
+/** Log-bucket step chart: distance magnitude → bucket index (qualitative). */
 export function LogBucketFigure() {
   const mid = 128;
   const maxPos = 512;
   const bucket = (d: number) => {
     if (d < mid) return d;
-    return mid + Math.floor((Math.log(d / mid) / Math.log((maxPos - 1) / mid)) * (mid - 1));
+    return mid + Math.ceil((Math.log(d / mid) / Math.log((maxPos - 1) / mid)) * (mid - 1));
   };
   const W = 380;
   const H = 150;
@@ -245,7 +245,7 @@ export function LogBucketFigure() {
     <Figure
       viewBox={`0 0 ${W} ${H + 40}`}
       title="relativePositionBucket: exact near, logarithmic far"
-      caption="256 buckets cover ±511 positions: distances up to ±128 each get their own bucket; beyond that, buckets widen logarithmically. Nearby word order is preserved exactly; far context is summarized."
+      caption="The curve shows bucket magnitude for nonnegative distance. Antfly adds the signed result to position_buckets=256 to index a 512-row relative table. Distances up to 128 map exactly; larger magnitudes use a ceiling-rounded logarithmic mapping."
     >
       <line x1={40} y1={H - 20} x2={W - 15} y2={H - 20} stroke="var(--border)" strokeWidth={1} />
       <line x1={40} y1={H - 20} x2={40} y2={20} stroke="var(--border)" strokeWidth={1} />
@@ -263,10 +263,10 @@ export function LogBucketFigure() {
         |d| = 128: exact ends, log begins
       </text>
       <text x={W - 15} y={H - 6} textAnchor="end" fontSize={8.5} className="fill-muted-foreground font-mono">
-        relative distance →
+        distance magnitude →
       </text>
       <text x={14} y={26} fontSize={8.5} className="fill-muted-foreground font-mono">
-        bucket
+        |bucket|
       </text>
     </Figure>
   );
@@ -277,19 +277,25 @@ export function LogBucketFigure() {
 /* ------------------------------------------------------------------ */
 
 export function FusedKernelPairFigure() {
-  const eagerOps = ["matmul", "gather", "add", "gather", "add", "scale", "mask", "softmax", "matmul"];
+  const eagerOps = [
+    { id: "content", label: "matmul" }, { id: "c2p", label: "gather" },
+    { id: "add-c2p", label: "add" }, { id: "p2c", label: "gather" },
+    { id: "add-p2c", label: "add" }, { id: "scale", label: "scale" },
+    { id: "mask", label: "mask" }, { id: "softmax", label: "softmax" },
+    { id: "context", label: "matmul" },
+  ];
   const bwd = ["bwd_scores", "bwd_dv", "bwd_dq_dk", "bwd_dqr_dkr"];
   return (
     <Figure
       viewBox="0 0 460 250"
-      title="eager op soup vs one kernel pair"
-      caption="Left: DeBERTa attention as PyTorch MPS runs it — a chain of separately-launched ops per layer, forward only; autograd replays another chain backward. Right: Antfly's fused disentangled-attention kernel, with hand-written backward kernels to match — training-grade fusion on Metal."
+      title="attention decomposition and fused implementation"
+      caption="Left: a schematic decomposition of the attention equations, not a framework trace. Right: the fused Metal forward operation and its separate gradient kernels. The backward operation uses multiple dispatches."
     >
       <text x={110} y={22} textAnchor="middle" fontSize={10} className="fill-muted-foreground font-mono">
-        eager (PyTorch MPS)
+        decomposed equations
       </text>
       {eagerOps.map((op, i) => (
-        <g key={i}>
+        <g key={op.id}>
           <rect
             x={40}
             y={34 + i * 22}
@@ -302,7 +308,7 @@ export function FusedKernelPairFigure() {
             opacity={0.6}
           />
           <text x={110} y={34 + i * 22 + 12} textAnchor="middle" fontSize={8} className="fill-muted-foreground font-mono">
-            {op}
+            {op.label}
           </text>
         </g>
       ))}
@@ -320,7 +326,7 @@ export function FusedKernelPairFigure() {
         ⟨c2c ⋄ c2p ⋄ p2c ⋄ softmax ⋄ context⟩
       </text>
       <text x={340} y={130} textAnchor="middle" fontSize={9} className="fill-muted-foreground font-mono">
-        + backward, also fused:
+        custom backward kernels:
       </text>
       {bwd.map((k, i) => (
         <g key={k}>
@@ -403,7 +409,7 @@ export function SpanHeadFigure({ step }: { step: 0 | 1 | 2 }) {
             span_rep @ label_projᵀ
           </text>
           <text x={220} y={198} textAnchor="middle" fontSize={8.5} className="fill-muted-foreground font-mono">
-            [S, L] → sigmoid → threshold → the highlights from chapter 1
+            [S, L] → sigmoid → threshold → overlap filtering (flat NER)
           </text>
         </>
       )}
@@ -428,13 +434,13 @@ export function GlinerSpineFigure() {
   ];
   return (
     <div className="flex h-full flex-col justify-center gap-4">
-      <div className="flex items-center gap-1.5">
+      <div className="grid grid-cols-4 gap-1.5 xl:grid-cols-8">
         {stages.map((s) => (
           <div
             key={s.label}
             className={cn(
-              "flex-1 rounded-md border px-1 py-2 text-center font-mono text-[10px]",
-              s.used ? "border-primary/60 text-foreground" : "border-dashed text-muted-foreground/50 line-through",
+              "min-w-0 rounded-md border px-1 py-2 text-center font-mono text-[10px]",
+              s.used ? "border-primary/60 text-foreground" : "border-dashed text-muted-foreground line-through",
             )}
           >
             {s.label}
@@ -442,7 +448,7 @@ export function GlinerSpineFigure() {
         ))}
       </div>
       <p className="text-center font-mono text-[11px] text-muted-foreground">
-        same server, same planner, same kernel dispatcher — minus the two decoder-only stages
+        shared server and backend execution · no autoregressive cache or sampler
       </p>
     </div>
   );

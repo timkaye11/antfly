@@ -13,6 +13,7 @@ import {
   SamplerGlyph,
   WeightGlyph,
 } from "@/components/viz/glyphs";
+import { kernels } from "@/lib/data";
 import type { KernelRoute } from "@/lib/schema";
 
 /* ------------------------------------------------------------------ */
@@ -23,13 +24,17 @@ export function CompilerPipelineFigure() {
   const stages = [
     { label: "schedule table", sub: "format × row_bucket × epilogue", color: "var(--kfam-matvec)" },
     { label: "renderer", sub: "one MSL skeleton", color: "var(--kfam-fusion)" },
-    { label: "generated .metal", sub: "25 quant-kernel files", color: "var(--kfam-mmsg)" },
+    {
+      label: "generated .metal",
+      sub: `${new Set(kernels.routes.map((r) => r.generatedFile).filter(Boolean)).size} routed source files`,
+      color: "var(--kfam-mmsg)",
+    },
   ];
   return (
     <Figure
       viewBox="0 0 480 230"
       title="the build-time kernel pipeline"
-      caption="A build step, not a runtime JIT: zig build quant-kernel-codegen -- --check fails CI if regenerating changes a single byte."
+      caption="Static generation: zig build quant-kernel-codegen -- --check detects source drift. The optional runtime JIT is a separate subsystem."
     >
       {stages.map((s, i) => {
         const x = 20 + i * 160;
@@ -154,24 +159,31 @@ export function ScheduleRowFigure({ route }: { route?: KernelRoute }) {
   );
 }
 
-const CENSUS: Array<{ family: string; count: number; color: string }> = [
-  { family: "matvec", count: 96, color: "var(--kfam-matvec)" },
-  { family: "other", count: 66, color: "var(--muted-foreground)" },
-  { family: "fusion", count: 51, color: "var(--kfam-fusion)" },
-  { family: "data_movement", count: 47, color: "var(--muted-foreground)" },
-  { family: "attention", count: 28, color: "var(--kfam-attention)" },
-  { family: "mm_sg", count: 26, color: "var(--kfam-mmsg)" },
-  { family: "training", count: 24, color: "var(--muted-foreground)" },
-  { family: "norm_rope", count: 17, color: "var(--muted-foreground)" },
-  { family: "vision", count: 15, color: "var(--muted-foreground)" },
-  { family: "sampling", count: 14, color: "var(--kfam-sampling)" },
-  { family: "moe", count: 11, color: "var(--kfam-moe)" },
-  { family: "gliner", count: 10, color: "var(--muted-foreground)" },
-  { family: "kv", count: 8, color: "var(--kfam-kv)" },
-];
+const censusCounts = new Map<string, number>();
+for (const kernel of kernels.inventory) {
+  censusCounts.set(kernel.family, (censusCounts.get(kernel.family) ?? 0) + 1);
+}
+const CENSUS = [...censusCounts]
+  .map(([family, count]) => ({
+    family,
+    count,
+    color:
+      (
+        {
+          matvec: "var(--kfam-matvec)",
+          attention: "var(--kfam-attention)",
+          fusion: "var(--kfam-fusion)",
+          sampling: "var(--kfam-sampling)",
+          moe: "var(--kfam-moe)",
+          kv: "var(--kfam-kv)",
+          mm_sg: "var(--kfam-mmsg)",
+        } as Record<string, string>
+      )[family] ?? "var(--muted-foreground)",
+  }))
+  .sort((a, b) => b.count - a.count);
 
 export function KernelCensusFigure() {
-  const max = CENSUS[0].count;
+  const max = CENSUS[0]?.count ?? 1;
   const rowH = 22;
   const H = CENSUS.length * rowH + 30;
   const barX = 118;
@@ -179,7 +191,7 @@ export function KernelCensusFigure() {
   return (
     <Figure
       viewBox={`0 0 480 ${H}`}
-      title="413 Metal kernels, by family"
+      title={`${kernels.inventory.length} extracted Metal entry points, by family`}
       caption="Families with a page-wide color keep it; the long tail stays neutral. Counts from the generated kernel inventory."
     >
       {CENSUS.map((c, i) => {
@@ -248,7 +260,7 @@ export function LmHeadZoomFigure({ isE4b }: { isE4b: boolean }) {
   return (
     <Figure
       viewBox="0 0 480 240"
-      title="bytes per token, zoomed on the tail (E4B Q4_0)"
+      title="historical E4B weight-size estimate, zoomed on the tail"
       caption={`One matvec against all 262,144 vocab rows: [${isE4b ? 2560 : 1536} × 262144]. On E4B that is 550 MB per token — 19.5% of all weight traffic.`}
     >
       {placed.map((s) => (
@@ -324,8 +336,8 @@ export function LmHeadPathsFigure() {
   return (
     <Figure
       viewBox="0 0 480 270"
-      title="the fix that shipped, and the ghost that didn't"
-      caption="Streaming Q6_K→Q4_K repack + the tuned v2 MMV: E2B 52.5→54.3–55.2, E4B 28.9→30.1 tok/s on the Air, token-identical. The Q4_0 head collapsed to instant end-of-turn — measured, struck, kept in the record."
+      title="opt-in candidate repacking and a rejected experiment"
+      caption="Opt-in Q4_K weights nominate greedy candidates; retained Q6_K weights rescore them (not drawn). Historical Air probes improved about 4–5%; sampled/full-logit paths retain Q6_K. The Q4_0 experiment produced instant end-of-turn."
     >
       <WeightGlyph
         x={20}
@@ -352,13 +364,11 @@ export function LmHeadPathsFigure() {
         q4_k_linear_1x_reduce_v2
       </text>
       <text x={410} y={82} textAnchor="middle" fontSize={9} className="fill-primary font-mono">
-        +4–5% · token-identical
+        opt-in · historical +4–5%
       </text>
       {/* ghost path */}
       <FlowArrow x1={134} y1={90} x2={220} y2={170} ghost label="re-quantize harder?" />
-      <g opacity={0.45}>
-        <WeightGlyph x={224} y={156} w={100} h={32} label="" quant="q4_0" />
-      </g>
+      <WeightGlyph x={224} y={156} w={100} h={32} label="" quant="q4_0" dim />
       <line x1={218} y1={192} x2={330} y2={152} stroke="var(--destructive)" strokeWidth={1.5} />
       <text x={280} y={216} textAnchor="middle" fontSize={9} className="fill-destructive font-mono">
         refuted: instant-EOT quality collapse
@@ -385,7 +395,7 @@ export function GpuSamplingFigure() {
     <Figure
       viewBox="0 0 480 280"
       title="the sampler lives inside the frame"
-      caption="Logits → top-8 rescore → Gumbel-max partials → argmax → token id, all device-resident. The crossed-out path is the 1 MB logits copy other runtimes make every token."
+      caption="Schematic eligible device path: apply supported constraints, choose argmax for greedy or Gumbel sampling for temperature, then reduce to a token id. Unsupported cases read logits back for host sampling."
     >
       {/* GPU boundary */}
       <rect
@@ -412,19 +422,19 @@ export function GpuSamplingFigure() {
         dtype="f32"
       />
       <FlowArrow x1={108} y1={115} x2={136} y2={115} />
-      <MatmulGlyph x={140} y={99} w={92} h={32} label="top-8 rescore" dtype="q6_k" />
+      <MatmulGlyph x={140} y={99} w={92} h={32} label="constraints" dtype="f32" />
       <FlowArrow x1={236} y1={115} x2={264} y2={115} />
       <MatmulGlyph
         x={268}
         y={99}
         w={86}
         h={32}
-        label="gumbel-max"
-        sublabel="partials"
+        label="selection"
+        sublabel="greedy / sample"
         dtype="f32"
       />
       <FlowArrow x1={358} y1={115} x2={386} y2={115} />
-      <SamplerGlyph x={390} y={98} w={34} label="argmax" dtype="f32" />
+      <SamplerGlyph x={390} y={98} w={34} label="reduce" dtype="f32" />
       <text x={407} y={160} textAnchor="middle" fontSize={9} className="fill-foreground font-mono">
         token id
       </text>
@@ -438,7 +448,7 @@ export function GpuSamplingFigure() {
         stays on device
       </text>
       {/* ghost host path */}
-      <FlowArrow x1={65} y1={134} x2={65} y2={230} ghost label="memcpy 262144 floats" />
+      <FlowArrow x1={65} y1={134} x2={65} y2={230} dashed label="fallback: logits readback" />
       <rect
         x={20}
         y={234}
@@ -458,7 +468,6 @@ export function GpuSamplingFigure() {
         dominantBaseline="central"
         fontSize={9}
         className="fill-muted-foreground font-mono"
-        opacity={0.7}
       >
         host sampler
       </text>
@@ -632,8 +641,7 @@ export function MtpSideBySideFigure({ isE4b }: { isE4b: boolean }) {
               width={100}
               height={26}
               rx={3}
-              fill="var(--kfam-moe)"
-              opacity={0.35}
+              fill="color-mix(in oklch, var(--kfam-moe) 14%, transparent)"
               stroke="var(--kfam-moe)"
               strokeWidth={1}
             />
@@ -685,7 +693,7 @@ export function ProposeVerifyFigure() {
     <Figure
       viewBox="0 0 480 240"
       title="propose → verify → accept"
-      caption="The drafter proposes k tokens; the main model verifies all of them in one batched step. Accepted tokens are solid; the first mismatch truncates the rest and the verifier's own token is used instead."
+      caption="Illustrative greedy propose/verify round on a batched verifier route. A mismatch truncates the draft tail and uses a target replacement; verification and KV rollback also cost work."
     >
       <text x={20} y={50} fontSize={9} className="fill-muted-foreground font-mono">
         draft proposes
@@ -725,16 +733,16 @@ export function ProposeVerifyFigure() {
         const x = 130 + i * 82;
         const rejectedTail = !d.ok && i > 2;
         return (
-          <g key={d.tok} opacity={rejectedTail ? 0.3 : 1}>
+          <g key={d.tok}>
             <rect
               x={x}
               y={120}
               width={72}
               height={26}
               rx={4}
-              fill={d.ok ? "var(--kfam-attention)" : "none"}
-              opacity={d.ok ? 0.7 : 1}
-              stroke={d.ok ? "none" : "var(--destructive)"}
+              fill={d.ok ? "color-mix(in oklch, var(--kfam-attention) 14%, transparent)" : "none"}
+              opacity={rejectedTail ? 0.5 : 1}
+              stroke={d.ok ? "var(--kfam-attention)" : "var(--destructive)"}
               strokeWidth={1.25}
               strokeDasharray={d.ok ? undefined : "4 3"}
             />
@@ -744,7 +752,7 @@ export function ProposeVerifyFigure() {
               textAnchor="middle"
               dominantBaseline="central"
               fontSize={9}
-              className={d.ok ? "fill-background font-mono" : "fill-destructive font-mono"}
+              className="fill-foreground font-mono"
             >
               {d.ok ? "accept" : i === 2 ? "reject" : "dropped"}
             </text>
@@ -765,20 +773,18 @@ export function ProposeVerifyFigure() {
 }
 
 const MTP_BOARD = [
-  { system: "llama.cpp (E2B drafting)", factor: 3.2, note: "reported" },
-  { system: "vLLM CUDA", factor: 108.8 / 40.9, note: "40.9→108.8 tok/s" },
-  { system: "mlx-serve (E4B)", factor: 1.5, note: "reported" },
-  { system: "Antfly Metal (E2B)", factor: 63.7 / 75.9, note: "75.9→63.7 · 64% acc", self: true },
+  { system: "E2B target only", factor: 1, note: "75.9 tok/s" },
+  { system: "E2B BF16 MTP", factor: 63.7 / 75.9, note: "63.7 tok/s; 64% accepted", self: true },
 ];
 
 export function MtpScoreboardFigure() {
   const barX = 150;
-  const scale = 70; // px per 1× — 3.2× fits inside the stage
+  const scale = 130; // px per 1×
   return (
     <Figure
       viewBox="0 0 480 250"
-      title="the same drafter, across runtimes"
-      caption="Speedup factor from enabling the official Gemma-4 drafter. Everything left of the 1× line is a slowdown — which is exactly where Antfly's Metal auto-gate measured itself, so it stays off."
+      title="historical E2B Metal pilot: acceptance is not speedup"
+      caption="Directional CLI pilot from the performance plan; binary identity was not recorded. The draft lane fell below the target-only baseline and disabled itself after its cost probe."
     >
       {/* 1x reference line */}
       <line
@@ -842,7 +848,7 @@ export function MtpScoreboardFigure() {
         fontSize={8.5}
         className="fill-muted-foreground font-mono"
       >
-        different machines and harnesses — compare factors, not tok/s
+        historical pilot only — not a current-head benchmark
       </text>
     </Figure>
   );

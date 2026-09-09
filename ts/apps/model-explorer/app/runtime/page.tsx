@@ -7,6 +7,7 @@ const LINK_IDS = [
   "server-generate",
   "server-chat",
   "session-factory",
+  "runtime-execution-control",
   "tokenizer-main",
   "tokenizer-sentencepiece",
   "tokenizer-hf",
@@ -18,12 +19,16 @@ const LINK_IDS = [
   "multi-executor",
   "compiler-schedules",
   "kv-manager",
+  "generation-kv-config",
+  "generation-kv-policy",
   "kv-pool-config",
   "kv-prompt-cache",
   "generation-config",
   "native-generate-scheduler",
   "kernel-gumbel",
 ];
+
+export const metadata = { title: "Runtime" };
 
 export default function RuntimePage() {
   return (

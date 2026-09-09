@@ -28,7 +28,9 @@ import { L } from "@/lib/links";
 function ModelUses({ items }: { items: Array<{ slug: string; label: string; note?: string }> }) {
   return (
     <p className="mt-4 border-t pt-2 text-xs text-muted-foreground">
-      <span className="font-mono text-[10px] uppercase tracking-wider">How each model uses this:</span>{" "}
+      <span className="font-mono text-[10px] uppercase tracking-wider">
+        How each model uses this:
+      </span>{" "}
       {items.map((m, i) => (
         <Fragment key={m.slug}>
           {i > 0 && <span> · </span>}
@@ -107,16 +109,16 @@ function Box({
 
 function HttpDoorsFigure() {
   const doors = [
-    { label: "generateEmbeddings", sub: "/v1/embeddings" },
-    { label: "rerankPrompts", sub: "/v1/rerank" },
-    { label: "generateContent", sub: "generateContent" },
-    { label: "chatCompletions", sub: "/v1/chat/completions" },
+    { label: "generateEmbeddings", sub: "/ai/v1/embeddings" },
+    { label: "rerankPrompts", sub: "/ai/v1/rerank" },
+    { label: "generateContent", sub: "/ai/v1/generate" },
+    { label: "chatCompletions", sub: "/ai/v1/chat/completions" },
   ];
   return (
     <Figure
       viewBox="0 0 460 250"
       title="four doors, one hall"
-      caption="Every public endpoint is a handler on the same server; past the door, the pipeline below is shared."
+      caption="Selected inference handlers share server infrastructure. Extraction, reading, and multimodal reranking have additional entry points."
     >
       {doors.map((d, i) => {
         const y = 15 + i * 58;
@@ -124,12 +126,28 @@ function HttpDoorsFigure() {
           <g key={d.label}>
             <Box x={10} y={y} w={175} h={44} label={d.label} sublabel={d.sub} />
             {/* door hinge stripe */}
-            <line x1={14} y1={y + 4} x2={14} y2={y + 40} stroke="var(--primary)" strokeWidth={2} opacity={0.6} />
+            <line
+              x1={14}
+              y1={y + 4}
+              x2={14}
+              y2={y + 40}
+              stroke="var(--primary)"
+              strokeWidth={2}
+              opacity={0.6}
+            />
             <FlowArrow x1={185} y1={y + 22} x2={300} y2={125} />
           </g>
         );
       })}
-      <Box x={302} y={95} w={148} h={60} label="server.zig" sublabel="one inference server" accent />
+      <Box
+        x={302}
+        y={95}
+        w={148}
+        h={60}
+        label="server.zig"
+        sublabel="one inference server"
+        accent
+      />
     </Figure>
   );
 }
@@ -142,7 +160,15 @@ function SessionFactoryFigure() {
       title="route by ModelFamily"
       caption="One switch on the detected family picks the architecture session; the model manager keeps loaded sessions warm."
     >
-      <Box x={10} y={95} w={150} h={56} label="session_factory" sublabel="detect family → session" accent />
+      <Box
+        x={10}
+        y={95}
+        w={150}
+        h={56}
+        label="session_factory"
+        sublabel="detect family → session"
+        accent
+      />
       {families.map((f, i) => {
         const y = 12 + i * 46;
         return (
@@ -152,12 +178,33 @@ function SessionFactoryFigure() {
           </g>
         );
       })}
-      <rect x={10} y={190} width={150} height={40} rx={6} fill="none" stroke="var(--border)" strokeDasharray="4 3" />
-      <text x={85} y={205} textAnchor="middle" fontSize={9} className="fill-muted-foreground font-mono">
+      <rect
+        x={10}
+        y={190}
+        width={150}
+        height={40}
+        rx={6}
+        fill="none"
+        stroke="var(--border)"
+        strokeDasharray="4 3"
+      />
+      <text
+        x={85}
+        y={205}
+        textAnchor="middle"
+        fontSize={9}
+        className="fill-muted-foreground font-mono"
+      >
         model manager cache
       </text>
-      <text x={85} y={218} textAnchor="middle" fontSize={8} className="fill-muted-foreground font-mono">
-        second request skips the load
+      <text
+        x={85}
+        y={218}
+        textAnchor="middle"
+        fontSize={8}
+        className="fill-muted-foreground font-mono"
+      >
+        cache hit can skip loading
       </text>
     </Figure>
   );
@@ -234,8 +281,8 @@ function OpGalleryFigure() {
   return (
     <Figure
       viewBox="0 0 470 320"
-      title="the op vocabulary (12 of 72)"
-      caption="34 primitive + 38 fused op kinds. Shapes follow the legend: hexagon = attention (shutter = sliding window), wide rect = matmul, thick-bottom rect = weight, die = sampling."
+      title="selected graph operations"
+      caption="Primitive and fused op examples. Shapes follow the legend: hexagon = attention (shutter = sliding window), wide rect = matmul, thick-bottom rect = weight, die = sampling."
     >
       {/* row 1 */}
       <EmbeddingGlyph x={15} y={40} label="embedding_lookup" />
@@ -261,8 +308,8 @@ function GraphToFrameFigure() {
   return (
     <Figure
       viewBox="0 0 460 240"
-      title="trace once → plan once"
-      caption="The graph is traced and cached per shape class; the planner lowers it to encoder scopes of planned ops."
+      title="reuse eligible graphs and plans"
+      caption="Eligible graph paths cache structure for compatible shapes and lower operations into planned scopes. Eager and direct runtime paths also exist."
     >
       {/* mini DAG */}
       <Box x={15} y={20} w={90} h={28} label="rms_norm" />
@@ -272,14 +319,26 @@ function GraphToFrameFigure() {
       <FlowArrow x1={60} y1={48} x2={60} y2={68} />
       <FlowArrow x1={60} y1={98} x2={60} y2={118} />
       <FlowArrow x1={60} y1={148} x2={60} y2={168} />
-      <text x={60} y={225} textAnchor="middle" fontSize={9} className="fill-muted-foreground font-mono">
+      <text
+        x={60}
+        y={225}
+        textAnchor="middle"
+        fontSize={9}
+        className="fill-muted-foreground font-mono"
+      >
         op graph (IR)
       </text>
 
       <FlowArrow x1={120} y1={110} x2={195} y2={110} label="plan" />
 
       {/* frame descriptor: scope brackets over op rects */}
-      <text x={330} y={30} textAnchor="middle" fontSize={9} className="fill-muted-foreground font-mono">
+      <text
+        x={330}
+        y={30}
+        textAnchor="middle"
+        fontSize={9}
+        className="fill-muted-foreground font-mono"
+      >
         FrameDescriptor
       </text>
       {[0, 1, 2].map((s) => {
@@ -311,13 +370,25 @@ function GraphToFrameFigure() {
                 opacity={0.75}
               />
             ))}
-            <text x={455} y={y + 20} fontSize={8} className="fill-muted-foreground font-mono" textAnchor="end">
+            <text
+              x={455}
+              y={y + 20}
+              fontSize={8}
+              className="fill-muted-foreground font-mono"
+              textAnchor="end"
+            >
               {["scope: attn setup", "scope: attention", "scope: ffn"][s]}
             </text>
           </g>
         );
       })}
-      <text x={330} y={225} textAnchor="middle" fontSize={9} className="fill-muted-foreground font-mono">
+      <text
+        x={330}
+        y={225}
+        textAnchor="middle"
+        fontSize={9}
+        className="fill-muted-foreground font-mono"
+      >
         PlannedOps grouped into EncoderScopes
       </text>
     </Figure>
@@ -328,8 +399,8 @@ function RebindFigure() {
   return (
     <Figure
       viewBox="0 0 460 200"
-      title="re-bind, don't re-encode"
-      caption="The same planned frame is submitted every step; only buffer bindings (token id, KV page tables) change."
+      title="reuse plans, bind and encode each step"
+      caption="Eligible routes reuse prepared metadata. Each step still binds resources, encodes commands, submits work, and synchronizes according to the selected route."
     >
       {[0, 1, 2].map((i) => {
         const y = 30 + i * 50;
@@ -346,16 +417,31 @@ function RebindFigure() {
                 width={50}
                 height={28}
                 rx={3}
-                fill={["var(--kfam-fusion)", "var(--kfam-matvec)", "var(--kfam-attention)", "var(--kfam-fusion)", "var(--kfam-matvec)", "var(--kfam-sampling)"][o]}
+                fill={
+                  [
+                    "var(--kfam-fusion)",
+                    "var(--kfam-matvec)",
+                    "var(--kfam-attention)",
+                    "var(--kfam-fusion)",
+                    "var(--kfam-matvec)",
+                    "var(--kfam-sampling)",
+                  ][o]
+                }
                 opacity={0.75}
               />
             ))}
-            <FlowArrow x1={405} y1={y + 14} x2={440} y2={y + 14} label={i === 0 ? "token" : undefined} />
+            <FlowArrow
+              x1={405}
+              y1={y + 14}
+              x2={440}
+              y2={y + 14}
+              label={i === 0 ? "token" : undefined}
+            />
           </g>
         );
       })}
       <text x={230} y={185} textAnchor="middle" fontSize={9} className="fill-emerald-500 font-mono">
-        1 encoder · 143 scopes · planned_barriers = 0 (live Q4_0 frame)
+        Historical Q4_0 example: 1 encoder · 143 scopes · 0 planned barriers
       </text>
     </Figure>
   );
@@ -366,20 +452,62 @@ function BackendVtableFigure() {
     <Figure
       viewBox="0 0 460 240"
       title="one vtable, many backends"
-      caption="Solid = Metal, dashed = native CPU — the same convention every figure on this site uses."
+      caption="Illustrated: Metal and native CPU. CUDA and other compiled backends have their own capability and admission contracts."
     >
-      <Box x={140} y={15} w={180} h={48} label="ComputeBackend" sublabel="vtable: one fn per op" accent />
+      <Box
+        x={140}
+        y={15}
+        w={180}
+        h={48}
+        label="ComputeBackend"
+        sublabel="vtable: one fn per op"
+        accent
+      />
       <FlowArrow x1={200} y1={63} x2={110} y2={105} />
       <FlowArrow x1={260} y1={63} x2={350} y2={105} />
-      <Box x={20} y={108} w={185} h={48} label="Metal executor" sublabel="DeviceMesh priority 10" />
-      <Box x={255} y={108} w={185} h={48} label="native CPU (SIMD Zig)" sublabel="priority 0 · supports all" dashed />
+      <Box
+        x={20}
+        y={108}
+        w={185}
+        h={48}
+        label="Metal executor"
+        sublabel="example GPU execution path"
+      />
+      <Box
+        x={255}
+        y={108}
+        w={185}
+        h={48}
+        label="native CPU (SIMD Zig)"
+        sublabel="fallback when permitted"
+        dashed
+      />
       <FlowArrow x1={112} y1={156} x2={112} y2={185} />
-      <Box x={20} y={188} w={185} h={40} label="generated quant routes" sublabel="schedule table → MSL" />
-      <text x={347} y={205} textAnchor="middle" fontSize={8} className="fill-muted-foreground font-mono">
+      <Box
+        x={20}
+        y={188}
+        w={185}
+        h={40}
+        label="generated quant routes"
+        sublabel="schedule table → MSL"
+      />
+      <text
+        x={347}
+        y={205}
+        textAnchor="middle"
+        fontSize={8}
+        className="fill-muted-foreground font-mono"
+      >
         DeviceMesh partitions each graph by
       </text>
-      <text x={347} y={216} textAnchor="middle" fontSize={8} className="fill-muted-foreground font-mono">
-        priority; native is the total fallback
+      <text
+        x={347}
+        y={216}
+        textAnchor="middle"
+        fontSize={8}
+        className="fill-muted-foreground font-mono"
+      >
+        capability and execution policy
       </text>
     </Figure>
   );
@@ -389,22 +517,51 @@ function KvPagesFigure() {
   const size = 20;
   const gap = 5;
   const row = (y: number, states: Array<"empty" | "filled" | "evicted" | "shared">) =>
-    states.map((s, i) => <KvBlockGlyph key={`${y}-${i}`} x={15 + i * (size + gap)} y={y} size={size} state={s} />);
+    states.map((s, i) => {
+      const x = 15 + i * (size + gap);
+      return <KvBlockGlyph key={`${x}:${y}`} x={x} y={y} size={size} state={s} />;
+    });
   return (
     <Figure
       viewBox="0 0 460 230"
       title="paged KV: 16-token blocks"
-      caption="A sequence is a block table over a shared pool — full pages behind a sliding window are evicted; shared prefixes point at the same physical blocks."
+      caption="Schematic of logical split retention and eligible prefix reuse. A mixed global/sliding layer-packed pool retains full history; split Metal routes can bound sliding retention. These rows are not a physical allocation trace."
     >
       <text x={15} y={30} fontSize={9} className="fill-muted-foreground font-mono">
         global layer · keeps everything
       </text>
-      {row(38, ["filled", "filled", "filled", "filled", "filled", "filled", "filled", "filled", "filled", "filled", "empty", "empty"])}
+      {row(38, [
+        "filled",
+        "filled",
+        "filled",
+        "filled",
+        "filled",
+        "filled",
+        "filled",
+        "filled",
+        "filled",
+        "filled",
+        "empty",
+        "empty",
+      ])}
 
       <text x={15} y={95} fontSize={9} className="fill-muted-foreground font-mono">
         sliding-window layer · evicts behind the window
       </text>
-      {row(103, ["evicted", "evicted", "evicted", "evicted", "filled", "filled", "filled", "filled", "filled", "filled", "empty", "empty"])}
+      {row(103, [
+        "evicted",
+        "evicted",
+        "evicted",
+        "evicted",
+        "filled",
+        "filled",
+        "filled",
+        "filled",
+        "filled",
+        "filled",
+        "empty",
+        "empty",
+      ])}
       <path d="M 115 130 v 5 h 149 v -5" fill="none" stroke="var(--primary)" strokeWidth={1} />
       <text x={190} y={148} textAnchor="middle" fontSize={8} className="fill-primary font-mono">
         window
@@ -413,7 +570,20 @@ function KvPagesFigure() {
       <text x={15} y={175} fontSize={9} className="fill-muted-foreground font-mono">
         second request, same prompt prefix · shares blocks
       </text>
-      {row(183, ["shared", "shared", "shared", "shared", "filled", "filled", "empty", "empty", "empty", "empty", "empty", "empty"])}
+      {row(183, [
+        "shared",
+        "shared",
+        "shared",
+        "shared",
+        "filled",
+        "filled",
+        "empty",
+        "empty",
+        "empty",
+        "empty",
+        "empty",
+        "empty",
+      ])}
     </Figure>
   );
 }
@@ -423,20 +593,35 @@ function GenerationLoopFigure() {
     <Figure
       viewBox="0 0 460 230"
       title="one scheduler step"
-      caption="Each step packs prefill chunks and decode tokens into one batch; the sampled token never has to visit the host."
+      caption="The scheduler can combine prefill and decode work. Eligible Metal paths retain a device token for the next step; output still reaches the host."
     >
       <text x={12} y={22} fontSize={9} className="fill-muted-foreground font-mono">
         batched step
       </text>
       {/* prefill chunk */}
       <rect x={12} y={32} width={190} height={30} rx={3} fill="var(--kfam-mmsg)" opacity={0.7} />
-      <text x={107} y={47} textAnchor="middle" dominantBaseline="central" fontSize={9} className="fill-foreground font-mono">
+      <text
+        x={107}
+        y={47}
+        textAnchor="middle"
+        dominantBaseline="central"
+        fontSize={9}
+        className="fill-foreground font-mono"
+      >
         prefill chunk · seq A
       </text>
       {/* decode tokens */}
       {[0, 1, 2, 3].map((i) => (
         <g key={i}>
-          <rect x={212 + i * 36} y={32} width={30} height={30} rx={3} fill="var(--kfam-matvec)" opacity={0.7} />
+          <rect
+            x={212 + i * 36}
+            y={32}
+            width={30}
+            height={30}
+            rx={3}
+            fill="var(--kfam-matvec)"
+            opacity={0.7}
+          />
           <text
             x={227 + i * 36}
             y={47}
@@ -449,7 +634,13 @@ function GenerationLoopFigure() {
           </text>
         </g>
       ))}
-      <text x={280} y={78} textAnchor="middle" fontSize={8} className="fill-muted-foreground font-mono">
+      <text
+        x={280}
+        y={78}
+        textAnchor="middle"
+        fontSize={8}
+        className="fill-muted-foreground font-mono"
+      >
         decode tokens · seqs B–E
       </text>
 
@@ -482,9 +673,10 @@ export function RuntimeClient({
         <header className="mx-auto max-w-7xl px-4">
           <h1 className="text-3xl font-bold tracking-tight">The spine</h1>
           <p className="mt-2 max-w-3xl text-muted-foreground">
-            Every model on this site — generative, embedder, or extractor — rides the same eight-stage pipeline
-            from HTTP request to output. This page walks the shared runtime once; the model pages then only have
-            to explain where they diverge from it.
+            These eight topics connect the runtime components used by the models on this site.
+            Execution depends on the model, task, artifact, and backend: generation uses a decode
+            loop and KV cache; embeddings and extraction produce their outputs in forward passes.
+            Metal is the main visual example.
           </p>
           <SpineStrip className="mt-4" />
         </header>
@@ -494,9 +686,10 @@ export function RuntimeClient({
           <Scene id="doors" graphic={<HttpDoorsFigure />}>
             <p>
               Four doors into one hall. <code>generateEmbeddings</code>, <code>rerankPrompts</code>,{" "}
-              <code>generateContent</code>, and <code>chatCompletions</code> are four handlers on the same
-              server binary — there is no separate embedding service or chat service. Past request parsing and
-              admission, all four converge on the same session, graph, and kernel machinery below.
+              <code>generateContent</code>, and <code>chatCompletions</code> are four handlers on
+              the same inference server. Extraction also has its own handler. Request parsing, model
+              resolution, and resource admission precede task-specific pipelines; a common server
+              does not imply an identical execution path.
             </p>
             <p>
               <CodeLink link={L("server-embeddings")} /> · <CodeLink link={L("server-rerank")} /> ·{" "}
@@ -517,18 +710,39 @@ export function RuntimeClient({
         <ScrollyChapter id="session" number={2} title="The session factory">
           <Scene id="factory" graphic={<SessionFactoryFigure />}>
             <p>
-              The factory detects a <code>ModelFamily</code> from the model's config — gemma, qwen3, qwen3_vl,
-              gliner2/deberta, and the rest — and builds the matching architecture session around the loaded
-              weights. The switch is boring on purpose: one detection, one construction, and everything
-              downstream is family code.
+              The factory detects a <code>ModelFamily</code> from the model's config — gemma, qwen3,
+              qwen3_vl, gliner2/deberta, and the rest — and builds the matching architecture session
+              around the loaded weights. Model-specific execution uses the resulting session
+              together with shared resource, graph, and backend services.
             </p>
             <p>
-              The model manager caches loaded sessions, so the first request pays the weight load and every
-              later request finds the session warm.
+              The model manager can reuse loaded resources. A warm hit avoids loading while the
+              resource remains resident; eviction, admission limits, and cancellation still apply.
+              Execution controls carry deadlines and cancellation through loading and inference, and
+              leases keep resources alive until work releases them.
             </p>
             <p>
-              <CodeLink link={L("session-factory")} />
+              <CodeLink link={L("session-factory")} /> ·{" "}
+              <CodeLink link={L("runtime-execution-control")} />
             </p>
+            <aside className="my-4 space-y-2 rounded-md border bg-muted/20 p-4 text-sm" aria-label="Upstream serving update">
+              <p className="font-semibold">Serving update · 9 September 2026</p>
+              <p>
+                After this tour's generated source snapshot, revision <code>aa44bddd</code> adds
+                bounded batching across qualified embedding and GLiNER requests. Compatible stages
+                whose rows can execute independently share a tensor-forward boundary. Grouping
+                happens before model execution gates, while each caller retains its cancellation
+                and deadline ownership.
+              </p>
+              <p>
+                Cached Metal providers also retain their weight-store lease through execution and
+                teardown; an overlapping provider owner receives <code>QueueFull</code>.
+                These serving boundaries are described in the newer{" "}
+                <a className="underline" href="https://github.com/antflydb/antfly/blob/aa44bddd1dd8befb5d0aec8bdb6c304054b89149/zig/pkg/inference/BATCHING.md#L95" target="_blank" rel="noreferrer">batching documentation</a>
+                {" and "}
+                <a className="underline" href="https://github.com/antflydb/antfly/blob/aa44bddd1dd8befb5d0aec8bdb6c304054b89149/zig/pkg/inference/src/ops/metal_compute.zig#L4319" target="_blank" rel="noreferrer">provider lease implementation</a>.
+              </p>
+            </aside>
             <ModelUses
               items={[
                 { slug: "gemma4-e4b", label: "gemma4", note: "gpt/gemma family" },
@@ -541,16 +755,19 @@ export function RuntimeClient({
         </ScrollyChapter>
 
         {/* ── 3 · Tokenizer ────────────────────────────────────────── */}
-        <ScrollyChapter id="tokenizer" number={3} title="Two tokenizers">
+        <ScrollyChapter id="tokenizer" number={3} title="Model-specific tokenization">
           <Scene id="pieces" graphic={<TokenizerFigure />}>
             <p>
-              The runtime carries two tokenizer implementations behind one interface. Gemma and DeBERTa-v3
-              (GLiNER2) ship SentencePiece models; the Qwen3 family ships a HuggingFace-style BPE{" "}
-              <code>tokenizer.json</code>. Same input string, different piece inventories, different ids — which
-              is why the tokenizer is a per-model artifact, not a runtime constant.
+              The runtime carries two tokenizer implementations behind one interface. Gemma and
+              DeBERTa-v3 (GLiNER2) use SentencePiece-derived tokenization; the Qwen3 family uses
+              byte-level BPE. Tokenizer assets can be loaded from sidecars such as{" "}
+              <code>tokenizer.json</code> or supported GGUF metadata. Same input string, different
+              piece inventories, different ids — which is why the tokenizer is a per-model artifact,
+              not a runtime constant.
             </p>
             <p>
-              <CodeLink link={L("tokenizer-main")} /> · <CodeLink link={L("tokenizer-sentencepiece")} /> ·{" "}
+              <CodeLink link={L("tokenizer-main")} /> ·{" "}
+              <CodeLink link={L("tokenizer-sentencepiece")} /> ·{" "}
               <CodeLink link={L("tokenizer-hf")} />
             </p>
             <ModelUses
@@ -568,25 +785,26 @@ export function RuntimeClient({
         <ScrollyChapter id="graph" number={4} title="The op graph">
           <Scene id="gallery" graphic={<OpGalleryFigure />}>
             <p>
-              Forward passes are described in an XLA-inspired IR: trace the computation once, cache the graph
-              per shape class, replay it thereafter. The vocabulary is deliberately small — 34 primitive ops
-              plus 38 fused ops, 72 total — and the fused tier is where architectures live:{" "}
+              Graph execution describes computation in an IR with primitive and fused operations.
+              Eligible paths cache graph structure and prepared plans for reuse; eager paths also
+              exist. The fused tier expresses larger operations such as{" "}
               <code>gqa_paged_attention</code>, <code>windowed_self_attention</code>,{" "}
               <code>disentangled_relative_attention</code>, the <code>moe_*</code> quartet.
             </p>
             <p>
-              A new model that fits this vocabulary needs no new backend code; a model that doesn't gets one new
-              fused op, implemented once per backend.
+              Reusing the vocabulary reduces backend work, but adding a model still requires correct
+              weight loading, preprocessing, output semantics, and validation on each supported
+              backend.
             </p>
             <p>
               <CodeLink link={L("node-primitive-op")} /> · <CodeLink link={L("node-fused-op")} />
             </p>
             <ModelUses
               items={[
-                { slug: "gemma4-e4b", label: "gemma4", note: "windowed + moe_*" },
+                { slug: "gemma4-e4b", label: "gemma4", note: "windowed attention + shared KV" },
                 { slug: "gliner2", label: "gliner2", note: "disentangled_relative_attention" },
                 { slug: "qwen3-embedding", label: "qwen3-embedding", note: "gqa attention" },
-                { slug: "qwen3-vl", label: "qwen3-vl", note: "conv2d patches + gqa" },
+                { slug: "qwen3-vl", label: "qwen3-vl", note: "patch projection + GQA" },
               ]}
             />
           </Scene>
@@ -596,10 +814,10 @@ export function RuntimeClient({
         <ScrollyChapter id="frames" number={5} title="Planned frames, not walked graphs">
           <Scene id="plan" graphic={<GraphToFrameFigure />}>
             <p>
-              On Metal, the graph is not walked at decode time. The planner compiles it — once — into a{" "}
+              Eligible Metal decode paths prepare the reusable work in a{" "}
               <code>FrameDescriptor</code>: an ordered list of <code>PlannedOp</code>s grouped into{" "}
-              <code>EncoderScope</code>s, with barriers derived from actual read/write byte ranges rather than
-              sprinkled defensively.
+              <code>EncoderScope</code>s, with barriers derived from actual read/write byte ranges
+              rather than sprinkled defensively.
             </p>
             <p>
               <CodeLink link={L("planner-frame-descriptor")} />
@@ -607,13 +825,21 @@ export function RuntimeClient({
           </Scene>
           <Scene id="rebind" graphic={<RebindFigure />}>
             <p>
-              Every subsequent step re-binds and re-submits the same frame. The live Gemma4 Q4_0 decode frame is
-              one compute encoder, 143 planned scopes, zero planned barriers — and with device-resident token
-              handoff, frame N+1 can be encoded before frame N finishes.
+              Reusable decode plans bind step-specific buffers and submit planned operations. A
+              historical Gemma4 Q4_0 census recorded one compute encoder, 143 planned scopes, and
+              zero planned barriers. Those counts depend on the workload and route. Eligible
+              device-token paths can encode frame N+1 before waiting on N.
             </p>
             <Divergence
-              others={<p>llama.cpp re-encodes its graph op-by-op, every token.</p>}
-              antfly={<p>plan once, re-bind per step; barriers only where byte ranges actually collide.</p>}
+              others={
+                <p>Graph structure can be reused while command encoding still happens each step.</p>
+              }
+              antfly={
+                <p>
+                  Prepared frame metadata avoids repeated planning; binding, encoding, and
+                  synchronization remain route-dependent.
+                </p>
+              }
               link={<CodeLink link={L("runtime-submit-frame")} />}
             />
             <p className="text-xs">
@@ -629,7 +855,11 @@ export function RuntimeClient({
             <ModelUses
               items={[
                 { slug: "gemma4-e4b", label: "gemma4", note: "pipelined decode frames" },
-                { slug: "qwen3-embedding", label: "qwen3-embedding", note: "batched prefill frames" },
+                {
+                  slug: "qwen3-embedding",
+                  label: "qwen3-embedding",
+                  note: "batched prefill frames",
+                },
                 { slug: "qwen3-vl", label: "qwen3-vl" },
               ]}
             />
@@ -640,18 +870,19 @@ export function RuntimeClient({
         <ScrollyChapter id="kernels" number={6} title="One vtable, many backends">
           <Scene id="vtable" graphic={<BackendVtableFigure />}>
             <p>
-              Every op dispatches through the <code>ComputeBackend</code> vtable to a native CPU implementation
-              (SIMD Zig) or a Metal one. The <code>DeviceMesh</code> partitions each graph by backend priority —
-              Metal at 10, native at 0 — so anything Metal can't run falls back to the CPU implementation of the
-              same op, not to an error.
+              The <code>ComputeBackend</code> interface and graph executors connect operations to
+              backend implementations, including native CPU, Metal, and CUDA when built.
+              Partitioning considers supported operations and execution policy. CPU fallback is
+              allowed only on compatible paths; a strict GPU contract can reject unsupported work.
             </p>
             <p>
-              The small-batch quantized matvec kernels aren't hand-written at all: the quant-kernel compiler
-              renders them from one schedule table into MSL at build time.
+              Some quantized matvec routes are rendered from schedule tables into checked-in MSL.
+              Handwritten kernels and optional runtime JIT routes coexist with those generated
+              kernels.
             </p>
             <p>
-              <CodeLink link={L("ops-compute-backend")} /> · <CodeLink link={L("multi-executor")} /> ·{" "}
-              <CodeLink link={L("compiler-schedules")} />
+              <CodeLink link={L("ops-compute-backend")} /> · <CodeLink link={L("multi-executor")} />{" "}
+              · <CodeLink link={L("compiler-schedules")} />
             </p>
             <p className="text-xs">
               Full route table:{" "}
@@ -674,14 +905,17 @@ export function RuntimeClient({
         <ScrollyChapter id="kv" number={7} title="Paged KV">
           <Scene id="pages" graphic={<KvPagesFigure />}>
             <p>
-              KV cache is paged: 16-token blocks in a shared pool, with a block table per sequence. Sliding-window
-              layers evict whole pages behind the window; identical prompt prefixes attach to the same physical
-              blocks instead of recomputing them; and TurboQuant can store keys at 4 bits (polar4) instead of
-              f16.
+              The generation runtime has a paged KV pool with 16-token pages. Eligible requests can
+              reuse prompt prefixes. Physical retention is route-dependent: mixed global/window
+              models may retain full history, while eligible Metal routes use split sliding-window
+              rings. Optional compressed KV formats, including polar4 keys, have their own geometry
+              and backend constraints.
             </p>
             <p>
               <CodeLink link={L("kv-manager")} /> · <CodeLink link={L("kv-pool-config")} /> ·{" "}
-              <CodeLink link={L("kv-prompt-cache")} />
+              <CodeLink link={L("kv-prompt-cache")} /> ·{" "}
+              <CodeLink link={L("generation-kv-config")} /> ·{" "}
+              <CodeLink link={L("generation-kv-policy")} />
             </p>
             <p className="text-xs">
               Watch the blocks move:{" "}
@@ -691,10 +925,18 @@ export function RuntimeClient({
             </p>
             <ModelUses
               items={[
-                { slug: "gemma4-e4b", label: "gemma4", note: "window eviction + shared-KV tail" },
-                { slug: "qwen3-embedding", label: "qwen3-embedding", note: "one pass, then released" },
+                {
+                  slug: "gemma4-e4b",
+                  label: "gemma4",
+                  note: "shared-KV tail; eligible split retention",
+                },
+                {
+                  slug: "qwen3-embedding",
+                  label: "qwen3-embedding",
+                  note: "temporary attention tensors, no decode cache",
+                },
                 { slug: "qwen3-vl", label: "qwen3-vl", note: "image-token prefill burst" },
-                { slug: "gliner2", label: "gliner2", note: "encoder — no KV at all" },
+                { slug: "gliner2", label: "gliner2", note: "encoder — no persistent decode KV" },
               ]}
             />
           </Scene>
@@ -704,20 +946,30 @@ export function RuntimeClient({
         <ScrollyChapter id="sample" number={8} title="The generation loop">
           <Scene id="loop" graphic={<GenerationLoopFigure />}>
             <p>
-              The batched step scheduler packs work, not requests: each step mixes prefill chunks from new
-              sequences with single decode tokens from running ones. Sampling happens on-device — logits never
-              round-trip to the host for a Gumbel-max draw — and the loop carries hooks for speculative decoding
-              and MTP drafts where a model provides them.
+              The scheduler can combine prefill chunks and decode work within admission and fairness
+              budgets. Eligible Metal generation paths sample on-device and hand a device token to
+              the next step; other sampling modes can use host logits. Generated token ids still
+              reach the host for output. Speculative decoding and MTP depend on compatible models,
+              draft artifacts, and policy.
             </p>
             <p>
-              <CodeLink link={L("generation-config")} /> · <CodeLink link={L("native-generate-scheduler")} /> ·{" "}
+              <CodeLink link={L("generation-config")} /> ·{" "}
+              <CodeLink link={L("native-generate-scheduler")} /> ·{" "}
               <CodeLink link={L("kernel-gumbel")} />
             </p>
             <ModelUses
               items={[
-                { slug: "gemma4-e4b", label: "gemma4", note: "device-resident Gumbel-max + MTP" },
+                {
+                  slug: "gemma4-e4b",
+                  label: "gemma4",
+                  note: "eligible device sampling; optional MTP",
+                },
                 { slug: "qwen3-vl", label: "qwen3-vl", note: "decode after vision prefill" },
-                { slug: "qwen3-embedding", label: "qwen3-embedding", note: "no sampling — pooled hidden state" },
+                {
+                  slug: "qwen3-embedding",
+                  label: "qwen3-embedding",
+                  note: "no sampling — pooled hidden state",
+                },
               ]}
             />
           </Scene>

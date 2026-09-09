@@ -6,36 +6,50 @@
  * graphs from data/curated/, verifies + self-heals file:line anchors, and
  * emits validated JSON into data/generated/.
  *
- *   pnpm gen         — regenerate in place
+ *   pnpm generate    — regenerate in place
  *   pnpm gen:check   — regenerate in memory and diff (exit 1 on drift)
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { SCHEMA_VERSION } from "../lib/schema/index.ts";
-import { extractEnvFlags, extractKernelInventory, extractOpKinds, extractSchedules } from "./extract.ts";
-import { appRoot, gitCommit, toJson } from "./lib.ts";
+import {
+  EnvFlagsFile,
+  type FrameScenario,
+  KernelsFile,
+  Manifest,
+  SCHEMA_VERSION,
+} from "../lib/schema/index.ts";
+import {
+  extractEnvFlags,
+  extractKernelInventory,
+  extractOpKinds,
+  extractSchedules,
+} from "./extract.ts";
+import { validateFrame } from "./frames.ts";
+import { appRoot, gitCommit, toJson, verifySourceRevision } from "./lib.ts";
 import { buildMergeContext, collectLinks, mergeCuratedModels, mergeNamedLinks } from "./merge.ts";
 import { buildSnippets } from "./snippets.ts";
 
 const OUT_DIR = join(appRoot, "data", "generated");
-const VOLATILE_KEYS = new Set(["generatedAt", "gitCommit"]);
 const SIZE_WARN_BYTES = 800 * 1024;
-
-function stripVolatile(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(stripVolatile);
-  if (value && typeof value === "object") {
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value)) {
-      if (!VOLATILE_KEYS.has(k)) out[k] = stripVolatile(v);
-    }
-    return out;
-  }
-  return value;
-}
+const checkMode = process.argv.includes("--check");
+const refIndex = process.argv.indexOf("--source-ref");
+const sourceRef = refIndex >= 0 ? process.argv[refIndex + 1] : "HEAD";
+if (!sourceRef || sourceRef.startsWith("--"))
+  throw new Error("--source-ref requires a Git revision");
+if (checkMode && refIndex >= 0)
+  throw new Error(
+    "--source-ref applies to generation; --check verifies the recorded source revision"
+  );
 
 async function generate(): Promise<Map<string, string>> {
-  const commit = gitCommit();
-  const generatedAt = new Date().toISOString();
+  // Retain the recorded revision in check mode, and verify its source bytes.
+  // Unrelated app commits need no refresh; changed runtime source does.
+  const saved =
+    checkMode && existsSync(join(OUT_DIR, "manifest.json"))
+      ? Manifest.parse(JSON.parse(readFileSync(join(OUT_DIR, "manifest.json"), "utf8")))
+      : undefined;
+  const commit = saved?.gitCommit ?? gitCommit(sourceRef);
+  const generatedAt = saved?.generatedAt ?? new Date().toISOString();
 
   const opKinds = extractOpKinds();
   const routes = extractSchedules();
@@ -49,28 +63,42 @@ async function generate(): Promise<Map<string, string>> {
 
   const files = new Map<string, string>();
   files.set("op-kinds.json", toJson({ schemaVersion: SCHEMA_VERSION, opKinds }));
-  files.set("kernels.json", toJson({ schemaVersion: SCHEMA_VERSION, routes, inventory }));
-  files.set("env-flags.json", toJson({ schemaVersion: SCHEMA_VERSION, flags }));
+  files.set(
+    "kernels.json",
+    toJson(KernelsFile.parse({ schemaVersion: SCHEMA_VERSION, routes, inventory }))
+  );
+  files.set("env-flags.json", toJson(EnvFlagsFile.parse({ schemaVersion: SCHEMA_VERSION, flags })));
   files.set("links.json", toJson({ schemaVersion: SCHEMA_VERSION, links: namedLinks }));
   for (const spec of models) {
     files.set(`models/${spec.id}.json`, toJson(spec));
   }
 
-  // Pass curated frame scenarios through (validated lazily by the app).
+  // Invalid curated frames must fail before static export, just like graphs.
   const framesDir = join(appRoot, "data", "curated", "frames");
+  const frames: FrameScenario[] = [];
   if (existsSync(framesDir)) {
     for (const file of readdirSync(framesDir).sort()) {
       if (file.endsWith(".json")) {
-        files.set(`frames/${file}`, readFileSync(join(framesDir, file), "utf8"));
+        const frame = validateFrame(
+          JSON.parse(readFileSync(join(framesDir, file), "utf8")),
+          inventory
+        );
+        if (!models.some((model) => model.id === frame.modelId))
+          throw new Error(`${file}: model is not generated`);
+        if (frames.some((other) => other.id === frame.id))
+          throw new Error(`${file}: duplicate frame ID ${frame.id}`);
+        frames.push(frame);
+        files.set(`frames/${file}`, toJson(frame));
       }
     }
   }
 
   // Snippets only for links the UI shows hover peeks for (model graphs +
   // schedule rows) — the full kernel/flag inventories link out without peeks.
-  const links = collectLinks([routes, models, Object.values(namedLinks)]);
+  const links = collectLinks([routes, models, frames, Object.values(namedLinks)]);
   const snippets = await buildSnippets(links);
   files.set("snippets.json", toJson({ schemaVersion: SCHEMA_VERSION, snippets }));
+  verifySourceRevision(commit);
 
   files.set(
     "manifest.json",
@@ -87,12 +115,14 @@ async function generate(): Promise<Map<string, string>> {
         envFlags: flags.length,
         snippets: Object.keys(snippets).length,
       },
-    }),
+    })
   );
 
   for (const [name, content] of files) {
     if (Buffer.byteLength(content) > SIZE_WARN_BYTES) {
-      console.warn(`  warn: ${name} is ${(Buffer.byteLength(content) / 1024).toFixed(0)} KB (budget 800 KB)`);
+      console.warn(
+        `  warn: ${name} is ${(Buffer.byteLength(content) / 1024).toFixed(0)} KB (budget 800 KB)`
+      );
     }
   }
   return files;
@@ -108,8 +138,8 @@ function check(files: Map<string, string>): number {
       continue;
     }
     const existing = readFileSync(target, "utf8");
-    const a = JSON.stringify(stripVolatile(JSON.parse(existing)));
-    const b = JSON.stringify(stripVolatile(JSON.parse(content)));
+    const a = JSON.stringify(JSON.parse(existing));
+    const b = JSON.stringify(JSON.parse(content));
     if (a !== b) {
       console.error(`DRIFT    ${name}`);
       drift++;
@@ -131,13 +161,12 @@ function check(files: Map<string, string>): number {
   return drift;
 }
 
-const checkMode = process.argv.includes("--check");
 const files = await generate();
 
 if (checkMode) {
   const drift = check(files);
   if (drift > 0) {
-    console.error(`\ngen:check: ${drift} file(s) drifted — run \`pnpm gen\` and review.`);
+    console.error(`\ngen:check: ${drift} file(s) drifted — run \`pnpm generate\` and review.`);
     process.exit(1);
   }
   console.log(`gen:check: ${files.size} files match.`);

@@ -5,12 +5,14 @@
   "type": "module",
   "scripts": {
     "dev": "next dev --turbopack",
-    "build": "next build",
-    "start": "next start",
+    "build": "node --experimental-strip-types generator/index.ts --check && node --experimental-strip-types --test generator/*.test.ts scripts/*.test.ts && next build",
+    "start": "node --experimental-strip-types scripts/preview.ts",
+    "preview": "node --experimental-strip-types scripts/preview.ts",
+    "test": "node --experimental-strip-types --test generator/*.test.ts scripts/*.test.ts",
     "typecheck": "tsc --noEmit",
     "generate": "node --experimental-strip-types generator/index.ts",
     "gen:check": "node --experimental-strip-types generator/index.ts --check",
-    "lint": "node --experimental-strip-types generator/index.ts --check",
+    "lint": "biome lint app components content lib generator scripts && node --experimental-strip-types generator/index.ts --check",
     "clean": "rm -rf .next out"
   },
   "dependencies": {

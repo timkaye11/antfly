@@ -35,14 +35,20 @@ export async function buildSnippets(links: SourceLink[]): Promise<Record<string,
     if (link.line === undefined) continue;
     const key = `${link.path}:${link.line}`;
     if (out[key]) continue;
-    if (++count > MAX_SNIPPETS) break;
+    if (++count > MAX_SNIPPETS)
+      throw new Error(
+        `snippet budget exceeded (${MAX_SNIPPETS}); raise the budget or scope the requested links`
+      );
     let lines = fileCache.get(link.path);
     if (!lines) {
       lines = readRepoFile(link.path).split("\n");
       fileCache.set(link.path, lines);
     }
-    const start = Math.max(1, link.line - CONTEXT_LINES);
-    const end = Math.min(lines.length, link.line + CONTEXT_LINES);
+    // Each schedule row is a complete long declaration. Avoid embedding ten
+    // neighboring, almost-identical rows in every table hover.
+    const context = link.anchor?.startsWith(".format = ") ? 1 : CONTEXT_LINES;
+    const start = Math.max(1, link.line - context);
+    const end = Math.min(lines.length, link.line + context);
     const code = lines.slice(start - 1, end).join("\n");
     const lang = langFor(link.path);
     const html = highlighter.codeToHtml(code, {
@@ -53,5 +59,6 @@ export async function buildSnippets(links: SourceLink[]): Promise<Record<string,
     });
     out[key] = { path: link.path, line: link.line, startLine: start, html, lang };
   }
+  highlighter.dispose();
   return out;
 }

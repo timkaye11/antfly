@@ -25,8 +25,8 @@ export function ComparisonBars({
           return (
             <Tooltip key={`${s.system}-${s.context ?? ""}`}>
               <TooltipTrigger asChild>
-                <div className="flex items-center gap-3">
-                  <span className={cn("w-40 shrink-0 truncate text-right text-xs", isAntfly ? "font-semibold" : "text-muted-foreground")}>
+                <button type="button" className="grid w-full text-left grid-cols-[minmax(0,1fr)_minmax(0,2fr)] items-center gap-x-3 gap-y-1 sm:grid-cols-[10rem_minmax(0,1fr)_6rem]">
+                  <span className={cn("min-w-0 break-words text-right text-xs", isAntfly ? "font-semibold" : "text-muted-foreground")}>
                     {s.system}
                     {s.caveat && <span className="text-primary">*</span>}
                   </span>
@@ -49,8 +49,8 @@ export function ComparisonBars({
                       />
                     )}
                   </div>
-                  <span className="w-24 shrink-0 font-mono text-[10px] text-muted-foreground">{s.machine}</span>
-                </div>
+                  <span className="col-span-2 font-mono text-[10px] text-muted-foreground sm:col-span-1">{s.machine}</span>
+                </button>
               </TooltipTrigger>
               <TooltipContent className="max-w-72 text-xs">
                 <div className="font-medium">
@@ -63,18 +63,7 @@ export function ComparisonBars({
           );
         })}
         {ceiling && (
-          <div className="flex items-center gap-3">
-            <span className="w-40" />
-            <div className="relative h-4 flex-1">
-              <span
-                className="absolute -translate-x-1/2 font-mono text-[10px] text-destructive/80"
-                style={{ left: `${(ceiling.value / max) * 100}%` }}
-              >
-                ▲ {ceiling.label}
-              </span>
-            </div>
-            <span className="w-24" />
-          </div>
+          <p className="pt-2 font-mono text-[10px] text-destructive">Dashed line: {ceiling.label}</p>
         )}
       </div>
     </TooltipProvider>

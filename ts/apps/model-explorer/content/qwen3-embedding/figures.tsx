@@ -14,7 +14,7 @@ export function VectorNotTokenFigure() {
       caption="The 28 decoder layers are stock Qwen3. What changes is the exit ramp: instead of the vocabulary matvec and a sampler, the last hidden state leaves sideways as a 1,024-dim vector."
     >
       {/* compressed layer stack */}
-      {Array.from({ length: 9 }, (_, i) => (
+      {Array.from({ length: 9 }, (_, i) => i).map((i) => (
         <rect
           key={i}
           x={60}
@@ -31,13 +31,13 @@ export function VectorNotTokenFigure() {
       </text>
       {/* ghosted LM head path */}
       <line x1={150} y1={158} x2={150} y2={186} stroke="var(--muted-foreground)" strokeWidth={1.25} strokeDasharray="5 4" opacity={0.4} />
-      <g opacity={0.35}>
-        <rect x={95} y={190} width={110} height={24} rx={3} fill="none" stroke="var(--kfam-sampling)" strokeWidth={1} strokeDasharray="4 3" />
+      <g>
+        <rect x={95} y={190} width={110} height={24} rx={3} fill="none" stroke="var(--kfam-sampling)" strokeWidth={1} strokeDasharray="4 3" opacity={0.35} />
         <text x={150} y={206} textAnchor="middle" fontSize={8.5} className="fill-muted-foreground font-mono">
           LM head · sampler
         </text>
-        <line x1={120} y1={186} x2={180} y2={218} stroke="var(--destructive)" strokeWidth={1.25} />
-        <line x1={120} y1={218} x2={180} y2={186} stroke="var(--destructive)" strokeWidth={1.25} />
+        <line x1={120} y1={186} x2={180} y2={218} stroke="var(--destructive)" strokeWidth={1.25} opacity={0.35} />
+        <line x1={120} y1={218} x2={180} y2={186} stroke="var(--destructive)" strokeWidth={1.25} opacity={0.35} />
       </g>
       {/* the bend */}
       <path d="M 240 152 C 290 152, 300 120, 330 110" fill="none" stroke="var(--primary)" strokeWidth={2} />
@@ -67,14 +67,14 @@ export function TokenizerContrastFigure() {
     <div>
       <div className="mb-1.5 flex items-baseline justify-between">
         <span className="font-mono text-[11px] uppercase tracking-wider text-muted-foreground">{label}</span>
-        <span className="font-mono text-[10px] text-muted-foreground/70">{note}</span>
+        <span className="font-mono text-[10px] text-muted-foreground">{note}</span>
       </div>
       <div className="flex flex-wrap gap-1">
-        {pieces.map((p, i) => (
+        {pieces.map((p) => (
           <span
-            key={i}
+            key={p}
             className="rounded border px-1.5 py-0.5 font-mono text-xs"
-            style={{ borderColor: color, color }}
+            style={{ borderColor: color, color: color.replace("--kfam-", "--kfam-text-") }}
           >
             {p.replace(/ /g, "␣")}
           </span>
@@ -85,8 +85,8 @@ export function TokenizerContrastFigure() {
   return (
     <div className="flex h-full flex-col justify-center gap-6">
       <div className="rounded-lg border bg-muted/30 p-3 text-center font-mono text-sm">"antfly runs on Metal"</div>
-      {row("Qwen3 · byte-level BPE", BPE_PIECES, "var(--kfam-attention)", "byte fallback — no unknown tokens, ever")}
-      {row("Gemma · SentencePiece", SP_PIECES, "var(--kfam-fusion)", "▁ marks word starts; unigram LM pieces")}
+      {row("Qwen3 · byte-level BPE", BPE_PIECES, "var(--kfam-attention)", "byte-level vocabulary coverage")}
+      {row("Gemma · SentencePiece", SP_PIECES, "var(--kfam-fusion)", "▁ represents whitespace in pieces")}
       <p className="text-center font-mono text-[10px] text-muted-foreground">
         illustrative split — the point is the two families, not these exact pieces
       </p>
@@ -106,11 +106,11 @@ export function LastTokenPoolFigure({ step }: { step: 0 | 1 }) {
       title={step === 0 ? "T hidden states in, one comes out" : "…then scaled onto the unit sphere"}
       caption={
         step === 0
-          ? "qwen3.pooling_type = 3 in the GGUF metadata: keep the last token's hidden state, discard the rest. The trailing EOS token (add_eos = 1) is the one that pooled — it has attended to the entire input."
+          ? "qwen3.pooling_type = 3 declares last-token pooling. Select the final non-padding hidden row in each batch item. Antfly ensures a trailing EOS, including when configured truncation fills the sequence buffer."
           : "L2 normalization puts every embedding on the unit sphere, so cosine similarity downstream is a plain dot product."
       }
     >
-      {Array.from({ length: rows }, (_, i) => {
+      {Array.from({ length: rows }, (_, i) => i).map((i) => {
         const last = i === rows - 1;
         return (
           <g key={i}>
@@ -153,44 +153,26 @@ export function LastTokenPoolFigure({ step }: { step: 0 | 1 }) {
 /* ------------------------------------------------------------------ */
 
 export function CosineFidelityFigure() {
-  const W = 400;
-  const H = 170;
-  const xOf = (t: number) => 50 + (Math.log2(t / 128) / Math.log2(8192 / 128)) * (W - 80);
-  const yOf = (c: number) => 30 + (1 - (c - 0.999) / 0.001) * (H - 60);
+  const checks = [
+    ["Artifact", "same model revision, tensor format and weights"],
+    ["Input", "same task prefix, token IDs, EOS and truncation"],
+    ["Vector", "last active row, dimensions and L2 normalization"],
+    ["Evidence", "cosine, retrieval quality and batch equivalence"],
+  ];
   return (
-    <Figure
-      viewBox={`0 0 ${W} ${H + 30}`}
-      title="Q8_0 vs reference, cosine of embeddings"
-      caption="The qualification gate: cosine similarity between Antfly's Q8_0 Metal embedding and the reference implementation at the full 8,192-token qualification input — 0.99976. The line is a guide; the circled point is the measured gate. Axis starts at 0.999: the interesting failure modes live in the third decimal."
-    >
-      <line x1={50} y1={H - 30} x2={W - 25} y2={H - 30} stroke="var(--border)" strokeWidth={1} />
-      <line x1={50} y1={H - 30} x2={50} y2={24} stroke="var(--border)" strokeWidth={1} />
-      <text x={30} y={34} fontSize={8} className="fill-muted-foreground font-mono">1.0</text>
-      <text x={22} y={H - 26} fontSize={8} className="fill-muted-foreground font-mono">0.999</text>
-      <line
-        x1={xOf(128)}
-        y1={yOf(0.99976) - 4}
-        x2={xOf(8192)}
-        y2={yOf(0.99976)}
-        stroke="var(--kfam-attention)"
-        strokeWidth={1.5}
-        strokeDasharray="5 4"
-        opacity={0.6}
-      />
-      <circle cx={xOf(8192)} cy={yOf(0.99976)} r={3} fill="var(--kfam-attention)" />
-      <circle cx={xOf(8192)} cy={yOf(0.99976)} r={6} fill="none" stroke="var(--primary)" strokeWidth={1.5} />
-      <text x={xOf(8192) - 8} y={yOf(0.99976) - 12} textAnchor="end" fontSize={8.5} className="fill-primary font-mono">
-        8,192 tok · 0.99976
-      </text>
-      {[128, 512, 2048, 8192].map((t) => (
-        <text key={t} x={xOf(t)} y={H - 16} textAnchor="middle" fontSize={8} className="fill-muted-foreground font-mono">
-          {t >= 1024 ? `${t / 1024}k` : t}
-        </text>
+    <div className="flex h-full flex-col justify-center gap-4">
+      <p className="text-sm font-semibold">What makes an embedding comparison valid?</p>
+      {checks.map(([name, detail]) => (
+        <div key={name} className="rounded-lg border p-3">
+          <p className="font-mono text-xs text-primary">{name}</p>
+          <p className="mt-1 text-sm text-muted-foreground">{detail}</p>
+        </div>
       ))}
-      <text x={(W + 25) / 2} y={H - 2} textAnchor="middle" fontSize={8} className="fill-muted-foreground font-mono">
-        input length (log) →
-      </text>
-    </Figure>
+      <p className="text-xs text-muted-foreground">
+        Validation checklist, not measured results. Follow the linked baseline for dated reports,
+        exact artifacts and timing boundaries.
+      </p>
+    </div>
   );
 }
 
@@ -201,21 +183,18 @@ export function CosineFidelityFigure() {
 const WINS = [
   {
     label: "batched FFN",
-    detail: "run [T×F] matmuls, not T matvecs — the single largest lever",
+    detail: "token rows share matrix operations; fused gate/up can reuse tiles",
     color: "var(--kfam-matvec)",
-    w: 0.95,
   },
   {
     label: "simdgroup flash attention",
     detail: "sg_q16 tiles, online softmax, no [T,T] score matrix",
     color: "var(--kfam-attention)",
-    w: 0.7,
   },
   {
     label: "f16-KV direct load",
     detail: "attention reads f16 K/V straight — half the KV bytes",
     color: "var(--kfam-kv)",
-    w: 0.45,
   },
 ];
 
@@ -223,7 +202,7 @@ export function BatchingWinsFigure() {
   return (
     <div className="flex h-full flex-col justify-center gap-5">
       <div className="font-mono text-[11px] uppercase tracking-wider text-muted-foreground">
-        the three levers behind 1,217 tok/s
+        mechanisms that improve prefill efficiency
       </div>
       <div className="grid gap-4">
         {WINS.map((win) => (
@@ -231,19 +210,16 @@ export function BatchingWinsFigure() {
             <div className="mb-1 flex items-baseline justify-between">
               <span className="font-mono text-xs text-foreground">{win.label}</span>
             </div>
-            <div className="h-3 overflow-hidden rounded-full bg-muted">
-              <div className="h-full rounded-full" style={{ width: `${win.w * 100}%`, background: win.color }} />
-            </div>
+            <div className="h-0.5 rounded-full" style={{ background: win.color }} />
             <div className="mt-1 text-[11px] text-muted-foreground">{win.detail}</div>
           </div>
         ))}
       </div>
       <div className="rounded-lg border bg-muted/30 p-3">
-        <span className="text-2xl font-bold tabular-nums">1,217</span>
-        <span className="ml-2 text-sm text-muted-foreground">embed tok/s · 511-token input · M4 Pro · Q8_0</span>
-        <div className="mt-1 font-mono text-[10px] text-muted-foreground">
-          bar lengths are ordinal (relative impact), not measured ratios
-        </div>
+        <p className="text-sm text-muted-foreground">
+          Conceptual mechanisms, not a measured speedup breakdown. Dispatch depends on shape,
+          precision, hardware and runtime flags; endpoint timing includes more than the encoder graph.
+        </p>
       </div>
     </div>
   );

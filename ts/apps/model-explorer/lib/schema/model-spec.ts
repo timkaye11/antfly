@@ -72,14 +72,20 @@ const StageBase = {
   source: SourceLink.optional(),
   repeat: z
     .object({
-      count: z.number(),
+      count: z.number().int().positive(),
       note: z.string().optional(),
       /**
        * One op-level layer is emitted per *variant kind* (SWA/global,
        * KV-owner/shared, MoE/dense) instead of N copies.
        */
       variants: z
-        .array(z.object({ tag: z.string(), layerIdxs: z.array(z.number()), note: z.string().optional() }))
+        .array(
+          z.object({
+            tag: z.string(),
+            layerIdxs: z.array(z.number().int().nonnegative()),
+            note: z.string().optional(),
+          })
+        )
         .optional(),
     })
     .optional(),
@@ -121,7 +127,7 @@ export const SankeyLink = z.object({
   source: z.string(),
   target: z.string(),
   /** Relative flow weight (e.g. bytes/token share). */
-  value: z.number(),
+  value: z.number().positive(),
   label: z.string().optional(),
 });
 export const SankeySpec = z.object({

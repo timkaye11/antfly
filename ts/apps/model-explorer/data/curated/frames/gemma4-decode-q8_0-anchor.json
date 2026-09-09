@@ -1,21 +1,34 @@
 {
   "schemaVersion": 1,
   "id": "decode-q8_0-anchor",
-  "modelId": "gemma4-e4b",
-  "title": "Q8_0 anchor frame (before the barrier reframe)",
-  "description": "The METAL.md Q8_0 census: 41 encoders, 422 range-driven barriers, 36 planned scopes per frame. Barriers below are representative ticks, not all 422 — every red line is a point where the GPU serializes on a read/write hazard the planner later proved unnecessary.",
-  "machine": "M4 Pro",
+  "modelId": "gemma4-e2b",
+  "title": "Historical E2B Q8_0 anchor \u00b7 schematic operations",
+  "description": "METAL.md records a 35-layer Q8_0/f32-KV greedy anchor with 41 compute encoders, 422 planned barriers and 36 planned scopes. The scopes and hazard ticks here are representative, not a capture. This differs in model/precision/route from the Q4_0 illustration and is not a matched before/after experiment.",
   "mode": "planned",
-  "stats": { "encoders": 41, "plannedScopes": 36, "plannedBarriers": 422 },
+  "stats": {
+    "encoders": 41,
+    "plannedScopes": 36,
+    "plannedBarriers": 422
+  },
   "encoderScopes": [
     {
       "id": "attn-setup",
       "kind": "compute",
       "label": "attention setup",
       "ops": [
-        { "label": "rms_norm", "family": "norm_rope", "estBytes": 10240 },
-        { "label": "QKV project", "kernel": "termite_q8_0_linear", "family": "matvec", "estBytes": 7900000 },
-        { "label": "rope", "family": "norm_rope", "estBytes": 65536 }
+        {
+          "label": "rms_norm",
+          "family": "norm_rope"
+        },
+        {
+          "label": "QKV project",
+          "kernel": "termite_q8_0_linear",
+          "family": "matvec"
+        },
+        {
+          "label": "rope",
+          "family": "norm_rope"
+        }
       ]
     },
     {
@@ -23,8 +36,16 @@
       "kind": "compute",
       "label": "attention",
       "ops": [
-        { "label": "paged attention", "kernel": "termite_paged_attention_kv_1x", "family": "attention", "estBytes": 4200000 },
-        { "label": "output project", "kernel": "termite_q8_0_linear", "family": "matvec", "estBytes": 6600000 }
+        {
+          "label": "paged attention",
+          "kernel": "termite_paged_attention_kv_1x",
+          "family": "attention"
+        },
+        {
+          "label": "output project",
+          "kernel": "termite_q8_0_linear",
+          "family": "matvec"
+        }
       ]
     },
     {
@@ -32,29 +53,105 @@
       "kind": "compute",
       "label": "FFN",
       "ops": [
-        { "label": "gate", "kernel": "termite_q8_0_linear", "family": "matvec", "estBytes": 14750000 },
-        { "label": "up", "kernel": "termite_q8_0_linear", "family": "matvec", "estBytes": 14750000 },
-        { "label": "silu·mul", "family": "norm_rope", "estBytes": 40960 },
-        { "label": "down", "kernel": "termite_q8_0_linear", "family": "matvec", "estBytes": 14700000 }
+        {
+          "label": "gate",
+          "kernel": "termite_q8_0_linear",
+          "family": "matvec"
+        },
+        {
+          "label": "up",
+          "kernel": "termite_q8_0_linear",
+          "family": "matvec"
+        },
+        {
+          "label": "GELU(tanh)\u00b7up",
+          "family": "norm_rope"
+        },
+        {
+          "label": "down",
+          "kernel": "termite_q8_0_linear",
+          "family": "matvec"
+        }
       ]
     },
     {
       "id": "tail",
       "kind": "compute",
-      "label": "LM head + readback",
+      "label": "LM head + device greedy selection",
       "ops": [
-        { "label": "LM head", "kernel": "termite_q6_k_high_row_mm_matrix_m64_n64", "family": "sampling", "estBytes": 550000000 },
-        { "label": "logits → host", "family": "kv", "estBytes": 1048576 }
+        {
+          "label": "Q8_0 LM head",
+          "kernel": "termite_q8_0_linear",
+          "family": "matvec"
+        },
+        {
+          "label": "parallel greedy argmax",
+          "kernel": "termite_argmax_logits_reduce",
+          "family": "sampling"
+        }
       ]
     }
   ],
   "barriers": [
-    { "afterScope": "attn-setup", "afterOpIndex": 0, "hazard": "raw", "tensors": ["normed_x"] },
-    { "afterScope": "attn-setup", "afterOpIndex": 1, "hazard": "raw", "tensors": ["qkv"] },
-    { "afterScope": "attn", "afterOpIndex": 0, "hazard": "raw", "tensors": ["attn_out"] },
-    { "afterScope": "ffn", "afterOpIndex": 0, "hazard": "waw", "tensors": ["gate_out"] },
-    { "afterScope": "ffn", "afterOpIndex": 1, "hazard": "raw", "tensors": ["up_out"] },
-    { "afterScope": "ffn", "afterOpIndex": 2, "hazard": "raw", "tensors": ["act"] },
-    { "afterScope": "tail", "afterOpIndex": 0, "hazard": "raw", "tensors": ["logits"] }
-  ]
+    {
+      "afterScope": "attn-setup",
+      "afterOpIndex": 0,
+      "hazard": "raw",
+      "tensors": [
+        "normed_x"
+      ]
+    },
+    {
+      "afterScope": "attn-setup",
+      "afterOpIndex": 1,
+      "hazard": "raw",
+      "tensors": [
+        "qkv"
+      ]
+    },
+    {
+      "afterScope": "attn",
+      "afterOpIndex": 0,
+      "hazard": "raw",
+      "tensors": [
+        "attn_out"
+      ]
+    },
+    {
+      "afterScope": "ffn",
+      "afterOpIndex": 0,
+      "hazard": "waw",
+      "tensors": [
+        "gate_out"
+      ]
+    },
+    {
+      "afterScope": "ffn",
+      "afterOpIndex": 1,
+      "hazard": "raw",
+      "tensors": [
+        "up_out"
+      ]
+    },
+    {
+      "afterScope": "ffn",
+      "afterOpIndex": 2,
+      "hazard": "raw",
+      "tensors": [
+        "act"
+      ]
+    },
+    {
+      "afterScope": "tail",
+      "afterOpIndex": 0,
+      "hazard": "raw",
+      "tensors": [
+        "logits"
+      ]
+    }
+  ],
+  "source": {
+    "path": "zig/pkg/inference/METAL.md",
+    "anchor": "`10979 236888 2088 740`, reports `planned_scopes=36`,"
+  }
 }

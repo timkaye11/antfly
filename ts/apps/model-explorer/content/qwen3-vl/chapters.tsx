@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { CodeLink } from "@/components/code/code-link";
 import { EnvFlagChip, QuantChip } from "@/components/primitives/chips";
-import { Divergence, Scene, ScrollyChapter } from "@/components/scrollytelling/scrolly";
+import { Scene, ScrollyChapter } from "@/components/scrollytelling/scrolly";
 import { L } from "@/lib/links";
 import type { ChaptersProps } from "../registry";
 import {
@@ -23,15 +23,16 @@ export function Qwen3VlChapters({ spec }: ChaptersProps) {
         id="ch-1"
         number={1}
         title="Pixels are tokens too"
-        intro="The spine strip above has a chip no other decoder page has: Vision. This page is about what flows through it."
+        intro="The 2B Instruct example connects an image encoder to a causal text decoder."
       >
         <Scene id="pixels" graphic={<PixelsToTokensFigure />}>
           <p>
             An image is chopped into 16×16-pixel patches (doubled across a 2-frame temporal window), pushed
-            through a 24-block vision tower, and merged 4-into-1 — a 768×768 image becomes 576 visual tokens
+            through a 24-block vision tower, and merged 4-into-1 — a 768×768 image after resizing becomes 576 visual tokens
             of width {spec.stats.hidden}. From the decoder's perspective they are just embeddings in the
-            sequence: attended to causally, cached in the same paged KV pools, costing exactly what text
-            costs.
+            sequence: attended to causally and cached in the same KV pools. Each visual token has the same
+            decoder KV footprint as a text token, but images also require preprocessing, the vision tower,
+            projector and DeepStack work.
           </p>
           <p>
             <CodeLink link={L("qwen3vl-projector")} /> <QuantChip format="q8_0" />
@@ -55,10 +56,11 @@ export function Qwen3VlChapters({ spec }: ChaptersProps) {
       >
         <Scene id="patch" graphic={<VisionTowerFigure step={0} />}>
           <p>
-            <strong>Patches first.</strong> The Conv3D patch embed spans 16×16 pixels × 2 frames — video is
-            native, and still images simply duplicate their frame. Positions come from a learned 48×48 table
-            (2,304 entries) that is <em>bilinearly interpolated</em> to whatever patch grid the actual image
-            produced, so arbitrary resolutions never leave the training distribution's position manifold.
+            <strong>Patches first.</strong> The architecture uses a temporal patch of 16×16 pixels × 2
+            frames. Antfly currently accepts still images and duplicates their frame to fill that patch;
+            video input is rejected. Images are resized to a merge-aligned grid within the request budget.
+            A learned 48×48 position table (2,304 entries) is <em>bilinearly interpolated</em> to that grid;
+            interpolation alone does not guarantee accuracy at arbitrary resolutions.
           </p>
           <p>
             <CodeLink link={L("qwen3vl-patchify")} /> · <CodeLink link={L("qwen3vl-pos-interp")} />
@@ -77,17 +79,17 @@ export function Qwen3VlChapters({ spec }: ChaptersProps) {
         </Scene>
         <Scene id="deepstack" graphic={<VisionTowerFigure step={2} />}>
           <p>
-            <strong>DeepStack.</strong> After vision blocks 5, 11 and 17, features exit sideways through
-            dedicated merger heads and are <em>added into the hidden states</em> of the first decoder layers
-            at visual-token positions — mid-level texture and layout information that the top of the tower
+            <strong>DeepStack.</strong> After zero-based vision blocks 5, 11 and 17, features exit sideways through
+            dedicated merger heads and are <em>added after decoder layers 0, 1 and 2</em>
+            at visual-token positions during prefill — mid-level texture and layout information that the top of the tower
             would have abstracted away. If Gemma4's PLE ribbon looked familiar, it should: this is the same
             visual grammar — a side lane feeding the main stack — carrying different physics.
           </p>
-          <Divergence
-            others={<p>most VLM runtimes flatten the projector to "encode image, get tokens" and would silently drop non-token outputs.</p>}
-            antfly={<p>the projector keeps DeepStack outputs structurally separate from tokens, so the decoder cannot mistake the concatenated payload for sequence content.</p>}
-            link={<CodeLink link={L("qwen3vl-deepstack-tap")} />}
-          />
+          <p>
+            Antfly carries DeepStack features separately from the main visual-token embeddings and checks
+            their layer count, shape and visual mask. These features add information without extending the
+            token sequence. <CodeLink link={L("qwen3vl-deepstack-tap")} />
+          </p>
         </Scene>
       </ScrollyChapter>
 
@@ -100,7 +102,7 @@ export function Qwen3VlChapters({ spec }: ChaptersProps) {
       >
         <Scene id="clocks" graphic={<MRopeClocksFigure />}>
           <p>
-            Every token carries <em>three</em> positions — text-time, image-height, image-width — and the
+            Every token carries <em>three</em> positions — temporal, height, width — and the
             head dimension is partitioned into interleaved sections rotating on each stream. In plain text the
             three clocks tick in lockstep, which collapses m-RoPE back to ordinary RoPE. Inside an image, the
             temporal hand freezes while h and w advance with the patch grid: two patches in the same row share
@@ -129,9 +131,10 @@ export function Qwen3VlChapters({ spec }: ChaptersProps) {
             The vision tower's RoPE is <strong>two-axis</strong>: patch row and patch column, bidirectional,
             scoped to one image — it only ever needs to know where a patch sits in <em>its</em> grid. The
             decoder's m-RoPE is <strong>three-axis</strong> because its problem is disambiguation across an
-            interleaved conversation: the word after an image, the second of two images, a video frame versus
-            the frame before it. Without the text-time axis, "patch (0,0) of image one" and "patch (0,0) of
-            image two" would be positionally identical.
+            interleaved sequence. All axes advance together through text; image grids have their own
+            spatial coordinates and start offsets derived from preceding content. Later text resumes
+            after the largest coordinate used. The temporal axis also belongs to the upstream video
+            architecture, although Antfly's current input path rejects video.
           </p>
         </Scene>
       </ScrollyChapter>
@@ -153,15 +156,14 @@ export function Qwen3VlChapters({ spec }: ChaptersProps) {
           <p>
             Visual tokens are spliced into the embedding stream at the <code>&lt;|image_pad|&gt;</code>{" "}
             markers before layer 0; from there the runtime is family-gated, not forked —{" "}
-            <code>family == .qwen3_vl</code> switches on m-RoPE positions and DeepStack injection, and
-            everything else is the shared machinery: planned Metal frames, paged KV, the generated quant
-            routes.
+            <code>family == .qwen3_vl</code> switches on m-RoPE positions and DeepStack injection, alongside Qwen-specific geometry and validation. Much of execution is shared: planned Metal
+            frames, paged KV and quantized linear operations.
           </p>
-          <Divergence
-            others={<p>llama.cpp runs multimodal through a separate clip.cpp path with its own execution model bolted on.</p>}
-            antfly={<p>one decoder runtime; vision is an input transformation plus two family-gated features, behind the same fail-closed qualification gates as every other model.</p>}
-            link={<CodeLink link={L("qwen3vl-family-gate")} />}
-          />
+          <p>
+            The projector has its own architecture implementation, while the decoder reuses shared GPT
+            execution. Admission validates the actual artifact route and backend capabilities.
+            <CodeLink link={L("qwen3vl-family-gate")} />
+          </p>
           <p>
             <CodeLink link={L("qwen3vl-splice")} /> ·{" "}
             <Link className="text-primary underline" href="/explore/qwen3-vl">
@@ -182,9 +184,11 @@ export function Qwen3VlChapters({ spec }: ChaptersProps) {
           <p>
             Qwen3-VL-Reranker wraps query, document and image into a prompt whose system message pins the
             answer space to "yes" or "no". The relevance score is{" "}
-            <code>sigmoid(logit_yes − logit_no)</code> — computed directly from the final hidden state against
-            the two corresponding LM-head rows. One prefill per candidate, no generation, no sampling; a
-            generative architecture used as a calibrated binary classifier for multimodal search ranking.
+            <code>sigmoid(logit_yes − logit_no)</code> — computed from the last active hidden state using the difference between the yes/no head rows.
+            The converted serving bundle stores a two-row semantic classifier head in F16. Each
+            query/candidate pair is scored pointwise; eligible text-only requests can batch candidates.
+            There is no generation or sampling. A score in [0,1] is not automatically a calibrated
+            probability of relevance for your dataset.
           </p>
           <p>
             <CodeLink link={L("qwen3vl-reranker-score")} />
@@ -201,8 +205,8 @@ export function Qwen3VlChapters({ spec }: ChaptersProps) {
       >
         <Scene id="notes" graphic={<VlSpineNotesFigure />}>
           <p>
-            VL-only surface: <code>termite_apply_mrope</code>, the Conv3D/merger vision path, and DeepStack
-            injection. Everything else — attention, the Q4_K matvec routes, frame planning — is shared, and
+            Qwen3-VL-specific integration: <code>termite_apply_mrope</code>, the Conv3D/merger vision path, and DeepStack
+            injection. Attention, quantized linear primitives and frame planning are shared, while
             the VL-specific fast paths ship behind their own flags:
           </p>
           <p>
@@ -211,11 +215,15 @@ export function Qwen3VlChapters({ spec }: ChaptersProps) {
             <EnvFlagChip name="TERMITE_QWEN3VL_PROFILE" defaultOn={false} />
           </p>
           <p>
-            The promotion is deliberately narrow — exact managed artifacts, Metal only, fail-closed for
-            everything else. The operational contract lives in the repo:
+            Current admission checks required artifacts, tensors, serving role and backend support; exact
+            qualification receipts are not a serving allowlist. The split decoder/projector route
+            requires Metal; integrated safetensors generation also supports CUDA. Historical qualification
+            reports cover specific artifacts and hardware, and do not certify every accepted model.
+            Architectural context ({Number(spec.stats.context).toLocaleString("en-US")} tokens for this example)
+            is distinct from the smaller request and resource limits used in serving.
           </p>
           <p>
-            <CodeLink link={L("qwen3vl-support-doc")} /> ·{" "}
+            <CodeLink link={L("model-compatibility-doc")} /> · <CodeLink link={L("qwen3vl-support-doc")} /> ·{" "}
             <Link className="text-primary underline" href="/systems/kernels">
               kernel inventory →
             </Link>

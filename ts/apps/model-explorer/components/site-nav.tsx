@@ -8,14 +8,14 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@antfly/design-system";
-import { ChevronDown, Moon, Sun } from "lucide-react";
+import { ChevronDown, Menu, Moon, Sun } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useTheme } from "next-themes";
 import { useEffect, useState } from "react";
 
 const MODELS = [
-  { slug: "gemma4-e4b", name: "Gemma4 E2B/E4B", hook: "PLE + iSWA + MoE + MTP" },
+  { slug: "gemma4-e4b", name: "Gemma4 E2B/E4B", hook: "PLE + variant-specific iSWA + shared KV" },
   { slug: "gliner2", name: "GLiNER2", hook: "disentangled attention + span head" },
   { slug: "qwen3-embedding", name: "Qwen3 Embedding", hook: "last-token pooling at 8k" },
   { slug: "qwen3-vl", name: "Qwen3-VL", hook: "pixels → m-RoPE" },
@@ -56,6 +56,7 @@ export function SiteNav() {
         <Link href="/" className="mr-4 font-semibold tracking-tight">
           Antfly <span className="text-muted-foreground">Model Explorer</span>
         </Link>
+        <div className="site-desktop-nav items-center gap-1">
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button variant={active("/models") ? "outline" : "ghost"} size="sm">
@@ -79,6 +80,7 @@ export function SiteNav() {
         <Button variant={active("/explore") ? "outline" : "ghost"} size="sm" asChild>
           <Link href="/explore/gemma4-e4b">Explorer</Link>
         </Button>
+
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button variant={active("/systems") ? "outline" : "ghost"} size="sm">
@@ -96,7 +98,23 @@ export function SiteNav() {
         <Button variant={active("/legend") ? "outline" : "ghost"} size="sm" asChild>
           <Link href="/legend">Legend</Link>
         </Button>
-        <div className={cn("ml-auto")}>
+        </div>
+        <div className="site-mobile-nav ml-auto">
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button variant="ghost" size="icon" aria-label="Open navigation"><Menu className="size-4" /></Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="max-h-[80vh] overflow-auto">
+              {[...MODELS.map((m) => ({ href: `/models/${m.slug}`, name: m.name })),
+                { href: "/runtime", name: "Runtime" },
+                { href: "/explore/gemma4-e4b", name: "DAG explorer" },
+                ...SYSTEMS, { href: "/legend", name: "Legend" }].map((item) => (
+                <DropdownMenuItem key={item.href} asChild><Link href={item.href}>{item.name}</Link></DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+        <div className={cn("ml-1 md:ml-auto")}>
           <ThemeToggle />
         </div>
       </div>

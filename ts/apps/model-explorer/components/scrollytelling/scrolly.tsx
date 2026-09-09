@@ -113,7 +113,7 @@ export function ScrollyChapter({ id, number, title, intro, children, className }
             {intro && <div className="mt-3 text-muted-foreground">{intro}</div>}
           </header>
 
-          <div className="grid gap-8 lg:grid-cols-[2fr_3fr]">
+          <div className="scrolly-layout grid gap-8 lg:grid-cols-[2fr_3fr]">
             {/* Prose column */}
             <div>
               {scenes.map((scene) => (
@@ -131,7 +131,7 @@ export function ScrollyChapter({ id, number, title, intro, children, className }
                     {scene.props.children}
                   </div>
                   {/* Mobile / reduced-motion: graphic inline under its prose */}
-                  <div className="mt-6 lg:hidden">{scene.props.graphic}</div>
+                  <div className="scrolly-inline mt-6">{scene.props.graphic}</div>
                 </div>
               ))}
             </div>
@@ -144,6 +144,7 @@ export function ScrollyChapter({ id, number, title, intro, children, className }
                     <div
                       key={scene.props.id}
                       aria-hidden={i !== activeIndex}
+                      inert={i !== activeIndex}
                       className={cn(
                         "absolute inset-0 overflow-auto p-4 transition-opacity duration-300",
                         i === activeIndex ? "opacity-100" : "pointer-events-none opacity-0",
@@ -161,6 +162,7 @@ export function ScrollyChapter({ id, number, title, intro, children, className }
                         key={scene.props.id}
                         href={`#${id}-${scene.props.id}`}
                         aria-label={`Scene ${i + 1}`}
+                        aria-current={i === activeIndex ? "step" : undefined}
                         className={cn(
                           "size-2.5 rounded-full transition-colors",
                           i === activeIndex ? "bg-primary" : "bg-muted-foreground/30 hover:bg-muted-foreground/60",
@@ -202,17 +204,17 @@ export function Divergence({
       style={{ borderLeftColor: "var(--diverge-accent)" }}
     >
       <div className="mb-2 font-mono text-[11px] font-semibold uppercase tracking-wider text-primary">
-        ⟂ Where Antfly diverges
+        Implementation detail
       </div>
       <div className="grid gap-3 sm:grid-cols-2">
         <div className="text-muted-foreground">
-          <div className="mb-1 text-[11px] font-medium uppercase tracking-wide opacity-70">
-            llama.cpp / vLLM / PyTorch
+          <div className="mb-1 text-[11px] font-medium uppercase tracking-wide">
+            Conceptual baseline
           </div>
           {others}
         </div>
         <div>
-          <div className="mb-1 text-[11px] font-medium uppercase tracking-wide text-primary/70">Antfly</div>
+          <div className="mb-1 text-[11px] font-medium uppercase tracking-wide text-primary">Antfly</div>
           {antfly}
         </div>
       </div>

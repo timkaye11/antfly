@@ -1,15 +1,16 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { z } from "zod";
 import {
   type EnvFlagGate,
   type KernelInventoryEntry,
   type KernelRoute,
   ModelSpec,
   SCHEMA_VERSION,
-  type SourceLink,
+  SourceLink,
   type Stage,
 } from "../lib/schema/index.ts";
-import { appRoot, verifyAnchor } from "./lib.ts";
+import { appRoot, verifySourceLink } from "./lib.ts";
 
 const CURATED_DIR = join(appRoot, "data", "curated");
 
@@ -29,7 +30,7 @@ export function buildMergeContext(
   routes: KernelRoute[],
   flags: EnvFlagGate[],
   gitCommit: string,
-  generatedAt: string,
+  generatedAt: string
 ): MergeContext {
   return {
     opKinds: new Set(opKinds.map((o) => o.name)),
@@ -43,11 +44,16 @@ export function buildMergeContext(
 }
 
 function healLink(link: SourceLink | undefined, ctx: MergeContext, where: string): void {
-  if (!link?.anchor) return;
+  if (!link) return;
   try {
-    const result = verifyAnchor(link.path, link.line, link.anchor);
-    if (result.healed) {
-      ctx.warnings.push(`healed anchor for ${where}: ${link.path}:${link.line} -> :${result.line}`);
+    const result = verifySourceLink(link);
+    if (result?.healed) {
+      if (link.line !== undefined)
+        ctx.warnings.push(
+          `healed anchor for ${where}: ${link.path}:${link.line} -> :${result.line}`
+        );
+      if (link.endLine !== undefined && link.line !== undefined)
+        link.endLine += result.line - link.line;
       link.line = result.line;
     }
   } catch (err) {
@@ -83,7 +89,18 @@ export function mergeCuratedModels(ctx: MergeContext): ModelSpec[] {
         sources: { gitCommit: ctx.gitCommit, generatedAt: ctx.generatedAt },
       });
       const repeatOverrides = (variant.repeatOverrides ?? {}) as Record<string, number>;
+      const stageOverrides = (variant.stageOverrides ?? {}) as Record<string, Partial<Stage>>;
+      const stageIds = new Set((candidate.stages as Stage[]).map((stage) => stage.id));
+      for (const id of [...Object.keys(repeatOverrides), ...Object.keys(stageOverrides)]) {
+        if (!stageIds.has(id))
+          throw new Error(`${file}/${String(variant.id)}: unknown stage override "${id}"`);
+      }
       for (const stage of candidate.stages as Stage[]) {
+        const override = stageOverrides[stage.id];
+        if (override) {
+          const repeat = override.repeat ? { ...stage.repeat, ...override.repeat } : stage.repeat;
+          Object.assign(stage, override, { id: stage.id, repeat });
+        }
         const count = repeatOverrides[stage.id];
         if (count !== undefined && stage.repeat) stage.repeat.count = count;
       }
@@ -92,15 +109,54 @@ export function mergeCuratedModels(ctx: MergeContext): ModelSpec[] {
       specs.push(spec);
     }
   }
+  requireUnique(
+    specs.map((spec) => spec.id),
+    "model IDs"
+  );
   return specs;
 }
 
-function validateSpec(spec: ModelSpec, ctx: MergeContext, file: string): void {
+export function requireUnique(ids: string[], where: string): void {
+  const seen = new Set<string>();
+  for (const id of ids) {
+    if (seen.has(id)) throw new Error(`${where}: duplicate ID "${id}"`);
+    seen.add(id);
+  }
+}
+
+export function validateSpec(spec: ModelSpec, ctx: MergeContext, file: string): void {
+  requireUnique(
+    spec.stages.map((stage) => stage.id),
+    `${file}/stages`
+  );
   const stageIds = new Set(spec.stages.map((s) => s.id));
-  for (const stage of spec.stages) healLink(stage.source, ctx, `${file}/${stage.id}`);
+  for (const stage of spec.stages) {
+    healLink(stage.source, ctx, `${file}/${stage.id}`);
+    if (stage.repeat?.variants) {
+      const count = stage.repeat.count;
+      requireUnique(
+        stage.repeat.variants.map((variant) => variant.tag),
+        `${file}/${stage.id}/variants`
+      );
+      for (const variant of stage.repeat.variants) {
+        requireUnique(variant.layerIdxs.map(String), `${file}/${stage.id}/${variant.tag}/layers`);
+        if (variant.layerIdxs.some((layer) => layer >= count)) {
+          throw new Error(`${file}/${stage.id}/${variant.tag}: layer index outside repeat count`);
+        }
+      }
+    }
+  }
 
   for (const [phase, graph] of Object.entries(spec.graphs)) {
     if (!graph) continue;
+    requireUnique(
+      graph.nodes.map((node) => node.id),
+      `${file}/${phase}/nodes`
+    );
+    requireUnique(
+      graph.edges.map((edge) => edge.id),
+      `${file}/${phase}/edges`
+    );
     const nodeIds = new Set(graph.nodes.map((n) => n.id));
     for (const node of graph.nodes) {
       const where = `${file}/${phase}/${node.id}`;
@@ -117,16 +173,45 @@ function validateSpec(spec: ModelSpec, ctx: MergeContext, file: string): void {
         if (!ctx.routes.has(r)) throw new Error(`${where}: unknown kernel route "${r}"`);
       }
       for (const f of node.envFlagNames) {
-        if (!ctx.flags.has(f)) ctx.warnings.push(`${where}: env flag not found in scan: "${f}"`);
+        if (!ctx.flags.has(f)) throw new Error(`${where}: env flag not found in scan: "${f}"`);
       }
       healLink(node.source, ctx, where);
       healLink(node.lowererSource, ctx, `${where} (lowerer)`);
     }
     for (const edge of graph.edges) {
       if (!nodeIds.has(edge.from) || !nodeIds.has(edge.to)) {
-        throw new Error(`${file}/${phase}/${edge.id}: edge endpoint missing (${edge.from} -> ${edge.to})`);
+        throw new Error(
+          `${file}/${phase}/${edge.id}: edge endpoint missing (${edge.from} -> ${edge.to})`
+        );
       }
     }
+  }
+  if (spec.sankey) {
+    const sankey = spec.sankey;
+    requireUnique(
+      spec.sankey.nodes.map((node) => node.id),
+      `${file}/sankey/nodes`
+    );
+    const ids = new Set(spec.sankey.nodes.map((node) => node.id));
+    for (const node of spec.sankey.nodes) {
+      if (node.stageId && !stageIds.has(node.stageId))
+        throw new Error(`${file}/sankey: unknown stage "${node.stageId}"`);
+    }
+    for (const link of spec.sankey.links) {
+      if (!ids.has(link.source) || !ids.has(link.target))
+        throw new Error(`${file}/sankey: edge endpoint missing (${link.source} -> ${link.target})`);
+    }
+    const visiting = new Set<string>();
+    const visited = new Set<string>();
+    const visit = (id: string) => {
+      if (visiting.has(id)) throw new Error(`${file}/sankey: circular link involving "${id}"`);
+      if (visited.has(id)) return;
+      visiting.add(id);
+      for (const link of sankey.links) if (link.source === id) visit(link.target);
+      visiting.delete(id);
+      visited.add(id);
+    };
+    for (const id of ids) visit(id);
   }
 }
 
@@ -138,7 +223,7 @@ function validateSpec(spec: ModelSpec, ctx: MergeContext, file: string): void {
 export function mergeNamedLinks(ctx: MergeContext): Record<string, SourceLink> {
   const file = join(CURATED_DIR, "links.json");
   if (!existsSync(file)) return {};
-  const raw = JSON.parse(readFileSync(file, "utf8")) as Record<string, SourceLink>;
+  const raw = z.record(z.string(), SourceLink).parse(JSON.parse(readFileSync(file, "utf8")));
   for (const [id, link] of Object.entries(raw)) {
     healLink(link, ctx, `links.json/${id}`);
   }

@@ -1,6 +1,12 @@
 "use client";
 
-import { cn, Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@antfly/design-system";
+import {
+  cn,
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@antfly/design-system";
 import { Fragment, useMemo } from "react";
 import type { FrameScenario } from "@/lib/schema";
 
@@ -27,8 +33,8 @@ interface Placed {
 }
 
 /**
- * Perfetto-style frame timeline. In "planned" mode, op width is proportional
- * to estimated bytes moved; in "captured" mode, to measured GPU nanos.
+ * Perfetto-style frame timeline. In "planned" mode, op width is log-scaled
+ * from illustrative bytes moved; in "captured" mode, to measured GPU nanos.
  */
 export function KernelTimelineFrame({
   scenario,
@@ -50,22 +56,54 @@ export function KernelTimelineFrame({
       <div className={cn("flex h-full flex-col", className)}>
         <div className="mb-2 flex flex-wrap items-center gap-x-4 gap-y-1 font-mono text-[10px] text-muted-foreground">
           {scenario.stats.encoders !== undefined && <span>{scenario.stats.encoders} encoders</span>}
-          {scenario.stats.plannedScopes !== undefined && <span>{scenario.stats.plannedScopes} planned scopes</span>}
+          {scenario.stats.plannedScopes !== undefined && (
+            <span>{scenario.stats.plannedScopes} planned scopes</span>
+          )}
           {scenario.stats.plannedBarriers !== undefined && (
-            <span className={scenario.stats.plannedBarriers === 0 ? "text-emerald-500" : "text-destructive"}>
+            <span
+              className={
+                scenario.stats.plannedBarriers === 0
+                  ? "text-emerald-700 dark:text-emerald-400"
+                  : "text-destructive"
+              }
+            >
               {scenario.stats.plannedBarriers} barriers
             </span>
           )}
-          {scenario.stats.frameMs !== undefined && <span>{scenario.stats.frameMs.toFixed(2)} ms/frame</span>}
-          <span className="ml-auto">{scenario.mode === "planned" ? "planned structure (no timings)" : scenario.machine}</span>
+          {scenario.stats.frameMs !== undefined && (
+            <span>{scenario.stats.frameMs.toFixed(2)} ms/frame</span>
+          )}
+          <span className="ml-auto">
+            {scenario.mode === "planned" ? "planned structure (no timings)" : scenario.machine}
+          </span>
         </div>
 
-        <svg viewBox={`0 0 ${WIDTH} ${height}`} className="min-h-0 w-full flex-1" role="img" aria-label="Frame timeline">
+        <svg
+          viewBox={`0 0 ${WIDTH} ${height}`}
+          className="min-h-0 w-full flex-1"
+          role="group"
+          aria-label="Frame timeline"
+        >
           {/* CPU encode lane */}
           <TimelineLane y={0} label="CPU encode">
-            <rect x={0} y={14} width={WIDTH * (pipelined ? 0.35 : 0.28)} height={OP_H} rx={3} fill="var(--muted-foreground)" opacity={0.35} />
-            <text x={6} y={14 + OP_H / 2} dominantBaseline="central" fontSize={9} className="fill-foreground font-mono">
-              beginFrame → encode {scenario.encoderScopes.reduce((n, s) => n + s.ops.length, 0)} ops → submit
+            <rect
+              x={0}
+              y={14}
+              width={WIDTH * (pipelined ? 0.35 : 0.28)}
+              height={OP_H}
+              rx={3}
+              fill="var(--muted-foreground)"
+              opacity={0.35}
+            />
+            <text
+              x={6}
+              y={14 + OP_H / 2}
+              dominantBaseline="central"
+              fontSize={9}
+              className="fill-foreground font-mono"
+            >
+              beginFrame → encode → submit (
+              {scenario.encoderScopes.reduce((n, s) => n + s.ops.length, 0)} ops illustrated)
             </text>
           </TimelineLane>
 
@@ -81,10 +119,14 @@ export function KernelTimelineFrame({
                   strokeWidth={1}
                   opacity={0.7}
                 />
-                {scope.ops.map((op, i) => (
-                  <Tooltip key={i}>
+                {scope.ops.map((op) => (
+                  <Tooltip key={`${scope.scopeId}:${op.x0}`}>
                     <TooltipTrigger asChild>
+                      {/* biome-ignore lint/a11y/noInteractiveElementToNoninteractiveRole: Focus exposes an informational image tooltip; this image has no button action. */}
                       <rect
+                        role="img"
+                        tabIndex={0}
+                        aria-label={op.label}
                         x={op.x0}
                         y={14}
                         width={Math.max(1.5, op.x1 - op.x0 - 1)}
@@ -103,7 +145,7 @@ export function KernelTimelineFrame({
               </Fragment>
             ))}
             {/* barriers */}
-            {scenario.barriers.map((b, i) => {
+            {scenario.barriers.map((b) => {
               const scope = placed.find((s) => s.scopeId === b.afterScope);
               if (!scope) return null;
               const x =
@@ -111,12 +153,24 @@ export function KernelTimelineFrame({
                   ? scope.ops[b.afterOpIndex].x1
                   : scope.scopeEnd;
               return (
-                <Tooltip key={`barrier-${i}`}>
+                <Tooltip key={`${b.afterScope}:${b.afterOpIndex ?? "end"}:${b.hazard}`}>
                   <TooltipTrigger asChild>
-                    <line x1={x} y1={10} x2={x} y2={14 + OP_H + 4} stroke="var(--destructive)" strokeWidth={2} />
+                    {/* biome-ignore lint/a11y/noInteractiveElementToNoninteractiveRole: Focus exposes an informational image tooltip; this image has no button action. */}
+                    <line
+                      role="img"
+                      tabIndex={0}
+                      aria-label={`${b.hazard.toUpperCase()} barrier${b.tensors.length > 0 ? `: ${b.tensors.join(", ")}` : ""}`}
+                      x1={x}
+                      y1={10}
+                      x2={x}
+                      y2={14 + OP_H + 4}
+                      stroke="var(--destructive)"
+                      strokeWidth={2}
+                    />
                   </TooltipTrigger>
                   <TooltipContent className="font-mono text-xs">
-                    {b.hazard.toUpperCase()} barrier{b.tensors.length > 0 && `: ${b.tensors.join(", ")}`}
+                    {b.hazard.toUpperCase()} barrier
+                    {b.tensors.length > 0 && `: ${b.tensors.join(", ")}`}
                   </TooltipContent>
                 </Tooltip>
               );
@@ -135,7 +189,13 @@ export function KernelTimelineFrame({
                 fill="var(--primary)"
                 opacity={0.3}
               />
-              <text x={WIDTH * 0.4 + 6} y={14 + OP_H / 2} dominantBaseline="central" fontSize={9} className="fill-foreground font-mono">
+              <text
+                x={WIDTH * 0.4 + 6}
+                y={14 + OP_H / 2}
+                dominantBaseline="central"
+                fontSize={9}
+                className="fill-foreground font-mono"
+              >
                 encodes from device-resident token — before frame N's wait
               </text>
             </TimelineLane>
@@ -146,10 +206,23 @@ export function KernelTimelineFrame({
   );
 }
 
-function TimelineLane({ y, label, children }: { y: number; label: string; children: React.ReactNode }) {
+function TimelineLane({
+  y,
+  label,
+  children,
+}: {
+  y: number;
+  label: string;
+  children: React.ReactNode;
+}) {
   return (
     <g transform={`translate(0, ${y + 12})`}>
-      <text x={0} y={0} fontSize={9} className="fill-muted-foreground font-mono uppercase tracking-wider">
+      <text
+        x={0}
+        y={0}
+        fontSize={9}
+        className="fill-muted-foreground font-mono uppercase tracking-wider"
+      >
         {label}
       </text>
       <g transform="translate(0, 4)">{children}</g>
@@ -159,8 +232,13 @@ function TimelineLane({ y, label, children }: { y: number; label: string; childr
 
 function placeScopes(scenario: FrameScenario): Placed[] {
   const weight = (op: { estBytes?: number; gpuNanos?: number }) =>
-    scenario.mode === "captured" && op.gpuNanos ? op.gpuNanos : Math.max(1, Math.log10((op.estBytes ?? 0) + 10));
-  const total = scenario.encoderScopes.reduce((sum, s) => sum + s.ops.reduce((n, op) => n + weight(op), 0), 0);
+    scenario.mode === "captured"
+      ? (op.gpuNanos ?? 0)
+      : Math.max(1, Math.log10((op.estBytes ?? 0) + 10));
+  const total = scenario.encoderScopes.reduce(
+    (sum, s) => sum + s.ops.reduce((n, op) => n + weight(op), 0),
+    0
+  );
   const scale = (WIDTH - scenario.encoderScopes.length * 6) / Math.max(1, total);
   let x = 0;
   const out: Placed[] = [];

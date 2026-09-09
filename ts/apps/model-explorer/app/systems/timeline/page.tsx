@@ -4,6 +4,8 @@ import { TimelineClient } from "./timeline-client";
 
 const LINK_IDS = ["planner-encoder-scope", "runtime-begin-frame", "executor-pipelined-decode"];
 
+export const metadata = { title: "Frame timeline" };
+
 export default function TimelinePage() {
   return (
     <TimelineClient

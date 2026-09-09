@@ -14,12 +14,12 @@
   "gpt-compute-ple": {
    "path": "zig/pkg/inference/src/architectures/gpt.zig",
    "anchor": "pub fn computePleVectors(",
-   "line": 11079
+   "line": 11135
   },
   "gpt-qk-head-norm": {
    "path": "zig/pkg/inference/src/architectures/gpt.zig",
    "anchor": "pub fn maybeApplyQKHeadNormRope(",
-   "line": 6846
+   "line": 6858
   },
   "config-sliding-pattern": {
    "path": "zig/pkg/inference/src/models/gpt.zig",
@@ -69,17 +69,17 @@
   "runtime-begin-frame": {
    "path": "zig/pkg/inference/src/backends/metal_runtime.zig",
    "anchor": "pub fn beginFrame(runtime: ?*RawMetalDecodeRuntime) FrameError!void {",
-   "line": 16747
+   "line": 17200
   },
   "runtime-submit-frame": {
    "path": "zig/pkg/inference/src/backends/metal_runtime.zig",
    "anchor": "pub fn submitFrame(runtime: ?*RawMetalDecodeRuntime) FrameError!void {",
-   "line": 16765
+   "line": 17218
   },
   "runtime-wait-frame": {
    "path": "zig/pkg/inference/src/backends/metal_runtime.zig",
    "anchor": "pub fn waitFrame(runtime: ?*RawMetalDecodeRuntime) FrameError!void {",
-   "line": 16785
+   "line": 17238
   },
   "executor-pipelined-decode": {
    "path": "zig/pkg/inference/src/graph/metal_executor.zig",
@@ -134,37 +134,37 @@
   "kernel-gumbel": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
    "anchor": "kernel void termite_sample_gumbel_partials(",
-   "line": 8289
+   "line": 8317
   },
   "kernel-head-rms-rope": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
    "anchor": "kernel void termite_apply_head_rms_rope(",
-   "line": 7588
+   "line": 7616
   },
   "server-generate": {
    "path": "zig/pkg/inference/src/server/server.zig",
    "anchor": "fn generateContent(",
-   "line": 6802
+   "line": 7492
   },
   "server-embeddings": {
    "path": "zig/pkg/inference/src/server/server.zig",
    "anchor": "fn generateEmbeddings(",
-   "line": 6108
+   "line": 6717
   },
   "server-rerank": {
    "path": "zig/pkg/inference/src/server/server.zig",
    "anchor": "fn rerankPrompts(",
-   "line": 6473
+   "line": 7144
   },
   "server-chat": {
    "path": "zig/pkg/inference/src/server/server.zig",
    "anchor": "fn chatCompletions(",
-   "line": 9556
+   "line": 10326
   },
   "ops-compute-backend": {
    "path": "zig/pkg/inference/src/ops/ops.zig",
    "anchor": "pub const ComputeBackend = struct {",
-   "line": 1298
+   "line": 1321
   },
   "node-primitive-op": {
    "path": "zig/lib/ml/src/graph/node.zig",
@@ -219,7 +219,7 @@
   "generation-config": {
    "path": "zig/pkg/inference/src/pipelines/generation.zig",
    "anchor": "pub const GenerationConfig = struct {",
-   "line": 311
+   "line": 329
   },
   "native-generate-scheduler": {
    "path": "zig/pkg/inference/src/runtime/scheduler/native_generate.zig",
@@ -244,22 +244,22 @@
   "gliner-fused-attn-kernel": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
    "anchor": "kernel void termite_disentangled_relative_attention_f32(",
-   "line": 9700
+   "line": 9768
   },
   "gliner-fused-attn-bwd-kernel": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
    "anchor": "kernel void termite_disentangled_relative_attention_bwd_scores_f32(",
-   "line": 9788
+   "line": 9856
   },
   "gliner-word-embeddings-kernel": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
    "anchor": "kernel void termite_gliner_word_embeddings_f32(",
-   "line": 9427
+   "line": 9467
   },
   "gliner-gru-combine-kernel": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
    "anchor": "kernel void termite_gliner_gru_combine_f32(",
-   "line": 9434
+   "line": 9474
   },
   "gliner-span-marker": {
    "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig",
@@ -289,52 +289,52 @@
   "embed-pooling-strategy": {
    "path": "zig/pkg/inference/src/pipelines/embedding.zig",
    "anchor": "pub const PoolingStrategy = enum {",
-   "line": 55
+   "line": 57
   },
   "embed-pipeline": {
    "path": "zig/pkg/inference/src/pipelines/embedding.zig",
    "anchor": "pub const EmbeddingPipeline = struct {",
-   "line": 247
+   "line": 249
   },
   "kernel-q8-mm-sg": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
    "anchor": "kernel void termite_q8_0_linear_mm_sg(",
-   "line": 6962
+   "line": 6990
   },
   "kernel-sg-q16-f16kv-gqa2": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
    "anchor": "kernel void termite_attention_f32_dense_causal_sg_q16_f16kv_gqa2(",
-   "line": 10510
+   "line": 10598
   },
   "qwen3vl-projector": {
    "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
    "anchor": "pub fn encodeProjectedImages(",
-   "line": 411
+   "line": 604
   },
   "qwen3vl-patchify": {
    "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
    "anchor": "fn extractPatchesMergeMajor(",
-   "line": 1059
+   "line": 1394
   },
   "qwen3vl-pos-interp": {
    "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
    "anchor": "fn addInterpolatedPositions(",
-   "line": 1112
+   "line": 1471
   },
   "qwen3vl-merger": {
    "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
    "anchor": "fn mergeProjected(",
-   "line": 946
+   "line": 1273
   },
   "qwen3vl-deepstack-tap": {
    "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
    "anchor": "if (next_tap < cfg.deepstack_len and cfg.deepstack_layers[next_tap] == layer) {",
-   "line": 759
+   "line": 1057
   },
   "qwen3vl-splice": {
    "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
    "anchor": "pub fn prepareExpandedPromptEmbeddings(",
-   "line": 546
+   "line": 792
   },
   "qwen3vl-plan": {
    "path": "zig/pkg/inference/src/architectures/qwen3vl_plan.zig",
@@ -349,7 +349,7 @@
   "qwen3vl-mrope-kernel": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
    "anchor": "kernel void termite_apply_mrope(",
-   "line": 10079
+   "line": 10155
   },
   "qwen3vl-reranker-score": {
    "path": "zig/pkg/inference/src/architectures/qwen3vl_reranker.zig",
@@ -358,13 +358,68 @@
   },
   "qwen3vl-support-doc": {
    "path": "zig/pkg/inference/QWEN3VL_SUPPORT.md",
-   "anchor": "This document is the operational contract for Qwen3-VL generation and",
+   "anchor": "This document records Qwen3-VL generation and reranking qualification evidence.",
    "line": 3
   },
   "qwen3vl-family-gate": {
    "path": "zig/pkg/inference/src/models/gpt.zig",
    "anchor": "return self.family == .qwen3_vl;",
    "line": 296
+  },
+  "model-compatibility-doc": {
+   "path": "zig/pkg/inference/MODEL_COMPATIBILITY.md",
+   "anchor": "# Model loading and download integrity",
+   "line": 1
+  },
+  "embed-baseline": {
+   "path": "zig/pkg/inference/scripts/qwen3_embedding/BASELINE.md",
+   "anchor": "# Qwen3-Embedding Baseline Measurement Protocol",
+   "line": 1
+  },
+  "embed-eos": {
+   "path": "zig/pkg/inference/src/pipelines/embedding.zig",
+   "anchor": "fn ensureTrailingEos(",
+   "line": 660
+  },
+  "qwen3-embed-graph": {
+   "path": "zig/pkg/inference/src/pipelines/embedding.zig",
+   "anchor": "fn tryEmbedTextResidentQwen3Graph(",
+   "line": 1505
+  },
+  "gliner-serving-head": {
+   "path": "zig/pkg/inference/src/architectures/gliner_head.zig",
+   "anchor": "fn extractWordEmbeddings(",
+   "line": 357
+  },
+  "gemma-lm-head-repack": {
+   "path": "zig/pkg/inference/src/backends/metal_runtime.zig",
+   "anchor": "fn lmHeadQ4RepackFormat() ?gguf_tensor_types.KnownTensorType {",
+   "line": 9779
+  },
+  "gemma-sampling-fallback": {
+   "path": "zig/pkg/inference/src/pipelines/generation.zig",
+   "anchor": "// Fallback: same fused forward, host-side sampling from the",
+   "line": 6888
+  },
+  "gemma-mtp-ledger": {
+   "path": "zig/pkg/inference/GEMMA4_PERF_PLAN.md",
+   "anchor": "An earlier standalone CLI pilot explains the auto decision;",
+   "line": 285
+  },
+  "generation-kv-config": {
+   "path": "zig/pkg/inference/src/pipelines/generation.zig",
+   "anchor": "pub fn kvPoolConfig(",
+   "line": 443
+  },
+  "generation-kv-policy": {
+   "path": "zig/pkg/inference/src/pipelines/generation.zig",
+   "anchor": "pub fn generationKvCapacityPolicyForRoute(",
+   "line": 430
+  },
+  "runtime-execution-control": {
+   "path": "zig/pkg/inference/src/execution_control.zig",
+   "anchor": "pub const InferenceExecutionControl",
+   "line": 104
   }
  }
 }

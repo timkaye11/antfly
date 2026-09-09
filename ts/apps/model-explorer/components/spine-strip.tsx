@@ -17,9 +17,9 @@ export const SPINE_STAGES = [
 export type SpineStageId = (typeof SPINE_STAGES)[number]["id"] | "vision";
 
 /**
- * The persistent runtime-pipeline breadcrumb. On model pages, stages the
- * model specializes get a "modified" dot; clicking jumps to that model's
- * chapter for the stage if one exists, else to /runtime#<stage>.
+ * Runtime learning topics, not a literal execution sequence. On model pages,
+ * topics covered by the curated stages receive a dot. Optional links can
+ * point to local chapters; otherwise each topic opens its shared explanation.
  */
 export function SpineStrip({
   modified = [],
@@ -50,26 +50,38 @@ export function SpineStrip({
     : [...SPINE_STAGES];
 
   return (
-    <nav aria-label="Runtime pipeline" className={cn("flex flex-wrap items-center gap-1 text-xs", className)}>
+    <nav
+      aria-label="Runtime learning topics"
+      className={cn("flex flex-wrap items-center gap-1 text-xs", className)}
+    >
+      <span className="mr-1 text-[10px] uppercase tracking-wide text-muted-foreground">
+        Runtime topics
+      </span>
       {stages.map((stage, i) => {
-        const href = links[stage.id] ?? `/runtime#${stage.id}`;
+        const href =
+          links[stage.id] ??
+          (stage.id === "vision" ? "/models/qwen3-vl#ch-2" : `/runtime#${stage.id}`);
         const isModified = modified.includes(stage.id);
         const isActive = active === stage.id;
         return (
           <span key={stage.id} className="flex items-center gap-1">
-            {i > 0 && <span className="text-muted-foreground/50">→</span>}
+            {i > 0 && (
+              <span className="text-muted-foreground/50" aria-hidden="true">
+                ·
+              </span>
+            )}
             <Link
               href={href}
               className={cn(
                 "relative rounded-full border px-2.5 py-0.5 font-mono transition-colors hover:bg-accent",
-                isActive ? "border-primary bg-primary/10 text-primary" : "text-muted-foreground",
+                isActive ? "border-primary bg-primary/10 text-primary" : "text-muted-foreground"
               )}
             >
               {stage.label}
               {isModified && (
                 <span
                   className="absolute -top-0.5 -right-0.5 size-2 rounded-full bg-primary"
-                  title="This model specializes this stage"
+                  title="This model page covers this topic"
                 />
               )}
             </Link>

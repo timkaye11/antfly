@@ -1,6 +1,8 @@
 import { envFlags, manifest } from "@/lib/data";
 import { FlagsClient } from "./flags-client";
 
+export const metadata = { title: "Environment names" };
+
 export default function FlagsPage() {
   // Trim to what the table renders — keeps the client payload lean.
   const flags = envFlags.flags.map((f) => ({

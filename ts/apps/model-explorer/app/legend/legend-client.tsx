@@ -1,6 +1,12 @@
 "use client";
 
-import { EnvFlagChip, FusionChip, OpKindBadge, QuantChip, TensorShapeBadge } from "@/components/primitives/chips";
+import {
+  EnvFlagChip,
+  FusionChip,
+  OpKindBadge,
+  QuantChip,
+  TensorShapeBadge,
+} from "@/components/primitives/chips";
 import { Divergence } from "@/components/scrollytelling/scrolly";
 import {
   ActivationGlyph,
@@ -20,17 +26,22 @@ const DTYPE_RAMP = [
   ["f32", "var(--dtype-f32)", "full precision"],
   ["f16 / bf16", "var(--dtype-f16)", "half precision"],
   ["q8", "var(--dtype-q8)", "8-bit blocks"],
-  ["q4–q6 / iq4 / mxfp4", "var(--dtype-q4)", "4–6-bit blocks"],
-  ["sub-4-bit (tl1/tl2, polar4)", "var(--dtype-sub4)", "ternary / compressed KV"],
+  ["q4–q6 / iq4 / mxfp4 / polar4", "var(--dtype-q4)", "4–6-bit payloads; metadata adds overhead"],
+  ["sub-4-bit (tl1/tl2, turbo3)", "var(--dtype-sub4)", "ternary / 3-bit key payloads"],
+  [
+    "unknown / integer / route-dependent",
+    "var(--muted-foreground)",
+    "no floating precision implied",
+  ],
 ] as const;
 
 const KERNEL_FAMILIES = [
-  ["matvec", "var(--kfam-matvec)", "decode-time quantized matrix-vector"],
-  ["mm_sg", "var(--kfam-mmsg)", "simdgroup tensor-core matmul (batch ≥ 8)"],
+  ["matvec", "var(--kfam-matvec)", "matrix-vector routes, often used for decode"],
+  ["mm_sg", "var(--kfam-mmsg)", "simdgroup matrix multiply; thresholds vary by route"],
   ["attention", "var(--kfam-attention)", "flash / paged / disentangled attention"],
   ["fusion", "var(--kfam-fusion)", "pair-fusion, norm⋄rope, fused epilogues"],
   ["moe", "var(--kfam-moe)", "expert routing, scatter, slot arena"],
-  ["sampling", "var(--kfam-sampling)", "device-resident Gumbel-max / argmax / top-8"],
+  ["sampling", "var(--kfam-sampling)", "token selection and candidate reduction routes"],
   ["kv", "var(--kfam-kv)", "KV seed / compress (polar4, turbo3)"],
 ] as const;
 
@@ -50,9 +61,9 @@ export function LegendClient() {
       <header>
         <h1 className="text-3xl font-bold tracking-tight">Visual vocabulary</h1>
         <p className="mt-2 max-w-2xl text-muted-foreground">
-          One legend for the whole explorer. Once a shape or color means something here, it never means
-          anything else — every figure states which color axis it uses (<code>colorBy</code>), and axes are
-          never mixed in one figure.
+          A guide to the explorer's schematic shapes and palettes. The operation explorer can color
+          nodes by activation dtype, illustrated backend, or operation family. Chapter illustrations
+          also use colors to distinguish functional stages; their captions define the context.
         </p>
       </header>
 
@@ -60,8 +71,14 @@ export function LegendClient() {
         <h2 className="mb-4 text-xl font-semibold">Shapes</h2>
         <div className="rounded-lg border bg-card p-4">
           <Figure viewBox="0 0 760 260">
-            <ActivationGlyph x={20} y={30} label="activation tensor" sublabel="width ∝ log(dim)" dtype="f16" />
-            <WeightGlyph x={170} y={30} label="weight (on disk)" quant="q4_0" />
+            <ActivationGlyph
+              x={20}
+              y={30}
+              label="activation tensor"
+              sublabel="schematic dimensions"
+              dtype="f16"
+            />
+            <WeightGlyph x={170} y={30} label="stored weight tensor" quant="q4_0" />
             <MatmulGlyph x={320} y={28} label="matmul / linear" dtype="f16" />
             <AttentionGlyph x={490} y={24} label="attention" dtype="f16" />
             <AttentionGlyph x={620} y={24} label="+ sliding window" dtype="f16" shutter />
@@ -71,7 +88,14 @@ export function LegendClient() {
             <EmbeddingGlyph x={260} y={100} label="embedding lookup" dtype="f16" />
             <ForkGlyph x={420} y={100} label="routing (MoE / MTP)" dtype="q4_0" />
             <SamplerGlyph x={560} y={100} label="sampling" dtype="f32" />
-            <MatmulGlyph x={620} y={96} w={120} label="fused (zipper)" fused={["gate", "up", "silu"]} dtype="q4_0" />
+            <MatmulGlyph
+              x={620}
+              y={96}
+              w={120}
+              label="fused (zipper)"
+              fused={["gate", "up", "silu"]}
+              dtype="q4_0"
+            />
 
             <g transform="translate(20, 190)">
               <KvBlockGlyph x={0} y={0} state="filled" />
@@ -85,9 +109,11 @@ export function LegendClient() {
           </Figure>
         </div>
         <p className="mt-2 text-sm text-muted-foreground">
-          Solid outline = runs on Metal; dashed outline = native CPU path. A thick bottom border marks weights
-          that stream from disk. Norm bars are deliberately tiny — they set up the systems story about hundreds
-          of small dispatches.
+          In the operation explorer, a dashed node outline marks the illustrated native CPU path; a
+          solid outline is used for the other backend labels. In chapter drawings, dashed lines may
+          instead mark boundaries, reuse, or optional paths. A thick lower edge identifies a weight
+          tensor and does not imply a disk read. Shapes and widths are schematic unless a caption
+          gives a measurement.
         </p>
       </section>
 
@@ -131,23 +157,35 @@ export function LegendClient() {
           <EnvFlagChip name="TERMITE_METAL_DISABLE_A4B_ZERO_BIAS_ELISION" defaultOn={false} />
         </div>
         <p className="mt-2 text-sm text-muted-foreground">
-          Quant chips use the precision ramp. Fused op kinds get the accent tint. Env-flag chips show the{" "}
-          <em>current default</em> in the runtime (green dot = the behavior is on by default). File chips like{" "}
-          <code className="font-mono text-xs">gpt.zig:1039</code> open a commit-pinned GitHub permalink and show
-          a code peek on hover.
+          Quant chips group storage formats by payload precision; scale and block metadata add
+          overhead. Polar4 specifically stores 4-bit keys with INT8 values plus scales. Activation
+          dtype is separate from weight format. Where shown, an environment flag's dot is a curated
+          default annotation; device, shape, and policy checks can still constrain eligibility. File
+          chips like <code className="font-mono text-xs">gpt.zig:1039</code> open a commit-pinned
+          GitHub permalink and show a code peek on hover or keyboard focus.
         </p>
       </section>
 
       <section id="divergences">
-        <h2 className="mb-4 text-xl font-semibold">"Where Antfly diverges" callouts</h2>
+        <h2 className="mb-4 text-xl font-semibold">Implementation callouts</h2>
         <p className="mb-3 max-w-2xl text-sm text-muted-foreground">
-          The explorer's comparisons with llama.cpp / vLLM / PyTorch always appear in this exact form — muted
-          column for them, full-color for Antfly, never more than three rows, always ending in a measurable or
-          linkable claim:
+          These callouts compare a conceptual baseline with the Antfly route being explained. They
+          do not establish how every other runtime behaves or imply that a capability applies to
+          every backend and request. For example:
         </p>
         <Divergence
-          others={<p>reads logits back to the host and samples on the CPU.</p>}
-          antfly={<p>keeps logits device-resident: top-8 rescore + Gumbel-max on the GPU, token id handed to the next frame without a round-trip.</p>}
+          others={<p>A host sampler reads logits and applies request constraints on the CPU.</p>}
+          antfly={
+            <p>
+              Eligible device routes select a token without full-logit readback; unsupported cases
+              use the host sampler. Greedy Q4_K/Q6_K candidate refinement is a separate opt-in path.
+            </p>
+          }
+          link={
+            <a className="text-primary underline" href="/models/gemma4-e4b#ch-10">
+              Gemma sampling routes and implementation links
+            </a>
+          }
         />
       </section>
     </div>

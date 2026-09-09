@@ -1,7 +1,13 @@
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
-import type { EnvFlagGate, KernelInventoryEntry, KernelRoute, SourceLink } from "../lib/schema/index.ts";
+import type {
+  EnvFlagGate,
+  KernelInventoryEntry,
+  KernelRoute,
+  SourceLink,
+} from "../lib/schema/index.ts";
 import { lineOf, readRepoFile, repoRoot } from "./lib.ts";
+import { requireUnique } from "./merge.ts";
 
 const NODE_ZIG = "zig/lib/ml/src/graph/node.zig";
 const COMPILER_ZIG = "zig/pkg/inference/src/graph/quant_kernel_compiler.zig";
@@ -27,10 +33,10 @@ export function extractOpKinds(): OpKindEntry[] {
     if (start < 0) throw new Error(`enum ${enumName} not found in ${NODE_ZIG}`);
     const bodyStart = content.indexOf("{", start);
     const bodyEnd = content.indexOf("\n};", bodyStart);
+    if (bodyEnd < 0) throw new Error(`unterminated enum ${enumName}`);
     const body = content.slice(bodyStart, bodyEnd);
-    const memberRe = /^\s{4}([a-z][a-z0-9_]*),\s*$/gm;
-    let m: RegExpExecArray | null;
-    while ((m = memberRe.exec(body)) !== null) {
+    const memberRe = /^[ \t]+([a-z][a-z0-9_]*),[ \t]*(?:\/\/[^\n]*)?$/gm;
+    for (const m of body.matchAll(memberRe)) {
       out.push({
         name: m[1],
         group,
@@ -38,28 +44,53 @@ export function extractOpKinds(): OpKindEntry[] {
       });
     }
   }
+  requireUnique(
+    out.map((op) => `${op.group}/${op.name}`),
+    "op vocabulary"
+  );
   if (out.length < 50) throw new Error(`suspiciously few op kinds parsed: ${out.length}`);
   return out;
 }
 
 /** Parse metal_production_schedules struct-literal rows. */
 export function extractSchedules(): KernelRoute[] {
-  const content = readRepoFile(COMPILER_ZIG);
+  return parseSchedules(readRepoFile(COMPILER_ZIG));
+}
+
+export function parseSchedules(content: string): KernelRoute[] {
   const tableStart = content.indexOf("pub const metal_production_schedules");
   if (tableStart < 0) throw new Error(`metal_production_schedules not found in ${COMPILER_ZIG}`);
   const tableEnd = content.indexOf("\n};", tableStart);
+  if (tableEnd < 0) throw new Error(`unterminated metal_production_schedules`);
   const table = content.slice(tableStart, tableEnd);
   const rowRe =
-    /\.\{ \.format = \.(\w+), \.row_bucket = \.(\w+), \.epilogue = \.(\w+), \.schedule = \.\{ ([^}]*) \} \}/g;
+    /\.\{\s*\.format\s*=\s*\.(\w+),\s*\.row_bucket\s*=\s*\.(\w+),\s*\.epilogue\s*=\s*\.(\w+),\s*\.schedule\s*=\s*\.\{\s*([^}]*)\}\s*\}/g;
   const routes: KernelRoute[] = [];
-  let m: RegExpExecArray | null;
-  while ((m = rowRe.exec(table)) !== null) {
+  for (const m of table.matchAll(rowRe)) {
     const [, format, rowBucket, epilogue, schedBody] = m;
-    const sched: Record<string, number | string> = {};
-    for (const fieldMatch of schedBody.matchAll(/\.(\w+) = \.?([\w]+)/g)) {
+    const sched: Record<string, number | string | boolean> = {};
+    for (const fieldMatch of schedBody.matchAll(/\.(\w+)\s*=\s*\.?([\w]+)\s*(?:,|$)/g)) {
       const [, key, raw] = fieldMatch;
-      sched[key] = /^\d+$/.test(raw) ? Number(raw) : raw;
+      sched[key] = /^\d+$/.test(raw)
+        ? Number(raw)
+        : raw === "true"
+          ? true
+          : raw === "false"
+            ? false
+            : raw;
     }
+    if (Object.keys(sched).length !== [...schedBody.matchAll(/\.\w+\s*=/g)].length) {
+      throw new Error(`unsupported schedule expression in ${format}/${rowBucket}/${epilogue}`);
+    }
+    const known = new Set([
+      "threads_per_threadgroup",
+      "cols_per_threadgroup",
+      "rows_per_threadgroup",
+      "reduction",
+      "key_chunk",
+      "skip_rescale",
+    ]);
+    const extra = Object.fromEntries(Object.entries(sched).filter(([key]) => !known.has(key)));
     routes.push({
       id: `${format}/${rowBucket}/${epilogue}`,
       format,
@@ -71,7 +102,8 @@ export function extractSchedules(): KernelRoute[] {
         rowsPerThreadgroup: sched.rows_per_threadgroup as number | undefined,
         reduction: sched.reduction as string | undefined,
         keyChunk: sched.key_chunk as number | undefined,
-        skipRescale: sched.skip_rescale === "true" ? true : undefined,
+        skipRescale: sched.skip_rescale as boolean | undefined,
+        ...(Object.keys(extra).length ? { extra } : {}),
       },
       generated: true,
       generatedFile: guessGeneratedFile(format, epilogue),
@@ -82,7 +114,16 @@ export function extractSchedules(): KernelRoute[] {
       },
     });
   }
-  if (routes.length < 10) throw new Error(`suspiciously few schedule rows parsed: ${routes.length}`);
+  const expectedRows = [...table.matchAll(/\.format\s*=/g)].length;
+  if (routes.length === 0 || routes.length !== expectedRows) {
+    throw new Error(
+      `schedule extraction incomplete: parsed ${routes.length} of ${expectedRows} rows`
+    );
+  }
+  requireUnique(
+    routes.map((route) => route.id),
+    "kernel routes"
+  );
   return routes;
 }
 
@@ -125,8 +166,7 @@ export function extractKernelInventory(): KernelInventoryEntry[] {
   const beginMarker = mContent.indexOf("quant-kernel-codegen:begin generated quant kernels");
   const endMarker = mContent.indexOf("quant-kernel-codegen:end generated quant kernels");
   const kernelRe = /kernel void ([a-zA-Z0-9_]+)/g;
-  let m: RegExpExecArray | null;
-  while ((m = kernelRe.exec(mContent)) !== null) {
+  for (const m of mContent.matchAll(kernelRe)) {
     const name = m[1];
     if (seen.has(name)) continue;
     const inGenerated = beginMarker >= 0 && m.index > beginMarker && m.index < endMarker;
@@ -138,13 +178,12 @@ export function extractKernelInventory(): KernelInventoryEntry[] {
     });
   }
 
-  for (const file of readdirSync(join(repoRoot, GENERATED_DIR))) {
+  for (const file of readdirSync(join(repoRoot, GENERATED_DIR)).sort()) {
     if (!file.endsWith(".metal")) continue;
     const rel = `${GENERATED_DIR}/${file}`;
     const content = readRepoFile(rel);
-    let g: RegExpExecArray | null;
     const re = /kernel void ([a-zA-Z0-9_]+)/g;
-    while ((g = re.exec(content)) !== null) {
+    for (const g of content.matchAll(re)) {
       const name = g[1];
       const entry: KernelInventoryEntry = {
         name,
@@ -158,23 +197,27 @@ export function extractKernelInventory(): KernelInventoryEntry[] {
   }
 
   const inventory = [...seen.values()].sort((a, b) => a.name.localeCompare(b.name));
-  if (inventory.length < 300) throw new Error(`suspiciously few kernels found: ${inventory.length}`);
+  if (inventory.length < 300)
+    throw new Error(`suspiciously few kernels found: ${inventory.length}`);
   return inventory;
 }
 
 function inferFlagKind(name: string): EnvFlagGate["kind"] {
   if (/_MB$/.test(name)) return "mb";
-  if (/(_BYTES|_CAPACITY)$/.test(name)) return "bytes";
+  if (/_BYTES$/.test(name)) return "bytes";
+  if (/_CAPACITY$/.test(name)) return "int";
   if (/(_COUNT|_THREADS|_CHUNK|_MIN_KV|_SIZE|_LIMIT|_MAX|_ROWS|_COLS)$/.test(name)) return "int";
   if (/(DISABLE|ENABLE|FORCE|STRICT|TRACE|DEBUG)/.test(name)) return "bool";
   return "unknown";
 }
 
-/** Scan inference src for TERMITE_METAL_* env flags with occurrence locations. */
+/** Textual TERMITE_/ANTFLY_ references, including comments/tests; kinds are inferred from names. */
 export function extractEnvFlags(): EnvFlagGate[] {
   const byName = new Map<string, { links: SourceLink[]; count: number }>();
   const walk = (relDir: string) => {
-    for (const entry of readdirSync(join(repoRoot, relDir), { withFileTypes: true })) {
+    for (const entry of readdirSync(join(repoRoot, relDir), { withFileTypes: true }).sort((a, b) =>
+      a.name.localeCompare(b.name)
+    )) {
       const rel = `${relDir}/${entry.name}`;
       if (entry.isDirectory()) {
         if (entry.name === "generated") continue;
@@ -182,8 +225,7 @@ export function extractEnvFlags(): EnvFlagGate[] {
       } else if (entry.name.endsWith(".zig") || entry.name.endsWith(".m")) {
         const content = readRepoFile(rel);
         const re = /(?:TERMITE|ANTFLY)_[A-Z0-9][A-Z0-9_]{3,}/g;
-        let m: RegExpExecArray | null;
-        while ((m = re.exec(content)) !== null) {
+        for (const m of content.matchAll(re)) {
           const name = m[0];
           const rec = byName.get(name) ?? { links: [], count: 0 };
           rec.count++;

@@ -6,11 +6,25 @@ import { z } from "zod";
  * `anchor` is an expected substring at `line`, used by the generator for
  * drift detection + self-healing line numbers.
  */
-export const SourceLink = z.object({
-  path: z.string(),
-  line: z.number().int().positive().optional(),
-  endLine: z.number().int().positive().optional(),
-  anchor: z.string().optional(),
-  symbol: z.string().optional(),
-});
+export const SourceLink = z
+  .object({
+    path: z
+      .string()
+      .min(1)
+      .refine(
+        (path) =>
+          !path.startsWith("/") &&
+          !path.includes("\\") &&
+          !path.split("/").some((part) => part === ".." || part === "." || part === ""),
+        "expected a repo-relative path"
+      ),
+    line: z.number().int().positive().optional(),
+    endLine: z.number().int().positive().optional(),
+    anchor: z.string().min(1).optional(),
+    symbol: z.string().optional(),
+  })
+  .refine(
+    (link) => link.endLine === undefined || (link.line !== undefined && link.endLine >= link.line),
+    "endLine requires line and must not precede it"
+  );
 export type SourceLink = z.infer<typeof SourceLink>;

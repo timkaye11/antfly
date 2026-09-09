@@ -2,8 +2,8 @@
  "schemaVersion": 1,
  "id": "gliner2",
  "family": "gliner",
- "displayName": "GLiNER2",
- "tagline": "Schema-driven entity extraction on a DeBERTa-v3 encoder: disentangled relative attention, one fused Metal kernel forward and backward, and a span head that scores every candidate span against every label at once.",
+ "displayName": "GLiNER2 Base",
+ "tagline": "Schema-conditioned entity extraction on a DeBERTa-v3 base encoder: bidirectional relative attention, fused Metal operations and a head that scores candidate spans against labels.",
  "stats": {
   "layers": 12,
   "hidden": 768,
@@ -14,7 +14,8 @@
   "relBuckets": 256,
   "maxSpanWidth": 8,
   "quant": "Q4_K",
-  "tokenizer": "SentencePiece"
+  "tokenizer": "SentencePiece",
+  "scope": "Base entity-extraction example; other GLiNER2 tasks use additional heads and pipeline logic"
  },
  "stages": [
   {
@@ -37,7 +38,7 @@
    },
    "repeat": {
     "count": 12,
-    "note": "12 identical bidirectional layers (deberta-v3-base backbone)"
+    "note": "12 layers with the same structure and distinct learned weights; diagram shows one layer"
    },
    "attention": "disentangled_relative"
   },
@@ -46,11 +47,11 @@
    "id": "head",
    "title": "Span head",
    "spine": "graph",
-   "summary": "Label embeddings gathered at entity-marker positions, span start/end reps concatenated to [total_spans, 2H], then one matmul scores every span against every label.",
+   "summary": "First-subtoken word features and entity-marker label features feed span and label heads. Sigmoid scores are thresholded, then flat NER filters overlapping spans.",
    "source": {
-    "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig",
-    "anchor": "pub fn buildForwardGraphPrecomputed(",
-    "line": 220
+    "path": "zig/pkg/inference/src/architectures/gliner_head.zig",
+    "anchor": "fn extractWordEmbeddings(",
+    "line": 357
    },
    "headType": "span"
   }
@@ -120,17 +121,16 @@
          "B·T",
          2304
         ],
-        "dtype": "f32",
-        "quant": "q4_k"
+        "dtype": "f32"
        }
       ]
      },
      "attrs": {
-      "note": "the same query_proj/key_proj also project the relative position embeddings (Q_r, K_r)"
+      "note": "the same query_proj/key_proj also project the relative position embeddings (Q_r, K_r)",
+      "weightFormat": "q4_k weights; activations use the displayed dtype",
+      "routeScope": "illustrative compatible route; actual dispatch depends on token rows, tensor format and hardware"
      },
-     "kernelRouteIds": [
-      "q4_k/rows_2_8/bias"
-     ],
+     "kernelRouteIds": [],
      "kernels": [],
      "envFlagNames": [],
      "backend": "metal",
@@ -147,8 +147,14 @@
       "in": [
        {
         "dims": [
-         "T",
-         "T"
+         512,
+         768
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "2T−1"
         ],
         "dtype": "i64"
        }
@@ -156,7 +162,7 @@
       "out": [
        {
         "dims": [
-         "2·buckets",
+         "2T−1",
          768
         ],
         "dtype": "f32"
@@ -166,7 +172,7 @@
      "attrs": {
       "buckets": 256,
       "maxPositions": 512,
-      "note": "relativePositionBucket: exact buckets near 0, log-spaced further out; rel_embeddings shared across all 12 layers"
+      "note": "Schematic graph formulation: normalize the 512-row shared table, then gather by signed distance; position_buckets=256 is the index offset."
      },
      "source": {
       "path": "zig/pkg/inference/src/models/deberta.zig",
@@ -181,8 +187,8 @@
     },
     {
      "id": "enc.relscore",
-     "opKind": "dot_general",
-     "label": "rel-score GEMM (Q_c·K_rᵀ, K_c·Q_rᵀ)",
+     "opKind": "linear",
+     "label": "relative Q/K projections",
      "stageId": "encoder",
      "inputs": [],
      "outputs": [],
@@ -190,9 +196,8 @@
       "in": [
        {
         "dims": [
-         "B·h",
-         "T",
-         64
+         "2T−1",
+         768
         ],
         "dtype": "f32"
        }
@@ -200,21 +205,25 @@
       "out": [
        {
         "dims": [
-         "B·h",
-         "T",
-         "2·buckets"
+         "2T−1",
+         768
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "2T−1",
+         768
         ],
         "dtype": "f32"
        }
       ]
      },
      "attrs": {
-      "note": "score-gather strategy: one [T, num_rel] GEMM per side, then a Toeplitz gather qi−ki+S−1 — instead of materializing [S·S, H]"
+      "note": "Relative Q/K use the same query/key projection weights as content Q/K. Fused attention consumes these projections; the debug score-gather path is an alternative, not an extra fused-path stage."
      },
      "kernelRouteIds": [],
-     "kernels": [
-      "termite_deberta_relative_score_gemm_f32"
-     ],
+     "kernels": [],
      "envFlagNames": [],
      "backend": "metal",
      "fusedOps": []
@@ -230,17 +239,23 @@
       "in": [
        {
         "dims": [
-         "B·h",
-         "T",
-         64
+         "3·B·T",
+         768
         ],
         "dtype": "f32"
        },
        {
         "dims": [
-         "B·h",
+         "2·(2T−1)",
+         768
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "B·heads",
          "T",
-         "2·buckets"
+         "T"
         ],
         "dtype": "f32"
        }
@@ -248,9 +263,8 @@
       "out": [
        {
         "dims": [
-         "B·h",
-         "T",
-         64
+         "B·T",
+         768
         ],
         "dtype": "f32"
        }
@@ -258,7 +272,7 @@
      },
      "attrs": {
       "scale": "1/√(3·head_dim)",
-      "note": "scores = (C2C + C2P + P2C) / sqrt(3·head_dim); bidirectional — the mask is padding-only, never causal"
+      "note": "Schematic fused graph node: packed Q/K/V, packed relative Q/K and additive padding mask. Scores combine all three terms; no causal mask."
      },
      "source": {
       "path": "zig/pkg/inference/src/architectures/deberta_graph.zig",
@@ -305,15 +319,15 @@
          "B·T",
          768
         ],
-        "dtype": "f32",
-        "quant": "q4_k"
+        "dtype": "f32"
        }
       ]
      },
-     "attrs": {},
-     "kernelRouteIds": [
-      "q4_k/rows_2_8/bias"
-     ],
+     "attrs": {
+      "weightFormat": "q4_k weights; activations use the displayed dtype",
+      "routeScope": "illustrative compatible route; actual dispatch depends on token rows, tensor format and hardware"
+     },
+     "kernelRouteIds": [],
      "kernels": [],
      "envFlagNames": [],
      "backend": "metal",
@@ -376,15 +390,15 @@
          "B·T",
          3072
         ],
-        "dtype": "f32",
-        "quant": "q4_k"
+        "dtype": "f32"
        }
       ]
      },
-     "attrs": {},
-     "kernelRouteIds": [
-      "q4_k/rows_2_8/bias_gelu"
-     ],
+     "attrs": {
+      "weightFormat": "q4_k weights; activations use the displayed dtype",
+      "routeScope": "illustrative compatible route; actual dispatch depends on token rows, tensor format and hardware"
+     },
+     "kernelRouteIds": [],
      "kernels": [],
      "envFlagNames": [
       "TERMITE_METAL_DISABLE_GLINER_DEBERTA_DIRECT_FFN"
@@ -418,15 +432,15 @@
          "B·T",
          768
         ],
-        "dtype": "f32",
-        "quant": "q4_k"
+        "dtype": "f32"
        }
       ]
      },
-     "attrs": {},
-     "kernelRouteIds": [
-      "q4_k/rows_2_8/bias"
-     ],
+     "attrs": {
+      "weightFormat": "q4_k weights; activations use the displayed dtype",
+      "routeScope": "illustrative compatible route; actual dispatch depends on token rows, tensor format and hardware"
+     },
+     "kernelRouteIds": [],
      "kernels": [],
      "envFlagNames": [],
      "backend": "metal",
@@ -494,7 +508,12 @@
       ]
      },
      "attrs": {
-      "note": "token_pooling = \"first\": each word is represented by its first sub-token's hidden state"
+      "note": "Serving path selects the first subtoken per word using words_mask. The separate graph-training helper averages subtokens; its pooling semantics differ."
+     },
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/gliner_head.zig",
+      "anchor": "fn extractWordEmbeddings(",
+      "line": 357
      },
      "kernelRouteIds": [],
      "kernels": [
@@ -569,6 +588,13 @@
          768
         ],
         "dtype": "f32"
+       },
+       {
+        "dims": [
+         "W",
+         768
+        ],
+        "dtype": "f32"
        }
       ]
      },
@@ -595,6 +621,13 @@
      "outputs": [],
      "shapes": {
       "in": [
+       {
+        "dims": [
+         "W",
+         768
+        ],
+        "dtype": "f32"
+       },
        {
         "dims": [
          "W",
@@ -687,7 +720,9 @@
        }
       ]
      },
-     "attrs": {},
+     "attrs": {
+      "note": "GRU step + residual, then downscaled mini-transformer and output MLP; these are multiple operations, not one fused kernel."
+     },
      "source": {
       "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig",
       "anchor": "pub fn downscaledTransformer(",
@@ -699,10 +734,7 @@
      ],
      "envFlagNames": [],
      "backend": "metal",
-     "fusedOps": [
-      "gru_combine",
-      "mini_transformer"
-     ]
+     "fusedOps": []
     },
     {
      "id": "head.score",
@@ -753,7 +785,7 @@
     {
      "id": "head.sigmoid",
      "opKind": "sigmoid",
-     "label": "sigmoid → threshold",
+     "label": "sigmoid span-label scores",
      "stageId": "head",
      "inputs": [],
      "outputs": [],
@@ -777,7 +809,9 @@
        }
       ]
      },
-     "attrs": {},
+     "attrs": {
+      "note": "The host pipeline subsequently thresholds valid spans and, with flat_ner=true, removes overlaps in score order. S denotes candidate spans per document; batch rows are schematically collapsed."
+     },
      "kernelRouteIds": [],
      "kernels": [],
      "envFlagNames": [],
@@ -802,12 +836,6 @@
      "id": "e.qkv.attn",
      "from": "enc.qkv",
      "to": "enc.attn",
-     "kind": "data"
-    },
-    {
-     "id": "e.qkv.relscore",
-     "from": "enc.qkv",
-     "to": "enc.relscore",
      "kind": "data"
     },
     {
@@ -916,7 +944,7 @@
   }
  },
  "sources": {
-  "gitCommit": "6f5b642fc86d811840a5b81a5143622cd628c51a",
-  "generatedAt": "2026-09-04T16:16:30.911Z"
+  "gitCommit": "26e332ed8c335d75eecd875548c6c36bcb47d183",
+  "generatedAt": "2026-09-09T21:41:47.835Z"
  }
 }
