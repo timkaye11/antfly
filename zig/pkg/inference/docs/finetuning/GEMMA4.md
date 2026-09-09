@@ -3817,3 +3817,36 @@ E2B/E4B models because the synthetic runner job is not a production-scale test.
 
 Do not call the path production-ready until every gate above has a reproducible
 artifact, pinned model/dataset provenance, and an explicit pass threshold.
+
+## Merge refresh (2026-09-09)
+
+Resolved 31 conflict blocks across the five inference/Metal files while merging
+`26e332ed8c335d75eecd875548c6c36bcb47d183` into branch head
+`3fd4d22304`. The resolution preserves Gemma4 training kernels and content-based
+RMSNorm slot identity alongside F16 embedding/linear paths, cached MPS views,
+weight-handle ownership, ModernBERT normalization, and serving admission floors.
+It also removes duplicate automatically merged declarations and reconciles the
+attention call signature and owned-backend factory.
+
+GPU validation exposed a cleanup hang when a synchronous weight store had no
+prefetch queue. Both per-handle and dense-cache pin release now guard the queue
+lock just as loading does. The lifetime tests cover dense and quantized weights
+with and without a queue, including allocation failures. Transient RMSNorm slot
+retirement now uses the same content key as slot preparation and has a regression
+covering reconstructed equal-content tensors and slot reclamation.
+
+Local validation with pinned Zig 0.16.0 and actual Metal access:
+
+- Gemma4 ReleaseFast gate: 314 selected, 312 passed, two optional fixture skips.
+- Expanded inference Debug gate: 247 selected, 245 passed, two optional model
+  skips; generated-kernel companion checks also passed 23/23.
+- Gemma4 Python discovery: 723/723 passed, including localhost server harnesses.
+- ReleaseFast Metal CLI build and both top-level/finetuning help smokes passed.
+- Resolved Zig files pass formatting; tracked text has no conflict markers;
+  worktree and staged whitespace checks pass.
+
+Logs and the resolution patch are retained under
+`/tmp/antfly-merge-prready-20260909/` as local review evidence. Git staging and the
+merge commit remain the user's handoff; the index still records five unmerged
+paths until they are staged. These checks establish local source readiness only;
+they do not refresh the real-model production qualification described below.

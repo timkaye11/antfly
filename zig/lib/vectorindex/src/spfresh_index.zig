@@ -445,7 +445,7 @@ fn waitForStablePublicationIfSupported(
     if (builtin.os.tag == .freestanding) {
         std.atomic.spinLoopHint();
     } else {
-        std.Thread.yield() catch {};
+        @import("antfly_platform").time.yieldNow();
     }
 }
 
@@ -1391,7 +1391,7 @@ test "posting backlog stats starts clean" {
     const txn = {};
     const stats = try postingBacklogStatsTxn(&index, txn);
     try std.testing.expectEqual(@as(u64, 0), stats.scanned_nodes);
-    try std.testing.expect(!stats.needsRepair());
+    try std.testing.expect(!stats.hasMaintenanceDebt());
 }
 
 test "flat centroid directory match includes publish generation" {

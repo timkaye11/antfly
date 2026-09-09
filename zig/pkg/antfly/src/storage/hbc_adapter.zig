@@ -97,13 +97,7 @@ pub const LsmMaintenanceStats = lsm_backend.Backend.MaintenanceStats;
 pub const LsmOpenStats = lsm_backend.Backend.OpenStats;
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) {
-        if (builtin.os.tag == .freestanding) {
-            std.atomic.spinLoopHint();
-        } else {
-            std.Thread.yield() catch {};
-        }
-    }
+    @import("antfly_platform").sync.lockYielding(mutex);
 }
 
 fn hbcRuntimeBatchMode(in_bulk_session: bool, lsm_direct_bulk_ingest_enabled: ?bool) vectorindex_store.BatchMode {
@@ -822,7 +816,7 @@ const CacheRwLock = struct {
         if (builtin.os.tag == .freestanding or builtin.single_threaded or attempts < 64) {
             std.atomic.spinLoopHint();
         } else {
-            std.Thread.yield() catch {};
+            @import("antfly_platform").time.yieldNow();
         }
     }
 
@@ -4539,6 +4533,10 @@ pub const HBCIndex = struct {
             .vector = self.hbc_cache_kind_stats[@intFromEnum(HbcCacheKind.vector)],
             .metadata = self.hbc_cache_kind_stats[@intFromEnum(HbcCacheKind.metadata)],
         };
+    }
+
+    pub fn usesSharedCache(self: *const HBCIndex) bool {
+        return self.shared_cache != null;
     }
 
     pub fn clearAllCaches(self: *HBCIndex) void {
@@ -9030,15 +9028,47 @@ pub const HBCIndex = struct {
     // Stats
     // ========================================================================
 
-    pub fn stats(self: *const HBCIndex) IndexStats {
+    fn loadPublishedStats(self: *const HBCIndex, generation: u64) PublishedIndexStats {
         return .{
-            .dims = self.metadata.dims,
-            .active_count = self.publishedActiveCount(),
-            .node_count = self.publishedNodeCount(),
-            .root_node = self.publishedRootNode(),
-            .branching_factor = self.metadata.branching_factor,
-            .leaf_size = self.metadata.leaf_size,
+            .generation = generation,
+            .stats = .{
+                .dims = self.metadata.dims,
+                .active_count = self.publishedActiveCount(),
+                .node_count = self.publishedNodeCount(),
+                .root_node = self.publishedRootNode(),
+                .branching_factor = self.metadata.branching_factor,
+                .leaf_size = self.metadata.leaf_size,
+            },
         };
+    }
+
+    /// Returns one coherent immutable serving snapshot and its process-local
+    /// publication generation. The optimistic path is lock-free. A publisher
+    /// that remains in its odd commit generation is joined through the shared
+    /// publication lock rather than exposing a torn root/count observation or
+    /// spinning an owner thread while durable I/O completes.
+    pub fn publishedStats(self: *const HBCIndex) PublishedIndexStats {
+        for (0..8) |_| {
+            const before = self.publishedGeneration();
+            if ((before & 1) != 0) {
+                std.atomic.spinLoopHint();
+                continue;
+            }
+            const snapshot = self.loadPublishedStats(before);
+            const after = self.publishedGeneration();
+            if (before == after) return snapshot;
+        }
+
+        const mutable = @constCast(self);
+        mutable.published_snapshot_mu.lockShared();
+        defer mutable.published_snapshot_mu.unlockShared();
+        const generation = self.publishedGeneration();
+        std.debug.assert((generation & 1) == 0);
+        return self.loadPublishedStats(generation);
+    }
+
+    pub fn stats(self: *const HBCIndex) IndexStats {
+        return self.publishedStats().stats;
     }
 
     pub fn debugLeafForVector(self: *HBCIndex, vector_id: u64) !?u64 {
@@ -9195,6 +9225,10 @@ const ApproxSearchResults = vectorindex_search_results.ApproxSearchResults;
 pub const DebugLeafScore = vectorindex_search_types.DebugLeafScore;
 pub const DebugNodeDistance = vectorindex_search_types.DebugNodeDistance;
 pub const IndexStats = vectorindex_search_types.IndexStats;
+pub const PublishedIndexStats = struct {
+    generation: u64,
+    stats: IndexStats,
+};
 pub const HBCDebugNode = vectorindex_search_types.HBCDebugNode;
 
 // ============================================================================
@@ -10786,6 +10820,22 @@ test "hbc shared cache namespaces entries" {
     try expectSharedVectorCached(&cache, ns_b, 7, &vec_b);
 }
 
+test "hbc index reports shared cache ownership" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var cache = Cache.init(alloc);
+    defer cache.deinit();
+    var idx = try HBCIndex.open(alloc, path, .{ .dims = 4 });
+    defer idx.close();
+
+    try std.testing.expect(!idx.usesSharedCache());
+    idx.attachSharedCache(&cache);
+    try std.testing.expect(idx.usesSharedCache());
+}
+
 test "hbc shared cache rejects node quantized and metadata fills from an older publication" {
     const alloc = std.testing.allocator;
     var cache = Cache.init(alloc);
@@ -10965,9 +11015,15 @@ test "hbc shared vector leases remain coherent during invalidate and replacement
     var stop = std.atomic.Value(bool).init(false);
     var borrows = std.atomic.Value(u64).init(0);
     var failed = std.atomic.Value(bool).init(false);
-    var readers: [8]std.Thread = undefined;
+    var readers: [8]std.Io.Future(void) = undefined;
+    var started_tasks: usize = 0;
+    defer {
+        start.store(true, .release);
+        stop.store(true, .release);
+        for (readers[0..started_tasks]) |*task| task.await(std.testing.io);
+    }
     for (&readers) |*reader| {
-        reader.* = try std.Thread.spawn(.{}, Reader.run, .{
+        reader.* = try std.testing.io.concurrent(Reader.run, .{
             &cache,
             namespace,
             &ready,
@@ -10976,6 +11032,7 @@ test "hbc shared vector leases remain coherent during invalidate and replacement
             &borrows,
             &failed,
         });
+        started_tasks += 1;
     }
     while (ready.load(.acquire) != readers.len) std.atomic.spinLoopHint();
     start.store(true, .release);
@@ -10991,7 +11048,7 @@ test "hbc shared vector leases remain coherent during invalidate and replacement
     }
 
     stop.store(true, .release);
-    for (&readers) |*reader| reader.join();
+    for (&readers) |*reader| reader.await(std.testing.io);
     try std.testing.expect(!failed.load(.acquire));
     try std.testing.expect(borrows.load(.acquire) > 0);
 }
@@ -11083,8 +11140,8 @@ test "hbc retained node and quantized handles survive threaded eviction" {
             target.invalidateQuantized(ns, node_id);
         }
     };
-    const evictor = try std.Thread.spawn(.{}, Evict.run, .{ &cache, namespace, node.id });
-    evictor.join();
+    var evictor = try std.testing.io.concurrent(Evict.run, .{ &cache, namespace, node.id });
+    evictor.await(std.testing.io);
 
     try std.testing.expectEqual(@as(u64, 3), node_lease.ptr().id);
     try std.testing.expectEqualSlices(f32, &centroid, node_lease.ptr().centroid);
@@ -11361,10 +11418,18 @@ test "hbc concurrent cold-start lease acquisition remains bounded" {
 
     var start = std.atomic.Value(bool).init(false);
     var admitted = std.atomic.Value(u32).init(0);
-    var workers: [worker_count]std.Thread = undefined;
-    for (&workers) |*worker| worker.* = try std.Thread.spawn(.{}, Worker.run, .{ &idx, &start, &admitted });
+    var workers: [worker_count]std.Io.Future(void) = undefined;
+    var started_tasks: usize = 0;
+    defer {
+        start.store(true, .release);
+        for (workers[0..started_tasks]) |*task| task.await(std.testing.io);
+    }
+    for (&workers) |*worker| {
+        worker.* = try std.testing.io.concurrent(Worker.run, .{ &idx, &start, &admitted });
+        started_tasks += 1;
+    }
     start.store(true, .release);
-    for (&workers) |*worker| worker.join();
+    for (&workers) |*worker| worker.await(std.testing.io);
 
     try std.testing.expectEqual(@as(u32, 1), admitted.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), cache.decoded_query_active_leases.load(.acquire));
@@ -11922,12 +11987,18 @@ test "hbc shared vector publication coalesces concurrent duplicate fills" {
     const namespace = hbcCacheNamespace("/tmp/hbc-vector-single-flight");
     var start = std.atomic.Value(bool).init(false);
     var failed = std.atomic.Value(bool).init(false);
-    var threads: [16]std.Thread = undefined;
+    var threads: [16]std.Io.Future(void) = undefined;
+    var started_tasks: usize = 0;
+    defer {
+        start.store(true, .release);
+        for (threads[0..started_tasks]) |*task| task.await(std.testing.io);
+    }
     for (&threads) |*thread| {
-        thread.* = try std.Thread.spawn(.{}, Worker.run, .{ &cache, namespace, &start, &failed });
+        thread.* = try std.testing.io.concurrent(Worker.run, .{ &cache, namespace, &start, &failed });
+        started_tasks += 1;
     }
     start.store(true, .release);
-    for (&threads) |*thread| thread.join();
+    for (&threads) |*thread| thread.await(std.testing.io);
 
     try std.testing.expect(!failed.load(.acquire));
     const stats = cache.namespaceStats(namespace).vector;
@@ -11976,7 +12047,7 @@ test "hbc shared cache lock reports striped reader wait" {
     const read_stripe = lock.lockVectorShared(1, 1);
     var writer_acquired = std.atomic.Value(bool).init(false);
     var release_writer = std.atomic.Value(bool).init(false);
-    var writer = try std.Thread.spawn(.{}, Writer.run, .{ &lock, &writer_acquired, &release_writer });
+    var writer = try std.testing.io.concurrent(Writer.run, .{ &lock, &writer_acquired, &release_writer });
     while (!lock.vector_fence_pending.load(.acquire)) std.atomic.spinLoopHint();
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
@@ -11985,7 +12056,7 @@ test "hbc shared cache lock reports striped reader wait" {
     while (!writer_acquired.load(.acquire)) std.atomic.spinLoopHint();
     try std.testing.expect(lock.vector_fence_pending.load(.acquire));
     release_writer.store(true, .release);
-    writer.join();
+    writer.await(std.testing.io);
 
     try std.testing.expect(writer_acquired.load(.acquire));
     try std.testing.expect(!lock.vector_fence_pending.load(.acquire));
@@ -12008,14 +12079,20 @@ test "hbc shared cache queued writer cannot be bypassed by nonblocking reclaim" 
     var lock: CacheRwLock = .{};
     lockAtomic(&lock.writer_gate);
     var writer_acquired = std.atomic.Value(bool).init(false);
-    var writer = try std.Thread.spawn(.{}, Writer.run, .{ &lock, &writer_acquired });
+    var writer = try std.testing.io.concurrent(Writer.run, .{ &lock, &writer_acquired });
+    var writer_awaited = false;
+    defer if (!writer_awaited) {
+        lock.writer_gate.unlock();
+        writer.await(std.testing.io);
+    };
     while (lock.writers_waiting.load(.acquire) == 0) std.atomic.spinLoopHint();
 
     try std.testing.expect(!lock.tryLockExclusive());
     try std.testing.expect(!writer_acquired.load(.acquire));
 
     lock.writer_gate.unlock();
-    writer.join();
+    writer.await(std.testing.io);
+    writer_awaited = true;
     try std.testing.expect(writer_acquired.load(.acquire));
 
     try std.testing.expect(lock.tryLockExclusive());
@@ -12059,9 +12136,15 @@ test "hbc shared cache writer progresses under continuous striped reads" {
     var stop = std.atomic.Value(bool).init(false);
     var reads = std.atomic.Value(u64).init(0);
     var writer_acquired = std.atomic.Value(bool).init(false);
-    var readers: [8]std.Thread = undefined;
+    var readers: [8]std.Io.Future(void) = undefined;
+    var started_tasks: usize = 0;
+    defer {
+        start.store(true, .release);
+        stop.store(true, .release);
+        for (readers[0..started_tasks]) |*task| task.await(std.testing.io);
+    }
     for (&readers, 0..) |*reader, index| {
-        reader.* = try std.Thread.spawn(.{}, Reader.run, .{
+        reader.* = try std.testing.io.concurrent(Reader.run, .{
             &lock,
             @as(u64, @intCast(index + 1)),
             @as(u64, @intCast(index * 17 + 1)),
@@ -12070,12 +12153,17 @@ test "hbc shared cache writer progresses under continuous striped reads" {
             &stop,
             &reads,
         });
+        started_tasks += 1;
     }
     while (ready.load(.acquire) != readers.len) std.atomic.spinLoopHint();
     start.store(true, .release);
     while (reads.load(.acquire) < readers.len) std.atomic.spinLoopHint();
 
-    var writer = try std.Thread.spawn(.{}, Writer.run, .{ &lock, &writer_acquired });
+    var writer = try std.testing.io.concurrent(Writer.run, .{ &lock, &writer_acquired });
+    defer {
+        stop.store(true, .release);
+        writer.await(std.testing.io);
+    }
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     var attempts: usize = 0;
@@ -12084,8 +12172,8 @@ test "hbc shared cache writer progresses under continuous striped reads" {
     }
     const progressed_under_load = writer_acquired.load(.acquire);
     stop.store(true, .release);
-    for (&readers) |*reader| reader.join();
-    writer.join();
+    for (&readers) |*reader| reader.await(std.testing.io);
+    writer.await(std.testing.io);
 
     try std.testing.expect(progressed_under_load);
 }
@@ -13442,11 +13530,16 @@ test "searchWithRequest tolerates concurrent readers with runtime caches enabled
 
     var failed = std.atomic.Value(u8).init(0);
     var workers = [_]Worker{.{ .idx = &idx, .failed = &failed }} ** 8;
-    var threads: [workers.len]std.Thread = undefined;
-    for (&threads, &workers, 0..) |*thread, *worker, worker_index| {
-        thread.* = try std.Thread.spawn(.{}, Worker.run, .{ worker, worker_index });
+    var threads: [workers.len]std.Io.Future(void) = undefined;
+    var started_tasks: usize = 0;
+    defer {
+        for (threads[0..started_tasks]) |*task| task.await(std.testing.io);
     }
-    for (threads) |thread| thread.join();
+    for (&threads, &workers, 0..) |*thread, *worker, worker_index| {
+        thread.* = try std.testing.io.concurrent(Worker.run, .{ worker, worker_index });
+        started_tasks += 1;
+    }
+    for (&threads) |*thread| thread.await(std.testing.io);
     try std.testing.expectEqual(@as(u8, 0), failed.load(.monotonic));
 }
 
@@ -15867,7 +15960,7 @@ test "posting backlog stats report lazy dirty leaves with std Io writer" {
     try idx.insert(2, &[_]f32{ 3.0, 0.0 });
 
     const stats = try idx.postingBacklogStats();
-    try std.testing.expect(stats.needsRepair());
+    try std.testing.expect(stats.hasMaintenanceDebt());
     try std.testing.expectEqual(@as(u64, 1), stats.dirty_postings);
     try std.testing.expectEqual(@as(u64, 1), stats.centroid_dirty_postings);
     try std.testing.expectEqual(@as(u64, 0), stats.payload_dirty_postings);
@@ -15939,7 +16032,7 @@ test "auto posting maintenance repairs bounded lazy backlog before commit" {
     try idx.insert(2, &[_]f32{ 3.0, 0.0 });
 
     const stats = try idx.postingBacklogStats();
-    try std.testing.expect(!stats.needsRepair());
+    try std.testing.expect(!stats.hasMaintenanceDebt());
     try std.testing.expectEqual(@as(u64, 0), stats.dirty_postings);
 
     {

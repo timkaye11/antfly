@@ -38,6 +38,8 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 
 pub fn normalizeQueryEmbeddingOperationalError(err: anyerror) ?anyerror {
     return switch (err) {
+        error.ProviderTokenBudgetExceeded => error.QueryEmbeddingInputTooLarge,
+        error.ProviderQuotaRegistryFull => error.QueryEmbeddingOverloaded,
         error.QueryEmbeddingInputTooLarge,
         error.QueryEmbeddingOverloaded,
         error.EmbedRateLimited,
@@ -135,6 +137,7 @@ pub const QueryPlanningContext = struct {
     inference_api_url: ?[]const u8 = null,
     inference_api_key: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
+    provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     query_embedding_cache: ?*query_embedding_cache.QueryEmbeddingCache = null,
     query_embedding_budget: ?*cache_budget.CacheBudget = null,
     query_embedding_security_domain: managed_embedder.QueryCacheSecurityDomain = .internal,
@@ -231,6 +234,7 @@ pub fn planSemanticQuery(
         .inference_api_url = planning.inference_api_url,
         .inference_api_key = planning.inference_api_key,
         .secret_store = planning.secret_store,
+        .provider_runtime = planning.provider_runtime,
     });
     defer runtime.deinit();
 
@@ -244,7 +248,7 @@ pub fn planSemanticQuery(
             };
             const cache = planning.query_embedding_cache orelse
                 break :blk try TemplateQueryComputeContext.run(&compute_context, alloc);
-            break :blk try cache.computeUncached(alloc, embedding_deadline_ns, &compute_context, TemplateQueryComputeContext.run);
+            break :blk try cache.computeUncached(alloc, cache.deadlineFromNative(embedding_deadline_ns), &compute_context, TemplateQueryComputeContext.run);
         } else blk: {
             var compute_context = DenseQueryComputeContext{
                 .runtime = &runtime,
@@ -254,12 +258,12 @@ pub fn planSemanticQuery(
             const cache = planning.query_embedding_cache orelse
                 break :blk try DenseQueryComputeContext.run(&compute_context, alloc);
             const budget = planning.query_embedding_budget orelse
-                break :blk try cache.computeUncached(alloc, embedding_deadline_ns, &compute_context, DenseQueryComputeContext.run);
+                break :blk try cache.computeUncached(alloc, cache.deadlineFromNative(embedding_deadline_ns), &compute_context, DenseQueryComputeContext.run);
             const key = runtime.queryCacheKey(index_name, planning.query_embedding_security_domain, planning.query_embedding_security_scope, semantic_search) catch |err| switch (err) {
-                error.QueryEmbeddingNotCacheable => break :blk try cache.computeUncached(alloc, embedding_deadline_ns, &compute_context, DenseQueryComputeContext.run),
+                error.QueryEmbeddingNotCacheable => break :blk try cache.computeUncached(alloc, cache.deadlineFromNative(embedding_deadline_ns), &compute_context, DenseQueryComputeContext.run),
                 else => return err,
             };
-            break :blk try cache.getOrCompute(budget, alloc, key, embedding_deadline_ns, &compute_context, DenseQueryComputeContext.run);
+            break :blk try cache.getOrCompute(budget, alloc, key, cache.deadlineFromNative(embedding_deadline_ns), &compute_context, DenseQueryComputeContext.run);
         },
         .k = limit,
     };

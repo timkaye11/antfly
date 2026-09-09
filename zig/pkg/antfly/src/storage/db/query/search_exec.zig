@@ -1266,12 +1266,16 @@ pub fn searchComposed(
     }
 
     const fuse_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
+    // Reranking and pruning are coordinator transforms. Keep their bounded
+    // retrieval window through local fusion instead of truncating it to the
+    // final page, and defer pruning until provider scores exist when present.
+    const fusion_req = composedFusionRequest(shared_req);
     var base = if (named_sets.items.len == 0)
         try emptySearchResult(alloc)
     else if (named_sets.items.len == 1)
         try executor.clone_named_set(executor.ctx, alloc, named_sets.items[0], shared_req.include_stored)
     else
-        try executor.fuse_named_sets(executor.ctx, alloc, shared_req, named_sets.items);
+        try executor.fuse_named_sets(executor.ctx, alloc, fusion_req, named_sets.items);
     if (bench_query_profile) fuse_ns = platform_time.monotonicNs() - fuse_start_ns;
     errdefer base.deinit();
 
@@ -1494,6 +1498,25 @@ pub fn isDefaultMatchAll(query: types.Query) bool {
     };
 }
 
+/// Whether request execution binds `index_name` directly as a full-text index.
+/// Keep planning, binding validation, and API lifecycle error classification
+/// on one definition so an unavailable index cannot change a permanent shape
+/// error into a retryable rebuilding response.
+pub fn requestBindsRootTextIndex(req: types.SearchRequest) bool {
+    return req.full_text != null or
+        req.filter_query_json.len > 0 or
+        req.exclusion_query_json.len > 0 or
+        (!isDefaultMatchAll(req.query) and isTextQuery(req.query));
+}
+
+/// Structured text filters use their own resolution chain: the routed primary
+/// text index, then the root index, then the default full-text index. Keep that
+/// distinct from direct root-index binding so preflight does not reject a
+/// valid request merely because its semantic root index is not full-text.
+pub fn requestBindsFilterTextIndex(req: types.SearchRequest) bool {
+    return req.filter_text != null or req.exclusion_text != null;
+}
+
 fn hasSearchRequestFullTextResults(req: types.SearchRequest) bool {
     if (req.full_text != null) return true;
     if (req.full_text_queries.len > 0) return true;
@@ -1697,7 +1720,10 @@ const ComponentPaging = struct {
 };
 
 fn componentPaging(req: types.SearchRequest) ComponentPaging {
-    var limit = req.limit +| req.offset;
+    var limit = if (req.reranker) |reranker|
+        reranker.candidate_count orelse (reranker.top_n orelse req.limit) +| req.offset
+    else
+        req.limit +| req.offset;
     const needs_component_window = requestHasPostprocessPageTransforms(req);
 
     if (!needs_component_window) {
@@ -1711,15 +1737,74 @@ fn componentPaging(req: types.SearchRequest) ComponentPaging {
         if (merge_config.window_size > limit) limit = merge_config.window_size;
     }
     if (req.reranker) |reranker| {
-        if (reranker.top_n) |top_n| {
-            if (top_n > limit) limit = top_n;
-        }
+        const reranker_window = reranker.candidate_count orelse (reranker.top_n orelse req.limit) +| req.offset;
+        if (reranker_window > limit) limit = reranker_window;
     }
 
     return .{
         .offset = 0,
         .limit = limit,
     };
+}
+
+fn composedFusionRequest(req: types.SearchRequest) types.SearchRequest {
+    if (req.reranker == null and req.pruner == null) return req;
+    const paging = componentPaging(req);
+    var copy = req;
+    copy.offset = paging.offset;
+    copy.limit = paging.limit;
+    copy.pruner = null;
+    return copy;
+}
+
+test "composed fusion preserves the coordinator reranker window" {
+    const req = types.SearchRequest{
+        .offset = 10,
+        .limit = 10,
+        .reranker = .{
+            .provider = .antfly,
+            .field = "body",
+            .candidate_count = 50,
+        },
+        .pruner = .{ .min_score_ratio = 0.5 },
+    };
+    const fusion_req = composedFusionRequest(req);
+    try std.testing.expectEqual(@as(u32, 0), fusion_req.offset);
+    try std.testing.expectEqual(@as(u32, 50), fusion_req.limit);
+    try std.testing.expect(fusion_req.pruner == null);
+
+    const pruner_only = composedFusionRequest(.{
+        .offset = 10,
+        .limit = 10,
+        .pruner = .{ .min_score_ratio = 0.5 },
+    });
+    try std.testing.expectEqual(@as(u32, 0), pruner_only.offset);
+    try std.testing.expectEqual(@as(u32, 20), pruner_only.limit);
+    try std.testing.expect(pruner_only.pruner == null);
+}
+
+test "reranker component paging includes the post-rerank offset" {
+    const paging = componentPaging(.{
+        .limit = 5,
+        .offset = 7,
+        .reranker = .{
+            .provider = .antfly,
+            .field = "body",
+            .top_n = 10,
+        },
+    });
+    try std.testing.expectEqual(@as(u32, 0), paging.offset);
+    try std.testing.expectEqual(@as(u32, 17), paging.limit);
+
+    const legacy_top_n = componentPaging(.{
+        .limit = 5,
+        .reranker = .{
+            .provider = .antfly,
+            .field = "body",
+            .top_n = 2,
+        },
+    });
+    try std.testing.expectEqual(@as(u32, 2), legacy_top_n.limit);
 }
 
 fn requestHasPostprocessPageTransforms(req: types.SearchRequest) bool {
@@ -1737,13 +1822,30 @@ fn hasStoredPatternFilters(req: types.SearchRequest) bool {
 
 fn requestWithoutResolvedStoredFilters(req: types.SearchRequest, filter_query_json_resolved: bool, exclusion_query_json_resolved: bool) types.SearchRequest {
     var next = req;
-    // Native text filters are resolved into the candidate constraints before
-    // post-processing. Clear the borrowed query views so later stages cannot
-    // accidentally resolve or apply them a second time.
+    // Native collectors have already enforced these predicates. Keep explicit
+    // identity constraints and residual predicates for hit hydration, but do not
+    // request ordinal lookups solely for predicates that no longer need them.
     next.filter_text = null;
     next.exclusion_text = null;
     if (filter_query_json_resolved) next.filter_query_json = "";
     if (exclusion_query_json_resolved) next.exclusion_query_json = "";
+    return next;
+}
+
+fn requestAfterNativeFilters(req: types.SearchRequest, filter_query_json_resolved: bool, exclusion_query_json_resolved: bool) types.SearchRequest {
+    var next = requestWithoutResolvedStoredFilters(req, filter_query_json_resolved, exclusion_query_json_resolved);
+    // Candidate collectors enforce these constraints against their pinned native
+    // snapshot. Only residual predicates belong in post-processing: applying an
+    // admitted document filter again to a page discards the upstream total and
+    // can confuse source document IDs with derived artifact IDs. This is a
+    // borrowed request copy; ownership and identity generation remain with req.
+    next.filter_doc_ids = &.{};
+    next.filter_doc_ids_positive = false;
+    next.exclude_doc_ids = &.{};
+    next.resolved_doc_filter = null;
+    next.resolved_doc_filter_owned = false;
+    next.resolved_doc_filter_wire_context = null;
+    next.resolved_text_doc_filter = null;
     return next;
 }
 
@@ -11655,7 +11757,11 @@ pub fn searchTextQuery(
             .window_len = 0,
             .total_ns = platform_time.monotonicNs() - total_start_ns,
         }) else null;
-        return executor.postprocess(executor.ctx, alloc, effective_req, .{
+        return executor.postprocess(executor.ctx, alloc, requestAfterNativeFilters(
+            effective_req,
+            native_constraints.filter_query_json_resolved,
+            native_constraints.exclusion_query_json_resolved,
+        ), .{
             .alloc = alloc,
             .hits = &.{},
             .total_hits = 0,
@@ -11841,19 +11947,15 @@ pub fn searchTextQuery(
     while (true) {
         try checkSearchRequestDeadline(effective_req);
         candidate_iterations += 1;
-        var postprocess_req = effective_req;
+        var postprocess_req = requestAfterNativeFilters(
+            effective_req,
+            native_constraints.filter_query_json_resolved,
+            native_constraints.exclusion_query_json_resolved,
+        );
         if (late_visibility_paginate or requires_field_sort or group_chunk_parents) {
             postprocess_req.offset = 0;
             postprocess_req.limit = candidate_limit;
         }
-        // Explicit document-ID constraints have already been resolved against
-        // this exact text snapshot and enforced by its native collector. Do
-        // not apply them a second time to derived artifact hit IDs in the
-        // stored-pattern layer, where source and artifact IDs intentionally
-        // use different representations of the same document.
-        postprocess_req.filter_doc_ids = &.{};
-        postprocess_req.filter_doc_ids_positive = false;
-        postprocess_req.exclude_doc_ids = &.{};
 
         const execute_start_ns = if (collect_score_timing) platform_time.monotonicNs() else 0;
         var result = if (effective_req.count_only)
@@ -13088,7 +13190,12 @@ fn searchDenseInternal(
     const unresolved_stored_filters =
         (req.filter_query_json.len > 0 and !native_constraints.filter_query_json_resolved) or
         (req.exclusion_query_json.len > 0 and !native_constraints.exclusion_query_json_resolved);
-    const postprocess_req = requestWithoutResolvedStoredFilters(
+    const hydration_req = requestWithoutResolvedStoredFilters(
+        req,
+        native_constraints.filter_query_json_resolved,
+        native_constraints.exclusion_query_json_resolved,
+    );
+    const postprocess_req = requestAfterNativeFilters(
         req,
         native_constraints.filter_query_json_resolved,
         native_constraints.exclusion_query_json_resolved,
@@ -13464,7 +13571,9 @@ fn searchDenseInternal(
             source_artifact_ref_owned = false;
         }
         const ordinal_lookup_start = platform_time.monotonicNs();
-        try lookupDenseHitDocOrdinals(alloc, postprocess_req, executor, hit_vector_ids.items, hits.items);
+        // Hydration retains explicit identity requirements and residual
+        // predicates; post-processing also consumes the native ID constraints.
+        try lookupDenseHitDocOrdinals(alloc, hydration_req, executor, hit_vector_ids.items, hits.items);
         profile.doc_ordinal_lookup_ns += platform_time.monotonicNs() - ordinal_lookup_start;
 
         const postprocess_start = platform_time.monotonicNs();
@@ -15090,7 +15199,7 @@ pub fn searchSparse(
     const unresolved_stored_filters =
         (req.filter_query_json.len > 0 and !native_constraints.filter_query_json_resolved) or
         (req.exclusion_query_json.len > 0 and !native_constraints.exclusion_query_json_resolved);
-    const postprocess_req = requestWithoutResolvedStoredFilters(
+    const postprocess_req = requestAfterNativeFilters(
         req,
         native_constraints.filter_query_json_resolved,
         native_constraints.exclusion_query_json_resolved,
@@ -16978,7 +17087,7 @@ pub fn searchMatchAll(
     const unresolved_stored_filters =
         (exec_req.filter_query_json.len > 0 and !native_constraints.filter_query_json_resolved) or
         (exec_req.exclusion_query_json.len > 0 and !native_constraints.exclusion_query_json_resolved);
-    const postprocess_req = requestWithoutResolvedStoredFilters(
+    const postprocess_req = requestAfterNativeFilters(
         exec_req,
         native_constraints.filter_query_json_resolved,
         native_constraints.exclusion_query_json_resolved,
@@ -26923,7 +27032,7 @@ test "match_all primary scan aborts promptly when cancellation arrives mid-fligh
                 defer self.alloc.free(key);
                 if (i == 1023) {
                     self.reached_checkpoint.store(true, .release);
-                    while (!self.release_checkpoint.load(.acquire)) std.Thread.yield() catch {};
+                    while (!self.release_checkpoint.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
                 }
                 if (try callback(scan_ctx, key, "{}") == .stop) return;
             }
@@ -26957,11 +27066,11 @@ test "match_all primary scan aborts promptly when cancellation arrives mid-fligh
     var harness = Harness{ .alloc = std.heap.page_allocator };
     var cancellation = std.atomic.Value(bool).init(false);
     var worker = Worker{ .harness = &harness, .cancellation = &cancellation };
-    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(Worker.run, .{&worker});
     var joined = false;
     defer if (!joined) {
         harness.release_checkpoint.store(true, .release);
-        thread.join();
+        thread.await(std.testing.io);
     };
 
     var wait_io = std.Io.Threaded.init(std.testing.allocator, .{});
@@ -26973,7 +27082,7 @@ test "match_all primary scan aborts promptly when cancellation arrives mid-fligh
     try std.testing.expect(harness.reached_checkpoint.load(.acquire));
     cancellation.store(true, .release);
     harness.release_checkpoint.store(true, .release);
-    thread.join();
+    thread.await(std.testing.io);
     joined = true;
     try std.testing.expect(worker.observed_cancel.load(.acquire));
 }

@@ -508,6 +508,26 @@ pub const CatalogProjectionReader = struct {
         );
     }
 
+    /// Validate retirement against the same retained, point-in-time catalog
+    /// projection used by routing and publication fences. Linearizability is
+    /// established by the caller before entering this allocation-free check.
+    pub fn validateGroupRetirement(
+        self: *CatalogProjectionReader,
+        alloc: std.mem.Allocator,
+        metadata_group_id: u64,
+        source: Source,
+        incarnation: ?metadata_api.MetadataClusterIncarnation,
+        contract: metadata_api.CatalogGroupRetirementContract,
+    ) !metadata_api.CatalogGroupRetirementValidation {
+        var lease = try self.snapshotLease(alloc, metadata_group_id, source, null);
+        defer lease.deinit();
+        return lease.snapshot().index.validateGroupRetirement(
+            contract,
+            metadata_group_id,
+            incarnation,
+        );
+    }
+
     pub fn freeRoutingSnapshot(
         _: *CatalogProjectionReader,
         alloc: std.mem.Allocator,
@@ -839,9 +859,17 @@ test "catalog projection cache coalesces concurrent refreshes outside its mutex"
     defer reader.deinit(std.testing.allocator);
     var first = Worker{ .reader = &reader, .source = fake.source() };
     var second = Worker{ .reader = &reader, .source = fake.source() };
-    var first_thread = try std.Thread.spawn(.{}, Worker.run, .{&first});
+    var first_thread = try std.testing.io.concurrent(Worker.run, .{&first});
+    defer {
+        fake.proceed.set(std.Options.debug_io);
+        first_thread.await(std.testing.io);
+    }
     fake.entered.waitUncancelable(std.Options.debug_io);
-    var second_thread = try std.Thread.spawn(.{}, Worker.run, .{&second});
+    var second_thread = try std.testing.io.concurrent(Worker.run, .{&second});
+    defer {
+        fake.proceed.set(std.Options.debug_io);
+        second_thread.await(std.testing.io);
+    }
 
     const waiter_deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
     while (true) {
@@ -853,8 +881,8 @@ test "catalog projection cache coalesces concurrent refreshes outside its mutex"
         platform_clock.Clock.real().sleepMs(1);
     }
     fake.proceed.set(std.Options.debug_io);
-    first_thread.join();
-    second_thread.join();
+    first_thread.await(std.testing.io);
+    second_thread.await(std.testing.io);
 
     try std.testing.expect(first.failure == null);
     try std.testing.expect(second.failure == null);
@@ -920,14 +948,22 @@ test "catalog projection waiter retries a shorter builder timeout" {
         .source = fake.source(),
         .deadline_ns = platform_time.monotonicNs() + 20 * std.time.ns_per_ms,
     };
-    var short_thread = try std.Thread.spawn(.{}, Worker.run, .{&short});
+    var short_thread = try std.testing.io.concurrent(Worker.run, .{&short});
+    defer {
+        fake.release_first.set(std.Options.debug_io);
+        short_thread.await(std.testing.io);
+    }
     fake.first_entered.waitUncancelable(std.Options.debug_io);
     var patient = Worker{
         .reader = &reader,
         .source = fake.source(),
         .deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s,
     };
-    var patient_thread = try std.Thread.spawn(.{}, Worker.run, .{&patient});
+    var patient_thread = try std.testing.io.concurrent(Worker.run, .{&patient});
+    defer {
+        fake.release_first.set(std.Options.debug_io);
+        patient_thread.await(std.testing.io);
+    }
 
     const waiter_deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
     while (true) {
@@ -940,8 +976,8 @@ test "catalog projection waiter retries a shorter builder timeout" {
     }
     platform_clock.Clock.real().sleepMs(25);
     fake.release_first.set(std.Options.debug_io);
-    short_thread.join();
-    patient_thread.join();
+    short_thread.await(std.testing.io);
+    patient_thread.await(std.testing.io);
 
     try std.testing.expectEqualStrings("CatalogRoutingSnapshotTimeout", @errorName(short.failure.?));
     try std.testing.expect(patient.failure == null);
@@ -1003,11 +1039,11 @@ test "catalog projection timeout does not publish a late build" {
         .source = fake.source(),
         .deadline_ns = platform_time.monotonicNs() + 10 * std.time.ns_per_ms,
     };
-    var thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(Worker.run, .{&worker});
     fake.entered.waitUncancelable(std.Options.debug_io);
     platform_clock.Clock.real().sleepMs(20);
     fake.proceed.set(std.Options.debug_io);
-    thread.join();
+    thread.await(std.testing.io);
 
     try std.testing.expect(worker.failure != null);
     try std.testing.expectEqualStrings("CatalogRoutingSnapshotTimeout", @errorName(worker.failure.?));

@@ -58,7 +58,7 @@ const RestoreIoScope = struct {
             if (runtime.filesystemIo()) |runtime_io|
                 return .{ .alloc = alloc, .io_value = runtime_io };
         }
-        if (restore.open_options.io orelse restore.io) |shared_io| {
+        if (restore.open_options.filesystem_io orelse restore.io) |shared_io| {
             return .{ .alloc = alloc, .io_value = shared_io };
         }
         if (restore.backend_runtime != null) return error.BackendRuntimeIoUnavailable;
@@ -113,7 +113,7 @@ fn openRestoreLocation(
         },
     };
     options.required_capability = "restore.read";
-    options.io = io;
+    if (options.filesystem_io == null) options.filesystem_io = io;
     return try backups_api.openBackupLocationWithOptions(alloc, restore.location, options);
 }
 
@@ -206,13 +206,25 @@ pub fn applyRestoreSnapshotToPathWithOptions(
     restore: RestoreSource,
     options: RestoreOptions,
 ) !void {
+    var io_scope = try RestoreIoScope.init(alloc, restore);
+    defer io_scope.deinit();
+    var restore_with_io = restore;
+    restore_with_io.io = io_scope.io();
+    // Provisioning and Raft admission may discover the same restore intent on
+    // adjacent control turns. Check the published generation under a read
+    // lease before requesting an exclusive transition: once the exact import
+    // identity is durable, the managed repair owner is allowed to keep that
+    // generation open while it advances restartable runtime-repair phases.
+    // Requiring repair completion here would make the idempotent caller fight
+    // that owner forever with GenerationTransitionActive.
+    if (try publishedRestoreAlreadyImported(alloc, path, group_id, restore_with_io)) return;
     var transition = try db_mod.generation_lifecycle.beginProcessExclusiveWithRuntimeAndIo(
         path,
         restore.backend_runtime,
-        restore.open_options.io orelse restore.io,
+        io_scope.io(),
     );
     defer transition.deinit();
-    try applyRestoreSnapshotToPathWithExclusiveTransition(&transition, alloc, path, group_id, restore, options);
+    try applyRestoreSnapshotToPathWithExclusiveTransition(&transition, alloc, path, group_id, restore_with_io, options);
 }
 
 pub fn applyRestoreSnapshotToPathWithExclusiveTransition(
@@ -248,15 +260,22 @@ fn repairPreparedRestoreUntilComplete(
     const io = io_scope.io();
     var state = (try db_mod.DB.readRestoreStateForPathWithIo(alloc, io, prepared.path())) orelse return;
     defer state.deinit(alloc);
+    const open_options = try preparedRestoreOpenOptionsForRepair(prepared, restore, options);
+    var restored = try db_mod.DB.open(alloc, prepared.path(), open_options);
+    defer restored.close();
+    // Backup artifacts contain the source replica's applied-entry fence. A
+    // restored generation is admitted into a distinct Raft history even when
+    // metadata intentionally preserves the logical group id, so publishing
+    // that fence would make the first destination entry look conflicting (or
+    // already applied). Clear it on the isolated candidate before either
+    // portable deferred repair or native inline repair can publish the root.
+    try restored.clearRaftAppliedEntry();
     // Legacy/portable repair may require table-managed provider wiring and is
     // completed by the provisioning restore job. Native selective repair is
     // self-contained and must finish before this lower-level bootstrap can
     // publish the candidate.
     if (!std.mem.eql(u8, state.phase, "repair_indexes")) return;
 
-    const open_options = try preparedRestoreOpenOptionsForRepair(prepared, restore, options);
-    var restored = try db_mod.DB.open(alloc, prepared.path(), open_options);
-    defer restored.close();
     var repair_cancellation = db_mod.types.RepairCancellation{ .token = restore.cancellation };
     while (try restored.restoreRuntimeRepairNeeded()) {
         try restore.cancellation.check();
@@ -351,7 +370,7 @@ pub fn publishPreparedRestore(
 ) !db_mod.generation_lifecycle.PublicationOutcome {
     try prepared._generation.validateLivePath(path);
     const outcome = try prepared._generation.publish();
-    cleanupSnapshotsForPublishedRestore(alloc, path);
+    cleanupSnapshotsForPublishedRestore(alloc, prepared._generation.io orelse std.Options.debug_io, path);
     return outcome;
 }
 
@@ -431,6 +450,22 @@ fn publishedRestoreAlreadyApplied(
         return false;
     defer generation_read.deinit();
     validateCommittedRestoreIdentity(alloc, path, group_id, restore) catch |err| switch (err) {
+        error.RestoreIdentityMismatch => return false,
+        else => return err,
+    };
+    return true;
+}
+
+fn publishedRestoreAlreadyImported(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    group_id: u64,
+    restore: RestoreSource,
+) !bool {
+    var generation_read = (try db_mod.generation_lifecycle.acquirePublishedGenerationRead(alloc, path)) orelse
+        return false;
+    defer generation_read.deinit();
+    validateImportedRestoreIdentity(alloc, path, group_id, restore) catch |err| switch (err) {
         error.RestoreIdentityMismatch => return false,
         else => return err,
     };
@@ -1011,10 +1046,10 @@ fn stageRestoreFile(
     return staging_path;
 }
 
-fn cleanupSnapshotsForPublishedRestore(alloc: std.mem.Allocator, path: []const u8) void {
+fn cleanupSnapshotsForPublishedRestore(alloc: std.mem.Allocator, io: std.Io, path: []const u8) void {
     const snapshot_dir = std.fmt.allocPrint(alloc, "{s}.snapshots", .{path}) catch return;
     defer alloc.free(snapshot_dir);
-    destroyPathIfExists(snapshot_dir);
+    destroyPathIfExistsWithIo(io, snapshot_dir);
 }
 
 fn ensureDirPath(path: []const u8) !void {
@@ -1276,7 +1311,7 @@ fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), 
     try out.appendSlice(alloc, escaped);
 }
 
-test "backup restore bootstrap deduplicates exact content across source aliases while a reader is resident" {
+test "backup restore bootstrap adopts an exact imported generation while repair holds a reader" {
     const alloc = std.testing.allocator;
     const group_id: u64 = 1701;
     const artifact_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -1290,7 +1325,7 @@ test "backup restore bootstrap deduplicates exact content across source aliases 
     const marker_path = try std.fmt.allocPrint(alloc, "{s}/.restore-state", .{path});
     defer alloc.free(marker_path);
     try writeFile(marker_path,
-        \\{"format_version":1,"backup_id":"backup-1701","location":"s3://backup/antfly","artifact_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","snapshot_path":"backup-1701/groups/1701.afb","group_id":1701,"phase":"complete","primary_restored":true,"runtime_repair_complete":true,"last_error":""}
+        \\{"format_version":1,"backup_id":"backup-1701","location":"s3://backup/antfly","artifact_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","snapshot_path":"backup-1701/groups/1701.afb","group_id":1701,"phase":"rebuild_graph","primary_restored":true,"runtime_repair_complete":false,"last_error":""}
     );
 
     var resident_read = (try db_mod.generation_lifecycle.acquirePublishedGenerationRead(alloc, path)) orelse

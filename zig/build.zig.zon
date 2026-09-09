@@ -27,6 +27,9 @@
         .protobuf = .{
             .path = "lib/protobuf",
         },
+        .vopr = .{
+            .path = "lib/vopr",
+        },
     },
     .paths = .{
         "build.zig",
@@ -35,6 +38,7 @@
         "e2e/inference",
         "lib/audio",
         "lib/chunker",
+        "lib/hash",
         "lib/httpx",
         "lib/jinja",
         "lib/json",
@@ -49,6 +53,7 @@
         "lib/protobuf",
         "lib/structlog",
         "lib/tokenizer",
+        "lib/vopr",
         "pkg/antfly",
         "pkg/inference",
         "pkg/inference-client",

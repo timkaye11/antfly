@@ -21,7 +21,7 @@ ONNXRUNTIME_VERSION ?= 1.24.3
 GENAI_VERSION ?= 0.12.1
 ONNXRUNTIME_STAMP := $(ONNXRUNTIME_ROOT)/.version-$(ONNXRUNTIME_VERSION)-$(GENAI_VERSION)
 
-.PHONY: build test unit-test download-onnx force-download-onnx clean-onnx
+.PHONY: build test unit-test antfly-unit-test download-onnx force-download-onnx clean-onnx
 
 $(ONNXRUNTIME_STAMP): $(INFERENCE_DIR)/scripts/download-onnxruntime.sh
 	@test -d $(INFERENCE_DIR) || (echo "ERROR: inference package not found at $(INFERENCE_DIR)" && exit 1)
@@ -35,14 +35,17 @@ force-download-onnx: ## Force re-download of ONNX Runtime + GenAI.
 	@rm -f $(ONNXRUNTIME_ROOT)/.version-*
 	$(MAKE) download-onnx
 
-build: download-onnx ## Build antfly with embedded inference + ONNX inference.
+build: ## Build the Antfly runtime; optional inference dependencies are provisioned explicitly.
 	python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build antfly $(ZIG_BUILD_FLAGS)
 
 test: ## Run the default Zig test aggregate with bounded scheduler memory.
 	python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build test $(ZIG_BUILD_FLAGS)
 
-unit-test: ## Run hermetic Antfly unit tests with bounded scheduler memory.
-	python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build unit-test $(ZIG_BUILD_FLAGS)
+unit-test: ## Run the existing repository unit gate across libraries, Antfly, and inference.
+	python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build lib-test antfly-unit-test inference-test inference-finetune-test $(ZIG_BUILD_FLAGS)
+
+antfly-unit-test: ## Run hermetic Antfly unit tests with bounded scheduler memory.
+	python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build antfly-unit-test $(ZIG_BUILD_FLAGS)
 
 clean-onnx: ## Remove downloaded ONNX Runtime files.
 	rm -rf $(ONNXRUNTIME_ROOT)

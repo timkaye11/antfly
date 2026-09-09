@@ -319,6 +319,17 @@ pub const ProvisionedGroupStorage = struct {
         self.* = undefined;
     }
 
+    /// Join every cached writer DB before an externally owned provider is
+    /// destroyed. Sources and request runtimes must already be quiescent, so
+    /// no new cache lease can appear while this barrier holds the shared state
+    /// mutex. The cache containers remain valid for the ordinary final deinit.
+    pub fn quiesceExternalProviderUsers(self: *ProvisionedGroupStorage) !void {
+        lockAtomic(&self.write_cache_state_mutex);
+        defer self.write_cache_state_mutex.unlock();
+        try self.startup_write_cache.closeAllDbsLocked();
+        try self.write_cache.closeAllDbsLocked();
+    }
+
     /// Break every cache-to-source callback edge while both owners are still
     /// alive. Call this after attached write sources are quiescent and before
     /// either the sources or this storage are destroyed.
@@ -327,6 +338,17 @@ pub const ProvisionedGroupStorage = struct {
         self.write_cache.detachRuntimeHooks();
         self.startup_write_cache.table_eviction_hook = null;
         self.write_cache.table_eviction_hook = null;
+    }
+
+    /// Install an operator/runtime-owned capacity domain before sources are
+    /// attached. Deterministic runtimes use this to keep admission and status
+    /// reporting on modeled storage instead of probing the host filesystem.
+    pub fn installCapacitySource(
+        self: *ProvisionedGroupStorage,
+        source: resource_manager_mod.CapacitySource,
+    ) !void {
+        if (self.filesystem_capacity_probe != null) return error.CapacitySourceAlreadyInstalled;
+        try self.resource_manager.installCapacitySource(source);
     }
 
     pub fn attachSources(
@@ -338,7 +360,7 @@ pub const ProvisionedGroupStorage = struct {
         // and therefore one physical capacity domain. BackendRuntime remains
         // the execution abstraction; filesystem policy and accounting stay in
         // the ResourceManager.
-        if (filesystem_capacity.supported) {
+        if (filesystem_capacity.supported and self.resource_manager.capacitySource() == null) {
             if (self.filesystem_capacity_probe) |probe| {
                 if (!std.mem.eql(u8, probe.path, write_source.replica_root_dir)) {
                     return error.CapacitySourceAlreadyInstalled;
@@ -360,6 +382,7 @@ pub const ProvisionedGroupStorage = struct {
         self.read_cache.backend_runtime = self.backend_runtime;
         self.read_cache.antfly_provider = read_source.antfly_provider;
         self.read_cache.secret_store = read_source.secret_store;
+        read_source.reranker_runtime = try self.read_cache.ensureRerankerRuntime();
         // Resident writer DBs also serve freshness-sensitive reads. Leaving
         // their cache unset makes the LSM backend retain a private decoded
         // index for every run, bypassing both the shared cache bound and the
@@ -404,6 +427,7 @@ pub const ProvisionedGroupStorage = struct {
         self.read_cache.backend_runtime = runtime;
         self.write_cache.backend_runtime = runtime;
         self.startup_write_cache.backend_runtime = runtime;
+        self.runtime_status_cache.setModeledRuntimeTelemetry(runtime.usesBorrowedIo());
         read_source.backend_runtime = runtime;
         write_source.backend_runtime = runtime;
     }
@@ -613,7 +637,7 @@ test "provisioned group storage wires remote content to writer caches" {
     var read_source = table_reads.ProvisionedTableReadSource.init("/tmp/unused-antfly-read", table_catalog.CatalogSource{
         .ptr = undefined,
         .vtable = undefined,
-    }, raft_mod.read_gate.noopReadableLeaseRequester());
+    }, raft_mod.read_gate.alreadyReadSafeBarrier());
     var write_source = table_writes.ProvisionedTableWriteSource.init(".", table_catalog.CatalogSource{
         .ptr = undefined,
         .vtable = undefined,

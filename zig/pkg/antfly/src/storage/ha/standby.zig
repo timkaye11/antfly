@@ -21,7 +21,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Crc32 = std.hash.Crc32;
+const Crc32 = @import("antfly_hash").Crc32;
 const replication_log = @import("replication_log.zig");
 const replication_record = @import("replication_record.zig");
 const wal_mod = @import("../wal.zig");
@@ -1119,15 +1119,15 @@ test "storage.ha standby snapshots do not wait behind the operation lease" {
     var operation_locked = true;
     defer if (operation_locked) standby.unlockExclusive();
     var worker = Worker{ .standby = &standby };
-    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(Worker.run, .{&worker});
     while (!worker.started.load(.acquire)) std.atomic.spinLoopHint();
     var attempts: usize = 0;
     while (!worker.done.load(.acquire) and attempts < 1_000) : (attempts += 1)
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     const completed_while_operation_locked = worker.done.load(.acquire);
     standby.unlockExclusive();
     operation_locked = false;
-    thread.join();
+    thread.await(std.testing.io);
     try std.testing.expect(completed_while_operation_locked);
 }
 

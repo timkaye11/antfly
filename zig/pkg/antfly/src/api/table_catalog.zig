@@ -25,12 +25,14 @@ const platform_clock = @import("antfly_platform").clock;
 const platform_time = @import("antfly_platform").time;
 const raft_reconciler = @import("../raft/reconciler.zig");
 const tables_api = @import("tables.zig");
+const runtime_io_abi = @import("../runtime_io_abi.zig");
 
 /// One absolute monotonic budget shared by snapshot capture and all CPU-side
 /// routing work that follows it. The periodic checkpoint keeps large catalog
 /// scans interruptible without putting a clock read on every range.
 pub const RoutingBudget = struct {
     deadline_ns: ?u64 = null,
+    io: ?runtime_io_abi.Borrow = null,
 
     const checkpoint_stride: usize = 64;
 
@@ -38,9 +40,44 @@ pub const RoutingBudget = struct {
         return .{ .deadline_ns = deadline_ns };
     }
 
+    pub fn initIo(deadline_ns: ?u64, io: ?std.Io) RoutingBudget {
+        return .{ .deadline_ns = deadline_ns, .io = if (io) |value| runtime_io_abi.Borrow.init(&value) else null };
+    }
+
+    pub fn nowNs(self: RoutingBudget) u64 {
+        const borrow = self.io orelse return platform_time.monotonicNs();
+        var receiver = borrow.receive() catch @panic("incompatible routing clock ABI");
+        return @intCast(@max(0, std.Io.Clock.now(.awake, receiver.io()).nanoseconds));
+    }
+
+    /// Translate a deadline into this budget's clock without extending it.
+    /// Threaded .awake and native MONOTONIC have different epochs on Darwin.
+    pub fn deadlineFrom(self: RoutingBudget, source: RoutingBudget) ?u64 {
+        const deadline = source.deadline_ns orelse return null;
+        if (self.io) |target| {
+            if (source.io) |origin| {
+                if (target.userdata == origin.userdata and target.vtable == origin.vtable and target.dispatch == origin.dispatch)
+                    return deadline;
+            }
+        } else if (source.io == null) return deadline;
+        // Sample the destination first so time spent translating cannot
+        // extend the caller's budget. Expired budgets remain expired.
+        const target_now = self.nowNs();
+        return target_now +| (deadline -| source.nowNs());
+    }
+
+    pub fn sleepNs(self: RoutingBudget, duration_ns: u64) !void {
+        if (self.io) |borrow| {
+            var receiver = try borrow.receive();
+            try receiver.io().sleep(.fromNanoseconds(duration_ns), .awake);
+        } else {
+            platform_clock.Clock.real().sleepMs(@max(@as(u64, 1), duration_ns / std.time.ns_per_ms));
+        }
+    }
+
     pub fn checkpoint(self: RoutingBudget) !void {
         if (self.deadline_ns) |deadline| {
-            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+            if (self.nowNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
         }
     }
 
@@ -68,12 +105,31 @@ fn cloneGroupIdsUntil(
 pub const CatalogSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    /// Authority for process-local routing deadlines, propagated through
+    /// request-scoped projections as well as remote capture and retries.
+    io: ?runtime_io_abi.Borrow = null,
+
+    pub fn budget(self: CatalogSource, deadline_ns: ?u64) RoutingBudget {
+        return .{ .deadline_ns = deadline_ns, .io = self.io };
+    }
+
+    /// Routing deadlines belong to this catalog, not necessarily to the
+    /// request executor. Preserve remaining time when crossing clock domains.
+    /// In particular, Threaded .awake and native MONOTONIC differ on Darwin.
+    pub fn deadlineFrom(self: CatalogSource, source: RoutingBudget) ?u64 {
+        return self.budget(null).deadlineFrom(source);
+    }
+
+    pub fn routeFenceDeadline(self: CatalogSource, fence: metadata_api.CatalogRouteFence) ?u64 {
+        return self.deadlineFrom(.{ .deadline_ns = fence.admission_deadline_ns, .io = fence.admission_deadline_io });
+    }
 
     pub const VTable = struct {
         /// Snapshot slices and all transitively referenced bytes must remain
         /// valid until the matching `free_admin_snapshot` call returns.
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
         free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
+        catalog_identity: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.CatalogIdentity = null,
         /// First-class table/range routing capability. First-party sources must
         /// override the unsupported defaults; test doubles that never route may
         /// retain them without silently falling back to an admin snapshot.
@@ -107,6 +163,10 @@ pub const CatalogSource = struct {
         /// Compares a compact contract after a Raft linearizable-read barrier.
         validate_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) anyerror!bool = null,
         validate_table_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogTablePublicationContract) anyerror!bool = null,
+        validate_group_retirement: ?*const fn (
+            ptr: *anyopaque,
+            contract: metadata_api.CatalogGroupRetirementContract,
+        ) anyerror!metadata_api.CatalogGroupRetirementValidation = null,
     };
 
     pub fn adminSnapshot(self: CatalogSource) !metadata_api.AdminSnapshot {
@@ -115,6 +175,12 @@ pub const CatalogSource = struct {
 
     pub fn freeAdminSnapshot(self: CatalogSource, snapshot: *metadata_api.AdminSnapshot) void {
         self.vtable.free_admin_snapshot(self.ptr, snapshot);
+    }
+
+    pub fn catalogIdentity(self: CatalogSource) !metadata_api.CatalogIdentity {
+        const identity = self.vtable.catalog_identity orelse
+            return error.CatalogPublicationFenceUnavailable;
+        return try identity(self.ptr);
     }
 
     /// Produce the complete routing capability carried by this catalog. A
@@ -141,6 +207,7 @@ pub const CatalogSource = struct {
                 .wait_for_change = self.vtable.wait_for_routing_change,
                 .await_route = self.vtable.await_route,
             },
+            .io = self.io,
         };
     }
 
@@ -154,12 +221,22 @@ pub const CatalogSource = struct {
         return try validate(self.ptr, contract);
     }
 
+    pub fn validateGroupRetirement(
+        self: CatalogSource,
+        contract: metadata_api.CatalogGroupRetirementContract,
+    ) !metadata_api.CatalogGroupRetirementValidation {
+        const validate = self.vtable.validate_group_retirement orelse
+            return error.CatalogPublicationFenceUnavailable;
+        return try validate(self.ptr, contract);
+    }
+
     pub fn fromMetadataService(svc: *metadata_service.MetadataService) CatalogSource {
         return .{
             .ptr = svc,
             .vtable = &.{
                 .admin_snapshot = metadataServiceAdminSnapshot,
                 .free_admin_snapshot = metadataServiceFreeAdminSnapshot,
+                .catalog_identity = metadataServiceCatalogIdentity,
                 .routing_snapshot = metadataServiceRoutingSnapshot,
                 .table_routing_snapshot = metadataServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataServiceLinearizableRoutingSnapshot,
@@ -169,6 +246,7 @@ pub const CatalogSource = struct {
                 .requires_linearizable_publication_fence = true,
                 .validate_publication = metadataServiceValidatePublication,
                 .validate_table_publication = metadataServiceValidateTablePublication,
+                .validate_group_retirement = metadataServiceValidateGroupRetirement,
             },
         };
     }
@@ -179,6 +257,7 @@ pub const CatalogSource = struct {
             .vtable = &.{
                 .admin_snapshot = metadataHttpServiceAdminSnapshot,
                 .free_admin_snapshot = metadataHttpServiceFreeAdminSnapshot,
+                .catalog_identity = metadataHttpServiceCatalogIdentity,
                 .routing_snapshot = metadataHttpServiceRoutingSnapshot,
                 .table_routing_snapshot = metadataHttpServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataHttpServiceLinearizableRoutingSnapshot,
@@ -188,6 +267,7 @@ pub const CatalogSource = struct {
                 .requires_linearizable_publication_fence = true,
                 .validate_publication = metadataHttpServiceValidatePublication,
                 .validate_table_publication = metadataHttpServiceValidateTablePublication,
+                .validate_group_retirement = metadataHttpServiceValidateGroupRetirement,
             },
         };
     }
@@ -198,6 +278,7 @@ pub const CatalogSource = struct {
             .vtable = &.{
                 .admin_snapshot = metadataServerAdminSnapshot,
                 .free_admin_snapshot = metadataServerFreeAdminSnapshot,
+                .catalog_identity = metadataServerCatalogIdentity,
                 .routing_snapshot = metadataServerRoutingSnapshot,
                 .table_routing_snapshot = metadataServerTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataServerLinearizableRoutingSnapshot,
@@ -207,6 +288,7 @@ pub const CatalogSource = struct {
                 .requires_linearizable_publication_fence = true,
                 .validate_publication = metadataServerValidatePublication,
                 .validate_table_publication = metadataServerValidateTablePublication,
+                .validate_group_retirement = metadataServerValidateGroupRetirement,
             },
         };
     }
@@ -234,6 +316,7 @@ pub const CatalogRouteAuthority = struct {
 };
 
 pub const CatalogRoutingSource = struct {
+    io: ?runtime_io_abi.Borrow = null,
     projection: CatalogProjectionSource,
     authority: CatalogRouteAuthority,
 
@@ -254,6 +337,13 @@ pub const CatalogRoutingSource = struct {
         deadline_ns: u64,
         probe_interval_ns: u64,
     ) !CatalogChangeWaitResult {
+        if (self.authority.wait_for_change == &defaultWaitForRoutingChange) {
+            const budget = RoutingBudget{ .io = self.io };
+            const now_ns = budget.nowNs();
+            if (now_ns < deadline_ns)
+                try budget.sleepNs(@min(deadline_ns - now_ns, @max(probe_interval_ns, std.time.ns_per_ms)));
+            return .retry;
+        }
         return try self.authority.wait_for_change(self.authority.ptr, observed_token, deadline_ns, probe_interval_ns);
     }
 };
@@ -292,7 +382,7 @@ pub const RoutingSession = struct {
         deadline_ns: ?u64,
     ) !RoutingSession {
         const routing = try base.routingSource();
-        return try initOwned(alloc, base, try routing.linearizableSnapshot(deadline_ns), true, RoutingBudget.init(deadline_ns));
+        return try initOwned(alloc, base, try routing.linearizableSnapshot(deadline_ns), true, base.budget(deadline_ns));
     }
 
     /// Use the cached/eventual projection for positive routes. Misses are
@@ -304,7 +394,7 @@ pub const RoutingSession = struct {
         query: RouteQuery,
         deadline_ns: ?u64,
     ) !RoutingSession {
-        const budget = RoutingBudget.init(deadline_ns);
+        const budget = base.budget(deadline_ns);
         try budget.checkpoint();
         const routing = try base.routingSource();
         var snapshot = try routing.eventualSnapshot(deadline_ns);
@@ -428,7 +518,7 @@ pub const RoutingSession = struct {
     }
 
     pub fn catalog(self: *RoutingSession) CatalogSource {
-        return .{ .ptr = self, .vtable = &vtable };
+        return .{ .ptr = self, .vtable = &vtable, .io = self.base.io };
     }
 
     const vtable: CatalogSource.VTable = .{
@@ -460,11 +550,9 @@ pub const RoutingSession = struct {
     }
 
     fn routingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
-        if (deadline_ns) |deadline| {
-            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
-        }
         const self = cast(ptr);
-        return try cloneRoutingSnapshot(self.alloc, self.snapshot.value, deadline_ns);
+        try self.base.budget(deadline_ns).checkpoint();
+        return try cloneRoutingSnapshot(self.alloc, self.snapshot.value, self.base.budget(deadline_ns));
     }
 
     fn freeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
@@ -540,9 +628,9 @@ pub const RoutingSession = struct {
     ) !RouteResult {
         const self = cast(ptr);
         if (deadline_ns) |deadline| {
-            if (platform_time.monotonicNs() >= deadline) return .timed_out;
+            if (self.base.budget(deadline_ns).nowNs() >= deadline) return .timed_out;
         }
-        const budget = RoutingBudget.init(deadline_ns);
+        const budget = self.base.budget(deadline_ns);
         const resolved = routePlanFromSnapshotWithBudget(alloc, self.snapshot.value, table_name, query, budget) catch |err| switch (err) {
             error.CatalogRoutingSnapshotTimeout => return .timed_out,
             else => return err,
@@ -592,9 +680,8 @@ pub const RoutingSession = struct {
 fn cloneRoutingSnapshot(
     alloc: std.mem.Allocator,
     source: metadata_api.CatalogRoutingSnapshot,
-    deadline_ns: ?u64,
+    budget: RoutingBudget,
 ) !metadata_api.CatalogRoutingSnapshot {
-    const budget = RoutingBudget.init(deadline_ns);
     try budget.checkpoint();
     const tables = try alloc.alloc(metadata_table_manager.TableRecord, source.tables.len);
     var table_count: usize = 0;
@@ -913,7 +1000,7 @@ pub fn routedGroupsSnapshotUntil(
     group_ids: []const u64,
     deadline_ns: ?u64,
 ) !RoutedSpanSnapshot {
-    const budget = RoutingBudget.init(deadline_ns);
+    const budget = catalog.budget(deadline_ns);
     try budget.checkpoint();
     if (catalog.vtable.route_fence) |route_fence| {
         const route_identity = catalog.vtable.route_identity;
@@ -1820,7 +1907,7 @@ pub fn resolveGroupsForSpanUntil(
     to_key: []const u8,
     deadline_ns: ?u64,
 ) ![]u64 {
-    const budget = RoutingBudget.init(deadline_ns);
+    const budget = catalog.budget(deadline_ns);
     return switch (try resolveGroupsForSpanWithDeadline(alloc, try catalog.routingSource(), table_name, from_key, to_key, deadline_ns)) {
         .found => |plan_value| blk: {
             var plan = plan_value;
@@ -1841,7 +1928,7 @@ pub fn resolveGroupsForSpanPinnedUntil(
     expected_epoch: u64,
     deadline_ns: ?u64,
 ) ![]u64 {
-    const budget = RoutingBudget.init(deadline_ns);
+    const budget = catalog.budget(deadline_ns);
     var result = try resolveCatalogRoute(alloc, catalog, table_name, .{ .span = .{
         .from_key = from_key,
         .to_key = to_key,
@@ -2051,7 +2138,7 @@ fn resolveRouteObserved(
         else => return err,
     };
     defer eventual.deinit();
-    const budget = RoutingBudget.init(deadline_ns);
+    const budget = RoutingBudget{ .deadline_ns = deadline_ns, .io = routing.io };
     const eventual_plan = routePlanFromSnapshotWithBudget(alloc, eventual.value, table_name, query, budget) catch |err| switch (err) {
         error.CatalogRoutingSnapshotTimeout => return .timed_out,
         else => return err,
@@ -2097,7 +2184,7 @@ pub fn awaitRoute(
         );
     }
     while (true) {
-        if (platform_time.monotonicNs() >= deadline_ns) return .timed_out;
+        if ((RoutingBudget{ .io = routing.io }).nowNs() >= deadline_ns) return .timed_out;
         var resolved = try resolveRouteObserved(alloc, routing, table_name, query, deadline_ns);
         switch (resolved) {
             .found => |plan| {
@@ -2155,7 +2242,7 @@ pub fn routePlanFromSnapshotUntil(
     );
 }
 
-fn routePlanFromSnapshotWithBudget(
+pub fn routePlanFromSnapshotWithBudget(
     alloc: std.mem.Allocator,
     snapshot: metadata_api.CatalogRoutingSnapshot,
     table_name: []const u8,
@@ -2488,7 +2575,7 @@ pub fn routedSpanSnapshotUntil(
     to_key: []const u8,
     deadline_ns: ?u64,
 ) !RoutedSpanSnapshot {
-    const budget = RoutingBudget.init(deadline_ns);
+    const budget = catalog.budget(deadline_ns);
     var result = try resolveCatalogRoute(alloc, catalog, table_name, .{ .span = .{
         .from_key = from_key,
         .to_key = to_key,
@@ -2526,7 +2613,7 @@ pub fn resolveGroupsForSpanEventually(
     timeout_ns: u64,
     poll_interval_ms: u64,
 ) !ResolveGroupsResult {
-    const deadline_ns = platform_time.monotonicNs() +| timeout_ns;
+    const deadline_ns = catalog.budget(null).nowNs() +| timeout_ns;
     return try resolveGroupsForSpanEventuallyUntil(
         alloc,
         catalog,
@@ -2572,6 +2659,11 @@ pub fn resolveGroupsForSpanEventuallyUntil(
 fn metadataServiceAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
     const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
     return try svc.adminSnapshot();
+}
+
+fn metadataServiceCatalogIdentity(ptr: *anyopaque) !metadata_api.CatalogIdentity {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    return try svc.catalogIdentity();
 }
 
 fn metadataServiceFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
@@ -2631,9 +2723,22 @@ fn metadataServiceValidateTablePublication(ptr: *anyopaque, contract: metadata_a
     return try svc.validateTablePublication(contract);
 }
 
+fn metadataServiceValidateGroupRetirement(
+    ptr: *anyopaque,
+    contract: metadata_api.CatalogGroupRetirementContract,
+) !metadata_api.CatalogGroupRetirementValidation {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    return try svc.validateGroupRetirement(contract);
+}
+
 fn metadataHttpServiceAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
     const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     return try svc.adminSnapshot();
+}
+
+fn metadataHttpServiceCatalogIdentity(ptr: *anyopaque) !metadata_api.CatalogIdentity {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return try svc.catalogIdentity();
 }
 
 fn metadataHttpServiceFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
@@ -2693,9 +2798,22 @@ fn metadataHttpServiceValidateTablePublication(ptr: *anyopaque, contract: metada
     return try svc.validateTablePublication(contract);
 }
 
+fn metadataHttpServiceValidateGroupRetirement(
+    ptr: *anyopaque,
+    contract: metadata_api.CatalogGroupRetirementContract,
+) !metadata_api.CatalogGroupRetirementValidation {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return try svc.validateGroupRetirement(contract);
+}
+
 fn metadataServerAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
     const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
     return try srv.adminSnapshot();
+}
+
+fn metadataServerCatalogIdentity(ptr: *anyopaque) !metadata_api.CatalogIdentity {
+    const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
+    return try srv.catalogIdentity();
 }
 
 fn metadataServerFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
@@ -2753,6 +2871,14 @@ fn metadataServerValidatePublication(ptr: *anyopaque, contract: metadata_api.Cat
 fn metadataServerValidateTablePublication(ptr: *anyopaque, contract: metadata_api.CatalogTablePublicationContract) !bool {
     const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
     return try srv.validateTablePublication(contract);
+}
+
+fn metadataServerValidateGroupRetirement(
+    ptr: *anyopaque,
+    contract: metadata_api.CatalogGroupRetirementContract,
+) !metadata_api.CatalogGroupRetirementValidation {
+    const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
+    return try srv.validateGroupRetirement(contract);
 }
 
 fn sortRangeRefs(ranges: []const *const metadata_table_manager.RangeRecord) void {

@@ -155,6 +155,11 @@ pub const SplitReplicationContext = struct {
     operation: Operation = .bootstrap_chunk,
     /// Source split-delta sequence. Zero for bootstrap chunks.
     sequence: u64 = 0,
+    /// Exact destination watermark that must precede this delta. Source
+    /// watermarks are Raft indexes and may be sparse when intervening entries
+    /// do not mutate the split range. Null preserves the legacy consecutive-
+    /// sequence contract for already persisted requests.
+    previous_sequence: ?u64 = null,
 };
 
 pub const SplitTransitionMutation = struct {
@@ -170,6 +175,73 @@ pub const SplitTransitionMutation = struct {
     attempt_epoch: u64,
     destination_group_id: u64,
     split_key: []const u8 = "",
+};
+
+/// Private donor-side merge lifecycle mutation. The command is ordered with
+/// ordinary data writes in the donor Raft log. A finalized donor is a durable
+/// write fence; rollback permits a later transition to start.
+pub const MergeSourceTransitionMutation = struct {
+    pub const Kind = enum {
+        prepare,
+        finalize,
+        rollback,
+    };
+
+    kind: Kind,
+    transition_id: u64,
+    receiver_group_id: u64,
+};
+
+/// Receiver-persisted fencing identity for one copy, ordered by the donor's
+/// elected Raft term and then its per-process attempt sequence.
+pub const MergeCopyAttempt = struct {
+    donor_term: u64 = 0,
+    sequence: u64 = 0,
+
+    pub fn order(a: MergeCopyAttempt, b: MergeCopyAttempt) std.math.Order {
+        const term_order = std.math.order(a.donor_term, b.donor_term);
+        return if (term_order == .eq) std.math.order(a.sequence, b.sequence) else term_order;
+    }
+};
+
+/// Replay identity for receiver-side merge copy batches. Unlike an ordinary
+/// write, these entries must reopen the already-provisioned receiver from its
+/// local manifest even while metadata publication is synchronously waiting on
+/// the merge. Carrying the identity in every command keeps follower and
+/// restart replay independent of the catalog.
+pub const MergeReplicationContext = struct {
+    transition_id: u64,
+    donor_group_id: u64,
+    receiver_group_id: u64,
+    identity_namespace: doc_identity_mod.Namespace,
+    copy_attempt: MergeCopyAttempt = .{},
+};
+
+/// Private receiver-side data-Raft checkpoint for a range merge. Document
+/// transfer batches are ordinary replicated writes; this record makes the
+/// structural phase, receiver range, and donor watermark durable on every
+/// receiver replica in the same log order.
+pub const MergeReplicationCheckpoint = struct {
+    pub const Kind = enum {
+        accept,
+        begin_copy,
+        bootstrap_complete,
+        finalize,
+        rollback,
+    };
+
+    kind: Kind,
+    transition_id: u64,
+    donor_group_id: u64,
+    receiver_group_id: u64,
+    receiver_base_start: []const u8,
+    receiver_base_end: []const u8,
+    merged_start: []const u8,
+    merged_end: []const u8,
+    bootstrap_applied_index: u64 = 0,
+    copy_attempt: MergeCopyAttempt = .{},
+    allow_doc_identity_reassignment: bool = false,
+    receiver_identity_reassignment_namespace: ?doc_identity_mod.Namespace = null,
 };
 
 /// Private data-Raft command used by the distributed transaction protocol.
@@ -232,9 +304,36 @@ pub const BatchRequest = struct {
     split_replication: ?SplitReplicationContext = null,
     /// Internal source lifecycle mutation. It must be ordered with data writes.
     split_transition: ?SplitTransitionMutation = null,
+    /// Internal merge-donor lifecycle mutation. It must be ordered with data
+    /// writes so finalize creates an exact replicated source fence.
+    merge_source_transition: ?MergeSourceTransitionMutation = null,
+    /// Internal receiver merge lifecycle. Public batch parsing never sets it.
+    merge_checkpoint: ?MergeReplicationCheckpoint = null,
+    /// Internal identity context for receiver-side merge copy and rollback
+    /// batches. Public batch parsing never sets it.
+    merge_replication: ?MergeReplicationContext = null,
+    /// Authoritative document-scoped store rows, not original write inputs.
+    /// Ordered after primary copy and before the receiver completion checkpoint.
+    merge_artifacts: []const BatchWrite = &.{},
     /// Internal 2PC phase. Public batch parsing never accepts this field.
     transaction: ?TransactionMutation = null,
 };
+
+pub fn validateMergeArtifacts(req: BatchRequest) !void {
+    if (req.merge_artifacts.len == 0) return;
+    if (req.merge_replication == null or req.merge_checkpoint != null or
+        req.split_checkpoint != null or req.split_replication != null or
+        req.split_transition != null or req.merge_source_transition != null or
+        req.writes.len != 0 or req.deletes.len != 0 or req.transaction != null or
+        req.transforms.len != 0 or req.predicates.len != 0 or
+        req.graph_writes.len != 0 or req.graph_deletes.len != 0)
+        return error.InvalidBatchRequest;
+    const keys = @import("../internal_keys.zig");
+    for (req.merge_artifacts) |row| {
+        if (!keys.isGraphEdgeArtifactKey(row.key) and !keys.isEmbeddingArtifactKey(row.key) and
+            !keys.isDerivedEmbeddingArtifactKey(row.key)) return error.InvalidBatchRequest;
+    }
+}
 
 pub const GraphEdgeWrite = struct {
     index_name: []const u8,
@@ -1105,9 +1204,16 @@ pub const LookupOptions = struct {
     /// Internal, absolute monotonic deadline used by routed lookups. It is not
     /// part of the public lookup projection contract and is never serialized.
     execution_deadline_ns: ?u64 = null,
+    execution_io: ?@import("../../runtime_io_abi.zig").Borrow = null,
     /// Borrowed request cancellation source. Callers must keep it alive for
     /// the synchronous lookup call.
     cancellation: ?CancellationToken = null,
+
+    pub fn executionNowNs(self: LookupOptions) u64 {
+        const borrow = self.execution_io orelse return @import("antfly_platform").time.monotonicNs();
+        var receiver = borrow.receive() catch @panic("incompatible lookup clock ABI");
+        return @intCast(@max(0, std.Io.Clock.now(.awake, receiver.io()).nanoseconds));
+    }
 };
 
 pub const LookupResult = struct {
@@ -2204,6 +2310,32 @@ pub const TTLCleanupStats = struct {
     last_acquired_ms: u64 = 0,
 };
 
+pub fn InlineStatusText(comptime capacity: usize) type {
+    return struct {
+        bytes: [capacity]u8 = [_]u8{0} ** capacity,
+        len: u16 = 0,
+
+        pub fn init(value: []const u8) @This() {
+            var result: @This() = .{};
+            const copy_len = @min(value.len, capacity);
+            @memcpy(result.bytes[0..copy_len], value[0..copy_len]);
+            result.len = @intCast(copy_len);
+            return result;
+        }
+
+        pub fn slice(self: *const @This()) []const u8 {
+            return self.bytes[0..self.len];
+        }
+
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            try jw.write(self.slice());
+        }
+    };
+}
+
+pub const EnrichmentActiveModel = InlineStatusText(256);
+pub const EnrichmentActiveBackend = InlineStatusText(32);
+
 pub const EnrichmentStats = struct {
     enabled: bool = false,
     lease_owned: bool = true,
@@ -2230,6 +2362,16 @@ pub const EnrichmentStats = struct {
     worker_failed: bool = false,
     worker_started: bool = false,
     stalled: bool = false,
+    stall_reason: []const u8 = "",
+    active_phase: []const u8 = "idle",
+    active_model: EnrichmentActiveModel = .{},
+    active_backend: EnrichmentActiveBackend = .{},
+    active_deadline_ms: u64 = 0,
+    last_progress_ms: u64 = 0,
+    active_progress_completed: u64 = 0,
+    active_progress_total: u64 = 0,
+    inference_timeout_count: u64 = 0,
+    inference_cancel_count: u64 = 0,
     skip_by_hash_count: u64 = 0,
     skipped_source_count: u64 = 0,
     codec_decode_failures: u64 = 0,
@@ -2251,6 +2393,58 @@ pub const EnrichmentStats = struct {
     sparse_artifact_bytes_written: u64 = 0,
     chunk_artifact_bytes_written: u64 = 0,
     artifact_bytes_written: u64 = 0,
+};
+
+/// Volatile, incarnation-scoped work counters for one embeddings index. These
+/// counters never participate in readiness; they let status clients explain
+/// active generation between durable publication checkpoints. `epoch` changes
+/// whenever the owning enrichment runtime is recreated.
+pub const EmbeddingActivityPhase = enum {
+    idle,
+    preparing,
+    embedding,
+    publishing,
+    waiting_retry,
+};
+
+/// Owner activity is emitted every 30 seconds while idle. Retain two missed
+/// heartbeats plus scheduling jitter so a contended best-effort status read
+/// does not turn a live worker into `unavailable`.
+pub const embedding_activity_retention_ms: u64 = 90 * std.time.ms_per_s;
+
+pub const EmbeddingActivityStats = struct {
+    epoch: u64 = 0,
+    // Monotonic within `epoch` and incremented for every phase/counter change.
+    // This orders volatile samples independently from durable status snapshots.
+    sample_sequence: u64 = 0,
+    // Internal incarnation fence. API encoders omit internal fence fields.
+    index_generation: u64 = 0,
+    // Internal ownership fence. A failed supervised provider batch records
+    // its exact failure identity here; only the worker supervisor may promote
+    // that candidate to the public `retrying` state.
+    retry_fingerprint: u64 = 0,
+    // Exact, component-owned in-flight scopes. These are local aggregation
+    // inputs, not public counters: clients see only `effectivePhase()`.
+    active_preparations: u64 = 0,
+    active_publications: u64 = 0,
+    // A status received from another runtime is already an owner-derived
+    // observation. Local owners leave this null and expose their exact scopes;
+    // transport adapters set it so counters cannot reinterpret that phase.
+    reported_phase: ?EmbeddingActivityPhase = null,
+    chunks_created: u64 = 0,
+    embedding_batches_completed: u64 = 0,
+    embeddings_computed: u64 = 0,
+    active_batch_size: u64 = 0,
+    retrying: bool = false,
+    last_progress_at_ms: u64 = 0,
+    pub fn effectivePhase(self: @This()) EmbeddingActivityPhase {
+        if (self.reported_phase) |phase| return phase;
+        if (self.retrying) return .waiting_retry;
+        if (self.active_batch_size != 0) return .embedding;
+        if (self.active_publications != 0) return .publishing;
+        if (self.active_preparations != 0) return .preparing;
+        return .idle;
+    }
 };
 
 pub const ReplayStageStats = struct {
@@ -2436,6 +2630,10 @@ pub const VisibilityStats = struct {
 };
 
 pub const DBStats = struct {
+    /// Process-local identity of the resident DB owner that sampled this
+    /// status. Cache merge logic uses it only with an exact table root and
+    /// index incarnation; it is not part of the public status contract.
+    runtime_owner_id: u64 = 0,
     /// Process-local fingerprint of physical LSM/WAL publications. Runtime
     /// status uses it only to invalidate cached directory-byte observations.
     storage_change_token: u64 = 0,
@@ -2985,6 +3183,15 @@ pub const IndexSourceReplayStatus = struct {
     observation_count: u64 = 1,
 };
 
+/// Internal durable lifecycle class. This is carried with shard observations
+/// so API projection can distinguish ordinary materialization from recovery
+/// without interpreting repair trigger strings.
+pub const IndexLifecycleWorkClass = enum {
+    none,
+    initial_build,
+    repair,
+};
+
 pub const DBIndexStats = struct {
     name: []const u8,
     kind: IndexKind,
@@ -3002,6 +3209,22 @@ pub const DBIndexStats = struct {
     // continuity, this proof can retain authority across table-level opening
     // metadata and applies to every index kind. It is never persisted.
     runtime_observation_targeted_sibling: bool = false,
+    // Cache-local convergence authority for this exact index incarnation.
+    // Ordinary target advances clear only the affected identities; an
+    // unknown-scope advance is represented by the enclosing table metadata.
+    // This is deliberately independent of serving authority and is never
+    // persisted or exposed as a separate public field.
+    runtime_target_observation_complete: bool = true,
+    // Replay witnesses belonging to retained serving/coverage payloads, not a
+    // newer progress overlay. Live owners issue these with publication stamps;
+    // incomplete/status-only observations may leave them unknown. Neither
+    // metadata relabeling nor cloning may manufacture a witness.
+    runtime_serving_applied_sequence: ?u64 = null,
+    runtime_coverage_applied_sequence: ?u64 = null,
+    // Owner-issued local payload authority. Null means unknown, not revision
+    // zero. These are never synthesized by metadata overlays or serialized.
+    serving_publication: ?@import("publication.zig").Stamp = null,
+    coverage_publication: ?@import("publication.zig").Stamp = null,
     // Error name recorded when the index's persisted artifacts failed to
     // load (e.g. "UnsupportedVersion"); null for healthy indexes.
     load_error: ?[]const u8 = null,
@@ -3010,9 +3233,35 @@ pub const DBIndexStats = struct {
     edge_count: u64 = 0,
     node_count: u64 = 0,
     root_node: u64 = 0,
+    // Exact physical artifact cardinality owned by this index incarnation.
+    // Unlike source coverage, this remains correct for chunked projections
+    // where one source document can publish multiple searchable vectors.
+    publication_target_count: u64 = 0,
+    publication_target_ready: bool = false,
+    // Authoritative O(1) projection of the resident search-admission gate for
+    // this exact dense incarnation. Zero members is still a valid snapshot.
+    serving_snapshot_ready: bool = false,
+    // Dense storage's process-local immutable serving revision. Zero is
+    // unavailable, not a comparable revision for another index kind. Generic
+    // owner-observation ordering uses serving_publication instead.
+    serving_snapshot_revision: u64 = 0,
+    // Process-local owner of the immutable serving snapshot above. This is
+    // index-scoped because targeted structural observations can retain a
+    // sibling's serving payload while the enclosing DBStats comes from a
+    // different temporary DB owner.
+    serving_snapshot_owner_id: u64 = 0,
     coverage_produced_count: u64 = 0,
     coverage_skipped_count: u64 = 0,
     coverage_terminal_failed_count: u64 = 0,
+    // True when this pass directly observed the owner or retains its last
+    // unexpired exact-incarnation sample. False is unavailable, not idle.
+    // This controls local projection only.
+    embedding_activity_observed: bool = false,
+    // True only for a direct owner sample accepted during this status pass.
+    // Wire adapters use this bit so locally retained activity cannot refresh
+    // the next hop's TTL indefinitely. This is not part of the public API.
+    embedding_activity_sample_fresh: bool = false,
+    embedding_activity: EmbeddingActivityStats = .{},
     // Stable across shard-local marker generations for the same stored config.
     coverage_config_hash: u64 = 0,
     coverage_summary_ready: bool = true,
@@ -3029,6 +3278,7 @@ pub const DBIndexStats = struct {
     repair_issue_count_estimated: bool = false,
     repair_scan_issue_count: u64 = 0,
     index_repair_id: ?u128 = null,
+    index_lifecycle_work_class: IndexLifecycleWorkClass = .none,
     index_repair_trigger: []const u8 = "none",
     index_repair_phase: []const u8 = "none",
     index_repair_automation: []const u8 = "none",
@@ -3654,55 +3904,57 @@ pub fn freeResolverReplayDiagnostics(alloc: Allocator, stats: ResolverReplayDiag
     if (stats.resolvers.len > 0) alloc.free(stats.resolvers);
 }
 
+pub fn freeDBIndexStatsItem(alloc: Allocator, item: DBIndexStats) void {
+    alloc.free(item.name);
+    for (item.source_replay) |source| alloc.free(source.artifact_name);
+    if (item.source_replay.len > 0) alloc.free(item.source_replay);
+    if (item.load_error) |value| alloc.free(value);
+    if (item.index_repair_last_error) |value| alloc.free(value);
+    if (item.algebraic_last_error_doc_key) |value| alloc.free(value);
+    if (item.algebraic_last_error_reason) |value| alloc.free(value);
+    if (item.algebraic_capability_fingerprint) |value| alloc.free(value);
+    if (item.algebraic_capability_lifecycle_status) |value| alloc.free(value);
+    if (item.algebraic_planner_last_decision) |value| alloc.free(value);
+    if (item.algebraic_planner_last_fallback_reason) |value| alloc.free(value);
+    if (item.algebraic_planner_lifecycle_blocking_reason) |value| alloc.free(value);
+    if (item.algebraic_last_observed_query_shape) |value| alloc.free(value);
+    if (item.algebraic_last_recommended_materialization) |value| alloc.free(value);
+    if (item.algebraic_top_candidate) |candidate| {
+        alloc.free(candidate.recommendation);
+        alloc.free(candidate.materialization_id);
+        alloc.free(candidate.lifecycle);
+        alloc.free(candidate.decision);
+    }
+    if (item.algebraic_active_progress) |progress| {
+        alloc.free(progress.recommendation);
+        alloc.free(progress.materialization_id);
+        alloc.free(progress.lifecycle);
+    }
+    for (item.algebraic_candidates) |candidate| {
+        alloc.free(candidate.recommendation);
+        alloc.free(candidate.materialization_id);
+        alloc.free(candidate.lifecycle);
+        alloc.free(candidate.decision);
+    }
+    if (item.algebraic_candidates.len > 0) alloc.free(item.algebraic_candidates);
+    for (item.algebraic_candidate_decision_history) |entry| {
+        alloc.free(entry.recommendation);
+        alloc.free(entry.materialization_id);
+        alloc.free(entry.lifecycle);
+        alloc.free(entry.previous_decision);
+        alloc.free(entry.decision);
+    }
+    if (item.algebraic_candidate_decision_history.len > 0) alloc.free(item.algebraic_candidate_decision_history);
+    for (item.algebraic_progress) |progress| {
+        alloc.free(progress.recommendation);
+        alloc.free(progress.materialization_id);
+        alloc.free(progress.lifecycle);
+    }
+    if (item.algebraic_progress.len > 0) alloc.free(item.algebraic_progress);
+}
+
 pub fn freeDBStats(alloc: Allocator, stats: DBStats) void {
     freeResolverReplayDiagnostics(alloc, stats.resolver_replay);
-    for (stats.indexes) |item| {
-        alloc.free(item.name);
-        for (item.source_replay) |source| alloc.free(source.artifact_name);
-        if (item.source_replay.len > 0) alloc.free(item.source_replay);
-        if (item.load_error) |value| alloc.free(value);
-        if (item.index_repair_last_error) |value| alloc.free(value);
-        if (item.algebraic_last_error_doc_key) |value| alloc.free(value);
-        if (item.algebraic_last_error_reason) |value| alloc.free(value);
-        if (item.algebraic_capability_fingerprint) |value| alloc.free(value);
-        if (item.algebraic_capability_lifecycle_status) |value| alloc.free(value);
-        if (item.algebraic_planner_last_decision) |value| alloc.free(value);
-        if (item.algebraic_planner_last_fallback_reason) |value| alloc.free(value);
-        if (item.algebraic_planner_lifecycle_blocking_reason) |value| alloc.free(value);
-        if (item.algebraic_last_observed_query_shape) |value| alloc.free(value);
-        if (item.algebraic_last_recommended_materialization) |value| alloc.free(value);
-        if (item.algebraic_top_candidate) |candidate| {
-            alloc.free(candidate.recommendation);
-            alloc.free(candidate.materialization_id);
-            alloc.free(candidate.lifecycle);
-            alloc.free(candidate.decision);
-        }
-        if (item.algebraic_active_progress) |progress| {
-            alloc.free(progress.recommendation);
-            alloc.free(progress.materialization_id);
-            alloc.free(progress.lifecycle);
-        }
-        for (item.algebraic_candidates) |candidate| {
-            alloc.free(candidate.recommendation);
-            alloc.free(candidate.materialization_id);
-            alloc.free(candidate.lifecycle);
-            alloc.free(candidate.decision);
-        }
-        if (item.algebraic_candidates.len > 0) alloc.free(item.algebraic_candidates);
-        for (item.algebraic_candidate_decision_history) |entry| {
-            alloc.free(entry.recommendation);
-            alloc.free(entry.materialization_id);
-            alloc.free(entry.lifecycle);
-            alloc.free(entry.previous_decision);
-            alloc.free(entry.decision);
-        }
-        if (item.algebraic_candidate_decision_history.len > 0) alloc.free(item.algebraic_candidate_decision_history);
-        for (item.algebraic_progress) |progress| {
-            alloc.free(progress.recommendation);
-            alloc.free(progress.materialization_id);
-            alloc.free(progress.lifecycle);
-        }
-        if (item.algebraic_progress.len > 0) alloc.free(item.algebraic_progress);
-    }
+    for (stats.indexes) |item| freeDBIndexStatsItem(alloc, item);
     if (stats.indexes.len > 0) alloc.free(stats.indexes);
 }

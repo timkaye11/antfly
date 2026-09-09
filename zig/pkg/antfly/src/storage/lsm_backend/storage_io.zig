@@ -13,6 +13,8 @@
 // limitations.
 
 const std = @import("std");
+const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
+const Crc32 = @import("antfly_hash").Crc32;
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const platform = @import("antfly_platform");
@@ -631,6 +633,116 @@ pub fn createDirPathPortable(io: anytype, path: []const u8) !void {
     return fs_paths.createDirPathPortable(io, path);
 }
 
+/// Borrowed `std.Io` storage adapter. This keeps durable LSM operations on the
+/// caller's I/O implementation, including deterministic VOPR filesystems,
+/// instead of silently creating a native threaded storage lane.
+pub const IoStorage = struct {
+    io: std.Io,
+
+    pub fn init(io: std.Io) IoStorage {
+        return .{ .io = io };
+    }
+
+    pub fn storage(self: *IoStorage) Storage {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: Storage.VTable = .{
+        .create_dir_path = createDirPath,
+        .read_file_alloc = readFileAlloc,
+        .read_file_range_alloc = readFileRangeAlloc,
+        .read_file_range_into = readFileRangeInto,
+        .read_file_range_at_most_into = readFileRangeAtMostInto,
+        .file_size = fileSize,
+        .read_file_trailer_alloc = readFileTrailerAlloc,
+        .write_file_absolute = writeFileAbsolute,
+        .append_file_absolute = appendFileAbsolute,
+        .sync_contents_absolute = syncContentsAbsolute,
+        .sync_parent_absolute = syncParentAbsolute,
+        .rename_absolute = renameAbsolute,
+        .delete_file_absolute = deleteFileAbsolute,
+        .delete_tree = deleteTree,
+        .now_ns = nowNs,
+        .root_identity_alloc = rootIdentityAlloc,
+        .rename_is_atomic = true,
+        .supports_native_path_locks = false,
+    };
+
+    fn context(ptr: *anyopaque) *IoStorage {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn createDirPath(ptr: *anyopaque, path: []const u8) !void {
+        try fs_paths.createDirPathPortable(context(ptr).io, path);
+    }
+
+    fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+        return try std.Io.Dir.cwd().readFileAlloc(context(ptr).io, path, allocator, .limited(max_bytes));
+    }
+
+    fn readFileRangeAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
+        return try readFileRangeWithIo(context(ptr).io, allocator, path, offset, len);
+    }
+
+    fn readFileRangeInto(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !void {
+        try readFileRangeWithIoInto(context(ptr).io, path, offset, out);
+    }
+
+    fn readFileRangeAtMostInto(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !usize {
+        return try readFileRangeWithIoAtMostInto(context(ptr).io, path, offset, out);
+    }
+
+    fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
+        return try fileSizeWithIo(context(ptr).io, path);
+    }
+
+    fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
+        return try readFileTrailerWithIo(context(ptr).io, allocator, path, len);
+    }
+
+    fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
+        try std.Io.Dir.cwd().writeFile(context(ptr).io, .{ .sub_path = path, .data = contents });
+    }
+
+    fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool) !void {
+        const io = context(ptr).io;
+        var file = try fs_paths.createFilePortable(io, path, .{ .read = true, .truncate = false });
+        defer file.close(io);
+        const offset = try file.length(io);
+        try file.writePositionalAll(io, contents, offset);
+        if (sync) try file.sync(io);
+    }
+
+    fn syncContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
+        try syncFileContentsPathWithIo(context(ptr).io, path);
+    }
+
+    fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
+        try syncParentPathWithIo(context(ptr).io, path);
+    }
+
+    fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), old_path, std.Io.Dir.cwd(), new_path, context(ptr).io);
+    }
+
+    fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
+        try deleteFilePathWithIo(context(ptr).io, path);
+    }
+
+    fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
+        try std.Io.Dir.cwd().deleteTree(context(ptr).io, path);
+    }
+
+    fn nowNs(ptr: *anyopaque) u64 {
+        const value = std.Io.Clock.awake.now(context(ptr).io).toNanoseconds();
+        return if (value <= 0) 0 else @intCast(@min(value, std.math.maxInt(u64)));
+    }
+
+    fn rootIdentityAlloc(ptr: *anyopaque, allocator: Allocator, root_dir: []const u8) ![]u8 {
+        return try std.fmt.allocPrint(allocator, "std-io:{x}:{s}", .{ @intFromPtr(context(ptr)), root_dir });
+    }
+};
+
 /// Thin wrapper for host-provided storage callbacks.
 /// Intended for embedders that want durable LSM semantics without native fs access,
 /// such as wasm or foreign host runtimes. Durable writers require either a
@@ -711,13 +823,13 @@ const BufferedAtomicWriteSink = struct {
     fn crc32Prefix(ptr: *anyopaque, len_prefix: usize) !u32 {
         const self: *BufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (len_prefix > self.out.items.len) return error.InvalidAtomicWriteOffset;
-        return std.hash.Crc32.hash(self.out.items[0..len_prefix]);
+        return Crc32.hash(self.out.items[0..len_prefix]);
     }
 
     fn crc32Range(ptr: *anyopaque, offset: usize, range_len: usize) !u32 {
         const self: *BufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (offset > self.out.items.len or range_len > self.out.items.len - offset) return error.InvalidAtomicWriteOffset;
-        return std.hash.Crc32.hash(self.out.items[offset..][0..range_len]);
+        return Crc32.hash(self.out.items[offset..][0..range_len]);
     }
 
     fn finish(ptr: *anyopaque) !void {
@@ -2771,13 +2883,13 @@ const NativeBufferedAtomicWriteSink = struct {
     fn crc32Prefix(ptr: *anyopaque, len_prefix: usize) !u32 {
         const self: *NativeBufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (len_prefix > self.out.items.len) return error.InvalidAtomicWriteOffset;
-        return std.hash.Crc32.hash(self.out.items[0..len_prefix]);
+        return Crc32.hash(self.out.items[0..len_prefix]);
     }
 
     fn crc32Range(ptr: *anyopaque, offset: usize, range_len: usize) !u32 {
         const self: *NativeBufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (offset > self.out.items.len or range_len > self.out.items.len - offset) return error.InvalidAtomicWriteOffset;
-        return std.hash.Crc32.hash(self.out.items[offset..][0..range_len]);
+        return Crc32.hash(self.out.items[offset..][0..range_len]);
     }
 
     fn finish(ptr: *anyopaque) !void {
@@ -2918,7 +3030,7 @@ const NativeAtomicWriteSink = struct {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (range_offset > self.bytes_written or range_len > self.bytes_written - range_offset) return error.InvalidAtomicWriteOffset;
 
-        var crc = std.hash.Crc32.init();
+        var crc = Crc32.init();
         var offset: usize = 0;
         var buf: [64 * 1024]u8 = undefined;
         while (offset < range_len) {
@@ -3432,11 +3544,14 @@ test "storage range read future fallback waits and cancels" {
 test "native atomic write sink supports patching and crc before finish" {
     if (!supports_native_storage) return error.SkipZigTest;
 
+    var test_tmp = try TestDirectory.init("storage");
+    defer test_tmp.cleanup();
+
     var native = try NativeStorage.init(std.testing.allocator, .threaded);
     defer native.deinit();
 
-    var path_buf: [256]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "/tmp/antfly-storage-atomic-{d}", .{atomic_write_nonce.fetchAdd(1, .monotonic)});
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}-antfly-storage-atomic-{d}", .{ test_tmp.path(), atomic_write_nonce.fetchAdd(1, .monotonic) });
     defer native.storage().deleteFileAbsolute(path) catch {};
 
     var writer = try native.storage().beginAtomicWrite(std.testing.allocator, path);
@@ -3448,7 +3563,7 @@ test "native atomic write sink supports patching and crc before finish" {
 
     try writer.appendSlice("hello _____");
     try writer.writeAt(6, "world");
-    try std.testing.expectEqual(std.hash.Crc32.hash("hello world"), try writer.crc32Prefix(writer.len()));
+    try std.testing.expectEqual(Crc32.hash("hello world"), try writer.crc32Prefix(writer.len()));
 
     active = false;
     try writer.finish();
@@ -3475,6 +3590,9 @@ test "native storage retained runtime has a finite worker ceiling" {
 test "native fd cache retries an open that straddles a mutation fence" {
     if (!supports_posix_fd_cache or builtin.single_threaded) return error.SkipZigTest;
 
+    var test_tmp = try TestDirectory.init("storage");
+    defer test_tmp.cleanup();
+
     var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 4);
     defer pool.deinit();
     var native = try NativeStorage.initWithPool(std.testing.allocator, .threaded, &pool);
@@ -3484,8 +3602,8 @@ test "native fd cache retries an open that straddles a mutation fence" {
     defer io_impl.deinit();
     const io = io_impl.io();
 
-    var path_buf: [256]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "/tmp/antfly-storage-invalidation-race-{d}", .{atomic_write_nonce.fetchAdd(1, .monotonic)});
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}-antfly-storage-invalidation-race-{d}", .{ test_tmp.path(), atomic_write_nonce.fetchAdd(1, .monotonic) });
     defer native.storage().deleteFileAbsolute(path) catch {};
     try native.storage().writeFileAbsolute(path, "old");
 
@@ -3546,14 +3664,17 @@ test "native fd cache retries an open that straddles a mutation fence" {
 test "native fd cache invalidates a deleted tree spelled with trailing separators" {
     if (!supports_posix_fd_cache) return error.SkipZigTest;
 
+    var test_tmp = try TestDirectory.init("storage");
+    defer test_tmp.cleanup();
+
     var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 8);
     defer pool.deinit();
     var native = try NativeStorage.initWithPool(std.testing.allocator, .threaded, &pool);
     defer native.deinit();
 
     const nonce = atomic_write_nonce.fetchAdd(1, .monotonic);
-    var root_buf: [256]u8 = undefined;
-    const root = try std.fmt.bufPrint(&root_buf, "/tmp/antfly-storage-tree-invalidation-{d}", .{nonce});
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "{s}-antfly-storage-tree-invalidation-{d}", .{ test_tmp.path(), nonce });
     defer native.storage().deleteTree(root) catch {};
     try native.storage().createDirPath(root);
 
@@ -3587,13 +3708,16 @@ test "path containment handles root and trailing separators" {
 test "native atomic write finish retains admission through parent sync" {
     if (!supports_posix_fd_cache) return error.SkipZigTest;
 
+    var test_tmp = try TestDirectory.init("storage");
+    defer test_tmp.cleanup();
+
     var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 4);
     defer pool.deinit();
     var native = try NativeStorage.initWithPool(std.testing.allocator, .threaded, &pool);
     defer native.deinit();
 
-    var path_buf: [256]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "/tmp/antfly-storage-atomic-admission-handoff-{d}", .{atomic_write_nonce.fetchAdd(1, .monotonic)});
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}-antfly-storage-atomic-admission-handoff-{d}", .{ test_tmp.path(), atomic_write_nonce.fetchAdd(1, .monotonic) });
     defer native.storage().deleteFileAbsolute(path) catch {};
 
     var writer = try native.storage().beginAtomicWrite(std.testing.allocator, path);
@@ -3622,13 +3746,16 @@ test "native atomic write finish retains admission through parent sync" {
 
 test "native atomic write sink cleans temporary file when content sync fails" {
     if (!supports_native_storage) return error.SkipZigTest;
+
+    var test_tmp = try TestDirectory.init("storage");
+    defer test_tmp.cleanup();
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     var native = try NativeStorage.init(std.testing.allocator, .threaded);
     defer native.deinit();
 
-    var path_buf: [256]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "/tmp/antfly-storage-atomic-sync-failure-{d}", .{atomic_write_nonce.fetchAdd(1, .monotonic)});
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}-antfly-storage-atomic-sync-failure-{d}", .{ test_tmp.path(), atomic_write_nonce.fetchAdd(1, .monotonic) });
     defer native.storage().deleteFileAbsolute(path) catch {};
 
     var writer = try native.storage().beginAtomicWrite(std.testing.allocator, path);
@@ -3678,6 +3805,9 @@ test "buffered atomic write sink supports overlapping writes and appends" {
 test "native fd cache evicts to per-store budget" {
     if (!supports_posix_fd_cache) return error.SkipZigTest;
 
+    var test_tmp = try TestDirectory.init("storage");
+    defer test_tmp.cleanup();
+
     var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, fallback_cached_native_fds);
     defer pool.deinit();
     var native = try NativeStorage.initWithPool(std.testing.allocator, .threaded, &pool);
@@ -3685,8 +3815,8 @@ test "native fd cache evicts to per-store budget" {
 
     const base_nonce = atomic_write_nonce.fetchAdd(1, .monotonic);
     for (0..fallback_cached_native_fds + 8) |i| {
-        var path_buf: [256]u8 = undefined;
-        const path = try std.fmt.bufPrint(&path_buf, "/tmp/antfly-storage-fd-cache-{d}-{d}", .{ base_nonce, i });
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "{s}-antfly-storage-fd-cache-{d}-{d}", .{ test_tmp.path(), base_nonce, i });
         try native.storage().writeFileAbsolute(path, "x");
         defer native.storage().deleteFileAbsolute(path) catch {};
 
@@ -3731,6 +3861,9 @@ test "backend runtime native fd pools share one process admission domain" {
 test "transient native writes wait before opening at descriptor capacity" {
     if (!supports_posix_fd_cache or builtin.single_threaded) return error.SkipZigTest;
 
+    var test_tmp = try TestDirectory.init("storage");
+    defer test_tmp.cleanup();
+
     var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 2);
     defer pool.deinit();
     var native = try NativeStorage.initWithPool(std.testing.allocator, .threaded, &pool);
@@ -3740,8 +3873,8 @@ test "transient native writes wait before opening at descriptor capacity" {
     const io = io_impl.io();
 
     const nonce = atomic_write_nonce.fetchAdd(1, .monotonic);
-    var path_buf: [256]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "/tmp/antfly-storage-transient-admission-{d}", .{nonce});
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}-antfly-storage-transient-admission-{d}", .{ test_tmp.path(), nonce });
     defer native.storage().deleteFileAbsolute(path) catch {};
 
     var occupying_permit = try native.acquireFdPermit();
@@ -3789,6 +3922,9 @@ test "transient native writes wait before opening at descriptor capacity" {
 test "persistent path locks use reserved headroom under transient saturation" {
     if (!supports_posix_fd_cache) return error.SkipZigTest;
 
+    var test_tmp = try TestDirectory.init("storage");
+    defer test_tmp.cleanup();
+
     var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 8);
     defer pool.deinit();
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
@@ -3800,8 +3936,8 @@ test "persistent path locks use reserved headroom under transient saturation" {
     defer pool.fd_cache.releaseDescriptors(io, held_descriptors);
 
     const nonce = atomic_write_nonce.fetchAdd(1, .monotonic);
-    var path_buf: [256]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "/tmp/antfly-storage-path-lock-admission-{d}", .{nonce});
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}-antfly-storage-path-lock-admission-{d}", .{ test_tmp.path(), nonce });
     defer deleteFilePathPosix(path) catch {};
 
     var lock_file = try openNativePathLockFileWithCache(
@@ -3820,6 +3956,9 @@ test "persistent path locks use reserved headroom under transient saturation" {
 test "persistent path lock exhaustion fails without waiting" {
     if (!supports_posix_fd_cache) return error.SkipZigTest;
 
+    var test_tmp = try TestDirectory.init("storage");
+    defer test_tmp.cleanup();
+
     var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 2);
     defer pool.deinit();
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
@@ -3829,8 +3968,8 @@ test "persistent path lock exhaustion fails without waiting" {
     defer pool.fd_cache.releasePersistentDescriptors(io, 2);
 
     const nonce = atomic_write_nonce.fetchAdd(1, .monotonic);
-    var path_buf: [256]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "/tmp/antfly-storage-path-lock-exhaustion-{d}", .{nonce});
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}-antfly-storage-path-lock-exhaustion-{d}", .{ test_tmp.path(), nonce });
     defer deleteFilePathPosix(path) catch {};
 
     try std.testing.expectError(
@@ -3872,14 +4011,17 @@ test "transient admission fails fast when only persistent descriptors prevent pr
 test "persistent path locks honor an explicitly configured pool" {
     if (!supports_posix_fd_cache) return error.SkipZigTest;
 
+    var test_tmp = try TestDirectory.init("storage");
+    defer test_tmp.cleanup();
+
     var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 2);
     defer pool.deinit();
     const nonce = atomic_write_nonce.fetchAdd(1, .monotonic);
-    var first_buf: [256]u8 = undefined;
-    const first_path = try std.fmt.bufPrint(&first_buf, "/tmp/antfly-storage-configured-lock-pool-{d}-first", .{nonce});
+    var first_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const first_path = try std.fmt.bufPrint(&first_buf, "{s}-antfly-storage-configured-lock-pool-{d}-first", .{ test_tmp.path(), nonce });
     defer deleteFilePathPosix(first_path) catch {};
-    var second_buf: [256]u8 = undefined;
-    const second_path = try std.fmt.bufPrint(&second_buf, "/tmp/antfly-storage-configured-lock-pool-{d}-second", .{nonce});
+    var second_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const second_path = try std.fmt.bufPrint(&second_buf, "{s}-antfly-storage-configured-lock-pool-{d}-second", .{ test_tmp.path(), nonce });
     defer deleteFilePathPosix(second_path) catch {};
 
     var first = try openNativePathLockFileWithPool(
@@ -3932,6 +4074,9 @@ test "persistent locks consume reserved headroom without stranding transient cap
 test "shared native fd cache blocks before opening more than 64 files across stores" {
     if (!supports_posix_fd_cache or builtin.single_threaded) return error.SkipZigTest;
 
+    var test_tmp = try TestDirectory.init("storage");
+    defer test_tmp.cleanup();
+
     const capacity = 64;
     const worker_count = capacity + 8;
     const store_count = 3;
@@ -3950,10 +4095,10 @@ test "shared native fd cache blocks before opening more than 64 files across sto
     }
 
     const nonce = atomic_write_nonce.fetchAdd(1, .monotonic);
-    var paths: [worker_count][256]u8 = undefined;
+    var paths: [worker_count][std.fs.max_path_bytes]u8 = undefined;
     var path_lens: [worker_count]usize = undefined;
     for (0..worker_count) |i| {
-        const path = try std.fmt.bufPrint(&paths[i], "/tmp/antfly-storage-shared-fd-cache-{d}-{d}", .{ nonce, i });
+        const path = try std.fmt.bufPrint(&paths[i], "{s}-antfly-storage-shared-fd-cache-{d}-{d}", .{ test_tmp.path(), nonce, i });
         path_lens[i] = path.len;
         try stores[i % store_count].storage().writeFileAbsolute(path, "x");
     }
@@ -4131,6 +4276,9 @@ test "weighted native fd admission preserves FIFO progress" {
 test "shared native fd admission wait is cancellation aware" {
     if (!supports_posix_fd_cache or builtin.single_threaded) return error.SkipZigTest;
 
+    var test_tmp = try TestDirectory.init("storage");
+    defer test_tmp.cleanup();
+
     var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 2);
     defer pool.deinit();
     var native = try NativeStorage.initWithPool(std.testing.allocator, .threaded, &pool);
@@ -4139,8 +4287,8 @@ test "shared native fd admission wait is cancellation aware" {
     defer io_impl.deinit();
     const io = io_impl.io();
     const nonce = atomic_write_nonce.fetchAdd(1, .monotonic);
-    var second_path_buf: [256]u8 = undefined;
-    const second_path = try std.fmt.bufPrint(&second_path_buf, "/tmp/antfly-storage-fd-cancel-{d}-waiting", .{nonce});
+    var second_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const second_path = try std.fmt.bufPrint(&second_path_buf, "{s}-antfly-storage-fd-cancel-{d}-waiting", .{ test_tmp.path(), nonce });
     try native.storage().writeFileAbsolute(second_path, "b");
     defer native.storage().deleteFileAbsolute(second_path) catch {};
 
@@ -4189,8 +4337,11 @@ test "native storage state is reclaimed after owner deinit" {
 test "native storage lease owns state past owner deinit" {
     if (!supports_native_storage) return error.SkipZigTest;
 
-    var path_buf: [256]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "/tmp/antfly-storage-owned-lease-{d}", .{atomic_write_nonce.fetchAdd(1, .monotonic)});
+    var test_tmp = try TestDirectory.init("storage");
+    defer test_tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}-antfly-storage-owned-lease-{d}", .{ test_tmp.path(), atomic_write_nonce.fetchAdd(1, .monotonic) });
 
     var native = try NativeStorage.init(std.testing.allocator, .threaded);
     var lease = try native.acquireLease();
@@ -4207,10 +4358,13 @@ test "native storage lease owns state past owner deinit" {
 
 test "native atomic write sink retains invalidation state past storage deinit" {
     if (!supports_native_storage) return error.SkipZigTest;
+
+    var test_tmp = try TestDirectory.init("storage");
+    defer test_tmp.cleanup();
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
-    var path_buf: [256]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "/tmp/antfly-storage-atomic-lease-{d}", .{atomic_write_nonce.fetchAdd(1, .monotonic)});
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}-antfly-storage-atomic-lease-{d}", .{ test_tmp.path(), atomic_write_nonce.fetchAdd(1, .monotonic) });
 
     var native = try NativeStorage.init(std.testing.allocator, .threaded);
     var writer = try native.storage().beginAtomicWrite(std.testing.allocator, path);
@@ -4234,10 +4388,13 @@ test "native atomic write sink retains invalidation state past storage deinit" {
 
 test "native buffered atomic write sink retains invalidation state past storage deinit" {
     if (!supports_native_storage) return error.SkipZigTest;
+
+    var test_tmp = try TestDirectory.init("storage");
+    defer test_tmp.cleanup();
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
-    var path_buf: [256]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "/tmp/antfly-storage-buffered-atomic-lease-{d}", .{atomic_write_nonce.fetchAdd(1, .monotonic)});
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}-antfly-storage-buffered-atomic-lease-{d}", .{ test_tmp.path(), atomic_write_nonce.fetchAdd(1, .monotonic) });
 
     var native = try NativeStorage.init(std.testing.allocator, .threaded);
     var writer = try NativeBufferedAtomicWriteSink.create(std.testing.allocator, path, native.state);
@@ -4246,7 +4403,7 @@ test "native buffered atomic write sink retains invalidation state past storage 
 
     try writer.appendSlice("buffered _____");
     try writer.writeAt(9, "lease");
-    try std.testing.expectEqual(std.hash.Crc32.hash("buffered lease"), try writer.crc32Prefix(writer.len()));
+    try std.testing.expectEqual(Crc32.hash("buffered lease"), try writer.crc32Prefix(writer.len()));
     native.deinit();
 
     active = false;
