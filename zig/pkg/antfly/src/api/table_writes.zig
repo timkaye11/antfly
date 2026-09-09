@@ -14,6 +14,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const TestDirectory = @import("../common/test_directory.zig").TestDirectory;
 const platform = @import("antfly_platform");
 const platform_sync = @import("antfly_platform").sync;
 const metadata_openapi = @import("antfly_metadata_openapi");
@@ -73,8 +74,8 @@ fn resolveCatalogGroupsEventually(
     timeout_ns: u64,
     poll_interval_ms: u64,
 ) ![]u64 {
-    const deadline_ns = platform_time.monotonicNs() +| timeout_ns;
-    const budget = table_catalog.RoutingBudget.init(deadline_ns);
+    const deadline_ns = catalog.budget(null).nowNs() +| timeout_ns;
+    const budget = catalog.budget(deadline_ns);
     return switch (try table_catalog.resolveGroupsForSpanEventuallyUntil(
         alloc,
         catalog,
@@ -801,6 +802,11 @@ const auto_bulk_ingest_finish_options: backend_types.BulkIngestFinishOptions = .
 
 fn startupCatchUpMonotonicMs() u64 {
     return @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+}
+
+fn monotonicMsWithIo(io: Io) u64 {
+    const now_ns = @max(0, std.Io.Clock.now(.awake, io).nanoseconds);
+    return @intCast(@divTrunc(now_ns, std.time.ns_per_ms));
 }
 const replicated_apply_writer_open_timeout_ns: u64 = 30 * std.time.ns_per_s;
 /// Public write admission must not wait forever behind catalog publication.
@@ -3102,6 +3108,14 @@ pub const ProvisionedTableWriteCache = struct {
         for (self.active_bulk_ingest_sessions.items) |*session| session.deinit(self.alloc);
         self.active_bulk_ingest_sessions.deinit(self.alloc);
         self.* = undefined;
+    }
+
+    /// Publish worker stop flags without joining. The caller must own a paused
+    /// borrowed scheduler, drain it, and only then call `deinit`.
+    pub fn beginTeardown(self: *ProvisionedTableWriteCache) void {
+        for (self.entries.items) |entry| entry.db.beginTeardown();
+        for (self.retired_entries.items) |entry| entry.db.beginTeardown();
+        for (self.closing_entries.items) |entry| entry.db.beginTeardown();
     }
 
     /// Detach every callback whose context is owned by the write source.
@@ -6221,11 +6235,22 @@ fn ensurePreDecisionContextActive(context: distributed_txn.PreDecisionContext) !
         // This check is deliberately adjacent to mutation admission. Keep its
         // error distinct from generic storage and transport deadlines so only
         // this proven pre-proposal outcome may authorize replica failover.
-        if (platform_time.monotonicNs() >= deadline_ns) return error.PreDecisionDeadlineExceeded;
+        const now_ns = (table_catalog.RoutingBudget{ .io = context.deadline_io }).nowNs();
+        if (now_ns >= deadline_ns) return error.PreDecisionDeadlineExceeded;
     }
 }
 
 test "pre-decision context deadline has typed admission provenance" {
+    var vopr_io = try @import("vopr").vopr_io.VoprIo.init(.{});
+    defer vopr_io.deinit();
+    const context = distributed_txn.PreDecisionContext{
+        .deadline_ns = 100,
+        .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&vopr_io.io()),
+    };
+    try ensurePreDecisionContextActive(context);
+    vopr_io.monotonic_ns = 100;
+    try std.testing.expectError(error.PreDecisionDeadlineExceeded, ensurePreDecisionContextActive(context));
+
     try std.testing.expectError(
         error.PreDecisionDeadlineExceeded,
         ensurePreDecisionContextActive(.{ .deadline_ns = 1 }),
@@ -6853,8 +6878,10 @@ pub const BoundTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
-        const txn_id = nextTxnId();
-        return try commitBoundTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false, cancellation);
+        const txn_source: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        const txn_io: ?Io = txn_source.db.backend_runtime.io();
+        const txn_id = nextTxnId(txn_io);
+        return try commitBoundTransaction(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation);
     }
 
     fn commitBatch(
@@ -6891,8 +6918,10 @@ pub const BoundTableWriteSource = struct {
             };
             return .{ .committed = .{ .participant_count = 1 } };
         }
-        const txn_id = nextTxnId();
-        return try commitBoundTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false, cancellation);
+        const txn_source: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        const txn_io: ?Io = txn_source.db.backend_runtime.io();
+        const txn_id = nextTxnId(txn_io);
+        return try commitBoundTransaction(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation);
     }
 
     fn commitTransactionWithId(
@@ -6958,7 +6987,7 @@ pub const BoundTableWriteSource = struct {
         _ = db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
             txn_id,
             begin_timestamp,
-            platform_time.realtimeNs(),
+            nextTxnTimestamp(db.backend_runtime.io()),
             &participants,
             true,
             retain_terminal,
@@ -7188,7 +7217,7 @@ pub const BoundTableWriteSource = struct {
         _ = try (try self.activeDb()).beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
             txn_id,
             begin_timestamp,
-            platform_time.realtimeNs(),
+            nextTxnTimestamp(self.db.backend_runtime.io()),
             participants,
             true,
             retain_terminal,
@@ -7932,7 +7961,7 @@ pub const ProvisionedTableWriteSource = struct {
     replica_root_dir: []const u8,
     catalog: table_catalog.CatalogSource,
     local_db_mutex: SourceStateMutex = .{},
-    table_activity_threaded: Io.Threaded,
+    table_activity_threaded: ?Io.Threaded,
     table_activity_mutex: Io.Mutex = .init,
     table_activity_ready: Io.Condition = .init,
     // Protected by table_activity_mutex. Seed capture closes only new
@@ -8243,8 +8272,9 @@ pub const ProvisionedTableWriteSource = struct {
     };
 
     /// Serializes source configuration with every cache container it can
-    /// mutate. The order matches request-time cache opens: cache-open locks by
-    /// address, then the source lock, then cache lifecycle locks by address.
+    /// mutate. The write-cache role always precedes the startup-cache role;
+    /// allocator addresses are deliberately excluded from lock ordering so a
+    /// clean VOPR replay cannot choose a different futex acquisition order.
     const WriteCacheTransitionLocks = struct {
         source: *ProvisionedTableWriteSource,
         first: ?*ProvisionedTableWriteCache,
@@ -8263,10 +8293,6 @@ pub const ProvisionedTableWriteSource = struct {
             if (first == null) {
                 first = second;
                 second = null;
-            } else if (second != null and @intFromPtr(first.?) > @intFromPtr(second.?)) {
-                const swap = first;
-                first = second;
-                second = swap;
             }
 
             if (first) |cache| lockAtomic(&cache.open_mutex);
@@ -8334,8 +8360,8 @@ pub const ProvisionedTableWriteSource = struct {
 
     /// Reclaim an idle lifetime-descriptor owner from either cache while no
     /// cache-open lock is held by the caller. Cross-cache reclamation is rare,
-    /// so use the full transition lock order here: both cache-open locks by
-    /// address, source state, then both lifecycle locks by address. This keeps
+    /// so use the full transition lock order here: write then startup cache-open
+    /// locks, source state, then write then startup lifecycle locks. This keeps
     /// descriptor pressure from introducing a lock inversion with cache
     /// rebinding, HA transitions, or startup-cache adoption.
     fn reclaimInactiveEntryAcrossWriteCachesForDescriptorPressure(
@@ -8388,11 +8414,42 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn init(replica_root_dir: []const u8, catalog: table_catalog.CatalogSource) ProvisionedTableWriteSource {
+        return initWithBackendRuntime(replica_root_dir, catalog, null);
+    }
+
+    /// Construct a source inside an existing runtime authority. Native-only
+    /// callers retain the bounded Threaded fallback through `init`, while a
+    /// composed DataServer does not create an unused hidden executor.
+    pub fn initWithBackendRuntime(
+        replica_root_dir: []const u8,
+        catalog: table_catalog.CatalogSource,
+        backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    ) ProvisionedTableWriteSource {
         return .{
             .replica_root_dir = replica_root_dir,
             .catalog = catalog,
-            .table_activity_threaded = threaded_io_limits.initService(std.heap.page_allocator),
+            .table_activity_threaded = if (backend_runtime == null)
+                threaded_io_limits.initService(std.heap.page_allocator)
+            else
+                null,
+            .backend_runtime = backend_runtime,
         };
+    }
+
+    /// Every source-owned background task must execute on the same std.Io
+    /// authority as the production runtime it can call back into. In
+    /// particular, a structural reconcile validates metadata through the
+    /// catalog's HTTP executor; launching that work on this source's native
+    /// fallback while the catalog borrows another executor crosses runtime
+    /// and cancellation domains. Standalone sources retain the bounded native
+    /// fallback, while composed and deterministic deployments borrow their
+    /// BackendRuntime control lane end-to-end.
+    fn tableActivityIo(self: *ProvisionedTableWriteSource) Io {
+        if (self.backend_runtime) |runtime| {
+            if (runtime.controlIo() orelse runtime.io()) |runtime_io| return runtime_io;
+        }
+        if (self.table_activity_threaded) |*threaded| return threaded.io();
+        @panic("ProvisionedTableWriteSource requires BackendRuntime std.Io");
     }
 
     pub fn bindWriteCaches(
@@ -8698,6 +8755,7 @@ pub const ProvisionedTableWriteSource = struct {
             .enabled = true,
             .lease_owned = !replicated,
             .owner_id = "provisioned-2pc",
+            .clock = backend_runtime.clock(),
             .interval_ms = 5_000,
             .cutoff_ns = 5 * std.time.ns_per_min,
             .resolver_ctx = self,
@@ -8857,7 +8915,7 @@ pub const ProvisionedTableWriteSource = struct {
             if (self.backend_runtime) |runtime|
                 runtime.durable_jobs.closeOwner(dropped_table_owner_id);
         }
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.structural_reconcile_mutex.lockUncancelable(io);
         self.structural_reconcile_ready.broadcast(io);
         self.structural_reconcile_mutex.unlock(io);
@@ -8892,6 +8950,17 @@ pub const ProvisionedTableWriteSource = struct {
         self.lifecycle.store(.closed, .release);
     }
 
+    /// Publish cached DB worker shutdown before a borrowed deterministic
+    /// scheduler is drained. This deliberately does not await work groups or
+    /// destroy cache entries.
+    pub fn beginTeardown(self: *ProvisionedTableWriteSource) void {
+        self.restore_repair_shutdown.store(true, .release);
+        if (self.write_cache) |cache| cache.beginTeardown();
+        if (self.startup_write_cache) |cache| {
+            if (self.write_cache != cache) cache.beginTeardown();
+        }
+    }
+
     pub fn deinit(self: *ProvisionedTableWriteSource) void {
         self.quiesce();
         lockAtomic(&self.dirty_write_tables_mutex);
@@ -8899,7 +8968,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.dirty_write_tables.deinit(std.heap.page_allocator);
         self.dirty_write_tables = .empty;
         self.dirty_write_tables_mutex.unlock();
-        self.table_activity_threaded.deinit();
+        if (self.table_activity_threaded) |*threaded| threaded.deinit();
         self.* = undefined;
     }
 
@@ -8908,7 +8977,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn freeWriteCoalesceQueues(self: *ProvisionedTableWriteSource) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         const alloc = std.heap.page_allocator;
         self.write_coalesce_mutex.lockUncancelable(io);
         defer self.write_coalesce_mutex.unlock(io);
@@ -9506,7 +9575,7 @@ pub const ProvisionedTableWriteSource = struct {
 
         // Active claims keep recovery from classifying the record. The keyed
         // lease remains held until the prepared phase is fully durable.
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         try fs_paths.createDirPathPortable(io, dir_path);
         var batch_created = false;
         if (std.Io.Dir.cwd().access(io, batch_path, .{})) |_| {
@@ -9539,7 +9608,7 @@ pub const ProvisionedTableWriteSource = struct {
         prepared: *const PreparedReplicaRetirements,
     ) void {
         var recovery_required = false;
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         if (prepared.batch_path == null) {
             _ = self.releaseActiveReplicaRetirementIntents(prepared.intents);
         }
@@ -9618,7 +9687,7 @@ pub const ProvisionedTableWriteSource = struct {
             break :blk null;
         };
         defer if (dir_path) |path| prepared.alloc.free(path);
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         var directory_dirty = false;
         if (prepared.batch_path) |path| {
             if (dir_path) |directory| {
@@ -9977,7 +10046,7 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         table_name: ?[]const u8,
     ) !void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         const owned_table_name = if (table_name) |name| try std.heap.page_allocator.dupe(u8, name) else null;
         errdefer if (owned_table_name) |name| std.heap.page_allocator.free(name);
         self.table_activity_mutex.lockUncancelable(io);
@@ -9992,7 +10061,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn endReplicaRetirementActivity(self: *ProvisionedTableWriteSource, group_id: u64) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const removed = self.retiring_replica_groups.fetchRemove(group_id) orelse return;
@@ -10077,7 +10146,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn waitForNoStructuralActivityLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         while (true) {
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
@@ -10091,7 +10160,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn beginTableRequestLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         while (true) {
             if (self.ha_seed_table_request_admission_closed) {
                 self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
@@ -10122,7 +10191,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn endTableRequestLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         const index = self.findTableActivityLocked(table_name, null) orelse {
             self.table_activity_ready.broadcast(io);
             return;
@@ -10137,7 +10206,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn beginStructuralReconcileActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.activityEntryLocked(table_name, null).structural_reconcile_waiters += 1;
@@ -10162,14 +10231,14 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn reserveStructuralReconcileActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.activityEntryLocked(table_name, null).structural_reconcile_queued += 1;
     }
 
     fn reserveStructuralReconcileStatus(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.activityEntryLocked(table_name, null).structural_reconcile_status_pending += 1;
@@ -10180,7 +10249,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         index_name: []const u8,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.reserveTargetedStructuralReconcileStatusLocked(table_name, index_name);
@@ -10211,7 +10280,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn releaseStructuralReconcileStatus(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, null) orelse return;
@@ -10227,7 +10296,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         index_name: []const u8,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.releaseTargetedStructuralReconcileStatusLocked(table_name, index_name);
@@ -10268,7 +10337,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         index_name: []const u8,
     ) ?runtime_status.TableRuntimeSnapshotCache.TargetedIndexTransitionToken {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, null) orelse return null;
@@ -10313,7 +10382,7 @@ pub const ProvisionedTableWriteSource = struct {
         index_name: []const u8,
     ) !void {
         const snapshot_cache = self.runtime_status_cache orelse return;
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const activity_index = self.findTableActivityLocked(table_name, null) orelse
@@ -10341,7 +10410,7 @@ pub const ProvisionedTableWriteSource = struct {
         expected_group_ids: ?[]const u64,
         snapshot_cache: *runtime_status.TableRuntimeSnapshotCache,
     ) !void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const activity_index = self.findTableActivityLocked(table_name, null) orelse
@@ -10414,7 +10483,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         group_id: u64,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const table_index = self.findTableActivityLocked(table_name, null) orelse return;
@@ -10436,7 +10505,7 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         target: PublicationHandoffTarget,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const table_index = self.findTableActivityLocked(table_name, null) orelse return;
@@ -10477,21 +10546,28 @@ pub const ProvisionedTableWriteSource = struct {
         };
     }
 
-    fn retireDroppedTablePublicationAuthority(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+    fn retireDroppedTablePublicationAuthorityForGroups(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_ids: []const u64,
+    ) void {
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
 
         // The successful drop owns the table-wide structural fence, so no new
         // reconcile can install publication authority while this allocation-free
-        // cleanup retires every old group incarnation. Those deleted DBs can no
-        // longer publish the edge that would otherwise release status polling.
+        // cleanup retires the captured old group incarnations. A replacement
+        // table with the same name may already own other groups; preserve its
+        // handoffs and status authority.
         const table_index = self.findTableActivityLocked(table_name, null) orelse unreachable;
         std.debug.assert(self.active_table_activities.items[table_index].structural_active);
         var index: usize = 0;
         while (index < self.active_table_activities.items.len) {
             const entry = &self.active_table_activities.items[index];
             if (!std.mem.eql(u8, entry.table_name, table_name) or
+                entry.group_id == null or
+                std.mem.indexOfScalar(u64, group_ids, entry.group_id.?) == null or
                 (entry.repair_handoff_status_pending == 0 and entry.publication_handoffs.items.len == 0))
             {
                 index += 1;
@@ -10524,7 +10600,7 @@ pub const ProvisionedTableWriteSource = struct {
         // This runs after ordinary status publications too. Preserve the hot
         // path's allocation profile by cloning a cached status only when an
         // actual create handoff is waiting for that observation.
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         const pending = if (self.findTableActivityLocked(table_name, group_id)) |index|
             self.active_table_activities.items[index].publication_handoffs.items.len != 0
@@ -10596,7 +10672,7 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         require_clear: bool,
     ) ?RepairHandoffPublicationToken {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, group_id) orelse return null;
@@ -10613,7 +10689,7 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         token: RepairHandoffPublicationToken,
     ) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, group_id) orelse return false;
@@ -10640,7 +10716,7 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         token: RepairHandoffPublicationToken,
     ) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, group_id) orelse return false;
@@ -10670,7 +10746,7 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         result: *StartupCatchUpResult,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, group_id) orelse return;
@@ -10692,7 +10768,7 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         result: *StartupCatchUpResult,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, group_id) orelse return;
@@ -10715,7 +10791,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         group_id: u64,
     ) ?RepairHandoffPublicationToken {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, group_id) orelse return null;
@@ -10738,7 +10814,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         group_id: u64,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, group_id) orelse return;
@@ -10757,7 +10833,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         group_id: u64,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         if (self.findTableActivityLocked(table_name, group_id)) |index| {
@@ -10781,7 +10857,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn cancelStructuralReconcileReservation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, null) orelse return;
@@ -10793,7 +10869,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn beginReservedStructuralReconcileActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         while (true) {
@@ -10812,7 +10888,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn endStructuralReconcileActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, null) orelse unreachable;
@@ -10823,7 +10899,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn beginReadRequestLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         while (true) {
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
@@ -10848,7 +10924,7 @@ pub const ProvisionedTableWriteSource = struct {
         admission: StatusRequestAdmission,
     ) void {
         if (admission == .snapshot_only) return;
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         const index = self.findTableActivityLocked(table_name, null) orelse {
             self.table_activity_ready.broadcast(io);
             return;
@@ -10932,14 +11008,14 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         statuses: *runtime_status.LocalTableRuntimeStatuses,
     ) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         return self.retainOnlyTargetedStatusSnapshotFreshnessLocked(table_name, statuses);
     }
 
     fn beginStatusRequestLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) StatusRequestAdmission {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         while (true) {
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
@@ -10962,7 +11038,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn endReadRequestLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         const index = self.findTableActivityLocked(table_name, null) orelse {
             self.table_activity_ready.broadcast(io);
             return;
@@ -10977,7 +11053,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn beginGroupOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         while (self.retiring_replica_groups.contains(group_id)) {
             self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
         }
@@ -11011,7 +11087,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn cancelGroupOperationWaiterLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         const index = self.findTableActivityLocked(table_name, group_id) orelse unreachable;
         std.debug.assert(self.active_table_activities.items[index].operation_waiters > 0);
         self.active_table_activities.items[index].operation_waiters -= 1;
@@ -11020,7 +11096,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn tryBeginGroupOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         if (self.retiring_replica_groups.contains(group_id)) return false;
         if (self.findTableActivityLocked(table_name, null)) |index| {
             const entry = self.active_table_activities.items[index];
@@ -11074,14 +11150,14 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn beginReplicatedApplyOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         while (!self.tryBeginReadCompatibleGroupOperationLocked(table_name, group_id)) {
             self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
         }
     }
 
     fn beginGroupTransitionOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         while (self.retiring_replica_groups.contains(group_id)) {
             self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
         }
@@ -11115,7 +11191,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn endGroupOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         const index = self.findTableActivityLocked(table_name, group_id) orelse unreachable;
         std.debug.assert(self.active_table_activities.items[index].operation_active);
         self.active_table_activities.items[index].operation_active = false;
@@ -11129,7 +11205,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn beginGroupGenerationPreparation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         while (true) {
@@ -11157,7 +11233,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn endGroupGenerationPreparation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, group_id) orelse unreachable;
@@ -11168,7 +11244,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn tryBeginStructuralTableActivityLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         if (self.structuralRetirementConflictsLocked(table_name)) return false;
         if (self.findTableActivityLocked(table_name, null)) |index| {
             const entry = self.active_table_activities.items[index];
@@ -11195,7 +11271,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         target_index_name: ?[]const u8,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         // Reserve before draining foreground activity. This closes admission
         // to new reads/writes and routes new status calls to the immutable
         // snapshot, while already-admitted table requests may finish their
@@ -11246,7 +11322,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn endStructuralTableActivityLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         const index = self.findTableActivityLocked(table_name, null) orelse unreachable;
         std.debug.assert(!self.active_table_activities.items[index].targeted_structural_mutation_active);
         self.active_table_activities.items[index].structural_active = false;
@@ -11259,7 +11335,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         index_name: []const u8,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         const index = self.findTableActivityLocked(table_name, null) orelse unreachable;
         const entry = &self.active_table_activities.items[index];
         std.debug.assert(entry.structural_active);
@@ -11272,7 +11348,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn beginRestoreLifecycleActivityLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         while (true) {
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
@@ -11292,7 +11368,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn endRestoreLifecycleActivityLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         const index = self.findTableActivityLocked(table_name, null) orelse {
             self.table_activity_ready.broadcast(io);
             return;
@@ -11305,56 +11381,56 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn beginRestoreLifecycleActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.beginRestoreLifecycleActivityLocked(table_name);
     }
 
     fn endRestoreLifecycleActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.endRestoreLifecycleActivityLocked(table_name);
     }
 
     fn waitForNoStructuralActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.waitForNoStructuralActivityLocked(table_name);
     }
 
     fn beginTableRequest(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.beginTableRequestLocked(table_name);
     }
 
     fn tryBeginTableRequest(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         return self.tryBeginTableRequestLocked(table_name);
     }
 
     fn endTableRequest(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.endTableRequestLocked(table_name);
     }
 
     fn beginReadRequest(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.beginReadRequestLocked(table_name);
     }
 
     fn beginStatusRequest(self: *ProvisionedTableWriteSource, table_name: []const u8) StatusRequestAdmission {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         return self.beginStatusRequestLocked(table_name);
@@ -11365,21 +11441,21 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         admission: StatusRequestAdmission,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.endStatusRequestLocked(table_name, admission);
     }
 
     fn endReadRequest(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.endReadRequestLocked(table_name);
     }
 
     fn beginGroupOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.beginGroupOperationLocked(table_name, group_id);
@@ -11387,7 +11463,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     pub fn testingMarkTableRequestActive(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         if (!builtin.is_test) @compileError("testingMarkTableRequestActive is test-only");
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const entry = self.activityEntryLocked(table_name, null);
@@ -11396,7 +11472,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     pub fn testingMarkGroupOperationActive(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
         if (!builtin.is_test) @compileError("testingMarkGroupOperationActive is test-only");
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const entry = self.activityEntryLocked(table_name, group_id);
@@ -11406,7 +11482,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     pub fn testingGroupTransitionWaiterCount(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) usize {
         if (!builtin.is_test) @compileError("testingGroupTransitionWaiterCount is test-only");
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, group_id) orelse return 0;
@@ -11415,7 +11491,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     pub fn testingGroupOperationWaiterCount(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) usize {
         if (!builtin.is_test) @compileError("testingGroupOperationWaiterCount is test-only");
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, group_id) orelse return 0;
@@ -11423,14 +11499,14 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn tryBeginGroupOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         return self.tryBeginGroupOperationLocked(table_name, group_id);
     }
 
     fn tryBeginReadCompatibleGroupOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         return self.tryBeginReadCompatibleGroupOperationLocked(table_name, group_id);
@@ -11447,7 +11523,7 @@ pub const ProvisionedTableWriteSource = struct {
         // generic write lets frequent status polling starve the edge-triggered
         // repair scheduler indefinitely. Cold startup/restore catch-up can
         // replace broader runtime state and retains the exclusive admission.
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const admitted = if (advance_index_repairs)
@@ -11492,7 +11568,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         group_id: u64,
     ) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const entry = self.activityEntryLocked(table_name, group_id);
@@ -11524,21 +11600,21 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn beginReplicatedApplyOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.beginReplicatedApplyOperationLocked(table_name, group_id);
     }
 
     fn beginGroupTransitionOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.beginGroupTransitionOperationLocked(table_name, group_id);
     }
 
     fn allowGroupOperationReads(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, group_id) orelse unreachable;
@@ -11549,7 +11625,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn endGroupOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         const wake_startup_catch_up = self.endGroupOperationLocked(table_name, group_id);
         self.table_activity_mutex.unlock(io);
@@ -11561,7 +11637,7 @@ pub const ProvisionedTableWriteSource = struct {
         alloc: std.mem.Allocator,
     ) ![]DeferredStartupCatchUp {
         if (self.local_write_owner) |owner| return try owner.snapshotDeferredStartupCatchUpGroups(alloc);
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
 
@@ -11587,7 +11663,7 @@ pub const ProvisionedTableWriteSource = struct {
         deferred: DeferredStartupCatchUp,
     ) void {
         if (self.local_write_owner) |owner| return owner.clearDeferredStartupCatchUpGroupIfUnchanged(deferred);
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         var index: usize = 0;
@@ -11627,7 +11703,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         group_id: u64,
     ) ?GroupRefreshActivity {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         if (self.findTableActivityLocked(table_name, null)) |index| {
@@ -11772,15 +11848,15 @@ pub const ProvisionedTableWriteSource = struct {
         cancellation: db_mod.types.CancellationToken,
     ) !RoutedWriteAdmission {
         try fence.validate();
-        const admission_deadline_ns = if (fence.admission_deadline_ns) |fence_deadline|
+        const admission_deadline_ns = if (self.catalog.routeFenceDeadline(fence)) |fence_deadline|
             @min(deadline_ns, fence_deadline)
         else
             deadline_ns;
         while (!self.tryBeginTableRequest(table_name)) {
             try cancellation.check();
             try fence.admission_cancellation.check();
-            if (platform_time.monotonicNs() >= admission_deadline_ns) return error.CatalogRoutingSnapshotTimeout;
-            platform.clock.Clock.real().sleepMs(1);
+            if (self.catalog.budget(null).nowNs() >= admission_deadline_ns) return error.CatalogRoutingSnapshotTimeout;
+            try self.catalog.budget(null).sleepNs(std.time.ns_per_ms);
         }
         errdefer self.endTableRequest(table_name);
         try cancellation.check();
@@ -11798,14 +11874,14 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn tryBeginStructuralTableActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         return self.tryBeginStructuralTableActivityLocked(table_name);
     }
 
     fn beginStructuralTableActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.beginStructuralTableActivityLocked(table_name);
@@ -11816,14 +11892,14 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         index_name: []const u8,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.beginStructuralTableActivityLockedForTarget(table_name, index_name);
     }
 
     fn endStructuralTableActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.endStructuralTableActivityLocked(table_name);
@@ -11834,7 +11910,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         index_name: []const u8,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.endTargetedStructuralTableActivityLocked(table_name, index_name);
@@ -12257,7 +12333,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn beginStructuralTableActivityFromRestorePreparation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         if (self.findTableActivityLocked(table_name, null)) |index| {
             const entry = &self.active_table_activities.items[index];
@@ -12578,6 +12654,31 @@ pub const ProvisionedTableWriteSource = struct {
         allow_bulk_session: bool,
         managed_open_options: ManagedDbOpenOptions,
     ) !ProvisionedTableWriteCache.CachedDb {
+        return try self.getOrOpenCachedDbForLocalMutationWithOptionsAndMetadata(
+            alloc,
+            cache,
+            path,
+            group_id,
+            lsm_root_generation,
+            table_name,
+            allow_bulk_session,
+            managed_open_options,
+            null,
+        );
+    }
+
+    fn getOrOpenCachedDbForLocalMutationWithOptionsAndMetadata(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        cache: *ProvisionedTableWriteCache,
+        path: []const u8,
+        group_id: u64,
+        lsm_root_generation: u64,
+        table_name: []const u8,
+        allow_bulk_session: bool,
+        managed_open_options: ManagedDbOpenOptions,
+        preloaded_metadata: ?StartupCatchUpMetadata,
+    ) !ProvisionedTableWriteCache.CachedDb {
         if (cache.backend_runtime == null) cache.backend_runtime = self.backend_runtime;
         cache.antfly_provider = self.antfly_provider;
         cache.inference_api_url = self.inference_api_url;
@@ -12606,7 +12707,7 @@ pub const ProvisionedTableWriteSource = struct {
                 return validated;
             }
             self.local_db_mutex.unlock();
-            return self.getOrOpenCachedDbModeAtGeneration(alloc, cache, path, group_id, lsm_root_generation, table_name, .default_async, null, null, null, managed_open_options) catch |err| {
+            return self.getOrOpenCachedDbModeAtGeneration(alloc, cache, path, group_id, lsm_root_generation, table_name, .default_async, null, null, preloaded_metadata, managed_open_options) catch |err| {
                 if (!isTransientWriterOpenConflict(err)) return err;
                 if (!managed_open_options.retry_transient_writer_open) return err;
                 const now_ns = platform_time.monotonicNs();
@@ -13727,6 +13828,11 @@ pub const ProvisionedTableWriteSource = struct {
         ranges: []const metadata_table_manager.RangeRecord,
         backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
     ) !metadata_table_provisioner.ProvisionSummary {
+        const effective_backend_runtime = backend_runtime orelse self.backend_runtime;
+        const io = if (effective_backend_runtime) |runtime|
+            runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable
+        else
+            self.restore_open_options.filesystem_io orelse std.Options.debug_io;
         const cache = self.write_cache orelse return try metadata_table_provisioner.reconcileReplicaRootWithOptions(
             alloc,
             self.replica_root_dir,
@@ -13735,6 +13841,7 @@ pub const ProvisionedTableWriteSource = struct {
             tables,
             ranges,
             .{
+                .io = io,
                 .backend_runtime = backend_runtime,
                 .restore_open_options = self.restore_open_options,
                 .embedding_options = .{
@@ -13766,15 +13873,7 @@ pub const ProvisionedTableWriteSource = struct {
             const path = try metadata_table_provisioner.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
             defer alloc.free(path);
 
-            var provision_io_impl: ?std.Io.Threaded = null;
-            defer if (provision_io_impl) |*owned| owned.deinit();
-            const provision_io = if (active_backend_runtime) |runtime|
-                runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable
-            else blk: {
-                provision_io_impl = std.Io.Threaded.init(alloc, .{});
-                break :blk provision_io_impl.?.io();
-            };
-            try fs_paths.createDirPathPortable(provision_io, path);
+            try fs_paths.createDirPathPortable(io, path);
             try metadata_table_provisioner.applyRestoreIntentIfNeededWithRuntime(
                 alloc,
                 path,
@@ -14115,7 +14214,7 @@ pub const ProvisionedTableWriteSource = struct {
         alloc: std.mem.Allocator,
         group_id: u64,
         table_name: []const u8,
-        identity_namespace: doc_identity.Namespace,
+        identity_namespace: ?doc_identity.Namespace,
     ) !?ProvisionedTableWriteCache.CachedDb {
         const cache = self.write_cache orelse return null;
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
@@ -14421,7 +14520,7 @@ pub const ProvisionedTableWriteSource = struct {
         // An opening attempt does not own runtime truth until it has leased the
         // generation. Publishing before the open lets a normal WriterLocked
         // return overwrite a healthy writer observation indefinitely.
-        const source_io = self.table_activity_threaded.io();
+        const source_io = self.tableActivityIo();
         if (!use_live_owner) {
             _ = db_mod.DB.recoverIncompleteRestoreImportIfNeededWithIo(alloc, source_io, path, .{}) catch |err| {
                 if (err == error.LsmRootWriterAlreadyOpen) return self.deferredStartupCatchUpResult(table_name, group_id, metadata.advance_index_repairs, busy_result);
@@ -15415,7 +15514,7 @@ pub const ProvisionedTableWriteSource = struct {
 
         pub fn release(self: *@This()) void {
             if (!self.active) return;
-            const io = self.source.table_activity_threaded.io();
+            const io = self.source.tableActivityIo();
             self.source.table_activity_mutex.lockUncancelable(io);
             std.debug.assert(self.source.ha_seed_table_request_admission_closed);
             self.source.ha_seed_table_request_admission_closed = false;
@@ -15426,7 +15525,7 @@ pub const ProvisionedTableWriteSource = struct {
     };
 
     pub fn acquireHASeedTableRequestAdmissionLease(self: *ProvisionedTableWriteSource) !HASeedTableRequestAdmissionLease {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         errdefer self.table_activity_mutex.unlock(io);
         if (self.ha_seed_table_request_admission_closed)
@@ -15461,13 +15560,13 @@ pub const ProvisionedTableWriteSource = struct {
 
         pub fn release(self: *@This()) void {
             if (!self.active) return;
-            self.source.table_activity_mutex.unlock(self.source.table_activity_threaded.io());
+            self.source.table_activity_mutex.unlock(self.source.tableActivityIo());
             self.active = false;
         }
     };
 
     pub fn acquireHASeedCaptureActivityLease(self: *ProvisionedTableWriteSource) !HASeedCaptureActivityLease {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         errdefer self.table_activity_mutex.unlock(io);
 
@@ -15659,7 +15758,8 @@ pub const ProvisionedTableWriteSource = struct {
         defer io_impl.deinit();
         Io.Dir.cwd().deleteTree(io_impl.io(), snapshot_root) catch {};
         defer Io.Dir.cwd().deleteTree(io_impl.io(), snapshot_root) catch {};
-        const maintenance_deadline_ns = platform_time.monotonicNs() +| std.time.ns_per_s;
+        const maintenance_clock = db.backend_runtime.monotonicClock();
+        const maintenance_deadline_ns = maintenance_clock.nowRealtimeNs() +| std.time.ns_per_s;
         _ = db.snapshotHASeed(snapshot_token, maintenance_deadline_ns) catch |err| switch (err) {
             error.EnrichmentWaitCanceled,
             error.EnrichmentWaitTimeout,
@@ -15820,7 +15920,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn hasGroupActivityBestEffort(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         if (self.findTableActivityLocked(table_name, null)) |index| {
@@ -15835,7 +15935,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn hasReadBlockingActivityBestEffort(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         if (self.findTableActivityLocked(table_name, null)) |index| {
@@ -15850,14 +15950,14 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn structuralStatusSnapshotOnlyBestEffort(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         return self.statusUsesPublishedSnapshotLocked(table_name);
     }
 
     fn readCompatibleMaintenanceActiveBestEffort(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         if (self.findTableActivityLocked(table_name, null)) |index| {
@@ -15883,7 +15983,7 @@ pub const ProvisionedTableWriteSource = struct {
         request_busy: bool,
         groups: []u64,
     } {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
 
@@ -16637,6 +16737,12 @@ pub const ProvisionedTableWriteSource = struct {
             cached.deinit(alloc);
             return;
         }
+        // A runtime backed by borrowed std.Io may execute every fiber on one
+        // scheduler thread. Blocking that thread on the native atomic mutex
+        // prevents the cache publisher that owns the mutex from ever
+        // resuming. Surface the existing retryable read contract instead;
+        // the caller will retry after the publisher gets a scheduler turn.
+        if (resident.open_contended) return error.StorageReadTemporarilyUnavailable;
         if (self.readCompatibleMaintenanceActiveBestEffort(table_name, group_id)) {
             return error.StorageReadTemporarilyUnavailable;
         }
@@ -16665,6 +16771,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     const ResidentDbSnapshot = struct {
         cached: ?ProvisionedTableWriteCache.CachedDb = null,
+        open_contended: bool = false,
     };
 
     fn snapshotResidentDbLocked(
@@ -16693,17 +16800,26 @@ pub const ProvisionedTableWriteSource = struct {
         lsm_root_generation: u64,
     ) ResidentDbSnapshot {
         const caches = [_]?*ProvisionedTableWriteCache{ self.write_cache, self.startup_write_cache };
+        const cooperative_runtime = if (self.backend_runtime) |runtime| runtime.usesBorrowedIo() else false;
+        var open_contended = false;
         for (caches, 0..) |maybe_cache, index| {
             const cache = maybe_cache orelse continue;
             if (index != 0 and caches[0] != null and cache == caches[0].?) continue;
-            lockAtomic(&cache.open_mutex);
+            if (cooperative_runtime) {
+                if (!cache.open_mutex.tryLock()) {
+                    open_contended = true;
+                    continue;
+                }
+            } else {
+                lockAtomic(&cache.open_mutex);
+            }
             lockAtomic(&self.local_db_mutex);
             const observed = self.snapshotResidentDbLocked(table_name, group_id, lsm_root_generation);
             self.local_db_mutex.unlock();
             cache.open_mutex.unlock();
             if (observed.cached != null) return observed;
         }
-        return .{};
+        return .{ .open_contended = open_contended };
     }
 
     const ResidentLeaseContext = struct {
@@ -16879,7 +16995,7 @@ pub const ProvisionedTableWriteSource = struct {
             return;
         };
 
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.restore_repair_completion_mutex.lockUncancelable(io);
         self.restore_repair_completions.append(alloc, owned_table_name) catch |err| {
             self.restore_repair_completion_mutex.unlock(io);
@@ -16893,7 +17009,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn scheduleRestoreRepairCompletionDrain(self: *ProvisionedTableWriteSource) void {
         if (self.restore_repair_completion_scheduled.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.restore_repair_completion_group.concurrent(io, drainRestoreRepairCompletionsTask, .{self}) catch |err| {
             self.restore_repair_completion_scheduled.store(false, .release);
             std.log.warn("restore repair completion drain schedule failed err={}", .{err});
@@ -16906,7 +17022,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn drainRestoreRepairCompletionsScheduled(self: *ProvisionedTableWriteSource) void {
         const alloc = std.heap.page_allocator;
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         while (true) {
             self.restore_repair_completion_mutex.lockUncancelable(io);
             if (self.restore_repair_completions.items.len == 0) {
@@ -16928,7 +17044,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn freeRestoreRepairCompletions(self: *ProvisionedTableWriteSource) void {
         const alloc = std.heap.page_allocator;
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.restore_repair_completion_mutex.lockUncancelable(io);
         defer self.restore_repair_completion_mutex.unlock(io);
         for (self.restore_repair_completions.items) |table_name| alloc.free(table_name);
@@ -17019,7 +17135,7 @@ pub const ProvisionedTableWriteSource = struct {
             try cancellation.check();
             const runtime_repair_needed = try db_mod.DB.restoreRuntimeRepairNeededForPathWithIo(
                 alloc,
-                self.table_activity_threaded.io(),
+                self.tableActivityIo(),
                 path,
             );
             if (!runtime_repair_needed and raft_apply_marker_reset) return;
@@ -17048,8 +17164,8 @@ pub const ProvisionedTableWriteSource = struct {
                             @errorName(err),
                         });
                     }
-                    self.table_activity_threaded.io().sleep(Io.Duration.fromNanoseconds(replicated_apply_writer_open_retry_ns), .awake) catch |sleep_err| switch (sleep_err) {
-                        error.Canceled => Io.recancel(self.table_activity_threaded.io()),
+                    self.tableActivityIo().sleep(Io.Duration.fromNanoseconds(replicated_apply_writer_open_retry_ns), .awake) catch |sleep_err| switch (sleep_err) {
+                        error.Canceled => return Io.recancel(self.tableActivityIo()),
                     };
                     continue;
                 }
@@ -17086,7 +17202,7 @@ pub const ProvisionedTableWriteSource = struct {
         return try repairRestoredDbRuntimeStateUntilCompleteWithIo(
             alloc,
             db,
-            self.table_activity_threaded.io(),
+            self.tableActivityIo(),
             group_id,
             open_attempts,
             cancellation,
@@ -17105,7 +17221,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         cancellation: db_mod.types.CancellationToken,
     ) !void {
-        if (!try db_mod.DB.restoreRuntimeRepairNeededForPathWithIo(alloc, self.table_activity_threaded.io(), path)) return;
+        if (!try db_mod.DB.restoreRuntimeRepairNeededForPathWithIo(alloc, self.tableActivityIo(), path)) return;
 
         self.beginLocalStructuralCachedDbMutationFromPreparation(table_name);
         errdefer self.abortLocalStructuralCachedDbMutation(table_name);
@@ -17192,8 +17308,8 @@ pub const ProvisionedTableWriteSource = struct {
 
         fn sleepRetry(self: *@This()) void {
             runTestBeforeRestoreRepairRetrySleepHook();
-            self.source.table_activity_threaded.io().sleep(Io.Duration.fromMilliseconds(100), .awake) catch |err| switch (err) {
-                error.Canceled => Io.recancel(self.source.table_activity_threaded.io()),
+            self.source.tableActivityIo().sleep(Io.Duration.fromMilliseconds(100), .awake) catch |err| switch (err) {
+                error.Canceled => Io.recancel(self.source.tableActivityIo()),
             };
         }
 
@@ -17247,7 +17363,7 @@ pub const ProvisionedTableWriteSource = struct {
             }
             if (!try db_mod.DB.restoreRuntimeRepairNeededForPathWithIo(
                 self.alloc,
-                self.source.table_activity_threaded.io(),
+                self.source.tableActivityIo(),
                 path,
             )) return false;
 
@@ -17313,7 +17429,7 @@ pub const ProvisionedTableWriteSource = struct {
             .group_id = group_id,
             .table_name = owned_table_name,
         };
-        self.restore_repair_work_group.concurrent(self.table_activity_threaded.io(), RestoreRepairCatchUpWork.runAndDeinit, .{work}) catch |err| {
+        self.restore_repair_work_group.concurrent(self.tableActivityIo(), RestoreRepairCatchUpWork.runAndDeinit, .{work}) catch |err| {
             RestoreRepairCatchUpWork.deinit(work);
             std.log.warn("restore background catch-up failed phase=submit group_id={d} class={s}", .{ group_id, @errorName(err) });
             return;
@@ -17321,7 +17437,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn freeStructuralReconcileTables(self: *ProvisionedTableWriteSource) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         const alloc = std.heap.page_allocator;
         self.structural_reconcile_mutex.lockUncancelable(io);
         defer self.structural_reconcile_mutex.unlock(io);
@@ -17469,7 +17585,7 @@ pub const ProvisionedTableWriteSource = struct {
         request: StructuralReconcileRequest,
         progress: metadata_mod.IndexActivationProgress,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.structural_reconcile_mutex.lockUncancelable(io);
         defer self.structural_reconcile_mutex.unlock(io);
         self.rememberRequestActivationProgressLocked(request, progress);
@@ -17501,7 +17617,7 @@ pub const ProvisionedTableWriteSource = struct {
         const target = request.activation_target orelse return;
         const index_name = request.index_name orelse return;
         const key = indexActivationKey(target, request.table_name, index_name);
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.structural_reconcile_mutex.lockUncancelable(io);
         defer self.structural_reconcile_mutex.unlock(io);
         if (self.index_activation_progress.get(key)) |progress| {
@@ -17516,7 +17632,7 @@ pub const ProvisionedTableWriteSource = struct {
         self: *ProvisionedTableWriteSource,
         request: StructuralReconcileRequest,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.structural_reconcile_mutex.lockUncancelable(io);
         defer self.structural_reconcile_mutex.unlock(io);
         const ownership = self.structural_reconcile_keys.get(request.scheduler_key) orelse return;
@@ -17556,7 +17672,7 @@ pub const ProvisionedTableWriteSource = struct {
             return error.InvalidIndexActivationTarget;
         const key = indexActivationKey(target, target.table_name, target.index_name);
         const scope_key = indexActivationScopeKey(target, target.table_name, target.index_name);
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.structural_reconcile_mutex.lockUncancelable(io);
         while (self.index_activation_admitting.contains(key)) {
             if (comptime builtin.is_test)
@@ -17717,7 +17833,7 @@ pub const ProvisionedTableWriteSource = struct {
         errdefer if (targeted_status_reserved)
             self.releaseTargetedStructuralReconcileStatus(table_name, index_name.?);
         const alloc = std.heap.page_allocator;
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         const scheduler_key = structuralReconcileKey(
             table_name,
             index_name,
@@ -17866,10 +17982,7 @@ pub const ProvisionedTableWriteSource = struct {
         const enqueue_sequence = self.structural_reconcile_next_sequence;
         self.structural_reconcile_next_sequence +%= 1;
         if (self.structural_reconcile_next_sequence == 0) self.structural_reconcile_next_sequence = 1;
-        const enqueue_now_ms: u64 = @intCast(@divTrunc(
-            platform_time.monotonicNs(),
-            std.time.ns_per_ms,
-        ));
+        const enqueue_now_ms = monotonicMsWithIo(io);
         self.structural_reconcile_tables.push(alloc, .{
             .scheduler_key = scheduler_key,
             .enqueue_sequence = enqueue_sequence,
@@ -17910,7 +18023,7 @@ pub const ProvisionedTableWriteSource = struct {
     fn ensureStructuralReconcileScheduled(self: *ProvisionedTableWriteSource) !void {
         if (!self.isOpen()) return error.BackgroundOwnerClosing;
         if (self.structural_reconcile_scheduled.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         const worker_target: u32 = if (self.structural_reconcile_dispatcher != null)
             structural_reconcile_dispatch_workers
         else
@@ -17952,9 +18065,8 @@ pub const ProvisionedTableWriteSource = struct {
 
             fn run(ptr: *anyopaque) !void {
                 const work: *@This() = @ptrCast(@alignCast(ptr));
-                var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-                defer io_impl.deinit();
-                io_impl.io().sleep(.fromMilliseconds(100), .awake) catch {};
+                const io = work.source.tableActivityIo();
+                io.sleep(.fromMilliseconds(100), .awake) catch {};
                 work.source.structural_reconcile_retry_scheduled.store(false, .release);
                 if (!work.source.isOpen()) return;
                 work.source.ensureStructuralReconcileScheduled() catch {
@@ -17987,7 +18099,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn tryAcquireStructuralDispatchGroup(self: *ProvisionedTableWriteSource, group_id: u64) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.structural_reconcile_mutex.lockUncancelable(io);
         defer self.structural_reconcile_mutex.unlock(io);
         if (self.structural_reconcile_inflight_groups.contains(group_id)) return false;
@@ -17996,7 +18108,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn releaseStructuralDispatchGroup(self: *ProvisionedTableWriteSource, group_id: u64) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.structural_reconcile_mutex.lockUncancelable(io);
         defer self.structural_reconcile_mutex.unlock(io);
         std.debug.assert(self.structural_reconcile_inflight_groups.remove(group_id));
@@ -18004,7 +18116,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn drainStructuralReconcileTask(self: *ProvisionedTableWriteSource) Io.Cancelable!void {
         const alloc = std.heap.page_allocator;
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         var worker_retired = false;
         defer {
             if (!worker_retired) {
@@ -18045,7 +18157,7 @@ pub const ProvisionedTableWriteSource = struct {
                 self.structural_reconcile_mutex.unlock(io);
                 return;
             }
-            const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+            const now_ms = monotonicMsWithIo(io);
             const next = self.structural_reconcile_tables.peek().?;
             if (next.not_before_ms > now_ms) {
                 self.structural_reconcile_mutex.unlock(io);
@@ -18104,7 +18216,7 @@ pub const ProvisionedTableWriteSource = struct {
                     continue;
                 }
                 request.failure_count +|= 1;
-                const retry_now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+                const retry_now_ms = monotonicMsWithIo(io);
                 request.not_before_ms = retry_now_ms +| structuralReconcileRetryDelayMs(request.failure_count);
                 if (request.index_name) |index_name| {
                     std.log.warn("structural reconcile deferred table={s} index={s} failures={d} retry_at_monotonic_ms={d} err={s}", .{ request.table_name, index_name, request.failure_count, request.not_before_ms, @errorName(err) });
@@ -18116,7 +18228,7 @@ pub const ProvisionedTableWriteSource = struct {
             }
             if (reconcile_outcome == .yielded) {
                 request.failure_count = 0;
-                const retry_now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+                const retry_now_ms = monotonicMsWithIo(io);
                 request.not_before_ms = structuralReconcileRequeueAtMs(.yielded, retry_now_ms);
                 self.requeueActiveStructuralReconcile(&request, alloc);
                 continue;
@@ -18124,7 +18236,7 @@ pub const ProvisionedTableWriteSource = struct {
             if (reconcile_outcome == .accepted_waiting) {
                 request.pending_count +|= 1;
                 request.failure_count = 0;
-                const retry_now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+                const retry_now_ms = monotonicMsWithIo(io);
                 request.not_before_ms = retry_now_ms +| structuralActivationPollDelayMs(request.pending_count);
                 if (request.pending_count == 1 or std.math.isPowerOfTwo(request.pending_count)) {
                     std.log.info("structural reconcile activation accepted; awaiting resident observation table={s} index={s} polls={d}", .{
@@ -18139,7 +18251,7 @@ pub const ProvisionedTableWriteSource = struct {
             if (reconcile_outcome == .blocked) {
                 request.pending_count +|= 1;
                 request.failure_count = 0;
-                const retry_now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+                const retry_now_ms = monotonicMsWithIo(io);
                 // Pending is expected bounded maintenance, and each pass can
                 // advance durable cleanup. A fixed delay preserves queue
                 // fairness without exponentially throttling forward progress.
@@ -18201,7 +18313,7 @@ pub const ProvisionedTableWriteSource = struct {
         request: *StructuralReconcileRequest,
         alloc: std.mem.Allocator,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         // Whole-table reconciliation keeps its reservation continuous across
         // retries. Index-targeted work has already installed write capability
         // and can retry without holding foreground admission.
@@ -18563,7 +18675,7 @@ pub const ProvisionedTableWriteSource = struct {
         request: StructuralReconcileRequest,
     ) bool {
         const scope_key = request.committed_index_scope_key orelse return true;
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.structural_reconcile_mutex.lockUncancelable(io);
         defer self.structural_reconcile_mutex.unlock(io);
         const latest = self.structural_reconcile_latest_committed.get(scope_key) orelse return false;
@@ -19612,8 +19724,8 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.localWriteOwnerSource()) |owner| return try owner.createTable(alloc, table_name, req);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         std.log.info("provisioned create table local begin table={s}", .{table_name});
-        const routing_deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
-        const routing_budget = table_catalog.RoutingBudget.init(routing_deadline_ns);
+        const routing_deadline_ns = self.catalog.budget(null).nowNs() +| 5 * std.time.ns_per_s;
+        const routing_budget = self.catalog.budget(routing_deadline_ns);
         var route = (try resolveCatalogRouteEventuallyUntil(
             alloc,
             self.catalog,
@@ -19662,7 +19774,7 @@ pub const ProvisionedTableWriteSource = struct {
 
                     const visible_generation = self.visibleRootGeneration(group_id);
                     {
-                        var cached = self.getOrOpenCachedDbForLocalMutationWithOptions(
+                        var cached = self.getOrOpenCachedDbForLocalMutationWithOptionsAndMetadata(
                             alloc,
                             cache,
                             path,
@@ -19670,7 +19782,15 @@ pub const ProvisionedTableWriteSource = struct {
                             visible_generation,
                             table_name,
                             false,
-                            .{ .identity_namespace_override = identity_namespace },
+                            .{
+                                .identity_namespace_override = identity_namespace,
+                                .reuse_cached_writer_for_metadata_reconcile = true,
+                            },
+                            .{
+                                .indexes_json = indexes_json,
+                                .schema_json = schema_json,
+                                .identity_namespace = identity_namespace,
+                            },
                         ) catch |err| {
                             if (err == error.LsmRootWriterAlreadyOpen) {
                                 if (structural_attempt < create_structural_publication_retry_limit) continue :cached_retry;
@@ -20160,7 +20280,7 @@ pub const ProvisionedTableWriteSource = struct {
         // while the committed catalog still confirms absence; a delayed
         // initial cleanup must not revoke authority from a replacement table.
         if (retire_publication_authority and validation.table_name_absent) {
-            self.retireDroppedTablePublicationAuthority(table_name);
+            self.retireDroppedTablePublicationAuthorityForGroups(table_name, group_ids);
         }
 
         // The keyed structural reservation above prevents new opens for this
@@ -20203,12 +20323,10 @@ pub const ProvisionedTableWriteSource = struct {
         if (moved_any_group) {
             const trash_dir_path = try droppedTableTrashDirPath(alloc, self.replica_root_dir);
             defer alloc.free(trash_dir_path);
-            var io_impl = std.Io.Threaded.init(alloc, .{});
-            defer io_impl.deinit();
             // The repair intent is removed only after both sides of every
             // rename are durable. One shared-directory sync avoids an fsync
             // per range while preserving crash recovery.
-            try fs_paths.syncDirPortable(io_impl.io(), trash_dir_path);
+            try fs_paths.syncDirPortable(self.tableActivityIo(), trash_dir_path);
         }
         self.finishDroppedTableCleanupMutation(table_name, group_ids, open_fence);
         structural_mutation_active = false;
@@ -20275,7 +20393,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn writeCoalescerActive(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.write_coalesce_mutex.lockUncancelable(io);
         defer self.write_coalesce_mutex.unlock(io);
         const queue_index = self.findWriteCoalesceQueueLocked(table_name, group_id) orelse return false;
@@ -20305,7 +20423,7 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
     ) usize {
         if (!builtin.is_test) @compileError("testingWriteCoalesceQueueEntryCount is test-only");
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.write_coalesce_mutex.lockUncancelable(io);
         defer self.write_coalesce_mutex.unlock(io);
         const queue_index = self.findWriteCoalesceQueueLocked(table_name, group_id) orelse return 0;
@@ -20340,7 +20458,7 @@ pub const ProvisionedTableWriteSource = struct {
         };
         defer freeWriteCoalesceGroupBatch(alloc, &entry.group);
 
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         var should_drain = false;
         self.write_coalesce_mutex.lockUncancelable(io);
         {
@@ -20390,7 +20508,7 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         owner_entry: *WriteCoalesceEntry,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
 
@@ -20455,7 +20573,7 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         owner_entry: *const WriteCoalesceEntry,
     ) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.write_coalesce_mutex.lockUncancelable(io);
         defer self.write_coalesce_mutex.unlock(io);
         if (!owner_entry.done) return false;
@@ -20606,7 +20724,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn finishCoalescedEntries(self: *ProvisionedTableWriteSource, entries: []const *WriteCoalesceEntry, err: ?anyerror) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.write_coalesce_mutex.lockUncancelable(io);
         defer self.write_coalesce_mutex.unlock(io);
         for (entries) |entry| {
@@ -20617,7 +20735,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn finishCoalescedEntry(self: *ProvisionedTableWriteSource, entry: *WriteCoalesceEntry, err: ?anyerror) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.write_coalesce_mutex.lockUncancelable(io);
         defer self.write_coalesce_mutex.unlock(io);
         entry.err = err;
@@ -20712,7 +20830,7 @@ pub const ProvisionedTableWriteSource = struct {
             alloc,
             self.catalog,
             table_name,
-            platform_time.monotonicNs() +| write_routing_snapshot_timeout_ns,
+            self.catalog.budget(null).nowNs() +| write_routing_snapshot_timeout_ns,
         )) orelse return null;
         defer routing.deinit(alloc);
         try cancellation.check();
@@ -21025,7 +21143,7 @@ pub const ProvisionedTableWriteSource = struct {
         try backups_api.validateSingleRangeRestoreManifestLayout(plan.manifest);
         try backups_api.validateRestoreManifest(alloc, plan.manifest, plan.manifest.backup_id);
         if (plan.reconcile_only and plan.replace_existing) return error.InvalidBackupRequest;
-        const restore_io = plan.io orelse self.table_activity_threaded.io();
+        const restore_io = plan.io orelse self.tableActivityIo();
         const source_identity = try backups_api.canonicalRestoreSourceIdentityAlloc(alloc, plan.source_location);
         defer alloc.free(source_identity);
 
@@ -21212,8 +21330,10 @@ pub const ProvisionedTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
-        const txn_id = nextTxnId();
-        return try commitProvisionedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false, cancellation);
+        const txn_source: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const txn_io: ?Io = if (txn_source.backend_runtime) |runtime| runtime.io() else null;
+        const txn_id = nextTxnId(txn_io);
+        return try commitProvisionedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation);
     }
 
     fn commitTransactionWithId(
@@ -21285,7 +21405,7 @@ pub const ProvisionedTableWriteSource = struct {
             .{
                 .retain_terminal = retain_terminal,
                 .report_post_commit_failure = false,
-                .fanout_io = self.table_activity_threaded.io(),
+                .fanout_io = self.tableActivityIo(),
                 .post_commit_cancellation = cancellation,
             },
         );
@@ -21309,45 +21429,20 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?distributed_txn.CommitOutcome {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceHAWriteGateOptional(self.ha_write_gate);
-        const retry_conflicts = statelessBatchMayRetry(tables);
-        var attempt: u8 = 0;
-        while (true) : (attempt += 1) {
-            const outcome = commitProvisionedBatchOnce(self, ptr, alloc, tables, sync_level, cancellation) catch |err| {
-                if (retry_conflicts and attempt + 1 < stateless_batch_max_attempts and err == error.TopologyChanged) {
-                    sleepNs(statelessBatchRetryDelayNs(attempt));
-                    continue;
-                }
-                return err;
-            };
-            if (outcome) |result| switch (result) {
-                .committed => return result,
-                .conflict => {
-                    // Every conflict outcome is returned only after the
-                    // coordinator has established that no commit decision is
-                    // durable. A fresh transaction ID is therefore safe for a
-                    // predicate-free public batch. Explicit OCC conflicts and
-                    // unknown outcomes remain visible to the caller.
-                    if (retry_conflicts and attempt + 1 < stateless_batch_max_attempts) {
-                        sleepNs(statelessBatchRetryDelayNs(attempt));
-                        continue;
-                    }
-                    return result;
-                },
-            } else return null;
-        }
+        return commitStatelessBatchWithRetries(self, commitProvisionedBatchOnce, alloc, tables, sync_level, cancellation);
     }
 
     fn commitProvisionedBatchOnce(
         self: *ProvisionedTableWriteSource,
-        ptr: *anyopaque,
         alloc: std.mem.Allocator,
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
         if (try self.commitSingleGroupBatch(alloc, tables, sync_level, cancellation)) |outcome| return outcome;
-        const txn_id = nextTxnId();
-        return commitProvisionedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false, cancellation) catch |err| {
+        const txn_io: ?Io = if (self.backend_runtime) |runtime| runtime.io() else null;
+        const txn_id = nextTxnId(txn_io);
+        return commitProvisionedTransaction(self, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation) catch |err| {
             if (err == error.CommitDecisionUnknown)
                 public_table_http.setLastAmbiguousBatchTxnId(distributed_txn.encodeTxnIdHex(txn_id));
             return err;
@@ -21434,7 +21529,7 @@ pub const ProvisionedTableWriteSource = struct {
             .deletes = table_req.deletes,
             .transforms = table_req.transforms,
             .predicates = table_req.predicates,
-            .timestamp_ns = nextTxnTimestamp(),
+            .timestamp_ns = nextTxnTimestamp(if (self.backend_runtime) |runtime| runtime.io() else null),
             .sync_level = sync_level,
             .reject_graph_transform_projections = true,
         }, cancellation) catch |err| switch (err) {
@@ -21466,7 +21561,7 @@ pub const ProvisionedTableWriteSource = struct {
             alloc,
             self.catalog,
             table_req.table_name,
-            platform_time.monotonicNs() +| write_routing_snapshot_timeout_ns,
+            self.catalog.budget(null).nowNs() +| write_routing_snapshot_timeout_ns,
         )) orelse return null;
         defer routing.deinit(alloc);
 
@@ -21592,7 +21687,14 @@ pub const ProvisionedTableWriteSource = struct {
         metadata_source: ReplicatedApplyMetadataSource,
         err: anyerror,
     ) anyerror {
-        if (metadata_source == .local_persisted and isTransientWriterOpenConflict(err)) {
+        // A committed Raft entry cannot be discarded because its local writer
+        // owner is temporarily unavailable. Process-envelope admission is the
+        // same pre-mutation retry boundary as a writer lock or descriptor
+        // permit: preserve the apply checkpoint and let Raft progress retry
+        // after capacity is released.
+        if (metadata_source == .local_persisted and
+            (isTransientWriterOpenConflict(err) or err == error.ResourceBudgetExceeded))
+        {
             return error.RaftApplyWriterUnavailable;
         }
         return err;
@@ -21611,6 +21713,8 @@ pub const ProvisionedTableWriteSource = struct {
         defer alloc.free(path);
         const apply_req = req;
         const split_identity_namespace = try validateSplitReplicationForApply(apply_req, group_id);
+        const merge_identity_namespace = try validateMergeReplicationForApply(apply_req, group_id);
+        try validateMergeCheckpointForApply(apply_req, group_id);
         if (metadata_source == .catalog) if (apply_req.split_replication) |replication| {
             try validateSplitReplicationIdentityAgainstCatalog(alloc, self.catalog, table_name, replication);
         };
@@ -21643,7 +21747,8 @@ pub const ProvisionedTableWriteSource = struct {
         }
         if (self.write_cache) |cache| {
             const target_generation = self.visibleRootGeneration(group_id);
-            var cached = if (split_identity_namespace) |namespace|
+            const prepared_identity_namespace = split_identity_namespace orelse merge_identity_namespace;
+            var cached = if (prepared_identity_namespace) |namespace|
                 (if (metadata_source == .local_persisted)
                     self.leasePreparedTransitionGroupWriter(alloc, group_id, table_name, namespace) catch |err|
                         return mapReplicatedApplyWriterAcquireError(metadata_source, err)
@@ -21695,28 +21800,45 @@ pub const ProvisionedTableWriteSource = struct {
             self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
             self.notifyLocalChange(table_name, .data);
         } else {
-            if (metadata_source == .local_persisted and split_identity_namespace != null) {
-                return error.TransitionDestinationNotProvisioned;
-            }
-            var db = try openManagedDbForReplicatedApply(
-                alloc,
-                path,
-                self.catalog,
-                table_name,
-                group_id,
-                self.backend_runtime,
-                self.ha_write_gate,
-                self.ha_async_mirror,
-                split_identity_namespace,
-            );
+            const prepared_identity_namespace = split_identity_namespace orelse merge_identity_namespace;
+            const local_prepared = metadata_source == .local_persisted and prepared_identity_namespace != null;
+            var db = if (local_prepared)
+                try openPreparedTransitionDbForReplicatedApply(
+                    alloc,
+                    path,
+                    self.backend_runtime,
+                    self.ha_write_gate,
+                    self.ha_async_mirror,
+                    prepared_identity_namespace.?,
+                )
+            else
+                try openManagedDbForReplicatedApply(
+                    alloc,
+                    path,
+                    self.catalog,
+                    table_name,
+                    group_id,
+                    self.backend_runtime,
+                    self.ha_write_gate,
+                    self.ha_async_mirror,
+                    split_identity_namespace,
+                );
             defer db.close();
-            try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
+            if (!local_prepared)
+                try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             const already_applied = if (raft_entry) |entry|
                 try db.raftEntryAlreadyApplied(entry)
             else
                 false;
             if (!already_applied) {
-                try validateTableBatchAgainstCatalogSchema(alloc, self.catalog, &db, table_name, apply_req.writes, apply_req.deletes, apply_req.transforms);
+                if (local_prepared) {
+                    const schema_json = (try loadLocalTableSchemaJson(alloc, &db)) orelse
+                        return error.MissingLocalTableManifest;
+                    defer alloc.free(schema_json);
+                    try validateTableBatchAgainstSchemaJson(alloc, &db, schema_json, apply_req.writes, apply_req.deletes, apply_req.transforms);
+                } else {
+                    try validateTableBatchAgainstCatalogSchema(alloc, self.catalog, &db, table_name, apply_req.writes, apply_req.deletes, apply_req.transforms);
+                }
                 runTestBeforeBatchExecutionHook();
                 try validateSplitCheckpointGroup(apply_req.split_checkpoint, group_id);
                 if (apply_req.transaction != null) {
@@ -22053,7 +22175,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .transaction = .{ .begin = .{
                     .txn_id = txn_id,
                     .begin_timestamp = begin_timestamp,
-                    .created_at_ns = platform_time.realtimeNs(),
+                    .created_at_ns = nextTxnTimestamp(if (self.backend_runtime) |runtime| runtime.io() else null),
                     .topology_epoch = topology_epoch,
                     .retain_terminal = retain_terminal,
                     .participants = participants,
@@ -22070,7 +22192,7 @@ pub const ProvisionedTableWriteSource = struct {
             try applyReplicatedTransactionMutation(alloc, cached.db, table_name, group_id, .{ .transaction = .{ .begin = .{
                 .txn_id = txn_id,
                 .begin_timestamp = begin_timestamp,
-                .created_at_ns = platform_time.realtimeNs(),
+                .created_at_ns = nextTxnTimestamp(if (self.backend_runtime) |runtime| runtime.io() else null),
                 .topology_epoch = topology_epoch,
                 .retain_terminal = retain_terminal,
                 .participants = participants,
@@ -22086,7 +22208,7 @@ pub const ProvisionedTableWriteSource = struct {
             try applyReplicatedTransactionMutation(alloc, &db, table_name, group_id, .{ .transaction = .{ .begin = .{
                 .txn_id = txn_id,
                 .begin_timestamp = begin_timestamp,
-                .created_at_ns = platform_time.realtimeNs(),
+                .created_at_ns = nextTxnTimestamp(if (self.backend_runtime) |runtime| runtime.io() else null),
                 .topology_epoch = topology_epoch,
                 .retain_terminal = retain_terminal,
                 .participants = participants,
@@ -23322,8 +23444,25 @@ test "provisioned table write source has a finite worker ceiling" {
 
     try std.testing.expectEqual(
         std.Io.Limit.limited(threaded_io_limits.service),
-        source.table_activity_threaded.concurrent_limit,
+        source.table_activity_threaded.?.concurrent_limit,
     );
+}
+
+test "provisioned table write source borrows runtime IO without native fallback" {
+    var runtime = try db_mod.background_runtime.BackendRuntime.init(std.testing.allocator, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = std.testing.io },
+    });
+    defer runtime.deinit();
+    var source = ProvisionedTableWriteSource.initWithBackendRuntime(
+        "unused",
+        table_catalog.emptyCatalogSource(),
+        &runtime,
+    );
+    defer source.deinit();
+
+    try std.testing.expect(source.table_activity_threaded == null);
+    try std.testing.expectEqual(std.testing.io.userdata, source.tableActivityIo().userdata);
 }
 
 test "provisioned owner clone snapshot preserves retired runtime counters" {
@@ -23529,6 +23668,23 @@ test "hosted backup fanout reports drain failure after worker outcomes" {
 }
 
 pub const HostedProvisionedTableWriteSource = struct {
+    /// Retains a hosted writer while a production-shaped structural operation
+    /// uses the DB directly. The caller must already own the corresponding
+    /// topology/admission fence; this lease only supplies lifetime ownership.
+    pub const GroupWriterLease = struct {
+        cached: ProvisionedTableWriteCache.CachedDb,
+        cache_alloc: std.mem.Allocator,
+
+        pub fn db(self: *const GroupWriterLease) *db_mod.DB {
+            return self.cached.db;
+        }
+
+        pub fn release(self: *GroupWriterLease) void {
+            self.cached.deinit(self.cache_alloc);
+            self.* = undefined;
+        }
+    };
+
     replica_root_dir: []const u8,
     catalog: table_catalog.CatalogSource,
     router: table_router.HostedGroupRouter,
@@ -23707,9 +23863,34 @@ pub const HostedProvisionedTableWriteSource = struct {
         owner.destination_authorizer = self.destination_authorizer;
     }
 
+    /// Publish optional-worker shutdown while the borrowed scheduler is
+    /// paused. Cache destruction follows after its tasks have drained.
+    pub fn beginTeardown(self: *HostedProvisionedTableWriteSource) void {
+        const cache = hostedManagedDbCacheForRootIfPresent(self.replica_root_dir) orelse return;
+        cache.write_cache.beginTeardown();
+    }
+
     pub fn withForegroundDerivedProgress(self: *HostedProvisionedTableWriteSource) *HostedProvisionedTableWriteSource {
         self.foreground_derived_progress = true;
         return self;
+    }
+
+    /// Borrow the same cached writer used by hosted public requests. This is
+    /// the hosted equivalent of DataServer's transition DB lease and prevents
+    /// structural coordinators from attempting a second native root open.
+    pub fn leaseGroupWriter(
+        self: *HostedProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+    ) !GroupWriterLease {
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
+        return .{
+            .cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default_async),
+            .cache_alloc = hosted_cache.write_cache.alloc,
+        };
     }
 
     fn transactionRecoveryConfig(self: *HostedProvisionedTableWriteSource) db_mod.transaction_runtime.Config {
@@ -23719,6 +23900,7 @@ pub const HostedProvisionedTableWriteSource = struct {
             .enabled = true,
             .lease_owned = true,
             .owner_id = "hosted-2pc",
+            .clock = backend_runtime.clock(),
             .interval_ms = 5_000,
             .cutoff_ns = 5 * std.time.ns_per_min,
             .resolver_ctx = self,
@@ -24194,7 +24376,7 @@ pub const HostedProvisionedTableWriteSource = struct {
             alloc,
             self.catalog,
             table_name,
-            platform_time.monotonicNs() +| write_routing_snapshot_timeout_ns,
+            self.catalog.budget(null).nowNs() +| write_routing_snapshot_timeout_ns,
         )) orelse return null;
         defer routing.deinit(alloc);
 
@@ -24304,8 +24486,10 @@ pub const HostedProvisionedTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
-        const txn_id = nextTxnId();
-        return try commitHostedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false, cancellation);
+        const txn_source: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const txn_io: ?Io = if (txn_source.backend_runtime) |runtime| runtime.io() else null;
+        const txn_id = nextTxnId(txn_io);
+        return try commitHostedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation);
     }
 
     fn commitBatch(
@@ -24324,8 +24508,20 @@ pub const HostedProvisionedTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
-        const txn_id = nextTxnId();
-        return try commitHostedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false, cancellation);
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        return commitStatelessBatchWithRetries(self, commitHostedBatchOnce, alloc, tables, sync_level, cancellation);
+    }
+
+    fn commitHostedBatchOnce(
+        self: *HostedProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?distributed_txn.CommitOutcome {
+        const txn_io: ?Io = if (self.backend_runtime) |runtime| runtime.io() else null;
+        const txn_id = nextTxnId(txn_io);
+        return try commitHostedTransaction(self, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation);
     }
 
     fn commitTransactionWithId(
@@ -24753,11 +24949,12 @@ pub const HostedProvisionedTableWriteSource = struct {
         participants: []const []const u8,
         context: distributed_txn.PreDecisionContext,
     ) !?void {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         return try batchGroupLocalFencedWithPreDecisionContext(ptr, alloc, group_id, table_name, .{
             .transaction = .{ .begin = .{
                 .txn_id = txn_id,
                 .begin_timestamp = begin_timestamp,
-                .created_at_ns = platform_time.realtimeNs(),
+                .created_at_ns = nextTxnTimestamp(if (self.backend_runtime) |runtime| runtime.io() else null),
                 .topology_epoch = topology_epoch,
                 .retain_terminal = retain_terminal,
                 .participants = participants,
@@ -25451,7 +25648,9 @@ test "prepared raft apply reclassifies every transient pre-mutation writer confl
     try std.testing.expect(map(.local_persisted, error.LsmRootWriterAlreadyOpen) == error.RaftApplyWriterUnavailable);
     try std.testing.expect(map(.local_persisted, error.WriterLocked) == error.RaftApplyWriterUnavailable);
     try std.testing.expect(map(.local_persisted, error.PersistentDescriptorAdmissionExhausted) == error.RaftApplyWriterUnavailable);
+    try std.testing.expect(map(.local_persisted, error.ResourceBudgetExceeded) == error.RaftApplyWriterUnavailable);
     try std.testing.expect(map(.catalog, error.LsmRootWriterAlreadyOpen) == error.LsmRootWriterAlreadyOpen);
+    try std.testing.expect(map(.catalog, error.ResourceBudgetExceeded) == error.ResourceBudgetExceeded);
     try std.testing.expect(map(.local_persisted, error.OutOfMemory) == error.OutOfMemory);
 }
 
@@ -25955,18 +26154,120 @@ fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), 
     try out.appendSlice(alloc, escaped);
 }
 
-fn nextTxnTimestamp() u64 {
+fn nextTxnTimestamp(io: ?Io) u64 {
     // Transaction timestamps are stored in shard metadata and later compared
     // against transaction recovery cutoffs, so they must stay on realtime.
+    if (io) |runtime_io| return @intCast(std.Io.Clock.real.now(runtime_io).toNanoseconds());
     return platform_time.realtimeNs();
 }
 
-fn nextTxnId() db_mod.types.TxnId {
-    const nonce = txn_id_nonce.fetchAdd(1, .monotonic);
+fn nextTxnId(io: ?Io) db_mod.types.TxnId {
     var txn_id: db_mod.types.TxnId = undefined;
-    std.mem.writeInt(u64, txn_id[0..8], nextTxnTimestamp(), .big);
+    if (io) |runtime_io| {
+        runtime_io.random(&txn_id);
+        return txn_id;
+    }
+    const nonce = txn_id_nonce.fetchAdd(1, .monotonic);
+    std.mem.writeInt(u64, txn_id[0..8], nextTxnTimestamp(null), .big);
     std.mem.writeInt(u64, txn_id[8..16], nonce, .big);
     return txn_id;
+}
+
+test "table transaction identities borrow runtime entropy and realtime" {
+    const VoprIo = @import("vopr").vopr_io.VoprIo;
+    var first = try VoprIo.init(.{ .seed = 42, .realtime_ns = 123456789 });
+    defer first.deinit();
+    var replay = try VoprIo.init(.{ .seed = 42, .realtime_ns = 123456789 });
+    defer replay.deinit();
+    const first_id = nextTxnId(first.io());
+    const second_id = nextTxnId(first.io());
+    try std.testing.expect(!std.mem.eql(u8, &first_id, &second_id));
+    try std.testing.expectEqual(first_id, nextTxnId(replay.io()));
+    try std.testing.expectEqual(second_id, nextTxnId(replay.io()));
+    try std.testing.expectEqual(@as(u64, 123456789), nextTxnTimestamp(first.io()));
+    try std.testing.expectEqual(nextTxnTimestamp(first.io()), nextTxnTimestamp(replay.io()));
+}
+
+test "table transaction recovery preserves fresh transactions on the runtime clock" {
+    const alloc = std.testing.allocator;
+    const now_ns = 7 * std.time.ns_per_s;
+    var vopr_io = try @import("vopr").vopr_io.VoprIo.init(.{ .realtime_ns = now_ns });
+    defer vopr_io.deinit();
+    var runtime = try db_mod.background_runtime.BackendRuntime.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = vopr_io.io() },
+    });
+    defer runtime.deinit();
+    var provisioned = ProvisionedTableWriteSource.initWithBackendRuntime("unused-recovery-clock", table_catalog.emptyCatalogSource(), &runtime);
+    defer provisioned.deinit();
+    var hosted = HostedProvisionedTableWriteSource.init("unused-recovery-clock", table_catalog.emptyCatalogSource(), undefined, undefined);
+    hosted.backend_runtime = &runtime;
+    for ([_]db_mod.transaction_runtime.Config{ provisioned.transactionRecoveryConfig(), hosted.transactionRecoveryConfig() }) |config| {
+        vopr_io.realtime_ns = now_ns;
+        try std.testing.expect(config.enabled);
+        var backend = @import("../storage/mem_backend.zig").Backend.init(alloc, .{});
+        defer backend.close();
+        var store = try backend.runtimeStore(alloc, .{ .name = "recovery-clock" });
+        defer store.deinit();
+        var manager = try transactions_mod.TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        const txn_id: transactions_mod.TxnId = .{7} ** 16;
+        try manager.initTransactionWithParticipantsCreatedAtAndRole(txn_id, now_ns, now_ns, &.{}, true);
+
+        const fresh = try db_mod.transaction_runtime.recoverOnce(alloc, &store, config);
+        try std.testing.expectEqual(@as(u64, 0), fresh.auto_aborted);
+        try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try manager.getTransactionStatus(txn_id));
+
+        vopr_io.realtime_ns = now_ns + config.cutoff_ns + 1;
+        const expired = try db_mod.transaction_runtime.recoverOnce(alloc, &store, config);
+        try std.testing.expectEqual(@as(u64, 1), expired.auto_aborted);
+        try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, try manager.getTransactionStatus(txn_id));
+    }
+}
+
+fn commitStatelessBatchWithRetries(
+    source: anytype,
+    comptime commit_once: anytype,
+    alloc: std.mem.Allocator,
+    tables: []const distributed_txn.TableCommitRequest,
+    sync_level: db_mod.types.SyncLevel,
+    cancellation: db_mod.types.CancellationToken,
+) !?distributed_txn.CommitOutcome {
+    const retry_conflicts = statelessBatchMayRetry(tables);
+    var attempt: u8 = 0;
+    while (true) : (attempt += 1) {
+        const outcome = commit_once(source, alloc, tables, sync_level, cancellation) catch |err| {
+            if (retry_conflicts and attempt + 1 < stateless_batch_max_attempts and err == error.TopologyChanged) {
+                try sleepStatelessBatchRetry(source, attempt);
+                continue;
+            }
+            return err;
+        };
+        if (outcome) |result| switch (result) {
+            .committed => return result,
+            .conflict => {
+                // The coordinator returns a conflict only after proving no
+                // commit decision is durable. A new transaction is safe for
+                // a predicate-free stateless batch at either write source.
+                // Explicit OCC and ambiguous outcomes remain caller-visible.
+                if (retry_conflicts and attempt + 1 < stateless_batch_max_attempts) {
+                    try sleepStatelessBatchRetry(source, attempt);
+                    continue;
+                }
+                return result;
+            },
+        } else return null;
+    }
+}
+
+fn sleepStatelessBatchRetry(source: anytype, attempt: u8) !void {
+    const delay_ns = statelessBatchRetryDelayNs(attempt);
+    if (source.backend_runtime) |runtime| {
+        const io = runtime.io() orelse return error.BackendRuntimeIoUnavailable;
+        try io.sleep(.fromNanoseconds(delay_ns), .awake);
+    } else {
+        sleepNs(delay_ns);
+    }
 }
 
 fn statelessBatchMayRetry(tables: []const distributed_txn.TableCommitRequest) bool {
@@ -26004,6 +26305,71 @@ test "stateless batch retries are bounded and exclude explicit OCC" {
     try std.testing.expectEqual(std.time.ns_per_ms, statelessBatchRetryDelayNs(0));
     try std.testing.expectEqual(2 * std.time.ns_per_ms, statelessBatchRetryDelayNs(1));
     try std.testing.expectEqual(@as(u8, 3), stateless_batch_max_attempts);
+}
+
+test "shared stateless batch retries borrow IO and preserve unknown outcomes" {
+    const RetryClock = struct {
+        threadlocal var active: ?*@This() = null;
+        elapsed_ns: i96 = 0,
+        calls: usize = 0,
+
+        fn sleep(_: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+            const self = active.?;
+            self.elapsed_ns += timeout.duration.raw.toNanoseconds();
+            self.calls += 1;
+        }
+    };
+    const Attempt = struct {
+        backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+        failure: ?anyerror = null,
+        calls: usize = 0,
+
+        fn commit(self: *@This(), _: std.mem.Allocator, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel, _: db_mod.types.CancellationToken) !?distributed_txn.CommitOutcome {
+            self.calls += 1;
+            if (self.calls < 3) {
+                if (self.failure) |err| return err;
+                return .{ .conflict = .{ .table_name = "docs", .key = "", .message = "participant unavailable" } };
+            }
+            return .{ .committed = .{ .participant_count = 1 } };
+        }
+    };
+    var clock: RetryClock = .{};
+    RetryClock.active = &clock;
+    defer RetryClock.active = null;
+    var io_vtable = std.testing.io.vtable.*;
+    io_vtable.sleep = RetryClock.sleep;
+    var runtime = try db_mod.background_runtime.BackendRuntime.init(std.testing.allocator, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = .{ .userdata = std.testing.io.userdata, .vtable = &io_vtable } },
+    });
+    defer runtime.deinit();
+    const tables = [_]distributed_txn.TableCommitRequest{.{ .table_name = "docs", .writes = &.{.{ .key = "doc:a", .value = "{}" }} }};
+    for ([_]?anyerror{ null, error.TopologyChanged }) |failure| {
+        var attempt = Attempt{ .backend_runtime = &runtime, .failure = failure };
+        clock = .{};
+        const result = (try commitStatelessBatchWithRetries(&attempt, Attempt.commit, std.testing.allocator, &tables, .write, .none)).?;
+        try std.testing.expect(result == .committed);
+        try std.testing.expectEqual(@as(usize, 3), attempt.calls);
+        try std.testing.expectEqual(@as(usize, 2), clock.calls);
+        try std.testing.expectEqual(@as(i96, 3 * std.time.ns_per_ms), clock.elapsed_ns);
+    }
+    for ([_]anyerror{ error.CommitDecisionUnknown, error.RaftBatchWriteOutcomeUnknown, error.UnexpectedHttpStatus }) |failure| {
+        var attempt = Attempt{ .backend_runtime = &runtime, .failure = failure };
+        clock = .{};
+        try std.testing.expectError(failure, commitStatelessBatchWithRetries(&attempt, Attempt.commit, std.testing.allocator, &tables, .write, .none));
+        try std.testing.expectEqual(@as(usize, 1), attempt.calls);
+        try std.testing.expectEqual(@as(usize, 0), clock.calls);
+    }
+    const conditional = [_]distributed_txn.TableCommitRequest{.{
+        .table_name = "docs",
+        .predicates = &.{.{ .key = "doc:a", .expected_version = 7 }},
+    }};
+    var attempt = Attempt{ .backend_runtime = &runtime };
+    clock = .{};
+    const conflict = (try commitStatelessBatchWithRetries(&attempt, Attempt.commit, std.testing.allocator, &conditional, .write, .none)).?;
+    try std.testing.expect(conflict == .conflict);
+    try std.testing.expectEqual(@as(usize, 1), attempt.calls);
+    try std.testing.expectEqual(@as(usize, 0), clock.calls);
 }
 
 test "raft single-group fast path excludes graph projection transforms only" {
@@ -26176,7 +26542,9 @@ test "provisioned stateless batch retries definite aborts to the production boun
 
 test "provisioned single-group commit batch uses atomic shard fast path" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-single-group-commit-fast-path";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-single-group-commit-fast-path");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -26209,7 +26577,9 @@ test "provisioned single-group commit batch uses atomic shard fast path" {
 
 test "provisioned single-group commit preserves transaction graph transform contract" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-single-group-graph-transform";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-single-group-graph-transform");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -26272,7 +26642,9 @@ test "provisioned single-group commit preserves transaction graph transform cont
 
 test "provisioned predicate-only batch validates matching and stale versions" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-predicate-only-batch";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-predicate-only-batch");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -26309,7 +26681,9 @@ test "provisioned predicate-only batch validates matching and stale versions" {
 
 test "resident writer repair state distinguishes clean and metadata-pending writers" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-resident-writer-repair-state";
+    var path_tmp = try TestDirectory.init("antfly-api-resident-writer-repair-state");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -31902,12 +32276,19 @@ fn validateTransactionAgainstLocalSchema(
     try validateTableBatchAgainstLocalSchema(alloc, db, batch_writes, deletes, transforms);
 }
 
-fn applyLocalTableSchemaJson(
+pub fn applyLocalTableSchemaJson(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
     schema_json: []const u8,
 ) !void {
-    if (schema_json.len == 0) return;
+    // An empty schema is still an explicit, durable table contract. Persist
+    // the marker so transition and Raft replay can distinguish a provisioned
+    // schema-less DB from an incomplete local generation without consulting
+    // the catalog.
+    if (schema_json.len == 0) {
+        try db.core.store.put(local_schema_json_key, "");
+        return;
+    }
 
     const previous_schema_json = try loadLocalTableSchemaJson(alloc, db);
     defer if (previous_schema_json) |value| alloc.free(value);
@@ -32068,7 +32449,7 @@ fn loadTableIdentityNamespaceForGroup(
     // safe for tentative reads because a removed/reassigned group may still
     // be present in a follower or TTL cache.
     var snapshot = try (try catalog.routingSource()).linearizableSnapshot(
-        platform_time.monotonicNs() +| write_routing_snapshot_timeout_ns,
+        catalog.budget(null).nowNs() +| write_routing_snapshot_timeout_ns,
     );
     defer snapshot.deinit();
     var table_id: ?u64 = null;
@@ -32305,6 +32686,67 @@ fn validateSplitCheckpointGroup(checkpoint: ?db_mod.types.SplitReplicationCheckp
     }
 }
 
+fn validateMergeReplicationForApply(
+    req: db_mod.types.BatchRequest,
+    group_id: u64,
+) !?doc_identity.Namespace {
+    try db_mod.types.validateMergeArtifacts(req);
+    const replication = req.merge_replication orelse return null;
+    if (replication.transition_id == 0 or replication.donor_group_id == 0 or
+        replication.receiver_group_id == 0 or
+        replication.donor_group_id == replication.receiver_group_id or
+        replication.receiver_group_id != group_id or
+        replication.identity_namespace.table_id == 0 or
+        replication.identity_namespace.shard_id == 0 or
+        replication.identity_namespace.range_id == 0 or
+        req.split_checkpoint != null or req.split_replication != null or
+        req.split_transition != null or req.merge_source_transition != null or
+        req.transaction != null or
+        req.transforms.len != 0 or req.predicates.len != 0 or
+        req.graph_writes.len != 0 or req.graph_deletes.len != 0)
+    {
+        return error.InvalidBatchRequest;
+    }
+    if (req.merge_checkpoint) |checkpoint| {
+        if (replication.transition_id != checkpoint.transition_id or
+            replication.donor_group_id != checkpoint.donor_group_id or
+            replication.receiver_group_id != checkpoint.receiver_group_id)
+            return error.InvalidBatchRequest;
+    }
+    return replication.identity_namespace;
+}
+
+fn validateMergeCheckpointForApply(
+    req: db_mod.types.BatchRequest,
+    group_id: u64,
+) !void {
+    const value = req.merge_checkpoint orelse return;
+    if (value.transition_id == 0 or value.donor_group_id == 0 or
+        value.receiver_group_id == 0 or value.donor_group_id == value.receiver_group_id or
+        value.receiver_group_id != group_id)
+        return error.InvalidBatchRequest;
+    if (value.allow_doc_identity_reassignment !=
+        (value.receiver_identity_reassignment_namespace != null))
+        return error.InvalidBatchRequest;
+    if (value.kind == .accept and value.bootstrap_applied_index != 0)
+        return error.InvalidBatchRequest;
+    if (req.split_checkpoint != null or req.split_replication != null or
+        req.split_transition != null or req.transaction != null or
+        req.transforms.len != 0 or req.predicates.len != 0 or req.writes.len != 0 or
+        req.graph_writes.len != 0 or req.graph_deletes.len != 0 or
+        (req.deletes.len != 0 and value.kind != .rollback))
+        return error.InvalidBatchRequest;
+    if (req.merge_replication) |replication| {
+        if (replication.transition_id != value.transition_id or
+            replication.donor_group_id != value.donor_group_id or
+            replication.receiver_group_id != value.receiver_group_id)
+            return error.InvalidBatchRequest;
+        if (value.receiver_identity_reassignment_namespace) |namespace| {
+            if (!replication.identity_namespace.eql(namespace)) return error.DocIdentityNamespaceMismatch;
+        }
+    }
+}
+
 fn validateSplitReplicationIdentityAgainstCatalog(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
@@ -32382,6 +32824,32 @@ fn openManagedDbForReplicatedApply(
         });
     errdefer db.close();
     try validateProvisionedDbIdentityNamespaceExpected(namespace, &db);
+    return db;
+}
+
+fn openPreparedTransitionDbForReplicatedApply(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    ha_write_gate: ?db_mod.HAWriteGate,
+    ha_async_mirror: ?db_mod.HAAsyncEffectMirror,
+    identity_namespace: doc_identity.Namespace,
+) !db_mod.DB {
+    const effective_ha_mirror = haMirrorForManagedDbOpenMode(.default_async, ha_async_mirror);
+    var db = try db_mod.DB.open(alloc, path, .{
+        .backend_runtime = backend_runtime,
+        .primary_backend = existingPrimaryBackend(),
+        .identity_namespace = identity_namespace,
+        .prefer_existing_identity_namespace = true,
+        .ha_write_gate = ha_write_gate,
+        .ha_async_effect_mirror = effective_ha_mirror,
+        .ha_async_batch_mirror = effective_ha_mirror,
+        .ha_async_metadata_mirror = effective_ha_mirror,
+        .open_mode = .writer_no_replay,
+        .index_open_parallelism = 1,
+    });
+    errdefer db.close();
+    try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
     return db;
 }
 
@@ -32531,7 +32999,9 @@ fn encodeRemoteDocumentArtifactChildRangeApplyBatch(
 
 test "bound table write source applies batch writes" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-batch";
+    var path_tmp = try TestDirectory.init("antfly-api-table-batch");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -32640,7 +33110,7 @@ test "bound table sources inspect and reprocess document artifact manifests" {
     });
 
     var write_source = BoundTableWriteSource.init("docs", &db);
-    var read_source = table_reads.BoundTableReadSource.init("docs", 11, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var read_source = table_reads.BoundTableReadSource.init("docs", 11, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
 
     _ = try write_source.source().batch(alloc, "docs", .{
         .writes = &.{.{
@@ -32737,7 +33207,9 @@ test "bound table sources inspect and reprocess document artifact manifests" {
 
 test "bound table write source resolves internal group transactions into visible documents" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-txn-group-local";
+    var path_tmp = try TestDirectory.init("antfly-api-table-txn-group-local");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -32846,7 +33318,9 @@ test "bound single-group batch reports prepared intent conflicts" {
 
 test "bound table write source provisions default full text index on create" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-create";
+    var path_tmp = try TestDirectory.init("antfly-api-table-create");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -33259,12 +33733,14 @@ test "replicated split destination seeds inherited doc identity before range pub
             .bootstrap_sequence = 0,
         },
     });
-    var destination = (try source.leaseCachedTransitionGroupWriter(alloc, 7002, "docs", namespace)) orelse
-        return error.TestUnexpectedResult;
-    defer destination.deinit(alloc);
-    var after_late = (try destination.db.lookup(alloc, "doc:m", .{})) orelse return error.TestUnexpectedResult;
-    defer after_late.deinit(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, after_late.json, "\"m\"") != null);
+    {
+        var destination = (try source.leaseCachedTransitionGroupWriter(alloc, 7002, "docs", namespace)) orelse
+            return error.TestUnexpectedResult;
+        defer destination.deinit(alloc);
+        var after_late = (try destination.db.lookup(alloc, "doc:m", .{})) orelse return error.TestUnexpectedResult;
+        defer after_late.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, after_late.json, "\"m\"") != null);
+    }
 
     const delta_req = db_mod.types.BatchRequest{
         .writes = &.{.{ .key = "doc:m", .value = "{\"title\":\"delta-1\"}" }},
@@ -33280,13 +33756,41 @@ test "replicated split destination seeds inherited doc identity before range pub
     };
     _ = try source.applyReplicatedBatchGroupLocal(alloc, 7002, "docs", delta_req);
     _ = try source.applyReplicatedBatchGroupLocal(alloc, 7002, "docs", delta_req);
-    try std.testing.expectEqual(@as(u64, 1), try destination.db.getSplitDeltaFinalSeq(alloc));
+    {
+        var destination = (try source.leaseCachedTransitionGroupWriter(alloc, 7002, "docs", namespace)) orelse
+            return error.TestUnexpectedResult;
+        defer destination.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 1), try destination.db.getSplitDeltaFinalSeq(alloc));
+    }
 
     var gap_req = delta_req;
     gap_req.split_replication.?.sequence = 3;
     try std.testing.expectError(
         error.SplitReplicationSequenceGap,
         source.applyReplicatedBatchGroupLocal(alloc, 7002, "docs", gap_req),
+    );
+
+    // Source watermarks are Raft indexes, so entries unrelated to the split
+    // range can create legitimate gaps. The explicit predecessor proves that
+    // no actual delta was omitted while preserving exact retry identity.
+    var sparse_req = delta_req;
+    sparse_req.split_replication.?.sequence = 7;
+    sparse_req.split_replication.?.previous_sequence = 1;
+    _ = try source.applyReplicatedBatchGroupLocal(alloc, 7002, "docs", sparse_req);
+    _ = try source.applyReplicatedBatchGroupLocal(alloc, 7002, "docs", sparse_req);
+    {
+        var destination = (try source.leaseCachedTransitionGroupWriter(alloc, 7002, "docs", namespace)) orelse
+            return error.TestUnexpectedResult;
+        defer destination.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 7), try destination.db.getSplitDeltaFinalSeq(alloc));
+    }
+
+    var omitted_req = delta_req;
+    omitted_req.split_replication.?.sequence = 9;
+    omitted_req.split_replication.?.previous_sequence = 1;
+    try std.testing.expectError(
+        error.SplitReplicationSequenceGap,
+        source.applyReplicatedBatchGroupLocal(alloc, 7002, "docs", omitted_req),
     );
 
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, source.applyReplicatedBatchGroupLocal(alloc, 7002, "docs", .{
@@ -33404,7 +33908,9 @@ test "provisioned table write source rejects stale doc identity namespace before
 
 test "bound table write source rejects invalid batch writes against persisted schema" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-batch-schema";
+    var path_tmp = try TestDirectory.init("antfly-api-table-batch-schema");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -33432,7 +33938,9 @@ test "bound table write source rejects invalid batch writes against persisted sc
 
 test "bound table write source enforces nested required fields and array items" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-nested-schema";
+    var path_tmp = try TestDirectory.init("antfly-api-table-nested-schema");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -33472,7 +33980,9 @@ test "bound table write source enforces nested required fields and array items" 
 
 test "bound table write source enforces enums numeric bounds and anyOf" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-enum-bounds-schema";
+    var path_tmp = try TestDirectory.init("antfly-api-table-enum-bounds-schema");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -33511,7 +34021,9 @@ test "bound table write source enforces enums numeric bounds and anyOf" {
 
 test "bound table write source enforces oneOf allOf pattern and item cardinality" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-pattern-compose-schema";
+    var path_tmp = try TestDirectory.init("antfly-api-table-pattern-compose-schema");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -33556,7 +34068,9 @@ test "bound table write source enforces oneOf allOf pattern and item cardinality
 
 test "bound table write source enforces string length and object cardinality" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-length-cardinality-schema";
+    var path_tmp = try TestDirectory.init("antfly-api-table-length-cardinality-schema");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -33768,8 +34282,12 @@ test "bound table write source backs up and restores a portable local table" {
 
 test "provisioned table write source backs up and restores a local table" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-table-backup-restore";
-    const backup_root = "/tmp/antfly-api-provisioned-table-backup-restore-out";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-table-backup-restore");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
+    var backup_root_tmp = try TestDirectory.init("antfly-api-provisioned-table-backup-restore-out");
+    defer backup_root_tmp.cleanup();
+    const backup_root = backup_root_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -34033,7 +34551,7 @@ test "provisioned table restore retry repairs exact incomplete restore state thr
         .artifact_backup_id = manifest.backup_id,
         .source_location = location,
     });
-    source.restore_repair_work_group.await(source.table_activity_threaded.io()) catch {};
+    source.restore_repair_work_group.await(source.tableActivityIo()) catch {};
     source.drainRestoreRepairCompletionsScheduled();
 
     try db_mod.DB.markRestorePrimaryRestoredForPathWithIdentityWithIo(
@@ -34307,8 +34825,8 @@ test "provisioned restore repair worker retries transient step failures to compl
     defer test_before_restore_repair_step_hook = null;
 
     source.requestRestoreRepairCatchUp("docs", 7001);
-    source.restore_repair_work_group.await(source.table_activity_threaded.io()) catch {};
-    source.restore_repair_completion_group.await(source.table_activity_threaded.io()) catch {};
+    source.restore_repair_work_group.await(source.tableActivityIo()) catch {};
+    source.restore_repair_completion_group.await(source.tableActivityIo()) catch {};
 
     try std.testing.expect(hook_ctx.calls.load(.acquire) >= 2);
     try std.testing.expect(!(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, db_path)));
@@ -34316,9 +34834,15 @@ test "provisioned restore repair worker retries transient step failures to compl
 
 test "provisioned table write source backs up a portable local table" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-table-portable-backup";
-    const backup_root = "/tmp/antfly-api-provisioned-table-portable-backup-out";
-    const restore_path = "/tmp/antfly-api-provisioned-table-portable-backup-restore";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-table-portable-backup");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
+    var backup_root_tmp = try TestDirectory.init("antfly-api-provisioned-table-portable-backup-out");
+    defer backup_root_tmp.cleanup();
+    const backup_root = backup_root_tmp.path();
+    var restore_path_tmp = try TestDirectory.init("antfly-api-provisioned-table-portable-backup-restore");
+    defer restore_path_tmp.cleanup();
+    const restore_path = restore_path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -34409,8 +34933,12 @@ test "provisioned table write source backs up a portable local table" {
 
 test "provisioned table restore rejects mismatched doc identity namespace" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-table-backup-restore-docid-mismatch";
-    const backup_root = "/tmp/antfly-api-provisioned-table-backup-restore-docid-mismatch-out";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-table-backup-restore-docid-mismatch");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
+    var backup_root_tmp = try TestDirectory.init("antfly-api-provisioned-table-backup-restore-docid-mismatch-out");
+    defer backup_root_tmp.cleanup();
+    const backup_root = backup_root_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -34520,8 +35048,12 @@ test "provisioned table restore rejects mismatched doc identity namespace" {
 
 test "provisioned table write source backs up and restores full_text writes from the write cache" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-write-cache-backup-restore";
-    const backup_root = "/tmp/antfly-api-provisioned-write-cache-backup-restore-out";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-write-cache-backup-restore");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
+    var backup_root_tmp = try TestDirectory.init("antfly-api-provisioned-write-cache-backup-restore-out");
+    defer backup_root_tmp.cleanup();
+    const backup_root = backup_root_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -34628,7 +35160,7 @@ test "provisioned table write source backs up and restores full_text writes from
     var read_source = table_reads.ProvisionedTableReadSource.init(
         path,
         FakeCatalog.iface(),
-        raft_mod.read_gate.noopReadableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var read_cache = table_reads.ProvisionedTableReadCache.init(alloc);
     defer read_cache.deinit();
@@ -34826,7 +35358,7 @@ test "provisioned native backup restore repeats through shared read and write ow
     var read_source = table_reads.ProvisionedTableReadSource.init(
         root,
         FakeCatalog.iface(&catalog_active),
-        raft_mod.read_gate.noopReadableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     read_source.backend_runtime = backend_runtime.ptr();
     read_source.cache = &read_cache;
@@ -35306,15 +35838,15 @@ test "HA ownership transition serializes with active writer cache mutation" {
     var worker = Worker{ .source = &source, .gate_state = &gate_state };
 
     lockAtomic(&source.local_db_mutex);
-    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(Worker.run, .{&worker});
     while (!worker.started.load(.acquire)) std.atomic.spinLoopHint();
     var attempts: usize = 0;
-    while (attempts < 1_000) : (attempts += 1) std.Thread.yield() catch {};
+    while (attempts < 1_000) : (attempts += 1) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     const completed_while_locked = worker.completed.load(.acquire);
     const gate_changed_while_locked = source.ha_write_gate != null;
     const metadata_count_while_locked = write_cache.table_metadata.items.len;
     source.local_db_mutex.unlock();
-    thread.join();
+    thread.await(std.testing.io);
 
     try std.testing.expect(!completed_while_locked);
     try std.testing.expect(!gate_changed_while_locked);
@@ -35368,7 +35900,9 @@ test "startup cache clear retires dirty identity without a serving owner" {
 
 test "provisioned read preparation invalidates readers without closing dirty writer cache" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-write-cache-read-prep";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-write-cache-read-prep");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -35512,7 +36046,9 @@ test "auto bulk best-effort finish does not spin when writer cache lock is busy"
 
 test "auto bulk max-window request waits for idle finish" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-auto-bulk-roll-without-next-write";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-auto-bulk-roll-without-next-write");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -36128,7 +36664,9 @@ test "managed visibility publish hook updates runtime status cache from live wri
 
 test "provisioned read preparation does not block on same-table batch after early dirty publication" {
     const alloc = std.testing.allocator;
-    const replica_root_dir = "/tmp/antfly-api-provisioned-read-prep-active-batch";
+    var replica_root_dir_tmp = try TestDirectory.init("antfly-api-provisioned-read-prep-active-batch");
+    defer replica_root_dir_tmp.cleanup();
+    const replica_root_dir = replica_root_dir_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -36227,7 +36765,7 @@ test "provisioned read preparation does not block on same-table batch after earl
     defer test_before_batch_execution_hook = null;
 
     var batch_worker = BatchWorker{ .source = &source, .alloc = alloc };
-    const batch_thread = try std.Thread.spawn(.{}, BatchWorker.run, .{&batch_worker});
+    var batch_thread = try std.testing.io.concurrent(BatchWorker.run, .{&batch_worker});
 
     const ReadWorker = struct {
         source: *ProvisionedTableWriteSource,
@@ -36244,9 +36782,9 @@ test "provisioned read preparation does not block on same-table batch after earl
     while (!probe.entered.load(.acquire)) std.atomic.spinLoopHint();
 
     var read_worker = ReadWorker{ .source = &source };
-    const read_thread = std.Thread.spawn(.{}, ReadWorker.run, .{&read_worker}) catch |err| {
+    var read_thread = std.testing.io.concurrent(ReadWorker.run, .{&read_worker}) catch |err| {
         probe.release.store(true, .release);
-        batch_thread.join();
+        batch_thread.await(std.testing.io);
         return err;
     };
     var threads_joined = false;
@@ -36254,8 +36792,8 @@ test "provisioned read preparation does not block on same-table batch after earl
         // A failed assertion must release both workers before joining them;
         // otherwise this regression masks the failure as a hung test shard.
         probe.release.store(true, .release);
-        read_thread.join();
-        batch_thread.join();
+        read_thread.await(std.testing.io);
+        batch_thread.await(std.testing.io);
     };
 
     while (!read_worker.started.load(.acquire)) std.atomic.spinLoopHint();
@@ -36265,14 +36803,14 @@ test "provisioned read preparation does not block on same-table batch after earl
             completed_before_batch_release = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     const cached_entries_before_batch_release = write_cache.entries.items.len;
     const dirty_before_batch_release = source.isWriteCacheDirtyForTable("docs");
 
     probe.release.store(true, .release);
-    read_thread.join();
-    batch_thread.join();
+    read_thread.await(std.testing.io);
+    batch_thread.await(std.testing.io);
     threads_joined = true;
 
     try std.testing.expect(completed_before_batch_release);
@@ -36286,7 +36824,9 @@ test "provisioned read preparation does not block on same-table batch after earl
 
 test "provisioned txn commit reuses cached writer state" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-txn-resolve-invalidates-write-cache";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-txn-resolve-invalidates-write-cache");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -36375,7 +36915,9 @@ test "provisioned txn commit reuses cached writer state" {
 
 test "bound table write source enforces root conditionals not and unique items" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-conditional-unique-schema";
+    var path_tmp = try TestDirectory.init("antfly-api-table-conditional-unique-schema");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -36420,7 +36962,9 @@ test "bound table write source enforces root conditionals not and unique items" 
 
 test "bound table write source enforces property names and dependent required" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-property-names-schema";
+    var path_tmp = try TestDirectory.init("antfly-api-table-property-names-schema");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -36456,7 +37000,9 @@ test "bound table write source enforces property names and dependent required" {
 
 test "bound table write source enforces dependent schemas" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-dependent-schemas";
+    var path_tmp = try TestDirectory.init("antfly-api-table-dependent-schemas");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -36495,7 +37041,9 @@ test "bound table write source enforces dependent schemas" {
 
 test "bound table write source enforces additional properties" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-additional-properties";
+    var path_tmp = try TestDirectory.init("antfly-api-table-additional-properties");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -36531,7 +37079,9 @@ test "bound table write source enforces additional properties" {
 
 test "bound table write source enforces contains semantics" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-contains";
+    var path_tmp = try TestDirectory.init("antfly-api-table-contains");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -36570,7 +37120,9 @@ test "bound table write source enforces contains semantics" {
 
 test "bound table write source enforces prefix items and pattern properties" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-prefix-pattern";
+    var path_tmp = try TestDirectory.init("antfly-api-table-prefix-pattern");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -36612,7 +37164,9 @@ test "bound table write source enforces prefix items and pattern properties" {
 
 test "bound table write source enforces exclusive numeric bounds and multipleOf" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-exclusive-multiple";
+    var path_tmp = try TestDirectory.init("antfly-api-table-exclusive-multiple");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -36651,7 +37205,9 @@ test "bound table write source enforces exclusive numeric bounds and multipleOf"
 
 test "bound table write source enforces nullable and type-array fields" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-nullable-types";
+    var path_tmp = try TestDirectory.init("antfly-api-table-nullable-types");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -36687,7 +37243,9 @@ test "bound table write source enforces nullable and type-array fields" {
 
 test "bound table write source enforces local defs and refs" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-defs-refs";
+    var path_tmp = try TestDirectory.init("antfly-api-table-defs-refs");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -36723,7 +37281,9 @@ test "bound table write source enforces local defs and refs" {
 
 test "bound table write source enforces ref siblings and nested local defs" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-ref-siblings-local-defs";
+    var path_tmp = try TestDirectory.init("antfly-api-table-ref-siblings-local-defs");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -36762,7 +37322,9 @@ test "bound table write source enforces ref siblings and nested local defs" {
 
 test "bound table write source enforces recursive root refs" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-recursive-root-refs";
+    var path_tmp = try TestDirectory.init("antfly-api-table-recursive-root-refs");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -36798,7 +37360,9 @@ test "bound table write source enforces recursive root refs" {
 
 test "bound table write source enforces format and additionalItems" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-format-additional-items";
+    var path_tmp = try TestDirectory.init("antfly-api-table-format-additional-items");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -36843,7 +37407,9 @@ test "bound table write source enforces format and additionalItems" {
 
 test "bound table write source enforces broader string formats" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-broader-formats";
+    var path_tmp = try TestDirectory.init("antfly-api-table-broader-formats");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -36891,7 +37457,9 @@ test "bound table write source enforces broader string formats" {
 
 test "bound table write source enforces unevaluated properties and items" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-unevaluated";
+    var path_tmp = try TestDirectory.init("antfly-api-table-unevaluated");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -36930,7 +37498,9 @@ test "bound table write source enforces unevaluated properties and items" {
 
 test "bound table write source enforces composed unevaluated coverage" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-unevaluated-composed";
+    var path_tmp = try TestDirectory.init("antfly-api-table-unevaluated-composed");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -36972,7 +37542,9 @@ test "bound table write source enforces composed unevaluated coverage" {
 
 test "bound table write source enforces root unevaluated properties" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-root-unevaluated";
+    var path_tmp = try TestDirectory.init("antfly-api-table-root-unevaluated");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -37005,7 +37577,9 @@ test "bound table write source enforces root unevaluated properties" {
 
 test "bound table write source enforces conditional and dependency unevaluated coverage" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-conditional-unevaluated";
+    var path_tmp = try TestDirectory.init("antfly-api-table-conditional-unevaluated");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -37047,7 +37621,9 @@ test "bound table write source enforces conditional and dependency unevaluated c
 
 test "bound table write source enforces anyOf and oneOf branch evaluation coverage" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-branch-unevaluated";
+    var path_tmp = try TestDirectory.init("antfly-api-table-branch-unevaluated");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -37092,7 +37668,9 @@ test "bound table write source enforces anyOf and oneOf branch evaluation covera
 
 test "bound table write source enforces anyOf and oneOf array evaluation coverage" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-array-branch-unevaluated";
+    var path_tmp = try TestDirectory.init("antfly-api-table-array-branch-unevaluated");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -37137,7 +37715,9 @@ test "bound table write source enforces anyOf and oneOf array evaluation coverag
 
 test "bound table write source enforces composed contains-driven array evaluation coverage" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-array-contains-unevaluated";
+    var path_tmp = try TestDirectory.init("antfly-api-table-array-contains-unevaluated");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -37182,7 +37762,9 @@ test "bound table write source enforces composed contains-driven array evaluatio
 
 test "bound table write source enforces composed pattern and additional properties evaluation coverage" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-pattern-additional-unevaluated";
+    var path_tmp = try TestDirectory.init("antfly-api-table-pattern-additional-unevaluated");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -37227,7 +37809,9 @@ test "bound table write source enforces composed pattern and additional properti
 
 test "bound table write source enforces composed ref closure evaluation coverage" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-ref-pattern-additional";
+    var path_tmp = try TestDirectory.init("antfly-api-table-ref-pattern-additional");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -37266,7 +37850,9 @@ test "bound table write source enforces composed ref closure evaluation coverage
 
 test "bound table write source enforces nullable composed refs" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-nullable-composed-refs";
+    var path_tmp = try TestDirectory.init("antfly-api-table-nullable-composed-refs");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -37302,7 +37888,9 @@ test "bound table write source enforces nullable composed refs" {
 
 test "bound table write source enforces recursive ref closure semantics" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-recursive-closure";
+    var path_tmp = try TestDirectory.init("antfly-api-table-recursive-closure");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -37341,7 +37929,9 @@ test "bound table write source enforces recursive ref closure semantics" {
 
 test "bound table write source enforces escaped ref tokens and direct fragment refs" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-ref-escaped-hash";
+    var path_tmp = try TestDirectory.init("antfly-api-table-ref-escaped-hash");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -37380,7 +37970,9 @@ test "bound table write source enforces escaped ref tokens and direct fragment r
 
 test "bound table write source enforces legacy dependencies keyword" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-legacy-dependencies";
+    var path_tmp = try TestDirectory.init("antfly-api-table-legacy-dependencies");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -37419,7 +38011,9 @@ test "bound table write source enforces legacy dependencies keyword" {
 
 test "bound table write source rejects invalid commit writes against persisted schema" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-commit-schema";
+    var path_tmp = try TestDirectory.init("antfly-api-table-commit-schema");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -37446,7 +38040,9 @@ test "bound table write source rejects invalid commit writes against persisted s
 
 test "bound table write source rejects invalid commit transforms against persisted schema" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-commit-transform-schema";
+    var path_tmp = try TestDirectory.init("antfly-api-table-commit-transform-schema");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -37519,7 +38115,9 @@ test "bound table write source aborts graph transform transaction on validation 
 
 test "bound table write source rejects invalid txn prepare writes against persisted schema" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-prepare-schema";
+    var path_tmp = try TestDirectory.init("antfly-api-table-prepare-schema");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -37547,7 +38145,9 @@ test "bound table write source rejects invalid txn prepare writes against persis
 
 test "bound table write source rejects invalid txn prepare transforms against persisted schema" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-prepare-transform-schema";
+    var path_tmp = try TestDirectory.init("antfly-api-table-prepare-transform-schema");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -37583,7 +38183,9 @@ test "bound table write source rejects invalid txn prepare transforms against pe
 
 test "bound table write source rejects invalid batch transforms against persisted schema" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-batch-transform-schema";
+    var path_tmp = try TestDirectory.init("antfly-api-table-batch-transform-schema");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -37617,7 +38219,9 @@ test "bound table write source rejects invalid batch transforms against persiste
 
 test "bound table write source validates transforms against same-batch writes" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-batch-transform-same-request-schema";
+    var path_tmp = try TestDirectory.init("antfly-api-table-batch-transform-same-request-schema");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -37657,7 +38261,9 @@ test "bound table write source validates transforms against same-batch writes" {
 
 test "bound table write source validates non-upsert transforms against same-batch deletes" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-batch-transform-delete-no-upsert-schema";
+    var path_tmp = try TestDirectory.init("antfly-api-table-batch-transform-delete-no-upsert-schema");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -37696,7 +38302,9 @@ test "bound table write source validates non-upsert transforms against same-batc
 
 test "bound table write source rejects upsert transforms against same-batch deletes" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-batch-transform-delete-upsert-schema";
+    var path_tmp = try TestDirectory.init("antfly-api-table-batch-transform-delete-upsert-schema");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -37732,7 +38340,9 @@ test "bound table write source rejects upsert transforms against same-batch dele
 
 test "bound table write source derives ttl timestamps from ttl_field values" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-ttl-field-schema";
+    var path_tmp = try TestDirectory.init("antfly-api-table-ttl-field-schema");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -37773,7 +38383,9 @@ test "bound table write source derives ttl timestamps from ttl_field values" {
 
 test "provisioned table write source routes batch writes across ranges" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-batch";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-batch");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -38059,7 +38671,9 @@ const ProvisionedWriteCoalesceFairnessProbe = struct {
 
 test "provisioned table write source coalesces same-group waiters" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-batch-coalesce-waiters";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-batch-coalesce-waiters");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -38082,20 +38696,32 @@ test "provisioned table write source coalesces same-group waiters" {
     defer test_before_batch_execution_hook = null;
 
     var first = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:a", .value = "{\"title\":\"alpha\"}" };
-    const first_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+    var first_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+    defer {
+        probe.release_first.store(true, .release);
+        first_thread.await(std.testing.io);
+    }
     while (!probe.first_entered.load(.acquire)) std.atomic.spinLoopHint();
 
     var second = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:b", .value = "{\"title\":\"beta\"}" };
     var third = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:c", .value = "{\"title\":\"gamma\"}" };
-    const second_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&second});
-    const third_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&third});
+    var second_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&second});
+    defer {
+        probe.release_first.store(true, .release);
+        second_thread.await(std.testing.io);
+    }
+    var third_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&third});
+    defer {
+        probe.release_first.store(true, .release);
+        third_thread.await(std.testing.io);
+    }
 
     try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 2);
     probe.release_first.store(true, .release);
 
-    first_thread.join();
-    second_thread.join();
-    third_thread.join();
+    first_thread.await(std.testing.io);
+    second_thread.await(std.testing.io);
+    third_thread.await(std.testing.io);
     if (first.err) |err| return err;
     if (second.err) |err| return err;
     if (third.err) |err| return err;
@@ -38115,7 +38741,9 @@ test "provisioned table write source coalesces same-group waiters" {
 
 test "provisioned table write coalescer hands off after owner completes" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-batch-coalesce-fairness";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-batch-coalesce-fairness");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -38134,21 +38762,37 @@ test "provisioned table write coalescer hands off after owner completes" {
     defer test_before_batch_execution_hook = null;
 
     var first = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:a", .value = "{}" };
-    const first_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+    var first_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+    defer {
+        for (&probe.release) |*release| release.store(true, .release);
+        first_thread.await(std.testing.io);
+    }
     while (!probe.entered[0].load(.acquire)) std.atomic.spinLoopHint();
 
     var owner_completed: std.atomic.Value(bool) = .init(false);
     var owner = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:b", .value = "{}", .completed = &owner_completed };
     var peer = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:c", .value = "{}" };
-    const owner_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&owner});
-    const peer_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&peer});
+    var owner_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&owner});
+    defer {
+        for (&probe.release) |*release| release.store(true, .release);
+        owner_thread.await(std.testing.io);
+    }
+    var peer_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&peer});
+    defer {
+        for (&probe.release) |*release| release.store(true, .release);
+        peer_thread.await(std.testing.io);
+    }
     try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 2);
 
     probe.release[0].store(true, .release);
     while (!probe.entered[1].load(.acquire)) std.atomic.spinLoopHint();
 
     var successor = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:d", .value = "{}" };
-    const successor_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&successor});
+    var successor_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&successor});
+    defer {
+        for (&probe.release) |*release| release.store(true, .release);
+        successor_thread.await(std.testing.io);
+    }
     try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 1);
     probe.release[1].store(true, .release);
     while (!probe.entered[2].load(.acquire)) std.atomic.spinLoopHint();
@@ -38158,10 +38802,10 @@ test "provisioned table write coalescer hands off after owner completes" {
     const owner_returned_before_successor_finished = owner_completed.load(.acquire);
     probe.release[2].store(true, .release);
 
-    first_thread.join();
-    owner_thread.join();
-    peer_thread.join();
-    successor_thread.join();
+    first_thread.await(std.testing.io);
+    owner_thread.await(std.testing.io);
+    peer_thread.await(std.testing.io);
+    successor_thread.await(std.testing.io);
     if (first.err) |err| return err;
     if (owner.err) |err| return err;
     if (peer.err) |err| return err;
@@ -38171,7 +38815,9 @@ test "provisioned table write coalescer hands off after owner completes" {
 
 test "provisioned table write source preserves same-key delete then write across coalesced waiters" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-batch-coalesce-delete-write-order";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-batch-coalesce-delete-write-order");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -38194,21 +38840,33 @@ test "provisioned table write source preserves same-key delete then write across
     defer test_before_batch_execution_hook = null;
 
     var first = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:a", .value = "{\"title\":\"alpha\"}" };
-    const first_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+    var first_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+    defer {
+        probe.release_first.store(true, .release);
+        first_thread.await(std.testing.io);
+    }
     while (!probe.first_entered.load(.acquire)) std.atomic.spinLoopHint();
 
     var second = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:order", .delete = true };
     var third = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:order", .value = "{\"title\":\"beta\"}" };
-    const second_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&second});
+    var second_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&second});
+    defer {
+        probe.release_first.store(true, .release);
+        second_thread.await(std.testing.io);
+    }
     try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 1);
-    const third_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&third});
+    var third_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&third});
+    defer {
+        probe.release_first.store(true, .release);
+        third_thread.await(std.testing.io);
+    }
 
     try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 2);
     probe.release_first.store(true, .release);
 
-    first_thread.join();
-    second_thread.join();
-    third_thread.join();
+    first_thread.await(std.testing.io);
+    second_thread.await(std.testing.io);
+    third_thread.await(std.testing.io);
     if (first.err) |err| return err;
     if (second.err) |err| return err;
     if (third.err) |err| return err;
@@ -38223,7 +38881,9 @@ test "provisioned table write source preserves same-key delete then write across
 
 test "provisioned table write coalescer isolates invalid waiter on same-key overlap" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-batch-coalesce-overlap-isolation";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-batch-coalesce-overlap-isolation");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -38246,7 +38906,11 @@ test "provisioned table write coalescer isolates invalid waiter on same-key over
     defer test_before_batch_execution_hook = null;
 
     var first = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:a", .value = "{\"title\":\"alpha\"}" };
-    const first_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+    var first_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+    defer {
+        probe.release_first.store(true, .release);
+        first_thread.await(std.testing.io);
+    }
     while (!probe.first_entered.load(.acquire)) std.atomic.spinLoopHint();
 
     // An invalid write and a later delete of the same key land in one
@@ -38255,16 +38919,24 @@ test "provisioned table write coalescer isolates invalid waiter on same-key over
     // delete succeeds independently.
     var second = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:order", .value = "{not json" };
     var third = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:order", .delete = true };
-    const second_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&second});
+    var second_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&second});
+    defer {
+        probe.release_first.store(true, .release);
+        second_thread.await(std.testing.io);
+    }
     try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 1);
-    const third_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&third});
+    var third_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&third});
+    defer {
+        probe.release_first.store(true, .release);
+        third_thread.await(std.testing.io);
+    }
 
     try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 2);
     probe.release_first.store(true, .release);
 
-    first_thread.join();
-    second_thread.join();
-    third_thread.join();
+    first_thread.await(std.testing.io);
+    second_thread.await(std.testing.io);
+    third_thread.await(std.testing.io);
     if (first.err) |err| return err;
     try std.testing.expect(second.err != null);
     if (third.err) |err| return err;
@@ -38277,7 +38949,9 @@ test "provisioned table write coalescer isolates invalid waiter on same-key over
 
 test "provisioned table write coalescer isolates failed waiters" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-batch-coalesce-failure-isolation";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-batch-coalesce-failure-isolation");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -38300,20 +38974,32 @@ test "provisioned table write coalescer isolates failed waiters" {
     defer test_before_batch_execution_hook = null;
 
     var first = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:a", .value = "{\"title\":\"alpha\"}" };
-    const first_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+    var first_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+    defer {
+        probe.release_first.store(true, .release);
+        first_thread.await(std.testing.io);
+    }
     while (!probe.first_entered.load(.acquire)) std.atomic.spinLoopHint();
 
     var invalid = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:b", .value = "{\"title\":" };
     var valid = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:c", .value = "{\"title\":\"gamma\"}" };
-    const invalid_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&invalid});
-    const valid_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&valid});
+    var invalid_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&invalid});
+    defer {
+        probe.release_first.store(true, .release);
+        invalid_thread.await(std.testing.io);
+    }
+    var valid_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&valid});
+    defer {
+        probe.release_first.store(true, .release);
+        valid_thread.await(std.testing.io);
+    }
 
     try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 2);
     probe.release_first.store(true, .release);
 
-    first_thread.join();
-    invalid_thread.join();
-    valid_thread.join();
+    first_thread.await(std.testing.io);
+    invalid_thread.await(std.testing.io);
+    valid_thread.await(std.testing.io);
     if (first.err) |err| return err;
     try std.testing.expect(invalid.err != null);
     if (valid.err) |err| return err;
@@ -38329,7 +39015,9 @@ test "provisioned table write coalescer isolates failed waiters" {
 
 test "provisioned table write source rejects writes that violate enforced document schemas" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-batch-schema";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-batch-schema");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -38378,7 +39066,9 @@ test "provisioned table write source rejects writes that violate enforced docume
 
 test "provisioned table write source drains managed dense enrichment before close" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-managed-dense-drain";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-managed-dense-drain");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     const FakeEmbeddingProvider = struct {
         fn executor() http_common.RequestExecutor {
@@ -38510,7 +39200,9 @@ test "provisioned table write source drains managed dense enrichment before clos
 
 test "structural reconcile reconfigures retained writer before managed dense writes" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-managed-dense-write-cache";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-managed-dense-write-cache");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     const FakeEmbeddingProvider = struct {
         var request_count: std.atomic.Value(u32) = .init(0);
@@ -39061,7 +39753,9 @@ test "provisioned managed replay tails converge and publish without later traffi
 
 test "failed full index enrichment does not make resident reads unavailable" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-managed-dense-write-cache-failed-close";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-managed-dense-write-cache-failed-close");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     const FakeEmbeddingProvider = struct {
         var request_count: std.atomic.Value(u32) = .init(0);
@@ -39280,7 +39974,9 @@ test "failed full index enrichment does not make resident reads unavailable" {
 
 test "provisioned table write source invalidates cached query db after managed dense replay becomes visible" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-managed-dense-query-visibility";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-managed-dense-query-visibility");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     const FakeEmbeddingProvider = struct {
         request_count: std.atomic.Value(u32) = .init(0),
@@ -39503,7 +40199,9 @@ test "provisioned table write source invalidates cached query db after managed d
 
 test "provisioned table write source persists chunk artifacts when chunker enables full text indexing" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-managed-chunk-full-text";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-managed-chunk-full-text");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     const FakeEmbeddingProvider = struct {
         fn executor() http_common.RequestExecutor {
@@ -40296,18 +40994,18 @@ test "provider shutdown barrier joins an in-flight generated embedding call" {
         }
     };
     var close = Close{ .cache = &cache };
-    const thread = try std.Thread.spawn(.{}, Close.run, .{&close});
+    var thread = try std.testing.io.concurrent(Close.run, .{&close});
     var thread_joined = false;
     defer if (!thread_joined) {
         provider.release.store(true, .release);
-        thread.join();
+        thread.await(std.testing.io);
     };
     while (!close.started.load(.acquire)) std.atomic.spinLoopHint();
     sleepNs(10 * std.time.ns_per_ms);
     try std.testing.expect(!close.returned.load(.acquire));
 
     provider.release.store(true, .release);
-    thread.join();
+    thread.await(std.testing.io);
     thread_joined = true;
     try std.testing.expect(!close.failed.load(.acquire));
     try std.testing.expect(close.returned.load(.acquire));
@@ -40621,7 +41319,7 @@ test "provisioned create index enqueues target-fenced cached-writer activation" 
         source.setLocalChangeHook(.{ .ptr = &fence, .on_change = Fence.onChange });
         defer source.setLocalChangeHook(null);
         _ = try source.source().createIndex(alloc, "docs", "semantic_idx", "{\"type\":\"embeddings\",\"dimension\":3,\"external\":true}");
-        try source.structural_reconcile_work_group.await(source.table_activity_threaded.io());
+        try source.structural_reconcile_work_group.await(source.tableActivityIo());
     }
 
     // Status is sampled only after releasing structural/cache admission. A
@@ -40662,7 +41360,7 @@ test "provisioned create index enqueues target-fenced cached-writer activation" 
         \\{"semantic_idx":{"type":"embeddings","dimension":3,"external":true,"_coverage_incarnation":42},"owner_forwarded_idx":{"type":"embeddings","dimension":3,"external":true,"_coverage_incarnation":43}}
     ;
     _ = try outer_source.source().createIndex(alloc, "docs", "owner_forwarded_idx", "{\"type\":\"embeddings\",\"dimension\":3,\"external\":true}");
-    try source.structural_reconcile_work_group.await(source.table_activity_threaded.io());
+    try source.structural_reconcile_work_group.await(source.tableActivityIo());
 
     try std.testing.expectEqual(@as(usize, 0), outer_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
@@ -40872,7 +41570,9 @@ test "raft batch aggregation makes failures after an accepted group non-retryabl
 
 test "provisioned table write source runtime status prefers shared snapshot cache" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-write-runtime-prefers-snapshot";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-write-runtime-prefers-snapshot");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -41925,18 +42625,18 @@ test "resident group write releases queued reads before remote completion" {
     defer if (operation_active) source.endGroupOperation("docs", 7001);
 
     var queued_writer = WriterWorker{ .source = &source };
-    const writer_thread = try std.Thread.spawn(.{}, WriterWorker.run, .{&queued_writer});
+    var writer_thread = try std.testing.io.concurrent(WriterWorker.run, .{&queued_writer});
     defer {
         queued_writer.release.store(true, .release);
-        writer_thread.join();
+        writer_thread.await(std.testing.io);
     }
     while (source.testingGroupOperationWaiterCount("docs", 7001) == 0) std.atomic.spinLoopHint();
 
     var worker = ReaderWorker{ .source = &source };
-    const thread = try std.Thread.spawn(.{}, ReaderWorker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(ReaderWorker.run, .{&worker});
     defer {
         worker.release.store(true, .release);
-        thread.join();
+        thread.await(std.testing.io);
     }
 
     // The writer remains exclusive until it has leased the authoritative
@@ -42016,10 +42716,10 @@ test "provisioned table transition waiter queues ahead of later writers" {
     defer if (operation_active) source.endGroupOperation("docs", 7001);
 
     var worker = Worker{ .source = &source };
-    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(Worker.run, .{&worker});
     defer {
         worker.release.store(true, .release);
-        thread.join();
+        thread.await(std.testing.io);
     }
     while (source.testingGroupTransitionWaiterCount("docs", 7001) == 0) std.atomic.spinLoopHint();
 
@@ -42070,18 +42770,18 @@ test "provisioned table transition waiter queues ahead of later readers" {
     defer if (initial_read_active) initial_read.deinit();
 
     var transition_worker = TransitionWorker{ .source = &source };
-    const transition_thread = try std.Thread.spawn(.{}, TransitionWorker.run, .{&transition_worker});
+    var transition_thread = try std.testing.io.concurrent(TransitionWorker.run, .{&transition_worker});
     defer {
         transition_worker.release.store(true, .release);
-        transition_thread.join();
+        transition_thread.await(std.testing.io);
     }
     while (source.testingGroupTransitionWaiterCount("docs", 7001) == 0) std.atomic.spinLoopHint();
 
     var reader_worker = ReaderWorker{ .source = &source };
-    const reader_thread = try std.Thread.spawn(.{}, ReaderWorker.run, .{&reader_worker});
+    var reader_thread = try std.testing.io.concurrent(ReaderWorker.run, .{&reader_worker});
     defer {
         transition_worker.release.store(true, .release);
-        reader_thread.join();
+        reader_thread.await(std.testing.io);
     }
     for (0..10_000) |_| std.atomic.spinLoopHint();
     try std.testing.expect(!reader_worker.entered.load(.acquire));
@@ -42261,23 +42961,23 @@ test "provisioned table restore preparation blocks writes while allowing reads" 
     errdefer if (restore_lifecycle_active) source.endRestoreLifecycleActivity("docs");
 
     var worker = RequestWorker{ .source = &source };
-    const thread = try std.Thread.spawn(.{}, RequestWorker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(RequestWorker.run, .{&worker});
     var read_worker = ReadWorker{ .source = &source };
-    const read_thread = try std.Thread.spawn(.{}, ReadWorker.run, .{&read_worker});
+    var read_thread = try std.testing.io.concurrent(ReadWorker.run, .{&read_worker});
 
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
     try std.testing.expect(!worker.entered.load(.acquire));
     try std.testing.expect(read_worker.entered.load(.acquire));
-    read_thread.join();
+    read_thread.await(std.testing.io);
 
     source.endRestoreLifecycleActivity("docs");
     restore_lifecycle_active = false;
     while (!worker.entered.load(.acquire)) {
         io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
-    thread.join();
+    thread.await(std.testing.io);
 }
 
 test "HA seed request admission drains accepted writes and closes the preflight race" {
@@ -42332,18 +43032,28 @@ test "HA seed request admission drains accepted writes and closes the preflight 
     // activity/cache lifecycle until preflight and snapshot finish.
     var capture_lease = try source.acquireHASeedTableRequestAdmissionLease();
     var request_worker = RequestWorker{ .source = &source };
-    const request_thread = try std.Thread.spawn(.{}, RequestWorker.run, .{&request_worker});
+    var request_thread = try std.testing.io.concurrent(RequestWorker.run, .{&request_worker});
+    defer {
+        capture_lease.release();
+        request_thread.await(std.testing.io);
+    }
     io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
     try std.testing.expect(!request_worker.entered.load(.acquire));
     capture_lease.release();
-    request_thread.join();
+    request_thread.await(std.testing.io);
     try std.testing.expect(request_worker.entered.load(.acquire));
 
     // Closing admission while a request is already active waits without
     // holding the mutex that request needs to publish its completion.
     source.beginTableRequest("docs");
     var capture_worker = CaptureWorker{ .source = &source };
-    const capture_thread = try std.Thread.spawn(.{}, CaptureWorker.run, .{&capture_worker});
+    var capture_thread = try std.testing.io.concurrent(CaptureWorker.run, .{&capture_worker});
+    var capture_thread_awaited = false;
+    defer if (!capture_thread_awaited) {
+        source.endTableRequest("docs");
+        capture_worker.release.store(true, .release);
+        capture_thread.await(std.testing.io);
+    };
     io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
     try std.testing.expect(!capture_worker.acquired.load(.acquire));
     source.endTableRequest("docs");
@@ -42351,7 +43061,8 @@ test "HA seed request admission drains accepted writes and closes the preflight 
         io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
     capture_worker.release.store(true, .release);
-    capture_thread.join();
+    capture_thread.await(std.testing.io);
+    capture_thread_awaited = true;
 }
 
 test "provisioned table restore lifecycle reserves forwarded owner and caller sources" {
@@ -42702,7 +43413,7 @@ test "managed maintenance admission distinguishes status from data reads" {
     source.beginGroupOperation("docs", 7001);
     var synthetic_waiter_active = false;
     defer {
-        const activity_io = source.table_activity_threaded.io();
+        const activity_io = source.tableActivityIo();
         source.table_activity_mutex.lockUncancelable(activity_io);
         if (synthetic_waiter_active) {
             const index = source.findTableActivityLocked("docs", 7001) orelse unreachable;
@@ -42712,7 +43423,7 @@ test "managed maintenance admission distinguishes status from data reads" {
         source.table_activity_mutex.unlock(activity_io);
     }
     {
-        const activity_io = source.table_activity_threaded.io();
+        const activity_io = source.tableActivityIo();
         source.table_activity_mutex.lockUncancelable(activity_io);
         defer source.table_activity_mutex.unlock(activity_io);
         source.activityEntryLocked("docs", 7001).operation_waiters += 1;
@@ -42721,7 +43432,7 @@ test "managed maintenance admission distinguishes status from data reads" {
     }
     source.endGroupOperation("docs", 7001);
     {
-        const activity_io = source.table_activity_threaded.io();
+        const activity_io = source.tableActivityIo();
         source.table_activity_mutex.lockUncancelable(activity_io);
         defer source.table_activity_mutex.unlock(activity_io);
         try std.testing.expect(!source.structuralDrainPendingLocked("docs"));
@@ -42873,10 +43584,10 @@ test "provisioned table group operation waiter queues ahead of later readers" {
     defer if (initial_read_active) initial_read.deinit();
 
     var write_worker = WriteWorker{ .source = &source };
-    const write_thread = try std.Thread.spawn(.{}, WriteWorker.run, .{&write_worker});
+    var write_thread = try std.testing.io.concurrent(WriteWorker.run, .{&write_worker});
     defer {
         write_worker.release.store(true, .release);
-        write_thread.join();
+        write_thread.await(std.testing.io);
     }
     while (source.testingGroupOperationWaiterCount("docs", 7001) == 0) std.atomic.spinLoopHint();
 
@@ -42892,8 +43603,8 @@ test "provisioned table group operation waiter queues ahead of later readers" {
     )) == null);
 
     var read_worker = ReadWorker{ .source = &source };
-    const read_thread = try std.Thread.spawn(.{}, ReadWorker.run, .{&read_worker});
-    defer read_thread.join();
+    var read_thread = try std.testing.io.concurrent(ReadWorker.run, .{&read_worker});
+    defer read_thread.await(std.testing.io);
 
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
@@ -42987,7 +43698,15 @@ test "provisioned table write request queues structural reconcile ahead of later
     errdefer if (request_active) source.endTableRequest("docs");
 
     var worker = ReconcileWorker{ .source = &source };
-    const thread = try std.Thread.spawn(.{}, ReconcileWorker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(ReconcileWorker.run, .{&worker});
+    defer {
+        if (request_active) {
+            source.endTableRequest("docs");
+            request_active = false;
+        }
+        worker.release.store(true, .release);
+        thread.await(std.testing.io);
+    }
 
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
@@ -42997,7 +43716,15 @@ test "provisioned table write request queues structural reconcile ahead of later
     try std.testing.expect(!worker.entered.load(.acquire));
 
     var write_worker = WriteWorker{ .source = &source };
-    const write_thread = try std.Thread.spawn(.{}, WriteWorker.run, .{&write_worker});
+    var write_thread = try std.testing.io.concurrent(WriteWorker.run, .{&write_worker});
+    defer {
+        if (request_active) {
+            source.endTableRequest("docs");
+            request_active = false;
+        }
+        worker.release.store(true, .release);
+        write_thread.await(std.testing.io);
+    }
     io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
     try std.testing.expect(!write_worker.entered.load(.acquire));
 
@@ -43008,11 +43735,11 @@ test "provisioned table write request queues structural reconcile ahead of later
     }
     try std.testing.expect(!write_worker.entered.load(.acquire));
     worker.release.store(true, .release);
-    thread.join();
+    thread.await(std.testing.io);
     while (!write_worker.entered.load(.acquire)) {
         io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
-    write_thread.join();
+    write_thread.await(std.testing.io);
 }
 
 const StructuralReconcileTestCatalog = struct {
@@ -43327,7 +44054,7 @@ test "resident activation requeue cannot displace a newer queued epoch" {
         .group_id = delayed.group_id,
         .activation_target = try ProvisionedTableWriteSource.OwnedIndexActivationTarget.clone(alloc, delayed),
     };
-    const io = source.table_activity_threaded.io();
+    const io = source.tableActivityIo();
     source.structural_reconcile_mutex.lockUncancelable(io);
     try source.structural_reconcile_keys.put(alloc, delayed_scheduler_key, .active);
     source.structural_reconcile_mutex.unlock(io);
@@ -43415,7 +44142,7 @@ test "whole table reconcile cannot absorb exact resident activation" {
         (try source.acceptIndexActivationTarget(target)).state,
     );
 
-    const io = source.table_activity_threaded.io();
+    const io = source.tableActivityIo();
     source.structural_reconcile_mutex.lockUncancelable(io);
     defer source.structural_reconcile_mutex.unlock(io);
     try std.testing.expectEqual(@as(usize, 2), source.structural_reconcile_tables.count());
@@ -43433,7 +44160,7 @@ test "active structural key coalesces duplicate and requeues allocation free" {
     source.structural_reconcile_scheduled.store(true, .release);
     try source.enqueueTableIndexStructuralReconcile("docs", "semantic_idx");
 
-    const io = source.table_activity_threaded.io();
+    const io = source.tableActivityIo();
     source.structural_reconcile_mutex.lockUncancelable(io);
     var active = source.structural_reconcile_tables.pop().?;
     const ownership = source.structural_reconcile_keys.getPtr(active.scheduler_key).?;
@@ -43482,7 +44209,7 @@ test "all structural workers retain allocation-free requeue capacity during admi
         owned.deinit(alloc);
     };
 
-    const io = source.table_activity_threaded.io();
+    const io = source.tableActivityIo();
     source.structural_reconcile_mutex.lockUncancelable(io);
     while (active_count < active.len) : (active_count += 1) {
         active[active_count] = source.structural_reconcile_tables.pop().?;
@@ -43531,7 +44258,7 @@ test "structural scheduler burst uses keyed coalescing and FIFO deadlines" {
         try source.enqueueTableIndexStructuralReconcile("docs", name);
     }
 
-    const io = source.table_activity_threaded.io();
+    const io = source.tableActivityIo();
     source.structural_reconcile_mutex.lockUncancelable(io);
     defer source.structural_reconcile_mutex.unlock(io);
     try std.testing.expectEqual(burst_size, source.structural_reconcile_tables.count());
@@ -43600,7 +44327,7 @@ test "structural scheduler capacity includes active ownership" {
         ProvisionedTableWriteSource.CommittedMutationWatermark.State.admitted,
         source.structural_reconcile_committed_watermark.?.state,
     );
-    const io = source.table_activity_threaded.io();
+    const io = source.tableActivityIo();
     source.structural_reconcile_mutex.lockUncancelable(io);
     var request = source.structural_reconcile_tables.pop().?;
     source.structural_reconcile_keys.getPtr(request.scheduler_key).?.* = .active;
@@ -43671,7 +44398,7 @@ test "yielded structural work advances under sustained new admission" {
     source.structural_reconcile_scheduled.store(true, .release);
     try source.enqueueTableIndexStructuralReconcile("docs", "yielded");
 
-    const io = source.table_activity_threaded.io();
+    const io = source.tableActivityIo();
     source.structural_reconcile_mutex.lockUncancelable(io);
     var yielded = source.structural_reconcile_tables.pop().?;
     const ownership = source.structural_reconcile_keys.getPtr(yielded.scheduler_key).?;
@@ -43725,7 +44452,7 @@ test "exact activation dual worker admission failure leaves no orphan" {
         error.TestStructuralReconcileSubmitFailure,
         source.acceptIndexActivationTarget(target),
     );
-    const io = source.table_activity_threaded.io();
+    const io = source.tableActivityIo();
     source.structural_reconcile_mutex.lockUncancelable(io);
     defer source.structural_reconcile_mutex.unlock(io);
     try std.testing.expectEqual(@as(usize, 0), source.structural_reconcile_tables.count());
@@ -43743,7 +44470,7 @@ test "duplicate activation cannot observe accepted before admission commits" {
         fn run(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.entered.store(true, .release);
-            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
     };
     const ActivationCall = struct {
@@ -43792,15 +44519,23 @@ test "duplicate activation cannot observe accepted before admission commits" {
 
     var first = ActivationCall{ .source = &source, .target = target };
     var duplicate = ActivationCall{ .source = &source, .target = target };
-    const first_thread = try std.Thread.spawn(.{}, ActivationCall.run, .{&first});
-    while (!barrier.entered.load(.acquire)) std.Thread.yield() catch {};
-    const duplicate_thread = try std.Thread.spawn(.{}, ActivationCall.run, .{&duplicate});
-    while (test_index_activation_admission_waits.load(.acquire) == 0) std.Thread.yield() catch {};
+    var first_thread = try std.testing.io.concurrent(ActivationCall.run, .{&first});
+    defer {
+        barrier.release.store(true, .release);
+        first_thread.await(std.testing.io);
+    }
+    while (!barrier.entered.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    var duplicate_thread = try std.testing.io.concurrent(ActivationCall.run, .{&duplicate});
+    defer {
+        barrier.release.store(true, .release);
+        duplicate_thread.await(std.testing.io);
+    }
+    while (test_index_activation_admission_waits.load(.acquire) == 0) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(!duplicate.returned.load(.acquire));
 
     barrier.release.store(true, .release);
-    first_thread.join();
-    duplicate_thread.join();
+    first_thread.await(std.testing.io);
+    duplicate_thread.await(std.testing.io);
     try std.testing.expectEqual(error.TestStructuralReconcileSubmitFailure, first.err.?);
     try std.testing.expect(duplicate.err == null);
 }
@@ -43858,7 +44593,7 @@ test "discard retires unreferenced scope revisions under churn" {
         .indexes_json = indexes_json,
         .indexes_digest = digest,
     };
-    const io = source.table_activity_threaded.io();
+    const io = source.tableActivityIo();
     for (0..ProvisionedTableWriteSource.max_retained_index_activation_progress + 32) |offset| {
         target.metadata_epoch = offset + 2;
         target.group_id = 7001 + offset;
@@ -43960,7 +44695,7 @@ test "discarded newer activation cannot resurrect an older terminal result" {
             .indexes_digest = digest,
         };
         _ = try source.acceptIndexActivationTarget(older);
-        const io = source.table_activity_threaded.io();
+        const io = source.tableActivityIo();
         source.structural_reconcile_mutex.lockUncancelable(io);
         var older_request = source.structural_reconcile_tables.pop().?;
         source.structural_reconcile_keys.getPtr(older_request.scheduler_key).?.* = .active;
@@ -44042,7 +44777,7 @@ test "hosted index lifecycle callback hands exact target to persistent control p
 
     const first_token = control_plane.targetedStructuralTransitionToken("docs", "semantic_idx") orelse
         return error.TestExpectedTargetedStatusFence;
-    const io = control_plane.table_activity_threaded.io();
+    const io = control_plane.tableActivityIo();
     control_plane.structural_reconcile_mutex.lockUncancelable(io);
     try std.testing.expectEqual(@as(usize, 1), control_plane.structural_reconcile_tables.items.len);
     try std.testing.expectEqualStrings("semantic_idx", control_plane.structural_reconcile_tables.items[0].index_name.?);
@@ -44177,7 +44912,7 @@ test "committed activation watermark stays bounded across completed scope churn"
                 .index = ordinal + 1,
             },
         ));
-        const io = source.table_activity_threaded.io();
+        const io = source.tableActivityIo();
         source.structural_reconcile_mutex.lockUncancelable(io);
         var request = source.structural_reconcile_tables.pop().?;
         source.structural_reconcile_keys.getPtr(request.scheduler_key).?.* = .active;
@@ -44277,16 +45012,16 @@ test "hosted index lifecycle owner retries transient activation failure" {
         structural_reconcile_test_index_json,
     );
     const control_plane = cache.index_control_source orelse return error.TestExpectedPersistentControlPlane;
-    control_plane.structural_reconcile_work_group.await(control_plane.table_activity_threaded.io()) catch {};
+    control_plane.structural_reconcile_work_group.await(control_plane.tableActivityIo()) catch {};
 
     // The first routed activation fails after a valid catalog capture. The
     // same owned plan retries through the persistent coordinator.
     try std.testing.expect(catalog.calls.load(.monotonic) >= 2);
     try std.testing.expect(activation_capture.calls.load(.acquire) >= 3);
     try std.testing.expect(control_plane.targetedStructuralTransitionToken("docs", "semantic_idx") == null);
-    control_plane.structural_reconcile_mutex.lockUncancelable(control_plane.table_activity_threaded.io());
+    control_plane.structural_reconcile_mutex.lockUncancelable(control_plane.tableActivityIo());
     try std.testing.expectEqual(@as(usize, 0), control_plane.structural_reconcile_tables.items.len);
-    control_plane.structural_reconcile_mutex.unlock(control_plane.table_activity_threaded.io());
+    control_plane.structural_reconcile_mutex.unlock(control_plane.tableActivityIo());
 }
 
 test "structural activation dispatch does not convoy unrelated groups" {
@@ -44397,7 +45132,7 @@ test "hosted index lifecycle backs off repeated stale resident observation" {
     );
     const cache = try hostedManagedDbCacheForRoot(replica_root_dir);
     const control_plane = cache.index_control_source orelse return error.TestExpectedPersistentControlPlane;
-    try control_plane.structural_reconcile_work_group.await(control_plane.table_activity_threaded.io());
+    try control_plane.structural_reconcile_work_group.await(control_plane.tableActivityIo());
 
     try std.testing.expectEqual(@as(u32, 3), activation_capture.calls.load(.acquire));
     // Two stale responses use 25ms then 50ms retry delays. Allow coarse timer
@@ -44437,7 +45172,7 @@ test "hosted activation revalidates topology after final resident RPC" {
     );
     const cache = try hostedManagedDbCacheForRoot(replica_root_dir);
     const control_plane = cache.index_control_source orelse return error.TestExpectedPersistentControlPlane;
-    try control_plane.structural_reconcile_work_group.await(control_plane.table_activity_threaded.io());
+    try control_plane.structural_reconcile_work_group.await(control_plane.tableActivityIo());
 
     // One obsolete single-group RPC is followed by a fresh two-group plan.
     // Completing after only the first call would prove the missing post-RPC
@@ -44495,7 +45230,7 @@ test "hosted index lifecycle durable wake repairs worker admission failure" {
     }
     try std.testing.expect(activation_capture.calls.load(.acquire) != 0);
     const control_plane = cache.index_control_source orelse return error.TestExpectedPersistentControlPlane;
-    try control_plane.structural_reconcile_work_group.await(control_plane.table_activity_threaded.io());
+    try control_plane.structural_reconcile_work_group.await(control_plane.tableActivityIo());
     try std.testing.expect(control_plane.targetedStructuralTransitionToken("docs", "semantic_idx") == null);
 }
 
@@ -44567,7 +45302,7 @@ test "status publication fence does not suppress structural work re-drive" {
     source.structural_reconcile_scheduled.store(true, .release);
     try source.enqueueTableStructuralReconcile("docs");
 
-    const io = source.table_activity_threaded.io();
+    const io = source.tableActivityIo();
     source.structural_reconcile_mutex.lockUncancelable(io);
     defer source.structural_reconcile_mutex.unlock(io);
     try std.testing.expectEqual(@as(usize, 1), source.structural_reconcile_tables.items.len);
@@ -44704,7 +45439,7 @@ test "unrelated repair visibility edge invalidates during targeted reconciliatio
     );
 
     try std.testing.expect((try cache.snapshot(alloc, "docs")) == null);
-    const io = source.table_activity_threaded.io();
+    const io = source.tableActivityIo();
     source.table_activity_mutex.lockUncancelable(io);
     const group_index = source.findTableActivityLocked("docs", 7001) orelse {
         source.table_activity_mutex.unlock(io);
@@ -45250,7 +45985,7 @@ test "live repair final audit excludes concurrent group mutation through publica
 
         fn run(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            const io = self.source.table_activity_threaded.io();
+            const io = self.source.tableActivityIo();
             self.source.table_activity_mutex.lockUncancelable(io);
             const clear_observed = if (self.source.findTableActivityLocked("docs", 7001)) |index|
                 self.source.active_table_activities.items[index].repair_handoff_clear_observed
@@ -45692,7 +46427,7 @@ test "index reconciliation request enqueues a catalog-deleted target without cre
     );
     try std.testing.expect(requested != null);
 
-    const io = source.table_activity_threaded.io();
+    const io = source.tableActivityIo();
     source.structural_reconcile_mutex.lockUncancelable(io);
     defer source.structural_reconcile_mutex.unlock(io);
     try std.testing.expectEqual(@as(usize, 1), source.structural_reconcile_tables.items.len);
@@ -45947,7 +46682,7 @@ test "structural reconcile publishes durable index repair debt once per group" {
 
             fn run(ptr: *anyopaque) void {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
-                const io = self.source.table_activity_threaded.io();
+                const io = self.source.tableActivityIo();
                 self.source.table_activity_mutex.lockUncancelable(io);
                 const clear_observed = if (self.source.findTableActivityLocked("docs", 7001)) |index|
                     self.source.active_table_activities.items[index].repair_handoff_clear_observed
@@ -46164,11 +46899,19 @@ test "best effort table request admission does not deadlock behind queued reconc
     var request_active = true;
 
     var worker = ReconcileWorker{ .source = &source };
-    const thread = try std.Thread.spawn(.{}, ReconcileWorker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(ReconcileWorker.run, .{&worker});
+    defer {
+        if (request_active) {
+            source.endTableRequest("docs");
+            request_active = false;
+        }
+        worker.release.store(true, .release);
+        thread.await(std.testing.io);
+    }
     var thread_joined = false;
     defer {
         if (request_active) source.endTableRequest("docs");
-        if (!thread_joined) thread.join();
+        if (!thread_joined) thread.await(std.testing.io);
     }
 
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
@@ -46182,7 +46925,7 @@ test "best effort table request admission does not deadlock behind queued reconc
 
     source.endTableRequest("docs");
     request_active = false;
-    thread.join();
+    thread.await(std.testing.io);
     thread_joined = true;
     try std.testing.expect(worker.entered.load(.acquire));
 }
@@ -46217,7 +46960,7 @@ test "provisioned structural reconcile blocks table write admission" {
     errdefer if (reconcile_active) source.endStructuralReconcileActivity("docs");
 
     var worker = WriteWorker{ .source = &source };
-    const thread = try std.Thread.spawn(.{}, WriteWorker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(WriteWorker.run, .{&worker});
 
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
@@ -46229,7 +46972,7 @@ test "provisioned structural reconcile blocks table write admission" {
     while (!worker.entered.load(.acquire)) {
         io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
-    thread.join();
+    thread.await(std.testing.io);
 }
 
 test "provisioned table write source group operation blocks read admission" {
@@ -46271,7 +47014,7 @@ test "provisioned table write source group operation blocks read admission" {
     errdefer if (group_active) source.endGroupOperation("docs", 7001);
 
     var worker = ReadWorker{ .source = &source };
-    const thread = try std.Thread.spawn(.{}, ReadWorker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(ReadWorker.run, .{&worker});
 
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
@@ -46283,7 +47026,7 @@ test "provisioned table write source group operation blocks read admission" {
     while (!worker.entered.load(.acquire)) {
         io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
-    thread.join();
+    thread.await(std.testing.io);
 }
 
 test "provisioned schema reconcile keeps reads and status available" {
@@ -47202,7 +47945,7 @@ test "provisioned table write source restore repair completion retires cached ve
     }
 
     source.enqueueRestoreRepairComplete("docs");
-    source.restore_repair_completion_group.await(source.table_activity_threaded.io()) catch {};
+    source.restore_repair_completion_group.await(source.tableActivityIo()) catch {};
 
     try std.testing.expectEqual(@as(u64, 0), hbc_cache.global_stats.total_bytes);
     var cached_after_completion = try snapshot_cache.snapshot(alloc, "docs");
@@ -49309,7 +50052,7 @@ test "provisioned table read source serves profiled dense query without runtime 
     });
     try write_source.syncReplicatedBatchGroupLocal(alloc, 7001, "docs", .full_index);
 
-    var read_source = table_reads.ProvisionedTableReadSource.init(replica_root_dir, Catalog.iface(), raft_mod.read_gate.noopReadableLeaseRequester());
+    var read_source = table_reads.ProvisionedTableReadSource.init(replica_root_dir, Catalog.iface(), raft_mod.read_gate.alreadyReadSafeBarrier());
     read_source.cache = &read_cache;
 
     var owned = try query_api.parseQueryRequest(alloc, null, "docs",
@@ -49432,7 +50175,7 @@ test "hosted provisioned table read source serves profiled dense query after ext
     var hosted = table_reads.HostedProvisionedTableReadSource.init(
         replica_root_dir,
         Catalog.iface(),
-        raft_mod.read_gate.noopReadableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
         FakeRouter.iface(),
         executor_state.iface(),
     );
@@ -49569,7 +50312,7 @@ test "provisioned table read source survives many external write-sync batches be
         var cold_read_source = table_reads.ProvisionedTableReadSource.init(
             replica_root_dir,
             Catalog.iface(),
-            raft_mod.read_gate.noopReadableLeaseRequester(),
+            raft_mod.read_gate.alreadyReadSafeBarrier(),
         );
         cold_read_source.cache = &read_cache;
 
@@ -49603,7 +50346,7 @@ test "provisioned table read source survives many external write-sync batches be
     var read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root_dir,
         Catalog.iface(),
-        raft_mod.read_gate.noopReadableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     read_source.cache = &read_cache;
 
@@ -52994,7 +53737,11 @@ test "provisioned group apply releases source mutex and retires readers opened d
     defer test_before_batch_execution_hook = null;
 
     var worker = BatchWorker{ .source = &source };
-    const thread = try std.Thread.spawn(.{}, BatchWorker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(BatchWorker.run, .{&worker});
+    defer {
+        probe.release.store(true, .release);
+        thread.await(std.testing.io);
+    }
 
     while (!probe.entered.load(.acquire)) std.atomic.spinLoopHint();
     try std.testing.expect(source.local_db_mutex.tryLock());
@@ -53005,7 +53752,7 @@ test "provisioned group apply releases source mutex and retires readers opened d
     pre_commit.release();
 
     probe.release.store(true, .release);
-    thread.join();
+    thread.await(std.testing.io);
 
     if (worker.err) |err| return err;
 
@@ -53273,7 +54020,7 @@ test "provisioned source quiesce closes cleanup admission and drains accepted ow
         fn run(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.entered.store(true, .release);
-            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
 
         fn deinit(ptr: *anyopaque) void {
@@ -53307,19 +54054,19 @@ test "provisioned source quiesce closes cleanup admission and drains accepted ow
         .run = JobProbe.run,
         .deinit = JobProbe.deinit,
     });
-    while (!probe.entered.load(.acquire)) std.Thread.yield() catch {};
+    while (!probe.entered.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     var quiesce = Quiesce{ .source = &source };
-    const thread = try std.Thread.spawn(.{}, Quiesce.run, .{&quiesce});
+    var thread = try std.testing.io.concurrent(Quiesce.run, .{&quiesce});
     var thread_joined = false;
     defer if (!thread_joined) {
         probe.release.store(true, .release);
-        thread.join();
+        thread.await(std.testing.io);
     };
-    while (source.lifecycle.load(.acquire) == .open) std.Thread.yield() catch {};
+    while (source.lifecycle.load(.acquire) == .open) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(!quiesce.complete.load(.acquire));
     probe.release.store(true, .release);
-    thread.join();
+    thread.await(std.testing.io);
     thread_joined = true;
 
     try std.testing.expect(quiesce.complete.load(.acquire));
@@ -53806,8 +54553,8 @@ test "provisioned table write source drop table retires old publication authorit
     defer source.deinit();
 
     // Model both publication fences that can outlive structural reconciliation.
-    // Include an old group absent from the drop request: table deletion ends the
-    // incarnation as a whole, not merely the catalog's current group list.
+    // Group 7002 represents a same-name replacement that appeared after the
+    // deletion request captured old group 7001.
     source.reserveStructuralReconcileStatus("docs");
     source.ensureStructuralRepairHandoffStatus("docs", 7001);
     source.ensureStructuralPublicationHandoffStatus("docs", 7002, .{
@@ -53835,12 +54582,13 @@ test "provisioned table write source drop table retires old publication authorit
 
     _ = try source.source().dropTable(alloc, "docs", .{ .table_id = 7, .expected_transition_generation = 1, .group_ids = &.{7001} });
 
-    // A same-name table with a different group incarnation must immediately be
-    // eligible for live status; no deleted group can publish another release.
+    // The dropped group can no longer publish another release, while the
+    // replacement group retains its snapshot-only handoff until its own
+    // publication becomes visible.
     const recreated_admission = source.beginStatusRequest("docs");
-    try std.testing.expectEqual(ProvisionedTableWriteSource.StatusRequestAdmission.live, recreated_admission);
+    try std.testing.expectEqual(ProvisionedTableWriteSource.StatusRequestAdmission.snapshot_only, recreated_admission);
     source.endStatusRequest("docs", recreated_admission);
-    try std.testing.expect(!source.structuralStatusSnapshotOnlyBestEffort("docs"));
+    try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
     try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("other"));
 }
 
@@ -53898,12 +54646,12 @@ test "provisioned table write source drop table does not hold local db mutex dur
     defer test_before_drop_table_delete_hook = null;
 
     var worker = DropWorker{ .source = &source };
-    const thread = try std.Thread.spawn(.{}, DropWorker.run, .{&worker});
-    thread.join();
+    var thread = try std.testing.io.concurrent(DropWorker.run, .{&worker});
+    thread.await(std.testing.io);
 
     if (worker.err) |err| return err;
 
-    while (!probe.entered.load(.acquire)) std.Thread.yield() catch {};
+    while (!probe.entered.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(source.local_db_mutex.tryLock());
     source.local_db_mutex.unlock();
 
@@ -54071,22 +54819,31 @@ test "provisioned table write source drop table waits for in-flight group batch 
     defer test_before_drop_table_delete_hook = null;
 
     var batch_worker = BatchWorker{ .source = &source };
-    const batch_thread = try std.Thread.spawn(.{}, BatchWorker.run, .{&batch_worker});
+    var batch_thread = try std.testing.io.concurrent(BatchWorker.run, .{&batch_worker});
+    defer {
+        batch_probe.release.store(true, .release);
+        batch_thread.await(std.testing.io);
+    }
     while (!batch_probe.entered.load(.acquire)) std.atomic.spinLoopHint();
 
     var drop_worker = DropWorker{ .source = &source };
-    const drop_thread = try std.Thread.spawn(.{}, DropWorker.run, .{&drop_worker});
+    var drop_thread = try std.testing.io.concurrent(DropWorker.run, .{&drop_worker});
+    defer {
+        batch_probe.release.store(true, .release);
+        drop_probe.release.store(true, .release);
+        drop_thread.await(std.testing.io);
+    }
 
     sleepNs(10 * std.time.ns_per_ms);
     try std.testing.expect(!drop_probe.entered.load(.acquire));
 
     batch_probe.release.store(true, .release);
-    batch_thread.join();
+    batch_thread.await(std.testing.io);
     if (batch_worker.err) |err| return err;
 
     while (!drop_probe.entered.load(.acquire)) std.atomic.spinLoopHint();
     drop_probe.release.store(true, .release);
-    drop_thread.join();
+    drop_thread.await(std.testing.io);
     if (drop_worker.err) |err| return err;
 }
 
@@ -54292,9 +55049,9 @@ test "provisioned table write source drop table waits for active read cache leas
     defer test_before_drop_table_delete_hook = null;
 
     var worker = DropWorker{ .source = &source };
-    const thread = try std.Thread.spawn(.{}, DropWorker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(DropWorker.run, .{&worker});
     var thread_joined = false;
-    defer if (!thread_joined) thread.join();
+    defer if (!thread_joined) thread.await(std.testing.io);
 
     // Observe the actual exclusive-cache barrier before checking deletion.
     // A fixed sleep can false-pass when the worker has not been scheduled.
@@ -54308,7 +55065,7 @@ test "provisioned table write source drop table waits for active read cache leas
     if (!barrier_observed) {
         read_lease.release();
         read_lease_active = false;
-        thread.join();
+        thread.await(std.testing.io);
         thread_joined = true;
         if (worker.err) |err| return err;
         return error.TestUnexpectedResult;
@@ -54320,7 +55077,7 @@ test "provisioned table write source drop table waits for active read cache leas
     // The production drain contract bounds this join even if lease retirement
     // regresses. The hook is observation-only, so the test itself cannot
     // manufacture an unbounded worker lifetime.
-    thread.join();
+    thread.await(std.testing.io);
     thread_joined = true;
     if (worker.err) |err| return err;
     try std.testing.expect(probe.entered.load(.acquire));
@@ -54449,7 +55206,15 @@ test "provisioned table write source backup releases read cache exclusive before
     defer test_before_native_backup_copy_hook = null;
 
     var backup_worker = BackupWorker{ .source = &source, .backup_root = backup_root };
-    const backup_thread = try std.Thread.spawn(.{}, BackupWorker.run, .{&backup_worker});
+    var backup_thread = try std.testing.io.concurrent(BackupWorker.run, .{&backup_worker});
+    defer {
+        if (read_lease_active) {
+            read_lease.release();
+            read_lease_active = false;
+        }
+        copy_probe.release.store(true, .release);
+        backup_thread.await(std.testing.io);
+    }
 
     io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
     try std.testing.expect(!copy_probe.entered.load(.acquire));
@@ -54461,7 +55226,11 @@ test "provisioned table write source backup releases read cache exclusive before
     }
 
     var read_worker = ReadWorker{ .path = path, .cache = &read_cache };
-    const read_thread = try std.Thread.spawn(.{}, ReadWorker.run, .{&read_worker});
+    var read_thread = try std.testing.io.concurrent(ReadWorker.run, .{&read_worker});
+    defer {
+        copy_probe.release.store(true, .release);
+        read_thread.await(std.testing.io);
+    }
     const read_deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s;
     while (!read_worker.entered.load(.acquire) and platform_time.monotonicNs() < read_deadline_ns) {
         io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
@@ -54469,8 +55238,8 @@ test "provisioned table write source backup releases read cache exclusive before
     const read_entered_during_copy = read_worker.entered.load(.acquire);
 
     copy_probe.release.store(true, .release);
-    read_thread.join();
-    backup_thread.join();
+    read_thread.await(std.testing.io);
+    backup_thread.await(std.testing.io);
 
     if (read_worker.err) |err| return err;
     if (backup_worker.err) |err| return err;
@@ -54562,14 +55331,18 @@ test "provisioned table write source drop index does not hold local db mutex dur
     defer test_before_drop_index_work_hook = null;
 
     var worker = Worker{ .source = &source };
-    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(Worker.run, .{&worker});
+    defer {
+        probe.release.store(true, .release);
+        thread.await(std.testing.io);
+    }
 
     while (!probe.entered.load(.acquire)) std.atomic.spinLoopHint();
     try std.testing.expect(source.local_db_mutex.tryLock());
     source.local_db_mutex.unlock();
 
     probe.release.store(true, .release);
-    thread.join();
+    thread.await(std.testing.io);
 
     if (worker.err) |err| return err;
 
@@ -54580,7 +55353,9 @@ test "provisioned table write source drop index does not hold local db mutex dur
 
 test "provisioned table write source create table provisions local indexes and schema" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-create-schema";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-create-schema");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
     const schema_json =
         "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}}}}}}";
 
@@ -54591,6 +55366,25 @@ test "provisioned table write source create table provisions local indexes and s
 
     const Catalog = struct {
         var indexes_json: []const u8 = tables_api.default_indexes_json;
+        var schema: []const u8 = schema_json;
+        var admin_snapshot_calls: usize = 0;
+        var admin_snapshot_call_limit: ?usize = null;
+        var tables = [_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .description = "docs table",
+            .schema_json = schema_json,
+            .read_schema_json = "",
+            .indexes_json = tables_api.default_indexes_json,
+            .replication_sources_json = "[]",
+            .placement_role = "data",
+        }};
+        var ranges = [_]metadata_table_manager.RangeRecord{.{
+            .group_id = 7001,
+            .table_id = 7,
+            .start_key = "",
+            .end_key = null,
+        }};
 
         fn iface() table_catalog.CatalogSource {
             return .{
@@ -54606,24 +55400,16 @@ test "provisioned table write source create table provisions local indexes and s
         }
 
         fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            admin_snapshot_calls += 1;
+            if (admin_snapshot_call_limit) |limit| {
+                if (admin_snapshot_calls > limit) return error.UnexpectedCatalogReentry;
+            }
+            tables[0].indexes_json = indexes_json;
+            tables[0].schema_json = schema;
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
-                    .table_id = 7,
-                    .name = "docs",
-                    .description = "docs table",
-                    .schema_json = schema_json,
-                    .read_schema_json = "",
-                    .indexes_json = indexes_json,
-                    .replication_sources_json = "[]",
-                    .placement_role = "data",
-                }})[0..]),
-                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
-                    .group_id = 7001,
-                    .table_id = 7,
-                    .start_key = "",
-                    .end_key = null,
-                }})[0..]),
+                .tables = tables[0..],
+                .ranges = ranges[0..],
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
                 .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
@@ -54641,12 +55427,21 @@ test "provisioned table write source create table provisions local indexes and s
     defer source.deinit();
     source.write_cache = &write_cache;
     Catalog.indexes_json = tables_api.default_indexes_json;
+    Catalog.schema = schema_json;
+    Catalog.admin_snapshot_calls = 0;
+    // The committed create already owns its table contract and routing
+    // capability. Its local writer open must not re-enter the catalog after
+    // the one routing projection.
+    Catalog.admin_snapshot_call_limit = 1;
+    defer Catalog.admin_snapshot_call_limit = null;
     var req = tables_api.CreateTableRequest{
         .schema_json = try alloc.dupe(u8, schema_json),
     };
     defer req.deinit(alloc);
 
     _ = try source.source().createTable(alloc, "docs", req);
+    try std.testing.expectEqual(@as(usize, 1), Catalog.admin_snapshot_calls);
+    Catalog.admin_snapshot_call_limit = null;
 
     {
         lockAtomic(&source.local_db_mutex);
@@ -54659,6 +55454,7 @@ test "provisioned table write source create table provisions local indexes and s
     const updated_schema_json =
         "{\"version\":1,\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"body\":{\"type\":\"text\"}}}}}}";
     Catalog.indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"full_text_index_v1\":{\"type\":\"full_text\"}}";
+    Catalog.schema = updated_schema_json;
     _ = try source.source().updateSchema(alloc, "docs", updated_schema_json);
 
     {
@@ -55316,7 +56112,7 @@ test "cached runtime status is independent of writer lock and target observation
     // the immutable cache and its explicit lifecycle fences.
     lockAtomic(&source.local_db_mutex);
     defer source.local_db_mutex.unlock();
-    const io = source.table_activity_threaded.io();
+    const io = source.tableActivityIo();
     source.table_activity_mutex.lockUncancelable(io);
     defer source.table_activity_mutex.unlock(io);
     var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
@@ -55349,8 +56145,12 @@ test "cached runtime status is independent of writer lock and target observation
 
 test "provisioned table write source restore table does not hold local db mutex during restore work" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-table-restore-mutex";
-    const backup_root = "/tmp/antfly-api-provisioned-table-restore-mutex-out";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-table-restore-mutex");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
+    var backup_root_tmp = try TestDirectory.init("antfly-api-provisioned-table-restore-mutex-out");
+    defer backup_root_tmp.cleanup();
+    const backup_root = backup_root_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -55423,11 +56223,12 @@ test "provisioned table write source restore table does not hold local db mutex 
     const Worker = struct {
         source: *ProvisionedTableWriteSource,
         manifest: *const backups_api.TableBackupManifest,
+        backup_root: []const u8,
         err: ?anyerror = null,
 
         fn run(self: *@This()) void {
             _ = self.source.source().restoreTable(std.heap.page_allocator, "docs", .{
-                .backup_root = backup_root,
+                .backup_root = self.backup_root,
                 .manifest = self.manifest,
                 .artifact_backup_id = self.manifest.backup_id,
                 .source_location = "file:///provisioned-restore-preparation-test",
@@ -55476,15 +56277,20 @@ test "provisioned table write source restore table does not hold local db mutex 
     var worker = Worker{
         .source = &source,
         .manifest = &manifest,
+        .backup_root = backup_root,
     };
-    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(Worker.run, .{&worker});
+    defer {
+        probe.release.store(true, .release);
+        thread.await(std.testing.io);
+    }
 
     while (!probe.entered.load(.acquire)) std.atomic.spinLoopHint();
     try std.testing.expect(source.local_db_mutex.tryLock());
     source.local_db_mutex.unlock();
 
     probe.release.store(true, .release);
-    thread.join();
+    thread.await(std.testing.io);
 
     if (worker.err) |err| return err;
     try std.testing.expect(!(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, db_path)));
@@ -55534,9 +56340,9 @@ test "provisioned table write source deinit drains restore repair work group" {
     var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-restore-repair-drain", NoCatalog.iface());
 
     var ctx = DrainCtx{};
-    try source.restore_repair_work_group.concurrent(source.table_activity_threaded.io(), DrainCtx.run, .{&ctx});
+    try source.restore_repair_work_group.concurrent(source.tableActivityIo(), DrainCtx.run, .{&ctx});
 
-    while (ctx.started.load(.acquire) == 0) std.Thread.yield() catch {};
+    while (ctx.started.load(.acquire) == 0) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     source.deinit();
 
     try std.testing.expectEqual(@as(u32, 1), ctx.started.load(.acquire));
@@ -57314,16 +58120,16 @@ test "write cache local mutation preempts stale startup writer" {
         .write_cache = &write_cache,
         .path = path,
     };
-    const thread = try std.Thread.spawn(.{}, Context.run, .{&context});
+    var thread = try std.testing.io.concurrent(Context.run, .{&context});
     var joined = false;
-    defer if (!joined) thread.join();
+    defer if (!joined) thread.await(std.testing.io);
 
     while (!context.started.load(.acquire)) std.atomic.spinLoopHint();
     sleepNs(10 * std.time.ns_per_ms);
     try std.testing.expect(!context.completed.load(.acquire));
 
     startup.deinit(alloc);
-    thread.join();
+    thread.await(std.testing.io);
     joined = true;
     if (context.err) |err| return err;
     try std.testing.expect(context.completed.load(.acquire));
@@ -57929,9 +58735,9 @@ test "resident DB retry preparation waits outside admission for writer publicati
     defer if (open_locked) startup_cache.open_mutex.unlock();
 
     var context = Context{ .source = &source };
-    const thread = try std.Thread.spawn(.{}, Context.run, .{&context});
+    var thread = try std.testing.io.concurrent(Context.run, .{&context});
     var thread_joined = false;
-    defer if (!thread_joined) thread.join();
+    defer if (!thread_joined) thread.await(std.testing.io);
 
     while (!context.started.load(.acquire)) std.atomic.spinLoopHint();
     sleepNs(10 * std.time.ns_per_ms);
@@ -57953,7 +58759,7 @@ test "resident DB retry preparation waits outside admission for writer publicati
     startup_cache.open_mutex.unlock();
     open_locked = false;
 
-    thread.join();
+    thread.await(std.testing.io);
     thread_joined = true;
     try std.testing.expect(context.completed.load(.acquire));
     try std.testing.expect(!context.failed.load(.acquire));
@@ -57968,6 +58774,63 @@ test "resident DB retry preparation waits outside admission for writer publicati
         .{ .read_activity_held = true },
     )).?;
     lease.release(alloc);
+}
+
+test "resident DB retry preparation does not block a borrowed std.Io scheduler" {
+    const alloc = std.testing.allocator;
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    var runtime = try db_mod.background_runtime.BackendRuntime.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = io_impl.io() },
+    });
+    defer runtime.deinit();
+
+    var startup_cache = ProvisionedTableWriteCache.init(alloc);
+    defer startup_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(
+        "/tmp/unused-antfly-cooperative-resident-open",
+        table_catalog.emptyCatalogSource(),
+    );
+    defer source.deinit();
+    source.startup_write_cache = &startup_cache;
+    source.backend_runtime = &runtime;
+
+    lockAtomic(&startup_cache.open_mutex);
+    defer startup_cache.open_mutex.unlock();
+    try std.testing.expectError(
+        error.StorageReadTemporarilyUnavailable,
+        source.residentDbSource().prepareGroupForReadRetry(
+            alloc,
+            "docs",
+            7001,
+            table_reads.backend_current_root_generation,
+        ),
+    );
+}
+
+test "write cache transition locks use stable cache roles instead of addresses" {
+    const alloc = std.testing.allocator;
+    var caches = [_]ProvisionedTableWriteCache{
+        ProvisionedTableWriteCache.init(alloc),
+        ProvisionedTableWriteCache.init(alloc),
+    };
+    defer caches[1].deinit();
+    defer caches[0].deinit();
+
+    var source = ProvisionedTableWriteSource.init("stable-lock-order", table_catalog.emptyCatalogSource());
+    defer source.deinit();
+    // Deliberately put the write role at the higher array address. The former
+    // pointer sort inverted these roles and made clean replay allocator-layout
+    // dependent.
+    source.write_cache = &caches[1];
+    source.startup_write_cache = &caches[0];
+
+    var locks = ProvisionedTableWriteSource.WriteCacheTransitionLocks.init(&source, true, true);
+    defer locks.deinit();
+    try std.testing.expect(locks.first == &caches[1]);
+    try std.testing.expect(locks.second == &caches[0]);
 }
 
 test "admitted resident DB lease never waits for an in-flight writer publication" {

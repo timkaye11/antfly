@@ -283,8 +283,8 @@ const ApplyRecorder = struct {
     snapshot_prepare_failures_remaining: usize = 0,
     materialized_groups: [8]std.atomic.Value(core.types.GroupId) = [_]std.atomic.Value(core.types.GroupId){.init(0)} ** 8,
     block_snapshot_materialization: bool = false,
-    snapshot_materialization_started: std.atomic.Value(bool) = .init(false),
-    release_snapshot_materialization: std.atomic.Value(bool) = .init(false),
+    snapshot_materialization_started: std.Io.Event = .unset,
+    release_snapshot_materialization: std.Io.Event = .unset,
     materialize_artifact: bool = false,
 
     const PreparedSnapshot = struct {
@@ -314,10 +314,8 @@ const ApplyRecorder = struct {
                 return error.InjectedSnapshotBuildFailure;
             }
             if (self.recorder.block_snapshot_materialization) {
-                self.recorder.snapshot_materialization_started.store(true, .release);
-                while (!self.recorder.release_snapshot_materialization.load(.acquire)) {
-                    std.Thread.yield() catch {};
-                }
+                self.recorder.snapshot_materialization_started.set(std.testing.io);
+                self.recorder.release_snapshot_materialization.waitUncancelable(std.testing.io);
             }
             const bytes = try std.fmt.allocPrint(alloc, "applied-state-{d}", .{self.applied_index});
             if (!self.recorder.materialize_artifact) return .{ .bytes = bytes };
@@ -334,7 +332,7 @@ const ApplyRecorder = struct {
 
         fn cancel(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.recorder.release_snapshot_materialization.store(true, .release);
+            self.recorder.release_snapshot_materialization.set(std.testing.io);
         }
     };
 
@@ -1155,7 +1153,7 @@ test "multi raft cancels and drops a snapshot from a retired group incarnation" 
         .alloc = std.testing.allocator,
         .block_snapshot_materialization = true,
     };
-    defer apply_recorder.release_snapshot_materialization.store(true, .release);
+    defer apply_recorder.release_snapshot_materialization.set(std.testing.io);
 
     var host = runtime.MultiRaft.init(std.testing.allocator, .{
         .applied_log_retained_entries = 1,
@@ -1173,12 +1171,12 @@ test "multi raft cancels and drops a snapshot from a retired group incarnation" 
     try std.testing.expectEqual(@as(usize, 1), try drainGroup(&host, 64));
 
     const start_deadline = clock.monotonicNs() +| 5 * std.time.ns_per_s;
-    while (!apply_recorder.snapshot_materialization_started.load(.acquire) and clock.monotonicNs() < start_deadline) {
+    while (!apply_recorder.snapshot_materialization_started.isSet() and clock.monotonicNs() < start_deadline) {
         sleepOneMillisecond();
     }
-    try std.testing.expect(apply_recorder.snapshot_materialization_started.load(.acquire));
+    try std.testing.expect(apply_recorder.snapshot_materialization_started.isSet());
     try std.testing.expect(host.removeGroup(64));
-    try std.testing.expect(apply_recorder.release_snapshot_materialization.load(.acquire));
+    try std.testing.expect(apply_recorder.release_snapshot_materialization.isSet());
     try storage_recorder.registerStore(64, &replacement_store);
     try addSingleNodeGroup(&host, 64, &replacement_store, false);
 
@@ -1335,14 +1333,14 @@ test "multi raft shutdown cancels a blocked snapshot materialization" {
     try std.testing.expectEqual(@as(usize, 1), try drainGroup(&host, 70));
 
     const start_deadline = clock.monotonicNs() +| 5 * std.time.ns_per_s;
-    while (!apply_recorder.snapshot_materialization_started.load(.acquire) and clock.monotonicNs() < start_deadline) {
+    while (!apply_recorder.snapshot_materialization_started.isSet() and clock.monotonicNs() < start_deadline) {
         sleepOneMillisecond();
     }
-    try std.testing.expect(apply_recorder.snapshot_materialization_started.load(.acquire));
+    try std.testing.expect(apply_recorder.snapshot_materialization_started.isSet());
 
     host.deinit();
     host_live = false;
-    try std.testing.expect(apply_recorder.release_snapshot_materialization.load(.acquire));
+    try std.testing.expect(apply_recorder.release_snapshot_materialization.isSet());
 }
 
 test "multi raft snapshot scheduling is fair when a hot group requeues" {
@@ -1358,7 +1356,7 @@ test "multi raft snapshot scheduling is fair when a hot group requeues" {
         .alloc = std.testing.allocator,
         .block_snapshot_materialization = true,
     };
-    defer apply_recorder.release_snapshot_materialization.store(true, .release);
+    defer apply_recorder.release_snapshot_materialization.set(std.testing.io);
 
     var host = runtime.MultiRaft.init(std.testing.allocator, .{
         .applied_log_retained_entries = 1,
@@ -1379,10 +1377,10 @@ test "multi raft snapshot scheduling is fair when a hot group requeues" {
     try std.testing.expectEqual(@as(usize, 1), try drainGroup(&host, 66));
 
     const start_deadline = clock.monotonicNs() +| 5 * std.time.ns_per_s;
-    while (!apply_recorder.snapshot_materialization_started.load(.acquire) and clock.monotonicNs() < start_deadline) {
+    while (!apply_recorder.snapshot_materialization_started.isSet() and clock.monotonicNs() < start_deadline) {
         sleepOneMillisecond();
     }
-    try std.testing.expect(apply_recorder.snapshot_materialization_started.load(.acquire));
+    try std.testing.expect(apply_recorder.snapshot_materialization_started.isSet());
     try host.propose(67, "cold");
     try std.testing.expectEqual(@as(usize, 1), try drainGroup(&host, 67));
     for (1..5) |i| {
@@ -1391,7 +1389,7 @@ test "multi raft snapshot scheduling is fair when a hot group requeues" {
         try std.testing.expectEqual(@as(usize, 1), try drainGroup(&host, 66));
     }
 
-    apply_recorder.release_snapshot_materialization.store(true, .release);
+    apply_recorder.release_snapshot_materialization.set(std.testing.io);
     const completion_deadline = clock.monotonicNs() +| 5 * std.time.ns_per_s;
     while (apply_recorder.snapshot_materializations.load(.acquire) < 3 and clock.monotonicNs() < completion_deadline) {
         _ = try host.drainReady(0);
@@ -1802,7 +1800,10 @@ test "multi raft fetches snapshot through snapshot transport and steps it into t
 
     var transport_recorder = TransportRecorder{ .alloc = std.testing.allocator };
 
-    const root_dir = "/tmp/antflydb-raft-runtime-fetch-snapshot";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_dir);
     var snapshot_transport = try runtime.LocalSnapshotTransport.init(std.testing.allocator, root_dir);
     defer snapshot_transport.deinit();
 
@@ -1929,7 +1930,10 @@ test "multi raft ensureReplica can fetch snapshot bootstrap" {
     var store = core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();
 
-    const root_dir = "/tmp/antflydb-raft-runtime-ensure-fetch-snapshot";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_dir);
     var snapshot_transport = try runtime.LocalSnapshotTransport.init(std.testing.allocator, root_dir);
     defer snapshot_transport.deinit();
 
@@ -2001,7 +2005,10 @@ test "multi raft rejects snapshot bootstrap above aggregate ownership budget" {
     var store = core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();
 
-    const root_dir = "/tmp/antflydb-raft-runtime-reject-fetch-snapshot";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_dir);
     var snapshot_transport = try runtime.LocalSnapshotTransport.init(std.testing.allocator, root_dir);
     defer snapshot_transport.deinit();
     var voters = [_]core.types.NodeId{ 1, 2 };
@@ -2113,7 +2120,10 @@ test "multi raft limit backpressure denies oversized snapshot ready" {
     defer storage_recorder.deinit();
     try storage_recorder.registerStore(134, &store);
 
-    const root_dir = "/tmp/antflydb-raft-runtime-limit-backpressure";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_dir);
     var snapshot_transport = try runtime.LocalSnapshotTransport.init(std.testing.allocator, root_dir);
     defer snapshot_transport.deinit();
 
@@ -3015,7 +3025,10 @@ test "runtime control plane restore_replicas can rejoin via snapshot bootstrap" 
     defer factory.deinit();
     try factory.registerStore(142, &store);
 
-    const root_dir = "/tmp/antflydb-raft-runtime-catalog-rejoin";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_dir);
     var snapshot_transport = try runtime.LocalSnapshotTransport.init(std.testing.allocator, root_dir);
     defer snapshot_transport.deinit();
 

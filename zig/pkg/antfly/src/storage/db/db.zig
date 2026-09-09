@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
 const ant_json = @import("antfly-json");
 const vector_mod = @import("antfly_vector").vector;
 const platform_sync = @import("antfly_platform").sync;
@@ -56,6 +57,7 @@ const promotion_runtime_mod = @import("promotion_runtime.zig");
 const resolver_lib = @import("antfly_resolver");
 const backfill_state_mod = @import("backfill_state.zig");
 const range_state_mod = @import("range_state.zig");
+const merge_state_mod = @import("merge_state.zig");
 const types = @import("types.zig");
 const document_artifact_child_range = @import("document_artifact_child_range.zig");
 const aggregations_mod = @import("aggregations.zig");
@@ -74,6 +76,7 @@ test {
     _ = index_generation_manifest;
     _ = native_backup;
     _ = root_identity;
+    _ = merge_state_mod;
 }
 
 const change_journal_mod = @import("derived/change_journal.zig");
@@ -340,8 +343,9 @@ test "document extraction inline source size uses remote content limit" {
 test "document extraction templated inline source size is rejected before persistence" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const security = scraping.ContentSecurityConfig{ .max_download_size_bytes = 4 };
@@ -456,6 +460,11 @@ pub const OpenOptions = struct {
     /// pins inside the same atomic storage generation as their indexes.
     index_repair_checkpoint_storage: ?lsm_backend_mod.Storage = null,
     physical_root_mode: PhysicalRootMode = .filesystem_managed,
+    /// Durable identity supplied by an externally owned physical backend.
+    /// Filesystem-managed roots persist their own checkpoint; container
+    /// backends such as Lite must bind the DB to the container generation and
+    /// logical namespace that actually owns its bytes.
+    external_root_incarnation: u128 = 0,
     /// Optional enrichment providers. `DB.open` takes ownership of every
     /// non-null provider when called, including when the open subsequently
     /// fails. A successfully opened DB releases them from `close`.
@@ -2009,7 +2018,7 @@ const EnrichmentAppendContext = struct {
     ha_async_batch_mirror: ?HAAsyncBatchMirror = null,
     ha_async_metadata_mirror: ?HAAsyncMetadataMirror = null,
     ha_write_gate: ?HAWriteGate = null,
-    identity_visibility_owner_slot: ?*const std.atomic.Value(?*DB) = null,
+    identity_visibility: ?*db_core.IdentityVisibilityState = null,
     resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
     promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
 
@@ -2037,7 +2046,7 @@ const EnrichmentAppendContext = struct {
             .ha_async_batch_mirror = self.ha_async_batch_mirror,
             .ha_async_metadata_mirror = self.ha_async_metadata_mirror,
             .ha_write_gate = self.ha_write_gate,
-            .identity_visibility_owner_slot = self.identity_visibility_owner_slot,
+            .identity_visibility = self.identity_visibility,
             .enrichment_runtime = null,
             .resolution_runtime = self.resolution_runtime,
             .promotion_runtime = self.promotion_runtime,
@@ -2083,7 +2092,7 @@ const BatchExecutionContext = struct {
     ha_async_batch_mirror: ?HAAsyncBatchMirror = null,
     ha_async_metadata_mirror: ?HAAsyncMetadataMirror = null,
     ha_write_gate: ?HAWriteGate = null,
-    identity_visibility_owner_slot: ?*const std.atomic.Value(?*DB) = null,
+    identity_visibility: ?*db_core.IdentityVisibilityState = null,
 };
 
 const ReplayApplyContext = struct {
@@ -2099,7 +2108,22 @@ const ReplayApplyContextBatch = struct {
 const TtlCleanupContext = struct {
     batch: BatchExecutionContext,
     grace_period_ns: u64,
-    identity_visibility_owner: std.atomic.Value(?*DB) = std.atomic.Value(?*DB).init(null),
+};
+
+/// Stable owner for transaction recovery callbacks. `DB.open` returns its
+/// public wrapper by value, so a background worker must never retain the
+/// address of that movable wrapper. The recovery-only snapshot is allocated
+/// after startup has initialized every shared subsystem and remains at a fixed
+/// address until the worker has joined during close.
+const TransactionRecoveryLocalContext = struct {
+    stable_owner: ?*DB = null,
+    /// A recovery call borrows replaceable providers for its entire mutation.
+    /// Reconfiguration takes this lock before retiring any provider runtime.
+    provider_mutex: Io.Mutex = .init,
+    /// Borrowed split state published under the core apply lock. The public DB
+    /// wrapper is movable, so its `shadow` field is not a stable source for the
+    /// recovery owner allocated during open.
+    split_shadow: ?ShadowState = null,
 };
 
 const ManagedSyncTargets = struct {
@@ -3041,7 +3065,6 @@ fn logSparseWriteProfileDelta(index_name: []const u8, delta: sparse_mod.WritePro
     );
 }
 
-var temp_path_nonce: u64 = 0;
 var split_replay_artifact_nonce: u64 = 0;
 var repair_shadow_nonce = AtomicU64.init(0);
 
@@ -3425,7 +3448,7 @@ fn spinOrYield() void {
     if (builtin.os.tag == .freestanding) {
         std.atomic.spinLoopHint();
     } else {
-        std.Thread.yield() catch {};
+        @import("antfly_platform").time.yieldNow();
     }
 }
 
@@ -3492,7 +3515,7 @@ fn lockAtomicWithBackoff(mutex: *std.atomic.Mutex) void {
             continue;
         }
         if (attempts < 128) {
-            std.Thread.yield() catch {};
+            @import("antfly_platform").time.yieldNow();
             continue;
         }
         const backoff_step = @min(attempts - 128, 5);
@@ -3512,7 +3535,7 @@ fn lockAtomicWithCancellation(mutex: *std.atomic.Mutex, cancellation: types.Canc
         if (builtin.os.tag == .freestanding or builtin.single_threaded or attempts < 64) {
             std.atomic.spinLoopHint();
         } else if (attempts < 128) {
-            std.Thread.yield() catch {};
+            @import("antfly_platform").time.yieldNow();
         } else {
             const backoff_step = @min(attempts - 128, 5);
             sleepNs(@min(@as(u64, 50_000) << @intCast(backoff_step), @as(u64, 1_000_000)));
@@ -3572,7 +3595,7 @@ fn lockAtomicWithBackoffProfiled(mutex: *std.atomic.Mutex, stats: *MutexContenti
             continue;
         }
         if (attempts < 128) {
-            std.Thread.yield() catch {};
+            @import("antfly_platform").time.yieldNow();
             yield_loops += 1;
             continue;
         }
@@ -3638,7 +3661,7 @@ fn lockApplyWithBackoffProfiled(rw_lock: *apply_rw_lock_mod.ApplyRwLock, stats: 
             continue;
         }
         if (attempts < 128) {
-            std.Thread.yield() catch {};
+            @import("antfly_platform").time.yieldNow();
             yield_loops += 1;
             continue;
         }
@@ -3686,8 +3709,9 @@ test "multi-source sparse replay retains each artifact member" {
 
 test "stale multi-source vector replay writes are source fenced" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -3882,7 +3906,8 @@ fn makeLsmBackgroundExecutor(runtime: *background_runtime_mod.BackendRuntime, ow
 }
 
 fn installLsmReadRuntime(options: *lsm_backend_mod.Options, runtime: *background_runtime_mod.BackendRuntime) void {
-    if (options.native_storage_pool == null) options.native_storage_pool = runtime.nativeStoragePool();
+    if (options.storage == null) options.storage = runtime.storage();
+    if (options.storage == null and options.native_storage_pool == null) options.native_storage_pool = runtime.nativeStoragePool();
     if (options.read_runtime != null) return;
     if (runtime.io()) |io| options.read_runtime = lsm_backend_mod.storage_io.ReadRuntime.init(io);
 }
@@ -4002,7 +4027,7 @@ pub const DB = struct {
     primary_lsm_storage: ?lsm_backend_mod.Storage,
     physical_root_mode: OpenOptions.PhysicalRootMode,
     index_backends: db_config.IndexBackendOptions,
-    core: db_core.DBCore,
+    core: *db_core.DBCore,
     /// Durable identity of the physical DB root. Unlike `core.root_generation`,
     /// this survives process restart and changes whenever a root is rebound.
     root_incarnation: u128 = 0,
@@ -4039,13 +4064,15 @@ pub const DB = struct {
     ttl_cleanup_context: ?*TtlCleanupContext,
     ttl_runtime: ?*ttl_runtime_mod.TtlRuntime,
     transaction_recovery_identity_context: ?*db_core.TransactionRecoveryIdentityContext,
+    transaction_recovery_local_context: ?*TransactionRecoveryLocalContext,
     transaction_runtime: ?*transaction_runtime_mod.Runtime,
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime,
     sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime,
     // Background retry of quarantined index loads (see retryQuarantinedIndexLoads).
     // Started after the DB reaches its final address; exits once all
     // quarantined indexes recover or the DB closes.
-    quarantine_retry_thread: ?std.Thread = null,
+    quarantine_retry_future: ?std.Io.Future(void) = null,
+    quarantine_retry_stop_event: Io.Event = .unset,
     quarantine_retry_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     quarantine_retry_start_address_for_test: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
     artifact_repair_metadata_future: ?Io.Future(void) = null,
@@ -4055,20 +4082,6 @@ pub const DB = struct {
     flushing_bulk_ingest_coalescer: bool = false,
     bulk_ingest_identity_all_new: bool = false,
     bulk_ingest_identity_state: doc_identity.AllNewTrustedState = .{},
-    identity_visibility_summary_cache: ?doc_identity.VisibilitySummary = null,
-    // Memoizes the resolved live-doc set for broad (.all) live filtering at a
-    // single identity read generation. Visibility at a fixed generation is
-    // stable, so the entry only turns over when queries arrive at a newer
-    // generation. Guarded by its own mutex because published-path queries do
-    // not hold the apply lock.
-    live_doc_set_cache_mutex: std.atomic.Mutex = .unlocked,
-    live_doc_set_cache_generation: ?u64 = null,
-    live_doc_set_cache_set: ?doc_set.ResolvedDocSet = null,
-    nonvisible_doc_set_cache_mutex: std.atomic.Mutex = .unlocked,
-    nonvisible_doc_set_cache_generation: ?u64 = null,
-    nonvisible_doc_set_cache_set: ?doc_set.ResolvedDocSet = null,
-    nonvisible_doc_set_cache_overflow: bool = false,
-    nonvisible_doc_set_cache_entries: AtomicU64 = AtomicU64.init(0),
     // Status snapshots are reconstructed from durable state on every poll, so
     // volatile worker observations need an independently owned cache. Keeping
     // it on the resident DB (rather than inside a returned DBStats value) lets
@@ -4166,6 +4179,7 @@ pub const DB = struct {
             .repair_replay_mutex = resources.repair_replay_mutex,
             .log_mutex = resources.log_mutex,
             .identity_namespace = resources.identity_namespace,
+            .identity_visibility = &self.core.identity_visibility,
             .artifact_cleanup_maybe = resources.artifact_cleanup_maybe,
             .executor = self.executor,
             .io = self.backend_runtime.io(),
@@ -4387,8 +4401,10 @@ pub const DB = struct {
                 if (owned_executor) |ptr| runtime_alloc.destroy(ptr);
                 if (owned_async_context) |ptr| runtime_alloc.destroy(ptr);
             }
+            if (opts.index_repair_checkpoint_storage == null)
+                opts.index_repair_checkpoint_storage = backend_runtime.storage();
             var effective_executor = opts.executor;
-            if (backend_runtime.io_impl == null and effective_executor.backend == .io_threaded) {
+            if ((backend_runtime.io() == null or backend_runtime.usesBorrowedIo()) and effective_executor.backend == .io_threaded) {
                 effective_executor.backend = .manual;
             }
             const backend_owner_id = try backend_runtime.allocOwnerId();
@@ -4448,6 +4464,13 @@ pub const DB = struct {
                 bind_cache_resource_manager,
                 effective_index_backends,
             );
+            const core_owner = try alloc.create(db_core.DBCore);
+            var core_owner_initialized = false;
+            var core_owner_transferred = false;
+            errdefer if (!core_owner_transferred) {
+                if (core_owner_initialized) core_owner.deinit();
+                alloc.destroy(core_owner);
+            };
             const open_primary_started_ns = monotonicTimeNs();
             const opened_primary = try openPrimaryStore(alloc, path, core_opts);
             profile.primary_store_ns = elapsedSince(open_primary_started_ns);
@@ -4472,6 +4495,8 @@ pub const DB = struct {
                 opts.lsm_root_generation,
                 openModeRequiresReadOnlyBackends(opts.open_mode),
             );
+            core_owner.* = db_core.DBCore.fromOpened(alloc, core);
+            core_owner_initialized = true;
             profile.core_resources_ns = elapsedSince(core_resources_started_ns);
             const async_context = try runtime_alloc.create(AsyncContext);
             owned_async_context = async_context;
@@ -4495,7 +4520,7 @@ pub const DB = struct {
                 .primary_lsm_storage = resolved_config.primary_lsm_storage,
                 .physical_root_mode = opts.physical_root_mode,
                 .index_backends = resolved_config.index_backends,
-                .core = db_core.DBCore.fromOpened(alloc, core),
+                .core = core_owner,
                 .async_context = async_context,
                 .backend_runtime = backend_runtime,
                 .backend_owner_id = backend_owner_id,
@@ -4523,11 +4548,13 @@ pub const DB = struct {
                 .ttl_cleanup_context = null,
                 .ttl_runtime = null,
                 .transaction_recovery_identity_context = null,
+                .transaction_recovery_local_context = null,
                 .transaction_runtime = null,
                 .text_merge_runtime = null,
                 .sparse_compaction_runtime = null,
                 .shadow = null,
             };
+            core_owner_transferred = true;
             backend_owner_transferred = true;
             repair_cleanup_owner_transferred = true;
             var executor_ready = false;
@@ -4548,6 +4575,8 @@ pub const DB = struct {
             {
                 const identity = try loadOrCreateDurableRootIdentity(alloc, db.backend_runtime, path);
                 db.root_incarnation = identity.incarnation;
+            } else if (opts.physical_root_mode == .external_backend) {
+                db.root_incarnation = opts.external_root_incarnation;
             }
             if (opts.schema_before_index_load) |table_schema| {
                 // This option is used by the metadata-authoritative local
@@ -4855,7 +4884,6 @@ pub const DB = struct {
     }
 
     pub fn setQueryVisibilityHook(self: *DB, hook: ?QueryVisibilityHook) void {
-        if (hook != null) self.bindTtlIdentityVisibilityOwner();
         var pending_hook: ?QueryVisibilityHook = null;
         lockAtomic(&self.async_context.query_visibility_hook_mutex);
         self.async_context.query_visibility_hook = hook;
@@ -4938,21 +4966,24 @@ pub const DB = struct {
         }
     }
 
-    fn bindTtlIdentityVisibilityOwner(self: *DB) void {
-        const ttl_ctx = self.ttl_cleanup_context orelse return;
-        ttl_ctx.identity_visibility_owner.store(self, .release);
-
-        // DB.open returns the wrapper by value, so optional runtimes are
-        // initialized before a managed writer reaches its stable cache
-        // address. Refresh any TTL mutation that may have landed during that
-        // move window when the serving layer attaches its visibility hook.
-        lockApply(self);
-        defer self.core.unlockApply();
-        if (doc_identity.visibilitySummaryFromStore(self.core.store) catch null) |summary| {
-            self.identity_visibility_summary_cache = summary;
-            self.clearLiveDocSetCache();
-            self.clearNonVisibleDocSetCache();
-        }
+    fn prepareTransactionRecoveryOwner(self: *DB) !void {
+        const ctx = self.transaction_recovery_local_context orelse return;
+        if (ctx.stable_owner != null) return;
+        ctx.split_shadow = self.shadow;
+        const stable_owner = try self.runtime_alloc.create(DB);
+        stable_owner.* = self.*;
+        // The snapshot shares durable/core/runtime pointers, but it must not
+        // alias wrapper-owned caches, maps, or mutex state. Visibility is
+        // owned by the shared core. Replaceable enrichment state is borrowed
+        // from the shared async context only while provider_mutex is held.
+        stable_owner.bulk_ingest_coalescer = .{};
+        stable_owner.flushing_bulk_ingest_coalescer = false;
+        stable_owner.bulk_ingest_identity_all_new = false;
+        stable_owner.bulk_ingest_identity_state = .{};
+        stable_owner.bulk_ingest_seen_doc_keys = .{};
+        stable_owner.enrichment_runtime = null;
+        stable_owner.enrichment_append_context = null;
+        ctx.stable_owner = stable_owner;
     }
 
     fn notifyAsyncContextVisibilityHook(ptr: *anyopaque) void {
@@ -5273,6 +5304,11 @@ pub const DB = struct {
     ) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
 
+        const recovery = self.transaction_recovery_local_context;
+        const recovery_io = self.backend_runtime.io();
+        if (recovery) |ctx| ctx.provider_mutex.lockUncancelable(recovery_io.?);
+        defer if (recovery) |ctx| ctx.provider_mutex.unlock(recovery_io.?);
+
         var owned_cfg = cfg;
         var cfg_owned = true;
         errdefer if (cfg_owned) self.deinitEnrichmentConfig(&owned_cfg);
@@ -5463,7 +5499,7 @@ pub const DB = struct {
             },
             .grace_period_ns = cfg.grace_period_ns,
         };
-        ttl_ctx.batch.identity_visibility_owner_slot = &ttl_ctx.identity_visibility_owner;
+        ttl_ctx.batch.identity_visibility = &self.core.identity_visibility;
         const runtime = try self.runtime_alloc.create(ttl_runtime_mod.TtlRuntime);
         errdefer self.runtime_alloc.destroy(runtime);
         runtime.* = try ttl_runtime_mod.TtlRuntime.init(
@@ -5488,8 +5524,13 @@ pub const DB = struct {
             .identity_namespace = self.core.identity_namespace,
             .alloc = self.runtime_alloc,
         };
+        const local_ctx = try self.runtime_alloc.create(TransactionRecoveryLocalContext);
+        errdefer self.runtime_alloc.destroy(local_ctx);
+        local_ctx.* = .{};
         var effective_cfg = cfg;
         effective_cfg.resolution_extra_hooks = db_core.transactionRecoveryIdentityHooks(identity_ctx);
+        effective_cfg.local_resolution_ctx = local_ctx;
+        effective_cfg.resolve_local_fn = resolveRecoveredLocalTransaction;
 
         const runtime = try self.runtime_alloc.create(transaction_runtime_mod.Runtime);
         errdefer self.runtime_alloc.destroy(runtime);
@@ -5501,6 +5542,7 @@ pub const DB = struct {
         );
         errdefer runtime.deinit();
         self.transaction_recovery_identity_context = identity_ctx;
+        self.transaction_recovery_local_context = local_ctx;
         self.transaction_runtime = runtime;
     }
 
@@ -5575,12 +5617,19 @@ pub const DB = struct {
         }
         if (self.ttl_runtime) |runtime| try runtime.start();
         if (self.transaction_runtime) |runtime| {
-            runtime.config.local_resolution_ctx = self;
-            runtime.config.resolve_local_fn = resolveRecoveredLocalTransaction;
+            try self.prepareTransactionRecoveryOwner();
             try runtime.start();
         }
         if (self.text_merge_runtime) |runtime| try runtime.start();
         if (self.sparse_compaction_runtime) |runtime| try runtime.start();
+    }
+
+    /// Publish non-joining shutdown to optional workers before a borrowed
+    /// deterministic scheduler drains them. Destruction still happens through
+    /// the ordinary close path after the drain completes.
+    pub fn beginTeardown(self: *DB) void {
+        if (self.enrichment_runtime) |runtime| runtime.beginTeardown();
+        if (self.transaction_runtime) |runtime| runtime.beginTeardown();
     }
 
     pub fn ensureTransactionRecoveryRuntime(self: *DB, cfg: transaction_runtime_mod.Config) !void {
@@ -5591,8 +5640,7 @@ pub const DB = struct {
         try self.initOptionalTransactionRuntime(cfg);
         if (self.optional_runtime_workers_enabled) {
             const runtime = self.transaction_runtime.?;
-            runtime.config.local_resolution_ctx = self;
-            runtime.config.resolve_local_fn = resolveRecoveredLocalTransaction;
+            try self.prepareTransactionRecoveryOwner();
             try runtime.start();
         }
     }
@@ -5641,21 +5689,11 @@ pub const DB = struct {
     }
 
     fn clearLiveDocSetCache(self: *DB) void {
-        lockAtomic(&self.live_doc_set_cache_mutex);
-        defer self.live_doc_set_cache_mutex.unlock();
-        if (self.live_doc_set_cache_set) |*cached| cached.deinit(self.alloc);
-        self.live_doc_set_cache_set = null;
-        self.live_doc_set_cache_generation = null;
+        self.core.identity_visibility.clearLive();
     }
 
     fn clearNonVisibleDocSetCache(self: *DB) void {
-        lockAtomic(&self.nonvisible_doc_set_cache_mutex);
-        defer self.nonvisible_doc_set_cache_mutex.unlock();
-        if (self.nonvisible_doc_set_cache_set) |*cached| cached.deinit(self.alloc);
-        self.nonvisible_doc_set_cache_set = null;
-        self.nonvisible_doc_set_cache_generation = null;
-        self.nonvisible_doc_set_cache_overflow = false;
-        self.nonvisible_doc_set_cache_entries.store(0, .monotonic);
+        self.core.identity_visibility.clearNonvisible();
     }
 
     fn clearEmbeddingActivityCache(self: *DB) void {
@@ -5671,6 +5709,20 @@ pub const DB = struct {
         // index state they may inspect.
         self.stopArtifactRepairMetadataWorker();
         self.stopQuarantineRetryWorker();
+        if (self.transaction_runtime) |runtime| {
+            runtime.deinit();
+            self.runtime_alloc.destroy(runtime);
+            self.transaction_runtime = null;
+        }
+        if (self.transaction_recovery_local_context) |ctx| {
+            if (ctx.stable_owner) |owner| self.runtime_alloc.destroy(owner);
+            self.runtime_alloc.destroy(ctx);
+            self.transaction_recovery_local_context = null;
+        }
+        if (self.transaction_recovery_identity_context) |ctx| {
+            self.runtime_alloc.destroy(ctx);
+            self.transaction_recovery_identity_context = null;
+        }
         // Close may flush/coalesce derived watermarks while workers are
         // stopping. That must not call back into the write/status cache after
         // optional runtimes or index state have started tearing down.
@@ -5697,11 +5749,6 @@ pub const DB = struct {
         self.clearActiveIndexRepairsLocked();
         self.active_index_repairs.deinit(self.alloc);
         self.closeShadowIndexManager() catch {};
-        if (self.transaction_runtime) |runtime| {
-            runtime.deinit();
-            self.runtime_alloc.destroy(runtime);
-        }
-        if (self.transaction_recovery_identity_context) |ctx| self.runtime_alloc.destroy(ctx);
         if (self.ttl_runtime) |runtime| {
             runtime.deinit();
             self.runtime_alloc.destroy(runtime);
@@ -5746,7 +5793,9 @@ pub const DB = struct {
             runtime.deinit();
             self.runtime_alloc.destroy(runtime);
         }
-        self.core.deinit();
+        const core = self.core;
+        core.deinit();
+        self.alloc.destroy(core);
         // Publication locks are opened and closed through the DB runtime's
         // `std.Io`. Release the read generation before destroying an owned
         // runtime, while still retaining the lease until all physical DB
@@ -6462,8 +6511,9 @@ pub const DB = struct {
 
     test "db lsm maintenance reclaims due index obsolete paths before primary compaction" {
         const alloc = std.testing.allocator;
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
 
         var db = try DB.open(alloc, std.mem.span(path), .{
@@ -6550,14 +6600,15 @@ pub const DB = struct {
             if (attempts >= 2000) {
                 return std.testing.expectEqual(expected, backend.snapshotMaintenanceStats().obsolete_paths_reclaimable);
             }
-            std.Thread.yield() catch {};
+            std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
     }
 
     test "db primary lsm maintenance step does not reclaim index obsolete paths" {
         const alloc = std.testing.allocator;
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
 
         var db = try DB.open(alloc, std.mem.span(path), .{
@@ -6695,6 +6746,11 @@ pub const DB = struct {
     fn projectedBatchLsmAdmissionBytes(req: types.BatchRequest) u64 {
         var payload_bytes: u64 = 0;
         var operations: u64 = 0;
+        for (req.merge_artifacts) |write| {
+            payload_bytes +|= @intCast(write.key.len);
+            payload_bytes +|= @intCast(write.value.len);
+            operations +|= 1;
+        }
         for (req.writes) |write| {
             payload_bytes +|= @intCast(write.key.len);
             payload_bytes +|= @intCast(write.value.len);
@@ -6915,7 +6971,12 @@ pub const DB = struct {
                     if (replication.sequence == 0) return error.InvalidBatchRequest;
                     const applied = try self.core.loadSplitDeltaFinalSeq(self.alloc);
                     if (replication.sequence <= applied) return false;
-                    if (replication.sequence != applied + 1) return error.SplitReplicationSequenceGap;
+                    if (replication.previous_sequence) |previous| {
+                        if (previous >= replication.sequence) return error.InvalidBatchRequest;
+                        if (previous != applied) return error.SplitReplicationSequenceGap;
+                    } else if (replication.sequence != applied + 1) {
+                        return error.SplitReplicationSequenceGap;
+                    }
                 },
                 .checkpoint => {
                     const checkpoint = req.split_checkpoint orelse return error.MissingSplitReplicationCheckpoint;
@@ -7181,6 +7242,7 @@ pub const DB = struct {
     }
 
     fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
+        try types.validateMergeArtifacts(req);
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         if (!opts.bypass_ha_write_gate and self.denseRepairWriteBackpressured()) return error.DenseRepairBackpressure;
         var ha_mutation = if (opts.bypass_ha_write_gate) null else self.acquireHAMutationShared();
@@ -7222,6 +7284,42 @@ pub const DB = struct {
                     apply_mutex_held = false;
                     return;
                 },
+            }
+        }
+
+        // Checkpoints certify a copy; payloads must use a separately fenced
+        // command so a stale checkpoint cannot smuggle destructive mutations.
+        if (req.merge_checkpoint != null and (req.writes.len != 0 or req.deletes.len != 0 or
+            req.merge_artifacts.len != 0 or req.transforms.len != 0 or
+            req.graph_writes.len != 0 or req.graph_deletes.len != 0))
+            return error.InvalidBatchRequest;
+        if (req.merge_replication) |replication| if (req.merge_checkpoint == null) {
+            const raw = try merge_state_mod.loadRawAlloc(self.alloc, self.core.store);
+            defer if (raw) |value| self.alloc.free(value);
+            var state = if (raw) |value| try merge_state_mod.decodeAlloc(self.alloc, value) else null;
+            defer if (state) |*value| value.deinit(self.alloc);
+            if (!merge_state_mod.copyAllowed(state, replication)) {
+                if (!opts.bypass_ha_write_gate) return error.MergeCopyFenced;
+                // A delayed committed command must advance the receipt without
+                // touching documents, artifacts, indexes or visibility state.
+                if (opts.raft_applied_entry_marker) |identity| {
+                    var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
+                    try self.core.store.putBatch(&.{raftAppliedEntryWrite(identity, &marker_buf)}, &.{});
+                }
+                self.core.unlockApply();
+                apply_mutex_held = false;
+                return;
+            }
+        };
+
+        if (req.merge_artifacts.len > 0) {
+            if (!req.merge_replication.?.identity_namespace.eql(self.core.identity_namespace))
+                return error.DocIdentityNamespaceMismatch;
+            for (req.merge_artifacts) |row| {
+                const owner = (try internal_keys.decodeDocumentComponentAlloc(self.alloc, row.key)) orelse
+                    return error.InvalidBatchRequest;
+                defer self.alloc.free(owner);
+                if (!self.core.byteRange().contains(owner)) return error.KeyOutOfRange;
             }
         }
 
@@ -7451,7 +7549,7 @@ pub const DB = struct {
             identity_visibility_deletes.deinit(self.alloc);
         }
 
-        const batch_timestamp_ns = if (effective_req.timestamp_ns != 0) effective_req.timestamp_ns else currentTimeNs();
+        const batch_timestamp_ns = if (effective_req.timestamp_ns != 0) effective_req.timestamp_ns else self.backend_runtime.clock().nowRealtimeNs();
 
         for (effective_req.writes, 0..) |write, i| {
             if (isMetadataKey(write.key)) {
@@ -7638,6 +7736,10 @@ pub const DB = struct {
         }
 
         try store_writes.appendSlice(self.alloc, timestamp_writes.items);
+        for (req.merge_artifacts) |row| {
+            try store_writes.append(self.alloc, .{ .key = row.key, .value = row.value });
+            try appendUniqueOwnedKeyIndexed(self.alloc, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, row.key);
+        }
         for (explicit_embedding_artifact_writes.items) |write| {
             try store_writes.append(self.alloc, .{
                 .key = write.key,
@@ -7738,7 +7840,7 @@ pub const DB = struct {
             }
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.precompute_generated_ns, precompute_generated_start_ns);
         }
-        if (explicit_embedding_artifact_writes.items.len > 0 or
+        if (req.merge_artifacts.len > 0 or explicit_embedding_artifact_writes.items.len > 0 or
             explicit_graph_artifact_writes.items.len > 0 or
             precomputed_generated.artifact_writes.len > 0)
         {
@@ -7934,6 +8036,10 @@ pub const DB = struct {
         }
         var split_range_value: ?[]u8 = null;
         defer if (split_range_value) |value| self.alloc.free(value);
+        var merge_range_value: ?[]u8 = null;
+        defer if (merge_range_value) |value| self.alloc.free(value);
+        var merge_state_value = std.ArrayListUnmanaged(u8).empty;
+        defer merge_state_value.deinit(self.alloc);
         var split_sequence_buf: [8]u8 = undefined;
         var split_marker_buf: [4 * @sizeOf(u64) + 1]u8 = undefined;
         var persisted_range: ?types.ByteRange = null;
@@ -7974,6 +8080,43 @@ pub const DB = struct {
                     .bootstrap_complete = checkpoint.kind == .destination_complete,
                 }, &split_marker_buf),
             });
+        }
+        if (req.merge_checkpoint) |checkpoint| {
+            if (checkpoint.receiver_identity_reassignment_namespace) |namespace| {
+                if (!checkpoint.allow_doc_identity_reassignment or
+                    !self.core.identity_namespace.eql(namespace))
+                    return error.DocIdentityNamespaceMismatch;
+            } else if (checkpoint.allow_doc_identity_reassignment) {
+                return error.InvalidBatchRequest;
+            }
+            const existing_raw = try merge_state_mod.loadRawAlloc(self.alloc, self.core.store);
+            defer if (existing_raw) |value| self.alloc.free(value);
+            var existing_state: ?merge_state_mod.State = if (existing_raw) |value|
+                try merge_state_mod.decodeAlloc(self.alloc, value)
+            else
+                null;
+            defer if (existing_state) |*state| state.deinit(self.alloc);
+            const plan = try merge_state_mod.planCheckpointApply(
+                self.alloc,
+                if (existing_state) |*state| state else null,
+                self.core.byteRange(),
+                checkpoint,
+            );
+            defer plan.deinit(self.alloc);
+            persisted_range = plan.range;
+            persisted_range_start_owned = try self.alloc.dupe(u8, plan.range.start);
+            persisted_range_end_owned = try self.alloc.dupe(u8, plan.range.end);
+            merge_range_value = try range_state_mod.encodeRangeAlloc(self.alloc, plan.range);
+            try store_writes.append(self.alloc, .{
+                .key = range_state_mod.range_key,
+                .value = merge_range_value.?,
+            });
+            try merge_state_mod.encode(&merge_state_value, self.alloc, plan.state);
+            try store_writes.append(self.alloc, .{
+                .key = merge_state_mod.key,
+                .value = merge_state_value.items,
+            });
+            try delete_keys.append(self.alloc, merge_state_mod.legacy_key);
         }
         try appendDenseArtifactCounterMutations(
             self.alloc,
@@ -8087,7 +8230,7 @@ pub const DB = struct {
             } else if (append_derived_replay) deferred_ha_gates.append(try appendHAReplayPayloadCommitLockedContext(&ha_ctx, replay_payload));
         }
         if (pending_identity_visibility_summary) |summary| {
-            self.identity_visibility_summary_cache = summary;
+            self.core.identity_visibility.summary = summary;
             self.clearLiveDocSetCache();
             self.clearNonVisibleDocSetCache();
         }
@@ -8298,7 +8441,7 @@ pub const DB = struct {
         if (!try self.primaryUserNamespaceIsEmptyLocked()) return;
         if (try doc_identity.loadAllNewTrustedStateForNamespace(self.core.store, self.core.identity_namespace)) |state| {
             self.bulk_ingest_identity_state = state;
-            self.identity_visibility_summary_cache = state.visibility_summary;
+            self.core.identity_visibility.summary = state.visibility_summary;
             self.clearLiveDocSetCache();
             self.clearNonVisibleDocSetCache();
             self.bulk_ingest_identity_all_new = true;
@@ -9028,7 +9171,7 @@ pub const DB = struct {
         if (builtin.is_test and test_block_generated_artifact_finalization.load(.acquire)) {
             test_generated_artifact_finalization_entered.store(true, .release);
             while (!test_release_generated_artifact_finalization.load(.acquire)) {
-                std.Thread.yield() catch {};
+                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
         }
         try finalizeRetiredIndexCleanupContext(ctx, index_name, cleanup_key);
@@ -14425,8 +14568,9 @@ pub const DB = struct {
 
     test "rollback action required atomically retires activation certification" {
         const alloc = std.testing.allocator;
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
 
         var db = try DB.open(alloc, std.mem.span(path), .{
@@ -17023,7 +17167,10 @@ pub const DB = struct {
 
         const shadow_index_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ shadow_indexes_path, cfg.name });
         defer alloc.free(shadow_index_path);
-        if (!resume_candidate and cfg.kind == .algebraic) try ensureDirPath(shadow_index_path);
+        // Generation manifests belong to the repair owner. Storage backends
+        // may keep index data in a separate namespace and need not create
+        // this filesystem directory as a side effect of opening an index.
+        try ensureDirPath(shadow_index_path);
         const shadow_checkpoint_path = try std.fmt.allocPrint(alloc, "{s}/applied-sequences", .{shadow_base});
         defer alloc.free(shadow_checkpoint_path);
         if (options.capacity_check) |check| try check.bindCandidateRoot(shadow_base);
@@ -17057,8 +17204,11 @@ pub const DB = struct {
             }
         }
 
+        // Detached index entries are adopted by the serving manager. Their
+        // mutexes, configs and runtime objects must share its allocator, even
+        // when this repair was requested through a short-lived HTTP arena.
         var shadow_manager = try index_manager_mod.IndexManager.initWithOptions(
-            alloc,
+            self.core.index_manager.alloc,
             shadow_base,
             self.index_backends,
         );
@@ -17551,7 +17701,7 @@ pub const DB = struct {
         if (durable_repair_id) |repair_id| try self.validateIndexRepairActivationState(alloc, repair_id, options.owner_epoch);
         try ensureRepairActivationDeadline(activation_deadline_ns);
         const previous_active_pointer = try self.core.index_manager.captureActiveIndexRootPointer(cfg.name);
-        defer if (previous_active_pointer) |value| alloc.free(value);
+        defer if (previous_active_pointer) |value| self.core.index_manager.alloc.free(value);
         try ensureRepairActivationDeadline(activation_deadline_ns);
         if (durable_repair_id) |repair_id| try self.updateIndexRepairIntent(alloc, repair_id, .{
             .phase = .activating,
@@ -18680,13 +18830,25 @@ pub const DB = struct {
             .range_start = shadow_start,
             .range_end = shadow_end,
         };
+        if (self.transaction_recovery_local_context) |ctx| {
+            ctx.split_shadow = self.shadow;
+        }
     }
 
     pub fn closeShadowIndexManager(self: *DB) !void {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
+        lockApply(self);
+        defer self.core.unlockApply();
+        try self.closeShadowIndexManagerLocked();
+    }
+
+    fn closeShadowIndexManagerLocked(self: *DB) !void {
         const shadow = self.shadow orelse return;
+        if (self.transaction_recovery_local_context) |ctx| {
+            ctx.split_shadow = null;
+        }
         shadow.manager.deinit();
         self.alloc.destroy(shadow.manager);
         self.alloc.free(shadow.base_path);
@@ -18780,9 +18942,11 @@ pub const DB = struct {
                 // reconciliation round trip, while waiting after the global
                 // barrier closes would deadlock its eventual publication.
                 error.EnrichmentRetryInProgress => {
-                    const now_ns = platform_time.monotonicNs();
+                    const wait_clock = self.backend_runtime.monotonicClock();
+                    const now_ns = wait_clock.nowRealtimeNs();
                     if (now_ns >= deadline_ns) return error.EnrichmentWaitTimeout;
-                    sleepNs(@min(25 * std.time.ns_per_ms, deadline_ns - now_ns));
+                    const sleep_ns = @min(25 * std.time.ns_per_ms, deadline_ns - now_ns);
+                    wait_clock.sleepMs(@max(1, @divTrunc(sleep_ns +| std.time.ns_per_ms - 1, std.time.ns_per_ms)));
                     continue;
                 },
                 else => return err,
@@ -19129,6 +19293,203 @@ pub const DB = struct {
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.index_manager.syncAll(force);
+    }
+
+    /// Raw primary outcomes for a transition snapshot. Do not use public scan
+    /// projection here: it can hydrate derived fields into the returned JSON.
+    pub fn mergeDocumentsPage(self: *DB, alloc: Allocator, byte_range: types.ByteRange, after_key: ?[]const u8) ![]types.BatchWrite {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        const lower = if (after_key) |key| try internal_keys.documentKeyAlloc(alloc, key) else try documentRangeLowerAlloc(alloc, byte_range.start);
+        defer alloc.free(lower);
+        const upper = if (byte_range.end.len > 0) try documentRangeUpperAlloc(alloc, byte_range.end) else null;
+        defer if (upper) |key| alloc.free(key);
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        cursor.setUpperBound(upper);
+        var rows = std.ArrayListUnmanaged(types.BatchWrite).empty;
+        errdefer {
+            for (rows.items) |row| {
+                alloc.free(row.key);
+                alloc.free(row.value);
+            }
+            rows.deinit(alloc);
+        }
+        var bytes: usize = 0;
+        var next = try cursor.seekAtOrAfter(lower);
+        while (next) |row| : (next = try cursor.next()) {
+            if (upper) |bound| if (std.mem.order(u8, row.key, bound) != .lt) break;
+            if (!internal_keys.isPrimaryDocumentKey(row.key)) continue;
+            const key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, row.key)).?;
+            errdefer alloc.free(key);
+            if (after_key) |after| if (std.mem.order(u8, key, after) != .gt) {
+                alloc.free(key);
+                continue;
+            };
+            const value = try alloc.dupe(u8, row.value);
+            errdefer alloc.free(value);
+            try rows.append(alloc, .{ .key = key, .value = value });
+            bytes +|= key.len +| value.len;
+            if (rows.items.len >= 128 or bytes >= 1024 * 1024) break;
+        }
+        return rows.toOwnedSlice(alloc);
+    }
+
+    /// Returns a bounded page of authoritative artifacts under a transition
+    /// lease. The continuation is an exclusive physical store key. One large
+    /// row may exceed the byte budget so pagination always makes progress.
+    pub fn mergeArtifactsPage(
+        self: *DB,
+        alloc: Allocator,
+        byte_range: types.ByteRange,
+        after_key: ?[]const u8,
+    ) ![]types.BatchWrite {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        const lower = try documentRangeLowerAlloc(alloc, byte_range.start);
+        defer alloc.free(lower);
+        const upper = if (byte_range.end.len > 0) try documentRangeUpperAlloc(alloc, byte_range.end) else null;
+        defer if (upper) |key| alloc.free(key);
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        cursor.setUpperBound(upper);
+        var rows = std.ArrayListUnmanaged(types.BatchWrite).empty;
+        errdefer {
+            for (rows.items) |row| {
+                alloc.free(row.key);
+                alloc.free(row.value);
+            }
+            rows.deinit(alloc);
+        }
+        var bytes: usize = 0;
+        var next = try cursor.seekAtOrAfter(after_key orelse lower);
+        while (next) |row| : (next = try cursor.next()) {
+            if (upper) |bound| if (std.mem.order(u8, row.key, bound) != .lt) break;
+            if (after_key) |key| if (std.mem.order(u8, row.key, key) != .gt) continue;
+            if (!isMergeArtifactKey(row.key)) continue;
+            const value = if (internal_keys.isGraphEdgeArtifactKey(row.key)) graph: {
+                const edge = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(alloc, row.key)) orelse return error.InvalidBatchRequest;
+                defer {
+                    alloc.free(edge.doc_key);
+                    alloc.free(edge.index_name);
+                    alloc.free(edge.edge_type);
+                    alloc.free(edge.target_doc_key);
+                }
+                const index = self.core.index_manager.graphIndex(edge.index_name) orelse continue;
+                var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, row.value);
+                defer decoded.deinit(alloc);
+                if (enrichment_artifact_codec.isLegacyUnboundGraphEdge(row.value)) continue;
+                if (decoded.generation != index.config.coverage_generation and
+                    !enrichment_artifact_codec.isPortableUnboundGraphEdge(row.value)) continue;
+                // Authenticate against the donor generation, then mark the
+                // edge portable. Receiver replay binds its own generation;
+                // copying the donor generation would silently discard it.
+                break :graph try enrichment_artifact_codec.encodePortableUnboundGraphEdgeAlloc(
+                    alloc,
+                    decoded.weight,
+                    decoded.created_at,
+                    decoded.updated_at,
+                    decoded.metadata_json,
+                );
+            } else try alloc.dupe(u8, row.value);
+            errdefer alloc.free(value);
+            const key = try alloc.dupe(u8, row.key);
+            errdefer alloc.free(key);
+            try rows.append(alloc, .{ .key = key, .value = value });
+            bytes +|= key.len +| value.len;
+            if (rows.items.len >= 128 or bytes >= 1024 * 1024) break;
+        }
+        return rows.toOwnedSlice(alloc);
+    }
+
+    /// Imports donor-owned derived artifacts into a live merge receiver while
+    /// both DBs are protected by transition leases. Primary documents are
+    /// copied separately from the authoritative Raft apply projection.
+    ///
+    /// The Raft apply projection used by range coordination deliberately stores
+    /// only primary documents. It therefore cannot reconstruct stripped inputs
+    /// such as `_edges` or explicit embeddings by itself. Copy the authoritative
+    /// document-scoped store rows and live graph projection before cutover so a
+    /// successful merge cannot publish primary data with incomplete indexes.
+    pub fn importMergeRangeFromTransitionDonor(
+        self: *DB,
+        donor: *DB,
+        byte_range: types.ByteRange,
+    ) !void {
+        if (self == donor or std.mem.eql(u8, self.core.path, donor.core.path))
+            return error.InvalidArgument;
+
+        // Transition activity prevents new public writes. The DB apply locks
+        // additionally give this copy one coherent donor view and keep index
+        // mutation atomic with respect to receiver maintenance. Order by path
+        // so independently initiated transitions cannot invert these locks.
+        const donor_first = std.mem.order(u8, donor.core.path, self.core.path) == .lt;
+        if (donor_first) {
+            donor.core.lockApplyShared();
+            self.core.lockApply();
+        } else {
+            self.core.lockApply();
+            donor.core.lockApplyShared();
+        }
+        defer if (donor_first) {
+            self.core.unlockApply();
+            donor.core.unlockApplyShared();
+        } else {
+            donor.core.unlockApplyShared();
+            self.core.unlockApply();
+        };
+
+        const store_lower = try documentRangeLowerAlloc(self.alloc, byte_range.start);
+        defer self.alloc.free(store_lower);
+        const store_upper = if (byte_range.end.len > 0)
+            try documentRangeUpperAlloc(self.alloc, byte_range.end)
+        else
+            null;
+        defer if (store_upper) |key| self.alloc.free(key);
+        const donor_rows = try donor.core.scanStoreRange(
+            self.alloc,
+            store_lower,
+            if (store_upper) |key| key else "",
+        );
+        defer docstore_mod.DocStore.freeResults(self.alloc, donor_rows);
+
+        var derived_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+        defer derived_writes.deinit(self.alloc);
+        for (donor_rows) |row| {
+            if (!internal_keys.isGraphEdgeArtifactKey(row.key) and
+                !internal_keys.isEmbeddingArtifactKey(row.key) and
+                !internal_keys.isDerivedEmbeddingArtifactKey(row.key)) continue;
+            try derived_writes.append(self.alloc, .{ .key = row.key, .value = row.value });
+        }
+        if (derived_writes.items.len > 0) {
+            const raw_writes: []const docstore_mod.KVPair = @ptrCast(derived_writes.items);
+            try self.core.store.putBatch(raw_writes, &.{});
+            try applySplitEmbeddingArtifactsFromBatch(
+                self.core.store,
+                self.core.index_manager,
+                derived_writes.items,
+                &.{},
+                &.{},
+            );
+        }
+        _ = try self.core.index_manager.copyGraphSplitDestinationFrom(
+            donor.core.index_manager,
+            byte_range.start,
+            byte_range.end,
+        );
+        try applySplitGraphArtifactsInRange(
+            self.alloc,
+            byte_range.start,
+            byte_range.end,
+            self.core.store,
+            self.core.index_manager,
+        );
+        try self.core.index_manager.syncAll(true);
+        try self.core.syncStore(true);
     }
 
     fn restoreSnapshotStoreTo(
@@ -21854,6 +22215,16 @@ pub const DB = struct {
         return try self.admitManagedIndex(cfg);
     }
 
+    /// VOPR-only preparation seam for a committed managed catalog admission
+    /// whose durable outbox has not yet been materialized. This exposes the
+    /// same crash boundary used by production recovery without pausing while
+    /// an apply or structural lock is held.
+    pub fn prepareManagedIndexAdmissionForVopr(self: *DB, cfg: types.IndexConfig) !void {
+        if (!builtin.is_test) return error.VoprTestSeamUnavailable;
+        const installed = try self.installIndexWhileEnrichmentQuiesced(cfg, .managed);
+        if (!installed.managed_admission_pending) return error.InvalidManagedIndexAdmission;
+    }
+
     pub fn addEnrichment(self: *DB, cfg: types.EnrichmentConfig) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var ha_mutation = self.acquireHAMutationShared();
@@ -23509,6 +23880,7 @@ pub const DB = struct {
         const wait = derived_executor_mod.VisibilityWait{
             .cancellation = cancellation,
             .deadline_ns = deadline_ns,
+            .clock = self.backend_runtime.monotonicClock(),
         };
         var stable_target = sequence;
         while (true) {
@@ -23774,7 +24146,6 @@ pub const DB = struct {
     }
 
     const quarantine_retry_poll_ns: u64 = 10 * std.time.ns_per_s;
-    const quarantine_retry_sleep_slice_ns: u64 = 25 * std.time.ns_per_ms;
     const artifact_repair_metadata_poll_ns: u64 = 5 * std.time.ns_per_s;
     const artifact_repair_metadata_active_poll_ns: u64 = 100 * std.time.ns_per_ms;
     const artifact_repair_metadata_sleep_slice_ns: u64 = 25 * std.time.ns_per_ms;
@@ -23789,9 +24160,9 @@ pub const DB = struct {
         if (!self.start_index_workers) return;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return;
         if (self.artifact_repair_metadata_future != null) return;
-        const io_impl = self.backend_runtime.io_impl orelse return;
+        const io = self.backend_runtime.io() orelse return;
         self.artifact_repair_metadata_stop.store(false, .release);
-        self.artifact_repair_metadata_future = io_impl.io().concurrent(artifactRepairMetadataWorkerMain, .{self}) catch |err| {
+        self.artifact_repair_metadata_future = io.concurrent(artifactRepairMetadataWorkerMain, .{self}) catch |err| {
             std.log.warn("artifact repair metadata worker spawn failed: {}", .{err});
             return;
         };
@@ -23800,18 +24171,19 @@ pub const DB = struct {
     fn stopArtifactRepairMetadataWorker(self: *DB) void {
         self.artifact_repair_metadata_stop.store(true, .release);
         if (self.artifact_repair_metadata_future) |*future| {
-            if (self.backend_runtime.io_impl) |io_impl| {
-                _ = future.await(io_impl.io());
+            if (self.backend_runtime.io()) |io| {
+                _ = future.await(io);
             }
             self.artifact_repair_metadata_future = null;
         }
     }
 
     fn sleepArtifactRepairMetadataWorker(self: *DB, target_ns: u64) bool {
+        const io = self.backend_runtime.io() orelse return false;
         var slept: u64 = 0;
         while (slept < target_ns) : (slept += artifact_repair_metadata_sleep_slice_ns) {
             if (self.artifact_repair_metadata_stop.load(.acquire)) return false;
-            sleepNs(artifact_repair_metadata_sleep_slice_ns);
+            io.sleep(.fromNanoseconds(artifact_repair_metadata_sleep_slice_ns), .awake) catch return false;
         }
         return !self.artifact_repair_metadata_stop.load(.acquire);
     }
@@ -23829,7 +24201,7 @@ pub const DB = struct {
     }
 
     /// Start only after the DB has reached its final address. The spawned
-    /// thread retains `self` after this call returns.
+    /// task retains `self` after this call returns.
     pub fn startQuarantineRetryWorkerIfNeeded(self: *DB) void {
         // Tests drive retries deterministically via retryQuarantinedIndexLoads;
         // a background worker racing them turns every quarantine-shaped test
@@ -23842,9 +24214,12 @@ pub const DB = struct {
         }
         if (comptime builtin.single_threaded or builtin.os.tag == .freestanding) return;
         if (!self.optional_runtime_workers_enabled or self.open_mode != .writer) return;
-        if (self.quarantine_retry_thread != null) return;
+        if (self.quarantine_retry_future != null) return;
         if (!self.core.index_manager.hasLoadFailures()) return;
-        self.quarantine_retry_thread = std.Thread.spawn(.{}, quarantineRetryWorkerMain, .{self}) catch |err| {
+        const io = self.backend_runtime.io() orelse return;
+        self.quarantine_retry_stop.store(false, .release);
+        self.quarantine_retry_stop_event.reset();
+        self.quarantine_retry_future = io.concurrent(quarantineRetryWorkerMain, .{self}) catch |err| {
             // Self-healing is best-effort: the quarantine still recovers on
             // the next open or via drop+recreate.
             std.log.warn("quarantine retry worker spawn failed: {}", .{err});
@@ -23862,18 +24237,28 @@ pub const DB = struct {
 
     fn stopQuarantineRetryWorker(self: *DB) void {
         self.quarantine_retry_stop.store(true, .release);
-        if (self.quarantine_retry_thread) |thread| {
-            thread.join();
-            self.quarantine_retry_thread = null;
+        if (self.quarantine_retry_future) |*future| {
+            const io = self.backend_runtime.io().?;
+            self.quarantine_retry_stop_event.set(io);
+            future.await(io);
+            self.quarantine_retry_future = null;
         }
     }
 
     fn quarantineRetryWorkerMain(self: *DB) void {
+        const io = self.backend_runtime.io().?;
         while (true) {
-            var slept: u64 = 0;
-            while (slept < quarantine_retry_poll_ns) : (slept += quarantine_retry_sleep_slice_ns) {
-                if (self.quarantine_retry_stop.load(.acquire)) return;
-                sleepNs(quarantine_retry_sleep_slice_ns);
+            const deadline_ns = std.Io.Clock.awake.now(io).toNanoseconds() +| quarantine_retry_poll_ns;
+            while (!self.quarantine_retry_stop.load(.acquire)) {
+                const now_ns = std.Io.Clock.awake.now(io).toNanoseconds();
+                if (now_ns >= deadline_ns) break;
+                self.quarantine_retry_stop_event.waitTimeout(io, .{ .duration = .{
+                    .raw = .fromNanoseconds(deadline_ns - now_ns),
+                    .clock = .awake,
+                } }) catch |err| switch (err) {
+                    error.Timeout => {},
+                    error.Canceled => return,
+                };
             }
             if (self.quarantine_retry_stop.load(.acquire)) return;
             const result = self.retryQuarantinedIndexLoads(false) catch |err| {
@@ -26109,10 +26494,12 @@ pub const DB = struct {
         else
             default_visibility_wait_timeout_ms;
         const timeout_ns = std.math.mul(u64, timeout_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
-        const deadline_ns = platform_time.monotonicNs() +| timeout_ns;
+        const visibility_clock = self.backend_runtime.monotonicClock();
+        const deadline_ns = visibility_clock.nowRealtimeNs() +| timeout_ns;
         const wait = derived_executor_mod.VisibilityWait{
             .cancellation = cancellation,
             .deadline_ns = deadline_ns,
+            .clock = visibility_clock,
         };
         switch (sync_level) {
             .propose, .write => try self.executor.failIfUnhealthy(),
@@ -27248,7 +27635,7 @@ pub const DB = struct {
         // being overlaid, so refresh the maintained O(1) identity summary at
         // the same apply-lock boundary before publishing live counters.
         var identity_stats = try doc_identity.fastStatsFromStore(self.core.store);
-        applyCachedIdentityVisibilitySummary(&identity_stats, self.identity_visibility_summary_cache);
+        applyCachedIdentityVisibilitySummary(&identity_stats, self.core.identity_visibility.summary);
         runtime_stats.source_doc_count = identity_stats.live_ordinals;
         runtime_stats.doc_identity = dbDocIdentityStats(identity_stats, self.core.identity_namespace);
         try self.hydrateDerivedCoverageIdentities(stats_alloc, runtime_stats.indexes);
@@ -27523,7 +27910,7 @@ pub const DB = struct {
 
     fn currentIdentityReadGeneration(self: *DB) !u64 {
         var current_generation = self.core.nextDerivedSequence();
-        if (self.identity_visibility_summary_cache) |summary| {
+        if (self.core.identity_visibility.summary) |summary| {
             return @max(current_generation, doc_identity.latestGenerationFromSummary(summary));
         }
         if (try doc_identity.latestGenerationFromSummaryFast(self.core.store)) |identity_generation| {
@@ -27540,7 +27927,7 @@ pub const DB = struct {
     }
 
     fn snapshotVisibilityStats(self: *DB) types.VisibilityStats {
-        return self.visibility_runtime_stats.snapshot(self.nonvisible_doc_set_cache_entries.load(.monotonic));
+        return self.visibility_runtime_stats.snapshot(self.core.identity_visibility.nonvisible_entries.load(.monotonic));
     }
 
     const DocIdentityCoverage = struct {
@@ -27588,7 +27975,7 @@ pub const DB = struct {
         // previous durable summary until the bulk window is published. Runtime
         // owners must publish the maintained live summary rather than making
         // status wait for a flush or fall back to a primary scan.
-        applyCachedIdentityVisibilitySummary(&raw_identity_stats, self.identity_visibility_summary_cache);
+        applyCachedIdentityVisibilitySummary(&raw_identity_stats, self.core.identity_visibility.summary);
         const identity_stats = dbDocIdentityStats(raw_identity_stats, self.core.identity_namespace);
         // Operational status is polled frequently. Identity metadata is the
         // normal O(1) source of the live document count; retain the legacy
@@ -29788,10 +30175,10 @@ pub const DB = struct {
         exec_ctx: types.ExecutionContext,
     ) !planning_stats_mod.PlanningStatsSummary {
         _ = exec_ctx;
-        try planning_bindings_mod.validateSearchRequestBindings(&self.core, self.alloc, req);
+        try planning_bindings_mod.validateSearchRequestBindings(self.core, self.alloc, req);
         return try planning_adapter_mod.collectSearchRequestStatsAlloc(
             alloc,
-            &self.core,
+            self.core,
             self,
             planningStatsSearchRequestCallback,
             req,
@@ -30161,10 +30548,10 @@ pub const DB = struct {
             return try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, &all_set, generation);
         };
         {
-            lockAtomic(&self.live_doc_set_cache_mutex);
-            defer self.live_doc_set_cache_mutex.unlock();
-            if (self.live_doc_set_cache_generation == gen) {
-                if (self.live_doc_set_cache_set) |*cached| {
+            lockAtomic(&self.core.identity_visibility.live_mutex);
+            defer self.core.identity_visibility.live_mutex.unlock();
+            if (self.core.identity_visibility.live_generation == gen) {
+                if (self.core.identity_visibility.live_set) |*cached| {
                     return try doc_set.cloneAlloc(alloc, cached);
                 }
             }
@@ -30172,11 +30559,11 @@ pub const DB = struct {
         var computed = try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, &all_set, generation);
         errdefer computed.deinit(alloc);
         if (doc_set.cloneAlloc(self.alloc, &computed)) |cloned| {
-            lockAtomic(&self.live_doc_set_cache_mutex);
-            defer self.live_doc_set_cache_mutex.unlock();
-            if (self.live_doc_set_cache_set) |*old| old.deinit(self.alloc);
-            self.live_doc_set_cache_set = cloned;
-            self.live_doc_set_cache_generation = gen;
+            lockAtomic(&self.core.identity_visibility.live_mutex);
+            defer self.core.identity_visibility.live_mutex.unlock();
+            if (self.core.identity_visibility.live_set) |*old| old.deinit(self.alloc);
+            self.core.identity_visibility.live_set = cloned;
+            self.core.identity_visibility.live_generation = gen;
         } else |_| {
             // Caching is best-effort; the computed set is still returned.
         }
@@ -30208,14 +30595,14 @@ pub const DB = struct {
             );
         };
         {
-            lockAtomic(&self.nonvisible_doc_set_cache_mutex);
-            defer self.nonvisible_doc_set_cache_mutex.unlock();
-            if (self.nonvisible_doc_set_cache_generation == gen) {
-                if (self.nonvisible_doc_set_cache_overflow) {
+            lockAtomic(&self.core.identity_visibility.nonvisible_mutex);
+            defer self.core.identity_visibility.nonvisible_mutex.unlock();
+            if (self.core.identity_visibility.nonvisible_generation == gen) {
+                if (self.core.identity_visibility.nonvisible_overflow) {
                     self.visibility_runtime_stats.recordCacheHit();
                     return null;
                 }
-                if (self.nonvisible_doc_set_cache_set) |*cached| {
+                if (self.core.identity_visibility.nonvisible_set) |*cached| {
                     self.visibility_runtime_stats.recordCacheHit();
                     return try doc_set.cloneAlloc(alloc, cached);
                 }
@@ -30234,25 +30621,25 @@ pub const DB = struct {
             // Overflow (more non-visible docs than the budget) is also worth
             // remembering, so each query does not rescan before falling back
             // to the include-set path.
-            lockAtomic(&self.nonvisible_doc_set_cache_mutex);
-            defer self.nonvisible_doc_set_cache_mutex.unlock();
-            if (self.nonvisible_doc_set_cache_set) |*old| old.deinit(self.alloc);
-            self.nonvisible_doc_set_cache_set = null;
-            self.nonvisible_doc_set_cache_generation = gen;
-            self.nonvisible_doc_set_cache_overflow = true;
-            self.nonvisible_doc_set_cache_entries.store(0, .monotonic);
+            lockAtomic(&self.core.identity_visibility.nonvisible_mutex);
+            defer self.core.identity_visibility.nonvisible_mutex.unlock();
+            if (self.core.identity_visibility.nonvisible_set) |*old| old.deinit(self.alloc);
+            self.core.identity_visibility.nonvisible_set = null;
+            self.core.identity_visibility.nonvisible_generation = gen;
+            self.core.identity_visibility.nonvisible_overflow = true;
+            self.core.identity_visibility.nonvisible_entries.store(0, .monotonic);
             return null;
         };
         self.visibility_runtime_stats.recordBuild(platform_time.monotonicNs() -| build_start_ns);
         errdefer computed.deinit(alloc);
         if (doc_set.cloneAlloc(self.alloc, &computed)) |cloned| {
-            lockAtomic(&self.nonvisible_doc_set_cache_mutex);
-            defer self.nonvisible_doc_set_cache_mutex.unlock();
-            if (self.nonvisible_doc_set_cache_set) |*old| old.deinit(self.alloc);
-            self.nonvisible_doc_set_cache_set = cloned;
-            self.nonvisible_doc_set_cache_generation = gen;
-            self.nonvisible_doc_set_cache_overflow = false;
-            self.nonvisible_doc_set_cache_entries.store(1, .monotonic);
+            lockAtomic(&self.core.identity_visibility.nonvisible_mutex);
+            defer self.core.identity_visibility.nonvisible_mutex.unlock();
+            if (self.core.identity_visibility.nonvisible_set) |*old| old.deinit(self.alloc);
+            self.core.identity_visibility.nonvisible_set = cloned;
+            self.core.identity_visibility.nonvisible_generation = gen;
+            self.core.identity_visibility.nonvisible_overflow = false;
+            self.core.identity_visibility.nonvisible_entries.store(1, .monotonic);
         } else |_| {
             // Caching is best-effort; the computed set is still returned.
         }
@@ -30326,7 +30713,7 @@ pub const DB = struct {
     }
 
     fn allDocsVisibleSummaryFastMaybe(self: *DB, generation: ?u64) !?bool {
-        if (self.identity_visibility_summary_cache) |summary| {
+        if (self.core.identity_visibility.summary) |summary| {
             return doc_identity.allVisibleFromSummary(summary, generation);
         }
         return try doc_identity.allVisibleFromSummaryFast(self.core.store, generation);
@@ -31318,10 +31705,45 @@ pub const DB = struct {
             if (spins < 64) {
                 std.atomic.spinLoopHint();
             } else {
-                std.Thread.yield() catch {};
+                @import("antfly_platform").time.yieldNow();
             }
         }
         return true;
+    }
+
+    /// Nonblocking production-protocol microsteps used by VOPR. They expose
+    /// the lock-free reader/catalog-writer admission state machine without
+    /// copying the protocol into a test model or parking a deterministic
+    /// executor on native atomic waits.
+    pub fn beginPublishedDenseCaptureForVopr(self: *DB, index_name: []const u8) bool {
+        if (!builtin.is_test) return false;
+        if (!self.beginPublishedDenseSearch()) return false;
+        if (self.core.denseIndex(index_name) == null) {
+            self.endPublishedDenseSearch();
+            return false;
+        }
+        return true;
+    }
+
+    pub fn endPublishedDenseCaptureForVopr(self: *DB) void {
+        if (!builtin.is_test) return;
+        self.endPublishedDenseSearch();
+    }
+
+    pub fn beginIndexCatalogBarrierForVopr(self: *DB) bool {
+        if (!builtin.is_test) return false;
+        const previous = self.published_dense_admission.fetchOr(published_dense_catalog_closed, .acq_rel);
+        return previous & published_dense_catalog_closed == 0;
+    }
+
+    pub fn indexCatalogBarrierDrainedForVopr(self: *const DB) bool {
+        if (!builtin.is_test) return false;
+        return self.indexCatalogBarrierActive() and self.publishedDenseSearchCount() == 0;
+    }
+
+    pub fn endIndexCatalogBarrierForVopr(self: *DB) void {
+        if (!builtin.is_test) return;
+        self.endIndexCatalogBarrier();
     }
 
     fn endIndexCatalogBarrier(self: *DB) void {
@@ -31345,7 +31767,7 @@ pub const DB = struct {
             if (spins < 64) {
                 std.atomic.spinLoopHint();
             } else {
-                std.Thread.yield() catch {};
+                @import("antfly_platform").time.yieldNow();
             }
         }
         return true;
@@ -31498,7 +31920,7 @@ pub const DB = struct {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         if (builtin.is_test and test_block_match_all_ordinal_lookup.load(.acquire)) {
             test_match_all_ordinal_lookup_entered.store(true, .release);
-            while (!test_release_match_all_ordinal_lookup.load(.acquire)) std.Thread.yield() catch {};
+            while (!test_release_match_all_ordinal_lookup.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
         return try self.lookupLiveDocOrdinalNoLock(alloc, doc_id, generation);
     }
@@ -33316,6 +33738,12 @@ fn isMetadataKey(key: []const u8) bool {
         internal_keys.isTtlKey(key);
 }
 
+fn isMergeArtifactKey(key: []const u8) bool {
+    return internal_keys.isGraphEdgeArtifactKey(key) or
+        internal_keys.isEmbeddingArtifactKey(key) or
+        internal_keys.isDerivedEmbeddingArtifactKey(key);
+}
+
 fn isPrimaryDocumentStoreKey(key: []const u8) bool {
     return internal_keys.isPrimaryDocumentKey(key);
 }
@@ -33507,6 +33935,10 @@ fn encodeThinReplayRecordPayload(
 
     for (changed_artifact_keys) |key| {
         try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, key);
+        if (internal_keys.isEmbeddingArtifactKey(key) or internal_keys.isDerivedEmbeddingArtifactKey(key)) {
+            try appendUniqueReplayRecordHint(alloc, &target_hints, .dense_vector);
+            try appendUniqueReplayRecordHint(alloc, &target_hints, .sparse_vector);
+        }
         if (internal_keys.isChunkArtifactRecordKey(key)) try appendUniqueReplayRecordHint(alloc, &target_hints, .full_text);
         if (internal_keys.isGraphEdgeArtifactKey(key) or internal_keys.isAssetArtifactKey(key) or internal_keys.isChunkArtifactRecordKey(key)) try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
         if (internal_keys.isAssetArtifactKey(key)) {
@@ -33882,7 +34314,7 @@ fn remoteRenderConfig(
             config.remote_content = db.remote_content;
         }
         if (comptime @hasField(template_remote.RenderConfig, "io")) {
-            config.io = db.backend_runtime.inferenceIo();
+            config.io = db.backend_runtime.inferenceIo() orelse db.backend_runtime.io();
         }
     }
     if (comptime @hasField(template_remote.RenderConfig, "max_media_parts")) {
@@ -40777,7 +41209,7 @@ fn checkLookupOptionsActive(opts: types.LookupOptions) !void {
         if (cancellation.isCancelled()) return error.Cancelled;
     }
     if (opts.execution_deadline_ns) |deadline_ns| {
-        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        if (opts.executionNowNs() >= deadline_ns) return error.Timeout;
     }
 }
 
@@ -41730,13 +42162,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
         .payload = replay_payload,
     });
     if (pending_identity_visibility_summary) |summary| {
-        if (ctx.identity_visibility_owner_slot) |slot| {
-            if (slot.load(.acquire)) |owner| {
-                owner.identity_visibility_summary_cache = summary;
-                owner.clearLiveDocSetCache();
-                owner.clearNonVisibleDocSetCache();
-            }
-        }
+        if (ctx.identity_visibility) |visibility| visibility.publish(summary);
     }
     var deferred_ha_gates = HADeferredCommitGates.begin(ctx);
     defer deferred_ha_gates.releaseTransition();
@@ -42972,8 +43398,8 @@ test "external dense bulk waiter owns admission across catch-up handoff" {
         }
     };
     var waiter = Waiter{ .ctx = &ctx };
-    const waiter_thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
-    defer waiter_thread.join();
+    var waiter_thread = try std.testing.io.concurrent(Waiter.run, .{&waiter});
+    defer waiter_thread.await(std.testing.io);
 
     const wait_deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
     while (ctx.waiting_external_dense_bulk_sessions.load(.acquire) == 0) {
@@ -43028,8 +43454,9 @@ test "async context dense catch-up session finish is idempotent when already clo
 test "dense target advance is not blocked by local catch-up session" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -43066,8 +43493,9 @@ test "dense target advance is not blocked by local catch-up session" {
 test "dense target advance is blocked while external bulk session is active" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -43261,8 +43689,9 @@ fn publishResolutionHandoffContextWithSink(
 test "db resolution handoff completion publishes fanout in one metadata batch" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -43319,14 +43748,17 @@ test "storage.ha resolution handoff fence rejects completion after durable HA re
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.heap.c_allocator;
-    var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
+    var db_path_tmp = try TestDirectory.init("db");
+    defer db_path_tmp.cleanup();
+    const db_path = db_path_tmp.path().ptr;
     defer cleanupTempDir(db_path);
-    var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
+    var ha_log_path_tmp = try TestDirectory.init("db");
+    defer ha_log_path_tmp.cleanup();
+    const ha_log_path = ha_log_path_tmp.path().ptr;
     defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    var ha_slots_path_tmp = try TestDirectory.init("db");
+    defer ha_slots_path_tmp.cleanup();
+    const ha_slots_path = ha_slots_path_tmp.path().ptr;
     defer cleanupTempDir(ha_slots_path);
 
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
@@ -43406,11 +43838,11 @@ test "storage.ha resolution handoff fence rejects completion after durable HA re
         .resolution_key = resolution_key,
         .pause = &pause,
     };
-    const thread = try std.Thread.spawn(.{}, WriteProbe.run, .{&probe});
+    var thread = try std.testing.io.concurrent(WriteProbe.run, .{&probe});
     var thread_joined = false;
     errdefer {
         pause.release.set(pause.io);
-        if (!thread_joined) thread.join();
+        if (!thread_joined) thread.await(std.testing.io);
     }
 
     pause.reached.waitUncancelable(pause.io);
@@ -43431,7 +43863,7 @@ test "storage.ha resolution handoff fence rejects completion after durable HA re
     public_gate.publishPrimaryFence(true);
     pause.release.set(pause.io);
     transition_mutex.unlock();
-    thread.join();
+    thread.await(std.testing.io);
     thread_joined = true;
 
     try std.testing.expectEqual(@as(u8, 1), probe.result.load(.acquire));
@@ -50965,7 +51397,13 @@ fn startAsyncWorkers(self: *DB) !void {
 }
 
 fn applyDerivedBatchToShadowIfNeeded(self: *DB, batch: derived_types.DerivedBatch) !void {
-    const shadow = self.shadow orelse return;
+    // Recovery runs through a stable heap owner whose wrapper fields were
+    // captured during open. Split ownership is mutable, so recovery reads the
+    // shared context updated by the serving wrapper under this same apply lock.
+    const shadow = if (self.transaction_recovery_local_context) |ctx|
+        ctx.split_shadow orelse return
+    else
+        self.shadow orelse return;
     const state = self.core.splitState() orelse return;
     if (state.phase != .splitting) return;
 
@@ -51265,7 +51703,7 @@ fn rebaseRangeCoverageMetadata(
     try store.putBatch(writes.items, &.{});
 }
 
-fn finalizePrimarySplitPreservingIdentity(
+fn finalizePrimarySplitPreservingMetadata(
     self: *DB,
     split_lower: []const u8,
     retained_range: types.ByteRange,
@@ -51274,6 +51712,7 @@ fn finalizePrimarySplitPreservingIdentity(
     const identity_rows = try self.core.store.scanRange(self.alloc, range.lower[0..], range.upper[0..]);
     defer docstore_mod.DocStore.freeResults(self.alloc, identity_rows);
 
+    try merge_state_mod.protectForSplit(self.alloc, self.core.store);
     _ = try tryFinalizePrimarySplitFast(self, split_lower);
     try putIdentityMetadataRows(self.alloc, self.core.store, identity_rows);
     try rebaseRangeCoverageMetadata(
@@ -51290,6 +51729,7 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
     const split_lower = try documentRangeLowerAlloc(self.alloc, byte_range.start);
     defer self.alloc.free(split_lower);
 
+    try merge_state_mod.protectForSplit(self.alloc, self.core.store);
     const page_split_built = try tryPreparePrimarySplitFast(self, split_lower, dest_dir);
 
     var opened_dest_store = try openSplitDestinationStore(self, dest_dir);
@@ -52132,7 +52572,7 @@ fn finalizeSplitLocked(self: *DB, new_range: types.ByteRange) !void {
     const split_lower = try documentRangeLowerAlloc(self.alloc, split_state.split_key);
     defer self.alloc.free(split_lower);
     try markSplitOffDocumentArtifactChildRangesLocked(self, split_state, split_lower);
-    try finalizePrimarySplitPreservingIdentity(self, split_lower, new_range);
+    try finalizePrimarySplitPreservingMetadata(self, split_lower, new_range);
     try ensureReplayFloor(self.core.store, replay_floor);
     try self.core.pruneSplitRangeFromPrimaryIndexes(split_state.split_key, split_state.original_range_end);
     try self.rebaseManagedIndexAppliedSequencesIfNeeded();
@@ -52145,7 +52585,7 @@ fn finalizeSplitLocked(self: *DB, new_range: types.ByteRange) !void {
 
     try self.core.finalizeSplitState();
     try self.refreshManagedIndexWorkersLocked();
-    try self.closeShadowIndexManager();
+    try self.closeShadowIndexManagerLocked();
     try self.refreshManagedIndexWorkersLocked();
 }
 
@@ -52301,7 +52741,12 @@ fn clearSystemMetadataFromSplitDestination(alloc: Allocator, dest_store: *docsto
     // The destination owns an independent Raft log. A physical page split can
     // copy the source's higher applied index; retaining it would suppress valid
     // low-index entries in the new group.
-    try dest_store.putBatch(&.{}, &.{internal_keys.raft_document_applied_entry_key[0..]});
+    // A destination prepared from an older layout must not inherit the
+    // parent's merge ownership or retired-transition fences either.
+    try dest_store.putBatch(&.{}, &.{
+        internal_keys.raft_document_applied_entry_key[0..],
+        merge_state_mod.legacy_key,
+    });
 }
 
 fn ensureReplayFloor(store: *docstore_mod.DocStore, next_sequence: u64) !void {
@@ -53851,7 +54296,13 @@ fn resolveRecoveredLocalTransaction(
     status: transactions_mod.TxnStatus,
     commit_version: u64,
 ) anyerror!void {
-    const db: *DB = @ptrCast(@alignCast(ctx));
+    const local_ctx: *TransactionRecoveryLocalContext = @ptrCast(@alignCast(ctx));
+    const db = local_ctx.stable_owner orelse return error.TransactionRecoveryOwnerUnbound;
+    const io = db.backend_runtime.io() orelse return error.MissingBackendRuntimeIo;
+    try local_ctx.provider_mutex.lock(io);
+    defer local_ctx.provider_mutex.unlock(io);
+    db.enrichment_runtime = db.async_context.enrichment_runtime;
+    defer db.enrichment_runtime = null;
     try db.resolveTransactionIntentsWithSyncLevel(txn_id, status, commit_version, .propose);
 }
 
@@ -53902,15 +54353,6 @@ fn allocStressDenseDocJson(alloc: Allocator, dims: usize, doc_index: usize) ![]u
     const owned = try alloc.dupe(u8, out.items);
     out.deinit(alloc);
     return owned;
-}
-
-fn tempPath(buf: []u8) [*:0]const u8 {
-    const base = "/tmp/antfly-db-test-";
-    const ts = monotonicTimeNs();
-    const pid: u32 = @intCast(std.posix.system.getpid());
-    const nonce = @atomicRmw(u64, &temp_path_nonce, .Add, 1, .monotonic);
-    const path = std.fmt.bufPrint(buf, "{s}{d}-{d}-{d}\x00", .{ base, pid, ts, nonce }) catch unreachable;
-    return @ptrCast(path.ptr);
 }
 
 fn denseTestVectorId(doc_key: []const u8) u64 {
@@ -54220,8 +54662,9 @@ fn putSparseEmbeddingArtifactForTest(
 test "db vector indexes combine direct document and chunk-backed artifact sources" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -54831,6 +55274,7 @@ const GateSparseEmbedder = struct {
 
 const DbSplitSimAction = db_split_sim_fixture.Action;
 const DbSplitSimDocSpec = db_split_sim_fixture.DocSpec;
+pub const VoprSplitAction = DbSplitSimAction;
 const db_split_sim_index_name = "ft_v1";
 const db_split_sim_split_key = "doc:m";
 
@@ -54840,7 +55284,7 @@ const DbSplitTerm = enum {
     gamma,
 };
 
-const DbSplitSimSummary = struct {
+pub const VoprSplitSummary = struct {
     source_doc_count: u32 = 0,
     dest_doc_count: u32 = 0,
     source_alpha_hits: u32 = 0,
@@ -54850,6 +55294,7 @@ const DbSplitSimSummary = struct {
     dest_beta_hits: u32 = 0,
     dest_gamma_hits: u32 = 0,
 };
+const DbSplitSimSummary = VoprSplitSummary;
 
 const DbSplitExpectedDoc = struct {
     side: enum { source, dest },
@@ -54961,7 +55406,7 @@ const DbSplitSimRuntime = struct {
         }
 
         if (!self.split_complete) {
-            try applyDbSplitWritesToDb(&self.source_db.?, writes);
+            try applyDbSplitWritesToDb(self.alloc, &self.source_db.?, writes);
             return;
         }
 
@@ -54993,6 +55438,89 @@ const DbSplitSimRuntime = struct {
     }
 };
 
+/// Live DB split seam for the common VOPR adapter. The harness owns the real
+/// DBs and their shared ModeledDevice; the adapter owns exploration policy.
+pub const VoprSplitHarness = struct {
+    alloc: Allocator,
+    source_directory: TestDirectory,
+    dest_directory: TestDirectory,
+    source_path: [*:0]const u8,
+    dest_path: [*:0]const u8,
+    modeled_device: storage_sim.ModeledDevice,
+    open_options: OpenOptions,
+    runtime: DbSplitSimRuntime,
+    runtime_open: bool,
+    actions: std.ArrayListUnmanaged(VoprSplitAction) = .empty,
+    recovered_summary: VoprSplitSummary = .{},
+    recovered: bool = false,
+
+    pub fn init(alloc: Allocator) !*VoprSplitHarness {
+        const self = try alloc.create(VoprSplitHarness);
+        errdefer alloc.destroy(self);
+        self.alloc = alloc;
+        self.source_directory = try TestDirectory.init("source");
+        errdefer self.source_directory.cleanup();
+        self.dest_directory = try TestDirectory.init("destination");
+        errdefer self.dest_directory.cleanup();
+        self.source_path = self.source_directory.path().ptr;
+        self.dest_path = self.dest_directory.path().ptr;
+        try ensureDirPath(std.mem.span(self.source_path));
+        try ensureDirPath(std.mem.span(self.dest_path));
+        self.modeled_device = storage_sim.ModeledDevice.init(alloc);
+        errdefer self.modeled_device.deinit();
+        try prepareModeledDbSplitRoot(&self.modeled_device, std.mem.span(self.source_path));
+        try prepareModeledDbSplitRoot(&self.modeled_device, std.mem.span(self.dest_path));
+        self.open_options = dbSplitModeledOpenOptions(&self.modeled_device);
+        self.runtime = try DbSplitSimRuntime.initWithOptions(alloc, self.source_path, self.dest_path, self.open_options);
+        self.runtime_open = true;
+        self.actions = .empty;
+        self.recovered_summary = .{};
+        self.recovered = false;
+        return self;
+    }
+
+    pub fn deinit(self: *VoprSplitHarness) void {
+        if (self.runtime_open) self.runtime.deinit();
+        self.actions.deinit(self.alloc);
+        self.modeled_device.deinit();
+        self.source_directory.cleanup();
+        self.dest_directory.cleanup();
+        const alloc = self.alloc;
+        self.* = undefined;
+        alloc.destroy(self);
+    }
+
+    pub fn apply(self: *VoprSplitHarness, action: VoprSplitAction) !void {
+        try self.runtime.applyAction(action, self.actions.items.len);
+        try self.actions.append(self.alloc, action);
+    }
+
+    pub fn crashAndRecover(self: *VoprSplitHarness) !void {
+        self.runtime.deinit();
+        self.runtime_open = false;
+        try self.modeled_device.device().crash();
+        self.recovered_summary = try summarizeDbSplitPathsWithOptions(
+            self.alloc,
+            self.source_path,
+            self.dest_path,
+            self.open_options,
+        );
+        self.recovered = true;
+    }
+
+    pub fn summary(self: *VoprSplitHarness) !VoprSplitSummary {
+        return if (self.recovered) self.recovered_summary else self.runtime.summary(self.alloc);
+    }
+
+    pub fn expected(self: *const VoprSplitHarness) !VoprSplitSummary {
+        return expectedDbSplitSummaryAlloc(self.alloc, self.actions.items);
+    }
+
+    pub fn splitComplete(self: *const VoprSplitHarness) bool {
+        return if (self.recovered) true else self.runtime.split_complete;
+    }
+};
+
 fn summarizeDbSplitDatabases(alloc: Allocator, source_db: *DB, dest_db: ?*DB) !DbSplitSimSummary {
     const source_text = source_db.core.textIndex(db_split_sim_index_name).?;
     const source_snapshot = source_text.snapshot();
@@ -55013,11 +55541,11 @@ fn summarizeDbSplitDatabases(alloc: Allocator, source_db: *DB, dest_db: ?*DB) !D
     };
 }
 
-fn applyDbSplitWritesToDb(db: *DB, writes: []const DbSplitOwnedWrite) !void {
+fn applyDbSplitWritesToDb(alloc: Allocator, db: *DB, writes: []const DbSplitOwnedWrite) !void {
     var batch_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
-    defer batch_writes.deinit(std.testing.allocator);
+    defer batch_writes.deinit(alloc);
     for (writes) |write| {
-        try batch_writes.append(std.testing.allocator, .{
+        try batch_writes.append(alloc, .{
             .key = write.key,
             .value = write.value,
         });
@@ -55057,8 +55585,12 @@ fn dbSplitWrite(alloc: Allocator, prefix: []const u8, step: usize, term: []const
 }
 
 fn expectedDbSplitSummary(actions: []const DbSplitSimAction) !DbSplitSimSummary {
+    return expectedDbSplitSummaryAlloc(std.testing.allocator, actions);
+}
+
+fn expectedDbSplitSummaryAlloc(alloc: Allocator, actions: []const DbSplitSimAction) !DbSplitSimSummary {
     var docs = std.StringHashMapUnmanaged(DbSplitExpectedDoc).empty;
-    defer docs.deinit(std.testing.allocator);
+    defer docs.deinit(alloc);
 
     var split_complete = false;
     for (actions, 0..) |action, step| {
@@ -55073,16 +55605,16 @@ fn expectedDbSplitSummary(actions: []const DbSplitSimAction) !DbSplitSimSummary 
                 }
             },
             .add_doc => |spec| {
-                const writes = try buildDbSplitWrites(std.testing.allocator, spec, step);
+                const writes = try buildDbSplitWrites(alloc, spec, step);
                 defer {
-                    for (writes) |*write| write.deinit(std.testing.allocator);
-                    std.testing.allocator.free(writes);
+                    for (writes) |*write| write.deinit(alloc);
+                    alloc.free(writes);
                 }
 
                 for (writes) |write| {
-                    const gop = try docs.getOrPut(std.testing.allocator, write.key);
+                    const gop = try docs.getOrPut(alloc, write.key);
                     if (!gop.found_existing) {
-                        gop.key_ptr.* = try std.testing.allocator.dupe(u8, write.key);
+                        gop.key_ptr.* = try alloc.dupe(u8, write.key);
                     }
                     gop.value_ptr.* = .{
                         .side = if (split_complete and std.mem.order(u8, write.key, db_split_sim_split_key) != .lt) .dest else .source,
@@ -55117,7 +55649,7 @@ fn expectedDbSplitSummary(actions: []const DbSplitSimAction) !DbSplitSimSummary 
     }
 
     var cleanup_it = docs.keyIterator();
-    while (cleanup_it.next()) |key| std.testing.allocator.free(key.*);
+    while (cleanup_it.next()) |key| alloc.free(key.*);
     return summary;
 }
 
@@ -55268,10 +55800,12 @@ fn reportReducedDbSplitSchedule(
         case_label: []const u8,
 
         pub fn replay(self: @This(), candidate: []const DbSplitSimAction) !void {
-            var source_path_buf: [256]u8 = undefined;
-            var dest_path_buf: [256]u8 = undefined;
-            const source_path = tempPath(&source_path_buf);
-            const dest_path = tempPath(&dest_path_buf);
+            var source_path_tmp = try TestDirectory.init("db");
+            defer source_path_tmp.cleanup();
+            var dest_path_tmp = try TestDirectory.init("db");
+            defer dest_path_tmp.cleanup();
+            const source_path = source_path_tmp.path().ptr;
+            const dest_path = dest_path_tmp.path().ptr;
             defer cleanupTempDir(source_path);
             defer cleanupTempDir(dest_path);
             const actual = try replayDbSplitActionsAtPaths(self.alloc, source_path, dest_path, candidate);
@@ -55358,6 +55892,21 @@ fn dbSplitModeledOpenOptions(modeled_device: *storage_sim.ModeledDevice) OpenOpt
     };
 }
 
+fn prepareModeledDbSplitRoot(modeled_device: *storage_sim.ModeledDevice, path: []const u8) !void {
+    try ensureDirPath(path);
+    // The fixture's parent already exists outside the simulated database
+    // lifecycle. Represent all of its ancestors as durable before DB.open,
+    // just as the model previously did implicitly for the top-level /tmp.
+    const storage = modeled_device.storage();
+    var parent = std.fs.path.dirname(path) orelse return;
+    try storage.createDirPath(parent);
+    while (std.fs.path.dirname(parent)) |ancestor| {
+        try storage.syncParentAbsolute(parent);
+        if (std.mem.eql(u8, parent, ancestor)) break;
+        parent = ancestor;
+    }
+}
+
 fn runDbSplitReplayCase(
     alloc: Allocator,
     case_label: []const u8,
@@ -55367,10 +55916,12 @@ fn runDbSplitReplayCase(
     const actions = try buildDbSplitReplayActions(alloc, seed, steps);
     defer alloc.free(actions);
 
-    var source_path_buf: [256]u8 = undefined;
-    var dest_path_buf: [256]u8 = undefined;
-    const source_path = tempPath(&source_path_buf);
-    const dest_path = tempPath(&dest_path_buf);
+    var source_path_tmp = try TestDirectory.init("db");
+    defer source_path_tmp.cleanup();
+    var dest_path_tmp = try TestDirectory.init("db");
+    defer dest_path_tmp.cleanup();
+    const source_path = source_path_tmp.path().ptr;
+    const dest_path = dest_path_tmp.path().ptr;
     defer cleanupTempDir(source_path);
     defer cleanupTempDir(dest_path);
 
@@ -55397,14 +55948,16 @@ fn runModeledDbSplitReplayCase(
     defer modeled_device.deinit();
     const open_options = dbSplitModeledOpenOptions(&modeled_device);
 
-    var source_path_buf: [256]u8 = undefined;
-    var dest_path_buf: [256]u8 = undefined;
-    const source_path = tempPath(&source_path_buf);
-    const dest_path = tempPath(&dest_path_buf);
+    var source_path_tmp = try TestDirectory.init("db");
+    defer source_path_tmp.cleanup();
+    var dest_path_tmp = try TestDirectory.init("db");
+    defer dest_path_tmp.cleanup();
+    const source_path = source_path_tmp.path().ptr;
+    const dest_path = dest_path_tmp.path().ptr;
     defer cleanupTempDir(source_path);
     defer cleanupTempDir(dest_path);
-    try ensureDirPath(std.mem.span(source_path));
-    try ensureDirPath(std.mem.span(dest_path));
+    try prepareModeledDbSplitRoot(&modeled_device, std.mem.span(source_path));
+    try prepareModeledDbSplitRoot(&modeled_device, std.mem.span(dest_path));
 
     const actual = try replayDbSplitActionsAtPathsWithOptions(
         alloc,
@@ -55465,10 +56018,12 @@ fn runDbSplitReplayFixtures(alloc: Allocator) !void {
         defer fixture.deinit(alloc);
 
         const fixture_name = fixture.case_label orelse fixture.label orelse fixture_rel_path;
-        var source_path_buf: [256]u8 = undefined;
-        var dest_path_buf: [256]u8 = undefined;
-        const source_path = tempPath(&source_path_buf);
-        const dest_path = tempPath(&dest_path_buf);
+        var source_path_tmp = try TestDirectory.init("db");
+        defer source_path_tmp.cleanup();
+        var dest_path_tmp = try TestDirectory.init("db");
+        defer dest_path_tmp.cleanup();
+        const source_path = source_path_tmp.path().ptr;
+        const dest_path = dest_path_tmp.path().ptr;
         defer cleanupTempDir(source_path);
         defer cleanupTempDir(dest_path);
 
@@ -55517,14 +56072,16 @@ fn runModeledDbSplitReplayFixtures(alloc: Allocator) !void {
         defer modeled_device.deinit();
         const open_options = dbSplitModeledOpenOptions(&modeled_device);
 
-        var source_path_buf: [256]u8 = undefined;
-        var dest_path_buf: [256]u8 = undefined;
-        const source_path = tempPath(&source_path_buf);
-        const dest_path = tempPath(&dest_path_buf);
+        var source_path_tmp = try TestDirectory.init("db");
+        defer source_path_tmp.cleanup();
+        var dest_path_tmp = try TestDirectory.init("db");
+        defer dest_path_tmp.cleanup();
+        const source_path = source_path_tmp.path().ptr;
+        const dest_path = dest_path_tmp.path().ptr;
         defer cleanupTempDir(source_path);
         defer cleanupTempDir(dest_path);
-        try ensureDirPath(std.mem.span(source_path));
-        try ensureDirPath(std.mem.span(dest_path));
+        try prepareModeledDbSplitRoot(&modeled_device, std.mem.span(source_path));
+        try prepareModeledDbSplitRoot(&modeled_device, std.mem.span(dest_path));
 
         const actual = try replayDbSplitActionsAtPathsWithOptions(
             alloc,
@@ -55575,10 +56132,12 @@ test "db split sim reopen-heavy workload stays green" {
 test "db split full keeps subsequent left-side source writes searchable" {
     const alloc = std.testing.allocator;
 
-    var source_path_buf: [256]u8 = undefined;
-    var dest_path_buf: [256]u8 = undefined;
-    const source_path = tempPath(&source_path_buf);
-    const dest_path = tempPath(&dest_path_buf);
+    var source_path_tmp = try TestDirectory.init("db");
+    defer source_path_tmp.cleanup();
+    var dest_path_tmp = try TestDirectory.init("db");
+    defer dest_path_tmp.cleanup();
+    const source_path = source_path_tmp.path().ptr;
+    const dest_path = dest_path_tmp.path().ptr;
     defer cleanupTempDir(source_path);
     defer cleanupTempDir(dest_path);
 
@@ -55628,8 +56187,9 @@ test "db split modeled sim workloads stay green" {
 test "db batch get match_all search and index registry" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -55672,8 +56232,9 @@ test "db batch get match_all search and index registry" {
 test "db match_all consumes resolved ordinal filter" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -55717,12 +56278,213 @@ test "db match_all consumes resolved ordinal filter" {
     try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
 }
 
+test "db native document filters preserve paged totals across representations" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+    try db.addIndex(.{ .name = "sp_v1", .kind = .sparse_vector, .config_json = "{\"field\":\"sparse\"}" });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha\",\"embedding\":[0,0],\"sparse\":{\"indices\":[1],\"values\":[5]}}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"alpha alpha\",\"embedding\":[1,0],\"sparse\":{\"indices\":[1],\"values\":[4]}}" },
+            .{ .key = "doc:c", .value = "{\"body\":\"alpha alpha alpha\",\"embedding\":[2,0],\"sparse\":{\"indices\":[1],\"values\":[3]}}" },
+            .{ .key = "doc:d", .value = "{\"body\":\"alpha alpha alpha alpha\",\"embedding\":[3,0],\"sparse\":{\"indices\":[1],\"values\":[2]}}" },
+            .{ .key = "doc:e", .value = "{\"body\":\"alpha\",\"embedding\":[4,0],\"sparse\":{\"indices\":[1],\"values\":[1]}}" },
+        },
+        .sync_level = .full_index,
+    });
+    const ids: []const []const u8 = &.{ "doc:a", "doc:b", "doc:c", "doc:d" };
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try db.resolveDocSetForIdsAlloc(alloc, ids),
+        .exclude = .none,
+    };
+    defer filter.deinit(alloc);
+    filter.exclude = try db.resolveDocSetForIdsAlloc(alloc, &.{"doc:d"});
+
+    const Shape = enum { match_all, full_text, dense, sparse, primary_store };
+    for (std.enums.values(Shape)) |shape| {
+        if (shape == .primary_store) try std.testing.expect(try db.deleteIndex("ft_v1"));
+        for ([_]types.SearchRequest{
+            .{ .limit = 1 },
+            .{ .limit = 1, .offset = 1 },
+            .{ .limit = 10 },
+            .{ .limit = 1, .offset = 10 },
+            .{ .limit = 1, .count_only = true },
+        }) |page| {
+            // Count-only text collectors omit hit materialization. The primary
+            // store and vector paths leave count-only response shaping to the API.
+            if (page.count_only and shape != .match_all and shape != .full_text) continue;
+            errdefer std.debug.print("shape={s} limit={d} offset={d} count_only={}\n", .{ @tagName(shape), page.limit, page.offset, page.count_only });
+            var req = page;
+            req.include_stored = false;
+            req.query = .{ .match_all = {} };
+            switch (shape) {
+                .match_all, .primary_store => {},
+                .full_text => req.full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+                .dense => {
+                    req.index_name = "dv_v1";
+                    req.dense = .{ .vector = &.{ 0, 0 }, .k = 10 };
+                },
+                .sparse => {
+                    req.index_name = "sp_v1";
+                    req.query = .{ .sparse_knn = .{ .indices = &.{1}, .values = &.{1}, .k = 10 } };
+                },
+            }
+            req.filter_doc_ids = ids;
+            req.filter_doc_ids_positive = true;
+            req.exclude_doc_ids = &.{"doc:d"};
+            var public = try db.search(alloc, req);
+            defer public.deinit();
+            req.filter_doc_ids = &.{};
+            req.filter_doc_ids_positive = false;
+            req.exclude_doc_ids = &.{};
+            req.resolved_doc_filter = &filter;
+            var ordinal = try db.search(alloc, req);
+            defer ordinal.deinit();
+
+            // The native engine counted all three matches before paging. Neither
+            // their representation nor an empty result page changes that count.
+            try std.testing.expectEqual(@as(u32, 3), public.total_hits);
+            try std.testing.expectEqual(types.TotalHitsRelation.exact, public.total_hits_relation);
+            try std.testing.expectEqual(public.total_hits, ordinal.total_hits);
+            try std.testing.expectEqual(public.total_hits_relation, ordinal.total_hits_relation);
+            const expected_page_len: usize = if (page.count_only) 0 else @min(page.limit, 3 -| page.offset);
+            try std.testing.expectEqual(expected_page_len, public.hits.len);
+            try std.testing.expectEqual(public.hits.len, ordinal.hits.len);
+            for (public.hits, ordinal.hits) |expected, actual| {
+                try std.testing.expectEqualStrings(expected.id, actual.id);
+                try std.testing.expectEqual(expected.doc_ordinal, actual.doc_ordinal);
+                try std.testing.expect(!std.mem.eql(u8, actual.id, "doc:d"));
+                try std.testing.expect(!std.mem.eql(u8, actual.id, "doc:e"));
+            }
+        }
+    }
+}
+
+test "db dense filter hydration only looks up required hit ordinals" {
+    const alloc = std.testing.allocator;
+    const Harness = struct {
+        db: DB,
+        lookup_calls: usize = 0,
+        seen_generation: ?u64 = null,
+
+        fn lookup(ctx: ?*anyopaque, allocator: Allocator, index_name: []const u8, vector_ids: []const u64, generation: ?u64) anyerror![]?doc_set.DocOrdinal {
+            const db: *DB = @ptrCast(@alignCast(ctx.?));
+            const self: *@This() = @fieldParentPtr("db", db);
+            self.lookup_calls += 1;
+            self.seen_generation = generation;
+            return try DB.denseOrdinalsForVectorIdsCallback(ctx, allocator, index_name, vector_ids, generation);
+        }
+    };
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var harness = Harness{ .db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false }) };
+    defer harness.db.close();
+    const db = &harness.db;
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha\",\"category\":\"keep\",\"embedding\":[0,0]}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"beta\",\"category\":\"reject\",\"embedding\":[1,0]}" },
+            .{ .key = "doc:c", .value = "{\"body\":\"alpha\",\"category\":\"keep\",\"embedding\":[2,0]}" },
+        },
+        .sync_level = .full_index,
+    });
+    var filter = doc_set.ResolvedDocFilter{ .include = try db.resolveDocSetForIdsAlloc(alloc, &.{ "doc:a", "doc:c" }) };
+    defer filter.deinit(alloc);
+    const generation = try db.currentIdentityReadGenerationForRequest(null);
+    // Exercise the real native collector and post-processor, counting the batch
+    // identity read separately from the identity work that admits candidates.
+    const executor = db_query_search.DenseSearchExecutor{
+        .ctx = db,
+        .text_index_entry = DB.textIndexEntryCallback,
+        .dense_index = DB.denseIndexCallback,
+        .lookup_doc_key = DB.denseDocKeyCallback,
+        .resolve_hit_key = DB.resolveDenseHitKeyCallback,
+        .lookup_vector_id = DB.denseVectorIdCallback,
+        .lookup_vector_ids_for_ordinals = DB.denseVectorIdsForOrdinalsCallback,
+        .all_docs_visible_fast = DB.allDocsVisibleFastCallback,
+        .lookup_doc_ordinal = DB.lookupLiveDocOrdinalNoLockCallback,
+        .lookup_doc_ordinals = DB.lookupLiveDocOrdinalsNoLockCallback,
+        .lookup_doc_ordinals_for_vector_ids = Harness.lookup,
+        .resolve_doc_set_doc_ids = DB.resolveDocSetDocIdsCallback,
+        .resolve_doc_ids_to_doc_set = DB.resolveDocIdsToDocSetCallback,
+        .live_filter_doc_set = DB.liveFilterDocSetCallback,
+        .nonvisible_doc_set = DB.nonVisibleDocSetCallback,
+        .load_projected_document = DB.loadRequiredProjectedSearchDocumentCallback,
+        .hbc_search = DB.hbcSearchCallback,
+        .hbc_search_profiled = DB.hbcSearchProfiledCallback,
+        .exact_dense_search = DB.exactDenseSearchCallback,
+        .postprocess = DB.postprocessVectorSearchResultCallback,
+    };
+    const Case = struct { req: types.SearchRequest, lookups: usize, without_text_index: bool = false };
+    var removed_text_index = false;
+    for ([_]Case{
+        .{ .req = .{ .filter_text = .{ .match = .{ .field = "body", .text = "alpha" } } }, .lookups = 0 },
+        .{ .req = .{ .exclusion_text = .{ .match = .{ .field = "body", .text = "beta" } } }, .lookups = 0 },
+        .{ .req = .{ .filter_query_json = "{\"doc_id\":[\"doc:a\",\"doc:c\"]}" }, .lookups = 0 },
+        .{ .req = .{ .exclusion_query_json = "{\"doc_id\":[\"doc:b\"]}" }, .lookups = 0 },
+        .{ .req = .{ .filter_doc_ids = &.{ "doc:a", "doc:c" }, .filter_doc_ids_positive = true }, .lookups = 1 },
+        .{ .req = .{ .exclude_doc_ids = &.{"doc:b"} }, .lookups = 1 },
+        .{ .req = .{ .resolved_doc_filter = &filter }, .lookups = 1 },
+        // Mix native ID constraints with residual stored predicates in both
+        // positions. Removing resolved predicates must preserve hydration when
+        // either remaining predicate still needs hit identity.
+        .{ .req = .{ .filter_query_json = "{\"term\":{\"category\":\"keep\"}}", .exclusion_query_json = "{\"doc_id\":[\"doc:b\"]}" }, .lookups = 1, .without_text_index = true },
+        .{ .req = .{ .filter_query_json = "{\"doc_id\":[\"doc:a\",\"doc:c\"]}", .exclusion_query_json = "{\"term\":{\"category\":\"reject\"}}" }, .lookups = 1, .without_text_index = true },
+    }, 0..) |case, i| {
+        errdefer std.debug.print("dense hydration case={d}\n", .{i});
+        if (case.without_text_index and !removed_text_index) {
+            try std.testing.expect(try db.deleteIndex("ft_v1"));
+            removed_text_index = true;
+        }
+        var req = case.req;
+        req.index_name = "dv_v1";
+        req.primary_text_index_name = if (removed_text_index) null else "ft_v1";
+        req.identity_read_generation = generation;
+        req.include_stored = false;
+        req.limit = 10;
+        harness.lookup_calls = 0;
+        harness.seen_generation = null;
+        var result = try db_query_search.searchDense(alloc, req, .{ .vector = &.{ 0, 0 }, .k = 10 }, executor);
+        defer result.deinit();
+        try std.testing.expectEqual(case.lookups, harness.lookup_calls);
+        try std.testing.expectEqual(@as(?u64, if (case.lookups == 0) null else generation), harness.seen_generation);
+        try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+        try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
+        try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+        try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+        try std.testing.expectEqualStrings("doc:c", result.hits[1].id);
+        if (case.lookups > 0) {
+            for (result.hits) |hit| try std.testing.expect(hit.doc_ordinal != null);
+        }
+    }
+}
+
 test "db stats report engine-owned algebraic adaptive observation status" {
     const alloc = std.testing.allocator;
     const algebraic_ir = @import("algebraic/ir.zig");
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const cfg =
@@ -55841,8 +56603,9 @@ test "db evaluates policy-gated algebraic adaptive candidates" {
     const alloc = std.testing.allocator;
     const algebraic_ir = @import("algebraic/ir.zig");
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
@@ -55954,12 +56717,14 @@ test "db open borrows shared backend runtime" {
     });
     defer runtime.deinit();
 
-    var first_path_buf: [256]u8 = undefined;
-    const first_path = tempPath(&first_path_buf);
+    var first_path_tmp = try TestDirectory.init("db");
+    defer first_path_tmp.cleanup();
+    const first_path = first_path_tmp.path().ptr;
     defer cleanupTempDir(first_path);
 
-    var second_path_buf: [256]u8 = undefined;
-    const second_path = tempPath(&second_path_buf);
+    var second_path_tmp = try TestDirectory.init("db");
+    defer second_path_tmp.cleanup();
+    const second_path = second_path_tmp.path().ptr;
     defer cleanupTempDir(second_path);
 
     var first = try DB.open(alloc, std.mem.span(first_path), .{
@@ -55998,8 +56763,9 @@ test "db close retires runtime owners for memory primary backend" {
     });
     defer runtime.deinit();
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -56032,10 +56798,145 @@ test "db close retires runtime owners for memory primary backend" {
     }));
 }
 
+test "db implicit batch timestamps use the borrowed runtime clock" {
+    const alloc = std.testing.allocator;
+    var vopr_io = try @import("vopr").vopr_io.VoprIo.init(.{ .realtime_ns = 7 * std.time.ns_per_s });
+    defer vopr_io.deinit();
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = vopr_io.io() },
+    });
+    defer runtime.deinit();
+    var directory = try TestDirectory.init("batch-clock");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{
+        .backend_runtime = runtime.ptr(),
+        .executor = .{ .backend = .manual },
+        .primary_backend = .{ .mem = .{} },
+        .physical_root_mode = .external_backend,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{}" }}, .sync_level = .write });
+    try std.testing.expectEqual(@as(u64, 7 * std.time.ns_per_s), try db.getTimestamp(alloc, "doc:a"));
+    vopr_io.realtime_ns += 3 * std.time.ns_per_s;
+    try db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = "{}" }}, .sync_level = .write });
+    try std.testing.expectEqual(@as(u64, 10 * std.time.ns_per_s), try db.getTimestamp(alloc, "doc:b"));
+    try db.batch(.{ .writes = &.{.{ .key = "doc:c", .value = "{}" }}, .timestamp_ns = 99, .sync_level = .write });
+    try std.testing.expectEqual(@as(u64, 99), try db.getTimestamp(alloc, "doc:c"));
+}
+
+test "background maintenance services lifecycle runs on borrowed VoprIo" {
+    const vopr = @import("vopr");
+    const alloc = std.testing.allocator;
+    var vopr_io = try vopr.vopr_io.VoprIo.init(.{
+        .required = .of(&.{ .clock_read, .task_scheduling, .synchronization, .sleep }),
+    });
+    defer vopr_io.deinit();
+    var backend_runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = vopr_io.io() },
+    });
+    defer backend_runtime.deinit();
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .backend_runtime = backend_runtime.ptr(),
+        .executor = .{ .backend = .manual },
+        .primary_backend = .{ .mem = .{} },
+        .physical_root_mode = .external_backend,
+        .start_index_workers = false,
+        .start_optional_runtimes = true,
+        .start_optional_runtime_workers = false,
+        .enrichment = .{ .enable_without_producers = true },
+    });
+    defer db.close();
+
+    const resources = db.core.batchExecutionResources();
+    var text_merge = try text_merge_runtime_mod.TextMergeRuntime.init(
+        alloc,
+        resources.index_manager,
+        resources.apply_mutex,
+        backend_runtime.ptr(),
+        .{ .enabled = true, .idle_interval_ms = 1 },
+    );
+    defer text_merge.deinit();
+    var sparse_compaction = try sparse_compaction_runtime_mod.SparseCompactionRuntime.init(
+        alloc,
+        resources.index_manager,
+        resources.apply_mutex,
+        backend_runtime.ptr(),
+        .{ .enabled = true, .idle_interval_ms = 1 },
+    );
+    defer sparse_compaction.deinit();
+
+    var lifecycle_ok = false;
+    const Lifecycle = struct {
+        fn cycle(runtime: anytype) bool {
+            runtime.start() catch return false;
+            if (!runtime.isStarted()) return false;
+            if (!runtime.pause()) return false;
+            if (runtime.isStarted()) return false;
+            runtime.resumeAfterPause() catch return false;
+            if (!runtime.isStarted()) return false;
+            if (!runtime.stop()) return false;
+            return !runtime.isStarted();
+        }
+
+        fn run(
+            database: *DB,
+            text: *text_merge_runtime_mod.TextMergeRuntime,
+            sparse: *sparse_compaction_runtime_mod.SparseCompactionRuntime,
+            passed: *bool,
+        ) void {
+            const enrichment = database.enrichment_runtime orelse return;
+            enrichment.start() catch return;
+            if (!enrichment.isStarted()) return;
+            enrichment.stop();
+            if (enrichment.isStarted()) return;
+
+            const resolution = database.resolution_runtime orelse return;
+            resolution.start() catch return;
+            if (!resolution.worker_started.load(.acquire)) return;
+            resolution.stop();
+            if (resolution.worker_started.load(.acquire)) return;
+
+            const promotion = database.promotion_runtime orelse return;
+            promotion.start() catch return;
+            if (!promotion.worker_started.load(.acquire)) return;
+            promotion.stop();
+            if (promotion.worker_started.load(.acquire)) return;
+
+            if (!cycle(text)) return;
+            if (!cycle(sparse)) return;
+            passed.* = true;
+        }
+    };
+    _ = vopr_io.io().async(Lifecycle.run, .{ &db, &text_merge, &sparse_compaction, &lifecycle_ok });
+    const scheduler = vopr_io.scheduler();
+    var enabled: vopr.transition.List = .{};
+    defer enabled.deinit(alloc);
+    var events: vopr.event.Sink = .{};
+    defer events.deinit(alloc);
+    while (!scheduler.quiescent()) {
+        enabled.items.clearRetainingCapacity();
+        try scheduler.enumerateReady(&enabled, alloc);
+        try enabled.canonicalize();
+        try std.testing.expect(enabled.items.items.len != 0);
+        try scheduler.executeReady(enabled.items.items[0].id, &events, alloc);
+    }
+    try std.testing.expect(lifecycle_ok);
+    try vopr_io.ensureNoCapabilityViolation();
+}
+
 test "db inherits the resource manager capacity source" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const CapacityContext = struct {
@@ -56088,8 +56989,9 @@ test "db open downgrades borrowed manual backend runtime to manual executor" {
     });
     defer runtime.deinit();
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -56104,8 +57006,9 @@ test "db open downgrades borrowed manual backend runtime to manual executor" {
 test "db open owns filesystem io for its manual backend runtime" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -56133,8 +57036,9 @@ test "db open rejects borrowed manual runtime without filesystem authority" {
     });
     defer runtime.deinit();
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     try std.testing.expectError(error.BackendRuntimeIoUnavailable, DB.open(alloc, std.mem.span(path), .{
@@ -56152,8 +57056,9 @@ test "db text merge enabled requires backend runtime io" {
     });
     defer runtime.deinit();
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     try std.testing.expectError(error.MissingBackendRuntimeIo, DB.open(alloc, std.mem.span(path), .{
@@ -56173,8 +57078,9 @@ test "db enrichment enabled requires backend runtime io" {
     defer runtime.deinit();
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     try std.testing.expectError(error.MissingBackendRuntimeIo, DB.open(alloc, std.mem.span(path), .{
@@ -56188,8 +57094,9 @@ test "db enrichment reconfigure preserves active runtime when replacement cannot
     const alloc = std.testing.allocator;
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -56213,8 +57120,9 @@ test "db enrichment reconfigure preserves active runtime when replacement cannot
 
 test "db enrichment reconfigure inherits resident execution and security capabilities" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var remote_content = scraping.RemoteContentConfig{
@@ -56238,8 +57146,9 @@ test "db enrichment reconfigure inherits resident execution and security capabil
 
 test "db enrichment reconfigure refreshes durable state after old worker joins" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var original_embedder = embedder_mod.DeterministicDenseEmbedder{};
@@ -56317,8 +57226,9 @@ test "db enrichment reconfigure refreshes durable state after old worker joins" 
 test "db enrichment restart supervisor recovers transient start failures" {
     const alloc = std.testing.allocator;
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -56350,8 +57260,9 @@ test "db enrichment restart supervisor recovers transient start failures" {
 test "db enrichment status does not wait for lifecycle mutation" {
     const alloc = std.testing.allocator;
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -56377,8 +57288,9 @@ test "db enrichment status does not wait for lifecycle mutation" {
 test "db runtime-only status overlay preserves a resident enrichment worker" {
     const alloc = std.testing.allocator;
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -56474,8 +57386,9 @@ test "db runtime-only status overlay preserves a resident enrichment worker" {
 
 test "runtime status best effort overlay cannot clear readiness under apply contention" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -56514,8 +57427,9 @@ test "db ttl cleanup enabled requires backend runtime io" {
     });
     defer runtime.deinit();
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     try std.testing.expectError(error.MissingBackendRuntimeIo, DB.open(alloc, std.mem.span(path), .{
@@ -56538,8 +57452,9 @@ test "db transaction recovery enabled requires backend runtime io" {
     });
     defer runtime.deinit();
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var resolver_ctx: u8 = 0;
@@ -56557,8 +57472,9 @@ test "db transaction recovery enabled requires backend runtime io" {
 test "db default primary backend survives reopen" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -56591,8 +57507,9 @@ test "db default primary backend survives reopen" {
 test "db basic batch/get works with memory primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -56616,8 +57533,9 @@ test "db basic batch/get works with memory primary backend" {
 test "db batch treats reserved namespace bytes as user document ids" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -56659,8 +57577,9 @@ test "db batch treats reserved namespace bytes as user document ids" {
 test "db batch and scan round trip adversarial document ids" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -56737,8 +57656,9 @@ test "db batch and scan round trip adversarial document ids" {
 test "db resolved doc-set projection honors identity read generation" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -56850,8 +57770,9 @@ test "db resolved doc-set projection honors identity read generation" {
 test "db persists configured doc identity namespace for batch writes" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 11, .range_id = 13 };
@@ -56898,8 +57819,9 @@ test "db persists configured doc identity namespace for batch writes" {
 test "db preferred identity namespace seeds new stores but preserves existing namespace" {
     const alloc = std.testing.allocator;
 
-    var managed_path_buf: [256]u8 = undefined;
-    const managed_path = tempPath(&managed_path_buf);
+    var managed_path_tmp = try TestDirectory.init("db");
+    defer managed_path_tmp.cleanup();
+    const managed_path = managed_path_tmp.path().ptr;
     defer cleanupTempDir(managed_path);
 
     const managed_namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 7001, .range_id = 7001 };
@@ -56926,8 +57848,9 @@ test "db preferred identity namespace seeds new stores but preserves existing na
         try std.testing.expect(reopened.core.identity_namespace.eql(managed_namespace));
     }
 
-    var legacy_path_buf: [256]u8 = undefined;
-    const legacy_path = tempPath(&legacy_path_buf);
+    var legacy_path_tmp = try TestDirectory.init("db");
+    defer legacy_path_tmp.cleanup();
+    const legacy_path = legacy_path_tmp.path().ptr;
     defer cleanupTempDir(legacy_path);
 
     {
@@ -56954,8 +57877,9 @@ test "db preferred identity namespace seeds new stores but preserves existing na
 test "db can reassign identity namespace for rebuild" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const old_namespace = doc_identity.Namespace{ .table_id = 8, .shard_id = 801, .range_id = 8001 };
@@ -57030,8 +57954,9 @@ test "db can reassign identity namespace for rebuild" {
 test "db strict namespace reopen recovers after identity reassignment repair" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const old_namespace = doc_identity.Namespace{ .table_id = 38, .shard_id = 3801, .range_id = 38001 };
@@ -57093,8 +58018,9 @@ test "db strict namespace reopen recovers after identity reassignment repair" {
 test "db identity namespace reassignment refreshes transaction recovery hook context" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const old_namespace = doc_identity.Namespace{ .table_id = 28, .shard_id = 2801, .range_id = 28001 };
@@ -57117,12 +58043,19 @@ test "db identity namespace reassignment refreshes transaction recovery hook con
     });
 
     const identity_ctx = db.transaction_recovery_identity_context orelse return error.TestExpectedEqual;
+    const local_ctx = db.transaction_recovery_local_context orelse return error.TestExpectedEqual;
     try std.testing.expect(identity_ctx.identity_namespace.eql(old_namespace));
     try std.testing.expect(db.transaction_runtime.?.config.resolution_extra_hooks.build != null);
     try std.testing.expectEqual(
         @intFromPtr(identity_ctx),
         @intFromPtr(db.transaction_runtime.?.config.resolution_extra_hooks.ctx.?),
     );
+    try std.testing.expectEqual(
+        @intFromPtr(local_ctx),
+        @intFromPtr(db.transaction_runtime.?.config.local_resolution_ctx.?),
+    );
+    try std.testing.expect(local_ctx.stable_owner != null);
+    try std.testing.expect(local_ctx.stable_owner.? != &db);
 
     try db.reassignIdentityNamespaceForInternalTransition(new_namespace);
     try std.testing.expect(db.core.identity_namespace.eql(new_namespace));
@@ -57138,8 +58071,9 @@ test "db identity namespace reassignment refreshes transaction recovery hook con
 test "db identity namespace reassignment is unavailable on status-only handles" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const old_namespace = doc_identity.Namespace{ .table_id = 18, .shard_id = 1801, .range_id = 18001 };
@@ -57183,8 +58117,9 @@ test "db identity namespace reassignment is unavailable on status-only handles" 
 test "db stats expose document identity coverage and tombstones" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -57279,14 +58214,15 @@ test "db operational stats prefer the maintained live identity summary" {
     try std.testing.expectEqual(@as(u64, 0), stats.min_deleted_generation);
     try std.testing.expectEqual(@as(u64, 0), stats.max_deleted_generation);
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(std.testing.allocator, std.mem.span(path), .{
         .primary_backend = .{ .mem = .{} },
     });
     defer db.close();
-    db.identity_visibility_summary_cache = .{
+    db.core.identity_visibility.summary = .{
         .live_ordinals = 1,
         .max_created_generation = 3,
     };
@@ -57299,8 +58235,9 @@ test "db operational stats prefer the maintained live identity summary" {
 test "db stats flag document identity ordinal capacity exhaustion" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -57327,8 +58264,9 @@ test "db stats flag document identity ordinal capacity exhaustion" {
 test "db allocates final document ordinal then rejects new documents" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -57376,8 +58314,9 @@ test "db allocates final document ordinal then rejects new documents" {
 test "document extraction template prompt failure is rejected before persistence" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -57471,8 +58410,9 @@ test "db embeddings index remoteMedia accepts bmp via shared image decode" {
     });
     defer template_remote.setHostRenderer(null);
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var image_embedder = ImageDecodingPartsEmbedder{};
@@ -57518,8 +58458,9 @@ test "db embeddings index remoteMedia accepts webp via shared image decode" {
     });
     defer template_remote.setHostRenderer(null);
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var image_embedder = ImageDecodingPartsEmbedder{};
@@ -57569,8 +58510,9 @@ test "db embeddings index remoteMedia accepts webp via shared image decode" {
 test "db allocates final document ordinal with all index families present" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -57653,8 +58595,9 @@ test "db allocates final document ordinal with all index families present" {
 test "db rejects new document writes at ordinal exhaustion for every sync level" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -57700,8 +58643,9 @@ test "db rejects new document writes at ordinal exhaustion for every sync level"
 test "db search requests default to current identity generation snapshot" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -57749,8 +58693,9 @@ test "db search requests default to current identity generation snapshot" {
 test "db caches identity visibility summary after local writes" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -57761,21 +58706,22 @@ test "db caches identity visibility summary after local writes" {
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
     });
-    try std.testing.expect(db.identity_visibility_summary_cache != null);
+    try std.testing.expect(db.core.identity_visibility.summary != null);
     try std.testing.expect(try db.allDocsVisibleAtGeneration(db.core.nextDerivedSequence()));
 
     try db.batch(.{
         .deletes = &.{"doc:a"},
     });
-    try std.testing.expect(db.identity_visibility_summary_cache != null);
+    try std.testing.expect(db.core.identity_visibility.summary != null);
     try std.testing.expect(!(try db.allDocsVisibleAtGeneration(db.core.nextDerivedSequence())));
 }
 
 test "db lsm primary compaction preserves doc identity ordinals" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
@@ -57844,8 +58790,9 @@ test "db lsm primary compaction preserves doc identity ordinals" {
 test "db validates internal resolved doc filter wire namespace and generation" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const namespace = doc_identity.Namespace{ .table_id = 1, .shard_id = 2, .range_id = 3 };
@@ -57900,8 +58847,9 @@ test "db validates internal resolved doc filter wire namespace and generation" {
 test "db explicit doc-id filter resolution honors identity generation" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -57967,8 +58915,9 @@ test "db explicit doc-id filter resolution honors identity generation" {
 test "db doc set planning stats record ordinal bitmap promotion" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -58013,8 +58962,9 @@ test "db doc set planning stats record ordinal bitmap promotion" {
 
 test "db sparse index uses identity ordinals as physical doc nums for primary docs" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -58081,8 +59031,9 @@ test "db sparse index uses identity ordinals as physical doc nums for primary do
 
 test "db sparse hits resolve doc ordinals through identity not sparse doc nums" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -58130,8 +59081,9 @@ test "db sparse hits resolve doc ordinals through identity not sparse doc nums" 
 
 test "db index catalog barrier disables published dense fast path" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -58150,8 +59102,9 @@ test "db index catalog barrier disables published dense fast path" {
 
 test "db index catalog barrier and apply acquisition honor activation deadline" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -58172,8 +59125,9 @@ test "db index catalog barrier and apply acquisition honor activation deadline" 
 
 test "db published dense admission cannot overflow into catalog closure" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -58213,8 +59167,9 @@ test "db dense fast path registers before catalog lookup during index deletion" 
             }
         }
     };
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     // Keep this fixture limited to the catalog-admission race under test.
@@ -58331,8 +59286,9 @@ test "db dense fast path registers before catalog lookup during index deletion" 
 
 test "db dense index stores stable vector ids with ordinal filter mappings" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -58421,8 +59377,9 @@ test "db dense index stores stable vector ids with ordinal filter mappings" {
 
 test "db resolved doc filter normalizes doc keys before composing native ids" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -58469,8 +59426,9 @@ test "db resolved doc filter normalizes doc keys before composing native ids" {
 
 test "db vector full text filters project through doc identity ordinals" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -58566,8 +59524,9 @@ test "db default dynamic schema vector term filters project through doc identity
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -58675,8 +59634,9 @@ test "db dense default dynamic 0.2 percent numeric filter exact scores bounded c
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -58836,8 +59796,9 @@ test "db exact sort resolves explicit keyword metadata filters natively" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -58926,8 +59887,9 @@ test "db exact sort resolves mapped numeric metadata filters from typed doc valu
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -59009,8 +59971,9 @@ test "db exact sort resolves mapped date metadata filters from typed doc values"
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -59092,8 +60055,9 @@ test "db exact sort resolves mapped boolean metadata filters from typed doc valu
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -59152,8 +60116,9 @@ test "db exact sort resolves mapped geo metadata filters from typed doc values" 
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -59234,8 +60199,9 @@ test "db exact sort resolves mapped geo metadata filters from typed doc values" 
 
 test "db non chunked search paths apply broad live doc filter" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -59275,7 +60241,7 @@ test "db non chunked search paths apply broad live doc filter" {
         try doc_identity.markDeletedTxn(alloc, &txn, 2, "doc:a");
         try txn.commit();
     }
-    db.identity_visibility_summary_cache = null;
+    db.core.identity_visibility.summary = null;
     db.clearLiveDocSetCache();
     db.clearNonVisibleDocSetCache();
 
@@ -59333,8 +60299,9 @@ test "db non chunked search paths apply broad live doc filter" {
 test "db status_only open reads index catalog without loading index state" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -59464,8 +60431,9 @@ test "db status_only open reads index catalog without loading index state" {
 test "db dense and sparse vector searches apply stored symbolic filters before final paging" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -59527,8 +60495,9 @@ test "db dense and sparse vector searches apply stored symbolic filters before f
 test "db dense stored symbolic filter candidate window covers offset pagination" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -59582,8 +60551,9 @@ test "db dense stored symbolic filter candidate window covers offset pagination"
 test "db dense algebraic doc facts feed native dense and sparse symbolic filters" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -60312,8 +61282,9 @@ test "db dense algebraic doc facts feed native dense and sparse symbolic filters
 test "db vector symbolic filters fail closed when algebraic lifecycle is stale" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -60394,8 +61365,9 @@ test "db vector symbolic filters fail closed when algebraic lifecycle is stale" 
 test "db basic batch/get works with in-memory lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -60423,8 +61395,9 @@ test "db in-memory primary backends keep derived log off disk" {
         .{ .mem = .{} },
         .{ .lsm_memory = .{} },
     }) |primary_backend| {
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
 
         {
@@ -60449,8 +61422,9 @@ test "db in-memory primary backends keep derived log off disk" {
 test "db can override change journal backend to lmdb" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -60476,8 +61450,9 @@ test "db can override change journal backend to lmdb" {
 test "db basic batch/get survives reopen with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -60510,8 +61485,9 @@ test "db basic batch/get survives reopen with durable lsm primary backend" {
 test "db lsm match-all query sees same latest value as point lookup" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -60560,8 +61536,9 @@ test "db lsm match-all query sees same latest value as point lookup" {
 test "db enrichment status changes notify query visibility hook" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -60607,8 +61584,9 @@ test "db enrichment status changes notify query visibility hook" {
 test "db source commit publishes exact target observation sequence" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -60686,8 +61664,9 @@ test "db source commit publishes exact target observation sequence" {
 test "db generated downstream indexes are exact convergence targets at source commit" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -60841,8 +61820,9 @@ test "db generated downstream indexes are exact convergence targets at source co
 
 test "db generated downstream indexes are exact convergence targets at source commit including implicit chunk deletion" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
@@ -60880,8 +61860,9 @@ test "db generated downstream indexes are exact convergence targets at source co
 test "db full-text index and search survive reopen with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -60937,8 +61918,9 @@ test "db full-text index and search survive reopen with durable lsm primary back
 test "db algebraic bulk ingest survives reopen with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const cfg =
@@ -61018,8 +62000,9 @@ test "db algebraic bulk ingest survives reopen with durable lsm primary backend"
 test "db batch appends only thin replay stream records" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -61042,8 +62025,9 @@ test "db batch appends only thin replay stream records" {
 test "db batch writes thin change journal record" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -61074,8 +62058,9 @@ test "db batch writes thin change journal record" {
 test "db batch delete replay record wakes managed index workers" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -61121,8 +62106,9 @@ test "db batch delete replay record wakes managed index workers" {
 test "db batch uses change journal as the replay authority" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -61159,8 +62145,9 @@ fn journalRecordHasHint(record: change_journal_mod.Record, hint: change_journal_
 test "db pending work stats track replay stream sequence" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -61185,8 +62172,9 @@ test "db pending work stats track replay stream sequence" {
 test "db open preserves existing change journal records" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -61218,8 +62206,9 @@ test "db open preserves existing change journal records" {
 test "db lsm primary reopens explicit dense replay stream state" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -61271,8 +62260,9 @@ test "db lsm primary reopens explicit dense replay stream state" {
 test "db lsm generated chunked enrichment publishes replay stream state" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -61353,8 +62343,9 @@ test "db lsm generated chunked enrichment publishes replay stream state" {
 test "db direct graph writes record graph artifacts in the replay stream instead of graph payload replay" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -61390,8 +62381,9 @@ test "db direct graph writes record graph artifacts in the replay stream instead
 test "db _edges writes record graph artifacts in the replay stream instead of graph payload replay" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -61449,8 +62441,9 @@ const FixedVectorEmbedder = struct {
 test "db starts resolver replay workers only while resolver catalog is configured" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -61512,8 +62505,9 @@ test "db starts resolver replay workers only while resolver catalog is configure
 test "db backfills a mention name embedding so ann/cosine resolution links end-to-end" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var embedder = FixedVectorEmbedder{};
@@ -61593,8 +62587,9 @@ test "db backfills a mention name embedding so ann/cosine resolution links end-t
 test "db runUntilIdle catches resolution up to the committed tail after a missed notification" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -61663,8 +62658,9 @@ test "db runUntilIdle catches resolution up to the committed tail after a missed
 test "db re-resolves the corpus when upsertResolver bumps the config generation" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -61730,8 +62726,9 @@ test "db re-resolves the corpus when upsertResolver bumps the config generation"
 test "db re-resolves existing corpus when upsertResolver inserts a new resolver" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -61796,8 +62793,9 @@ test "db re-resolves existing corpus when upsertResolver inserts a new resolver"
 test "db drains pending resolver backfill when retrying a no-op upsertResolver" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -61860,8 +62858,9 @@ test "db drains pending resolver backfill when retrying a no-op upsertResolver" 
 test "db refuses resolver removal while resolution or promotion replay is pending" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -61957,8 +62956,9 @@ const FakePromotionSink = struct {
 test "db promotes resolved entities into entity-document upserts end-to-end" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var sink = FakePromotionSink{ .alloc = alloc };
@@ -62024,8 +63024,9 @@ test "db promotes resolved entities into entity-document upserts end-to-end" {
 test "db graph index materializes relation asset artifacts into graph edge artifacts" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -62070,8 +63071,9 @@ test "db graph index materializes relation asset artifacts into graph edge artif
 test "db graph index materializes unit-derived chunk artifacts into graph edge artifacts" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -62125,8 +63127,9 @@ test "db graph index materializes unit-derived chunk artifacts into graph edge a
 test "db direct generated chunks feed multi-source text and graph indexes" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -62208,8 +63211,9 @@ test "db direct generated chunks feed multi-source text and graph indexes" {
 test "db multi-source full text unions chunk and textual asset streams across deletion and reopen" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -62397,8 +63401,9 @@ test "db multi-source full text unions chunk and textual asset streams across de
 test "db graph replay blocks resolution artifact without resolver contract" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
@@ -62473,8 +63478,9 @@ test "db graph replay blocks resolution artifact without resolver contract" {
 test "db graph replay ignores resolution artifacts bound to another source contract" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
@@ -62532,8 +63538,9 @@ test "db graph replay ignores resolution artifacts bound to another source contr
 test "db materializes doc->entity mention edges as provenance and clears them on delete" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -62651,8 +63658,9 @@ test "db materializes doc->entity mention edges as provenance and clears them on
 test "db resolver removal retires resolution artifacts and mention graph state" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var sink = FakePromotionSink{ .alloc = alloc };
@@ -62791,8 +63799,9 @@ test "db resolver removal retires resolution artifacts and mention graph state" 
 test "db does not materialize review-band resolution as canonical mention edges" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     // Keep production workers enabled: this is the regression for the original
@@ -62884,8 +63893,9 @@ test "db does not materialize review-band resolution as canonical mention edges"
 test "db mention edge weight is fused from extractor trust and mention confidence" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -62975,8 +63985,9 @@ test "db mention edge weight is fused from extractor trust and mention confidenc
 test "db rewriteEntityEdges repoints provenance edges to a merge survivor" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -63041,8 +64052,9 @@ test "db rewriteEntityEdges repoints provenance edges to a merge survivor" {
 test "db graph hydration rejects table-qualified entity nodes in local snapshots" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -63178,8 +64190,9 @@ test "db graph hydration rejects table-qualified entity nodes in local snapshots
 test "db graph relation artifact materializer uses mapping templates" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -63269,8 +64282,9 @@ test "graph artifact parser enforces its independent raw item safety limit" {
 test "db graph visible edge limit applies after identity deduplication" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -63309,8 +64323,9 @@ test "db graph visible edge limit applies after identity deduplication" {
 test "db graph relation artifact materializer resolves entity refs and artifact template values" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -63355,8 +64370,9 @@ test "db graph relation artifact materializer resolves entity refs and artifact 
 test "db graph relation artifact materializer replaces stale document edges" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -63401,8 +64417,9 @@ test "db graph relation artifact materializer replaces stale document edges" {
 test "db multi-source graph precedence falls back after winner deletion and reopen" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -63503,11 +64520,13 @@ test "db multi-source graph precedence falls back after winner deletion and reop
 test "db portable restore rebuilds multi-source graph contender provenance" {
     const alloc = std.testing.allocator;
 
-    var source_buf: [256]u8 = undefined;
-    const source_path = tempPath(&source_buf);
+    var source_tmp = try TestDirectory.init("db");
+    defer source_tmp.cleanup();
+    const source_path = source_tmp.path().ptr;
     defer cleanupTempDir(source_path);
-    var restore_buf: [256]u8 = undefined;
-    const restore_path = tempPath(&restore_buf);
+    var restore_tmp = try TestDirectory.init("db");
+    defer restore_tmp.cleanup();
+    const restore_path = restore_tmp.path().ptr;
     defer cleanupTempDir(restore_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
@@ -63612,8 +64631,9 @@ test "db portable restore rebuilds multi-source graph contender provenance" {
 
 test "db graph config rejects cross-document materialized source ownership" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -63630,8 +64650,9 @@ test "db graph config rejects cross-document materialized source ownership" {
 test "db graph relation artifact materializer deletes edges when asset source disappears" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -63680,8 +64701,9 @@ test "db graph relation artifact materializer deletes edges when asset source di
 test "db graph artifact source lifecycle reuses and protects asset enrichments" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -63731,8 +64753,9 @@ test "db graph artifact source lifecycle reuses and protects asset enrichments" 
 
 test "db query repair gate revalidates stale debt" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
@@ -63753,8 +64776,9 @@ test "db query repair gate revalidates stale debt" {
 
 test "db vector status revalidates stale repair admission without a query" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
@@ -63829,8 +64853,9 @@ test "db vector status revalidates stale repair admission without a query" {
 test "db resolver catalog persists across reopen" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -63896,8 +64921,9 @@ test "db resolver catalog persists across reopen" {
 test "db graph artifact source reuses user enrichment and rejects incompatible shorthand" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -63935,8 +64961,9 @@ test "db graph artifact source reuses user enrichment and rejects incompatible s
 test "db graph source artifact deletion clears materialized graph edges" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -63985,8 +65012,9 @@ test "db graph source artifact deletion clears materialized graph edges" {
 test "db graph artifact edges are visible to graph search queries" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -64038,8 +65066,9 @@ test "db graph artifact edges are visible to graph search queries" {
 test "db graph artifact external node targets return ids without document hydration" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -64134,8 +65163,9 @@ test "db graph artifact external node targets return ids without document hydrat
 test "db async asset producer graph source materializes through replay" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var fake = TestAssetProducer{};
@@ -64180,8 +65210,9 @@ test "db async asset producer graph source materializes through replay" {
 test "db async asset producer mention edges come from resolution artifacts" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var fake = TestAssetProducer{
@@ -64274,8 +65305,9 @@ test "db async asset producer mention edges come from resolution artifacts" {
 test "db graph artifact source replay catches up after reopen" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -64326,8 +65358,9 @@ test "db graph artifact source replay catches up after reopen" {
 test "db graph edge artifact replay catches up after reopen" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -64395,8 +65428,9 @@ test "db graph edge artifact replay catches up after reopen" {
 test "db query_readonly opens empty declared graph index" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -64430,8 +65464,9 @@ test "db query_readonly opens empty declared graph index" {
 test "db batch marks generated enrichment replay for generator-enabled dense index" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -64469,8 +65504,9 @@ test "db batch marks generated enrichment replay for generator-enabled dense ind
 test "db full_index precomputes generated enrichments into the committed batch" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
@@ -64539,8 +65575,9 @@ test "db full_index precomputes generated enrichments into the committed batch" 
 test "db full_text sync level does not wait for dense hbc visibility" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -64581,8 +65618,9 @@ test "db full_text sync level does not wait for dense hbc visibility" {
 test "db enrichments precomputes generated enrichments into the committed batch" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
@@ -64642,8 +65680,9 @@ test "db enrichments precomputes generated enrichments into the committed batch"
 test "db replicated apply decouples client enrichment sync from raft apply execution" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
@@ -64687,8 +65726,9 @@ test "db replicated apply decouples client enrichment sync from raft apply execu
 test "db enrichments precomputed watermark advances across replay entries without enrichment debt" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
@@ -64729,8 +65769,9 @@ test "db enrichments precomputed watermark advances across replay entries withou
 test "db derived target advance does not skip unseen matching replay records" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
@@ -64848,8 +65889,9 @@ fn jsonTestNumber(value: std.json.Value) f64 {
 test "db asset producer enrichments execute fake providers and skip unchanged state" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var fake = TestAssetProducer{};
@@ -65028,8 +66070,9 @@ test "db asset producer enrichments batch compatible generated assets" {
         }
     };
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var fake = BatchProducer{};
@@ -65112,8 +66155,9 @@ test "db asset producer sync precompute fails closed on permanent item failure" 
         }
     };
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var fake = FallbackProducer{};
@@ -65304,8 +66348,9 @@ test "db document unit payload marks scanned pdf pages as pending OCR" {
 test "db document extraction asset materializes unit artifacts from data url" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var fake = TestAssetProducer{};
@@ -65786,8 +66831,9 @@ test "db canonical hierarchy traversal rejects typed retrieval controls" {
 test "db hierarchy navigation seeks only the descriptor blocks needed by the page" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -65890,8 +66936,9 @@ test "db hierarchy navigation seeks only the descriptor blocks needed by the pag
 test "db hierarchy cursor binds every unit artifact revision under its source" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var fake = TestAssetProducer{};
@@ -65979,8 +67026,9 @@ test "db hierarchy cursor binds every unit artifact revision under its source" {
 test "db async document extraction accounts resource manager working set" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var resource_manager = resource_manager_mod.ResourceManager.init(.{});
@@ -66024,8 +67072,9 @@ test "db async document extraction accounts resource manager working set" {
 test "db async document extraction deletes artifacts with corrupt previous extraction state" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -66114,8 +67163,9 @@ test "db async document extraction deletes artifacts with corrupt previous extra
 test "db document extraction routes mixed files using source metadata fields" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -66158,8 +67208,9 @@ test "db document extraction routes mixed files using source metadata fields" {
 test "db document extraction stores docx section units" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -66205,8 +67256,9 @@ test "db document extraction stores docx section units" {
 test "db document extraction stores zip archive entry units" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -66253,8 +67305,9 @@ test "db document extraction stores zip archive entry units" {
 test "db document extraction stores image pending OCR unit" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -66304,8 +67357,9 @@ test "db document extraction stores image pending OCR unit" {
 test "db document extraction completes image OCR with reader producer" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var fake = TestAssetProducer{};
@@ -66356,8 +67410,9 @@ test "db document extraction attempts forced OCR for a scanned PDF" {
 
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var fake = TestAssetProducer{ .reader_output = "scanned PDF transcription with enough text to remain selected" };
@@ -66424,8 +67479,9 @@ test "db document extraction attempts forced OCR for a scanned PDF" {
 test "db async document extraction reuses generated OCR text across streaming passes" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var fake = TestAssetProducer{};
@@ -66470,8 +67526,9 @@ test "db async document extraction reuses generated OCR text across streaming pa
 test "db document extraction stores structured OCR confidence and coordinates" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var fake = TestAssetProducer{
@@ -66526,8 +67583,9 @@ test "db document extraction stores structured OCR confidence and coordinates" {
 test "db document extraction completes audio transcription with transcriber producer" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var fake = TestAssetProducer{
@@ -66582,8 +67640,9 @@ test "db document extraction completes audio transcription with transcriber prod
 test "db document extraction stores rfc822 email units" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -66636,8 +67695,9 @@ test "db document extraction stores rfc822 email units" {
 test "db document extraction stores multipart rfc822 text parts" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -66689,8 +67749,9 @@ test "db document extraction stores multipart rfc822 text parts" {
 test "db document extraction stores unsupported file manifest without searchable units" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -66817,8 +67878,9 @@ test "db document extraction manifest classifies unit fingerprint keeps" {
 test "db document extraction skips stable unit local rewrites without text consumers" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var counting = CountingDenseEmbedder{};
@@ -66891,8 +67953,9 @@ test "db document extraction skips stable unit local rewrites without text consu
 test "db applies document artifact child range batch without source row write" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -66936,8 +67999,9 @@ test "db applies document artifact child range batch without source row write" {
 test "db document artifact child range batch atomically tracks dense artifact counters" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -67013,8 +68077,9 @@ test "db document artifact child range batch atomically tracks dense artifact co
 test "db dispatches generated document child range artifacts to remote owner" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -67267,8 +68332,9 @@ test "generated enrichment preparation helpers release partial allocations" {
 test "db retries remote document child range dispatch from durable outbox" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -67378,8 +68444,9 @@ test "db retries remote document child range dispatch from durable outbox" {
 test "db document extraction manifest inspection and reprocess API" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var counting = CountingDenseEmbedder{};
@@ -67557,8 +68624,9 @@ test "db document extraction manifest inspection and reprocess API" {
 test "db generic artifact repair queue reprocesses document asset artifacts" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -67641,8 +68709,9 @@ test "db generic artifact repair queue reprocesses document asset artifacts" {
 test "db generic artifact repair queue regenerates set-valued chunk artifacts" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -67693,8 +68762,9 @@ test "db generic artifact repair queue regenerates set-valued chunk artifacts" {
 test "db repair completion cannot clear debt behind terminal coverage" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -67791,8 +68861,9 @@ test "db repair completion cannot clear debt behind terminal coverage" {
 test "db successful embedding publication retires covered provider failure debt" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -67843,8 +68914,9 @@ test "db successful embedding publication retires covered provider failure debt"
 test "db shared repair completion reprocesses consumer with terminal coverage" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -67916,8 +68988,9 @@ test "db shared repair completion reprocesses consumer with terminal coverage" {
 test "db artifact repair summary is persisted for status-only reopen" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -67961,8 +69034,9 @@ test "db artifact repair summary is persisted for status-only reopen" {
 test "db artifact repair summary rebuild is bounded and exact until ready" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const seeded_count: usize = 1030;
@@ -68043,8 +69117,9 @@ test "db artifact repair summary rebuild is bounded and exact until ready" {
 test "db artifact repair summary rebuild invalidates partial counters on mutation" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const seeded_count: usize = 1030;
@@ -68160,8 +69235,9 @@ test "db artifact repair summary rebuild invalidates partial counters on mutatio
 test "db artifact repair summary durably scopes debt to configured source" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -68218,8 +69294,9 @@ test "db artifact repair summary durably scopes debt to configured source" {
 
 test "db artifact repair v1 ready marker forces source-summary rebuild" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -68242,8 +69319,9 @@ test "db artifact repair v1 ready marker forces source-summary rebuild" {
 test "db artifact repair dirty marker drains shadow summaries in bounded pages" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -68313,8 +69391,9 @@ test "db artifact repair dirty marker drains shadow summaries in bounded pages" 
 test "db artifact repair summary store writer invalidates partial rebuild" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const seeded_count: usize = 1030;
@@ -68435,8 +69514,9 @@ test "db artifact repair summary store writer invalidates partial rebuild" {
 test "db artifact repair metadata maintenance drains summary rebuild without restart" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const seeded_count: usize = 2050;
@@ -68494,8 +69574,9 @@ test "db artifact repair metadata maintenance drains summary rebuild without res
 test "db artifact repair list cursor pages durable repair debt" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -68543,8 +69624,9 @@ test "db artifact repair list cursor pages durable repair debt" {
 test "db artifact repair queue keeps distinct unit artifacts for same document and name" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -68594,8 +69676,9 @@ test "db artifact repair queue keeps distinct unit artifacts for same document a
 test "db artifact repair fallback issue ids do not collide on delimiter-bearing fields" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -68633,8 +69716,9 @@ test "db artifact repair fallback issue ids do not collide on delimiter-bearing 
 test "db artifact repair kind filter uses selective index after reopen" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -68691,8 +69775,9 @@ test "db artifact repair kind filter uses selective index after reopen" {
 test "db artifact repair kind fallback scan is bounded when kind index is rebuilding" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -68764,8 +69849,9 @@ test "db artifact repair kind fallback scan is bounded when kind index is rebuil
 test "db artifact repair reports unsupported artifact kinds without clearing debt" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -68806,8 +69892,9 @@ test "db artifact repair reports unsupported artifact kinds without clearing deb
 test "db index repair requires explicit index and force for healthy rebuild" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -68851,8 +69938,9 @@ test "db index repair requires explicit index and force for healthy rebuild" {
 test "db managed operator repair persists intent without running reconstruction inline" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -68890,8 +69978,9 @@ test "db managed operator repair persists intent without running reconstruction 
 test "index repair advance lease covers cancellation and deletion" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -68923,7 +70012,7 @@ test "index repair advance lease covers cancellation and deletion" {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expectEqual(self.repair_id, observed_repair_id);
             self.entered.store(true, .release);
-            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
 
         fn run(self: *@This()) void {
@@ -68940,11 +70029,11 @@ test "index repair advance lease covers cancellation and deletion" {
     };
     defer DB.test_index_repair_advance_lease_hook = null;
 
-    var advance_thread = try std.Thread.spawn(.{}, Race.run, .{&race});
+    var advance_thread = try std.testing.io.concurrent(Race.run, .{&race});
     var joined = false;
     defer if (!joined) {
         race.release.store(true, .release);
-        advance_thread.join();
+        advance_thread.await(std.testing.io);
     };
     var entered = false;
     for (0..100_000) |_| {
@@ -68952,7 +70041,7 @@ test "index repair advance lease covers cancellation and deletion" {
             entered = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!entered) return error.TestTimeout;
 
@@ -68966,7 +70055,7 @@ test "index repair advance lease covers cancellation and deletion" {
     );
 
     race.release.store(true, .release);
-    advance_thread.join();
+    advance_thread.await(std.testing.io);
     joined = true;
     DB.test_index_repair_advance_lease_hook = null;
     try std.testing.expect(race.err == null);
@@ -69005,8 +70094,9 @@ test "index repair advance lease covers cancellation and deletion" {
 test "db index repair targets one graph index per selected config" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -69076,8 +70166,9 @@ test "db index repair targets one graph index per selected config" {
 test "db index repair resets sparse index before rebuilding from artifacts" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -69139,8 +70230,9 @@ test "db index repair resets sparse index before rebuilding from artifacts" {
 test "db index repair rebuilds full text index from stored documents" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -69216,8 +70308,9 @@ test "db index repair rebuilds full text index from stored documents" {
 
 test "db index repair replacement loads named artifact producer dependencies" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
@@ -69281,8 +70374,9 @@ test "db index repair replacement loads named artifact producer dependencies" {
 test "db index repair shadow swap survives reopen" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const text_cfg: types.IndexConfig = .{
@@ -69365,8 +70459,9 @@ test "db index repair shadow swap survives reopen" {
 test "db index repair shadow roots are allocated uniquely" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const first = try createUniqueRepairShadowBase(alloc, std.mem.span(path));
@@ -69391,8 +70486,9 @@ test "db index repair shadow roots are allocated uniquely" {
 test "db index repair shadow swap preserves post snapshot mutations" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const text_cfg: types.IndexConfig = .{
@@ -69501,8 +70597,9 @@ test "db index repair shadow swap preserves post snapshot mutations" {
 test "db artifact repair issue list reports recorded graph issue" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -69546,8 +70643,9 @@ test "db artifact repair issue list reports recorded graph issue" {
 test "db artifact repair reports remaining debt when source is missing" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -69594,8 +70692,9 @@ test "db artifact repair reports remaining debt when source is missing" {
 test "db graph generation repair preserves corrupt artifact debt after rebuild" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -69646,8 +70745,9 @@ test "db graph generation repair preserves corrupt artifact debt after rebuild" 
 test "db repair issue list exposes algebraic generation debt as repairable" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -69714,8 +70814,9 @@ test "db repair issue list exposes algebraic generation debt as repairable" {
 test "db index repair serializes duplicate repairs for one index" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -69745,8 +70846,9 @@ test "db index repair serializes duplicate repairs for one index" {
 test "db index repair recovers quarantined index load before rebuild" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -69785,8 +70887,9 @@ test "db index repair recovers quarantined index load before rebuild" {
 test "db index repair rebuilds full text after quarantined root recreation" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     const path_slice = std.mem.span(path);
 
@@ -69857,8 +70960,9 @@ test "db index repair rebuilds full text after quarantined root recreation" {
 test "db index repair streams graph artifact rebuild in batches" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -69936,8 +71040,9 @@ test "db index repair streams graph artifact rebuild in batches" {
 test "db artifact repair records corrupt graph edge artifacts during replay" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var appended_sequence: u64 = 0;
@@ -69996,8 +71101,9 @@ test "db artifact repair records corrupt graph edge artifacts during replay" {
 test "db artifact repair records corrupt graph source asset artifacts during replay" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var appended_sequence: u64 = 0;
@@ -70095,8 +71201,9 @@ test "db document extraction unit ranges split by text bytes" {
 test "db document extraction failure preserves last-known-good children and recovers" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -70183,8 +71290,9 @@ test "db document extraction failure preserves last-known-good children and reco
 test "db document extraction skips stable unit local rewrites while replaying full text from stored artifacts" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var counting = CountingDenseEmbedder{};
@@ -70394,8 +71502,9 @@ fn testMaterializedEmbeddingWriteGrowth(comptime mode: enum { dense, derived_den
     const is_sparse = mode == .sparse;
     const embedding_name = if (is_sparse) "document_sparse" else "document_dense";
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
@@ -70551,8 +71660,9 @@ fn testMaterializedEmbeddingWriteGrowth(comptime mode: enum { dense, derived_den
 test "db document extraction chunks units through source artifact enrichment" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
@@ -70961,8 +72071,9 @@ test "db document extraction state round-trips binary chunk keys beyond one byte
 test "db document extraction changed version updates large chunked source document" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -71048,8 +72159,9 @@ test "db document extraction changed version updates large chunked source docume
 test "db document extraction update recovers corrupt previous extraction state" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -71121,8 +72233,9 @@ test "db document extraction update recovers corrupt previous extraction state" 
 test "db extractEnrichments exposes cleaned writes and special fields" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -71159,8 +72272,9 @@ test "db extractEnrichments exposes cleaned writes and special fields" {
 test "db extractEnrichments rejects unsupported legacy summaries field" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -71177,8 +72291,9 @@ test "db extractEnrichments rejects unsupported legacy summaries field" {
 test "db computeEnrichments synchronously builds chunk and embedding outputs" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -71237,8 +72352,9 @@ test "db computeEnrichments synchronously builds chunk and embedding outputs" {
 test "db leased enrichment worker generates dense embeddings" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -71297,8 +72413,9 @@ test "db leased enrichment worker generates dense embeddings" {
 test "db leased enrichment worker backs off while a stale owner holds the lease" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -71350,8 +72467,9 @@ test "db leased enrichment worker backs off while a stale owner holds the lease"
 test "db leased enrichment worker generates dense embeddings with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -71414,8 +72532,9 @@ test "db leased enrichment worker generates dense embeddings with durable lsm pr
 test "db managed dense enrichment remains searchable after transient rate limits" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     // Admit the first request, then force the worker through the real
@@ -71498,8 +72617,9 @@ test "db managed dense enrichment remains searchable after transient rate limits
 test "db retryable chunked producer does not block independent dense publication" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var gated = SelectiveGateDenseEmbedder{
@@ -71578,8 +72698,9 @@ test "db retryable chunked producer does not block independent dense publication
 test "db retryable asset producer batches do not block independent dense publication" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var gated_asset = GateAssetProducer{};
@@ -71668,8 +72789,9 @@ test "db retryable asset producer batches do not block independent dense publica
 test "db managed dense enrichment retries temporary model capacity without terminal coverage" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var gated = GateDenseEmbedder{
@@ -71751,8 +72873,9 @@ test "db managed dense enrichment retries temporary model capacity without termi
 test "db managed sparse enrichment retries temporary model capacity without terminal coverage" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var gated = GateSparseEmbedder{};
@@ -71830,8 +72953,9 @@ test "db managed sparse enrichment retries temporary model capacity without term
 test "db chunked dense enrichment retries temporary model capacity without terminal coverage" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var gated = GateDenseEmbedder{
@@ -71904,8 +73028,9 @@ test "db chunked dense enrichment retries temporary model capacity without termi
 test "db managed dense delete quiesces rate-limited enrichment and recreates cleanly" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var gated = GateDenseEmbedder{};
@@ -72064,8 +73189,9 @@ test "retired repair cleanup propagates allocation failures from durable metadat
 test "retired repair cleanup resumes marker retirement and removes corrupt sidecars after reopen" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const issue: types.ArtifactRepairIssue = .{
@@ -72159,8 +73285,9 @@ test "retired repair cleanup resumes marker retirement and removes corrupt sidec
 test "db dense checkpoint persistence serializes with index apply" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -72199,14 +73326,14 @@ test "db dense checkpoint persistence serializes with index apply" {
         }
     };
     var persist = Persist{ .db = &db };
-    const thread = try std.Thread.spawn(.{}, Persist.run, .{&persist});
+    var thread = try std.testing.io.concurrent(Persist.run, .{&persist});
     while (!persist.started.load(.acquire)) std.atomic.spinLoopHint();
     sleepNs(25 * std.time.ns_per_ms);
     const completed_while_apply_active = persist.done.load(.acquire);
 
     apply_guard.unlock();
     apply_locked = false;
-    thread.join();
+    thread.await(std.testing.io);
 
     try std.testing.expect(!completed_while_apply_active);
     if (persist.err) |err| return err;
@@ -72216,8 +73343,9 @@ test "db dense checkpoint persistence serializes with index apply" {
 test "db open quarantines dense index with unsupported artifact version" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const dense_cfg: types.IndexConfig = .{
@@ -72361,8 +73489,9 @@ fn corruptNonEmptyFilesUnderDir(alloc: Allocator, root_path: []const u8) !usize 
 test "db drops quarantined dense index after persisted index directory corruption" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     const path_slice = std.mem.span(path);
 
@@ -72418,8 +73547,9 @@ test "db drops quarantined dense index after persisted index directory corruptio
 test "db quarantined index self-heals via retryQuarantinedIndexLoads" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -72517,11 +73647,11 @@ test "db quarantined index self-heals via retryQuarantinedIndexLoads" {
     lockApplyShared(&db);
     var apply_shared_held = true;
     var retry_state = RetryState{ .db = &db };
-    var retry_thread = try std.Thread.spawn(.{}, RetryState.run, .{&retry_state});
+    var retry_thread = try std.testing.io.concurrent(RetryState.run, .{&retry_state});
     var retry_thread_joined = false;
     defer {
         if (apply_shared_held) db.core.unlockApplyShared();
-        if (!retry_thread_joined) retry_thread.join();
+        if (!retry_thread_joined) retry_thread.await(std.testing.io);
     }
 
     const publication_deadline = monotonicTimeNs() +| 30 * std.time.ns_per_s;
@@ -72532,7 +73662,7 @@ test "db quarantined index self-heals via retryQuarantinedIndexLoads" {
     const publication_waited_for_reader = publication_fence_entered and !retry_state.completed.load(.acquire);
     db.core.unlockApplyShared();
     apply_shared_held = false;
-    retry_thread.join();
+    retry_thread.await(std.testing.io);
     retry_thread_joined = true;
 
     try std.testing.expect(publication_fence_entered);
@@ -72557,8 +73687,9 @@ test "db quarantined index self-heals via retryQuarantinedIndexLoads" {
 test "db targeted quarantine retry does not open unrelated failed indexes" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -72591,8 +73722,9 @@ test "db targeted quarantine retry does not open unrelated failed indexes" {
 test "db read-only open propagates transient index load errors instead of quarantining" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -72633,8 +73765,9 @@ test "db read-only open propagates transient index load errors instead of quaran
 test "db managed dense enrichment delete recreate recovers after corrupt artifact" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var counting = CountingDenseEmbedder{};
@@ -72703,8 +73836,9 @@ test "db managed dense enrichment delete recreate recovers after corrupt artifac
 test "db managed dense enrichment delete recreate recovers after corrupt artifact across reopen" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var counting = CountingDenseEmbedder{};
@@ -72777,8 +73911,9 @@ test "db managed dense enrichment delete recreate recovers after corrupt artifac
 test "db dense repair reprocesses corrupt managed source before rebuilding" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var counting = CountingDenseEmbedder{};
@@ -72870,8 +74005,9 @@ test "db dense repair reprocesses corrupt managed source before rebuilding" {
 test "db dense enrichment skips unchanged source hash" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var counting = CountingDenseEmbedder{};
@@ -72928,8 +74064,9 @@ test "db dense enrichment skips unchanged source hash" {
 test "db dense enrichment republishes unchanged source hash from cached artifact after index reset" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var counting = CountingDenseEmbedder{};
@@ -72985,8 +74122,9 @@ test "db dense enrichment republishes unchanged source hash from cached artifact
 test "db chunked dense enrichment skips unchanged chunks and deletes stale chunk artifacts" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var counting = CountingDenseEmbedder{};
@@ -73074,8 +74212,9 @@ test "db chunked dense enrichment skips unchanged chunks and deletes stale chunk
 test "db chunked dense enrichment replays cached artifacts after dense reset without re-embedding" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var counting = CountingDenseEmbedder{};
@@ -73134,8 +74273,9 @@ test "db chunked dense enrichment replays cached artifacts after dense reset wit
 test "db recreated managed dense index converges replay and irrelevant resolver stages" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var counting = CountingDenseEmbedder{};
@@ -73186,8 +74326,9 @@ test "db recreated managed dense index converges replay and irrelevant resolver 
 test "db reopened chunked dense HBC deletes stale vectors through artifact loader" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var counting = CountingDenseEmbedder{};
@@ -73244,8 +74385,9 @@ test "db reopened chunked dense HBC deletes stale vectors through artifact loade
 test "db chunked generated dense and sparse embeddings search as parent results" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
@@ -73341,7 +74483,7 @@ test "db chunked generated dense and sparse embeddings search as parent results"
         try doc_identity.markDeletedTxn(alloc, &txn, 2, "doc:a");
         try txn.commit();
     }
-    db.identity_visibility_summary_cache = null;
+    db.core.identity_visibility.summary = null;
     db.clearLiveDocSetCache();
     db.clearNonVisibleDocSetCache();
 
@@ -73364,8 +74506,9 @@ test "db chunked generated dense and sparse embeddings search as parent results"
 test "db sparse enrichment skips unchanged source hash" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var counting = CountingSparseEmbedder{};
@@ -73423,8 +74566,9 @@ test "db sparse enrichment skips unchanged source hash" {
 test "db chunked sparse enrichment skips unchanged chunks and deletes stale sparse artifacts" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var counting = CountingSparseEmbedder{};
@@ -73507,8 +74651,9 @@ test "db chunked sparse enrichment skips unchanged chunks and deletes stale spar
 test "db runUntilIdle drains enrichment and derived indexing" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -73560,8 +74705,9 @@ test "db runUntilIdle drains enrichment and derived indexing" {
 test "db write sync trailing dense no-op batches drain stale delete replay at idle" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -73681,8 +74827,9 @@ test "db write sync trailing dense no-op batches drain stale delete replay at id
 test "db generated enrichment empty backfill advances enrichment checkpoint" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -73708,8 +74855,9 @@ test "db generated enrichment empty backfill advances enrichment checkpoint" {
 test "db generated enrichment backfill drains stored docs beyond first replay chunk" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -73764,8 +74912,9 @@ test "db generated enrichment backfill drains stored docs beyond first replay ch
 test "db runUntilIdle drains lazy dense posting maintenance" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -73817,8 +74966,9 @@ test "db runUntilIdle drains lazy dense posting maintenance" {
 test "db leased enrichment worker materializes chunk artifacts" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -73876,8 +75026,9 @@ test "db leased enrichment worker materializes chunk artifacts" {
 test "db leased enrichment worker keeps chunk storage ephemeral when store_chunks is false" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var counting = CountingDenseEmbedder{};
@@ -73955,8 +75106,9 @@ test "db leased enrichment worker keeps chunk storage ephemeral when store_chunk
 test "db leased enrichment worker persists chunk storage when full text consumes chunked text" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -74005,8 +75157,9 @@ test "db leased enrichment worker persists chunk storage when full text consumes
 test "db deferred generated coverage remains pending until the enrichment worker decides an outcome" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     const config_json =
         "{\"field\":\"embedding\",\"dims\":3,\"coverage_policy\":\"partial\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"image_url\",\"source_template\":\"{{#if image_url}}{{image_url}}{{/if}}\"}}";
@@ -74069,8 +75222,9 @@ test "db deferred generated coverage remains pending until the enrichment worker
 test "db generated enrichment replay cannot infer terminal skip from an omitted partial artifact" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
@@ -74117,8 +75271,9 @@ test "db generated enrichment replay cannot infer terminal skip from an omitted 
 test "db managed conditional embeddings persist exact mixed corpus coverage across reopen" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     const config_json =
         "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"image_url\",\"source_template\":\"{{#if image_url}}{{image_url}}{{/if}}\"}}";
@@ -74191,8 +75346,9 @@ test "db managed conditional embeddings persist exact mixed corpus coverage acro
 test "db leased enrichment worker persists chunk storage when chunker enables full text indexing" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -74236,8 +75392,9 @@ test "db leased enrichment worker persists chunk storage when chunker enables fu
 test "db default full text index searches template chunk text when chunker full text indexing is enabled" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -74282,8 +75439,9 @@ test "db default full text index searches template chunk text when chunker full 
 test "db full_text sync level does not precompute template chunk full text routing" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -74356,8 +75514,9 @@ test "cloneManagedSyncTargetsAll duplicates names independently" {
 test "collectManagedSyncTargets includes graph index for graph artifact journal changes" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -74392,8 +75551,9 @@ test "collectManagedSyncTargets includes graph index for graph artifact journal 
 test "visibility targets include graph replay blocked by a missing dependency" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -74424,8 +75584,9 @@ test "visibility targets include graph replay blocked by a missing dependency" {
 test "db full_index supports dense parent search for template chunked embeddings" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -74467,8 +75628,9 @@ test "db full_index supports dense parent search for template chunked embeddings
 test "db full_index supports dense parent search when chunk artifacts are ephemeral" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -74539,8 +75701,9 @@ test "db full_index supports dense parent search when chunk artifacts are epheme
 test "db reopened full_index supports dense parent search when chunk artifacts are ephemeral" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -74587,8 +75750,9 @@ test "db reopened full_index supports dense parent search when chunk artifacts a
 test "db leased enrichment worker materializes chunk artifacts with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -74647,8 +75811,9 @@ test "db leased enrichment worker materializes chunk artifacts with durable lsm 
 test "db shared embedding enrichment feeds multiple dense indexes" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -74711,8 +75876,9 @@ test "db shared embedding enrichment feeds multiple dense indexes" {
 test "db shared enrichment failure parks repair debt for every consumer" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var gated = GateDenseEmbedder{};
@@ -74812,8 +75978,9 @@ test "db upstream asset failure dominates downstream coverage in one replay sequ
         }
     };
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var failing = FailingProducer{};
@@ -74900,8 +76067,9 @@ test "db foreign inference provider failure releases enrichment waiter as termin
         }
     };
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var failing = ForeignFailingProducer{};
@@ -75002,8 +76170,9 @@ test "db foreign inference provider failure releases enrichment waiter as termin
 
 test "db terminal enrichment sequence index survives coalescing and retires with repair debt" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -75106,8 +76275,9 @@ test "db terminal enrichment sequence index survives coalescing and retires with
 
 test "db terminal enrichment marker cleanup isolates corrupt cross issue reverse entries" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -75194,8 +76364,9 @@ test "db terminal enrichment marker cleanup isolates corrupt cross issue reverse
 
 test "db terminal enrichment marker retirement is bounded and fences stale generations" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -75275,8 +76446,9 @@ test "db terminal enrichment marker retirement is bounded and fences stale gener
 
 test "db terminal enrichment markers do not resurrect across rollback recreation" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -75341,8 +76513,9 @@ test "db terminal enrichment markers do not resurrect across rollback recreation
 test "db enrichment retry makes monotonic progress across provider batches" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var gated = GateDenseEmbedder{};
@@ -75394,8 +76567,9 @@ test "db enrichment retry makes monotonic progress across provider batches" {
 test "db shared enrichment repair regenerates one physical artifact once" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var gated = GateDenseEmbedder{};
@@ -75472,8 +76646,9 @@ test "db shared enrichment repair regenerates one physical artifact once" {
 test "db chunked enrichment failure repair completes from request coverage" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var gated = GateDenseEmbedder{};
@@ -75531,8 +76706,9 @@ test "db chunked enrichment failure repair completes from request coverage" {
 
 test "db asset repair reports a missing source document precisely" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtime_workers = false });
@@ -75585,8 +76761,9 @@ test "db asset repair reports a missing source document precisely" {
 
 test "db enrichment repair never clears a newer failure revision" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtime_workers = false });
@@ -75660,8 +76837,9 @@ test "db enrichment repair never clears a newer failure revision" {
 test "db shared embedding enrichment feeds multiple dense indexes with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -75725,8 +76903,9 @@ test "db shared embedding enrichment feeds multiple dense indexes with durable l
 test "db addEnrichment supports explicit shared definitions" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var validating = ValidatingChunkDenseEmbedder{};
@@ -75811,8 +76990,9 @@ test "db addEnrichment supports explicit shared definitions" {
 test "db index inspection lists graph indexes" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -75837,8 +77017,9 @@ test "db index inspection lists graph indexes" {
 test "db preflight classifies canonical artifact full-text sources consistently" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -75873,8 +77054,9 @@ test "db preflight classifies canonical artifact full-text sources consistently"
 test "artifact text replay deletes only keys owned by its source projection" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -75944,8 +77126,9 @@ test "artifact text replay deletes only keys owned by its source projection" {
 
 test "db chunk retirement removes dense and sparse members from generated and artifact projections" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var dense = embedder_mod.DeterministicDenseEmbedder{};
     var sparse = embedder_mod.DeterministicSparseEmbedder{};
@@ -75998,8 +77181,9 @@ test "db chunk retirement removes dense and sparse members from generated and ar
 
 test "db chunk deletion replay targets only matching vector sources" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -76091,8 +77275,9 @@ test "db chunk deletion replay targets only matching vector sources" {
 test "embedding artifact replay deletes only the consuming vector projection" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -76138,8 +77323,9 @@ test "embedding artifact replay deletes only the consuming vector projection" {
 test "db preflightSearchRequest validates live lane bindings" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -76441,8 +77627,9 @@ test "db preflightSearchRequest validates live lane bindings" {
 test "db preflightSearchRequest surfaces structured filter probe counts when count is budget limited" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -76496,8 +77683,9 @@ test "db preflightSearchRequest surfaces structured filter probe counts when cou
 test "db graph methods expose edges, neighbors, and shortest path" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -76581,8 +77769,9 @@ test "db graph methods expose edges, neighbors, and shortest path" {
 test "db graph algebraic shortest path applies exact min-hop edge weight filters" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -76626,8 +77815,9 @@ test "db graph algebraic shortest path applies exact min-hop edge weight filters
 test "db deleteEnrichment rejects referenced definitions" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -76652,8 +77842,9 @@ test "db deleteEnrichment rejects referenced definitions" {
 test "db deleteEnrichment rejects asset referenced by chunk enrichment" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -76679,8 +77870,9 @@ test "db deleteEnrichment rejects asset referenced by chunk enrichment" {
 test "db upsertEnrichment rejects replacing referenced asset with chunk" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -76716,8 +77908,9 @@ test "db upsertEnrichment rejects replacing referenced asset with chunk" {
 test "db upsertEnrichment rejects replacing referenced chunk with asset" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -76752,8 +77945,9 @@ test "db upsertEnrichment rejects replacing referenced chunk with asset" {
 test "db upsertEnrichment rejects replacing indexed chunk with asset" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -76786,8 +77980,9 @@ test "db upsertEnrichment rejects replacing indexed chunk with asset" {
 test "db addEnrichment rejects duplicate names across enrichment kinds" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -76810,8 +78005,9 @@ test "db addEnrichment rejects duplicate names across enrichment kinds" {
 test "db addEnrichment allows unrelated definitions after field sparse index" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -76833,8 +78029,9 @@ test "db addEnrichment allows unrelated definitions after field sparse index" {
 test "db enrichment artifact consumer resolution includes graph and default full text indexes" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -76876,8 +78073,9 @@ test "db enrichment artifact consumer resolution includes graph and default full
 test "db asset enrichment full_text_index feeds default full text index after full_index sync" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -76946,8 +78144,9 @@ test "db asset enrichment full_text_index feeds default full text index after fu
 test "db dense index can reference existing whole-doc embedding enrichment" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -76995,8 +78194,9 @@ test "db dense index can reference existing whole-doc embedding enrichment" {
 test "db dense index can reference existing chunk embedding enrichment" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -77055,8 +78255,9 @@ test "db dense index can reference existing chunk embedding enrichment" {
 test "db persists shorthand chunk enrichment catalog across reopen" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -77113,8 +78314,9 @@ test "db persists shorthand chunk enrichment catalog across reopen" {
 test "db persists shorthand chunk enrichment catalog across reopen with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = db_config.primary_lsm_options_default };
@@ -77177,8 +78379,9 @@ test "db persists shorthand chunk enrichment catalog across reopen with durable 
 test "db listEnrichments returns explicit definitions across reopen" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -77216,8 +78419,9 @@ test "db listEnrichments returns explicit definitions across reopen" {
 test "db listEnrichments returns explicit definitions across reopen with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = db_config.primary_lsm_options_default };
@@ -77261,8 +78465,9 @@ test "db listEnrichments returns explicit definitions across reopen with durable
 test "db full-text chunk consumer returns parent and chunk modes" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -77333,8 +78538,9 @@ test "db full-text chunk consumer returns parent and chunk modes" {
 test "db full-text chunk consumer filters expired parents under ttl" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -77404,8 +78610,9 @@ test "db full-text chunk consumer filters expired parents under ttl" {
 test "db full-text ttl filters before pagination and count-only totals" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -77456,8 +78663,9 @@ test "db full-text ttl filters before pagination and count-only totals" {
 test "db composed full-text ttl filters resolved text filters before pagination" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -77506,8 +78714,9 @@ test "db composed full-text ttl filters resolved text filters before pagination"
 test "db full-text ttl uses lower-bound totals for non-exhaustive visible pages" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -77546,8 +78755,9 @@ test "db full-text ttl uses lower-bound totals for non-exhaustive visible pages"
 test "db ttl broad live filter preserves all-doc sentinel" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -77579,8 +78789,9 @@ test "db ttl broad live filter preserves all-doc sentinel" {
 test "db public artifact lookup strips private hierarchy metadata without changing internal records" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -77665,8 +78876,9 @@ test "canonical grouped match requests isolate nested pagination and work" {
 test "db full-text chunk parent paging applies after grouping" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -77733,8 +78945,9 @@ test "db full-text chunk parent paging applies after grouping" {
 test "db dense chunk consumer supports parent and parent_with_chunks modes" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -77870,7 +79083,7 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes" {
         try doc_identity.markDeletedTxn(alloc, &txn, 2, "doc:a");
         try txn.commit();
     }
-    db.identity_visibility_summary_cache = null;
+    db.core.identity_visibility.summary = null;
     db.clearLiveDocSetCache();
     db.clearNonVisibleDocSetCache();
 
@@ -77896,8 +79109,9 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes" {
 test "db dense chunk consumer supports parent and parent_with_chunks modes with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -77975,8 +79189,9 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes with 
 test "db dense parent paging fetches enough chunk hits before grouping" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -78032,8 +79247,9 @@ test "db dense parent paging fetches enough chunk hits before grouping" {
 test "db batch persists per-index applied sequence watermark" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -78075,8 +79291,9 @@ test "db batch persists per-index applied sequence watermark" {
 test "db managed projection checkpoints persist status and config identity" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const configs = [_]types.IndexConfig{
@@ -78145,8 +79362,9 @@ test "db managed projection checkpoints persist status and config identity" {
 test "db batch truncates replay logs after managed indexes catch up" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -78184,8 +79402,9 @@ test "db batch truncates replay logs after managed indexes catch up" {
 test "db async replay truncation retains durable enrichment debt" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -78232,8 +79451,9 @@ test "db async replay truncation retains durable enrichment debt" {
 test "db restart after provider failure resumes enrichment from retained async replay" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var first_applied_sequence: u64 = 0;
@@ -78343,8 +79563,9 @@ test "db restart after provider failure resumes enrichment from retained async r
 test "db async replay truncation retains journal behind generated enrichment" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var gated = GateDenseEmbedder{};
@@ -78407,8 +79628,9 @@ test "db async replay truncation retains journal behind generated enrichment" {
 test "db io_threaded executor processes indexed writes" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -78449,8 +79671,9 @@ test "db io_threaded executor stress applies explicit dense embeddings on lsm ba
     const progress_interval = @max(batch_size, stressEnvUsize("ANTFLY_STRESS_DENSE_PROGRESS", batch_size * 8));
     const dense_backend = stressDenseBackend();
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -78539,8 +79762,9 @@ test "db io_threaded executor stress applies explicit dense embeddings on lsm ba
 test "db reopen replays pending derived embeddings from durable log" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var appended_sequence: u64 = 0;
@@ -78604,14 +79828,17 @@ test "db reopen replays pending derived embeddings from durable log" {
 test "storage.ha db mirrors appended derived replay records into HA stream" {
     const alloc = std.testing.allocator;
 
-    var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
+    var db_path_tmp = try TestDirectory.init("db");
+    defer db_path_tmp.cleanup();
+    const db_path = db_path_tmp.path().ptr;
     defer cleanupTempDir(db_path);
-    var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
+    var ha_log_path_tmp = try TestDirectory.init("db");
+    defer ha_log_path_tmp.cleanup();
+    const ha_log_path = ha_log_path_tmp.path().ptr;
     defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    var ha_slots_path_tmp = try TestDirectory.init("db");
+    defer ha_slots_path_tmp.cleanup();
+    const ha_slots_path = ha_slots_path_tmp.path().ptr;
     defer cleanupTempDir(ha_slots_path);
 
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
@@ -78665,14 +79892,17 @@ test "storage.ha db mirrors appended derived replay records into HA stream" {
 test "storage.ha db waits for remote apply before completing derived enrichment" {
     const alloc = std.testing.allocator;
 
-    var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
+    var db_path_tmp = try TestDirectory.init("db");
+    defer db_path_tmp.cleanup();
+    const db_path = db_path_tmp.path().ptr;
     defer cleanupTempDir(db_path);
-    var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
+    var ha_log_path_tmp = try TestDirectory.init("db");
+    defer ha_log_path_tmp.cleanup();
+    const ha_log_path = ha_log_path_tmp.path().ptr;
     defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    var ha_slots_path_tmp = try TestDirectory.init("db");
+    defer ha_slots_path_tmp.cleanup();
+    const ha_slots_path = ha_slots_path_tmp.path().ptr;
     defer cleanupTempDir(ha_slots_path);
 
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
@@ -78743,23 +79973,29 @@ test "storage.ha db waits for remote apply before completing derived enrichment"
 test "storage.ha db mirrors committed batch mutations into HA stream for standby apply" {
     const alloc = std.testing.allocator;
 
-    var primary_db_path_buf: [256]u8 = undefined;
-    const primary_db_path = tempPath(&primary_db_path_buf);
+    var primary_db_path_tmp = try TestDirectory.init("db");
+    defer primary_db_path_tmp.cleanup();
+    const primary_db_path = primary_db_path_tmp.path().ptr;
     defer cleanupTempDir(primary_db_path);
-    var standby_db_path_buf: [256]u8 = undefined;
-    const standby_db_path = tempPath(&standby_db_path_buf);
+    var standby_db_path_tmp = try TestDirectory.init("db");
+    defer standby_db_path_tmp.cleanup();
+    const standby_db_path = standby_db_path_tmp.path().ptr;
     defer cleanupTempDir(standby_db_path);
-    var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
+    var ha_log_path_tmp = try TestDirectory.init("db");
+    defer ha_log_path_tmp.cleanup();
+    const ha_log_path = ha_log_path_tmp.path().ptr;
     defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    var ha_slots_path_tmp = try TestDirectory.init("db");
+    defer ha_slots_path_tmp.cleanup();
+    const ha_slots_path = ha_slots_path_tmp.path().ptr;
     defer cleanupTempDir(ha_slots_path);
-    var standby_log_path_buf: [256]u8 = undefined;
-    const standby_log_path = tempPath(&standby_log_path_buf);
+    var standby_log_path_tmp = try TestDirectory.init("db");
+    defer standby_log_path_tmp.cleanup();
+    const standby_log_path = standby_log_path_tmp.path().ptr;
     defer cleanupTempDir(standby_log_path);
-    var standby_progress_path_buf: [256]u8 = undefined;
-    const standby_progress_path = tempPath(&standby_progress_path_buf);
+    var standby_progress_path_tmp = try TestDirectory.init("db");
+    defer standby_progress_path_tmp.cleanup();
+    const standby_progress_path = standby_progress_path_tmp.path().ptr;
     defer cleanupTempDir(standby_progress_path);
 
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
@@ -78845,14 +80081,17 @@ test "storage.ha seed capture barrier prevents local commit without matching wal
 
     const alloc = std.heap.c_allocator;
 
-    var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
+    var db_path_tmp = try TestDirectory.init("db");
+    defer db_path_tmp.cleanup();
+    const db_path = db_path_tmp.path().ptr;
     defer cleanupTempDir(db_path);
-    var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
+    var ha_log_path_tmp = try TestDirectory.init("db");
+    defer ha_log_path_tmp.cleanup();
+    const ha_log_path = ha_log_path_tmp.path().ptr;
     defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    var ha_slots_path_tmp = try TestDirectory.init("db");
+    defer ha_slots_path_tmp.cleanup();
+    const ha_slots_path = ha_slots_path_tmp.path().ptr;
     defer cleanupTempDir(ha_slots_path);
 
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
@@ -78877,17 +80116,17 @@ test "storage.ha seed capture barrier prevents local commit without matching wal
 
     var capture = barrier.acquireExclusive();
     var write_probe = ConcurrentWriteProbe{ .db = &db };
-    const write_thread = try std.Thread.spawn(.{}, ConcurrentWriteProbe.runBatch, .{&write_probe});
+    var write_thread = try std.testing.io.concurrent(ConcurrentWriteProbe.runBatch, .{&write_probe});
     errdefer {
         capture.release();
-        write_thread.join();
+        write_thread.await(std.testing.io);
     }
 
     try std.testing.expect(waitForAtomicFlag(&write_probe.started, 1, 10_000));
     var attempts: usize = 0;
     while (attempts < 10_000) : (attempts += 1) {
         if (barrier.pendingSharedAcquisitions() > 0) break;
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
 
     try std.testing.expect(barrier.pendingSharedAcquisitions() > 0);
@@ -78897,7 +80136,7 @@ test "storage.ha seed capture barrier prevents local commit without matching wal
     try std.testing.expect((try db.get(alloc, "doc:b")) == null);
 
     capture.release();
-    write_thread.join();
+    write_thread.await(std.testing.io);
     try std.testing.expectEqual(@as(u8, 0), write_probe.failed.load(.monotonic));
     try std.testing.expectEqual(@as(u8, 1), write_probe.done.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
@@ -78910,8 +80149,9 @@ test "storage.ha seed snapshot predrains enrichment before exclusive capture" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
-    var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
+    var db_path_tmp = try TestDirectory.init("db");
+    defer db_path_tmp.cleanup();
+    const db_path = db_path_tmp.path().ptr;
     defer cleanupTempDir(db_path);
     defer {
         var snapshots_buf: [512]u8 = undefined;
@@ -78919,11 +80159,13 @@ test "storage.ha seed snapshot predrains enrichment before exclusive capture" {
             std.Io.Dir.cwd().deleteTree(std.testing.io, snapshots) catch {};
         } else |_| {}
     }
-    var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
+    var ha_log_path_tmp = try TestDirectory.init("db");
+    defer ha_log_path_tmp.cleanup();
+    const ha_log_path = ha_log_path_tmp.path().ptr;
     defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    var ha_slots_path_tmp = try TestDirectory.init("db");
+    defer ha_slots_path_tmp.cleanup();
+    const ha_slots_path = ha_slots_path_tmp.path().ptr;
     defer cleanupTempDir(ha_slots_path);
 
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
@@ -79004,14 +80246,17 @@ test "storage.ha fence cannot strand a local commit beyond the HA tail" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.heap.c_allocator;
-    var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
+    var db_path_tmp = try TestDirectory.init("db");
+    defer db_path_tmp.cleanup();
+    const db_path = db_path_tmp.path().ptr;
     defer cleanupTempDir(db_path);
-    var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
+    var ha_log_path_tmp = try TestDirectory.init("db");
+    defer ha_log_path_tmp.cleanup();
+    const ha_log_path = ha_log_path_tmp.path().ptr;
     defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    var ha_slots_path_tmp = try TestDirectory.init("db");
+    defer ha_slots_path_tmp.cleanup();
+    const ha_slots_path = ha_slots_path_tmp.path().ptr;
     defer cleanupTempDir(ha_slots_path);
 
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
@@ -79041,11 +80286,11 @@ test "storage.ha fence cannot strand a local commit beyond the HA tail" {
     lockAtomic(&transition_mutex);
     var transition_locked = true;
     var write_probe = ConcurrentWriteProbe{ .db = &db };
-    const write_thread = try std.Thread.spawn(.{}, ConcurrentWriteProbe.runBatch, .{&write_probe});
+    var write_thread = try std.testing.io.concurrent(ConcurrentWriteProbe.runBatch, .{&write_probe});
     var thread_joined = false;
     errdefer {
         if (transition_locked) transition_mutex.unlock();
-        if (!thread_joined) write_thread.join();
+        if (!thread_joined) write_thread.await(std.testing.io);
     }
     try std.testing.expect(waitForAtomicFlag(&write_probe.started, 1, 10_000));
     var local_commit_observed = false;
@@ -79055,7 +80300,7 @@ test "storage.ha fence cannot strand a local commit beyond the HA tail" {
             local_commit_observed = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     try std.testing.expect(local_commit_observed);
     try std.testing.expectEqual(@as(u64, 0), primary.lastLsn());
@@ -79063,7 +80308,7 @@ test "storage.ha fence cannot strand a local commit beyond the HA tail" {
     public_gate.publishPrimaryFence(true);
     transition_mutex.unlock();
     transition_locked = false;
-    write_thread.join();
+    write_thread.await(std.testing.io);
     thread_joined = true;
 
     try std.testing.expectEqual(@as(u8, 1), write_probe.failed.load(.monotonic));
@@ -79077,14 +80322,17 @@ test "storage.ha schema json mutation does not reacquire shared barrier behind q
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
-    var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
+    var db_path_tmp = try TestDirectory.init("db");
+    defer db_path_tmp.cleanup();
+    const db_path = db_path_tmp.path().ptr;
     defer cleanupTempDir(db_path);
-    var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
+    var ha_log_path_tmp = try TestDirectory.init("db");
+    defer ha_log_path_tmp.cleanup();
+    const ha_log_path = ha_log_path_tmp.path().ptr;
     defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    var ha_slots_path_tmp = try TestDirectory.init("db");
+    defer ha_slots_path_tmp.cleanup();
+    const ha_slots_path = ha_slots_path_tmp.path().ptr;
     defer cleanupTempDir(ha_slots_path);
 
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
@@ -79120,18 +80368,18 @@ test "storage.ha schema json mutation does not reacquire shared barrier behind q
             self.started.store(1, .release);
             var capture = self.barrier.acquireExclusive();
             self.acquired.store(1, .release);
-            while (self.release.load(.acquire) == 0) std.Thread.yield() catch {};
+            while (self.release.load(.acquire) == 0) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             capture.release();
         }
     };
 
     var outer = barrier.acquireShared();
     var probe = CaptureProbe{ .barrier = &barrier };
-    const capture_thread = try std.Thread.spawn(.{}, CaptureProbe.run, .{&probe});
+    var capture_thread = try std.testing.io.concurrent(CaptureProbe.run, .{&probe});
     errdefer {
         outer.release();
         probe.release.store(1, .release);
-        capture_thread.join();
+        capture_thread.await(std.testing.io);
     }
     try std.testing.expect(waitForAtomicFlag(&probe.started, 1, 10_000));
     var capture_queued = false;
@@ -79140,7 +80388,7 @@ test "storage.ha schema json mutation does not reacquire shared barrier behind q
             capture_queued = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     try std.testing.expect(capture_queued);
 
@@ -79151,7 +80399,7 @@ test "storage.ha schema json mutation does not reacquire shared barrier behind q
     outer.release();
     try std.testing.expect(waitForAtomicFlag(&probe.acquired, 1, 10_000));
     probe.release.store(1, .release);
-    capture_thread.join();
+    capture_thread.await(std.testing.io);
 
     const stored = (try db.getSchemaJson(alloc)) orelse return error.TestExpectedEqual;
     defer alloc.free(stored);
@@ -79162,14 +80410,17 @@ test "storage.ha schema json mutation does not reacquire shared barrier behind q
 test "storage.ha db evaluates sync commit gate for mirrored batch mutations" {
     const alloc = std.testing.allocator;
 
-    var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
+    var db_path_tmp = try TestDirectory.init("db");
+    defer db_path_tmp.cleanup();
+    const db_path = db_path_tmp.path().ptr;
     defer cleanupTempDir(db_path);
-    var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
+    var ha_log_path_tmp = try TestDirectory.init("db");
+    defer ha_log_path_tmp.cleanup();
+    const ha_log_path = ha_log_path_tmp.path().ptr;
     defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    var ha_slots_path_tmp = try TestDirectory.init("db");
+    defer ha_slots_path_tmp.cleanup();
+    const ha_slots_path = ha_slots_path_tmp.path().ptr;
     defer cleanupTempDir(ha_slots_path);
 
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
@@ -79221,14 +80472,17 @@ test "storage.ha db evaluates sync commit gate for mirrored batch mutations" {
 test "storage.ha db block sync policy waits for standby acknowledgement" {
     const alloc = std.testing.allocator;
 
-    var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
+    var db_path_tmp = try TestDirectory.init("db");
+    defer db_path_tmp.cleanup();
+    const db_path = db_path_tmp.path().ptr;
     defer cleanupTempDir(db_path);
-    var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
+    var ha_log_path_tmp = try TestDirectory.init("db");
+    defer ha_log_path_tmp.cleanup();
+    const ha_log_path = ha_log_path_tmp.path().ptr;
     defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    var ha_slots_path_tmp = try TestDirectory.init("db");
+    defer ha_slots_path_tmp.cleanup();
+    const ha_slots_path = ha_slots_path_tmp.path().ptr;
     defer cleanupTempDir(ha_slots_path);
 
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
@@ -79294,23 +80548,29 @@ test "storage.ha db block sync policy waits for standby acknowledgement" {
 test "storage.ha db session sync wait satisfies remote apply through standby DB apply" {
     const alloc = std.testing.allocator;
 
-    var primary_db_path_buf: [256]u8 = undefined;
-    const primary_db_path = tempPath(&primary_db_path_buf);
+    var primary_db_path_tmp = try TestDirectory.init("db");
+    defer primary_db_path_tmp.cleanup();
+    const primary_db_path = primary_db_path_tmp.path().ptr;
     defer cleanupTempDir(primary_db_path);
-    var standby_db_path_buf: [256]u8 = undefined;
-    const standby_db_path = tempPath(&standby_db_path_buf);
+    var standby_db_path_tmp = try TestDirectory.init("db");
+    defer standby_db_path_tmp.cleanup();
+    const standby_db_path = standby_db_path_tmp.path().ptr;
     defer cleanupTempDir(standby_db_path);
-    var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
+    var ha_log_path_tmp = try TestDirectory.init("db");
+    defer ha_log_path_tmp.cleanup();
+    const ha_log_path = ha_log_path_tmp.path().ptr;
     defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    var ha_slots_path_tmp = try TestDirectory.init("db");
+    defer ha_slots_path_tmp.cleanup();
+    const ha_slots_path = ha_slots_path_tmp.path().ptr;
     defer cleanupTempDir(ha_slots_path);
-    var standby_log_path_buf: [256]u8 = undefined;
-    const standby_log_path = tempPath(&standby_log_path_buf);
+    var standby_log_path_tmp = try TestDirectory.init("db");
+    defer standby_log_path_tmp.cleanup();
+    const standby_log_path = standby_log_path_tmp.path().ptr;
     defer cleanupTempDir(standby_log_path);
-    var standby_progress_path_buf: [256]u8 = undefined;
-    const standby_progress_path = tempPath(&standby_progress_path_buf);
+    var standby_progress_path_tmp = try TestDirectory.init("db");
+    defer standby_progress_path_tmp.cleanup();
+    const standby_progress_path = standby_progress_path_tmp.path().ptr;
     defer cleanupTempDir(standby_progress_path);
 
     const identity = ha_standby_mod.Identity{
@@ -79389,23 +80649,29 @@ test "storage.ha db session sync wait satisfies remote apply through standby DB 
 test "storage.ha db allows progress but rejects acknowledgement when fenced during remote apply wait" {
     const alloc = std.testing.allocator;
 
-    var primary_db_path_buf: [256]u8 = undefined;
-    const primary_db_path = tempPath(&primary_db_path_buf);
+    var primary_db_path_tmp = try TestDirectory.init("db");
+    defer primary_db_path_tmp.cleanup();
+    const primary_db_path = primary_db_path_tmp.path().ptr;
     defer cleanupTempDir(primary_db_path);
-    var standby_db_path_buf: [256]u8 = undefined;
-    const standby_db_path = tempPath(&standby_db_path_buf);
+    var standby_db_path_tmp = try TestDirectory.init("db");
+    defer standby_db_path_tmp.cleanup();
+    const standby_db_path = standby_db_path_tmp.path().ptr;
     defer cleanupTempDir(standby_db_path);
-    var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
+    var ha_log_path_tmp = try TestDirectory.init("db");
+    defer ha_log_path_tmp.cleanup();
+    const ha_log_path = ha_log_path_tmp.path().ptr;
     defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    var ha_slots_path_tmp = try TestDirectory.init("db");
+    defer ha_slots_path_tmp.cleanup();
+    const ha_slots_path = ha_slots_path_tmp.path().ptr;
     defer cleanupTempDir(ha_slots_path);
-    var standby_log_path_buf: [256]u8 = undefined;
-    const standby_log_path = tempPath(&standby_log_path_buf);
+    var standby_log_path_tmp = try TestDirectory.init("db");
+    defer standby_log_path_tmp.cleanup();
+    const standby_log_path = standby_log_path_tmp.path().ptr;
     defer cleanupTempDir(standby_log_path);
-    var standby_progress_path_buf: [256]u8 = undefined;
-    const standby_progress_path = tempPath(&standby_progress_path_buf);
+    var standby_progress_path_tmp = try TestDirectory.init("db");
+    defer standby_progress_path_tmp.cleanup();
+    const standby_progress_path = standby_progress_path_tmp.path().ptr;
     defer cleanupTempDir(standby_progress_path);
 
     const identity = ha_standby_mod.Identity{
@@ -79522,20 +80788,25 @@ test "storage.ha db allows progress but rejects acknowledgement when fenced duri
 test "storage.ha db session sync wait remote write acknowledges durable receive despite apply failure" {
     const alloc = std.testing.allocator;
 
-    var primary_db_path_buf: [256]u8 = undefined;
-    const primary_db_path = tempPath(&primary_db_path_buf);
+    var primary_db_path_tmp = try TestDirectory.init("db");
+    defer primary_db_path_tmp.cleanup();
+    const primary_db_path = primary_db_path_tmp.path().ptr;
     defer cleanupTempDir(primary_db_path);
-    var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
+    var ha_log_path_tmp = try TestDirectory.init("db");
+    defer ha_log_path_tmp.cleanup();
+    const ha_log_path = ha_log_path_tmp.path().ptr;
     defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    var ha_slots_path_tmp = try TestDirectory.init("db");
+    defer ha_slots_path_tmp.cleanup();
+    const ha_slots_path = ha_slots_path_tmp.path().ptr;
     defer cleanupTempDir(ha_slots_path);
-    var standby_log_path_buf: [256]u8 = undefined;
-    const standby_log_path = tempPath(&standby_log_path_buf);
+    var standby_log_path_tmp = try TestDirectory.init("db");
+    defer standby_log_path_tmp.cleanup();
+    const standby_log_path = standby_log_path_tmp.path().ptr;
     defer cleanupTempDir(standby_log_path);
-    var standby_progress_path_buf: [256]u8 = undefined;
-    const standby_progress_path = tempPath(&standby_progress_path_buf);
+    var standby_progress_path_tmp = try TestDirectory.init("db");
+    defer standby_progress_path_tmp.cleanup();
+    const standby_progress_path = standby_progress_path_tmp.path().ptr;
     defer cleanupTempDir(standby_progress_path);
 
     const identity = ha_standby_mod.Identity{
@@ -79619,14 +80890,17 @@ test "storage.ha db session sync wait remote write acknowledges durable receive 
 test "storage.ha db primary progress sync wait observes reported remote apply ack" {
     const alloc = std.testing.allocator;
 
-    var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
+    var db_path_tmp = try TestDirectory.init("db");
+    defer db_path_tmp.cleanup();
+    const db_path = db_path_tmp.path().ptr;
     defer cleanupTempDir(db_path);
-    var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
+    var ha_log_path_tmp = try TestDirectory.init("db");
+    defer ha_log_path_tmp.cleanup();
+    const ha_log_path = ha_log_path_tmp.path().ptr;
     defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    var ha_slots_path_tmp = try TestDirectory.init("db");
+    defer ha_slots_path_tmp.cleanup();
+    const ha_slots_path = ha_slots_path_tmp.path().ptr;
     defer cleanupTempDir(ha_slots_path);
 
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
@@ -79700,11 +80974,13 @@ test "storage.ha db primary progress sync wait observes reported remote apply ac
 test "storage.ha primary progress sync wait fast fails without enough eligible candidates" {
     const alloc = std.testing.allocator;
 
-    var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
+    var ha_log_path_tmp = try TestDirectory.init("db");
+    defer ha_log_path_tmp.cleanup();
+    const ha_log_path = ha_log_path_tmp.path().ptr;
     defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    var ha_slots_path_tmp = try TestDirectory.init("db");
+    defer ha_slots_path_tmp.cleanup();
+    const ha_slots_path = ha_slots_path_tmp.path().ptr;
     defer cleanupTempDir(ha_slots_path);
 
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
@@ -79748,14 +81024,17 @@ test "storage.ha primary progress sync wait fast fails without enough eligible c
 test "storage.ha db primary progress sync wait returns would block without reported ack" {
     const alloc = std.testing.allocator;
 
-    var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
+    var db_path_tmp = try TestDirectory.init("db");
+    defer db_path_tmp.cleanup();
+    const db_path = db_path_tmp.path().ptr;
     defer cleanupTempDir(db_path);
-    var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
+    var ha_log_path_tmp = try TestDirectory.init("db");
+    defer ha_log_path_tmp.cleanup();
+    const ha_log_path = ha_log_path_tmp.path().ptr;
     defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    var ha_slots_path_tmp = try TestDirectory.init("db");
+    defer ha_slots_path_tmp.cleanup();
+    const ha_slots_path = ha_slots_path_tmp.path().ptr;
     defer cleanupTempDir(ha_slots_path);
 
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
@@ -79807,14 +81086,17 @@ test "storage.ha db primary progress sync wait returns would block without repor
 test "storage.ha pending acknowledgement preserves batch and replay tail order" {
     const alloc = std.testing.allocator;
 
-    var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
+    var db_path_tmp = try TestDirectory.init("db");
+    defer db_path_tmp.cleanup();
+    const db_path = db_path_tmp.path().ptr;
     defer cleanupTempDir(db_path);
-    var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
+    var ha_log_path_tmp = try TestDirectory.init("db");
+    defer ha_log_path_tmp.cleanup();
+    const ha_log_path = ha_log_path_tmp.path().ptr;
     defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    var ha_slots_path_tmp = try TestDirectory.init("db");
+    defer ha_slots_path_tmp.cleanup();
+    const ha_slots_path = ha_slots_path_tmp.path().ptr;
     defer cleanupTempDir(ha_slots_path);
 
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
@@ -79874,14 +81156,17 @@ test "storage.ha pending acknowledgement preserves batch and replay tail order" 
 
 test "db transaction HA retry drains durable mirror outbox" {
     const alloc = std.testing.allocator;
-    var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
+    var db_path_tmp = try TestDirectory.init("db");
+    defer db_path_tmp.cleanup();
+    const db_path = db_path_tmp.path().ptr;
     defer cleanupTempDir(db_path);
-    var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
+    var ha_log_path_tmp = try TestDirectory.init("db");
+    defer ha_log_path_tmp.cleanup();
+    const ha_log_path = ha_log_path_tmp.path().ptr;
     defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    var ha_slots_path_tmp = try TestDirectory.init("db");
+    defer ha_slots_path_tmp.cleanup();
+    const ha_slots_path = ha_slots_path_tmp.path().ptr;
     defer cleanupTempDir(ha_slots_path);
 
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
@@ -79943,14 +81228,17 @@ test "db transaction HA retry drains durable mirror outbox" {
 test "storage.ha db primary progress sync wait survives primary restart before ack" {
     const alloc = std.testing.allocator;
 
-    var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
+    var db_path_tmp = try TestDirectory.init("db");
+    defer db_path_tmp.cleanup();
+    const db_path = db_path_tmp.path().ptr;
     defer cleanupTempDir(db_path);
-    var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
+    var ha_log_path_tmp = try TestDirectory.init("db");
+    defer ha_log_path_tmp.cleanup();
+    const ha_log_path = ha_log_path_tmp.path().ptr;
     defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    var ha_slots_path_tmp = try TestDirectory.init("db");
+    defer ha_slots_path_tmp.cleanup();
+    const ha_slots_path = ha_slots_path_tmp.path().ptr;
     defer cleanupTempDir(ha_slots_path);
 
     const identity = ha_primary_mod.Identity{
@@ -80028,14 +81316,17 @@ test "storage.ha db primary progress sync wait survives primary restart before a
 test "storage.ha db block sync policy surfaces wait provider errors" {
     const alloc = std.testing.allocator;
 
-    var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
+    var db_path_tmp = try TestDirectory.init("db");
+    defer db_path_tmp.cleanup();
+    const db_path = db_path_tmp.path().ptr;
     defer cleanupTempDir(db_path);
-    var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
+    var ha_log_path_tmp = try TestDirectory.init("db");
+    defer ha_log_path_tmp.cleanup();
+    const ha_log_path = ha_log_path_tmp.path().ptr;
     defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    var ha_slots_path_tmp = try TestDirectory.init("db");
+    defer ha_slots_path_tmp.cleanup();
+    const ha_slots_path = ha_slots_path_tmp.path().ptr;
     defer cleanupTempDir(ha_slots_path);
 
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
@@ -80095,14 +81386,17 @@ test "storage.ha db block sync policy surfaces wait provider errors" {
 test "storage.ha db fail-closed sync policy rejects before local batch commit" {
     const alloc = std.testing.allocator;
 
-    var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
+    var db_path_tmp = try TestDirectory.init("db");
+    defer db_path_tmp.cleanup();
+    const db_path = db_path_tmp.path().ptr;
     defer cleanupTempDir(db_path);
-    var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
+    var ha_log_path_tmp = try TestDirectory.init("db");
+    defer ha_log_path_tmp.cleanup();
+    const ha_log_path = ha_log_path_tmp.path().ptr;
     defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    var ha_slots_path_tmp = try TestDirectory.init("db");
+    defer ha_slots_path_tmp.cleanup();
+    const ha_slots_path = ha_slots_path_tmp.path().ptr;
     defer cleanupTempDir(ha_slots_path);
 
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
@@ -80149,23 +81443,29 @@ test "storage.ha db fail-closed sync policy rejects before local batch commit" {
 test "storage.ha db mirrors and applies schema metadata mutation records" {
     const alloc = std.testing.allocator;
 
-    var primary_db_path_buf: [256]u8 = undefined;
-    const primary_db_path = tempPath(&primary_db_path_buf);
+    var primary_db_path_tmp = try TestDirectory.init("db");
+    defer primary_db_path_tmp.cleanup();
+    const primary_db_path = primary_db_path_tmp.path().ptr;
     defer cleanupTempDir(primary_db_path);
-    var standby_db_path_buf: [256]u8 = undefined;
-    const standby_db_path = tempPath(&standby_db_path_buf);
+    var standby_db_path_tmp = try TestDirectory.init("db");
+    defer standby_db_path_tmp.cleanup();
+    const standby_db_path = standby_db_path_tmp.path().ptr;
     defer cleanupTempDir(standby_db_path);
-    var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
+    var ha_log_path_tmp = try TestDirectory.init("db");
+    defer ha_log_path_tmp.cleanup();
+    const ha_log_path = ha_log_path_tmp.path().ptr;
     defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    var ha_slots_path_tmp = try TestDirectory.init("db");
+    defer ha_slots_path_tmp.cleanup();
+    const ha_slots_path = ha_slots_path_tmp.path().ptr;
     defer cleanupTempDir(ha_slots_path);
-    var standby_log_path_buf: [256]u8 = undefined;
-    const standby_log_path = tempPath(&standby_log_path_buf);
+    var standby_log_path_tmp = try TestDirectory.init("db");
+    defer standby_log_path_tmp.cleanup();
+    const standby_log_path = standby_log_path_tmp.path().ptr;
     defer cleanupTempDir(standby_log_path);
-    var standby_progress_path_buf: [256]u8 = undefined;
-    const standby_progress_path = tempPath(&standby_progress_path_buf);
+    var standby_progress_path_tmp = try TestDirectory.init("db");
+    defer standby_progress_path_tmp.cleanup();
+    const standby_progress_path = standby_progress_path_tmp.path().ptr;
     defer cleanupTempDir(standby_progress_path);
 
     const identity = ha_standby_mod.Identity{
@@ -80238,20 +81538,25 @@ test "storage.ha db mirrors and applies schema metadata mutation records" {
 test "storage.ha db applies batch mutation records through replication session callback" {
     const alloc = std.testing.allocator;
 
-    var standby_db_path_buf: [256]u8 = undefined;
-    const standby_db_path = tempPath(&standby_db_path_buf);
+    var standby_db_path_tmp = try TestDirectory.init("db");
+    defer standby_db_path_tmp.cleanup();
+    const standby_db_path = standby_db_path_tmp.path().ptr;
     defer cleanupTempDir(standby_db_path);
-    var primary_log_path_buf: [256]u8 = undefined;
-    const primary_log_path = tempPath(&primary_log_path_buf);
+    var primary_log_path_tmp = try TestDirectory.init("db");
+    defer primary_log_path_tmp.cleanup();
+    const primary_log_path = primary_log_path_tmp.path().ptr;
     defer cleanupTempDir(primary_log_path);
-    var primary_slots_path_buf: [256]u8 = undefined;
-    const primary_slots_path = tempPath(&primary_slots_path_buf);
+    var primary_slots_path_tmp = try TestDirectory.init("db");
+    defer primary_slots_path_tmp.cleanup();
+    const primary_slots_path = primary_slots_path_tmp.path().ptr;
     defer cleanupTempDir(primary_slots_path);
-    var standby_log_path_buf: [256]u8 = undefined;
-    const standby_log_path = tempPath(&standby_log_path_buf);
+    var standby_log_path_tmp = try TestDirectory.init("db");
+    defer standby_log_path_tmp.cleanup();
+    const standby_log_path = standby_log_path_tmp.path().ptr;
     defer cleanupTempDir(standby_log_path);
-    var standby_progress_path_buf: [256]u8 = undefined;
-    const standby_progress_path = tempPath(&standby_progress_path_buf);
+    var standby_progress_path_tmp = try TestDirectory.init("db");
+    defer standby_progress_path_tmp.cleanup();
+    const standby_progress_path = standby_progress_path_tmp.path().ptr;
     defer cleanupTempDir(standby_progress_path);
 
     const identity = ha_standby_mod.Identity{
@@ -80345,14 +81650,17 @@ test "storage.ha db applies batch mutation records through replication session c
 test "storage.ha db persists applied replication marker across reopen" {
     const alloc = std.testing.allocator;
 
-    var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
+    var db_path_tmp = try TestDirectory.init("db");
+    defer db_path_tmp.cleanup();
+    const db_path = db_path_tmp.path().ptr;
     defer cleanupTempDir(db_path);
-    var primary_log_path_buf: [256]u8 = undefined;
-    const primary_log_path = tempPath(&primary_log_path_buf);
+    var primary_log_path_tmp = try TestDirectory.init("db");
+    defer primary_log_path_tmp.cleanup();
+    const primary_log_path = primary_log_path_tmp.path().ptr;
     defer cleanupTempDir(primary_log_path);
-    var primary_slots_path_buf: [256]u8 = undefined;
-    const primary_slots_path = tempPath(&primary_slots_path_buf);
+    var primary_slots_path_tmp = try TestDirectory.init("db");
+    defer primary_slots_path_tmp.cleanup();
+    const primary_slots_path = primary_slots_path_tmp.path().ptr;
     defer cleanupTempDir(primary_slots_path);
 
     const identity = ha_standby_mod.Identity{
@@ -80397,8 +81705,9 @@ test "storage.ha db persists applied replication marker across reopen" {
 test "storage.ha db applies timeline switch as durable replication boundary" {
     const alloc = std.testing.allocator;
 
-    var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
+    var db_path_tmp = try TestDirectory.init("db");
+    defer db_path_tmp.cleanup();
+    const db_path = db_path_tmp.path().ptr;
     defer cleanupTempDir(db_path);
 
     const switch_record = ha_replication_record_mod.RecordView{
@@ -80433,14 +81742,17 @@ test "storage.ha db applies timeline switch as durable replication boundary" {
 test "storage.ha db write gate rejects client writes on standby but allows replicated apply" {
     const alloc = std.testing.allocator;
 
-    var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
+    var db_path_tmp = try TestDirectory.init("db");
+    defer db_path_tmp.cleanup();
+    const db_path = db_path_tmp.path().ptr;
     defer cleanupTempDir(db_path);
-    var standby_log_path_buf: [256]u8 = undefined;
-    const standby_log_path = tempPath(&standby_log_path_buf);
+    var standby_log_path_tmp = try TestDirectory.init("db");
+    defer standby_log_path_tmp.cleanup();
+    const standby_log_path = standby_log_path_tmp.path().ptr;
     defer cleanupTempDir(standby_log_path);
-    var standby_progress_path_buf: [256]u8 = undefined;
-    const standby_progress_path = tempPath(&standby_progress_path_buf);
+    var standby_progress_path_tmp = try TestDirectory.init("db");
+    defer standby_progress_path_tmp.cleanup();
+    const standby_progress_path = standby_progress_path_tmp.path().ptr;
     defer cleanupTempDir(standby_progress_path);
 
     var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, .{
@@ -80492,17 +81804,21 @@ test "storage.ha db write gate rejects client writes on standby but allows repli
 test "storage.ha db write gate rejects fenced former primary writes" {
     const alloc = std.testing.allocator;
 
-    var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
+    var db_path_tmp = try TestDirectory.init("db");
+    defer db_path_tmp.cleanup();
+    const db_path = db_path_tmp.path().ptr;
     defer cleanupTempDir(db_path);
-    var primary_log_path_buf: [256]u8 = undefined;
-    const primary_log_path = tempPath(&primary_log_path_buf);
+    var primary_log_path_tmp = try TestDirectory.init("db");
+    defer primary_log_path_tmp.cleanup();
+    const primary_log_path = primary_log_path_tmp.path().ptr;
     defer cleanupTempDir(primary_log_path);
-    var primary_slots_path_buf: [256]u8 = undefined;
-    const primary_slots_path = tempPath(&primary_slots_path_buf);
+    var primary_slots_path_tmp = try TestDirectory.init("db");
+    defer primary_slots_path_tmp.cleanup();
+    const primary_slots_path = primary_slots_path_tmp.path().ptr;
     defer cleanupTempDir(primary_slots_path);
-    var fence_path_buf: [256]u8 = undefined;
-    const fence_path = tempPath(&fence_path_buf);
+    var fence_path_tmp = try TestDirectory.init("db");
+    defer fence_path_tmp.cleanup();
+    const fence_path = fence_path_tmp.path().ptr;
     defer cleanupTempDir(fence_path);
 
     const identity = ha_primary_mod.Identity{
@@ -80558,14 +81874,17 @@ test "storage.ha db write gate rejects fenced former primary writes" {
 test "storage.ha db standby role suppresses mutating background runtimes" {
     const alloc = std.testing.allocator;
 
-    var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
+    var db_path_tmp = try TestDirectory.init("db");
+    defer db_path_tmp.cleanup();
+    const db_path = db_path_tmp.path().ptr;
     defer cleanupTempDir(db_path);
-    var standby_log_path_buf: [256]u8 = undefined;
-    const standby_log_path = tempPath(&standby_log_path_buf);
+    var standby_log_path_tmp = try TestDirectory.init("db");
+    defer standby_log_path_tmp.cleanup();
+    const standby_log_path = standby_log_path_tmp.path().ptr;
     defer cleanupTempDir(standby_log_path);
-    var standby_progress_path_buf: [256]u8 = undefined;
-    const standby_progress_path = tempPath(&standby_progress_path_buf);
+    var standby_progress_path_tmp = try TestDirectory.init("db");
+    defer standby_progress_path_tmp.cleanup();
+    const standby_progress_path = standby_progress_path_tmp.path().ptr;
     defer cleanupTempDir(standby_progress_path);
 
     var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, .{
@@ -80603,8 +81922,9 @@ test "storage.ha db standby role suppresses mutating background runtimes" {
 test "db reopen replays pending derived embeddings with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var appended_sequence: u64 = 0;
@@ -80672,8 +81992,9 @@ test "db reopen replays pending derived embeddings with durable lsm primary back
 test "db reopen preserves applied watermark above retained replay floor" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -80709,8 +82030,9 @@ test "db reopen preserves applied watermark above retained replay floor" {
 test "db query_readonly open skips pending derived replay on reopen" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var appended_sequence: u64 = 0;
@@ -80833,8 +82155,9 @@ test "db query_readonly open skips pending derived replay on reopen" {
 test "db query_readonly lsm primary opens physical backend read-only" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -80875,8 +82198,9 @@ test "db query_readonly lsm primary opens physical backend read-only" {
 test "db read-only open modes can share lsm root with live writer" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var writer = try DB.open(alloc, std.mem.span(path), .{
@@ -80918,8 +82242,9 @@ test "db read-only open modes can share lsm root with live writer" {
 test "db read-only open modes reject catalog mutations before side effects" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -80988,8 +82313,9 @@ test "db read-only open modes reject catalog mutations before side effects" {
 test "db query_readonly lmdb primary does not create missing database" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var readonly = DB.open(alloc, std.mem.span(path), .{
@@ -81008,8 +82334,9 @@ test "db query_readonly lmdb primary does not create missing database" {
 test "db query_readonly lmdb primary rejects writes after readonly open" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -81048,8 +82375,9 @@ test "db query_readonly lmdb primary rejects writes after readonly open" {
 test "db writer_no_replay open defers pending derived replay until runUntilIdle" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var appended_sequence: u64 = 0;
@@ -81149,8 +82477,9 @@ test "db writer_no_replay open defers pending derived replay until runUntilIdle"
 test "db catch-up advances vacuous derived replay target gap" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const target_sequence: u64 = 7;
@@ -81204,8 +82533,9 @@ test "db catch-up advances vacuous derived replay target gap" {
 test "db stats report projection checkpoint replay tail per index hint" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const dense_target_sequence: u64 = 7;
@@ -81291,8 +82621,9 @@ test "db stats report projection checkpoint replay tail per index hint" {
 test "db catch-up hands dense coverage debt to resumable maintenance" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const target_sequence: u64 = 7;
@@ -81386,8 +82717,9 @@ test "db catch-up hands dense coverage debt to resumable maintenance" {
 
 test "idle generated coverage gap becomes durable paged recovery debt" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -81448,8 +82780,9 @@ test "idle generated coverage gap becomes durable paged recovery debt" {
 test "db catch-up defers artifact dense target advance without durable counter" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const target_sequence: u64 = 7;
@@ -81505,8 +82838,9 @@ test "db catch-up defers artifact dense target advance without durable counter" 
 
 test "db asynchronous dense replay lag is not classified as repair debt" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -81549,8 +82883,9 @@ test "db asynchronous dense replay lag is not classified as repair debt" {
 
 test "db source artifact debt does not synthesize index generation repair debt" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -81599,8 +82934,9 @@ test "db source artifact debt does not synthesize index generation repair debt" 
 test "dense replay progress target matches replay debt target" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var appended_sequence: u64 = 0;
@@ -81686,8 +83022,9 @@ test "dense replay progress target matches replay debt target" {
 test "db writer_no_replay starts workers without resuming pending derived replay" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var appended_sequence: u64 = 0;
@@ -81774,8 +83111,9 @@ test "db writer_no_replay starts workers without resuming pending derived replay
 test "db writer open resumes generated enrichment replay from journal" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -81850,8 +83188,9 @@ test "db writer open resumes generated enrichment replay from journal" {
 test "enrichment worker bounds retries against a durable foreign lease" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const lease_ttl_ms: u64 = 5_000;
@@ -81963,8 +83302,9 @@ test "collectDocumentWrites skips missing out-of-range replay docs" {
 test "text replay delete keys include upserted derived document keys" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -82017,8 +83357,9 @@ test "text replay delete keys include upserted derived document keys" {
 test "db replay respects per-index applied watermarks" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var appended_sequence: u64 = 0;
@@ -82090,8 +83431,9 @@ test "db replay respects per-index applied watermarks" {
 test "db replay applies dense embeddings from artifact payloads" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -82146,8 +83488,9 @@ test "db replay applies dense embeddings from artifact payloads" {
 test "db replay blocks dense embedding writes when artifact payload is missing" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var appended_sequence: u64 = 0;
@@ -82223,8 +83566,9 @@ test "db replay blocks dense embedding writes when artifact payload is missing" 
 test "db replay skips a missing dense artifact after its source document was deleted" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var appended_sequence: u64 = 0;
@@ -82265,8 +83609,9 @@ test "db replay skips a missing dense artifact after its source document was del
 test "db replay blocks and preserves corrupt dense embedding artifacts" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var appended_sequence: u64 = 0;
@@ -82394,8 +83739,9 @@ test "db replay blocks and preserves corrupt dense embedding artifacts" {
 test "db repeated replay preserves nonblocking dense artifact repair intent" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -82455,8 +83801,9 @@ test "db repeated replay preserves nonblocking dense artifact repair intent" {
 test "db replay records wrong-dimension dense embedding artifact as repair debt" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var appended_sequence: u64 = 0;
@@ -82519,8 +83866,9 @@ test "db replay records wrong-dimension dense embedding artifact as repair debt"
 test "db repair queue reprocesses corrupt generated dense embedding artifacts" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -82600,8 +83948,9 @@ test "db repair queue reprocesses corrupt generated dense embedding artifacts" {
 test "db repair queue reprocesses corrupt chunk generated dense embedding artifacts from parent document" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -82686,8 +84035,9 @@ test "db repair queue reprocesses corrupt chunk generated dense embedding artifa
 test "db replay applies sparse embeddings from artifact payloads" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -82734,8 +84084,9 @@ test "db replay applies sparse embeddings from artifact payloads" {
 test "db replay skips a missing sparse artifact after its source document was deleted" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var appended_sequence: u64 = 0;
@@ -82778,8 +84129,9 @@ test "db replay skips a missing sparse artifact after its source document was de
 test "db replay blocks and preserves corrupt sparse embedding artifacts" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var appended_sequence: u64 = 0;
@@ -83144,8 +84496,9 @@ test "db thin replay omits derived work for an unchanged source write" {
 test "db full-text index backfill and search routing" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -83203,8 +84556,9 @@ test "db full-text index backfill and search routing" {
 test "db full-text backfill resumes after interrupted reopen" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -83284,8 +84638,9 @@ test "db full-text backfill resumes after interrupted reopen" {
 test "db full-text backfill retires segment fanout at durable batch boundaries" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -83338,8 +84693,9 @@ test "db full-text backfill retires segment fanout at durable batch boundaries" 
 test "db sparse backfill restarts safely from a legacy cursor after interrupted reopen" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -83440,7 +84796,7 @@ fn waitForAtomicFlag(flag: *const std.atomic.Value(u8), expected: u8, max_attemp
     var attempts: usize = 0;
     while (attempts < max_attempts) : (attempts += 1) {
         if (flag.load(.monotonic) == expected) return true;
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     return flag.load(.monotonic) == expected;
 }
@@ -83454,7 +84810,7 @@ const SharedReadLockHold = struct {
         self.db.core.lockApplyShared();
         self.acquired.store(1, .monotonic);
         while (self.release.load(.monotonic) == 0) {
-            std.Thread.yield() catch {};
+            std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
         self.db.core.unlockApplyShared();
     }
@@ -83516,8 +84872,9 @@ const ConcurrentWriteProbe = struct {
 test "db dense vector index routes knn search" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -83555,8 +84912,9 @@ test "db dense vector index routes knn search" {
 test "db dense vector index routes knn search with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -83596,8 +84954,9 @@ test "db dense vector index routes knn search with durable lsm primary backend" 
 test "db full text conjunction query" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -83637,8 +84996,9 @@ test "db full text conjunction query" {
 test "db full text conjunction query with incremental full_index batches" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -83683,8 +85043,9 @@ test "db full text conjunction query with incremental full_index batches" {
 test "db full text count_only applies stored filters" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -83720,8 +85081,9 @@ test "db full text count_only applies stored filters" {
 test "db full text match_all applies stored filters" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -83759,8 +85121,9 @@ test "db full text match_all applies stored filters" {
 test "db full_index delete waits for full text visibility" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -83807,8 +85170,9 @@ test "db full_index delete waits for full text visibility" {
 test "db stats uses full text visible count when available" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -83852,8 +85216,9 @@ test "db stats uses full text visible count when available" {
 test "db schemaless full text indexes strings into _all for bare text search" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -83895,8 +85260,9 @@ test "db schemaless full text indexes strings into _all for bare text search" {
 test "db stats does not scan primary docs when full text count is available" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -83934,8 +85300,9 @@ test "db stats does not scan primary docs when full text count is available" {
 test "db sparse vector index routes knn search" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -83976,8 +85343,9 @@ test "db sparse vector index routes knn search" {
 test "db sparse vector index routes knn search with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -84016,8 +85384,9 @@ test "db sparse vector index routes knn search with durable lsm primary backend"
 test "db graph index routes neighbor queries and doc deletes clean edges" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -84083,8 +85452,9 @@ test "db graph index routes neighbor queries and doc deletes clean edges" {
 test "db direct graph writes persist graph artifacts and deletes remove them" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -84136,8 +85506,9 @@ test "db direct graph writes persist graph artifacts and deletes remove them" {
 test "db delete artifact cleanup isolates binary document id prefixes" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const first_doc = "doc\x00a";
@@ -84180,8 +85551,9 @@ test "db delete artifact cleanup isolates binary document id prefixes" {
 test "db graph index routes neighbor queries and doc deletes clean edges with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -84249,8 +85621,9 @@ test "db graph index routes neighbor queries and doc deletes clean edges with du
 test "db document _edges reconcile graph state and preserve base document" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -84327,8 +85700,9 @@ test "db document _edges reconcile graph state and preserve base document" {
 test "db document _edges reconcile graph state and preserve base document with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -84404,11 +85778,105 @@ test "db document _edges reconcile graph state and preserve base document with d
     try std.testing.expectEqualStrings("doc:c", after.hits[0].id);
 }
 
+test "db replicated merge artifacts preserve graph dense sparse projections across replay and reopen" {
+    const alloc = std.testing.allocator;
+    var donor_path_tmp = try TestDirectory.init("db");
+    defer donor_path_tmp.cleanup();
+    const donor_path = donor_path_tmp.path().ptr;
+    var donor = try DB.open(alloc, std.mem.span(donor_path), .{});
+    defer donor.close();
+    const configs = [_]types.IndexConfig{
+        .{ .name = "dv_v1", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}" },
+        .{ .name = "sp_v1", .kind = .sparse_vector, .config_json = "{\"field\":\"sparse\"}" },
+        .{ .name = "gr_v1", .kind = .graph, .config_json = "{}" },
+    };
+    for (configs) |config| try donor.addIndex(config);
+    try donor.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"embedding\":[1,0,0],\"sparse\":{\"indices\":[7],\"values\":[1]},\"_edges\":{\"gr_v1\":{\"links\":[{\"target\":\"doc:b\"}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+        },
+        .sync_level = .full_index,
+    });
+    const rows = try donor.mergeArtifactsPage(alloc, .{ .start = "", .end = "" }, null);
+    defer {
+        for (rows) |row| {
+            alloc.free(row.key);
+            alloc.free(row.value);
+        }
+        alloc.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
+    const end_page = try donor.mergeArtifactsPage(alloc, .{ .start = "", .end = "" }, rows[rows.len - 1].key);
+    defer alloc.free(end_page);
+    try std.testing.expectEqual(@as(usize, 0), end_page.len);
+    const primary = (try donor.get(alloc, "doc:a")).?;
+    defer alloc.free(primary);
+    // Exercise both a live indexed receiver and a replica that restarts with
+    // artifact replay still pending.
+    for ([_]bool{ true, false }) |start_workers| {
+        var receiver_path_tmp = try TestDirectory.init("db");
+        defer receiver_path_tmp.cleanup();
+        const receiver_path = receiver_path_tmp.path().ptr;
+        {
+            var receiver = try DB.open(alloc, std.mem.span(receiver_path), .{ .start_index_workers = start_workers });
+            defer receiver.close();
+            for (configs) |config| try receiver.addIndex(config);
+            try receiver.updateRange(.{ .start = "doc:m", .end = "" });
+            try receiver.batch(.{ .merge_checkpoint = .{
+                .kind = .accept,
+                .transition_id = 1,
+                .donor_group_id = 2,
+                .receiver_group_id = 3,
+                .receiver_base_start = "doc:m",
+                .receiver_base_end = "",
+                .merged_start = "",
+                .merged_end = "",
+            } });
+            try receiver.batch(.{
+                .writes = &.{ .{ .key = "doc:a", .value = primary }, .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" } },
+                .sync_level = .full_index,
+            });
+            const req: types.BatchRequest = .{
+                .merge_replication = .{ .transition_id = 1, .donor_group_id = 2, .receiver_group_id = 3, .identity_namespace = receiver.core.identity_namespace },
+                .merge_artifacts = rows,
+            };
+            const identity: RaftAppliedEntryIdentity = .{ .term = 1, .index = 10 };
+            try receiver.batchRaftReplicatedApply(req, identity);
+            try receiver.batchRaftReplicatedApply(req, identity);
+            if (start_workers) {
+                try receiver.runUntilIdle();
+                try expectMergeArtifactSearches(alloc, &receiver);
+            }
+        }
+        var reopened = try DB.open(alloc, std.mem.span(receiver_path), .{});
+        defer reopened.close();
+        try reopened.runUntilIdle();
+        try expectMergeArtifactSearches(alloc, &reopened);
+    }
+}
+
+fn expectMergeArtifactSearches(alloc: Allocator, db: *DB) !void {
+    var dense = try db.search(alloc, .{ .index_name = "dv_v1", .query = .{ .dense_knn = .{ .vector = &.{ 1, 0, 0 }, .k = 1 } }, .limit = 1 });
+    defer dense.deinit();
+    try std.testing.expectEqual(@as(usize, 1), dense.hits.len);
+    try std.testing.expectEqualStrings("doc:a", dense.hits[0].id);
+    var sparse = try db.search(alloc, .{ .index_name = "sp_v1", .query = .{ .sparse_knn = .{ .indices = &.{7}, .values = &.{1}, .k = 1 } }, .limit = 1 });
+    defer sparse.deinit();
+    try std.testing.expectEqual(@as(usize, 1), sparse.hits.len);
+    try std.testing.expectEqualStrings("doc:a", sparse.hits[0].id);
+    var graph = try db.search(alloc, .{ .query = .{ .graph = .{ .query_type = .neighbors, .index_name = "gr_v1", .start_nodes = .{ .keys = &.{"doc:a"} }, .params = .{ .edge_types = &.{"links"} } } }, .limit = 10 });
+    defer graph.deinit();
+    try std.testing.expectEqual(@as(usize, 1), graph.hits.len);
+    try std.testing.expectEqualStrings("doc:b", graph.hits[0].id);
+}
+
 test "db document _embeddings update vector index and strip stored special fields" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -84473,8 +85941,9 @@ test "db document _embeddings update vector index and strip stored special field
 test "db dense and sparse field-backed vector indexes strip vector fields and persist embedding artifacts" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -84631,8 +86100,9 @@ test "db dense and sparse field-backed vector indexes strip vector fields and pe
 
 test "db external dense coverage tracks exact writes deletes and reopen" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const ExpectCoverage = struct {
@@ -84686,8 +86156,9 @@ test "db external dense coverage tracks exact writes deletes and reopen" {
 
 test "db coverage status reports partial counter tuples without scanning markers" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -84790,8 +86261,9 @@ test "runtime status never regresses below durable projection checkpoint" {
 
 test "runtime status overlay hydrates cached derived coverage identity" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}";
@@ -84824,8 +86296,9 @@ test "runtime status overlay hydrates cached derived coverage identity" {
 test "db document _embeddings update vector index and strip stored special fields with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -84892,8 +86365,9 @@ test "db document _embeddings update vector index and strip stored special field
 test "db full_index persists explicit dense embeddings across reopen" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var iter: usize = 0;
@@ -84951,8 +86425,9 @@ test "db full_index persists explicit dense embeddings across reopen" {
 test "db rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded repairs external dense doc gaps on reopen" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -85058,8 +86533,9 @@ test "db rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded repairs externa
 
 test "db dense artifact surplus uses quarantined generation replacement" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -85195,8 +86671,9 @@ test "db dense artifact surplus uses quarantined generation replacement" {
 
 test "db dense shadow activation rejects surplus candidate coverage" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -85312,8 +86789,9 @@ test "db repair activation admission is time and sequence bounded" {
 
 test "db automatic dense repair bootstraps missing coverage metadata" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -85382,8 +86860,9 @@ test "db automatic dense repair bootstraps missing coverage metadata" {
 
 test "db quarantined dense bootstrap tracks concurrent insert update and delete" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     const cfg: types.IndexConfig = .{
         .name = "dense_idx",
@@ -85492,8 +86971,9 @@ test "db quarantined dense bootstrap tracks concurrent insert update and delete"
 
 test "db corrupt repair checkpoint preserves primary availability and fails indexes closed" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var repair_checkpoint_path: []u8 = undefined;
 
@@ -85550,8 +87030,9 @@ test "db corrupt repair checkpoint preserves primary availability and fails inde
 test "db index repair rebuilds dense index quarantined by incomplete bulk publish" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -85743,8 +87224,9 @@ test "db index repair rebuilds dense index quarantined by incomplete bulk publis
 
 test "quarantine binding reconciliation serializes with terminal transition" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -85805,7 +87287,7 @@ test "quarantine binding reconciliation serializes with terminal transition" {
         terminal_error: ?anyerror = null,
 
         fn terminal(ptr: *@This()) void {
-            while (!ptr.observed.load(.acquire)) std.Thread.yield() catch {};
+            while (!ptr.observed.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             ptr.terminal_attempted.store(true, .release);
             ptr.db.recordIndexRepairAttemptFailure(
                 ptr.db.alloc,
@@ -85821,18 +87303,18 @@ test "quarantine binding reconciliation serializes with terminal transition" {
             const ptr: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expectEqual(ptr.repair_id, observed_repair_id);
             ptr.observed.store(true, .release);
-            while (!ptr.terminal_attempted.load(.acquire)) std.Thread.yield() catch {};
+            while (!ptr.terminal_attempted.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             // The terminal thread is now waiting on repair-control ownership.
             // Returning lets discovery finish its pending binding transaction;
             // terminalization must then release that exact binding.
         }
     };
     var context = Context{ .db = &reopened, .repair_id = repair_id };
-    var terminal_thread = try std.Thread.spawn(.{}, Context.terminal, .{&context});
+    var terminal_thread = try std.testing.io.concurrent(Context.terminal, .{&context});
     var terminal_thread_joined = false;
     defer if (!terminal_thread_joined) {
         context.observed.store(true, .release);
-        terminal_thread.join();
+        terminal_thread.await(std.testing.io);
     };
     DB.test_index_repair_discovery_observation_hook = .{
         .ptr = &context,
@@ -85840,7 +87322,7 @@ test "quarantine binding reconciliation serializes with terminal transition" {
     };
     defer DB.test_index_repair_discovery_observation_hook = null;
     const discovery = try reopened.discoverRecoverableStartupIndexFailures(alloc, 1);
-    terminal_thread.join();
+    terminal_thread.await(std.testing.io);
     terminal_thread_joined = true;
     try std.testing.expect(context.terminal_error == null);
     try std.testing.expectEqual(@as(usize, 1), discovery.already_pending);
@@ -85855,8 +87337,9 @@ test "quarantine binding reconciliation serializes with terminal transition" {
 
 test "db restart reconciles activated dense repair without rebuilding" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -85957,7 +87440,7 @@ test "db restart reconciles activated dense repair without rebuilding" {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expectEqual(self.repair_id, observed_repair_id);
             self.entered.store(true, .release);
-            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
 
         fn reconcile(self: *@This()) void {
@@ -85981,11 +87464,11 @@ test "db restart reconciles activated dense repair without rebuilding" {
     };
     defer DB.test_index_repair_reconcile_fence_hook = null;
 
-    var reconcile_thread = try std.Thread.spawn(.{}, ReconcileRace.reconcile, .{&race});
+    var reconcile_thread = try std.testing.io.concurrent(ReconcileRace.reconcile, .{&race});
     var reconcile_joined = false;
     defer if (!reconcile_joined) {
         race.release.store(true, .release);
-        reconcile_thread.join();
+        reconcile_thread.await(std.testing.io);
     };
     var reconcile_entered = false;
     for (0..100_000) |_| {
@@ -85993,15 +87476,15 @@ test "db restart reconciles activated dense repair without rebuilding" {
             reconcile_entered = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!reconcile_entered) return error.TestTimeout;
 
-    var structural_thread = try std.Thread.spawn(.{}, ReconcileRace.structural, .{&race});
+    var structural_thread = try std.testing.io.concurrent(ReconcileRace.structural, .{&race});
     var structural_joined = false;
     defer if (!structural_joined) {
         race.release.store(true, .release);
-        structural_thread.join();
+        structural_thread.await(std.testing.io);
     };
     var structural_started = false;
     for (0..100_000) |_| {
@@ -86009,16 +87492,16 @@ test "db restart reconciles activated dense repair without rebuilding" {
             structural_started = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!structural_started) return error.TestTimeout;
-    for (0..256) |_| std.Thread.yield() catch {};
+    for (0..256) |_| std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(!race.structural_acquired.load(.acquire));
 
     race.release.store(true, .release);
-    reconcile_thread.join();
+    reconcile_thread.await(std.testing.io);
     reconcile_joined = true;
-    structural_thread.join();
+    structural_thread.await(std.testing.io);
     structural_joined = true;
     DB.test_index_repair_reconcile_fence_hook = null;
     try std.testing.expect(race.err == null);
@@ -86039,8 +87522,9 @@ test "db restart reconciles activated dense repair without rebuilding" {
 
 test "db root generation rollover preserves activated repair debt fail closed" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var old_repair_id: u128 = 0;
@@ -86150,8 +87634,9 @@ test "db root generation rollover preserves activated repair debt fail closed" {
 
 test "db durable root incarnation follows the physical root rather than visibility generations" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var first_incarnation: u128 = 0;
@@ -86239,8 +87724,9 @@ test "db durable root incarnation follows the physical root rather than visibili
 
 test "db restart reconciles an activated graph repair without rebuilding" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var repair_id: u128 = 0;
@@ -86304,8 +87790,9 @@ test "db restart reconciles an activated graph repair without rebuilding" {
 
 test "db paused dense repair resumes its durable candidate after restart" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -86420,8 +87907,9 @@ test "db paused dense repair resumes its durable candidate after restart" {
 
 test "db dense repair durably yields and resumes a reopenable building candidate" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     test_dense_repair_rebuild_batch_size = 1;
     defer test_dense_repair_rebuild_batch_size = null;
@@ -86598,10 +88086,38 @@ test "db dense repair durably yields and resumes a reopenable building candidate
     try std.testing.expect(found_replayed_insert);
 }
 
+test "db modeled index repair adopts replacements with the serving allocator" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("repair-allocator");
+    defer directory.cleanup();
+    var device = storage_sim.ModeledDevice.init(alloc);
+    defer device.deinit();
+    try prepareModeledDbSplitRoot(&device, directory.path());
+    var options = dbSplitModeledOpenOptions(&device);
+    options.start_index_workers = false;
+    options.ttl_cleanup = .{ .enabled = false };
+    var db = try DB.open(std.heap.page_allocator, directory.path(), options);
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"hello allocator\"}" }}, .sync_level = .write });
+    _ = try db.admitManagedIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    // HTTP repair requests use an allocator independent of the cached DB.
+    // Rebuild twice to exercise both adoption and retirement of a shadow.
+    for (0..2) |_| {
+        var result = try db.repairArtifactIssuesWithRequest(alloc, .{ .target = .index, .index_name = "text", .force = true });
+        defer result.deinit(alloc);
+        try std.testing.expect(!result.debt_remaining);
+        try std.testing.expectEqual(@as(u64, 1), result.indexes_rebuilt);
+        var found = try db.search(alloc, .{ .index_name = "text", .query = .{ .match_all = {} } });
+        defer found.deinit();
+        try std.testing.expectEqual(@as(usize, 1), found.hits.len);
+    }
+}
+
 test "db managed vector admission captures writes while durable repair is pending" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const cfg = types.IndexConfig{
@@ -86648,8 +88164,9 @@ test "db managed vector admission captures writes while durable repair is pendin
 
 test "db managed full text admission replays transitive artifact producers" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -86743,8 +88260,9 @@ test "db managed full text admission replays transitive artifact producers" {
 
 test "db managed vector admission discovers artifacts committed before resident activation" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const cfg = types.IndexConfig{
@@ -86812,8 +88330,9 @@ test "db managed vector admission discovers artifacts committed before resident 
 
 test "db managed vector admission durably seeds missing enrichment artifacts" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const document_count: usize = 129;
@@ -86948,8 +88467,9 @@ fn drainManagedAdmissionSourceReplayForTest(db: *DB, alloc: Allocator, repair_id
 
 test "db managed repair scheduler defers canonical worker until shadow activation" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -87048,8 +88568,9 @@ test "index repair inspection window is bounded and rotates fairly" {
 
 test "resident index repair scheduler skips deferred prefixes with bounded fair quanta" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -87272,8 +88793,9 @@ test "resident index repair progress waits are revision scoped and event driven"
 
 test "index repair intent string replacement is allocation failure safe" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -87352,8 +88874,9 @@ test "index repair intent string replacement is allocation failure safe" {
 
 test "repair admission revisions stay fail closed and reject delayed publishers" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -87461,8 +88984,9 @@ test "repair admission revisions stay fail closed and reject delayed publishers"
 
 test "db progressive managed admission serves a checkpointed partial generation" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     // Keep exactly one published vector available while the rest of the
@@ -87993,8 +89517,9 @@ test "db progressive managed admission serves a checkpointed partial generation"
 
 test "db progressive managed sparse admission serves a checkpointed partial generation" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicSparseEmbedder{};
@@ -88096,8 +89621,9 @@ test "db coverage recovery admits a published generation after its admission mar
 
 fn testManagedGenerationRepairAdmission(mode: enum { quarantine, shadow_handoff, replay_handoff, late_completion, coverage_recovery }) !void {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -88215,8 +89741,9 @@ fn testManagedGenerationRepairAdmission(mode: enum { quarantine, shadow_handoff,
 
 test "db empty managed index does not invent generated coverage recovery debt" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -88252,8 +89779,9 @@ test "db empty managed index does not invent generated coverage recovery debt" {
 
 test "db completed partial managed admission serves and retires redundant repair" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -88319,8 +89847,9 @@ test "db completed partial managed admission serves and retires redundant repair
 
 test "db completed chunked managed admission uses physical artifact count" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var counting = CountingDenseEmbedder{};
@@ -88411,8 +89940,9 @@ test "db completed chunked managed admission uses physical artifact count" {
 
 test "db managed algebraic admission builds and reopens requires generation marker" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const cfg = types.IndexConfig{
@@ -88459,8 +89989,9 @@ const repair_completion_test_options = types.ArtifactRepairRunOptions{
 
 test "db managed algebraic admission builds and reopens an isolated generation" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const cfg = types.IndexConfig{
@@ -88545,8 +90076,9 @@ test "db managed algebraic admission builds and reopens an isolated generation" 
 
 test "db algebraic generation build yields and resumes from its durable source cursor" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const cfg = types.IndexConfig{
@@ -88646,8 +90178,9 @@ test "db algebraic generation build yields and resumes from its durable source c
 
 test "db forced algebraic repair persists an operator generation intent before execution" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     const cfg = types.IndexConfig{
         .name = "analytics_idx",
@@ -88711,8 +90244,9 @@ test "db forced algebraic repair persists an operator generation intent before e
 
 test "db algebraic post-commit activation crash recovers through generation repair" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const cfg = types.IndexConfig{
@@ -88786,8 +90320,9 @@ test "db algebraic post-commit activation crash recovers through generation repa
 
 test "db managed full text admission survives restart without in-place backfill" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const cfg = types.IndexConfig{
@@ -88894,8 +90429,9 @@ test "db managed full text admission survives restart without in-place backfill"
 
 test "db named repair advances managed full text admission without force" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -88938,8 +90474,9 @@ test "db named repair advances managed full text admission without force" {
 
 test "db managed full text admission avoids debt for an empty source" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -88961,8 +90498,9 @@ test "db managed full text admission avoids debt for an empty source" {
 
 test "db ordinary index admission remains fail closed after post-commit activation failure" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -89001,8 +90539,9 @@ test "db ordinary index admission remains fail closed after post-commit activati
 
 test "db managed admission ignores stale zero identity cache" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -89018,7 +90557,7 @@ test "db managed admission ignores stale zero identity cache" {
 
     // Model a primary commit followed by an HA mirror failure before runtime
     // cache publication. Admission authority must remain the primary store.
-    db.identity_visibility_summary_cache = .{};
+    db.core.identity_visibility.summary = .{};
     try std.testing.expect((try db.admitManagedFullTextIndex(.{
         .name = "full_text_index_v1",
         .kind = .full_text,
@@ -89029,8 +90568,9 @@ test "db managed admission ignores stale zero identity cache" {
 
 test "db managed index deletion commits catalog absence with marker removal" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     const index_name = "full_text_index_v1";
 
@@ -89074,8 +90614,9 @@ test "db managed index deletion commits catalog absence with marker removal" {
 
 test "db managed index deletion remains successful after post-commit cleanup failure" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     const index_name = "full_text_index_v1";
 
@@ -89133,8 +90674,9 @@ test "db managed index deletion remains successful after post-commit cleanup fai
 
 test "db generated artifact cleanup retries beyond the transient burst" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     const cfg: types.IndexConfig = .{
         .name = "full_text_index_v1",
@@ -89175,8 +90717,9 @@ test "db generated artifact cleanup retries beyond the transient burst" {
 
 test "db generated artifact finalization releases page arbitration and preserves admission fence" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     const first: types.IndexConfig = .{
         .name = "a_full_text",
@@ -89209,7 +90752,7 @@ test "db generated artifact finalization releases page arbitration and preserves
     var wait_attempts: usize = 0;
     while (!DB.test_generated_artifact_finalization_entered.load(.acquire)) : (wait_attempts += 1) {
         try std.testing.expect(wait_attempts < 100_000);
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
 
     try std.testing.expect(db.async_context.index_artifact_cleanup_mutex.tryLock());
@@ -89233,7 +90776,7 @@ test "db generated artifact finalization releases page arbitration and preserves
                 break;
             },
             .progressed => {},
-            .busy => std.Thread.yield() catch {},
+            .busy => std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {},
         }
     }
     try std.testing.expect(second_drained);
@@ -89243,8 +90786,9 @@ test "db generated artifact finalization releases page arbitration and preserves
 
 test "db managed admission drain preserves a generation requested during the pass" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -89278,8 +90822,9 @@ test "db managed admission drain preserves a generation requested during the pas
 
 test "db managed admission materialization serializes with index deletion" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     const index_name = "full_text_index_v1";
 
@@ -89313,7 +90858,7 @@ test "db managed admission materialization serializes with index deletion" {
         fn afterConfigLookup(ptr: *anyopaque, _: *DB, _: []const u8) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.entered.store(true, .release);
-            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
 
         fn materialize(self: *@This()) void {
@@ -89341,24 +90886,24 @@ test "db managed admission materialization serializes with index deletion" {
     };
     defer DB.test_managed_admission_materialization_hook = null;
 
-    var materialize_thread = try std.Thread.spawn(.{}, Race.materialize, .{&race});
+    var materialize_thread = try std.testing.io.concurrent(Race.materialize, .{&race});
     var entered = false;
     for (0..100_000) |_| {
         if (race.entered.load(.acquire)) {
             entered = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!entered) {
         race.release.store(true, .release);
-        materialize_thread.join();
+        materialize_thread.await(std.testing.io);
         return error.TestTimeout;
     }
 
-    var delete_thread = std.Thread.spawn(.{}, Race.delete, .{&race}) catch |err| {
+    var delete_thread = std.testing.io.concurrent(Race.delete, .{&race}) catch |err| {
         race.release.store(true, .release);
-        materialize_thread.join();
+        materialize_thread.await(std.testing.io);
         return err;
     };
     var delete_started = false;
@@ -89367,19 +90912,19 @@ test "db managed admission materialization serializes with index deletion" {
             delete_started = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!delete_started) {
         race.release.store(true, .release);
-        materialize_thread.join();
-        delete_thread.join();
+        materialize_thread.await(std.testing.io);
+        delete_thread.await(std.testing.io);
         return error.TestTimeout;
     }
-    for (0..256) |_| std.Thread.yield() catch {};
+    for (0..256) |_| std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     const deletion_crossed_materialization = race.delete_completed.load(.acquire);
     race.release.store(true, .release);
-    materialize_thread.join();
-    delete_thread.join();
+    materialize_thread.await(std.testing.io);
+    delete_thread.await(std.testing.io);
 
     try std.testing.expect(!deletion_crossed_materialization);
     try std.testing.expect(race.materialize_err == null);
@@ -89392,8 +90937,9 @@ test "db managed admission materialization serializes with index deletion" {
 
 test "db managed admission materialization never infers debt from replay lag" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -89414,8 +90960,9 @@ test "db managed admission materialization never infers debt from replay lag" {
 
 test "db managed visibility hook rehydrates exact durable initial build debt once" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     const index_name = "full_text_index_v1";
 
@@ -89502,8 +91049,9 @@ test "db managed visibility hook rehydrates exact durable initial build debt onc
 
 test "db completed managed admission emits an initial build clear edge" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -89557,8 +91105,9 @@ test "db completed managed admission emits an initial build clear edge" {
 
 test "db managed admission rejects regressed identity evidence" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -89596,8 +91145,9 @@ test "db managed admission rejects regressed identity evidence" {
 
 test "db managed admission reconciliation retains same-name catalog mismatches" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -89633,8 +91183,9 @@ test "db managed admission reconciliation retains same-name catalog mismatches" 
 
 test "db dense repair defers before candidate creation when node admission is exhausted" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -89718,8 +91269,9 @@ test "db dense repair defers before candidate creation when node admission is ex
 
 test "db dense repair uses resource manager capacity admission before building" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -89775,8 +91327,9 @@ test "db dense repair uses resource manager capacity admission before building" 
 
 test "db dense replay failure upgrades a preflight validation intent" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -89819,8 +91372,9 @@ test "db dense replay failure upgrades a preflight validation intent" {
 
 test "db dense replay missing artifact remains a normal managed admission dependency" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -89850,8 +91404,9 @@ test "db dense replay missing artifact remains a normal managed admission depend
 
 test "db durable repair classification emits exact admission and action edges" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -89951,8 +91506,9 @@ test "db durable repair classification emits exact admission and action edges" {
 
 test "db forced generation repair completion is crash idempotent before api acknowledgement" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -89996,8 +91552,9 @@ test "db forced generation repair completion is crash idempotent before api ackn
 
 test "db incomplete HBC snapshot persists generation repair before maintenance" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var repair_id: u128 = 0;
@@ -90048,8 +91605,9 @@ test "db incomplete HBC snapshot persists generation repair before maintenance" 
 
 test "db forced repair attaches to automatic generation intent idempotently" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -90125,8 +91683,9 @@ test "db forced repair attaches to automatic generation intent idempotently" {
 
 test "db forced repair preserves missing-counter fail-closed classification" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -90175,11 +91734,13 @@ test "db forced repair preserves missing-counter fail-closed classification" {
 
 test "db repair capacity converts materialized shadow bytes into consumed reservation" {
     const alloc = std.testing.allocator;
-    var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
+    var db_path_tmp = try TestDirectory.init("db");
+    defer db_path_tmp.cleanup();
+    const db_path = db_path_tmp.path().ptr;
     defer cleanupTempDir(db_path);
-    var candidate_path_buf: [256]u8 = undefined;
-    const candidate_path = tempPath(&candidate_path_buf);
+    var candidate_path_tmp = try TestDirectory.init("db");
+    defer candidate_path_tmp.cleanup();
+    const candidate_path = candidate_path_tmp.path().ptr;
     defer cleanupTempDir(candidate_path);
     try ensureDirPath(std.mem.span(candidate_path));
 
@@ -90235,8 +91796,9 @@ test "db repair capacity converts materialized shadow bytes into consumed reserv
 
 test "db repair replay pin applies hard-pressure write backpressure" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
@@ -90268,8 +91830,9 @@ test "db repair replay pin applies hard-pressure write backpressure" {
 
 test "db removing one repair pin preserves pressure gate for another index" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -90356,8 +91919,9 @@ test "db removing one repair pin preserves pressure gate for another index" {
 
 test "db healthy dense generation remains searchable until replacement activation" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -90458,8 +92022,9 @@ test "db healthy dense generation remains searchable until replacement activatio
 
 test "db forced dense repair stays fail closed until background health proof" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -90519,8 +92084,9 @@ test "db forced dense repair stays fail closed until background health proof" {
 
 test "db forced dense repair keeps structurally invalid generation fail closed" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -90583,8 +92149,9 @@ test "db forced dense repair keeps structurally invalid generation fail closed" 
 
 test "db restart automatically resumes pinned explicit dense generation rebuild" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -90676,8 +92243,9 @@ test "db restart automatically resumes pinned explicit dense generation rebuild"
 
 test "db restart clears stale dense generation intent after clean checkpoint" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var repair_id: u128 = 0;
@@ -90867,8 +92435,9 @@ fn interruptDenseRepairAfterActivation(
 
 test "db missing activation certification rolls back to serviceable dense predecessor" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -90919,8 +92488,9 @@ test "db missing activation certification rolls back to serviceable dense predec
 
 test "db missing activation certification exposes predecessor action required" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -91020,8 +92590,9 @@ test "db missing activation certification exposes predecessor action required" {
 
 test "db failed activated dense generation rolls back to retained predecessor" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var repair_id: u128 = 0;
@@ -91215,8 +92786,9 @@ test "db failed activated dense generation rolls back to retained predecessor" {
 test "db dense artifact rebuild preserves stable vector ids distinct from ordinals" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -91284,8 +92856,9 @@ test "db dense artifact rebuild preserves stable vector ids distinct from ordina
 test "db dense artifact rebuild trusts clean projection checkpoint without artifact recount" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -91365,8 +92938,9 @@ test "db dense artifact rebuild trusts clean projection checkpoint without artif
 test "db dense projection checkpoint prefers hbc metadata over corrupt sidecar" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const dense_cfg: types.IndexConfig = .{
@@ -91430,8 +93004,9 @@ test "db dense projection checkpoint prefers hbc metadata over corrupt sidecar" 
 test "db dense artifact coverage finalizes a completed rebuilding checkpoint" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -91472,8 +93047,9 @@ test "db dense artifact coverage finalizes a completed rebuilding checkpoint" {
 test "db last dense catch-up lease finalizes every covered rebuilding generation" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -91534,8 +93110,9 @@ test "db last dense catch-up lease finalizes every covered rebuilding generation
 test "db artifact dense target prefers current incarnation outcomes over stale name counter" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var counting = CountingDenseEmbedder{};
@@ -91583,8 +93160,9 @@ test "db artifact dense target prefers current incarnation outcomes over stale n
 test "db dense finalization owner drains requests queued during publication" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -91636,8 +93214,9 @@ test "db dense finalization owner drains requests queued during publication" {
 test "db last external dense bulk lease finalizes covered rebuilding generations" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -91684,8 +93263,9 @@ test "db last external dense bulk lease finalizes covered rebuilding generations
 test "db empty inline dense generation finalizes without scanning primary documents" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -91715,8 +93295,9 @@ test "db empty inline dense generation finalizes without scanning primary docume
 test "db inline dense generation remains rebuilding until outcomes cover the live corpus" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -91807,8 +93388,9 @@ test "db inline dense generation remains rebuilding until outcomes cover the liv
 test "db inline dense coverage counters rebase with range ownership" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -91848,8 +93430,9 @@ test "db inline dense coverage counters rebase with range ownership" {
 test "db runtime status overlay refreshes identity totals with coverage counters" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -91901,8 +93484,9 @@ test "db runtime status overlay refreshes identity totals with coverage counters
 test "db external dense ingest finalizes an exactly covered rebuilding checkpoint" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -91936,8 +93520,9 @@ test "db external dense ingest finalizes an exactly covered rebuilding checkpoin
 test "db corrupt projection sidecar degrades non-dense checkpoint and quarantines writes" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const text_cfg: types.IndexConfig = .{
@@ -92016,8 +93601,9 @@ test "db corrupt projection sidecar degrades non-dense checkpoint and quarantine
 test "db dense artifact rebuild rejects clean checkpoint for stale config identity" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -92081,8 +93667,9 @@ test "db dense artifact rebuild rejects clean checkpoint for stale config identi
 test "db dense artifact rebuild checks artifact counters before clean checkpoint skip" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const dense_cfg: types.IndexConfig = .{
@@ -92142,8 +93729,9 @@ test "db dense artifact rebuild checks artifact counters before clean checkpoint
 
 test "db dense artifact planner does not let stale status override authoritative counter" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -92190,8 +93778,9 @@ test "db dense artifact planner does not let stale status override authoritative
 test "db dense artifact rebuild bootstraps missing counter metadata" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const dense_cfg: types.IndexConfig = .{
@@ -92288,8 +93877,9 @@ test "db dense artifact rebuild bootstraps missing counter metadata" {
 test "db dense artifact counter bootstrap combines snapshot with concurrent write delta" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -92357,8 +93947,9 @@ test "db dense artifact counter bootstrap combines snapshot with concurrent writ
 
 test "db dense artifact counter bootstrap restarts from a fresh snapshot" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     const cfg: types.IndexConfig = .{
         .name = "dense_idx",
@@ -92425,8 +94016,9 @@ test "db dense artifact counter bootstrap restarts from a fresh snapshot" {
 
 test "db dense artifact counter bootstrap fences stale concurrent attempt" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -92470,8 +94062,9 @@ test "db dense artifact counter bootstrap fences stale concurrent attempt" {
 
 test "db malformed quarantined dense config does not block healthy artifact counters" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -92558,8 +94151,9 @@ test "db dense counter bootstrap admission respects soft background budget" {
 test "db dense artifact rebuild uses durable artifact counters instead of recount" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -92609,8 +94203,9 @@ test "db dense artifact rebuild uses durable artifact counters instead of recoun
 test "db dense artifact counters include derived chunk embedding artifacts" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -92665,8 +94260,9 @@ test "db dense artifact counters include derived chunk embedding artifacts" {
 test "db dense artifact rebuild force-resets corrupt external dense structure" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -92750,8 +94346,9 @@ test "db dense artifact rebuild resumes from persisted state" {
     const alloc = std.testing.allocator;
     const doc_count: usize = 8;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -92984,8 +94581,9 @@ test "db dense artifact rebuild resume keys are owned by plan allocator" {
     const db_alloc = std.heap.page_allocator;
     const doc_count: usize = 3;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -93045,8 +94643,9 @@ test "db dense artifact rebuild progress counts source artifacts across multiple
     const doc_count: usize = 3;
     const shared_cfg = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true,\"embedding_name\":\"shared_dense_v1\"}";
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -93140,8 +94739,9 @@ test "db dense artifact rebuild keeps resume keys owned by caller allocator" {
     const alloc = std.testing.allocator;
     const rebuild_alloc = std.heap.page_allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -93189,8 +94789,9 @@ test "db dense artifact rebuild keeps resume keys owned by caller allocator" {
 test "db chunk-backed dense artifact rebuild stays pending until all chunk artifacts are rebuilt" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -93312,8 +94913,9 @@ test "db dense artifact rebuild does not let resumed targets skip fresh targets"
     const doc_count: usize = 4;
     const shared_cfg = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true,\"embedding_name\":\"shared_dense_v1\"}";
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -93439,8 +95041,9 @@ test "db dense artifact rebuild does not let resumed targets skip fresh targets"
 test "db dense artifact rebuild ignores stale wrong-dimension artifacts when counting progress" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -93514,8 +95117,9 @@ test "db dense artifact rebuild ignores stale wrong-dimension artifacts when cou
 test "db dense artifact rebuild clears stale persisted state when no valid artifacts remain" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -93571,8 +95175,9 @@ test "db dense artifact rebuild clears stale persisted state when no valid artif
 test "db dense artifact rebuild waits for replay debt instead of raw doc count alone" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var appended_sequence: u64 = 0;
@@ -93649,8 +95254,9 @@ test "db dense artifact rebuild waits for replay debt instead of raw doc count a
 test "db search supports graph result_ref from full-text hits" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -93708,8 +95314,9 @@ test "db search supports graph result_ref from full-text hits" {
 test "db search supports graph result_ref from dense hits without public id handoff" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -93768,8 +95375,9 @@ test "db search supports graph result_ref from dense hits without public id hand
 test "db search rejects unbounded graph result_ref when base result is paged" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -93816,8 +95424,9 @@ test "db search rejects unbounded graph result_ref when base result is paged" {
 test "db search supports graph-only named queries" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -93867,8 +95476,9 @@ test "db search supports graph-only named queries" {
 test "db unfiltered graph search retains algebraic execution" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -93922,8 +95532,9 @@ test "db unfiltered graph search retains algebraic execution" {
 test "db graph search filters result nodes and hidden traversal intermediates" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -94181,8 +95792,9 @@ test "db graph search filters result nodes and hidden traversal intermediates" {
 test "db graph shortest path searches through admitted alternatives" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -94239,8 +95851,9 @@ test "db graph shortest path searches through admitted alternatives" {
 test "db named graph input sets carry resolved doc sets" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -94321,8 +95934,9 @@ test "db named graph input sets carry resolved doc sets" {
 test "db search supports fused graph selectors for single-lane full-text searches" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -94377,8 +95991,9 @@ test "db search supports fused graph selectors for single-lane full-text searche
 test "db search fuses full_text and dense named searches before graph expansion" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -94459,8 +96074,9 @@ test "db search fuses full_text and dense named searches before graph expansion"
 test "db search marks a truncated fused candidate union as a lower bound" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -94522,8 +96138,9 @@ test "db search marks a truncated fused candidate union as a lower bound" {
 test "db hybrid search does not hard-filter dense leg with scoring full_text" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -94588,8 +96205,9 @@ test "db hybrid search does not hard-filter dense leg with scoring full_text" {
 test "db search fuses full_text and dense named searches before graph expansion with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -94667,8 +96285,9 @@ test "db search fuses full_text and dense named searches before graph expansion 
 test "db search supports named full_text queries fused with dense and sparse before graph expansion" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -94767,8 +96386,9 @@ test "db search supports named full_text queries fused with dense and sparse bef
 test "db search supports named full_text queries fused with dense and sparse before graph expansion with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -94869,8 +96489,9 @@ test "db search supports named full_text queries fused with dense and sparse bef
 test "db search sorts graph queries by dependency and resolves prior graph results" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -94927,8 +96548,9 @@ test "db search sorts graph queries by dependency and resolves prior graph resul
 test "db search expand_strategy union and intersection apply graph hits to top level results" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -95087,8 +96709,9 @@ test "db graph intersection preserves artifact refs" {
 test "db graph index reloads on reopen for neighbor queries" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -95140,8 +96763,9 @@ test "db graph index reloads on reopen for neighbor queries" {
 test "db graph index reloads on reopen for neighbor queries with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
@@ -95199,8 +96823,9 @@ test "db graph index reloads on reopen for neighbor queries with durable lsm pri
 test "db graph reverse rebuild resumes after interrupted reopen" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -95304,8 +96929,9 @@ test "db graph reverse rebuild resumes after interrupted reopen" {
 test "db reopens persisted index catalog and text index" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -95349,8 +96975,9 @@ test "db reopens persisted index catalog and text index" {
 test "db delete index persists across reopen" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -95388,8 +97015,9 @@ test "db delete index persists across reopen" {
 
 test "db delete full text index drains active merge before closing generation" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -95463,11 +97091,11 @@ test "db delete full text index drains active merge before closing generation" {
         }
     };
     var deletion = Delete{ .db = &db };
-    var delete_thread = try std.Thread.spawn(.{}, Delete.run, .{&deletion});
+    var delete_thread = try std.testing.io.concurrent(Delete.run, .{&deletion});
     var joined = false;
     defer if (!joined) {
         text_merge_runtime_mod.test_release_after_task_begin.store(true, .release);
-        delete_thread.join();
+        delete_thread.await(std.testing.io);
     };
 
     var stop_entered = false;
@@ -95486,7 +97114,7 @@ test "db delete full text index drains active merge before closing generation" {
     try std.testing.expect(!deletion.completed.load(.acquire));
 
     text_merge_runtime_mod.test_release_after_task_begin.store(true, .release);
-    delete_thread.join();
+    delete_thread.await(std.testing.io);
     joined = true;
     try std.testing.expect(deletion.err == null);
     try std.testing.expect(deletion.removed);
@@ -95502,8 +97130,9 @@ test "db delete full text index drains active merge before closing generation" {
 
 test "db structural mutation autonomously retries transient maintenance restart failures" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -95548,8 +97177,9 @@ test "db post-delete filter reader does not deadlock behind queued cleanup write
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const doc_count: u32 = 40;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -95610,11 +97240,11 @@ test "db post-delete filter reader does not deadlock behind queued cleanup write
         }
     };
     var reader = Reader{ .db = &db };
-    var reader_thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});
+    var reader_thread = try std.testing.io.concurrent(Reader.run, .{&reader});
     var reader_joined = false;
     defer if (!reader_joined) {
         test_release_match_all_ordinal_lookup.store(true, .release);
-        reader_thread.join();
+        reader_thread.await(std.testing.io);
     };
     var lookup_entered = false;
     for (0..200_000) |_| {
@@ -95622,7 +97252,7 @@ test "db post-delete filter reader does not deadlock behind queued cleanup write
             lookup_entered = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!lookup_entered) return error.TestTimeout;
 
@@ -95637,11 +97267,11 @@ test "db post-delete filter reader does not deadlock behind queued cleanup write
         }
     };
     var writer = Writer{ .db = &db };
-    var writer_thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});
+    var writer_thread = try std.testing.io.concurrent(Writer.run, .{&writer});
     var writer_joined = false;
     defer if (!writer_joined) {
         test_release_match_all_ordinal_lookup.store(true, .release);
-        writer_thread.join();
+        writer_thread.await(std.testing.io);
     };
 
     // Wait until a cleanup-style writer owns the reader gate and is blocked on
@@ -95655,16 +97285,16 @@ test "db post-delete filter reader does not deadlock behind queued cleanup write
             break;
         }
         db.core.unlockApplyShared();
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!writer_queued) return error.TestTimeout;
     try std.testing.expect(!reader.completed.load(.acquire));
     try std.testing.expect(!writer.completed.load(.acquire));
 
     test_release_match_all_ordinal_lookup.store(true, .release);
-    reader_thread.join();
+    reader_thread.await(std.testing.io);
     reader_joined = true;
-    writer_thread.join();
+    writer_thread.await(std.testing.io);
     writer_joined = true;
     if (reader.err) |err| return err;
     try std.testing.expectEqual(doc_count, reader.total_hits);
@@ -95674,8 +97304,9 @@ test "db post-delete filter reader does not deadlock behind queued cleanup write
 test "db delete index persists across reopen with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
@@ -95720,8 +97351,9 @@ test "db delete index persists across reopen with durable lsm primary backend" {
 test "db indexed delete removes hits across reopen" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -95776,8 +97408,9 @@ test "db indexed delete removes hits across reopen" {
 test "db indexed delete removes hits across reopen with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
@@ -95838,8 +97471,9 @@ test "db indexed delete removes hits across reopen with durable lsm primary back
 test "db indexed overwrite replaces old hits across reopen" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -95909,8 +97543,9 @@ test "db indexed overwrite replaces old hits across reopen" {
 test "db indexed overwrite replaces old hits across reopen with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
@@ -95986,8 +97621,9 @@ test "db indexed overwrite replaces old hits across reopen with durable lsm prim
 test "db runUntilIdle drains scheduled text merges after repeated writes" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -96036,8 +97672,9 @@ test "db runUntilIdle drains scheduled text merges after repeated writes" {
 test "db text merge descriptor admission failures retry without quarantine" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -96123,8 +97760,9 @@ test "db text merge shutdown cancels a worker blocked on descriptor admission" {
     if (builtin.single_threaded) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
@@ -96180,14 +97818,14 @@ test "db text merge shutdown cancels a worker blocked on descriptor admission" {
         }
     };
     var stop = Stop{ .runtime = &runtime };
-    const stop_thread = try std.Thread.spawn(.{}, Stop.run, .{&stop});
+    var stop_thread = try std.testing.io.concurrent(Stop.run, .{&stop});
     var stop_joined = false;
     defer if (!stop_joined) {
         if (held_descriptors) {
             pool.releaseDescriptorsForTest(io, 2);
             held_descriptors = false;
         }
-        stop_thread.join();
+        stop_thread.await(std.testing.io);
     };
 
     for (0..1_000) |_| {
@@ -96195,7 +97833,7 @@ test "db text merge shutdown cancels a worker blocked on descriptor admission" {
         try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
     }
     if (!stop.completed.load(.acquire)) return error.TestTimeout;
-    stop_thread.join();
+    stop_thread.await(std.testing.io);
     stop_joined = true;
 
     try std.testing.expect(stop.stopped);
@@ -96210,8 +97848,9 @@ test "db close stops text admission before joining derived publishers" {
     if (builtin.single_threaded) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -96262,8 +97901,9 @@ test "db close stops text admission before joining derived publishers" {
 test "db text merge backpressure drains sustained segment debt to low watermark" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     // Build the backlog without an automatic merge worker so the admission
@@ -96439,19 +98079,19 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     };
     var waiter = Waiter{ .runtime = &admission_runtime };
     const events_before = admission_runtime.stats().backpressure_events;
-    var waiter_thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+    var waiter_thread = try std.testing.io.concurrent(Waiter.run, .{&waiter});
     var waiter_joined = false;
     defer if (!waiter_joined) {
         held_permit.release();
-        waiter_thread.join();
+        waiter_thread.await(std.testing.io);
     };
     const waiter_deadline = monotonicTimeNs() +| std.time.ns_per_s;
     while (admission_runtime.stats().backpressure_events == events_before and monotonicTimeNs() < waiter_deadline) {
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     try std.testing.expect(admission_runtime.stats().backpressure_events > events_before);
     held_permit.release();
-    waiter_thread.join();
+    waiter_thread.await(std.testing.io);
     waiter_joined = true;
     try std.testing.expect(waiter.acquired.load(.acquire));
     try std.testing.expect(!waiter.failed.load(.acquire));
@@ -96490,20 +98130,20 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     };
     var cross_index_waiter = CrossIndexWaiter{ .runtime = &fair_runtime, .acquired = &cross_index_acquired };
     const cross_events_before = fair_runtime.stats().backpressure_events;
-    const cross_index_thread = try std.Thread.spawn(.{}, CrossIndexWaiter.run, .{&cross_index_waiter});
+    var cross_index_thread = try std.testing.io.concurrent(CrossIndexWaiter.run, .{&cross_index_waiter});
     var cross_index_joined = false;
     defer if (!cross_index_joined) {
         cross_index_blocker.release();
-        cross_index_thread.join();
+        cross_index_thread.await(std.testing.io);
     };
     const cross_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (fair_runtime.stats().backpressure_events == cross_events_before and monotonicTimeNs() < cross_wait_deadline) std.Thread.yield() catch {};
+    while (fair_runtime.stats().backpressure_events == cross_events_before and monotonicTimeNs() < cross_wait_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(fair_runtime.stats().backpressure_events > cross_events_before);
     var independent_index_permit = try fair_runtime.acquireProducerPermit("admission-b", 100, 0);
     independent_index_permit.release();
     try std.testing.expect(!cross_index_acquired.load(.acquire));
     cross_index_blocker.release();
-    cross_index_thread.join();
+    cross_index_thread.await(std.testing.io);
     cross_index_joined = true;
     try std.testing.expect(cross_index_acquired.load(.acquire));
 
@@ -96549,7 +98189,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
                 return;
             };
             self.acquisition_order.store(self.acquisition_counter.fetchAdd(1, .acq_rel) + 1, .release);
-            while (!self.release_gate.load(.acquire)) std.Thread.yield() catch {};
+            while (!self.release_gate.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             permit.release();
         }
     };
@@ -96570,7 +98210,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         .failed = &mixed_older_failed,
     };
     const mixed_events_before = mixed_runtime.stats().backpressure_events;
-    const mixed_older_thread = try std.Thread.spawn(.{}, MixedWaiter.run, .{&mixed_older});
+    var mixed_older_thread = try std.testing.io.concurrent(MixedWaiter.run, .{&mixed_older});
     var mixed_older_joined = false;
     defer if (!mixed_older_joined) {
         if (mixed_segment_blocker_active) {
@@ -96582,10 +98222,10 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
             mixed_byte_blocker_active = false;
         }
         mixed_release.store(true, .release);
-        mixed_older_thread.join();
+        mixed_older_thread.await(std.testing.io);
     };
     const mixed_older_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (mixed_runtime.stats().backpressure_events == mixed_events_before and monotonicTimeNs() < mixed_older_wait_deadline) std.Thread.yield() catch {};
+    while (mixed_runtime.stats().backpressure_events == mixed_events_before and monotonicTimeNs() < mixed_older_wait_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(mixed_runtime.stats().backpressure_events > mixed_events_before);
 
     var mixed_younger = MixedWaiter{
@@ -96598,7 +98238,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         .release_gate = &mixed_release,
         .failed = &mixed_younger_failed,
     };
-    const mixed_younger_thread = try std.Thread.spawn(.{}, MixedWaiter.run, .{&mixed_younger});
+    var mixed_younger_thread = try std.testing.io.concurrent(MixedWaiter.run, .{&mixed_younger});
     var mixed_younger_joined = false;
     defer if (!mixed_younger_joined) {
         if (mixed_segment_blocker_active) {
@@ -96610,10 +98250,10 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
             mixed_byte_blocker_active = false;
         }
         mixed_release.store(true, .release);
-        mixed_younger_thread.join();
+        mixed_younger_thread.await(std.testing.io);
     };
     const mixed_younger_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (mixed_runtime.stats().backpressure_events < mixed_events_before + 2 and monotonicTimeNs() < mixed_younger_wait_deadline) std.Thread.yield() catch {};
+    while (mixed_runtime.stats().backpressure_events < mixed_events_before + 2 and monotonicTimeNs() < mixed_younger_wait_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(mixed_runtime.stats().backpressure_events >= mixed_events_before + 2);
     try std.testing.expectEqual(@as(u32, 0), mixed_older_order.load(.acquire));
     try std.testing.expectEqual(@as(u32, 0), mixed_younger_order.load(.acquire));
@@ -96623,18 +98263,18 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     mixed_byte_blocker.release();
     mixed_byte_blocker_active = false;
     const mixed_older_acquired_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (mixed_older_order.load(.acquire) == 0 and monotonicTimeNs() < mixed_older_acquired_deadline) std.Thread.yield() catch {};
+    while (mixed_older_order.load(.acquire) == 0 and monotonicTimeNs() < mixed_older_acquired_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expectEqual(@as(u32, 1), mixed_older_order.load(.acquire));
     try std.testing.expectEqual(@as(u32, 0), mixed_younger_order.load(.acquire));
     try std.testing.expect(!mixed_older_failed.load(.acquire));
     try std.testing.expect(!mixed_younger_failed.load(.acquire));
     mixed_release.store(true, .release);
-    mixed_older_thread.join();
+    mixed_older_thread.await(std.testing.io);
     mixed_older_joined = true;
     const mixed_younger_acquired_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (mixed_younger_order.load(.acquire) == 0 and monotonicTimeNs() < mixed_younger_acquired_deadline) std.Thread.yield() catch {};
+    while (mixed_younger_order.load(.acquire) == 0 and monotonicTimeNs() < mixed_younger_acquired_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expectEqual(@as(u32, 2), mixed_younger_order.load(.acquire));
-    mixed_younger_thread.join();
+    mixed_younger_thread.await(std.testing.io);
     mixed_younger_joined = true;
 
     var blocking_permit = try fair_runtime.acquireProducerPermit("admission-test", 80, 0);
@@ -96651,7 +98291,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
             var permit = self.runtime.acquireProducerPermit("admission-test", self.segment_count, 0) catch return;
             self.acquired.store(true, .release);
             if (self.release_gate) |gate| {
-                while (!gate.load(.acquire)) std.Thread.yield() catch {};
+                while (!gate.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
             permit.release();
         }
@@ -96666,7 +98306,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         .acquired = &large_acquired,
         .release_gate = &release_large,
     };
-    const large_thread = try std.Thread.spawn(.{}, FairWaiter.run, .{&large_waiter});
+    var large_thread = try std.testing.io.concurrent(FairWaiter.run, .{&large_waiter});
     var large_joined = false;
     defer if (!large_joined) {
         if (blocking_active) {
@@ -96674,10 +98314,10 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
             blocking_active = false;
         }
         release_large.store(true, .release);
-        large_thread.join();
+        large_thread.await(std.testing.io);
     };
     const large_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (fair_runtime.stats().backpressure_events < fair_events_before + 1 and monotonicTimeNs() < large_wait_deadline) std.Thread.yield() catch {};
+    while (fair_runtime.stats().backpressure_events < fair_events_before + 1 and monotonicTimeNs() < large_wait_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(fair_runtime.stats().backpressure_events >= fair_events_before + 1);
 
     var small_waiter = FairWaiter{
@@ -96686,7 +98326,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         .acquired = &small_acquired,
         .release_gate = null,
     };
-    const small_thread = try std.Thread.spawn(.{}, FairWaiter.run, .{&small_waiter});
+    var small_thread = try std.testing.io.concurrent(FairWaiter.run, .{&small_waiter});
     var small_joined = false;
     defer if (!small_joined) {
         if (blocking_active) {
@@ -96694,23 +98334,23 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
             blocking_active = false;
         }
         release_large.store(true, .release);
-        small_thread.join();
+        small_thread.await(std.testing.io);
     };
     const small_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (fair_runtime.stats().backpressure_events < fair_events_before + 2 and monotonicTimeNs() < small_wait_deadline) std.Thread.yield() catch {};
+    while (fair_runtime.stats().backpressure_events < fair_events_before + 2 and monotonicTimeNs() < small_wait_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(fair_runtime.stats().backpressure_events >= fair_events_before + 2);
     try std.testing.expect(!small_acquired.load(.acquire));
 
     blocking_permit.release();
     blocking_active = false;
     const fair_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (!large_acquired.load(.acquire) and monotonicTimeNs() < fair_deadline) std.Thread.yield() catch {};
+    while (!large_acquired.load(.acquire) and monotonicTimeNs() < fair_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(large_acquired.load(.acquire));
     try std.testing.expect(!small_acquired.load(.acquire));
     release_large.store(true, .release);
-    large_thread.join();
+    large_thread.await(std.testing.io);
     large_joined = true;
-    small_thread.join();
+    small_thread.await(std.testing.io);
     small_joined = true;
     try std.testing.expect(small_acquired.load(.acquire));
 
@@ -96736,13 +98376,13 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     var cancel_waiter = CancelWaiter{ .runtime = &fair_runtime, .outcome = &cancel_outcome };
     const cancel_events_before = fair_runtime.stats().backpressure_events;
     const timeouts_before = fair_runtime.stats().backpressure_timeouts;
-    const fair_io = db.backend_runtime.io_impl.?.io();
+    const fair_io = db.backend_runtime.io().?;
     var cancel_group: std.Io.Group = .init;
     try cancel_group.concurrent(fair_io, CancelWaiter.run, .{&cancel_waiter});
     var cancel_group_active = true;
     defer if (cancel_group_active) cancel_group.cancel(fair_io);
     const cancel_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (fair_runtime.stats().backpressure_events == cancel_events_before and monotonicTimeNs() < cancel_wait_deadline) std.Thread.yield() catch {};
+    while (fair_runtime.stats().backpressure_events == cancel_events_before and monotonicTimeNs() < cancel_wait_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(fair_runtime.stats().backpressure_events > cancel_events_before);
     cancel_group.cancel(fair_io);
     cancel_group_active = false;
@@ -96785,8 +98425,9 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
 test "db text merge producer admission isolates quarantined dimensions" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -96900,8 +98541,9 @@ test "db text merge producer admission isolates quarantined dimensions" {
 test "db text kernel admits natural segments below hard segment limit" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -96938,8 +98580,9 @@ test "db text kernel admits natural segments below hard segment limit" {
 test "db derived text replay admits natural segments below hard segment limit" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -96985,8 +98628,9 @@ test "db derived text replay admits natural segments below hard segment limit" {
 test "db runUntilIdle drains scheduled text merges without index workers" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -97031,8 +98675,9 @@ test "db runUntilIdle drains scheduled text merges without index workers" {
 test "db full_text sync does not require draining scheduled text merges" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -97074,8 +98719,9 @@ test "db full_text sync does not require draining scheduled text merges" {
 test "db force compacts text index to searchable merge tier" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -97127,8 +98773,9 @@ test "db force compacts text index to searchable merge tier" {
 test "db text kernel search matches projected search without stored bodies" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
@@ -97201,8 +98848,9 @@ test "db text kernel search matches projected search without stored bodies" {
 test "db text compaction preserves index sort acceleration" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -97391,8 +99039,9 @@ test "db text compaction preserves index sort acceleration" {
 test "db index sort schema change requires a new text index generation" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -97503,8 +99152,9 @@ test "db index sort schema change requires a new text index generation" {
 test "db text compaction preserves ordinal filters across reopen" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const expected_ordinal: doc_set.DocOrdinal = 9;
@@ -97615,8 +99265,9 @@ test "db provisioning schema is persisted before configured full text indexes op
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     // Persist the target-generation catalog entry while the shard still has
@@ -97701,8 +99352,9 @@ test "db best effort force compact leaves text merge debt under pressure" {
     resource_manager.observeUsage(.text_merge_buffers, &tracked_usage, 2);
     defer resource_manager.observeUsage(.text_merge_buffers, &tracked_usage, 0);
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -97790,8 +99442,9 @@ test "db runUntilIdle defers full text merge pressure without failing" {
         .policies = policies,
     });
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -97834,8 +99487,9 @@ test "db runUntilIdle defers full text merge pressure without failing" {
 test "db phrase query survives text compaction deletes and reopen" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -97920,8 +99574,9 @@ test "db phrase query survives text compaction deletes and reopen" {
 test "db prefix wildcard and regexp queries use text dictionary filters" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -97972,8 +99627,9 @@ test "db search_as_you_type schema emits Elasticsearch-style field variants" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -98180,8 +99836,9 @@ test "db one real delete keeps filtered full text on complement path across rest
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const schema_json =
@@ -98316,8 +99973,9 @@ test "db production ingest preserves high-frequency keyword recall across clean 
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const schema_json =
@@ -98394,8 +100052,9 @@ test "db versioned full text indexes reload matching schema mappings after reope
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const schema_v0_json =
@@ -98524,8 +100183,9 @@ test "db additionalProperties true nested text fields survive reopen" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const schema_json =
@@ -98605,8 +100265,9 @@ test "db explicit field analyzer override drives match queries" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const schema_json =
@@ -98667,8 +100328,9 @@ test "db dynamic template match_mapping_type analyzer survives reopen" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const schema_json =
@@ -98753,8 +100415,9 @@ test "db dynamic template precedence beats open additionalProperties fallback" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const schema_json =
@@ -98817,8 +100480,9 @@ test "db patternProperties text fields survive reopen" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const schema_json =
@@ -98910,8 +100574,9 @@ test "db root additionalProperties true text fields survive reopen" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const schema_json =
@@ -98985,8 +100650,9 @@ test "db schema-driven text query matrix covers explicit dynamic template and fa
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const schema_json =
@@ -99136,8 +100802,9 @@ test "db schema-driven text query matrix covers explicit dynamic template and fa
 test "db no-schema path recursively infers nested text and typed fields" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const jan2 = (try parsePatternRfc3339ToNs("2026-01-02T00:00:00Z")).?;
@@ -99226,8 +100893,9 @@ test "db schema-present infer_types opt-in recursively infers nested fields afte
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const jan2 = (try parsePatternRfc3339ToNs("2026-01-02T00:00:00Z")).?;
@@ -99343,8 +101011,9 @@ test "db schema-present infer_types opt-in recursively infers nested fields afte
 test "db typed and dictionary queries survive compaction delete and reopen" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -99536,8 +101205,9 @@ test "db typed and dictionary queries survive compaction delete and reopen" {
 test "db mixed-type stored fields survive text compaction and reopen" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -99603,8 +101273,9 @@ test "db mixed-type stored fields survive text compaction and reopen" {
 test "db lookup projects nested document fields" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -99637,8 +101308,9 @@ test "db lookup projects nested document fields" {
 test "db lookup returns full stored json by default" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -99658,8 +101330,9 @@ test "db lookup returns full stored json by default" {
 test "db search projects stored fields for hydrated hits" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -99701,8 +101374,9 @@ test "db search projects stored fields for hydrated hits" {
 test "db lookup includes chunk artifacts when _chunks is requested" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -99746,8 +101420,9 @@ test "db lookup includes chunk artifacts when _chunks is requested" {
 test "db lookup includes unified artifact projection when _artifacts is requested" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -99845,8 +101520,9 @@ test "db lookup includes unified artifact projection when _artifacts is requeste
 test "db search includes chunk artifacts on hydrated hits when _chunks is requested" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -99887,8 +101563,9 @@ test "db search includes chunk artifacts on hydrated hits when _chunks is reques
 test "db scan includes chunk artifacts when _chunks is requested" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -99920,8 +101597,9 @@ test "db scan includes chunk artifacts when _chunks is requested" {
 test "db lookup does not load chunks for nested _chunks projection without explicit include-all selector" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -99949,8 +101627,9 @@ test "db lookup does not load chunks for nested _chunks projection without expli
 test "db lookup loads chunks for _chunks.* selector and allows nested projection" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -99981,8 +101660,9 @@ test "db lookup loads chunks for _chunks.* selector and allows nested projection
 test "db lookup includes embedding artifacts when _embeddings is requested" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -100015,8 +101695,9 @@ test "db lookup includes embedding artifacts when _embeddings is requested" {
 test "db search includes embedding artifacts on hydrated hits when _embeddings is requested" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -100057,8 +101738,9 @@ test "db search includes embedding artifacts on hydrated hits when _embeddings i
 test "db scan includes embedding artifacts when _embeddings is requested" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -100089,8 +101771,9 @@ test "db scan includes embedding artifacts when _embeddings is requested" {
 test "db lookup does not load embeddings for nested _embeddings projection without explicit include-all selector" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -100118,8 +101801,9 @@ test "db lookup does not load embeddings for nested _embeddings projection witho
 test "db lookup loads embeddings for _embeddings.* selector and allows nested projection" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -100198,8 +101882,9 @@ test "db field selection plan only enables chunk special field for explicit incl
 test "db writes and reads timestamp metadata" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -100235,8 +101920,9 @@ test "db writes and reads timestamp metadata" {
 test "db identical rewrite refreshes timestamp metadata" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -100276,8 +101962,9 @@ test "db lookup hides expired documents when ttl schema is configured" {
     const alloc = std.testing.allocator;
     const ttl_duration_ns: u64 = 60 * std.time.ns_per_s;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -100309,8 +101996,9 @@ test "db search filters expired documents when ttl schema is configured" {
     const alloc = std.testing.allocator;
     const ttl_duration_ns: u64 = 60 * std.time.ns_per_s;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -100364,8 +102052,9 @@ test "db dense broad visibility filtering does not bypass ttl" {
     const alloc = std.testing.allocator;
     const ttl_duration_ns: u64 = 60 * std.time.ns_per_s;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -100418,8 +102107,9 @@ test "db ttl falls back to write timestamp when ttl field is missing" {
     const alloc = std.testing.allocator;
     const ttl_duration_ns: u64 = 60 * std.time.ns_per_s;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -100474,8 +102164,9 @@ test "db ttl falls back to write timestamp when ttl field is missing" {
 test "db ttl cleanup reclaims expired documents through normal delete semantics" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const ttl_cfg: ttl_runtime_mod.Config = .{
@@ -100568,8 +102259,9 @@ test "db ttl delete callback atomically removes dense artifacts and updates repa
     const alloc = std.testing.allocator;
     const ttl_duration_ns: u64 = std.time.ns_per_s;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -100606,8 +102298,6 @@ test "db ttl delete callback atomically removes dense artifacts and updates repa
         .batch = db.batchContext(),
         .grace_period_ns = 0,
     };
-    ttl_ctx.identity_visibility_owner.store(&db, .release);
-    ttl_ctx.batch.identity_visibility_owner_slot = &ttl_ctx.identity_visibility_owner;
     const candidate_key = try alloc.dupe(u8, "doc:expired");
     defer alloc.free(candidate_key);
     const candidates = [_]ttl_runtime_mod.DeleteCandidate{.{
@@ -100635,8 +102325,9 @@ test "db ttl delete callback atomically removes dense artifacts and updates repa
 test "db stats expose ttl cleanup activity" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const ttl_cfg: ttl_runtime_mod.Config = .{
@@ -100677,8 +102368,9 @@ test "db stats expose ttl cleanup activity" {
 test "db ttl cleanup can run under lease ownership" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const ttl_cfg: ttl_runtime_mod.Config = .{
@@ -100722,8 +102414,9 @@ test "db ttl cleanup can run under lease ownership" {
 test "db ttl cleanup can run under lease ownership with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
@@ -100770,8 +102463,9 @@ test "db ttl cleanup can run under lease ownership with durable lsm primary back
 test "db ttl cleanup can run with manual clock" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var clock = platform_clock.ManualClock{
@@ -100816,8 +102510,9 @@ test "db ttl cleanup can run with manual clock" {
 test "db ttl cleanup background worker starts and deletes with manual clock" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var clock = platform_clock.ManualClock{
@@ -100884,8 +102579,9 @@ const TxnResolverRecorder = struct {
 test "db exposes local transaction lifecycle" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -100946,8 +102642,9 @@ test "db exposes local transaction lifecycle" {
 test "db transaction intent writes reject new documents at ordinal exhaustion" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -100992,8 +102689,9 @@ test "db transaction intent writes reject new documents at ordinal exhaustion" {
 test "db transaction-created identity rows remain visible after reopen" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -101032,8 +102730,9 @@ test "db transaction-created identity rows remain visible after reopen" {
 test "db batch resolves transforms against pending same-batch writes" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -101071,8 +102770,9 @@ test "db batch resolves transforms against pending same-batch writes" {
 test "db graph push and pull transforms update projected edges across restart" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -101179,8 +102879,9 @@ test "db graph push and pull transforms update projected edges across restart" {
 
 test "db graph transforms fail closed for replacement operations" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -101218,8 +102919,9 @@ test "db graph transforms fail closed for replacement operations" {
 test "db batch keeps delete when same-batch transform targets deleted key" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -101249,8 +102951,9 @@ test "db batch keeps delete when same-batch transform targets deleted key" {
 test "db transaction abort leaves no visible document" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -101269,8 +102972,9 @@ test "db transaction abort leaves no visible document" {
 test "db transaction resolves transforms against pending same-transaction writes" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -101307,8 +103011,9 @@ test "db transaction resolves transforms against pending same-transaction writes
 
 test "db transaction intents fence ordinary batch transforms" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -101339,8 +103044,9 @@ test "db transaction intents fence ordinary batch transforms" {
 test "db bulk ingest write commits document writes before finish" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -101368,8 +103074,9 @@ test "db bulk ingest write commits document writes before finish" {
 test "db bulk ingest primary lsm writes use direct sorted ingest batch mode" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -101406,8 +103113,9 @@ test "db bulk ingest primary lsm writes use direct sorted ingest batch mode" {
 test "db bulk ingest resolves transforms across direct write batches" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -101452,8 +103160,9 @@ test "db bulk ingest resolves transforms across direct write batches" {
 test "db bulk ingest applies pure-doc work at requested sync level" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -101499,8 +103208,9 @@ test "db bulk ingest applies pure-doc work at requested sync level" {
 test "db bulk ingest keeps direct writes visible before timestamped batch" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -101537,8 +103247,9 @@ test "db bulk ingest keeps direct writes visible before timestamped batch" {
 test "db bulk ingest keeps direct writes visible before predicate batch" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -101585,8 +103296,9 @@ test "db bulk ingest keeps direct writes visible before predicate batch" {
 test "db bulk ingest keeps direct writes visible before graph batch" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -101626,8 +103338,9 @@ test "db bulk ingest keeps direct writes visible before graph batch" {
 test "db query_readonly reopen during active bulk ingest serves empty dense search instead of index-not-found" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var writer = try DB.open(alloc, std.mem.span(path), .{});
@@ -101671,8 +103384,9 @@ test "db query_readonly reopen during active bulk ingest serves empty dense sear
 
 test "db table bulk abort does not quarantine the active dense index" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -101701,8 +103415,9 @@ test "db table bulk abort does not quarantine the active dense index" {
 
 test "db standalone resource manager governs dense cache and storage" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -101726,8 +103441,9 @@ test "db standalone resource manager governs dense cache and storage" {
 
 test "db fallback resource manager does not bind caller owned lsm cache" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var cache = lsm_backend_mod.Cache.init(alloc, lsm_backend_mod.DefaultCacheSizeBytes);
@@ -101829,8 +103545,9 @@ test "db dense streaming replay qualification survives full ingest and reopen" {
     const max_working_set_bytes = readEnvU64("ANTFLY_DENSE_STREAMING_QUALIFICATION_MAX_WORKING_SET_BYTES", 2 * 1024 * 1024 * 1024);
     var peak_rss_bytes: u64 = 0;
     var peak_working_set_bytes: u64 = 0;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const started_ns = monotonicTimeNs();
@@ -101961,8 +103678,9 @@ test "db dense streaming replay qualification survives full ingest and reopen" {
 test "db query_readonly reopen does not backfill pending external dense artifacts" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -102005,8 +103723,9 @@ test "db query_readonly reopen does not backfill pending external dense artifact
 test "db primary auto bulk leaves dense replay active while session is open" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -102041,8 +103760,9 @@ test "db primary auto bulk leaves dense replay active while session is open" {
 test "db dense auto bulk finish wakes weak-sync replay and publishes visibility after catch-up" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -102166,8 +103886,9 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
 test "db dense auto bulk finish wakes current replay target if deferred wake is absent" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -102205,8 +103926,9 @@ test "db dense auto bulk finish wakes current replay target if deferred wake is 
 test "db dense auto bulk replays packed external embedding strings" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -102241,8 +103963,9 @@ test "db dense auto bulk replays packed external embedding strings" {
 test "db bulk ingest keeps full text merge maintenance live" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -102299,8 +104022,9 @@ test "db bulk ingest keeps full text merge maintenance live" {
 test "db bulk ingest finish publishes primary store before streaming dense catch up" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -102349,8 +104073,9 @@ test "db bulk ingest finish publishes primary store before streaming dense catch
 test "db transaction write request enforces version predicates" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -102381,8 +104106,9 @@ test "db transaction write request enforces version predicates" {
 test "db transaction write request detects concurrent intent conflicts" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -102403,8 +104129,9 @@ test "db transaction write request detects concurrent intent conflicts" {
 test "db committed transaction exposes commit timestamp for later predicates" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -102445,8 +104172,9 @@ test "db committed transaction exposes commit timestamp for later predicates" {
 test "db aborted transaction preserves prior committed state and version" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -102484,8 +104212,9 @@ test "db aborted transaction preserves prior committed state and version" {
 test "db explicit resolveTransactionIntents applies participant-style commit version" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -102509,8 +104238,9 @@ test "db explicit resolveTransactionIntents applies participant-style commit ver
 
 test "db replicated transaction commits each raft receipt atomically" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
@@ -102588,8 +104318,9 @@ test "db replicated transaction commits each raft receipt atomically" {
 
 test "db raced replicated transaction completion persists receipt and participant acknowledgement" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
@@ -102648,8 +104379,9 @@ test "db raced replicated transaction completion persists receipt and participan
 
 test "db transaction repeated committed resolve cannot overwrite a newer write" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
@@ -102675,8 +104407,9 @@ test "db transaction repeated committed resolve cannot overwrite a newer write" 
 
 test "db transaction committed transform appends derived replay from final value" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
@@ -102710,8 +104443,9 @@ test "db transaction committed transform appends derived replay from final value
 
 test "db transaction committed transform reaches full text visibility" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -102743,8 +104477,9 @@ test "db transaction committed transform reaches full text visibility" {
 
 test "db transaction idempotent resolve honors stronger sync level" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -102771,8 +104506,9 @@ test "db transaction idempotent resolve honors stronger sync level" {
 test "db recoverTransactions auto-aborts stale pending intents" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -102795,8 +104531,9 @@ test "db recoverTransactions auto-aborts stale pending intents" {
 test "db participant recovery preserves finalized transaction until all participants resolve" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -102831,8 +104568,9 @@ test "db participant recovery preserves finalized transaction until all particip
 test "db participant recovery callbacks run outside the apply lock" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -102874,8 +104612,9 @@ test "db participant recovery callbacks run outside the apply lock" {
 test "db transaction recovery runtime resolves participants and unblocks cleanup" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var recorder = TxnResolverRecorder{};
@@ -102953,8 +104692,9 @@ test "db transaction recovery runtime resolves participants and unblocks cleanup
 test "db transaction recovery runtime rebuilds all derived effects for committed orphaned intents" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const txn_id = blk: {
@@ -102996,10 +104736,28 @@ test "db transaction recovery runtime rebuilds all derived effects for committed
     });
     defer db.close();
 
-    var cleaned = false;
+    // Do not call a DB wrapper method while waiting. Recovery must be able to
+    // resolve the orphan from its stable heap owner without a caller first
+    // publishing the address of this by-value handle.
+    const recovered_store_key = try encodeStoreLookupKeyAlloc(alloc, "doc:recovered_orphan");
+    defer alloc.free(recovered_store_key);
+    var recovered_without_api_call = false;
     var attempts: usize = 0;
     while (attempts < 500) : (attempts += 1) {
-        const status = db.getTransactionStatus(txn_id);
+        const raw = try db.core.getStoreValue(alloc, recovered_store_key);
+        if (raw) |value| {
+            alloc.free(value);
+            recovered_without_api_call = true;
+            break;
+        }
+        sleepPollInterval();
+    }
+    if (!recovered_without_api_call) return error.TransactionRecoveryLocalResolutionTimeout;
+
+    var cleaned = false;
+    attempts = 0;
+    while (attempts < 500) : (attempts += 1) {
+        const status = db.core.getTransactionStatus(txn_id);
         if (status) |_| {} else |err| {
             if (err == transactions_mod.TxnError.TxnNotFound) {
                 cleaned = true;
@@ -103034,11 +104792,202 @@ test "db transaction recovery runtime rebuilds all derived effects for committed
     try std.testing.expectEqualStrings("doc:recovered_orphan", result.hits[0].id);
 }
 
+test "db transaction recovery shares serving visibility and invalidates query caches" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    var recorder = TxnResolverRecorder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .transaction_recovery = .{
+            .enabled = true,
+            .resolver_ctx = &recorder,
+            .resolve_participant_fn = TxnResolverRecorder.resolve,
+        },
+    });
+    defer db.close();
+    try db.prepareTransactionRecoveryOwner();
+    const recovery = db.transaction_recovery_local_context.?.stable_owner.?;
+    try std.testing.expect(&db.core.identity_visibility == &recovery.core.identity_visibility);
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }} });
+    try std.testing.expect(try db.allDocsVisibleSummaryFast(null));
+    const generation = try db.currentIdentityReadGeneration();
+    var live = try db.broadLiveDocSetCachedAlloc(alloc, generation);
+    defer live.deinit(alloc);
+    var hidden = (try db.nonVisibleDocSetCachedAlloc(alloc, generation)).?;
+    defer hidden.deinit(alloc);
+    try std.testing.expect(db.core.identity_visibility.live_generation != null);
+    try std.testing.expect(db.core.identity_visibility.nonvisible_generation != null);
+
+    const txn_id = try db.beginTransaction(1_000);
+    try db.writeTransaction(txn_id, .{ .deletes = &.{"doc:a"} });
+    const config = db.transaction_runtime.?.config;
+    try config.resolve_local_fn.?(config.local_resolution_ctx.?, txn_id, .committed, 2_000);
+    const stored = try db.get(alloc, "doc:a");
+    if (stored) |value| alloc.free(value);
+    try std.testing.expect(stored == null);
+    const durable = (try doc_identity.visibilitySummaryFromStore(db.core.store)).?;
+    try std.testing.expectEqual(@as(u64, 0), durable.live_ordinals);
+    try std.testing.expectEqualDeep(durable, db.core.identity_visibility.summary.?);
+    try std.testing.expect(!try db.allDocsVisibleSummaryFast(null));
+    try std.testing.expect(db.core.identity_visibility.live_generation == null);
+    try std.testing.expect(db.core.identity_visibility.nonvisible_generation == null);
+
+    // Serving writes also replace the recovery view, rather than leaving a
+    // second cached summary that can later mask the next recovered mutation.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }} });
+    try std.testing.expectEqual(@as(u64, 1), recovery.core.identity_visibility.summary.?.live_ordinals);
+}
+
+test "db transaction recovery borrows replacement enrichment only during resolution" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    var recorder = TxnResolverRecorder{};
+    var initial = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
+        .enrichment = .{ .dense_embedder = initial.interface() },
+        .transaction_recovery = .{
+            .enabled = true,
+            .resolver_ctx = &recorder,
+            .resolve_participant_fn = TxnResolverRecorder.resolve,
+        },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "ft_recovery", .kind = .full_text, .config_json = "{}" });
+    try db.prepareTransactionRecoveryOwner();
+    const recovery = db.transaction_recovery_local_context.?.stable_owner.?;
+    try std.testing.expect(recovery.enrichment_runtime == null);
+    const original = db.enrichment_runtime.?;
+    var replacement = embedder_mod.DeterministicDenseEmbedder{};
+    try db.reconfigureEnrichmentRuntimePaused(.{ .dense_embedder = replacement.interface() });
+    try std.testing.expect(db.enrichment_runtime.? != original);
+    try std.testing.expect(recovery.enrichment_runtime == null);
+    const config = db.transaction_runtime.?.config;
+    const txn_id = try db.beginTransaction(1_000);
+    try db.writeTransaction(txn_id, .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"recovered\"}" }},
+    });
+    try config.resolve_local_fn.?(config.local_resolution_ctx.?, txn_id, .committed, 2_000);
+    try std.testing.expect(recovery.enrichment_runtime == null);
+    const sequence = db.core.nextDerivedSequence();
+    try std.testing.expect(sequence > 0);
+    try std.testing.expectEqual(sequence, db.enrichment_runtime.?.stats().target_sequence);
+    try db.waitForCurrentSyncLevel(.full_text);
+    var result = try db.search(alloc, .{
+        .index_name = "ft_recovery",
+        .query = .{ .match = .{ .field = "_all", .text = "recovered" } },
+        .limit = 10,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+
+    // Removing the producer must also leave no dangling pointer behind.
+    try db.reconfigureEnrichmentRuntimePaused(.{});
+    try std.testing.expect(db.enrichment_runtime == null);
+    const deleted = try db.beginTransaction(3_000);
+    try db.writeTransaction(deleted, .{ .deletes = &.{"doc:a"} });
+    try config.resolve_local_fn.?(config.local_resolution_ctx.?, deleted, .committed, 4_000);
+    try std.testing.expect(recovery.enrichment_runtime == null);
+}
+
+test "db transaction recovery provider guard survives failed enrichment replacement" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    var recorder = TxnResolverRecorder{};
+    var initial = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
+        .enrichment = .{ .dense_embedder = initial.interface() },
+        .transaction_recovery = .{
+            .enabled = true,
+            .resolver_ctx = &recorder,
+            .resolve_participant_fn = TxnResolverRecorder.resolve,
+        },
+    });
+    defer db.close();
+    try db.prepareTransactionRecoveryOwner();
+    const original = db.enrichment_runtime.?;
+    const recovery = db.transaction_recovery_local_context.?;
+    const Fault = struct {
+        fn afterDetached(target: *DB) !void {
+            const context = target.transaction_recovery_local_context.?;
+            if (context.provider_mutex.tryLock()) {
+                context.provider_mutex.unlock(target.backend_runtime.io().?);
+                return error.TestMissingRecoveryProviderGuard;
+            }
+            return error.TestReplacementInterrupted;
+        }
+    };
+    DB.test_enrichment_reconfigure_after_detached_hook = Fault.afterDetached;
+    defer DB.test_enrichment_reconfigure_after_detached_hook = null;
+    var replacement = embedder_mod.DeterministicDenseEmbedder{};
+    try std.testing.expectError(error.TestReplacementInterrupted, db.reconfigureEnrichmentRuntimePaused(.{
+        .dense_embedder = replacement.interface(),
+    }));
+    try std.testing.expectEqual(original, db.enrichment_runtime.?);
+    try std.testing.expect(recovery.provider_mutex.tryLock());
+    recovery.provider_mutex.unlock(db.backend_runtime.io().?);
+    try std.testing.expect(recovery.stable_owner.?.enrichment_runtime == null);
+    const config = db.transaction_runtime.?.config;
+    const txn_id = try db.beginTransaction(1_000);
+    try db.writeTransaction(txn_id, .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"after failure\"}" }},
+    });
+    try config.resolve_local_fn.?(config.local_resolution_ctx.?, txn_id, .committed, 2_000);
+    try std.testing.expect(recovery.stable_owner.?.enrichment_runtime == null);
+    try std.testing.expect(recovery.provider_mutex.tryLock());
+    recovery.provider_mutex.unlock(db.backend_runtime.io().?);
+}
+
+test "db transaction recovery stable owner observes split shadow lifetime" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+
+    var recorder = TxnResolverRecorder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
+        .transaction_recovery = .{
+            .enabled = true,
+            .resolver_ctx = &recorder,
+            .resolve_participant_fn = TxnResolverRecorder.resolve,
+        },
+    });
+    defer db.close();
+    try db.prepareTransactionRecoveryOwner();
+    const recovery_ctx = db.transaction_recovery_local_context orelse
+        return error.TransactionRecoveryOwnerUnbound;
+    try std.testing.expect(recovery_ctx.stable_owner != null);
+    try std.testing.expect(recovery_ctx.stable_owner.?.shadow == null);
+
+    try db.addIndex(.{
+        .name = "ft_split_recovery",
+        .kind = .full_text,
+        .config_json = "{\"field\":\"title\"}",
+    });
+    try db.createShadowIndexManager("doc:m", "");
+    try std.testing.expect(recovery_ctx.split_shadow != null);
+    try std.testing.expect(recovery_ctx.split_shadow.?.manager == db.shadow.?.manager);
+
+    try db.closeShadowIndexManager();
+    try std.testing.expect(recovery_ctx.split_shadow == null);
+}
+
 test "db batch enforces optimistic version predicates" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -103070,8 +105019,9 @@ test "db batch enforces optimistic version predicates" {
 test "db persists byte range across reopen" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -103106,8 +105056,9 @@ test "db persists byte range across reopen" {
 test "db split state and split deltas are exposed through public api" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -103162,8 +105113,9 @@ test "db split state and split deltas are exposed through public api" {
 test "db split finalization marks split-off document child ranges remote" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -103259,8 +105211,9 @@ test "db split finalization marks split-off document child ranges remote" {
 test "db shadow index manager backfills split-off range and ignores parent-range live writes after split" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -103311,12 +105264,14 @@ test "db shadow index manager backfills split-off range and ignores parent-range
 test "db split prepare and finalize produce destination shard and trim parent range" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
-    var dest_buf: [256]u8 = undefined;
-    const dest = tempPath(&dest_buf);
+    var dest_tmp = try TestDirectory.init("db");
+    defer dest_tmp.cleanup();
+    const dest = dest_tmp.path().ptr;
     defer cleanupTempDir(dest);
 
     const identity_namespace = doc_identity.Namespace{ .table_id = 71, .shard_id = 101, .range_id = 1001 };
@@ -103498,11 +105453,13 @@ test "db split prepare and finalize produce destination shard and trim parent ra
 test "db split preserves multi-source graph fallback ownership on destination" {
     const alloc = std.testing.allocator;
 
-    var parent_buf: [256]u8 = undefined;
-    const parent_path = tempPath(&parent_buf);
+    var parent_tmp = try TestDirectory.init("db");
+    defer parent_tmp.cleanup();
+    const parent_path = parent_tmp.path().ptr;
     defer cleanupTempDir(parent_path);
-    var child_buf: [256]u8 = undefined;
-    const child_path = tempPath(&child_buf);
+    var child_tmp = try TestDirectory.init("db");
+    defer child_tmp.cleanup();
+    const child_path = child_tmp.path().ptr;
     defer cleanupTempDir(child_path);
 
     var parent = try DB.open(alloc, std.mem.span(parent_path), .{});
@@ -103566,12 +105523,14 @@ test "db split preserves multi-source graph fallback ownership on destination" {
 test "db split prepare and finalize work with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
-    var dest_buf: [256]u8 = undefined;
-    const dest = tempPath(&dest_buf);
+    var dest_tmp = try TestDirectory.init("db");
+    defer dest_tmp.cleanup();
+    const dest = dest_tmp.path().ptr;
     defer cleanupTempDir(dest);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
@@ -103648,12 +105607,14 @@ test "db split prepare and finalize work with durable lsm primary backend" {
 test "db split prepare survives reopen and finalizes with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var parent_buf: [256]u8 = undefined;
-    const parent_path = tempPath(&parent_buf);
+    var parent_tmp = try TestDirectory.init("db");
+    defer parent_tmp.cleanup();
+    const parent_path = parent_tmp.path().ptr;
     defer cleanupTempDir(parent_path);
 
-    var child_buf: [256]u8 = undefined;
-    const child_path = tempPath(&child_buf);
+    var child_tmp = try TestDirectory.init("db");
+    defer child_tmp.cleanup();
+    const child_path = child_tmp.path().ptr;
     defer cleanupTempDir(child_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
@@ -103706,12 +105667,14 @@ test "db split prepare survives reopen and finalizes with durable lsm primary ba
 test "db split prepare survives reopen and finalizes text sparse and graph indexes with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var parent_buf: [256]u8 = undefined;
-    const parent_path = tempPath(&parent_buf);
+    var parent_tmp = try TestDirectory.init("db");
+    defer parent_tmp.cleanup();
+    const parent_path = parent_tmp.path().ptr;
     defer cleanupTempDir(parent_path);
 
-    var child_buf: [256]u8 = undefined;
-    const child_path = tempPath(&child_buf);
+    var child_tmp = try TestDirectory.init("db");
+    defer child_tmp.cleanup();
+    const child_path = child_tmp.path().ptr;
     defer cleanupTempDir(child_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = db_config.primary_lsm_options_default };
@@ -103851,12 +105814,14 @@ test "db split prepare survives reopen and finalizes text sparse and graph index
 test "db split cutover fences enrichment to the owning range" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
-    var dest_buf: [256]u8 = undefined;
-    const dest = tempPath(&dest_buf);
+    var dest_tmp = try TestDirectory.init("db");
+    defer dest_tmp.cleanup();
+    const dest = dest_tmp.path().ptr;
     defer cleanupTempDir(dest);
 
     var deterministic_parent = embedder_mod.DeterministicDenseEmbedder{};
@@ -103942,8 +105907,9 @@ test "db split cutover fences enrichment to the owning range" {
 
 test "db raft snapshot replacement preserves overlapping incoming documents" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -103969,8 +105935,9 @@ test "db raft snapshot replacement preserves overlapping incoming documents" {
 
 test "db staged raft snapshot chunks atomically replace the live generation" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -104025,8 +105992,9 @@ test "db staged raft snapshot chunks atomically replace the live generation" {
 
 test "db split bootstrap replacement preserves overlapping incoming documents" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -104064,8 +106032,9 @@ test "db split bootstrap replacement preserves overlapping incoming documents" {
 
 test "db split bootstrap retries preserve reserved data and exact sequence" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -104113,8 +106082,9 @@ test "db split bootstrap retries preserve reserved data and exact sequence" {
 test "db replicated split bootstrap requires and preserves begin barrier" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const identity_namespace: DocIdentityNamespace = .{
@@ -104212,15 +106182,576 @@ test "db replicated split bootstrap requires and preserves begin barrier" {
     try std.testing.expectEqualStrings("{\"v\":1}", found.json);
 }
 
+test "db merge receiver fences stale copies and retains retired transitions across reopen" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    const first: types.MergeReplicationCheckpoint = .{
+        .kind = .accept,
+        .transition_id = 100,
+        .donor_group_id = 101,
+        .receiver_group_id = 102,
+        .receiver_base_start = "m",
+        .receiver_base_end = "z",
+        .merged_start = "a",
+        .merged_end = "z",
+    };
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer db.close();
+        try db.updateRange(.{ .start = "m", .end = "z" });
+        const copy: types.MergeReplicationContext = .{
+            .transition_id = 100,
+            .donor_group_id = 101,
+            .receiver_group_id = 102,
+            .identity_namespace = db.core.identity_namespace,
+        };
+        const payload: types.BatchRequest = .{ .merge_replication = copy, .writes = &.{.{ .key = "b", .value = "{}" }} };
+        try db.batchRaftReplicatedApply(payload, .{ .term = 1, .index = 1 });
+        try std.testing.expect((try db.get(alloc, "b")) == null);
+        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = first }, .{ .term = 1, .index = 2 });
+        try db.batchRaftReplicatedApply(payload, .{ .term = 1, .index = 3 });
+        var terminal = first;
+        terminal.kind = .bootstrap_complete;
+        terminal.bootstrap_applied_index = 3;
+        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = terminal }, .{ .term = 1, .index = 4 });
+        terminal.kind = .finalize;
+        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = terminal }, .{ .term = 1, .index = 5 });
+        try db.batch(.{ .writes = &.{.{ .key = "b", .value = "{\"public\":true}" }} });
+        const before = db.core.nextDerivedSequence();
+        try db.batchRaftReplicatedApply(payload, .{ .term = 2, .index = 6 });
+        try db.batchRaftReplicatedApply(.{ .merge_replication = copy, .deletes = &.{"b"} }, .{ .term = 2, .index = 7 });
+        // A stale artifact must be ignored before its payload is decoded.
+        const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "b", "graph", "links", "c");
+        defer alloc.free(artifact_key);
+        try db.batchRaftReplicatedApply(.{ .merge_replication = copy, .merge_artifacts = &.{.{ .key = artifact_key, .value = "invalid stale artifact" }} }, .{ .term = 2, .index = 8 });
+        try std.testing.expect((try db.core.getStoreValue(alloc, artifact_key)) == null);
+        try std.testing.expectEqual(before, db.core.nextDerivedSequence());
+        try std.testing.expectEqual(@as(u64, 8), (try db.raftAppliedEntry()).?.index);
+        const value = (try db.get(alloc, "b")).?;
+        defer alloc.free(value);
+        try std.testing.expectEqualStrings("{\"public\":true}", value);
+        var second = first;
+        second.transition_id = 200;
+        second.donor_group_id = 201;
+        second.receiver_base_start = "a";
+        second.merged_start = "";
+        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = second }, .{ .term = 2, .index = 9 });
+        try db.batchRaftReplicatedApply(payload, .{ .term = 2, .index = 10 });
+        second.kind = .bootstrap_complete;
+        second.bootstrap_applied_index = 10;
+        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = second }, .{ .term = 2, .index = 11 });
+        second.kind = .finalize;
+        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = second }, .{ .term = 2, .index = 12 });
+    }
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    try db.batchRaftReplicatedApply(.{ .merge_checkpoint = first }, .{ .term = 3, .index = 13 });
+    const raw = (try db.core.getStoreValue(alloc, merge_state_mod.key)).?;
+    defer alloc.free(raw);
+    var state = try merge_state_mod.decodeAlloc(alloc, raw);
+    defer state.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 200), state.transition_id);
+    try std.testing.expectEqual(merge_state_mod.Phase.finalized, state.phase);
+    try std.testing.expectEqualSlices(u64, &.{100}, state.retired_transition_ids);
+    try std.testing.expectEqualStrings("", db.getRange().start);
+    const value = (try db.get(alloc, "b")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("{\"public\":true}", value);
+}
+
+test "db merge copy attempts fence delayed leaders before finalize across reopen" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    var checkpoint: types.MergeReplicationCheckpoint = .{
+        .kind = .accept,
+        .transition_id = 100,
+        .donor_group_id = 101,
+        .receiver_group_id = 102,
+        .receiver_base_start = "m",
+        .receiver_base_end = "z",
+        .merged_start = "a",
+        .merged_end = "z",
+    };
+    const Apply = struct {
+        fn command(db: *DB, index: *u64, req: types.BatchRequest) !void {
+            index.* += 1;
+            try db.batchRaftReplicatedApply(req, .{ .term = 7, .index = index.* });
+        }
+    };
+    var index: u64 = 0;
+    var old_copy: types.MergeReplicationContext = undefined;
+    var old_begin = checkpoint;
+    old_begin.kind = .begin_copy;
+    old_begin.copy_attempt = .{ .donor_term = 1, .sequence = 100 };
+    var new_begin = old_begin;
+    // Term must dominate sequence, even if the successor just restarted.
+    new_begin.copy_attempt = .{ .donor_term = 2, .sequence = 1 };
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer db.close();
+        try db.updateRange(.{ .start = "m", .end = "z" });
+        old_copy = .{
+            .transition_id = 100,
+            .donor_group_id = 101,
+            .receiver_group_id = 102,
+            .identity_namespace = db.core.identity_namespace,
+            .copy_attempt = old_begin.copy_attempt,
+        };
+        try Apply.command(&db, &index, .{ .merge_checkpoint = checkpoint });
+        try Apply.command(&db, &index, .{ .merge_checkpoint = old_begin });
+        try Apply.command(&db, &index, .{ .merge_replication = old_copy, .writes = &.{.{ .key = "b", .value = "{}" }} });
+        try Apply.command(&db, &index, .{ .merge_checkpoint = new_begin });
+        var new_copy = old_copy;
+        new_copy.copy_attempt = new_begin.copy_attempt;
+        try Apply.command(&db, &index, .{ .merge_replication = new_copy, .writes = &.{.{ .key = "b", .value = "{\"new\":true}" }} });
+        // A delayed begin cannot take ownership back. Nor can its completion
+        // or finalize certify B's still-incomplete copy.
+        try Apply.command(&db, &index, .{ .merge_checkpoint = old_begin });
+        var stale = old_begin;
+        stale.kind = .bootstrap_complete;
+        stale.bootstrap_applied_index = 900;
+        try Apply.command(&db, &index, .{ .merge_checkpoint = stale });
+        stale.kind = .finalize;
+        try Apply.command(&db, &index, .{ .merge_checkpoint = stale });
+        try Apply.command(&db, &index, .{ .merge_replication = old_copy, .deletes = &.{"b"} });
+        const raw = (try db.core.getStoreValue(alloc, merge_state_mod.key)).?;
+        defer alloc.free(raw);
+        var state = try merge_state_mod.decodeAlloc(alloc, raw);
+        defer state.deinit(alloc);
+        try std.testing.expectEqual(merge_state_mod.Phase.accepting, state.phase);
+        try std.testing.expect(!state.bootstrap_complete);
+        try std.testing.expectEqual(std.math.Order.eq, state.copy_attempt.order(new_begin.copy_attempt));
+    }
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    checkpoint = new_begin;
+    checkpoint.kind = .bootstrap_complete;
+    checkpoint.bootstrap_applied_index = 20;
+    try Apply.command(&db, &index, .{ .merge_checkpoint = checkpoint });
+    const before = db.core.nextDerivedSequence();
+    // This is the reported window: B completed bootstrap, but has not yet
+    // finalized, when A's delayed clear and artifact page are delivered.
+    try Apply.command(&db, &index, .{ .merge_replication = old_copy, .deletes = &.{"b"} });
+    const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "b", "graph", "links", "c");
+    defer alloc.free(artifact_key);
+    try Apply.command(&db, &index, .{ .merge_replication = old_copy, .merge_artifacts = &.{.{ .key = artifact_key, .value = "invalid stale artifact" }} });
+    // Completion also closes the winning attempt against duplicate packets.
+    var completed_copy = old_copy;
+    completed_copy.copy_attempt = checkpoint.copy_attempt;
+    try Apply.command(&db, &index, .{ .merge_replication = completed_copy, .deletes = &.{"b"} });
+    try std.testing.expectEqual(before, db.core.nextDerivedSequence());
+    try std.testing.expectEqual(index, (try db.raftAppliedEntry()).?.index);
+    try std.testing.expect((try db.core.getStoreValue(alloc, artifact_key)) == null);
+    checkpoint.kind = .finalize;
+    try Apply.command(&db, &index, .{ .merge_checkpoint = checkpoint });
+    const value = (try db.get(alloc, "b")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("{\"new\":true}", value);
+    const raw = (try db.core.getStoreValue(alloc, merge_state_mod.key)).?;
+    defer alloc.free(raw);
+    var state = try merge_state_mod.decodeAlloc(alloc, raw);
+    defer state.deinit(alloc);
+    try std.testing.expectEqual(merge_state_mod.Phase.finalized, state.phase);
+    try std.testing.expectEqual(@as(u64, 20), state.bootstrap_applied_index);
+}
+
+test "db replicated merge checkpoints persist phase range and watermark across reopen" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+
+    const namespace: DocIdentityNamespace = .{ .table_id = 7, .shard_id = 42, .range_id = 420 };
+    const base_range: types.ByteRange = .{ .start = "doc:m", .end = "" };
+    const merged_range: types.ByteRange = .{ .start = "doc:a", .end = "" };
+    const checkpoint_base: types.MergeReplicationCheckpoint = .{
+        .kind = .accept,
+        .transition_id = 40,
+        .donor_group_id = 41,
+        .receiver_group_id = 42,
+        .receiver_base_start = base_range.start,
+        .receiver_base_end = base_range.end,
+        .merged_start = merged_range.start,
+        .merged_end = merged_range.end,
+        .allow_doc_identity_reassignment = true,
+        .receiver_identity_reassignment_namespace = namespace,
+    };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .identity_namespace = namespace,
+            .start_index_workers = false,
+        });
+        defer db.close();
+        try db.updateRange(base_range);
+        try db.batchReplicatedApply(.{ .merge_checkpoint = checkpoint_base });
+        try std.testing.expectEqualStrings("doc:a", db.getRange().start);
+
+        var premature_finalize = checkpoint_base;
+        premature_finalize.kind = .finalize;
+        premature_finalize.bootstrap_applied_index = 19;
+        try std.testing.expectError(
+            error.MergeTransitionNotReady,
+            db.batchReplicatedApply(.{ .merge_checkpoint = premature_finalize }),
+        );
+
+        var conflicting_range = checkpoint_base;
+        conflicting_range.kind = .bootstrap_complete;
+        conflicting_range.merged_start = "doc:b";
+        conflicting_range.bootstrap_applied_index = 19;
+        try std.testing.expectError(
+            error.ConflictingMergeTransition,
+            db.batchReplicatedApply(.{ .merge_checkpoint = conflicting_range }),
+        );
+
+        try db.batchReplicatedApply(.{
+            .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"from donor\"}" }},
+        });
+        var complete = checkpoint_base;
+        complete.kind = .bootstrap_complete;
+        complete.bootstrap_applied_index = 19;
+        try db.batchReplicatedApply(.{ .merge_checkpoint = complete });
+        try std.testing.expectEqualStrings("doc:a", db.getRange().start);
+        // A delayed accept is a no-op: it cannot regress either the expanded
+        // range or the durable bootstrap watermark.
+        try db.batchReplicatedApply(.{ .merge_checkpoint = checkpoint_base });
+        try std.testing.expectEqualStrings("doc:a", db.getRange().start);
+
+        const raw = (try db.core.getStoreValue(alloc, merge_state_mod.key)) orelse return error.TestExpectedEqual;
+        defer alloc.free(raw);
+        var state = try merge_state_mod.decodeAlloc(alloc, raw);
+        defer state.deinit(alloc);
+        try std.testing.expectEqual(merge_state_mod.Phase.accepting, state.phase);
+        try std.testing.expect(state.bootstrap_complete);
+        try std.testing.expectEqual(@as(u64, 19), state.bootstrap_applied_index);
+        try std.testing.expectEqual(@as(u64, 40), state.transition_id);
+        const corrupt = try alloc.dupe(u8, raw);
+        defer alloc.free(corrupt);
+        corrupt[0] = 0xff;
+        try std.testing.expectError(error.InvalidMergeState, merge_state_mod.decodeAlloc(alloc, corrupt));
+    }
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .identity_namespace = namespace,
+            .start_index_workers = false,
+        });
+        defer db.close();
+        try std.testing.expectEqualStrings("doc:a", db.getRange().start);
+        const donor = (try db.get(alloc, "doc:b")) orelse return error.TestExpectedEqual;
+        defer alloc.free(donor);
+        try std.testing.expectEqualStrings("{\"title\":\"from donor\"}", donor);
+
+        var finalized = checkpoint_base;
+        finalized.kind = .finalize;
+        finalized.bootstrap_applied_index = 19;
+        try db.batchReplicatedApply(.{ .merge_checkpoint = finalized });
+        try db.batchReplicatedApply(.{ .merge_checkpoint = checkpoint_base });
+        try std.testing.expectEqualStrings("doc:a", db.getRange().start);
+        var newer_after_finalize = finalized;
+        newer_after_finalize.bootstrap_applied_index = 20;
+        try db.batchReplicatedApply(.{ .merge_checkpoint = newer_after_finalize });
+        var different_transition = checkpoint_base;
+        different_transition.transition_id = 41;
+        try std.testing.expectError(
+            error.ConflictingMergeTransition,
+            db.batchReplicatedApply(.{ .merge_checkpoint = different_transition }),
+        );
+        var rollback = checkpoint_base;
+        rollback.kind = .rollback;
+        try db.batchReplicatedApply(.{ .merge_checkpoint = rollback });
+        const raw = (try db.core.getStoreValue(alloc, merge_state_mod.key)) orelse return error.TestExpectedEqual;
+        defer alloc.free(raw);
+        var state = try merge_state_mod.decodeAlloc(alloc, raw);
+        defer state.deinit(alloc);
+        try std.testing.expectEqual(merge_state_mod.Phase.finalized, state.phase);
+        try std.testing.expect(state.bootstrap_complete);
+        try std.testing.expectEqual(@as(u64, 19), state.bootstrap_applied_index);
+    }
+}
+
+test "db replicated merge checkpoints keep rolled back receivers live across delayed controls and reopen" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    var checkpoint: types.MergeReplicationCheckpoint = .{
+        .kind = .accept,
+        .transition_id = 50,
+        .donor_group_id = 51,
+        .receiver_group_id = 52,
+        .receiver_base_start = "m",
+        .receiver_base_end = "z",
+        .merged_start = "a",
+        .merged_end = "z",
+    };
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer db.close();
+        try db.updateRange(.{ .start = "m", .end = "z" });
+        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 1 });
+        checkpoint.kind = .rollback;
+        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 2 });
+    }
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    for ([_]types.MergeReplicationCheckpoint.Kind{ .accept, .begin_copy, .bootstrap_complete, .finalize, .rollback }, 3..) |kind, index| {
+        checkpoint.kind = kind;
+        checkpoint.copy_attempt = .{ .donor_term = 2, .sequence = 1 };
+        checkpoint.bootstrap_applied_index = if (kind == .bootstrap_complete or kind == .finalize) 100 else 0;
+        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 2, .index = index });
+        try std.testing.expectEqualStrings("m", db.getRange().start);
+    }
+    try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "n", .value = "{\"live\":true}" }} }, .{ .term = 2, .index = 8 });
+    const raw = (try db.core.getStoreValue(alloc, merge_state_mod.key)).?;
+    defer alloc.free(raw);
+    var state = try merge_state_mod.decodeAlloc(alloc, raw);
+    defer state.deinit(alloc);
+    try std.testing.expectEqual(merge_state_mod.Phase.rolled_back, state.phase);
+    try std.testing.expect(!state.bootstrap_complete);
+    try std.testing.expectEqual(@as(u64, 0), state.bootstrap_applied_index);
+    try std.testing.expectEqual(@as(u64, 8), (try db.raftAppliedEntry()).?.index);
+    const value = (try db.get(alloc, "n")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("{\"live\":true}", value);
+}
+
+test "db terminal merge controls preserve a subsequent split across reopen" {
+    const alloc = std.testing.allocator;
+    for ([_]types.MergeReplicationCheckpoint.Kind{ .finalize, .rollback }) |terminal| {
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
+        var checkpoint: types.MergeReplicationCheckpoint = .{
+            .kind = .accept,
+            .transition_id = 60,
+            .donor_group_id = 61,
+            .receiver_group_id = 62,
+            .receiver_base_start = "m",
+            .receiver_base_end = "z",
+            .merged_start = "a",
+            .merged_end = "z",
+        };
+        const expected_start = if (terminal == .finalize) "a" else "m";
+        {
+            var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+            defer db.close();
+            try db.updateRange(.{ .start = "m", .end = "z" });
+            try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 1 });
+            checkpoint.kind = .bootstrap_complete;
+            checkpoint.bootstrap_applied_index = 1;
+            try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 2 });
+            checkpoint.kind = terminal;
+            checkpoint.bootstrap_applied_index = if (terminal == .finalize) 1 else 0;
+            try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 3 });
+            // Exercise the production split-start mutation, including its
+            // persisted range, without replacing the terminal merge receipt.
+            try db.core.prepareSplit("t");
+            try db.core.completeSplitTransition(63, "t");
+            checkpoint.kind = .accept;
+            checkpoint.bootstrap_applied_index = 0;
+            try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 2, .index = 4 });
+            try std.testing.expectEqualStrings(expected_start, db.getRange().start);
+            try std.testing.expectEqualStrings("t", db.getRange().end);
+        }
+        {
+            var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+            defer db.close();
+            for ([_]types.MergeReplicationCheckpoint.Kind{ .accept, .begin_copy, .bootstrap_complete, .finalize, .rollback }, 5..) |kind, index| {
+                checkpoint.kind = kind;
+                checkpoint.copy_attempt = .{ .donor_term = 2, .sequence = 1 };
+                checkpoint.bootstrap_applied_index = if (kind == .bootstrap_complete or kind == .finalize) 100 else 0;
+                try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 2, .index = index });
+                try std.testing.expectEqualStrings(expected_start, db.getRange().start);
+                try std.testing.expectEqualStrings("t", db.getRange().end);
+            }
+            var conflicting = checkpoint;
+            conflicting.donor_group_id = 99;
+            try std.testing.expectError(error.ConflictingMergeTransition, db.batchRaftReplicatedApply(
+                .{ .merge_checkpoint = conflicting },
+                .{ .term = 2, .index = 10 },
+            ));
+            conflicting = checkpoint;
+            conflicting.merged_end = "zz";
+            try std.testing.expectError(error.ConflictingMergeTransition, db.batchRaftReplicatedApply(
+                .{ .merge_checkpoint = conflicting },
+                .{ .term = 2, .index = 10 },
+            ));
+            try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "n", .value = "{\"live\":true}" }} }, .{ .term = 2, .index = 10 });
+            const raw = (try db.core.getStoreValue(alloc, merge_state_mod.key)).?;
+            defer alloc.free(raw);
+            var state = try merge_state_mod.decodeAlloc(alloc, raw);
+            defer state.deinit(alloc);
+            try std.testing.expectEqual(if (terminal == .finalize) merge_state_mod.Phase.finalized else .rolled_back, state.phase);
+            try std.testing.expectEqual(terminal == .finalize, state.bootstrap_complete);
+            try std.testing.expectEqual(@as(u64, if (terminal == .finalize) 1 else 0), state.bootstrap_applied_index);
+            try std.testing.expectEqualStrings("z", state.receiver_base_range.end);
+            try std.testing.expectEqualStrings("z", state.merged_range.?.end);
+            try std.testing.expectEqual(@as(u64, 10), (try db.raftAppliedEntry()).?.index);
+            try std.testing.expectEqual(shard_mod.SplitPhase.splitting, db.core.splitState().?.phase);
+        }
+        var reopened = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer reopened.close();
+        try std.testing.expectEqualStrings(expected_start, reopened.getRange().start);
+        try std.testing.expectEqualStrings("t", reopened.getRange().end);
+        const value = (try reopened.get(alloc, "n")).?;
+        defer alloc.free(value);
+        try std.testing.expectEqualStrings("{\"live\":true}", value);
+        try std.testing.expectEqual(@as(u64, 10), (try reopened.raftAppliedEntry()).?.index);
+    }
+}
+
+test "db physical lsm split retains parent merge receipts and clears child receipts across reopen" {
+    const alloc = std.testing.allocator;
+    const options: OpenOptions = .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        .start_index_workers = false,
+    };
+    for ([_]types.MergeReplicationCheckpoint.Kind{ .finalize, .rollback }) |terminal| {
+        for ([_]bool{ false, true }) |old_key_layout| {
+            var parent_path_tmp = try TestDirectory.init("db");
+            defer parent_path_tmp.cleanup();
+            const parent_path = parent_path_tmp.path().ptr;
+            var child_path_tmp = try TestDirectory.init("db");
+            defer child_path_tmp.cleanup();
+            const child_path = child_path_tmp.path().ptr;
+            var checkpoint: types.MergeReplicationCheckpoint = .{
+                .kind = .accept,
+                .transition_id = 70,
+                .donor_group_id = 71,
+                .receiver_group_id = 72,
+                .receiver_base_start = "a",
+                .receiver_base_end = "m",
+                .merged_start = "a",
+                .merged_end = "z",
+            };
+            const split_key = if (terminal == .finalize) "m" else "g";
+            const right_key = if (terminal == .finalize) "t" else "j";
+            {
+                var parent = try DB.open(alloc, std.mem.span(parent_path), options);
+                defer parent.close();
+                try parent.updateRange(.{ .start = "a", .end = "m" });
+                try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 1 });
+                checkpoint.kind = .rollback;
+                try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 2 });
+                checkpoint.kind = .accept;
+                checkpoint.transition_id = 80;
+                checkpoint.donor_group_id = 81;
+                try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 3 });
+                checkpoint.kind = .begin_copy;
+                checkpoint.copy_attempt = .{ .donor_term = 1, .sequence = 1 };
+                try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 4 });
+                checkpoint.kind = .bootstrap_complete;
+                checkpoint.bootstrap_applied_index = 4;
+                try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 5 });
+                checkpoint.kind = terminal;
+                checkpoint.bootstrap_applied_index = if (terminal == .finalize) 4 else 0;
+                try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 6 });
+                try parent.batchRaftReplicatedApply(.{ .writes = &.{
+                    .{ .key = "b", .value = "{\"side\":\"parent\"}" },
+                    .{ .key = right_key, .value = "{\"side\":\"child\"}" },
+                } }, .{ .term = 1, .index = 7 });
+                const before = (try parent.core.getStoreValue(alloc, merge_state_mod.key)).?;
+                defer alloc.free(before);
+                // Production records predating the protected metadata key
+                // must be promoted before a physical split can discard them.
+                if (old_key_layout and !std.mem.eql(u8, merge_state_mod.key, "raftmerge:state")) {
+                    try parent.core.store.putBatch(&.{.{ .key = "raftmerge:state", .value = before }}, &.{merge_state_mod.key});
+                }
+                try parent.split(parent.getRange(), split_key, "", std.mem.span(child_path), true);
+                const prepared_receipt = (try parent.core.getStoreValue(alloc, merge_state_mod.key)) orelse return error.MissingMergeReceiptAfterPrepare;
+                defer alloc.free(prepared_receipt);
+                try std.testing.expectEqualSlices(u8, before, prepared_receipt);
+                // Inspect the destructive rewrite boundary itself: receipt
+                // preservation must not rely on a later restoration write.
+                const split_lower = try documentRangeLowerAlloc(alloc, split_key);
+                defer alloc.free(split_lower);
+                _ = try tryFinalizePrimarySplitFast(&parent, split_lower);
+                const rewritten_receipt = (try parent.core.getStoreValue(alloc, merge_state_mod.key)) orelse return error.MissingMergeReceiptAfterPhysicalRewrite;
+                defer alloc.free(rewritten_receipt);
+                try std.testing.expectEqualSlices(u8, before, rewritten_receipt);
+                try parent.finalizeSplit(.{ .start = "a", .end = split_key });
+                const after = (try parent.core.getStoreValue(alloc, merge_state_mod.key)) orelse return error.MissingMergeReceiptAfterSplit;
+                defer alloc.free(after);
+                try std.testing.expectEqualSlices(u8, before, after);
+                try std.testing.expect((try parent.get(alloc, right_key)) == null);
+            }
+            {
+                var parent = try DB.open(alloc, std.mem.span(parent_path), options);
+                defer parent.close();
+                for ([_]types.MergeReplicationCheckpoint.Kind{ .accept, .begin_copy, .bootstrap_complete, .finalize, .rollback }, 8..) |kind, index| {
+                    checkpoint.kind = kind;
+                    checkpoint.copy_attempt = .{ .donor_term = 2, .sequence = 1 };
+                    checkpoint.bootstrap_applied_index = if (kind == .bootstrap_complete or kind == .finalize) 100 else 0;
+                    try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 2, .index = index });
+                    try std.testing.expectEqualStrings("a", parent.getRange().start);
+                    try std.testing.expectEqualStrings(split_key, parent.getRange().end);
+                }
+                var retired = checkpoint;
+                retired.kind = .accept;
+                retired.transition_id = 70;
+                retired.donor_group_id = 71;
+                retired.bootstrap_applied_index = 0;
+                try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = retired }, .{ .term = 2, .index = 13 });
+                try parent.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "b", .value = "{\"live\":true}" }} }, .{ .term = 2, .index = 14 });
+                const raw = (try parent.core.getStoreValue(alloc, merge_state_mod.key)).?;
+                defer alloc.free(raw);
+                var receipt = try merge_state_mod.decodeAlloc(alloc, raw);
+                defer receipt.deinit(alloc);
+                try std.testing.expectEqual(if (terminal == .finalize) merge_state_mod.Phase.finalized else .rolled_back, receipt.phase);
+                try std.testing.expectEqual(@as(u64, 80), receipt.transition_id);
+                try std.testing.expectEqualSlices(u64, &.{70}, receipt.retired_transition_ids);
+                try std.testing.expectEqual(std.math.Order.eq, receipt.copy_attempt.order(.{ .donor_term = 1, .sequence = 1 }));
+                try std.testing.expectEqual(@as(u64, if (terminal == .finalize) 4 else 0), receipt.bootstrap_applied_index);
+                try std.testing.expectEqual(@as(u64, 14), (try parent.raftAppliedEntry()).?.index);
+            }
+            {
+                var child = try DB.open(alloc, std.mem.span(child_path), options);
+                defer child.close();
+                try std.testing.expect((try child.core.getStoreValue(alloc, merge_state_mod.key)) == null);
+                try std.testing.expect((try child.core.getStoreValue(alloc, "raftmerge:state")) == null);
+                const value = (try child.get(alloc, right_key)).?;
+                defer alloc.free(value);
+                try std.testing.expectEqualStrings("{\"side\":\"child\"}", value);
+                var fresh = checkpoint;
+                fresh.kind = .accept;
+                fresh.transition_id = 90;
+                fresh.donor_group_id = 91;
+                fresh.receiver_group_id = 92;
+                fresh.receiver_base_start = split_key;
+                fresh.receiver_base_end = if (terminal == .finalize) "z" else "m";
+                fresh.merged_start = "a";
+                fresh.merged_end = fresh.receiver_base_end;
+                fresh.bootstrap_applied_index = 0;
+                fresh.copy_attempt = .{};
+                try child.batchRaftReplicatedApply(.{ .merge_checkpoint = fresh }, .{ .term = 1, .index = 1 });
+                try std.testing.expectEqual(@as(u64, 1), (try child.raftAppliedEntry()).?.index);
+            }
+            var reopened = try DB.open(alloc, std.mem.span(parent_path), options);
+            defer reopened.close();
+            try std.testing.expectEqualStrings(split_key, reopened.getRange().end);
+            const value = (try reopened.get(alloc, "b")).?;
+            defer alloc.free(value);
+            try std.testing.expectEqualStrings("{\"live\":true}", value);
+        }
+    }
+}
+
 test "db split cutover fences enrichment to the owning range with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
-    var dest_buf: [256]u8 = undefined;
-    const dest = tempPath(&dest_buf);
+    var dest_tmp = try TestDirectory.init("db");
+    defer dest_tmp.cleanup();
+    const dest = dest_tmp.path().ptr;
     defer cleanupTempDir(dest);
 
     const primary_backend: PrimaryBackend = .{ .lsm = db_config.primary_lsm_options_default };
@@ -104311,12 +106842,14 @@ test "db split cutover fences enrichment to the owning range with durable lsm pr
 test "db merge-style cutover fences enrichment to the merged receiver range" {
     const alloc = std.testing.allocator;
 
-    var receiver_buf: [256]u8 = undefined;
-    const receiver_path = tempPath(&receiver_buf);
+    var receiver_tmp = try TestDirectory.init("db");
+    defer receiver_tmp.cleanup();
+    const receiver_path = receiver_tmp.path().ptr;
     defer cleanupTempDir(receiver_path);
 
-    var donor_buf: [256]u8 = undefined;
-    const donor_path = tempPath(&donor_buf);
+    var donor_tmp = try TestDirectory.init("db");
+    defer donor_tmp.cleanup();
+    const donor_path = donor_tmp.path().ptr;
     defer cleanupTempDir(donor_path);
 
     var deterministic_receiver = embedder_mod.DeterministicDenseEmbedder{};
@@ -104405,12 +106938,14 @@ test "db merge-style cutover fences enrichment to the merged receiver range" {
 test "db merge-style cutover fences enrichment to the merged receiver range with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var receiver_buf: [256]u8 = undefined;
-    const receiver_path = tempPath(&receiver_buf);
+    var receiver_tmp = try TestDirectory.init("db");
+    defer receiver_tmp.cleanup();
+    const receiver_path = receiver_tmp.path().ptr;
     defer cleanupTempDir(receiver_path);
 
-    var donor_buf: [256]u8 = undefined;
-    const donor_path = tempPath(&donor_buf);
+    var donor_tmp = try TestDirectory.init("db");
+    defer donor_tmp.cleanup();
+    const donor_path = donor_tmp.path().ptr;
     defer cleanupTempDir(donor_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
@@ -104500,15 +107035,69 @@ test "db merge-style cutover fences enrichment to the merged receiver range with
     }
 }
 
+test "db merge artifact import holds both apply locks through copy failure" {
+    const Probe = struct {
+        donor: *apply_rw_lock_mod.ApplyRwLock,
+        receiver: *apply_rw_lock_mod.ApplyRwLock,
+        checked: bool = false,
+        both_held: bool = false,
+
+        fn allocate(ptr: *anyopaque, _: usize, _: std.mem.Alignment, _: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const donor_unlocked = self.donor.tryLockExclusive();
+            if (donor_unlocked) self.donor.unlockExclusive();
+            const receiver_unlocked = self.receiver.tryLockExclusive();
+            if (receiver_unlocked) self.receiver.unlockExclusive();
+            self.checked = true;
+            self.both_held = !donor_unlocked and !receiver_unlocked;
+            return null;
+        }
+    };
+    for ([_]bool{ true, false }) |donor_first| {
+        var donor_lock: apply_rw_lock_mod.ApplyRwLock = .{};
+        var receiver_lock: apply_rw_lock_mod.ApplyRwLock = .{};
+        var probe = Probe{ .donor = &donor_lock, .receiver = &receiver_lock };
+        // Allocation fails at the start of the actual copy; no store or index
+        // fields may be touched. Verify both lock orders and error unwinding.
+        var first_path = [_]u8{'a'};
+        var last_path = [_]u8{'z'};
+        var donor_core: db_core.DBCore = undefined;
+        donor_core.path = if (donor_first) &first_path else &last_path;
+        donor_core.apply_mutex = &donor_lock;
+        var receiver_core: db_core.DBCore = undefined;
+        receiver_core.path = if (donor_first) &last_path else &first_path;
+        receiver_core.apply_mutex = &receiver_lock;
+        var donor: DB = undefined;
+        donor.core = &donor_core;
+        var receiver: DB = undefined;
+        receiver.core = &receiver_core;
+        receiver.alloc = .{ .ptr = &probe, .vtable = &.{
+            .alloc = Probe.allocate,
+            .resize = std.mem.Allocator.noResize,
+            .remap = std.mem.Allocator.noRemap,
+            .free = std.mem.Allocator.noFree,
+        } };
+        try std.testing.expectError(error.OutOfMemory, receiver.importMergeRangeFromTransitionDonor(&donor, .{ .start = "a", .end = "z" }));
+        try std.testing.expect(probe.checked);
+        try std.testing.expect(probe.both_held);
+        try std.testing.expect(donor_lock.tryLockExclusive());
+        donor_lock.unlockExclusive();
+        try std.testing.expect(receiver_lock.tryLockExclusive());
+        receiver_lock.unlockExclusive();
+    }
+}
+
 test "db merge-style cutover routes text sparse and graph indexes to the merged receiver range with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var receiver_buf: [256]u8 = undefined;
-    const receiver_path = tempPath(&receiver_buf);
+    var receiver_tmp = try TestDirectory.init("db");
+    defer receiver_tmp.cleanup();
+    const receiver_path = receiver_tmp.path().ptr;
     defer cleanupTempDir(receiver_path);
 
-    var donor_buf: [256]u8 = undefined;
-    const donor_path = tempPath(&donor_buf);
+    var donor_tmp = try TestDirectory.init("db");
+    defer donor_tmp.cleanup();
+    const donor_path = donor_tmp.path().ptr;
     defer cleanupTempDir(donor_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
@@ -104618,12 +107207,14 @@ test "db merge-style cutover routes text sparse and graph indexes to the merged 
 test "db split cutover preserves enrichment resume and fencing across reopen" {
     const alloc = std.testing.allocator;
 
-    var parent_buf: [256]u8 = undefined;
-    const parent_path = tempPath(&parent_buf);
+    var parent_tmp = try TestDirectory.init("db");
+    defer parent_tmp.cleanup();
+    const parent_path = parent_tmp.path().ptr;
     defer cleanupTempDir(parent_path);
 
-    var child_buf: [256]u8 = undefined;
-    const child_path = tempPath(&child_buf);
+    var child_tmp = try TestDirectory.init("db");
+    defer child_tmp.cleanup();
+    const child_path = child_tmp.path().ptr;
     defer cleanupTempDir(child_path);
 
     {
@@ -104746,12 +107337,14 @@ test "db split cutover preserves enrichment resume and fencing across reopen" {
 test "db split cutover preserves enrichment resume and fencing across reopen with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var parent_buf: [256]u8 = undefined;
-    const parent_path = tempPath(&parent_buf);
+    var parent_tmp = try TestDirectory.init("db");
+    defer parent_tmp.cleanup();
+    const parent_path = parent_tmp.path().ptr;
     defer cleanupTempDir(parent_path);
 
-    var child_buf: [256]u8 = undefined;
-    const child_path = tempPath(&child_buf);
+    var child_tmp = try TestDirectory.init("db");
+    defer child_tmp.cleanup();
+    const child_path = child_tmp.path().ptr;
     defer cleanupTempDir(child_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = db_config.primary_lsm_options_default };
@@ -104882,12 +107475,14 @@ test "db split cutover preserves enrichment resume and fencing across reopen wit
 test "db merge-style cutover preserves enrichment resume and fencing across reopen" {
     const alloc = std.testing.allocator;
 
-    var receiver_buf: [256]u8 = undefined;
-    const receiver_path = tempPath(&receiver_buf);
+    var receiver_tmp = try TestDirectory.init("db");
+    defer receiver_tmp.cleanup();
+    const receiver_path = receiver_tmp.path().ptr;
     defer cleanupTempDir(receiver_path);
 
-    var donor_buf: [256]u8 = undefined;
-    const donor_path = tempPath(&donor_buf);
+    var donor_tmp = try TestDirectory.init("db");
+    defer donor_tmp.cleanup();
+    const donor_path = donor_tmp.path().ptr;
     defer cleanupTempDir(donor_path);
 
     {
@@ -105013,12 +107608,14 @@ test "db merge-style cutover preserves enrichment resume and fencing across reop
 test "db merge-style cutover preserves enrichment resume and fencing across reopen with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var receiver_buf: [256]u8 = undefined;
-    const receiver_path = tempPath(&receiver_buf);
+    var receiver_tmp = try TestDirectory.init("db");
+    defer receiver_tmp.cleanup();
+    const receiver_path = receiver_tmp.path().ptr;
     defer cleanupTempDir(receiver_path);
 
-    var donor_buf: [256]u8 = undefined;
-    const donor_path = tempPath(&donor_buf);
+    var donor_tmp = try TestDirectory.init("db");
+    defer donor_tmp.cleanup();
+    const donor_path = donor_tmp.path().ptr;
     defer cleanupTempDir(donor_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = db_config.primary_lsm_options_default };
@@ -105152,12 +107749,14 @@ test "db merge-style cutover preserves enrichment resume and fencing across reop
 test "db merge-style cutover preserves text sparse and graph indexes across reopen with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var receiver_buf: [256]u8 = undefined;
-    const receiver_path = tempPath(&receiver_buf);
+    var receiver_tmp = try TestDirectory.init("db");
+    defer receiver_tmp.cleanup();
+    const receiver_path = receiver_tmp.path().ptr;
     defer cleanupTempDir(receiver_path);
 
-    var donor_buf: [256]u8 = undefined;
-    const donor_path = tempPath(&donor_buf);
+    var donor_tmp = try TestDirectory.init("db");
+    defer donor_tmp.cleanup();
+    const donor_path = donor_tmp.path().ptr;
     defer cleanupTempDir(donor_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = db_config.primary_lsm_options_default };
@@ -105341,8 +107940,9 @@ test "db dense lsm cache profile benchmark" {
     if (!profileBenchTestsEnabled()) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var lsm_cache = lsm_backend_mod.Cache.init(alloc, 64 * 1024 * 1024);
@@ -105620,8 +108220,9 @@ test "db batch load profile benchmark" {
     if (!profileBenchTestsEnabled()) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -105777,8 +108378,9 @@ test "db hbc posting lazy versus eager profile benchmark" {
     };
 
     for (modes) |mode| {
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
 
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -105875,8 +108477,9 @@ test "native restore deletes projections only for explicit physical corruption" 
 test "db native snapshot exports self-contained generation" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
@@ -105939,8 +108542,9 @@ test "db native snapshot rejects projections without immutable checkpoints" {
     @import("../../test_error_logs.zig").expectErrorLogs(1);
 
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     defer {
         var snapshots_buf: [512]u8 = undefined;
@@ -105974,8 +108578,9 @@ test "db native snapshot rejects storage without atomic host generation publicat
     @import("../../test_error_logs.zig").expectErrorLogs(1);
 
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var memory_storage = lsm_backend_mod.MemoryStorage.init(alloc);
@@ -105994,8 +108599,9 @@ test "db native snapshot rejects storage without atomic host generation publicat
 
 test "db native snapshot rejects an external physical root before creating artifacts" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = std.mem.span(tempPath(&path_buf));
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = std.mem.span(path_tmp.path().ptr);
     defer cleanupTempDir(path);
 
     var backend = mem_backend_mod.Backend.init(alloc, .{});
@@ -106024,11 +108630,13 @@ test "db native snapshot rejects an external physical root before creating artif
 
 test "native restore backend configuration is resolved exactly once" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = std.mem.span(tempPath(&path_buf));
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = std.mem.span(path_tmp.path().ptr);
     defer cleanupTempDir(path);
-    var candidate_path_buf: [256]u8 = undefined;
-    const candidate_path = std.mem.span(tempPath(&candidate_path_buf));
+    var candidate_path_tmp = try TestDirectory.init("db");
+    defer candidate_path_tmp.cleanup();
+    const candidate_path = std.mem.span(candidate_path_tmp.path().ptr);
     defer cleanupTempDir(candidate_path);
 
     const ConfiguratorContext = struct {
@@ -106094,8 +108702,9 @@ test "native restore backend configuration is resolved exactly once" {
 
 test "native restore filesystem publication rejects non-publishable storage capabilities" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = std.mem.span(tempPath(&path_buf));
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = std.mem.span(path_tmp.path().ptr);
     defer cleanupTempDir(path);
 
     var memory_storage = lsm_backend_mod.MemoryStorage.init(alloc);
@@ -106132,8 +108741,9 @@ test "native restore filesystem publication rejects non-publishable storage capa
 
 test "db native snapshot admission bounds capture under concurrent writes" {
     const alloc = std.heap.page_allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     defer {
         var snapshots_buf: [512]u8 = undefined;
@@ -106246,7 +108856,13 @@ test "db native snapshot admission bounds capture under concurrent writes" {
     };
     defer DB.test_snapshot_fence_hook = null;
     var worker = SnapshotWorker{ .db = &db };
-    const snapshot_thread = try std.Thread.spawn(.{}, SnapshotWorker.run, .{&worker});
+    var snapshot_thread = try std.testing.io.concurrent(SnapshotWorker.run, .{&worker});
+    defer {
+        fence.release.store(true, .release);
+        fence.release_copy.store(true, .release);
+        fence.release_materialize.store(true, .release);
+        snapshot_thread.await(std.testing.io);
+    }
     while (!fence.entered.load(.acquire)) std.atomic.spinLoopHint();
 
     // Maintenance-owned replay production is not a client mutation and must
@@ -106259,9 +108875,15 @@ test "db native snapshot admission bounds capture under concurrent writes" {
     // selected revision. It resumes immediately after staging, before manifest
     // hashing and publication complete.
     var writer = Writer{ .db = &db };
-    const writer_thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});
+    var writer_thread = try std.testing.io.concurrent(Writer.run, .{&writer});
+    defer {
+        fence.release.store(true, .release);
+        fence.release_copy.store(true, .release);
+        fence.release_materialize.store(true, .release);
+        writer_thread.await(std.testing.io);
+    }
     while (!writer.started.load(.acquire)) std.atomic.spinLoopHint();
-    for (0..1024) |_| std.Thread.yield() catch {};
+    for (0..1024) |_| std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(!writer.done.load(.acquire));
     fence.release.store(true, .release);
     while (!fence.copy_entered.load(.acquire)) std.atomic.spinLoopHint();
@@ -106269,9 +108891,15 @@ test "db native snapshot admission bounds capture under concurrent writes" {
     // Apply release alone is not the publication boundary: the short metadata
     // pin still excludes physical index maintenance.
     var maintenance = Maintenance{ .db = &db };
-    const maintenance_thread = try std.Thread.spawn(.{}, Maintenance.run, .{&maintenance});
+    var maintenance_thread = try std.testing.io.concurrent(Maintenance.run, .{&maintenance});
+    defer {
+        fence.release.store(true, .release);
+        fence.release_copy.store(true, .release);
+        fence.release_materialize.store(true, .release);
+        maintenance_thread.await(std.testing.io);
+    }
     while (!maintenance.started.load(.acquire)) std.atomic.spinLoopHint();
-    for (0..1024) |_| std.Thread.yield() catch {};
+    for (0..1024) |_| std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(!maintenance.done.load(.acquire));
     fence.release_copy.store(true, .release);
     while (!fence.materialize_entered.load(.acquire)) std.atomic.spinLoopHint();
@@ -106281,14 +108909,14 @@ test "db native snapshot admission bounds capture under concurrent writes" {
     const outside_fence_deadline = monotonicTimeNs() +| 5 * std.time.ns_per_s;
     while (monotonicTimeNs() < outside_fence_deadline) {
         if (writer.done.load(.acquire) and maintenance.done.load(.acquire)) break;
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     const writer_finished_outside_fence = writer.done.load(.acquire);
     const maintenance_finished_outside_fence = maintenance.done.load(.acquire);
     fence.release_materialize.store(true, .release);
-    snapshot_thread.join();
-    maintenance_thread.join();
-    writer_thread.join();
+    snapshot_thread.await(std.testing.io);
+    maintenance_thread.await(std.testing.io);
+    writer_thread.await(std.testing.io);
     if (worker.err) |err| return err;
     if (maintenance.err) |err| return err;
     if (writer.err) |err| return err;
@@ -106324,8 +108952,9 @@ test "db native snapshot admission bounds capture under concurrent writes" {
 test "db snapshot exports logical store only for durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -106364,11 +108993,13 @@ test "db snapshot exports logical store only for durable lsm primary backend" {
 
 test "db native deferred restore preserves generated dense generation without embedder" {
     const alloc = std.testing.allocator;
-    var source_buf: [256]u8 = undefined;
-    const source_path = tempPath(&source_buf);
+    var source_tmp = try TestDirectory.init("db");
+    defer source_tmp.cleanup();
+    const source_path = source_tmp.path().ptr;
     defer cleanupTempDir(source_path);
-    var restore_buf: [256]u8 = undefined;
-    const restore_path = tempPath(&restore_buf);
+    var restore_tmp = try TestDirectory.init("db");
+    defer restore_tmp.cleanup();
+    const restore_path = restore_tmp.path().ptr;
     defer cleanupTempDir(restore_path);
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
 
@@ -106492,11 +109123,13 @@ test "db native restore rejects a primary revision outside the manifest generati
     @import("../../test_error_logs.zig").expectErrorLogs(1);
 
     const alloc = std.testing.allocator;
-    var source_buf: [256]u8 = undefined;
-    const source_path = tempPath(&source_buf);
+    var source_tmp = try TestDirectory.init("db");
+    defer source_tmp.cleanup();
+    const source_path = source_tmp.path().ptr;
     defer cleanupTempDir(source_path);
-    var restore_buf: [256]u8 = undefined;
-    const restore_path = tempPath(&restore_buf);
+    var restore_tmp = try TestDirectory.init("db");
+    defer restore_tmp.cleanup();
+    const restore_path = restore_tmp.path().ptr;
     defer cleanupTempDir(restore_path);
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
 
@@ -106558,11 +109191,13 @@ test "db native restore rejects a primary revision outside the manifest generati
 
 test "db native restore preserves primary generation and repairs only a missing projection" {
     const alloc = std.testing.allocator;
-    var source_buf: [256]u8 = undefined;
-    const source_path = tempPath(&source_buf);
+    var source_tmp = try TestDirectory.init("db");
+    defer source_tmp.cleanup();
+    const source_path = source_tmp.path().ptr;
     defer cleanupTempDir(source_path);
-    var restore_buf: [256]u8 = undefined;
-    const restore_path = tempPath(&restore_buf);
+    var restore_tmp = try TestDirectory.init("db");
+    defer restore_tmp.cleanup();
+    const restore_path = restore_tmp.path().ptr;
     defer cleanupTempDir(restore_path);
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
 
@@ -106702,12 +109337,14 @@ test "db native restore preserves primary generation and repairs only a missing 
 test "db restore snapshot recreates logical store for durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var src_buf: [256]u8 = undefined;
-    const src_path = tempPath(&src_buf);
+    var src_tmp = try TestDirectory.init("db");
+    defer src_tmp.cleanup();
+    const src_path = src_tmp.path().ptr;
     defer cleanupTempDir(src_path);
 
-    var restore_buf: [256]u8 = undefined;
-    const restore_path = tempPath(&restore_buf);
+    var restore_tmp = try TestDirectory.init("db");
+    defer restore_tmp.cleanup();
+    const restore_path = restore_tmp.path().ptr;
     defer cleanupTempDir(restore_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
@@ -106763,11 +109400,13 @@ test "db restore snapshot recreates logical store for durable lsm primary backen
 
 test "logical snapshot descriptor is strict while descriptorless compatibility remains readable" {
     const alloc = std.testing.allocator;
-    var src_buf: [256]u8 = undefined;
-    const src_path = tempPath(&src_buf);
+    var src_tmp = try TestDirectory.init("db");
+    defer src_tmp.cleanup();
+    const src_path = src_tmp.path().ptr;
     defer cleanupTempDir(src_path);
-    var restore_buf: [256]u8 = undefined;
-    const restore_path = tempPath(&restore_buf);
+    var restore_tmp = try TestDirectory.init("db");
+    defer restore_tmp.cleanup();
+    const restore_path = restore_tmp.path().ptr;
     defer cleanupTempDir(restore_path);
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
 
@@ -106824,8 +109463,9 @@ test "db restore snapshot repeatedly validates run-backed doc identity metadata"
     // diagnostics only poison and guard allocations that cross this boundary.
     const alloc = platform.allocator.processAllocator(std.testing.allocator);
 
-    var src_buf: [256]u8 = undefined;
-    const src_path = tempPath(&src_buf);
+    var src_tmp = try TestDirectory.init("db");
+    defer src_tmp.cleanup();
+    const src_path = src_tmp.path().ptr;
     defer cleanupTempDir(src_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
@@ -106868,8 +109508,9 @@ test "db restore snapshot repeatedly validates run-backed doc identity metadata"
     }
 
     for (0..32) |i| {
-        var restore_buf: [256]u8 = undefined;
-        const restore_path = tempPath(&restore_buf);
+        var restore_tmp = try TestDirectory.init("db");
+        defer restore_tmp.cleanup();
+        const restore_path = restore_tmp.path().ptr;
         defer cleanupTempDir(restore_path);
 
         var transition = try generation_lifecycle.beginProcessExclusive(std.mem.span(restore_path));
@@ -106917,12 +109558,14 @@ test "db restore snapshot repeatedly validates run-backed doc identity metadata"
 test "db restore snapshot rejects invalid doc identity metadata" {
     const alloc = std.testing.allocator;
 
-    var src_buf: [256]u8 = undefined;
-    const src_path = tempPath(&src_buf);
+    var src_tmp = try TestDirectory.init("db");
+    defer src_tmp.cleanup();
+    const src_path = src_tmp.path().ptr;
     defer cleanupTempDir(src_path);
 
-    var restore_buf: [256]u8 = undefined;
-    const restore_path = tempPath(&restore_buf);
+    var restore_tmp = try TestDirectory.init("db");
+    defer restore_tmp.cleanup();
+    const restore_path = restore_tmp.path().ptr;
     defer cleanupTempDir(restore_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
@@ -106967,12 +109610,14 @@ test "db restore snapshot rejects invalid doc identity metadata" {
 test "db deferred restore rejects strict doc identity namespace mismatch" {
     const alloc = std.testing.allocator;
 
-    var src_buf: [256]u8 = undefined;
-    const src_path = tempPath(&src_buf);
+    var src_tmp = try TestDirectory.init("db");
+    defer src_tmp.cleanup();
+    const src_path = src_tmp.path().ptr;
     defer cleanupTempDir(src_path);
 
-    var restore_buf: [256]u8 = undefined;
-    const restore_path = tempPath(&restore_buf);
+    var restore_tmp = try TestDirectory.init("db");
+    defer restore_tmp.cleanup();
+    const restore_path = restore_tmp.path().ptr;
     defer cleanupTempDir(restore_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
@@ -107038,12 +109683,14 @@ test "db deferred restore rejects strict doc identity namespace mismatch" {
 test "db restore snapshot recreates text sparse and graph indexes for durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var src_buf: [256]u8 = undefined;
-    const src_path = tempPath(&src_buf);
+    var src_tmp = try TestDirectory.init("db");
+    defer src_tmp.cleanup();
+    const src_path = src_tmp.path().ptr;
     defer cleanupTempDir(src_path);
 
-    var restore_buf: [256]u8 = undefined;
-    const restore_path = tempPath(&restore_buf);
+    var restore_tmp = try TestDirectory.init("db");
+    defer restore_tmp.cleanup();
+    const restore_path = restore_tmp.path().ptr;
     defer cleanupTempDir(restore_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
@@ -107135,12 +109782,14 @@ test "db restore snapshot recreates text sparse and graph indexes for durable ls
 test "db restore snapshot replays managed chunked dense embeddings for durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var src_buf: [256]u8 = undefined;
-    const src_path = tempPath(&src_buf);
+    var src_tmp = try TestDirectory.init("db");
+    defer src_tmp.cleanup();
+    const src_path = src_tmp.path().ptr;
     defer cleanupTempDir(src_path);
 
-    var restore_buf: [256]u8 = undefined;
-    const restore_path = tempPath(&restore_buf);
+    var restore_tmp = try TestDirectory.init("db");
+    defer restore_tmp.cleanup();
+    const restore_path = restore_tmp.path().ptr;
     defer cleanupTempDir(restore_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
@@ -107234,8 +109883,9 @@ test "db restore snapshot replays managed chunked dense embeddings for durable l
 
 test "db restore dense artifact completion publishes counter bootstrap as a bounded quantum" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -107289,8 +109939,9 @@ test "db restore dense artifact completion publishes counter bootstrap as a boun
 
 test "db restore dense artifact completion keeps every intent when one proof is pending" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -107347,8 +109998,9 @@ test "db restore dense artifact completion keeps every intent when one proof is 
 
 test "db restore dense rebuild rediscovery is pending rather than progress" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -107406,8 +110058,9 @@ test "db restore dense rebuild rediscovery is pending rather than progress" {
 
 test "db restore dense rebuild publishes mixed progress before worker wait" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -107466,12 +110119,14 @@ test "db restore dense rebuild publishes mixed progress before worker wait" {
 test "db explicit restore runtime repair repairs managed chunked dense embeddings once for restored shard" {
     const alloc = std.testing.allocator;
 
-    var src_buf: [256]u8 = undefined;
-    const src_path = tempPath(&src_buf);
+    var src_tmp = try TestDirectory.init("db");
+    defer src_tmp.cleanup();
+    const src_path = src_tmp.path().ptr;
     defer cleanupTempDir(src_path);
 
-    var restore_buf: [256]u8 = undefined;
-    const restore_path = tempPath(&restore_buf);
+    var restore_tmp = try TestDirectory.init("db");
+    defer restore_tmp.cleanup();
+    const restore_path = restore_tmp.path().ptr;
     defer cleanupTempDir(restore_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
@@ -107635,12 +110290,14 @@ test "db explicit restore runtime repair repairs managed chunked dense embedding
 test "db restore repair does not complete before regenerated chunk embeddings are query visible" {
     const alloc = std.testing.allocator;
 
-    var src_buf: [256]u8 = undefined;
-    const src_path = tempPath(&src_buf);
+    var src_tmp = try TestDirectory.init("db");
+    defer src_tmp.cleanup();
+    const src_path = src_tmp.path().ptr;
     defer cleanupTempDir(src_path);
 
-    var restore_buf: [256]u8 = undefined;
-    const restore_path = tempPath(&restore_buf);
+    var restore_tmp = try TestDirectory.init("db");
+    defer restore_tmp.cleanup();
+    const restore_path = restore_tmp.path().ptr;
     defer cleanupTempDir(restore_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
@@ -107773,12 +110430,14 @@ test "db restore repair does not complete before regenerated chunk embeddings ar
 test "db incomplete deferred restore import recovers before runtime repair" {
     const alloc = std.testing.allocator;
 
-    var src_buf: [256]u8 = undefined;
-    const src_path = tempPath(&src_buf);
+    var src_tmp = try TestDirectory.init("db");
+    defer src_tmp.cleanup();
+    const src_path = src_tmp.path().ptr;
     defer cleanupTempDir(src_path);
 
-    var restore_buf: [256]u8 = undefined;
-    const restore_path = tempPath(&restore_buf);
+    var restore_tmp = try TestDirectory.init("db");
+    defer restore_tmp.cleanup();
+    const restore_path = restore_tmp.path().ptr;
     defer cleanupTempDir(restore_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
@@ -107840,8 +110499,9 @@ test "db incomplete deferred restore import recovers before runtime repair" {
 
 test "db restore state uses strict structured content identity markers" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     const location = "file:///tmp/backups?note=line\nphase=complete";
     const artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -107910,8 +110570,9 @@ test "db graph ownership restore cursor resumes one artifact index exactly" {
 
 test "db graph ownership restore materializes large artifacts in published segments" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
@@ -108040,8 +110701,9 @@ test "db graph ownership restore materializes large artifacts in published segme
 
 test "db restore graph ownership replay persists a bounded page cursor" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
@@ -108111,8 +110773,9 @@ test "db restore graph ownership replay persists a bounded page cursor" {
 test "db rebuild dense indexes preserves corrupt stored embedding artifacts" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -108155,8 +110818,9 @@ test "db dense artifact rebuild write cleanup tolerates artifact-backed empty ve
 test "db rw lock allows search and scan while shared read lock is held" {
     const alloc = std.heap.c_allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -108175,33 +110839,46 @@ test "db rw lock allows search and scan while shared read lock is held" {
     });
 
     var held = SharedReadLockHold{ .db = &db };
-    const held_thread = try std.Thread.spawn(.{}, SharedReadLockHold.run, .{&held});
+    var held_thread = try std.testing.io.concurrent(SharedReadLockHold.run, .{&held});
+    defer {
+        held.release.store(1, .release);
+        held_thread.await(std.testing.io);
+    }
     try std.testing.expect(waitForAtomicFlag(&held.acquired, 1, 10_000));
 
     var search_probe = ConcurrentReadProbe{ .db = &db };
-    const search_thread = try std.Thread.spawn(.{}, ConcurrentReadProbe.runSearch, .{&search_probe});
+    var search_thread = try std.testing.io.concurrent(ConcurrentReadProbe.runSearch, .{&search_probe});
+    defer {
+        held.release.store(1, .release);
+        search_thread.await(std.testing.io);
+    }
 
     try std.testing.expect(waitForAtomicFlag(&search_probe.started, 1, 10_000));
     try std.testing.expect(waitForAtomicFlag(&search_probe.done, 1, 10_000));
     try std.testing.expectEqual(@as(u8, 0), search_probe.failed.load(.monotonic));
-    search_thread.join();
+    search_thread.await(std.testing.io);
 
     var scan_probe = ConcurrentReadProbe{ .db = &db };
-    const scan_thread = try std.Thread.spawn(.{}, ConcurrentReadProbe.runScan, .{&scan_probe});
+    var scan_thread = try std.testing.io.concurrent(ConcurrentReadProbe.runScan, .{&scan_probe});
+    defer {
+        held.release.store(1, .release);
+        scan_thread.await(std.testing.io);
+    }
     try std.testing.expect(waitForAtomicFlag(&scan_probe.started, 1, 10_000));
     try std.testing.expect(waitForAtomicFlag(&scan_probe.done, 1, 10_000));
     try std.testing.expectEqual(@as(u8, 0), scan_probe.failed.load(.monotonic));
-    scan_thread.join();
+    scan_thread.await(std.testing.io);
 
     held.release.store(1, .monotonic);
-    held_thread.join();
+    held_thread.await(std.testing.io);
 }
 
 test "db rw lock keeps batch writes blocked behind shared read lock" {
     const alloc = std.heap.c_allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -108214,11 +110891,19 @@ test "db rw lock keeps batch writes blocked behind shared read lock" {
     });
 
     var held = SharedReadLockHold{ .db = &db };
-    const held_thread = try std.Thread.spawn(.{}, SharedReadLockHold.run, .{&held});
+    var held_thread = try std.testing.io.concurrent(SharedReadLockHold.run, .{&held});
+    defer {
+        held.release.store(1, .release);
+        held_thread.await(std.testing.io);
+    }
     try std.testing.expect(waitForAtomicFlag(&held.acquired, 1, 10_000));
 
     var write_probe = ConcurrentWriteProbe{ .db = &db };
-    const write_thread = try std.Thread.spawn(.{}, ConcurrentWriteProbe.runBatch, .{&write_probe});
+    var write_thread = try std.testing.io.concurrent(ConcurrentWriteProbe.runBatch, .{&write_probe});
+    defer {
+        held.release.store(1, .release);
+        write_thread.await(std.testing.io);
+    }
 
     try std.testing.expect(waitForAtomicFlag(&write_probe.started, 1, 10_000));
 
@@ -108229,13 +110914,13 @@ test "db rw lock keeps batch writes blocked behind shared read lock" {
             still_blocked = false;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     try std.testing.expect(still_blocked);
 
     held.release.store(1, .monotonic);
-    held_thread.join();
-    write_thread.join();
+    held_thread.await(std.testing.io);
+    write_thread.await(std.testing.io);
     try std.testing.expectEqual(@as(u8, 0), write_probe.failed.load(.monotonic));
     try std.testing.expectEqual(@as(u8, 1), write_probe.done.load(.monotonic));
 
@@ -108247,8 +110932,9 @@ test "db rw lock keeps batch writes blocked behind shared read lock" {
 test "db scan returns hashes and projected documents" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -108280,8 +110966,9 @@ test "db scan returns hashes and projected documents" {
 test "db scan applies structured filter before limit" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -108310,8 +110997,9 @@ test "db scan applies structured filter before limit" {
 test "db updateRange constrains index backfill" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -108342,8 +111030,9 @@ test "db updateRange constrains index backfill" {
 test "db range cardinality remains exact across mutations and reopen" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
