@@ -3846,7 +3846,67 @@ Local validation with pinned Zig 0.16.0 and actual Metal access:
   worktree and staged whitespace checks pass.
 
 Logs and the resolution patch are retained under
-`/tmp/antfly-merge-prready-20260909/` as local review evidence. Git staging and the
-merge commit remain the user's handoff; the index still records five unmerged
-paths until they are staged. These checks establish local source readiness only;
-they do not refresh the real-model production qualification described below.
+`/tmp/antfly-merge-prready-20260909/` as local review evidence. The merge was
+subsequently committed as `6c36b2e015a9f18f6339173cf748e322a22ebab0`, with no
+unmerged index entries. These checks establish local source readiness only;
+they do not refresh the real-model production qualification described above.
+
+### Final review fixes (2026-09-09)
+
+Checkpoint path isolation now resolves existing symlinks before interpreting
+parent traversal. An `alias/../model.safetensors` checkpoint can no longer pass
+preflight as an unrelated path when `alias` points inside the immutable model.
+Missing suffixes containing `.` or `..`, and dangling symlinks, fail closed;
+ordinary missing suffixes still normalize repeated separators. Regression tests
+cover absolute and relative paths, existing and missing destinations, dangling
+links with trailing separators, and checkpoint rejection without modifying the
+input file or creating an output directory.
+
+The GRPO planning test now checks Metal admission only when Metal is compiled,
+and expects `BackendUnavailable` otherwise while retaining the remaining native
+contract assertions. The bootstrap/output collision fixture creates the parent
+directory it traverses, so it tests a real filesystem alias.
+
+Validation with Zig 0.16.0:
+
+- Both new path regressions fail against the original helper; all five standalone
+  path-isolation tests pass against the fix.
+- Gemma4 Debug without Metal: 298 selected, 274 passed, 24 skipped, no failures.
+- Strict actual-Metal Gemma4 Debug: 317 selected, 315 passed, two optional fixture
+  skips, no failures. The strict run embeds the base merge revision, with the
+  uncommitted source patch retained separately.
+- Formatting, whitespace, and unresolved-index checks pass.
+
+Fix validation logs and the source patch are retained under
+`/tmp/antfly-review-fixes-20260909/`. These results close the two local review
+findings without refreshing the real-model production qualification gates.
+
+### Qualification restart (2026-09-09)
+
+The new E4B GRPO acceptance and native/Metal/HF parity campaign is in input
+recovery and preflight. The old `/private/tmp` campaign directories remain, but
+their model, adapter, report, prepared-input, and environment files are missing.
+The recorded commands recover the two frozen recipes byte-for-byte and recreate
+the 1,960 training rows, 256 fresh diagnostic prompts, and 254 reserved final
+prompts at the exact SHA-256 values recorded above. The fresh diagnostic IDs
+exclude all 448 previously observed IDs plus all 254 reserved IDs. The reserved
+split has been reconstructed and hashed, but has not been evaluated.
+
+Pinned model restoration now targets the durable, Git-ignored
+`.benchmark-assets/gemma4-qualification-20260909/` directory. The oracle lock
+validates, and the 1,536-row numerical contract fixture regenerates exactly.
+The predeclared plan covers E4B/E2B diagnostic and final campaigns plus 36
+native/Metal/HF traces and 36 comparisons across both target presets and the
+locked 1/2/8-step AdamW trajectories. Full-length recovery is tied to the
+current accepted seed-42 adapter before interruption.
+
+The latest preflight still reports 687.62 MiB host swap on the 24 GiB Mac, and
+the reviewed source changes remain uncommitted. Zero-paging acceptance therefore
+has not started; the Zig oracle also requires a clean source revision, and the
+HF/PEFT oracle needs an available CUDA host with the pinned environment. No
+quality, parity, or recovery gap is claimed closed by this preparation.
+Run plans, reconstructed recipes, source-ID exclusion checks, and current
+preflight evidence are under
+`.benchmark-results/gemma4-qualification-20260909/QUALIFICATION.md`. Numerical
+outputs are planned outside the source tree at
+`/Users/tim/Documents/af/antfly-qualification/20260909/` as required by the oracle.

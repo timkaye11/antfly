@@ -15117,8 +15117,19 @@ test "gemma4 recipe keeps bootstrap and immutable training outputs distinct" {
     );
 
     var normalized_conflict = base;
-    normalized_conflict.adapter = .{ .path = "/tmp/out/seed/../same" };
-    normalized_conflict.artifacts = .{ .trained_adapter_dir = "/tmp/out/same" };
+    // Parent traversal is only meaningful after resolving an existing parent;
+    // a missing seed directory is now rejected as an invalid requested path.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "seed", .default_dir);
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const bootstrap = try std.fs.path.join(std.testing.allocator, &.{ root, "seed", "..", "same" });
+    defer std.testing.allocator.free(bootstrap);
+    const trained = try std.fs.path.join(std.testing.allocator, &.{ root, "same" });
+    defer std.testing.allocator.free(trained);
+    normalized_conflict.adapter = .{ .path = bootstrap };
+    normalized_conflict.artifacts = .{ .trained_adapter_dir = trained };
     try std.testing.expectError(
         error.Gemma4BootstrapAndTrainingOutputConflict,
         buildPlan(std.heap.page_allocator, normalized_conflict),
@@ -15987,19 +15998,26 @@ test "gemma4 GRPO reward and group contracts fail during planning" {
         .grpo_incremental_kv_clone_prompt_tail = true,
         .grpo_incremental_kv_shadow_exact = true,
     };
-    const incremental_checkpointed_plan = try buildPlan(
-        std.heap.page_allocator,
-        incremental_checkpointed,
-    );
-    defer freePlan(std.heap.page_allocator, incremental_checkpointed_plan);
+    if (build_options.enable_metal) {
+        const incremental_checkpointed_plan = try buildPlan(
+            std.heap.page_allocator,
+            incremental_checkpointed,
+        );
+        defer freePlan(std.heap.page_allocator, incremental_checkpointed_plan);
 
-    var direct_gguf_incremental = incremental_checkpointed;
-    direct_gguf_incremental.model.path = "/models/gemma4.gguf";
-    direct_gguf_incremental.model.allow_direct_gguf_training = true;
-    try std.testing.expectError(
-        error.DirectGgufGrpoIncrementalKvNotQualified,
-        buildPlan(std.heap.page_allocator, direct_gguf_incremental),
-    );
+        var direct_gguf_incremental = incremental_checkpointed;
+        direct_gguf_incremental.model.path = "/models/gemma4.gguf";
+        direct_gguf_incremental.model.allow_direct_gguf_training = true;
+        try std.testing.expectError(
+            error.DirectGgufGrpoIncrementalKvNotQualified,
+            buildPlan(std.heap.page_allocator, direct_gguf_incremental),
+        );
+    } else {
+        try std.testing.expectError(
+            error.BackendUnavailable,
+            buildPlan(std.heap.page_allocator, incremental_checkpointed),
+        );
+    }
 
     var bad_reward = valid;
     bad_reward.grpo.reward_mode = "webhook";

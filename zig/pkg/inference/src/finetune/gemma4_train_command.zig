@@ -3241,6 +3241,41 @@ test "gemma4 checkpoint path is isolated from immutable inputs and output" {
     try validateCheckpointPathIsolation(allocator, io, safe_checkpoint, out_dir, &immutable_inputs);
 }
 
+test "gemma4 checkpoint preflight rejects symlink parent traversal without touching inputs" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "model/subdir");
+    try tmp.dir.symLink(io, "model/subdir", "alias", .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/model.safetensors", .data = "BASE" });
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const model = try std.fs.path.join(allocator, &.{ root, "model" });
+    defer allocator.free(model);
+    const out = try std.fs.path.join(allocator, &.{ root, "out" });
+    defer allocator.free(out);
+    const relative_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(relative_root);
+    for ([_][]const u8{ root, relative_root }) |requested_root| {
+        for ([_][]const u8{ "model.safetensors", "new/checkpoint.safetensors" }) |suffix| {
+            const checkpoint = try std.fs.path.join(allocator, &.{ requested_root, "alias", "..", suffix });
+            defer allocator.free(checkpoint);
+            try std.testing.expectError(
+                error.CheckpointPathOverlapsImmutableInput,
+                validateCheckpointPathIsolation(allocator, io, checkpoint, out, &.{model}),
+            );
+        }
+    }
+    var buffer: [16]u8 = undefined;
+    const contents = try tmp.dir.readFile(io, "model/model.safetensors", &buffer);
+    try std.testing.expectEqualStrings("BASE", contents);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "model/new", .{}));
+}
+
 test "gemma4 public train parser rejects surrogate and multimodal modes before artifact IO" {
     const prefix = [_][]const u8{ "base", "adapter", "train.json", "out", "--eval-prepared", "eval.json", "--backend", "native" };
     try std.testing.expectError(
