@@ -39,11 +39,13 @@ const gguf_writer = @import("../gguf/writer.zig");
 const clipclap_format_mod = @import("../architectures/clipclap_format.zig");
 const projector_format_mod = @import("../architectures/projector_format.zig");
 const qwen3vl_reranker = @import("../architectures/qwen3vl_reranker.zig");
+const florence_arch = @import("../architectures/florence.zig");
 const hf_tokenizer = @import("inference_hf_tokenizer");
 const sentencepiece = @import("inference_tokenizer").sentencepiece;
 const tokenizer_mod = @import("inference_tokenizer");
 const whisper_prompt = @import("../pipelines/whisper_prompt.zig");
 const encoder_decoder = @import("../pipelines/encoder_decoder.zig");
+const vision_config = @import("../readers/vision_config.zig");
 const embedding_mod = @import("../pipelines/embedding.zig");
 const EmbeddingPipeline = embedding_mod.EmbeddingPipeline;
 const EmbeddingConfig = embedding_mod.EmbeddingConfig;
@@ -886,7 +888,7 @@ fn selectWorseCompatibility(
 
 const ComponentPlanKey = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 const component_plan_cache_capacity = 256;
-const whisper_assets_cache_capacity = 256;
+const composite_assets_cache_capacity = 256;
 
 fn updateComponentPlanKeySlice(
     hash: *std.crypto.hash.sha2.Sha256,
@@ -2308,6 +2310,12 @@ pub const LoadedModel = struct {
     model_manager: *ModelManager,
     model_dir: []const u8,
     allocator: std.mem.Allocator,
+    /// Borrowed from the serving BackendRuntime and valid for the model's
+    /// loaded lifetime. Offline model owners leave this null.
+    executor_io: ?std.Io = null,
+    /// Immutable Florence reader sidecars, parsed before this generation is
+    /// published so request microbatches perform no filesystem discovery.
+    florence_reader_config: ?vision_config.RuntimeConfig = null,
     chat_tmpl: ?*ChatTemplate = null,
     whisper_prompt_cache: ?whisper_prompt.PromptCache = null,
     /// The model shipped a chat template that we could not parse, so chat requests fall
@@ -2372,6 +2380,7 @@ pub const LoadedModel = struct {
     }
 
     pub fn attachIo(self: *LoadedModel, io: std.Io) void {
+        self.executor_io = io;
         session_factory.attachIo(self.session, io);
         if (self.vision_session) |session| session_factory.attachIo(session, io);
         if (self.audio_session) |session| session_factory.attachIo(session, io);
@@ -2786,6 +2795,7 @@ pub const LoadedModel = struct {
                 session_factory.supportsResidentTextEncoder(self.session),
             .resident_qwen3_embedding = isJinaStyleEmbeddingManifest(&self.manifest),
             .resident_text_encoder = resident_text_encoder,
+            .preprocess_io = self.executor_io,
             // Last-token pooling reads the EOS position; guarantee exactly
             // one trailing EOS regardless of tokenizer.json snapshot age.
             .ensure_trailing_eos_id = if (isJinaStyleEmbeddingManifest(&self.manifest) and tok.specialTokens().sep_id >= 0)
@@ -2835,15 +2845,13 @@ pub const LoadedModel = struct {
 
     pub fn rerankingPipeline(self: *LoadedModel, allocator: std.mem.Allocator) RerankingPipeline {
         const tok = self.getTokenizer();
-        const is_qwen3vl_reranker = self.manifest.isQwen3VlReranker();
-        const is_qwen3_text_reranker = self.manifest.isQwen3TextReranker();
-        const is_generative_reranker = is_qwen3vl_reranker or is_qwen3_text_reranker;
+        const is_qwen3_generative_reranker = self.manifest.isQwen3GenerativeReranker();
         var pipeline = RerankingPipeline.init(allocator, self.session, tok, .{
-            .max_length = if (is_generative_reranker)
+            .max_length = if (is_qwen3_generative_reranker)
                 @min(self.manifest.maxTextSequenceLength(), qwen3vl_reranker.default_max_length)
             else
                 self.manifest.maxTextSequenceLength(),
-            .mode = if (is_generative_reranker)
+            .mode = if (is_qwen3_generative_reranker)
                 ScoringMode.generative_yes_no
             else if (self.manifest.hasCapability("late_interaction") or
                 self.manifest.hasCapability("colbert") or
@@ -2852,8 +2860,8 @@ pub const LoadedModel = struct {
                 ScoringMode.late_interaction
             else
                 ScoringMode.cross_encoder,
-            .single_text_encoding = if (is_generative_reranker or self.manifest.prefersGenerationEncodingForLateInteraction()) .generation else .encoder,
-            .generative_prompt = if (is_qwen3_text_reranker) .qwen3_text else .qwen3_vl,
+            .single_text_encoding = if (is_qwen3_generative_reranker or self.manifest.prefersGenerationEncodingForLateInteraction()) .generation else .encoder,
+            .generative_prompt_profile = if (self.manifest.isQwen3TextReranker()) .qwen3_text else .qwen3_vl,
             .add_bos_token = self.manifest.add_bos_token,
             .distributed = runtime.distributed.configFromEnv(),
         });
@@ -2953,6 +2961,15 @@ pub const LoadedModel = struct {
     }
 
     pub fn deinit(self: *LoadedModel) void {
+        // Cache destruction may enter a driver before Session.close. Protect
+        // every retained component first, without borrowing request controls.
+        var close_scopes: [6]backends.Session.CloseScope = @splat(.{});
+        close_scopes[0] = self.session.beginClose();
+        const optional_sessions = [_]?backends.Session{ self.vision_session, self.audio_session, self.text_projection, self.visual_projection, self.audio_projection };
+        for (optional_sessions, 1..) |session, index| {
+            if (session) |component| close_scopes[index] = component.beginClose();
+        }
+        defer for (&close_scopes) |*scope| scope.deinit();
         self.native_generation_graph_cache.deinit();
         self.prompt_prefix_cache.deinit();
         self.session.close();
@@ -3371,14 +3388,55 @@ test "load flight retirement reservations exclude the manager task" {
     try std.testing.expectEqual(@as(usize, 3), flight.unadoptedWaiterRefs());
 }
 
-const WhisperAssetsLoadFlight = struct {
+const CompositeAssetsLoadFlight = struct {
     completed: std.Io.Event = .unset,
     io: std.Io,
-    assets: ?*WhisperCompositeAssets = null,
+    assets: ?*CompositeAssets = null,
     err: ?anyerror = null,
     /// Protected by ModelManager.load_lock. The owner starts with one reference;
     /// every waiter takes one before dropping the manager lock.
     refs: usize = 1,
+    registered: bool = true,
+    // Reuse the model-loader waiter/cancellation state machine. The component
+    // task is manager-owned; no individual request controls a shared cold load.
+    load_state: LoadFlight,
+};
+
+const CompositeLoadTask = struct {
+    manager: *ModelManager,
+    flight: *CompositeAssetsLoadFlight,
+    key: ComponentPlanKey,
+    model_dir: []u8,
+    paths: [][]const u8,
+    kind: CompositeKind,
+
+    fn create(manager: *ModelManager, flight: *CompositeAssetsLoadFlight, key: ComponentPlanKey, model_dir: []const u8, paths: []const []const u8, kind: CompositeKind) !*@This() {
+        const allocator = manager.allocator;
+        const task = try allocator.create(@This());
+        errdefer allocator.destroy(task);
+        const owned_dir = try allocator.dupe(u8, model_dir);
+        errdefer allocator.free(owned_dir);
+        const owned_paths = try allocator.alloc([]const u8, paths.len);
+        var count: usize = 0;
+        errdefer {
+            for (owned_paths[0..count]) |path| allocator.free(path);
+            allocator.free(owned_paths);
+        }
+        for (paths, owned_paths) |path, *owned| {
+            owned.* = try allocator.dupe(u8, path);
+            count += 1;
+        }
+        task.* = .{ .manager = manager, .flight = flight, .key = key, .model_dir = owned_dir, .paths = owned_paths, .kind = kind };
+        return task;
+    }
+
+    fn deinit(self: *@This()) void {
+        const allocator = self.manager.allocator;
+        for (self.paths) |path| allocator.free(path);
+        allocator.free(self.paths);
+        allocator.free(self.model_dir);
+        allocator.destroy(self);
+    }
 };
 
 fn admissionBackendClassForRuntime(
@@ -3459,6 +3517,12 @@ pub const ModelHandle = struct {
     }
 
     pub fn release(self: *ModelHandle) void {
+        self.releaseWithUsage(true);
+    }
+
+    // Observation pins share exactly the same final-retired-owner cleanup,
+    // but are not inference usage and must not renew idle cache residency.
+    fn releaseWithUsage(self: *ModelHandle, used: bool) void {
         const model = self.model orelse return;
         var destroy_retired = false;
         self.manager.lockLoadedModels();
@@ -3466,7 +3530,7 @@ pub const ModelHandle = struct {
         model.active_handles -= 1;
         if (model.retired) {
             destroy_retired = model.active_handles == 0;
-        } else {
+        } else if (used) {
             model.last_used_ns = platform.time.monotonicNs();
         }
         self.manager.unlockLoadedModels();
@@ -3496,50 +3560,71 @@ pub const ModelHandle = struct {
 
 pub const LoadedModelSnapshot = struct {
     allocator: std.mem.Allocator,
+    /// Borrowed observation pins; release them only through this owner.
     handles: []ModelHandle,
 
     pub fn deinit(self: *LoadedModelSnapshot) void {
-        for (self.handles) |*handle| handle.release();
+        for (self.handles) |*handle| handle.releaseWithUsage(false);
         self.allocator.free(self.handles);
         self.handles = &.{};
     }
 };
 
-/// Immutable tokenizer and decoder metadata shared by every request using a
-/// split encoder/decoder Whisper bundle. The heavyweight sessions continue to
-/// use ManagedSession so admission and backend lifetime stay unchanged.
-pub const WhisperCompositeAssets = struct {
+pub const CompositeKind = enum { whisper_metadata, whisper, seq2seq };
+
+/// One immutable publication pinned across tokenization, encode and decode.
+/// Component sessions keep their resident admission and backend ownership.
+pub const CompositeAssets = struct {
+    encoder_gate: std.atomic.Mutex = .unlocked,
+    decoder_gate: std.atomic.Mutex = .unlocked,
     managed_tokenizer: ManagedHfTokenizer,
-    prompt_cache: whisper_prompt.PromptCache,
+    prompt_cache: ?whisper_prompt.PromptCache,
+    encoder: ?ManagedSession = null,
+    decoder: ?ManagedSession = null,
+    kind: CompositeKind = .whisper_metadata,
+    decoder_execution: enum { full_prefix, merged_kv } = .full_prefix,
+    considered_merged_decoder: bool = false,
     decoder_config: encoder_decoder.DecoderConfig,
     generation: ComponentPlanKey,
     active_handles: usize = 0,
     last_used_ns: u64 = 0,
 
-    pub fn tokenizer(self: *const WhisperCompositeAssets) tokenizer_mod.Tokenizer {
+    pub fn tokenizer(self: *const CompositeAssets) tokenizer_mod.Tokenizer {
         return self.managed_tokenizer.tokenizer.tokenizer();
     }
 
-    fn reclaimableAdmission(self: *const WhisperCompositeAssets) ?runtime.tier.memory.AdmissionLease {
-        return self.managed_tokenizer.reclaimableAdmission();
+    fn reclaimRelevant(self: *const CompositeAssets, pressure: runtime.tier.memory.AdmissionPressure) bool {
+        if (self.managed_tokenizer.reclaimableAdmission()) |lease|
+            if (ModelManager.admissionReclaimRelevant(lease, pressure)) return true;
+        if (self.encoder) |managed| if (managed.resource_lease) |lease|
+            if (ModelManager.admissionReclaimRelevant(lease, pressure)) return true;
+        if (self.decoder) |managed| if (managed.resource_lease) |lease|
+            if (ModelManager.admissionReclaimRelevant(lease, pressure)) return true;
+        return false;
     }
 
-    fn deinit(self: *WhisperCompositeAssets) void {
-        self.prompt_cache.deinit();
+    fn deinit(self: *CompositeAssets) void {
+        var encoder_scope = if (self.encoder) |managed| managed.session.beginClose() else backends.Session.CloseScope{};
+        defer encoder_scope.deinit();
+        var decoder_scope = if (self.decoder) |managed| managed.session.beginClose() else backends.Session.CloseScope{};
+        defer decoder_scope.deinit();
+        if (self.decoder) |*managed| managed.deinit();
+        if (self.encoder) |*managed| managed.deinit();
+        if (self.prompt_cache) |*cache| cache.deinit();
         self.managed_tokenizer.deinit();
         self.* = undefined;
     }
 };
 
-pub const WhisperAssetsHandle = struct {
+pub const CompositeAssetsHandle = struct {
     manager: *ModelManager,
-    assets: ?*WhisperCompositeAssets,
+    assets: ?*CompositeAssets,
 
-    pub fn get(self: *const WhisperAssetsHandle) *const WhisperCompositeAssets {
+    pub fn get(self: *const CompositeAssetsHandle) *const CompositeAssets {
         return self.assets orelse unreachable;
     }
 
-    pub fn release(self: *WhisperAssetsHandle) void {
+    pub fn release(self: *CompositeAssetsHandle) void {
         const assets = self.assets orelse return;
         self.manager.lockLoadedModels();
         std.debug.assert(assets.active_handles > 0);
@@ -3558,6 +3643,136 @@ pub const ResourceOwnership = enum {
     external_required,
 };
 
+/// Offline sessions may retain this runtime after a raw Session ownership
+/// transfer. The manager and teardown domain therefore hold independent refs.
+const OwnedManagerIo = struct {
+    allocator: std.mem.Allocator,
+    runtime: std.Io.Threaded,
+    refs: std.atomic.Value(usize) = .init(1),
+
+    fn create(allocator: std.mem.Allocator) !*OwnedManagerIo {
+        const self = try allocator.create(OwnedManagerIo);
+        self.* = .{ .allocator = allocator, .runtime = std.Io.Threaded.init(allocator, .{}) };
+        return self;
+    }
+
+    fn retain(self: *OwnedManagerIo) void {
+        const old = self.refs.fetchAdd(1, .monotonic);
+        std.debug.assert(old > 0 and old < std.math.maxInt(usize));
+    }
+
+    fn release(self: *OwnedManagerIo) void {
+        const old = self.refs.fetchSub(1, .acq_rel);
+        std.debug.assert(old > 0);
+        if (old != 1) return;
+        self.runtime.deinit();
+        self.allocator.destroy(self);
+    }
+};
+
+/// Separate from request/load watchdogs: dormant lifetime entries must not
+/// obscure their idle counts. Its private monitor runtime never borrows Node
+/// or request state. A domain survives its manager until its final ticket.
+const TeardownDomain = struct {
+    allocator: std.mem.Allocator,
+    monitor_io: *OwnedManagerIo,
+    driver_io: ?*OwnedManagerIo,
+    watchdog: *HardCancellationWatchdog,
+    refs: std.atomic.Value(usize) = .init(1),
+
+    fn create(allocator: std.mem.Allocator, driver_io: ?*OwnedManagerIo) !*TeardownDomain {
+        const self = try allocator.create(TeardownDomain);
+        errdefer allocator.destroy(self);
+        const monitor_io = try OwnedManagerIo.create(allocator);
+        errdefer monitor_io.release();
+        const watchdog = try HardCancellationWatchdog.create(allocator);
+        errdefer watchdog.destroy();
+        try watchdog.start(monitor_io.runtime.io());
+        if (driver_io) |owner| owner.retain();
+        self.* = .{
+            .allocator = allocator,
+            .monitor_io = monitor_io,
+            .driver_io = driver_io,
+            .watchdog = watchdog,
+        };
+        return self;
+    }
+
+    fn retain(self: *TeardownDomain) void {
+        const old = self.refs.fetchAdd(1, .monotonic);
+        std.debug.assert(old > 0 and old < std.math.maxInt(usize));
+    }
+
+    fn release(self: *TeardownDomain) void {
+        const old = self.refs.fetchSub(1, .acq_rel);
+        std.debug.assert(old > 0);
+        if (old != 1) return;
+        // Final ticket disarms synchronously before it releases this ref.
+        self.watchdog.destroy();
+        self.monitor_io.release();
+        if (self.driver_io) |owner| owner.release();
+        self.allocator.destroy(self);
+    }
+};
+
+const TeardownTicket = struct {
+    const timeout_ns: u64 = 30 * std.time.ns_per_s;
+
+    domain: *TeardownDomain,
+    token: u64 = 0,
+    refs: std.atomic.Value(usize) = .init(1),
+    deadline_ns: std.atomic.Value(u64) = .init(0),
+    close_timeout_ns: u64 = timeout_ns,
+
+    fn create(domain: *TeardownDomain) !backends.Session.CloseProtection {
+        const self = try domain.allocator.create(TeardownTicket);
+        errdefer domain.allocator.destroy(self);
+        self.* = .{ .domain = domain };
+        // All fallible work occurs before backend entry. This callback borrows
+        // only the stable ticket, never a caller, manager or request control.
+        const boundary = domain.watchdog.boundary();
+        self.token = try boundary.arm_fn(boundary.ptr, .{ .ptr = self, .check_fn = check });
+        domain.retain();
+        return .{ .ptr = self, .begin_fn = begin, .release_fn = release };
+    }
+
+    fn check(raw: ?*anyopaque) !void {
+        const self: *TeardownTicket = @ptrCast(@alignCast(raw.?));
+        const deadline = self.deadline_ns.load(.acquire);
+        if (deadline != 0 and platform.time.monotonicNs() >= deadline)
+            return error.Timeout;
+    }
+
+    fn begin(raw: *anyopaque) backends.Session.CloseScope {
+        const self: *TeardownTicket = @ptrCast(@alignCast(raw));
+        const old = self.refs.fetchAdd(1, .monotonic);
+        std.debug.assert(old > 0 and old < std.math.maxInt(usize));
+        const deadline = platform.time.monotonicNs() +| self.close_timeout_ns;
+        // Nested aggregate/session closes cannot extend or clear the original
+        // deadline. No allocator, IO call, or watchdog arm occurs here.
+        _ = self.deadline_ns.cmpxchgStrong(0, @max(deadline, 1), .release, .monotonic);
+        return .{ .ptr = self, .release_fn = release };
+    }
+
+    fn release(raw: *anyopaque) void {
+        const self: *TeardownTicket = @ptrCast(@alignCast(raw));
+        const old = self.refs.fetchSub(1, .acq_rel);
+        std.debug.assert(old > 0);
+        if (old != 1) return;
+        const domain = self.domain;
+        // The watcher may be between polls when close returns. A completed
+        // over-deadline close still cannot report successful cleanup.
+        check(self) catch {
+            // Fatal progress cannot depend on stderr locks or pipe consumers.
+            // The supervisor observes exit86; this thread must not log first.
+            platform.inference_process_supervisor.restartWorker();
+        };
+        const boundary = domain.watchdog.boundary();
+        boundary.disarm_fn(boundary.ptr, self.token);
+        domain.allocator.destroy(self);
+        domain.release();
+    }
+};
 pub const ModelManager = struct {
     const LoadedModelMap = std.StringHashMapUnmanaged(*LoadedModel);
     const tokenizer_cache_budget_shard_count = 16;
@@ -3757,9 +3972,9 @@ pub const ModelManager = struct {
         model: *LoadedModel,
     };
 
-    const EvictedWhisperAssets = struct {
+    const EvictedCompositeAssets = struct {
         key: ComponentPlanKey,
-        assets: *WhisperCompositeAssets,
+        assets: *CompositeAssets,
     };
 
     allocator: std.mem.Allocator,
@@ -3794,10 +4009,12 @@ pub const ModelManager = struct {
     /// Lazily allocated at a stable address for offline/direct callers. Never
     /// borrow a request's Io: shared loads and resident sessions outlive it.
     owned_load_runtime: ?*std.Io.Threaded = null,
+    owned_load_io_owner: ?*OwnedManagerIo = null,
+    teardown_domain: ?*TeardownDomain = null,
     owned_load_watchdog: ?*HardCancellationWatchdog = null,
     in_flight_loads: std.StringHashMapUnmanaged(*LoadFlight) = .empty,
-    whisper_assets: std.AutoHashMapUnmanaged(ComponentPlanKey, *WhisperCompositeAssets) = .empty,
-    in_flight_whisper_assets: std.AutoHashMapUnmanaged(ComponentPlanKey, *WhisperAssetsLoadFlight) = .empty,
+    composite_assets: std.AutoHashMapUnmanaged(ComponentPlanKey, *CompositeAssets) = .empty,
+    in_flight_composite_assets: std.AutoHashMapUnmanaged(ComponentPlanKey, *CompositeAssetsLoadFlight) = .empty,
     component_plan_cache: std.AutoHashMapUnmanaged(
         ComponentPlanKey,
         *ComponentPlanCacheEntry,
@@ -3821,7 +4038,7 @@ pub const ModelManager = struct {
 
     pub fn configureServingPolicy(self: *ModelManager, policy: model_compatibility.Policy) void {
         std.debug.assert(self.loaded.count() == 0);
-        std.debug.assert(self.whisper_assets.count() == 0);
+        std.debug.assert(self.composite_assets.count() == 0);
         self.serving_policy = policy;
         self.admission_enabled = true;
         if (self.resource_domain) |domain|
@@ -3833,7 +4050,7 @@ pub const ModelManager = struct {
         ownership: ResourceOwnership,
     ) !void {
         std.debug.assert(self.loaded.count() == 0);
-        std.debug.assert(self.whisper_assets.count() == 0);
+        std.debug.assert(self.composite_assets.count() == 0);
         spinLock(&self.tokenizer_cache_config_mutex);
         defer self.tokenizer_cache_config_mutex.unlock();
         if (self.tokenizer_cache_budget_source != .none)
@@ -3847,7 +4064,7 @@ pub const ModelManager = struct {
         provenance: runtime.tier.memory.ProcessMemoryLimitProvenance,
     ) void {
         std.debug.assert(self.loaded.count() == 0);
-        std.debug.assert(self.whisper_assets.count() == 0);
+        std.debug.assert(self.composite_assets.count() == 0);
         self.process_memory_limit_bytes = limit_bytes;
         self.process_memory_limit_provenance = provenance;
         if (self.resource_domain) |domain|
@@ -4227,7 +4444,7 @@ pub const ModelManager = struct {
         max_loaded_models: usize,
     ) void {
         std.debug.assert(self.loaded.count() == 0);
-        std.debug.assert(self.whisper_assets.count() == 0);
+        std.debug.assert(self.composite_assets.count() == 0);
         std.debug.assert(!self.eviction_loop_started);
         self.keep_alive_ms = keep_alive_ms;
         self.max_loaded_models = max_loaded_models;
@@ -4272,7 +4489,7 @@ pub const ModelManager = struct {
         overrides: runtime.tier.memory.Limits,
     ) void {
         std.debug.assert(self.loaded.count() == 0);
-        std.debug.assert(self.whisper_assets.count() == 0);
+        std.debug.assert(self.composite_assets.count() == 0);
         self.admission_limit_overrides = overrides;
         if (self.resource_domain) |domain|
             self.configureAdmissionController(domain);
@@ -4287,7 +4504,7 @@ pub const ModelManager = struct {
         tokenizer_budget: hf_tokenizer.HfTokenizer.BpeCacheResourceBudget,
     ) !void {
         std.debug.assert(self.loaded.count() == 0);
-        std.debug.assert(self.whisper_assets.count() == 0);
+        std.debug.assert(self.composite_assets.count() == 0);
         if (self.resource_ownership != .external_required)
             return error.ExternalResourceBudgetInLocalOwnership;
         spinLock(&self.tokenizer_cache_config_mutex);
@@ -4335,6 +4552,18 @@ pub const ModelManager = struct {
         expired_only: bool,
         admission_pressure: ?runtime.tier.memory.AdmissionPressure,
     ) ?EvictedModel {
+        return self.takeLruModelWithWorkspaceLocked(now_ns, expired_only, admission_pressure, session_factory.glinerBoundaryWorkspaceAdmissionAmounts);
+    }
+
+    /// The private compile-time reader permits model-free ownership tests.
+    /// Production always selects the concrete session factory reader above.
+    fn takeLruModelWithWorkspaceLocked(
+        self: *ModelManager,
+        now_ns: u64,
+        expired_only: bool,
+        admission_pressure: ?runtime.tier.memory.AdmissionPressure,
+        workspace_amounts: anytype,
+    ) ?EvictedModel {
         const ttl_ns = std.math.mul(
             u64,
             self.keep_alive_ms,
@@ -4351,7 +4580,15 @@ pub const ModelManager = struct {
                 continue;
             }
             if (admission_pressure) |pressure| {
-                if (!loadedModelAdmissionReclaimRelevant(model, pressure)) continue;
+                if (!loadedModelAdmissionReclaimRelevant(model, pressure)) {
+                    // This slot can change during execution. Only inspect it
+                    // after proving no active/pending owner under this cache
+                    // lock, which also prevents any new handle acquisition.
+                    const amounts = workspace_amounts(model.session);
+                    var by_backend: @FieldType(runtime.tier.memory.AdmissionLease, "amounts_by_backend") = @splat(.{});
+                    by_backend[@intFromEnum(runtime.tier.memory.BackendClass.gpu)] = amounts;
+                    if (!admissionAmountsReclaimRelevant(amounts, by_backend, pressure)) continue;
+                }
             }
             const age_ns = if (now_ns >= model.last_used_ns)
                 now_ns - model.last_used_ns
@@ -4476,23 +4713,23 @@ pub const ModelManager = struct {
         _ = platform.allocator.reclaimUnusedProcessMemory();
     }
 
-    fn takeLruWhisperAssetsLocked(
+    fn takeLruCompositeAssetsLocked(
         self: *ModelManager,
         now_ns: u64,
         expired_only: bool,
-    ) ?EvictedWhisperAssets {
+    ) ?EvictedCompositeAssets {
         const ttl_ns = std.math.mul(
             u64,
             self.keep_alive_ms,
             std.time.ns_per_ms,
         ) catch std.math.maxInt(u64);
         var victim_key: ?ComponentPlanKey = null;
-        var victim: ?*WhisperCompositeAssets = null;
+        var victim: ?*CompositeAssets = null;
         var oldest_ns: u64 = std.math.maxInt(u64);
-        var it = self.whisper_assets.iterator();
+        var it = self.composite_assets.iterator();
         while (it.next()) |entry| {
             const assets = entry.value_ptr.*;
-            if (assets.active_handles != 0 or self.whisperAssetsIsInFlightLocked(assets)) continue;
+            if (assets.active_handles != 0 or self.compositeAssetsIsInFlightLocked(assets)) continue;
             const age_ns = if (now_ns >= assets.last_used_ns)
                 now_ns - assets.last_used_ns
             else
@@ -4509,25 +4746,25 @@ pub const ModelManager = struct {
             }
         }
         const selected = victim orelse return null;
-        const removed = self.whisper_assets.fetchRemove(victim_key.?) orelse unreachable;
+        const removed = self.composite_assets.fetchRemove(victim_key.?) orelse unreachable;
         std.debug.assert(removed.value == selected);
         return .{ .key = removed.key, .assets = selected };
     }
 
-    fn whisperAssetsIsInFlightLocked(
+    fn compositeAssetsIsInFlightLocked(
         self: *ModelManager,
-        assets: *WhisperCompositeAssets,
+        assets: *CompositeAssets,
     ) bool {
-        var it = self.in_flight_whisper_assets.valueIterator();
+        var it = self.in_flight_composite_assets.valueIterator();
         while (it.next()) |flight_ptr| {
             if (flight_ptr.*.assets == assets) return true;
         }
         return false;
     }
 
-    fn destroyEvictedWhisperAssets(
+    fn destroyEvictedCompositeAssets(
         self: *ModelManager,
-        evicted: EvictedWhisperAssets,
+        evicted: EvictedCompositeAssets,
     ) void {
         evicted.assets.deinit();
         self.allocator.destroy(evicted.assets);
@@ -4542,21 +4779,29 @@ pub const ModelManager = struct {
         reclaimable: runtime.tier.memory.AdmissionLease,
         pressure: runtime.tier.memory.AdmissionPressure,
     ) bool {
+        return admissionAmountsReclaimRelevant(reclaimable.amounts, reclaimable.amounts_by_backend, pressure);
+    }
+
+    fn admissionAmountsReclaimRelevant(
+        amounts: runtime.tier.memory.AdmissionAmounts,
+        amounts_by_backend: @FieldType(runtime.tier.memory.AdmissionLease, "amounts_by_backend"),
+        pressure: runtime.tier.memory.AdmissionPressure,
+    ) bool {
         return switch (pressure) {
-            .shared_host => reclaimable.amounts.hostTotalBytes() > 0,
-            .shared_unified => admissionAmountsPresent(reclaimable.amounts),
-            .live_host => reclaimable.amounts.hostTotalBytes() > 0 or
-                (builtin.os.tag == .macos and reclaimable.amounts.backendTotalBytes() > 0),
-            .domain_host => |backend_class| reclaimable.amounts_by_backend[@intFromEnum(backend_class)].hostTotalBytes() > 0,
-            .domain_backend => |backend_class| reclaimable.amounts_by_backend[@intFromEnum(backend_class)].backendTotalBytes() > 0,
+            .shared_host => amounts.hostTotalBytes() > 0,
+            .shared_unified => admissionAmountsPresent(amounts),
+            .live_host => amounts.hostTotalBytes() > 0 or
+                (builtin.os.tag == .macos and amounts.backendTotalBytes() > 0),
+            .domain_host => |backend_class| amounts_by_backend[@intFromEnum(backend_class)].hostTotalBytes() > 0,
+            .domain_backend => |backend_class| amounts_by_backend[@intFromEnum(backend_class)].backendTotalBytes() > 0,
             .domain_combined => |backend_class| admissionAmountsPresent(
-                reclaimable.amounts_by_backend[@intFromEnum(backend_class)],
+                amounts_by_backend[@intFromEnum(backend_class)],
             ),
-            .domain_kv => |backend_class| reclaimable.amounts_by_backend[@intFromEnum(backend_class)].kvTotalBytes() > 0,
-            .domain_scratch => |backend_class| reclaimable.amounts_by_backend[@intFromEnum(backend_class)].scratchTotalBytes() > 0,
+            .domain_kv => |backend_class| amounts_by_backend[@intFromEnum(backend_class)].kvTotalBytes() > 0,
+            .domain_scratch => |backend_class| amounts_by_backend[@intFromEnum(backend_class)].scratchTotalBytes() > 0,
             // The process-owner budget is intentionally opaque. Any resident
             // admission released from the aggregate can potentially satisfy it.
-            .external_budget => admissionAmountsPresent(reclaimable.amounts),
+            .external_budget => admissionAmountsPresent(amounts),
         };
     }
 
@@ -4580,19 +4825,18 @@ pub const ModelManager = struct {
         return false;
     }
 
-    fn takeLruWhisperAssetsForAdmissionLocked(
+    fn takeLruCompositeAssetsForAdmissionLocked(
         self: *ModelManager,
         pressure: runtime.tier.memory.AdmissionPressure,
-    ) ?EvictedWhisperAssets {
+    ) ?EvictedCompositeAssets {
         var victim_key: ?ComponentPlanKey = null;
-        var victim: ?*WhisperCompositeAssets = null;
+        var victim: ?*CompositeAssets = null;
         var oldest_ns: u64 = std.math.maxInt(u64);
-        var it = self.whisper_assets.iterator();
+        var it = self.composite_assets.iterator();
         while (it.next()) |entry| {
             const assets = entry.value_ptr.*;
-            if (assets.active_handles != 0 or self.whisperAssetsIsInFlightLocked(assets)) continue;
-            const reclaimable = assets.reclaimableAdmission() orelse continue;
-            if (!admissionReclaimRelevant(reclaimable, pressure)) continue;
+            if (assets.active_handles != 0 or self.compositeAssetsIsInFlightLocked(assets)) continue;
+            if (!assets.reclaimRelevant(pressure)) continue;
             if (victim == null or assets.last_used_ns < oldest_ns) {
                 victim_key = entry.key_ptr.*;
                 victim = assets;
@@ -4600,7 +4844,7 @@ pub const ModelManager = struct {
             }
         }
         const selected = victim orelse return null;
-        const removed = self.whisper_assets.fetchRemove(victim_key.?) orelse unreachable;
+        const removed = self.composite_assets.fetchRemove(victim_key.?) orelse unreachable;
         std.debug.assert(removed.value == selected);
         return .{ .key = removed.key, .assets = selected };
     }
@@ -4615,14 +4859,14 @@ pub const ModelManager = struct {
     ) bool {
         self.lockLoadedModels();
         const now_ns = platform.time.monotonicNs();
-        const assets = self.takeLruWhisperAssetsForAdmissionLocked(pressure);
+        const assets = self.takeLruCompositeAssetsForAdmissionLocked(pressure);
         const model = if (assets == null)
             self.takeLruModelLocked(now_ns, false, pressure)
         else
             null;
         self.unlockLoadedModels();
         if (assets) |evicted| {
-            self.destroyEvictedWhisperAssets(evicted);
+            self.destroyEvictedCompositeAssets(evicted);
             return true;
         }
         if (model) |evicted| {
@@ -4838,10 +5082,17 @@ pub const ModelManager = struct {
     }
 
     fn evictExpired(self: *ModelManager) void {
+        self.evictExpiredAt(null);
+    }
+
+    /// The ordinary maintenance loop samples the real clock under the same
+    /// eviction lock as before. A private test bridge may supply an exact
+    /// timestamp without changing model timestamps or exposing a runtime knob.
+    fn evictExpiredAt(self: *ModelManager, supplied_now_ns: ?u64) void {
         if (self.keep_alive_ms == 0) return;
         spinLock(&self.eviction_lock);
         defer self.eviction_lock.unlock();
-        const now_ns = platform.time.monotonicNs();
+        const now_ns = supplied_now_ns orelse platform.time.monotonicNs();
         while (true) {
             self.lockLoadedModels();
             const evicted = self.takeLruModelLocked(now_ns, true, null);
@@ -4851,10 +5102,10 @@ pub const ModelManager = struct {
         }
         while (true) {
             self.lockLoadedModels();
-            const evicted = self.takeLruWhisperAssetsLocked(now_ns, true);
+            const evicted = self.takeLruCompositeAssetsLocked(now_ns, true);
             self.unlockLoadedModels();
             if (evicted == null) break;
-            self.destroyEvictedWhisperAssets(evicted.?);
+            self.destroyEvictedCompositeAssets(evicted.?);
         }
     }
 
@@ -4881,6 +5132,7 @@ pub const ModelManager = struct {
         const PathDigest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 
         manager: *ModelManager,
+        validated_generation: ?ComponentPlanKey = null,
         allowed_backends: [7]backends.BackendType = undefined,
         allowed_backend_count: usize = 0,
         component_path_digests: [max_component_paths]PathDigest = undefined,
@@ -5049,26 +5301,33 @@ pub const ModelManager = struct {
         key: ComponentPlanKey,
         loader: *ComponentLoader,
     ) !bool {
+        const entry = try self.cachedComponentPlan(key) orelse return false;
+        defer entry.release();
+        @memcpy(loader.allowed_backends[0..entry.allowed_backend_count], entry.allowed_backends[0..entry.allowed_backend_count]);
+        loader.allowed_backend_count = entry.allowed_backend_count;
+        loader.validated_generation = entry.signature;
+        return true;
+    }
+
+    fn cachedComponentPlan(self: *ModelManager, key: ComponentPlanKey) !?*ComponentPlanCacheEntry {
         spinLock(&self.component_plan_cache_lock);
         const entry = self.component_plan_cache.get(key) orelse {
             self.component_plan_cache_lock.unlock();
-            return false;
+            return null;
         };
         entry.retain();
         self.component_plan_cache_lock.unlock();
-        defer entry.release();
+        errdefer entry.release();
 
         const signature = try componentDependencySignature(
             self.componentPlanIo(),
             entry.dependencies,
         );
-        if (!std.mem.eql(u8, signature[0..], entry.signature[0..])) return false;
-        @memcpy(
-            loader.allowed_backends[0..entry.allowed_backend_count],
-            entry.allowed_backends[0..entry.allowed_backend_count],
-        );
-        loader.allowed_backend_count = entry.allowed_backend_count;
-        return true;
+        if (!std.mem.eql(u8, signature[0..], entry.signature[0..])) {
+            entry.release();
+            return null;
+        }
+        return entry;
     }
 
     fn publishComponentPlan(
@@ -5200,6 +5459,7 @@ pub const ModelManager = struct {
                 validated,
                 inspection.dependencies.items,
             ) catch {};
+            loader.validated_generation = signature_after;
             break :blk validated;
         } else effective_backends;
         for (allowed) |backend| {
@@ -5379,11 +5639,22 @@ pub const ModelManager = struct {
                 return err;
             };
             defer construction.deinit();
+            var close_protection = self.prepareSessionClose(backend_runtime) catch |err| {
+                if (err == error.ProcessIsolationRequired) {
+                    rememberPreferredLoadError(&first_err, err);
+                    continue;
+                }
+                return err;
+            };
+            defer if (close_protection) |protection| protection.release();
             if (session_manager.loadModelWithImportedOnnxContext(
                 model_path,
                 shared_backend_ctx,
             )) |loaded_session| {
                 var loaded = ManagedSession{ .session = loaded_session, .resource_lease = resource_lease };
+                std.debug.assert(loaded.session.close_protection == null);
+                loaded.session.close_protection = close_protection;
+                close_protection = null;
                 resource_lease = null;
                 defer loaded.deinit();
                 if (control) |active| try active.check();
@@ -5484,7 +5755,8 @@ pub const ModelManager = struct {
 
     /// Pin one handle for every currently published model. Callers may release
     /// load_lock before taking per-model locks without racing model eviction or
-    /// retirement destruction.
+    /// retirement destruction. Metrics/listing observation does not renew TTL;
+    /// ordinary inference handles still record use when they are released.
     pub fn acquireLoadedModelSnapshot(
         self: *ModelManager,
         allocator: std.mem.Allocator,
@@ -5522,7 +5794,7 @@ pub const ModelManager = struct {
         self: *ModelManager,
         config: hf_tokenizer.HfTokenizer.BpeCacheConfig,
     ) !void {
-        if (self.loaded.count() != 0 or self.whisper_assets.count() != 0)
+        if (self.loaded.count() != 0 or self.composite_assets.count() != 0)
             return error.TokenizerCacheConfigAfterModelLoad;
         spinLock(&self.tokenizer_cache_config_mutex);
         defer self.tokenizer_cache_config_mutex.unlock();
@@ -5548,7 +5820,7 @@ pub const ModelManager = struct {
         self: *ModelManager,
         config: hf_tokenizer.HfTokenizer.ParallelBpeConfig,
     ) !void {
-        if (self.loaded.count() != 0 or self.whisper_assets.count() != 0)
+        if (self.loaded.count() != 0 or self.composite_assets.count() != 0)
             return error.TokenizerParallelConfigAfterModelLoad;
         self.tokenizer_parallel_bpe_config = config;
     }
@@ -5556,27 +5828,27 @@ pub const ModelManager = struct {
     pub fn deinit(self: *ModelManager) void {
         // Sessions can retain the load runtime. Join work and destroy all
         // resident resources before tearing down the manager-owned fallback.
-        defer if (self.owned_load_runtime) |owned| {
-            owned.deinit();
-            self.allocator.destroy(owned);
-        };
+        defer if (self.owned_load_io_owner) |owner| owner.release();
         defer if (self.owned_load_watchdog) |watchdog| watchdog.destroy();
+        // Escaped raw sessions retain this domain and any manager-owned driver
+        // IO until their final close scope, even after the cache owner exits.
+        defer if (self.teardown_domain) |domain| domain.release();
         if (self.load_io) |io| self.load_group.cancel(io);
         if (self.eviction_io) |io| self.eviction_group.cancel(io);
         std.debug.assert(self.in_flight_loads.count() == 0);
-        std.debug.assert(self.in_flight_whisper_assets.count() == 0);
+        std.debug.assert(self.in_flight_composite_assets.count() == 0);
         self.in_flight_loads.deinit(self.allocator);
-        self.in_flight_whisper_assets.deinit(self.allocator);
+        self.in_flight_composite_assets.deinit(self.allocator);
         var component_plan_it = self.component_plan_cache.iterator();
         while (component_plan_it.next()) |entry| entry.value_ptr.*.release();
         self.component_plan_cache.deinit(self.allocator);
         self.unhealthy_model_backends.deinit(self.allocator);
-        var whisper_assets_it = self.whisper_assets.iterator();
-        while (whisper_assets_it.next()) |entry| {
+        var composite_assets_it = self.composite_assets.iterator();
+        while (composite_assets_it.next()) |entry| {
             entry.value_ptr.*.deinit();
             self.allocator.destroy(entry.value_ptr.*);
         }
-        self.whisper_assets.deinit(self.allocator);
+        self.composite_assets.deinit(self.allocator);
         var it = self.loaded.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.*.deinit();
@@ -5699,10 +5971,10 @@ pub const ModelManager = struct {
         }
     }
 
-    fn finishWhisperAssetsLoadFlight(
+    fn finishCompositeAssetsLoadFlight(
         self: *ModelManager,
-        flight: *WhisperAssetsLoadFlight,
-        assets: ?*WhisperCompositeAssets,
+        flight: *CompositeAssetsLoadFlight,
+        assets: ?*CompositeAssets,
         err: ?anyerror,
     ) void {
         self.lockLoadedModels();
@@ -5712,10 +5984,10 @@ pub const ModelManager = struct {
         flight.completed.set(flight.io);
     }
 
-    fn releaseWhisperAssetsLoadFlight(
+    fn releaseCompositeAssetsLoadFlight(
         self: *ModelManager,
         flight_key: ComponentPlanKey,
-        flight: *WhisperAssetsLoadFlight,
+        flight: *CompositeAssetsLoadFlight,
     ) void {
         self.lockLoadedModels();
         std.debug.assert(flight.refs > 0);
@@ -5724,19 +5996,34 @@ pub const ModelManager = struct {
             self.unlockLoadedModels();
             return;
         }
-        const removed = self.in_flight_whisper_assets.fetchRemove(flight_key) orelse unreachable;
-        std.debug.assert(removed.value == flight);
+        if (flight.registered) {
+            const removed = self.in_flight_composite_assets.fetchRemove(flight_key) orelse unreachable;
+            std.debug.assert(removed.value == flight);
+            flight.registered = false;
+        }
         self.unlockLoadedModels();
 
         self.allocator.destroy(flight);
     }
 
-    fn waitForWhisperAssetsLoadFlight(
+    fn waitForCompositeAssetsLoadFlight(
         self: *ModelManager,
         flight_key: ComponentPlanKey,
-        flight: *WhisperAssetsLoadFlight,
-    ) !WhisperAssetsHandle {
-        flight.completed.waitUncancelable(flight.io);
+        flight: *CompositeAssetsLoadFlight,
+        control: ?InferenceExecutionControl,
+    ) !CompositeAssetsHandle {
+        defer self.releaseCompositeAssetsLoadFlight(flight_key, flight);
+        defer flight.load_state.releaseWaiter(!flight.completed.isSet());
+        while (!flight.completed.isSet()) {
+            if (control) |active| try active.update(.loading_model, 0, 1);
+            flight.completed.waitTimeout(flight.io, .{
+                .duration = .{ .raw = std.Io.Duration.fromNanoseconds(10 * std.time.ns_per_ms), .clock = .awake },
+            }) catch |err| switch (err) {
+                error.Timeout => continue,
+                else => return err,
+            };
+        }
+        if (control) |active| try active.check();
         const assets = flight.assets;
         const maybe_err = flight.err;
 
@@ -5745,12 +6032,34 @@ pub const ModelManager = struct {
             loaded.active_handles += 1;
             self.unlockLoadedModels();
         }
-        self.releaseWhisperAssetsLoadFlight(flight_key, flight);
         if (maybe_err) |err| return err;
         return .{
             .manager = self,
             .assets = assets orelse return error.TokenizerLoadFailed,
         };
+    }
+
+    fn runCompositeLoadTask(task: *CompositeLoadTask) std.Io.Cancelable!void {
+        defer task.deinit();
+        const manager = task.manager;
+        defer manager.releaseCompositeAssetsLoadFlight(task.key, task.flight);
+        var active = LoadFlightControl{ .flight = &task.flight.load_state };
+        const assets = manager.loadCompositeAssetsUncached(task.model_dir, task.paths, task.key, task.kind, active.control()) catch |err| {
+            manager.finishCompositeAssetsLoadFlight(task.flight, null, err);
+            return;
+        };
+        active.control().check() catch |err| {
+            assets.deinit();
+            manager.allocator.destroy(assets);
+            manager.finishCompositeAssetsLoadFlight(task.flight, null, err);
+            return;
+        };
+        var handle = manager.publishCompositeAssets(task.key, assets) catch |err| {
+            manager.finishCompositeAssetsLoadFlight(task.flight, null, err);
+            return;
+        };
+        manager.finishCompositeAssetsLoadFlight(task.flight, handle.assets, null);
+        handle.release();
     }
 
     const ResolvedWhisperSidecars = struct {
@@ -5813,7 +6122,7 @@ pub const ModelManager = struct {
         };
     }
 
-    fn whisperAssetGenerationSignature(
+    fn compositeAssetGenerationSignature(
         self: *ModelManager,
         model_dir: []const u8,
         component_paths: []const []const u8,
@@ -5826,6 +6135,13 @@ pub const ModelManager = struct {
             "tokenizer.json",
             "config.json",
             "generation_config.json",
+            "clip_config.json",
+            "model_manifest.json",
+            "antfly_inference_bundle.json",
+            "antfly_inference_variants.json",
+            "gliner_config.json",
+            "added_tokens.json",
+            "1_SpladePooling/config.json",
             managed_receipt.complete_filename,
             managed_receipt.in_progress_filename,
             managed_receipt.plan_filename,
@@ -5841,54 +6157,150 @@ pub const ModelManager = struct {
             owned_paths.appendAssumeCapacity(path);
             try dependencies.append(self.allocator, path);
         }
-        return componentDependencySignature(self.componentPlanIo(), dependencies.items);
+        const direct = try componentDependencySignature(self.componentPlanIo(), dependencies.items);
+        if (component_paths.len == 0) return direct;
+        // Artifact identity is backend-neutral. Optional graphs participate in
+        // invalidation, but must not restrict the backend of the selected pair.
+        // Cache the closure under a distinct namespace in the bounded plan cache.
+        var closure_hash = std.crypto.hash.sha2.Sha256.init(.{});
+        closure_hash.update("composite-artifact-closure-v1");
+        closure_hash.update(&direct);
+        const closure_key = closure_hash.finalResult();
+        const closure = if (try self.cachedComponentPlan(closure_key)) |entry| blk: {
+            defer entry.release();
+            break :blk entry.signature;
+        } else blk: {
+            var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
+            defer man.deinit();
+            var inspection = try inspectComponentArtifacts(self.allocator, &man, component_paths, .multistage_ocr);
+            defer inspection.deinit();
+            if (inspection.invalid_summary != null) return error.IncompatibleModel;
+            const signature = try componentDependencySignature(self.componentPlanIo(), inspection.dependencies.items);
+            if (!std.mem.eql(u8, &direct, &try componentDependencySignature(self.componentPlanIo(), dependencies.items))) return error.ModelArtifactsChanging;
+            try self.publishComponentPlan(closure_key, signature, &.{}, inspection.dependencies.items);
+            break :blk signature;
+        };
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(&direct);
+        hash.update(&closure);
+        return hash.finalResult();
     }
 
-    fn loadWhisperCompositeAssetsUncached(
+    fn loadCompositeAssetsUncached(
         self: *ModelManager,
         model_dir: []const u8,
         component_paths: []const []const u8,
         asset_generation: ComponentPlanKey,
-    ) !*WhisperCompositeAssets {
+        kind: CompositeKind,
+        control: ?InferenceExecutionControl,
+    ) !*CompositeAssets {
+        if (control) |active| try active.check();
         var sidecars = try self.resolveWhisperSidecars(model_dir);
         defer sidecars.deinit();
 
         var managed_tokenizer = try self.loadManagedHfTokenizerFile(sidecars.tokenizer_path);
         errdefer managed_tokenizer.deinit();
-        var prompt_cache = try whisper_prompt.PromptCache.initFromPaths(
+        var prompt_cache: ?whisper_prompt.PromptCache = if (kind == .seq2seq) null else try whisper_prompt.PromptCache.initFromPaths(
             self.allocator,
             sidecars.generation_config_path,
             sidecars.config_path,
             managed_tokenizer.tokenizer.tokenizer(),
         );
-        errdefer prompt_cache.deinit();
+        errdefer if (prompt_cache) |*cache| cache.deinit();
         const decoder_config = try encoder_decoder.loadDecoderConfigFile(
             self.allocator,
             sidecars.config_path,
         );
-        const verified_generation = try self.whisperAssetGenerationSignature(
+        var encoder: ?ManagedSession = null;
+        errdefer if (encoder) |*managed| managed.deinit();
+        var decoder: ?ManagedSession = null;
+        errdefer if (decoder) |*managed| managed.deinit();
+        if (kind != .whisper_metadata) {
+            if (component_paths.len != 2 and component_paths.len != 3) return error.InvalidModelLayout;
+            var metadata = std.heap.ArenaAllocator.init(self.allocator);
+            defer metadata.deinit();
+            const merged = if (component_paths.len == 3) blk: {
+                const signature = @import("../backends/imported_onnx_session.zig").inspectSignature(metadata.allocator(), component_paths[2]) catch |err| switch (err) {
+                    error.IncompatibleModel, error.UnsupportedDType => break :blk false,
+                    else => return err,
+                };
+                break :blk @import("../pipelines/seq2seq_decode.zig").qualifiedSignature(signature.inputs, signature.outputs);
+            } else false;
+            if (merged) {
+                const selected = [_][]const u8{ component_paths[0], component_paths[2] };
+                // Optional graph support must not constrain fallback placement.
+                const loaded = blk: {
+                    var loader = self.componentLoaderForPaths(model_dir, self.session_manager.preferred_backends, &selected) catch |err| break :blk err;
+                    encoder = (if (control) |active| loader.loadWithControl(selected[0], active) else loader.load(selected[0])) catch |err| break :blk err;
+                    var strict = loader.restrictToBackend(encoder.?.session.backend()) catch |err| break :blk err;
+                    decoder = (if (control) |active| strict.loadWithControl(selected[1], active) else strict.load(selected[1])) catch |err| break :blk err;
+                    if (!@import("../pipelines/seq2seq_decode.zig").qualified(decoder.?.session)) break :blk error.IncompatibleModel;
+                    break :blk @as(anyerror!void, {});
+                };
+                if (loaded) |_| {} else |err| {
+                    switch (err) {
+                        error.IncompatibleModel, error.UnsupportedArchitecture, error.UnsupportedOperation, error.UnsupportedOperator, error.NoCompatibleBackend, error.NoBackendAvailable, error.UnsupportedBackend => {},
+                        else => return err,
+                    }
+                    if (decoder) |*candidate| candidate.deinit();
+                    decoder = null;
+                    if (encoder) |*candidate| candidate.deinit();
+                    encoder = null;
+                }
+            }
+            if (decoder == null) {
+                var loader = try self.componentLoaderForPaths(model_dir, self.session_manager.preferred_backends, component_paths[0..2]);
+                encoder = if (control) |active| try loader.loadWithControl(component_paths[0], active) else try loader.load(component_paths[0]);
+                var strict = try loader.restrictToBackend(encoder.?.session.backend());
+                decoder = if (control) |active| try strict.loadWithControl(component_paths[1], active) else try strict.load(component_paths[1]);
+            }
+        }
+        const verified_generation = try self.compositeRuntimeKey(
             model_dir,
             component_paths,
+            kind,
         );
         if (!std.mem.eql(u8, asset_generation[0..], verified_generation[0..]))
             return error.ModelArtifactsChanging;
 
-        const assets = try self.allocator.create(WhisperCompositeAssets);
+        const assets = try self.allocator.create(CompositeAssets);
+        errdefer self.allocator.destroy(assets);
         assets.* = .{
             .managed_tokenizer = managed_tokenizer.take(),
             .prompt_cache = prompt_cache,
+            .encoder = encoder,
+            .decoder = decoder,
+            .kind = kind,
+            .decoder_execution = if (decoder != null and @import("../pipelines/seq2seq_decode.zig").qualified(decoder.?.session)) .merged_kv else .full_prefix,
+            .considered_merged_decoder = component_paths.len == 3,
             .decoder_config = decoder_config,
             .generation = asset_generation,
         };
+        if (assets.encoder) |*managed| {
+            managed.session.execution_gate = &assets.encoder_gate;
+            const info = managed.session.outputInfo();
+            if (info.len == 1 and info[0].shape.len == 3 and info[0].dtype == .f32) {
+                // Exported hidden width is authoritative; the validated model
+                // configuration supplies the bound when the export is symbolic.
+                const width = if (info[0].shape[2] > 0) @as(usize, @intCast(info[0].shape[2])) else decoder_config.hidden_size orelse 0;
+                if (width > 0) managed.session.output_geometry = .{ .input_name = if (kind == .whisper) "input_features" else "input_ids", .sequence_axis = if (kind == .whisper) 2 else 1, .sequence_divisor = if (kind == .whisper) 2 else 1, .width = width };
+            }
+        }
+        if (assets.decoder) |*managed| {
+            managed.session.execution_gate = &assets.decoder_gate;
+            const info = managed.session.outputInfo();
+            if (info.len == 1 and info[0].shape.len == 3 and info[0].dtype == .f32)
+                managed.session.output_geometry = .{ .input_name = "input_ids", .width = if (info[0].shape[2] > 0) @intCast(info[0].shape[2]) else decoder_config.vocab_size };
+        }
         prompt_cache = undefined;
         return assets;
     }
 
-    fn publishWhisperCompositeAssets(
+    fn publishCompositeAssets(
         self: *ModelManager,
         asset_generation: ComponentPlanKey,
-        assets: *WhisperCompositeAssets,
-    ) !WhisperAssetsHandle {
+        assets: *CompositeAssets,
+    ) !CompositeAssetsHandle {
         var assets_owned = true;
         errdefer if (assets_owned) {
             assets.deinit();
@@ -5899,7 +6311,7 @@ pub const ModelManager = struct {
         defer self.eviction_lock.unlock();
         while (true) {
             self.lockLoadedModels();
-            if (self.whisper_assets.get(asset_generation)) |existing| {
+            if (self.composite_assets.get(asset_generation)) |existing| {
                 existing.active_handles += 1;
                 self.unlockLoadedModels();
                 assets.deinit();
@@ -5912,29 +6324,29 @@ pub const ModelManager = struct {
             const configured_capacity = if (self.max_loaded_models > 0)
                 self.max_loaded_models
             else
-                whisper_assets_cache_capacity;
+                composite_assets_cache_capacity;
             const capacity = @max(
                 @as(usize, 1),
-                @min(configured_capacity, whisper_assets_cache_capacity),
+                @min(configured_capacity, composite_assets_cache_capacity),
             );
-            if (self.whisper_assets.count() >= capacity) {
-                const evicted = self.takeLruWhisperAssetsLocked(
+            if (self.composite_assets.count() >= capacity) {
+                const evicted = self.takeLruCompositeAssetsLocked(
                     platform.time.monotonicNs(),
                     false,
                 );
                 self.unlockLoadedModels();
                 if (evicted == null) return error.ResourceTemporarilyUnavailable;
-                self.destroyEvictedWhisperAssets(evicted.?);
+                self.destroyEvictedCompositeAssets(evicted.?);
                 continue;
             }
 
-            self.whisper_assets.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+            self.composite_assets.ensureUnusedCapacity(self.allocator, 1) catch |err| {
                 self.unlockLoadedModels();
                 return err;
             };
             assets.active_handles = 1;
             assets.last_used_ns = platform.time.monotonicNs();
-            self.whisper_assets.putAssumeCapacity(asset_generation, assets);
+            self.composite_assets.putAssumeCapacity(asset_generation, assets);
             self.unlockLoadedModels();
             assets_owned = false;
             return .{ .manager = self, .assets = assets };
@@ -5944,76 +6356,132 @@ pub const ModelManager = struct {
     /// Acquire immutable tokenizer and decoder metadata for a split Whisper
     /// bundle. Cold construction is single-flight; warm requests perform one
     /// map lookup and keep the entry pinned through the returned handle.
-    pub fn acquireWhisperCompositeAssets(
+    pub fn acquireCompositeAssets(
         self: *ModelManager,
         model_dir: []const u8,
         component_paths: []const []const u8,
-    ) !WhisperAssetsHandle {
-        const asset_generation = try self.whisperAssetGenerationSignature(
+    ) !CompositeAssetsHandle {
+        return self.acquireCompositeRuntime(model_dir, component_paths, .whisper_metadata, null);
+    }
+
+    fn compositeRuntimeKey(self: *ModelManager, model_dir: []const u8, paths: []const []const u8, kind: CompositeKind) !ComponentPlanKey {
+        const generation_key = try self.compositeAssetGenerationSignature(model_dir, paths);
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(&generation_key);
+        hash.update(@tagName(kind));
+        for (self.session_manager.preferred_backends) |backend| {
+            hash.update("/");
+            hash.update(@tagName(backend));
+        }
+        return hash.finalResult();
+    }
+
+    /// Lazy, single-flight component runtime. The handle pins both sessions,
+    /// tokenizer and metadata; callers must not close the borrowed sessions.
+    pub fn acquireCompositeRuntime(
+        self: *ModelManager,
+        model_dir: []const u8,
+        component_paths: []const []const u8,
+        kind: CompositeKind,
+        control: ?InferenceExecutionControl,
+    ) !CompositeAssetsHandle {
+        if (control) |active| try active.check();
+        if (kind != .whisper_metadata and component_paths.len == 2 and std.mem.endsWith(u8, component_paths[1], ".onnx")) {
+            if (try encoder_decoder.findMergedDecoder(self.allocator, model_dir)) |candidate| {
+                defer self.allocator.free(candidate);
+                if (!std.mem.eql(u8, candidate, component_paths[1])) {
+                    const planned = [_][]const u8{ component_paths[0], component_paths[1], candidate };
+                    // The runtime single-flight pins metadata-only selection.
+                    // Artifact identity includes the optional graph; backend
+                    // policy is applied only to the selected executable pair.
+                    return self.acquireCompositeRuntimePlanned(model_dir, &planned, kind, control) catch |err| switch (err) {
+                        error.IncompatibleModel, error.UnsupportedArchitecture, error.UnsupportedOperation, error.UnsupportedOperator, error.NoCompatibleBackend, error.NoBackendAvailable, error.UnsupportedBackend => return self.acquireCompositeRuntimePlanned(model_dir, component_paths, kind, control),
+                        else => return err,
+                    };
+                }
+            }
+        }
+        return self.acquireCompositeRuntimePlanned(model_dir, component_paths, kind, control);
+    }
+
+    fn acquireCompositeRuntimePlanned(self: *ModelManager, model_dir: []const u8, component_paths: []const []const u8, kind: CompositeKind, control: ?InferenceExecutionControl) !CompositeAssetsHandle {
+        const asset_generation = try self.compositeRuntimeKey(
             model_dir,
             component_paths,
+            kind,
         );
         self.lockLoadedModels();
-        if (self.whisper_assets.get(asset_generation)) |assets| {
+        if (self.composite_assets.get(asset_generation)) |assets| {
             assets.active_handles += 1;
             self.unlockLoadedModels();
             return .{ .manager = self, .assets = assets };
         }
-        if (self.in_flight_whisper_assets.get(asset_generation)) |flight| {
+        if (self.joinableCompositeLoadFlightLocked(asset_generation)) |flight| {
+            if (!flight.load_state.tryAddWaiter()) {
+                self.unlockLoadedModels();
+                return error.ResourceTemporarilyUnavailable;
+            }
             flight.refs += 1;
             self.unlockLoadedModels();
-            return self.waitForWhisperAssetsLoadFlight(asset_generation, flight);
+            return self.waitForCompositeAssetsLoadFlight(asset_generation, flight, control);
         }
 
-        const flight = self.allocator.create(WhisperAssetsLoadFlight) catch |err| {
+        const coordination_io = self.loadCoordinationIoLocked() catch |err| {
             self.unlockLoadedModels();
             return err;
         };
-        const coordination_io = self.session_manager.io orelse
-            std.Io.Threaded.global_single_threaded.io();
-        flight.* = .{ .io = coordination_io };
-        self.in_flight_whisper_assets.put(
-            self.allocator,
-            asset_generation,
-            flight,
-        ) catch |err| {
+        const flight = self.allocator.create(CompositeAssetsLoadFlight) catch |err| {
+            self.unlockLoadedModels();
+            return err;
+        };
+        flight.* = .{
+            .io = coordination_io,
+            .refs = 2,
+            .load_state = .{
+                .io = coordination_io,
+                .hard_cancellation = if (control) |active| active.hard_cancellation else null,
+            },
+        };
+        const task = CompositeLoadTask.create(self, flight, asset_generation, model_dir, component_paths, kind) catch |err| {
+            self.allocator.destroy(flight);
+            self.unlockLoadedModels();
+            return err;
+        };
+        self.in_flight_composite_assets.put(self.allocator, asset_generation, flight) catch |err| {
+            task.deinit();
             self.allocator.destroy(flight);
             self.unlockLoadedModels();
             return err;
         };
         self.unlockLoadedModels();
-
-        const assets = self.loadWhisperCompositeAssetsUncached(
-            model_dir,
-            component_paths,
-            asset_generation,
-        ) catch |err| {
-            self.finishWhisperAssetsLoadFlight(flight, null, err);
-            self.releaseWhisperAssetsLoadFlight(asset_generation, flight);
-            return err;
-        };
-        const handle = self.publishWhisperCompositeAssets(asset_generation, assets) catch |err| {
-            self.finishWhisperAssetsLoadFlight(flight, null, err);
-            self.releaseWhisperAssetsLoadFlight(asset_generation, flight);
-            return err;
-        };
-        self.finishWhisperAssetsLoadFlight(flight, handle.assets, null);
-        self.releaseWhisperAssetsLoadFlight(asset_generation, flight);
-        return handle;
+        if (control != null) {
+            self.load_group.concurrent(coordination_io, runCompositeLoadTask, .{task}) catch |err| {
+                self.finishCompositeAssetsLoadFlight(flight, null, err);
+                task.deinit();
+                self.releaseCompositeAssetsLoadFlight(asset_generation, flight);
+            };
+        } else {
+            self.load_group.async(coordination_io, runCompositeLoadTask, .{task});
+        }
+        return self.waitForCompositeAssetsLoadFlight(asset_generation, flight, control);
     }
 
     /// Verify that sessions loaded after asset acquisition still describe the
     /// same immutable publication. A model pull may atomically replace the
     /// directory between those operations; fail the request instead of pairing
     /// sessions and token IDs from different generations.
-    pub fn validateWhisperAssetsCurrent(
+    pub fn validateCompositeAssetsCurrent(
         self: *ModelManager,
-        handle: *const WhisperAssetsHandle,
+        handle: *const CompositeAssetsHandle,
         model_dir: []const u8,
         component_paths: []const []const u8,
     ) !void {
-        const current = try self.whisperAssetGenerationSignature(model_dir, component_paths);
         const assets = handle.get();
+        const current = if (assets.considered_merged_decoder and component_paths.len == 2) blk: {
+            const candidate = try encoder_decoder.findMergedDecoder(self.allocator, model_dir) orelse return error.ModelArtifactsChanging;
+            defer self.allocator.free(candidate);
+            break :blk try self.compositeRuntimeKey(model_dir, &.{ component_paths[0], component_paths[1], candidate }, assets.kind);
+        } else try self.compositeRuntimeKey(model_dir, component_paths, assets.kind);
         if (!std.mem.eql(u8, assets.generation[0..], current[0..]))
             return error.ModelArtifactsChanging;
     }
@@ -6259,6 +6727,29 @@ pub const ModelManager = struct {
         flight.completed.set(flight.io);
     }
 
+    /// Completed failures are not negative cache entries. The task and its old
+    /// waiters may still own the flight, but a new request must be able to retry
+    /// after admission or artifacts change. Detachment does not destroy it, and
+    /// old-reference cleanup must never remove a replacement with the same key.
+    fn joinableCompositeLoadFlightLocked(self: *ModelManager, key: ComponentPlanKey) ?*CompositeAssetsLoadFlight {
+        const flight = self.in_flight_composite_assets.get(key) orelse return null;
+        if (!flight.completed.isSet() or flight.err == null) return flight;
+        const removed = self.in_flight_composite_assets.fetchRemove(key) orelse unreachable;
+        std.debug.assert(removed.value == flight);
+        flight.registered = false;
+        return null;
+    }
+
+    fn joinableLoadFlightLocked(self: *ModelManager, key: []const u8) ?*LoadFlight {
+        const flight = self.in_flight_loads.get(key) orelse return null;
+        if (!flight.completed.isSet() or flight.err == null) return flight;
+        const removed = self.in_flight_loads.fetchRemove(key) orelse unreachable;
+        std.debug.assert(removed.value == flight);
+        flight.registered = false;
+        self.allocator.free(removed.key);
+        return null;
+    }
+
     fn runLoadTask(task: *LoadTask) std.Io.Cancelable!void {
         defer task.deinit();
         const manager = task.manager;
@@ -6393,13 +6884,31 @@ pub const ModelManager = struct {
     fn loadCoordinationIoLocked(self: *ModelManager) !std.Io {
         if (self.load_io) |io| return io;
         const io = self.session_manager.io orelse blk: {
-            const owned = try self.allocator.create(std.Io.Threaded);
-            owned.* = std.Io.Threaded.init(self.allocator, .{});
-            self.owned_load_runtime = owned;
-            break :blk owned.io();
+            const owner = try OwnedManagerIo.create(self.allocator);
+            self.owned_load_io_owner = owner;
+            self.owned_load_runtime = &owner.runtime;
+            break :blk owner.runtime.io();
         };
         self.load_io = io;
         return io;
+    }
+
+    /// Establish a lifetime ticket before entering a process-required backend.
+    /// Embedded/nonisolated callers fail here; cooperative fallback can still
+    /// proceed. Nothing allocates or arms a monitor when eventual close starts.
+    fn prepareSessionClose(self: *ModelManager, backend_runtime: backends.BackendRuntime) !?backends.Session.CloseProtection {
+        if (!backend_runtime.requiresProcessIsolation()) return null;
+        self.lockLoadedModels();
+        defer self.unlockLoadedModels();
+        if (!self.session_manager.process_isolation_available)
+            return error.ProcessIsolationRequired;
+        if (self.teardown_domain == null) {
+            // Stabilize a possible manager-owned offline driver runtime before
+            // the independent teardown owner takes its lifetime reference.
+            _ = try self.loadCoordinationIoLocked();
+            self.teardown_domain = try TeardownDomain.create(self.allocator, self.owned_load_io_owner);
+        }
+        return try TeardownTicket.create(self.teardown_domain.?);
     }
 
     fn offlineLoadBoundaryLocked(self: *ModelManager, io: std.Io) !?execution_control_mod.HardCancellationBoundary {
@@ -6450,7 +6959,7 @@ pub const ModelManager = struct {
             self.unlockLoadedModels();
             return .{ .manager = self, .model = model };
         }
-        if (self.in_flight_loads.get(flight_key)) |flight| {
+        if (self.joinableLoadFlightLocked(flight_key)) |flight| {
             flight.refs += 1;
             if (!flight.tryAddWaiter()) {
                 flight.refs -= 1;
@@ -6649,7 +7158,15 @@ pub const ModelManager = struct {
         if (control) |active| try active.check();
         switch (tokenizer_type) {
             .huggingface => {
-                hf_tok = try loadHuggingFaceTokenizerFromDirOrGguf(self.allocator, model_dir, man.gguf_path);
+                hf_tok = if (man.gliner_architecture == .boundary) blk: {
+                    const path = man.tokenizer_json_path orelse return error.NoTokenizerFound;
+                    const bytes = try c_file.readFileMax(self.allocator, path, 32 * 1024 * 1024);
+                    defer self.allocator.free(bytes);
+                    // Parse the same bytes that pass the receipt check. A
+                    // separate pathname check leaves a replacement window.
+                    try man.verifyBoundarySidecar("tokenizer.json", bytes);
+                    break :blk try hf_tokenizer.HfTokenizer.loadFromBytesWithOptions(self.allocator, bytes, .{ .strict_unigram_normalizer = true });
+                } else try loadHuggingFaceTokenizerFromDirOrGguf(self.allocator, model_dir, man.gguf_path);
                 try hf_tok.?.configureBpeCache(self.tokenizer_cache_config);
                 try hf_tok.?.configureParallelBpe(
                     self.tokenizer_parallel_bpe_config,
@@ -6686,6 +7203,10 @@ pub const ModelManager = struct {
         defer loaded_session.deinit();
         if (control) |active| try active.update(.loading_model, 3, 4);
         const session = loaded_session.session;
+        if (man.gliner_architecture == .boundary) {
+            const identity = try session_factory.getGlinerBoundaryIdentity(session);
+            try identity.verifySidecars(try man.boundarySidecarDigests());
+        }
 
         var whisper_prompt_cache: ?whisper_prompt.PromptCache = if (session_factory.getWhisperConfig(session) != null)
             try whisper_prompt.PromptCache.init(
@@ -6763,6 +7284,24 @@ pub const ModelManager = struct {
             break :blk coordinator;
         } else null;
         errdefer if (native_generate_coordinator) |coordinator| self.allocator.destroy(coordinator);
+        const florence_reader_config: ?vision_config.RuntimeConfig = if (session_factory.getFlorenceConfig(session)) |florence| blk: {
+            const config_path = man.config_path orelse return error.IncompleteFlorence2Bundle;
+            const preprocessor_path = man.preprocessor_config_path orelse return error.IncompleteFlorence2Bundle;
+            const preprocessor = try vision_config.loadPreprocessorConfigFile(self.allocator, preprocessor_path);
+            if (preprocessor.image_size != @as(usize, florence.image_size))
+                return error.InvalidPreprocessorConfig;
+            var cb = try session_factory.getComputeBackend(session, self.allocator);
+            defer cb.deinit();
+            break :blk .{
+                .decoder = try encoder_decoder.loadDecoderConfigFile(self.allocator, config_path),
+                .preprocessor = preprocessor,
+                .final_logits_bias_zero = try florence_arch.decoderFinalLogitsBiasIsZero(
+                    &cb,
+                    self.allocator,
+                    florence.vocab_size,
+                ),
+            };
+        } else null;
         const owned_model_dir = try self.allocator.dupe(u8, model_dir);
         var owned_model_dir_owned = true;
         errdefer if (owned_model_dir_owned) self.allocator.free(owned_model_dir);
@@ -6778,6 +7317,8 @@ pub const ModelManager = struct {
             .model_manager = self,
             .model_dir = owned_model_dir,
             .allocator = self.allocator,
+            .executor_io = self.session_manager.io,
+            .florence_reader_config = florence_reader_config,
             .chat_tmpl = chat_tmpl,
             .whisper_prompt_cache = whisper_prompt_cache,
             .chat_template_failed = chat_template_failed,
@@ -6795,6 +7336,7 @@ pub const ModelManager = struct {
             .tokenizer_resource_lease = tokenizer_resource_lease,
             .resource_lease = loaded_session.resource_lease,
         };
+        model.session.execution_gate = &model.target_inference_run_lock;
 
         // Keep publication behind the same cooperative boundary as expensive
         // construction. An abandoned manager task should release its fully
@@ -7249,10 +7791,16 @@ test "explicit A4B loads ignore unqualified model aliases" {
 }
 
 fn admissionEvictionTestModel(last_used_ns: u64) LoadedModel {
+    const Stub = struct {
+        var probe: TeardownTestProbe = .{};
+    };
     var model: LoadedModel = undefined;
+    // Metadata-only tests never enter or close this foreign architecture.
+    model.session = .{ .ptr = &Stub.probe, .vtable = &TeardownTestProbe.vtable };
     model.active_handles = 0;
     model.last_used_ns = last_used_ns;
     model.pinned = false;
+    model.retired = false;
     model.resource_lease = null;
     model.tokenizer_resource_lease = null;
     model.vision_resource_lease = null;
@@ -7317,7 +7865,7 @@ test "model cache eviction skips active and pinned models and removes aliases" {
     allocator.free(evicted.?.key);
 }
 
-test "loaded model snapshot pins model lifetimes until release" {
+test "loaded model snapshot preserves TTL while ordinary inference release records use" {
     const allocator = std.testing.allocator;
     var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
     defer {
@@ -7327,21 +7875,120 @@ test "loaded model snapshot pins model lifetimes until release" {
         manager.loaded_aliases.deinit(allocator);
         manager.in_flight_loads.deinit(allocator);
     }
-
+    manager.configureModelCache(1, 1);
     var model: LoadedModel = undefined;
     model.active_handles = 0;
     model.last_used_ns = 1;
     model.pinned = false;
     model.retired = false;
     try manager.loaded.put(allocator, try allocator.dupe(u8, "model"), &model);
+    const old_expiry = model.last_used_ns + std.time.ns_per_ms;
 
-    var snapshot = try manager.acquireLoadedModelSnapshot(allocator);
-    try std.testing.expectEqual(@as(usize, 1), snapshot.handles.len);
+    for (0..3) |_| {
+        var snapshot = try manager.acquireLoadedModelSnapshot(allocator);
+        defer snapshot.deinit();
+        try std.testing.expectEqual(@as(usize, 1), snapshot.handles.len);
+        try std.testing.expectEqual(@as(usize, 1), model.active_handles);
+        try std.testing.expect(snapshot.handles[0].get() == &model);
+        manager.lockLoadedModels();
+        const held = manager.takeLruModelLocked(old_expiry, true, null);
+        manager.unlockLoadedModels();
+        defer if (held) |removed| allocator.free(removed.key);
+        try std.testing.expect(held == null);
+        snapshot.deinit();
+        try std.testing.expectEqual(@as(usize, 0), model.active_handles);
+        try std.testing.expectEqual(@as(u64, 1), model.last_used_ns);
+    }
+
+    // A real inference handle can finish while observation remains pinned.
+    // Releasing that observer must neither reset nor renew the inference time.
+    var observation = try manager.acquireLoadedModelSnapshot(allocator);
+    defer observation.deinit();
+    var inference = manager.acquireLoadedModel("model") orelse return error.MissingTestModel;
+    defer inference.release();
+    try std.testing.expectEqual(@as(usize, 2), model.active_handles);
+    const before_release = platform.time.monotonicNs();
+    inference.release();
+    const used_at = model.last_used_ns;
+    try std.testing.expect(used_at >= before_release and used_at > 1);
     try std.testing.expectEqual(@as(usize, 1), model.active_handles);
-    try std.testing.expect(snapshot.handles[0].get() == &model);
-
-    snapshot.deinit();
+    observation.deinit();
+    try std.testing.expectEqual(used_at, model.last_used_ns);
     try std.testing.expectEqual(@as(usize, 0), model.active_handles);
+
+    manager.lockLoadedModels();
+    const not_yet = manager.takeLruModelLocked(used_at + std.time.ns_per_ms - 1, true, null);
+    manager.unlockLoadedModels();
+    defer if (not_yet) |removed| allocator.free(removed.key);
+    try std.testing.expect(not_yet == null);
+    manager.lockLoadedModels();
+    const expired = manager.takeLruModelLocked(used_at + std.time.ns_per_ms, true, null);
+    manager.unlockLoadedModels();
+    defer if (expired) |removed| allocator.free(removed.key);
+    try std.testing.expect(expired != null and expired.?.model == &model);
+    try std.testing.expectEqual(@as(usize, 0), manager.loaded.count());
+}
+
+test "loaded model snapshot allocation failure preserves lifetime usage and retry" {
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    defer {
+        var it = manager.loaded.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        manager.loaded.deinit(allocator);
+        manager.loaded_aliases.deinit(allocator);
+        manager.in_flight_loads.deinit(allocator);
+    }
+    var model: LoadedModel = undefined;
+    model.active_handles = 0;
+    model.last_used_ns = 123;
+    model.pinned = false;
+    model.retired = false;
+    try manager.loaded.put(allocator, try allocator.dupe(u8, "model"), &model);
+    var failure = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, manager.acquireLoadedModelSnapshot(failure.allocator()));
+    try std.testing.expectEqual(@as(usize, 0), model.active_handles);
+    try std.testing.expectEqual(@as(u64, 123), model.last_used_ns);
+    try std.testing.expectEqual(@as(usize, 1), manager.loaded.count());
+    // The failed acquisition also releases load_lock before this retry.
+    var retry = try manager.acquireLoadedModelSnapshot(allocator);
+    defer retry.deinit();
+    try std.testing.expectEqual(@as(usize, 1), model.active_handles);
+    retry.deinit();
+    try std.testing.expectEqual(@as(usize, 0), model.active_handles);
+    try std.testing.expectEqual(@as(u64, 123), model.last_used_ns);
+}
+
+test "loaded model snapshot final retired observation keeps protected cleanup and admission" {
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native} });
+    defer manager.deinit();
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 64 });
+    try manager.ensureResourceOwnerReady();
+    var probe = TeardownTestProbe{};
+    const model = try teardownTestModel(&manager, &probe);
+    var inference = try manager.publishLoadedModel(model, true, null);
+    defer inference.release();
+    var snapshot = try manager.acquireLoadedModelSnapshot(allocator);
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(usize, 2), model.active_handles);
+    const used_at = model.last_used_ns;
+    inference.retire();
+    try std.testing.expectEqual(@as(usize, 0), manager.loaded.count());
+    try std.testing.expectEqual(@as(usize, 0), manager.loaded_aliases.count());
+    try std.testing.expect(model.retired and !probe.closed);
+    try std.testing.expectEqual(@as(usize, 1), model.active_handles);
+    try std.testing.expectEqual(used_at, model.last_used_ns);
+    try std.testing.expectEqual(@as(usize, 64), manager.admissionController().snapshot().host_weight_bytes);
+    // This is the final owner. The existing fake process-required session
+    // asserts active close protection and its 64-byte lease inside close().
+    snapshot.deinit();
+    try std.testing.expect(probe.closed);
+    try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
+    const watchdog = manager.teardown_domain.?.watchdog;
+    spinLock(&watchdog.mutex);
+    defer watchdog.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 0), watchdog.entries.items.len);
 }
 
 test "failed loaded model retires from lookup while active handles unwind" {
@@ -7471,6 +8118,76 @@ test "admission eviction skips older models outside the rejected domain" {
     try std.testing.expect(no_relevant_victim == null);
     try std.testing.expectEqual(@as(usize, 1), manager.loaded.count());
     try std.testing.expect(manager.loaded.get("older-cpu") == &older_cpu);
+}
+
+test "admission eviction selects idle GPU workspace and never reads active workspace state" {
+    const Snapshot = struct {
+        amounts: runtime.tier.memory.AdmissionAmounts = .{},
+        readable: bool = true,
+        reads: usize = 0,
+
+        fn read(session: backends.Session) runtime.tier.memory.AdmissionAmounts {
+            const self: *@This() = @ptrCast(@alignCast(session.ptr));
+            std.debug.assert(self.readable);
+            self.reads += 1;
+            return self.amounts;
+        }
+    };
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    defer {
+        var it = manager.loaded.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        manager.loaded.deinit(allocator);
+        var aliases = manager.loaded_aliases.iterator();
+        while (aliases.next()) |entry| allocator.free(entry.key_ptr.*);
+        manager.loaded_aliases.deinit(allocator);
+        manager.in_flight_loads.deinit(allocator);
+    }
+    const owned_workspace = runtime.tier.memory.AdmissionAmounts{ .host_scratch_bytes = 8, .backend_scratch_bytes = 64 };
+    var active_snapshot = Snapshot{ .amounts = owned_workspace, .readable = false };
+    var idle_snapshot = Snapshot{ .amounts = owned_workspace };
+    var empty_snapshot = Snapshot{};
+    var active = admissionEvictionTestModel(1);
+    active.session.ptr = &active_snapshot;
+    active.active_handles = 1;
+    var idle = admissionEvictionTestModel(2);
+    idle.session.ptr = &idle_snapshot;
+    var empty = admissionEvictionTestModel(0);
+    empty.session.ptr = &empty_snapshot;
+    try manager.loaded.put(allocator, try allocator.dupe(u8, "active"), &active);
+    try manager.loaded.put(allocator, try allocator.dupe(u8, "idle"), &idle);
+    try manager.loaded.put(allocator, try allocator.dupe(u8, "empty"), &empty);
+    try manager.loaded_aliases.put(allocator, try allocator.dupe(u8, "idle-alias"), &idle);
+    // GPU workspace cannot relieve CPU-domain or KV pressure. Active state
+    // must remain unread even while these unsuccessful searches scan the map.
+    for ([_]runtime.tier.memory.AdmissionPressure{ .{ .domain_scratch = .cpu }, .{ .domain_backend = .cpu }, .{ .domain_kv = .gpu } }) |pressure| {
+        manager.lockLoadedModels();
+        const absent = manager.takeLruModelWithWorkspaceLocked(100, false, pressure, Snapshot.read);
+        manager.unlockLoadedModels();
+        defer if (absent) |found| allocator.free(found.key);
+        try std.testing.expect(absent == null);
+    }
+    manager.lockLoadedModels();
+    const chosen = manager.takeLruModelWithWorkspaceLocked(100, false, .{ .domain_scratch = .gpu }, Snapshot.read);
+    manager.unlockLoadedModels();
+    defer if (chosen) |found| allocator.free(found.key);
+    try std.testing.expect(chosen != null and chosen.?.model == &idle);
+    try std.testing.expectEqual(@as(usize, 0), manager.loaded_aliases.count());
+    try std.testing.expectEqual(@as(usize, 0), active_snapshot.reads);
+    try std.testing.expect(idle_snapshot.reads > 0);
+    // Release through the real handle owner; only then may eviction inspect
+    // the formerly active model's stable workspace accounting.
+    var handle = ModelHandle{ .manager = &manager, .model = &active };
+    handle.release();
+    active_snapshot.readable = true;
+    manager.lockLoadedModels();
+    const released = manager.takeLruModelWithWorkspaceLocked(100, false, .{ .domain_scratch = .gpu }, Snapshot.read);
+    manager.unlockLoadedModels();
+    defer if (released) |found| allocator.free(found.key);
+    try std.testing.expect(released != null and released.?.model == &active);
+    try std.testing.expectEqual(@as(usize, 1), active_snapshot.reads);
+    try std.testing.expectEqual(@as(usize, 1), manager.loaded.count());
 }
 
 test "model cache idle expiration can be disabled" {
@@ -7987,6 +8704,11 @@ fn estimateModelLoadAdmission(
     const weights = try estimateModelArtifactBytes(man, backend_runtime.backend);
     const uses_onnx_artifact = backend_runtime.backend == .onnx or !manifestHasNativeAssets(man);
     if (uses_onnx_artifact) return onnxModelLoadAdmission(weights, backend_runtime);
+    if (backend_runtime.backend == .metal) {
+        if (try session_factory.glinerBoundaryResidentLoadAmounts(man, weights)) |resident| {
+            return .{ .peak = resident.peak, .resident = resident.resident };
+        }
+    }
     if (backend_runtime.backend == .metal or backend_runtime.backend == .cuda) {
         const config = if (backend_runtime.backend == .cuda)
             try session_factory.resolveCudaA4bInferenceConfigForModelListing(
@@ -8292,11 +9014,23 @@ fn loadSessionForPreferredBackends(
             return err;
         };
         defer hard_cancellation.deinit();
+        var close_protection = manager.prepareSessionClose(backend_runtime) catch |err| {
+            if (err == error.ProcessIsolationRequired) {
+                rememberPreferredLoadError(&first_err, err);
+                continue;
+            }
+            return err;
+        };
+        defer if (close_protection) |protection| protection.release();
         if (backend_session_manager.loadModel(candidate_path)) |loaded_session| {
             var loaded = ManagedSession{ .session = loaded_session, .resource_lease = resource_lease };
+            std.debug.assert(loaded.session.close_protection == null);
+            loaded.session.close_protection = close_protection;
+            close_protection = null;
             resource_lease = null;
             defer loaded.deinit();
             if (control) |active| try active.check();
+            try session_factory.prepareGlinerBoundaryResident(loaded.session, control);
             if (loaded.resource_lease) |*lease| try lease.retain(resident_amounts);
             if (manager.admission_enabled) {
                 const session_admission_limits = manager.admissionLimitsForSession(
@@ -10051,6 +10785,61 @@ test "component compatibility validates explicit split ONNX graphs" {
     );
 }
 
+test "composite decoder selection qualifies optional merged artifacts and pins fallback" {
+    const allocator = std.testing.allocator;
+    var graph = ml.graph.Graph.init(allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("input", ml.graph.Shape.init(.f32, &.{4}));
+    const bias = try builder.tensorConst(&.{ 1, 1, 1, 1 }, ml.graph.Shape.init(.f32, &.{4}));
+    try graph.markOutput(try builder.add(input, bias));
+    const bytes = try onnx_graph.exportGraph(allocator, &graph, .{});
+    defer allocator.free(bytes);
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    for ([_][]const u8{ "encoder_model.onnx", "decoder_model.onnx", "decoder_model_merged.onnx" }) |name|
+        try dir.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = bytes });
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data =
+        \\{"model_type":"t5","vocab_size":4,"d_model":4,"decoder_start_token_id":0}
+    });
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "tokenizer.json", .data =
+        \\{"version":"1.0","added_tokens":[{"id":0,"content":"<unk>"}],"model":{"type":"BPE","vocab":{"<unk>":0},"merges":[]}}
+    });
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer allocator.free(root);
+    const paths = try encoder_decoder.findEncoderDecoderPaths(allocator, root);
+    defer allocator.free(paths.encoder);
+    defer allocator.free(paths.decoder);
+    var sessions = backends.SessionManager.init(allocator);
+    sessions.preferred_backends = &.{.native};
+    var manager = ModelManager.init(allocator, sessions);
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    var first = try manager.acquireCompositeRuntime(root, &.{ paths.encoder, paths.decoder }, .seq2seq, null);
+    defer first.release();
+    try std.testing.expect(first.get().considered_merged_decoder);
+    try std.testing.expectEqual(.full_prefix, first.get().decoder_execution);
+    // The unqualified graph is fingerprinted, but never enters executable
+    // backend policy (or its heavyweight session construction).
+    var plans = manager.component_plan_cache.valueIterator();
+    while (plans.next()) |entry| {
+        if (entry.*.allowed_backend_count == 0) continue;
+        for (entry.*.dependencies) |dependency|
+            try std.testing.expect(!std.mem.endsWith(u8, dependency, "decoder_model_merged.onnx"));
+    }
+    var second = try manager.acquireCompositeRuntime(root, &.{ paths.encoder, paths.decoder }, .seq2seq, null);
+    defer second.release();
+    try std.testing.expect(first.get() == second.get());
+    try manager.validateCompositeAssetsCurrent(&first, root, &.{ paths.encoder, paths.decoder });
+    // Invalid optional publication cannot displace the working ordinary graph.
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "decoder_model_merged.onnx", .data = "invalid" });
+    var fallback = try manager.acquireCompositeRuntime(root, &.{ paths.encoder, paths.decoder }, .seq2seq, null);
+    defer fallback.release();
+    try std.testing.expect(!fallback.get().considered_merged_decoder);
+    try std.testing.expectEqual(.full_prefix, fallback.get().decoder_execution);
+    try std.testing.expect(first.get() != fallback.get());
+}
+
 test "split Whisper assets remain model-lifetime cached across request handles" {
     const allocator = std.testing.allocator;
     var dir = std.testing.tmpDir(.{});
@@ -10092,12 +10881,12 @@ test "split Whisper assets remain model-lifetime cached across request handles" 
     defer manager.deinit();
     manager.configureModelCache(0, 2);
 
-    var first = try manager.acquireWhisperCompositeAssets(root, &.{});
+    var first = try manager.acquireCompositeAssets(root, &.{});
     defer first.release();
     const cached = first.get();
     try std.testing.expectEqual(@as(usize, 99), cached.decoder_config.max_length);
     try std.testing.expectEqual(@as(i32, 7), cached.decoder_config.decoder_start_token_id);
-    try std.testing.expectEqual(@as(usize, 2), cached.prompt_cache.language_tokens.len);
+    try std.testing.expectEqual(@as(usize, 2), cached.prompt_cache.?.language_tokens.len);
 
     // A republished directory gets a distinct immutable generation even while
     // requests still hold the previous tokenizer and prompt metadata.
@@ -10113,32 +10902,140 @@ test "split Whisper assets remain model-lifetime cached across request handles" 
         \\{"decoder_start_token_id":17,"eos_token_id":8,"max_length":77}
         ,
     });
-    var second = try manager.acquireWhisperCompositeAssets(root, &.{});
+    var second = try manager.acquireCompositeAssets(root, &.{});
     defer second.release();
     try std.testing.expect(cached != second.get());
     try std.testing.expectEqual(@as(i32, 17), second.get().decoder_config.decoder_start_token_id);
     try std.testing.expectEqual(@as(usize, 77), second.get().decoder_config.max_length);
-    try std.testing.expectEqual(@as(usize, 2), manager.whisper_assets.count());
+    try std.testing.expectEqual(@as(usize, 2), manager.composite_assets.count());
     try std.testing.expectError(
         error.ModelArtifactsChanging,
-        manager.validateWhisperAssetsCurrent(&first, root, &.{}),
+        manager.validateCompositeAssetsCurrent(&first, root, &.{}),
     );
-    try manager.validateWhisperAssetsCurrent(&second, root, &.{});
+    try manager.validateCompositeAssetsCurrent(&second, root, &.{});
 
     // Capacity pressure cannot invalidate an entry while either request holds it.
     try std.testing.expectError(
         error.ResourceTemporarilyUnavailable,
-        manager.acquireWhisperCompositeAssets(other_root, &.{}),
+        manager.acquireCompositeAssets(other_root, &.{}),
     );
     second.release();
     first.release();
 
     // Once idle, the oldest generation is reclaimable and all admission-owned
     // tokenizer memory moves to the replacement entry.
-    var replacement = try manager.acquireWhisperCompositeAssets(other_root, &.{});
+    var replacement = try manager.acquireCompositeAssets(other_root, &.{});
     defer replacement.release();
-    try std.testing.expectEqual(@as(usize, 2), manager.whisper_assets.count());
+    try std.testing.expectEqual(@as(usize, 2), manager.composite_assets.count());
     try std.testing.expectEqual(@as(usize, 88), replacement.get().decoder_config.max_length);
+
+    // Publish a fake component pair through the real runtime cache. Warm
+    // acquisition must lend the exact sessions, and device pressure must see
+    // component leases even though the tokenizer resides in the CPU domain.
+    const Probe = struct {
+        closes: usize = 0,
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closes += 1;
+        }
+        fn session(self: *@This()) backends.Session {
+            return .{ .ptr = self, .vtable = &.{ .run = undefined, .runWithControl = undefined, .inputInfo = undefined, .outputInfo = undefined, .backend = undefined, .close = close } };
+        }
+    };
+    var probe = Probe{};
+    var controller = runtime.tier.memory.AdmissionController{};
+    const metadata_key = try manager.compositeRuntimeKey(root, &.{}, .whisper_metadata);
+    const runtime_key = try manager.compositeRuntimeKey(root, &.{}, .seq2seq);
+    try std.testing.expect(!std.mem.eql(u8, &metadata_key, &runtime_key));
+    const candidate = try manager.loadCompositeAssetsUncached(root, &.{}, metadata_key, .whisper_metadata, null);
+    candidate.prompt_cache.?.deinit();
+    candidate.prompt_cache = null;
+    candidate.generation = runtime_key;
+    candidate.kind = .seq2seq;
+    candidate.encoder = .{ .session = probe.session(), .resource_lease = try controller.tryAcquire(.gpu, .{}, .{ .backend_weight_bytes = 256 }, false) };
+    candidate.decoder = .{ .session = probe.session(), .resource_lease = null };
+    var published = try manager.publishCompositeAssets(runtime_key, candidate);
+    defer published.release();
+    var warm = try manager.acquireCompositeRuntime(root, &.{}, .seq2seq, null);
+    defer warm.release();
+    try std.testing.expectEqual(published.get(), warm.get());
+    try std.testing.expectEqual(candidate.encoder.?.session.ptr, warm.get().encoder.?.session.ptr);
+    manager.lockLoadedModels();
+    const pinned = manager.takeLruCompositeAssetsForAdmissionLocked(.{ .domain_backend = .gpu });
+    manager.unlockLoadedModels();
+    try std.testing.expect(pinned == null);
+    warm.release();
+    published.release();
+    manager.lockLoadedModels();
+    const evicted = manager.takeLruCompositeAssetsForAdmissionLocked(.{ .domain_backend = .gpu });
+    manager.unlockLoadedModels();
+    try std.testing.expect(evicted != null);
+    manager.destroyEvictedCompositeAssets(evicted.?);
+    try std.testing.expectEqual(@as(usize, 2), probe.closes);
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, controller.snapshot());
+}
+
+test "composite cold load cancellation abandons only the departing waiter" {
+    var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+    const flight = try std.testing.allocator.create(CompositeAssetsLoadFlight);
+    const key = [_]u8{0} ** 32;
+    flight.* = .{ .io = std.testing.io, .refs = 3, .load_state = .{ .io = std.testing.io } };
+    try std.testing.expect(flight.load_state.tryAddWaiter());
+    try manager.in_flight_composite_assets.put(std.testing.allocator, key, flight);
+    const Canceled = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    try std.testing.expectError(error.Cancelled, manager.waitForCompositeAssetsLoadFlight(key, flight, .{ .check_fn = Canceled.check }));
+    var load_control = LoadFlightControl{ .flight = &flight.load_state };
+    try load_control.control().check();
+    try std.testing.expectEqual(@as(usize, 2), flight.refs);
+    manager.finishCompositeAssetsLoadFlight(flight, null, error.TestLoadFailure);
+    try std.testing.expectError(error.TestLoadFailure, manager.waitForCompositeAssetsLoadFlight(key, flight, null));
+    manager.releaseCompositeAssetsLoadFlight(key, flight);
+    try std.testing.expectEqual(@as(usize, 0), manager.in_flight_composite_assets.count());
+}
+
+test "failed load flights allow immediate retry before the old task releases" {
+    const alloc = std.testing.allocator;
+    var manager = ModelManager.init(alloc, backends.SessionManager.init(alloc));
+    defer manager.deinit();
+    const key = [_]u8{1} ** 32;
+    const old = try alloc.create(CompositeAssetsLoadFlight);
+    old.* = .{ .io = std.testing.io, .refs = 2, .load_state = .{ .io = std.testing.io } };
+    try manager.in_flight_composite_assets.put(alloc, key, old);
+    manager.finishCompositeAssetsLoadFlight(old, null, error.ResourceTemporarilyUnavailable);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.waitForCompositeAssetsLoadFlight(key, old, null));
+    manager.lockLoadedModels();
+    const joinable = manager.joinableCompositeLoadFlightLocked(key);
+    manager.unlockLoadedModels();
+    try std.testing.expect(joinable == null);
+    try std.testing.expect(!old.registered);
+    const replacement = try alloc.create(CompositeAssetsLoadFlight);
+    replacement.* = .{ .io = std.testing.io, .load_state = .{ .io = std.testing.io } };
+    try manager.in_flight_composite_assets.put(alloc, key, replacement);
+    manager.releaseCompositeAssetsLoadFlight(key, old);
+    try std.testing.expect(manager.in_flight_composite_assets.get(key).? == replacement);
+    manager.releaseCompositeAssetsLoadFlight(key, replacement);
+
+    const old_model = try alloc.create(LoadFlight);
+    old_model.* = .{ .io = std.testing.io };
+    try manager.in_flight_loads.put(alloc, try alloc.dupe(u8, "retry"), old_model);
+    manager.finishLoadFlight(old_model, null, error.ResourceTemporarilyUnavailable);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.waitForLoadFlight("retry", old_model, null));
+    manager.lockLoadedModels();
+    const model_joinable = manager.joinableLoadFlightLocked("retry");
+    manager.unlockLoadedModels();
+    try std.testing.expect(model_joinable == null);
+    try std.testing.expect(!old_model.registered);
+    const new_model = try alloc.create(LoadFlight);
+    new_model.* = .{ .io = std.testing.io, .refs = 1 };
+    try manager.in_flight_loads.put(alloc, try alloc.dupe(u8, "retry"), new_model);
+    manager.releaseLoadFlight("retry", old_model);
+    try std.testing.expect(manager.in_flight_loads.get("retry").? == new_model);
+    manager.releaseLoadFlight("retry", new_model);
 }
 
 test "component compatibility rejects malformed directory-backed native artifacts" {
@@ -10297,10 +11194,13 @@ test "component plan invalidates lazy ONNX graphs and their external data" {
 
     // Updating a child in place does not change the component directory's
     // identity. The external-data file itself must invalidate the cached plan.
+    const composite_generation = try manager.compositeAssetGenerationSignature(root, &.{root});
+    try std.testing.expectEqualSlices(u8, &composite_generation, &(try manager.compositeAssetGenerationSignature(root, &.{root})));
     try dir.dir.writeFile(std.testing.io, .{
         .sub_path = "visual_model.data",
         .data = "truncated",
     });
+    try std.testing.expectError(error.IncompatibleModel, manager.compositeAssetGenerationSignature(root, &.{root}));
     try std.testing.expectError(
         error.IncompatibleModel,
         manager.componentLoaderForPathsWithContract(
@@ -11446,6 +12346,10 @@ fn appendTestMetadataF32Array(allocator: std.mem.Allocator, data: *std.ArrayList
     for (values) |value| try appendTestLe(u32, allocator, data, @bitCast(value));
 }
 
+test "gliner boundary cache pinned small Metal handle retention eviction and reload" {
+    try @import("gliner_boundary_cache_lifecycle_test.zig").exercise(.{ .run = ModelManager.evictExpiredAt, .close_timeout_ns = TeardownTicket.timeout_ns });
+}
+
 test "offline load runtime supplies a real hard cancellation boundary only for disposable processes" {
     const alloc = std.testing.allocator;
     var manager = ModelManager.init(alloc, .{ .allocator = alloc, .preferred_backends = &.{.metal}, .process_isolation_available = false });
@@ -11460,4 +12364,410 @@ test "offline load runtime supplies a real hard cancellation boundary only for d
     var guard = try control.enterUninterruptible(.process_required);
     guard.deinit();
     try std.testing.expectEqual(@as(usize, 0), manager.owned_load_watchdog.?.entries.items.len);
+}
+
+// One bounded test-only OS thread owns stderr while the actual watchdog must
+// terminate another thread. Ready is published only after the lock is held.
+const TeardownStderrBlocker = struct {
+    ready: std.atomic.Value(bool) = .init(false),
+    stopping: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+
+    fn hold(self: *@This()) void {
+        const locked = std.debug.lockStderr(&.{});
+        defer std.debug.unlockStderr();
+        locked.file_writer.interface.writeAll("teardown-fixture stderr-lock-held\n") catch return;
+        locked.file_writer.interface.flush() catch return;
+        self.ready.store(true, .release);
+        while (!self.stopping.load(.acquire)) std.atomic.spinLoopHint();
+    }
+
+    fn start(self: *@This()) !void {
+        self.thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, hold, .{self});
+        const deadline = platform.time.monotonicNs() + std.time.ns_per_s;
+        while (!self.ready.load(.acquire)) {
+            if (platform.time.monotonicNs() >= deadline) return error.StderrLockFixtureNotReady;
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn deinit(self: *@This()) void {
+        self.stopping.store(true, .release);
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+    }
+};
+
+const TeardownTestProbe = struct {
+    ticket: ?*TeardownTicket = null,
+    controller: ?*runtime.tier.memory.AdmissionController = null,
+    peer_ticket: ?*TeardownTicket = null,
+    constructor_entries: usize = 0,
+    closed: bool = false,
+    block: bool = false,
+    stderr_locked: bool = false,
+    wait_until_deadline: bool = false,
+
+    fn run(_: *anyopaque, _: []const backends.Tensor, allocator: std.mem.Allocator) ![]backends.Tensor {
+        return allocator.alloc(backends.Tensor, 0);
+    }
+    fn info(_: *anyopaque) []const backends.TensorInfo {
+        return &.{};
+    }
+    fn backend(_: *anyopaque) backends.BackendType {
+        return .metal;
+    }
+    fn close(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.closed) @panic("teardown fixture session closed twice");
+        const ticket = self.ticket.?;
+        if (ticket.deadline_ns.load(.acquire) == 0 or ticket.refs.load(.acquire) < 2)
+            @panic("teardown fixture session has no active close protection");
+        if (self.peer_ticket) |peer| {
+            if (peer.deadline_ns.load(.acquire) == 0)
+                @panic("teardown fixture peer protection is not active");
+        }
+        if (self.controller) |controller| {
+            if (controller.snapshot().host_weight_bytes != 64)
+                @panic("teardown fixture released admission before physical close");
+        }
+        if (self.block or self.wait_until_deadline) {
+            const marker: []const u8 = if (self.controller != null)
+                "teardown-fixture close-entered lease-held64\n"
+            else
+                "teardown-fixture close-entered no-lease\n";
+            if (self.stderr_locked) {
+                // Separate bounded regular-file output supplied by the child
+                // runner; never reacquire the deliberately held stderr lock.
+                std.Io.File.stdout().writeStreamingAll(std.testing.io, marker) catch
+                    @panic("teardown fixture marker write failed");
+            } else std.debug.print("{s}", .{marker});
+            if (self.block) while (true) std.atomic.spinLoopHint();
+            while (platform.time.monotonicNs() < ticket.deadline_ns.load(.acquire)) std.atomic.spinLoopHint();
+        }
+        self.closed = true;
+    }
+    const vtable = backends.Session.VTable{
+        .run = run,
+        .inputInfo = info,
+        .outputInfo = info,
+        .backend = backend,
+        .close = close,
+    };
+
+    fn session(self: *@This(), manager: *ModelManager) !backends.Session {
+        // The fake backend must not be entered before fallible protection.
+        const protection = (try manager.prepareSessionClose(.{ .backend = .metal })).?;
+        self.constructor_entries += 1;
+        self.ticket = @ptrCast(@alignCast(protection.ptr));
+        return .{ .ptr = self, .vtable = &vtable, .close_protection = protection };
+    }
+};
+
+fn teardownTestModel(manager: *ModelManager, probe: *TeardownTestProbe) !*LoadedModel {
+    const allocator = manager.allocator;
+    const model = try allocator.create(LoadedModel);
+    errdefer allocator.destroy(model);
+    const path = try allocator.dupe(u8, "teardown-fixture");
+    errdefer allocator.free(path);
+    var lease = try manager.acquireAmountsWithEviction(.cpu, .{ .host_limit_bytes = 64 }, .{ .host_weight_bytes = 64 });
+    errdefer lease.release();
+    probe.controller = manager.admissionController();
+    const session = try probe.session(manager);
+    model.* = .{
+        .manifest = .{ .allocator = allocator },
+        .hf_tok = null,
+        .sp_tok = null,
+        .session = session,
+        .session_manager = &manager.session_manager,
+        .model_manager = manager,
+        .model_dir = path,
+        .allocator = allocator,
+        .prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator),
+        .native_generation_graph_cache = graph_mod.cache.GraphCache.init(allocator),
+        .resource_lease = lease,
+    };
+    return model;
+}
+
+const TeardownCacheProbe = struct {
+    primary: *TeardownTestProbe,
+    optional: *TeardownTestProbe,
+    destroyed: bool = false,
+    block: bool = false,
+
+    fn destroy(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.destroyed or self.primary.closed or self.optional.closed)
+            @panic("teardown fixture cache destroyed after physical session close");
+        for ([_]*TeardownTestProbe{ self.primary, self.optional }) |session| {
+            const ticket = session.ticket.?;
+            if (ticket.deadline_ns.load(.acquire) == 0 or ticket.refs.load(.acquire) < 2)
+                @panic("teardown fixture cache has no active aggregate protection");
+        }
+        if (self.primary.controller.?.snapshot().host_weight_bytes != 64)
+            @panic("teardown fixture released admission before cached executor close");
+        if (self.block) {
+            std.debug.print("teardown-fixture cache-entered primary-and-optional-active lease-held64\n", .{});
+            while (true) std.atomic.spinLoopHint();
+        }
+        self.destroyed = true;
+    }
+
+    fn attach(self: *@This(), model: *LoadedModel) !void {
+        const key = graph_mod.cache.CacheKey{ .config_hash = 1, .batch = 1, .seq_len = 1, .attention_mode = .paged_decode };
+        var graph = ml.graph.Graph.init(model.allocator);
+        errdefer graph.deinit();
+        try model.native_generation_graph_cache.put(key, graph);
+        model.native_generation_graph_cache.getEntry(key).?.compiled_model_executor = .{ .ptr = self, .deinit = destroy };
+    }
+};
+
+test "model manager teardown starts both tickets before cached executor destruction" {
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native} });
+    defer manager.deinit();
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 64 });
+    try manager.ensureResourceOwnerReady();
+    var primary = TeardownTestProbe{};
+    const model = try teardownTestModel(&manager, &primary);
+    var model_owned = true;
+    defer if (model_owned) manager.destroyLoadedModel(model);
+    var optional = TeardownTestProbe{};
+    model.vision_session = try optional.session(&manager);
+    var cached = TeardownCacheProbe{ .primary = &primary, .optional = &optional };
+    try cached.attach(model);
+    try std.testing.expectEqual(@as(u64, 0), primary.ticket.?.deadline_ns.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), optional.ticket.?.deadline_ns.load(.acquire));
+    // No externally entered scope: only LoadedModel's production deinit can
+    // activate both tickets before the cached executor's destructor runs.
+    manager.destroyLoadedModel(model);
+    model_owned = false;
+    try std.testing.expect(cached.destroyed and primary.closed and optional.closed);
+    try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
+    try std.testing.expectEqual(@as(usize, 0), manager.teardown_domain.?.watchdog.entries.items.len);
+}
+
+test "model manager teardown composite keeps both peer tickets through ordered session cleanup" {
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native} });
+    defer manager.deinit();
+    var tokenizer = ManagedHfTokenizer{ .tokenizer = try hf_tokenizer.HfTokenizer.loadFromBytes(allocator,
+        \\{"version":"1.0","model":{"type":"BPE","vocab":{"<unk>":0},"merges":[]}}
+    ) };
+    defer tokenizer.deinit();
+    var encoder_probe = TeardownTestProbe{};
+    var encoder = ManagedSession{ .session = try encoder_probe.session(&manager) };
+    defer encoder.deinit();
+    var decoder_probe = TeardownTestProbe{};
+    var decoder = ManagedSession{ .session = try decoder_probe.session(&manager) };
+    defer decoder.deinit();
+    var assets = CompositeAssets{
+        .managed_tokenizer = tokenizer.take(),
+        .prompt_cache = null,
+        .encoder = encoder.take(),
+        .decoder = decoder.take(),
+        .kind = .seq2seq,
+        .decoder_config = .{},
+        .generation = @splat(0),
+    };
+    encoder_probe.peer_ticket = decoder_probe.ticket;
+    decoder_probe.peer_ticket = encoder_probe.ticket;
+    try std.testing.expectEqual(@as(u64, 0), encoder_probe.ticket.?.deadline_ns.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), decoder_probe.ticket.?.deadline_ns.load(.acquire));
+    assets.deinit();
+    try std.testing.expect(encoder_probe.closed and decoder_probe.closed);
+    try std.testing.expectEqual(@as(usize, 0), manager.teardown_domain.?.watchdog.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), manager.teardown_domain.?.refs.load(.acquire));
+}
+
+test "model manager teardown dormant ticket covers nested close without allocation or borrowed request" {
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native} });
+    defer manager.deinit();
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 64 });
+    try manager.ensureResourceOwnerReady();
+    var probe = TeardownTestProbe{};
+    const model = try teardownTestModel(&manager, &probe);
+    var optional_probe = TeardownTestProbe{};
+    model.vision_session = try optional_probe.session(&manager);
+    probe.peer_ticket = optional_probe.ticket;
+    const ticket = probe.ticket.?;
+    try std.testing.expectEqual(@as(u64, 0), ticket.deadline_ns.load(.acquire));
+    try std.testing.expect(manager.owned_load_watchdog == null);
+    try std.testing.expectEqual(@as(usize, 2), manager.teardown_domain.?.watchdog.entries.items.len);
+
+    // beginClose cannot allocate even when every future allocation is denied.
+    // The aggregate scope must preserve the ticket after Session.close drops
+    // its owning reference, until dependent-cache cleanup has also returned.
+    var scope = model.session.beginClose();
+    const deadline = ticket.deadline_ns.load(.acquire);
+    const domain = manager.teardown_domain.?;
+    var failure = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    const original_allocator = domain.watchdog.allocator;
+    domain.watchdog.allocator = failure.allocator();
+    manager.destroyLoadedModel(model);
+    domain.watchdog.allocator = original_allocator;
+    try std.testing.expect(probe.closed and optional_probe.closed);
+    try std.testing.expectEqual(deadline, ticket.deadline_ns.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), failure.alloc_index);
+    try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
+    try std.testing.expectEqual(@as(usize, 1), domain.watchdog.entries.items.len);
+    scope.deinit();
+    try std.testing.expectEqual(@as(usize, 0), domain.watchdog.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), domain.refs.load(.acquire));
+}
+
+test "model manager teardown raw session retains monitor and offline driver IO after manager" {
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native} });
+    var alive = true;
+    defer if (alive) manager.deinit();
+    var probe = TeardownTestProbe{};
+    var managed = ManagedSession{ .session = try probe.session(&manager) };
+    const escaped = managed.disownSession();
+    managed.deinit();
+    const domain = manager.teardown_domain.?;
+    const driver = domain.driver_io.?;
+    try std.testing.expectEqual(@as(usize, 2), driver.refs.load(.acquire));
+    manager.deinit();
+    alive = false;
+    try std.testing.expectEqual(@as(usize, 1), domain.refs.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), driver.refs.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), probe.ticket.?.deadline_ns.load(.acquire));
+    escaped.close();
+    try std.testing.expect(probe.closed);
+}
+
+test "model manager teardown rejects missing isolation and failed ticket before backend entry" {
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native}, .process_isolation_available = false });
+    defer manager.deinit();
+    try std.testing.expectError(error.ProcessIsolationRequired, manager.prepareSessionClose(.{ .backend = .metal }));
+    try std.testing.expect(manager.teardown_domain == null and manager.owned_load_runtime == null);
+    try std.testing.expect(try manager.prepareSessionClose(.{ .backend = .native }) == null);
+
+    manager.session_manager.process_isolation_available = true;
+    _ = try manager.loadCoordinationIoLocked();
+    const domain = try TeardownDomain.create(allocator, manager.owned_load_io_owner);
+    manager.teardown_domain = domain;
+    for (0..2) |fail_index| {
+        // Failure 0 is ticket allocation; failure 1 is watchdog entry arm.
+        var failure = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        domain.allocator = failure.allocator();
+        domain.watchdog.allocator = failure.allocator();
+        var probe = TeardownTestProbe{};
+        const result = probe.session(&manager);
+        domain.allocator = allocator;
+        domain.watchdog.allocator = allocator;
+        try std.testing.expectError(error.OutOfMemory, result);
+        try std.testing.expect(probe.ticket == null and !probe.closed);
+        try std.testing.expectEqual(@as(usize, 0), probe.constructor_entries);
+        try std.testing.expectEqual(@as(usize, 0), domain.watchdog.entries.items.len);
+        try std.testing.expectEqual(@as(usize, 1), domain.refs.load(.acquire));
+    }
+}
+
+// The process-level runner selects only this test, once per fresh child. Its
+// deadline is private test data, never a production option or environment knob.
+test "model manager teardown supervised child fixture" {
+    if (!builtin.is_test) unreachable;
+    const mode = if (std.c.getenv("ANTFLY_TEST_MANAGER_TEARDOWN_CHILD")) |raw| std.mem.span(raw) else return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native} });
+    var manager_alive = true;
+    defer if (manager_alive) manager.deinit();
+    var probe = TeardownTestProbe{ .block = true };
+    const stderr_close = std.mem.eql(u8, mode, "stderr-close");
+    const stderr_return = std.mem.eql(u8, mode, "stderr-return");
+    if (stderr_close or stderr_return) {
+        manager.configureAdmissionLimits(.{ .host_limit_bytes = 64 });
+        try manager.ensureResourceOwnerReady();
+        var lease: ?runtime.tier.memory.AdmissionLease = try manager.acquireAmountsWithEviction(.cpu, .{ .host_limit_bytes = 64 }, .{ .host_weight_bytes = 64 });
+        defer if (lease) |*owned| owned.release();
+        probe.controller = manager.admissionController();
+        probe.block = false;
+        var managed = ManagedSession{ .session = try probe.session(&manager), .resource_lease = lease };
+        lease = null;
+        defer managed.deinit();
+        probe.ticket.?.close_timeout_ns = 100 * std.time.ns_per_ms;
+        var blocker = TeardownStderrBlocker{};
+        defer blocker.deinit();
+        std.debug.print("teardown-fixture operation-start:{s}\n", .{mode});
+        if (stderr_return) {
+            // Isolate the final-release deadline check: the polling watcher
+            // cannot run until this exact check exits. Its mutex is test-only
+            // coordination, not a production clock or watchdog override.
+            const watchdog = manager.teardown_domain.?.watchdog;
+            spinLock(&watchdog.mutex);
+            defer watchdog.mutex.unlock();
+            std.debug.print("teardown-fixture final-check-isolated\n", .{});
+            try blocker.start();
+            probe.stderr_locked = true;
+            probe.wait_until_deadline = true;
+            managed.deinit();
+        } else {
+            try blocker.start();
+            probe.stderr_locked = true;
+            probe.block = true;
+            managed.deinit();
+        }
+        try std.Io.File.stdout().writeStreamingAll(std.testing.io, "teardown-fixture lease-released\n");
+        return error.ExpectedTeardownWatchdogExit;
+    } else if (std.mem.eql(u8, mode, "escaped")) {
+        var managed = ManagedSession{ .session = try probe.session(&manager) };
+        probe.ticket.?.close_timeout_ns = 100 * std.time.ns_per_ms;
+        const session = managed.disownSession();
+        managed.deinit();
+        manager.deinit();
+        manager_alive = false;
+        std.debug.print("teardown-fixture operation-start:{s}\n", .{mode});
+        session.close();
+    } else {
+        manager.configureAdmissionLimits(.{ .host_limit_bytes = 64 });
+        try manager.ensureResourceOwnerReady();
+        manager.configureModelCache(1, 1);
+        const model = try teardownTestModel(&manager, &probe);
+        probe.ticket.?.close_timeout_ns = 100 * std.time.ns_per_ms;
+        if (std.mem.eql(u8, mode, "cache")) {
+            // Exercise the existing compiled-executor destructor before any
+            // Session.close call; neither session nor test arms an outer scope.
+            probe.block = false;
+            var optional = TeardownTestProbe{};
+            model.vision_session = try optional.session(&manager);
+            optional.ticket.?.close_timeout_ns = 100 * std.time.ns_per_ms;
+            var cached = TeardownCacheProbe{ .primary = &probe, .optional = &optional, .block = true };
+            try cached.attach(model);
+            var handle = try manager.publishLoadedModel(model, true, null);
+            handle.release();
+            std.debug.print("teardown-fixture operation-start:{s}\n", .{mode});
+            manager.evictExpiredAt(model.last_used_ns + 2 * std.time.ns_per_ms);
+        } else if (std.mem.eql(u8, mode, "rollback")) {
+            std.debug.print("teardown-fixture operation-start:{s}\n", .{mode});
+            manager.destroyLoadedModel(model);
+        } else {
+            var handle = try manager.publishLoadedModel(model, true, null);
+            std.debug.print("teardown-fixture operation-start:{s}\n", .{mode});
+            if (std.mem.eql(u8, mode, "retired")) {
+                manager.retireLoadedModel(model);
+                handle.release();
+            } else {
+                handle.release();
+                if (std.mem.eql(u8, mode, "ttl")) {
+                    manager.evictExpiredAt(model.last_used_ns + 2 * std.time.ns_per_ms);
+                } else if (std.mem.eql(u8, mode, "admission")) {
+                    var unexpected = manager.acquireAmountsWithEviction(.cpu, .{ .host_limit_bytes = 64 }, .{ .host_weight_bytes = 64 }) catch |err| {
+                        std.debug.print("teardown-fixture operation-error:{s}\n", .{@errorName(err)});
+                        return err;
+                    };
+                    unexpected.release();
+                } else if (std.mem.eql(u8, mode, "shutdown")) {
+                    manager.deinit();
+                    manager_alive = false;
+                } else return error.InvalidTeardownFixtureMode;
+            }
+        }
+    }
+    std.debug.print("teardown-fixture cleanup-returned\n", .{});
+    return error.ExpectedTeardownWatchdogExit;
 }

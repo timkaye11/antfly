@@ -1,3 +1,17 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! HTTP Server Implementation for httpx.zig
 //!
 //! Production-ready HTTP server with comprehensive features:
@@ -34,6 +48,7 @@ const Allocator = mem.Allocator;
 const Io = std.Io;
 const milliTimestamp = @import("../util/common.zig").milliTimestamp;
 const encoding = @import("../util/encoding.zig");
+const attachment_envelope = @import("../util/attachment_envelope.zig");
 
 const types = @import("../core/types.zig");
 const Request = @import("../core/request.zig").Request;
@@ -387,6 +402,7 @@ pub const Context = struct {
     /// use this to retain transport ownership while application admission runs
     /// before a streaming upload is buffered.
     body_delegate: ?BodyDelegate = null,
+    body_read_offset: usize = 0,
 
     /// Streaming body reader for HTTP/2 requests where the body arrives
     /// incrementally (dispatch-on-HEADERS mode). Null for HTTP/1.1 or
@@ -412,7 +428,7 @@ pub const Context = struct {
 
     pub const StreamDelegate = struct {
         ptr: ?*anyopaque,
-        start: *const fn (?*anyopaque, u16) anyerror!void,
+        start: *const fn (?*anyopaque, u16, []const u8, *const Headers) anyerror!void,
         write: *const fn (?*anyopaque, []const u8) anyerror!void,
         close: *const fn (?*anyopaque) anyerror!void,
     };
@@ -420,7 +436,16 @@ pub const Context = struct {
     pub const BodyDelegate = struct {
         ptr: ?*anyopaque,
         read_all: *const fn (?*anyopaque) anyerror!?[]const u8,
+        read: ?*const fn (?*anyopaque, []u8) anyerror!usize = null,
         streaming: bool,
+    };
+
+    pub const RequestBodyReader = struct {
+        context: *Self,
+
+        pub fn read(self: *@This(), dest: []u8) !usize {
+            return self.context.readBodyChunk(dest);
+        }
     };
 
     /// Creates a new context for a request.
@@ -654,6 +679,65 @@ pub const Context = struct {
         return self.response.build();
     }
 
+    /// Reader for fixed-length HTTP/1 request bodies dispatched immediately
+    /// after headers. It consumes already-buffered body bytes first and never
+    /// reads beyond Content-Length, preserving a pipelined next request.
+    pub const H1StreamReader = struct {
+        allocator: Allocator,
+        io: Io,
+        sock: *Socket,
+        buffer: *[8192]u8,
+        leftover: *usize,
+        remaining: u64,
+        deadline_ms: i64,
+        owned_body: ?[]u8 = null,
+
+        pub fn deinit(self: *H1StreamReader) void {
+            if (self.owned_body) |body_bytes| self.allocator.free(body_bytes);
+            self.owned_body = null;
+        }
+
+        pub fn read(self: *H1StreamReader, dest: []u8) !usize {
+            if (dest.len == 0 or self.remaining == 0) return 0;
+            const requested = @min(dest.len, std.math.cast(usize, self.remaining) orelse dest.len);
+            if (self.leftover.* > 0) {
+                const n = @min(requested, self.leftover.*);
+                @memcpy(dest[0..n], self.buffer[0..n]);
+                if (n < self.leftover.*)
+                    std.mem.copyForwards(u8, self.buffer[0 .. self.leftover.* - n], self.buffer[n..self.leftover.*]);
+                self.leftover.* -= n;
+                self.remaining -= n;
+                return n;
+            }
+            try applyReadDeadline(self.sock, self.io, self.deadline_ms);
+            const n = try self.sock.recv(dest[0..requested]);
+            if (n == 0) return error.EndOfStream;
+            self.remaining -= n;
+            return n;
+        }
+
+        fn readErased(ptr: ?*anyopaque, dest: []u8) anyerror!usize {
+            const self: *H1StreamReader = @ptrCast(@alignCast(ptr orelse return error.EndOfStream));
+            return self.read(dest);
+        }
+
+        fn readAllErased(ptr: ?*anyopaque) anyerror!?[]const u8 {
+            const self: *H1StreamReader = @ptrCast(@alignCast(ptr orelse return error.EndOfStream));
+            if (self.owned_body != null) return self.owned_body.?;
+            const len = std.math.cast(usize, self.remaining) orelse return error.BodyTooLarge;
+            const body_bytes = try self.allocator.alloc(u8, len);
+            errdefer self.allocator.free(body_bytes);
+            var offset: usize = 0;
+            while (offset < body_bytes.len) {
+                const n = try self.read(body_bytes[offset..]);
+                if (n == 0) return error.EndOfStream;
+                offset += n;
+            }
+            self.owned_body = body_bytes;
+            return body_bytes;
+        }
+    };
+
     /// Reader for server-side HTTP/2 streaming request bodies.
     /// Reads incrementally from the stream's data_buf mailbox, waiting
     /// on data_event when no data is available. Returns 0 (EOF) when
@@ -721,9 +805,9 @@ pub const Context = struct {
         }
     };
 
-    /// Returns the request body, buffering from the streaming H2 reader if needed.
-    /// For HTTP/1.1 this returns request.body directly. For HTTP/2 streaming,
-    /// reads the entire body on first call.
+    /// Returns the request body, materializing an incremental transport reader
+    /// when needed. Ordinary HTTP/1 requests return request.body directly;
+    /// opted-in fixed-length HTTP/1 and streaming HTTP/2 bodies are read once.
     pub fn body(self: *Self) !?[]const u8 {
         if (self.request.body != null) return self.request.body;
         if (self.body_delegate) |delegate| {
@@ -748,6 +832,35 @@ pub const Context = struct {
             return self.request.body;
         }
         return null;
+    }
+
+    /// Return an incremental reader over whichever transport owns the request
+    /// body. Buffered H1 requests borrow their existing slice; H2 and linked
+    /// delegates can release transport chunks as the application consumes
+    /// them. Calling code must choose either this reader or body(), not both.
+    pub fn requestBodyReader(self: *Self) RequestBodyReader {
+        return .{ .context = self };
+    }
+
+    fn readBodyChunk(self: *Self, dest: []u8) !usize {
+        if (dest.len == 0) return 0;
+        if (self.request.body) |body_bytes| {
+            if (self.body_read_offset >= body_bytes.len) return 0;
+            const n = @min(dest.len, body_bytes.len - self.body_read_offset);
+            @memcpy(dest[0..n], body_bytes[self.body_read_offset..][0..n]);
+            self.body_read_offset += n;
+            return n;
+        }
+        if (self.body_delegate) |delegate| {
+            if (delegate.read) |read| return read(delegate.ptr, dest);
+            const data = (try delegate.read_all(delegate.ptr)) orelse return 0;
+            self.request.body = data;
+            self.request.body_owned = false;
+            self.body_delegate = null;
+            return self.readBodyChunk(dest);
+        }
+        if (self.h2_body_reader) |reader| return reader.read(dest);
+        return 0;
     }
 
     /// Charge transformed request-body capacity to the server-wide body
@@ -1006,18 +1119,28 @@ pub const Context = struct {
     /// return ctx.response.build(); // return value is ignored for streams
     /// ```
     pub fn streamResponse(self: *Self, status_code: u16) !StreamWriter {
+        return try self.streamResponseWithContentType(status_code, "text/event-stream; charset=utf-8");
+    }
+
+    /// Starts a transport-native streaming response with an explicit media
+    /// type. This is the general body-streaming primitive; `streamResponse`
+    /// remains the SSE convenience wrapper.
+    pub fn streamResponseWithContentType(self: *Self, status_code: u16, content_type: []const u8) !StreamWriter {
         if (self.stream_delegate) |delegate| {
-            try delegate.start(delegate.ptr, status_code);
+            _ = try self.response.header(HeaderName.CONTENT_TYPE, content_type);
+            self.response.headers.removeAll(HeaderName.CONTENT_LENGTH);
+            self.response.headers.removeAll(HeaderName.TRANSFER_ENCODING);
+            try delegate.start(delegate.ptr, status_code, content_type, &self.response.headers);
             return .{ .h1_sock = null, .h2_writer = null, .delegate = delegate };
         }
         // Middleware has already established response policy (e.g. CORS).
-        // Copy it before committing headers, then let the transport own SSE
+        // Copy it before committing headers, then let the transport own the
         // content type and framing. Never reuse a buffered Content-Length.
         var headers = try self.response.headers.clone(self.allocator);
         defer headers.deinit();
-        _ = headers.remove(HeaderName.CONTENT_LENGTH);
-        _ = headers.remove(HeaderName.TRANSFER_ENCODING);
-        try headers.set(HeaderName.CONTENT_TYPE, "text/event-stream; charset=utf-8");
+        headers.removeAll(HeaderName.CONTENT_LENGTH);
+        headers.removeAll(HeaderName.TRANSFER_ENCODING);
+        try headers.set(HeaderName.CONTENT_TYPE, content_type);
         if (!headers.contains(HeaderName.CACHE_CONTROL)) try headers.set(HeaderName.CACHE_CONTROL, "no-cache");
         if (self.h2 != null) {
             var extra = std.ArrayListUnmanaged(hpack.HeaderEntry).empty;
@@ -1482,6 +1605,13 @@ pub const Server = struct {
         try self.router.addWithBodyLimit(method, path, handler, max_body_size);
     }
 
+    /// Register a route whose fixed-length body may be consumed incrementally
+    /// after header parsing. Transport-specific framing still decides whether
+    /// a particular request is safe to stream.
+    pub fn routeStreaming(self: *Self, method: types.Method, path: []const u8, handler: anytype) !void {
+        try self.router.addStreaming(method, path, handler);
+    }
+
     /// Registers a route with borrowed opaque data copied into Context.
     pub fn routeWithData(self: *Self, method: types.Method, path: []const u8, handler: anytype, data: *anyopaque) !void {
         try self.router.addWithData(method, path, handler, data);
@@ -1495,6 +1625,18 @@ pub const Server = struct {
     /// Registers a POST route.
     pub fn post(self: *Self, path: []const u8, handler: anytype) !void {
         try self.route(.POST, path, handler);
+    }
+
+    /// Buffered request, streaming response. Native contexts already own the
+    /// transport; route-manifest adapters use this declaration to lend that
+    /// capability to independently compiled handlers. This is not a streamed
+    /// request body (see postStreaming).
+    pub fn postResponseStreaming(self: *Self, path: []const u8, handler: anytype) !void {
+        try self.post(path, handler);
+    }
+
+    pub fn postStreaming(self: *Self, path: []const u8, handler: anytype) !void {
+        try self.routeStreaming(.POST, path, handler);
     }
 
     pub fn postWithBodyLimit(self: *Self, path: []const u8, max_body_size: usize, handler: anytype) !void {
@@ -1924,6 +2066,8 @@ pub const Server = struct {
             parser.request_body_limit_context = self;
             parser.request_body_limit_resolver = resolveRequestBodyLimit;
         }
+        parser.request_body_streaming_context = self;
+        parser.request_body_streaming_resolver = resolveRequestBodyStreaming;
 
         var first_request = true;
         var request_active = false;
@@ -2057,7 +2201,7 @@ pub const Server = struct {
                 }
             }
 
-            if (h1_body_reserved) {
+            if (h1_body_reserved and !parser.headers_only) {
                 self.h1_body_budget.release(1);
                 h1_body_reserved = false;
             }
@@ -2123,6 +2267,24 @@ pub const Server = struct {
             ctx.max_request_body_size = resolveRequestBodyLimit(self, req.method, req.uri.path) orelse self.config.max_body_size;
             req.body_budget = &self.body_budget;
             ctx.h1_sock = &sock;
+            var h1_stream_reader: ?Context.H1StreamReader = if (parser.headers_only and parser.content_length.? > 0) .{
+                .allocator = self.allocator,
+                .io = self.io,
+                .sock = &sock,
+                .buffer = &buffer,
+                .leftover = &leftover,
+                .remaining = parser.content_length.?,
+                .deadline_ms = deadlineAfter(self.io, self.config.body_read_timeout_ms),
+            } else null;
+            defer if (h1_stream_reader) |*reader| reader.deinit();
+            if (h1_stream_reader) |*reader| {
+                ctx.body_delegate = .{
+                    .ptr = reader,
+                    .read_all = Context.H1StreamReader.readAllErased,
+                    .read = Context.H1StreamReader.readErased,
+                    .streaming = true,
+                };
+            }
             const reaches_request_limit = self.config.max_requests_per_connection > 0 and
                 request_count + 1 >= self.config.max_requests_per_connection;
             ctx.h1_keep_alive = self.config.keep_alive and
@@ -2238,13 +2400,22 @@ pub const Server = struct {
             // for the next request, similar to Go's net/http finishRequest.
             if (parser.content_length) |cl| {
                 const body_read = parser.getBody().len;
-                var remaining: u64 = if (cl > body_read) cl - body_read else 0;
+                var remaining: u64 = if (h1_stream_reader) |reader|
+                    reader.remaining
+                else if (cl > body_read)
+                    cl - body_read
+                else
+                    0;
                 const max_drain: u64 = 256 * 1024; // Match Go's 256 KB limit.
                 if (remaining > max_drain) return; // Too much to drain; close.
                 var drain_buf: [8192]u8 = undefined;
                 while (remaining > 0) {
-                    const to_read = @min(remaining, drain_buf.len);
-                    const n = sock.recv(drain_buf[0..@intCast(to_read)]) catch return;
+                    const n = if (h1_stream_reader) |*reader|
+                        reader.read(&drain_buf) catch return
+                    else blk: {
+                        const to_read = @min(remaining, drain_buf.len);
+                        break :blk sock.recv(drain_buf[0..@intCast(to_read)]) catch return;
+                    };
                     if (n == 0) return;
                     remaining -= n;
                 }
@@ -2265,7 +2436,9 @@ pub const Server = struct {
     /// Admit an HTTP/1 request body as soon as headers identify it, rather
     /// than after the parser has waited for an attacker-controlled upload.
     fn reserveH1BodyAfterHeaders(self: *Self, parser: *const Parser, reserved: *bool) bool {
-        if (reserved.* or !parser.hasCompleteHeaders() or parser.isComplete()) return true;
+        if (reserved.* or !parser.hasCompleteHeaders()) return true;
+        if (parser.isComplete() and !parser.headers_only) return true;
+        if (parser.content_length == null and !parser.chunked) return true;
         if (!self.h1_body_budget.tryReserve(1)) return false;
         reserved.* = true;
         return true;
@@ -2276,6 +2449,19 @@ pub const Server = struct {
         const path = if (mem.indexOfScalar(u8, request_target, '?')) |query| request_target[0..query] else request_target;
         const route_limit = self.router.bodySizeLimit(method, path) orelse return null;
         return @min(route_limit, self.config.max_body_size);
+    }
+
+    fn resolveRequestBodyStreaming(ptr: *anyopaque, method: types.Method, request_target: []const u8, content_type_value: ?[]const u8) bool {
+        if (method != .POST and method != .PUT and method != .PATCH) return false;
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        const query_start = mem.indexOfScalar(u8, request_target, '?') orelse request_target.len;
+        if (!self.router.streamsRequestBody(method, request_target[0..query_start])) return false;
+        const content_type = content_type_value orelse return false;
+        const separator = mem.indexOfScalar(u8, content_type, ';') orelse content_type.len;
+        return std.ascii.eqlIgnoreCase(
+            mem.trim(u8, content_type[0..separator], " \t"),
+            attachment_envelope.content_type,
+        );
     }
 
     /// Handles an HTTP/1.1 → HTTP/2 upgrade (h2c, RFC 7540 §3.2).
@@ -3705,6 +3891,37 @@ test "route body limits resolve before transport body admission" {
     try std.testing.expectEqual(@as(?usize, null), Server.resolveRequestBodyLimit(&server, .POST, "/global"));
 }
 
+test "attachment body streaming requires route opt-in and framed content type" {
+    var server = Server.init(std.testing.allocator, std.testing.io);
+    defer server.deinit();
+    const handler = struct {
+        fn h(ctx: *Context) !Response {
+            return ctx.text("ok");
+        }
+    }.h;
+    try server.postStreaming("/stream/:id", handler);
+    try server.post("/buffered", handler);
+
+    try std.testing.expect(Server.resolveRequestBodyStreaming(
+        &server,
+        .POST,
+        "/stream/7?x=1",
+        attachment_envelope.content_type,
+    ));
+    try std.testing.expect(!Server.resolveRequestBodyStreaming(
+        &server,
+        .POST,
+        "/buffered",
+        attachment_envelope.content_type,
+    ));
+    try std.testing.expect(!Server.resolveRequestBodyStreaming(
+        &server,
+        .POST,
+        "/stream/7",
+        "application/json",
+    ));
+}
+
 test "Context queryDecoded decodes percent escapes exactly once" {
     const allocator = std.testing.allocator;
     var req = try Request.init(
@@ -3956,6 +4173,75 @@ test "H1 body deadline starts after headers and rejects a stalled upload" {
     try std.testing.expect(!State.handled.load(.acquire));
 }
 
+test "H1 opted-in framed route dispatches before the full body arrives" {
+    const State = struct {
+        var started = std.atomic.Value(bool).init(false);
+
+        fn handler(ctx: *Context) anyerror!Response {
+            started.store(true, .release);
+            var reader = ctx.requestBodyReader();
+            var body: [3]u8 = undefined;
+            var offset: usize = 0;
+            while (offset < body.len) {
+                const n = try reader.read(body[offset..]);
+                if (n == 0) return error.EndOfStream;
+                offset += n;
+            }
+            if (!mem.eql(u8, &body, "xyz")) return error.TestUnexpectedResult;
+            return ctx.text("streamed");
+        }
+    };
+    State.started.store(false, .release);
+
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(allocator, io_impl.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .body_read_timeout_ms = 2_000,
+        .h1_disconnect_cancellation = .disabled,
+    });
+    defer server.deinit();
+    try server.postStreaming("/upload", State.handler);
+    try server.bind();
+
+    const listener_thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *Server) void {
+            s.listen() catch |err| std.debug.panic("streaming-body listener failed: {}", .{err});
+        }
+    }.run, .{&server});
+    defer {
+        server.stop();
+        listener_thread.join();
+    }
+    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+
+    const client_io = std.Io.Threaded.global_single_threaded.io();
+    var client = try Socket.connect(server.boundAddress().?, client_io);
+    defer client.close();
+    try client.setRecvTimeout(5_000);
+    try client.sendAll(
+        "POST /upload HTTP/1.1\r\n" ++
+            "Host: test\r\n" ++
+            "Content-Type: application/vnd.antfly.attachments.v1\r\n" ++
+            "Content-Length: 3\r\n" ++
+            "Connection: close\r\n\r\n" ++
+            "x",
+    );
+
+    const start_deadline = milliTimestamp(client_io) + 1_000;
+    while (!State.started.load(.acquire) and milliTimestamp(client_io) < start_deadline)
+        std.Thread.yield() catch {};
+    const dispatched_before_full_body = State.started.load(.acquire);
+    try client.sendAll("yz");
+    try std.testing.expect(dispatched_before_full_body);
+
+    var response: [1024]u8 = undefined;
+    const n = try client.recv(&response);
+    try std.testing.expect(mem.indexOf(u8, response[0..n], "streamed") != null);
+}
+
 test "H1 oversized content length returns 413 before handler admission" {
     const State = struct {
         var handled = std.atomic.Value(usize).init(0);
@@ -4045,11 +4331,11 @@ test "H1 oversized content length returns 413 before handler admission" {
 
 test "HTTP streaming headers and automatic preflight preserve middleware policy" {
     const State = struct {
-        fn request(alloc: Allocator, io: Io, address: Address, http2: bool, method: types.Method, origin: ?[]const u8) !Response {
+        fn request(alloc: Allocator, io: Io, address: Address, http2: bool, method: types.Method, origin: ?[]const u8, path: []const u8) !Response {
             if (!http2) {
                 var client = @import("../client/client.zig").Client.initWithConfig(alloc, io, .{ .keep_alive = false, .timeouts = .uniform(5000) });
                 defer client.deinit();
-                const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/stream", .{address.getPort()});
+                const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}{s}", .{ address.getPort(), path });
                 defer alloc.free(url);
                 const headers = [_][2][]const u8{.{ "Origin", origin orelse "" }};
                 return client.request(method, url, .{ .headers = if (origin != null) &headers else null });
@@ -4065,7 +4351,7 @@ test "HTTP streaming headers and automatic preflight preserve middleware policy"
             try h2.sendClientPreface(&socket);
             const stream = try h2.stream_manager.createStream();
             const extra = [_]hpack.HeaderEntry{.{ .name = "origin", .value = origin orelse "" }};
-            const headers = try H2Connection.buildRequestHeaders(method.toString(), "/stream", "http", "localhost", if (origin != null) &extra else &.{}, alloc);
+            const headers = try H2Connection.buildRequestHeaders(method.toString(), path, "http", "localhost", if (origin != null) &extra else &.{}, alloc);
             defer alloc.free(headers);
             try h2.sendHeaders(&socket, stream.id, headers, true);
             while (!stream.completed) _ = try h2.processOneFrame(&socket, &socket);
@@ -4104,8 +4390,9 @@ test "HTTP streaming headers and automatic preflight preserve middleware policy"
             try ctx.setHeader("Content-Type", "application/json");
             try ctx.response.headers.append("Set-Cookie", "one=1");
             try ctx.response.headers.append("Set-Cookie", "two=2");
-            var writer = try ctx.streamResponse(200);
-            try writer.writeEvent("done", "{}");
+            const rows = mem.eql(u8, ctx.request.uri.path, "/rows");
+            var writer = if (rows) try ctx.streamResponseWithContentType(200, "application/x-ndjson") else try ctx.streamResponse(200);
+            if (rows) try writer.write("{}\n") else try writer.writeEvent("done", "{}");
             try writer.close();
             return ctx.response.build();
         }
@@ -4117,6 +4404,7 @@ test "HTTP streaming headers and automatic preflight preserve middleware policy"
     defer server.deinit();
     try server.use(.{ .name = "policy", .handler = State.policy });
     try server.get("/stream", State.handler);
+    try server.get("/rows", State.handler);
     try server.bind();
     var thread = try std.testing.io.concurrent(struct {
         fn run(s: *Server) void {
@@ -4129,7 +4417,7 @@ test "HTTP streaming headers and automatic preflight preserve middleware policy"
     }
     while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     for ([_]bool{ false, true }) |http2| {
-        var stream = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .GET, "https://allowed.example");
+        var stream = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .GET, "https://allowed.example", "/stream");
         defer stream.deinit();
         try std.testing.expectEqualStrings("https://allowed.example", stream.headers.get("Access-Control-Allow-Origin").?);
         try std.testing.expectEqualStrings("true", stream.headers.get("Access-Control-Allow-Credentials").?);
@@ -4142,15 +4430,21 @@ test "HTTP streaming headers and automatic preflight preserve middleware policy"
             if (std.ascii.eqlIgnoreCase(header.name, "Set-Cookie")) cookies += 1;
         }
         try std.testing.expectEqual(@as(usize, 2), cookies);
-        var preflight = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .OPTIONS, "https://allowed.example");
+        var rows = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .GET, "https://allowed.example", "/rows");
+        defer rows.deinit();
+        try std.testing.expectEqualStrings("application/x-ndjson", rows.contentType().?);
+        try std.testing.expectEqualStrings("{}\n", rows.body.?);
+        try std.testing.expectEqualStrings("https://allowed.example", rows.headers.get("Access-Control-Allow-Origin").?);
+        try std.testing.expectEqualStrings("stream-request", rows.headers.get("X-Request-ID").?);
+        var preflight = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .OPTIONS, "https://allowed.example", "/stream");
         defer preflight.deinit();
         try std.testing.expectEqual(@as(u16, 204), preflight.status.code);
         try std.testing.expectEqualStrings("GET", preflight.headers.get("Access-Control-Allow-Methods").?);
-        var denied = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .OPTIONS, "https://denied.example");
+        var denied = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .OPTIONS, "https://denied.example", "/stream");
         defer denied.deinit();
         try std.testing.expectEqual(@as(u16, 403), denied.status.code);
         try std.testing.expect(denied.headers.get("Access-Control-Allow-Origin") == null);
-        var automatic = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .OPTIONS, null);
+        var automatic = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .OPTIONS, null, "/stream");
         defer automatic.deinit();
         try std.testing.expectEqual(@as(u16, 204), automatic.status.code);
         try std.testing.expectEqualStrings("GET, OPTIONS", automatic.headers.get("Allow").?);

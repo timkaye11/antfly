@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const inference_provider = @import("inference_provider.zig");
 const lease_executor = @import("lease_executor.zig");
 const builtin = @import("builtin");
 const platform_sync = @import("antfly_platform").sync;
@@ -30,8 +31,16 @@ const inference_bridge = @import("inference_bridge.zig");
 const inference_connection_abi = @import("../inference_connection_abi.zig");
 const internal_service_auth = @import("../api/internal_service_auth.zig");
 const runtime_http_abi = @import("../runtime_http_abi.zig");
+const kernel_owner_client = @import("../storage/kernel_owner_client.zig");
+const storage_source_options = @import("storage_source_options");
+const control_only_storage_sources = storage_source_options.control_only;
+const LegacyLiteHandle = if (control_only_storage_sources) struct {} else antfly.lite.backend.Handle;
+const LegacyAuthBackend = if (control_only_storage_sources) struct {} else antfly.lsm_backend.BackendHandle;
+const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const inline_inference_codegen = builtin.is_test;
 const inference_host = if (inline_inference_codegen) @import("inference_host.zig") else struct {};
+const inference_chunker = @import("inference_chunker");
+const chunking_types = @import("../chunking/types.zig");
 
 const ApiHttpServer = antfly.public_api.ApiHttpServer;
 const ApiKernelHandler = antfly.public_api.kernel_bridge.HttpxHandler;
@@ -40,12 +49,11 @@ const public_api_max_requests_per_connection: u32 = 64;
 const public_api_max_body_size: usize = antfly.common.http.default_max_request_bytes;
 const local_schema_migration_finalize_interval_ms: u64 = std.time.ms_per_s;
 
-const LocalInferenceConnectionContext = struct {
-    handle: *anyopaque,
-};
+const LocalInferenceConnectionContext = inference_provider.LocalInferenceConnectionContext;
 
 const LocalSchemaProgressProvider = struct {
     ptr: *anyopaque,
+    shard_db_adapter: ?antfly.metadata.ShardDbAdapter = null,
     collect: *const fn (
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -71,7 +79,10 @@ const standalone_session_cleanup_interval_ns: u64 = std.time.ns_per_min;
 const standalone_session_max_count: usize = 1024;
 const standalone_session_max_record_bytes: usize = 16 * 1024 * 1024;
 const standalone_session_savepoint_limit: usize = 64;
-const antfarm_installed_asset_root = "../share/antfly/antfarm";
+const antfarm_installed_asset_roots = [_][]const u8{
+    "../share/antfly/antfarm", // Prefix installation: bin/antfly.
+    "share/antfly/antfarm", // Release archive: antfly at the archive root.
+};
 const antfarm_asset_roots = [_][]const u8{
     "zig/pkg/antfly/antfarm",
     "pkg/antfly/antfarm",
@@ -148,10 +159,10 @@ const CliConfig = struct {
     ha_retention_max_lag_lsn: ?u64 = null,
     ha_retention_max_retained_bytes: ?u64 = null,
     ha_retention_max_retained_age_ns: ?u64 = null,
-    ha_sync_mode: ?antfly.ha.primary.DurabilityMode = null,
-    ha_sync_selection: ?antfly.ha.primary.StandbySelection = null,
+    ha_sync_mode: ?antfly.hot_standby.primary.DurabilityMode = null,
+    ha_sync_selection: ?antfly.hot_standby.primary.StandbySelection = null,
     ha_sync_required: ?usize = null,
-    ha_sync_failure_policy: ?antfly.ha.primary.FailurePolicy = null,
+    ha_sync_failure_policy: ?antfly.hot_standby.primary.FailurePolicy = null,
     ha_sync_standby_names: std.ArrayListUnmanaged([]const u8) = .empty,
     ha_standby_log: ?[]const u8 = null,
     ha_standby_progress: ?[]const u8 = null,
@@ -237,7 +248,7 @@ fn resolveKernelJitMode(
 const RuntimeLeaseWatchdog = struct {
     const ObservationFailureStage = enum { fetch, validation };
 
-    watchdog: antfly.ha.kubernetes_lease_watchdog.Watchdog,
+    watchdog: antfly.hot_standby.kubernetes_lease_watchdog.Watchdog,
     io: std.Io,
     executor: lease_executor.LeaseExecutor,
     uri: []u8,
@@ -277,15 +288,15 @@ const RuntimeLeaseWatchdog = struct {
         const grace_ms = std.fmt.parseInt(u64, grace_raw, 10) catch return error.HALeaseGraceInvalid;
         if (grace_ms < ha_lease_min_grace_ms or grace_ms >= 30_000) return error.HALeaseGraceInvalid;
         const requested_generation = cli.ha_startup_generation orelse "initial";
-        const sentinel_generation = try antfly.ha.kubernetes_lease_watchdog.loadSentinelGenerationAlloc(alloc, io, sentinel_path);
+        const sentinel_generation = try antfly.hot_standby.kubernetes_lease_watchdog.loadSentinelGenerationAlloc(alloc, io, sentinel_path);
         defer if (sentinel_generation) |generation| alloc.free(generation);
         const repaired_generation = if (sentinel_generation != null)
-            try antfly.ha.kubernetes_lease_watchdog.loadValidatedRepairGenerationAlloc(alloc, io, sentinel_path, topology_id, node_id)
+            try antfly.hot_standby.kubernetes_lease_watchdog.loadValidatedRepairGenerationAlloc(alloc, io, sentinel_path, topology_id, node_id)
         else
             null;
         errdefer if (repaired_generation) |generation| alloc.free(generation);
         if (repaired_generation) |generation| {
-            try antfly.ha.kubernetes_lease_watchdog.rotateSentinelAfterValidatedRepair(
+            try antfly.hot_standby.kubernetes_lease_watchdog.rotateSentinelAfterValidatedRepair(
                 alloc,
                 io,
                 sentinel_path,
@@ -298,7 +309,7 @@ const RuntimeLeaseWatchdog = struct {
         var entropy: [32]u8 = undefined;
         try io.randomSecure(&entropy);
         const process_boot_id = std.fmt.bytesToHex(entropy, .lower);
-        const scope = antfly.ha.kubernetes_lease_watchdog.Scope{
+        const scope = antfly.hot_standby.kubernetes_lease_watchdog.Scope{
             .topology_id = topology_id,
             .node_id = node_id,
             .data_generation = data_generation,
@@ -307,7 +318,7 @@ const RuntimeLeaseWatchdog = struct {
         var executor = try lease_executor.LeaseExecutor.init(
             alloc,
             io,
-            env.get("ANTFLY_HA_LEASE_CA_PATH") orelse antfly.ha.kubernetes_lease_watchdog.service_account_ca_path,
+            env.get("ANTFLY_HA_LEASE_CA_PATH") orelse antfly.hot_standby.kubernetes_lease_watchdog.service_account_ca_path,
             ha_lease_max_response_bytes,
         );
         errdefer executor.deinit();
@@ -319,8 +330,8 @@ const RuntimeLeaseWatchdog = struct {
             }, sentinel_generation, repaired_generation),
             .io = io,
             .executor = executor,
-            .uri = try antfly.ha.kubernetes_lease_watchdog.leaseURLAlloc(alloc, api_endpoint.host, api_endpoint.port, namespace, lease_name),
-            .token_path = env.get("ANTFLY_HA_LEASE_TOKEN_PATH") orelse antfly.ha.kubernetes_lease_watchdog.service_account_token_path,
+            .uri = try antfly.hot_standby.kubernetes_lease_watchdog.leaseURLAlloc(alloc, api_endpoint.host, api_endpoint.port, namespace, lease_name),
+            .token_path = env.get("ANTFLY_HA_LEASE_TOKEN_PATH") orelse antfly.hot_standby.kubernetes_lease_watchdog.service_account_token_path,
             .lease_name = lease_name,
             .lease_namespace = namespace,
             .stable_topology_id = topology_id,
@@ -332,7 +343,7 @@ const RuntimeLeaseWatchdog = struct {
         };
     }
 
-    fn proofSource(self: *const RuntimeLeaseWatchdog) antfly.ha.http_admin.Server.AuthOptions.LeaseWatchdogProofSource {
+    fn proofSource(self: *const RuntimeLeaseWatchdog) antfly.hot_standby.http_admin.Server.AuthOptions.LeaseWatchdogProofSource {
         return .{ .ptr = self, .snapshot_fn = proofSnapshot };
     }
 
@@ -346,13 +357,13 @@ const RuntimeLeaseWatchdog = struct {
         self.watchdog.cfg.scope.process_boot_id = &self.process_boot_id;
     }
 
-    fn repairReceiptSink(self: *RuntimeLeaseWatchdog) antfly.ha.http_admin.Server.AuthOptions.RepairReceiptSink {
+    fn repairReceiptSink(self: *RuntimeLeaseWatchdog) antfly.hot_standby.http_admin.Server.AuthOptions.RepairReceiptSink {
         return .{ .ptr = self, .record_fn = recordRepairReceipt };
     }
 
-    fn recordRepairReceipt(ptr: *anyopaque, result: antfly.ha.rejoin.RewindResult) !void {
+    fn recordRepairReceipt(ptr: *anyopaque, result: antfly.hot_standby.rejoin.RewindResult) !void {
         const self: *RuntimeLeaseWatchdog = @ptrCast(@alignCast(ptr));
-        _ = try antfly.ha.kubernetes_lease_watchdog.persistRepairReceipt(
+        _ = try antfly.hot_standby.kubernetes_lease_watchdog.persistRepairReceipt(
             self.executor.alloc,
             self.io,
             self.watchdog.cfg.sentinel_path,
@@ -416,7 +427,7 @@ const RuntimeLeaseWatchdog = struct {
         const poll_started_ns = platform_time.authorityNs();
         if (poll_started_ns < self.next_poll_ns) return;
         self.next_poll_ns = poll_started_ns +| ha_lease_poll_interval_ns;
-        const body = antfly.ha.kubernetes_lease_watchdog.fetchLeaseAlloc(
+        const body = antfly.hot_standby.kubernetes_lease_watchdog.fetchLeaseAlloc(
             alloc,
             io,
             self.executor.executor(),
@@ -457,7 +468,7 @@ const RuntimeLeaseWatchdog = struct {
     // process remains inactive.
     fn publishValidatedObservationLocked(
         self: *RuntimeLeaseWatchdog,
-        decision: antfly.ha.kubernetes_lease_watchdog.Decision,
+        decision: antfly.hot_standby.kubernetes_lease_watchdog.Decision,
         observed_monotonic_ns: u64,
     ) void {
         switch (decision) {
@@ -474,7 +485,7 @@ const RuntimeLeaseWatchdog = struct {
     }
 
     const ObservationFailureTransition = struct {
-        decision: antfly.ha.kubernetes_lease_watchdog.Decision,
+        decision: antfly.hot_standby.kubernetes_lease_watchdog.Decision,
         should_log: bool,
     };
 
@@ -515,11 +526,11 @@ const RuntimeLeaseWatchdog = struct {
         stage: ObservationFailureStage,
         err: anyerror,
         now_ns: u64,
-    ) antfly.ha.kubernetes_lease_watchdog.Decision {
+    ) antfly.hot_standby.kubernetes_lease_watchdog.Decision {
         const transition = self.transitionObservationFailureLocked(stage, now_ns);
         if (transition.should_log) switch (stage) {
-            .fetch => std.log.err("HA Lease watchdog Kubernetes Lease fetch failed err={s}", .{@errorName(err)}),
-            .validation => std.log.err("HA Lease watchdog Lease response validation failed err={s}", .{@errorName(err)}),
+            .fetch => std.log.err("Hot-standby lease watchdog Kubernetes Lease fetch failed err={s}", .{@errorName(err)}),
+            .validation => std.log.err("Hot-standby lease watchdog Lease response validation failed err={s}", .{@errorName(err)}),
         };
         return transition.decision;
     }
@@ -549,7 +560,7 @@ const RuntimeLeaseWatchdog = struct {
         alloc: std.mem.Allocator,
         io: std.Io,
         data_server: *antfly.data.runtime.DataServer,
-        decision: antfly.ha.kubernetes_lease_watchdog.Decision,
+        decision: antfly.hot_standby.kubernetes_lease_watchdog.Decision,
     ) !void {
         switch (decision) {
             .waiting, .observed, .pending_authority, .grace => {},
@@ -711,7 +722,7 @@ fn standaloneReadyFromState(api_server_initialized: bool, unified_api_ready: boo
     return api_server_initialized and unified_api_ready;
 }
 
-fn startupCheckpointSatisfied(progress: antfly.ha.standby.Progress, checkpoint_lsn: u64) bool {
+fn startupCheckpointSatisfied(progress: antfly.hot_standby.standby.Progress, checkpoint_lsn: u64) bool {
     return progress.applied_lsn >= checkpoint_lsn and progress.safe_read_lsn >= checkpoint_lsn;
 }
 
@@ -730,6 +741,7 @@ const LocalStandaloneMetadata = struct {
     catalog_store: ?*antfly.storage_backend_erased.Store,
     backend_runtime: *antfly.db.background_runtime.BackendRuntime,
     storage_engine: antfly.common.config.StorageEngine = .local,
+    vector_source_storage_allowed: bool = true,
     epoch: u64 = 1,
     last_schema_migration_finalize_at_ms: u64 = 0,
     local_schema_progress_provider: ?LocalSchemaProgressProvider = null,
@@ -1040,14 +1052,24 @@ const LocalStandaloneMetadata = struct {
         probe_interval_ns: u64,
     ) !antfly.public_api.table_catalog.CatalogChangeWaitResult {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
-        if (!lockAtomicUntil(&self.mutex, deadline_ns)) return .retry;
+        return self.catalogWaitForRoutingChangeWithClock(observed_token, deadline_ns, probe_interval_ns, StandaloneWaitClock{});
+    }
+
+    fn catalogWaitForRoutingChangeWithClock(
+        self: *LocalStandaloneMetadata,
+        observed_token: antfly.metadata_api.CatalogRoutingChangeToken,
+        deadline_ns: u64,
+        probe_interval_ns: u64,
+        clock: anytype,
+    ) !antfly.public_api.table_catalog.CatalogChangeWaitResult {
+        if (!lockAtomicUntilWithClock(&self.mutex, deadline_ns, clock)) return .retry;
         if (standaloneCatalogTokenChanged(self, observed_token)) {
             self.mutex.unlock();
             return .changed;
         }
         self.mutex.unlock();
 
-        var now_ns = platform_time.monotonicNs();
+        var now_ns = clock.nowNs();
         if (now_ns < deadline_ns) {
             // Finish the passive watch before the outer deadline and reserve
             // bounded time for the authoritative mutex confirmation. Waiting
@@ -1064,15 +1086,15 @@ const LocalStandaloneMetadata = struct {
                     watch_deadline_ns - now_ns,
                     @max(probe_interval_ns, std.time.ns_per_ms),
                 );
-                platform_clock.Clock.real().sleepMs(@max(@as(u64, 1), wait_ns / std.time.ns_per_ms));
-                if (!lockAtomicUntil(&self.mutex, deadline_ns)) return .retry;
+                clock.sleepMs(@max(@as(u64, 1), wait_ns / std.time.ns_per_ms));
+                if (!lockAtomicUntilWithClock(&self.mutex, deadline_ns, clock)) return .retry;
                 const changed = standaloneCatalogTokenChanged(self, observed_token);
                 self.mutex.unlock();
                 if (changed) return .changed;
-                now_ns = platform_time.monotonicNs();
+                now_ns = clock.nowNs();
             }
         }
-        if (!lockAtomicUntil(&self.mutex, deadline_ns)) return .retry;
+        if (!lockAtomicUntilWithClock(&self.mutex, deadline_ns, clock)) return .retry;
         defer self.mutex.unlock();
         if (standaloneCatalogTokenChanged(self, observed_token)) return .changed;
         return .authoritative_absence;
@@ -1115,6 +1137,9 @@ const LocalStandaloneMetadata = struct {
 
     fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: antfly.public_api.tables.CreateTableRequest) !void {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        const replicated = !self.vector_source_storage_allowed or
+            (if (req.replication_sources_json) |sources| !std.mem.eql(u8, sources, "[]") else false);
+        try req.storage.validateStandalone(req.num_shards orelse 1, replicated, self.storage_engine != .local);
         const table = try deriveStandaloneTableRecord(self.storage_engine, table_name, req);
         const ranges = try antfly.public_api.tables.deriveInitialRanges(alloc, table);
         defer {
@@ -1165,6 +1190,44 @@ const LocalStandaloneMetadata = struct {
             .range_id = ranges[0].range_id,
         };
         try verifyAdoptedLiteIdentity(self.alloc, backend, namespace, target_identity);
+
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.findTableByNameLocked("default") != null) return;
+        var mutation = try self.beginCatalogMutationLocked();
+        defer mutation.deinit(self);
+        try self.manager.upsertTable(table);
+        for (ranges) |range| try self.manager.upsertRange(range);
+        self.epoch +|= 1;
+        try mutation.commit(self);
+    }
+
+    fn adoptEmbeddedLiteRootFromKernelIfNeeded(
+        self: *LocalStandaloneMetadata,
+        context: *kernel_owner_client.Context,
+    ) !void {
+        const existing = try self.manager.listTables(self.alloc);
+        defer self.manager.freeTables(self.alloc, existing);
+        if (existing.len != 0) return;
+        const probe = try context.liteAdoptionProbe();
+        if (probe.is_embedded_artifact == 0 and probe.embedded_root_has_user_documents == 0) return;
+
+        const table = try deriveStandaloneTableRecord(.lite, "default", .{});
+        const ranges = try antfly.public_api.tables.deriveInitialRanges(self.alloc, table);
+        defer {
+            for (ranges) |record| antfly.metadata.table_manager.freeRange(self.alloc, record);
+            self.alloc.free(ranges);
+        }
+        if (ranges.len != 1) return error.InvalidCreateTableRequest;
+        const namespace = try std.fmt.allocPrint(self.alloc, "group-{d}/table-db", .{ranges[0].group_id});
+        defer self.alloc.free(namespace);
+
+        try context.liteAdoptAndVerify(.{
+            .namespace = .fromSlice(namespace),
+            .identity_table_id = table.table_id,
+            .identity_shard_id = ranges[0].group_id,
+            .identity_range_id = ranges[0].range_id,
+        });
 
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
@@ -1604,14 +1667,23 @@ const LocalStandaloneMetadata = struct {
         defer if (runtime_progress) |*progress| progress.deinit(self.alloc);
         var filesystem_progress: ?[]antfly.metadata.SchemaProgressRecord = null;
         defer if (filesystem_progress) |progress| self.alloc.free(progress);
+        var shard_db_adapter: ?antfly.metadata.ShardDbAdapter = null;
         const progress: []const antfly.metadata.SchemaProgressRecord = progress: {
             if (self.local_schema_progress_provider) |provider| {
+                shard_db_adapter = provider.shard_db_adapter;
                 runtime_progress = try provider.collect(provider.ptr, self.alloc, snapshot.tables, snapshot.ranges);
                 if (runtime_progress.?.records.len != 0) break :progress runtime_progress.?.records;
                 // A complete runtime observation is authoritative even while
                 // not ready. Do not contend with its live writer by reopening
                 // the same root through the filesystem fallback.
                 if (runtime_progress.?.runtime_coverage_complete) return;
+            }
+            // A control-only process has no legal filesystem fallback. If its
+            // live data-server adapter is not installed yet, retain the
+            // migration and retry on the next metadata round instead of
+            // terminating the standalone runtime.
+            if (comptime control_only_storage_sources) {
+                if (shard_db_adapter == null) return;
             }
             filesystem_progress = try antfly.metadata.table_provisioner.collectLocalSchemaProgressWithOptions(
                 self.alloc,
@@ -1623,6 +1695,7 @@ const LocalStandaloneMetadata = struct {
                 snapshot.ranges,
                 .{
                     .backend_runtime = self.backend_runtime,
+                    .shard_db_adapter = shard_db_adapter,
                 },
             );
             break :progress filesystem_progress.?;
@@ -1779,6 +1852,7 @@ fn deriveStandaloneTableRecord(
     table_name: []const u8,
     req: antfly.public_api.tables.CreateTableRequest,
 ) !antfly.metadata.TableRecord {
+    try req.storage.validateStandalone(req.num_shards orelse 1, false, storage_engine != .local);
     if (storage_engine == .lite and (req.num_shards orelse 1) != 1) {
         return error.InvalidCreateTableRequest;
     }
@@ -1887,6 +1961,7 @@ pub fn runFromIterator(
     else
         null;
     defer if (loaded_config) |*cfg| cfg.deinit();
+    if (loaded_config) |*cfg| try applyHAConfigDefaults(alloc, &cli, cfg);
 
     antfly.common.config.Config.validateServerTlsConfig(if (loaded_config) |*cfg| cfg.tls else null) catch |err| {
         std.log.err("standalone startup rejected configured tls: built-in server TLS is unsupported; terminate TLS at a trusted reverse proxy", .{});
@@ -1946,6 +2021,21 @@ pub fn runFromIterator(
     try ensureParent(setup_io.io(), resolved.secret_store_path);
     try ensureDirPath(setup_io.io(), resolved.auth_store_root_dir);
 
+    const auth_enabled = resolveAuthEnabled(cli, if (loaded_config) |*cfg| cfg else null);
+    var storage_kernel_context = kernel_owner_client.Context{};
+    defer if (control_only_storage_sources) storage_kernel_context.deinit();
+    if (comptime control_only_storage_sources) {
+        try storage_kernel_context.ensureWith(.{
+            .storage_kind = if (lite_path != null) .lite else .directory,
+            .no_sync = @intFromBool(!lite_fsync),
+            .storage_path = .fromSlice(lite_path orelse ""),
+            .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else ""),
+        });
+        const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
+        defer alloc.free(security_json);
+        try storage_kernel_context.configureRemoteContentSecurity(security_json);
+    }
+
     var node_backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer node_backend_runtime.deinit();
     // The linked inference archive retains std.Io for its full node lifetime.
@@ -1953,13 +2043,17 @@ pub fn runFromIterator(
     var inference_lane_lease = try node_backend_runtime.ptr().acquireInferenceLane();
     defer inference_lane_lease.release();
     const inference_io = inference_lane_lease.io();
-    var lite_backend: ?antfly.lite.backend.Handle = if (lite_path) |path|
-        try antfly.lite.backend.Handle.openOrCreate(alloc, path, .{ .no_sync = !lite_fsync })
-    else
-        null;
-    defer if (lite_backend) |*backend| backend.deinit();
-    if (lite_backend) |*backend| {
-        node_backend_runtime.ptr().db_open_configurator = backend.dbOpenConfigurator();
+    var lite_backend: ?LegacyLiteHandle = null;
+    if (comptime !control_only_storage_sources) {
+        if (lite_path) |path| lite_backend = try antfly.lite.backend.Handle.openOrCreate(
+            alloc,
+            path,
+            .{ .no_sync = !lite_fsync },
+        );
+    }
+    defer if (comptime !control_only_storage_sources) if (lite_backend) |*backend| backend.deinit();
+    if (comptime !control_only_storage_sources) {
+        if (lite_backend) |*backend| node_backend_runtime.ptr().db_open_configurator = backend.dbOpenConfigurator();
     }
 
     // Restore jobs are storage-engine state. Local standalone keeps them in a
@@ -1981,10 +2075,13 @@ pub fn runFromIterator(
     else
         null;
     defer if (local_restore_job_store) |*store| store.deinit();
-    const restore_job_store = if (lite_backend) |*backend|
-        try backend.runtimeStoreForNamespace("system/api-restore-jobs")
-    else
-        &local_restore_job_store.?;
+    var restore_job_store: ?*antfly.storage_backend_erased.Store = null;
+    if (comptime !control_only_storage_sources) {
+        restore_job_store = if (lite_backend) |*backend|
+            try backend.runtimeStoreForNamespace("system/api-restore-jobs")
+        else
+            &local_restore_job_store.?;
+    }
     // Incoming reverse-route observations are an exact, fenced directory, not
     // disposable cache state: retain one latest generation per logical graph
     // key so restarts and L1 eviction do not reintroduce all-shard probes.
@@ -2003,13 +2100,20 @@ pub fn runFromIterator(
     else
         null;
     defer if (local_incoming_graph_route_store) |*store| store.deinit();
-    const incoming_graph_route_store = if (lite_backend) |*backend|
+    const incoming_graph_route_store = if (comptime control_only_storage_sources)
+        &local_incoming_graph_route_store.?
+    else if (lite_backend) |*backend|
         try backend.runtimeStoreForNamespace("system/incoming-graph-routes")
     else
         &local_incoming_graph_route_store.?;
     var storage_maintenance = try antfly.storage_maintenance.Coordinator.init(
         alloc,
-        if (lite_backend) |*backend| backend.maintenanceSource() else antfly.storage_maintenance.localSource,
+        if (comptime control_only_storage_sources)
+            storage_kernel_context.maintenanceSource()
+        else if (lite_backend) |*backend|
+            backend.maintenanceSource()
+        else
+            antfly.storage_maintenance.localSource,
         node_backend_runtime.ptr(),
     );
     defer storage_maintenance.deinit();
@@ -2162,6 +2266,11 @@ pub fn runFromIterator(
         else
             linkedInferenceApiInfallible().destroy(antfly_node);
     };
+    // Attach before opening any context-backed auth/system stores. Those
+    // handles intentionally retain the storage context for their lifetime;
+    // attaching afterward is rejected as a live-owner configuration mutation.
+    if (comptime control_only_storage_sources)
+        try storage_kernel_context.attachInferenceProvider(antfly_node);
 
     var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
         alloc,
@@ -2188,19 +2297,35 @@ pub fn runFromIterator(
         };
     }
 
-    const auth_enabled = resolveAuthEnabled(cli, if (loaded_config) |*cfg| cfg else null);
-    var auth_backend: ?antfly.lsm_backend.BackendHandle = null;
+    var auth_backend: ?LegacyAuthBackend = null;
     var auth_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
+    var kernel_auth_users_store: ?antfly.storage_backend_erased.Store = null;
+    var kernel_auth_casbin_store: ?antfly.storage_backend_erased.Store = null;
+    var kernel_auth_users_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
+    var kernel_auth_casbin_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
     var auth_user_store: ?antfly.usermgr.StorageUserStore = null;
     var auth_casbin_store: ?antfly.usermgr.StorageCasbinAdapter = null;
     var user_manager: ?antfly.usermgr.UserManager = null;
     if (auth_enabled) {
-        auth_backend = try antfly.lsm_backend.BackendHandle.open(alloc, resolved.auth_store_root_dir, .{});
-        errdefer if (auth_backend) |*backend| backend.close();
-        auth_runtime = try auth_backend.?.backend.runtimeNamespaceStore(alloc);
-        errdefer if (auth_runtime) |*runtime| runtime.deinit();
-        auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, auth_runtime.?);
-        auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, auth_runtime.?);
+        if (comptime control_only_storage_sources) {
+            kernel_auth_users_store = try storage_kernel_context.systemStore(alloc, "system/auth-users");
+            errdefer kernel_auth_users_store.?.deinit();
+            kernel_auth_casbin_store = try storage_kernel_context.systemStore(alloc, "system/auth-casbin");
+            errdefer kernel_auth_casbin_store.?.deinit();
+            kernel_auth_users_runtime = try kernel_owner_client.singleNamespaceStore(alloc, &kernel_auth_users_store.?, "usermgr_users");
+            errdefer kernel_auth_users_runtime.?.deinit();
+            kernel_auth_casbin_runtime = try kernel_owner_client.singleNamespaceStore(alloc, &kernel_auth_casbin_store.?, "usermgr_casbin");
+            errdefer kernel_auth_casbin_runtime.?.deinit();
+            auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, kernel_auth_users_runtime.?);
+            auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, kernel_auth_casbin_runtime.?);
+        } else {
+            auth_backend = try antfly.lsm_backend.BackendHandle.open(alloc, resolved.auth_store_root_dir, .{});
+            errdefer if (auth_backend) |*backend| backend.close();
+            auth_runtime = try auth_backend.?.backend.runtimeNamespaceStore(alloc);
+            errdefer if (auth_runtime) |*runtime| runtime.deinit();
+            auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, auth_runtime.?);
+            auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, auth_runtime.?);
+        }
         user_manager = try antfly.usermgr.UserManager.initWithIo(
             alloc,
             setup_io.io(),
@@ -2226,7 +2351,11 @@ pub fn runFromIterator(
     }
     defer if (user_manager) |*manager| manager.deinit();
     defer if (auth_runtime) |*runtime| runtime.deinit();
-    defer if (auth_backend) |*backend| backend.close();
+    defer if (comptime !control_only_storage_sources) if (auth_backend) |*backend| backend.close();
+    defer if (kernel_auth_users_store) |*store| store.deinit();
+    defer if (kernel_auth_casbin_store) |*store| store.deinit();
+    defer if (kernel_auth_users_runtime) |*runtime| runtime.deinit();
+    defer if (kernel_auth_casbin_runtime) |*runtime| runtime.deinit();
 
     const public_listener = resolvePublicListener(cli);
     const local_node_id = cli.local_node_id orelse 1;
@@ -2237,6 +2366,12 @@ pub fn runFromIterator(
     );
     defer alloc.free(public_api_url);
 
+    var kernel_catalog_store: ?antfly.storage_backend_erased.Store = null;
+    if (comptime control_only_storage_sources) {
+        if (lite_path != null) kernel_catalog_store = try storage_kernel_context.systemStore(alloc, "system/metadata");
+    }
+    defer if (kernel_catalog_store) |*store| store.deinit();
+
     var local_metadata = LocalStandaloneMetadata.init(
         alloc,
         local_node_id,
@@ -2245,24 +2380,64 @@ pub fn runFromIterator(
         resolved.replica_root_dir,
         resolved.local_metadata_catalog_path,
         node_backend_runtime.ptr(),
-        if (lite_backend) |*backend| try backend.runtimeStoreForNamespace("system/metadata") else null,
+        if (comptime control_only_storage_sources)
+            if (kernel_catalog_store) |*store| store else null
+        else if (lite_backend) |*backend|
+            try backend.runtimeStoreForNamespace("system/metadata")
+        else
+            null,
         storage_engine,
     ) catch |err| {
         std.log.err("standalone startup failed step=local_metadata_init err={}", .{err});
         return err;
     };
     defer local_metadata.deinit();
-    if (lite_backend) |*backend| {
-        try local_metadata.adoptEmbeddedLiteRootIfNeeded(backend);
-        // Mark only after embedded adoption and metadata publication succeed.
-        // Offline root-only backup must reject every standalone artifact, not
-        // merely artifacts that originated in the embedded profile.
-        try backend.markStandaloneArtifact();
+    local_metadata.vector_source_storage_allowed = !ha_role_requested;
+    // Reject persisted experimental tables before HA can snapshot or mirror
+    // primary roots whose references need a separate source-store lifecycle.
+    if (ha_role_requested) {
+        var tables = local_metadata.manager.tables.valueIterator();
+        while (tables.next()) |table| {
+            if (table.storage.dense_embeddings == .vector_store)
+                return error.VectorStoreRequiresLocalSingleShardTable;
+        }
+    }
+    if (lite_path != null) {
+        if (comptime control_only_storage_sources) {
+            try local_metadata.adoptEmbeddedLiteRootFromKernelIfNeeded(&storage_kernel_context);
+            try storage_kernel_context.liteMarkStandalone();
+        } else if (lite_backend) |*backend| {
+            try local_metadata.adoptEmbeddedLiteRootIfNeeded(backend);
+            try backend.markStandaloneArtifact();
+        }
     }
     // API transaction sessions are engine state, not a sidecar. Keeping them
     // in a reserved Lite namespace makes a copied/reopened .aflite file a
     // complete database and preserves staged multi-request transactions.
-    var lite_session_store = if (lite_backend) |*backend|
+    var kernel_session_backend: ?antfly.storage_backend_erased.Store = null;
+    var kernel_restore_job_backend: ?antfly.storage_backend_erased.Store = null;
+    if (comptime control_only_storage_sources) {
+        if (lite_path != null) {
+            kernel_session_backend = try storage_kernel_context.systemStore(alloc, "system/api-transaction-sessions");
+            kernel_restore_job_backend = try storage_kernel_context.systemStore(alloc, "system/api-restore-jobs");
+        }
+    }
+    defer if (kernel_session_backend) |*store| store.deinit();
+    defer if (kernel_restore_job_backend) |*store| store.deinit();
+    if (comptime control_only_storage_sources) {
+        restore_job_store = if (kernel_restore_job_backend) |*store|
+            store
+        else if (local_restore_job_store) |*store|
+            store
+        else
+            null;
+    }
+    var lite_session_store = if (comptime control_only_storage_sources)
+        if (kernel_session_backend) |*store|
+            antfly.public_api.transactions.DurableSessionStore.initRuntime(alloc, store)
+        else
+            null
+    else if (lite_backend) |*backend|
         antfly.public_api.transactions.DurableSessionStore.initRuntime(
             alloc,
             try backend.runtimeStoreForNamespace("system/api-transaction-sessions"),
@@ -2282,13 +2457,20 @@ pub fn runFromIterator(
 
     try validateHAPathsUnderRoot(cli, data_dir);
     const ha_startup_expectation = try haStartupExpectationFromCli(cli);
-    const ha_startup_checkpoint_lsn = if (ha_startup_expectation) |expectation|
-        antfly.ha.seed_activation.validateActivatedGeneration(alloc, expectation) catch |err| {
+    const ha_startup_checkpoint_lsn = if (ha_startup_expectation) |expectation| blk: {
+        if (comptime control_only_storage_sources) {
+            const request_json = try std.json.Stringify.valueAlloc(alloc, expectation, .{});
+            defer alloc.free(request_json);
+            break :blk kernel_owner_client.haSeedValidateActivatedGeneration(request_json) catch |err| {
+                std.log.err("standalone startup failed step=validate_ha_active_generation err={}", .{err});
+                return err;
+            };
+        }
+        break :blk antfly.hot_standby.seed_activation.validateActivatedGeneration(alloc, expectation) catch |err| {
             std.log.err("standalone startup failed step=validate_ha_active_generation err={}", .{err});
             return err;
-        }
-    else
-        null;
+        };
+    } else null;
     // A reseed may rotate a persisted Lease fence only after the complete,
     // immutable activation chain on this exact target volume has validated.
     // A generic checkpoint or caller-selected startup generation never reaches
@@ -2298,7 +2480,7 @@ pub fn runFromIterator(
             if (init.environ_map.get("ANTFLY_HA_LEASE_SENTINEL_PATH")) |sentinel_path| {
                 if (init.environ_map.get("ANTFLY_HA_LEASE_TOPOLOGY_ID")) |topology_id| {
                     if (!std.mem.eql(u8, topology_id, expectation.binding.topology_id)) return error.HALeaseSentinelScopeMismatch;
-                    const existing = try antfly.ha.kubernetes_lease_watchdog.loadValidatedRepairGenerationAlloc(
+                    const existing = try antfly.hot_standby.kubernetes_lease_watchdog.loadValidatedRepairGenerationAlloc(
                         alloc,
                         setup_io.io(),
                         sentinel_path,
@@ -2306,8 +2488,8 @@ pub fn runFromIterator(
                         expectation.binding.node_id,
                     );
                     defer if (existing) |generation| alloc.free(generation);
-                    if (existing == null and try antfly.ha.kubernetes_lease_watchdog.sentinelExists(setup_io.io(), sentinel_path)) {
-                        _ = try antfly.ha.kubernetes_lease_watchdog.persistRepairReceipt(
+                    if (existing == null and try antfly.hot_standby.kubernetes_lease_watchdog.sentinelExists(setup_io.io(), sentinel_path)) {
+                        _ = try antfly.hot_standby.kubernetes_lease_watchdog.persistRepairReceipt(
                             alloc,
                             setup_io.io(),
                             sentinel_path,
@@ -2323,6 +2505,7 @@ pub fn runFromIterator(
             }
         }
     }
+    try migrateHALegacyLayoutFromCli(alloc, setup_io.io(), cli);
     var ha_sync_policy = try haSyncPolicyFromCli(alloc, cli);
     defer ha_sync_policy.deinit(alloc);
     const ha_retention_policy = try haRetentionPolicyFromCli(cli);
@@ -2384,6 +2567,7 @@ pub fn runFromIterator(
         .replica_root_dir = resolved.replica_root_dir,
         .replica_catalog_path = resolved.replica_catalog_path,
         .snapshot_root_dir = resolved.snapshot_root_dir,
+        .storage_kernel_context_handle = if (control_only_storage_sources) storage_kernel_context.handle else null,
         .process_memory_limit_bytes = process_memory_limit_bytes,
         .process_memory_limit_source = storageMemoryLimitSource(process_memory_resolution.effective_source),
         .store_registration = .{
@@ -2461,6 +2645,18 @@ pub fn runFromIterator(
         } else .{},
         .backend_runtime = node_backend_runtime.ptr(),
     }, local_metadata.catalogSource(), local_metadata.statusSource());
+    // A non-HA standalone process is the complete set of readers and writers
+    // for its local generations; there is no older peer whose storage
+    // capability must be negotiated. Provisioned storage defaults closed for
+    // distributed startup, but LocalStandaloneMetadata has no remote store
+    // reporter that could ever open that gate. Authorize the current native
+    // format before the public listener becomes reachable so a freshly
+    // created dense index is v2 from its first catalog publication. HA roles
+    // remain closed until their replication protocol has an equivalent
+    // all-peer capability fence.
+    if (standaloneNativeAuthorityInitiallyPermitted(cli)) {
+        data_server.provisioned_storage.setDenseNativeAuthorityPermitted(true);
+    }
     defer data_server.deinitWithDeadline(supervisor.deadline());
     const managed_memory = data_server.provisioned_storage.resource_manager.snapshot().memory;
     std.log.info(
@@ -3454,16 +3650,7 @@ fn isInferenceApiPath(path: []const u8) bool {
         hasPathComponentPrefix(path, inference_bridge.public_api_prefix);
 }
 
-fn isInteractiveGeneratePath(path: []const u8) bool {
-    for ([_][]const u8{ inference_bridge.ai_api_prefix, inference_bridge.public_api_prefix }) |prefix| {
-        if (!std.mem.startsWith(u8, path, prefix)) continue;
-        const suffix = path[prefix.len..];
-        if (std.mem.eql(u8, suffix, "/generate") or
-            std.mem.eql(u8, suffix, "/generate/batch") or
-            std.mem.eql(u8, suffix, "/chat/completions")) return true;
-    }
-    return false;
-}
+const isInteractiveGeneratePath = inference_provider.isInteractiveGeneratePath;
 
 fn hasPathComponentPrefix(path: []const u8, prefix: []const u8) bool {
     return std.mem.eql(u8, path, prefix) or
@@ -3576,14 +3763,20 @@ fn serveInstalledAntfarmFile(ctx: *httpx.Context, rel_path: []const u8) anyerror
     const exe_dir = std.process.executableDirPathAlloc(ctx.io, ctx.allocator) catch return null;
     defer ctx.allocator.free(exe_dir);
 
-    var full_path_buf: [4096]u8 = undefined;
-    const full_path = std.fmt.bufPrint(
-        &full_path_buf,
-        "{s}/{s}/{s}",
-        .{ exe_dir, antfarm_installed_asset_root, rel_path },
-    ) catch return null;
+    return serveAntfarmFileFromExecutableDir(ctx, exe_dir, rel_path);
+}
 
-    return try serveAntfarmPath(ctx, rel_path, full_path);
+fn serveAntfarmFileFromExecutableDir(ctx: *httpx.Context, exe_dir: []const u8, rel_path: []const u8) anyerror!?httpx.Response {
+    for (antfarm_installed_asset_roots) |root| {
+        var full_path_buf: [4096]u8 = undefined;
+        const full_path = std.fmt.bufPrint(
+            &full_path_buf,
+            "{s}/{s}/{s}",
+            .{ exe_dir, root, rel_path },
+        ) catch continue;
+        if (try serveAntfarmPath(ctx, rel_path, full_path)) |resp| return resp;
+    }
+    return null;
 }
 
 fn serveAntfarmPath(ctx: *httpx.Context, rel_path: []const u8, full_path: []const u8) anyerror!?httpx.Response {
@@ -3688,6 +3881,7 @@ fn localReplicaRootReconcileHook(data_server: *antfly.data.runtime.DataServer) a
 fn localSchemaProgressProvider(data_server: *antfly.data.runtime.DataServer) LocalSchemaProgressProvider {
     return .{
         .ptr = data_server,
+        .shard_db_adapter = data_server.localShardDbAdapter(),
         .collect = collectLocalSchemaProgress,
     };
 }
@@ -3737,15 +3931,36 @@ fn readFileAlloc(alloc: std.mem.Allocator, io: std.Io, path: []const u8, max_byt
     return try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(max_bytes));
 }
 
+// Keep watch sleeps and deadline-aware locking on the same monotonic clock.
+// Tests supply a manual clock to exercise confirmation and expiry without
+// depending on the host scheduler.
+const StandaloneWaitClock = struct {
+    fn nowNs(_: @This()) u64 {
+        return platform_time.monotonicNs();
+    }
+
+    fn sleepMs(_: @This(), ms: u64) void {
+        platform_clock.Clock.real().sleepMs(ms);
+    }
+
+    fn yieldNow(_: @This()) void {
+        platform_time.yieldNow();
+    }
+};
+
 fn lockAtomicUntil(mutex: *std.atomic.Mutex, deadline_ns: ?u64) bool {
+    return lockAtomicUntilWithClock(mutex, deadline_ns, StandaloneWaitClock{});
+}
+
+fn lockAtomicUntilWithClock(mutex: *std.atomic.Mutex, deadline_ns: ?u64, clock: anytype) bool {
     const deadline = deadline_ns orelse {
         lockAtomic(mutex);
         return true;
     };
     while (true) {
-        if (platform_time.monotonicNs() >= deadline) return false;
+        if (clock.nowNs() >= deadline) return false;
         if (mutex.tryLock()) return true;
-        @import("antfly_platform").time.yieldNow();
+        clock.yieldNow();
     }
 }
 
@@ -3795,6 +4010,14 @@ fn parsePreloadModelFlag(value: []const u8) !inference_bridge.WarmModel {
         .name = inference_bridge.String.init(spec.name),
         .backend = inference_bridge.OptionalString.init(spec.backend),
     };
+}
+
+/// Matches a parsed argument against a flag's canonical spelling or its
+/// deprecated `--ha-*` alias. The `--ha-*` spellings predate the `ha` ->
+/// `standby` rename (see HOT_STANDBY.md "Naming") and are kept working for
+/// one minor release because the Kubernetes operator still generates them.
+fn flagMatches(arg: []const u8, canonical: []const u8, legacy_alias: []const u8) bool {
+    return std.mem.eql(u8, arg, canonical) or std.mem.eql(u8, arg, legacy_alias);
 }
 
 fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConfig {
@@ -3965,27 +4188,27 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             try cfg.secret_store_paths.append(alloc, args.next() orelse return error.InvalidArguments);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-primary-log")) {
+        if (flagMatches(arg, "--hot-standby-primary-log", "--ha-primary-log")) {
             cfg.ha_primary_log = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-primary-slots")) {
+        if (flagMatches(arg, "--hot-standby-primary-slots", "--ha-primary-slots")) {
             cfg.ha_primary_slots = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-primary-node-id")) {
+        if (flagMatches(arg, "--hot-standby-primary-node-id", "--ha-primary-node-id")) {
             cfg.ha_primary_node_id = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-seed-capture-root")) {
+        if (flagMatches(arg, "--hot-standby-seed-capture-root", "--ha-seed-capture-root")) {
             cfg.ha_seed_capture_root = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-fence-wal")) {
+        if (flagMatches(arg, "--hot-standby-fence-wal", "--ha-fence-wal")) {
             cfg.ha_fence_wal = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-former-primary-log")) {
+        if (flagMatches(arg, "--hot-standby-former-primary-log", "--ha-former-primary-log")) {
             cfg.ha_former_primary_log = args.next() orelse return error.InvalidArguments;
             continue;
         }
@@ -3993,143 +4216,143 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.admin_token_env = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-retention-max-lag-lsn")) {
+        if (flagMatches(arg, "--hot-standby-retention-max-lag-lsn", "--ha-retention-max-lag-lsn")) {
             cfg.ha_retention_max_lag_lsn = try parsePositiveU64(args.next() orelse return error.InvalidArguments);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-retention-max-retained-bytes")) {
+        if (flagMatches(arg, "--hot-standby-retention-max-retained-bytes", "--ha-retention-max-retained-bytes")) {
             cfg.ha_retention_max_retained_bytes = try parsePositiveU64(args.next() orelse return error.InvalidArguments);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-retention-max-retained-age-ns")) {
+        if (flagMatches(arg, "--hot-standby-retention-max-retained-age-ns", "--ha-retention-max-retained-age-ns")) {
             cfg.ha_retention_max_retained_age_ns = try parsePositiveU64(args.next() orelse return error.InvalidArguments);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-sync-mode")) {
+        if (flagMatches(arg, "--hot-standby-sync-mode", "--ha-sync-mode")) {
             cfg.ha_sync_mode = try parseHASyncDurabilityMode(args.next() orelse return error.InvalidArguments);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-sync-selection")) {
+        if (flagMatches(arg, "--hot-standby-sync-selection", "--ha-sync-selection")) {
             cfg.ha_sync_selection = try parseHASyncStandbySelection(args.next() orelse return error.InvalidArguments);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-sync-required")) {
+        if (flagMatches(arg, "--hot-standby-sync-required", "--ha-sync-required")) {
             cfg.ha_sync_required = try parsePositiveUsize(args.next() orelse return error.InvalidArguments);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-sync-standby")) {
+        if (flagMatches(arg, "--hot-standby-sync-standby", "--ha-sync-standby")) {
             try cfg.ha_sync_standby_names.append(alloc, args.next() orelse return error.InvalidArguments);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-sync-failure")) {
+        if (flagMatches(arg, "--hot-standby-sync-failure", "--ha-sync-failure")) {
             cfg.ha_sync_failure_policy = try parseHASyncFailurePolicy(args.next() orelse return error.InvalidArguments);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-standby-log")) {
+        if (flagMatches(arg, "--hot-standby-log", "--ha-standby-log")) {
             cfg.ha_standby_log = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-standby-progress")) {
+        if (flagMatches(arg, "--hot-standby-progress", "--ha-standby-progress")) {
             cfg.ha_standby_progress = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-standby-node-id")) {
+        if (flagMatches(arg, "--hot-standby-node-id", "--ha-standby-node-id")) {
             cfg.ha_standby_node_id = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-standby-upstream-url")) {
+        if (flagMatches(arg, "--hot-standby-upstream-url", "--ha-standby-upstream-url")) {
             cfg.ha_standby_upstream_url = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-standby-slot")) {
+        if (flagMatches(arg, "--hot-standby-slot", "--ha-standby-slot")) {
             cfg.ha_standby_slot = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-target-root")) {
+        if (flagMatches(arg, "--hot-standby-startup-target-root", "--ha-startup-target-root")) {
             cfg.ha_startup_target_root = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-topology-id")) {
+        if (flagMatches(arg, "--hot-standby-startup-topology-id", "--ha-startup-topology-id")) {
             cfg.ha_startup_topology_id = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-topology-generation")) {
+        if (flagMatches(arg, "--hot-standby-startup-topology-generation", "--ha-startup-topology-generation")) {
             cfg.ha_startup_topology_generation = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-generation")) {
+        if (flagMatches(arg, "--hot-standby-startup-generation", "--ha-startup-generation")) {
             cfg.ha_startup_generation = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-slot-name")) {
+        if (flagMatches(arg, "--hot-standby-startup-slot-name", "--ha-startup-slot-name")) {
             cfg.ha_startup_slot_name = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-timeline-id")) {
+        if (flagMatches(arg, "--hot-standby-startup-timeline-id", "--ha-startup-timeline-id")) {
             cfg.ha_startup_timeline_id = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-epoch")) {
+        if (flagMatches(arg, "--hot-standby-startup-epoch", "--ha-startup-epoch")) {
             cfg.ha_startup_epoch = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-target-pvc-name")) {
+        if (flagMatches(arg, "--hot-standby-startup-target-pvc-name", "--ha-startup-target-pvc-name")) {
             cfg.ha_startup_target_pvc_name = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-target-pvc-uid")) {
+        if (flagMatches(arg, "--hot-standby-startup-target-pvc-uid", "--ha-startup-target-pvc-uid")) {
             cfg.ha_startup_target_pvc_uid = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-manifest-sha256")) {
+        if (flagMatches(arg, "--hot-standby-startup-manifest-sha256", "--ha-startup-manifest-sha256")) {
             cfg.ha_startup_manifest_sha256 = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-aggregate-sha256")) {
+        if (flagMatches(arg, "--hot-standby-startup-aggregate-sha256", "--ha-startup-aggregate-sha256")) {
             cfg.ha_startup_aggregate_sha256 = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-seed-receipt-sha256")) {
+        if (flagMatches(arg, "--hot-standby-startup-seed-receipt-sha256", "--ha-startup-seed-receipt-sha256")) {
             cfg.ha_startup_seed_receipt_sha256 = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-capture-receipt-sha256")) {
+        if (flagMatches(arg, "--hot-standby-startup-capture-receipt-sha256", "--ha-startup-capture-receipt-sha256")) {
             cfg.ha_startup_capture_receipt_sha256 = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-materialized-receipt-sha256")) {
+        if (flagMatches(arg, "--hot-standby-startup-materialized-receipt-sha256", "--ha-startup-materialized-receipt-sha256")) {
             cfg.ha_startup_materialized_receipt_sha256 = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-materialized-aggregate-sha256")) {
+        if (flagMatches(arg, "--hot-standby-startup-materialized-aggregate-sha256", "--ha-startup-materialized-aggregate-sha256")) {
             cfg.ha_startup_materialized_aggregate_sha256 = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-target-local-node-id")) {
+        if (flagMatches(arg, "--hot-standby-startup-target-local-node-id", "--ha-startup-target-local-node-id")) {
             cfg.ha_startup_target_local_node_id = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-target-replica-id")) {
+        if (flagMatches(arg, "--hot-standby-startup-target-replica-id", "--ha-startup-target-replica-id")) {
             cfg.ha_startup_target_replica_id = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-cluster-id")) {
+        if (flagMatches(arg, "--hot-standby-cluster-id", "--ha-cluster-id")) {
             cfg.ha_cluster_id = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-shard-id")) {
+        if (flagMatches(arg, "--hot-standby-shard-id", "--ha-shard-id")) {
             cfg.ha_shard_id = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-table-id")) {
+        if (flagMatches(arg, "--hot-standby-table-id", "--ha-table-id")) {
             cfg.ha_table_id = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-timeline-id")) {
+        if (flagMatches(arg, "--hot-standby-timeline-id", "--ha-timeline-id")) {
             cfg.ha_timeline_id = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-epoch")) {
+        if (flagMatches(arg, "--hot-standby-epoch", "--ha-epoch")) {
             cfg.ha_epoch = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
@@ -4392,6 +4615,48 @@ fn resolvePublicListener(cli: CliConfig) antfly.metadata.runtime.ListenerConfig 
     };
 }
 
+/// Fills HA flags that were not given on the command line from the config
+/// file's `ha` section. Command-line flags always win, so operator-generated
+/// argument lists keep their exact meaning; the section only removes the need
+/// to repeat the same paths and identity on every invocation. Strings borrow
+/// from `cfg`, which outlives `cli` in `run`.
+fn applyHAConfigDefaults(alloc: std.mem.Allocator, cli: *CliConfig, cfg: *const antfly.common.config.Config) !void {
+    const ha = cfg.ha orelse return;
+    if (cli.admin_token_env == null) cli.admin_token_env = ha.admin_token_env;
+    if (cli.ha_cluster_id == null) cli.ha_cluster_id = ha.cluster_id;
+    if (cli.ha_shard_id == null) cli.ha_shard_id = ha.shard_id;
+    if (cli.ha_table_id == null) cli.ha_table_id = ha.table_id;
+    if (cli.ha_timeline_id == null) cli.ha_timeline_id = ha.timeline_id;
+    if (cli.ha_epoch == null) cli.ha_epoch = ha.epoch;
+    if (cli.ha_primary_log == null) cli.ha_primary_log = ha.primary_log;
+    if (cli.ha_primary_slots == null) cli.ha_primary_slots = ha.primary_slots;
+    if (cli.ha_primary_node_id == null) cli.ha_primary_node_id = ha.primary_node_id;
+    if (cli.ha_seed_capture_root == null) cli.ha_seed_capture_root = ha.seed_capture_root;
+    if (cli.ha_standby_log == null) cli.ha_standby_log = ha.standby_log;
+    if (cli.ha_standby_progress == null) cli.ha_standby_progress = ha.standby_progress;
+    if (cli.ha_standby_node_id == null) cli.ha_standby_node_id = ha.standby_node_id;
+    if (cli.ha_standby_upstream_url == null) cli.ha_standby_upstream_url = ha.standby_upstream_url;
+    if (cli.ha_standby_slot == null) cli.ha_standby_slot = ha.standby_slot;
+    if (cli.ha_fence_wal == null) cli.ha_fence_wal = ha.fence_wal;
+    if (cli.ha_former_primary_log == null) cli.ha_former_primary_log = ha.former_primary_log;
+    if (cli.ha_sync_mode == null) {
+        if (ha.sync_mode) |raw| cli.ha_sync_mode = try parseHASyncDurabilityMode(raw);
+    }
+    if (cli.ha_sync_selection == null) {
+        if (ha.sync_selection) |raw| cli.ha_sync_selection = try parseHASyncStandbySelection(raw);
+    }
+    if (cli.ha_sync_required == null) cli.ha_sync_required = ha.sync_required;
+    if (cli.ha_sync_failure_policy == null) {
+        if (ha.sync_failure) |raw| cli.ha_sync_failure_policy = try parseHASyncFailurePolicy(raw);
+    }
+    if (cli.ha_sync_standby_names.items.len == 0) {
+        for (ha.sync_standbys) |name| try cli.ha_sync_standby_names.append(alloc, name);
+    }
+    if (cli.ha_retention_max_lag_lsn == null) cli.ha_retention_max_lag_lsn = ha.retention_max_lag_lsn;
+    if (cli.ha_retention_max_retained_bytes == null) cli.ha_retention_max_retained_bytes = ha.retention_max_retained_bytes;
+    if (cli.ha_retention_max_retained_age_ns == null) cli.ha_retention_max_retained_age_ns = ha.retention_max_retained_age_ns;
+}
+
 fn haPrimaryRequested(cli: CliConfig) bool {
     return cli.ha_primary_log != null or
         cli.ha_primary_slots != null or
@@ -4404,6 +4669,10 @@ fn haStandbyRequested(cli: CliConfig) bool {
         cli.ha_standby_node_id != null or
         cli.ha_standby_upstream_url != null or
         cli.ha_standby_slot != null;
+}
+
+fn standaloneNativeAuthorityInitiallyPermitted(cli: CliConfig) bool {
+    return !haPrimaryRequested(cli) and !haStandbyRequested(cli);
 }
 
 fn haContinuousMutationGuardEnabled(cli: CliConfig) bool {
@@ -4420,7 +4689,7 @@ fn haContinuousMutationGuardEnabled(cli: CliConfig) bool {
         cli.ha_table_id != null;
 }
 
-fn haRemoteApplyMutationsEnabled(policy: antfly.ha.primary.SyncPolicy) bool {
+fn haRemoteApplyMutationsEnabled(policy: antfly.hot_standby.primary.SyncPolicy) bool {
     return policy.mode == .remote_apply and
         policy.failure_policy == .block and
         policy.standby_names.len > 0;
@@ -4481,12 +4750,12 @@ fn validateHARole(cli: CliConfig) !void {
         _ = try requireHAPath(cli.ha_former_primary_log, error.HAFormerPrimaryLogInvalid, error.HAFormerPrimaryLogInvalid);
     }
     if (cli.admin_token_env) |env_var| {
-        switch (antfly.ha.validation.classifyHAString(env_var)) {
+        switch (antfly.hot_standby.validation.classifyHAString(env_var)) {
             .ok => {},
             .missing => return error.AdminTokenEnvMissing,
             .padded => return error.AdminTokenEnvInvalid,
         }
-        if (!antfly.ha.validation.isEnvVarName(env_var)) return error.AdminTokenEnvInvalid;
+        if (!antfly.hot_standby.validation.isEnvVarName(env_var)) return error.AdminTokenEnvInvalid;
     }
     if (primary_requested or standby_requested) {
         _ = try requireHAPath(cli.ha_fence_wal, error.HAFenceWalMissing, error.HAFenceWalInvalid);
@@ -4509,7 +4778,7 @@ fn validateHAIdentity(cli: CliConfig) !void {
 }
 
 fn requireHAString(value: ?[]const u8, comptime missing_err: anyerror, comptime padded_err: anyerror) ![]const u8 {
-    switch (antfly.ha.validation.classifyHAString(value)) {
+    switch (antfly.hot_standby.validation.classifyHAString(value)) {
         .ok => return value.?,
         .missing => return missing_err,
         .padded => return padded_err,
@@ -4518,19 +4787,19 @@ fn requireHAString(value: ?[]const u8, comptime missing_err: anyerror, comptime 
 
 fn requireHAPath(value: ?[]const u8, comptime missing_err: anyerror, comptime invalid_err: anyerror) ![]const u8 {
     const raw = try requireHAString(value, missing_err, invalid_err);
-    if (!antfly.ha.validation.isAbsoluteNormalizedPath(raw)) return invalid_err;
+    if (!antfly.hot_standby.validation.isAbsoluteNormalizedPath(raw)) return invalid_err;
     return raw;
 }
 
 fn requireHAPathWithinRoot(value: ?[]const u8, root: []const u8, comptime missing_err: anyerror, comptime invalid_err: anyerror) ![]const u8 {
     const raw = try requireHAPath(value, missing_err, invalid_err);
-    if (!antfly.ha.validation.isAbsoluteNormalizedPathWithinRoot(raw, root)) return invalid_err;
+    if (!antfly.hot_standby.validation.isAbsoluteNormalizedPathWithinRoot(raw, root)) return invalid_err;
     return raw;
 }
 
 fn requireHAIdentifier(value: ?[]const u8, comptime missing_err: anyerror, comptime invalid_err: anyerror) ![]const u8 {
     const raw = try requireHAString(value, missing_err, invalid_err);
-    if (!antfly.ha.validation.isIdentifier(raw)) return invalid_err;
+    if (!antfly.hot_standby.validation.isIdentifier(raw)) return invalid_err;
     return raw;
 }
 
@@ -4569,7 +4838,7 @@ fn validateHAPathsUnderRoot(cli: CliConfig, data_root: []const u8) !void {
     }
 }
 
-fn haStartupExpectationFromCli(cli: CliConfig) !?antfly.ha.seed_activation.StartupExpectation {
+fn haStartupExpectationFromCli(cli: CliConfig) !?antfly.hot_standby.seed_activation.StartupExpectation {
     if (!haStartupGateRequested(cli)) return null;
     const primary_requested = haPrimaryRequested(cli);
     const standby_requested = haStandbyRequested(cli);
@@ -4599,7 +4868,7 @@ fn haStartupExpectationFromCli(cli: CliConfig) !?antfly.ha.seed_activation.Start
         // would turn a seed receipt into an alternate primary-creation path.
         return error.HAStartupReplicationIdentityMismatch;
     }
-    const binding = antfly.ha.seed_activation.ActivationBinding{
+    const binding = antfly.hot_standby.seed_activation.ActivationBinding{
         .topology_id = try requireHAIdentifier(cli.ha_startup_topology_id, error.HAStartupTopologyIdMissing, error.HAStartupTopologyIdInvalid),
         .topology_generation = cli.ha_startup_topology_generation orelse return error.HAStartupTopologyGenerationMissing,
         .node_id = runtime_node_id,
@@ -4672,7 +4941,7 @@ fn haStandbyReplicationConfigFromCliWithBearerToken(
     if (cli.ha_standby_upstream_url == null and cli.ha_standby_slot == null) return null;
     const upstream = try requireHAString(cli.ha_standby_upstream_url, error.HAStandbyUpstreamUrlMissing, error.HAStandbyUpstreamUrlInvalid);
     const slot = try requireHAIdentifier(cli.ha_standby_slot, error.HAStandbySlotMissing, error.HAStandbySlotInvalid);
-    const parsed = antfly.ha.validation.parseURLNoHiddenWhitespace(upstream) catch return error.HAStandbyUpstreamUrlInvalid;
+    const parsed = antfly.hot_standby.validation.parseURLNoHiddenWhitespace(upstream) catch return error.HAStandbyUpstreamUrlInvalid;
     if (!isHAReplicationUpstreamScheme(parsed)) return error.HAStandbyUpstreamUrlInvalid;
     if (parsed.host == null) return error.HAStandbyUpstreamUrlInvalid;
     return .{
@@ -4689,7 +4958,7 @@ fn isHAReplicationUpstreamScheme(parsed: std.Uri) bool {
 }
 
 const OwnedHASyncPolicy = struct {
-    policy: antfly.ha.primary.SyncPolicy = .{},
+    policy: antfly.hot_standby.primary.SyncPolicy = .{},
     standby_names: []const []const u8 = &.{},
 
     fn deinit(self: *OwnedHASyncPolicy, alloc: std.mem.Allocator) void {
@@ -4708,7 +4977,7 @@ fn haSyncPolicyFromCli(alloc: std.mem.Allocator, cli: CliConfig) !OwnedHASyncPol
     const selection = cli.ha_sync_selection orelse .any;
     if (selection == .all and cli.ha_sync_required != null) return error.InvalidHASyncPolicy;
 
-    const policy = antfly.ha.primary.SyncPolicy{
+    const policy = antfly.hot_standby.primary.SyncPolicy{
         .mode = cli.ha_sync_mode orelse .remote_write,
         .selection = selection,
         .required = if (selection == .all) names.len else cli.ha_sync_required orelse 1,
@@ -4723,7 +4992,7 @@ fn haSyncPolicyFromCli(alloc: std.mem.Allocator, cli: CliConfig) !OwnedHASyncPol
     };
 }
 
-fn haRetentionPolicyFromCli(cli: CliConfig) !antfly.ha.slot_store.RetentionPolicy {
+fn haRetentionPolicyFromCli(cli: CliConfig) !antfly.hot_standby.slot_store.RetentionPolicy {
     if (!haRetentionPolicyRequested(cli)) return .{};
     if (!haPrimaryRequested(cli)) return error.HARetentionPolicyRequiresPrimary;
     return .{
@@ -4733,7 +5002,7 @@ fn haRetentionPolicyFromCli(cli: CliConfig) !antfly.ha.slot_store.RetentionPolic
     };
 }
 
-fn validateHASyncPolicy(policy: antfly.ha.primary.SyncPolicy) !void {
+fn validateHASyncPolicy(policy: antfly.hot_standby.primary.SyncPolicy) !void {
     if (policy.required == 0) return error.InvalidHASyncPolicy;
     if (policy.mode == .async) return;
     if (policy.standby_names.len == 0) return error.InvalidHASyncPolicy;
@@ -4742,7 +5011,7 @@ fn validateHASyncPolicy(policy: antfly.ha.primary.SyncPolicy) !void {
     }
 }
 
-fn haPrimaryIdentity(cli: CliConfig) !antfly.ha.primary.Identity {
+fn haPrimaryIdentity(cli: CliConfig) !antfly.hot_standby.primary.Identity {
     return .{
         .cluster_id = cli.ha_cluster_id orelse return error.HAClusterIdMissing,
         .shard_id = cli.ha_shard_id orelse 0,
@@ -4752,7 +5021,47 @@ fn haPrimaryIdentity(cli: CliConfig) !antfly.ha.primary.Identity {
     };
 }
 
-fn openHAPrimaryFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?antfly.ha.primary.Primary {
+/// Moves an existing pre-0.3 `<root>/ha/` hot-standby tree to the canonical
+/// `<root>/standby/` layout, once, before any hot-standby store below is
+/// opened. See `storage/hot_standby/layout.zig` for the exact algorithm.
+/// A no-op when no hot-standby path is configured at all, and idempotent on
+/// every later startup once a root has been migrated.
+fn migrateHALegacyLayoutFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !void {
+    const candidates = [_]?[]const u8{
+        cli.ha_primary_log,
+        cli.ha_primary_slots,
+        cli.ha_standby_log,
+        cli.ha_standby_progress,
+        cli.ha_fence_wal,
+        cli.ha_former_primary_log,
+        cli.ha_seed_capture_root,
+        cli.ha_startup_target_root,
+    };
+    var configured_paths: [candidates.len][]const u8 = undefined;
+    var count: usize = 0;
+    for (candidates) |maybe_path| {
+        const path = maybe_path orelse continue;
+        configured_paths[count] = path;
+        count += 1;
+    }
+    if (count == 0) return;
+
+    const report = try antfly.hot_standby.layout.migrateLegacyLayout(io, alloc, configured_paths[0..count]);
+    if (report.changed()) {
+        std.log.info(
+            "standalone hot-standby layout migration moved legacy state: dirs_renamed={d} files_renamed={d}",
+            .{ report.dirs_renamed, report.files_renamed },
+        );
+    }
+    if (report.coexisting_roots != 0) {
+        std.log.warn(
+            "standalone hot-standby layout migration found {d} root(s) with both a legacy 'ha' tree and a canonical 'standby' tree present; the legacy tree was left in place",
+            .{report.coexisting_roots},
+        );
+    }
+}
+
+fn openHAPrimaryFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?antfly.hot_standby.primary.Primary {
     if (!haPrimaryRequested(cli)) return null;
     const log_path = cli.ha_primary_log orelse return error.HAPrimaryLogMissing;
     const slots_path = cli.ha_primary_slots orelse return error.HAPrimarySlotsMissing;
@@ -4766,10 +5075,10 @@ fn openHAPrimaryFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?
     const slots_z = try alloc.dupeZ(u8, slots_path);
     defer alloc.free(slots_z);
 
-    return try antfly.ha.primary.Primary.open(alloc, log_z.ptr, slots_z.ptr, try haPrimaryIdentity(cli), .{});
+    return try antfly.hot_standby.primary.Primary.open(alloc, log_z.ptr, slots_z.ptr, try haPrimaryIdentity(cli), .{});
 }
 
-fn haStandbyIdentity(cli: CliConfig) !antfly.ha.standby.Identity {
+fn haStandbyIdentity(cli: CliConfig) !antfly.hot_standby.standby.Identity {
     return .{
         .cluster_id = cli.ha_cluster_id orelse return error.HAClusterIdMissing,
         .shard_id = cli.ha_shard_id orelse 0,
@@ -4779,7 +5088,7 @@ fn haStandbyIdentity(cli: CliConfig) !antfly.ha.standby.Identity {
     };
 }
 
-fn openHAStandbyFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?antfly.ha.standby.Standby {
+fn openHAStandbyFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?antfly.hot_standby.standby.Standby {
     if (!haStandbyRequested(cli)) return null;
     const log_path = cli.ha_standby_log orelse return error.HAStandbyLogMissing;
     const progress_path = cli.ha_standby_progress orelse return error.HAStandbyProgressMissing;
@@ -4793,7 +5102,7 @@ fn openHAStandbyFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?
     const progress_z = try alloc.dupeZ(u8, progress_path);
     defer alloc.free(progress_z);
 
-    return try antfly.ha.standby.Standby.open(alloc, log_z.ptr, progress_z.ptr, try haStandbyIdentity(cli), .{});
+    return try antfly.hot_standby.standby.Standby.open(alloc, log_z.ptr, progress_z.ptr, try haStandbyIdentity(cli), .{});
 }
 
 /// The activated storage snapshot already contains every mutation through the
@@ -4804,7 +5113,7 @@ fn openHAStandbyFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?
 /// materialized data would make both safe-read and promotion LSNs untrustworthy.
 fn bootstrapHAStandbyAtActivatedCheckpoint(
     alloc: std.mem.Allocator,
-    standby: *antfly.ha.standby.Standby,
+    standby: *antfly.hot_standby.standby.Standby,
     generation: []const u8,
     slot_name: []const u8,
     checkpoint_lsn: u64,
@@ -4831,7 +5140,7 @@ fn bootstrapHAStandbyAtActivatedCheckpoint(
     }
 }
 
-fn openHAFenceStoreFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?antfly.ha.fencing.Store {
+fn openHAFenceStoreFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?antfly.hot_standby.fencing.Store {
     const fence_wal_path = cli.ha_fence_wal orelse return null;
     if (!haPrimaryRequested(cli) and !haStandbyRequested(cli)) return error.HARoleMissing;
 
@@ -4840,10 +5149,10 @@ fn openHAFenceStoreFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig)
     const fence_wal_z = try alloc.dupeZ(u8, fence_wal_path);
     defer alloc.free(fence_wal_z);
 
-    return try antfly.ha.fencing.Store.open(alloc, fence_wal_z.ptr, .{});
+    return try antfly.hot_standby.fencing.Store.open(alloc, fence_wal_z.ptr, .{});
 }
 
-fn openHAFormerPrimaryLogFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?antfly.ha.replication_log.ReplicationLog {
+fn openHAFormerPrimaryLogFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?antfly.hot_standby.replication_log.ReplicationLog {
     const former_primary_log_path = cli.ha_former_primary_log orelse return null;
     if (!haPrimaryRequested(cli) and !haStandbyRequested(cli)) return error.HARoleMissing;
     if (cli.ha_primary_log) |primary_log_path| {
@@ -4858,14 +5167,14 @@ fn openHAFormerPrimaryLogFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliC
     const former_primary_log_z = try alloc.dupeZ(u8, former_primary_log_path);
     defer alloc.free(former_primary_log_z);
 
-    return try antfly.ha.replication_log.ReplicationLog.open(former_primary_log_z.ptr, .{});
+    return try antfly.hot_standby.replication_log.ReplicationLog.open(former_primary_log_z.ptr, .{});
 }
 
 fn resolveAdminBearerTokenFromCli(alloc: std.mem.Allocator, cli: CliConfig) !?[]u8 {
     const raw_env_var = cli.admin_token_env orelse return null;
     const env_var = std.mem.trim(u8, raw_env_var, " \t\r\n");
     if (env_var.len == 0) return error.AdminTokenEnvMissing;
-    if (!antfly.ha.validation.isEnvVarName(env_var)) return error.AdminTokenEnvInvalid;
+    if (!antfly.hot_standby.validation.isEnvVarName(env_var)) return error.AdminTokenEnvInvalid;
 
     const env_var_z = try alloc.dupeZ(u8, env_var);
     defer alloc.free(env_var_z);
@@ -4879,7 +5188,7 @@ fn resolveAdminBearerTokenFromCli(alloc: std.mem.Allocator, cli: CliConfig) !?[]
 fn resolveHAPodUID(alloc: std.mem.Allocator) !?[]u8 {
     const raw_z = std.c.getenv("ANTFLY_POD_UID") orelse return null;
     const pod_uid = std.mem.trim(u8, std.mem.span(raw_z), " \t\r\n");
-    if (!antfly.ha.validation.isIdentifier(pod_uid)) return error.HAPodUIDInvalid;
+    if (!antfly.hot_standby.validation.isIdentifier(pod_uid)) return error.HAPodUIDInvalid;
     return try alloc.dupe(u8, pod_uid);
 }
 
@@ -4947,67 +5256,7 @@ fn resolveInferenceBudgetOverrides(cli: CliConfig) !InferenceBudgetOverrides {
 /// API runtimes borrow this stable object rather than the model-manager handle
 /// directly, so shutdown can reject new calls and wait for every admitted call
 /// before destroying the underlying inference node.
-const EmbeddedInferenceProviderLifetime = struct {
-    const closed_bit: usize = @as(usize, 1) << (@bitSizeOf(usize) - 1);
-    const count_mask: usize = closed_bit - 1;
-
-    handle: *anyopaque,
-    // Admission and borrower count share one modification order. A separate
-    // accepting flag and counter would leave a check/increment window where
-    // shutdown could observe zero and destroy the node before that borrower
-    // committed its reference.
-    state: std.atomic.Value(usize) = .init(0),
-    drain_mutex: std.Io.Mutex = .init,
-    drained: std.Io.Condition = .init,
-
-    const CallGuard = struct {
-        owner: *EmbeddedInferenceProviderLifetime,
-        active: bool = true,
-
-        fn deinit(self: *@This()) void {
-            if (!self.active) return;
-            const io = std.Io.Threaded.global_single_threaded.io();
-            self.owner.drain_mutex.lockUncancelable(io);
-            const previous = self.owner.state.fetchSub(1, .acq_rel);
-            std.debug.assert(previous & count_mask > 0);
-            if (previous & closed_bit != 0 and previous & count_mask == 1) {
-                self.owner.drained.broadcast(io);
-            }
-            self.owner.drain_mutex.unlock(io);
-            self.active = false;
-        }
-    };
-
-    fn acquire(self: *EmbeddedInferenceProviderLifetime) !CallGuard {
-        var observed = self.state.load(.acquire);
-        while (true) {
-            if (observed & closed_bit != 0) return error.InferenceProviderShuttingDown;
-            if (observed & count_mask == count_mask)
-                return error.InferenceProviderCallCapacityExhausted;
-            if (self.state.cmpxchgWeak(observed, observed + 1, .acq_rel, .acquire)) |actual| {
-                observed = actual;
-                continue;
-            }
-            return .{ .owner = self };
-        }
-    }
-
-    fn quiesce(self: *EmbeddedInferenceProviderLifetime) void {
-        _ = self.state.fetchOr(closed_bit, .acq_rel);
-        const io = std.Io.Threaded.global_single_threaded.io();
-        self.drain_mutex.lockUncancelable(io);
-        defer self.drain_mutex.unlock(io);
-        while (self.activeCallCount() != 0) self.drained.waitUncancelable(io, &self.drain_mutex);
-    }
-
-    fn isAccepting(self: *const EmbeddedInferenceProviderLifetime) bool {
-        return self.state.load(.acquire) & closed_bit == 0;
-    }
-
-    fn activeCallCount(self: *const EmbeddedInferenceProviderLifetime) usize {
-        return self.state.load(.acquire) & count_mask;
-    }
-};
+const EmbeddedInferenceProviderLifetime = inference_provider.EmbeddedInferenceProviderLifetime;
 
 test "embedded provider lifetime rejects new calls and joins admitted calls" {
     var handle_storage: u8 = 0;
@@ -5041,122 +5290,48 @@ test "embedded provider lifetime rejects new calls and joins admitted calls" {
     try std.testing.expectError(error.InferenceProviderShuttingDown, lifetime.acquire());
 }
 
-fn inferenceBoundaryProvider(lifetime: *EmbeddedInferenceProviderLifetime) antfly.inference.managed_embedder.AntflyProvider {
-    return .{
-        .ptr = lifetime,
-        .embed_dense_texts = inferenceProviderEmbedDenseTexts,
-        .embed_dense_texts_with_context = inferenceProviderEmbedDenseTextsWithContext,
-        .embed_sparse_texts = inferenceProviderEmbedSparseTexts,
-        .embed_sparse_texts_with_context = inferenceProviderEmbedSparseTextsWithContext,
-        .embed_dense_parts = inferenceProviderEmbedDenseParts,
-        .embed_dense_parts_with_context = inferenceProviderEmbedDensePartsWithContext,
-        .rerank_texts = inferenceProviderRerankTexts,
-        .rerank_texts_with_context = inferenceProviderRerankTextsWithContext,
-        .generate_text = inferenceProviderGenerateText,
-        .generate_text_with_context = inferenceProviderGenerateTextWithContext,
-        .generate_messages = inferenceProviderGenerateMessages,
-        .generate_messages_with_context = inferenceProviderGenerateMessagesWithContext,
-        .generate_json = inferenceProviderGenerateJson,
-        .read_images = inferenceProviderReadImages,
-        .read_images_with_context = inferenceProviderReadImagesWithContext,
-        .transcribe_audio = inferenceProviderTranscribeAudio,
-        .transcribe_audio_with_context = inferenceProviderTranscribeAudioWithContext,
-        .extract = inferenceProviderExtract,
-        .extract_with_context = inferenceProviderExtractWithContext,
-        .list_models_json = inferenceProviderListModelsJson,
-    };
-}
+const inferenceBoundaryProvider = inference_provider.inferenceBoundaryProvider;
 
-fn invokeInferenceProvider(
+const invokeInferenceProvider = inference_provider.invokeInferenceProvider;
+
+const invokeInferenceProviderControlled = inference_provider.invokeInferenceProviderControlled;
+
+fn invokeInferenceProviderWithBinary(
     comptime Result: type,
     alloc: std.mem.Allocator,
     provider_context: *anyopaque,
     operation: inference_bridge.ProviderOperation,
     request: anytype,
-    request_context: ?antfly.inference.RequestContext,
+    deadline_ns: ?u64,
+    binary_payloads: []const inference_bridge.ProviderBinaryPayload,
+    attachment_refs: []const inference_bridge.ProviderAttachmentRef,
 ) !Result {
-    if (request_context) |context| try context.check();
-    const lifetime: *EmbeddedInferenceProviderLifetime = @ptrCast(@alignCast(provider_context));
-    var call_guard = try lifetime.acquire();
-    defer call_guard.deinit();
-    const handle = lifetime.handle;
-    const request_json = try std.json.Stringify.valueAlloc(alloc, request, .{});
-    defer alloc.free(request_json);
-    var response_handle: ?*anyopaque = null;
-    var response_json: inference_bridge.String = undefined;
-    const deadline_ns = if (request_context) |context| context.deadline_ns else null;
-    const effective_deadline_ns = deadline_ns orelse platform_time.monotonicNs() +| 5 * std.time.ns_per_min;
-    const RequestCancellation = struct {
-        fn requested(raw: ?*const anyopaque) callconv(.c) u8 {
-            const context: *const ?antfly.inference.RequestContext = @ptrCast(@alignCast(raw orelse return 1));
-            const active = context.* orelse return 0;
-            return @intFromBool(if (active.cancellation) |token| token.isCancelled() else false);
-        }
-    };
-    const RequestProgress = struct {
-        fn update(raw: ?*anyopaque, phase: u8, completed: u64, total: u64, model: inference_bridge.String, backend: inference_bridge.String) callconv(.c) void {
-            const context: *const ?antfly.inference.RequestContext = @ptrCast(@alignCast(raw orelse return));
-            const active = context.* orelse return;
-            const progress = active.progress orelse return;
-            const typed_phase = std.enums.fromInt(antfly.inference.request_context.Phase, phase) orelse return;
-            progress.update(.{
-                .phase = typed_phase,
-                .completed = completed,
-                .total = total,
-                .model = model.slice(),
-                .backend = backend.slice(),
-                .deadline_ns = active.deadline_ns,
-            });
-        }
-    };
-    const context = inference_bridge.ProviderInvokeContext{
-        .abi_version = inference_bridge.abi_version,
-        .handle = handle,
-        .operation = @intFromEnum(operation),
-        .request_json = inference_bridge.String.init(request_json),
-        .deadline_ns = effective_deadline_ns,
-        .has_deadline = 1,
-        .out_response_handle = &response_handle,
-        .out_response_json = &response_json,
-        .cancellation = if (request_context != null and request_context.?.cancellation != null)
-            .{ .context = &request_context, .is_cancelled = RequestCancellation.requested }
-        else
-            .{},
-        .progress = if (request_context != null and request_context.?.progress != null)
-            .{ .context = @constCast(&request_context), .update_progress = RequestProgress.update }
-        else
-            .{},
-    };
-    if (comptime inline_inference_codegen) {
-        try inference_host.linkedInferenceInvokeProvider(&context);
-    } else {
-        const status = (try linkedInferenceApi(
-            inference_bridge.Capability.provider,
-        )).invoke_provider(&context);
-        if (!status.isOk()) return inference_bridge.errorFromStatus(status);
+    return try invokeInferenceProviderWithBinaryContext(Result, alloc, provider_context, operation, request, requestContextFromControls(deadline_ns, .none), binary_payloads, attachment_refs);
+}
+
+const invokeInferenceProviderWithBinaryControlled = inference_provider.invokeInferenceProviderWithBinaryControlled;
+
+const requestContextFromControls = inference_provider.requestContextFromControls;
+
+const invokeInferenceProviderWithBinaryContext = inference_provider.invokeInferenceProviderWithBinaryContext;
+
+const ProviderInvocationCancellation = struct {
+    token: CancellationToken,
+
+    fn requested(raw: ?*const anyopaque) callconv(.c) u8 {
+        const self: *const ProviderInvocationCancellation = @ptrCast(@alignCast(raw orelse return 1));
+        return @intFromBool(self.token.isCancelled());
     }
-    const owned_response = response_handle orelse return error.InferenceRuntimeResponseMissing;
-    defer if (comptime inline_inference_codegen)
-        inference_host.linkedInferenceDestroyProviderResponse(owned_response)
-    else
-        linkedInferenceApiInfallible().destroy_provider_response(owned_response);
-    if (request_context) |active| try active.check();
-    return try std.json.parseFromSliceLeaky(Result, alloc, response_json.slice(), .{
-        .allocate = .alloc_always,
-        .ignore_unknown_fields = true,
-    });
-}
 
-fn linkedInferenceApi(required_capabilities: u64) !*const inference_bridge.FunctionTable {
-    const table = inference_bridge.antfly_standalone_inference_get_function_table();
-    if (!inference_bridge.validFunctionTable(table, required_capabilities))
-        return error.UnsupportedVersion;
-    return table;
-}
+    fn view(self: *const ProviderInvocationCancellation) runtime_http_abi.CancellationView {
+        if (self.token.ptr == null or self.token.is_cancelled_fn == null) return .{};
+        return .{ .context = self, .is_cancelled = requested };
+    }
+};
 
-fn linkedInferenceApiInfallible() *const inference_bridge.FunctionTable {
-    return linkedInferenceApi(0) catch @panic("linked inference ABI changed after startup");
-}
+const linkedInferenceApi = inference_provider.linkedInferenceApi;
+
+const linkedInferenceApiInfallible = inference_provider.linkedInferenceApiInfallible;
 
 /// Dispatch the runtime-reserved local-inference connection through the same
 /// embedded route handler used by the public inference API. This preserves the
@@ -5170,28 +5345,7 @@ fn invokeLocalInferenceConnection(context: *const inference_connection_abi.Invok
     return .ok;
 }
 
-const LocalInferenceInvocationLifetime = struct {
-    upstream: runtime_http_abi.CancellationView,
-    deadline_ns: u64,
-
-    fn expired(self: *const LocalInferenceInvocationLifetime) bool {
-        return self.deadline_ns != 0 and platform_time.monotonicNs() >= self.deadline_ns;
-    }
-
-    fn check(self: *const LocalInferenceInvocationLifetime) !void {
-        if (self.upstream.requested()) return error.Canceled;
-        if (self.expired()) return error.Timeout;
-    }
-
-    fn isCancelled(raw: ?*const anyopaque) callconv(.c) u8 {
-        const self: *const LocalInferenceInvocationLifetime = @ptrCast(@alignCast(raw orelse return 1));
-        return @intFromBool(self.upstream.requested() or self.expired());
-    }
-
-    fn cancellation(self: *const LocalInferenceInvocationLifetime) runtime_http_abi.CancellationView {
-        return .{ .context = self, .is_cancelled = isCancelled };
-    }
-};
+const LocalInferenceInvocationLifetime = inference_provider.LocalInferenceInvocationLifetime;
 
 test "standalone local inference lifetime distinguishes deadline from upstream cancellation" {
     const expired = LocalInferenceInvocationLifetime{
@@ -5213,131 +5367,11 @@ test "standalone local inference lifetime distinguishes deadline from upstream c
     try std.testing.expectError(error.Canceled, canceled.check());
 }
 
-fn ownedInferenceConnectionBytes(alloc: std.mem.Allocator, value: []const u8) !inference_connection_abi.OwnedBytes {
-    const owned = try alloc.dupe(u8, value);
-    return .{
-        .ptr = if (owned.len == 0) null else owned.ptr,
-        .len = owned.len,
-    };
-}
+const ownedInferenceConnectionBytes = inference_provider.ownedInferenceConnectionBytes;
 
-fn optionalOwnedInferenceConnectionBytes(
-    alloc: std.mem.Allocator,
-    value: ?[]const u8,
-) !inference_connection_abi.OptionalOwnedBytes {
-    const present = value orelse return .{};
-    return .{
-        .bytes = try ownedInferenceConnectionBytes(alloc, present),
-        .present = 1,
-    };
-}
+const optionalOwnedInferenceConnectionBytes = inference_provider.optionalOwnedInferenceConnectionBytes;
 
-fn invokeLocalInferenceConnectionFallible(context: *const inference_connection_abi.InvokeContext) !void {
-    if (!inference_connection_abi.validInvokeContext(context)) return error.UnsupportedVersion;
-    const local_context: *LocalInferenceConnectionContext = @ptrCast(@alignCast(context.target_context));
-    const alloc = context.allocator.asStd();
-    const operation = context.operation.slice();
-    const body = context.body.slice();
-    var lifetime = LocalInferenceInvocationLifetime{
-        .upstream = context.cancellation,
-        .deadline_ns = context.deadline_ns,
-    };
-    try lifetime.check();
-    const functions: ?*const inference_bridge.FunctionTable = if (comptime inline_inference_codegen)
-        null
-    else
-        try linkedInferenceApi(inference_bridge.Capability.route_manifest);
-
-    var entries_ptr: ?[*]const inference_bridge.RouteManifestEntry = null;
-    var entries_len: usize = 0;
-    const manifest_context = inference_bridge.RouteManifestContext{
-        .abi_version = inference_bridge.abi_version,
-        .handle = local_context.handle,
-        .out_entries = &entries_ptr,
-        .out_len = &entries_len,
-    };
-    if (comptime inline_inference_codegen) {
-        try inference_host.linkedInferenceRouteManifest(&manifest_context);
-    } else {
-        const status = functions.?.route_manifest(&manifest_context);
-        if (!status.isOk()) return inference_bridge.errorFromStatus(status);
-    }
-
-    const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ inference_bridge.ai_api_prefix, operation });
-    defer alloc.free(path);
-    const interactive_generate = isInteractiveGeneratePath(path);
-    if (interactive_generate)
-        _ = antfly.db.enrichment_types.interactive_generate_inflight.fetchAdd(1, .monotonic);
-    defer {
-        if (interactive_generate)
-            _ = antfly.db.enrichment_types.interactive_generate_inflight.fetchSub(1, .monotonic);
-    }
-    const entries = if (entries_ptr) |ptr| ptr[0..entries_len] else &.{};
-    const route_handle = for (entries) |entry| {
-        if (entry.method == .post and std.mem.eql(u8, entry.path.slice(), path))
-            break entry.route_handle;
-    } else return error.UnsupportedInferenceOperation;
-
-    const headers = [_]runtime_http_abi.HeaderView{.{
-        .name = runtime_http_abi.Bytes.init("Content-Type"),
-        .value = runtime_http_abi.Bytes.init("application/json"),
-    }};
-    const request = runtime_http_abi.HttpRequestView{
-        .method = .post,
-        .path = runtime_http_abi.Bytes.init(path),
-        .headers_ptr = &headers,
-        .headers_len = headers.len,
-        .body = runtime_http_abi.OptionalBytes.init(body),
-        .content_type = runtime_http_abi.OptionalBytes.init("application/json"),
-    };
-    var response_handle: ?*anyopaque = null;
-    var response_view: runtime_http_abi.HttpResponseView = undefined;
-    const handle_context = inference_bridge.HttpHandleContext{
-        .abi_version = inference_bridge.abi_version,
-        .route_handle = route_handle,
-        .request = &request,
-        .cancellation = lifetime.cancellation(),
-        .stream = context.stream,
-        .out_response_handle = &response_handle,
-        .out_response = &response_view,
-    };
-    if (comptime inline_inference_codegen) {
-        inference_host.linkedInferenceHandleHttp(&handle_context) catch |err| {
-            try lifetime.check();
-            return err;
-        };
-    } else {
-        const status = functions.?.handle_http(&handle_context);
-        if (!status.isOk()) {
-            try lifetime.check();
-            return inference_bridge.errorFromStatus(status);
-        }
-    }
-    try lifetime.check();
-    const owned_response = response_handle orelse return error.InferenceRuntimeResponseMissing;
-    defer if (comptime inline_inference_codegen)
-        inference_host.linkedInferenceDestroyHttpResponse(owned_response)
-    else
-        functions.?.destroy_http_response(owned_response);
-
-    var response: inference_connection_abi.InvokeResponse = .{
-        .status = response_view.status,
-        .body = try ownedInferenceConnectionBytes(alloc, response_view.body.slice()),
-    };
-    errdefer alloc.free(response.body.slice());
-    var retry_after: ?[]const u8 = null;
-    const response_headers = if (response_view.headers_ptr) |ptr| ptr[0..response_view.headers_len] else &.{};
-    for (response_headers) |header| {
-        if (std.ascii.eqlIgnoreCase(header.name.slice(), "Retry-After")) {
-            retry_after = header.value.slice();
-            break;
-        }
-    }
-    response.retry_after = try optionalOwnedInferenceConnectionBytes(alloc, retry_after);
-    errdefer if (response.retry_after.present != 0) alloc.free(response.retry_after.bytes.slice());
-    response.content_type = try optionalOwnedInferenceConnectionBytes(alloc, response_view.content_type.slice());
-    context.out_response.* = response;
-}
+const invokeLocalInferenceConnectionFallible = inference_provider.invokeLocalInferenceConnectionFallible;
 
 fn tryAcquireEmbeddedInferenceRequest(handle: *anyopaque) bool {
     if (comptime inline_inference_codegen) {
@@ -5370,301 +5404,99 @@ fn embeddedInferenceRequestStats(handle: *anyopaque) antfly.common.request_admis
     };
 }
 
-fn inferenceProviderEmbedDenseTexts(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    texts: []const []const u8,
-) anyerror![][]f32 {
-    return try invokeInferenceProvider([][]f32, alloc, handle, .embed_dense_texts, .{
-        .model = model,
-        .texts = texts,
-    }, null);
-}
+const inferenceProviderEmbedDenseTexts = inference_provider.inferenceProviderEmbedDenseTexts;
 
-fn inferenceProviderEmbedDenseTextsWithContext(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    texts: []const []const u8,
-    context: antfly.inference.managed_embedder.EmbeddingRequestContext,
-) anyerror![][]f32 {
-    try context.check();
-    return try invokeInferenceProvider([][]f32, alloc, handle, .embed_dense_texts_with_context, .{
-        .model = model,
-        .texts = texts,
-        .task_type = context.task_type.canonical(),
-        .instruction = context.instruction,
-    }, context.request);
-}
+const inferenceProviderEmbedDenseTextsWithContext = inference_provider.inferenceProviderEmbedDenseTextsWithContext;
 
-fn inferenceProviderEmbedSparseTexts(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    texts: []const []const u8,
-) anyerror![]antfly.db.embedder.SparseEmbedding {
-    return try invokeInferenceProvider([]antfly.db.embedder.SparseEmbedding, alloc, handle, .embed_sparse_texts, .{
-        .model = model,
-        .texts = texts,
-    }, null);
-}
+const inferenceProviderEmbedSparseTexts = inference_provider.inferenceProviderEmbedSparseTexts;
 
-fn inferenceProviderEmbedSparseTextsWithContext(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    texts: []const []const u8,
-    context: antfly.inference.managed_embedder.EmbeddingRequestContext,
-) anyerror![]antfly.db.embedder.SparseEmbedding {
-    try context.check();
-    return try invokeInferenceProvider([]antfly.db.embedder.SparseEmbedding, alloc, handle, .embed_sparse_texts, .{
-        .model = model,
-        .texts = texts,
-    }, context.request);
-}
+const inferenceProviderEmbedSparseTextsWithContext = inference_provider.inferenceProviderEmbedSparseTextsWithContext;
 
-fn inferenceProviderEmbedDenseParts(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    parts: []const antfly.template.ContentPart,
-) anyerror![][]f32 {
-    return try invokeInferenceProvider([][]f32, alloc, handle, .embed_dense_parts, .{
-        .model = model,
-        .parts = parts,
-    }, null);
-}
+const inferenceProviderEmbedDenseParts = inference_provider.inferenceProviderEmbedDenseParts;
 
-fn inferenceProviderEmbedDensePartsWithContext(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    parts: []const antfly.template.ContentPart,
-    context: antfly.inference.managed_embedder.EmbeddingRequestContext,
-) anyerror![][]f32 {
-    try context.check();
-    return try invokeInferenceProvider([][]f32, alloc, handle, .embed_dense_parts_with_context, .{
-        .model = model,
-        .parts = parts,
-        .task_type = context.task_type.canonical(),
-        .instruction = context.instruction,
-    }, context.request);
-}
+const inferenceProviderEmbedDensePartsWithContext = inference_provider.inferenceProviderEmbedDensePartsWithContext;
 
-fn inferenceProviderRerankTexts(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    query: []const u8,
-    documents: []const []const u8,
-) anyerror![]f32 {
-    return try invokeInferenceProvider([]f32, alloc, handle, .rerank_texts, .{
-        .model = model,
-        .query = query,
-        .documents = documents,
-    }, null);
-}
+const inferenceProviderEmbedDensePartsBorrowed = inference_provider.inferenceProviderEmbedDensePartsBorrowed;
 
-fn inferenceProviderRerankTextsWithContext(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    query: []const u8,
-    documents: []const []const u8,
-    context: antfly.inference.RequestContext,
-) anyerror![]f32 {
-    try context.check();
-    const scores = try invokeInferenceProvider([]f32, alloc, handle, .rerank_texts, .{
-        .model = model,
-        .query = query,
-        .documents = documents,
-    }, context);
-    try context.check();
-    return scores;
-}
+const inferenceProviderRerankTexts = inference_provider.inferenceProviderRerankTexts;
 
-fn inferenceProviderGenerateText(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    roles: []const []const u8,
-    contents: []const []const u8,
-    options: antfly.inference.GenerationOptions,
-) anyerror![]u8 {
-    return try invokeInferenceProvider([]u8, alloc, handle, .generate_text, antfly.inference.types.GenerateTextRequest{
-        .model = model,
-        .roles = roles,
-        .contents = contents,
-        .options = options,
-    }, null);
-}
+const inferenceProviderRerankTextsWithContext = inference_provider.inferenceProviderRerankTextsWithContext;
 
-fn inferenceProviderGenerateTextWithContext(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    roles: []const []const u8,
-    contents: []const []const u8,
-    options: antfly.inference.GenerationOptions,
-    context: antfly.inference.RequestContext,
-) anyerror![]u8 {
-    return try invokeInferenceProvider([]u8, alloc, handle, .generate_text, antfly.inference.types.GenerateTextRequest{
-        .model = model,
-        .roles = roles,
-        .contents = contents,
-        .options = options,
-    }, context);
-}
+const inferenceProviderGenerateText = inference_provider.inferenceProviderGenerateText;
 
-fn inferenceProviderGenerateMessages(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    messages: []const antfly.inference.ChatMessage,
-    options: antfly.inference.GenerationOptions,
-) anyerror![]u8 {
-    return try invokeInferenceProvider([]u8, alloc, handle, .generate_messages, antfly.inference.types.GenerateMessagesRequest{
-        .model = model,
-        .messages = messages,
-        .options = options,
-    }, null);
-}
+const inferenceProviderGenerateTextWithContext = inference_provider.inferenceProviderGenerateTextWithContext;
 
-fn inferenceProviderGenerateJson(
-    ptr: *anyopaque,
-    alloc: std.mem.Allocator,
-    body: []const u8,
-    request: ?antfly.inference.RequestContext,
-) ![]u8 {
-    if (request) |context| try context.check();
-    const lifetime: *EmbeddedInferenceProviderLifetime = @ptrCast(@alignCast(ptr));
-    var guard = try lifetime.acquire();
-    defer guard.deinit();
-    var target = LocalInferenceConnectionContext{ .handle = lifetime.handle };
-    var abi_alloc = inference_connection_abi.Allocator.fromStd(&alloc);
-    var response: inference_connection_abi.InvokeResponse = .{};
-    defer response.deinit(&abi_alloc);
-    try invokeLocalInferenceConnectionFallible(&.{
-        .abi_version = inference_connection_abi.abi_version,
-        .target_context = &target,
-        .allocator = &abi_alloc,
-        .operation = .init("generate"),
-        .body = .init(body),
-        .deadline_ns = if (request) |context| context.deadline_ns orelse 0 else platform_time.monotonicNs() +| 5 * std.time.ns_per_min,
-        .cancellation = .{ .context = &request, .is_cancelled = struct {
-            fn cancelled(raw: ?*const anyopaque) callconv(.c) u8 {
-                const source: *const ?antfly.inference.RequestContext = @ptrCast(@alignCast(raw orelse return 1));
-                const active = source.* orelse return 0;
-                return @intFromBool(if (active.cancellation) |token| token.isCancelled() else false);
-            }
-        }.cancelled },
-        .out_response = &response,
-    });
-    if (request) |context| try context.check();
-    if (!response.valid()) return error.RuntimeBoundaryFailure;
-    if (response.status >= 300) return antfly.inference.types.localGenerationStatusError(alloc, response.status, response.body.slice());
-    return alloc.dupe(u8, response.body.slice());
-}
+const inferenceProviderGenerateMessages = inference_provider.inferenceProviderGenerateMessages;
 
-fn inferenceProviderGenerateMessagesWithContext(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    messages: []const antfly.inference.ChatMessage,
-    options: antfly.inference.GenerationOptions,
-    context: antfly.inference.RequestContext,
-) anyerror![]u8 {
-    return try invokeInferenceProvider([]u8, alloc, handle, .generate_messages, antfly.inference.types.GenerateMessagesRequest{
-        .model = model,
-        .messages = messages,
-        .options = options,
-    }, context);
-}
+const inferenceProviderGenerateJson = inference_provider.inferenceProviderGenerateJson;
 
-fn inferenceProviderReadImages(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    request: antfly.readers.Request,
-) anyerror![]antfly.readers.Result {
-    return try invokeInferenceProvider([]antfly.readers.Result, alloc, handle, .read_images, .{
-        .model = model,
-        .request = request,
-    }, null);
-}
+const inferenceProviderGenerateMessagesWithContext = inference_provider.inferenceProviderGenerateMessagesWithContext;
 
-fn inferenceProviderReadImagesWithContext(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    request: antfly.readers.Request,
-    context: antfly.inference.RequestContext,
-) anyerror![]antfly.readers.Result {
-    return try invokeInferenceProvider([]antfly.readers.Result, alloc, handle, .read_images, .{
-        .model = model,
-        .request = request,
-    }, context);
-}
+const inferenceProviderGenerateMessagesWithAttachments = inference_provider.inferenceProviderGenerateMessagesWithAttachments;
 
-fn inferenceProviderTranscribeAudio(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    request: antfly.transcribing.Request,
-) anyerror!antfly.transcribing.Response {
-    return try invokeInferenceProvider(antfly.transcribing.Response, alloc, handle, .transcribe_audio, .{
-        .model = model,
-        .request = request,
-    }, null);
-}
+const inferenceProviderGenerateMessagesWithAttachmentsWithContext = inference_provider.inferenceProviderGenerateMessagesWithAttachmentsWithContext;
 
-fn inferenceProviderTranscribeAudioWithContext(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    request: antfly.transcribing.Request,
-    context: antfly.inference.RequestContext,
-) anyerror!antfly.transcribing.Response {
-    return try invokeInferenceProvider(antfly.transcribing.Response, alloc, handle, .transcribe_audio, .{
-        .model = model,
-        .request = request,
-    }, context);
-}
+const inferenceProviderGenerateMessagesWithAttachmentsControlled = inference_provider.inferenceProviderGenerateMessagesWithAttachmentsControlled;
 
-fn inferenceProviderExtract(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    request: antfly.extracting.Request,
-) anyerror!antfly.extracting.Response {
-    const json = try invokeInferenceProvider([]u8, alloc, handle, .extract, .{
-        .model = model,
-        .request = request,
-    }, null);
-    return .{ .allocator = alloc, .json = json };
-}
+const inferenceProviderModelCapabilities = inference_provider.inferenceProviderModelCapabilities;
 
-fn inferenceProviderExtractWithContext(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    request: antfly.extracting.Request,
-    context: antfly.inference.RequestContext,
-) anyerror!antfly.extracting.Response {
-    const json = try invokeInferenceProvider([]u8, alloc, handle, .extract, .{
-        .model = model,
-        .request = request,
-    }, context);
-    return .{ .allocator = alloc, .json = json };
-}
+const inferenceProviderModelCapabilitiesWithContext = inference_provider.inferenceProviderModelCapabilitiesWithContext;
 
-fn inferenceProviderListModelsJson(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-) anyerror![]u8 {
-    return try invokeInferenceProvider([]u8, alloc, handle, .list_models_json, .{}, null);
-}
+const inferenceProviderChunkInput = inference_provider.inferenceProviderChunkInput;
+
+const inferenceProviderChunkInputWithContext = inference_provider.inferenceProviderChunkInputWithContext;
+
+const inferenceProviderChunkInputControlled = inference_provider.inferenceProviderChunkInputControlled;
+
+const inferenceProviderRewriteTexts = inference_provider.inferenceProviderRewriteTexts;
+
+const inferenceProviderClassifyTexts = inference_provider.inferenceProviderClassifyTexts;
+
+const inferenceProviderReadImages = inference_provider.inferenceProviderReadImages;
+
+const inferenceProviderReadImagesWithContext = inference_provider.inferenceProviderReadImagesWithContext;
+
+const inferenceProviderReadEncodedImages = inference_provider.inferenceProviderReadEncodedImages;
+
+const inferenceProviderReadEncodedImagesWithContext = inference_provider.inferenceProviderReadEncodedImagesWithContext;
+
+const inferenceProviderReadEncodedImagesControlled = inference_provider.inferenceProviderReadEncodedImagesControlled;
+
+const inferenceProviderReadEncodedImagesReported = inference_provider.inferenceProviderReadEncodedImagesReported;
+
+const inferenceProviderReadEncodedImagesReportedWithContext = inference_provider.inferenceProviderReadEncodedImagesReportedWithContext;
+
+const inferenceProviderReadEncodedImagesReportedControlled = inference_provider.inferenceProviderReadEncodedImagesReportedControlled;
+
+const encodedImageProviderMetadata = inference_provider.encodedImageProviderMetadata;
+
+const EncodedImageProviderPayloads = inference_provider.EncodedImageProviderPayloads;
+
+const encodedImageProviderPayloadsAlloc = inference_provider.encodedImageProviderPayloadsAlloc;
+
+const inferenceProviderReadRasterImagesReported = inference_provider.inferenceProviderReadRasterImagesReported;
+
+const inferenceProviderReadRasterImagesReportedWithContext = inference_provider.inferenceProviderReadRasterImagesReportedWithContext;
+
+const inferenceProviderReadRasterImagesReportedControlled = inference_provider.inferenceProviderReadRasterImagesReportedControlled;
+
+const inferenceProviderEmbedDenseRasters = inference_provider.inferenceProviderEmbedDenseRasters;
+
+const RasterProviderPayloads = inference_provider.RasterProviderPayloads;
+
+const rasterProviderPayloadsAlloc = inference_provider.rasterProviderPayloadsAlloc;
+
+const inferenceProviderTranscribeAudio = inference_provider.inferenceProviderTranscribeAudio;
+
+const inferenceProviderTranscribeAudioWithContext = inference_provider.inferenceProviderTranscribeAudioWithContext;
+
+const inferenceProviderExtract = inference_provider.inferenceProviderExtract;
+
+const inferenceProviderExtractWithContext = inference_provider.inferenceProviderExtractWithContext;
+
+const inferenceProviderExtractControlled = inference_provider.inferenceProviderExtractControlled;
+
+const inferenceProviderListModelsJson = inference_provider.inferenceProviderListModelsJson;
 
 fn inferenceResourceSlices(amounts: *const inference_bridge.AdmissionAmounts) ![3]antfly.resource_manager.SliceAmount {
     return .{
@@ -6065,45 +5897,46 @@ fn printUsage() void {
         \\  --snapshot-root-dir <path>            Snapshot root directory
         \\  --extension-package-store <path>      Extension package store directory
         \\  --secret-store-path <path>            Antfly secrets.json file path; repeat for fallback layers
-        \\  --ha-primary-log <path>               Enable HA primary WAL/admin API with this replication log path
-        \\  --ha-primary-slots <path>             HA primary replication slot store path
-        \\  --ha-primary-node-id <id>             HA primary node id for typed admin receipts
-        \\  --ha-seed-capture-root <path>          Durable runtime-owned immutable seed generation root
-        \\  --ha-fence-wal <path>                 Durable HA promotion fence WAL path
-        \\  --ha-former-primary-log <path>        Durable HA log used by former-primary rewind admin workflows
-        \\  --admin-token-env <name>              Require Authorization: Bearer token from this environment variable for admin and HA APIs
-        \\  --ha-retention-max-lag-lsn <n>        HA primary marks slots reseed-required after this LSN retention lag
-        \\  --ha-retention-max-retained-bytes <n> HA primary marks oldest slots reseed-required above this retained WAL byte cap
-        \\  --ha-retention-max-retained-age-ns <n> HA primary marks oldest slots reseed-required above this retained WAL age cap
-        \\  --ha-sync-mode <mode>                 HA primary sync mode: async, remote-write, remote-apply
-        \\  --ha-sync-selection <selection>       HA sync standby selection: any, first, all
-        \\  --ha-sync-required <n>                HA sync required standby acknowledgements
-        \\  --ha-sync-standby <name>              HA sync standby name; repeat for multiple standbys
-        \\  --ha-sync-failure <policy>            HA sync failure policy: block, fail-closed, degrade-to-async
-        \\  --ha-standby-log <path>               Enable HA standby admin API with this received replication log path
-        \\  --ha-standby-progress <path>          HA standby durable receive/apply progress WAL path
-        \\  --ha-standby-node-id <id>             HA standby node id for typed admin receipts
-        \\  --ha-standby-upstream-url <url>       Upstream primary URL for continuous standby pull/apply
-        \\  --ha-standby-slot <name>              Upstream replication slot name for continuous standby pull/apply
-        \\  --ha-startup-target-root <path>       Activated generation root; requires the complete startup evidence set
-        \\  --ha-startup-topology-id <id>         Exact topology id bound into the activation receipt
-        \\  --ha-startup-topology-generation <n>  Exact topology generation bound into the activation receipt
-        \\  --ha-startup-generation <id>          Exact activated seed generation
-        \\  --ha-startup-slot-name <id>           Exact slot bound into the activation receipt
-        \\  --ha-startup-timeline-id <id>         Exact predecessor timeline bound into the activation receipt
-        \\  --ha-startup-epoch <id>               Exact predecessor epoch bound into the activation receipt
-        \\  --ha-startup-target-pvc-name <name>   Exact target PVC name bound into the activation receipt
-        \\  --ha-startup-target-pvc-uid <uid>     Exact target PVC UID bound into the activation receipt
-        \\  --ha-startup-capture-receipt-sha256 <sha256> Exact runtime capture authority digest
-        \\  --ha-startup-materialized-receipt-sha256 <sha256> Exact materialized topology receipt digest
-        \\  --ha-startup-materialized-aggregate-sha256 <sha256> Exact materialized file aggregate digest
-        \\  --ha-startup-target-local-node-id <id> Exact local node id used to materialize the live generation
-        \\  --ha-startup-target-replica-id <id>   Exact replica id used to materialize the live generation
-        \\  --ha-cluster-id <id>                  HA replicated cluster id
-        \\  --ha-shard-id <id>                    HA replicated shard id (default: 0)
-        \\  --ha-table-id <id>                    HA replicated table id (default: 0)
-        \\  --ha-timeline-id <id>                 HA primary timeline id
-        \\  --ha-epoch <id>                       HA primary epoch
+        \\  --hot-standby-primary-log <path>      Enable hot-standby primary WAL/admin API with this replication log path
+        \\  --hot-standby-primary-slots <path>    Hot-standby primary replication slot store path
+        \\  --hot-standby-primary-node-id <id>    Hot-standby primary node id for typed admin receipts
+        \\  --hot-standby-seed-capture-root <path> Durable runtime-owned immutable seed generation root
+        \\  --hot-standby-fence-wal <path>        Durable hot-standby promotion fence WAL path
+        \\  --hot-standby-former-primary-log <path> Durable hot-standby log used by former-primary rewind admin workflows
+        \\  --admin-token-env <name>              Require Authorization: Bearer token from this environment variable for admin and hot-standby APIs
+        \\  --hot-standby-retention-max-lag-lsn <n> Hot-standby primary marks slots reseed-required after this LSN retention lag
+        \\  --hot-standby-retention-max-retained-bytes <n> Hot-standby primary marks oldest slots reseed-required above this retained WAL byte cap
+        \\  --hot-standby-retention-max-retained-age-ns <n> Hot-standby primary marks oldest slots reseed-required above this retained WAL age cap
+        \\  --hot-standby-sync-mode <mode>        Hot-standby primary sync mode: async, remote-write, remote-apply
+        \\  --hot-standby-sync-selection <selection> Hot-standby sync standby selection: any, first, all
+        \\  --hot-standby-sync-required <n>       Hot-standby sync required standby acknowledgements
+        \\  --hot-standby-sync-standby <name>     Hot-standby sync standby name; repeat for multiple standbys
+        \\  --hot-standby-sync-failure <policy>   Hot-standby sync failure policy: block, fail-closed, degrade-to-async
+        \\  --hot-standby-log <path>              Enable hot-standby admin API with this received replication log path
+        \\  --hot-standby-progress <path>         Hot-standby durable receive/apply progress WAL path
+        \\  --hot-standby-node-id <id>            Hot-standby node id for typed admin receipts
+        \\  --hot-standby-upstream-url <url>      Upstream primary URL for continuous standby pull/apply
+        \\  --hot-standby-slot <name>             Upstream replication slot name for continuous standby pull/apply
+        \\  --hot-standby-startup-target-root <path> Activated generation root; requires the complete startup evidence set
+        \\  --hot-standby-startup-topology-id <id> Exact topology id bound into the activation receipt
+        \\  --hot-standby-startup-topology-generation <n> Exact topology generation bound into the activation receipt
+        \\  --hot-standby-startup-generation <id> Exact activated seed generation
+        \\  --hot-standby-startup-slot-name <id>  Exact slot bound into the activation receipt
+        \\  --hot-standby-startup-timeline-id <id> Exact predecessor timeline bound into the activation receipt
+        \\  --hot-standby-startup-epoch <id>      Exact predecessor epoch bound into the activation receipt
+        \\  --hot-standby-startup-target-pvc-name <name> Exact target PVC name bound into the activation receipt
+        \\  --hot-standby-startup-target-pvc-uid <uid> Exact target PVC UID bound into the activation receipt
+        \\  --hot-standby-startup-capture-receipt-sha256 <sha256> Exact runtime capture authority digest
+        \\  --hot-standby-startup-materialized-receipt-sha256 <sha256> Exact materialized topology receipt digest
+        \\  --hot-standby-startup-materialized-aggregate-sha256 <sha256> Exact materialized file aggregate digest
+        \\  --hot-standby-startup-target-local-node-id <id> Exact local node id used to materialize the live generation
+        \\  --hot-standby-startup-target-replica-id <id> Exact replica id used to materialize the live generation
+        \\  --hot-standby-cluster-id <id>         Hot-standby replicated cluster id
+        \\  --hot-standby-shard-id <id>           Hot-standby replicated shard id (default: 0)
+        \\  --hot-standby-table-id <id>           Hot-standby replicated table id (default: 0)
+        \\  --hot-standby-timeline-id <id>        Hot-standby primary timeline id
+        \\  --hot-standby-epoch <id>              Hot-standby primary epoch
+        \\  --ha-* spellings of the flags above    Deprecated aliases for --hot-standby-*; kept for one minor release
         \\  -h, --help                            Show this help
         \\
     , .{});
@@ -6115,21 +5948,21 @@ fn parseBoolFlag(raw: []const u8) ?bool {
     return null;
 }
 
-fn parseHASyncDurabilityMode(raw: []const u8) !antfly.ha.primary.DurabilityMode {
+fn parseHASyncDurabilityMode(raw: []const u8) !antfly.hot_standby.primary.DurabilityMode {
     if (std.mem.eql(u8, raw, "async")) return .async;
     if (std.mem.eql(u8, raw, "remote_write") or std.mem.eql(u8, raw, "remote-write")) return .remote_write;
     if (std.mem.eql(u8, raw, "remote_apply") or std.mem.eql(u8, raw, "remote-apply")) return .remote_apply;
     return error.InvalidHASyncMode;
 }
 
-fn parseHASyncStandbySelection(raw: []const u8) !antfly.ha.primary.StandbySelection {
+fn parseHASyncStandbySelection(raw: []const u8) !antfly.hot_standby.primary.StandbySelection {
     if (std.mem.eql(u8, raw, "any")) return .any;
     if (std.mem.eql(u8, raw, "first")) return .first;
     if (std.mem.eql(u8, raw, "all")) return .all;
     return error.InvalidHASyncSelection;
 }
 
-fn parseHASyncFailurePolicy(raw: []const u8) !antfly.ha.primary.FailurePolicy {
+fn parseHASyncFailurePolicy(raw: []const u8) !antfly.hot_standby.primary.FailurePolicy {
     if (std.mem.eql(u8, raw, "block")) return .block;
     if (std.mem.eql(u8, raw, "fail_closed") or std.mem.eql(u8, raw, "fail-closed")) return .fail_closed;
     if (std.mem.eql(u8, raw, "degrade_to_async") or std.mem.eql(u8, raw, "degrade-to-async")) return .degrade_to_async;
@@ -6304,7 +6137,7 @@ test "standalone runtime local generator accepts media url data uris" {
         .content = .{ .parts = &.{
             .{ .text = "describe" },
             .{ .media = .{
-                .url = "data:image/png;base64,AQI=",
+                .url = "DATA:IMAGE/PNG;BASE64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD",
                 .mime_type = "image/png",
             } },
         } },
@@ -6318,7 +6151,11 @@ test "standalone runtime local generator accepts media url data uris" {
     const message = converted.messages[0];
     try std.testing.expectEqualStrings("describe", message.content);
     try std.testing.expectEqual(@as(usize, 1), message.image_bytes.?.len);
-    try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, message.image_bytes.?[0]);
+    var expected = [_]u8{0} ** 24;
+    @memcpy(expected[0..8], "\x89PNG\r\n\x1a\n");
+    std.mem.writeInt(u32, expected[16..20], 2, .big);
+    std.mem.writeInt(u32, expected[20..24], 3, .big);
+    try std.testing.expectEqualSlices(u8, &expected, message.image_bytes.?[0]);
     try std.testing.expectEqual(@as(usize, 2), message.content_parts.?.len);
     try std.testing.expectEqual(@as(usize, 0), message.content_parts.?[1].image);
 }
@@ -6341,6 +6178,244 @@ test "standalone runtime local dense embed preserves borrowed binary media" {
     try std.testing.expectEqualSlices(u8, &raw, direct[2].media.data);
 }
 
+test "standalone encoded reader ABI round trips borrowed payloads" {
+    const alloc = std.testing.allocator;
+    const png = [_]u8{ 0x89, 'P', 'N', 'G', 1 };
+    const jpeg = [_]u8{ 0xff, 0xd8, 0xff, 2 };
+    const images = [_]antfly.readers.EncodedImage{
+        .{ .bytes = &png, .mime_type = "image/png" },
+        .{ .bytes = &jpeg, .mime_type = "image/jpeg" },
+    };
+    const request = antfly.readers.EncodedRequest{
+        .images = &images,
+        .prompt = "<OCR>",
+        .max_tokens = 128,
+        .source_fingerprint = "mixed-deadbeef",
+    };
+
+    const FakeReader = struct {
+        first_ptr: [*]const u8,
+        second_ptr: [*]const u8,
+        calls: usize = 0,
+
+        fn read(
+            ptr: *anyopaque,
+            result_alloc: std.mem.Allocator,
+            model: []const u8,
+            encoded: antfly.readers.EncodedRequest,
+        ) ![]antfly.readers.Result {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("florence2", model);
+            try std.testing.expectEqualStrings("<OCR>", encoded.prompt.?);
+            try std.testing.expectEqual(@as(i64, 128), encoded.max_tokens.?);
+            try std.testing.expectEqualStrings("mixed-deadbeef", encoded.source_fingerprint.?);
+            try std.testing.expectEqual(@as(usize, 2), encoded.images.len);
+            try std.testing.expectEqualStrings("image/png", encoded.images[0].mime_type);
+            try std.testing.expectEqualStrings("image/jpeg", encoded.images[1].mime_type);
+            try std.testing.expectEqual(@intFromPtr(self.first_ptr), @intFromPtr(encoded.images[0].bytes.ptr));
+            try std.testing.expectEqual(@intFromPtr(self.second_ptr), @intFromPtr(encoded.images[1].bytes.ptr));
+
+            const out = try result_alloc.alloc(antfly.readers.Result, 2);
+            out[0] = .{ .text = try result_alloc.dupe(u8, "first") };
+            out[1] = .{ .text = try result_alloc.dupe(u8, "second") };
+            return out;
+        }
+    };
+    var fake = FakeReader{ .first_ptr = png[0..].ptr, .second_ptr = jpeg[0..].ptr };
+    var state = inference_host.LinkedInferenceState{
+        .alloc = alloc,
+        .executor = try @import("../runtime_io_abi.zig").Borrow.init(&std.testing.io).receive(),
+        .io = std.testing.io,
+        .node = undefined, // The model-free override must not enter Node.
+        .warm_models = undefined,
+        .content_security = null,
+        .s3_credentials = null,
+        .runtime_config = undefined,
+        .owned_models_dir = null,
+        .owned_ml_dir = null,
+        .route_validator = undefined,
+        .read_encoded_images_override = .{ .ptr = &fake, .read_fn = FakeReader.read },
+    };
+    var lifetime = EmbeddedInferenceProviderLifetime{ .handle = &state };
+
+    // Traverse the production caller, ProviderInvokeContext construction,
+    // host operation dispatch, borrowed-payload decode, JSON response, and
+    // response destruction without loading a model.
+    const results = try inferenceProviderReadEncodedImages(&lifetime, alloc, "florence2", request);
+    defer {
+        for (results) |*result| antfly.readers.deinitResult(alloc, result);
+        alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqualStrings("first", results[0].text);
+    try std.testing.expectEqualStrings("second", results[1].text);
+
+    // Keep malformed-context coverage at the codec boundary, where a corrupt
+    // pointer/count pair can be represented without dereferencing it.
+    var payloads = try encodedImageProviderPayloadsAlloc(alloc, request.images);
+    defer payloads.deinit(alloc);
+    const metadata = encodedImageProviderMetadata("florence2", request);
+    const request_json = try std.json.Stringify.valueAlloc(alloc, metadata, .{});
+    defer alloc.free(request_json);
+
+    try std.testing.expectError(
+        error.InvalidArguments,
+        inference_host.decodeReadEncodedImagesProviderRequest(alloc, request_json, null, payloads.payloads.len, payloads.refs.ptr, payloads.refs.len),
+    );
+    var bad_metadata = metadata;
+    bad_metadata.image_count += 1;
+    const bad_json = try std.json.Stringify.valueAlloc(alloc, bad_metadata, .{});
+    defer alloc.free(bad_json);
+    try std.testing.expectError(
+        error.InvalidArguments,
+        inference_host.decodeReadEncodedImagesProviderRequest(alloc, bad_json, payloads.payloads.ptr, payloads.payloads.len, payloads.refs.ptr, payloads.refs.len),
+    );
+
+    const invalid_mime_images = [_]antfly.readers.EncodedImage{.{ .bytes = &png, .mime_type = "" }};
+    try std.testing.expectError(
+        error.InvalidArguments,
+        inferenceProviderReadEncodedImages(&lifetime, alloc, "florence2", .{ .images = &invalid_mime_images }),
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+
+    const empty_request = antfly.readers.EncodedRequest{ .images = &.{} };
+    const empty_metadata = encodedImageProviderMetadata("florence2", empty_request);
+    const empty_json = try std.json.Stringify.valueAlloc(alloc, empty_metadata, .{});
+    defer alloc.free(empty_json);
+    try std.testing.expectError(
+        error.ReadBatchTooLarge,
+        inference_host.decodeReadEncodedImagesProviderRequest(alloc, empty_json, null, 0, null, 0),
+    );
+
+    const unused_handle: *anyopaque = @ptrFromInt(1);
+    try std.testing.expectError(
+        error.ReadBatchTooLarge,
+        inferenceProviderReadEncodedImages(unused_handle, alloc, "florence2", empty_request),
+    );
+    try std.testing.expectError(
+        error.ReadBatchTooLarge,
+        inferenceProviderReadEncodedImagesReported(unused_handle, alloc, "florence2", empty_request),
+    );
+}
+
+test "standalone raster reader ABI preserves borrowed strided pages and identity" {
+    const alloc = std.testing.allocator;
+    var first = [_]u8{ 1, 2, 3, 255, 4, 5, 6, 255 };
+    var second = [_]u8{ 7, 8, 9, 255, 10, 11, 12, 255 };
+    const images = [_]antfly.readers.RasterImage{
+        .{ .bytes = &first, .width = 2, .height = 1, .stride_bytes = 8, .item_id = "page:1", .source_fingerprint = "doc", .page_number = 1 },
+        .{ .bytes = &second, .width = 2, .height = 1, .stride_bytes = 8, .item_id = "page:2", .source_fingerprint = "doc", .page_number = 2 },
+    };
+    const request = antfly.readers.RasterRequest{
+        .images = &images,
+        .prompt = "<OCR>",
+        .max_tokens = 128,
+        .source_fingerprint = "doc",
+    };
+
+    const FakeReader = struct {
+        expected: [2][*]const u8,
+        observed_addresses: [2]usize = .{ 0, 0 },
+        calls: usize = 0,
+
+        fn read(
+            ptr: *anyopaque,
+            result_alloc: std.mem.Allocator,
+            model: []const u8,
+            raster_request: antfly.readers.RasterRequest,
+        ) !antfly.readers.BatchResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("florence2", model);
+            try std.testing.expectEqualStrings("<OCR>", raster_request.prompt.?);
+            try std.testing.expectEqual(@as(usize, 2), raster_request.images.len);
+            const out = try result_alloc.alloc(antfly.readers.Result, 2);
+            var filled: usize = 0;
+            errdefer {
+                for (out[0..filled]) |*result| antfly.readers.deinitResult(result_alloc, result);
+                result_alloc.free(out);
+            }
+            for (raster_request.images, 0..) |raster, i| {
+                try std.testing.expectEqual(@intFromPtr(self.expected[i]), @intFromPtr(raster.bytes.ptr));
+                try std.testing.expectEqual(@as(usize, 8), raster.stride_bytes);
+                self.observed_addresses[i] = @intFromPtr(raster.bytes.ptr);
+                out[i] = .{
+                    .text = try result_alloc.dupe(u8, if (i == 0) "first" else "second"),
+                    .item_id = try result_alloc.dupe(u8, raster.item_id),
+                    .source_fingerprint = if (raster.source_fingerprint) |value| try result_alloc.dupe(u8, value) else null,
+                    .page_number = raster.page_number,
+                };
+                filled += 1;
+            }
+            return .{
+                .items = out,
+                .execution = .{ .requested_items = 2, .native_batches = 1, .native_items = 2 },
+            };
+        }
+    };
+    var fake = FakeReader{ .expected = .{ first[0..].ptr, second[0..].ptr } };
+    var state = inference_host.LinkedInferenceState{
+        .alloc = alloc,
+        .executor = try @import("../runtime_io_abi.zig").Borrow.init(&std.testing.io).receive(),
+        .io = std.testing.io,
+        .node = undefined, // The model-free override must not enter Node.
+        .warm_models = undefined,
+        .content_security = null,
+        .s3_credentials = null,
+        .runtime_config = undefined,
+        .owned_models_dir = null,
+        .owned_ml_dir = null,
+        .route_validator = undefined,
+        .read_raster_images_override = .{ .ptr = &fake, .read_fn = FakeReader.read },
+    };
+    var lifetime = EmbeddedInferenceProviderLifetime{ .handle = &state };
+
+    var batch = try inferenceProviderReadRasterImagesReported(&lifetime, alloc, "florence2", request);
+    defer batch.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@intFromPtr(first[0..].ptr), fake.observed_addresses[0]);
+    try std.testing.expectEqualStrings("first", batch.items[0].text);
+    first[0] = 99;
+    try std.testing.expectEqualStrings("first", batch.items[0].text);
+
+    var payloads = try rasterProviderPayloadsAlloc(alloc, request.images);
+    defer payloads.deinit(alloc);
+    const metadata = inference_bridge.ReadRasterImagesRequest{
+        .model = "florence2",
+        .raster_count = request.images.len,
+        .rasters = payloads.metadata,
+        .prompt = request.prompt,
+        .max_tokens = request.max_tokens,
+        .source_fingerprint = request.source_fingerprint,
+    };
+    const request_json = try std.json.Stringify.valueAlloc(alloc, metadata, .{});
+    defer alloc.free(request_json);
+    try std.testing.expectError(
+        error.InvalidArguments,
+        inference_host.decodeReadRasterImagesProviderRequest(
+            alloc,
+            request_json,
+            null,
+            payloads.payloads.len,
+            payloads.refs.ptr,
+            payloads.refs.len,
+        ),
+    );
+    payloads.refs[1].item_index = payloads.refs[0].item_index;
+    try std.testing.expectError(
+        error.InvalidArguments,
+        inference_host.decodeReadRasterImagesProviderRequest(
+            alloc,
+            request_json,
+            payloads.payloads.ptr,
+            payloads.payloads.len,
+            payloads.refs.ptr,
+            payloads.refs.len,
+        ),
+    );
+}
+
 test "standalone runtime local generator preflights mixed resident media exactly" {
     const messages = [_]antfly.inference.ChatMessage{.{
         .role = .user,
@@ -6350,17 +6425,17 @@ test "standalone runtime local generator preflights mixed resident media exactly
                 .data = "AQID",
                 .mime_type = "audio/wav",
             } },
-            .{ .image_url = .{ .url = "data:image/png;base64,BAU=" } },
+            .{ .image_url = .{ .url = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD" } },
         } },
     }};
 
     const preflight = try inference_host.preflightLocalGenerateMessages(&messages);
     try std.testing.expectEqual(@as(usize, "listen".len), preflight.text_bytes);
     try std.testing.expectEqual(
-        @as(usize, "AQID".len + "data:image/png;base64,BAU=".len),
+        @as(usize, "AQID".len + "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD".len),
         preflight.encoded_media_bytes,
     );
-    try std.testing.expectEqual(@as(usize, 5), preflight.decoded_media_bytes);
+    try std.testing.expectEqual(@as(usize, 27), preflight.decoded_media_bytes);
     try std.testing.expectEqual(@as(usize, 2), preflight.media_count);
     try std.testing.expectEqual(@as(usize, 1), preflight.image_count);
     try std.testing.expect(preflight.has_audio);
@@ -6390,6 +6465,9 @@ test "standalone runtime leaves auth disabled unless config or cli enables it" {
 }
 
 test "standalone continuous HA mutation guard follows role lifecycle" {
+    try std.testing.expect(standaloneNativeAuthorityInitiallyPermitted(.{}));
+    try std.testing.expect(!standaloneNativeAuthorityInitiallyPermitted(.{ .ha_primary_log = "/ha/primary.wal" }));
+    try std.testing.expect(!standaloneNativeAuthorityInitiallyPermitted(.{ .ha_standby_log = "/ha/standby.wal" }));
     try std.testing.expect(!haContinuousMutationGuardEnabled(.{}));
     try std.testing.expect(!haContinuousMutationGuardEnabled(.{ .ha_primary_log = "/ha/primary.wal" }));
     try std.testing.expect(!haContinuousMutationGuardEnabled(.{
@@ -6819,6 +6897,41 @@ test "standalone runtime registers antfarm static routes" {
     try std.testing.expect(server.hasRoute(.get, "/*"));
 }
 
+test "standalone runtime antfarm assets support archive and prefix layouts outside cwd" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    for ([_][]const u8{ "archive", "prefix/bin" }) |layout| {
+        const exe_dir = try std.fs.path.join(alloc, &.{ root, layout });
+        defer alloc.free(exe_dir);
+        try std.Io.Dir.cwd().createDirPath(io, exe_dir);
+        const asset_root = if (std.mem.eql(u8, layout, "archive")) "archive/share/antfly/antfarm" else "prefix/share/antfly/antfarm";
+        for ([_][]const u8{ "index.html", "assets/app.js", "fonts/test.woff2" }) |rel_path| {
+            const path = try std.fs.path.join(alloc, &.{ root, asset_root, rel_path });
+            defer alloc.free(path);
+            try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(path).?);
+            var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+            defer file.close(io);
+            try file.writeStreamingAll(io, rel_path);
+
+            var request = try httpx.Request.init(alloc, .GET, "/");
+            defer request.deinit();
+            var ctx = httpx.Context.init(alloc, io, &request);
+            defer ctx.deinit();
+            var response = (try serveAntfarmFileFromExecutableDir(&ctx, exe_dir, rel_path)).?;
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 200), response.status.code);
+            try std.testing.expectEqualStrings(rel_path, response.body.?);
+            try std.testing.expectEqualStrings(antfarmContentType(rel_path), response.headers.get("Content-Type").?);
+            try std.testing.expectEqual(null, try serveAntfarmFileFromExecutableDir(&ctx, exe_dir, "missing.js"));
+        }
+    }
+}
+
 test "standalone runtime antfarm path guards keep api routes reserved" {
     try std.testing.expect(isAntfarmReservedPath("/db/v1/tables"));
     try std.testing.expect(isAntfarmReservedPath("/ai/v1/models"));
@@ -6929,35 +7042,35 @@ test "parse cli preserves registry variants and recognizes explicit preload back
 
 test "parse cli accepts HA primary runtime flags" {
     var argv = [_][*:0]const u8{
-        "--ha-primary-log",
+        "--hot-standby-primary-log",
         "/tmp/ha-primary.log",
-        "--ha-primary-slots",
+        "--hot-standby-primary-slots",
         "/tmp/ha-slots.wal",
-        "--ha-primary-node-id",
+        "--hot-standby-primary-node-id",
         "primary-a",
-        "--ha-seed-capture-root",
+        "--hot-standby-seed-capture-root",
         "/tmp/ha-seed-captures",
-        "--ha-fence-wal",
+        "--hot-standby-fence-wal",
         "/tmp/ha-fence.wal",
-        "--ha-former-primary-log",
+        "--hot-standby-former-primary-log",
         "/tmp/ha-primary.log",
         "--admin-token-env",
         "ANTFLY_HA_ADMIN_TOKEN",
-        "--ha-retention-max-lag-lsn",
+        "--hot-standby-retention-max-lag-lsn",
         "500",
-        "--ha-retention-max-retained-bytes",
+        "--hot-standby-retention-max-retained-bytes",
         "8192",
-        "--ha-retention-max-retained-age-ns",
+        "--hot-standby-retention-max-retained-age-ns",
         "1000000",
-        "--ha-cluster-id",
+        "--hot-standby-cluster-id",
         "100",
-        "--ha-shard-id",
+        "--hot-standby-shard-id",
         "10",
-        "--ha-table-id",
+        "--hot-standby-table-id",
         "20",
-        "--ha-timeline-id",
+        "--hot-standby-timeline-id",
         "3",
-        "--ha-epoch",
+        "--hot-standby-epoch",
         "4",
     };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
@@ -6983,31 +7096,31 @@ test "parse cli accepts HA primary runtime flags" {
 
 test "parse cli accepts HA primary sync policy flags" {
     var argv = [_][*:0]const u8{
-        "--ha-primary-log",
+        "--hot-standby-primary-log",
         "/tmp/ha-primary.log",
-        "--ha-primary-slots",
+        "--hot-standby-primary-slots",
         "/tmp/ha-slots.wal",
-        "--ha-primary-node-id",
+        "--hot-standby-primary-node-id",
         "primary-a",
-        "--ha-fence-wal",
+        "--hot-standby-fence-wal",
         "/tmp/ha-fence.wal",
-        "--ha-cluster-id",
+        "--hot-standby-cluster-id",
         "100",
-        "--ha-timeline-id",
+        "--hot-standby-timeline-id",
         "3",
-        "--ha-epoch",
+        "--hot-standby-epoch",
         "4",
-        "--ha-sync-mode",
+        "--hot-standby-sync-mode",
         "remote-apply",
-        "--ha-sync-selection",
+        "--hot-standby-sync-selection",
         "first",
-        "--ha-sync-required",
+        "--hot-standby-sync-required",
         "2",
-        "--ha-sync-standby",
+        "--hot-standby-sync-standby",
         "standby-a",
-        "--ha-sync-standby",
+        "--hot-standby-sync-standby",
         "standby-b",
-        "--ha-sync-failure",
+        "--hot-standby-sync-failure",
         "fail-closed",
     };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
@@ -7018,10 +7131,10 @@ test "parse cli accepts HA primary sync policy flags" {
     var sync_policy = try haSyncPolicyFromCli(std.testing.allocator, cfg);
     defer sync_policy.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(antfly.ha.primary.DurabilityMode.remote_apply, sync_policy.policy.mode);
-    try std.testing.expectEqual(antfly.ha.primary.StandbySelection.first, sync_policy.policy.selection);
+    try std.testing.expectEqual(antfly.hot_standby.primary.DurabilityMode.remote_apply, sync_policy.policy.mode);
+    try std.testing.expectEqual(antfly.hot_standby.primary.StandbySelection.first, sync_policy.policy.selection);
     try std.testing.expectEqual(@as(usize, 2), sync_policy.policy.required);
-    try std.testing.expectEqual(antfly.ha.primary.FailurePolicy.fail_closed, sync_policy.policy.failure_policy);
+    try std.testing.expectEqual(antfly.hot_standby.primary.FailurePolicy.fail_closed, sync_policy.policy.failure_policy);
     try std.testing.expectEqual(@as(usize, 2), sync_policy.policy.standby_names.len);
     try std.testing.expectEqualStrings("standby-a", sync_policy.policy.standby_names[0]);
     try std.testing.expectEqualStrings("standby-b", sync_policy.policy.standby_names[1]);
@@ -7029,27 +7142,27 @@ test "parse cli accepts HA primary sync policy flags" {
 
 test "parse cli treats ALL HA sync policy as all named standbys" {
     var argv = [_][*:0]const u8{
-        "--ha-primary-log",
+        "--hot-standby-primary-log",
         "/tmp/ha-primary.log",
-        "--ha-primary-slots",
+        "--hot-standby-primary-slots",
         "/tmp/ha-primary.slots",
-        "--ha-primary-node-id",
+        "--hot-standby-primary-node-id",
         "primary-a",
-        "--ha-fence-wal",
+        "--hot-standby-fence-wal",
         "/tmp/ha-fence.wal",
-        "--ha-cluster-id",
+        "--hot-standby-cluster-id",
         "100",
-        "--ha-timeline-id",
+        "--hot-standby-timeline-id",
         "3",
-        "--ha-epoch",
+        "--hot-standby-epoch",
         "4",
-        "--ha-sync-mode",
+        "--hot-standby-sync-mode",
         "remote-apply",
-        "--ha-sync-selection",
+        "--hot-standby-sync-selection",
         "all",
-        "--ha-sync-standby",
+        "--hot-standby-sync-standby",
         "standby-a",
-        "--ha-sync-standby",
+        "--hot-standby-sync-standby",
         "standby-b",
     };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
@@ -7060,8 +7173,8 @@ test "parse cli treats ALL HA sync policy as all named standbys" {
     var sync_policy = try haSyncPolicyFromCli(std.testing.allocator, cfg);
     defer sync_policy.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(antfly.ha.primary.DurabilityMode.remote_apply, sync_policy.policy.mode);
-    try std.testing.expectEqual(antfly.ha.primary.StandbySelection.all, sync_policy.policy.selection);
+    try std.testing.expectEqual(antfly.hot_standby.primary.DurabilityMode.remote_apply, sync_policy.policy.mode);
+    try std.testing.expectEqual(antfly.hot_standby.primary.StandbySelection.all, sync_policy.policy.selection);
     try std.testing.expectEqual(@as(usize, 2), sync_policy.policy.required);
     try std.testing.expectEqual(@as(usize, 2), sync_policy.policy.standby_names.len);
 
@@ -7071,25 +7184,25 @@ test "parse cli treats ALL HA sync policy as all named standbys" {
 
 test "parse cli accepts HA primary retention policy flags" {
     var argv = [_][*:0]const u8{
-        "--ha-primary-log",
+        "--hot-standby-primary-log",
         "/tmp/ha-primary.log",
-        "--ha-primary-slots",
+        "--hot-standby-primary-slots",
         "/tmp/ha-slots.wal",
-        "--ha-primary-node-id",
+        "--hot-standby-primary-node-id",
         "primary-a",
-        "--ha-fence-wal",
+        "--hot-standby-fence-wal",
         "/tmp/ha-fence.wal",
-        "--ha-cluster-id",
+        "--hot-standby-cluster-id",
         "100",
-        "--ha-timeline-id",
+        "--hot-standby-timeline-id",
         "3",
-        "--ha-epoch",
+        "--hot-standby-epoch",
         "4",
-        "--ha-retention-max-lag-lsn",
+        "--hot-standby-retention-max-lag-lsn",
         "50",
-        "--ha-retention-max-retained-bytes",
+        "--hot-standby-retention-max-retained-bytes",
         "4096",
-        "--ha-retention-max-retained-age-ns",
+        "--hot-standby-retention-max-retained-age-ns",
         "1000000",
     };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
@@ -7153,51 +7266,51 @@ test "parse cli accepts HA standby runtime flags" {
     var argv = [_][*:0]const u8{
         "--id",
         "7",
-        "--ha-standby-log",
+        "--hot-standby-log",
         "/tmp/ha-standby.log",
-        "--ha-standby-progress",
+        "--hot-standby-progress",
         "/tmp/ha-standby-progress.wal",
-        "--ha-standby-node-id",
+        "--hot-standby-node-id",
         "standby-a",
-        "--ha-seed-capture-root",
+        "--hot-standby-seed-capture-root",
         "/tmp/ha-seed-captures",
-        "--ha-fence-wal",
+        "--hot-standby-fence-wal",
         "/tmp/ha-fence.wal",
-        "--ha-standby-upstream-url",
+        "--hot-standby-upstream-url",
         "http://primary.antfly.svc:8080",
-        "--ha-standby-slot",
+        "--hot-standby-slot",
         "standby-a",
-        "--ha-startup-target-root",
+        "--hot-standby-startup-target-root",
         "/tmp/active",
-        "--ha-startup-topology-id",
+        "--hot-standby-startup-topology-id",
         "topology-a",
-        "--ha-startup-topology-generation",
+        "--hot-standby-startup-topology-generation",
         "3",
-        "--ha-startup-generation",
+        "--hot-standby-startup-generation",
         "generation-a",
-        "--ha-startup-target-pvc-name",
+        "--hot-standby-startup-target-pvc-name",
         "standby-a-data",
-        "--ha-startup-target-pvc-uid",
+        "--hot-standby-startup-target-pvc-uid",
         "pvc-uid-1",
-        "--ha-startup-capture-receipt-sha256",
+        "--hot-standby-startup-capture-receipt-sha256",
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "--ha-startup-materialized-receipt-sha256",
+        "--hot-standby-startup-materialized-receipt-sha256",
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        "--ha-startup-materialized-aggregate-sha256",
+        "--hot-standby-startup-materialized-aggregate-sha256",
         "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-        "--ha-startup-target-local-node-id",
+        "--hot-standby-startup-target-local-node-id",
         "7",
-        "--ha-startup-target-replica-id",
+        "--hot-standby-startup-target-replica-id",
         "1",
-        "--ha-cluster-id",
+        "--hot-standby-cluster-id",
         "100",
-        "--ha-shard-id",
+        "--hot-standby-shard-id",
         "10",
-        "--ha-table-id",
+        "--hot-standby-table-id",
         "20",
-        "--ha-timeline-id",
+        "--hot-standby-timeline-id",
         "3",
-        "--ha-epoch",
+        "--hot-standby-epoch",
         "4",
     };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
@@ -7274,6 +7387,94 @@ test "parse cli accepts HA standby runtime flags" {
     try std.testing.expectError(error.HAStartupTargetReplicaIDMismatch, haStartupExpectationFromCli(wrong_target_replica));
 }
 
+test "deprecated --ha-* flags remain aliases for --hot-standby-* flags" {
+    // HOT_STANDBY.md "Naming": the role segment collapses for --ha-standby-*
+    // (`--hot-standby-log` etc.), --ha-primary-* keeps its role segment
+    // (`--hot-standby-primary-*`), and every other --ha-* just swaps its
+    // prefix. Every pair below must parse to the identical field value
+    // regardless of which spelling is used, proving flagMatches keeps the
+    // legacy alias working.
+    const Pair = struct {
+        canonical: [:0]const u8,
+        legacy: [:0]const u8,
+        value: [:0]const u8,
+        field: []const u8,
+    };
+    const pairs = [_]Pair{
+        .{ .canonical = "--hot-standby-primary-log", .legacy = "--ha-primary-log", .value = "/tmp/primary.log", .field = "ha_primary_log" },
+        .{ .canonical = "--hot-standby-primary-slots", .legacy = "--ha-primary-slots", .value = "/tmp/slots.wal", .field = "ha_primary_slots" },
+        .{ .canonical = "--hot-standby-primary-node-id", .legacy = "--ha-primary-node-id", .value = "primary-a", .field = "ha_primary_node_id" },
+        .{ .canonical = "--hot-standby-seed-capture-root", .legacy = "--ha-seed-capture-root", .value = "/tmp/seed-captures", .field = "ha_seed_capture_root" },
+        .{ .canonical = "--hot-standby-fence-wal", .legacy = "--ha-fence-wal", .value = "/tmp/fence.wal", .field = "ha_fence_wal" },
+        .{ .canonical = "--hot-standby-former-primary-log", .legacy = "--ha-former-primary-log", .value = "/tmp/former-primary.log", .field = "ha_former_primary_log" },
+        .{ .canonical = "--hot-standby-retention-max-lag-lsn", .legacy = "--ha-retention-max-lag-lsn", .value = "500", .field = "ha_retention_max_lag_lsn" },
+        .{ .canonical = "--hot-standby-retention-max-retained-bytes", .legacy = "--ha-retention-max-retained-bytes", .value = "8192", .field = "ha_retention_max_retained_bytes" },
+        .{ .canonical = "--hot-standby-retention-max-retained-age-ns", .legacy = "--ha-retention-max-retained-age-ns", .value = "1000000", .field = "ha_retention_max_retained_age_ns" },
+        .{ .canonical = "--hot-standby-sync-mode", .legacy = "--ha-sync-mode", .value = "remote-apply", .field = "ha_sync_mode" },
+        .{ .canonical = "--hot-standby-sync-selection", .legacy = "--ha-sync-selection", .value = "first", .field = "ha_sync_selection" },
+        .{ .canonical = "--hot-standby-sync-required", .legacy = "--ha-sync-required", .value = "2", .field = "ha_sync_required" },
+        .{ .canonical = "--hot-standby-sync-failure", .legacy = "--ha-sync-failure", .value = "fail-closed", .field = "ha_sync_failure_policy" },
+        .{ .canonical = "--hot-standby-log", .legacy = "--ha-standby-log", .value = "/tmp/standby.log", .field = "ha_standby_log" },
+        .{ .canonical = "--hot-standby-progress", .legacy = "--ha-standby-progress", .value = "/tmp/standby-progress.wal", .field = "ha_standby_progress" },
+        .{ .canonical = "--hot-standby-node-id", .legacy = "--ha-standby-node-id", .value = "standby-a", .field = "ha_standby_node_id" },
+        .{ .canonical = "--hot-standby-upstream-url", .legacy = "--ha-standby-upstream-url", .value = "http://primary.antfly.svc:8080", .field = "ha_standby_upstream_url" },
+        .{ .canonical = "--hot-standby-slot", .legacy = "--ha-standby-slot", .value = "standby-a", .field = "ha_standby_slot" },
+        .{ .canonical = "--hot-standby-startup-target-root", .legacy = "--ha-startup-target-root", .value = "/tmp/active", .field = "ha_startup_target_root" },
+        .{ .canonical = "--hot-standby-startup-topology-id", .legacy = "--ha-startup-topology-id", .value = "topology-a", .field = "ha_startup_topology_id" },
+        .{ .canonical = "--hot-standby-startup-topology-generation", .legacy = "--ha-startup-topology-generation", .value = "3", .field = "ha_startup_topology_generation" },
+        .{ .canonical = "--hot-standby-startup-generation", .legacy = "--ha-startup-generation", .value = "generation-a", .field = "ha_startup_generation" },
+        .{ .canonical = "--hot-standby-startup-slot-name", .legacy = "--ha-startup-slot-name", .value = "standby-a", .field = "ha_startup_slot_name" },
+        .{ .canonical = "--hot-standby-startup-timeline-id", .legacy = "--ha-startup-timeline-id", .value = "1", .field = "ha_startup_timeline_id" },
+        .{ .canonical = "--hot-standby-startup-epoch", .legacy = "--ha-startup-epoch", .value = "1", .field = "ha_startup_epoch" },
+        .{ .canonical = "--hot-standby-startup-target-pvc-name", .legacy = "--ha-startup-target-pvc-name", .value = "standby-a-data", .field = "ha_startup_target_pvc_name" },
+        .{ .canonical = "--hot-standby-startup-target-pvc-uid", .legacy = "--ha-startup-target-pvc-uid", .value = "pvc-uid-1", .field = "ha_startup_target_pvc_uid" },
+        .{ .canonical = "--hot-standby-startup-manifest-sha256", .legacy = "--ha-startup-manifest-sha256", .value = "sha-manifest", .field = "ha_startup_manifest_sha256" },
+        .{ .canonical = "--hot-standby-startup-aggregate-sha256", .legacy = "--ha-startup-aggregate-sha256", .value = "sha-aggregate", .field = "ha_startup_aggregate_sha256" },
+        .{ .canonical = "--hot-standby-startup-seed-receipt-sha256", .legacy = "--ha-startup-seed-receipt-sha256", .value = "sha-seed-receipt", .field = "ha_startup_seed_receipt_sha256" },
+        .{ .canonical = "--hot-standby-startup-capture-receipt-sha256", .legacy = "--ha-startup-capture-receipt-sha256", .value = "sha-capture-receipt", .field = "ha_startup_capture_receipt_sha256" },
+        .{ .canonical = "--hot-standby-startup-materialized-receipt-sha256", .legacy = "--ha-startup-materialized-receipt-sha256", .value = "sha-materialized-receipt", .field = "ha_startup_materialized_receipt_sha256" },
+        .{ .canonical = "--hot-standby-startup-materialized-aggregate-sha256", .legacy = "--ha-startup-materialized-aggregate-sha256", .value = "sha-materialized-aggregate", .field = "ha_startup_materialized_aggregate_sha256" },
+        .{ .canonical = "--hot-standby-startup-target-local-node-id", .legacy = "--ha-startup-target-local-node-id", .value = "7", .field = "ha_startup_target_local_node_id" },
+        .{ .canonical = "--hot-standby-startup-target-replica-id", .legacy = "--ha-startup-target-replica-id", .value = "1", .field = "ha_startup_target_replica_id" },
+        .{ .canonical = "--hot-standby-cluster-id", .legacy = "--ha-cluster-id", .value = "100", .field = "ha_cluster_id" },
+        .{ .canonical = "--hot-standby-shard-id", .legacy = "--ha-shard-id", .value = "10", .field = "ha_shard_id" },
+        .{ .canonical = "--hot-standby-table-id", .legacy = "--ha-table-id", .value = "20", .field = "ha_table_id" },
+        .{ .canonical = "--hot-standby-timeline-id", .legacy = "--ha-timeline-id", .value = "3", .field = "ha_timeline_id" },
+        .{ .canonical = "--hot-standby-epoch", .legacy = "--ha-epoch", .value = "4", .field = "ha_epoch" },
+    };
+
+    inline for (pairs) |pair| {
+        var canonical_argv = [_][*:0]const u8{ pair.canonical, pair.value };
+        var canonical_iter = std.process.Args.Iterator.init(.{ .vector = canonical_argv[0..] });
+        var canonical_cfg = try parseCli(std.testing.allocator, &canonical_iter);
+        defer canonical_cfg.deinit(std.testing.allocator);
+
+        var legacy_argv = [_][*:0]const u8{ pair.legacy, pair.value };
+        var legacy_iter = std.process.Args.Iterator.init(.{ .vector = legacy_argv[0..] });
+        var legacy_cfg = try parseCli(std.testing.allocator, &legacy_iter);
+        defer legacy_cfg.deinit(std.testing.allocator);
+
+        try std.testing.expectEqualDeep(@field(canonical_cfg, pair.field), @field(legacy_cfg, pair.field));
+    }
+
+    // ha_sync_standby_names is list-appended rather than assigned, so it is
+    // checked separately from the scalar/string table above.
+    var canonical_sync_standby_argv = [_][*:0]const u8{ "--hot-standby-sync-standby", "standby-a" };
+    var canonical_sync_standby_iter = std.process.Args.Iterator.init(.{ .vector = canonical_sync_standby_argv[0..] });
+    var canonical_sync_standby_cfg = try parseCli(std.testing.allocator, &canonical_sync_standby_iter);
+    defer canonical_sync_standby_cfg.deinit(std.testing.allocator);
+
+    var legacy_sync_standby_argv = [_][*:0]const u8{ "--ha-sync-standby", "standby-a" };
+    var legacy_sync_standby_iter = std.process.Args.Iterator.init(.{ .vector = legacy_sync_standby_argv[0..] });
+    var legacy_sync_standby_cfg = try parseCli(std.testing.allocator, &legacy_sync_standby_iter);
+    defer legacy_sync_standby_cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualDeep(
+        canonical_sync_standby_cfg.ha_sync_standby_names.items,
+        legacy_sync_standby_cfg.ha_sync_standby_names.items,
+    );
+}
+
 test "standalone HA standby replication flags require upstream and slot" {
     try std.testing.expectError(error.HAStandbySlotMissing, haStandbyReplicationConfigFromCli(.{
         .ha_standby_upstream_url = "http://primary.antfly.svc:8080",
@@ -7332,12 +7533,12 @@ test "standalone HA standby replication flags require upstream and slot" {
 }
 
 test "standalone HA string classifier distinguishes missing padded and valid values" {
-    try std.testing.expectEqual(antfly.ha.validation.HAStringValidation.missing, antfly.ha.validation.classifyHAString(null));
-    try std.testing.expectEqual(antfly.ha.validation.HAStringValidation.missing, antfly.ha.validation.classifyHAString(""));
-    try std.testing.expectEqual(antfly.ha.validation.HAStringValidation.missing, antfly.ha.validation.classifyHAString(" \t\r\n"));
-    try std.testing.expectEqual(antfly.ha.validation.HAStringValidation.padded, antfly.ha.validation.classifyHAString(" standby-a"));
-    try std.testing.expectEqual(antfly.ha.validation.HAStringValidation.padded, antfly.ha.validation.classifyHAString("standby-a\n"));
-    try std.testing.expectEqual(antfly.ha.validation.HAStringValidation.ok, antfly.ha.validation.classifyHAString("standby-a"));
+    try std.testing.expectEqual(antfly.hot_standby.validation.HAStringValidation.missing, antfly.hot_standby.validation.classifyHAString(null));
+    try std.testing.expectEqual(antfly.hot_standby.validation.HAStringValidation.missing, antfly.hot_standby.validation.classifyHAString(""));
+    try std.testing.expectEqual(antfly.hot_standby.validation.HAStringValidation.missing, antfly.hot_standby.validation.classifyHAString(" \t\r\n"));
+    try std.testing.expectEqual(antfly.hot_standby.validation.HAStringValidation.padded, antfly.hot_standby.validation.classifyHAString(" standby-a"));
+    try std.testing.expectEqual(antfly.hot_standby.validation.HAStringValidation.padded, antfly.hot_standby.validation.classifyHAString("standby-a\n"));
+    try std.testing.expectEqual(antfly.hot_standby.validation.HAStringValidation.ok, antfly.hot_standby.validation.classifyHAString("standby-a"));
 
     try std.testing.expectError(error.HAStandbySlotMissing, requireHAString(null, error.HAStandbySlotMissing, error.HAStandbySlotInvalid));
     try std.testing.expectError(error.HAStandbySlotMissing, requireHAString(" \t", error.HAStandbySlotMissing, error.HAStandbySlotInvalid));
@@ -7671,10 +7872,10 @@ test "standalone HA runtime rejects ambiguous role flags" {
     try validateHARole(promoted_policy_cli);
     var promoted_policy = try haSyncPolicyFromCli(std.testing.allocator, promoted_policy_cli);
     defer promoted_policy.deinit(std.testing.allocator);
-    try std.testing.expectEqual(antfly.ha.primary.DurabilityMode.remote_apply, promoted_policy.policy.mode);
+    try std.testing.expectEqual(antfly.hot_standby.primary.DurabilityMode.remote_apply, promoted_policy.policy.mode);
     try std.testing.expectEqual(@as(usize, 1), promoted_policy.policy.required);
     try std.testing.expectEqualStrings("primary-a", promoted_policy.policy.standby_names[0]);
-    try std.testing.expectEqual(antfly.ha.primary.FailurePolicy.block, promoted_policy.policy.failure_policy);
+    try std.testing.expectEqual(antfly.hot_standby.primary.FailurePolicy.block, promoted_policy.policy.failure_policy);
     try std.testing.expectError(error.InvalidHASyncPolicy, haSyncPolicyFromCli(std.testing.allocator, .{
         .ha_primary_log = "/tmp/primary.log",
         .ha_fence_wal = "/tmp/fence.wal",
@@ -7684,6 +7885,86 @@ test "standalone HA runtime rejects ambiguous role flags" {
         .ha_sync_mode = .remote_write,
         .ha_sync_required = 1,
     }));
+}
+
+test "standalone hot-standby startup migrates a legacy layout before opening local handles" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root: [:0]u8 = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+
+    const writeFile = struct {
+        fn call(dir_path: []const u8, name: []const u8, body: []const u8) !void {
+            const a = std.testing.allocator;
+            const path = try std.fs.path.join(a, &.{ dir_path, name });
+            defer a.free(path);
+            if (std.fs.path.dirname(path)) |parent| try std.Io.Dir.cwd().createDirPath(std.testing.io, parent);
+            var file = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .truncate = true });
+            defer file.close(std.testing.io);
+            try file.writeStreamingAll(std.testing.io, body);
+        }
+    }.call;
+    const testPathExists = struct {
+        fn call(path: []const u8) bool {
+            std.Io.Dir.cwd().access(std.testing.io, path, .{}) catch return false;
+            return true;
+        }
+    }.call;
+
+    const legacy = try std.fs.path.join(alloc, &.{ root, "ha" });
+    defer alloc.free(legacy);
+    try writeFile(legacy, "primary.wal", "primary");
+    try writeFile(legacy, "slots", "slots");
+    try writeFile(legacy, "standby.wal", "standby-log");
+    try writeFile(legacy, "standby-progress.wal", "standby-progress");
+    try writeFile(legacy, "fence.wal", "fence");
+    try writeFile(legacy, "seed-captures/generations/gen-1/complete.json", "capture");
+
+    const canonical = try std.fs.path.join(alloc, &.{ root, "standby" });
+    defer alloc.free(canonical);
+    const primary_log = try std.fs.path.join(alloc, &.{ canonical, "primary.wal" });
+    defer alloc.free(primary_log);
+    const primary_slots = try std.fs.path.join(alloc, &.{ canonical, "slots" });
+    defer alloc.free(primary_slots);
+    const standby_log = try std.fs.path.join(alloc, &.{ canonical, "log.wal" });
+    defer alloc.free(standby_log);
+    const standby_progress = try std.fs.path.join(alloc, &.{ canonical, "progress.wal" });
+    defer alloc.free(standby_progress);
+    const fence_wal = try std.fs.path.join(alloc, &.{ canonical, "fence.wal" });
+    defer alloc.free(fence_wal);
+    const seed_capture_root = try std.fs.path.join(alloc, &.{ canonical, "seed-captures" });
+    defer alloc.free(seed_capture_root);
+
+    const cli = CliConfig{
+        .ha_primary_log = primary_log,
+        .ha_primary_slots = primary_slots,
+        .ha_standby_log = standby_log,
+        .ha_standby_progress = standby_progress,
+        .ha_fence_wal = fence_wal,
+        .ha_seed_capture_root = seed_capture_root,
+    };
+
+    try migrateHALegacyLayoutFromCli(alloc, std.testing.io, cli);
+
+    try std.testing.expect(!testPathExists(legacy));
+    try std.testing.expect(testPathExists(primary_log));
+    try std.testing.expect(testPathExists(primary_slots));
+    try std.testing.expect(testPathExists(standby_log));
+    try std.testing.expect(testPathExists(standby_progress));
+    try std.testing.expect(testPathExists(fence_wal));
+    const migrated_capture = try std.fs.path.join(alloc, &.{ seed_capture_root, "generations/gen-1/complete.json" });
+    defer alloc.free(migrated_capture);
+    try std.testing.expect(testPathExists(migrated_capture));
+
+    // Calling again with an already-canonical tree is a no-op that must not
+    // error, matching every later startup on this node.
+    try migrateHALegacyLayoutFromCli(alloc, std.testing.io, cli);
+    try std.testing.expect(testPathExists(primary_log));
+}
+
+test "standalone hot-standby startup migration is a no-op with no hot-standby paths configured" {
+    try migrateHALegacyLayoutFromCli(std.testing.allocator, std.testing.io, .{});
 }
 
 test "standalone HA runtime requires HA paths under resolved data root" {
@@ -7789,7 +8070,7 @@ test "standalone activated seed bootstraps exact standby checkpoint and rejects 
     defer alloc.free(receive_path);
     const progress_path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/standby-progress.wal", .{tmp.sub_path}, 0);
     defer alloc.free(progress_path);
-    const identity = antfly.ha.standby.Identity{
+    const identity = antfly.hot_standby.standby.Identity{
         .cluster_id = 101,
         .shard_id = 202,
         .table_id = 303,
@@ -7798,7 +8079,7 @@ test "standalone activated seed bootstraps exact standby checkpoint and rejects 
     };
 
     {
-        var standby = try antfly.ha.standby.Standby.open(alloc, receive_path.ptr, progress_path.ptr, identity, .{});
+        var standby = try antfly.hot_standby.standby.Standby.open(alloc, receive_path.ptr, progress_path.ptr, identity, .{});
         defer standby.close();
         try bootstrapHAStandbyAtActivatedCheckpoint(alloc, &standby, "seed-generation-7", "standby-a", 41);
         const progress = standby.currentProgress();
@@ -7817,7 +8098,7 @@ test "standalone activated seed bootstraps exact standby checkpoint and rejects 
         );
     }
 
-    var reopened = try antfly.ha.standby.Standby.open(alloc, receive_path.ptr, progress_path.ptr, identity, .{});
+    var reopened = try antfly.hot_standby.standby.Standby.open(alloc, receive_path.ptr, progress_path.ptr, identity, .{});
     defer reopened.close();
     try std.testing.expectEqual(@as(u64, 42), reopened.nextReceiveLsn());
 }
@@ -8522,18 +8803,109 @@ test "standalone routing watch does not report absence after one probe" {
     metadata.epoch = 9;
 
     const start_ns = platform_time.monotonicNs();
+    const deadline_ns = start_ns + 60 * std.time.ns_per_ms;
     const result = try (try metadata.catalogSource().routingSource()).waitForChange(
         .{ .metadata_group_id = group_ids.main_metadata_group_id, .revision = 9 },
-        start_ns + 60 * std.time.ns_per_ms,
+        deadline_ns,
         2 * std.time.ns_per_ms,
     );
-    try std.testing.expectEqual(
-        antfly.public_api.table_catalog.CatalogChangeWaitResult.authoritative_absence,
-        result,
-    );
+    const end_ns = platform_time.monotonicNs();
+    switch (result) {
+        .authoritative_absence => {},
+        // Scheduler delays can exhaust the confirmation budget. In that case
+        // the deadline-aware mutex correctly refuses the final read and the
+        // watch must retry instead of claiming authoritative absence.
+        .retry => try std.testing.expect(end_ns >= deadline_ns),
+        .changed => return error.TestUnexpectedResult,
+    }
     // The old one-probe implementation returned in roughly 2 ms. Keep a
-    // generous lower bound so scheduler jitter can only make the test safer.
-    try std.testing.expect(platform_time.monotonicNs() -| start_ns >= 30 * std.time.ns_per_ms);
+    // generous lower bound that still rejects premature absence or retry.
+    try std.testing.expect(end_ns -| start_ns >= 30 * std.time.ns_per_ms);
+}
+
+test "standalone routing watch confirms absence before deadline and retries after expiry" {
+    const ManualClock = struct {
+        now_ns: u64 = 0,
+        sleep_delay_ms: u64 = 0,
+        sleep_count: usize = 0,
+
+        fn nowNs(self: *@This()) u64 {
+            return self.now_ns;
+        }
+
+        fn sleepMs(self: *@This(), ms: u64) void {
+            self.sleep_count += 1;
+            self.now_ns += (ms + self.sleep_delay_ms) * std.time.ns_per_ms;
+        }
+
+        fn yieldNow(self: *@This()) void {
+            self.now_ns += std.time.ns_per_ms;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var metadata = LocalStandaloneMetadata{
+        .alloc = alloc,
+        .manager = antfly.metadata.TableManager.init(alloc),
+        .extension_catalog = antfly.extensions.ExtensionCatalog.init(alloc),
+        .local_node_id = 1,
+        .store_id = 1,
+        .api_url = try alloc.dupe(u8, "http://127.0.0.1:8080"),
+        .replica_root_dir = try alloc.dupe(u8, "."),
+        .catalog_path = try alloc.dupe(u8, ".zig-cache/unused-routing-watch-catalog"),
+        .catalog_store = null,
+        .backend_runtime = backend_runtime.ptr(),
+    };
+    defer metadata.deinit();
+    metadata.epoch = 9;
+
+    const observed_token = antfly.metadata_api.CatalogRoutingChangeToken{
+        .metadata_group_id = group_ids.main_metadata_group_id,
+        .revision = 9,
+    };
+    const deadline_ns = 60 * std.time.ns_per_ms;
+    const probe_interval_ns = 2 * std.time.ns_per_ms;
+
+    // A stable, uncontended watch must reserve time for confirmation. Merely
+    // waiting until expiry and always returning retry is a regression.
+    var clock = ManualClock{};
+    try std.testing.expectEqual(
+        .authoritative_absence,
+        try metadata.catalogWaitForRoutingChangeWithClock(observed_token, deadline_ns, probe_interval_ns, &clock),
+    );
+    try std.testing.expect(clock.now_ns >= 30 * std.time.ns_per_ms);
+    try std.testing.expect(clock.now_ns < deadline_ns);
+    try std.testing.expect(clock.sleep_count > 1);
+
+    // Simulate a scheduler pause that overshoots the outer deadline.
+    clock = .{ .sleep_delay_ms = 150 };
+    try std.testing.expectEqual(
+        .retry,
+        try metadata.catalogWaitForRoutingChangeWithClock(observed_token, deadline_ns, probe_interval_ns, &clock),
+    );
+    try std.testing.expect(clock.now_ns >= deadline_ns);
+    try std.testing.expectEqual(@as(usize, 1), clock.sleep_count);
+
+    // An expired caller budget must not start a watch or confirm absence.
+    clock = .{ .now_ns = deadline_ns };
+    try std.testing.expectEqual(
+        .retry,
+        try metadata.catalogWaitForRoutingChangeWithClock(observed_token, deadline_ns, probe_interval_ns, &clock),
+    );
+    try std.testing.expectEqual(@as(usize, 0), clock.sleep_count);
+
+    // Mutex contention consumes the same deadline budget as watch sleeps.
+    clock = .{};
+    try std.testing.expect(metadata.mutex.tryLock());
+    defer metadata.mutex.unlock();
+    try std.testing.expectEqual(
+        .retry,
+        try metadata.catalogWaitForRoutingChangeWithClock(observed_token, deadline_ns, probe_interval_ns, &clock),
+    );
+    try std.testing.expectEqual(deadline_ns, clock.now_ns);
+    try std.testing.expectEqual(@as(usize, 0), clock.sleep_count);
 }
 
 test "standalone metadata rejects corrupt catalog without double-freeing owned paths" {
@@ -8623,6 +8995,100 @@ test "standalone metadata finalizes schema migration from resident runtime evide
     try std.testing.expect(std.mem.indexOf(u8, table.indexes_json, "full_text_index_v1") != null);
 }
 
+test "standalone metadata finalizes schema migration through split shard adapter fallback" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const catalog_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer alloc.free(catalog_path);
+
+    var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var metadata = LocalStandaloneMetadata{
+        .alloc = alloc,
+        .manager = antfly.metadata.TableManager.init(alloc),
+        .extension_catalog = antfly.extensions.ExtensionCatalog.init(alloc),
+        .local_node_id = 1,
+        .store_id = 1,
+        .api_url = try alloc.dupe(u8, "http://127.0.0.1:8080"),
+        .replica_root_dir = try alloc.dupe(u8, "."),
+        .catalog_path = try alloc.dupe(u8, catalog_path),
+        .catalog_store = null,
+        .backend_runtime = backend_runtime.ptr(),
+    };
+    defer metadata.deinit();
+    try metadata.manager.upsertTable(.{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = "{\"version\":1}",
+        .read_schema_json = "{\"version\":0}",
+        .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"full_text_index_v1\":{\"type\":\"full_text\"}}",
+    });
+    try metadata.manager.upsertRange(.{
+        .group_id = 70,
+        .table_id = 7,
+        .start_key = "",
+    });
+
+    const Provider = struct {
+        fn collect(
+            _: *anyopaque,
+            provider_alloc: std.mem.Allocator,
+            _: []const antfly.metadata.TableRecord,
+            _: []const antfly.metadata.RangeRecord,
+        ) !antfly.data.runtime.DataServer.LocalSchemaProgressSnapshot {
+            return .{
+                .records = try provider_alloc.alloc(antfly.metadata.SchemaProgressRecord, 0),
+                .runtime_coverage_complete = false,
+            };
+        }
+    };
+    const Adapter = struct {
+        calls: usize = 0,
+
+        fn fetchMedianKey(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return null;
+        }
+
+        fn schemaIndexReady(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            group_id: u64,
+            schema_version: u32,
+            read_schema_version: u32,
+        ) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(@as(u64, 70), group_id);
+            try std.testing.expectEqual(@as(u32, 1), schema_version);
+            try std.testing.expectEqual(@as(u32, 0), read_schema_version);
+            return true;
+        }
+    };
+    var adapter = Adapter{};
+    metadata.local_schema_progress_provider = .{
+        .ptr = undefined,
+        .collect = Provider.collect,
+        .shard_db_adapter = .{
+            .ptr = &adapter,
+            .vtable = &.{
+                .fetch_median_key = Adapter.fetchMedianKey,
+                .schema_index_ready = Adapter.schemaIndexReady,
+            },
+        },
+    };
+
+    try metadata.finalizeReadySchemaMigrations();
+
+    try std.testing.expectEqual(@as(usize, 1), adapter.calls);
+    const table = metadata.findTableByNameLocked("docs") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("", table.read_schema_json);
+    try std.testing.expect(std.mem.indexOf(u8, table.indexes_json, "full_text_index_v0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, table.indexes_json, "full_text_index_v1") != null);
+}
+
 test "standalone unified server lifecycle propagates startup failure" {
     var lifecycle = UnifiedServerLifecycle.init(std.testing.io);
     lifecycle.publishFailure(error.AddressInUse);
@@ -8643,7 +9109,7 @@ test "runtime lease watchdog publishes active self-fenced proof from exact expir
     ;
     const after_expiry: u64 = 1_784_116_831 * std.time.ns_per_s;
     var runtime_watchdog = RuntimeLeaseWatchdog{
-        .watchdog = try antfly.ha.kubernetes_lease_watchdog.Watchdog.init(.{
+        .watchdog = try antfly.hot_standby.kubernetes_lease_watchdog.Watchdog.init(.{
             .scope = .{
                 .topology_id = "topology-7",
                 .node_id = "standby-a",
@@ -8674,7 +9140,7 @@ test "runtime lease watchdog publishes active self-fenced proof from exact expir
     runtime_watchdog.publishValidatedObservationLocked(decision, observed_monotonic_ns);
     runtime_watchdog.proof_mutex.unlock();
 
-    try std.testing.expectEqual(antfly.ha.kubernetes_lease_watchdog.Decision.waiting, decision);
+    try std.testing.expectEqual(antfly.hot_standby.kubernetes_lease_watchdog.Decision.waiting, decision);
     const proof = (try RuntimeLeaseWatchdog.proofSnapshot(&runtime_watchdog, std.testing.allocator)).?;
     defer std.testing.allocator.free(proof.observed_holder_node_id);
     try std.testing.expect(proof.active);
@@ -8692,7 +9158,7 @@ test "standalone metadata catalog source provides compact routing" {
 test "runtime lease watchdog fetch and validation failures publish no bootstrap capability" {
     inline for ([_]RuntimeLeaseWatchdog.ObservationFailureStage{ .fetch, .validation }) |stage| {
         var runtime_watchdog = RuntimeLeaseWatchdog{
-            .watchdog = try antfly.ha.kubernetes_lease_watchdog.Watchdog.init(.{
+            .watchdog = try antfly.hot_standby.kubernetes_lease_watchdog.Watchdog.init(.{
                 .scope = .{
                     .topology_id = "topology-7",
                     .node_id = "primary-a",
@@ -8716,9 +9182,9 @@ test "runtime lease watchdog fetch and validation failures publish no bootstrap 
         const transition = runtime_watchdog.transitionObservationFailureLocked(stage, 1);
         const repeated_transition = runtime_watchdog.transitionObservationFailureLocked(stage, 2);
         runtime_watchdog.proof_mutex.unlock();
-        try std.testing.expectEqual(antfly.ha.kubernetes_lease_watchdog.Decision.waiting, transition.decision);
+        try std.testing.expectEqual(antfly.hot_standby.kubernetes_lease_watchdog.Decision.waiting, transition.decision);
         try std.testing.expect(transition.should_log);
-        try std.testing.expectEqual(antfly.ha.kubernetes_lease_watchdog.Decision.waiting, repeated_transition.decision);
+        try std.testing.expectEqual(antfly.hot_standby.kubernetes_lease_watchdog.Decision.waiting, repeated_transition.decision);
         try std.testing.expect(!repeated_transition.should_log);
         try std.testing.expectEqual(stage == .fetch, runtime_watchdog.fetch_failure_logged);
         try std.testing.expectEqual(stage == .validation, runtime_watchdog.validation_failure_logged);
@@ -8733,7 +9199,7 @@ test "runtime lease watchdog fetch and validation failures publish no bootstrap 
     }
 
     var source = RuntimeLeaseWatchdog{
-        .watchdog = try antfly.ha.kubernetes_lease_watchdog.Watchdog.init(.{
+        .watchdog = try antfly.hot_standby.kubernetes_lease_watchdog.Watchdog.init(.{
             .scope = .{
                 .topology_id = "topology-7",
                 .node_id = "primary-a",
@@ -8781,4 +9247,42 @@ test "runtime lease watchdog prefers a DNS-verified Kubernetes API host and reta
     const overridden_endpoint = try haLeaseAPIEndpoint(&env);
     try std.testing.expectEqualStrings("kubernetes.default.svc.cluster.local", overridden_endpoint.host);
     try std.testing.expectEqualStrings("443", overridden_endpoint.port);
+}
+
+test "standalone fills ha flags from the config ha section without overriding flags" {
+    const alloc = std.testing.allocator;
+    var cfg = try antfly.common.config.Config.parseFromSlice(alloc,
+        \\{
+        \\  "ha": {
+        \\    "admin": { "token_env": "ANTFLY_HA_ADMIN_TOKEN" },
+        \\    "identity": { "cluster_id": 7, "shard_id": 1, "timeline_id": 3, "epoch": 2 },
+        \\    "primary": { "log": "/data/ha/primary.wal", "slots": "/data/ha/slots", "node_id": "primary-a" },
+        \\    "sync": { "mode": "remote-apply", "selection": "all", "standbys": ["standby-a"], "failure": "degrade-to-async" },
+        \\    "retention": { "max_lag_lsn": 4096 },
+        \\    "fence_wal": "/data/ha/fence.wal"
+        \\  }
+        \\}
+    );
+    defer cfg.deinit();
+
+    var cli = CliConfig{ .ha_epoch = 9, .ha_primary_node_id = "flag-primary" };
+    defer cli.deinit(alloc);
+    try applyHAConfigDefaults(alloc, &cli, &cfg);
+
+    try std.testing.expectEqualStrings("ANTFLY_HA_ADMIN_TOKEN", cli.admin_token_env.?);
+    try std.testing.expectEqual(@as(u64, 7), cli.ha_cluster_id.?);
+    try std.testing.expectEqual(@as(u64, 1), cli.ha_shard_id.?);
+    try std.testing.expectEqual(@as(u64, 3), cli.ha_timeline_id.?);
+    try std.testing.expectEqual(@as(u64, 9), cli.ha_epoch.?);
+    try std.testing.expectEqualStrings("/data/ha/primary.wal", cli.ha_primary_log.?);
+    try std.testing.expectEqualStrings("flag-primary", cli.ha_primary_node_id.?);
+    try std.testing.expect(haPrimaryRequested(cli));
+    try std.testing.expect(!haStandbyRequested(cli));
+    try std.testing.expectEqual(antfly.hot_standby.primary.DurabilityMode.remote_apply, cli.ha_sync_mode.?);
+    try std.testing.expectEqual(antfly.hot_standby.primary.StandbySelection.all, cli.ha_sync_selection.?);
+    try std.testing.expectEqual(antfly.hot_standby.primary.FailurePolicy.degrade_to_async, cli.ha_sync_failure_policy.?);
+    try std.testing.expectEqual(@as(usize, 1), cli.ha_sync_standby_names.items.len);
+    try std.testing.expectEqual(@as(u64, 4096), cli.ha_retention_max_lag_lsn.?);
+    try std.testing.expectEqualStrings("/data/ha/fence.wal", cli.ha_fence_wal.?);
+    try std.testing.expect(cli.ha_standby_log == null);
 }

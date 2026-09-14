@@ -54,6 +54,7 @@ SDK_FILES = {
     "scripts/join_public_openapi.py",
     "scripts/join_openapi.py",
     "scripts/openapi_joiner.py",
+    "scripts/openapi_inputs.py",
     "scripts/public_openapi_overlays.py",
     "scripts/generate_graph_identifier_policy.py",
     "scripts/pyproject.toml",
@@ -80,6 +81,7 @@ RELEASE_FILES = {
     ".github/dependabot.yml",
 }
 FORMAT_INFRASTRUCTURE = {
+    "ruff.toml",
     "scripts/format.sh",
     "py/packages/sdk/pyproject.toml",
     "py/packages/sdk/uv.lock",

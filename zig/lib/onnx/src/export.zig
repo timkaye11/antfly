@@ -22,8 +22,7 @@
 
 const std = @import("std");
 const ml = @import("ml");
-const message = @import("protobuf").message;
-const proto = @import("proto.zig");
+const proto = @import("onnx_data").proto;
 
 const Allocator = std.mem.Allocator;
 
@@ -56,9 +55,7 @@ const DataType = proto.DataType;
 // thin wrapper that hands the assembled struct to the runtime encoder.
 
 /// Serialize a ModelProto to protobuf bytes.
-pub fn serializeModel(alloc: Allocator, model: *const ModelProto) ![]u8 {
-    return message.encode(ModelProto, alloc, model);
-}
+pub const serializeModel = @import("onnx_data").serializeModel;
 
 // ── Graph IR → ONNX Proto ───────────────────────────────────────────
 
@@ -719,9 +716,7 @@ fn exportGraphResultMaybeStream(
     defer if (lowered) |*l| l.deinit();
 
     const effective_graph: *const Graph = if (opts.lower_fused) blk: {
-        lowered = ml.graph.lower.lower(alloc, graph) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-        };
+        lowered = try ml.graph.lower.lower(alloc, graph);
         break :blk &lowered.?.graph;
     } else graph;
 
@@ -2912,6 +2907,21 @@ test "exportGraph roundtrip — export then import" {
 
     try std.testing.expect(model.graph() != null);
     try std.testing.expectEqual(@as(u64, 17), model.opsetVersion());
+}
+
+test "exportGraph with lower_fused preserves graph validation errors" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("input", Shape.init(.f32, &.{2}));
+    const output = try builder.mul(input, input);
+    try graph.markOutput(output);
+
+    graph.nodes.items[output].inputs[0] = output;
+    try std.testing.expectError(error.CyclicGraph, exportGraph(a, &graph, .{ .lower_fused = true }));
+    graph.nodes.items[output].inputs[0] = @intCast(graph.nodes.items.len);
+    try std.testing.expectError(error.InvalidGraphDependency, exportGraph(a, &graph, .{ .lower_fused = true }));
 }
 
 test "exportGraph with lower_fused decomposes fused ops" {

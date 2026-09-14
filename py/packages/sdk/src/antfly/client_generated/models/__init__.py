@@ -60,6 +60,7 @@ from .backup_outcome_ambiguous_conflict_code import BackupOutcomeAmbiguousConfli
 from .backup_request import BackupRequest
 from .backup_request_format import BackupRequestFormat
 from .backup_table_response_201 import BackupTableResponse201
+from .batch_committed_failure import BatchCommittedFailure
 from .batch_request import BatchRequest
 from .batch_request_inserts import BatchRequestInserts
 from .batch_request_inserts_additional_property import BatchRequestInsertsAdditionalProperty
@@ -112,6 +113,8 @@ from .cohere_embedder_config_provider import CohereEmbedderConfigProvider
 from .cohere_embedder_config_truncate import CohereEmbedderConfigTruncate
 from .cohere_reranker_config import CohereRerankerConfig
 from .cohere_reranker_config_provider import CohereRerankerConfigProvider
+from .committed_mutation_outcome import CommittedMutationOutcome
+from .committed_mutation_outcome_status import CommittedMutationOutcomeStatus
 from .confidence_step_config import ConfidenceStepConfig
 from .configure_extension_request import ConfigureExtensionRequest
 from .conjunction_query import ConjunctionQuery
@@ -151,6 +154,7 @@ from .created_graph_artifact_source_config import CreatedGraphArtifactSourceConf
 from .created_graph_artifact_source_config_format import CreatedGraphArtifactSourceConfigFormat
 from .created_graph_index import CreatedGraphIndex
 from .created_graph_index_config import CreatedGraphIndexConfig
+from .created_graph_index_config_metrics import CreatedGraphIndexConfigMetrics
 from .created_graph_index_type import CreatedGraphIndexType
 from .created_index_common import CreatedIndexCommon
 from .created_provider_config import CreatedProviderConfig
@@ -159,6 +163,7 @@ from .data_shape_decl import DataShapeDecl
 from .data_shape_kind import DataShapeKind
 from .date_range_string_query import DateRangeStringQuery
 from .delete_artifact_enrichment_response_201 import DeleteArtifactEnrichmentResponse201
+from .dense_native_storage_phase import DenseNativeStoragePhase
 from .dense_repair_backpressure_error import DenseRepairBackpressureError
 from .dense_repair_backpressure_error_code import DenseRepairBackpressureErrorCode
 from .dense_vector_publication_status import DenseVectorPublicationStatus
@@ -245,6 +250,7 @@ from .exa_search_config_search_type import ExaSearchConfigSearchType
 from .exact_sort_error import ExactSortError
 from .exact_sort_error_error import ExactSortErrorError
 from .exact_sort_error_status import ExactSortErrorStatus
+from .execute_graph_metric_action_action import ExecuteGraphMetricActionAction
 from .execution_policy import ExecutionPolicy
 from .extension_error import ExtensionError
 from .extension_member import ExtensionMember
@@ -254,15 +260,112 @@ from .extension_scope import ExtensionScope
 from .extension_scope_kind import ExtensionScopeKind
 from .external_io_connection import ExternalIoConnection
 from .external_io_protocol import ExternalIoProtocol
+from .extraction_attribute_group import ExtractionAttributeGroup
+from .extraction_attribute_label import ExtractionAttributeLabel
 from .extraction_classification import ExtractionClassification
+from .extraction_classification_example_type_0 import ExtractionClassificationExampleType0
 from .extraction_classification_schema import ExtractionClassificationSchema
+from .extraction_classification_schema_activation import ExtractionClassificationSchemaActivation
+from .extraction_classification_schema_label_definitions import ExtractionClassificationSchemaLabelDefinitions
+from .extraction_classification_schema_mode import ExtractionClassificationSchemaMode
+from .extraction_constraint_and import ExtractionConstraintAnd
+from .extraction_constraint_and_type import ExtractionConstraintAndType
+from .extraction_constraint_any_other_selected import ExtractionConstraintAnyOtherSelected
+from .extraction_constraint_any_other_selected_type import ExtractionConstraintAnyOtherSelectedType
+from .extraction_constraint_any_selected import ExtractionConstraintAnySelected
+from .extraction_constraint_any_selected_type import ExtractionConstraintAnySelectedType
+from .extraction_constraint_at_level import ExtractionConstraintAtLevel
+from .extraction_constraint_at_level_type import ExtractionConstraintAtLevelType
+from .extraction_constraint_cardinality import ExtractionConstraintCardinality
+from .extraction_constraint_cardinality_type import ExtractionConstraintCardinalityType
+from .extraction_constraint_exactly_one_of import ExtractionConstraintExactlyOneOf
+from .extraction_constraint_exactly_one_of_type import ExtractionConstraintExactlyOneOfType
+from .extraction_constraint_excludes import ExtractionConstraintExcludes
+from .extraction_constraint_excludes_type import ExtractionConstraintExcludesType
+from .extraction_constraint_iff import ExtractionConstraintIff
+from .extraction_constraint_iff_type import ExtractionConstraintIffType
+from .extraction_constraint_implies import ExtractionConstraintImplies
+from .extraction_constraint_implies_type import ExtractionConstraintImpliesType
+from .extraction_constraint_is_default import ExtractionConstraintIsDefault
+from .extraction_constraint_is_default_type import ExtractionConstraintIsDefaultType
+from .extraction_constraint_label_ref import ExtractionConstraintLabelRef
+from .extraction_constraint_label_ref_type import ExtractionConstraintLabelRefType
+from .extraction_constraint_max_level import ExtractionConstraintMaxLevel
+from .extraction_constraint_max_level_type import ExtractionConstraintMaxLevelType
+from .extraction_constraint_min_level import ExtractionConstraintMinLevel
+from .extraction_constraint_min_level_type import ExtractionConstraintMinLevelType
+from .extraction_constraint_not import ExtractionConstraintNot
+from .extraction_constraint_not_type import ExtractionConstraintNotType
+from .extraction_constraint_or import ExtractionConstraintOr
+from .extraction_constraint_or_type import ExtractionConstraintOrType
+from .extraction_decoder_options import ExtractionDecoderOptions
+from .extraction_decoder_options_algorithm import ExtractionDecoderOptionsAlgorithm
 from .extraction_entity import ExtractionEntity
+from .extraction_entity_attributes import ExtractionEntityAttributes
+from .extraction_entity_definition import ExtractionEntityDefinition
+from .extraction_entity_definition_dtype import ExtractionEntityDefinitionDtype
+from .extraction_entity_definition_type import ExtractionEntityDefinitionType
 from .extraction_input import ExtractionInput
 from .extraction_input_metadata import ExtractionInputMetadata
+from .extraction_joint_constraint_acyclic_relation import ExtractionJointConstraintAcyclicRelation
+from .extraction_joint_constraint_acyclic_relation_type import ExtractionJointConstraintAcyclicRelationType
+from .extraction_joint_constraint_entity_overlap_policy import ExtractionJointConstraintEntityOverlapPolicy
+from .extraction_joint_constraint_entity_overlap_policy_policy import ExtractionJointConstraintEntityOverlapPolicyPolicy
+from .extraction_joint_constraint_entity_overlap_policy_type import ExtractionJointConstraintEntityOverlapPolicyType
+from .extraction_joint_constraint_inverse_relation import ExtractionJointConstraintInverseRelation
+from .extraction_joint_constraint_inverse_relation_type import ExtractionJointConstraintInverseRelationType
+from .extraction_joint_constraint_max_relations_per_head import ExtractionJointConstraintMaxRelationsPerHead
+from .extraction_joint_constraint_max_relations_per_head_type import ExtractionJointConstraintMaxRelationsPerHeadType
+from .extraction_joint_constraint_max_relations_per_tail import ExtractionJointConstraintMaxRelationsPerTail
+from .extraction_joint_constraint_max_relations_per_tail_type import ExtractionJointConstraintMaxRelationsPerTailType
+from .extraction_joint_constraint_no_self_loops import ExtractionJointConstraintNoSelfLoops
+from .extraction_joint_constraint_no_self_loops_type import ExtractionJointConstraintNoSelfLoopsType
+from .extraction_joint_constraint_symmetric_relation import ExtractionJointConstraintSymmetricRelation
+from .extraction_joint_constraint_symmetric_relation_type import ExtractionJointConstraintSymmetricRelationType
+from .extraction_joint_constraint_typed_endpoints import ExtractionJointConstraintTypedEndpoints
+from .extraction_joint_constraint_typed_endpoints_type import ExtractionJointConstraintTypedEndpointsType
+from .extraction_joint_constraint_unique_relation_pair import ExtractionJointConstraintUniqueRelationPair
+from .extraction_joint_constraint_unique_relation_pair_type import ExtractionJointConstraintUniqueRelationPairType
+from .extraction_joint_constraint_unique_relation_slot import ExtractionJointConstraintUniqueRelationSlot
+from .extraction_joint_constraint_unique_relation_slot_slot import ExtractionJointConstraintUniqueRelationSlotSlot
+from .extraction_joint_constraint_unique_relation_slot_type import ExtractionJointConstraintUniqueRelationSlotType
+from .extraction_joint_entity import ExtractionJointEntity
+from .extraction_joint_options import ExtractionJointOptions
+from .extraction_joint_relation import ExtractionJointRelation
+from .extraction_joint_schema import ExtractionJointSchema
+from .extraction_joint_schema_entities import ExtractionJointSchemaEntities
+from .extraction_joint_schema_relations import ExtractionJointSchemaRelations
+from .extraction_label_definition import ExtractionLabelDefinition
+from .extraction_long_document_metadata import ExtractionLongDocumentMetadata
+from .extraction_long_document_metadata_classification_aggregation import (
+    ExtractionLongDocumentMetadataClassificationAggregation,
+)
+from .extraction_long_document_metadata_duplicate_score import ExtractionLongDocumentMetadataDuplicateScore
+from .extraction_long_document_metadata_natural_record_identity import (
+    ExtractionLongDocumentMetadataNaturalRecordIdentity,
+)
+from .extraction_long_document_metadata_other_record_identity import ExtractionLongDocumentMetadataOtherRecordIdentity
+from .extraction_long_document_metadata_solver_optimality_scope import (
+    ExtractionLongDocumentMetadataSolverOptimalityScope,
+)
+from .extraction_long_document_metadata_version import ExtractionLongDocumentMetadataVersion
+from .extraction_long_document_metadata_window_policy import ExtractionLongDocumentMetadataWindowPolicy
+from .extraction_long_document_options import ExtractionLongDocumentOptions
+from .extraction_long_document_options_mode import ExtractionLongDocumentOptionsMode
+from .extraction_long_document_options_record_identity import ExtractionLongDocumentOptionsRecordIdentity
 from .extraction_object import ExtractionObject
+from .extraction_object_structure_metadata import ExtractionObjectStructureMetadata
 from .extraction_object_structures import ExtractionObjectStructures
+from .extraction_offset_unit import ExtractionOffsetUnit
 from .extraction_options import ExtractionOptions
+from .extraction_options_overlap import ExtractionOptionsOverlap
+from .extraction_options_word_splitter import ExtractionOptionsWordSplitter
 from .extraction_reader_options import ExtractionReaderOptions
+from .extraction_record_metadata import ExtractionRecordMetadata
+from .extraction_record_metadata_anchor import ExtractionRecordMetadataAnchor
+from .extraction_regex_validator import ExtractionRegexValidator
+from .extraction_regex_validator_mode import ExtractionRegexValidatorMode
+from .extraction_regex_validator_type import ExtractionRegexValidatorType
 from .extraction_relation import ExtractionRelation
 from .extraction_relation_endpoint import ExtractionRelationEndpoint
 from .extraction_relation_schema import ExtractionRelationSchema
@@ -272,11 +375,21 @@ from .extraction_response import ExtractionResponse
 from .extraction_response_object import ExtractionResponseObject
 from .extraction_response_usage import ExtractionResponseUsage
 from .extraction_schema import ExtractionSchema
+from .extraction_schema_entity_attributes import ExtractionSchemaEntityAttributes
+from .extraction_schema_entity_definitions import ExtractionSchemaEntityDefinitions
 from .extraction_schema_structures import ExtractionSchemaStructures
+from .extraction_schema_version import ExtractionSchemaVersion
+from .extraction_solver_diagnostics import ExtractionSolverDiagnostics
+from .extraction_solver_status import ExtractionSolverStatus
+from .extraction_solver_status_status import ExtractionSolverStatusStatus
 from .extraction_structure_field_type_1 import ExtractionStructureFieldType1
+from .extraction_structure_field_type_1_cardinality import ExtractionStructureFieldType1Cardinality
+from .extraction_structure_field_type_1_dtype import ExtractionStructureFieldType1Dtype
 from .extraction_structure_field_type_1_type import ExtractionStructureFieldType1Type
 from .extraction_structure_schema import ExtractionStructureSchema
 from .extraction_structure_schema_fields import ExtractionStructureSchemaFields
+from .extraction_structure_schema_mode import ExtractionStructureSchemaMode
+from .extraction_structure_schema_occurrence_policy import ExtractionStructureSchemaOccurrencePolicy
 from .extraction_token import ExtractionToken
 from .failed_operation import FailedOperation
 from .failed_operation_operation import FailedOperationOperation
@@ -382,6 +495,7 @@ from .graph_edge_weight_range import GraphEdgeWeightRange
 from .graph_exact_result_stats import GraphExactResultStats
 from .graph_identity_node_selector import GraphIdentityNodeSelector
 from .graph_index_config import GraphIndexConfig
+from .graph_index_config_metrics import GraphIndexConfigMetrics
 from .graph_index_stats import GraphIndexStats
 from .graph_index_stats_algebraic_graph import GraphIndexStatsAlgebraicGraph
 from .graph_index_stats_algebraic_graph_traversal import GraphIndexStatsAlgebraicGraphTraversal
@@ -403,8 +517,39 @@ from .graph_match_operation_limit_exceeded_error import GraphMatchOperationLimit
 from .graph_match_operation_limit_exceeded_error_error import GraphMatchOperationLimitExceededErrorError
 from .graph_match_operation_limit_exceeded_error_status import GraphMatchOperationLimitExceededErrorStatus
 from .graph_match_query import GraphMatchQuery
+from .graph_metric_action_response import GraphMetricActionResponse
+from .graph_metric_build_page_status import GraphMetricBuildPageStatus
+from .graph_metric_build_page_status_range_kind import GraphMetricBuildPageStatusRangeKind
+from .graph_metric_build_page_status_state import GraphMetricBuildPageStatusState
+from .graph_metric_config import GraphMetricConfig
+from .graph_metric_config_kind import GraphMetricConfigKind
+from .graph_metric_config_refresh import GraphMetricConfigRefresh
+from .graph_metric_edge_filter import GraphMetricEdgeFilter
+from .graph_metric_edge_filter_mode import GraphMetricEdgeFilterMode
+from .graph_metric_edge_filter_status import GraphMetricEdgeFilterStatus
+from .graph_metric_edge_filter_status_mode import GraphMetricEdgeFilterStatusMode
+from .graph_metric_event import GraphMetricEvent
+from .graph_metric_event_kind import GraphMetricEventKind
+from .graph_metric_filter import GraphMetricFilter
+from .graph_metric_filter_op import GraphMetricFilterOp
+from .graph_metric_order import GraphMetricOrder
+from .graph_metric_order_direction import GraphMetricOrderDirection
+from .graph_metric_order_nulls import GraphMetricOrderNulls
+from .graph_metric_profile import GraphMetricProfile
+from .graph_metric_query import GraphMetricQuery
+from .graph_metric_query_metric_freshness import GraphMetricQueryMetricFreshness
+from .graph_metric_rerank import GraphMetricRerank
+from .graph_metric_rerank_metric_freshness import GraphMetricRerankMetricFreshness
+from .graph_metric_rerank_score_details import GraphMetricRerankScoreDetails
+from .graph_metric_result import GraphMetricResult
+from .graph_metric_runtime_stats import GraphMetricRuntimeStats
+from .graph_metric_runtime_stats_role import GraphMetricRuntimeStatsRole
+from .graph_metric_score import GraphMetricScore
+from .graph_metric_status import GraphMetricStatus
+from .graph_metric_status_phase import GraphMetricStatusPhase
 from .graph_nodes_result import GraphNodesResult
 from .graph_nodes_result_kind import GraphNodesResultKind
+from .graph_nodes_result_metric_status import GraphNodesResultMetricStatus
 from .graph_not_equal_predicate import GraphNotEqualPredicate
 from .graph_not_exists_pattern import GraphNotExistsPattern
 from .graph_optional_match import GraphOptionalMatch
@@ -439,6 +584,7 @@ from .graph_resolver_config_source_artifact_kind import GraphResolverConfigSourc
 from .graph_result_node import GraphResultNode
 from .graph_result_node_document import GraphResultNodeDocument
 from .graph_result_node_evidence import GraphResultNodeEvidence
+from .graph_result_node_metrics import GraphResultNodeMetrics
 from .graph_result_ref_node_selector import GraphResultRefNodeSelector
 from .graph_result_row import GraphResultRow
 from .graph_result_stats import GraphResultStats
@@ -447,6 +593,7 @@ from .graph_row_count_target import GraphRowCountTarget
 from .graph_shortest_path import GraphShortestPath
 from .graph_shortest_path_query import GraphShortestPathQuery
 from .graph_traversal import GraphTraversal
+from .graph_traversal_metric_freshness import GraphTraversalMetricFreshness
 from .graph_traverse_query import GraphTraverseQuery
 from .graph_where_and import GraphWhereAnd
 from .graph_where_not_equal import GraphWhereNotEqual
@@ -513,6 +660,7 @@ from .inference_a4b_residency_mode import InferenceA4BResidencyMode
 from .inference_admission_config import InferenceAdmissionConfig
 from .inference_audio_chunk_config import InferenceAudioChunkConfig
 from .inference_backend_runtimes import InferenceBackendRuntimes
+from .inference_batch_execution_report import InferenceBatchExecutionReport
 from .inference_binary_content import InferenceBinaryContent
 from .inference_capacity_error import InferenceCapacityError
 from .inference_capacity_error_reason import InferenceCapacityErrorReason
@@ -592,7 +740,6 @@ from .inference_model_quantization import InferenceModelQuantization
 from .inference_model_ref import InferenceModelRef
 from .inference_models_response import InferenceModelsResponse
 from .inference_models_response_chunkers import InferenceModelsResponseChunkers
-from .inference_models_response_classifiers import InferenceModelsResponseClassifiers
 from .inference_models_response_data_item import InferenceModelsResponseDataItem
 from .inference_models_response_embedders import InferenceModelsResponseEmbedders
 from .inference_models_response_extractors import InferenceModelsResponseExtractors
@@ -679,11 +826,13 @@ from .key_range import KeyRange
 from .legacy_graph_document_query import LegacyGraphDocumentQuery
 from .legacy_graph_node_selector import LegacyGraphNodeSelector
 from .legacy_graph_query import LegacyGraphQuery
+from .legacy_graph_query_metric_freshness import LegacyGraphQueryMetricFreshness
 from .legacy_graph_result_node import LegacyGraphResultNode
 from .legacy_graph_result_node_document import LegacyGraphResultNodeDocument
 from .legacy_graph_result_node_evidence import LegacyGraphResultNodeEvidence
 from .legacy_graph_search_result import LegacyGraphSearchResult
 from .legacy_graph_search_result_kind import LegacyGraphSearchResultKind
+from .legacy_graph_search_result_metric_status import LegacyGraphSearchResultMetricStatus
 from .linear_merge_page_status import LinearMergePageStatus
 from .linear_merge_request import LinearMergeRequest
 from .linear_merge_request_records import LinearMergeRequestRecords
@@ -801,6 +950,8 @@ from .query_result import QueryResult
 from .query_result_base import QueryResultBase
 from .query_result_base_aggregations import QueryResultBaseAggregations
 from .query_result_base_analyses import QueryResultBaseAnalyses
+from .query_result_base_graph_metric_results import QueryResultBaseGraphMetricResults
+from .query_score_details import QueryScoreDetails
 from .query_strategy import QueryStrategy
 from .query_string_query import QueryStringQuery
 from .query_temporarily_unavailable_error import QueryTemporarilyUnavailableError
@@ -905,9 +1056,12 @@ from .table_catalog_changed_conflict_code import TableCatalogChangedConflictCode
 from .table_indexes import TableIndexes
 from .table_migration import TableMigration
 from .table_migration_state import TableMigrationState
+from .table_repair_control_job_start_request import TableRepairControlJobStartRequest
+from .table_repair_control_job_start_request_control import TableRepairControlJobStartRequestControl
 from .table_repair_issue import TableRepairIssue
 from .table_repair_issue_list import TableRepairIssueList
 from .table_repair_job import TableRepairJob
+from .table_repair_job_control import TableRepairJobControl
 from .table_repair_job_phase import TableRepairJobPhase
 from .table_repair_job_repair_status import TableRepairJobRepairStatus
 from .table_repair_job_start_request import TableRepairJobStartRequest
@@ -922,6 +1076,8 @@ from .table_shards import TableShards
 from .table_statistics import TableStatistics
 from .table_statistics_field_stats import TableStatisticsFieldStats
 from .table_status import TableStatus
+from .table_storage_settings import TableStorageSettings
+from .table_storage_settings_dense_embeddings import TableStorageSettingsDenseEmbeddings
 from .table_storage_unreadable_error import TableStorageUnreadableError
 from .table_storage_unreadable_error_code import TableStorageUnreadableErrorCode
 from .tavily_search_config import TavilySearchConfig
@@ -995,6 +1151,7 @@ from .update_password_request import UpdatePasswordRequest
 from .user import User
 from .user_metadata_type_0 import UserMetadataType0
 from .vad_options import VADOptions
+from .vector_source_storage_status import VectorSourceStorageStatus
 from .vertex_embedder_config import VertexEmbedderConfig
 from .vertex_embedder_config_provider import VertexEmbedderConfigProvider
 from .vertex_generator_config import VertexGeneratorConfig
@@ -1070,6 +1227,7 @@ __all__ = (
     "BackupRequest",
     "BackupRequestFormat",
     "BackupTableResponse201",
+    "BatchCommittedFailure",
     "BatchRequest",
     "BatchRequestInserts",
     "BatchRequestInsertsAdditionalProperty",
@@ -1122,6 +1280,8 @@ __all__ = (
     "CohereEmbedderConfigTruncate",
     "CohereRerankerConfig",
     "CohereRerankerConfigProvider",
+    "CommittedMutationOutcome",
+    "CommittedMutationOutcomeStatus",
     "ConfidenceStepConfig",
     "ConfigureExtensionRequest",
     "ConjunctionQuery",
@@ -1150,6 +1310,7 @@ __all__ = (
     "CreatedGraphArtifactSourceConfigFormat",
     "CreatedGraphIndex",
     "CreatedGraphIndexConfig",
+    "CreatedGraphIndexConfigMetrics",
     "CreatedGraphIndexType",
     "CreatedIndexCommon",
     "CreatedProviderConfig",
@@ -1169,6 +1330,7 @@ __all__ = (
     "DataShapeKind",
     "DateRangeStringQuery",
     "DeleteArtifactEnrichmentResponse201",
+    "DenseNativeStoragePhase",
     "DenseRepairBackpressureError",
     "DenseRepairBackpressureErrorCode",
     "DenseVectorPublicationStatus",
@@ -1253,6 +1415,7 @@ __all__ = (
     "ExactSortErrorStatus",
     "ExaSearchConfig",
     "ExaSearchConfigSearchType",
+    "ExecuteGraphMetricActionAction",
     "ExecutionPolicy",
     "ExtensionError",
     "ExtensionMember",
@@ -1262,15 +1425,106 @@ __all__ = (
     "ExtensionScopeKind",
     "ExternalIoConnection",
     "ExternalIoProtocol",
+    "ExtractionAttributeGroup",
+    "ExtractionAttributeLabel",
     "ExtractionClassification",
+    "ExtractionClassificationExampleType0",
     "ExtractionClassificationSchema",
+    "ExtractionClassificationSchemaActivation",
+    "ExtractionClassificationSchemaLabelDefinitions",
+    "ExtractionClassificationSchemaMode",
+    "ExtractionConstraintAnd",
+    "ExtractionConstraintAndType",
+    "ExtractionConstraintAnyOtherSelected",
+    "ExtractionConstraintAnyOtherSelectedType",
+    "ExtractionConstraintAnySelected",
+    "ExtractionConstraintAnySelectedType",
+    "ExtractionConstraintAtLevel",
+    "ExtractionConstraintAtLevelType",
+    "ExtractionConstraintCardinality",
+    "ExtractionConstraintCardinalityType",
+    "ExtractionConstraintExactlyOneOf",
+    "ExtractionConstraintExactlyOneOfType",
+    "ExtractionConstraintExcludes",
+    "ExtractionConstraintExcludesType",
+    "ExtractionConstraintIff",
+    "ExtractionConstraintIffType",
+    "ExtractionConstraintImplies",
+    "ExtractionConstraintImpliesType",
+    "ExtractionConstraintIsDefault",
+    "ExtractionConstraintIsDefaultType",
+    "ExtractionConstraintLabelRef",
+    "ExtractionConstraintLabelRefType",
+    "ExtractionConstraintMaxLevel",
+    "ExtractionConstraintMaxLevelType",
+    "ExtractionConstraintMinLevel",
+    "ExtractionConstraintMinLevelType",
+    "ExtractionConstraintNot",
+    "ExtractionConstraintNotType",
+    "ExtractionConstraintOr",
+    "ExtractionConstraintOrType",
+    "ExtractionDecoderOptions",
+    "ExtractionDecoderOptionsAlgorithm",
     "ExtractionEntity",
+    "ExtractionEntityAttributes",
+    "ExtractionEntityDefinition",
+    "ExtractionEntityDefinitionDtype",
+    "ExtractionEntityDefinitionType",
     "ExtractionInput",
     "ExtractionInputMetadata",
+    "ExtractionJointConstraintAcyclicRelation",
+    "ExtractionJointConstraintAcyclicRelationType",
+    "ExtractionJointConstraintEntityOverlapPolicy",
+    "ExtractionJointConstraintEntityOverlapPolicyPolicy",
+    "ExtractionJointConstraintEntityOverlapPolicyType",
+    "ExtractionJointConstraintInverseRelation",
+    "ExtractionJointConstraintInverseRelationType",
+    "ExtractionJointConstraintMaxRelationsPerHead",
+    "ExtractionJointConstraintMaxRelationsPerHeadType",
+    "ExtractionJointConstraintMaxRelationsPerTail",
+    "ExtractionJointConstraintMaxRelationsPerTailType",
+    "ExtractionJointConstraintNoSelfLoops",
+    "ExtractionJointConstraintNoSelfLoopsType",
+    "ExtractionJointConstraintSymmetricRelation",
+    "ExtractionJointConstraintSymmetricRelationType",
+    "ExtractionJointConstraintTypedEndpoints",
+    "ExtractionJointConstraintTypedEndpointsType",
+    "ExtractionJointConstraintUniqueRelationPair",
+    "ExtractionJointConstraintUniqueRelationPairType",
+    "ExtractionJointConstraintUniqueRelationSlot",
+    "ExtractionJointConstraintUniqueRelationSlotSlot",
+    "ExtractionJointConstraintUniqueRelationSlotType",
+    "ExtractionJointEntity",
+    "ExtractionJointOptions",
+    "ExtractionJointRelation",
+    "ExtractionJointSchema",
+    "ExtractionJointSchemaEntities",
+    "ExtractionJointSchemaRelations",
+    "ExtractionLabelDefinition",
+    "ExtractionLongDocumentMetadata",
+    "ExtractionLongDocumentMetadataClassificationAggregation",
+    "ExtractionLongDocumentMetadataDuplicateScore",
+    "ExtractionLongDocumentMetadataNaturalRecordIdentity",
+    "ExtractionLongDocumentMetadataOtherRecordIdentity",
+    "ExtractionLongDocumentMetadataSolverOptimalityScope",
+    "ExtractionLongDocumentMetadataVersion",
+    "ExtractionLongDocumentMetadataWindowPolicy",
+    "ExtractionLongDocumentOptions",
+    "ExtractionLongDocumentOptionsMode",
+    "ExtractionLongDocumentOptionsRecordIdentity",
     "ExtractionObject",
+    "ExtractionObjectStructureMetadata",
     "ExtractionObjectStructures",
+    "ExtractionOffsetUnit",
     "ExtractionOptions",
+    "ExtractionOptionsOverlap",
+    "ExtractionOptionsWordSplitter",
     "ExtractionReaderOptions",
+    "ExtractionRecordMetadata",
+    "ExtractionRecordMetadataAnchor",
+    "ExtractionRegexValidator",
+    "ExtractionRegexValidatorMode",
+    "ExtractionRegexValidatorType",
     "ExtractionRelation",
     "ExtractionRelationEndpoint",
     "ExtractionRelationSchema",
@@ -1280,11 +1534,21 @@ __all__ = (
     "ExtractionResponseObject",
     "ExtractionResponseUsage",
     "ExtractionSchema",
+    "ExtractionSchemaEntityAttributes",
+    "ExtractionSchemaEntityDefinitions",
     "ExtractionSchemaStructures",
+    "ExtractionSchemaVersion",
+    "ExtractionSolverDiagnostics",
+    "ExtractionSolverStatus",
+    "ExtractionSolverStatusStatus",
     "ExtractionStructureFieldType1",
+    "ExtractionStructureFieldType1Cardinality",
+    "ExtractionStructureFieldType1Dtype",
     "ExtractionStructureFieldType1Type",
     "ExtractionStructureSchema",
     "ExtractionStructureSchemaFields",
+    "ExtractionStructureSchemaMode",
+    "ExtractionStructureSchemaOccurrencePolicy",
     "ExtractionToken",
     "FailedOperation",
     "FailedOperationOperation",
@@ -1390,6 +1654,7 @@ __all__ = (
     "GraphExactResultStats",
     "GraphIdentityNodeSelector",
     "GraphIndexConfig",
+    "GraphIndexConfigMetrics",
     "GraphIndexStats",
     "GraphIndexStatsAlgebraicGraph",
     "GraphIndexStatsAlgebraicGraphTraversal",
@@ -1411,8 +1676,39 @@ __all__ = (
     "GraphMatchOperationLimitExceededErrorError",
     "GraphMatchOperationLimitExceededErrorStatus",
     "GraphMatchQuery",
+    "GraphMetricActionResponse",
+    "GraphMetricBuildPageStatus",
+    "GraphMetricBuildPageStatusRangeKind",
+    "GraphMetricBuildPageStatusState",
+    "GraphMetricConfig",
+    "GraphMetricConfigKind",
+    "GraphMetricConfigRefresh",
+    "GraphMetricEdgeFilter",
+    "GraphMetricEdgeFilterMode",
+    "GraphMetricEdgeFilterStatus",
+    "GraphMetricEdgeFilterStatusMode",
+    "GraphMetricEvent",
+    "GraphMetricEventKind",
+    "GraphMetricFilter",
+    "GraphMetricFilterOp",
+    "GraphMetricOrder",
+    "GraphMetricOrderDirection",
+    "GraphMetricOrderNulls",
+    "GraphMetricProfile",
+    "GraphMetricQuery",
+    "GraphMetricQueryMetricFreshness",
+    "GraphMetricRerank",
+    "GraphMetricRerankMetricFreshness",
+    "GraphMetricRerankScoreDetails",
+    "GraphMetricResult",
+    "GraphMetricRuntimeStats",
+    "GraphMetricRuntimeStatsRole",
+    "GraphMetricScore",
+    "GraphMetricStatus",
+    "GraphMetricStatusPhase",
     "GraphNodesResult",
     "GraphNodesResultKind",
+    "GraphNodesResultMetricStatus",
     "GraphNotEqualPredicate",
     "GraphNotExistsPattern",
     "GraphOptionalMatch",
@@ -1447,6 +1743,7 @@ __all__ = (
     "GraphResultNode",
     "GraphResultNodeDocument",
     "GraphResultNodeEvidence",
+    "GraphResultNodeMetrics",
     "GraphResultRefNodeSelector",
     "GraphResultRow",
     "GraphResultStats",
@@ -1455,6 +1752,7 @@ __all__ = (
     "GraphShortestPath",
     "GraphShortestPathQuery",
     "GraphTraversal",
+    "GraphTraversalMetricFreshness",
     "GraphTraverseQuery",
     "GraphWhereAnd",
     "GraphWhereNotEqual",
@@ -1521,6 +1819,7 @@ __all__ = (
     "InferenceAdmissionConfig",
     "InferenceAudioChunkConfig",
     "InferenceBackendRuntimes",
+    "InferenceBatchExecutionReport",
     "InferenceBinaryContent",
     "InferenceCapacityError",
     "InferenceCapacityErrorReason",
@@ -1600,7 +1899,6 @@ __all__ = (
     "InferenceModelRef",
     "InferenceModelsResponse",
     "InferenceModelsResponseChunkers",
-    "InferenceModelsResponseClassifiers",
     "InferenceModelsResponseDataItem",
     "InferenceModelsResponseEmbedders",
     "InferenceModelsResponseExtractors",
@@ -1685,11 +1983,13 @@ __all__ = (
     "LegacyGraphDocumentQuery",
     "LegacyGraphNodeSelector",
     "LegacyGraphQuery",
+    "LegacyGraphQueryMetricFreshness",
     "LegacyGraphResultNode",
     "LegacyGraphResultNodeDocument",
     "LegacyGraphResultNodeEvidence",
     "LegacyGraphSearchResult",
     "LegacyGraphSearchResultKind",
+    "LegacyGraphSearchResultMetricStatus",
     "LinearMergePageStatus",
     "LinearMergeRequest",
     "LinearMergeRequestRecords",
@@ -1805,6 +2105,8 @@ __all__ = (
     "QueryResultBase",
     "QueryResultBaseAggregations",
     "QueryResultBaseAnalyses",
+    "QueryResultBaseGraphMetricResults",
+    "QueryScoreDetails",
     "QueryStrategy",
     "QueryStringQuery",
     "QueryTemporarilyUnavailableError",
@@ -1909,9 +2211,12 @@ __all__ = (
     "TableIndexes",
     "TableMigration",
     "TableMigrationState",
+    "TableRepairControlJobStartRequest",
+    "TableRepairControlJobStartRequestControl",
     "TableRepairIssue",
     "TableRepairIssueList",
     "TableRepairJob",
+    "TableRepairJobControl",
     "TableRepairJobPhase",
     "TableRepairJobRepairStatus",
     "TableRepairJobStartRequest",
@@ -1926,6 +2231,8 @@ __all__ = (
     "TableStatistics",
     "TableStatisticsFieldStats",
     "TableStatus",
+    "TableStorageSettings",
+    "TableStorageSettingsDenseEmbeddings",
     "TableStorageUnreadableError",
     "TableStorageUnreadableErrorCode",
     "TavilySearchConfig",
@@ -1999,6 +2306,7 @@ __all__ = (
     "User",
     "UserMetadataType0",
     "VADOptions",
+    "VectorSourceStorageStatus",
     "VertexEmbedderConfig",
     "VertexEmbedderConfigProvider",
     "VertexGeneratorConfig",

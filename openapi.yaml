@@ -410,21 +410,24 @@ tags:
       ### Basic Configuration
 
 
-      Configure TTL when creating a table using a `ttl` policy:
+      Configure TTL when creating a table (`POST /db/v1/tables/{tableName}`)
+
+      with a `ttl` policy under `schema`. The table name is part of the URL:
 
 
       ```json
 
       {
-        "name": "sessions",
-        "ttl": {"duration": "24h"},
-        "document_schemas": {
-          "session": {
-            "schema": {
-              "type": "object",
-              "properties": {
-                "user_id": {"type": "string"},
-                "data": {"type": "object"}
+        "schema": {
+          "ttl": {"duration": "24h"},
+          "document_schemas": {
+            "session": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "user_id": {"type": "string"},
+                  "data": {"type": "object"}
+                }
               }
             }
           }
@@ -456,20 +459,21 @@ tags:
       ```json
 
       {
-        "name": "events",
-        "ttl": {
-          "duration": "7d",
-          "field": "created_at"
-        },
-        "document_schemas": {
-          "event": {
-            "schema": {
-              "type": "object",
-              "properties": {
-                "created_at": {"type": "string", "format": "date-time"},
-                "event_type": {"type": "string"}
-              },
-              "required": ["created_at"]
+        "schema": {
+          "ttl": {
+            "duration": "7d",
+            "field": "created_at"
+          },
+          "document_schemas": {
+            "event": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "created_at": {"type": "string", "format": "date-time"},
+                  "event_type": {"type": "string"}
+                },
+                "required": ["created_at"]
+              }
             }
           }
         }
@@ -513,7 +517,7 @@ tags:
       ```json
 
       {
-        "ttl": {"duration": "1h", "field": "last_accessed"}
+        "schema": {"ttl": {"duration": "1h", "field": "last_accessed"}}
       }
 
       ```
@@ -527,7 +531,7 @@ tags:
       ```json
 
       {
-        "ttl": {"duration": "24h"}
+        "schema": {"ttl": {"duration": "24h"}}
       }
 
       ```
@@ -540,7 +544,7 @@ tags:
       ```json
 
       {
-        "ttl": {"duration": "30d"}
+        "schema": {"ttl": {"duration": "30d"}}
       }
 
       ```
@@ -2409,6 +2413,93 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: indexName
+        in: path
+        required: true
+        description: Name of the graph index
+        schema:
+          type: string
+      - name: metricName
+        in: path
+        required: true
+        description: Name of the configured graph metric
+        schema:
+          type: string
+      - name: action
+        in: path
+        required: true
+        description: Operational action to apply to the graph metric materialization
+        schema:
+          type: string
+          enum:
+            - refresh
+            - rebuild
+            - delete
+            - pause
+            - resume
+    post:
+      summary: Execute a graph metric operational action
+      description: >
+        Refresh, rebuild, delete, pause, or resume maintenance for a configured
+
+        graph metric. The metric configuration remains owned by the graph index.
+
+        Refresh and rebuild durably enqueue bounded, resumable maintenance and
+
+        return the aggregate shard status without waiting for graph-sized work.
+
+        `delete` clears materialized metric state and durably disables automatic
+
+        maintenance. A later refresh, rebuild, or resume action re-enables the
+
+        metric and can publish a new generation.
+      tags:
+        - index_management
+      operationId: executeGraphMetricAction
+      responses:
+        '200':
+          description: Aggregate graph metric status after the action is durably accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphMetricActionResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: The table topology or write-owner generation changed, or only some shards accepted
+            the action; retrying is consistency-safe and reuses any still-active build
+          content:
+            text/plain:
+              schema:
+                type: string
+        '429':
+          description: Local storage resources are temporarily exhausted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          description: Graph metric actions are unavailable for this runtime
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/transactions/commit:
     post:
       summary: Commit an OCC transaction
@@ -2986,7 +3077,8 @@ paths:
             x-go-type-skip-optional-pointer: false
           description: Stable key used to safely retry creation of this restore job. Keys are scoped to
             the authenticated principal and cluster restore target. Requests without this header create
-            a new job.
+            a new job and return its generated key. Reuse that key after an unknown admission outcome;
+            supply a key initially to recover from losing the entire response.
       requestBody:
         required: true
         content:
@@ -2997,6 +3089,10 @@ paths:
         '202':
           description: Restore job durably accepted
           headers:
+            Idempotency-Key:
+              description: Recovery key for retries of this request.
+              schema:
+                type: string
             Location:
               description: Relative URL of the durable restore job resource.
               schema:
@@ -3022,7 +3118,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '503':
-          $ref: '#/components/responses/ServiceUnavailable'
+          $ref: '#/components/responses/RestoreAdmissionUnavailable'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:
@@ -3768,6 +3864,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Table'
+        '202':
+          $ref: '#/components/responses/CommittedMutationAccepted'
         '400':
           $ref: '#/components/responses/IndexMutationBadRequest'
         '422':
@@ -3790,6 +3888,8 @@ paths:
       responses:
         '204':
           description: Table dropped successfully
+        '202':
+          $ref: '#/components/responses/CommittedMutationAccepted'
         '400':
           $ref: '#/components/responses/BadRequest'
         '500':
@@ -4111,7 +4211,9 @@ paths:
             maxLength: 256
             x-go-type-skip-optional-pointer: false
           description: Stable key used to safely retry creation of this restore job. Keys are scoped to
-            the authenticated principal and table. Requests without this header create a new job.
+            the authenticated principal and table. Requests without this header create a new job and return
+            its generated key. Reuse that key after an unknown admission outcome; supply a key initially
+            to recover from losing the entire response.
       requestBody:
         required: true
         content:
@@ -4122,6 +4224,10 @@ paths:
         '202':
           description: Durable restore job accepted
           headers:
+            Idempotency-Key:
+              description: Recovery key for retries of this request.
+              schema:
+                type: string
             Location:
               description: Relative URL of the durable restore job resource.
               schema:
@@ -4147,7 +4253,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '503':
-          $ref: '#/components/responses/IndexMutationServiceUnavailable'
+          $ref: '#/components/responses/RestoreAdmissionUnavailable'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:
@@ -4267,6 +4373,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Table'
+        '202':
+          $ref: '#/components/responses/CommittedMutationAccepted'
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
@@ -4322,6 +4430,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Table'
+        '202':
+          $ref: '#/components/responses/CommittedMutationAccepted'
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
@@ -4694,6 +4804,62 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/TableRepairJobStartRequest'
+      responses:
+        '200':
+          description: Job completed during the initial advance.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TableRepairJob'
+        '202':
+          description: Repair job accepted or advanced but not terminal.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TableRepairJob'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/repair/control-jobs:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+    post:
+      summary: Start a durable index control job
+      description: >
+        Applies pause, resume, or attempt cancellation across all table groups.
+
+        Traversal is durable and server-owned. The resulting repair job can be
+
+        inspected or cancelled with the regular repair job endpoints. Cancelling
+
+        a control job stops remaining passes without undoing applied controls.
+
+        This distinct endpoint prevents older servers from interpreting a control
+
+        request as ordinary repair work.
+      tags:
+        - data_operations
+      operationId: startTableRepairControlJob
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TableRepairControlJobStartRequest'
       responses:
         '200':
           description: Job completed during the initial advance.
@@ -6837,11 +7003,13 @@ paths:
         batching will use the same request item shape with `mode: async`.
 
 
-        Batch generation is text-only. Image or other multimodal content parts are
+        Batch generation accepts bounded image and audio content parts. Media is
 
-        rejected per item as `UNSUPPORTED_MULTIMODAL` before media fetch or model loading;
+        validated and admitted before model dispatch; models without compatible
 
-        other item failures remain independently reported.
+        multimodal capabilities return an independent per-item error without
+
+        failing sibling requests.
       operationId: generateBatchContent
       requestBody:
         required: true
@@ -7105,7 +7273,11 @@ paths:
 
         multimodal reranking, image `/extract`, and the embedded read, extract, and dense
 
-        embedding APIs. Batch generation rejects multimodal content before media fetch.
+        embedding APIs. Batch generation accepts bounded image and audio media parts,
+
+        applies the same aggregate encoded-byte and decoded-image admission before model
+
+        execution, and rejects malformed or unsupported parts before dispatch.
       operationId: readImages
       requestBody:
         required: true
@@ -7281,6 +7453,19 @@ paths:
         document extraction.
 
 
+        Set `schema_version: 2` for strict mixed-task schemas, span attributes,
+
+        constrained classification, typed records and JointIE. Each input may
+
+        replace the shared schema/options. Offsets default to half-open UTF-8
+
+        bytes, and text content parts are joined by a single newline. Inputs
+
+        are validated atomically. Unsupported features and long documents are
+
+        rejected explicitly; windowing requires runtime support.
+
+
         Image-backed extraction uses the same byte-reserving and image-count-weighted
 
         admission policy as `/read`, before model resolution or download. Text-only
@@ -7319,7 +7504,15 @@ paths:
               schema:
                 $ref: '#/components/schemas/InferenceError'
         '413':
-          description: Media content exceeds the configured size limit
+          description: Media, text, schema, candidate graph, or output exceeds a configured size/work
+            limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '422':
+          description: Extraction hard constraints are infeasible, required record fields are missing,
+            or bounded search exhausted without an accepted feasible witness
           content:
             application/json:
               schema:
@@ -7927,6 +8120,26 @@ components:
         type: string
         example: role:tenant_reader
   schemas:
+    CommittedMutationOutcome:
+      type: object
+      required:
+        - status
+      description: >
+        The metadata mutation committed, but requested visibility or local
+
+        materialization is not yet fully healthy. Clients must observe status
+
+        instead of automatically replaying the mutation. `committed_superseded`
+
+        is terminal: a newer schema version became visible first.
+      properties:
+        status:
+          type: string
+          enum:
+            - committed_visibility_pending
+            - committed_superseded
+            - committed_repair_required
+            - committed_repair_unavailable
     TableSchemaPatch:
       type: object
       additionalProperties: true
@@ -10315,8 +10528,8 @@ components:
         next_cursor:
           type: string
           nullable: true
-          description: Opaque cursor for the next artifact repair pass when has_more is true. Index repair
-            currently repairs one named index per request and does not return a continuation cursor.
+          description: Opaque cursor for the next artifact repair pass when has_more is true. Named-index
+            operations may return a continuation cursor when table groups remain.
         has_more:
           type: boolean
           description: Whether another repair scan page is available via next_cursor.
@@ -10378,6 +10591,43 @@ components:
           default: true
           description: When true, the server immediately attempts the first bounded repair pass before
             returning the job.
+    TableRepairControlJobStartRequest:
+      type: object
+      description: Starts a durable named-index control traversal. The server advances every bounded pass,
+        including after restart. Use the repair job status and cancellation endpoints to inspect or stop
+        the traversal.
+      required:
+        - index
+        - control
+      properties:
+        index:
+          type: string
+          description: Index to control across the table.
+        control:
+          type: string
+          enum:
+            - pause_automatic
+            - resume_automatic
+            - cancel_current_attempt
+          description: Durable named-index control applied in bounded server-owned passes across every
+            table group.
+        repair_id:
+          type: string
+          description: Decimal repair attempt fence, preserved across every pass. A stale fence fails
+            the control job.
+        cursor:
+          type: string
+          description: Opaque continuation cursor from a prior bounded control response.
+        limit:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 1000
+          default: 100
+        advance:
+          type: boolean
+          default: true
+          description: Attempt the first bounded pass immediately. Remaining passes always run server-side.
     TableRepairJob:
       type: object
       description: Durable table repair job state.
@@ -10432,6 +10682,18 @@ components:
         index:
           type: string
           description: Index name when the job is restricted to one index.
+        control:
+          type: string
+          enum:
+            - pause_automatic
+            - resume_automatic
+            - cancel_current_attempt
+          description: Durable named-index control applied in bounded server-owned passes across every
+            table group.
+        repair_id:
+          type: string
+          description: Decimal repair attempt fence, preserved across every pass. A stale fence fails
+            the control job.
         cursor:
           type: string
           nullable: true
@@ -10452,9 +10714,14 @@ components:
           description: Last stable job-level error code.
         cancel_requested:
           type: boolean
-          description: Whether cancellation is pending. For a named-index job, cancellation durably pauses
-            the matching repair in every group and becomes terminal only after that bounded traversal
-            completes.
+          description: Whether cancellation is pending. For a named-index repair/rebuild job, cancellation
+            durably pauses the matching repair in every group. Cancelling a control job stops remaining
+            passes without undoing controls already applied.
+        next_retry_at_millis:
+          type: integer
+          format: uint64
+          description: Unix epoch milliseconds when a deferred pass may next run; zero means immediately
+            eligible.
         created_at_millis:
           type: integer
           format: uint64
@@ -11050,9 +11317,24 @@ components:
       properties:
         byte_range:
           $ref: '#/components/schemas/ByteRange'
+    TableStorageSettings:
+      type: object
+      additionalProperties: false
+      description: Immutable source embedding storage selected when creating a table.
+      properties:
+        dense_embeddings:
+          type: string
+          enum:
+            - primary_lsm
+            - vector_store
+          default: primary_lsm
+          description: Experimental vector_store mode requires a fresh local single-shard table without
+            HA or replication.
     CreateTableRequest:
       type: object
       properties:
+        storage:
+          $ref: '#/components/schemas/TableStorageSettings'
         num_shards:
           type: integer
           format: uint
@@ -11304,6 +11586,8 @@ components:
         - shards
         - indexes
       properties:
+        storage:
+          $ref: '#/components/schemas/TableStorageSettings'
         name:
           type: string
         description:
@@ -11766,6 +12050,13 @@ components:
           $ref: '#/components/schemas/CreatedIndex'
         status:
           $ref: '#/components/schemas/IndexStats'
+    GraphMetricActionResponse:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          $ref: '#/components/schemas/GraphMetricStatus'
     LsmStorageStatus:
       type: object
       description: Compact LSM backend operational status. Detailed low-level counters are available through
@@ -12056,9 +12347,341 @@ components:
         direct_bulk_ingest_fallback_below_threshold_count:
           type: integer
           format: uint64
+    VectorSourceStorageStatus:
+      type: object
+      description: Source vector payload counters and the last completed reclamation observation. Counters
+        reset on process reopen.
+      properties:
+        directory_publications:
+          type: integer
+          format: int64
+        directory_publication_deferrals:
+          type: integer
+          format: int64
+        outer_db_batch_lock_wait_ns:
+          type: integer
+          format: int64
+        collection_mark_budget_yields:
+          type: integer
+          format: int64
+          description: Mark steps that yielded after their elapsed time budget.
+        collection_mark_busy_deferrals:
+          type: integer
+          format: int64
+          description: Concurrent scan attempts deferred to the active snapshot scanner.
+        collection_mark_outside_lock_ns:
+          type: integer
+          format: int64
+          description: Snapshot marking time spent outside the source writer lock in nanoseconds.
+        collection_mark_merge_ns:
+          type: integer
+          format: int64
+          description: Time merging bounded scan discoveries and concurrent preparation tails under the
+            source writer lock.
+        collection_mark_max_merge_ns:
+          type: integer
+          format: int64
+          description: Longest scan tail merge under the source writer lock in nanoseconds.
+        collection_mark_steps:
+          type: integer
+          format: int64
+        collection_mark_rows:
+          type: integer
+          format: int64
+        collection_mark_max_step_rows:
+          type: integer
+          format: int64
+        collection_mark_max_step_ns:
+          type: integer
+          format: int64
+        collection_plan_ns:
+          type: integer
+          format: int64
+        collection_apply_visits_avoided:
+          type: integer
+          format: int64
+          description: Incomplete scan turns advanced without entering DB apply; metadata maintenance
+            retains its own cadence.
+        inventory_rows_scanned:
+          type: integer
+          format: int64
+          description: Segment entries visited during full physical inventory scans or incremental updates;
+            excludes WAL entries.
+        catalog_metadata_bytes_shared:
+          type: integer
+          format: int64
+          description: Logical immutable catalog bytes shared instead of copied by successful source snapshot
+            and WAL-successor allocations; not resident bytes.
+        catalog_metadata_bytes_copied:
+          type: integer
+          format: int64
+          description: Immutable catalog array bytes copied by successful source snapshot and WAL-successor
+            allocations; excludes object and root-path allocations.
+        inventory_wal_rows:
+          type: integer
+          format: int64
+          description: WAL identities visited while maintaining the current occurrence cache, including
+            foreground append deltas; resets when the cache is discarded.
+        inventory_wal_retirements:
+          type: integer
+          format: int64
+          description: WAL identity contributions retired by checkpoint deltas; resets when the cache
+            is discarded.
+        inventory_delta_installs:
+          type: integer
+          format: int64
+          description: Inventory installations that used a validated WAL prefix delta; resets when the
+            cache is discarded.
+        inventory_fallback_installs:
+          type: integer
+          format: int64
+          description: Inventory installations that rebuilt WAL membership, including initialization;
+            resets when the cache is discarded.
+        inventory_policy_switches:
+          type: integer
+          format: int64
+          description: Changes between full and incremental physical inventory under the optional size
+            cutoff.
+        inventory_incremental_active:
+          type: integer
+          format: int64
+          description: One when incremental physical inventory is currently enabled, otherwise zero.
+        mark_bitmap_bytes:
+          type: integer
+          format: int64
+          description: Current segment bitmap and offset allocation bytes; excludes pinned source metadata
+            and WAL fallback maps.
+        mark_fallback_entries:
+          type: integer
+          format: int64
+          description: Current WAL-only reachability entries when bitmap marking is enabled, or all mark
+            entries in the hash-map control.
+        collection_debt_deferrals:
+          type: integer
+          format: int64
+          description: Background mark setups deferred by the optional obsolete-debt scheduling policy.
+        obsolete_payload_debt_bytes:
+          type: integer
+          format: int64
+          description: Conservative committed obsolete-payload scheduling debt; not a measurement of reclaimable
+            bytes.
+        inventory_updates:
+          type: integer
+          format: int64
+          description: Full physical inventory scans and incremental occurrence-cache updates; this cache
+            is not ownership authority.
+        inventory_update_ns:
+          type: integer
+          format: int64
+          description: Time spent on full physical inventory scans or incremental occurrence-cache updates.
+        collection_locked_ns:
+          type: integer
+          format: int64
+          description: Total time inside the source writer lock for collection entry points; includes
+            nested stages.
+        collection_max_locked_ns:
+          type: integer
+          format: int64
+          description: Longest collection entry point hold of the source writer lock.
+        collection_setup_ns:
+          type: integer
+          format: int64
+          description: Collection setup time, including primary sync, checkpoint and snapshot acquisition.
+        collection_max_setup_ns:
+          type: integer
+          format: int64
+          description: Longest collection setup.
+        collection_max_plan_ns:
+          type: integer
+          format: int64
+          description: Longest locked collection planning step.
+        collection_copy_ns:
+          type: integer
+          format: int64
+          description: Locked collection copy time excluding final publication.
+        collection_max_copy_ns:
+          type: integer
+          format: int64
+          description: Longest locked collection copy step.
+        collection_publish_ns:
+          type: integer
+          format: int64
+          description: Locked publication time including directory refresh, inventory, receipts and reclamation.
+        collection_max_publish_ns:
+          type: integer
+          format: int64
+          description: Longest locked publication step.
+        collection_active_scan_turns:
+          type: integer
+          format: int64
+          description: Active scan turns scheduled using the experimental wall-time duty policy.
+        collection_active_scan_pause_ns:
+          type: integer
+          format: int64
+          description: Requested pause time under the active scan policy; not measured CPU time.
+        collection_rescued_payloads:
+          type: integer
+          format: int64
+          description: Protection requests merged into marking, including repeated requests across turns.
+        deduplicated_reappend_payloads:
+          type: integer
+          format: int64
+          description: Durable payload preparations protected by marking without another append.
+        deduplicated_reappend_bytes:
+          type: integer
+          format: int64
+          description: Raw vector bytes avoided by protecting existing durable payloads during marking.
+        directory_bytes_written:
+          type: integer
+          format: int64
+        directory_entries:
+          type: integer
+          format: int64
+        directory_hits:
+          type: integer
+          format: int64
+        directory_misses:
+          type: integer
+          format: int64
+        source_segments:
+          type: integer
+          format: int64
+        ownership_index_collections:
+          type: integer
+          format: int64
+        ownership_index_entries_scanned:
+          type: integer
+          format: int64
+        prepare_requests:
+          type: integer
+          format: int64
+        prepare_lock_wait_ns:
+          type: integer
+          format: int64
+        decode_outside_lock_ns:
+          type: integer
+          format: int64
+        snapshot_read_ns:
+          type: integer
+          format: int64
+        cache_reclaimed_bytes:
+          type: integer
+          format: int64
+        retired_ann_references_skipped:
+          type: integer
+          format: int64
+        retained_payloads:
+          type: integer
+          format: uint64
+        retained_payload_bytes:
+          type: integer
+          format: uint64
+        unreferenced_payload_bytes_at_collection:
+          type: integer
+          format: uint64
+        checkpoint_bytes_read:
+          type: integer
+          format: uint64
+        checkpoint_bytes_written:
+          type: integer
+          format: uint64
+        heap_bytes:
+          type: integer
+          format: uint64
+          description: Allocator-backed source-store state charged to the shared resource manager, excluding
+            mmap pages and request-owned buffers.
+        location_cache_hits:
+          type: integer
+          format: int64
+        location_cache_misses:
+          type: integer
+          format: int64
+        location_cache_bytes:
+          type: integer
+          format: int64
+        source_shards:
+          type: integer
+          format: int64
+        collection_steps:
+          type: integer
+          format: int64
+        collection_pending_bytes:
+          type: integer
+          format: int64
+        collection_mark_ns:
+          type: integer
+          format: int64
+        checkpoint_receipt_hits:
+          type: integer
+          format: int64
+        checkpoint_inventory_restores:
+          type: integer
+          format: int64
+        checkpoint_receipt_bytes_written:
+          type: integer
+          format: int64
+        prepare_batches:
+          type: integer
+          format: int64
+        preparation_ns:
+          type: integer
+          format: int64
+        durable_append_ns:
+          type: integer
+          format: int64
+        checkpoint_ns:
+          type: integer
+          format: int64
+        prepared_payloads:
+          type: integer
+          format: uint64
+        prepared_payload_bytes:
+          type: integer
+          format: uint64
+        wal_bytes_written:
+          type: integer
+          format: uint64
+        active_sessions:
+          type: integer
+          format: uint64
+        resolved_payloads:
+          type: integer
+          format: uint64
+        resolved_bytes:
+          type: integer
+          format: uint64
+        active_wal_bytes:
+          type: integer
+          format: uint64
+        immutable_block_bytes:
+          type: integer
+          format: uint64
+        live_payloads_at_collection:
+          type: integer
+          format: uint64
+        live_payload_bytes_at_collection:
+          type: integer
+          format: uint64
+        collections:
+          type: integer
+          format: uint64
+        collection_deferrals:
+          type: integer
+          format: uint64
+        collection_bytes_read:
+          type: integer
+          format: uint64
+        collection_bytes_written:
+          type: integer
+          format: uint64
+        unresolved_primary_commits:
+          type: integer
+          format: uint64
     StorageStatus:
       type: object
       properties:
+        source_vectors:
+          $ref: '#/components/schemas/VectorSourceStorageStatus'
         disk_usage:
           type: integer
           format: uint64
@@ -12427,9 +13050,11 @@ components:
 
             participant propagation is still completing. `committed_repair_required`
 
-            means the primary write committed, but a terminal enrichment failure needs
+            means the primary write committed, but a terminal background materialization
 
-            operator repair and will not be retried indefinitely.
+            failure needs operator repair and will not be retried indefinitely. Inspect
+
+            `failure` when present; retrying the document write is unnecessary.
         inserted:
           type: integer
           description: Number of documents successfully inserted
@@ -12439,6 +13064,34 @@ components:
         transformed:
           type: integer
           description: Number of documents successfully transformed
+        failure:
+          $ref: '#/components/schemas/BatchCommittedFailure'
+    BatchCommittedFailure:
+      type: object
+      description: >
+        Additive details for a committed batch that needs operator action. The
+
+        open string code is forward-compatible with older SDKs; clients should
+
+        treat unknown codes as non-retryable when `retryable` is false.
+      required:
+        - code
+        - message
+        - retryable
+      properties:
+        code:
+          type: string
+          description: Stable machine-readable failure code, such as `graph_metric_materialization_rejected`.
+        message:
+          type: string
+          description: Actionable operator guidance.
+        reason:
+          type: string
+          description: Optional stable reason within the failure category, such as `build_budget_exceeded`.
+        retryable:
+          type: boolean
+          description: Whether replaying the document mutation is safe. Committed repair outcomes are
+            false.
     DenseRepairBackpressureError:
       type: object
       description: A dense-index rebuild is retaining replay history and the node has reached its hard
@@ -14961,6 +15614,10 @@ components:
                   - required:
                       - reranker
                   - required:
+                      - graph_metric
+                  - required:
+                      - graph_metric_rerank
+                  - required:
                       - analyses
                   - required:
                       - aggregations
@@ -15551,6 +16208,16 @@ components:
             }
 
             ```
+        graph_metric:
+          $ref: '#/components/schemas/GraphMetricQuery'
+          description: Direct top-k read from a published graph metric generation. Results are returned
+            in graph_metric_results under the requested name or the metric name when no explicit name
+            is supplied.
+        graph_metric_rerank:
+          $ref: '#/components/schemas/GraphMetricRerank'
+          description: Blend a published graph metric feature into ordinary search hit scores. Requests
+            may require either any published generation or a generation that is fresh with respect to
+            graph writes.
         analyses:
           $ref: '#/components/schemas/Analyses'
         graph_queries:
@@ -16043,10 +16710,43 @@ components:
         merge:
           $ref: '#/components/schemas/MergeProfile'
           description: Result merge statistics (present for hybrid search).
+        graph_metrics:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphMetricProfile'
+          description: Graph metric freshness and generation details for metric-aware query work.
         sort:
           $ref: '#/components/schemas/SortProfile'
           description: Sort execution statistics (present when the query used ordered page options and
             profiling was enabled).
+    GraphMetricProfile:
+      type: object
+      required:
+        - query_name
+        - source
+        - index_name
+        - metric_name
+        - freshness
+        - status
+      properties:
+        query_name:
+          type: string
+          description: Name of the graph query or graph metric query that used the metric.
+        source:
+          type: string
+          description: Profile source, such as `graph_query`, `graph_metric`, or `graph_metric_rerank`.
+        index_name:
+          type: string
+          description: Graph index that owns the metric.
+        metric_name:
+          type: string
+          description: Graph metric name within the index.
+        freshness:
+          type: string
+          description: Effective freshness mode requested for this metric use.
+        status:
+          $ref: '#/components/schemas/GraphMetricStatus'
+          description: Published generation and freshness status observed by the query.
     SortProfile:
       type: object
       additionalProperties: false
@@ -16653,6 +17353,67 @@ components:
           description: Deprecated child chunk hits included by the v0.2-compatible implicit source rollup.
           items:
             $ref: '#/components/schemas/HierarchyMatchHit'
+    QueryScoreDetails:
+      type: object
+      description: Optional score provenance for ranking features that changed the final hit score.
+      properties:
+        graph_metric_rerank:
+          $ref: '#/components/schemas/GraphMetricRerankScoreDetails'
+          description: Score contribution from an explicit graph_metric_rerank request.
+    GraphMetricRerankScoreDetails:
+      type: object
+      required:
+        - index_name
+        - metric_name
+        - base_score
+        - base_weight
+        - metric_score_used
+        - metric_weight
+        - missing_score_used
+        - final_score
+        - published_generation
+      properties:
+        index_name:
+          type: string
+          description: Graph index that provided the metric score.
+        metric_name:
+          type: string
+          description: Graph metric used as a score feature.
+        base_score:
+          type: number
+          format: double
+          description: Hit score before graph metric rerank composition.
+        base_weight:
+          type: number
+          format: double
+          description: Weight applied to the base score.
+        metric_score:
+          type: number
+          format: double
+          nullable: true
+          description: Published metric score for this hit, or null when the hit was missing from the
+            metric generation.
+        metric_score_used:
+          type: number
+          format: double
+          description: Metric feature value used in the formula after applying missing_score fallback
+            if needed.
+        metric_weight:
+          type: number
+          format: double
+          description: Weight applied to the metric score feature.
+        missing_score_used:
+          type: boolean
+          description: True when metric_score was missing and the request's missing_score fallback was
+            used.
+        final_score:
+          type: number
+          format: double
+          description: Final hit score after graph metric rerank composition.
+        published_generation:
+          type: integer
+          format: int64
+          description: Published graph metric score generation used for this hit.
     QueryHit:
       type: object
       description: A single query result hit
@@ -16691,6 +17452,10 @@ components:
             format: double
           description: Scores partitioned by index when using RRF search.
           x-go-name: indexScores
+        _score_details:
+          $ref: '#/components/schemas/QueryScoreDetails'
+          description: Optional score provenance for ranking features applied to this hit.
+          x-go-name: scoreDetails
         _source:
           type: object
           additionalProperties: true
@@ -16805,6 +17570,11 @@ components:
           additionalProperties:
             $ref: '#/components/schemas/AnalysesResult'
           description: Analysis results like PCA and t-SNE per index embeddings.
+        graph_metric_results:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/GraphMetricResult'
+          description: Results from direct graph metric reads.
         profile:
           x-go-type-skip-optional-pointer: false
           allOf:
@@ -18458,6 +19228,12 @@ components:
           minimum: 1
           format: uint64
           description: Approximate maximum source bytes to process in one batch for this operation.
+        max_document_pages:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 1
+          format: uint32
+          description: Maximum PDF pages admitted for one request-atomic document operation.
     EnrichmentConfig:
       type: object
       description: Inline managed enrichment definition. Enrichments materialize generated artifacts before
@@ -18633,9 +19409,13 @@ components:
       properties:
         target_tokens:
           type: integer
+          minimum: 0
+          maximum: 1000000
           description: Target number of tokens per chunk.
         overlap_tokens:
           type: integer
+          minimum: 0
+          maximum: 1000000
           description: Number of tokens to overlap between consecutive chunks. Helps maintain context
             across chunk boundaries. Only used by fixed-size chunkers.
         separator:
@@ -18648,9 +19428,13 @@ components:
       properties:
         window_duration_ms:
           type: integer
+          minimum: 0
+          maximum: 86400000
           description: 'Window duration in milliseconds for fixed-window audio chunking (default: 30000).'
         overlap_duration_ms:
           type: integer
+          minimum: 0
+          maximum: 86400000
           description: 'Overlap duration in milliseconds between audio chunks (default: 0).'
     ChunkOptions:
       type: object
@@ -18659,10 +19443,14 @@ components:
       properties:
         max_chunks:
           type: integer
+          minimum: 0
+          maximum: 4096
           description: Maximum number of chunks to generate per document.
         threshold:
           type: number
           format: float
+          minimum: 0
+          maximum: 1
           description: Confidence threshold for model-based chunking (0.0-1.0).
         text:
           $ref: '#/components/schemas/TextChunkOptions'
@@ -18766,7 +19554,9 @@ components:
               example: fixed
             max_chunks:
               type: integer
-              minimum: 1
+              minimum: 0
+              maximum: 4096
+              description: Maximum number of chunks to generate per document. Zero uses the chunker default.
             threshold:
               type: number
               format: float
@@ -18929,6 +19719,68 @@ components:
       description: Durable graph edge type. Values must be valid UTF-8 and encode to at most 64 KiB; `maxLength`
         is the standard-schema code-point ceiling and `x-antfly-max-utf8-bytes` carries the exact wire-byte
         limit.
+    GraphMetricEdgeFilter:
+      type: object
+      additionalProperties: false
+      description: Omitting this object selects all edge types. A types list selects only those types;
+        mode and types cannot both be supplied.
+      properties:
+        mode:
+          type: string
+          enum:
+            - all
+        types:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/GraphEdgeType'
+    GraphMetricConfig:
+      type: object
+      additionalProperties: false
+      description: Published metric configuration. If kind is omitted, the metric name must be a supported
+        kind.
+      properties:
+        enabled:
+          type: boolean
+          default: true
+        kind:
+          type: string
+          enum:
+            - pagerank
+            - degree
+            - eigenvector
+            - hits_authority
+            - hits_hub
+        refresh:
+          type: string
+          enum:
+            - background
+            - manual
+          default: background
+          description: Serverless accepts background only.
+        damping:
+          type: number
+          format: double
+          minimum: 0
+          exclusiveMinimum: true
+          maximum: 1
+          exclusiveMaximum: true
+          default: 0.85
+        tolerance:
+          type: number
+          format: double
+          minimum: 0
+          exclusiveMinimum: true
+          default: 1.0e-06
+        max_iterations:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 1000
+          default: 50
+        edge_filter:
+          $ref: '#/components/schemas/GraphMetricEdgeFilter'
     GraphTemplateValue:
       description: A literal string or finite numeric value, or a Handlebars template evaluated for each
         materialized graph item.
@@ -19445,6 +20297,13 @@ components:
         - - sources
           - source
       properties:
+        metrics:
+          type: object
+          description: Named published graph metrics. Serverless supports background refresh only and
+            limits configurations to 16 metrics per graph, 64 total per publication, 64 types per filter,
+            and 128 UTF-8 bytes per metric name.
+          additionalProperties:
+            $ref: '#/components/schemas/GraphMetricConfig'
         sources:
           type: array
           minItems: 1
@@ -20254,6 +21113,10 @@ components:
       type: object
       description: Credential-free normalized graph configuration returned after creation.
       properties:
+        metrics:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/GraphMetricConfig'
         summarizer:
           $ref: '#/components/schemas/CreatedProviderConfig'
         template:
@@ -20949,6 +21812,15 @@ components:
           type: boolean
           description: Whether all sources are settled but coverage remains unhealthy under the configured
             policy, including terminal failures or policy-rejected skips.
+    DenseNativeStoragePhase:
+      type: string
+      enum:
+        - legacy
+        - native_building
+        - native_validating
+        - native_authoritative
+      description: Conservative distributed rollout phase for native WAL-backed dense-index storage. native_authoritative
+        is reported only when every expected shard has supplied current authority evidence.
     EnrichmentRuntimeStatus:
       type: object
       additionalProperties: false
@@ -21306,6 +22178,14 @@ components:
           type: boolean
           description: Whether dense/vector artifacts still need publication before queries see the latest
             data.
+        dense_vector_projection_pending:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: Whether the shared native exact-vector projection is still being built or reconciled.
+            Queries remain correct by falling back to primary embedding artifacts while this is true.
+        dense_native_storage_phase:
+          x-go-type-skip-optional-pointer: true
+          $ref: '#/components/schemas/DenseNativeStoragePhase'
         replay_applied_sequence:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -21445,9 +22325,165 @@ components:
           type: object
           additionalProperties: true
           description: Artifact promotion replay diagnostics.
+    GraphMetricRuntimeStats:
+      type: object
+      description: Summarized graph metric maintenance runtime state. Identity fields are stable hashes,
+        not raw process or owner identifiers.
+      properties:
+        enabled:
+          type: boolean
+        role:
+          type: string
+          enum:
+            - combined
+            - coordinator
+            - worker
+            - worker_pool
+        runtime_id_hash:
+          type: integer
+          format: uint64
+        owner_id_hash:
+          type: integer
+          format: uint64
+        lease_key_hash:
+          type: integer
+          format: uint64
+        worker_id_hash:
+          type: integer
+          format: uint64
+        worker_count:
+          type: integer
+          format: uint64
+        lease_owned:
+          type: boolean
+        has_lease:
+          type: boolean
+        acquisition_count:
+          type: integer
+          format: uint64
+        takeover_count:
+          type: integer
+          format: uint64
+        lease_acquire_failures:
+          type: integer
+          format: uint64
+        lost_leases:
+          type: integer
+          format: uint64
+        last_acquired_ms:
+          type: integer
+          format: uint64
+        lease_expires_at_ms:
+          type: integer
+          format: uint64
+          description: Cached expiry of the currently held maintenance lease, or zero when no lease is
+            held.
+        lease_renew_after_ms:
+          type: integer
+          format: uint64
+          description: Earliest time the runtime will renew its maintenance lease, or zero when no lease
+            is held.
+        renewal_count:
+          type: integer
+          format: uint64
+          description: Number of durable maintenance lease renewals completed by this runtime.
+        started:
+          type: boolean
+        shutdown:
+          type: boolean
+        notified:
+          type: boolean
+        ticks_started:
+          type: integer
+          format: uint64
+        ticks_completed:
+          type: integer
+          format: uint64
+        durable_progress_ticks:
+          type: integer
+          format: uint64
+        idle_ticks:
+          type: integer
+          format: uint64
+        error_ticks:
+          type: integer
+          format: uint64
+        last_error_name:
+          type: string
+        total_metrics_scanned:
+          type: integer
+          format: uint64
+        total_active_builds:
+          type: integer
+          format: uint64
+        total_builds_started:
+          type: integer
+          format: uint64
+        total_worker_steps:
+          type: integer
+          format: uint64
+        total_coordinator_steps:
+          type: integer
+          format: uint64
+        total_retired_input_records:
+          description: Consumed intermediate records retired at completed reduction barriers.
+          type: integer
+          format: uint64
+        total_pages_claimed:
+          type: integer
+          format: uint64
+        total_pages_completed:
+          type: integer
+          format: uint64
+        total_phases_advanced:
+          type: integer
+          format: uint64
+        total_published:
+          type: integer
+          format: uint64
+        total_failed_builds:
+          type: integer
+          format: uint64
+        last_metrics_scanned:
+          type: integer
+          format: uint64
+        last_active_builds:
+          type: integer
+          format: uint64
+        last_builds_started:
+          type: integer
+          format: uint64
+        last_worker_steps:
+          type: integer
+          format: uint64
+        last_coordinator_steps:
+          type: integer
+          format: uint64
+        last_retired_input_records:
+          description: Consumed intermediate records retired in the latest maintenance tick.
+          type: integer
+          format: uint64
+        last_pages_claimed:
+          type: integer
+          format: uint64
+        last_pages_completed:
+          type: integer
+          format: uint64
+        last_phases_advanced:
+          type: integer
+          format: uint64
+        last_published:
+          type: integer
+          format: uint64
+        last_failed_builds:
+          type: integer
+          format: uint64
+        last_budget_exhausted:
+          type: boolean
     GraphIndexStats:
       type: object
-      description: Statistics for graph index
+      description: Statistics for graph index. While counts_pending is true, edge/node/document counts
+        are physical upper bounds awaiting ownership cleanup, not exact logical counts.
       required:
         - index_type
       properties:
@@ -21485,6 +22521,11 @@ components:
           type: integer
           format: uint64
           description: Total number of edges in the graph
+        counts_pending:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: True while ownership cleanup is pending on any observed shard. Counts are physical
+            upper bounds until cleanup completes; serving adjacency already enforces ownership.
         edge_types:
           type: object
           additionalProperties:
@@ -21684,6 +22725,9 @@ components:
                 result_nodes:
                   type: integer
                   format: uint64
+        graph_metric_runtime:
+          x-go-type-skip-optional-pointer: true
+          $ref: '#/components/schemas/GraphMetricRuntimeStats'
     AlgebraicIndexStats:
       type: object
       description: Compact public statistics for an algebraic sidecar index. Detailed runtime, adaptive,
@@ -22001,6 +23045,251 @@ components:
         - $ref: '#/components/schemas/EmbeddingsIndexStats'
         - $ref: '#/components/schemas/GraphIndexStats'
         - $ref: '#/components/schemas/AlgebraicIndexStats'
+    GraphMetricEdgeFilterStatus:
+      type: object
+      required:
+        - mode
+      properties:
+        mode:
+          type: string
+          enum:
+            - all
+            - types
+        types:
+          type: array
+          items:
+            type: string
+    GraphMetricBuildPageStatus:
+      type: object
+      required:
+        - phase
+        - iteration
+        - page_id
+        - state
+        - range_kind
+      properties:
+        phase:
+          type: string
+        iteration:
+          type: integer
+          format: int64
+        page_id:
+          type: integer
+          format: int64
+        state:
+          type: string
+          enum:
+            - pending
+            - leased
+            - complete
+            - failed
+        range_kind:
+          type: string
+          enum:
+            - full
+            - reverse_edges
+            - nodes
+            - scores
+            - contributions
+            - job_control
+            - summary
+        worker_id:
+          type: string
+          description: Worker id that owns or last failed this page.
+        lease_expires_at_ms:
+          type: integer
+          format: int64
+          description: Unix epoch milliseconds when the page lease expires, or 0 when not leased.
+        attempt:
+          type: integer
+          format: int64
+          description: Current attempt number for this page.
+        cursor:
+          type: string
+          description: Opaque resumable cursor for this page.
+        completed_units:
+          type: integer
+          format: int64
+          description: Completed work units for this page.
+        total_units:
+          type: integer
+          format: int64
+          description: Estimated total work units for this page.
+        last_error:
+          type: string
+          description: Last page-level error.
+    GraphMetricEvent:
+      type: object
+      required:
+        - sequence
+        - kind
+        - at_ms
+        - target_edge_generation
+        - published_generation
+        - score_count
+      properties:
+        sequence:
+          type: integer
+          format: int64
+        kind:
+          type: string
+          enum:
+            - publish
+            - delete
+            - pause
+            - resume
+            - failed
+        at_ms:
+          type: integer
+          format: int64
+        target_edge_generation:
+          type: integer
+          format: int64
+        published_generation:
+          type: integer
+          format: int64
+        score_count:
+          type: integer
+          format: int64
+    GraphMetricStatus:
+      type: object
+      required:
+        - state
+        - phase
+        - published_generation
+        - edge_generation
+        - target_edge_generation
+        - build_queued
+        - progress
+        - converged
+        - iterations_completed
+        - delta
+        - computed_at_ms
+      properties:
+        state:
+          type: string
+        phase:
+          type: string
+          enum:
+            - idle
+            - computing
+            - publishing
+            - complete
+            - prepare_generation
+            - scan_edges_and_out_degree
+            - initialize_ranks
+            - iterate_contributions
+            - reduce_ranks
+            - hits_hub_contributions
+            - hits_hub_reduce_ranks
+            - check_convergence
+            - publish_generation
+            - cleanup_old_generations
+        edge_filter:
+          $ref: '#/components/schemas/GraphMetricEdgeFilterStatus'
+        metadata_version:
+          type: integer
+          format: int64
+          description: Version of the published graph metric metadata schema.
+        config_fingerprint:
+          type: string
+          pattern: ^[0-9a-f]{16}$
+          description: Deterministic configuration fingerprint encoded as fixed-width hexadecimal so every
+            SDK preserves all 64 bits.
+        maintenance_paused:
+          type: boolean
+        build_queued:
+          type: boolean
+          description: Whether a local or distributed build is queued after the currently published or
+            building generation.
+        published_generation:
+          type: integer
+          format: int64
+        edge_generation:
+          type: integer
+          format: int64
+        target_edge_generation:
+          type: integer
+          format: int64
+        queued_generation:
+          type: integer
+          format: int64
+          description: Pending edge generation waiting to build, or 0 when no build is queued.
+        building_generation:
+          type: integer
+          format: int64
+          description: Edge generation currently held by an active build lease, or 0 when idle.
+        build_job_id:
+          type: integer
+          format: int64
+          description: Durable identifier for the active graph metric build job, or 0 when idle.
+        build_started_at_ms:
+          type: integer
+          format: int64
+          description: Unix epoch milliseconds when the active graph metric build started, or 0 when idle.
+        build_iteration:
+          type: integer
+          format: int64
+          description: Iteration number reported by the active build lease, or 0 when idle or not iterative.
+        build_lease_expires_at_ms:
+          type: integer
+          format: int64
+          description: Unix epoch milliseconds when the active build lease expires, or 0 when idle.
+        build_worker_id:
+          type: string
+          description: Worker id that owns the active build lease. Local builds use `local`.
+        build_cursor:
+          type: string
+          description: Opaque resumable cursor for the active build phase. Empty or omitted when idle
+            or when the phase has no cursor.
+        build_completed_units:
+          type: integer
+          format: int64
+          description: Completed work units for the active graph metric build, or 0 when idle or unknown.
+        build_total_units:
+          type: integer
+          format: int64
+          description: Estimated total work units for the active graph metric build, or 0 when idle or
+            unknown.
+        build_pages:
+          type: array
+          description: Active leased or failed build pages for the current build phase, capped and ordered
+            by durable page key.
+          items:
+            $ref: '#/components/schemas/GraphMetricBuildPageStatus'
+        build_pages_truncated:
+          type: boolean
+          description: Whether build_pages was capped before every active page could be included.
+        retry_count:
+          type: integer
+          format: int64
+          description: Number of consecutive failed build attempts for the current target generation,
+            or 0 when no failure applies.
+        last_error:
+          type: string
+          description: Last build error for the current failed target generation.
+        progress:
+          type: number
+          format: double
+          description: Build progress for the target edge generation, from 0.0 to 1.0
+        converged:
+          type: boolean
+        iterations_completed:
+          type: integer
+          format: int64
+        delta:
+          type: number
+          format: double
+        computed_at_ms:
+          type: integer
+          format: int64
+        last_event:
+          $ref: '#/components/schemas/GraphMetricEvent'
+        recent_events:
+          type: array
+          description: Recent graph metric events, newest first.
+          items:
+            $ref: '#/components/schemas/GraphMetricEvent'
     ChatToolName:
       type: string
       description: >
@@ -23926,6 +25215,90 @@ components:
         provider: cohere
         model: rerank-v4.0-pro
         field: content
+    GraphMetricQuery:
+      type: object
+      description: Reads a published graph metric. Score-bearing graph metric queries on multi-shard tables
+        require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required
+        instead of merging mathematically incompatible shard-local scores.
+      required:
+        - index
+        - metric
+      properties:
+        name:
+          type: string
+          minLength: 1
+          description: Optional result key. Defaults to the metric name.
+        index:
+          type: string
+          minLength: 1
+          description: Graph index that owns the published metric.
+        metric:
+          type: string
+          minLength: 1
+          description: Graph metric to read.
+        top_k:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 10000
+          default: 10
+          description: Maximum ranked metric scores to return. Multi-shard tables require a globally coordinated
+            metric snapshot.
+        metric_freshness:
+          type: string
+          enum:
+            - published
+            - fresh
+          default: published
+          description: Whether the latest published generation may be stale or must match the graph edge
+            generation.
+    GraphMetricRerank:
+      type: object
+      description: Blends a published graph metric into hit scores. Multi-shard tables require a globally
+        coordinated metric snapshot and otherwise return graph_metric_global_materialization_required.
+      required:
+        - index
+        - metric
+      properties:
+        index:
+          type: string
+          description: Graph index that owns the published metric.
+        metric:
+          type: string
+          description: Graph metric name to blend into the search hit score.
+        candidate_count:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 10000
+          description: Bounded retrieval window scored by the graph metric before offset and limit are
+            applied. When omitted, Antfly uses an adaptive four-times page window, capped at 10,000 candidates.
+            An explicit value must cover offset plus limit. Larger windows improve promotion recall at
+            predictable linear score-read cost.
+        base_weight:
+          type: number
+          format: double
+          default: 1.0
+          description: Multiplier applied to the existing hit score before adding the graph metric feature.
+        weight:
+          type: number
+          format: double
+          default: 1.0
+          description: Multiplier applied to the graph metric score before it is added to the existing
+            hit score.
+        missing_score:
+          type: number
+          format: double
+          default: 0.0
+          description: Metric feature value to use for hits that do not have a score in the published
+            metric generation.
+        metric_freshness:
+          type: string
+          enum:
+            - published
+            - fresh
+          default: published
+          description: Whether stale published generations are acceptable or the metric must be fresh.
     GraphIdentifier:
       type: string
       minLength: 1
@@ -24732,6 +26105,50 @@ components:
         - $ref: '#/components/schemas/GraphIdentityNodeSelector'
         - $ref: '#/components/schemas/GraphResultRefNodeSelector'
       description: Select graph nodes using exactly one explicit, exact selector form.
+    GraphMetricOrder:
+      type: object
+      required:
+        - metric
+      properties:
+        metric:
+          type: string
+          minLength: 1
+        direction:
+          type: string
+          enum:
+            - asc
+            - desc
+        nulls:
+          type: string
+          enum:
+            - first
+            - last
+            - nulls_first
+            - nulls_last
+    GraphMetricFilter:
+      type: object
+      required:
+        - metric
+        - op
+        - value
+      properties:
+        metric:
+          type: string
+          minLength: 1
+        op:
+          type: string
+          description: Semantic comparison operator. Named values keep generated SDK enums portable and
+            readable.
+          enum:
+            - gt
+            - gte
+            - lt
+            - lte
+            - eq
+            - neq
+        value:
+          type: number
+          format: double
     GraphTraversal:
       type: object
       additionalProperties: false
@@ -24780,6 +26197,38 @@ components:
           items:
             type: string
           description: Requires include_documents=true. Omit to include all document fields.
+        metrics:
+          type: array
+          maxItems: 16
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+          description: Graph metric names to project onto returned traversal nodes.
+        order_by:
+          type: array
+          maxItems: 8
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/GraphMetricOrder'
+          description: Sort traversal candidates by graph metric score before applying limit.
+        where_metric:
+          type: array
+          maxItems: 32
+          items:
+            $ref: '#/components/schemas/GraphMetricFilter'
+          description: Filter traversal candidates by graph metric score before applying limit.
+        metric_freshness:
+          type: string
+          enum:
+            - published
+            - fresh
+          default: published
+          description: Freshness required for projected, ordered, and filtered graph metrics.
+        include_metric_status:
+          type: boolean
+          default: false
+          description: Include graph metric status metadata in the traversal profile.
         filter:
           $ref: '#/components/schemas/GraphDocumentFilter'
           description: Non-scoring structured stored-document predicate for reached nodes.
@@ -25233,6 +26682,70 @@ components:
           type: array
           items:
             type: string
+        metrics:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          maxItems: 16
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+          description: Graph metric names to project onto legacy graph_searches result nodes.
+        order_by:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          maxItems: 8
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/GraphMetricOrder'
+          description: Sort legacy graph_searches result nodes by graph metric score.
+        where_metric:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          maxItems: 32
+          items:
+            $ref: '#/components/schemas/GraphMetricFilter'
+          description: Filter legacy graph_searches result nodes by graph metric score.
+        metric_freshness:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          enum:
+            - published
+            - fresh
+          description: Freshness required for projected, ordered, and filtered graph metrics.
+        include_metric_status:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: Include graph metric status metadata in the legacy graph_searches result.
+    GraphMetricScore:
+      type: object
+      required:
+        - node
+        - score
+      properties:
+        node:
+          type: string
+        score:
+          type: number
+          format: double
+    GraphMetricResult:
+      type: object
+      required:
+        - index_name
+        - metric
+        - scores
+        - status
+      properties:
+        index_name:
+          type: string
+        metric:
+          type: string
+        scores:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphMetricScore'
+        status:
+          $ref: '#/components/schemas/GraphMetricStatus'
     GraphBindingNode:
       type: object
       additionalProperties: false
@@ -25464,6 +26977,12 @@ components:
             type: string
           description: Algebraic provenance labels folded into this result, when requested by an algebraic
             graph executor
+        metrics:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Projected graph metric scores keyed by metric name. Values are numbers or null
+            when a requested metric has no score for the node.
         evidence:
           x-go-type-skip-optional-pointer: true
           type: object
@@ -25490,6 +27009,11 @@ components:
           items:
             $ref: '#/components/schemas/GraphResultNode'
           description: Traversal result nodes; requested paths are stored on each node.
+        metric_status:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/GraphMetricStatus'
+          description: Graph metric status metadata keyed by metric name when requested.
         stats:
           $ref: '#/components/schemas/GraphResultStats'
     GraphPath:
@@ -25726,6 +27250,12 @@ components:
           deprecated: true
           description: Whole-query execution time in milliseconds; optional for compatibility with v0.2
             responses. Use the parent query result's took field.
+        metric_status:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/GraphMetricStatus'
+          description: Graph metric status metadata keyed by metric name.
     StatefulGraphResult:
       description: Graph result emitted by the stateful compatibility transport. Canonical graph_queries
         produce GraphResult; deprecated graph_searches may produce LegacyGraphSearchResult during the
@@ -25827,6 +27357,14 @@ components:
           type: integer
           minimum: 0
           description: Minimum retry delay in milliseconds
+        input_index:
+          type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+          description: Input whose atomic extraction validation or decoding failed, when known
+        stage:
+          type: string
+          description: Extraction failure stage, when known
     InferenceTransientCapacityError:
       type: object
       description: Actionable retry contract for temporary inference-capacity failures.
@@ -26551,6 +28089,9 @@ components:
           description: Name of model used for reading
         usage:
           $ref: '#/components/schemas/InferenceGenerateUsage'
+        execution:
+          $ref: '#/components/schemas/InferenceBatchExecutionReport'
+          description: Observed execution path. Omitted by older compatible servers.
     InferenceReadObject:
       allOf:
         - $ref: '#/components/schemas/InferenceReadResult'
@@ -26569,11 +28110,14 @@ components:
     InferenceTranscribeRequest:
       type: object
       required:
+        - model
         - audio
       properties:
         model:
           type: string
-          description: Name of transcriber model from models_dir/transcribers/
+          minLength: 1
+          description: Explicit name of the transcriber model from models_dir/transcribers/. Required
+            so direct and distributed execution resolve the same model.
           example: openai/whisper-tiny
         audio:
           type: string
@@ -26656,7 +28200,6 @@ components:
         - generators
         - extractors
         - rewriters
-        - classifiers
         - readers
         - transcribers
       properties:
@@ -26687,11 +28230,6 @@ components:
           additionalProperties:
             $ref: '#/components/schemas/InferenceModelInfo'
           description: Available reranking models
-        classifiers:
-          type: object
-          additionalProperties:
-            $ref: '#/components/schemas/InferenceModelInfo'
-          description: Available zero-shot classification models
         embedders:
           type: object
           additionalProperties:
@@ -27241,6 +28779,39 @@ components:
           type: integer
         failed:
           type: integer
+    InferenceBatchExecutionReport:
+      type: object
+      required:
+        - requested_items
+        - native_batches
+        - native_items
+        - serial_items
+        - rejected_items
+        - fallback_items
+      properties:
+        requested_items:
+          type: integer
+          minimum: 0
+        native_batches:
+          type: integer
+          minimum: 0
+        native_items:
+          type: integer
+          minimum: 0
+        serial_items:
+          type: integer
+          minimum: 0
+        rejected_items:
+          type: integer
+          minimum: 0
+          description: Items rejected before model execution by validation, resolution, or admission.
+        fallback_items:
+          type: integer
+          minimum: 0
+        fallback_reason:
+          type: string
+          nullable: true
+      description: Observed executor behavior, not a capability prediction.
     InferenceGenerateBatchResponse:
       type: object
       required:
@@ -27258,6 +28829,9 @@ components:
             $ref: '#/components/schemas/InferenceGenerateBatchResultItem'
         summary:
           $ref: '#/components/schemas/InferenceGenerateBatchSummary'
+        execution:
+          $ref: '#/components/schemas/InferenceBatchExecutionReport'
+          description: Observed execution path. Omitted by older compatible servers.
     InferenceGenerateChoice:
       type: object
       required:
@@ -27655,8 +29229,6 @@ components:
               $ref: '#/components/schemas/InferenceAdmissionConfig'
     InferenceRuntimeConfig:
       type: object
-      required:
-        - api_url
       properties:
         max_concurrent_requests:
           type: integer
@@ -27675,7 +29247,16 @@ components:
         api_url:
           type: string
           format: uri
-          description: URL of the Antfly inference embedding/chunking service
+          description: >
+            URL of an out-of-process Antfly inference service that the Antfly
+
+            server should call for embedding, chunking, reranking, and
+
+            generation. Omit it to use the in-process inference runtime
+
+            (the default in standalone mode). `antfly inference run` ignores
+
+            this field; it configures the client side only.
           example: http://localhost:8080
         api_key:
           type: string
@@ -27717,17 +29298,18 @@ components:
             remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled,
             IP literals and every address resolved from an allowlisted DNS hostname must be globally routable,
             and the connection is pinned to a vetted address. Setting it to false explicitly opts into
-            private and special destinations. Across generate, dense embed, and multimodal rerank, downloaded
-            and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes,
-            and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity;
-            zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved
-            before fetch, while inline sources use their actual encoded size. Accepted image inputs also
-            undergo header-only dimension and aggregate decoded-pixel admission before model execution.
-            Batch generation rejects multimodal content before fetch. Embedded direct transcription and
-            extraction use the configured encoded-media per-call ceiling, and direct dense embedding also
-            applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty
-            inference policy may first inherit a nonempty remote_content security policy, which is then
-            merged over this baseline.
+            private and special destinations. Across generate, dense embed, multimodal rerank, and batch
+            generation, downloaded and inline encoded media is capped cumulatively per request at the
+            lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests
+            is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media.
+            Remote URL byte potential is reserved before fetch, while inline sources use their actual
+            encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel
+            admission before model execution. Batch generation accepts bounded image and audio media parts
+            and rejects malformed or unsupported parts before dispatch. Embedded direct transcription
+            and extraction use the configured encoded-media per-call ceiling, and direct dense embedding
+            also applies pre-allocation and decoded-image admission. In unified Antfly configuration,
+            an empty inference policy may first inherit a nonempty remote_content security policy, which
+            is then merged over this baseline.
         s3_credentials:
           $ref: '#/components/schemas/InferenceCredentials'
           description: S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
@@ -27964,10 +29546,10 @@ components:
         max_image_dimension:
           type: integer
           description: Maximum source-image width or height for accepted inference image inputs, including
-            generate/chat, dense embed, multimodal rerank, `/read`, image `/extract`, and their embedded
-            direct APIs. Headers exceeding this limit are rejected before model execution; images are
-            not resized. Batch generation rejects multimodal content before fetch. Non-inference scraping
-            consumers do not enforce this setting.
+            generate/chat, batch generation, dense embed, multimodal rerank, `/read`, image `/extract`,
+            and their embedded direct APIs. Headers exceeding this limit are rejected before model execution;
+            images are not resized. Batch generation applies the same image-header admission before model
+            execution. Non-inference scraping consumers do not enforce this setting.
           minimum: 1
         allowed_paths:
           type: array
@@ -28469,6 +30051,15 @@ components:
           type: string
       required:
         - error
+    ExtractionSchemaVersion:
+      type: integer
+      enum:
+        - 1
+        - 2
+      default: 1
+      description: Omission preserves the legacy extraction contract. Version 2 opts into strict mixed-task
+        schemas, per-input replacements and explicit offsets; the selected model/runtime must support
+        every requested feature.
     ExtractionToken:
       type: object
       required:
@@ -28482,22 +30073,12 @@ components:
           maxItems: 4
           items:
             type: integer
-    ExtractionInput:
-      type: object
-      required:
-        - content
-      properties:
-        id:
-          type: string
-        content:
-          $ref: '#/components/schemas/ChatMessageContent'
-        tokens:
-          type: array
-          items:
-            $ref: '#/components/schemas/ExtractionToken'
-        metadata:
-          type: object
-          additionalProperties: true
+    ExtractionProbability:
+      type: number
+      format: double
+      minimum: 0
+      maximum: 1
+      x-go-type-skip-optional-pointer: false
     ExtractionRelationSchema:
       type: object
       description: Optional source and target labels constrain relation endpoints. A target requires a
@@ -28514,6 +30095,49 @@ components:
         target:
           type: string
           minLength: 1
+        description:
+          type: string
+          description: Version 2 model-facing relation description.
+          x-go-type-skip-optional-pointer: false
+        threshold:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionProbability'
+          x-go-type-skip-optional-pointer: false
+    ExtractionLabelDefinition:
+      type: object
+      properties:
+        description:
+          type: string
+          description: Model-facing label description.
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionDecisionProbability:
+      type: number
+      format: double
+      minimum: 0
+      maximum: 1
+      exclusiveMinimum: true
+      exclusiveMaximum: true
+      x-go-type-skip-optional-pointer: false
+      description: Finite centered-logit decisions require a threshold strictly between zero and one.
+    ExtractionClassificationExample:
+      oneOf:
+        - type: object
+          required:
+            - input
+            - label
+          properties:
+            input:
+              type: string
+            label:
+              type: string
+          additionalProperties: false
+        - type: array
+          minItems: 2
+          maxItems: 2
+          items:
+            type: string
+          description: A two-string [input,label] pair.
     ExtractionClassificationSchema:
       type: object
       required:
@@ -28528,28 +30152,123 @@ components:
             type: string
         multi_label:
           type: boolean
-          default: false
-          description: >
-            When false, return the highest-ranked labels up to `top_k` (one by
-
-            default). When true, return every label meeting `options.threshold`.
+          description: 'The server uses false when omitted. Version 1: return highest-ranked labels up
+            to top_k when false, or labels meeting options.threshold when true. Version 2: selects ordinary
+            single or multi classification unless mode is specified; classification.threshold controls
+            the decision threshold.'
         hypothesis_template:
           type: string
-          default: This example is {}.
-          description: >
-            NLI hypothesis template for this named taxonomy. Use `{}` as the
-
-            candidate-label placeholder. Non-NLI extractors ignore this field.
+          description: Version 1 NLI hypothesis template with {} as the label placeholder; the server
+            uses "This example is {}." when omitted. Version 2 GLiNER boundary extraction rejects an explicit
+            hypothesis_template; use prompt/instruction and label_definitions for model conditioning.
         top_k:
           type: integer
           minimum: 1
-          default: 1
-          description: >
-            Maximum labels returned for single-label classification. Ignored
-
-            when `multi_label` is true, where `options.threshold` controls the
-
-            returned set.
+          description: Maximum labels for ordinary single-label classification; the server uses 1 when
+            omitted. Version 2 constrained or ordinal selection uses min_labels/max_labels. Advanced set-selection
+            options or cross-task constraints on any classification in the collection reject every explicit
+            top_k in that collection, including 1. Omit top_k when using these options.
+        mode:
+          type: string
+          enum:
+            - single
+            - multi
+            - ordinal
+          description: Version 2 classification mode. Ordinal labels are ordered from lowest to highest.
+          x-go-type-skip-optional-pointer: false
+        label_definitions:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ExtractionLabelDefinition'
+          x-go-type-skip-optional-pointer: false
+        min_labels:
+          type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+        max_labels:
+          type: integer
+          minimum: 0
+          nullable: true
+          x-go-type: stdjson.RawMessage
+          x-go-type-import:
+            path: encoding/json
+            name: stdjson
+          description: Version 2 maximum selected labels. Explicit null means no maximum; omission preserves
+            mode defaults.
+        ordered:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+        threshold:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionDecisionProbability'
+          x-go-type-skip-optional-pointer: false
+        candidate_threshold:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionProbability'
+          x-go-type-skip-optional-pointer: false
+        activation:
+          type: string
+          enum:
+            - auto
+            - sigmoid
+            - softmax
+          x-go-type-skip-optional-pointer: false
+        temperature:
+          type: number
+          format: double
+          minimum: 0
+          exclusiveMinimum: true
+          x-go-type-skip-optional-pointer: false
+        default:
+          type: string
+          description: Version 2 fallback label; must be declared in labels.
+          x-go-type-skip-optional-pointer: false
+        prompt:
+          type: string
+          description: Version 2 model-facing task instruction. Mutually exclusive with instruction.
+          x-go-type-skip-optional-pointer: false
+        instruction:
+          type: string
+          description: Alias of prompt.
+          x-go-type-skip-optional-pointer: false
+        examples:
+          type: array
+          maxItems: 128
+          items:
+            $ref: '#/components/schemas/ExtractionClassificationExample'
+          x-go-type-skip-optional-pointer: false
+    ExtractionRegexValidator:
+      type: object
+      required:
+        - pattern
+      properties:
+        type:
+          type: string
+          enum:
+            - regex
+          x-go-type-skip-optional-pointer: false
+        pattern:
+          type: string
+          maxLength: 4096
+        mode:
+          type: string
+          enum:
+            - full
+            - partial
+          default: full
+          x-go-type-skip-optional-pointer: false
+        exclude:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          default: false
+        flags:
+          type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+          default: 2
+          description: Python-compatible regex flags supported by the active bounded validator engine;
+            unsupported flags or syntax fail validation.
+      additionalProperties: false
     ExtractionStructureField:
       oneOf:
         - type: string
@@ -28568,6 +30287,44 @@ components:
               items:
                 type: string
                 minLength: 1
+            dtype:
+              type: string
+              enum:
+                - str
+                - list
+              x-go-type-skip-optional-pointer: false
+            choices:
+              type: array
+              minItems: 2
+              items:
+                type: string
+              x-go-type-skip-optional-pointer: false
+            description:
+              type: string
+              x-go-type-skip-optional-pointer: false
+            threshold:
+              allOf:
+                - $ref: '#/components/schemas/ExtractionProbability'
+              x-go-type-skip-optional-pointer: false
+            cardinality:
+              type: string
+              enum:
+                - optional_one
+                - required_one
+                - zero_or_more
+                - one_or_more
+              description: Version 2 explicit cardinality. Required fields are validated after record
+                assignment.
+              x-go-type-skip-optional-pointer: false
+            exclusive:
+              type: boolean
+              description: Version 2 field spans cannot be assigned to multiple record instances.
+              x-go-type-skip-optional-pointer: false
+            validators:
+              type: array
+              items:
+                $ref: '#/components/schemas/ExtractionRegexValidator'
+              x-go-type-skip-optional-pointer: false
           additionalProperties: true
     ExtractionStructureSchema:
       type: object
@@ -28579,15 +30336,690 @@ components:
           minProperties: 1
           additionalProperties:
             $ref: '#/components/schemas/ExtractionStructureField'
+        mode:
+          type: string
+          enum:
+            - natural
+            - latent
+            - anchorless
+          description: Version 2 record grouping. Omission preserves one-record extraction.
+          x-go-type-skip-optional-pointer: false
+        anchor:
+          type: string
+          description: Natural mode only; defaults to the first declared field.
+          x-go-type-skip-optional-pointer: false
+        occurrence_policy:
+          type: string
+          enum:
+            - all
+            - first
+            - error_on_ambiguous
+            - latent_all
+          x-go-type-skip-optional-pointer: false
       additionalProperties: true
+    ExtractionEntityDefinition:
+      type: object
+      properties:
+        description:
+          type: string
+          x-go-type-skip-optional-pointer: false
+        dtype:
+          type: string
+          enum:
+            - str
+            - list
+          x-go-type-skip-optional-pointer: false
+        type:
+          type: string
+          enum:
+            - str
+            - string
+            - list
+            - array
+          x-go-type-skip-optional-pointer: false
+        threshold:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionProbability'
+          x-go-type-skip-optional-pointer: false
+        validators:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExtractionRegexValidator'
+          maxItems: 64
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionAttributeGroup:
+      type: object
+      required:
+        - labels
+      properties:
+        labels:
+          type: array
+          items:
+            type: string
+          maxItems: 128
+          minItems: 1
+        multi_label:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          default: false
+        threshold:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionProbability'
+          x-go-type-skip-optional-pointer: false
+        applies_to:
+          type: array
+          items:
+            type: string
+          maxItems: 128
+          x-go-type-skip-optional-pointer: false
+        qualify_labels:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          default: false
+      additionalProperties: false
+      description: Version 2 attributes are scored on retained entity spans using shared encoded states.
+        Omitted applies_to selects all entities; [] selects none. Raw labels must be unique across groups,
+        including when qualify_labels is true. Group names text,confidence,start,end are reserved.
+    ExtractionConstraintLabelRef:
+      type: object
+      required:
+        - type
+        - task
+        - label
+      properties:
+        type:
+          type: string
+          enum:
+            - LabelRef
+        task:
+          type: string
+        label:
+          type: string
+      additionalProperties: false
+    ExtractionConstraintAnySelected:
+      type: object
+      required:
+        - type
+        - task
+      properties:
+        type:
+          type: string
+          enum:
+            - AnySelected
+        task:
+          type: string
+      additionalProperties: false
+    ExtractionConstraintAnyOtherSelected:
+      type: object
+      required:
+        - type
+        - task
+      properties:
+        type:
+          type: string
+          enum:
+            - AnyOtherSelected
+        task:
+          type: string
+      additionalProperties: false
+    ExtractionConstraintIsDefault:
+      type: object
+      required:
+        - type
+        - task
+      properties:
+        type:
+          type: string
+          enum:
+            - IsDefault
+        task:
+          type: string
+      additionalProperties: false
+    ExtractionConstraintCardinality:
+      type: object
+      required:
+        - type
+        - task
+      properties:
+        type:
+          type: string
+          enum:
+            - Cardinality
+        task:
+          type: string
+        minimum:
+          type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+        maximum:
+          type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+          nullable: true
+      additionalProperties: false
+    ExtractionConstraintMinLevel:
+      type: object
+      required:
+        - type
+        - task
+        - level
+      properties:
+        type:
+          type: string
+          enum:
+            - MinLevel
+        task:
+          type: string
+        level:
+          oneOf:
+            - type: string
+            - type: integer
+              minimum: 0
+              x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionConstraintMaxLevel:
+      type: object
+      required:
+        - type
+        - task
+        - level
+      properties:
+        type:
+          type: string
+          enum:
+            - MaxLevel
+        task:
+          type: string
+        level:
+          oneOf:
+            - type: string
+            - type: integer
+              minimum: 0
+              x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionConstraintAtLevel:
+      type: object
+      required:
+        - type
+        - task
+        - level
+      properties:
+        type:
+          type: string
+          enum:
+            - AtLevel
+        task:
+          type: string
+        level:
+          oneOf:
+            - type: string
+            - type: integer
+              minimum: 0
+              x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionConstraintNot:
+      type: object
+      required:
+        - type
+        - child
+      properties:
+        type:
+          type: string
+          enum:
+            - Not
+        child:
+          $ref: '#/components/schemas/ExtractionClassificationConstraint'
+      additionalProperties: false
+    ExtractionConstraintAnd:
+      type: object
+      required:
+        - type
+        - children
+      properties:
+        type:
+          type: string
+          enum:
+            - And
+        children:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExtractionClassificationConstraint'
+          maxItems: 512
+      additionalProperties: false
+    ExtractionConstraintOr:
+      type: object
+      required:
+        - type
+        - children
+      properties:
+        type:
+          type: string
+          enum:
+            - Or
+        children:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExtractionClassificationConstraint'
+          maxItems: 512
+      additionalProperties: false
+    ExtractionConstraintExactlyOneOf:
+      type: object
+      required:
+        - type
+        - children
+      properties:
+        type:
+          type: string
+          enum:
+            - ExactlyOneOf
+        children:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExtractionClassificationConstraint'
+          maxItems: 512
+      additionalProperties: false
+    ExtractionConstraintImplies:
+      type: object
+      required:
+        - type
+        - cond
+        - then
+      properties:
+        type:
+          type: string
+          enum:
+            - Implies
+        cond:
+          $ref: '#/components/schemas/ExtractionClassificationConstraint'
+        then:
+          $ref: '#/components/schemas/ExtractionClassificationConstraint'
+      additionalProperties: false
+    ExtractionConstraintIff:
+      type: object
+      required:
+        - type
+        - left
+        - right
+      properties:
+        type:
+          type: string
+          enum:
+            - Iff
+        left:
+          $ref: '#/components/schemas/ExtractionClassificationConstraint'
+        right:
+          $ref: '#/components/schemas/ExtractionClassificationConstraint'
+      additionalProperties: false
+    ExtractionConstraintExcludes:
+      type: object
+      required:
+        - type
+        - left
+        - right
+      properties:
+        type:
+          type: string
+          enum:
+            - Excludes
+        left:
+          $ref: '#/components/schemas/ExtractionClassificationConstraint'
+        right:
+          $ref: '#/components/schemas/ExtractionClassificationConstraint'
+      additionalProperties: false
+    ExtractionClassificationConstraint:
+      x-zig-type: std.json.Value
+      description: Declarative, bounded constraint AST. Task and label references are validated before
+        inference. Nesting is bounded by the server schema limit.
+      oneOf:
+        - $ref: '#/components/schemas/ExtractionConstraintLabelRef'
+        - $ref: '#/components/schemas/ExtractionConstraintAnySelected'
+        - $ref: '#/components/schemas/ExtractionConstraintAnyOtherSelected'
+        - $ref: '#/components/schemas/ExtractionConstraintIsDefault'
+        - $ref: '#/components/schemas/ExtractionConstraintCardinality'
+        - $ref: '#/components/schemas/ExtractionConstraintMinLevel'
+        - $ref: '#/components/schemas/ExtractionConstraintMaxLevel'
+        - $ref: '#/components/schemas/ExtractionConstraintAtLevel'
+        - $ref: '#/components/schemas/ExtractionConstraintNot'
+        - $ref: '#/components/schemas/ExtractionConstraintAnd'
+        - $ref: '#/components/schemas/ExtractionConstraintOr'
+        - $ref: '#/components/schemas/ExtractionConstraintExactlyOneOf'
+        - $ref: '#/components/schemas/ExtractionConstraintImplies'
+        - $ref: '#/components/schemas/ExtractionConstraintIff'
+        - $ref: '#/components/schemas/ExtractionConstraintExcludes'
+      discriminator:
+        propertyName: type
+        mapping:
+          LabelRef: '#/components/schemas/ExtractionConstraintLabelRef'
+          AnySelected: '#/components/schemas/ExtractionConstraintAnySelected'
+          AnyOtherSelected: '#/components/schemas/ExtractionConstraintAnyOtherSelected'
+          IsDefault: '#/components/schemas/ExtractionConstraintIsDefault'
+          Cardinality: '#/components/schemas/ExtractionConstraintCardinality'
+          MinLevel: '#/components/schemas/ExtractionConstraintMinLevel'
+          MaxLevel: '#/components/schemas/ExtractionConstraintMaxLevel'
+          AtLevel: '#/components/schemas/ExtractionConstraintAtLevel'
+          Not: '#/components/schemas/ExtractionConstraintNot'
+          And: '#/components/schemas/ExtractionConstraintAnd'
+          Or: '#/components/schemas/ExtractionConstraintOr'
+          ExactlyOneOf: '#/components/schemas/ExtractionConstraintExactlyOneOf'
+          Implies: '#/components/schemas/ExtractionConstraintImplies'
+          Iff: '#/components/schemas/ExtractionConstraintIff'
+          Excludes: '#/components/schemas/ExtractionConstraintExcludes'
+    ExtractionJointEntity:
+      type: object
+      properties:
+        description:
+          type: string
+          x-go-type-skip-optional-pointer: false
+        threshold:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionDecisionProbability'
+          x-go-type-skip-optional-pointer: false
+        candidate_threshold:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionProbability'
+          x-go-type-skip-optional-pointer: false
+        max_candidates:
+          type: integer
+          minimum: 1
+          maximum: 256
+          x-go-type-skip-optional-pointer: false
+        allow_nested:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionJointRelation:
+      type: object
+      required:
+        - head
+        - tail
+      properties:
+        head:
+          type: array
+          items:
+            type: string
+          maxItems: 128
+          minItems: 1
+        tail:
+          type: array
+          items:
+            type: string
+          maxItems: 128
+          minItems: 1
+        description:
+          type: string
+          description: Retained declarative metadata; model conditioning follows the pinned JointIE compiler.
+          x-go-type-skip-optional-pointer: false
+        threshold:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionDecisionProbability'
+          x-go-type-skip-optional-pointer: false
+        candidate_threshold:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionProbability'
+          x-go-type-skip-optional-pointer: false
+        directed:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          default: true
+        symmetric:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          default: false
+        inverse:
+          type: string
+          x-go-type-skip-optional-pointer: false
+        allow_self:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          default: false
+        max_per_head:
+          type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+        max_per_tail:
+          type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionJointConstraintTypedEndpoints:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          type: string
+          enum:
+            - TypedEndpoints
+        relation:
+          type: string
+          x-go-type-skip-optional-pointer: false
+        head_types:
+          type: array
+          items:
+            type: string
+          maxItems: 128
+          x-go-type-skip-optional-pointer: false
+        tail_types:
+          type: array
+          items:
+            type: string
+          maxItems: 128
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionJointConstraintNoSelfLoops:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          type: string
+          enum:
+            - NoSelfLoops
+        relation:
+          type: string
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionJointConstraintUniqueRelationPair:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          type: string
+          enum:
+            - UniqueRelationPair
+        relation:
+          type: string
+          x-go-type-skip-optional-pointer: false
+        directed:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          default: true
+      additionalProperties: false
+    ExtractionJointConstraintUniqueRelationSlot:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          type: string
+          enum:
+            - UniqueRelationSlot
+        relation:
+          type: string
+          x-go-type-skip-optional-pointer: false
+        slot:
+          type: string
+          enum:
+            - head
+            - tail
+            - slot
+          default: head
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionJointConstraintEntityOverlapPolicy:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          type: string
+          enum:
+            - EntityOverlapPolicy
+        policy:
+          type: string
+          enum:
+            - allow
+            - disallow
+            - nested
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionJointConstraintMaxRelationsPerHead:
+      type: object
+      required:
+        - type
+        - limit
+      properties:
+        type:
+          type: string
+          enum:
+            - MaxRelationsPerHead
+        relation:
+          type: string
+          x-go-type-skip-optional-pointer: false
+        limit:
+          type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionJointConstraintMaxRelationsPerTail:
+      type: object
+      required:
+        - type
+        - limit
+      properties:
+        type:
+          type: string
+          enum:
+            - MaxRelationsPerTail
+        relation:
+          type: string
+          x-go-type-skip-optional-pointer: false
+        limit:
+          type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionJointConstraintSymmetricRelation:
+      type: object
+      required:
+        - type
+        - relation
+      properties:
+        type:
+          type: string
+          enum:
+            - SymmetricRelation
+        relation:
+          type: string
+      additionalProperties: false
+    ExtractionJointConstraintAcyclicRelation:
+      type: object
+      required:
+        - type
+        - relation
+      properties:
+        type:
+          type: string
+          enum:
+            - AcyclicRelation
+        relation:
+          type: string
+      additionalProperties: false
+    ExtractionJointConstraintInverseRelation:
+      type: object
+      required:
+        - type
+        - relation
+        - inverse
+      properties:
+        type:
+          type: string
+          enum:
+            - InverseRelation
+        relation:
+          type: string
+        inverse:
+          type: string
+      additionalProperties: false
+    ExtractionJointConstraint:
+      x-zig-type: std.json.Value
+      oneOf:
+        - $ref: '#/components/schemas/ExtractionJointConstraintTypedEndpoints'
+        - $ref: '#/components/schemas/ExtractionJointConstraintNoSelfLoops'
+        - $ref: '#/components/schemas/ExtractionJointConstraintUniqueRelationPair'
+        - $ref: '#/components/schemas/ExtractionJointConstraintUniqueRelationSlot'
+        - $ref: '#/components/schemas/ExtractionJointConstraintEntityOverlapPolicy'
+        - $ref: '#/components/schemas/ExtractionJointConstraintMaxRelationsPerHead'
+        - $ref: '#/components/schemas/ExtractionJointConstraintMaxRelationsPerTail'
+        - $ref: '#/components/schemas/ExtractionJointConstraintSymmetricRelation'
+        - $ref: '#/components/schemas/ExtractionJointConstraintAcyclicRelation'
+        - $ref: '#/components/schemas/ExtractionJointConstraintInverseRelation'
+      discriminator:
+        propertyName: type
+        mapping:
+          TypedEndpoints: '#/components/schemas/ExtractionJointConstraintTypedEndpoints'
+          NoSelfLoops: '#/components/schemas/ExtractionJointConstraintNoSelfLoops'
+          UniqueRelationPair: '#/components/schemas/ExtractionJointConstraintUniqueRelationPair'
+          UniqueRelationSlot: '#/components/schemas/ExtractionJointConstraintUniqueRelationSlot'
+          EntityOverlapPolicy: '#/components/schemas/ExtractionJointConstraintEntityOverlapPolicy'
+          MaxRelationsPerHead: '#/components/schemas/ExtractionJointConstraintMaxRelationsPerHead'
+          MaxRelationsPerTail: '#/components/schemas/ExtractionJointConstraintMaxRelationsPerTail'
+          SymmetricRelation: '#/components/schemas/ExtractionJointConstraintSymmetricRelation'
+          AcyclicRelation: '#/components/schemas/ExtractionJointConstraintAcyclicRelation'
+          InverseRelation: '#/components/schemas/ExtractionJointConstraintInverseRelation'
+    ExtractionJointSchema:
+      type: object
+      required:
+        - entities
+      properties:
+        entities:
+          type: object
+          minProperties: 1
+          maxProperties: 128
+          additionalProperties:
+            oneOf:
+              - type: string
+              - $ref: '#/components/schemas/ExtractionJointEntity'
+        relations:
+          type: object
+          maxProperties: 32
+          additionalProperties:
+            $ref: '#/components/schemas/ExtractionJointRelation'
+          x-go-type-skip-optional-pointer: false
+        constraints:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExtractionJointConstraint'
+          maxItems: 512
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+      description: Separate typed graph schema, mutually exclusive with ordinary extraction families.
+        Hard typed endpoints, overlap, uniqueness and declared graph constraints apply to every returned
+        edge, including derived companions.
     ExtractionSchema:
       type: object
       description: >
-        Selects one extraction operation family per request. Entity labels may
+        Version 1 selects one extraction family; entities may accompany relations.
 
-        accompany relation schemas so relation extraction can return its
+        With schema_version 2, entities, attributes, classifications, structures,
 
-        participating entities in the same response.
+        and ordinary relations may share one encoded input. joint_ie is a separate,
+
+        mutually exclusive typed graph schema. The version 2 compiler rejects
+
+        unknown fields and validates all references before model execution.
       properties:
         entities:
           type: array
@@ -28606,7 +31038,162 @@ components:
           type: object
           additionalProperties:
             $ref: '#/components/schemas/ExtractionStructureSchema'
+        entity_definitions:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ExtractionEntityDefinition'
+          x-go-type-skip-optional-pointer: false
+        entity_attributes:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ExtractionAttributeGroup'
+          x-go-type-skip-optional-pointer: false
+        classification_constraints:
+          type: array
+          maxItems: 512
+          items:
+            $ref: '#/components/schemas/ExtractionClassificationConstraint'
+          x-go-type-skip-optional-pointer: false
+        joint_ie:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionJointSchema'
+          x-go-type-skip-optional-pointer: false
       additionalProperties: true
+    ExtractionOffsetUnit:
+      type: string
+      description: Half-open offsets into the immutable caller text. Version 2 defaults to utf8_bytes.
+        No normalization, lowercasing or synthetic suffix is included in these coordinates.
+      enum:
+        - utf8_bytes
+        - unicode_codepoints
+        - utf16_codeunits
+    ExtractionLongDocumentOptions:
+      type: object
+      properties:
+        mode:
+          type: string
+          enum:
+            - reject
+            - window
+          default: reject
+          x-go-type-skip-optional-pointer: false
+        window_words:
+          type: integer
+          minimum: 1
+          maximum: 4096
+          x-go-type-skip-optional-pointer: false
+          description: Maximum body words per window; also bounded by the checkpoint and encoded token
+            limits.
+        overlap_words:
+          type: integer
+          minimum: 0
+          maximum: 4095
+          x-go-type-skip-optional-pointer: false
+        max_windows:
+          type: integer
+          minimum: 1
+          maximum: 128
+          x-go-type-skip-optional-pointer: false
+        record_identity:
+          type: string
+          enum:
+            - occurrence
+            - semantic
+          default: occurrence
+          description: Identity of latent, anchorless and legacy records across windows. Occurrence uses
+            exact source spans; semantic explicitly merges equal field values. Natural records always
+            use their exact source anchor. This is independent of annotation occurrence_policy.
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+      description: Version 2 never silently truncates. Reject is the default. Windowing requires an enabled
+        runtime capability, reconstructs document-global offsets and revalidates all hard graph constraints
+        after merging.
+    ExtractionDecoderOptions:
+      type: object
+      properties:
+        algorithm:
+          type: string
+          enum:
+            - auto
+            - exact
+            - beam
+          description: Omit to use the model's per-task default. GLiNER2.5 uses source-compatible beam
+            selection for single-window JointIE and automatic selection for classification. Windowed JointIE
+            uses the native automatic global solver with independent window resources. Explicit values
+            select the native bounded search algorithm.
+          x-go-type-skip-optional-pointer: false
+        beam_width:
+          type: integer
+          minimum: 1
+          maximum: 1024
+          x-go-type-skip-optional-pointer: false
+        max_search_nodes:
+          type: integer
+          minimum: 0
+          maximum: 200000
+          x-go-type-skip-optional-pointer: false
+        max_local_assignments:
+          type: integer
+          minimum: 1
+          maximum: 4096
+          x-go-type-skip-optional-pointer: false
+        best_effort:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          default: false
+      additionalProperties: false
+      description: Bounded classification and JointIE selection. Exact optimality is with respect to admitted
+        candidates. A completed beam may be feasible without an optimality proof. By default exhausted
+        search is an error; best_effort permits only a validated feasible witness and reports exhausted:true.
+    ExtractionJointOptions:
+      type: object
+      properties:
+        candidate_threshold:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionProbability'
+          x-go-type-skip-optional-pointer: false
+        entity_threshold:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionProbability'
+          x-go-type-skip-optional-pointer: false
+        relation_role_threshold:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionProbability'
+          x-go-type-skip-optional-pointer: false
+        top_k_entities:
+          type: integer
+          minimum: 1
+          maximum: 256
+          x-go-type-skip-optional-pointer: false
+        top_k_roles:
+          type: integer
+          minimum: 1
+          maximum: 32
+          x-go-type-skip-optional-pointer: false
+        relation_pair_cap:
+          type: integer
+          minimum: 1
+          maximum: 128
+          x-go-type-skip-optional-pointer: false
+        max_edges_per_type:
+          type: integer
+          minimum: 1
+          maximum: 256
+          x-go-type-skip-optional-pointer: false
+        entity_weight:
+          type: number
+          format: double
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+        relation_weight:
+          type: number
+          format: double
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+      description: JointIE proposal admission and utility calibration. Entity candidate caps are bypassed
+        for endpoints of retained relation proposals, subject to server hard bounds. entity_threshold
+        overrides candidate admission, not entity decision thresholds.
     ExtractionReaderOptions:
       type: object
       properties:
@@ -28662,13 +31249,79 @@ components:
           type: boolean
         include_spans:
           type: boolean
+        word_splitter:
+          type: string
+          enum:
+            - whitespace
+            - char
+          description: Version 2 source word splitting. char keeps ASCII alphanumeric and @._-+ runs together
+            and splits other non-whitespace codepoints, preserving original source offsets. An input's
+            options replace the shared options in full; omitted word_splitter uses whitespace. Explicit
+            word_splitter is rejected by version 1.
+          x-go-type-skip-optional-pointer: false
+        overlap:
+          type: string
+          enum:
+            - allow
+            - nested
+            - flat
+            - disallow
+            - longest
+          description: Version 2 overlap selection. flat/disallow prohibit overlap, nested permits containment,
+            longest removes strictly contained spans.
+          x-go-type-skip-optional-pointer: false
+        offset_unit:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionOffsetUnit'
+          x-go-type-skip-optional-pointer: false
+        long_document:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionLongDocumentOptions'
+          x-go-type-skip-optional-pointer: false
+        decoder:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionDecoderOptions'
+          x-go-type-skip-optional-pointer: false
+        joint_ie:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionJointOptions'
+          x-go-type-skip-optional-pointer: false
         reader:
           $ref: '#/components/schemas/ExtractionReaderOptions'
         resolver:
           $ref: '#/components/schemas/ExtractionResolverOptions'
       additionalProperties: true
+    ExtractionInput:
+      type: object
+      required:
+        - content
+      properties:
+        id:
+          type: string
+        content:
+          $ref: '#/components/schemas/ChatMessageContent'
+        tokens:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExtractionToken'
+        metadata:
+          type: object
+          additionalProperties: true
+        schema:
+          description: Version 2 only. Replaces the complete shared schema for this input.
+          allOf:
+            - $ref: '#/components/schemas/ExtractionSchema'
+          x-go-type-skip-optional-pointer: false
+        options:
+          description: Version 2 only. Replaces the complete shared options; omitted fields use runtime
+            defaults.
+          allOf:
+            - $ref: '#/components/schemas/ExtractionOptions'
+          x-go-type-skip-optional-pointer: false
     ExtractionRequest:
       type: object
+      description: Atomic extraction request. Every input is validated before inference; failures return
+        no partial data.
       required:
         - model
         - inputs
@@ -28677,15 +31330,38 @@ components:
         model:
           type: string
           minLength: 1
+        schema_version:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionSchemaVersion'
+          x-go-type-skip-optional-pointer: false
         inputs:
           type: array
           minItems: 1
+          maxItems: 128
           items:
             $ref: '#/components/schemas/ExtractionInput'
         schema:
           $ref: '#/components/schemas/ExtractionSchema'
         options:
           $ref: '#/components/schemas/ExtractionOptions'
+    ExtractionAttributeLabel:
+      type: object
+      required:
+        - label
+        - confidence
+      properties:
+        label:
+          type: string
+        confidence:
+          $ref: '#/components/schemas/ExtractionProbability'
+      additionalProperties: false
+    ExtractionAttributeSelection:
+      oneOf:
+        - $ref: '#/components/schemas/ExtractionAttributeLabel'
+        - type: array
+          items:
+            $ref: '#/components/schemas/ExtractionAttributeLabel'
+          maxItems: 128
     ExtractionEntity:
       type: object
       required:
@@ -28703,6 +31379,12 @@ components:
         score:
           type: number
           format: float
+        attributes:
+          type: object
+          description: Version 2 span attributes. Attribute confidence is retained independently of include_confidence.
+          additionalProperties:
+            $ref: '#/components/schemas/ExtractionAttributeSelection'
+          x-go-type-skip-optional-pointer: false
     ExtractionRelationEndpoint:
       type: object
       properties:
@@ -28710,6 +31392,26 @@ components:
           type: integer
         id:
           type: string
+        label:
+          type: string
+          description: Entity type when the endpoint has a typed identity.
+          x-go-type-skip-optional-pointer: false
+        text:
+          type: string
+          description: Version 2 endpoint surface, including endpoints absent from the entities list.
+          x-go-type-skip-optional-pointer: false
+        start:
+          type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+        end:
+          type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+        score:
+          type: number
+          format: float
+          x-go-type-skip-optional-pointer: false
       additionalProperties: true
     ExtractionRelation:
       type: object
@@ -28725,6 +31427,10 @@ components:
         score:
           type: number
           format: float
+        derived:
+          type: boolean
+          description: Version 2 inverse or symmetric companion derived from a selected relation.
+          x-go-type-skip-optional-pointer: false
       additionalProperties: true
     ExtractionClassification:
       type: object
@@ -28740,11 +31446,124 @@ components:
           type: number
           format: float
       additionalProperties: true
+    ExtractionRecordMetadata:
+      type: object
+      properties:
+        score:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionProbability'
+          x-go-type-skip-optional-pointer: false
+        anchor:
+          type: object
+          required:
+            - start
+            - end
+          properties:
+            start:
+              type: integer
+              minimum: 0
+              x-go-type-skip-optional-pointer: false
+            end:
+              type: integer
+              minimum: 0
+              x-go-type-skip-optional-pointer: false
+          additionalProperties: false
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionSolverStatus:
+      type: object
+      required:
+        - status
+        - utility
+        - visited_nodes
+        - exhausted
+      properties:
+        status:
+          type: string
+          enum:
+            - optimal
+            - feasible
+        utility:
+          type: number
+          format: double
+        visited_nodes:
+          type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+        exhausted:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionSolverDiagnostics:
+      type: object
+      properties:
+        classification:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionSolverStatus'
+          x-go-type-skip-optional-pointer: false
+        joint_ie:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionSolverStatus'
+          x-go-type-skip-optional-pointer: false
+        records:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionSolverStatus'
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionLongDocumentMetadata:
+      type: object
+      additionalProperties: false
+      required:
+        - version
+        - window_count
+        - window_policy
+        - classification_aggregation
+        - duplicate_score
+        - natural_record_identity
+        - other_record_identity
+        - solver_optimality_scope
+      properties:
+        version:
+          type: integer
+          enum:
+            - 1
+        window_count:
+          type: integer
+          minimum: 1
+        window_policy:
+          type: string
+          enum:
+            - source_words_midpoint_ownership
+        classification_aggregation:
+          type: string
+          enum:
+            - owned_word_weighted_mean_raw_logits
+        duplicate_score:
+          type: string
+          enum:
+            - maximum_calibrated_score
+        natural_record_identity:
+          type: string
+          enum:
+            - exact_source_anchor
+        other_record_identity:
+          type: string
+          enum:
+            - occurrence
+            - semantic
+        solver_optimality_scope:
+          type: string
+          enum:
+            - retained_candidate_graph
     ExtractionObject:
       type: object
       properties:
         id:
           type: string
+        offset_unit:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionOffsetUnit'
+          x-go-type-skip-optional-pointer: false
         entities:
           type: array
           items:
@@ -28759,7 +31578,25 @@ components:
             $ref: '#/components/schemas/ExtractionClassification'
         structures:
           type: object
+          description: Structure name to record array. Each record maps field names to value objects or
+            arrays of value objects; v2 value objects follow ExtractionFieldValue.
           additionalProperties: true
+        structure_metadata:
+          type: object
+          description: Version 2 metadata arrays aligned with each named structure's record array.
+          additionalProperties:
+            type: array
+            items:
+              $ref: '#/components/schemas/ExtractionRecordMetadata'
+          x-go-type-skip-optional-pointer: false
+        solvers:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionSolverDiagnostics'
+          x-go-type-skip-optional-pointer: false
+        long_document:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionLongDocumentMetadata'
+          x-go-type-skip-optional-pointer: false
       additionalProperties: true
     ExtractionResponse:
       type: object
@@ -28774,6 +31611,10 @@ components:
             - extraction
         model:
           type: string
+        schema_version:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionSchemaVersion'
+          x-go-type-skip-optional-pointer: false
         data:
           type: array
           items:
@@ -28811,9 +31652,13 @@ components:
       properties:
         window_duration_ms:
           type: integer
+          minimum: 0
+          maximum: 86400000
           description: 'Window duration in milliseconds for fixed-window audio chunking (default: 30000).'
         overlap_duration_ms:
           type: integer
+          minimum: 0
+          maximum: 86400000
           description: 'Overlap duration in milliseconds between audio chunks (default: 0).'
         vad:
           $ref: '#/components/schemas/VADOptions'
@@ -28832,10 +31677,14 @@ components:
           example: fixed
         max_chunks:
           type: integer
+          minimum: 0
+          maximum: 4096
           description: Maximum number of chunks to generate per document.
         threshold:
           type: number
           format: float
+          minimum: 0
+          maximum: 1
           description: Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models
             and VAD audio models.
         text:
@@ -28843,6 +31692,12 @@ components:
         audio:
           $ref: '#/components/schemas/InferenceAudioChunkConfig'
   responses:
+    CommittedMutationAccepted:
+      description: Mutation committed with pending visibility or explicit repair debt
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CommittedMutationOutcome'
     BadRequest:
       description: Bad request
       content:
@@ -28903,6 +31758,37 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    RestoreAdmissionUnavailable:
+      description: Restore admission could not be confirmed. If X-Antfly-Raft-Mutation-Outcome is unknown-v1,
+        the job may still commit. Poll Location or retry the identical request using the returned Idempotency-Key.
+        A missing job does not prove non-admission. Supply a stable key on the first request to recover
+        if the entire response is lost. Without the unknown marker, this is a regular service or validation
+        availability failure.
+      headers:
+        Location:
+          description: Recovery job resource, present for an unknown admission outcome.
+          schema:
+            type: string
+        Idempotency-Key:
+          description: Reuse this key with the identical request and authenticated principal.
+          schema:
+            type: string
+        X-Antfly-Raft-Mutation-Outcome:
+          description: An unknown-v1 value prohibits replay with a new key.
+          schema:
+            type: string
+            enum:
+              - unknown-v1
+        Retry-After:
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            anyOf:
+              - $ref: '#/components/schemas/IndexMutationServiceUnavailableError'
+              - $ref: '#/components/schemas/Error'
     IndexMutationServiceUnavailable:
       description: Index validation is temporarily unavailable or a distributed rolling upgrade has not
         yet converged.

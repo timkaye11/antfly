@@ -175,6 +175,41 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the graph index */
+                indexName: string;
+                /** @description Name of the configured graph metric */
+                metricName: string;
+                /** @description Operational action to apply to the graph metric materialization */
+                action: "refresh" | "rebuild" | "delete" | "pause" | "resume";
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Execute a graph metric operational action
+         * @description Refresh, rebuild, delete, pause, or resume maintenance for a configured
+         *     graph metric. The metric configuration remains owned by the graph index.
+         *     Refresh and rebuild durably enqueue bounded, resumable maintenance and
+         *     return the aggregate shard status without waiting for graph-sized work.
+         *     `delete` clears materialized metric state and durably disables automatic
+         *     maintenance. A later refresh, rebuild, or resume action re-enables the
+         *     metric and can publish a new generation.
+         */
+        post: operations["executeGraphMetricAction"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/transactions/commit": {
         parameters: {
             query?: never;
@@ -1257,6 +1292,34 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/repair/control-jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start a durable index control job
+         * @description Applies pause, resume, or attempt cancellation across all table groups.
+         *     Traversal is durable and server-owned. The resulting repair job can be
+         *     inspected or cancelled with the regular repair job endpoints. Cancelling
+         *     a control job stops remaining passes without undoing applied controls.
+         *     This distinct endpoint prevents older servers from interpreting a control
+         *     request as ordinary repair work.
+         */
+        post: operations["startTableRepairControlJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables/{tableName}/repair/jobs/{jobId}": {
         parameters: {
             query?: never;
@@ -2163,9 +2226,10 @@ export interface paths {
          *     This endpoint implements the synchronous form only. Future async durable
          *     batching will use the same request item shape with `mode: async`.
          *
-         *     Batch generation is text-only. Image or other multimodal content parts are
-         *     rejected per item as `UNSUPPORTED_MULTIMODAL` before media fetch or model loading;
-         *     other item failures remain independently reported.
+         *     Batch generation accepts bounded image and audio content parts. Media is
+         *     validated and admitted before model dispatch; models without compatible
+         *     multimodal capabilities return an independent per-item error without
+         *     failing sibling requests.
          */
         post: operations["generateBatchContent"];
         delete?: never;
@@ -2277,7 +2341,9 @@ export interface paths {
          *     each source edge; malformed images return 400 and dimension or aggregate excess
          *     returns 413. The same decoded-pixel policy covers generate/chat, dense embedding,
          *     multimodal reranking, image `/extract`, and the embedded read, extract, and dense
-         *     embedding APIs. Batch generation rejects multimodal content before media fetch.
+         *     embedding APIs. Batch generation accepts bounded image and audio media parts,
+         *     applies the same aggregate encoded-byte and decoded-image admission before model
+         *     execution, and rejects malformed or unsupported parts before dispatch.
          */
         post: operations["readImages"];
         delete?: never;
@@ -2356,6 +2422,13 @@ export interface paths {
          *     canonical public API for named entity recognition, relation extraction,
          *     text/document classification, token classification, and structured
          *     document extraction.
+         *
+         *     Set `schema_version: 2` for strict mixed-task schemas, span attributes,
+         *     constrained classification, typed records and JointIE. Each input may
+         *     replace the shared schema/options. Offsets default to half-open UTF-8
+         *     bytes, and text content parts are joined by a single newline. Inputs
+         *     are validated atomically. Unsupported features and long documents are
+         *     rejected explicitly; windowing requires runtime support.
          *
          *     Image-backed extraction uses the same byte-reserving and image-count-weighted
          *     admission policy as `/read`, before model resolution or download. Text-only
@@ -2695,6 +2768,16 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * @description The metadata mutation committed, but requested visibility or local
+         *     materialization is not yet fully healthy. Clients must observe status
+         *     instead of automatically replaying the mutation. `committed_superseded`
+         *     is terminal: a newer schema version became visible first.
+         */
+        CommittedMutationOutcome: {
+            /** @enum {string} */
+            status: "committed_visibility_pending" | "committed_superseded" | "committed_repair_required" | "committed_repair_unavailable";
+        };
         /**
          * @description RFC 7396 JSON Merge Patch for a table schema. Object members are merged
          *     recursively; null removes a member. The resulting document must be a
@@ -4132,7 +4215,7 @@ export interface components {
              * @description Effective repair limit.
              */
             limit: number;
-            /** @description Opaque cursor for the next artifact repair pass when has_more is true. Index repair currently repairs one named index per request and does not return a continuation cursor. */
+            /** @description Opaque cursor for the next artifact repair pass when has_more is true. Named-index operations may return a continuation cursor when table groups remain. */
             next_cursor?: string | null;
             /** @description Whether another repair scan page is available via next_cursor. */
             has_more: boolean;
@@ -4177,6 +4260,30 @@ export interface components {
              */
             advance?: boolean;
         };
+        /** @description Starts a durable named-index control traversal. The server advances every bounded pass, including after restart. Use the repair job status and cancellation endpoints to inspect or stop the traversal. */
+        TableRepairControlJobStartRequest: {
+            /** @description Index to control across the table. */
+            index: string;
+            /**
+             * @description Durable named-index control applied in bounded server-owned passes across every table group.
+             * @enum {string}
+             */
+            control: "pause_automatic" | "resume_automatic" | "cancel_current_attempt";
+            /** @description Decimal repair attempt fence, preserved across every pass. A stale fence fails the control job. */
+            repair_id?: string;
+            /** @description Opaque continuation cursor from a prior bounded control response. */
+            cursor?: string;
+            /**
+             * Format: uint32
+             * @default 100
+             */
+            limit?: number;
+            /**
+             * @description Attempt the first bounded pass immediately. Remaining passes always run server-side.
+             * @default true
+             */
+            advance?: boolean;
+        };
         /** @description Durable table repair job state. */
         TableRepairJob: {
             /**
@@ -4205,6 +4312,13 @@ export interface components {
             kind?: components["schemas"]["ArtifactRepairKind"];
             /** @description Index name when the job is restricted to one index. */
             index?: string;
+            /**
+             * @description Durable named-index control applied in bounded server-owned passes across every table group.
+             * @enum {string}
+             */
+            control?: "pause_automatic" | "resume_automatic" | "cancel_current_attempt";
+            /** @description Decimal repair attempt fence, preserved across every pass. A stale fence fails the control job. */
+            repair_id?: string;
             /** @description Opaque continuation cursor for the next bounded repair pass. */
             cursor?: string | null;
             /**
@@ -4217,8 +4331,13 @@ export interface components {
             result: components["schemas"]["TableRepairRunResult"];
             /** @description Last stable job-level error code. */
             last_error?: string | null;
-            /** @description Whether cancellation is pending. For a named-index job, cancellation durably pauses the matching repair in every group and becomes terminal only after that bounded traversal completes. */
+            /** @description Whether cancellation is pending. For a named-index repair/rebuild job, cancellation durably pauses the matching repair in every group. Cancelling a control job stops remaining passes without undoing controls already applied. */
             cancel_requested: boolean;
+            /**
+             * Format: uint64
+             * @description Unix epoch milliseconds when a deferred pass may next run; zero means immediately eligible.
+             */
+            next_retry_at_millis?: number;
             /**
              * Format: uint64
              * @description Unix epoch milliseconds when the job was created.
@@ -4583,7 +4702,17 @@ export interface components {
         ShardConfig: {
             byte_range: components["schemas"]["ByteRange"];
         };
+        /** @description Immutable source embedding storage selected when creating a table. */
+        TableStorageSettings: {
+            /**
+             * @description Experimental vector_store mode requires a fresh local single-shard table without HA or replication.
+             * @default primary_lsm
+             * @enum {string}
+             */
+            dense_embeddings?: "primary_lsm" | "vector_store";
+        };
         CreateTableRequest: {
+            storage?: components["schemas"]["TableStorageSettings"];
             /**
              * Format: uint
              * @description Number of shards to create for the table. Data is partitioned across shards based on key ranges.
@@ -4734,6 +4863,7 @@ export interface components {
         /** @enum {string} */
         AntflyType: "search_as_you_type" | "keyword" | "text" | "html" | "numeric" | "datetime" | "boolean" | "link" | "geopoint" | "geoshape" | "embedding" | "blob";
         Table: {
+            storage?: components["schemas"]["TableStorageSettings"];
             name: string;
             /**
              * @description Optional description of the table.
@@ -5000,6 +5130,9 @@ export interface components {
             config: components["schemas"]["CreatedIndex"];
             status: components["schemas"]["IndexStats"];
         };
+        GraphMetricActionResponse: {
+            status: components["schemas"]["GraphMetricStatus"];
+        };
         /** @description Compact LSM backend operational status. Detailed low-level counters are available through metrics. */
         LsmStorageStatus: {
             /** Format: uint64 */
@@ -5204,7 +5337,301 @@ export interface components {
             /** Format: uint64 */
             direct_bulk_ingest_fallback_below_threshold_count?: number;
         };
+        /** @description Source vector payload counters and the last completed reclamation observation. Counters reset on process reopen. */
+        VectorSourceStorageStatus: {
+            /** Format: int64 */
+            directory_publications?: number;
+            /** Format: int64 */
+            directory_publication_deferrals?: number;
+            /** Format: int64 */
+            outer_db_batch_lock_wait_ns?: number;
+            /**
+             * Format: int64
+             * @description Mark steps that yielded after their elapsed time budget.
+             */
+            collection_mark_budget_yields?: number;
+            /**
+             * Format: int64
+             * @description Concurrent scan attempts deferred to the active snapshot scanner.
+             */
+            collection_mark_busy_deferrals?: number;
+            /**
+             * Format: int64
+             * @description Snapshot marking time spent outside the source writer lock in nanoseconds.
+             */
+            collection_mark_outside_lock_ns?: number;
+            /**
+             * Format: int64
+             * @description Time merging bounded scan discoveries and concurrent preparation tails under the source writer lock.
+             */
+            collection_mark_merge_ns?: number;
+            /**
+             * Format: int64
+             * @description Longest scan tail merge under the source writer lock in nanoseconds.
+             */
+            collection_mark_max_merge_ns?: number;
+            /** Format: int64 */
+            collection_mark_steps?: number;
+            /** Format: int64 */
+            collection_mark_rows?: number;
+            /** Format: int64 */
+            collection_mark_max_step_rows?: number;
+            /** Format: int64 */
+            collection_mark_max_step_ns?: number;
+            /** Format: int64 */
+            collection_plan_ns?: number;
+            /**
+             * Format: int64
+             * @description Incomplete scan turns advanced without entering DB apply; metadata maintenance retains its own cadence.
+             */
+            collection_apply_visits_avoided?: number;
+            /**
+             * Format: int64
+             * @description Segment entries visited during full physical inventory scans or incremental updates; excludes WAL entries.
+             */
+            inventory_rows_scanned?: number;
+            /**
+             * Format: int64
+             * @description Logical immutable catalog bytes shared instead of copied by successful source snapshot and WAL-successor allocations; not resident bytes.
+             */
+            catalog_metadata_bytes_shared?: number;
+            /**
+             * Format: int64
+             * @description Immutable catalog array bytes copied by successful source snapshot and WAL-successor allocations; excludes object and root-path allocations.
+             */
+            catalog_metadata_bytes_copied?: number;
+            /**
+             * Format: int64
+             * @description WAL identities visited while maintaining the current occurrence cache, including foreground append deltas; resets when the cache is discarded.
+             */
+            inventory_wal_rows?: number;
+            /**
+             * Format: int64
+             * @description WAL identity contributions retired by checkpoint deltas; resets when the cache is discarded.
+             */
+            inventory_wal_retirements?: number;
+            /**
+             * Format: int64
+             * @description Inventory installations that used a validated WAL prefix delta; resets when the cache is discarded.
+             */
+            inventory_delta_installs?: number;
+            /**
+             * Format: int64
+             * @description Inventory installations that rebuilt WAL membership, including initialization; resets when the cache is discarded.
+             */
+            inventory_fallback_installs?: number;
+            /**
+             * Format: int64
+             * @description Changes between full and incremental physical inventory under the optional size cutoff.
+             */
+            inventory_policy_switches?: number;
+            /**
+             * Format: int64
+             * @description One when incremental physical inventory is currently enabled, otherwise zero.
+             */
+            inventory_incremental_active?: number;
+            /**
+             * Format: int64
+             * @description Current segment bitmap and offset allocation bytes; excludes pinned source metadata and WAL fallback maps.
+             */
+            mark_bitmap_bytes?: number;
+            /**
+             * Format: int64
+             * @description Current WAL-only reachability entries when bitmap marking is enabled, or all mark entries in the hash-map control.
+             */
+            mark_fallback_entries?: number;
+            /**
+             * Format: int64
+             * @description Background mark setups deferred by the optional obsolete-debt scheduling policy.
+             */
+            collection_debt_deferrals?: number;
+            /**
+             * Format: int64
+             * @description Conservative committed obsolete-payload scheduling debt; not a measurement of reclaimable bytes.
+             */
+            obsolete_payload_debt_bytes?: number;
+            /**
+             * Format: int64
+             * @description Full physical inventory scans and incremental occurrence-cache updates; this cache is not ownership authority.
+             */
+            inventory_updates?: number;
+            /**
+             * Format: int64
+             * @description Time spent on full physical inventory scans or incremental occurrence-cache updates.
+             */
+            inventory_update_ns?: number;
+            /**
+             * Format: int64
+             * @description Total time inside the source writer lock for collection entry points; includes nested stages.
+             */
+            collection_locked_ns?: number;
+            /**
+             * Format: int64
+             * @description Longest collection entry point hold of the source writer lock.
+             */
+            collection_max_locked_ns?: number;
+            /**
+             * Format: int64
+             * @description Collection setup time, including primary sync, checkpoint and snapshot acquisition.
+             */
+            collection_setup_ns?: number;
+            /**
+             * Format: int64
+             * @description Longest collection setup.
+             */
+            collection_max_setup_ns?: number;
+            /**
+             * Format: int64
+             * @description Longest locked collection planning step.
+             */
+            collection_max_plan_ns?: number;
+            /**
+             * Format: int64
+             * @description Locked collection copy time excluding final publication.
+             */
+            collection_copy_ns?: number;
+            /**
+             * Format: int64
+             * @description Longest locked collection copy step.
+             */
+            collection_max_copy_ns?: number;
+            /**
+             * Format: int64
+             * @description Locked publication time including directory refresh, inventory, receipts and reclamation.
+             */
+            collection_publish_ns?: number;
+            /**
+             * Format: int64
+             * @description Longest locked publication step.
+             */
+            collection_max_publish_ns?: number;
+            /**
+             * Format: int64
+             * @description Active scan turns scheduled using the experimental wall-time duty policy.
+             */
+            collection_active_scan_turns?: number;
+            /**
+             * Format: int64
+             * @description Requested pause time under the active scan policy; not measured CPU time.
+             */
+            collection_active_scan_pause_ns?: number;
+            /**
+             * Format: int64
+             * @description Protection requests merged into marking, including repeated requests across turns.
+             */
+            collection_rescued_payloads?: number;
+            /**
+             * Format: int64
+             * @description Durable payload preparations protected by marking without another append.
+             */
+            deduplicated_reappend_payloads?: number;
+            /**
+             * Format: int64
+             * @description Raw vector bytes avoided by protecting existing durable payloads during marking.
+             */
+            deduplicated_reappend_bytes?: number;
+            /** Format: int64 */
+            directory_bytes_written?: number;
+            /** Format: int64 */
+            directory_entries?: number;
+            /** Format: int64 */
+            directory_hits?: number;
+            /** Format: int64 */
+            directory_misses?: number;
+            /** Format: int64 */
+            source_segments?: number;
+            /** Format: int64 */
+            ownership_index_collections?: number;
+            /** Format: int64 */
+            ownership_index_entries_scanned?: number;
+            /** Format: int64 */
+            prepare_requests?: number;
+            /** Format: int64 */
+            prepare_lock_wait_ns?: number;
+            /** Format: int64 */
+            decode_outside_lock_ns?: number;
+            /** Format: int64 */
+            snapshot_read_ns?: number;
+            /** Format: int64 */
+            cache_reclaimed_bytes?: number;
+            /** Format: int64 */
+            retired_ann_references_skipped?: number;
+            /** Format: uint64 */
+            retained_payloads?: number;
+            /** Format: uint64 */
+            retained_payload_bytes?: number;
+            /** Format: uint64 */
+            unreferenced_payload_bytes_at_collection?: number;
+            /** Format: uint64 */
+            checkpoint_bytes_read?: number;
+            /** Format: uint64 */
+            checkpoint_bytes_written?: number;
+            /**
+             * Format: uint64
+             * @description Allocator-backed source-store state charged to the shared resource manager, excluding mmap pages and request-owned buffers.
+             */
+            heap_bytes?: number;
+            /** Format: int64 */
+            location_cache_hits?: number;
+            /** Format: int64 */
+            location_cache_misses?: number;
+            /** Format: int64 */
+            location_cache_bytes?: number;
+            /** Format: int64 */
+            source_shards?: number;
+            /** Format: int64 */
+            collection_steps?: number;
+            /** Format: int64 */
+            collection_pending_bytes?: number;
+            /** Format: int64 */
+            collection_mark_ns?: number;
+            /** Format: int64 */
+            checkpoint_receipt_hits?: number;
+            /** Format: int64 */
+            checkpoint_inventory_restores?: number;
+            /** Format: int64 */
+            checkpoint_receipt_bytes_written?: number;
+            /** Format: int64 */
+            prepare_batches?: number;
+            /** Format: int64 */
+            preparation_ns?: number;
+            /** Format: int64 */
+            durable_append_ns?: number;
+            /** Format: int64 */
+            checkpoint_ns?: number;
+            /** Format: uint64 */
+            prepared_payloads?: number;
+            /** Format: uint64 */
+            prepared_payload_bytes?: number;
+            /** Format: uint64 */
+            wal_bytes_written?: number;
+            /** Format: uint64 */
+            active_sessions?: number;
+            /** Format: uint64 */
+            resolved_payloads?: number;
+            /** Format: uint64 */
+            resolved_bytes?: number;
+            /** Format: uint64 */
+            active_wal_bytes?: number;
+            /** Format: uint64 */
+            immutable_block_bytes?: number;
+            /** Format: uint64 */
+            live_payloads_at_collection?: number;
+            /** Format: uint64 */
+            live_payload_bytes_at_collection?: number;
+            /** Format: uint64 */
+            collections?: number;
+            /** Format: uint64 */
+            collection_deferrals?: number;
+            /** Format: uint64 */
+            collection_bytes_read?: number;
+            /** Format: uint64 */
+            collection_bytes_written?: number;
+            /** Format: uint64 */
+            unresolved_primary_commits?: number;
+        };
         StorageStatus: {
+            source_vectors?: components["schemas"]["VectorSourceStorageStatus"];
             /**
              * Format: uint64
              * @description Disk usage in bytes.
@@ -5482,8 +5909,9 @@ export interface components {
             /**
              * @description Durable commit outcome. `committed_pending` means requested visibility or
              *     participant propagation is still completing. `committed_repair_required`
-             *     means the primary write committed, but a terminal enrichment failure needs
-             *     operator repair and will not be retried indefinitely.
+             *     means the primary write committed, but a terminal background materialization
+             *     failure needs operator repair and will not be retried indefinitely. Inspect
+             *     `failure` when present; retrying the document write is unnecessary.
              * @enum {string}
              */
             status?: "committed" | "committed_pending" | "committed_repair_required";
@@ -5493,6 +5921,22 @@ export interface components {
             deleted?: number;
             /** @description Number of documents successfully transformed */
             transformed?: number;
+            failure?: components["schemas"]["BatchCommittedFailure"];
+        };
+        /**
+         * @description Additive details for a committed batch that needs operator action. The
+         *     open string code is forward-compatible with older SDKs; clients should
+         *     treat unknown codes as non-retryable when `retryable` is false.
+         */
+        BatchCommittedFailure: {
+            /** @description Stable machine-readable failure code, such as `graph_metric_materialization_rejected`. */
+            code: string;
+            /** @description Actionable operator guidance. */
+            message: string;
+            /** @description Optional stable reason within the failure category, such as `build_budget_exceeded`. */
+            reason?: string;
+            /** @description Whether replaying the document mutation is safe. Committed repair outcomes are false. */
+            retryable: boolean;
         };
         /** @description A dense-index rebuild is retaining replay history and the node has reached its hard safety budget. */
         DenseRepairBackpressureError: {
@@ -7329,6 +7773,10 @@ export interface components {
              *     ```
              */
             reranker?: components["schemas"]["RerankerConfig"];
+            /** @description Direct top-k read from a published graph metric generation. Results are returned in graph_metric_results under the requested name or the metric name when no explicit name is supplied. */
+            graph_metric?: components["schemas"]["GraphMetricQuery"];
+            /** @description Blend a published graph metric feature into ordinary search hit scores. Requests may require either any published generation or a generation that is fresh with respect to graph writes. */
+            graph_metric_rerank?: components["schemas"]["GraphMetricRerank"];
             analyses?: components["schemas"]["Analyses"];
             /**
              * @description Declarative graph matching, traversal, and path queries. A nested node
@@ -7644,8 +8092,24 @@ export interface components {
             reranker?: components["schemas"]["RerankerProfile"];
             /** @description Result merge statistics (present for hybrid search). */
             merge?: components["schemas"]["MergeProfile"];
+            /** @description Graph metric freshness and generation details for metric-aware query work. */
+            graph_metrics?: components["schemas"]["GraphMetricProfile"][];
             /** @description Sort execution statistics (present when the query used ordered page options and profiling was enabled). */
             sort?: components["schemas"]["SortProfile"];
+        };
+        GraphMetricProfile: {
+            /** @description Name of the graph query or graph metric query that used the metric. */
+            query_name: string;
+            /** @description Profile source, such as `graph_query`, `graph_metric`, or `graph_metric_rerank`. */
+            source: string;
+            /** @description Graph index that owns the metric. */
+            index_name: string;
+            /** @description Graph metric name within the index. */
+            metric_name: string;
+            /** @description Effective freshness mode requested for this metric use. */
+            freshness: string;
+            /** @description Published generation and freshness status observed by the query. */
+            status: components["schemas"]["GraphMetricStatus"];
         };
         /**
          * @description Sort execution profile. These fields are the stable public diagnostic
@@ -8040,6 +8504,54 @@ export interface components {
              */
             chunks?: components["schemas"]["HierarchyMatchHit"][];
         };
+        /** @description Optional score provenance for ranking features that changed the final hit score. */
+        QueryScoreDetails: {
+            /** @description Score contribution from an explicit graph_metric_rerank request. */
+            graph_metric_rerank?: components["schemas"]["GraphMetricRerankScoreDetails"];
+        };
+        GraphMetricRerankScoreDetails: {
+            /** @description Graph index that provided the metric score. */
+            index_name: string;
+            /** @description Graph metric used as a score feature. */
+            metric_name: string;
+            /**
+             * Format: double
+             * @description Hit score before graph metric rerank composition.
+             */
+            base_score: number;
+            /**
+             * Format: double
+             * @description Weight applied to the base score.
+             */
+            base_weight: number;
+            /**
+             * Format: double
+             * @description Published metric score for this hit, or null when the hit was missing from the metric generation.
+             */
+            metric_score?: number | null;
+            /**
+             * Format: double
+             * @description Metric feature value used in the formula after applying missing_score fallback if needed.
+             */
+            metric_score_used: number;
+            /**
+             * Format: double
+             * @description Weight applied to the metric score feature.
+             */
+            metric_weight: number;
+            /** @description True when metric_score was missing and the request's missing_score fallback was used. */
+            missing_score_used: boolean;
+            /**
+             * Format: double
+             * @description Final hit score after graph metric rerank composition.
+             */
+            final_score: number;
+            /**
+             * Format: int64
+             * @description Published graph metric score generation used for this hit.
+             */
+            published_generation: number;
+        };
         /** @description A single query result hit */
         QueryHit: {
             /** @description ID of the record. */
@@ -8061,6 +8573,8 @@ export interface components {
             _index_scores?: {
                 [key: string]: number;
             };
+            /** @description Optional score provenance for ranking features applied to this hit. */
+            _score_details?: components["schemas"]["QueryScoreDetails"];
             _source?: {
                 [key: string]: unknown;
             };
@@ -8127,6 +8641,10 @@ export interface components {
             /** @description Analysis results like PCA and t-SNE per index embeddings. */
             analyses?: {
                 [key: string]: components["schemas"]["AnalysesResult"];
+            };
+            /** @description Results from direct graph metric reads. */
+            graph_metric_results?: {
+                [key: string]: components["schemas"]["GraphMetricResult"];
             };
             /** @description Detailed execution profile (present when `profile: true` in request). */
             profile?: components["schemas"]["QueryProfile"];
@@ -9309,6 +9827,11 @@ export interface components {
              * @description Approximate maximum source bytes to process in one batch for this operation.
              */
             batch_bytes?: number;
+            /**
+             * Format: uint32
+             * @description Maximum PDF pages admitted for one request-atomic document operation.
+             */
+            max_document_pages?: number;
         };
         /** @description Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams. */
         EnrichmentConfig: {
@@ -9494,6 +10017,7 @@ export interface components {
              * @example fixed
              */
             model?: string;
+            /** @description Maximum number of chunks to generate per document. Zero uses the chunker default. */
             max_chunks?: number;
             /** Format: float */
             threshold?: number;
@@ -9568,6 +10092,41 @@ export interface components {
         };
         /** @description Durable graph edge type. Values must be valid UTF-8 and encode to at most 64 KiB; `maxLength` is the standard-schema code-point ceiling and `x-antfly-max-utf8-bytes` carries the exact wire-byte limit. */
         GraphEdgeType: string;
+        /** @description Omitting this object selects all edge types. A types list selects only those types; mode and types cannot both be supplied. */
+        GraphMetricEdgeFilter: {
+            /** @enum {string} */
+            mode?: "all";
+            types?: components["schemas"]["GraphEdgeType"][];
+        };
+        /** @description Published metric configuration. If kind is omitted, the metric name must be a supported kind. */
+        GraphMetricConfig: {
+            /** @default true */
+            enabled?: boolean;
+            /** @enum {string} */
+            kind?: "pagerank" | "degree" | "eigenvector" | "hits_authority" | "hits_hub";
+            /**
+             * @description Serverless accepts background only.
+             * @default background
+             * @enum {string}
+             */
+            refresh?: "background" | "manual";
+            /**
+             * Format: double
+             * @default 0.85
+             */
+            damping?: number;
+            /**
+             * Format: double
+             * @default 0.000001
+             */
+            tolerance?: number;
+            /**
+             * Format: int32
+             * @default 50
+             */
+            max_iterations?: number;
+            edge_filter?: components["schemas"]["GraphMetricEdgeFilter"];
+        };
         /** @description A literal string or finite numeric value, or a Handlebars template evaluated for each materialized graph item. */
         GraphTemplateValue: string | number;
         /** @description Maps each artifact item to graph node identifiers. */
@@ -9879,6 +10438,10 @@ export interface components {
         };
         /** @description Configuration for graph index type */
         GraphIndexConfig: {
+            /** @description Named published graph metrics. Serverless supports background refresh only and limits configurations to 16 metrics per graph, 64 total per publication, 64 types per filter, and 128 UTF-8 bytes per metric name. */
+            metrics?: {
+                [key: string]: components["schemas"]["GraphMetricConfig"];
+            };
             /** @description Ordered chunk or JSON asset streams whose edge-like values are unioned into this graph index. Artifact names must be unique within the array because the artifact name is the source identity. Earlier sources win when multiple sources materialize the same edge identity. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
             sources?: components["schemas"]["GraphArtifactSourceConfig"][];
             /** @description Configuration for generating node summaries (enables tree navigation in Retrieval Agent) */
@@ -10370,6 +10933,9 @@ export interface components {
         };
         /** @description Credential-free normalized graph configuration returned after creation. */
         CreatedGraphIndexConfig: {
+            metrics?: {
+                [key: string]: components["schemas"]["GraphMetricConfig"];
+            };
             summarizer?: components["schemas"]["CreatedProviderConfig"];
             template?: string;
             edge_types?: components["schemas"]["EdgeTypeConfig"][];
@@ -10770,6 +11336,11 @@ export interface components {
             /** @description Whether all sources are settled but coverage remains unhealthy under the configured policy, including terminal failures or policy-rejected skips. */
             degraded: boolean;
         };
+        /**
+         * @description Conservative distributed rollout phase for native WAL-backed dense-index storage. native_authoritative is reported only when every expected shard has supplied current authority evidence.
+         * @enum {string}
+         */
+        DenseNativeStoragePhase: "legacy" | "native_building" | "native_validating" | "native_authoritative";
         /** @description Runtime state for the durable embeddings enrichment worker. */
         EnrichmentRuntimeStatus: {
             enabled: boolean;
@@ -10974,6 +11545,9 @@ export interface components {
             dense_replay_target_sequence?: number;
             /** @description Whether dense/vector artifacts still need publication before queries see the latest data. */
             dense_publish_pending?: boolean;
+            /** @description Whether the shared native exact-vector projection is still being built or reconciled. Queries remain correct by falling back to primary embedding artifacts while this is true. */
+            dense_vector_projection_pending?: boolean;
+            dense_native_storage_phase?: components["schemas"]["DenseNativeStoragePhase"];
             /** Format: uint64 */
             replay_applied_sequence?: number;
             /** Format: uint64 */
@@ -11055,7 +11629,115 @@ export interface components {
                 [key: string]: unknown;
             };
         };
-        /** @description Statistics for graph index */
+        /** @description Summarized graph metric maintenance runtime state. Identity fields are stable hashes, not raw process or owner identifiers. */
+        GraphMetricRuntimeStats: {
+            enabled?: boolean;
+            /** @enum {string} */
+            role?: "combined" | "coordinator" | "worker" | "worker_pool";
+            /** Format: uint64 */
+            runtime_id_hash?: number;
+            /** Format: uint64 */
+            owner_id_hash?: number;
+            /** Format: uint64 */
+            lease_key_hash?: number;
+            /** Format: uint64 */
+            worker_id_hash?: number;
+            /** Format: uint64 */
+            worker_count?: number;
+            lease_owned?: boolean;
+            has_lease?: boolean;
+            /** Format: uint64 */
+            acquisition_count?: number;
+            /** Format: uint64 */
+            takeover_count?: number;
+            /** Format: uint64 */
+            lease_acquire_failures?: number;
+            /** Format: uint64 */
+            lost_leases?: number;
+            /** Format: uint64 */
+            last_acquired_ms?: number;
+            /**
+             * Format: uint64
+             * @description Cached expiry of the currently held maintenance lease, or zero when no lease is held.
+             */
+            lease_expires_at_ms?: number;
+            /**
+             * Format: uint64
+             * @description Earliest time the runtime will renew its maintenance lease, or zero when no lease is held.
+             */
+            lease_renew_after_ms?: number;
+            /**
+             * Format: uint64
+             * @description Number of durable maintenance lease renewals completed by this runtime.
+             */
+            renewal_count?: number;
+            started?: boolean;
+            shutdown?: boolean;
+            notified?: boolean;
+            /** Format: uint64 */
+            ticks_started?: number;
+            /** Format: uint64 */
+            ticks_completed?: number;
+            /** Format: uint64 */
+            durable_progress_ticks?: number;
+            /** Format: uint64 */
+            idle_ticks?: number;
+            /** Format: uint64 */
+            error_ticks?: number;
+            last_error_name?: string;
+            /** Format: uint64 */
+            total_metrics_scanned?: number;
+            /** Format: uint64 */
+            total_active_builds?: number;
+            /** Format: uint64 */
+            total_builds_started?: number;
+            /** Format: uint64 */
+            total_worker_steps?: number;
+            /** Format: uint64 */
+            total_coordinator_steps?: number;
+            /**
+             * Format: uint64
+             * @description Consumed intermediate records retired at completed reduction barriers.
+             */
+            total_retired_input_records?: number;
+            /** Format: uint64 */
+            total_pages_claimed?: number;
+            /** Format: uint64 */
+            total_pages_completed?: number;
+            /** Format: uint64 */
+            total_phases_advanced?: number;
+            /** Format: uint64 */
+            total_published?: number;
+            /** Format: uint64 */
+            total_failed_builds?: number;
+            /** Format: uint64 */
+            last_metrics_scanned?: number;
+            /** Format: uint64 */
+            last_active_builds?: number;
+            /** Format: uint64 */
+            last_builds_started?: number;
+            /** Format: uint64 */
+            last_worker_steps?: number;
+            /** Format: uint64 */
+            last_coordinator_steps?: number;
+            /**
+             * Format: uint64
+             * @description Consumed intermediate records retired in the latest maintenance tick.
+             */
+            last_retired_input_records?: number;
+            /** Format: uint64 */
+            last_pages_claimed?: number;
+            /** Format: uint64 */
+            last_pages_completed?: number;
+            /** Format: uint64 */
+            last_phases_advanced?: number;
+            /** Format: uint64 */
+            last_published?: number;
+            /** Format: uint64 */
+            last_failed_builds?: number;
+            last_budget_exhausted?: boolean;
+        };
+        /** @description Statistics for graph index. While counts_pending is true, edge/node/document counts are physical upper bounds awaiting ownership cleanup, not exact logical counts. */
         GraphIndexStats: {
             /**
              * @description Discriminator for the index stats variant. (enum property replaced by openapi-typescript)
@@ -11081,6 +11763,8 @@ export interface components {
              * @description Total number of edges in the graph
              */
             total_edges?: number;
+            /** @description True while ownership cleanup is pending on any observed shard. Counts are physical upper bounds until cleanup completes; serving adjacency already enforces ownership. */
+            counts_pending?: boolean;
             /** @description Count of edges per edge type */
             edge_types?: {
                 [key: string]: number;
@@ -11209,6 +11893,7 @@ export interface components {
                     result_nodes?: number;
                 };
             };
+            graph_metric_runtime?: components["schemas"]["GraphMetricRuntimeStats"];
         };
         /** @description Compact public statistics for an algebraic sidecar index. Detailed runtime, adaptive, and materialization records remain internal diagnostics. */
         AlgebraicIndexStats: {
@@ -11394,6 +12079,154 @@ export interface components {
         };
         /** @description Statistics for an index */
         IndexStats: components["schemas"]["FullTextIndexStats"] | components["schemas"]["EmbeddingsIndexStats"] | components["schemas"]["GraphIndexStats"] | components["schemas"]["AlgebraicIndexStats"];
+        GraphMetricEdgeFilterStatus: {
+            /** @enum {string} */
+            mode: "all" | "types";
+            types?: string[];
+        };
+        GraphMetricBuildPageStatus: {
+            phase: string;
+            /** Format: int64 */
+            iteration: number;
+            /** Format: int64 */
+            page_id: number;
+            /** @enum {string} */
+            state: "pending" | "leased" | "complete" | "failed";
+            /** @enum {string} */
+            range_kind: "full" | "reverse_edges" | "nodes" | "scores" | "contributions" | "job_control" | "summary";
+            /** @description Worker id that owns or last failed this page. */
+            worker_id?: string;
+            /**
+             * Format: int64
+             * @description Unix epoch milliseconds when the page lease expires, or 0 when not leased.
+             */
+            lease_expires_at_ms?: number;
+            /**
+             * Format: int64
+             * @description Current attempt number for this page.
+             */
+            attempt?: number;
+            /** @description Opaque resumable cursor for this page. */
+            cursor?: string;
+            /**
+             * Format: int64
+             * @description Completed work units for this page.
+             */
+            completed_units?: number;
+            /**
+             * Format: int64
+             * @description Estimated total work units for this page.
+             */
+            total_units?: number;
+            /** @description Last page-level error. */
+            last_error?: string;
+        };
+        GraphMetricEvent: {
+            /** Format: int64 */
+            sequence: number;
+            /** @enum {string} */
+            kind: "publish" | "delete" | "pause" | "resume" | "failed";
+            /** Format: int64 */
+            at_ms: number;
+            /** Format: int64 */
+            target_edge_generation: number;
+            /** Format: int64 */
+            published_generation: number;
+            /** Format: int64 */
+            score_count: number;
+        };
+        GraphMetricStatus: {
+            state: string;
+            /** @enum {string} */
+            phase: "idle" | "computing" | "publishing" | "complete" | "prepare_generation" | "scan_edges_and_out_degree" | "initialize_ranks" | "iterate_contributions" | "reduce_ranks" | "hits_hub_contributions" | "hits_hub_reduce_ranks" | "check_convergence" | "publish_generation" | "cleanup_old_generations";
+            edge_filter?: components["schemas"]["GraphMetricEdgeFilterStatus"];
+            /**
+             * Format: int64
+             * @description Version of the published graph metric metadata schema.
+             */
+            metadata_version?: number;
+            /** @description Deterministic configuration fingerprint encoded as fixed-width hexadecimal so every SDK preserves all 64 bits. */
+            config_fingerprint?: string;
+            maintenance_paused?: boolean;
+            /** @description Whether a local or distributed build is queued after the currently published or building generation. */
+            build_queued: boolean;
+            /** Format: int64 */
+            published_generation: number;
+            /** Format: int64 */
+            edge_generation: number;
+            /** Format: int64 */
+            target_edge_generation: number;
+            /**
+             * Format: int64
+             * @description Pending edge generation waiting to build, or 0 when no build is queued.
+             */
+            queued_generation?: number;
+            /**
+             * Format: int64
+             * @description Edge generation currently held by an active build lease, or 0 when idle.
+             */
+            building_generation?: number;
+            /**
+             * Format: int64
+             * @description Durable identifier for the active graph metric build job, or 0 when idle.
+             */
+            build_job_id?: number;
+            /**
+             * Format: int64
+             * @description Unix epoch milliseconds when the active graph metric build started, or 0 when idle.
+             */
+            build_started_at_ms?: number;
+            /**
+             * Format: int64
+             * @description Iteration number reported by the active build lease, or 0 when idle or not iterative.
+             */
+            build_iteration?: number;
+            /**
+             * Format: int64
+             * @description Unix epoch milliseconds when the active build lease expires, or 0 when idle.
+             */
+            build_lease_expires_at_ms?: number;
+            /** @description Worker id that owns the active build lease. Local builds use `local`. */
+            build_worker_id?: string;
+            /** @description Opaque resumable cursor for the active build phase. Empty or omitted when idle or when the phase has no cursor. */
+            build_cursor?: string;
+            /**
+             * Format: int64
+             * @description Completed work units for the active graph metric build, or 0 when idle or unknown.
+             */
+            build_completed_units?: number;
+            /**
+             * Format: int64
+             * @description Estimated total work units for the active graph metric build, or 0 when idle or unknown.
+             */
+            build_total_units?: number;
+            /** @description Active leased or failed build pages for the current build phase, capped and ordered by durable page key. */
+            build_pages?: components["schemas"]["GraphMetricBuildPageStatus"][];
+            /** @description Whether build_pages was capped before every active page could be included. */
+            build_pages_truncated?: boolean;
+            /**
+             * Format: int64
+             * @description Number of consecutive failed build attempts for the current target generation, or 0 when no failure applies.
+             */
+            retry_count?: number;
+            /** @description Last build error for the current failed target generation. */
+            last_error?: string;
+            /**
+             * Format: double
+             * @description Build progress for the target edge generation, from 0.0 to 1.0
+             */
+            progress: number;
+            converged: boolean;
+            /** Format: int64 */
+            iterations_completed: number;
+            /** Format: double */
+            delta: number;
+            /** Format: int64 */
+            computed_at_ms: number;
+            last_event?: components["schemas"]["GraphMetricEvent"];
+            /** @description Recent graph metric events, newest first. */
+            recent_events?: components["schemas"]["GraphMetricEvent"][];
+        };
         /**
          * @description Available tool names for retrieval agents.
          *     - add_filter: Add search filters (field constraints)
@@ -12573,6 +13406,63 @@ export interface components {
              */
             top_n?: number;
         } & (components["schemas"]["AntflyRerankerConfig"] | components["schemas"]["CohereRerankerConfig"] | components["schemas"]["VertexRerankerConfig"]);
+        /** @description Reads a published graph metric. Score-bearing graph metric queries on multi-shard tables require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required instead of merging mathematically incompatible shard-local scores. */
+        GraphMetricQuery: {
+            /** @description Optional result key. Defaults to the metric name. */
+            name?: string;
+            /** @description Graph index that owns the published metric. */
+            index: string;
+            /** @description Graph metric to read. */
+            metric: string;
+            /**
+             * Format: int32
+             * @description Maximum ranked metric scores to return. Multi-shard tables require a globally coordinated metric snapshot.
+             * @default 10
+             */
+            top_k?: number;
+            /**
+             * @description Whether the latest published generation may be stale or must match the graph edge generation.
+             * @default published
+             * @enum {string}
+             */
+            metric_freshness?: "published" | "fresh";
+        };
+        /** @description Blends a published graph metric into hit scores. Multi-shard tables require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required. */
+        GraphMetricRerank: {
+            /** @description Graph index that owns the published metric. */
+            index: string;
+            /** @description Graph metric name to blend into the search hit score. */
+            metric: string;
+            /**
+             * Format: int32
+             * @description Bounded retrieval window scored by the graph metric before offset and limit are applied. When omitted, Antfly uses an adaptive four-times page window, capped at 10,000 candidates. An explicit value must cover offset plus limit. Larger windows improve promotion recall at predictable linear score-read cost.
+             */
+            candidate_count?: number;
+            /**
+             * Format: double
+             * @description Multiplier applied to the existing hit score before adding the graph metric feature.
+             * @default 1
+             */
+            base_weight?: number;
+            /**
+             * Format: double
+             * @description Multiplier applied to the graph metric score before it is added to the existing hit score.
+             * @default 1
+             */
+            weight?: number;
+            /**
+             * Format: double
+             * @description Metric feature value to use for hits that do not have a score in the published metric generation.
+             * @default 0
+             */
+            missing_score?: number;
+            /**
+             * @description Whether stale published generations are acceptable or the metric must be fresh.
+             * @default published
+             * @enum {string}
+             */
+            metric_freshness?: "published" | "fresh";
+        };
         /** @description User-visible graph alias or named result under Antfly graph identifier policy v1 (Unicode 15.0.0). Identifiers are exact UTF-8 strings and are not normalized. Ordinary internal ASCII spaces are allowed. The value must not equal `*`, begin with `$`, have leading or trailing spaces, contain non-ASCII Unicode White_Space, or contain Unicode Cc control or Cf format code points. UTF-8 encoding is limited to 512 bytes. */
         GraphIdentifier: string;
         GraphDocumentFuzzyFilter: {
@@ -12825,6 +13715,23 @@ export interface components {
         };
         /** @description Select graph nodes using exactly one explicit, exact selector form. */
         GraphNodeSelector: components["schemas"]["GraphKeyNodeSelector"] | components["schemas"]["GraphIdentityNodeSelector"] | components["schemas"]["GraphResultRefNodeSelector"];
+        GraphMetricOrder: {
+            metric: string;
+            /** @enum {string} */
+            direction?: "asc" | "desc";
+            /** @enum {string} */
+            nulls?: "first" | "last" | "nulls_first" | "nulls_last";
+        };
+        GraphMetricFilter: {
+            metric: string;
+            /**
+             * @description Semantic comparison operator. Named values keep generated SDK enums portable and readable.
+             * @enum {string}
+             */
+            op: "gt" | "gte" | "lt" | "lte" | "eq" | "neq";
+            /** Format: double */
+            value: number;
+        };
         /** @description Breadth-first traversal with request-wide deduplication by exact table-qualified node identity. Direction defaults to `out`; use `both` to traverse a relationship as undirected without storing a reciprocal edge. */
         GraphTraversal: {
             start: components["schemas"]["GraphNodeSelector"];
@@ -12849,6 +13756,23 @@ export interface components {
             include_documents?: boolean;
             /** @description Requires include_documents=true. Omit to include all document fields. */
             fields?: string[];
+            /** @description Graph metric names to project onto returned traversal nodes. */
+            metrics?: string[];
+            /** @description Sort traversal candidates by graph metric score before applying limit. */
+            order_by?: components["schemas"]["GraphMetricOrder"][];
+            /** @description Filter traversal candidates by graph metric score before applying limit. */
+            where_metric?: components["schemas"]["GraphMetricFilter"][];
+            /**
+             * @description Freshness required for projected, ordered, and filtered graph metrics.
+             * @default published
+             * @enum {string}
+             */
+            metric_freshness?: "published" | "fresh";
+            /**
+             * @description Include graph metric status metadata in the traversal profile.
+             * @default false
+             */
+            include_metric_status?: boolean;
             /** @description Non-scoring structured stored-document predicate for reached nodes. */
             filter?: components["schemas"]["GraphDocumentFilter"];
         };
@@ -13075,6 +13999,30 @@ export interface components {
             include_documents?: boolean;
             include_edges?: boolean;
             fields?: string[];
+            /** @description Graph metric names to project onto legacy graph_searches result nodes. */
+            metrics?: string[];
+            /** @description Sort legacy graph_searches result nodes by graph metric score. */
+            order_by?: components["schemas"]["GraphMetricOrder"][];
+            /** @description Filter legacy graph_searches result nodes by graph metric score. */
+            where_metric?: components["schemas"]["GraphMetricFilter"][];
+            /**
+             * @description Freshness required for projected, ordered, and filtered graph metrics.
+             * @enum {string}
+             */
+            metric_freshness?: "published" | "fresh";
+            /** @description Include graph metric status metadata in the legacy graph_searches result. */
+            include_metric_status?: boolean;
+        };
+        GraphMetricScore: {
+            node: string;
+            /** Format: double */
+            score: number;
+        };
+        GraphMetricResult: {
+            index_name: string;
+            metric: string;
+            scores: components["schemas"]["GraphMetricScore"][];
+            status: components["schemas"]["GraphMetricStatus"];
         };
         /** @description One exact node identity projected from a MATCH binding. Conjunctive bindings deliberately do not expose traversal depth, distance, or path: those values are not uniquely defined for branched patterns and may depend on execution order. */
         GraphBindingNode: {
@@ -13179,6 +14127,10 @@ export interface components {
             path_edges?: components["schemas"]["GraphPathEdge"][];
             /** @description Algebraic provenance labels folded into this result, when requested by an algebraic graph executor */
             provenance?: string[];
+            /** @description Projected graph metric scores keyed by metric name. Values are numbers or null when a requested metric has no score for the node. */
+            metrics?: {
+                [key: string]: unknown;
+            };
             /** @description Parsed evidence envelope for provenance labels and edge metadata */
             evidence?: {
                 [key: string]: unknown;
@@ -13193,6 +14145,10 @@ export interface components {
             kind: "nodes";
             /** @description Traversal result nodes; requested paths are stored on each node. */
             nodes: components["schemas"]["GraphResultNode"][];
+            /** @description Graph metric status metadata keyed by metric name when requested. */
+            metric_status?: {
+                [key: string]: components["schemas"]["GraphMetricStatus"];
+            };
             stats: components["schemas"]["GraphResultStats"];
         };
         /** @description An ordered canonical graph path with table-qualified node identities and a self-describing ranking score. */
@@ -13313,6 +14269,10 @@ export interface components {
              * @description Whole-query execution time in milliseconds; optional for compatibility with v0.2 responses. Use the parent query result's took field.
              */
             took?: number;
+            /** @description Graph metric status metadata keyed by metric name. */
+            metric_status?: {
+                [key: string]: components["schemas"]["GraphMetricStatus"];
+            };
         };
         /** @description Graph result emitted by the stateful compatibility transport. Canonical graph_queries produce GraphResult; deprecated graph_searches may produce LegacyGraphSearchResult during the compatibility window. */
         StatefulGraphResult: components["schemas"]["GraphResult"] | components["schemas"]["LegacyGraphSearchResult"];
@@ -13363,6 +14323,10 @@ export interface components {
             retryable?: boolean;
             /** @description Minimum retry delay in milliseconds */
             retry_after_ms?: number;
+            /** @description Input whose atomic extraction validation or decoding failed, when known */
+            input_index?: number;
+            /** @description Extraction failure stage, when known */
+            stage?: string;
         };
         /** @description Actionable retry contract for temporary inference-capacity failures. */
         InferenceTransientCapacityError: {
@@ -13775,6 +14739,8 @@ export interface components {
             /** @description Name of model used for reading */
             model: string;
             usage: components["schemas"]["InferenceGenerateUsage"];
+            /** @description Observed execution path. Omitted by older compatible servers. */
+            execution?: components["schemas"]["InferenceBatchExecutionReport"];
         };
         InferenceReadObject: components["schemas"]["InferenceReadResult"] & {
             /** @enum {string} */
@@ -13784,10 +14750,10 @@ export interface components {
         };
         InferenceTranscribeRequest: {
             /**
-             * @description Name of transcriber model from models_dir/transcribers/
+             * @description Explicit name of the transcriber model from models_dir/transcribers/. Required so direct and distributed execution resolve the same model.
              * @example openai/whisper-tiny
              */
-            model?: string;
+            model: string;
             /**
              * Format: byte
              * @description Base64-encoded audio data (WAV, MP3, FLAC, etc.)
@@ -13856,10 +14822,6 @@ export interface components {
             };
             /** @description Available reranking models */
             rerankers: {
-                [key: string]: components["schemas"]["InferenceModelInfo"];
-            };
-            /** @description Available zero-shot classification models */
-            classifiers: {
                 [key: string]: components["schemas"]["InferenceModelInfo"];
             };
             /** @description Available embedding models from models_dir/embedders/ */
@@ -14212,11 +15174,24 @@ export interface components {
             succeeded: number;
             failed: number;
         };
+        /** @description Observed executor behavior, not a capability prediction. */
+        InferenceBatchExecutionReport: {
+            requested_items: number;
+            native_batches: number;
+            native_items: number;
+            serial_items: number;
+            /** @description Items rejected before model execution by validation, resolution, or admission. */
+            rejected_items: number;
+            fallback_items: number;
+            fallback_reason?: string | null;
+        };
         InferenceGenerateBatchResponse: {
             /** @enum {string} */
             object: "generate.batch";
             data: components["schemas"]["InferenceGenerateBatchResultItem"][];
             summary: components["schemas"]["InferenceGenerateBatchSummary"];
+            /** @description Observed execution path. Omitted by older compatible servers. */
+            execution?: components["schemas"]["InferenceBatchExecutionReport"];
         };
         InferenceGenerateChoice: {
             /** @description Index of this choice in the list */
@@ -14449,10 +15424,14 @@ export interface components {
             max_concurrent_requests?: number;
             /**
              * Format: uri
-             * @description URL of the Antfly inference embedding/chunking service
+             * @description URL of an out-of-process Antfly inference service that the Antfly
+             *     server should call for embedding, chunking, reranking, and
+             *     generation. Omit it to use the in-process inference runtime
+             *     (the default in standalone mode). `antfly inference run` ignores
+             *     this field; it configures the client side only.
              * @example http://localhost:8080
              */
-            api_url: string;
+            api_url?: string;
             /** @description API key used when calling an authenticated shared Antfly inference API. */
             api_key?: string;
             /**
@@ -14475,7 +15454,7 @@ export interface components {
              * @example ~/.antfly/inference/ml
              */
             ml_dir?: string;
-            /** @description Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, and multimodal rerank, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation rejects multimodal content before fetch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline. */
+            /** @description Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, multimodal rerank, and batch generation, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation accepts bounded image and audio media parts and rejects malformed or unsupported parts before dispatch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline. */
             content_security?: components["schemas"]["InferenceContentSecurityConfig"];
             /** @description S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail. */
             s3_credentials?: components["schemas"]["InferenceCredentials"];
@@ -14666,7 +15645,7 @@ export interface components {
              * @default 30
              */
             download_timeout_seconds?: number;
-            /** @description Maximum source-image width or height for accepted inference image inputs, including generate/chat, dense embed, multimodal rerank, `/read`, image `/extract`, and their embedded direct APIs. Headers exceeding this limit are rejected before model execution; images are not resized. Batch generation rejects multimodal content before fetch. Non-inference scraping consumers do not enforce this setting. */
+            /** @description Maximum source-image width or height for accepted inference image inputs, including generate/chat, batch generation, dense embed, multimodal rerank, `/read`, image `/extract`, and their embedded direct APIs. Headers exceeding this limit are rejected before model execution; images are not resized. Batch generation applies the same image-header admission before model execution. Non-inference scraping consumers do not enforce this setting. */
             max_image_dimension?: number;
             /**
              * @description Explicit path-prefix allowlist for inference file:// and s3:// URLs. Omission and an explicit empty list both deny all file and S3 paths. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
@@ -14919,51 +15898,109 @@ export interface components {
         ExtensionError: {
             error: string;
         };
+        /**
+         * @description Omission preserves the legacy extraction contract. Version 2 opts into strict mixed-task schemas, per-input replacements and explicit offsets; the selected model/runtime must support every requested feature.
+         * @default 1
+         * @enum {integer}
+         */
+        ExtractionSchemaVersion: 1 | 2;
         ExtractionToken: {
             text: string;
             box?: number[];
         };
-        ExtractionInput: {
-            id?: string;
-            content: components["schemas"]["ChatMessageContent"];
-            tokens?: components["schemas"]["ExtractionToken"][];
-            metadata?: {
-                [key: string]: unknown;
-            };
-        };
+        /** Format: double */
+        ExtractionProbability: number;
         /** @description Optional source and target labels constrain relation endpoints. A target requires a source. */
         ExtractionRelationSchema: {
             type: string;
             source?: string;
             target?: string;
+            /** @description Version 2 model-facing relation description. */
+            description?: string;
+            threshold?: components["schemas"]["ExtractionProbability"];
         };
+        ExtractionLabelDefinition: {
+            /** @description Model-facing label description. */
+            description?: string;
+        };
+        /**
+         * Format: double
+         * @description Finite centered-logit decisions require a threshold strictly between zero and one.
+         */
+        ExtractionDecisionProbability: number;
+        ExtractionClassificationExample: {
+            input: string;
+            label: string;
+        } | string[];
         ExtractionClassificationSchema: {
             name: string;
             labels: string[];
-            /**
-             * @description When false, return the highest-ranked labels up to `top_k` (one by
-             *     default). When true, return every label meeting `options.threshold`.
-             * @default false
-             */
+            /** @description The server uses false when omitted. Version 1: return highest-ranked labels up to top_k when false, or labels meeting options.threshold when true. Version 2: selects ordinary single or multi classification unless mode is specified; classification.threshold controls the decision threshold. */
             multi_label?: boolean;
-            /**
-             * @description NLI hypothesis template for this named taxonomy. Use `{}` as the
-             *     candidate-label placeholder. Non-NLI extractors ignore this field.
-             * @default This example is {}.
-             */
+            /** @description Version 1 NLI hypothesis template with {} as the label placeholder; the server uses "This example is {}." when omitted. Version 2 GLiNER boundary extraction rejects an explicit hypothesis_template; use prompt/instruction and label_definitions for model conditioning. */
             hypothesis_template?: string;
-            /**
-             * @description Maximum labels returned for single-label classification. Ignored
-             *     when `multi_label` is true, where `options.threshold` controls the
-             *     returned set.
-             * @default 1
-             */
+            /** @description Maximum labels for ordinary single-label classification; the server uses 1 when omitted. Version 2 constrained or ordinal selection uses min_labels/max_labels. Advanced set-selection options or cross-task constraints on any classification in the collection reject every explicit top_k in that collection, including 1. Omit top_k when using these options. */
             top_k?: number;
+            /**
+             * @description Version 2 classification mode. Ordinal labels are ordered from lowest to highest.
+             * @enum {string}
+             */
+            mode?: "single" | "multi" | "ordinal";
+            label_definitions?: {
+                [key: string]: components["schemas"]["ExtractionLabelDefinition"];
+            };
+            min_labels?: number;
+            /** @description Version 2 maximum selected labels. Explicit null means no maximum; omission preserves mode defaults. */
+            max_labels?: number | null;
+            ordered?: boolean;
+            threshold?: components["schemas"]["ExtractionDecisionProbability"];
+            candidate_threshold?: components["schemas"]["ExtractionProbability"];
+            /** @enum {string} */
+            activation?: "auto" | "sigmoid" | "softmax";
+            /** Format: double */
+            temperature?: number;
+            /** @description Version 2 fallback label; must be declared in labels. */
+            default?: string;
+            /** @description Version 2 model-facing task instruction. Mutually exclusive with instruction. */
+            prompt?: string;
+            /** @description Alias of prompt. */
+            instruction?: string;
+            examples?: components["schemas"]["ExtractionClassificationExample"][];
+        };
+        ExtractionRegexValidator: {
+            /** @enum {string} */
+            type?: "regex";
+            pattern: string;
+            /**
+             * @default full
+             * @enum {string}
+             */
+            mode?: "full" | "partial";
+            /** @default false */
+            exclude?: boolean;
+            /**
+             * @description Python-compatible regex flags supported by the active bounded validator engine; unsupported flags or syntax fail validation.
+             * @default 2
+             */
+            flags?: number;
         };
         ExtractionStructureField: string | ({
             /** @enum {string} */
             type?: "str" | "string" | "list" | "array";
             enum?: string[];
+            /** @enum {string} */
+            dtype?: "str" | "list";
+            choices?: string[];
+            description?: string;
+            threshold?: components["schemas"]["ExtractionProbability"];
+            /**
+             * @description Version 2 explicit cardinality. Required fields are validated after record assignment.
+             * @enum {string}
+             */
+            cardinality?: "optional_one" | "required_one" | "zero_or_more" | "one_or_more";
+            /** @description Version 2 field spans cannot be assigned to multiple record instances. */
+            exclusive?: boolean;
+            validators?: components["schemas"]["ExtractionRegexValidator"][];
         } & {
             [key: string]: unknown;
         });
@@ -14971,13 +16008,302 @@ export interface components {
             fields: {
                 [key: string]: components["schemas"]["ExtractionStructureField"];
             };
+            /**
+             * @description Version 2 record grouping. Omission preserves one-record extraction.
+             * @enum {string}
+             */
+            mode?: "natural" | "latent" | "anchorless";
+            /** @description Natural mode only; defaults to the first declared field. */
+            anchor?: string;
+            /** @enum {string} */
+            occurrence_policy?: "all" | "first" | "error_on_ambiguous" | "latent_all";
         } & {
             [key: string]: unknown;
         };
+        ExtractionEntityDefinition: {
+            description?: string;
+            /** @enum {string} */
+            dtype?: "str" | "list";
+            /** @enum {string} */
+            type?: "str" | "string" | "list" | "array";
+            threshold?: components["schemas"]["ExtractionProbability"];
+            validators?: components["schemas"]["ExtractionRegexValidator"][];
+        };
+        /** @description Version 2 attributes are scored on retained entity spans using shared encoded states. Omitted applies_to selects all entities; [] selects none. Raw labels must be unique across groups, including when qualify_labels is true. Group names text,confidence,start,end are reserved. */
+        ExtractionAttributeGroup: {
+            labels: string[];
+            /** @default false */
+            multi_label?: boolean;
+            threshold?: components["schemas"]["ExtractionProbability"];
+            applies_to?: string[];
+            /** @default false */
+            qualify_labels?: boolean;
+        };
+        ExtractionConstraintLabelRef: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "LabelRef";
+            task: string;
+            label: string;
+        };
+        ExtractionConstraintAnySelected: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "AnySelected";
+            task: string;
+        };
+        ExtractionConstraintAnyOtherSelected: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "AnyOtherSelected";
+            task: string;
+        };
+        ExtractionConstraintIsDefault: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "IsDefault";
+            task: string;
+        };
+        ExtractionConstraintCardinality: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "Cardinality";
+            task: string;
+            minimum?: number;
+            maximum?: number | null;
+        };
+        ExtractionConstraintMinLevel: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "MinLevel";
+            task: string;
+            level: string | number;
+        };
+        ExtractionConstraintMaxLevel: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "MaxLevel";
+            task: string;
+            level: string | number;
+        };
+        ExtractionConstraintAtLevel: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "AtLevel";
+            task: string;
+            level: string | number;
+        };
+        ExtractionConstraintNot: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "Not";
+            child: components["schemas"]["ExtractionClassificationConstraint"];
+        };
+        ExtractionConstraintAnd: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "And";
+            children: components["schemas"]["ExtractionClassificationConstraint"][];
+        };
+        ExtractionConstraintOr: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "Or";
+            children: components["schemas"]["ExtractionClassificationConstraint"][];
+        };
+        ExtractionConstraintExactlyOneOf: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "ExactlyOneOf";
+            children: components["schemas"]["ExtractionClassificationConstraint"][];
+        };
+        ExtractionConstraintImplies: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "Implies";
+            cond: components["schemas"]["ExtractionClassificationConstraint"];
+            then: components["schemas"]["ExtractionClassificationConstraint"];
+        };
+        ExtractionConstraintIff: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "Iff";
+            left: components["schemas"]["ExtractionClassificationConstraint"];
+            right: components["schemas"]["ExtractionClassificationConstraint"];
+        };
+        ExtractionConstraintExcludes: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "Excludes";
+            left: components["schemas"]["ExtractionClassificationConstraint"];
+            right: components["schemas"]["ExtractionClassificationConstraint"];
+        };
+        /** @description Declarative, bounded constraint AST. Task and label references are validated before inference. Nesting is bounded by the server schema limit. */
+        ExtractionClassificationConstraint: components["schemas"]["ExtractionConstraintLabelRef"] | components["schemas"]["ExtractionConstraintAnySelected"] | components["schemas"]["ExtractionConstraintAnyOtherSelected"] | components["schemas"]["ExtractionConstraintIsDefault"] | components["schemas"]["ExtractionConstraintCardinality"] | components["schemas"]["ExtractionConstraintMinLevel"] | components["schemas"]["ExtractionConstraintMaxLevel"] | components["schemas"]["ExtractionConstraintAtLevel"] | components["schemas"]["ExtractionConstraintNot"] | components["schemas"]["ExtractionConstraintAnd"] | components["schemas"]["ExtractionConstraintOr"] | components["schemas"]["ExtractionConstraintExactlyOneOf"] | components["schemas"]["ExtractionConstraintImplies"] | components["schemas"]["ExtractionConstraintIff"] | components["schemas"]["ExtractionConstraintExcludes"];
+        ExtractionJointEntity: {
+            description?: string;
+            threshold?: components["schemas"]["ExtractionDecisionProbability"];
+            candidate_threshold?: components["schemas"]["ExtractionProbability"];
+            max_candidates?: number;
+            allow_nested?: boolean;
+        };
+        ExtractionJointRelation: {
+            head: string[];
+            tail: string[];
+            /** @description Retained declarative metadata; model conditioning follows the pinned JointIE compiler. */
+            description?: string;
+            threshold?: components["schemas"]["ExtractionDecisionProbability"];
+            candidate_threshold?: components["schemas"]["ExtractionProbability"];
+            /** @default true */
+            directed?: boolean;
+            /** @default false */
+            symmetric?: boolean;
+            inverse?: string;
+            /** @default false */
+            allow_self?: boolean;
+            max_per_head?: number;
+            max_per_tail?: number;
+        };
+        ExtractionJointConstraintTypedEndpoints: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "TypedEndpoints";
+            relation?: string;
+            head_types?: string[];
+            tail_types?: string[];
+        };
+        ExtractionJointConstraintNoSelfLoops: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "NoSelfLoops";
+            relation?: string;
+        };
+        ExtractionJointConstraintUniqueRelationPair: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "UniqueRelationPair";
+            relation?: string;
+            /** @default true */
+            directed?: boolean;
+        };
+        ExtractionJointConstraintUniqueRelationSlot: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "UniqueRelationSlot";
+            relation?: string;
+            /**
+             * @default head
+             * @enum {string}
+             */
+            slot?: "head" | "tail" | "slot";
+        };
+        ExtractionJointConstraintEntityOverlapPolicy: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "EntityOverlapPolicy";
+            /** @enum {string} */
+            policy?: "allow" | "disallow" | "nested";
+        };
+        ExtractionJointConstraintMaxRelationsPerHead: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "MaxRelationsPerHead";
+            relation?: string;
+            limit: number;
+        };
+        ExtractionJointConstraintMaxRelationsPerTail: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "MaxRelationsPerTail";
+            relation?: string;
+            limit: number;
+        };
+        ExtractionJointConstraintSymmetricRelation: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "SymmetricRelation";
+            relation: string;
+        };
+        ExtractionJointConstraintAcyclicRelation: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "AcyclicRelation";
+            relation: string;
+        };
+        ExtractionJointConstraintInverseRelation: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "InverseRelation";
+            relation: string;
+            inverse: string;
+        };
+        ExtractionJointConstraint: components["schemas"]["ExtractionJointConstraintTypedEndpoints"] | components["schemas"]["ExtractionJointConstraintNoSelfLoops"] | components["schemas"]["ExtractionJointConstraintUniqueRelationPair"] | components["schemas"]["ExtractionJointConstraintUniqueRelationSlot"] | components["schemas"]["ExtractionJointConstraintEntityOverlapPolicy"] | components["schemas"]["ExtractionJointConstraintMaxRelationsPerHead"] | components["schemas"]["ExtractionJointConstraintMaxRelationsPerTail"] | components["schemas"]["ExtractionJointConstraintSymmetricRelation"] | components["schemas"]["ExtractionJointConstraintAcyclicRelation"] | components["schemas"]["ExtractionJointConstraintInverseRelation"];
+        /** @description Separate typed graph schema, mutually exclusive with ordinary extraction families. Hard typed endpoints, overlap, uniqueness and declared graph constraints apply to every returned edge, including derived companions. */
+        ExtractionJointSchema: {
+            entities: {
+                [key: string]: string | components["schemas"]["ExtractionJointEntity"];
+            };
+            relations?: {
+                [key: string]: components["schemas"]["ExtractionJointRelation"];
+            };
+            constraints?: components["schemas"]["ExtractionJointConstraint"][];
+        };
         /**
-         * @description Selects one extraction operation family per request. Entity labels may
-         *     accompany relation schemas so relation extraction can return its
-         *     participating entities in the same response.
+         * @description Version 1 selects one extraction family; entities may accompany relations.
+         *     With schema_version 2, entities, attributes, classifications, structures,
+         *     and ordinary relations may share one encoded input. joint_ie is a separate,
+         *     mutually exclusive typed graph schema. The version 2 compiler rejects
+         *     unknown fields and validates all references before model execution.
          */
         ExtractionSchema: {
             entities?: string[];
@@ -14986,8 +16312,66 @@ export interface components {
             structures?: {
                 [key: string]: components["schemas"]["ExtractionStructureSchema"];
             };
+            entity_definitions?: {
+                [key: string]: components["schemas"]["ExtractionEntityDefinition"];
+            };
+            entity_attributes?: {
+                [key: string]: components["schemas"]["ExtractionAttributeGroup"];
+            };
+            classification_constraints?: components["schemas"]["ExtractionClassificationConstraint"][];
+            joint_ie?: components["schemas"]["ExtractionJointSchema"];
         } & {
             [key: string]: unknown;
+        };
+        /**
+         * @description Half-open offsets into the immutable caller text. Version 2 defaults to utf8_bytes. No normalization, lowercasing or synthetic suffix is included in these coordinates.
+         * @enum {string}
+         */
+        ExtractionOffsetUnit: "utf8_bytes" | "unicode_codepoints" | "utf16_codeunits";
+        /** @description Version 2 never silently truncates. Reject is the default. Windowing requires an enabled runtime capability, reconstructs document-global offsets and revalidates all hard graph constraints after merging. */
+        ExtractionLongDocumentOptions: {
+            /**
+             * @default reject
+             * @enum {string}
+             */
+            mode?: "reject" | "window";
+            /** @description Maximum body words per window; also bounded by the checkpoint and encoded token limits. */
+            window_words?: number;
+            overlap_words?: number;
+            max_windows?: number;
+            /**
+             * @description Identity of latent, anchorless and legacy records across windows. Occurrence uses exact source spans; semantic explicitly merges equal field values. Natural records always use their exact source anchor. This is independent of annotation occurrence_policy.
+             * @default occurrence
+             * @enum {string}
+             */
+            record_identity?: "occurrence" | "semantic";
+        };
+        /** @description Bounded classification and JointIE selection. Exact optimality is with respect to admitted candidates. A completed beam may be feasible without an optimality proof. By default exhausted search is an error; best_effort permits only a validated feasible witness and reports exhausted:true. */
+        ExtractionDecoderOptions: {
+            /**
+             * @description Omit to use the model's per-task default. GLiNER2.5 uses source-compatible beam selection for single-window JointIE and automatic selection for classification. Windowed JointIE uses the native automatic global solver with independent window resources. Explicit values select the native bounded search algorithm.
+             * @enum {string}
+             */
+            algorithm?: "auto" | "exact" | "beam";
+            beam_width?: number;
+            max_search_nodes?: number;
+            max_local_assignments?: number;
+            /** @default false */
+            best_effort?: boolean;
+        };
+        /** @description JointIE proposal admission and utility calibration. Entity candidate caps are bypassed for endpoints of retained relation proposals, subject to server hard bounds. entity_threshold overrides candidate admission, not entity decision thresholds. */
+        ExtractionJointOptions: {
+            candidate_threshold?: components["schemas"]["ExtractionProbability"];
+            entity_threshold?: components["schemas"]["ExtractionProbability"];
+            relation_role_threshold?: components["schemas"]["ExtractionProbability"];
+            top_k_entities?: number;
+            top_k_roles?: number;
+            relation_pair_cap?: number;
+            max_edges_per_type?: number;
+            /** Format: double */
+            entity_weight?: number;
+            /** Format: double */
+            relation_weight?: number;
         };
         ExtractionReaderOptions: {
             provider?: string;
@@ -15027,17 +16411,50 @@ export interface components {
             flat_ner?: boolean;
             include_confidence?: boolean;
             include_spans?: boolean;
+            /**
+             * @description Version 2 source word splitting. char keeps ASCII alphanumeric and @._-+ runs together and splits other non-whitespace codepoints, preserving original source offsets. An input's options replace the shared options in full; omitted word_splitter uses whitespace. Explicit word_splitter is rejected by version 1.
+             * @enum {string}
+             */
+            word_splitter?: "whitespace" | "char";
+            /**
+             * @description Version 2 overlap selection. flat/disallow prohibit overlap, nested permits containment, longest removes strictly contained spans.
+             * @enum {string}
+             */
+            overlap?: "allow" | "nested" | "flat" | "disallow" | "longest";
+            offset_unit?: components["schemas"]["ExtractionOffsetUnit"];
+            long_document?: components["schemas"]["ExtractionLongDocumentOptions"];
+            decoder?: components["schemas"]["ExtractionDecoderOptions"];
+            joint_ie?: components["schemas"]["ExtractionJointOptions"];
             reader?: components["schemas"]["ExtractionReaderOptions"];
             resolver?: components["schemas"]["ExtractionResolverOptions"];
         } & {
             [key: string]: unknown;
         };
+        ExtractionInput: {
+            id?: string;
+            content: components["schemas"]["ChatMessageContent"];
+            tokens?: components["schemas"]["ExtractionToken"][];
+            metadata?: {
+                [key: string]: unknown;
+            };
+            /** @description Version 2 only. Replaces the complete shared schema for this input. */
+            schema?: components["schemas"]["ExtractionSchema"];
+            /** @description Version 2 only. Replaces the complete shared options; omitted fields use runtime defaults. */
+            options?: components["schemas"]["ExtractionOptions"];
+        };
+        /** @description Atomic extraction request. Every input is validated before inference; failures return no partial data. */
         ExtractionRequest: {
             model: string;
+            schema_version?: components["schemas"]["ExtractionSchemaVersion"];
             inputs: components["schemas"]["ExtractionInput"][];
             schema: components["schemas"]["ExtractionSchema"];
             options?: components["schemas"]["ExtractionOptions"];
         };
+        ExtractionAttributeLabel: {
+            label: string;
+            confidence: components["schemas"]["ExtractionProbability"];
+        };
+        ExtractionAttributeSelection: components["schemas"]["ExtractionAttributeLabel"] | components["schemas"]["ExtractionAttributeLabel"][];
         ExtractionEntity: {
             label: string;
             text: string;
@@ -15045,10 +16462,22 @@ export interface components {
             end?: number;
             /** Format: float */
             score?: number;
+            /** @description Version 2 span attributes. Attribute confidence is retained independently of include_confidence. */
+            attributes?: {
+                [key: string]: components["schemas"]["ExtractionAttributeSelection"];
+            };
         };
         ExtractionRelationEndpoint: {
             entity_index?: number;
             id?: string;
+            /** @description Entity type when the endpoint has a typed identity. */
+            label?: string;
+            /** @description Version 2 endpoint surface, including endpoints absent from the entities list. */
+            text?: string;
+            start?: number;
+            end?: number;
+            /** Format: float */
+            score?: number;
         } & {
             [key: string]: unknown;
         };
@@ -15058,6 +16487,8 @@ export interface components {
             target?: components["schemas"]["ExtractionRelationEndpoint"];
             /** Format: float */
             score?: number;
+            /** @description Version 2 inverse or symmetric companion derived from a selected relation. */
+            derived?: boolean;
         } & {
             [key: string]: unknown;
         };
@@ -15069,14 +16500,59 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        ExtractionRecordMetadata: {
+            score?: components["schemas"]["ExtractionProbability"];
+            anchor?: {
+                start: number;
+                end: number;
+            };
+        };
+        ExtractionSolverStatus: {
+            /** @enum {string} */
+            status: "optimal" | "feasible";
+            /** Format: double */
+            utility: number;
+            visited_nodes: number;
+            exhausted: boolean;
+        };
+        ExtractionSolverDiagnostics: {
+            classification?: components["schemas"]["ExtractionSolverStatus"];
+            joint_ie?: components["schemas"]["ExtractionSolverStatus"];
+            records?: components["schemas"]["ExtractionSolverStatus"];
+        };
+        ExtractionLongDocumentMetadata: {
+            /** @enum {integer} */
+            version: 1;
+            window_count: number;
+            /** @enum {string} */
+            window_policy: "source_words_midpoint_ownership";
+            /** @enum {string} */
+            classification_aggregation: "owned_word_weighted_mean_raw_logits";
+            /** @enum {string} */
+            duplicate_score: "maximum_calibrated_score";
+            /** @enum {string} */
+            natural_record_identity: "exact_source_anchor";
+            /** @enum {string} */
+            other_record_identity: "occurrence" | "semantic";
+            /** @enum {string} */
+            solver_optimality_scope: "retained_candidate_graph";
+        };
         ExtractionObject: {
             id?: string;
+            offset_unit?: components["schemas"]["ExtractionOffsetUnit"];
             entities?: components["schemas"]["ExtractionEntity"][];
             relations?: components["schemas"]["ExtractionRelation"][];
             classifications?: components["schemas"]["ExtractionClassification"][];
+            /** @description Structure name to record array. Each record maps field names to value objects or arrays of value objects; v2 value objects follow ExtractionFieldValue. */
             structures?: {
                 [key: string]: unknown;
             };
+            /** @description Version 2 metadata arrays aligned with each named structure's record array. */
+            structure_metadata?: {
+                [key: string]: components["schemas"]["ExtractionRecordMetadata"][];
+            };
+            solvers?: components["schemas"]["ExtractionSolverDiagnostics"];
+            long_document?: components["schemas"]["ExtractionLongDocumentMetadata"];
         } & {
             [key: string]: unknown;
         };
@@ -15084,6 +16560,7 @@ export interface components {
             /** @enum {string} */
             object: "extraction";
             model: string;
+            schema_version?: components["schemas"]["ExtractionSchemaVersion"];
             data: components["schemas"]["ExtractionObject"][];
             usage?: {
                 [key: string]: unknown;
@@ -15133,6 +16610,15 @@ export interface components {
         };
     };
     responses: {
+        /** @description Mutation committed with pending visibility or explicit repair debt */
+        CommittedMutationAccepted: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["CommittedMutationOutcome"];
+            };
+        };
         /** @description Bad request */
         BadRequest: {
             headers: {
@@ -15205,6 +16691,22 @@ export interface components {
             };
             content: {
                 "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description Restore admission could not be confirmed. If X-Antfly-Raft-Mutation-Outcome is unknown-v1, the job may still commit. Poll Location or retry the identical request using the returned Idempotency-Key. A missing job does not prove non-admission. Supply a stable key on the first request to recover if the entire response is lost. Without the unknown marker, this is a regular service or validation availability failure. */
+        RestoreAdmissionUnavailable: {
+            headers: {
+                /** @description Recovery job resource, present for an unknown admission outcome. */
+                Location?: string;
+                /** @description Reuse this key with the identical request and authenticated principal. */
+                "Idempotency-Key"?: string;
+                /** @description An unknown-v1 value prohibits replay with a new key. */
+                "X-Antfly-Raft-Mutation-Outcome"?: "unknown-v1";
+                "Retry-After"?: number;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["IndexMutationServiceUnavailableError"] | components["schemas"]["Error"];
             };
         };
         /** @description Index validation is temporarily unavailable or a distributed rolling upgrade has not yet converged. */
@@ -15771,6 +17273,65 @@ export interface operations {
             };
         };
     };
+    executeGraphMetricAction: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the graph index */
+                indexName: string;
+                /** @description Name of the configured graph metric */
+                metricName: string;
+                /** @description Operational action to apply to the graph metric materialization */
+                action: "refresh" | "rebuild" | "delete" | "pause" | "resume";
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Aggregate graph metric status after the action is durably accepted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphMetricActionResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Graph metric actions are unavailable for this runtime */
+            405: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description The table topology or write-owner generation changed, or only some shards accepted the action; retrying is consistency-safe and reuses any still-active build */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+            /** @description Local storage resources are temporarily exhausted */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
     commitTransaction: {
         parameters: {
             query?: never;
@@ -16213,7 +17774,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Stable key used to safely retry creation of this restore job. Keys are scoped to the authenticated principal and cluster restore target. Requests without this header create a new job. */
+                /** @description Stable key used to safely retry creation of this restore job. Keys are scoped to the authenticated principal and cluster restore target. Requests without this header create a new job and return its generated key. Reuse that key after an unknown admission outcome; supply a key initially to recover from losing the entire response. */
                 "Idempotency-Key"?: string;
             };
             path?: never;
@@ -16228,6 +17789,8 @@ export interface operations {
             /** @description Restore job durably accepted */
             202: {
                 headers: {
+                    /** @description Recovery key for retries of this request. */
+                    "Idempotency-Key"?: string;
                     /** @description Relative URL of the durable restore job resource. */
                     Location?: string;
                     /** @description Suggested polling delay in seconds. */
@@ -16250,7 +17813,7 @@ export interface operations {
                 };
             };
             500: components["responses"]["InternalServerError"];
-            503: components["responses"]["ServiceUnavailable"];
+            503: components["responses"]["RestoreAdmissionUnavailable"];
         };
     };
     listRestoreJobs: {
@@ -16639,6 +18202,7 @@ export interface operations {
                     "application/json": components["schemas"]["Table"];
                 };
             };
+            202: components["responses"]["CommittedMutationAccepted"];
             400: components["responses"]["IndexMutationBadRequest"];
             /** @description Durable destinations cannot be bound to this credential type */
             422: {
@@ -16664,6 +18228,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
+            202: components["responses"]["CommittedMutationAccepted"];
             /** @description Table dropped successfully */
             204: {
                 headers: {
@@ -16854,7 +18419,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Stable key used to safely retry creation of this restore job. Keys are scoped to the authenticated principal and table. Requests without this header create a new job. */
+                /** @description Stable key used to safely retry creation of this restore job. Keys are scoped to the authenticated principal and table. Requests without this header create a new job and return its generated key. Reuse that key after an unknown admission outcome; supply a key initially to recover from losing the entire response. */
                 "Idempotency-Key"?: string;
             };
             path: {
@@ -16872,6 +18437,8 @@ export interface operations {
             /** @description Durable restore job accepted */
             202: {
                 headers: {
+                    /** @description Recovery key for retries of this request. */
+                    "Idempotency-Key"?: string;
                     /** @description Relative URL of the durable restore job resource. */
                     Location?: string;
                     /** @description Suggested polling delay in seconds. */
@@ -16894,7 +18461,7 @@ export interface operations {
                 };
             };
             500: components["responses"]["InternalServerError"];
-            503: components["responses"]["IndexMutationServiceUnavailable"];
+            503: components["responses"]["RestoreAdmissionUnavailable"];
         };
     };
     reauthorizeTableDestinations: {
@@ -16976,6 +18543,7 @@ export interface operations {
                     "application/json": components["schemas"]["Table"];
                 };
             };
+            202: components["responses"]["CommittedMutationAccepted"];
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
@@ -17013,6 +18581,7 @@ export interface operations {
                     "application/json": components["schemas"]["Table"];
                 };
             };
+            202: components["responses"]["CommittedMutationAccepted"];
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
@@ -17239,6 +18808,46 @@ export interface operations {
         requestBody?: {
             content: {
                 "application/json": components["schemas"]["TableRepairJobStartRequest"];
+            };
+        };
+        responses: {
+            /** @description Job completed during the initial advance. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableRepairJob"];
+                };
+            };
+            /** @description Repair job accepted or advanced but not terminal. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableRepairJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    startTableRepairControlJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TableRepairControlJobStartRequest"];
             };
         };
         responses: {
@@ -19777,8 +21386,17 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Media content exceeds the configured size limit */
+            /** @description Media, text, schema, candidate graph, or output exceeds a configured size/work limit */
             413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Extraction hard constraints are infeasible, required record fields are missing, or bounded search exhausted without an accepted feasible witness */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

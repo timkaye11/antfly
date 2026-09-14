@@ -15,6 +15,7 @@
 const std = @import("std");
 const structlog = @import("structlog");
 const inference = @import("inference");
+const build_info = @import("build_info");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 
@@ -452,7 +453,9 @@ fn consumeParsedMaxLoadedModelsOption(args: []const []const u8, index: *usize) b
     return true;
 }
 
-fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+/// Also used by the focused resident-server benchmark executable, so its
+/// argument parsing, resource ownership and HTTP routes remain production code.
+pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     structlog.init(.{ .formatter = .json, .level = .info });
 
     var host: []const u8 = "127.0.0.1";
@@ -543,7 +546,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         }
     }
 
-    print("antfly inference v{s}\n", .{build_options.inference_version});
+    print("antfly inference v{s}\n", .{build_info.version()});
     print("backends: native={} onnx={} onnx_runtime={} metal={} cuda={}\n", .{
         build_options.enable_native,
         !build_options.enable_wasm,
@@ -760,7 +763,7 @@ fn isPredictorPull(args: []const []const u8) bool {
 }
 
 pub fn printVersion() void {
-    print("antfly inference v{s}\n", .{build_options.inference_version});
+    print("antfly inference v{s}\n", .{build_info.version()});
     print("backends: native={} onnx={} onnx_runtime={} metal={} cuda={}\n", .{
         build_options.enable_native,
         !build_options.enable_wasm,
