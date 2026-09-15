@@ -472,9 +472,12 @@ def _validate_checkpoint_contract(path: Path, targets: Sequence[Mapping[str, Any
         for target in targets:
             slot = str(target["trainer_slot_name"])
             shape = tuple(_integer(dim, "capture target shape", minimum=1) for dim in _list(target["shape"], "capture target shape"))
+            # RealAutodiffTrainer serializes each training-state slot as a
+            # flat vector; the independently bound adapter supplies its shape.
+            checkpoint_shape = (math.prod(shape),)
             for prefix in ("weight", "adam_m", "adam_v", "grad_accum"):
                 tensor = source.get_tensor(f"{prefix}::{slot}")
-                if tensor.dtype.name != "float32" or tuple(tensor.shape) != shape:
+                if tensor.dtype.name != "float32" or tuple(tensor.shape) != checkpoint_shape:
                     raise ContractError(f"checkpoint {prefix} tensor metadata differs for {slot}")
                 if not bool((tensor == tensor).all()) or not bool(abs(tensor).max(initial=0) < float("inf")):
                     raise ContractError(f"checkpoint {prefix} tensor is non-finite for {slot}")
@@ -724,21 +727,21 @@ def _build_trace_tensor_store(
             checkpoint_weight = _tensor_f32(
                 checkpoint_source,
                 str(target["checkpoint_weight_storage_key"]),
-                shape,
+                (math.prod(shape),),
                 "trainer checkpoint",
-            )
+            ).reshape(shape)
             optimizer_m = _tensor_f32(
                 checkpoint_source,
                 str(target["checkpoint_m_storage_key"]),
-                shape,
+                (math.prod(shape),),
                 "trainer checkpoint",
-            )
+            ).reshape(shape)
             optimizer_v = _tensor_f32(
                 checkpoint_source,
                 str(target["checkpoint_v_storage_key"]),
-                shape,
+                (math.prod(shape),),
                 "trainer checkpoint",
-            )
+            ).reshape(shape)
             if not np.array_equal(updated, checkpoint_weight):
                 raise ContractError(f"candidate adapter and trainer checkpoint weights differ for {identity}")
 

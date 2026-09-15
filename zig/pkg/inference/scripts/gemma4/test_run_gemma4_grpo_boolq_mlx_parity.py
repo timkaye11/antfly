@@ -124,6 +124,49 @@ class BoolQGrpoMlxParityTests(unittest.TestCase):
             )
             self.assertEqual((7, 7), groups[0].token_ids)
 
+    def test_shuffled_trace_preserves_update_order_and_prompt_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "trace.jsonl"
+            rows = [
+                self._trace_row(
+                    call_index=index,
+                    prompt_index=prompt,
+                    token_id=7 + prompt,
+                    reward=1.0,
+                )
+                for index, prompt in enumerate((1, 1, 0, 0))
+            ]
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            trace = parity.load_trace(path, phase="train", expected_groups=2, group_size=2)
+            self.assertEqual([1, 0], [group.prompt_index for group in trace])
+            source = [
+                parity.BoolQRow("first", "yes", (10,), "train", 17, "first-id"),
+                parity.BoolQRow("second", "no", (20,), "train", 42, "second-id"),
+            ]
+            ordered = parity.rows_in_prompt_order(source, [group.prompt_index for group in trace])
+            self.assertEqual(["second-id", "first-id"], [row.source_id for row in ordered])
+
+            class Tokenizer:
+                def decode(self, tokens: list[int], **_kwargs: object) -> str:
+                    return {7: "yes", 8: "no"}[tokens[0]]
+
+            parity._validate_trace_rewards(Tokenizer(), ordered, trace)
+            with self.assertRaises(parity.BoolQParityContractError):
+                parity.rows_in_prompt_order(source, [trace[0].prompt_index, trace[0].prompt_index])
+
+    def test_trace_rejects_interleaved_optimizer_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "trace.jsonl"
+            rows = [
+                self._trace_row(
+                    call_index=index, prompt_index=prompt, token_id=7, reward=1.0
+                )
+                for index, prompt in enumerate((0, 1, 0, 1))
+            ]
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            with self.assertRaisesRegex(parity.BoolQParityContractError, "interleaved"):
+                parity.load_trace(path, phase="train", expected_groups=2, group_size=2)
+
     def _materialization(self, root: Path) -> Path:
         train = root / "train.jsonl"
         evaluation = root / "eval.jsonl"
@@ -245,7 +288,7 @@ class BoolQGrpoMlxParityTests(unittest.TestCase):
             {"reference_mode": parity.ANTFLY_LEGACY_REFERENCE_MODE}, {}
         )
 
-    def test_v4_kl_control_trace_is_digest_bound_and_fully_admitted(self) -> None:
+    def test_current_kl_control_trace_is_digest_bound_and_fully_admitted(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp).resolve()
             trace_path = root / "grpo_kl_control_trace.jsonl"
@@ -254,9 +297,12 @@ class BoolQGrpoMlxParityTests(unittest.TestCase):
                     "schema_version": parity.GRPO_KL_TRACE_SCHEMA_VERSION,
                     "group_index": index,
                     "optimizer_steps_before": index,
+                    "observed_completions": parity.FIXED_GROUP_SIZE,
                     "status": "admitted",
                     "budget_policy": "skip_group",
                     "mean_kl": 0.001,
+                    "kl_coef_before": 0.04,
+                    "objective_kl_coef": 0.04,
                     "train_max_kl": 0.1,
                 }
                 for index in range(parity.FIXED_TRAIN_GROUPS)
@@ -270,9 +316,10 @@ class BoolQGrpoMlxParityTests(unittest.TestCase):
                 return "sha256:" + hashlib.sha256(trace_path.read_bytes()).hexdigest()
 
             report = {
-                "schema_version": "antfly_inference_finetune_grpo_report/v4",
+                "schema_version": "antfly_inference_finetune_grpo_report/v10",
                 "mean_kl": 0.001,
                 "kl_control": {
+                    "kl_horizon_unit": "completion-episodes",
                     "trace_path": str(trace_path),
                     "trace_digest": write_trace(),
                 },
@@ -331,6 +378,37 @@ class BoolQGrpoMlxParityTests(unittest.TestCase):
                     metal_wheel_path=metal_wheel,
                     expected_version="0.31.2",
                 )
+
+    def test_same_length_rotated_updates_do_not_pass_vector_parity(self) -> None:
+        evaluation = {
+            "mean_reward": 0.5, "top_rank_mean_reward": 0.75, "kl_loss": 0.0,
+            "candidate_overlap_with_antfly": {"mean_recall": 1.0, "top1_match_rate": 1.0},
+        }
+        adapter = {
+            "delta_cosine_similarity": 0.995,
+            "delta_l2_relative_difference": 0.0,
+            "delta_vector_l2_relative_error": 0.1,
+            "delta_max_abs_difference": 1e-7,
+        }
+        for vector_error in (0.1, None, float("nan")):
+            with self.subTest(vector_error=vector_error):
+                adapter["delta_vector_l2_relative_error"] = vector_error
+                assessment = parity.assess_parity(
+                    antfly_evaluation=evaluation, baseline_evaluation=evaluation,
+                    native_evaluation=evaluation,
+                    trace_training={"candidate_overlap_with_antfly": {"exact_set_rate": 1.0}},
+                    trace_adapter=adapter, native_quality_passed=True,
+                )
+                self.assertFalse(assessment["numerical"]["passed"])
+        adapter["delta_vector_l2_relative_error"] = 0.01
+        adapter["delta_cosine_similarity"] = 0.99995
+        assessment = parity.assess_parity(
+            antfly_evaluation=evaluation, baseline_evaluation=evaluation,
+            native_evaluation=evaluation,
+            trace_training={"candidate_overlap_with_antfly": {"exact_set_rate": 1.0}},
+            trace_adapter=adapter, native_quality_passed=True,
+        )
+        self.assertTrue(assessment["numerical"]["passed"])
 
     def test_parity_assessment_does_not_hide_update_drift(self) -> None:
         antfly = {

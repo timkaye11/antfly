@@ -219,7 +219,7 @@ if task == "grpo":
 final_examples = epochs * per_epoch
 common = {
     "schema_version": ("antfly_inference_finetune_dpo_report/v7"
-                       if task == "dpo" else "antfly_inference_finetune_grpo_report/v8"),
+                       if task == "dpo" else "antfly_inference_finetune_grpo_report/v10"),
     "execution_mode": "train", "dataset_format": "text-preference" if task == "dpo" else "text-grpo",
     "policy_backend": "metal", "optimizer_steps": final_examples,
     "micro_batch_steps": final_examples * (2 if task == "dpo" else 4),

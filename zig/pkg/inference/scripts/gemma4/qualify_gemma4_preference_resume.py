@@ -32,7 +32,7 @@ from typing import Any, Mapping, Sequence
 
 SCHEMA_VERSION = "antfly_gemma4_preference_resume_qualification/v4"
 DPO_REPORT_SCHEMA_VERSION = "antfly_inference_finetune_dpo_report/v7"
-GRPO_REPORT_SCHEMA_VERSION = "antfly_inference_finetune_grpo_report/v8"
+GRPO_REPORT_SCHEMA_VERSION = "antfly_inference_finetune_grpo_report/v10"
 GRPO_TRAINING_ORDER = {
     "algorithm": "seeded-fisher-yates-per-epoch/v1",
     "stream_derivation": "run-seed-order-domain-epoch-dataset-size/v1",

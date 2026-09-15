@@ -1152,6 +1152,7 @@ typedef struct termite_metal_decode_runtime {
     // total threads, which is pure serial latency on the planned frame
     // encoders at MTP-verify shapes.
     id<MTLComputePipelineState> rms_norm_rows_reduce_pipeline;
+    id<MTLComputePipelineState> rms_norm_rows_precise_reduce_pipeline;
     // A4B decode specialization: vectorized loads/stores plus SIMD-group
     // reduction avoids the eight threadgroup-wide barriers in the generic
     // reduce kernel. Kept behind TERMITE_METAL_ENABLE_A4B_PARALLEL_RMS_NORM.
@@ -1189,6 +1190,7 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> linear_bf16_multi_row_shared_reduce_pipeline;
     id<MTLComputePipelineState> linear_bf16_multi_row_tiled32_m16_pipeline;
     id<MTLComputePipelineState> linear_bf16_multi_row_simdgroup_pipeline;
+    id<MTLComputePipelineState> linear_bf16_multi_row_compensated_pipeline;
     id<MTLComputePipelineState> linear_bf16_multi_row_simdgroup_m64_pipeline;
     id<MTLComputePipelineState> linear_bf16_multi_row_simdgroup_m64_packed_pipeline;
     id<MTLComputePipelineState> gemma4_bf16_gate_up_simdgroup_m64_pipeline;
@@ -1262,6 +1264,8 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> linear_cce_tile_stats_pipeline;
     id<MTLComputePipelineState> linear_cce_finalize_pipeline;
     id<MTLComputePipelineState> linear_cce_grad_tile_pipeline;
+    id<MTLComputePipelineState> linear_cce_backward_bf16_blocked_pipeline;
+    id<MTLComputePipelineState> linear_cce_backward_bf16_small_blocked_pipeline;
     id<MTLComputePipelineState> linear_cce_grad_tile_f16_pipeline;
     id<MTLComputePipelineState> linear_bf16_to_f16_pipeline;
     id<MTLComputePipelineState> reduce_last_dim_pipeline;
@@ -8380,7 +8384,10 @@ static NSString *termite_metal_shader_source(void) {
 	           "    if (row < p.rows && col2 < p.out_dim) output[row * p.out_dim + col2] = acc2;\n"
 	           "    if (row < p.rows && col3 < p.out_dim) output[row * p.out_dim + col3] = acc3;\n"
 	           "}\n"
-	           "kernel void termite_apply_linear_bf16_multi_row_simdgroup(device const float *input [[buffer(0)]], device const ushort *weight [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], threadgroup char *shmem [[threadgroup(0)]], ushort tiitg [[thread_index_in_threadgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
+	           // BF16 storage does not authorize rounding F32 activations or gradients
+               // to F16. Both SIMD operands retain F32, including the BF16 exponent
+               // range; the two 64x32 staging tiles require 16 KiB.
+               "kernel void termite_apply_linear_bf16_multi_row_simdgroup(device const float *input [[buffer(0)]], device const ushort *weight [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], threadgroup char *shmem [[threadgroup(0)]], ushort tiitg [[thread_index_in_threadgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
 	           "    threadgroup float *initial = (threadgroup float *)(shmem);\n"
 	           "    constexpr uint tile_n = 64u; constexpr uint tile_m = 32u; constexpr uint tile_k = 32u;\n"
 	           "    uint first_col = tg.x * tile_n; uint first_row = tg.y * tile_m;\n"
@@ -8392,23 +8399,66 @@ static NSString *termite_metal_shader_source(void) {
 	           "    simdgroup_float8x8 mc[8];\n"
 	           "    for (short i = 0; i < 8; ++i) simdgroup_load(mc[i], initial + sg_col + sg_row * tile_n + 8u * uint(i % 4) + 8u * tile_n * uint(i / 4), tile_n, 0, false);\n"
 	           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-	           "    threadgroup half *sa = (threadgroup half *)(shmem); threadgroup half *sb = (threadgroup half *)(shmem + 4096u);\n"
+	           "    threadgroup float *sa = (threadgroup float *)(shmem); threadgroup float *sb = (threadgroup float *)(shmem + 8192u);\n"
 	           "    constexpr short NL0 = 2; constexpr short NL1 = 4;\n"
 	           "    short local_col = short(min(uint(tiitg) / uint(NL0), valid_cols - 1u)); short local_row = short(min(uint(tiitg) / uint(NL1), valid_rows - 1u));\n"
 	           "    short half_k = short(tiitg) % NL0; short input_k8 = 8 * (short(tiitg) % NL1);\n"
-	           "    simdgroup_half8x8 ma[4]; simdgroup_half8x8 mb[2];\n"
+	           "    simdgroup_float8x8 ma[4]; simdgroup_float8x8 mb[2];\n"
 	           "    for (uint k0 = 0u; k0 < p.in_dim; k0 += tile_k) {\n"
-	           "        half4x4 weight_values; for (short i = 0; i < 16; ++i) { uint k = k0 + uint(half_k * 16 + i); weight_values[i / 4][i % 4] = k < p.in_dim ? half(termite_bf16_to_f32(weight[(first_col + uint(local_col)) * p.in_dim + k])) : half(0.0f); }\n"
+	           "        float4x4 weight_values; for (short i = 0; i < 16; ++i) { uint k = k0 + uint(half_k * 16 + i); weight_values[i / 4][i % 4] = k < p.in_dim ? float(termite_bf16_to_f32(weight[(first_col + uint(local_col)) * p.in_dim + k])) : float(0.0f); }\n"
 	           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
 	           "        for (short i = 0; i < 16; ++i) { short sx = 2 * half_k + i / 8; short sy = (short(tiitg) / NL0) / 8; short lx = (short(tiitg) / NL0) % 8; short ly = i % 8; short ib = 8 * sx + sy; *(sa + 64 * ib + 8 * ly + lx) = weight_values[i / 4][i % 4]; }\n"
-	           "        for (short i = 0; i < 8; ++i) { short sx = short(tiitg) % NL1; short sy = (short(tiitg) / NL1) / 8; short lx = i; short ly = (short(tiitg) / NL1) % 8; short ib = 4 * sx + sy; uint k = k0 + uint(input_k8 + i); *(sb + 64 * ib + 8 * ly + lx) = k < p.in_dim ? half(input[(first_row + uint(local_row)) * p.in_dim + k]) : half(0.0f); }\n"
+	           "        for (short i = 0; i < 8; ++i) { short sx = short(tiitg) % NL1; short sy = (short(tiitg) / NL1) / 8; short lx = i; short ly = (short(tiitg) / NL1) % 8; short ib = 4 * sx + sy; uint k = k0 + uint(input_k8 + i); *(sb + 64 * ib + 8 * ly + lx) = k < p.in_dim ? float(input[(first_row + uint(local_row)) * p.in_dim + k]) : float(0.0f); }\n"
 	           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-	           "        threadgroup const half *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const half *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u);\n"
+	           "        threadgroup const float *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const float *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u);\n"
 	           "        for (short ik = 0; ik < 4; ++ik) { simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 4; ++i) simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 2; ++i) simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 8; ++i) simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]); lsma += 8 * 64; lsmb += 4 * 64; }\n"
 	           "    }\n"
 	           "    if (valid_cols == tile_n && valid_rows == tile_m) { device float *dst = output + first_row * p.out_dim + first_col + sg_col + sg_row * p.out_dim; for (short i = 0; i < 8; ++i) simdgroup_store(mc[i], dst + 8u * uint(i % 4) + 8u * p.out_dim * uint(i / 4), p.out_dim, 0, false); }\n"
 	           "    else { threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup float *temp = (threadgroup float *)(shmem); threadgroup float *sg_temp = temp + sg_col + sg_row * tile_n; for (short i = 0; i < 8; ++i) simdgroup_store(mc[i], sg_temp + 8u * uint(i % 4) + 8u * tile_n * uint(i / 4), tile_n, 0, false); threadgroup_barrier(mem_flags::mem_threadgroup); if (sgitg == 0u) { for (uint r = uint(tiitg); r < valid_rows; r += 128u) { device float *dst = output + (first_row + r) * p.out_dim + first_col; threadgroup float *src = temp + r * tile_n; for (uint c = 0u; c < valid_cols; ++c) dst[c] = src[c]; } } }\n"
 	           "}\n"
+           // Long dense projections feed trainable gradients through many layers.
+           // Bound each SIMD sum to 256 terms and compensate the merge using
+           // the existing 16 KiB staging allocation. Compile this path precisely
+           // so reassociation cannot eliminate the correction terms.
+           "kernel void termite_apply_linear_bf16_multi_row_compensated(device const float *input [[buffer(0)]], device const ushort *weight [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], threadgroup char *shmem [[threadgroup(0)]], ushort tiitg [[thread_index_in_threadgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
+           "    threadgroup float *initial = (threadgroup float *)(shmem);\n"
+           "    constexpr uint tile_n = 64u; constexpr uint tile_m = 32u; constexpr uint tile_k = 32u;\n"
+           "    uint first_col = tg.x * tile_n; uint first_row = tg.y * tile_m;\n"
+           "    if (first_col >= p.out_dim || first_row >= p.rows) return;\n"
+           "    uint valid_cols = min(tile_n, p.out_dim - first_col); uint valid_rows = min(tile_m, p.rows - first_row);\n"
+           "    for (uint idx = uint(tiitg); idx < tile_m * tile_n; idx += 128u) { uint col = idx % tile_n; initial[idx] = col < valid_cols ? bias[first_col + col] : 0.0f; }\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    uint sg_col = 32u * (uint(sgitg) & 1u); uint sg_row = 16u * (uint(sgitg) >> 1u);\n"
+           "    simdgroup_float8x8 mc[8];\n"
+           "    float sums[16]; float corrections[16];\n"
+           "    for (uint i = 0u; i < 16u; ++i) { sums[i]=initial[uint(tiitg)+i*128u]; corrections[i]=0.0f; }\n"
+           "    for (short i = 0; i < 8; ++i) mc[i]=make_filled_simdgroup_matrix<float,8>(0.0f);\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    threadgroup float *sa = (threadgroup float *)(shmem); threadgroup float *sb = (threadgroup float *)(shmem + 8192u);\n"
+           "    constexpr short NL0 = 2; constexpr short NL1 = 4;\n"
+           "    short local_col = short(min(uint(tiitg) / uint(NL0), valid_cols - 1u)); short local_row = short(min(uint(tiitg) / uint(NL1), valid_rows - 1u));\n"
+           "    short half_k = short(tiitg) % NL0; short input_k8 = 8 * (short(tiitg) % NL1);\n"
+           "    simdgroup_float8x8 ma[4]; simdgroup_float8x8 mb[2];\n"
+           "    for (uint k0 = 0u; k0 < p.in_dim; k0 += tile_k) {\n"
+           "        float4x4 weight_values; for (short i = 0; i < 16; ++i) { uint k = k0 + uint(half_k * 16 + i); weight_values[i / 4][i % 4] = k < p.in_dim ? float(termite_bf16_to_f32(weight[(first_col + uint(local_col)) * p.in_dim + k])) : float(0.0f); }\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        for (short i = 0; i < 16; ++i) { short sx = 2 * half_k + i / 8; short sy = (short(tiitg) / NL0) / 8; short lx = (short(tiitg) / NL0) % 8; short ly = i % 8; short ib = 8 * sx + sy; *(sa + 64 * ib + 8 * ly + lx) = weight_values[i / 4][i % 4]; }\n"
+           "        for (short i = 0; i < 8; ++i) { short sx = short(tiitg) % NL1; short sy = (short(tiitg) / NL1) / 8; short lx = i; short ly = (short(tiitg) / NL1) % 8; short ib = 4 * sx + sy; uint k = k0 + uint(input_k8 + i); *(sb + 64 * ib + 8 * ly + lx) = k < p.in_dim ? float(input[(first_row + uint(local_row)) * p.in_dim + k]) : float(0.0f); }\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        threadgroup const float *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const float *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u);\n"
+           "        for (short ik = 0; ik < 4; ++ik) { simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 4; ++i) simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 2; ++i) simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 8; ++i) simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]); lsma += 8 * 64; lsmb += 4 * 64; }\n"
+           "        if (((k0+tile_k)%256u)==0u || k0+tile_k>=p.in_dim) {\n"
+           "            threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "            threadgroup float *sg_temp=(threadgroup float *)(shmem)+sg_col+sg_row*tile_n;\n"
+           "            for (short i = 0; i < 8; ++i) simdgroup_store(mc[i],sg_temp+8u*uint(i%4)+8u*tile_n*uint(i/4),tile_n,0,false);\n"
+           "            threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "            for (uint i = 0u; i < 16u; ++i) { float value=((threadgroup float *)(shmem))[uint(tiitg)+i*128u]-corrections[i]; float next=sums[i]+value; corrections[i]=(next-sums[i])-value; sums[i]=next; }\n"
+           "            for (short i = 0; i < 8; ++i) mc[i]=make_filled_simdgroup_matrix<float,8>(0.0f);\n"
+           "            threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        }\n"
+           "    }\n"
+           "    for (uint i = 0u; i < 16u; ++i) { uint index=uint(tiitg)+i*128u; uint row=index/tile_n; uint col=index%tile_n; if (row<valid_rows && col<valid_cols) output[(first_row+row)*p.out_dim+first_col+col]=sums[i]; }\n"
+           "}\n"
 	           "kernel void termite_apply_linear_bf16_multi_row_simdgroup_m64(device const float *input [[buffer(0)]], device const ushort *weight [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], threadgroup char *shmem [[threadgroup(0)]], ushort tiitg [[thread_index_in_threadgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
 	           "    constexpr uint tile_n = 64u; constexpr uint tile_m = 64u; constexpr uint tile_k = 32u;\n"
 	           "    uint first_col = tg.x * tile_n; uint first_row = tg.y * tile_m;\n"
@@ -8420,16 +8470,16 @@ static NSString *termite_metal_shader_source(void) {
 	           "    simdgroup_float8x8 mc[8];\n"
 	           "    for (short i = 0; i < 8; ++i) simdgroup_load(mc[i], initial + sg_col + 8u * uint(i % 4) + 8u * tile_n * uint(i / 4), tile_n, 0, false);\n"
 	           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-	           "    threadgroup half *sa = (threadgroup half *)(shmem); threadgroup half *sb = (threadgroup half *)(shmem + 4096u);\n"
+	           "    threadgroup float *sa = (threadgroup float *)(shmem); threadgroup float *sb = (threadgroup float *)(shmem + 8192u);\n"
 	           "    short local_col = short(uint(tiitg) / 4u); short local_row = short(uint(tiitg) / 4u); short k_octet = short(tiitg) % 4;\n"
-	           "    simdgroup_half8x8 ma[4]; simdgroup_half8x8 mb[2];\n"
+	           "    simdgroup_float8x8 ma[4]; simdgroup_float8x8 mb[2];\n"
 	           "    for (uint k0 = 0u; k0 < p.in_dim; k0 += tile_k) {\n"
-	           "        half4x4 weight_values; for (short i = 0; i < 8; ++i) weight_values[i / 4][i % 4] = half(termite_bf16_to_f32(weight[(first_col + uint(local_col)) * p.in_dim + k0 + uint(8 * k_octet + i)]));\n"
+	           "        float4x4 weight_values; for (short i = 0; i < 8; ++i) weight_values[i / 4][i % 4] = float(termite_bf16_to_f32(weight[(first_col + uint(local_col)) * p.in_dim + k0 + uint(8 * k_octet + i)]));\n"
 	           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
 	           "        for (short i = 0; i < 8; ++i) { short sx = k_octet; short sy = local_col / 8; short lx = local_col % 8; short ly = i; short ib = 8 * sx + sy; *(sa + 64 * ib + 8 * ly + lx) = weight_values[i / 4][i % 4]; }\n"
-	           "        for (short i = 0; i < 8; ++i) { short sx = k_octet; short sy = local_row / 8; short lx = i; short ly = local_row % 8; short ib = 8 * sx + sy; *(sb + 64 * ib + 8 * ly + lx) = half(input[(first_row + uint(local_row)) * p.in_dim + k0 + uint(8 * k_octet + i)]); }\n"
+	           "        for (short i = 0; i < 8; ++i) { short sx = k_octet; short sy = local_row / 8; short lx = i; short ly = local_row % 8; short ib = 8 * sx + sy; *(sb + 64 * ib + 8 * ly + lx) = float(input[(first_row + uint(local_row)) * p.in_dim + k0 + uint(8 * k_octet + i)]); }\n"
 	           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-	           "        threadgroup const half *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const half *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u);\n"
+	           "        threadgroup const float *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const float *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u);\n"
 	           "        for (short ik = 0; ik < 4; ++ik) { simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 4; ++i) simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 2; ++i) simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 8; ++i) simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]); lsma += 8 * 64; lsmb += 8 * 64; }\n"
 	           "    }\n"
 	           "    device float *dst = output + first_row * p.out_dim + first_col + sg_col + sg_row * p.out_dim; for (short i = 0; i < 8; ++i) simdgroup_store(mc[i], dst + 8u * uint(i % 4) + 8u * p.out_dim * uint(i / 4), p.out_dim, 0, false);\n"
@@ -8450,23 +8500,23 @@ static NSString *termite_metal_shader_source(void) {
 	           "    simdgroup_float8x8 mc[8];\n"
 	           "    for (short i = 0; i < 8; ++i) simdgroup_load(mc[i], initial + sg_col + 8u * uint(i % 4) + 8u * tile_n * uint(i / 4), tile_n, 0, false);\n"
 	           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-	           "    threadgroup half *sa = (threadgroup half *)(shmem); threadgroup half *sb = (threadgroup half *)(shmem + 4096u);\n"
+	           "    threadgroup float *sa = (threadgroup float *)(shmem); threadgroup float *sb = (threadgroup float *)(shmem + 8192u);\n"
 	           "    short local_col = short(uint(tiitg) / 4u); short local_row = short(uint(tiitg) / 4u); short k_octet = short(tiitg) % 4;\n"
-	           "    simdgroup_half8x8 ma[4]; simdgroup_half8x8 mb[2];\n"
+	           "    simdgroup_float8x8 ma[4]; simdgroup_float8x8 mb[2];\n"
 	           "    for (uint k0 = 0u; k0 < p.in_dim; k0 += tile_k) {\n"
 	           "        uint weight_base = (first_col + uint(local_col)) * p.in_dim + k0 + uint(8 * k_octet);\n"
 	           "        device const packed_ushort4 *weight_vector = (device const packed_ushort4 *)(weight + weight_base);\n"
-	           "        half4x4 weight_values; weight_values[0] = half4(as_type<float4>(uint4(ushort4(weight_vector[0])) << 16u)); weight_values[1] = half4(as_type<float4>(uint4(ushort4(weight_vector[1])) << 16u));\n"
+	           "        float4x4 weight_values; weight_values[0] = float4(as_type<float4>(uint4(ushort4(weight_vector[0])) << 16u)); weight_values[1] = float4(as_type<float4>(uint4(ushort4(weight_vector[1])) << 16u));\n"
 	           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
 	           "        for (short i = 0; i < 8; ++i) { short sx = k_octet; short sy = local_col / 8; short lx = local_col % 8; short ly = i; short ib = 8 * sx + sy; *(sa + 64 * ib + 8 * ly + lx) = weight_values[i / 4][i % 4]; }\n"
 	           "        uint input_base = (first_row + uint(local_row)) * p.in_dim + k0 + uint(8 * k_octet);\n"
 	           "        device const packed_float4 *input_vector = (device const packed_float4 *)(input + input_base);\n"
-	           "        half4 input_values0 = half4(float4(input_vector[0])); half4 input_values1 = half4(float4(input_vector[1]));\n"
+	           "        float4 input_values0 = float4(float4(input_vector[0])); float4 input_values1 = float4(float4(input_vector[1]));\n"
 	           "        short input_ib = 8 * k_octet + local_row / 8;\n"
-	           "        threadgroup half4 *input_dst = (threadgroup half4 *)(sb + 64 * input_ib + 8 * (local_row % 8));\n"
+	           "        threadgroup float4 *input_dst = (threadgroup float4 *)(sb + 64 * input_ib + 8 * (local_row % 8));\n"
 	           "        input_dst[0] = input_values0; input_dst[1] = input_values1;\n"
 	           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-	           "        threadgroup const half *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const half *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u);\n"
+	           "        threadgroup const float *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const float *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u);\n"
 	           "        for (short ik = 0; ik < 4; ++ik) { simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 4; ++i) simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 2; ++i) simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 8; ++i) simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]); lsma += 8 * 64; lsmb += 8 * 64; }\n"
 	           "    }\n"
 	           "    device float *dst = output + first_row * p.out_dim + first_col + sg_col + sg_row * p.out_dim; for (short i = 0; i < 8; ++i) simdgroup_store(mc[i], dst + 8u * uint(i % 4) + 8u * p.out_dim * uint(i / 4), p.out_dim, 0, false);\n"
@@ -8486,16 +8536,16 @@ static NSString *termite_metal_shader_source(void) {
 	           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
 	           "    for (short i = 0; i < 8; ++i) simdgroup_load(up_acc[i], initial + sg_col + 8u * uint(i % 4) + 8u * tile_n * uint(i / 4), tile_n, 0, false);\n"
 	           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-	           "    threadgroup half *sa = (threadgroup half *)(shmem); threadgroup half *sb = (threadgroup half *)(shmem + 4096u);\n"
+	           "    threadgroup float *sa = (threadgroup float *)(shmem); threadgroup float *sb = (threadgroup float *)(shmem + 8192u);\n"
 	           "    short local_col = short(uint(tiitg) / 4u); short local_row = short(uint(tiitg) / 4u); short k_octet = short(tiitg) % 4;\n"
-	           "    simdgroup_half8x8 ma[4]; simdgroup_half8x8 mb[2];\n"
+	           "    simdgroup_float8x8 ma[4]; simdgroup_float8x8 mb[2];\n"
 	           "    for (uint k0 = 0u; k0 < p.in_dim; k0 += tile_k) {\n"
-	           "        half4x4 gate_values; half4x4 up_values; for (short i = 0; i < 8; ++i) { uint wi = (first_col + uint(local_col)) * p.in_dim + k0 + uint(8 * k_octet + i); gate_values[i / 4][i % 4] = half(termite_bf16_to_f32(gate_weight[wi])); up_values[i / 4][i % 4] = half(termite_bf16_to_f32(up_weight[wi])); }\n"
+	           "        float4x4 gate_values; float4x4 up_values; for (short i = 0; i < 8; ++i) { uint wi = (first_col + uint(local_col)) * p.in_dim + k0 + uint(8 * k_octet + i); gate_values[i / 4][i % 4] = float(termite_bf16_to_f32(gate_weight[wi])); up_values[i / 4][i % 4] = float(termite_bf16_to_f32(up_weight[wi])); }\n"
 	           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
 	           "        for (short i = 0; i < 8; ++i) { short sx = k_octet; short sy = local_col / 8; short lx = local_col % 8; short ly = i; short ib = 8 * sx + sy; *(sa + 64 * ib + 8 * ly + lx) = gate_values[i / 4][i % 4]; }\n"
-	           "        for (short i = 0; i < 8; ++i) { short sx = k_octet; short sy = local_row / 8; short lx = i; short ly = local_row % 8; short ib = 8 * sx + sy; *(sb + 64 * ib + 8 * ly + lx) = half(input[(first_row + uint(local_row)) * p.in_dim + k0 + uint(8 * k_octet + i)]); }\n"
+	           "        for (short i = 0; i < 8; ++i) { short sx = k_octet; short sy = local_row / 8; short lx = i; short ly = local_row % 8; short ib = 8 * sx + sy; *(sb + 64 * ib + 8 * ly + lx) = float(input[(first_row + uint(local_row)) * p.in_dim + k0 + uint(8 * k_octet + i)]); }\n"
 	           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-	           "        threadgroup const half *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const half *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u);\n"
+	           "        threadgroup const float *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const float *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u);\n"
 	           "        for (short ik = 0; ik < 4; ++ik) { simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 4; ++i) simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 2; ++i) simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 8; ++i) simdgroup_multiply_accumulate(gate_acc[i], mb[i / 4], ma[i % 4], gate_acc[i]); lsma += 8 * 64; lsmb += 8 * 64; }\n"
 	           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
 	           "        for (short i = 0; i < 8; ++i) { short sx = k_octet; short sy = local_col / 8; short lx = local_col % 8; short ly = i; short ib = 8 * sx + sy; *(sa + 64 * ib + 8 * ly + lx) = up_values[i / 4][i % 4]; }\n"
@@ -8732,24 +8782,75 @@ static NSString *termite_metal_shader_source(void) {
            "    if (row < p.rows && col2 < p.in_dim) input_grad[row * p.in_dim + col2] = acc2;\n"
            "    if (row < p.rows && col3 < p.in_dim) input_grad[row * p.in_dim + col3] = acc3;\n"
            "}\n"
+           // CCE-only long-K products use short SIMD sums and a compensated
+           // merge, or per-product compensation on the scalar small-row path.
+           // Compile precisely so the correction terms cannot be reassociated.
+           "kernel void termite_linear_cce_backward_bf16_blocked(device const float *output_grad [[buffer(0)]], device const ushort *weight [[buffer(1)]], device float *input_grad [[buffer(2)]], constant termite_metal_linear_params &p [[buffer(3)]], threadgroup char *shmem [[threadgroup(0)]], ushort tiitg [[thread_index_in_threadgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
+           "    constexpr uint tile_n = 64u; constexpr uint tile_m = 32u; constexpr uint tile_k = 32u;\n"
+           "    uint first_col = tg.x * tile_n; uint first_row = tg.y * tile_m;\n"
+           "    if (first_col >= p.in_dim || first_row >= p.rows) return;\n"
+           "    uint valid_cols = min(tile_n, p.in_dim - first_col); uint valid_rows = min(tile_m, p.rows - first_row);\n"
+           "    threadgroup float *sa = (threadgroup float *)(shmem); threadgroup float *sb = (threadgroup float *)(shmem + 8192u);\n"
+           "    constexpr short NL0 = 2; constexpr short NL1 = 4;\n"
+           "    short local_col = short(min(uint(tiitg) / uint(NL0), valid_cols - 1u)); short local_row = short(min(uint(tiitg) / uint(NL1), valid_rows - 1u));\n"
+           "    short half_k = short(tiitg) % NL0; short input_k8 = 8 * (short(tiitg) % NL1);\n"
+           "    simdgroup_float8x8 ma[4]; simdgroup_float8x8 mb[2]; simdgroup_float8x8 mc[8];\n"
+           "    for (short i = 0; i < 8; ++i) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
+           "    float sums[16]; float corrections[16]; for (uint i = 0u; i < 16u; ++i) { sums[i] = 0.0f; corrections[i] = 0.0f; }\n"
+           "    for (uint k0 = 0u; k0 < p.out_dim; k0 += tile_k) {\n"
+           "        float4x4 weight_values; for (short i = 0; i < 16; ++i) { uint k = k0 + uint(half_k * 16 + i); weight_values[i / 4][i % 4] = k < p.out_dim ? float(termite_bf16_to_f32(weight[k * p.in_dim + first_col + uint(local_col)])) : float(0.0f); }\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        for (short i = 0; i < 16; ++i) { short sx = 2 * half_k + i / 8; short sy = (short(tiitg) / NL0) / 8; short lx = (short(tiitg) / NL0) % 8; short ly = i % 8; short ib = 8 * sx + sy; *(sa + 64 * ib + 8 * ly + lx) = weight_values[i / 4][i % 4]; }\n"
+           "        for (short i = 0; i < 8; ++i) { short sx = short(tiitg) % NL1; short sy = (short(tiitg) / NL1) / 8; short lx = i; short ly = (short(tiitg) / NL1) % 8; short ib = 4 * sx + sy; uint k = k0 + uint(input_k8 + i); *(sb + 64 * ib + 8 * ly + lx) = k < p.out_dim ? float(output_grad[(first_row + uint(local_row)) * p.out_dim + k]) : float(0.0f); }\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        threadgroup const float *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const float *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u);\n"
+           "        for (short ik = 0; ik < 4; ++ik) { simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 4; ++i) simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 2; ++i) simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 8; ++i) simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]); lsma += 8 * 64; lsmb += 4 * 64; }\n"
+           "        if (((k0 + tile_k) % 256u) == 0u || k0 + tile_k >= p.out_dim) {\n"
+           "            threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "            uint sg_col = 32u * (uint(sgitg) & 1u); uint sg_row = 16u * (uint(sgitg) >> 1u);\n"
+           "            threadgroup float *sg_temp = (threadgroup float *)(shmem) + sg_col + sg_row * tile_n;\n"
+           "            for (short i = 0; i < 8; ++i) simdgroup_store(mc[i], sg_temp + 8u * uint(i % 4) + 8u * tile_n * uint(i / 4), tile_n, 0, false);\n"
+           "            threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "            for (uint i = 0u; i < 16u; ++i) { float value = ((threadgroup float *)(shmem))[uint(tiitg) + i * 128u] - corrections[i]; float next = sums[i] + value; corrections[i] = (next - sums[i]) - value; sums[i] = next; }\n"
+           "            for (short i = 0; i < 8; ++i) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
+           "            threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        }\n"
+           "    }\n"
+           "    for (uint i = 0u; i < 16u; ++i) { uint index = uint(tiitg) + i * 128u; uint r = index / tile_n; uint c = index % tile_n; if (r < valid_rows && c < valid_cols) input_grad[(first_row + r) * p.in_dim + first_col + c] = sums[i]; }\n"
+           "}\n"
+           "\n"
+           "kernel void termite_linear_cce_backward_bf16_small_blocked(device const float *output_grad [[buffer(0)]], device const ushort *weight [[buffer(1)]], device float *input_grad [[buffer(2)]], constant termite_metal_linear_params &p [[buffer(3)]], ushort2 tid [[thread_position_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
+           "    constexpr uint tile_m = 8u; constexpr uint tile_n = 32u; constexpr uint tile_k = 64u;\n"
+           "    threadgroup float a_tile[8][64]; threadgroup float b_tile[32][64];\n"
+           "    uint row = tg.y * tile_m + uint(tid.y); uint col0 = tg.x * tile_n + uint(tid.x); uint col1 = col0 + 16u; uint lane = uint(tid.y) * 16u + uint(tid.x);\n"
+           "    float acc0 = 0.0f; float acc1 = 0.0f; float correction0 = 0.0f; float correction1 = 0.0f;\n"
+           "    for (uint k0 = 0u; k0 < p.out_dim; k0 += tile_k) {\n"
+           "        for (uint idx = lane; idx < tile_m * tile_k; idx += 128u) { uint ar = idx / tile_k; uint ak = idx - ar * tile_k; uint g_row = tg.y * tile_m + ar; uint g_k = k0 + ak; a_tile[ar][ak] = (g_row < p.rows && g_k < p.out_dim) ? output_grad[g_row * p.out_dim + g_k] : 0.0f; }\n"
+           "        for (uint idx = lane; idx < tile_n * tile_k; idx += 128u) { uint bc = idx / tile_k; uint bk = idx - bc * tile_k; uint g_col = tg.x * tile_n + bc; uint g_k = k0 + bk; b_tile[bc][bk] = (g_col < p.in_dim && g_k < p.out_dim) ? termite_bf16_to_f32(weight[g_k * p.in_dim + g_col]) : 0.0f; }\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        for (uint kk = 0u; kk < tile_k; ++kk) { float a = a_tile[uint(tid.y)][kk]; float value0 = a * b_tile[uint(tid.x)][kk] - correction0; float next0 = acc0 + value0; correction0 = (next0 - acc0) - value0; acc0 = next0; float value1 = a * b_tile[uint(tid.x) + 16u][kk] - correction1; float next1 = acc1 + value1; correction1 = (next1 - acc1) - value1; acc1 = next1; }\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    }\n"
+           "    if (row < p.rows && col0 < p.in_dim) { uint dst = row * p.in_dim + col0; if (p.row_blocks != 0u) input_grad[dst] += acc0; else input_grad[dst] = acc0; } if (row < p.rows && col1 < p.in_dim) { uint dst = row * p.in_dim + col1; if (p.row_blocks != 0u) input_grad[dst] += acc1; else input_grad[dst] = acc1; }\n"
+           "}\n"
            "kernel void termite_apply_linear_backward_input_bf16_simdgroup(device const float *output_grad [[buffer(0)]], device const ushort *weight [[buffer(1)]], device float *input_grad [[buffer(2)]], constant termite_metal_linear_params &p [[buffer(3)]], threadgroup char *shmem [[threadgroup(0)]], ushort tiitg [[thread_index_in_threadgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
            "    constexpr uint tile_n = 64u; constexpr uint tile_m = 32u; constexpr uint tile_k = 32u;\n"
            "    uint first_col = tg.x * tile_n; uint first_row = tg.y * tile_m;\n"
            "    if (first_col >= p.in_dim || first_row >= p.rows) return;\n"
            "    uint valid_cols = min(tile_n, p.in_dim - first_col); uint valid_rows = min(tile_m, p.rows - first_row);\n"
-           "    threadgroup half *sa = (threadgroup half *)(shmem); threadgroup half *sb = (threadgroup half *)(shmem + 4096u);\n"
+           "    threadgroup float *sa = (threadgroup float *)(shmem); threadgroup float *sb = (threadgroup float *)(shmem + 8192u);\n"
            "    constexpr short NL0 = 2; constexpr short NL1 = 4;\n"
            "    short local_col = short(min(uint(tiitg) / uint(NL0), valid_cols - 1u)); short local_row = short(min(uint(tiitg) / uint(NL1), valid_rows - 1u));\n"
            "    short half_k = short(tiitg) % NL0; short input_k8 = 8 * (short(tiitg) % NL1);\n"
-           "    simdgroup_half8x8 ma[4]; simdgroup_half8x8 mb[2]; simdgroup_float8x8 mc[8];\n"
+           "    simdgroup_float8x8 ma[4]; simdgroup_float8x8 mb[2]; simdgroup_float8x8 mc[8];\n"
            "    for (short i = 0; i < 8; ++i) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
            "    for (uint k0 = 0u; k0 < p.out_dim; k0 += tile_k) {\n"
-           "        half4x4 weight_values; for (short i = 0; i < 16; ++i) { uint k = k0 + uint(half_k * 16 + i); weight_values[i / 4][i % 4] = k < p.out_dim ? half(termite_bf16_to_f32(weight[k * p.in_dim + first_col + uint(local_col)])) : half(0.0f); }\n"
+           "        float4x4 weight_values; for (short i = 0; i < 16; ++i) { uint k = k0 + uint(half_k * 16 + i); weight_values[i / 4][i % 4] = k < p.out_dim ? float(termite_bf16_to_f32(weight[k * p.in_dim + first_col + uint(local_col)])) : float(0.0f); }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        for (short i = 0; i < 16; ++i) { short sx = 2 * half_k + i / 8; short sy = (short(tiitg) / NL0) / 8; short lx = (short(tiitg) / NL0) % 8; short ly = i % 8; short ib = 8 * sx + sy; *(sa + 64 * ib + 8 * ly + lx) = weight_values[i / 4][i % 4]; }\n"
-           "        for (short i = 0; i < 8; ++i) { short sx = short(tiitg) % NL1; short sy = (short(tiitg) / NL1) / 8; short lx = i; short ly = (short(tiitg) / NL1) % 8; short ib = 4 * sx + sy; uint k = k0 + uint(input_k8 + i); *(sb + 64 * ib + 8 * ly + lx) = k < p.out_dim ? half(output_grad[(first_row + uint(local_row)) * p.out_dim + k]) : half(0.0f); }\n"
+           "        for (short i = 0; i < 8; ++i) { short sx = short(tiitg) % NL1; short sy = (short(tiitg) / NL1) / 8; short lx = i; short ly = (short(tiitg) / NL1) % 8; short ib = 4 * sx + sy; uint k = k0 + uint(input_k8 + i); *(sb + 64 * ib + 8 * ly + lx) = k < p.out_dim ? float(output_grad[(first_row + uint(local_row)) * p.out_dim + k]) : float(0.0f); }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        threadgroup const half *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const half *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u);\n"
+           "        threadgroup const float *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const float *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u);\n"
            "        for (short ik = 0; ik < 4; ++ik) { simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 4; ++i) simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 2; ++i) simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 8; ++i) simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]); lsma += 8 * 64; lsmb += 4 * 64; }\n"
            "    }\n"
            "    uint sg_col = 32u * (uint(sgitg) & 1u); uint sg_row = 16u * (uint(sgitg) >> 1u);\n"
@@ -8760,17 +8861,17 @@ static NSString *termite_metal_shader_source(void) {
            "    constexpr uint tile_n = 64u; constexpr uint tile_m = 64u; constexpr uint tile_k = 32u;\n"
            "    uint first_col = tg.x * tile_n; uint first_row = tg.y * tile_m;\n"
            "    if (first_col >= p.in_dim || first_row >= p.rows || (p.rows & 63u) != 0u || (p.in_dim & 63u) != 0u || (p.out_dim & 31u) != 0u) return;\n"
-           "    threadgroup half *sa = (threadgroup half *)(shmem); threadgroup half *sb = (threadgroup half *)(shmem + 4096u);\n"
+           "    threadgroup float *sa = (threadgroup float *)(shmem); threadgroup float *sb = (threadgroup float *)(shmem + 8192u);\n"
            "    short local_col = short(uint(tiitg) / 4u); short local_row = short(uint(tiitg) / 4u); short k_octet = short(tiitg) % 4;\n"
-           "    simdgroup_half8x8 ma[4]; simdgroup_half8x8 mb[2]; simdgroup_float8x8 mc[8];\n"
+           "    simdgroup_float8x8 ma[4]; simdgroup_float8x8 mb[2]; simdgroup_float8x8 mc[8];\n"
            "    for (short i = 0; i < 8; ++i) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
            "    for (uint k0 = 0u; k0 < p.out_dim; k0 += tile_k) {\n"
-           "        half4x4 weight_values; for (short i = 0; i < 8; ++i) weight_values[i / 4][i % 4] = half(termite_bf16_to_f32(weight[(k0 + uint(8 * k_octet + i)) * p.in_dim + first_col + uint(local_col)]));\n"
+           "        float4x4 weight_values; for (short i = 0; i < 8; ++i) weight_values[i / 4][i % 4] = float(termite_bf16_to_f32(weight[(k0 + uint(8 * k_octet + i)) * p.in_dim + first_col + uint(local_col)]));\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        for (short i = 0; i < 8; ++i) { short sx = k_octet; short sy = local_col / 8; short lx = local_col % 8; short ly = i; short ib = 8 * sx + sy; *(sa + 64 * ib + 8 * ly + lx) = weight_values[i / 4][i % 4]; }\n"
-           "        for (short i = 0; i < 8; ++i) { short sx = k_octet; short sy = local_row / 8; short lx = i; short ly = local_row % 8; short ib = 8 * sx + sy; *(sb + 64 * ib + 8 * ly + lx) = half(output_grad[(first_row + uint(local_row)) * p.out_dim + k0 + uint(8 * k_octet + i)]); }\n"
+           "        for (short i = 0; i < 8; ++i) { short sx = k_octet; short sy = local_row / 8; short lx = i; short ly = local_row % 8; short ib = 8 * sx + sy; *(sb + 64 * ib + 8 * ly + lx) = float(output_grad[(first_row + uint(local_row)) * p.out_dim + k0 + uint(8 * k_octet + i)]); }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        threadgroup const half *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const half *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u);\n"
+           "        threadgroup const float *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const float *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u);\n"
            "        for (short ik = 0; ik < 4; ++ik) { simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 4; ++i) simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 2; ++i) simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 8; ++i) simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]); lsma += 8 * 64; lsmb += 8 * 64; }\n"
            "    }\n"
            "    uint sg_col = 32u * (uint(sgitg) & 1u); uint sg_row = 16u * (uint(sgitg) >> 1u);\n"
@@ -8788,17 +8889,17 @@ static NSString *termite_metal_shader_source(void) {
            "    constexpr uint tile_n = 64u; constexpr uint tile_m = 64u; constexpr uint tile_k = 32u;\n"
            "    uint first_col = tg.x * tile_n; uint first_row = tg.y * tile_m;\n"
            "    if (first_col >= p.in_dim || first_row >= p.rows || (p.rows & 63u) != 0u || (p.in_dim & 63u) != 0u || (p.out_dim & 31u) != 0u) return;\n"
-           "    threadgroup half *sa = (threadgroup half *)(shmem); threadgroup half *sb = (threadgroup half *)(shmem + 4096u);\n"
+           "    threadgroup float *sa = (threadgroup float *)(shmem); threadgroup float *sb = (threadgroup float *)(shmem + 8192u);\n"
            "    short weight_k = short(uint(tiitg) / 8u); short weight_col_octet = short(uint(tiitg) % 8u); short local_row = short(uint(tiitg) / 4u); short k_octet = short(tiitg) % 4;\n"
-           "    simdgroup_half8x8 ma[4]; simdgroup_half8x8 mb[2]; simdgroup_float8x8 mc[8];\n"
+           "    simdgroup_float8x8 ma[4]; simdgroup_float8x8 mb[2]; simdgroup_float8x8 mc[8];\n"
            "    for (short i = 0; i < 8; ++i) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
            "    for (uint k0 = 0u; k0 < p.out_dim; k0 += tile_k) {\n"
-           "        half4x4 weight_values; for (short i = 0; i < 8; ++i) weight_values[i / 4][i % 4] = half(termite_bf16_to_f32(weight[(k0 + uint(weight_k)) * p.in_dim + first_col + uint(8 * weight_col_octet + i)]));\n"
+           "        float4x4 weight_values; for (short i = 0; i < 8; ++i) weight_values[i / 4][i % 4] = float(termite_bf16_to_f32(weight[(k0 + uint(weight_k)) * p.in_dim + first_col + uint(8 * weight_col_octet + i)]));\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        for (short i = 0; i < 8; ++i) { short col = 8 * weight_col_octet + i; short sx = weight_k / 8; short sy = col / 8; short lx = col % 8; short ly = weight_k % 8; short ib = 8 * sx + sy; *(sa + 64 * ib + 8 * ly + lx) = weight_values[i / 4][i % 4]; }\n"
-           "        for (short i = 0; i < 8; ++i) { short sx = k_octet; short sy = local_row / 8; short lx = i; short ly = local_row % 8; short ib = 8 * sx + sy; *(sb + 64 * ib + 8 * ly + lx) = half(output_grad[(first_row + uint(local_row)) * p.out_dim + k0 + uint(8 * k_octet + i)]); }\n"
+           "        for (short i = 0; i < 8; ++i) { short sx = k_octet; short sy = local_row / 8; short lx = i; short ly = local_row % 8; short ib = 8 * sx + sy; *(sb + 64 * ib + 8 * ly + lx) = float(output_grad[(first_row + uint(local_row)) * p.out_dim + k0 + uint(8 * k_octet + i)]); }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        threadgroup const half *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const half *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u);\n"
+           "        threadgroup const float *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const float *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u);\n"
            "        for (short ik = 0; ik < 4; ++ik) { simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 4; ++i) simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 2; ++i) simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 8; ++i) simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]); lsma += 8 * 64; lsmb += 8 * 64; }\n"
            "    }\n"
            "    uint sg_col = 32u * (uint(sgitg) & 1u); uint sg_row = 16u * (uint(sgitg) >> 1u);\n"
@@ -8812,48 +8913,46 @@ static NSString *termite_metal_shader_source(void) {
            "    constexpr uint tile_n = 64u; constexpr uint tile_m = 64u; constexpr uint tile_k = 32u;\n"
            "    uint first_col = tg.x * tile_n; uint first_row = tg.y * tile_m;\n"
            "    if (first_col >= p.in_dim || first_row >= p.rows || (p.rows & 63u) != 0u || (p.in_dim & 63u) != 0u || (p.out_dim & 31u) != 0u) return;\n"
-           "    threadgroup half *sa = (threadgroup half *)(shmem); threadgroup half *sb = (threadgroup half *)(shmem + 4096u);\n"
+           "    threadgroup float *sa = (threadgroup float *)(shmem); threadgroup float *sb = (threadgroup float *)(shmem + 8192u);\n"
            "    short weight_k = short(uint(tiitg) / 8u); short weight_col_octet = short(uint(tiitg) % 8u); short local_row = short(uint(tiitg) / 4u); short k_octet = short(tiitg) % 4;\n"
-           "    simdgroup_half8x8 ma[4]; simdgroup_half8x8 mb[2]; simdgroup_float8x8 mc[8];\n"
+           "    simdgroup_float8x8 ma[4]; simdgroup_float8x8 mb[2]; simdgroup_float8x8 mc[8];\n"
            "    for (short i = 0; i < 8; ++i) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
            "    for (uint k0 = 0u; k0 < p.out_dim; k0 += tile_k) {\n"
            "        uint weight_base = (k0 + uint(weight_k)) * p.in_dim + first_col + uint(8 * weight_col_octet);\n"
            "        device const packed_ushort4 *weight_vector = (device const packed_ushort4 *)(weight + weight_base);\n"
-           "        half4 weight_values0 = half4(as_type<float4>(uint4(ushort4(weight_vector[0])) << 16u));\n"
-           "        half4 weight_values1 = half4(as_type<float4>(uint4(ushort4(weight_vector[1])) << 16u));\n"
+           "        float4 weight_values0 = float4(as_type<float4>(uint4(ushort4(weight_vector[0])) << 16u));\n"
+           "        float4 weight_values1 = float4(as_type<float4>(uint4(ushort4(weight_vector[1])) << 16u));\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        short weight_col = 8 * weight_col_octet; short weight_ib = 8 * (weight_k / 8) + weight_col / 8;\n"
-           "        threadgroup half4 *weight_dst = (threadgroup half4 *)(sa + 64 * weight_ib + 8 * (weight_k % 8));\n"
+           "        threadgroup float4 *weight_dst = (threadgroup float4 *)(sa + 64 * weight_ib + 8 * (weight_k % 8));\n"
            "        weight_dst[0] = weight_values0; weight_dst[1] = weight_values1;\n"
            "        uint grad_base = (first_row + uint(local_row)) * p.out_dim + k0 + uint(8 * k_octet);\n"
            "        device const packed_float4 *grad_vector = (device const packed_float4 *)(output_grad + grad_base);\n"
-           "        half4 grad_values0 = half4(float4(grad_vector[0])); half4 grad_values1 = half4(float4(grad_vector[1]));\n"
+           "        float4 grad_values0 = float4(float4(grad_vector[0])); float4 grad_values1 = float4(float4(grad_vector[1]));\n"
            "        short grad_ib = 8 * k_octet + local_row / 8;\n"
-           "        threadgroup half4 *grad_dst = (threadgroup half4 *)(sb + 64 * grad_ib + 8 * (local_row % 8));\n"
+           "        threadgroup float4 *grad_dst = (threadgroup float4 *)(sb + 64 * grad_ib + 8 * (local_row % 8));\n"
            "        grad_dst[0] = grad_values0; grad_dst[1] = grad_values1;\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        threadgroup const half *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const half *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u);\n"
+           "        threadgroup const float *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const float *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u);\n"
            "        for (short ik = 0; ik < 4; ++ik) { simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 4; ++i) simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 2; ++i) simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 8; ++i) simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]); lsma += 8 * 64; lsmb += 8 * 64; }\n"
            "    }\n"
            "    uint sg_col = 32u * (uint(sgitg) & 1u); uint sg_row = 16u * (uint(sgitg) >> 1u);\n"
            "    device float *dst = input_grad + first_row * p.in_dim + first_col + sg_col + sg_row * p.in_dim; for (short i = 0; i < 8; ++i) simdgroup_store(mc[i], dst + 8u * uint(i % 4) + 8u * p.in_dim * uint(i / 4), p.in_dim, 0, false);\n"
            "}\n"
-           // CCE emits FP16 gradient logits because every qualified BF16
-           // backward GEMM immediately rounds its FP32 input to FP16. Keeping
-           // that exact consumed representation cuts the tile write in half
-           // and halves the gradient traffic reread by each input-column tile.
+           // Explicit reduced-precision CCE experiment. Default CCE retains
+           // F32 gradients; only this opt-in buffer has an F16 input contract.
            "kernel void termite_linear_cce_backward_input_f16_bf16_simdgroup(device const half *output_grad [[buffer(0)]], device const ushort *weight [[buffer(1)]], device float *input_grad [[buffer(2)]], constant termite_metal_linear_params &p [[buffer(3)]], threadgroup char *shmem [[threadgroup(0)]], ushort tiitg [[thread_index_in_threadgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
            "    constexpr uint tile_n = 64u; constexpr uint tile_m = 32u; constexpr uint tile_k = 32u;\n"
            "    uint first_col = tg.x * tile_n; uint first_row = tg.y * tile_m; if (first_col >= p.in_dim || first_row >= p.rows) return;\n"
            "    uint valid_cols = min(tile_n, p.in_dim - first_col); uint valid_rows = min(tile_m, p.rows - first_row);\n"
-           "    threadgroup half *sa = (threadgroup half *)(shmem); threadgroup half *sb = (threadgroup half *)(shmem + 4096u); constexpr short NL0 = 2; constexpr short NL1 = 4;\n"
+           "    threadgroup float *sa = (threadgroup float *)(shmem); threadgroup float *sb = (threadgroup float *)(shmem + 8192u); constexpr short NL0 = 2; constexpr short NL1 = 4;\n"
            "    short local_col = short(min(uint(tiitg) / uint(NL0), valid_cols - 1u)); short local_row = short(min(uint(tiitg) / uint(NL1), valid_rows - 1u)); short half_k = short(tiitg) % NL0; short input_k8 = 8 * (short(tiitg) % NL1);\n"
-           "    simdgroup_half8x8 ma[4]; simdgroup_half8x8 mb[2]; simdgroup_float8x8 mc[8]; for (short i = 0; i < 8; ++i) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
+           "    simdgroup_float8x8 ma[4]; simdgroup_float8x8 mb[2]; simdgroup_float8x8 mc[8]; for (short i = 0; i < 8; ++i) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
            "    for (uint k0 = 0u; k0 < p.out_dim; k0 += tile_k) {\n"
-           "        half4x4 weight_values; for (short i = 0; i < 16; ++i) { uint k = k0 + uint(half_k * 16 + i); weight_values[i / 4][i % 4] = k < p.out_dim ? half(termite_bf16_to_f32(weight[k * p.in_dim + first_col + uint(local_col)])) : half(0.0f); }\n"
+           "        float4x4 weight_values; for (short i = 0; i < 16; ++i) { uint k = k0 + uint(half_k * 16 + i); weight_values[i / 4][i % 4] = k < p.out_dim ? float(termite_bf16_to_f32(weight[k * p.in_dim + first_col + uint(local_col)])) : float(0.0f); }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup); for (short i = 0; i < 16; ++i) { short sx = 2 * half_k + i / 8; short sy = (short(tiitg) / NL0) / 8; short lx = (short(tiitg) / NL0) % 8; short ly = i % 8; short ib = 8 * sx + sy; *(sa + 64 * ib + 8 * ly + lx) = weight_values[i / 4][i % 4]; }\n"
-           "        for (short i = 0; i < 8; ++i) { short sx = short(tiitg) % NL1; short sy = (short(tiitg) / NL1) / 8; short lx = i; short ly = (short(tiitg) / NL1) % 8; short ib = 4 * sx + sy; uint k = k0 + uint(input_k8 + i); *(sb + 64 * ib + 8 * ly + lx) = k < p.out_dim ? output_grad[(first_row + uint(local_row)) * p.out_dim + k] : half(0.0f); }\n"
-           "        threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup const half *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const half *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u);\n"
+           "        for (short i = 0; i < 8; ++i) { short sx = short(tiitg) % NL1; short sy = (short(tiitg) / NL1) / 8; short lx = i; short ly = (short(tiitg) / NL1) % 8; short ib = 4 * sx + sy; uint k = k0 + uint(input_k8 + i); *(sb + 64 * ib + 8 * ly + lx) = k < p.out_dim ? output_grad[(first_row + uint(local_row)) * p.out_dim + k] : float(0.0f); }\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup const float *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const float *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u);\n"
            "        for (short ik = 0; ik < 4; ++ik) { simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 4; ++i) simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 2; ++i) simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 8; ++i) simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]); lsma += 8 * 64; lsmb += 4 * 64; }\n"
            "    }\n"
            "    uint sg_col = 32u * (uint(sgitg) & 1u); uint sg_row = 16u * (uint(sgitg) >> 1u);\n"
@@ -8863,15 +8962,15 @@ static NSString *termite_metal_shader_source(void) {
            "kernel void termite_linear_cce_backward_input_f16_bf16_simdgroup_m64_packed(device const half *output_grad [[buffer(0)]], device const ushort *weight [[buffer(1)]], device float *input_grad [[buffer(2)]], constant termite_metal_linear_params &p [[buffer(3)]], threadgroup char *shmem [[threadgroup(0)]], ushort tiitg [[thread_index_in_threadgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
            "    constexpr uint tile_n = 64u; constexpr uint tile_m = 64u; constexpr uint tile_k = 32u; uint first_col = tg.x * tile_n; uint first_row = tg.y * tile_m;\n"
            "    if (first_col >= p.in_dim || first_row >= p.rows || (p.rows & 63u) != 0u || (p.in_dim & 63u) != 0u || (p.out_dim & 31u) != 0u) return;\n"
-           "    threadgroup half *sa = (threadgroup half *)(shmem); threadgroup half *sb = (threadgroup half *)(shmem + 4096u); short weight_k = short(uint(tiitg) / 8u); short weight_col_octet = short(uint(tiitg) % 8u); short local_row = short(uint(tiitg) / 4u); short k_octet = short(tiitg) % 4;\n"
-           "    simdgroup_half8x8 ma[4]; simdgroup_half8x8 mb[2]; simdgroup_float8x8 mc[8]; for (short i = 0; i < 8; ++i) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
+           "    threadgroup float *sa = (threadgroup float *)(shmem); threadgroup float *sb = (threadgroup float *)(shmem + 8192u); short weight_k = short(uint(tiitg) / 8u); short weight_col_octet = short(uint(tiitg) % 8u); short local_row = short(uint(tiitg) / 4u); short k_octet = short(tiitg) % 4;\n"
+           "    simdgroup_float8x8 ma[4]; simdgroup_float8x8 mb[2]; simdgroup_float8x8 mc[8]; for (short i = 0; i < 8; ++i) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
            "    for (uint k0 = 0u; k0 < p.out_dim; k0 += tile_k) {\n"
            "        uint weight_base = (k0 + uint(weight_k)) * p.in_dim + first_col + uint(8 * weight_col_octet); device const packed_ushort4 *weight_vector = (device const packed_ushort4 *)(weight + weight_base);\n"
-           "        half4 weight_values0 = half4(as_type<float4>(uint4(ushort4(weight_vector[0])) << 16u)); half4 weight_values1 = half4(as_type<float4>(uint4(ushort4(weight_vector[1])) << 16u));\n"
-           "        threadgroup_barrier(mem_flags::mem_threadgroup); short weight_col = 8 * weight_col_octet; short weight_ib = 8 * (weight_k / 8) + weight_col / 8; threadgroup half4 *weight_dst = (threadgroup half4 *)(sa + 64 * weight_ib + 8 * (weight_k % 8)); weight_dst[0] = weight_values0; weight_dst[1] = weight_values1;\n"
+           "        float4 weight_values0 = float4(as_type<float4>(uint4(ushort4(weight_vector[0])) << 16u)); float4 weight_values1 = float4(as_type<float4>(uint4(ushort4(weight_vector[1])) << 16u));\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup); short weight_col = 8 * weight_col_octet; short weight_ib = 8 * (weight_k / 8) + weight_col / 8; threadgroup float4 *weight_dst = (threadgroup float4 *)(sa + 64 * weight_ib + 8 * (weight_k % 8)); weight_dst[0] = weight_values0; weight_dst[1] = weight_values1;\n"
            "        uint grad_base = (first_row + uint(local_row)) * p.out_dim + k0 + uint(8 * k_octet); device const packed_ushort4 *grad_vector = (device const packed_ushort4 *)((device const ushort *)output_grad + grad_base);\n"
-           "        half4 grad_values0 = as_type<half4>(ushort4(grad_vector[0])); half4 grad_values1 = as_type<half4>(ushort4(grad_vector[1])); short grad_ib = 8 * k_octet + local_row / 8; threadgroup half4 *grad_dst = (threadgroup half4 *)(sb + 64 * grad_ib + 8 * (local_row % 8)); grad_dst[0] = grad_values0; grad_dst[1] = grad_values1;\n"
-           "        threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup const half *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const half *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u);\n"
+           "        float4 grad_values0 = float4(as_type<half4>(ushort4(grad_vector[0]))); float4 grad_values1 = float4(as_type<half4>(ushort4(grad_vector[1]))); short grad_ib = 8 * k_octet + local_row / 8; threadgroup float4 *grad_dst = (threadgroup float4 *)(sb + 64 * grad_ib + 8 * (local_row % 8)); grad_dst[0] = grad_values0; grad_dst[1] = grad_values1;\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup const float *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const float *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u);\n"
            "        for (short ik = 0; ik < 4; ++ik) { simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 4; ++i) simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 2; ++i) simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 8; ++i) simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]); lsma += 8 * 64; lsmb += 8 * 64; }\n"
            "    }\n"
            "    uint sg_col = 32u * (uint(sgitg) & 1u); uint sg_row = 16u * (uint(sgitg) >> 1u); device float *dst = input_grad + first_row * p.in_dim + first_col + sg_col + sg_row * p.in_dim; for (short i = 0; i < 8; ++i) simdgroup_store(mc[i], dst + 8u * uint(i % 4) + 8u * p.in_dim * uint(i / 4), p.in_dim, 0, false);\n"
@@ -8887,38 +8986,38 @@ static NSString *termite_metal_shader_source(void) {
            "    constexpr uint tile_n = 64u; constexpr uint tile_m = 64u; constexpr uint tile_k = 32u;\n"
            "    uint first_col = tg.x * tile_n; uint first_row = tg.y * tile_m;\n"
            "    if (first_col >= p.in_dim || first_row >= p.rows || (p.rows & 63u) != 0u || (p.in_dim & 63u) != 0u || (p.out_dim & 31u) != 0u) return;\n"
-           "    threadgroup half *sa = (threadgroup half *)(shmem); threadgroup half *sb = (threadgroup half *)(shmem + 4096u);\n"
+           "    threadgroup float *sa = (threadgroup float *)(shmem); threadgroup float *sb = (threadgroup float *)(shmem + 8192u);\n"
            "    short weight_k = short(uint(tiitg) / 8u); short weight_col_octet = short(uint(tiitg) % 8u); short local_row = short(uint(tiitg) / 4u); short k_octet = short(tiitg) % 4;\n"
-           "    simdgroup_half8x8 ma[4]; simdgroup_half8x8 mb[2]; simdgroup_float8x8 mc[8];\n"
+           "    simdgroup_float8x8 ma[4]; simdgroup_float8x8 mb[2]; simdgroup_float8x8 mc[8];\n"
            "    for (short i = 0; i < 8; ++i) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
            "    for (uint k0 = 0u; k0 < p.out_dim; k0 += tile_k) {\n"
            "        uint first_weight_base = (k0 + uint(weight_k)) * p.in_dim + first_col + uint(8 * weight_col_octet);\n"
            "        device const packed_ushort4 *first_weight_vector = (device const packed_ushort4 *)(first_weight + first_weight_base);\n"
-           "        half4 first_weight_values0 = half4(as_type<float4>(uint4(ushort4(first_weight_vector[0])) << 16u)); half4 first_weight_values1 = half4(as_type<float4>(uint4(ushort4(first_weight_vector[1])) << 16u));\n"
+           "        float4 first_weight_values0 = float4(as_type<float4>(uint4(ushort4(first_weight_vector[0])) << 16u)); float4 first_weight_values1 = float4(as_type<float4>(uint4(ushort4(first_weight_vector[1])) << 16u));\n"
            "        uint first_grad_base = (first_row + uint(local_row)) * p.out_dim + k0 + uint(8 * k_octet);\n"
            "        device const packed_float4 *first_grad_vector = (device const packed_float4 *)(first_output_grad + first_grad_base);\n"
-           "        half4 first_grad_values0 = half4(float4(first_grad_vector[0])); half4 first_grad_values1 = half4(float4(first_grad_vector[1]));\n"
+           "        float4 first_grad_values0 = float4(float4(first_grad_vector[0])); float4 first_grad_values1 = float4(float4(first_grad_vector[1]));\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        short weight_col = 8 * weight_col_octet; short weight_ib = 8 * (weight_k / 8) + weight_col / 8;\n"
-           "        threadgroup half4 *weight_dst = (threadgroup half4 *)(sa + 64 * weight_ib + 8 * (weight_k % 8)); weight_dst[0] = first_weight_values0; weight_dst[1] = first_weight_values1;\n"
-           "        short grad_ib = 8 * k_octet + local_row / 8; threadgroup half4 *grad_dst = (threadgroup half4 *)(sb + 64 * grad_ib + 8 * (local_row % 8)); grad_dst[0] = first_grad_values0; grad_dst[1] = first_grad_values1;\n"
+           "        threadgroup float4 *weight_dst = (threadgroup float4 *)(sa + 64 * weight_ib + 8 * (weight_k % 8)); weight_dst[0] = first_weight_values0; weight_dst[1] = first_weight_values1;\n"
+           "        short grad_ib = 8 * k_octet + local_row / 8; threadgroup float4 *grad_dst = (threadgroup float4 *)(sb + 64 * grad_ib + 8 * (local_row % 8)); grad_dst[0] = first_grad_values0; grad_dst[1] = first_grad_values1;\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        threadgroup const half *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const half *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u);\n"
+           "        threadgroup const float *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const float *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u);\n"
            "        for (short ik = 0; ik < 4; ++ik) { simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 4; ++i) simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 2; ++i) simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 8; ++i) simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]); lsma += 8 * 64; lsmb += 8 * 64; }\n"
            "    }\n"
            "    for (uint k0 = 0u; k0 < p.out_dim; k0 += tile_k) {\n"
            "        uint second_weight_base = (k0 + uint(weight_k)) * p.in_dim + first_col + uint(8 * weight_col_octet);\n"
            "        device const packed_ushort4 *second_weight_vector = (device const packed_ushort4 *)(second_weight + second_weight_base);\n"
-           "        half4 second_weight_values0 = half4(as_type<float4>(uint4(ushort4(second_weight_vector[0])) << 16u)); half4 second_weight_values1 = half4(as_type<float4>(uint4(ushort4(second_weight_vector[1])) << 16u));\n"
+           "        float4 second_weight_values0 = float4(as_type<float4>(uint4(ushort4(second_weight_vector[0])) << 16u)); float4 second_weight_values1 = float4(as_type<float4>(uint4(ushort4(second_weight_vector[1])) << 16u));\n"
            "        uint second_grad_base = (first_row + uint(local_row)) * p.out_dim + k0 + uint(8 * k_octet);\n"
            "        device const packed_float4 *second_grad_vector = (device const packed_float4 *)(second_output_grad + second_grad_base);\n"
-           "        half4 second_grad_values0 = half4(float4(second_grad_vector[0])); half4 second_grad_values1 = half4(float4(second_grad_vector[1]));\n"
+           "        float4 second_grad_values0 = float4(float4(second_grad_vector[0])); float4 second_grad_values1 = float4(float4(second_grad_vector[1]));\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        short weight_col = 8 * weight_col_octet; short weight_ib = 8 * (weight_k / 8) + weight_col / 8;\n"
-           "        threadgroup half4 *weight_dst = (threadgroup half4 *)(sa + 64 * weight_ib + 8 * (weight_k % 8)); weight_dst[0] = second_weight_values0; weight_dst[1] = second_weight_values1;\n"
-           "        short grad_ib = 8 * k_octet + local_row / 8; threadgroup half4 *grad_dst = (threadgroup half4 *)(sb + 64 * grad_ib + 8 * (local_row % 8)); grad_dst[0] = second_grad_values0; grad_dst[1] = second_grad_values1;\n"
+           "        threadgroup float4 *weight_dst = (threadgroup float4 *)(sa + 64 * weight_ib + 8 * (weight_k % 8)); weight_dst[0] = second_weight_values0; weight_dst[1] = second_weight_values1;\n"
+           "        short grad_ib = 8 * k_octet + local_row / 8; threadgroup float4 *grad_dst = (threadgroup float4 *)(sb + 64 * grad_ib + 8 * (local_row % 8)); grad_dst[0] = second_grad_values0; grad_dst[1] = second_grad_values1;\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        threadgroup const half *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const half *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u);\n"
+           "        threadgroup const float *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const float *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u);\n"
            "        for (short ik = 0; ik < 4; ++ik) { simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 4; ++i) simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 2; ++i) simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 8; ++i) simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]); lsma += 8 * 64; lsmb += 8 * 64; }\n"
            "    }\n"
            "    uint sg_col = 32u * (uint(sgitg) & 1u); uint sg_row = 16u * (uint(sgitg) >> 1u); device float *dst = input_grad + first_row * p.in_dim + first_col + sg_col + sg_row * p.in_dim;\n"
@@ -9907,30 +10006,34 @@ static NSString *termite_metal_shader_source(void) {
            "    constexpr uint threads = 256u; if (row >= p.rows || p.tile_vocab_size == 0u) return; uint base = row * p.tile_vocab_size;\n"
            "    float local_max = -INFINITY; for (uint col = tid; col < p.tile_vocab_size; col += threads) local_max = max(local_max, termite_linear_ce_logit(logits[base + col], p.logit_softcap));\n"
            "    shmem[tid] = local_max; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) { if (tid < stride) shmem[tid] = max(shmem[tid], shmem[tid + stride]); threadgroup_barrier(mem_flags::mem_threadgroup); } float tile_max = shmem[0];\n"
-           "    float local_sum = 0.0f; for (uint col = tid; col < p.tile_vocab_size; col += threads) local_sum += exp(termite_linear_ce_logit(logits[base + col], p.logit_softcap) - tile_max);\n"
+           "    float local_sum = 0.0f; float correction = 0.0f; for (uint col = tid; col < p.tile_vocab_size; col += threads) { float value = exp(termite_linear_ce_logit(logits[base + col], p.logit_softcap) - tile_max) - correction; float next_sum = local_sum + value; correction = (next_sum - local_sum) - value; local_sum = next_sum; }\n"
            "    shmem[tid] = local_sum; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) { if (tid < stride) shmem[tid] += shmem[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
            "    if (tid == 0u) { float target = NAN; float rounded = round(labels[row]); if (termite_linear_cce_label_state(labels[row], p.vocab_size, p.ignore_index) > 0.0f) { uint label = uint(rounded); if (label >= p.vocab_start && label < p.vocab_start + p.tile_vocab_size) target = termite_linear_ce_logit(logits[base + label - p.vocab_start], p.logit_softcap); } uint dst = (p.tile_index * p.rows + row) * 3u; partials[dst] = tile_max; partials[dst + 1u] = shmem[0]; partials[dst + 2u] = target; }\n"
            "}\n"
+           // Preserve the maximum and shifted log-normalizer separately.
+           // Rounding their sum destroys small losses and probability gradients
+           // when all logits have a large common offset. State is [max, log_sum,
+           // valid_count], with two row-sized arrays and one trailing scalar.
            "kernel void termite_linear_cce_finalize(device const float *partials [[buffer(0)]], device const float *labels [[buffer(1)]], device float *state [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_linear_cce_tile_params &p [[buffer(4)]], threadgroup float *shmem [[threadgroup(0)]], uint tid [[thread_index_in_threadgroup]]) {\n"
            "    constexpr uint threads = 256u; float local_loss = 0.0f; float local_valid = 0.0f; bool invalid = false;\n"
            "    for (uint row = tid; row < p.rows; row += threads) {\n"
            "        float label_state = termite_linear_cce_label_state(labels[row], p.vocab_size, p.ignore_index);\n"
-           "        if (label_state < 0.0f) { state[row] = NAN; invalid = true; continue; }\n"
-           "        if (label_state == 0.0f) { state[row] = -INFINITY; continue; }\n"
+           "        if (label_state < 0.0f) { state[row] = NAN; state[p.rows + row] = NAN; invalid = true; continue; }\n"
+           "        if (label_state == 0.0f) { state[row] = -INFINITY; state[p.rows + row] = 0.0f; continue; }\n"
            "        float row_max = -INFINITY; for (uint tile = 0u; tile < p.tile_count; ++tile) row_max = max(row_max, partials[(tile * p.rows + row) * 3u]);\n"
-           "        float sum_exp = 0.0f; for (uint tile = 0u; tile < p.tile_count; ++tile) { uint src = (tile * p.rows + row) * 3u; sum_exp += partials[src + 1u] * exp(partials[src] - row_max); }\n"
+           "        float sum_exp = 0.0f; float correction = 0.0f; for (uint tile = 0u; tile < p.tile_count; ++tile) { uint src = (tile * p.rows + row) * 3u; float value = partials[src + 1u] * exp(partials[src] - row_max) - correction; float next_sum = sum_exp + value; correction = (next_sum - sum_exp) - value; sum_exp = next_sum; }\n"
            "        uint label = uint(round(labels[row])); uint target_tile = label / p.tile_vocab_size; float target = partials[(target_tile * p.rows + row) * 3u + 2u];\n"
-           "        float lse = row_max + log(sum_exp); state[row] = lse; local_loss += lse - target; local_valid += 1.0f;\n"
+           "        float log_sum = log(sum_exp); state[row] = row_max; state[p.rows + row] = log_sum; local_loss += (row_max - target) + log_sum; local_valid += 1.0f;\n"
            "    }\n"
            "    shmem[tid] = invalid ? NAN : local_loss; shmem[threads + tid] = local_valid; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) { if (tid < stride) { shmem[tid] += shmem[tid + stride]; shmem[threads + tid] += shmem[threads + tid + stride]; } threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
-           "    if (tid == 0u) { float valid = shmem[threads]; state[p.rows] = isnan(shmem[0]) ? NAN : valid; output[0] = isnan(shmem[0]) ? NAN : (valid == 0.0f ? 0.0f : shmem[0] / valid); }\n"
+           "    if (tid == 0u) { float valid = shmem[threads]; state[2u * p.rows] = isnan(shmem[0]) ? NAN : valid; output[0] = isnan(shmem[0]) ? NAN : (valid == 0.0f ? 0.0f : shmem[0] / valid); }\n"
            "}\n"
            "kernel void termite_linear_cce_grad_tile(device const float *logits [[buffer(0)]], device const float *labels [[buffer(1)]], device const float *upstream [[buffer(2)]], device const float *state [[buffer(3)]], device float *output [[buffer(4)]], constant termite_metal_linear_cce_tile_params &p [[buffer(5)]], uint gid [[thread_position_in_grid]]) {\n"
-           "    uint total = p.rows * p.tile_vocab_size; if (gid >= total) return; uint row = gid / p.tile_vocab_size; uint col = gid - row * p.tile_vocab_size; float valid = state[p.rows]; float lse = state[row]; if (isnan(valid) || isnan(lse)) { output[gid] = NAN; return; } if (lse == -INFINITY || valid == 0.0f) { output[gid] = 0.0f; return; } float raw = logits[gid]; float capped = termite_linear_ce_logit(raw, p.logit_softcap); uint vocab = p.vocab_start + col; uint label = uint(round(labels[row])); float grad = exp(capped - lse) - (vocab == label ? 1.0f : 0.0f); if (p.logit_softcap > 0.0f) { float t = tanh(raw / p.logit_softcap); grad *= 1.0f - t * t; } output[gid] = upstream[0] * grad / valid;\n"
+           "    uint total = p.rows * p.tile_vocab_size; if (gid >= total) return; uint row = gid / p.tile_vocab_size; uint col = gid - row * p.tile_vocab_size; float valid = state[2u * p.rows]; float row_max = state[row]; float log_sum = state[p.rows + row]; if (isnan(valid) || isnan(row_max)) { output[gid] = NAN; return; } if (row_max == -INFINITY || valid == 0.0f) { output[gid] = 0.0f; return; } float raw = logits[gid]; float capped = termite_linear_ce_logit(raw, p.logit_softcap); uint vocab = p.vocab_start + col; uint label = uint(round(labels[row])); float grad = exp((capped - row_max) - log_sum) - (vocab == label ? 1.0f : 0.0f); if (p.logit_softcap > 0.0f) { float t = tanh(raw / p.logit_softcap); grad *= 1.0f - t * t; } output[gid] = upstream[0] * grad / valid;\n"
            "}\n"
            "kernel void termite_linear_cce_grad_tile_f16(device const float *logits [[buffer(0)]], device const float *labels [[buffer(1)]], device const float *upstream [[buffer(2)]], device const float *state [[buffer(3)]], device half *output [[buffer(4)]], constant termite_metal_linear_cce_tile_params &p [[buffer(5)]], uint gid [[thread_position_in_grid]]) {\n"
-           "    uint total = p.rows * p.tile_vocab_size; if (gid >= total) return; uint row = gid / p.tile_vocab_size; uint col = gid - row * p.tile_vocab_size; float valid = state[p.rows]; float lse = state[row]; if (isnan(valid) || isnan(lse)) { output[gid] = half(NAN); return; } if (lse == -INFINITY || valid == 0.0f) { output[gid] = half(0.0f); return; } float raw = logits[gid]; float capped = termite_linear_ce_logit(raw, p.logit_softcap); uint vocab = p.vocab_start + col; uint label = uint(round(labels[row])); float grad = exp(capped - lse) - (vocab == label ? 1.0f : 0.0f); if (p.logit_softcap > 0.0f) { float t = tanh(raw / p.logit_softcap); grad *= 1.0f - t * t; } output[gid] = half(upstream[0] * grad / valid);\n"
+           "    uint total = p.rows * p.tile_vocab_size; if (gid >= total) return; uint row = gid / p.tile_vocab_size; uint col = gid - row * p.tile_vocab_size; float valid = state[2u * p.rows]; float row_max = state[row]; float log_sum = state[p.rows + row]; if (isnan(valid) || isnan(row_max)) { output[gid] = half(NAN); return; } if (row_max == -INFINITY || valid == 0.0f) { output[gid] = half(0.0f); return; } float raw = logits[gid]; float capped = termite_linear_ce_logit(raw, p.logit_softcap); uint vocab = p.vocab_start + col; uint label = uint(round(labels[row])); float grad = exp((capped - row_max) - log_sum) - (vocab == label ? 1.0f : 0.0f); if (p.logit_softcap > 0.0f) { float t = tanh(raw / p.logit_softcap); grad *= 1.0f - t * t; } output[gid] = half(upstream[0] * grad / valid);\n"
            "}\n"
            "kernel void termite_multiply_reduce_last_dim_rows(device const float *lhs [[buffer(0)]], device const float *rhs [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_reduce_last_dim_params &p [[buffer(3)]], threadgroup float *shmem [[threadgroup(0)]], uint tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
            "    if (row >= p.rows || p.dim == 0u) return;\n"
@@ -10024,14 +10127,23 @@ static NSString *termite_metal_shader_source(void) {
            "    weight[gid] -= p.lr * update;\n"
            "    grad[gid] = 0.0f;\n"
            "}\n"
-           "kernel void termite_training_sumsq_f32(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_training_sumsq_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
-           "    if (gid != 0u) return;\n"
-           "    float sum = 0.0f;\n"
-           "    for (uint i = 0u; i < p.elem_count; i += 1u) {\n"
-           "        float v = input[i];\n"
-           "        sum += v * v;\n"
+           // Norms drive clipping before every optimizer update. Compensated
+           // lane sums plus a balanced tree preserve small squared gradients
+           // that a serial F32 sum loses in large LoRA tensors.
+           "kernel void termite_training_sumsq_f32(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_training_sumsq_params &p [[buffer(2)]], threadgroup float *scratch [[threadgroup(0)]], uint tid [[thread_index_in_threadgroup]]) {\n"
+           "    constexpr uint threads = 256u;\n"
+           "    float sum = 0.0f; float correction = 0.0f;\n"
+           "    for (ulong i = ulong(tid); i < ulong(p.elem_count); i += ulong(threads)) {\n"
+           "        float v = input[i]; float corrected = v * v - correction;\n"
+           "        float next_sum = sum + corrected;\n"
+           "        correction = (next_sum - sum) - corrected; sum = next_sum;\n"
            "    }\n"
-           "    output[0] = sum;\n"
+           "    scratch[tid] = sum; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) {\n"
+           "        if (tid < stride) scratch[tid] += scratch[tid + stride];\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    }\n"
+           "    if (tid == 0u) output[0] = scratch[0];\n"
            "}\n"
            "kernel void termite_apply_subtract_1x(device const float *lhs [[buffer(0)]], device const float *rhs [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_apply_add_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.rows * p.dim; if (gid >= total) return;\n"
@@ -15681,9 +15793,12 @@ static bool termite_metal_bf16_simdgroup_m64_prefix_tail_enabled(void) {
     return disabled == NULL || disabled[0] == '\0' || strcmp(disabled, "0") == 0;
 }
 
+// Loss gradients can be smaller than F16 subnormals. Preserve F32 by default;
+// the reduced-precision buffer remains an explicit diagnostic experiment.
 static bool termite_metal_linear_cce_f16_grad_enabled(void) {
     const char *disabled = getenv("TERMITE_METAL_DISABLE_LINEAR_CCE_F16_GRAD");
-    return disabled == NULL || disabled[0] == '\0' || strcmp(disabled, "0") == 0;
+    if (disabled != NULL && disabled[0] != '\0' && strcmp(disabled, "0") != 0) return false;
+    return termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_LINEAR_CCE_F16_GRAD"));
 }
 
 // Retaining the forward logits removes the second full-vocabulary projection
@@ -15697,12 +15812,13 @@ static bool termite_metal_linear_cce_forward_logits_cache_enabled(void) {
 }
 
 // MPSMatrix cannot consume BF16 in its mixed F32 matrix multiply, so the
-// qualified large-row CCE backward path builds one persistent F16 mirror of
-// the frozen vocabulary weight. Keep the exact BF16 kernel as an unconditional
-// rollback for memory-constrained deployments and numerical investigations.
+// large-row CCE backward experiment builds a persistent F16 weight mirror.
+// BF16's exponent range exceeds F16's, so this is not an exact storage change.
+// Keep it opt-in, like the F16 gradient-buffer experiment.
 static bool termite_metal_linear_cce_f16_mps_backward_enabled(void) {
     const char *disabled = getenv("TERMITE_METAL_DISABLE_LINEAR_CCE_F16_MPS_BACKWARD");
-    return disabled == NULL || disabled[0] == '\0' || strcmp(disabled, "0") == 0;
+    if (disabled != NULL && disabled[0] != '\0' && strcmp(disabled, "0") != 0) return false;
+    return termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_LINEAR_CCE_F16_MPS_BACKWARD"));
 }
 
 // Qualification gate for the Gemma 4 gate/up projection fusion.  Training
@@ -25812,6 +25928,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->rms_inv_scale_pipeline = termite_metal_make_pipeline(device, library, @"termite_compute_rms_inv_scale_1x");
         runtime->rms_norm_rows_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_rms_norm_rows");
         runtime->rms_norm_rows_reduce_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_rms_norm_rows_reduce");
+        runtime->rms_norm_rows_precise_reduce_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_apply_rms_norm_rows_reduce");
         runtime->rms_norm_rows_simd4_reduce_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_rms_norm_rows_simd4_reduce");
         runtime->rms_norm_rows_triple_simd4_reduce_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_rms_norm_rows_triple_simd4_reduce");
         runtime->parallel_ffn_post_residual_simd4_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_parallel_ffn_post_residual_simd4");
@@ -25841,6 +25958,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->linear_bf16_multi_row_shared_reduce_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_linear_bf16_multi_row_shared_reduce");
         runtime->linear_bf16_multi_row_tiled32_m16_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_linear_bf16_multi_row_tiled32_m16");
         runtime->linear_bf16_multi_row_simdgroup_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_linear_bf16_multi_row_simdgroup");
+        runtime->linear_bf16_multi_row_compensated_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_apply_linear_bf16_multi_row_compensated");
         runtime->linear_bf16_multi_row_simdgroup_m64_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_linear_bf16_multi_row_simdgroup_m64");
         runtime->linear_bf16_multi_row_simdgroup_m64_packed_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_linear_bf16_multi_row_simdgroup_m64_packed");
         runtime->gemma4_bf16_gate_up_simdgroup_m64_pipeline = termite_metal_make_pipeline(device, library, @"termite_gemma4_bf16_gate_up_simdgroup_m64");
@@ -25914,6 +26032,8 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->linear_cce_tile_stats_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_linear_cce_tile_stats");
         runtime->linear_cce_finalize_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_linear_cce_finalize");
         runtime->linear_cce_grad_tile_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_linear_cce_grad_tile");
+        runtime->linear_cce_backward_bf16_blocked_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_linear_cce_backward_bf16_blocked");
+        runtime->linear_cce_backward_bf16_small_blocked_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_linear_cce_backward_bf16_small_blocked");
         runtime->linear_cce_grad_tile_f16_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_linear_cce_grad_tile_f16");
         runtime->linear_bf16_to_f16_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_linear_bf16_to_f16");
         runtime->reduce_last_dim_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_reduce_last_dim_rows");
@@ -25931,8 +26051,11 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->multiply_add_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_multiply_add_1x");
         runtime->multiply_add2_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_multiply_add2_1x");
         runtime->training_accumulate_pipeline = termite_metal_make_pipeline(device, library, @"termite_training_accumulate_f32");
-        runtime->training_adamw_pipeline = termite_metal_make_pipeline(device, library, @"termite_training_adamw_f32");
-        runtime->training_sumsq_pipeline = termite_metal_make_pipeline(device, library, @"termite_training_sumsq_f32");
+        // Fast-math reassociation loses precision in the small (1-beta2)
+        // contribution to the variance. Optimizer state must retain the
+        // same precise arithmetic contract as the clipping reduction.
+        runtime->training_adamw_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_training_adamw_f32");
+        runtime->training_sumsq_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_training_sumsq_f32");
         runtime->layer_norm_bwd_dx_pipeline = termite_metal_make_pipeline(device, library, @"termite_layer_norm_bwd_dx");
         runtime->layer_norm_bwd_dgdb_pipeline = termite_metal_make_pipeline(device, library, @"termite_layer_norm_bwd_dgdb");
         runtime->rms_norm_bwd_dx_pipeline = termite_metal_make_pipeline(device, library, @"termite_rms_norm_bwd_dx");
@@ -26170,7 +26293,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         BOOL missing_dense_bf16_backward_input_pipeline = runtime->linear_backward_input_f16_pipeline == nil || runtime->linear_backward_input_f16_simdgroup_pipeline == nil || runtime->linear_backward_input_bf16_pipeline == nil || runtime->linear_backward_input_bf16_tiled32_m16_pipeline == nil;
         BOOL missing_quantized_backward_input_pipeline = runtime->linear_backward_input_q4_0_pipeline == nil || runtime->linear_backward_input_q4_k_pipeline == nil || runtime->linear_backward_input_q6_k_pipeline == nil;
         BOOL missing_embedding_gather_pipeline = runtime->gather_axis0_bf16_f32_indices_pipeline == nil || runtime->gather_axis0_quant_f32_indices_pipeline == nil;
-        BOOL missing_linear_ce_pipeline = runtime->linear_cross_entropy_loss_pipeline == nil || runtime->linear_cross_entropy_backward_pipeline == nil || runtime->linear_cce_tile_stats_pipeline == nil || runtime->linear_cce_finalize_pipeline == nil || runtime->linear_cce_grad_tile_pipeline == nil || runtime->masked_softmax_pipeline == nil || runtime->softmax_backward_pipeline == nil;
+        BOOL missing_linear_ce_pipeline = runtime->linear_cross_entropy_loss_pipeline == nil || runtime->linear_cross_entropy_backward_pipeline == nil || runtime->linear_cce_tile_stats_pipeline == nil || runtime->linear_cce_finalize_pipeline == nil || runtime->linear_cce_grad_tile_pipeline == nil || runtime->linear_cce_backward_bf16_blocked_pipeline == nil || runtime->linear_cce_backward_bf16_small_blocked_pipeline == nil || runtime->masked_softmax_pipeline == nil || runtime->softmax_backward_pipeline == nil;
         BOOL missing_requested_generated_pipeline =
             (termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_ATTENTION_1X_GENERATED")) && runtime->attention_1x_generated_pipeline == nil) ||
             (termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_FLASH_PREFILL_GENERATED")) &&
@@ -26209,7 +26332,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
                  runtime->attention_decode_gqa_split_scratch_buffer_alt == nil));
         // Default generated candidates remain optional. Explicit requests must
         // fail closed instead of silently benchmarking handwritten fallbacks.
-        if (missing_requested_generated_pipeline || missing_quant_reduce_pipeline || missing_dense_multi_row_reduce_pipeline || missing_dense_bf16_backward_input_pipeline || missing_quantized_backward_input_pipeline || missing_embedding_gather_pipeline || missing_linear_ce_pipeline || runtime->embed_absolute_position_pipeline == nil || runtime->embedding_lookup_pipeline == nil || runtime->q4_0_get_rows_pipeline == nil || runtime->q4_0_set_rows_pipeline == nil || runtime->q4_0_cpy_q_to_f32_pipeline == nil || runtime->q4_0_cpy_f32_to_q_pipeline == nil || runtime->q4_1_get_rows_pipeline == nil || runtime->q4_1_set_rows_pipeline == nil || runtime->q4_1_cpy_q_to_f32_pipeline == nil || runtime->q4_1_cpy_f32_to_q_pipeline == nil || runtime->q5_0_get_rows_pipeline == nil || runtime->q5_0_set_rows_pipeline == nil || runtime->q5_0_cpy_q_to_f32_pipeline == nil || runtime->q5_0_cpy_f32_to_q_pipeline == nil || runtime->q5_1_get_rows_pipeline == nil || runtime->q5_1_set_rows_pipeline == nil || runtime->q5_1_cpy_q_to_f32_pipeline == nil || runtime->q5_1_cpy_f32_to_q_pipeline == nil || runtime->q4_k_get_rows_pipeline == nil || runtime->q4_k_set_rows_pipeline == nil || runtime->q4_k_cpy_q_to_f32_pipeline == nil || runtime->q4_k_cpy_f32_to_q_pipeline == nil || runtime->q5_k_get_rows_pipeline == nil || runtime->q5_k_set_rows_pipeline == nil || runtime->q5_k_cpy_q_to_f32_pipeline == nil || runtime->q5_k_cpy_f32_to_q_pipeline == nil || runtime->q6_k_get_rows_pipeline == nil || runtime->q6_k_set_rows_pipeline == nil || runtime->q6_k_cpy_q_to_f32_pipeline == nil || runtime->q6_k_cpy_f32_to_q_pipeline == nil || runtime->q8_0_get_rows_pipeline == nil || runtime->q8_0_set_rows_pipeline == nil || runtime->q8_0_cpy_q_to_f32_pipeline == nil || runtime->q8_0_cpy_f32_to_q_pipeline == nil || runtime->q8_1_get_rows_pipeline == nil || runtime->q8_1_set_rows_pipeline == nil || runtime->q8_1_cpy_q_to_f32_pipeline == nil || runtime->q8_1_cpy_f32_to_q_pipeline == nil || runtime->rope_pipeline == nil || runtime->head_rms_rope_pipeline == nil || runtime->attention_f32_pipeline == nil || runtime->attention_f32_prefill_pipeline == nil || runtime->attention_paged_pipeline == nil || runtime->paged_f32_kv_seed_pipeline == nil || runtime->paged_f16_kv_seed_pipeline == nil || runtime->paged_f32_v_seed_pipeline == nil || runtime->slice_last_dim_f32_2d_pipeline == nil || runtime->gather_axis0_add_bias_f32_2d_pipeline == nil || runtime->transpose_f32_pipeline == nil || runtime->dot_general_2d_f32_pipeline == nil || runtime->dot_general_2d_f32_reduce_pipeline == nil || runtime->dot_general_batched_f32_pipeline == nil || runtime->lora_after_a_f32_pipeline == nil || runtime->lora_finish_f32_pipeline == nil || runtime->scatter_add_axis0_f32_pipeline == nil || runtime->conv1d_f32_pipeline == nil || runtime->conv2d_f32_pipeline == nil || runtime->layer_norm_pipeline == nil || runtime->rms_norm_pipeline == nil || runtime->rms_norm_reduce_pipeline == nil || runtime->rms_norm_rows_pipeline == nil || runtime->rms_norm_add_pipeline == nil || runtime->rms_norm_add_sumsq_pipeline == nil || runtime->rms_norm_add_f16_input_pipeline == nil || runtime->rms_norm_add_scale_pipeline == nil || runtime->rms_norm_add_scale_rows_pipeline == nil || runtime->linear_pipeline == nil || runtime->linear_reduce_pipeline == nil || runtime->linear_bf16_pipeline == nil || runtime->linear_bf16_reduce_pipeline == nil || runtime->linear_bf16_multi_row_pipeline == nil || runtime->linear_pair_reduce_pipeline == nil || runtime->linear_multi_row_pipeline == nil || runtime->linear_bias_pipeline == nil || runtime->argmax_logits_pipeline == nil || runtime->argmax_logits_partials_pipeline == nil || runtime->argmax_logits_suppress_partials_pipeline == nil || runtime->argmax_logits_reduce_pipeline == nil || runtime->sample_logits_pipeline == nil || runtime->sample_topk_partials_pipeline == nil || runtime->sample_topk_reduce_pipeline == nil || runtime->activation_pipeline == nil || runtime->gelu_backward_pipeline == nil || runtime->activation_multiply_pipeline == nil || runtime->softmax_pipeline == nil || runtime->reduce_last_dim_pipeline == nil || runtime->reduce_axis_f32_pipeline == nil || runtime->multiply_reduce_last_dim_pipeline == nil || runtime->broadcast_last_dim_pipeline == nil || runtime->broadcast_f32_pipeline == nil || runtime->multiply_pipeline == nil || runtime->scale_pipeline == nil || runtime->add_pipeline == nil || runtime->add_scale_pipeline == nil || runtime->subtract_pipeline == nil || runtime->divide_pipeline == nil || runtime->less_than_pipeline == nil || runtime->where_select_pipeline == nil || runtime->i2_s_quantize_pipeline == nil || runtime->q1_0_pipeline == nil || runtime->i8_s_pipeline == nil || runtime->q2_k_pipeline == nil || runtime->q3_k_pipeline == nil || runtime->q4_k_pipeline == nil || runtime->q4_k_reduce_pipeline == nil || runtime->q4_k_pair_pipeline == nil || runtime->q4_k_pair_activation_reduce_pipeline == nil || runtime->q4_k_pair_activation_reduce_f16_output_pipeline == nil || runtime->q4_k_activation_rhs_reduce_pipeline == nil || runtime->q4_0_activation_rhs_reduce_pipeline == nil || runtime->q4_0_activation_rhs_reduce_f16_output_pipeline == nil || runtime->q4_0_pipeline == nil || runtime->q4_0_pair_pipeline == nil || runtime->q4_0_pair_reduce_pipeline == nil || runtime->q4_0_pair_activation_reduce_pipeline == nil || runtime->q4_0_pair_activation_reduce_f16_output_pipeline == nil || runtime->q4_0_pair_activation_rms_scale_reduce_f16_output_pipeline == nil || runtime->q4_0_reduce_pipeline == nil || runtime->q4_0_reduce_sumsq_pipeline == nil || runtime->q4_0_reduce_f16_input_pipeline == nil || runtime->q4_0_reduce_f16_input_sumsq_pipeline == nil || runtime->q4_0_reduce_f16_output_pipeline == nil || runtime->q4_0_reduce_f16_input_f16_output_pipeline == nil || runtime->q4_1_pipeline == nil || runtime->q5_0_pipeline == nil || runtime->q5_0_reduce_pipeline == nil || runtime->q5_1_pipeline == nil || runtime->q8_0_pipeline == nil || runtime->q8_0_pair_pipeline == nil || runtime->q8_0_mmv_pipeline == nil || runtime->q8_0_rms_scale_mmv_pipeline == nil || runtime->q8_0_small_batch_pipeline == nil || (runtime->q8_0_mm_pipeline == nil && runtime->q8_0_mm_sg_pipeline == nil) || runtime->q8_0_pair_mmv_pipeline == nil || runtime->q8_0_pair_small_batch_pipeline == nil || runtime->q8_0_qkv_mmv_pipeline == nil || runtime->q8_0_pair_activation_reduce_pipeline == nil || runtime->q8_0_pair_activation_mmv_pipeline == nil || runtime->q8_0_pair_activation_small_batch_pipeline == nil || runtime->q8_0_activation_multiply_reduce_pipeline == nil || runtime->q8_0_activation_multiply_mmv_pipeline == nil || runtime->q8_1_pipeline == nil || runtime->q5_k_pipeline == nil || runtime->q5_k_reduce_pipeline == nil || runtime->q6_k_pipeline == nil || runtime->q6_k_reduce_pipeline == nil || runtime->q6_k_pair_pipeline == nil || runtime->q8_k_pipeline == nil || runtime->iq4_nl_pipeline == nil || runtime->iq4_xs_pipeline == nil || runtime->mxfp4_pipeline == nil || runtime->nvfp4_pipeline == nil || runtime->iq2_xs_pipeline == nil || runtime->i2_s_pipeline == nil || runtime->i2_s_pair_pipeline == nil || runtime->i2_s_linear_i8_pipeline == nil || runtime->i2_s_pair_i8_pipeline == nil || runtime->tl1_pipeline == nil || runtime->tl2_pipeline == nil || runtime->encode_polar4_key_pipeline == nil || runtime->encode_turbo3_key_pipeline == nil || runtime->polar4_attention_span_pipeline == nil || runtime->turbo3_attention_span_pipeline == nil) {
+        if (missing_requested_generated_pipeline || missing_quant_reduce_pipeline || missing_dense_multi_row_reduce_pipeline || missing_dense_bf16_backward_input_pipeline || missing_quantized_backward_input_pipeline || missing_embedding_gather_pipeline || missing_linear_ce_pipeline || runtime->embed_absolute_position_pipeline == nil || runtime->embedding_lookup_pipeline == nil || runtime->q4_0_get_rows_pipeline == nil || runtime->q4_0_set_rows_pipeline == nil || runtime->q4_0_cpy_q_to_f32_pipeline == nil || runtime->q4_0_cpy_f32_to_q_pipeline == nil || runtime->q4_1_get_rows_pipeline == nil || runtime->q4_1_set_rows_pipeline == nil || runtime->q4_1_cpy_q_to_f32_pipeline == nil || runtime->q4_1_cpy_f32_to_q_pipeline == nil || runtime->q5_0_get_rows_pipeline == nil || runtime->q5_0_set_rows_pipeline == nil || runtime->q5_0_cpy_q_to_f32_pipeline == nil || runtime->q5_0_cpy_f32_to_q_pipeline == nil || runtime->q5_1_get_rows_pipeline == nil || runtime->q5_1_set_rows_pipeline == nil || runtime->q5_1_cpy_q_to_f32_pipeline == nil || runtime->q5_1_cpy_f32_to_q_pipeline == nil || runtime->q4_k_get_rows_pipeline == nil || runtime->q4_k_set_rows_pipeline == nil || runtime->q4_k_cpy_q_to_f32_pipeline == nil || runtime->q4_k_cpy_f32_to_q_pipeline == nil || runtime->q5_k_get_rows_pipeline == nil || runtime->q5_k_set_rows_pipeline == nil || runtime->q5_k_cpy_q_to_f32_pipeline == nil || runtime->q5_k_cpy_f32_to_q_pipeline == nil || runtime->q6_k_get_rows_pipeline == nil || runtime->q6_k_set_rows_pipeline == nil || runtime->q6_k_cpy_q_to_f32_pipeline == nil || runtime->q6_k_cpy_f32_to_q_pipeline == nil || runtime->q8_0_get_rows_pipeline == nil || runtime->q8_0_set_rows_pipeline == nil || runtime->q8_0_cpy_q_to_f32_pipeline == nil || runtime->q8_0_cpy_f32_to_q_pipeline == nil || runtime->q8_1_get_rows_pipeline == nil || runtime->q8_1_set_rows_pipeline == nil || runtime->q8_1_cpy_q_to_f32_pipeline == nil || runtime->q8_1_cpy_f32_to_q_pipeline == nil || runtime->rope_pipeline == nil || runtime->head_rms_rope_pipeline == nil || runtime->attention_f32_pipeline == nil || runtime->attention_f32_prefill_pipeline == nil || runtime->attention_paged_pipeline == nil || runtime->paged_f32_kv_seed_pipeline == nil || runtime->paged_f16_kv_seed_pipeline == nil || runtime->paged_f32_v_seed_pipeline == nil || runtime->slice_last_dim_f32_2d_pipeline == nil || runtime->gather_axis0_add_bias_f32_2d_pipeline == nil || runtime->transpose_f32_pipeline == nil || runtime->dot_general_2d_f32_pipeline == nil || runtime->dot_general_2d_f32_reduce_pipeline == nil || runtime->dot_general_batched_f32_pipeline == nil || runtime->lora_after_a_f32_pipeline == nil || runtime->lora_finish_f32_pipeline == nil || runtime->scatter_add_axis0_f32_pipeline == nil || runtime->conv1d_f32_pipeline == nil || runtime->conv2d_f32_pipeline == nil || runtime->layer_norm_pipeline == nil || runtime->rms_norm_pipeline == nil || runtime->rms_norm_reduce_pipeline == nil || runtime->rms_norm_rows_pipeline == nil || runtime->rms_norm_add_pipeline == nil || runtime->rms_norm_add_sumsq_pipeline == nil || runtime->rms_norm_add_f16_input_pipeline == nil || runtime->rms_norm_add_scale_pipeline == nil || runtime->rms_norm_add_scale_rows_pipeline == nil || runtime->linear_pipeline == nil || runtime->linear_reduce_pipeline == nil || runtime->linear_bf16_pipeline == nil || runtime->linear_bf16_reduce_pipeline == nil || runtime->linear_bf16_multi_row_pipeline == nil || runtime->linear_bf16_multi_row_compensated_pipeline == nil || runtime->linear_pair_reduce_pipeline == nil || runtime->linear_multi_row_pipeline == nil || runtime->linear_bias_pipeline == nil || runtime->argmax_logits_pipeline == nil || runtime->argmax_logits_partials_pipeline == nil || runtime->argmax_logits_suppress_partials_pipeline == nil || runtime->argmax_logits_reduce_pipeline == nil || runtime->sample_logits_pipeline == nil || runtime->sample_topk_partials_pipeline == nil || runtime->sample_topk_reduce_pipeline == nil || runtime->activation_pipeline == nil || runtime->gelu_backward_pipeline == nil || runtime->activation_multiply_pipeline == nil || runtime->softmax_pipeline == nil || runtime->reduce_last_dim_pipeline == nil || runtime->reduce_axis_f32_pipeline == nil || runtime->multiply_reduce_last_dim_pipeline == nil || runtime->broadcast_last_dim_pipeline == nil || runtime->broadcast_f32_pipeline == nil || runtime->multiply_pipeline == nil || runtime->scale_pipeline == nil || runtime->add_pipeline == nil || runtime->add_scale_pipeline == nil || runtime->subtract_pipeline == nil || runtime->divide_pipeline == nil || runtime->less_than_pipeline == nil || runtime->where_select_pipeline == nil || runtime->i2_s_quantize_pipeline == nil || runtime->q1_0_pipeline == nil || runtime->i8_s_pipeline == nil || runtime->q2_k_pipeline == nil || runtime->q3_k_pipeline == nil || runtime->q4_k_pipeline == nil || runtime->q4_k_reduce_pipeline == nil || runtime->q4_k_pair_pipeline == nil || runtime->q4_k_pair_activation_reduce_pipeline == nil || runtime->q4_k_pair_activation_reduce_f16_output_pipeline == nil || runtime->q4_k_activation_rhs_reduce_pipeline == nil || runtime->q4_0_activation_rhs_reduce_pipeline == nil || runtime->q4_0_activation_rhs_reduce_f16_output_pipeline == nil || runtime->q4_0_pipeline == nil || runtime->q4_0_pair_pipeline == nil || runtime->q4_0_pair_reduce_pipeline == nil || runtime->q4_0_pair_activation_reduce_pipeline == nil || runtime->q4_0_pair_activation_reduce_f16_output_pipeline == nil || runtime->q4_0_pair_activation_rms_scale_reduce_f16_output_pipeline == nil || runtime->q4_0_reduce_pipeline == nil || runtime->q4_0_reduce_sumsq_pipeline == nil || runtime->q4_0_reduce_f16_input_pipeline == nil || runtime->q4_0_reduce_f16_input_sumsq_pipeline == nil || runtime->q4_0_reduce_f16_output_pipeline == nil || runtime->q4_0_reduce_f16_input_f16_output_pipeline == nil || runtime->q4_1_pipeline == nil || runtime->q5_0_pipeline == nil || runtime->q5_0_reduce_pipeline == nil || runtime->q5_1_pipeline == nil || runtime->q8_0_pipeline == nil || runtime->q8_0_pair_pipeline == nil || runtime->q8_0_mmv_pipeline == nil || runtime->q8_0_rms_scale_mmv_pipeline == nil || runtime->q8_0_small_batch_pipeline == nil || (runtime->q8_0_mm_pipeline == nil && runtime->q8_0_mm_sg_pipeline == nil) || runtime->q8_0_pair_mmv_pipeline == nil || runtime->q8_0_pair_small_batch_pipeline == nil || runtime->q8_0_qkv_mmv_pipeline == nil || runtime->q8_0_pair_activation_reduce_pipeline == nil || runtime->q8_0_pair_activation_mmv_pipeline == nil || runtime->q8_0_pair_activation_small_batch_pipeline == nil || runtime->q8_0_activation_multiply_reduce_pipeline == nil || runtime->q8_0_activation_multiply_mmv_pipeline == nil || runtime->q8_1_pipeline == nil || runtime->q5_k_pipeline == nil || runtime->q5_k_reduce_pipeline == nil || runtime->q6_k_pipeline == nil || runtime->q6_k_reduce_pipeline == nil || runtime->q6_k_pair_pipeline == nil || runtime->q8_k_pipeline == nil || runtime->iq4_nl_pipeline == nil || runtime->iq4_xs_pipeline == nil || runtime->mxfp4_pipeline == nil || runtime->nvfp4_pipeline == nil || runtime->iq2_xs_pipeline == nil || runtime->i2_s_pipeline == nil || runtime->i2_s_pair_pipeline == nil || runtime->i2_s_linear_i8_pipeline == nil || runtime->i2_s_pair_i8_pipeline == nil || runtime->tl1_pipeline == nil || runtime->tl2_pipeline == nil || runtime->encode_polar4_key_pipeline == nil || runtime->encode_turbo3_key_pipeline == nil || runtime->polar4_attention_span_pipeline == nil || runtime->turbo3_attention_span_pipeline == nil) {
             fprintf(stderr, "metal-runtime-create: pipeline=nil");
             if (termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_ATTENTION_1X_GENERATED")) && runtime->attention_1x_generated_pipeline == nil) fprintf(stderr, " generated_attention_1x");
             if (termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_FLASH_PREFILL_GENERATED")) &&
@@ -26330,6 +26453,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
             if (runtime->linear_f16_multi_row_pipeline == nil) fprintf(stderr, " linear_f16_multi_row");
             if (runtime->linear_f16_multi_row_reduce_pipeline == nil) fprintf(stderr, " linear_f16_multi_row_reduce");
             if (runtime->linear_bf16_multi_row_pipeline == nil) fprintf(stderr, " linear_bf16_multi_row");
+            if (runtime->linear_bf16_multi_row_compensated_pipeline == nil) fprintf(stderr, " linear_bf16_multi_row_compensated");
             if (runtime->linear_bf16_multi_row_reduce_pipeline == nil) fprintf(stderr, " linear_bf16_multi_row_reduce");
             if (runtime->linear_bf16_multi_row_tiled32_m16_pipeline == nil) fprintf(stderr, " linear_bf16_multi_row_tiled32_m16");
             if (runtime->linear_backward_input_f16_pipeline == nil) fprintf(stderr, " linear_backward_input_f16");
@@ -26743,6 +26867,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->rms_inv_scale_pipeline = nil;
     runtime->rms_norm_rows_pipeline = nil;
     runtime->rms_norm_rows_reduce_pipeline = nil;
+    runtime->rms_norm_rows_precise_reduce_pipeline = nil;
     runtime->rms_norm_rows_simd4_reduce_pipeline = nil;
     runtime->rms_norm_rows_triple_simd4_reduce_pipeline = nil;
     runtime->parallel_ffn_post_residual_simd4_pipeline = nil;
@@ -26767,6 +26892,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->linear_bf16_multi_row_shared_reduce_pipeline = nil;
     runtime->linear_bf16_multi_row_tiled32_m16_pipeline = nil;
     runtime->linear_bf16_multi_row_simdgroup_pipeline = nil;
+    runtime->linear_bf16_multi_row_compensated_pipeline = nil;
     runtime->linear_bf16_multi_row_simdgroup_m64_pipeline = nil;
     runtime->linear_bf16_multi_row_simdgroup_m64_packed_pipeline = nil;
     runtime->gemma4_bf16_gate_up_simdgroup_m64_pipeline = nil;
@@ -26837,6 +26963,8 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->linear_cce_tile_stats_pipeline = nil;
     runtime->linear_cce_finalize_pipeline = nil;
     runtime->linear_cce_grad_tile_pipeline = nil;
+    runtime->linear_cce_backward_bf16_blocked_pipeline = nil;
+    runtime->linear_cce_backward_bf16_small_blocked_pipeline = nil;
     runtime->linear_cce_grad_tile_f16_pipeline = nil;
     runtime->linear_bf16_to_f16_pipeline = nil;
     runtime->reduce_last_dim_pipeline = nil;
@@ -32253,7 +32381,7 @@ int termite_metal_decode_runtime_apply_rms_norm_rows_device(
     }
 }
 
-int termite_metal_decode_runtime_apply_rms_norm_weight_device(
+static int termite_metal_decode_runtime_apply_rms_norm_weight_device_impl(
     termite_metal_decode_runtime *runtime,
     void *input_handle,
     size_t input_offset,
@@ -32263,10 +32391,13 @@ int termite_metal_decode_runtime_apply_rms_norm_weight_device(
     size_t hidden_size,
     float eps,
     void *output_handle,
-    size_t output_offset
+    size_t output_offset,
+    bool precise
 ) {
     if (runtime == NULL || input_handle == NULL || weight_handle == NULL || output_handle == NULL) return -1;
-    if (runtime->rms_norm_rows_pipeline == nil) return -2;
+    if (precise ? (runtime->rms_norm_rows_precise_reduce_pipeline == nil ||
+                   runtime->rms_norm_rows_precise_reduce_pipeline.maxTotalThreadsPerThreadgroup < 256)
+                : runtime->rms_norm_rows_pipeline == nil) return -2;
     if (rows == 0 || hidden_size == 0 || rows > UINT32_MAX || hidden_size > UINT32_MAX) return -3;
     @autoreleasepool {
         id<MTLBuffer> input_buffer = (__bridge id<MTLBuffer>)input_handle;
@@ -32305,13 +32436,53 @@ int termite_metal_decode_runtime_apply_rms_norm_weight_device(
         [encoder setBuffer:weight_buffer offset:weight_offset atIndex:1];
         [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
-        termite_metal_dispatch_rms_norm_rows(runtime, encoder, rows, hidden_size);
+        if (precise) {
+            [encoder setComputePipelineState:runtime->rms_norm_rows_precise_reduce_pipeline];
+            [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
+            [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        } else {
+            termite_metal_dispatch_rms_norm_rows(runtime, encoder, rows, hidden_size);
+        }
         if (!planned_encoder) [encoder endEncoding];
         if (!frame_owned) return 0;
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
         return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -9;
     }
+}
+
+int termite_metal_decode_runtime_apply_rms_norm_weight_device(
+    termite_metal_decode_runtime *runtime,
+    void *input_handle,
+    size_t input_offset,
+    void *weight_handle,
+    size_t weight_offset,
+    size_t rows,
+    size_t hidden_size,
+    float eps,
+    void *output_handle,
+    size_t output_offset
+) {
+    return termite_metal_decode_runtime_apply_rms_norm_weight_device_impl(
+        runtime, input_handle, input_offset, weight_handle, weight_offset, rows, hidden_size, eps,
+        output_handle, output_offset, false);
+}
+
+int termite_metal_decode_runtime_apply_rms_norm_weight_device_precise(
+    termite_metal_decode_runtime *runtime,
+    void *input_handle,
+    size_t input_offset,
+    void *weight_handle,
+    size_t weight_offset,
+    size_t rows,
+    size_t hidden_size,
+    float eps,
+    void *output_handle,
+    size_t output_offset
+) {
+    return termite_metal_decode_runtime_apply_rms_norm_weight_device_impl(
+        runtime, input_handle, input_offset, weight_handle, weight_offset, rows, hidden_size, eps,
+        output_handle, output_offset, true);
 }
 
 int termite_metal_decode_runtime_apply_rms_norm_triple_weight_device(
@@ -33579,6 +33750,7 @@ int termite_metal_decode_runtime_apply_linear_multi_row(
             runtime->linear_bf16_multi_row_simdgroup_m64_packed_pipeline != nil &&
             runtime->linear_bf16_multi_row_simdgroup_m64_packed_pipeline.maxTotalThreadsPerThreadgroup >= 256u;
         const BOOL use_bf16_simdgroup = use_bf16 && use_reduce && rows >= 128u && termite_metal_bf16_simdgroup_enabled() && runtime->linear_bf16_multi_row_simdgroup_pipeline != nil;
+        const BOOL use_bf16_compensated = use_bf16_simdgroup && in_dim > 4096u;
         const BOOL use_bf16_tiled32_m16 = use_bf16 && use_reduce && rows >= 128u && termite_metal_bf16_tiled32_m16_enabled() && runtime->linear_bf16_multi_row_tiled32_m16_pipeline != nil;
         const BOOL use_shared_row_reduce = use_bf16 && use_reduce && rows > 1u && rows <= 64u && runtime->linear_bf16_multi_row_shared_reduce_pipeline != nil;
         const BOOL use_tiled32_m16 = !use_bf16 && !use_f16 && use_reduce && rows >= 128u && runtime->linear_multi_row_tiled32_m16_f32_pipeline != nil;
@@ -33588,7 +33760,7 @@ int termite_metal_decode_runtime_apply_linear_multi_row(
 	        id<MTLComputePipelineState> pipeline = use_f16
 	            ? (use_reduce ? runtime->linear_f16_multi_row_reduce_pipeline : runtime->linear_f16_multi_row_pipeline)
 	            : (use_bf16
-	            ? (use_bf16_simdgroup_m64_packed ? runtime->linear_bf16_multi_row_simdgroup_m64_packed_pipeline : (use_bf16_simdgroup_m64 ? runtime->linear_bf16_multi_row_simdgroup_m64_pipeline : (use_bf16_simdgroup ? runtime->linear_bf16_multi_row_simdgroup_pipeline : (use_bf16_tiled32_m16 ? runtime->linear_bf16_multi_row_tiled32_m16_pipeline : (use_reduce ? (use_shared_row_reduce ? runtime->linear_bf16_multi_row_shared_reduce_pipeline : runtime->linear_bf16_multi_row_reduce_pipeline) : runtime->linear_bf16_multi_row_pipeline)))))
+	            ? (use_bf16_simdgroup_m64_packed ? runtime->linear_bf16_multi_row_simdgroup_m64_packed_pipeline : (use_bf16_simdgroup_m64 ? runtime->linear_bf16_multi_row_simdgroup_m64_pipeline : (use_bf16_simdgroup ? (use_bf16_compensated ? runtime->linear_bf16_multi_row_compensated_pipeline : runtime->linear_bf16_multi_row_simdgroup_pipeline) : (use_bf16_tiled32_m16 ? runtime->linear_bf16_multi_row_tiled32_m16_pipeline : (use_reduce ? (use_shared_row_reduce ? runtime->linear_bf16_multi_row_shared_reduce_pipeline : runtime->linear_bf16_multi_row_reduce_pipeline) : runtime->linear_bf16_multi_row_pipeline)))))
 	            : (use_tiled32_m16 ? runtime->linear_multi_row_tiled32_m16_f32_pipeline : (use_tiled32 ? runtime->linear_multi_row_tiled32_f32_pipeline : (use_tiled ? runtime->linear_multi_row_tiled_f32_pipeline : (use_reduce ? runtime->linear_multi_row_reduce_pipeline : runtime->linear_multi_row_pipeline)))));
 	        termite_metal_maybe_trace_dense_linear_dispatch(
 	            "linear_multi_row",
@@ -33596,7 +33768,7 @@ int termite_metal_decode_runtime_apply_linear_multi_row(
 	            rows,
 	            in_dim,
 	            out_dim,
-	            use_f16 ? (use_reduce ? "f16_multi_row_reduce" : "f16_multi_row") : (use_bf16_simdgroup_m64_packed ? "bf16_simdgroup_m64_packed" : (use_bf16_simdgroup_m64 ? "bf16_simdgroup_m64" : (use_bf16_simdgroup ? "bf16_simdgroup" : (use_bf16_tiled32_m16 ? "bf16_tiled32_m16" : termite_metal_dense_linear_variant(use_bf16, use_shared_row_reduce, use_tiled32_m16, use_tiled32, use_tiled, use_reduce, false))))),
+	            use_f16 ? (use_reduce ? "f16_multi_row_reduce" : "f16_multi_row") : (use_bf16_simdgroup_m64_packed ? "bf16_simdgroup_m64_packed" : (use_bf16_simdgroup_m64 ? "bf16_simdgroup_m64" : (use_bf16_simdgroup ? (use_bf16_compensated ? "bf16_compensated_simdgroup" : "bf16_simdgroup") : (use_bf16_tiled32_m16 ? "bf16_tiled32_m16" : termite_metal_dense_linear_variant(use_bf16, use_shared_row_reduce, use_tiled32_m16, use_tiled32, use_tiled, use_reduce, false))))),
 	            !frame_owned,
 	            false,
 	            false,
@@ -33610,10 +33782,10 @@ int termite_metal_decode_runtime_apply_linear_multi_row(
         [encoder setBuffer:output_buffer offset:0 atIndex:3];
         [encoder setBytes:&params length:sizeof(params) atIndex:4];
 	        if (use_bf16_simdgroup_m64) {
-            [encoder setThreadgroupMemoryLength:8192u atIndex:0];
+            [encoder setThreadgroupMemoryLength:16384u atIndex:0];
             [encoder dispatchThreadgroups:MTLSizeMake(out_dim / 64u, rows / 64u, 1) threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
         } else if (use_bf16_simdgroup) {
-            [encoder setThreadgroupMemoryLength:8192u atIndex:0];
+            [encoder setThreadgroupMemoryLength:16384u atIndex:0];
             [encoder dispatchThreadgroups:MTLSizeMake((out_dim + 63u) / 64u, (rows + 31u) / 32u, 1) threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
         } else if (use_bf16_tiled32_m16 || use_tiled32_m16) {
             [encoder dispatchThreadgroups:MTLSizeMake((out_dim + 31u) / 32u, (rows + 15u) / 16u, 1) threadsPerThreadgroup:MTLSizeMake(8u, 16u, 1)];
@@ -33806,6 +33978,7 @@ int termite_metal_decode_runtime_apply_linear_multi_row_device(
             runtime->linear_bf16_multi_row_simdgroup_m64_packed_pipeline != nil &&
             runtime->linear_bf16_multi_row_simdgroup_m64_packed_pipeline.maxTotalThreadsPerThreadgroup >= 256u;
         const BOOL use_bf16_simdgroup = use_bf16 && use_reduce && rows >= 128u && termite_metal_bf16_simdgroup_enabled() && runtime->linear_bf16_multi_row_simdgroup_pipeline != nil;
+        const BOOL use_bf16_compensated = use_bf16_simdgroup && in_dim > 4096u;
         const size_t bf16_m64_prefix_rows = rows & ~(size_t)63u;
         const BOOL use_bf16_simdgroup_m64_prefix_tail = use_bf16 && use_reduce &&
             bf16_m64_prefix_rows >= 128u && bf16_m64_prefix_rows < rows &&
@@ -33845,7 +34018,7 @@ int termite_metal_decode_runtime_apply_linear_multi_row_device(
             [encoder setBuffer:runtime->linear_bias_buffers[slot] offset:0 atIndex:2];
             [encoder setBuffer:output_buffer offset:output_offset atIndex:3];
             [encoder setBytes:&prefix_params length:sizeof(prefix_params) atIndex:4];
-            [encoder setThreadgroupMemoryLength:8192u atIndex:0];
+            [encoder setThreadgroupMemoryLength:16384u atIndex:0];
             [encoder dispatchThreadgroups:MTLSizeMake(out_dim / 64u, bf16_m64_prefix_rows / 64u, 1)
                    threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
 
@@ -33858,7 +34031,7 @@ int termite_metal_decode_runtime_apply_linear_multi_row_device(
             [encoder setBuffer:runtime->linear_bias_buffers[slot] offset:0 atIndex:2];
             [encoder setBuffer:output_buffer offset:output_offset + bf16_m64_prefix_rows * out_dim * sizeof(float) atIndex:3];
             [encoder setBytes:&tail_params length:sizeof(tail_params) atIndex:4];
-            [encoder setThreadgroupMemoryLength:8192u atIndex:0];
+            [encoder setThreadgroupMemoryLength:16384u atIndex:0];
             [encoder dispatchThreadgroups:MTLSizeMake((out_dim + 63u) / 64u, (tail_rows + 31u) / 32u, 1)
                    threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
 
@@ -33869,7 +34042,7 @@ int termite_metal_decode_runtime_apply_linear_multi_row_device(
             return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -12;
         }
 	        id<MTLComputePipelineState> pipeline = use_bf16
-	            ? (use_bf16_simdgroup_m64_packed ? runtime->linear_bf16_multi_row_simdgroup_m64_packed_pipeline : (use_bf16_simdgroup_m64 ? runtime->linear_bf16_multi_row_simdgroup_m64_pipeline : (use_bf16_simdgroup ? runtime->linear_bf16_multi_row_simdgroup_pipeline : (use_bf16_tiled32_m16 ? runtime->linear_bf16_multi_row_tiled32_m16_pipeline : (use_reduce ? (use_shared_row_reduce ? runtime->linear_bf16_multi_row_shared_reduce_pipeline : runtime->linear_bf16_multi_row_reduce_pipeline) : runtime->linear_bf16_multi_row_pipeline)))))
+	            ? (use_bf16_simdgroup_m64_packed ? runtime->linear_bf16_multi_row_simdgroup_m64_packed_pipeline : (use_bf16_simdgroup_m64 ? runtime->linear_bf16_multi_row_simdgroup_m64_pipeline : (use_bf16_simdgroup ? (use_bf16_compensated ? runtime->linear_bf16_multi_row_compensated_pipeline : runtime->linear_bf16_multi_row_simdgroup_pipeline) : (use_bf16_tiled32_m16 ? runtime->linear_bf16_multi_row_tiled32_m16_pipeline : (use_reduce ? (use_shared_row_reduce ? runtime->linear_bf16_multi_row_shared_reduce_pipeline : runtime->linear_bf16_multi_row_reduce_pipeline) : runtime->linear_bf16_multi_row_pipeline)))))
 	            : (use_tiled32_m16 ? runtime->linear_multi_row_tiled32_m16_f32_pipeline : (use_tiled32 ? runtime->linear_multi_row_tiled32_f32_pipeline : (use_tiled ? runtime->linear_multi_row_tiled_f32_pipeline : (use_reduce ? runtime->linear_multi_row_reduce_pipeline : runtime->linear_multi_row_pipeline))));
 	        termite_metal_maybe_trace_dense_linear_dispatch(
 	            "linear_multi_row_device",
@@ -33877,7 +34050,7 @@ int termite_metal_decode_runtime_apply_linear_multi_row_device(
 	            rows,
 	            in_dim,
 	            out_dim,
-	            use_bf16_simdgroup_m64_packed ? "bf16_simdgroup_m64_packed" : (use_bf16_simdgroup_m64 ? "bf16_simdgroup_m64" : (use_bf16_simdgroup ? "bf16_simdgroup" : (use_bf16_tiled32_m16 ? "bf16_tiled32_m16" : termite_metal_dense_linear_variant(use_bf16, use_shared_row_reduce, use_tiled32_m16, use_tiled32, use_tiled, use_reduce, false)))),
+	            use_bf16_simdgroup_m64_packed ? "bf16_simdgroup_m64_packed" : (use_bf16_simdgroup_m64 ? "bf16_simdgroup_m64" : (use_bf16_simdgroup ? (use_bf16_compensated ? "bf16_compensated_simdgroup" : "bf16_simdgroup") : (use_bf16_tiled32_m16 ? "bf16_tiled32_m16" : termite_metal_dense_linear_variant(use_bf16, use_shared_row_reduce, use_tiled32_m16, use_tiled32, use_tiled, use_reduce, false)))),
 	            !frame_owned,
 	            planned_encoder,
 	            false,
@@ -33891,10 +34064,10 @@ int termite_metal_decode_runtime_apply_linear_multi_row_device(
         [encoder setBuffer:output_buffer offset:output_offset atIndex:3];
         [encoder setBytes:&params length:sizeof(params) atIndex:4];
 	        if (use_bf16_simdgroup_m64) {
-            [encoder setThreadgroupMemoryLength:8192u atIndex:0];
+            [encoder setThreadgroupMemoryLength:16384u atIndex:0];
             [encoder dispatchThreadgroups:MTLSizeMake(out_dim / 64u, rows / 64u, 1) threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
         } else if (use_bf16_simdgroup) {
-            [encoder setThreadgroupMemoryLength:8192u atIndex:0];
+            [encoder setThreadgroupMemoryLength:16384u atIndex:0];
             [encoder dispatchThreadgroups:MTLSizeMake((out_dim + 63u) / 64u, (rows + 31u) / 32u, 1) threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
         } else if (use_bf16_tiled32_m16 || use_tiled32_m16) {
             [encoder dispatchThreadgroups:MTLSizeMake((out_dim + 31u) / 32u, (rows + 15u) / 16u, 1) threadsPerThreadgroup:MTLSizeMake(8u, 16u, 1)];
@@ -34050,7 +34223,7 @@ int termite_metal_decode_runtime_apply_linear_backward_input_bf16_device(
             [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:runtime->linear_weight_offsets[slot] atIndex:1];
             [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
             [encoder setBytes:&prefix_params length:sizeof(prefix_params) atIndex:3];
-            [encoder setThreadgroupMemoryLength:8192u atIndex:0];
+            [encoder setThreadgroupMemoryLength:16384u atIndex:0];
             [encoder dispatchThreadgroups:MTLSizeMake(in_dim / 64u, m64_prefix_rows / 64u, 1)
                    threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
 
@@ -34062,7 +34235,7 @@ int termite_metal_decode_runtime_apply_linear_backward_input_bf16_device(
             [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:runtime->linear_weight_offsets[slot] atIndex:1];
             [encoder setBuffer:output_buffer offset:output_offset + m64_prefix_rows * in_dim * sizeof(float) atIndex:2];
             [encoder setBytes:&tail_params length:sizeof(tail_params) atIndex:3];
-            [encoder setThreadgroupMemoryLength:8192u atIndex:0];
+            [encoder setThreadgroupMemoryLength:16384u atIndex:0];
             [encoder dispatchThreadgroups:MTLSizeMake((in_dim + 63u) / 64u, (tail_rows + 31u) / 32u, 1)
                    threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
 
@@ -34095,11 +34268,11 @@ int termite_metal_decode_runtime_apply_linear_backward_input_bf16_device(
             [encoder dispatchThreadgroups:MTLSizeMake(in_dim / 32u, rows / 8u, 1)
                    threadsPerThreadgroup:MTLSizeMake(16u, 8u, 1u)];
         } else if (use_simdgroup_m64) {
-            [encoder setThreadgroupMemoryLength:8192u atIndex:0];
+            [encoder setThreadgroupMemoryLength:16384u atIndex:0];
             [encoder dispatchThreadgroups:MTLSizeMake(in_dim / 64u, rows / 64u, 1)
                    threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
         } else if (use_simdgroup || use_f16_simdgroup) {
-            [encoder setThreadgroupMemoryLength:8192u atIndex:0];
+            [encoder setThreadgroupMemoryLength:(use_f16_simdgroup ? 8192u : 16384u) atIndex:0];
             [encoder dispatchThreadgroups:MTLSizeMake((in_dim + 63u) / 64u, (rows + 31u) / 32u, 1)
                    threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
         } else if (use_tiled32_m16) {
@@ -34223,7 +34396,7 @@ int termite_metal_decode_runtime_apply_linear_backward_input_bf16_pair_sum_devic
         [encoder setBuffer:output_buffer offset:output_offset atIndex:4];
         [encoder setBytes:&params length:sizeof(params) atIndex:5];
         if (use_simdgroup_m64_packed) {
-            [encoder setThreadgroupMemoryLength:8192u atIndex:0];
+            [encoder setThreadgroupMemoryLength:16384u atIndex:0];
             [encoder dispatchThreadgroups:MTLSizeMake(in_dim / 64u, rows / 64u, 1)
                    threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
         } else {
@@ -38628,7 +38801,7 @@ int termite_metal_decode_runtime_apply_linear_pair_slots_device(
             [encoder setBuffer:output_a_buffer offset:output_a_offset atIndex:5];
             [encoder setBuffer:output_b_buffer offset:output_b_offset atIndex:6];
             [encoder setBytes:&fused_params length:sizeof(fused_params) atIndex:7];
-            [encoder setThreadgroupMemoryLength:8192u atIndex:0];
+            [encoder setThreadgroupMemoryLength:16384u atIndex:0];
             [encoder dispatchThreadgroups:MTLSizeMake(out_dim / 64u, rows / 64u, 1u)
                      threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
             termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
@@ -39316,7 +39489,7 @@ int termite_metal_decode_runtime_apply_dense_linear_pair_slots_scratch_device(
             [encoder setBuffer:a_output_buffer offset:0 atIndex:5];
             [encoder setBuffer:b_output_buffer offset:0 atIndex:6];
             [encoder setBytes:&params length:sizeof(params) atIndex:7];
-            [encoder setThreadgroupMemoryLength:8192u atIndex:0];
+            [encoder setThreadgroupMemoryLength:16384u atIndex:0];
             [encoder dispatchThreadgroups:MTLSizeMake(out_dim / 64u, rows / 64u, 1u)
                      threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
             termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
@@ -44597,7 +44770,7 @@ static void termite_metal_encode_linear_cce_bf16_projection_tile(
         [encoder setBuffer:runtime->linear_bias_buffers[slot] offset:bias_offset atIndex:2];
         [encoder setBuffer:logits_buffer offset:logits_offset atIndex:3];
         [encoder setBytes:&linear_params length:sizeof(linear_params) atIndex:4];
-        [encoder setThreadgroupMemoryLength:8192u atIndex:0];
+        [encoder setThreadgroupMemoryLength:16384u atIndex:0];
         [encoder dispatchThreadgroups:MTLSizeMake(tile_vocab_size / 64u, rows / 64u, 1)
                threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
         return;
@@ -44625,7 +44798,7 @@ static void termite_metal_encode_linear_cce_bf16_projection_tile(
         [encoder setBuffer:runtime->linear_bias_buffers[slot] offset:bias_offset atIndex:2];
         [encoder setBuffer:logits_buffer offset:logits_offset atIndex:3];
         [encoder setBytes:&prefix_params length:sizeof(prefix_params) atIndex:4];
-        [encoder setThreadgroupMemoryLength:8192u atIndex:0];
+        [encoder setThreadgroupMemoryLength:16384u atIndex:0];
         [encoder dispatchThreadgroups:MTLSizeMake(tile_vocab_size / 64u, prefix_rows / 64u, 1)
                threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
 
@@ -44638,7 +44811,7 @@ static void termite_metal_encode_linear_cce_bf16_projection_tile(
         [encoder setBuffer:runtime->linear_bias_buffers[slot] offset:bias_offset atIndex:2];
         [encoder setBuffer:logits_buffer offset:logits_offset + prefix_rows * tile_vocab_size * sizeof(float) atIndex:3];
         [encoder setBytes:&tail_params length:sizeof(tail_params) atIndex:4];
-        [encoder setThreadgroupMemoryLength:8192u atIndex:0];
+        [encoder setThreadgroupMemoryLength:16384u atIndex:0];
         [encoder dispatchThreadgroups:MTLSizeMake((tile_vocab_size + 63u) / 64u, (tail_rows + 31u) / 32u, 1)
                threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
         return;
@@ -44663,7 +44836,7 @@ static void termite_metal_encode_linear_cce_bf16_projection_tile(
         [encoder setBuffer:runtime->linear_bias_buffers[slot] offset:bias_offset atIndex:2];
         [encoder setBuffer:logits_buffer offset:logits_offset atIndex:3];
         [encoder setBytes:&linear_params length:sizeof(linear_params) atIndex:4];
-        [encoder setThreadgroupMemoryLength:8192u atIndex:0];
+        [encoder setThreadgroupMemoryLength:16384u atIndex:0];
         [encoder dispatchThreadgroups:MTLSizeMake((tile_vocab_size + 63u) / 64u, (rows + 31u) / 32u, 1)
                threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
         return;
@@ -44701,6 +44874,26 @@ static void termite_metal_encode_linear_cce_bf16_backward_tile(
         .second_weight_offset = 0u,
     };
     const size_t weight_offset = vocab_start * in_dim * sizeof(uint16_t);
+    // CCE reductions can span 65K vocabulary terms. Bound each running F32
+    // sum to 256 products and compensate the block merge; this avoids losing
+    // small tail probabilities after the target-token contribution. Small-row
+    // scalar products compensate each term; SIMD products compensate 256-term blocks.
+    if (!grad_is_f16 && tile_vocab_size > 4096u) {
+        const bool simd = rows > 64u && termite_metal_bf16_backward_simdgroup_enabled();
+        termite_metal_maybe_trace_dense_linear_dispatch("linear_cce_backward_tile", slot, rows, in_dim, tile_vocab_size, simd ? "bf16_compensated_simdgroup" : "bf16_compensated_small", runtime->active_frame_cb != nil, false, false, false, false);
+        [encoder setComputePipelineState:simd ? runtime->linear_cce_backward_bf16_blocked_pipeline : runtime->linear_cce_backward_bf16_small_blocked_pipeline];
+        [encoder setBuffer:grad_logits_buffer offset:0 atIndex:0];
+        [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:runtime->linear_weight_offsets[slot] + weight_offset atIndex:1];
+        [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
+        [encoder setBytes:&params length:sizeof(params) atIndex:3];
+        if (simd) {
+            [encoder setThreadgroupMemoryLength:16384u atIndex:0];
+            [encoder dispatchThreadgroups:MTLSizeMake((in_dim + 63u) / 64u, (rows + 31u) / 32u, 1u) threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
+        } else {
+            [encoder dispatchThreadgroups:MTLSizeMake((in_dim + 31u) / 32u, (rows + 7u) / 8u, 1u) threadsPerThreadgroup:MTLSizeMake(16u, 8u, 1u)];
+        }
+        return;
+    }
     id<MTLComputePipelineState> simdgroup_pipeline = grad_is_f16
         ? runtime->linear_cce_backward_input_f16_bf16_simdgroup_pipeline
         : runtime->linear_backward_input_bf16_simdgroup_pipeline;
@@ -44739,7 +44932,7 @@ static void termite_metal_encode_linear_cce_bf16_backward_tile(
         [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:runtime->linear_weight_offsets[slot] + weight_offset atIndex:1];
         [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
-        [encoder setThreadgroupMemoryLength:8192u atIndex:0];
+        [encoder setThreadgroupMemoryLength:16384u atIndex:0];
         [encoder dispatchThreadgroups:MTLSizeMake(in_dim / 64u, rows / 64u, 1)
                threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
         return;
@@ -44765,7 +44958,7 @@ static void termite_metal_encode_linear_cce_bf16_backward_tile(
         [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:runtime->linear_weight_offsets[slot] + weight_offset atIndex:1];
         [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
         [encoder setBytes:&prefix_params length:sizeof(prefix_params) atIndex:3];
-        [encoder setThreadgroupMemoryLength:8192u atIndex:0];
+        [encoder setThreadgroupMemoryLength:16384u atIndex:0];
         [encoder dispatchThreadgroups:MTLSizeMake(in_dim / 64u, prefix_rows / 64u, 1)
                threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
 
@@ -44778,7 +44971,7 @@ static void termite_metal_encode_linear_cce_bf16_backward_tile(
         [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:runtime->linear_weight_offsets[slot] + weight_offset atIndex:1];
         [encoder setBuffer:output_buffer offset:output_offset + prefix_rows * in_dim * sizeof(float) atIndex:2];
         [encoder setBytes:&tail_params length:sizeof(tail_params) atIndex:3];
-        [encoder setThreadgroupMemoryLength:8192u atIndex:0];
+        [encoder setThreadgroupMemoryLength:16384u atIndex:0];
         [encoder dispatchThreadgroups:MTLSizeMake((in_dim + 63u) / 64u, (tail_rows + 31u) / 32u, 1)
                threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
         return;
@@ -44802,7 +44995,7 @@ static void termite_metal_encode_linear_cce_bf16_backward_tile(
         [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:runtime->linear_weight_offsets[slot] + weight_offset atIndex:1];
         [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
-        [encoder setThreadgroupMemoryLength:8192u atIndex:0];
+        [encoder setThreadgroupMemoryLength:16384u atIndex:0];
         [encoder dispatchThreadgroups:MTLSizeMake((in_dim + 63u) / 64u, (rows + 31u) / 32u, 1)
                threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
         return;
@@ -44988,6 +45181,8 @@ static int termite_metal_validate_linear_cce_bf16(
     if (runtime->linear_cce_tile_stats_pipeline == nil ||
         runtime->linear_cce_finalize_pipeline == nil ||
         runtime->linear_cce_grad_tile_pipeline == nil ||
+        runtime->linear_cce_backward_bf16_blocked_pipeline == nil ||
+        runtime->linear_cce_backward_bf16_small_blocked_pipeline == nil ||
         runtime->training_accumulate_pipeline == nil) return -2;
     if (rows <= 64u) {
         if (runtime->linear_bf16_multi_row_shared_reduce_pipeline == nil ||
@@ -45062,7 +45257,7 @@ int termite_metal_decode_runtime_linear_cce_bf16_loss_device(
             !termite_metal_size_mul(partial_elements, 3u * sizeof(float), &partial_bytes)) return -11;
         id<MTLBuffer> logits_buffer = [runtime->device newBufferWithLength:logits_bytes options:MTLResourceStorageModePrivate];
         id<MTLBuffer> partials_buffer = [runtime->device newBufferWithLength:partial_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> state_buffer = [runtime->device newBufferWithLength:(rows + 1u) * sizeof(float) options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> state_buffer = [runtime->device newBufferWithLength:(2u * rows + 1u) * sizeof(float) options:MTLResourceStorageModePrivate];
         if (logits_buffer == nil || partials_buffer == nil || state_buffer == nil) return -12;
         bool frame_owned = true;
         id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
@@ -45201,7 +45396,7 @@ int termite_metal_decode_runtime_linear_cce_bf16_backward_device(
             ? nil
             : [runtime->device newBufferWithLength:partial_bytes options:MTLResourceStorageModePrivate];
         if (!reused_forward_state) {
-            state_buffer = [runtime->device newBufferWithLength:(rows + 1u) * sizeof(float) options:MTLResourceStorageModePrivate];
+            state_buffer = [runtime->device newBufferWithLength:(2u * rows + 1u) * sizeof(float) options:MTLResourceStorageModePrivate];
         }
         id<MTLBuffer> loss_buffer = reused_forward_state
             ? nil
@@ -49001,7 +49196,8 @@ int termite_metal_decode_runtime_training_sumsq_f32(
         [encoder setBuffer:input_buffer offset:input_offset atIndex:0];
         [encoder setBuffer:output_buffer offset:output_offset atIndex:1];
         [encoder setBytes:&params length:sizeof(params) atIndex:2];
-        [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [encoder setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0];
+        [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -8);
     }
@@ -49029,7 +49225,7 @@ int termite_metal_decode_runtime_training_sumsq_many_f32(
         // distinct input buffer and writes a distinct output[idx] slot. Under
         // the default (serial) dispatch type Metal hazard-tracks the shared
         // output buffer at buffer granularity and inserts a barrier between
-        // every one of the (up to 256) 1-thread dispatches, serializing them
+        // every one of the (up to 256) per-input dispatches, serializing them
         // into ~0.27ms each. A concurrent-dispatch encoder lets them overlap;
         // the lack of cross-dispatch dependencies makes this safe without
         // explicit barriers. Only used on a frame-owned command buffer (this
@@ -49065,7 +49261,8 @@ int termite_metal_decode_runtime_training_sumsq_many_f32(
             [encoder setBuffer:input_buffer offset:input_offset atIndex:0];
             [encoder setBuffer:output_buffer offset:output_offset + idx * sizeof(float) atIndex:1];
             [encoder setBytes:&params length:sizeof(params) atIndex:2];
-            [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            [encoder setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0];
+            [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);

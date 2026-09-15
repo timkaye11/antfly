@@ -6,12 +6,12 @@ materialization that produced it. It executes two MLX lanes from the identical
 seed adapter:
 
 * ``trace_replay`` trains on Antfly's exact completion sequences and rewards;
-* ``native_rollout`` is the retired deterministic ranked multi-token rollout.
-  The acceptance loader fails closed for stochastic Antfly reports until this
-  lane has a matching categorical sampler and statistical behavioral gates.
+* ``native_rollout`` supports the historical ranked rollout and an explicit
+  categorical diagnostic mode. The latter matches seeded train/evaluation
+  sampling and skipped updates, but cannot publish a parity classification.
 
 Both lanes use a frozen base-equivalent reference, one optimizer update per
-completion group, token-normalized GRPO loss, the same hard raw-K3 KL budget,
+admitted completion group, token-normalized GRPO loss, the same hard raw-K3 KL budget,
 and the same proportional next-group KL controller as Antfly. The result is a
 bounded campaign artifact, not a claim of broad or long-horizon quality parity.
 """
@@ -27,6 +27,7 @@ import platform
 import statistics
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -40,7 +41,13 @@ RESULT_SCHEMA_VERSION = "antfly_gemma4_grpo_boolq_mlx_multitoken/v1"
 MATERIALIZATION_SCHEMA_VERSION = boolq_materializer.SCHEMA_VERSION
 MATERIALIZATION_SCHEMA_VERSIONS = boolq_materializer.SCHEMA_VERSIONS
 REWARD_TRACE_SCHEMA_VERSION = "antfly_inference_grpo_reward_trace/v1"
-KL_TRACE_SCHEMA_VERSION = "antfly_inference_grpo_kl_control_trace/v2"
+KL_TRACE_SCHEMA_VERSION = "antfly_inference_grpo_kl_control_trace/v5"
+KL_TRACE_SCHEMA_VERSIONS = frozenset({
+    "antfly_inference_grpo_kl_control_trace/v2",
+    "antfly_inference_grpo_kl_control_trace/v3",
+    "antfly_inference_grpo_kl_control_trace/v4",
+    KL_TRACE_SCHEMA_VERSION,
+})
 GRPO_TRAINING_ORDER = {
     "algorithm": "seeded-fisher-yates-per-epoch/v1",
     "stream_derivation": "run-seed-order-domain-epoch-dataset-size/v1",
@@ -53,6 +60,8 @@ GRPO_REPORT_SCHEMA_VERSIONS = frozenset(
         "antfly_inference_finetune_grpo_report/v6",
         "antfly_inference_finetune_grpo_report/v7",
         "antfly_inference_finetune_grpo_report/v8",
+        "antfly_inference_finetune_grpo_report/v9",
+        "antfly_inference_finetune_grpo_report/v10",
     }
 )
 GRPO_EVAL_SCHEMA_VERSIONS = frozenset(
@@ -87,6 +96,8 @@ GRPO = {
 sys.path.insert(0, str(SCRIPT_DIR))
 import run_gemma4_grpo_boolq_mlx_parity as legacy  # noqa: E402
 import run_gemma4_grpo_mlx_benchmark as microbenchmark  # noqa: E402
+from gemma4_grpo_sampling import SamplingPolicy, categorical_rollout_group, _f32  # noqa: E402
+from gemma4_mlx_source import attest_mlx_lm_archive  # noqa: E402
 
 locked = microbenchmark.locked
 
@@ -96,23 +107,60 @@ class MultiTokenParityError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class RecipeProfile:
+    target_preset: str
+    sequence_length: int
+    learning_rate: float
+    advantage_epsilon: float
+    min_kl_coef: float = GRPO["min_kl_coef"]
+    max_kl_coef: float = GRPO["max_kl_coef"]
+
+
+RECIPE_PROFILES = {
+    "qv-multitoken": RecipeProfile(TARGET_PRESET, SEQUENCE_LENGTH, LEARNING_RATE, GRPO["advantage_epsilon"]),
+    "all-linear-single-token": RecipeProfile("text-all-linear", 160, 5.0e-8, 1.0e-8),
+    "all-linear-single-token-quality": RecipeProfile(
+        "text-all-linear", 160, 1.0e-8, 1.0e-8, 0.04, 4.0,
+    ),
+}
+
+ALL_LINEAR_SINGLE_TOKEN_PROFILES = frozenset({
+    "all-linear-single-token",
+    "all-linear-single-token-quality",
+})
+
+
+@dataclass(frozen=True)
 class CampaignSpec:
     model_key: str
     train_groups: int
     eval_groups: int
     group_size: int
     max_completion_tokens: int
+    recipe_profile: str = "qv-multitoken"
+
+    @property
+    def profile(self) -> RecipeProfile:
+        try:
+            return RECIPE_PROFILES[self.recipe_profile]
+        except KeyError as exc:
+            raise MultiTokenParityError("unsupported GRPO recipe profile") from exc
 
     def validate(self) -> None:
         if self.model_key not in MODEL_KEYS:
             raise MultiTokenParityError("unsupported Gemma4 model key")
         if self.train_groups < 2 or self.eval_groups < 2:
             raise MultiTokenParityError("matched campaigns require at least two train/eval groups")
-        if not 2 <= self.group_size <= 8:
-            raise MultiTokenParityError("group size must be in [2, 8]")
-        if not 2 <= self.max_completion_tokens <= 32:
-            raise MultiTokenParityError("multi-token completion budget must be in [2, 32]")
-        if self.max_completion_tokens >= SEQUENCE_LENGTH:
+        profile = self.profile
+        if self.recipe_profile in ALL_LINEAR_SINGLE_TOKEN_PROFILES:
+            if self.group_size != 16 or self.max_completion_tokens != 1:
+                raise MultiTokenParityError("all-linear single-token profile requires group 16 and one completion token")
+        else:
+            if not 2 <= self.group_size <= 8:
+                raise MultiTokenParityError("group size must be in [2, 8]")
+            if not 2 <= self.max_completion_tokens <= 32:
+                raise MultiTokenParityError("multi-token completion budget must be in [2, 32]")
+        if self.max_completion_tokens >= profile.sequence_length:
             raise MultiTokenParityError("completion budget exceeds the sequence contract")
 
 
@@ -156,9 +204,89 @@ class AcceptanceEvidence:
     config: Mapping[str, Any]
     train_report: Mapping[str, Any]
     eval_report: Mapping[str, Any]
+    eval_report_path: Path
+    train_dataset_path: Path
+    train_source_ids: tuple[str, ...]
+    train_source_row_indices: tuple[int, ...]
+    kl_trace_schema_version: str
     train_trace: tuple[TraceGroup, ...]
     eval_trace: tuple[TraceGroup, ...]
-    trained_adapter_dir: Path
+    trained_adapter_dir: Path | None
+
+
+CATEGORICAL_MODES = frozenset({
+    "shared-prompt-seeded-categorical-sparse-row",
+    "shared-page-prompt-seeded-categorical-incremental-kv",
+    "compiled-shared-prompt-seeded-categorical-sparse-row-each-step",
+    "shared-prompt-seeded-categorical-sparse-row-each-step",
+    "shared-prompt-seeded-categorical",
+})
+
+
+def categorical_contract(
+    config: Mapping[str, Any], train: Mapping[str, Any], evaluation: Mapping[str, Any],
+) -> tuple[int, SamplingPolicy]:
+    """Admit a current sampling contract for diagnostics, never acceptance."""
+    recipe = config.get("recipe", {})
+    if not isinstance(recipe, dict):
+        raise MultiTokenParityError("categorical recipe is missing")
+    optimizer, grpo = recipe.get("optimizer", {}), recipe.get("grpo", {})
+    if not isinstance(optimizer, dict) or not isinstance(grpo, dict):
+        raise MultiTokenParityError("categorical optimizer/sampling recipe is missing")
+    seed = optimizer.get("seed", 42)
+    if (isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**64
+            or train.get("training_seed") != seed):
+        raise MultiTokenParityError("categorical training seed drifted")
+    if (train.get("schema_version") not in {
+            "antfly_inference_finetune_grpo_report/v8",
+            "antfly_inference_finetune_grpo_report/v9",
+            "antfly_inference_finetune_grpo_report/v10",
+        }
+            or train.get("training_order") != GRPO_TRAINING_ORDER
+            or train.get("sampling_mode") not in CATEGORICAL_MODES
+            or evaluation.get("schema_version") != "antfly_inference_finetune_grpo_evaluation/v4"):
+        raise MultiTokenParityError("categorical report/order contract drifted")
+    raw = grpo.get("sampling")
+    if not isinstance(raw, dict) or set(raw) != {"temperature", "top_p", "top_k"}:
+        raise MultiTokenParityError("categorical recipe sampling must be explicit")
+    try:
+        finite_float(raw["temperature"], "sampling.temperature")
+        finite_float(raw["top_p"], "sampling.top_p")
+        policy = SamplingPolicy(**raw)
+    except (ValueError, TypeError) as exc:
+        raise MultiTokenParityError("invalid categorical sampling policy") from exc
+    for report, greedy in ((train, False), (evaluation, True)):
+        actual = report.get("sampling")
+        if (not isinstance(actual, dict)
+                or set(actual) != {"temperature", "top_p", "top_k", "first_completion_greedy", "algorithm", "stream_derivation"}
+                or actual.get("algorithm") != "seeded-categorical-temperature-top-k-top-p"
+                or actual.get("stream_derivation") != "run-seed-domain-epoch-dataset-prompt-index-completion/v2"
+                or actual.get("first_completion_greedy") is not greedy
+                or type(actual.get("top_k")) is not int or actual["top_k"] != policy.top_k):
+            raise MultiTokenParityError("categorical sampling phase/top-k drifted")
+        for field in ("temperature", "top_p"):
+            require_close(actual.get(field), getattr(policy, field), f"sampling.{field}")
+    return seed, policy
+
+
+def group_admission(rewards: Sequence[float], mean_kl: float) -> str:
+    """Match Zig's ordering with the runner's unmasked completion contract."""
+    if not rewards or not all(math.isfinite(value) for value in rewards):
+        raise MultiTokenParityError("group rewards must be finite and nonempty")
+    if all(value == rewards[0] for value in rewards):
+        return "zero-reward-std-skipped"
+    if not math.isfinite(mean_kl) or mean_kl < 0:
+        raise MultiTokenParityError("group KL must be finite and nonnegative")
+    if _f32(mean_kl) > _f32(GRPO["train_max_kl"]):
+        return "budget-exceeded-skipped"
+    return "admitted"
+
+
+def campaign_classification(trace_close: bool, behavior_close: bool, *, categorical: bool) -> str:
+    if categorical:
+        return "categorical-diagnostic-only"
+    return ("bounded-behavior-and-update-parity" if trace_close and behavior_close
+            else "bounded-campaign-with-measured-drift")
 
 
 def sha256_file(path: Path) -> str:
@@ -206,12 +334,44 @@ def normalized_advantages(rewards: Sequence[float], epsilon: float) -> list[floa
     return [(reward - mean) / denominator for reward in rewards]
 
 
-def adaptive_kl_update(current: float, mean_kl: float) -> float:
+def adaptive_kl_update(
+    current: float,
+    mean_kl: float,
+    observed_completions: int = 1,
+    *,
+    min_kl_coef: float = GRPO["min_kl_coef"],
+    max_kl_coef: float = GRPO["max_kl_coef"],
+) -> float:
     if not math.isfinite(mean_kl) or mean_kl < 0.0:
         raise MultiTokenParityError("adaptive KL observation must be finite and non-negative")
-    proportional_error = min(max(mean_kl / GRPO["target_kl"] - 1.0, -0.2), 0.2)
-    updated = current * (1.0 + proportional_error / GRPO["kl_horizon"])
-    return min(max(updated, GRPO["min_kl_coef"]), GRPO["max_kl_coef"])
+    if isinstance(observed_completions, bool) or not isinstance(observed_completions, int) or observed_completions <= 0:
+        raise MultiTokenParityError("adaptive KL observed completions must be positive")
+    current_f32 = _f32(current)
+    mean_kl_f32 = _f32(mean_kl)
+    target_f32 = _f32(GRPO["target_kl"])
+    horizon_f32 = _f32(GRPO["kl_horizon"])
+    min_f32 = _f32(min_kl_coef)
+    max_f32 = _f32(max_kl_coef)
+    proportional_error = min(max(mean_kl_f32 / target_f32 - 1.0, -0.2), 0.2)
+    updated = current_f32 * (
+        1.0
+        + proportional_error * observed_completions / horizon_f32
+    )
+    return _f32(min(max(updated, min_f32), max_f32))
+
+
+def controller_observed_completions(
+    row: Mapping[str, Any], schema_version: str, group_size: int,
+) -> int:
+    if schema_version not in {
+        "antfly_inference_grpo_kl_control_trace/v4",
+        KL_TRACE_SCHEMA_VERSION,
+    }:
+        return 1
+    observed = row.get("observed_completions")
+    if isinstance(observed, bool) or not isinstance(observed, int) or observed != group_size:
+        raise MultiTokenParityError("Antfly KL trace observed-completion count drifted")
+    return observed
 
 
 def mean_k3(policy_logps: Sequence[float], reference_logps: Sequence[float]) -> float:
@@ -238,25 +398,31 @@ def decode_reward(tokenizer: Any, token_ids: Sequence[int], target: str) -> tupl
 
 
 def sequence_overlap(
-    actual: Sequence[Sequence[int]], expected: Sequence[Sequence[int]]
+    actual: Sequence[Sequence[int]], expected: Sequence[Sequence[int]],
+    *, with_replacement: bool = False,
 ) -> Mapping[str, Any]:
     actual_tuples = tuple(tuple(item) for item in actual)
     expected_tuples = tuple(tuple(item) for item in expected)
     if (
         not actual_tuples
         or len(actual_tuples) != len(expected_tuples)
-        or len(set(actual_tuples)) != len(actual_tuples)
-        or len(set(expected_tuples)) != len(expected_tuples)
+        or any(not item for item in actual_tuples + expected_tuples)
+        or (not with_replacement and (
+            len(set(actual_tuples)) != len(actual_tuples)
+            or len(set(expected_tuples)) != len(expected_tuples)))
     ):
         raise MultiTokenParityError("completion groups must be distinct and equal-length")
-    overlap = len(set(actual_tuples) & set(expected_tuples))
+    overlap = (sum((Counter(actual_tuples) & Counter(expected_tuples)).values())
+               if with_replacement else len(set(actual_tuples) & set(expected_tuples)))
     actual_first = tuple(item[0] for item in actual_tuples)
     expected_first = tuple(item[0] for item in expected_tuples)
-    first_overlap = len(set(actual_first) & set(expected_first))
+    first_overlap = (sum((Counter(actual_first) & Counter(expected_first)).values())
+                     if with_replacement else len(set(actual_first) & set(expected_first)))
     return {
         "sequence_overlap": overlap,
         "sequence_recall": overlap / len(expected_tuples),
         "exact_sequence_set": set(actual_tuples) == set(expected_tuples),
+        "exact_sequence_multiset": Counter(actual_tuples) == Counter(expected_tuples),
         "exact_sequence_order": actual_tuples == expected_tuples,
         "top_sequence_match": actual_tuples[0] == expected_tuples[0],
         "first_token_overlap": first_overlap,
@@ -290,6 +456,7 @@ def load_trace(
     max_completion_tokens: int,
 ) -> tuple[TraceGroup, ...]:
     groups: dict[int, list[TraceCompletion]] = {}
+    previous_prompt: int | None = None
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError) as exc:
@@ -316,12 +483,15 @@ def load_trace(
         reward = finite_float(row.get("aggregate_reward"), "aggregate_reward")
         if reward not in (0.0, 1.0):
             raise MultiTokenParityError("BoolQ trace reward must be binary")
+        if prompt_index in groups and prompt_index != previous_prompt:
+            raise MultiTokenParityError(f"{phase} reward trace optimizer groups are interleaved")
         groups.setdefault(prompt_index, []).append(
             TraceCompletion(tuple(raw_tokens), reward)
         )
+        previous_prompt = prompt_index
     if sorted(groups) != list(range(expected_groups)):
         raise MultiTokenParityError(f"{phase} reward trace prompt groups are incomplete")
-    result = tuple(TraceGroup(index, tuple(groups[index])) for index in range(expected_groups))
+    result = tuple(TraceGroup(index, tuple(completions)) for index, completions in groups.items())
     for group in result:
         if len(group.completions) != group_size:
             raise MultiTokenParityError(f"{phase} reward trace group size drifted")
@@ -352,7 +522,6 @@ def load_materialization(
     policy = dataset.get("selection_policy")
     expected_policy = {
         "dataset_format": "rendered-text-grpo",
-        "max_seq_len": SEQUENCE_LENGTH,
         "max_completion_tokens": spec.max_completion_tokens,
         "target_tokens": 1,
         "rendered_prompt_truncation": "forbidden",
@@ -360,6 +529,14 @@ def load_materialization(
     }
     if not isinstance(policy, dict) or any(policy.get(key) != value for key, value in expected_policy.items()):
         raise MultiTokenParityError("BoolQ selection policy differs from the campaign")
+    admission_length = policy.get("max_seq_len")
+    if (
+        isinstance(admission_length, bool)
+        or not isinstance(admission_length, int)
+        or not 16 <= admission_length <= spec.profile.sequence_length
+        or (spec.recipe_profile == "qv-multitoken" and admission_length != spec.profile.sequence_length)
+    ):
+        raise MultiTokenParityError("BoolQ admission length differs from the campaign")
     for section, manifest_key in (("train", "train_jsonl"), ("evaluation", "eval_jsonl")):
         record = dataset.get(section)
         jsonl_path = Path(str(manifest.get(manifest_key, ""))).expanduser().resolve()
@@ -385,6 +562,44 @@ def load_materialization(
     return manifest
 
 
+def load_campaign_materialization(
+    path: Path,
+    evaluation_path: Path | None,
+    spec: CampaignSpec,
+    model_dir: Path,
+) -> Mapping[str, Any]:
+    """Bind independently verified train/eval materializations without relabeling either."""
+    train = load_materialization(path, spec, model_dir)
+    if evaluation_path is None:
+        return train
+    evaluation = load_materialization(evaluation_path, spec, model_dir)
+    for field in ("repo_id", "revision"):
+        if train["dataset"][field] != evaluation["dataset"][field]:
+            raise MultiTokenParityError("train/evaluation dataset revisions differ")
+    for field in ("tokenizer_files", "dependency_versions"):
+        if train.get(field) != evaluation.get(field):
+            raise MultiTokenParityError(f"train/evaluation {field} differ")
+    if set(train["train_source_ids"]) & set(evaluation["eval_source_ids"]):
+        raise MultiTokenParityError("campaign train/evaluation identities overlap")
+    # This is an in-memory campaign view, not a newly materialized or self-attested dataset.
+    view = {key: value for key, value in train.items() if key != "semantic_sha256"}
+    view["schema_version"] = "antfly_gemma4_grpo_campaign_dataset/v1"
+    for field in ("eval_jsonl", "eval_prompt_tokens", "eval_source_ids", "eval_source_row_indices", "evaluation_exclusion_manifests"):
+        view[field] = evaluation.get(field)
+    dataset = dict(train["dataset"])
+    dataset.pop("selection_policy")
+    dataset["evaluation"] = evaluation["dataset"]["evaluation"]
+    dataset["train_selection_policy"] = train["dataset"]["selection_policy"]
+    dataset["evaluation_selection_policy"] = evaluation["dataset"]["selection_policy"]
+    view["dataset"] = dataset
+    view["campaign_manifest_bindings"] = {
+        role: {"path": str(source.expanduser().resolve()), "sha256": sha256_file(source.expanduser().resolve()),
+               "semantic_sha256": manifest["semantic_sha256"], "selection_policy": manifest["dataset"]["selection_policy"]}
+        for role, source, manifest in (("train", path, train), ("evaluation", evaluation_path, evaluation))
+    }
+    return view
+
+
 def load_rows(
     path: Path,
     *,
@@ -393,6 +608,7 @@ def load_rows(
     expected_indices: Sequence[int],
     tokenizer: Any,
     max_completion_tokens: int,
+    sequence_length: int = SEQUENCE_LENGTH,
 ) -> tuple[BoolQRow, ...]:
     rows: list[BoolQRow] = []
     try:
@@ -413,7 +629,7 @@ def load_rows(
         target_ids = tuple(int(value) for value in tokenizer.encode(target, add_special_tokens=False).ids)
         if (
             not prompt_ids
-            or len(prompt_ids) + max_completion_tokens > SEQUENCE_LENGTH
+            or len(prompt_ids) + max_completion_tokens > sequence_length
             or len(target_ids) != 1
             or metadata.get("prompt_tokens") != len(prompt_ids)
             or metadata.get("target_tokens") != 1
@@ -439,7 +655,7 @@ def load_rows(
     return selected
 
 
-def validate_kl_trace(root: Path, report: Mapping[str, Any], spec: CampaignSpec) -> None:
+def validate_kl_trace(root: Path, report: Mapping[str, Any], spec: CampaignSpec) -> str:
     telemetry = report.get("kl_control")
     if not isinstance(telemetry, dict):
         raise MultiTokenParityError("Antfly adaptive KL telemetry is missing")
@@ -450,13 +666,21 @@ def validate_kl_trace(root: Path, report: Mapping[str, Any], spec: CampaignSpec)
         or telemetry.get("rejected_groups") != 0
     ):
         raise MultiTokenParityError("Antfly adaptive KL telemetry counts drifted")
+    if (
+        report.get("schema_version") in {
+            "antfly_inference_finetune_grpo_report/v9",
+            "antfly_inference_finetune_grpo_report/v10",
+        }
+        and telemetry.get("kl_horizon_unit") != "completion-episodes"
+    ):
+        raise MultiTokenParityError("Antfly adaptive KL horizon unit drifted")
     for field, expected in (
         ("train_max_kl", GRPO["train_max_kl"]),
         ("target_kl", GRPO["target_kl"]),
         ("kl_horizon", GRPO["kl_horizon"]),
         ("initial_kl_coef", GRPO["initial_kl_coef"]),
-        ("min_kl_coef", GRPO["min_kl_coef"]),
-        ("max_kl_coef", GRPO["max_kl_coef"]),
+        ("min_kl_coef", spec.profile.min_kl_coef),
+        ("max_kl_coef", spec.profile.max_kl_coef),
     ):
         require_close(telemetry.get(field), expected, f"kl_control.{field}")
     trace_path = root / "grpo_kl_control_trace.jsonl"
@@ -468,11 +692,17 @@ def validate_kl_trace(root: Path, report: Mapping[str, Any], spec: CampaignSpec)
     if len(lines) != spec.train_groups:
         raise MultiTokenParityError("Antfly KL trace group count drifted")
     previous_after: float | None = None
+    schema_version: str | None = None
     for index, line in enumerate(lines):
         row = json.loads(line)
+        row_schema = row.get("schema_version") if isinstance(row, dict) else None
+        if row_schema not in KL_TRACE_SCHEMA_VERSIONS:
+            raise MultiTokenParityError("Antfly KL trace schema drifted")
+        if schema_version is None:
+            schema_version = row_schema
         if (
             not isinstance(row, dict)
-            or row.get("schema_version") != KL_TRACE_SCHEMA_VERSION
+            or row_schema != schema_version
             or row.get("group_index") != index
             or row.get("status") != "admitted"
             or row.get("budget_policy") != "skip_group"
@@ -480,15 +710,182 @@ def validate_kl_trace(root: Path, report: Mapping[str, Any], spec: CampaignSpec)
             raise MultiTokenParityError("Antfly KL trace decision/order drifted")
         before = finite_float(row.get("kl_coef_before"), "kl_coef_before")
         after = finite_float(row.get("kl_coef_after"), "kl_coef_after")
+        if row_schema == KL_TRACE_SCHEMA_VERSION:
+            require_close(
+                row.get("objective_kl_coef"), before, "objective_kl_coef", 0.0
+            )
         observed = finite_float(row.get("mean_kl"), "mean_kl")
         if observed > GRPO["train_max_kl"]:
             raise MultiTokenParityError("Antfly admitted a group above the hard KL budget")
         if previous_after is not None and abs(before - previous_after) > 1.0e-7:
             raise MultiTokenParityError("Antfly KL coefficient trajectory is discontinuous")
-        expected_after = adaptive_kl_update(before, observed)
+        observed_completions = controller_observed_completions(
+            row, schema_version, spec.group_size
+        )
+        expected_after = adaptive_kl_update(
+            before,
+            observed,
+            observed_completions,
+            min_kl_coef=spec.profile.min_kl_coef,
+            max_kl_coef=spec.profile.max_kl_coef,
+        )
         if abs(after - expected_after) > 2.0e-7:
             raise MultiTokenParityError("Antfly adaptive KL update differs from the matched rule")
         previous_after = after
+    assert schema_version is not None
+    return schema_version
+
+
+def validate_categorical_groups(
+    root: Path, report: Mapping[str, Any], spec: CampaignSpec, trace: Sequence[TraceGroup],
+) -> str:
+    """Bind skips and Adam step indices to chronological reward/KL evidence."""
+    telemetry = report.get("kl_control")
+    if (not isinstance(telemetry, dict) or telemetry.get("mode") != "adaptive"
+            or telemetry.get("budget_policy") != "skip_group"):
+        raise MultiTokenParityError("categorical KL control contract drifted")
+    if (
+        report.get("schema_version") in {
+            "antfly_inference_finetune_grpo_report/v9",
+            "antfly_inference_finetune_grpo_report/v10",
+        }
+        and telemetry.get("kl_horizon_unit") != "completion-episodes"
+    ):
+        raise MultiTokenParityError("categorical KL horizon unit drifted")
+    kl_contract = dict(GRPO)
+    kl_contract.update(
+        min_kl_coef=spec.profile.min_kl_coef,
+        max_kl_coef=spec.profile.max_kl_coef,
+    )
+    for field in ("train_max_kl", "target_kl", "kl_horizon", "initial_kl_coef", "min_kl_coef", "max_kl_coef"):
+        require_close(telemetry.get(field), kl_contract[field], f"kl_control.{field}")
+    path = root / "grpo_kl_control_trace.jsonl"
+    if (telemetry.get("trace_path") != str(path)
+            or telemetry.get("trace_digest") != "sha256:" + sha256_file(path)):
+        raise MultiTokenParityError("categorical KL trace identity drifted")
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    schemas = {
+        row.get("schema_version") for row in records if isinstance(row, dict)
+    }
+    if not records:
+        schema_version = KL_TRACE_SCHEMA_VERSION
+    elif len(schemas) == 1 and schemas.issubset(KL_TRACE_SCHEMA_VERSIONS):
+        schema_version = next(iter(schemas))
+    else:
+        raise MultiTokenParityError("categorical KL trace schema drifted")
+    cursor = admitted = zero = rejected = 0
+    coefficient = GRPO["initial_kl_coef"]
+    for index, group in enumerate(trace):
+        if all(value == group.rewards[0] for value in group.rewards):
+            zero += 1
+            continue
+        if cursor >= len(records):
+            raise MultiTokenParityError("categorical KL decision is missing")
+        row = records[cursor]
+        cursor += 1
+        if (not isinstance(row, dict) or row.get("schema_version") != schema_version
+                or row.get("group_index") != index or row.get("epoch_index") != 0
+                or row.get("prompt_index") != group.prompt_index
+                or row.get("optimizer_steps_before") != admitted
+                or row.get("budget_policy") != "skip_group"):
+            raise MultiTokenParityError("categorical KL decision/order drifted")
+        observed = finite_float(row.get("mean_kl"), "mean_kl")
+        status = group_admission(group.rewards, observed)
+        if row.get("status") != status:
+            raise MultiTokenParityError("categorical KL admission disagrees with budget")
+        require_close(row.get("train_max_kl"), GRPO["train_max_kl"], "train_max_kl")
+        require_close(row.get("target_kl"), GRPO["target_kl"], "target_kl")
+        before = finite_float(row.get("kl_coef_before"), "kl_coef_before")
+        require_close(before, coefficient, "kl_coef_before", 2e-7)
+        if schema_version == KL_TRACE_SCHEMA_VERSION:
+            require_close(
+                row.get("objective_kl_coef"), before,
+                "objective_kl_coef", 0.0,
+            )
+        require_close(row.get("weighted_kl_loss"), coefficient * observed, "weighted_kl_loss", 2e-7)
+        if status == "admitted":
+            admitted += 1
+        if status == "admitted" or schema_version in {
+            "antfly_inference_grpo_kl_control_trace/v3",
+            "antfly_inference_grpo_kl_control_trace/v4",
+            KL_TRACE_SCHEMA_VERSION,
+        }:
+            observed_completions = controller_observed_completions(
+                row, schema_version, spec.group_size
+            )
+            coefficient = adaptive_kl_update(
+                coefficient,
+                observed,
+                observed_completions,
+                min_kl_coef=spec.profile.min_kl_coef,
+                max_kl_coef=spec.profile.max_kl_coef,
+            )
+        if status != "admitted":
+            rejected += 1
+        require_close(row.get("kl_coef_after"), coefficient, "kl_coef_after", 2e-7)
+    if cursor != len(records):
+        raise MultiTokenParityError("categorical KL trace contains extra decisions")
+    counts = {"optimizer_steps": admitted, "optimizer_groups": admitted,
+              "zero_reward_std_groups": zero, "all_truncated_groups": 0,
+              "kl_rejected_groups": rejected}
+    if (len(trace) != spec.train_groups or admitted + zero + rejected != spec.train_groups
+            or any(type(report.get(k)) is not int or report[k] != v for k, v in counts.items())
+            or telemetry.get("admitted_groups") != admitted
+            or telemetry.get("rejected_groups") != rejected):
+        raise MultiTokenParityError("categorical skipped-group counts drifted")
+    require_close(report.get("frac_reward_zero_std"), zero / spec.train_groups, "frac_reward_zero_std")
+    require_close(report.get("frac_kl_rejected"), rejected / spec.train_groups, "frac_kl_rejected")
+    return schema_version
+
+
+def bind_training_dataset(
+    config: Mapping[str, Any],
+    dataset_path: Path,
+    manifest: Mapping[str, Any],
+    expected_count: int,
+) -> tuple[tuple[str, ...], tuple[int, ...]]:
+    """Bind a campaign seed permutation to its admitted source-row multiset."""
+    dataset_path = dataset_path.expanduser().resolve()
+    if not dataset_path.is_file():
+        raise MultiTokenParityError("Antfly training dataset is missing")
+    metadata = config.get("metadata")
+    fingerprints = metadata.get("dataset_fingerprints") if isinstance(metadata, dict) else None
+    expected_digest = "sha256:" + sha256_file(dataset_path)
+    if not isinstance(fingerprints, list) or not any(
+        isinstance(item, dict)
+        and item.get("label") == "dataset"
+        and Path(str(item.get("path", ""))).expanduser().resolve() == dataset_path
+        and item.get("digest") == expected_digest
+        and item.get("size_bytes") == dataset_path.stat().st_size
+        for item in fingerprints
+    ):
+        raise MultiTokenParityError("Antfly training dataset fingerprint is missing or stale")
+
+    source_ids: list[str] = []
+    source_indices: list[int] = []
+    try:
+        lines = dataset_path.read_text(encoding="utf-8").splitlines()
+        for line in lines:
+            row = json.loads(line)
+            row_metadata = row.get("metadata") if isinstance(row, dict) else None
+            source_id = row_metadata.get("source_id") if isinstance(row_metadata, dict) else None
+            source_index = row_metadata.get("source_row_index") if isinstance(row_metadata, dict) else None
+            if not isinstance(source_id, str) or isinstance(source_index, bool) or not isinstance(source_index, int):
+                raise MultiTokenParityError("Antfly training dataset source identity is invalid")
+            source_ids.append(source_id)
+            source_indices.append(source_index)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise MultiTokenParityError(f"could not validate Antfly training dataset: {exc}") from exc
+    if len(source_ids) != expected_count:
+        raise MultiTokenParityError("Antfly training dataset row count drifted")
+    admitted_pairs = list(zip(source_ids, source_indices))
+    manifest_pairs = list(zip(
+        manifest.get("train_source_ids", [])[:expected_count],
+        manifest.get("train_source_row_indices", [])[:expected_count],
+    ))
+    if len(manifest_pairs) != expected_count or Counter(admitted_pairs) != Counter(manifest_pairs):
+        raise MultiTokenParityError("Antfly training dataset is not the admitted source-row multiset")
+    return tuple(source_ids), tuple(source_indices)
 
 
 def load_acceptance(
@@ -497,22 +894,47 @@ def load_acceptance(
     spec: CampaignSpec,
     model_dir: Path,
     adapter_dir: Path,
+    *, categorical_diagnostic: bool = False,
 ) -> AcceptanceEvidence:
+    spec.validate()
+    if spec.recipe_profile in ALL_LINEAR_SINGLE_TOKEN_PROFILES and not categorical_diagnostic:
+        raise MultiTokenParityError("all-linear single-token profile requires categorical diagnostics")
     evidence_root = root.expanduser().resolve()
     config = load_json(evidence_root / "training_config.json", "Antfly training config")
     train_report = load_json(evidence_root / "grpo_report.json", "Antfly GRPO report")
-    eval_report = load_json(evidence_root / "grpo_evaluation_report.json", "Antfly GRPO evaluation report")
+    reported_evaluation = train_report.get("evaluation")
+    reported_evaluation_path = (
+        reported_evaluation.get("report_path")
+        if isinstance(reported_evaluation, dict)
+        else None
+    )
+    if reported_evaluation_path is None:
+        eval_report_path = evidence_root / "grpo_evaluation_report.json"
+    elif isinstance(reported_evaluation_path, str):
+        eval_report_path = Path(reported_evaluation_path).expanduser().resolve()
+        if eval_report_path.parent != evidence_root:
+            raise MultiTokenParityError("Antfly GRPO evaluation report escaped the campaign root")
+    else:
+        raise MultiTokenParityError("Antfly GRPO evaluation report path is invalid")
+    eval_report = load_json(eval_report_path, "Antfly GRPO evaluation report")
     if train_report.get("schema_version") not in GRPO_REPORT_SCHEMA_VERSIONS:
         raise MultiTokenParityError("Antfly GRPO report is not the adaptive-KL schema")
     if (
-        train_report.get("schema_version") == "antfly_inference_finetune_grpo_report/v8"
+        train_report.get("schema_version") in {
+            "antfly_inference_finetune_grpo_report/v8",
+            "antfly_inference_finetune_grpo_report/v9",
+            "antfly_inference_finetune_grpo_report/v10",
+        }
         and train_report.get("training_order") != GRPO_TRAINING_ORDER
     ):
         raise MultiTokenParityError("Antfly GRPO training-order contract drifted")
-    try:
-        legacy.require_native_rollout_sampler_compatibility(train_report)
-    except legacy.BoolQParityContractError as exc:
-        raise MultiTokenParityError(str(exc)) from exc
+    if categorical_diagnostic:
+        categorical_contract(config, train_report, eval_report)
+    else:
+        try:
+            legacy.require_native_rollout_sampler_compatibility(train_report)
+        except legacy.BoolQParityContractError as exc:
+            raise MultiTokenParityError(str(exc)) from exc
     if eval_report.get("schema_version") not in GRPO_EVAL_SCHEMA_VERSIONS:
         raise MultiTokenParityError("Antfly GRPO evaluation is not the raw-KL schema")
     if train_report.get("execution_mode") != "train" or train_report.get("dataset_format") != "rendered-text-grpo":
@@ -520,13 +942,15 @@ def load_acceptance(
     expected_counts = {
         "groups": spec.train_groups,
         "completions": spec.train_groups * spec.group_size,
-        "optimizer_steps": spec.train_groups,
     }
+    if not categorical_diagnostic:
+        expected_counts["optimizer_steps"] = spec.train_groups
     if any(train_report.get(key) != value for key, value in expected_counts.items()):
         raise MultiTokenParityError("Antfly training counts differ from the matched campaign")
     if train_report.get("policy_backend") != "metal":
         raise MultiTokenParityError("Antfly campaign must run on Metal")
-    if eval_report.get("status") != "passed" or eval_report.get("groups") != spec.eval_groups:
+    allowed_eval_statuses = {"passed", "failed", "failed-quality-gate"} if categorical_diagnostic else {"passed"}
+    if eval_report.get("status") not in allowed_eval_statuses or eval_report.get("groups") != spec.eval_groups:
         raise MultiTokenParityError("Antfly held-out campaign did not pass")
     if eval_report.get("mask_truncated_completions") is not False:
         raise MultiTokenParityError("Antfly evaluation truncation policy drifted")
@@ -535,18 +959,22 @@ def load_acceptance(
     if train_report.get("schema_version") in {
         "antfly_inference_finetune_grpo_report/v7",
         "antfly_inference_finetune_grpo_report/v8",
+        "antfly_inference_finetune_grpo_report/v9",
+        "antfly_inference_finetune_grpo_report/v10",
     }:
+        for field in ("epsilon_low", "epsilon_high"):
+            value = finite_float(train_report.get(field), f"report.{field}")
+            if value not in (GRPO["clip_epsilon"], _f32(GRPO["clip_epsilon"])):
+                raise MultiTokenParityError(f"report.{field} differs from the matched campaign")
         if (
-            train_report.get("optimizer_groups") != spec.train_groups
+            (not categorical_diagnostic and (train_report.get("optimizer_groups") != spec.train_groups
             or train_report.get("zero_reward_std_groups") != 0
             or train_report.get("all_truncated_groups") != 0
             or train_report.get("kl_rejected_groups") != 0
             or float(train_report.get("frac_reward_zero_std", -1.0)) != 0.0
-            or float(train_report.get("frac_kl_rejected", -1.0)) != 0.0
+            or float(train_report.get("frac_kl_rejected", -1.0)) != 0.0))
             or train_report.get("loss_type") != "bnpo"
             or train_report.get("scale_rewards") != "group"
-            or float(train_report.get("epsilon_low", 0.0)) != GRPO["clip_epsilon"]
-            or float(train_report.get("epsilon_high", 0.0)) != GRPO["clip_epsilon"]
             or train_report.get("max_completion_tokens") != spec.max_completion_tokens
             or train_report.get("mask_truncated_completions") is not False
             or train_report.get("num_iterations") != 1
@@ -584,20 +1012,32 @@ def load_acceptance(
         raise MultiTokenParityError("Antfly seed adapter differs from the campaign")
     if adapter.get("rank") != 16 or float(adapter.get("alpha", 0.0)) != 32.0:
         raise MultiTokenParityError("Antfly adapter rank/alpha drifted")
-    if adapter.get("target_preset") not in (None, TARGET_PRESET):
+    if adapter.get("target_preset") not in (None, spec.profile.target_preset):
         raise MultiTokenParityError("Antfly adapter target preset drifted")
+    if spec.recipe_profile in ALL_LINEAR_SINGLE_TOKEN_PROFILES:
+        if adapter.get("target_preset") != spec.profile.target_preset:
+            raise MultiTokenParityError("all-linear profile requires an explicit target preset")
+        if grpo.get("sampling") != {"temperature": 2.0, "top_p": 1.0, "top_k": 32}:
+            raise MultiTokenParityError("all-linear profile sampling policy drifted")
+    train_dataset_path = Path(str(dataset.get("path", ""))).expanduser().resolve()
+    train_source_ids, train_source_row_indices = bind_training_dataset(
+        config, train_dataset_path, manifest, spec.train_groups
+    )
     if (
-        dataset.get("path") != manifest.get("train_jsonl")
-        or evaluation.get("path") != manifest.get("eval_jsonl")
+        evaluation.get("path") != manifest.get("eval_jsonl")
         or dataset.get("max_examples") != spec.train_groups
         or evaluation.get("max_examples") != spec.eval_groups
-        or dataset.get("max_seq_len") != SEQUENCE_LENGTH
+        or dataset.get("max_seq_len") != spec.profile.sequence_length
     ):
         raise MultiTokenParityError("Antfly dataset is not the pinned matched split")
-    require_close(optimizer.get("learning_rate"), LEARNING_RATE, "optimizer.learning_rate", 1.0e-14)
+    require_close(optimizer.get("learning_rate"), spec.profile.learning_rate, "optimizer.learning_rate", 1.0e-14)
     if optimizer.get("epochs") != 1 or optimizer.get("gradient_accumulation_steps") != 1:
         raise MultiTokenParityError("Antfly optimizer schedule drifted")
     require_close(optimizer.get("max_grad_norm"), OPTIMIZER["max_grad_norm"], "optimizer.max_grad_norm")
+    if categorical_diagnostic:
+        require_close(grpo.get("advantage_eps", 1e-4), spec.profile.advantage_epsilon, "grpo.advantage_eps", 1e-14)
+        if grpo.get("train_max_kl_policy") != "skip_group":
+            raise MultiTokenParityError("categorical KL budget policy drifted")
     if grpo.get("group_size") != spec.group_size or grpo.get("max_completion_tokens") != spec.max_completion_tokens:
         raise MultiTokenParityError("Antfly group/completion shape drifted")
     for field, expected in (
@@ -606,34 +1046,60 @@ def load_acceptance(
         ("train_max_kl", GRPO["train_max_kl"]),
         ("target_kl", GRPO["target_kl"]),
         ("kl_horizon", GRPO["kl_horizon"]),
-        ("min_kl_coef", GRPO["min_kl_coef"]),
-        ("max_kl_coef", GRPO["max_kl_coef"]),
+        ("min_kl_coef", spec.profile.min_kl_coef),
+        ("max_kl_coef", spec.profile.max_kl_coef),
     ):
         require_close(grpo.get(field), expected, f"grpo.{field}")
     if (
         grpo.get("adaptive_kl") is not True
-        or grpo.get("normalize_advantage") is not True
+        or (grpo.get("normalize_advantage") is not None and grpo.get("normalize_advantage") is not True)
         or grpo.get("loss_type") not in (None, "bnpo")
         or grpo.get("scale_rewards") not in (None, "group")
         or grpo.get("epsilon_high") not in (None, GRPO["clip_epsilon"])
         or grpo.get("mask_truncated_completions") not in (None, False)
     ):
         raise MultiTokenParityError("Antfly adaptive/advantage policy drifted")
-    validate_kl_trace(evidence_root, train_report, spec)
+    if categorical_diagnostic:
+        kl_trace_schema_version = validate_categorical_groups(
+            evidence_root, train_report, spec, load_trace(
+            evidence_root / "grpo_reward_trace.jsonl", phase="train",
+            expected_groups=spec.train_groups, group_size=spec.group_size,
+            max_completion_tokens=spec.max_completion_tokens,
+            )
+        )
+    else:
+        kl_trace_schema_version = validate_kl_trace(
+            evidence_root, train_report, spec
+        )
     train_trace_path = evidence_root / "grpo_reward_trace.jsonl"
     eval_trace_path = evidence_root / "grpo_evaluation_reward_trace.jsonl"
     for trace_path, report in ((train_trace_path, train_report), (eval_trace_path, eval_report)):
         telemetry = report.get("reward_pipeline")
         if not isinstance(telemetry, dict) or telemetry.get("trace_digest") != "sha256:" + sha256_file(trace_path):
             raise MultiTokenParityError("Antfly reward trace digest drifted")
-    trained_adapter_dir = Path(str(train_report.get("trained_adapter_dir", ""))).resolve()
-    if trained_adapter_dir.parent != evidence_root or not trained_adapter_dir.is_dir():
-        raise MultiTokenParityError("Antfly trained adapter escaped the campaign root")
+    raw_adapter_dir = train_report.get("trained_adapter_dir")
+    quality_rejected = any(
+        isinstance(train_report.get(field), dict) and train_report[field].get("passed") is False
+        for field in ("evaluation", "baseline_relative")
+    )
+    if raw_adapter_dir is None and categorical_diagnostic and quality_rejected:
+        # Failed quality must not force publication of an accepted adapter.
+        # Replay/rollout mechanics remain measurable, with adapter parity unavailable.
+        trained_adapter_dir = None
+    else:
+        trained_adapter_dir = Path(str(raw_adapter_dir or "")).resolve()
+        if trained_adapter_dir.parent != evidence_root or not trained_adapter_dir.is_dir():
+            raise MultiTokenParityError("Antfly trained adapter escaped the campaign root")
     return AcceptanceEvidence(
         root=evidence_root,
         config=config,
         train_report=train_report,
         eval_report=eval_report,
+        eval_report_path=eval_report_path,
+        train_dataset_path=train_dataset_path,
+        train_source_ids=train_source_ids,
+        train_source_row_indices=train_source_row_indices,
+        kl_trace_schema_version=kl_trace_schema_version,
         train_trace=load_trace(
             train_trace_path,
             phase="train",
@@ -683,25 +1149,176 @@ def write_json_exclusive(path: Path, payload: Mapping[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def write_adapter_exclusive(
+    path: Path,
+    *,
+    final_trainables: Mapping[str, Any],
+    target_names: Sequence[str],
+    adapter: Any,
+    mx: Any,
+) -> Mapping[str, Any]:
+    """Persist MLX trainables in the seed adapter's canonical orientation."""
+    destination = path.expanduser().resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        raise MultiTokenParityError(
+            f"campaign adapter output already exists: {destination}"
+        )
+    mlx_targets = {
+        locked.canonicalize_module_name(name): name for name in target_names
+    }
+    if len(mlx_targets) != len(target_names):
+        raise MultiTokenParityError("MLX adapter target names are not canonical")
+    serialized: dict[str, Any] = {}
+    for (module, role), descriptor in adapter.tensors.items():
+        suffix = "lora_a" if role == "lora_A" else "lora_b"
+        try:
+            value = final_trainables[f"{mlx_targets[module]}.{suffix}"]
+        except KeyError as exc:
+            raise MultiTokenParityError(
+                f"final MLX adapter is missing {module}.{role}"
+            ) from exc
+        serialized[descriptor.source_name] = value.T.astype(mx.float32)
+    expected_names = {item.source_name for item in adapter.tensors.values()}
+    if set(serialized) != expected_names:
+        raise MultiTokenParityError("serialized MLX adapter inventory drifted")
+    temporary = destination.with_name(
+        f".{destination.stem}.{os.getpid()}.tmp.safetensors"
+    )
+    try:
+        mx.save_safetensors(str(temporary), serialized, metadata={"format": "pt"})
+        os.link(temporary, destination)
+    except FileExistsError as exc:
+        raise MultiTokenParityError(
+            f"campaign adapter output already exists: {destination}"
+        ) from exc
+    finally:
+        temporary.unlink(missing_ok=True)
+    return {
+        "path": str(destination),
+        "sha256": sha256_file(destination),
+        "tensor_count": len(serialized),
+        "orientation": "seed-adapter-source-layout",
+    }
+
+
+def execution_lanes(selection: str, *, categorical: bool) -> tuple[str, ...]:
+    if selection == "both":
+        return ("trace_replay", "native_rollout")
+    if selection not in ("trace-replay", "native-rollout"):
+        raise MultiTokenParityError(f"unknown execution lane: {selection}")
+    if not categorical:
+        raise MultiTokenParityError("individual execution lanes require categorical diagnostics")
+    return (selection.replace("-", "_"),)
+
+
+def diagnostic_execution_shape(
+    spec: CampaignSpec,
+    *,
+    train_prefix_groups: int | None,
+    skip_evaluation: bool,
+    categorical: bool,
+) -> tuple[int, bool]:
+    """Resolve a bounded replay only after preserving the full source shape."""
+    executed_train_groups = (
+        spec.train_groups if train_prefix_groups is None else train_prefix_groups
+    )
+    if (
+        isinstance(executed_train_groups, bool)
+        or not isinstance(executed_train_groups, int)
+        or not 2 <= executed_train_groups <= spec.train_groups
+    ):
+        raise MultiTokenParityError(
+            "training prefix must contain between two groups and the full source horizon"
+        )
+    if executed_train_groups != spec.train_groups and not categorical:
+        raise MultiTokenParityError("training-prefix replay is diagnostic-only")
+    if skip_evaluation and not categorical:
+        raise MultiTokenParityError("skipping evaluation is diagnostic-only")
+    return executed_train_groups, skip_evaluation
+
+
 def run(args: argparse.Namespace) -> Mapping[str, Any]:
+    run_started = time.monotonic()
+
+    def progress(stage: str, **details: Any) -> None:
+        # Flush before expensive work so an externally stopped process leaves
+        # its last stage in stderr. These events are not completed result artifacts.
+        print(json.dumps({
+            "event": "gemma4_grpo_mlx_progress",
+            "stage": stage,
+            "elapsed_seconds": time.monotonic() - run_started,
+            **details,
+        }, sort_keys=True), file=sys.stderr, flush=True)
+
+    progress("input-validation")
+    lanes = execution_lanes(args.execution_lane, categorical=args.categorical_diagnostic)
+    trace_adapter_output = getattr(args, "trace_adapter_output", None)
+    if trace_adapter_output is not None and "trace_replay" not in lanes:
+        raise MultiTokenParityError(
+            "trace adapter output requires the trace-replay execution lane"
+        )
     spec = CampaignSpec(
         model_key=args.model_key,
         train_groups=args.train_groups,
         eval_groups=args.eval_groups,
         group_size=args.group_size,
         max_completion_tokens=args.max_completion_tokens,
+        recipe_profile=args.recipe_profile,
     )
     spec.validate()
+    skip_evaluation = bool(getattr(args, "skip_evaluation", False))
+    executed_train_groups, skip_evaluation = diagnostic_execution_shape(
+        spec,
+        train_prefix_groups=getattr(args, "train_prefix_groups", None),
+        skip_evaluation=skip_evaluation,
+        categorical=args.categorical_diagnostic,
+    )
+    if spec.recipe_profile in ALL_LINEAR_SINGLE_TOKEN_PROFILES and not args.categorical_diagnostic:
+        raise MultiTokenParityError("all-linear single-token profile requires categorical diagnostics")
+    if args.activation_mode == "aligned-f32" and not args.categorical_diagnostic:
+        raise MultiTokenParityError("aligned F32 activations require categorical diagnostics")
+    if args.capture_initial_training_logits and not args.categorical_diagnostic:
+        raise MultiTokenParityError("predictor capture requires categorical diagnostics")
+    if args.shared_single_token_scoring and spec.max_completion_tokens != 1:
+        raise MultiTokenParityError("shared single-token scoring requires a one-token completion budget")
     model_dir = args.model_dir.expanduser().resolve()
     adapter_dir = args.adapter_dir.expanduser().resolve()
-    manifest = load_materialization(args.dataset_manifest, spec, model_dir)
+    manifest = load_campaign_materialization(
+        args.dataset_manifest, args.evaluation_dataset_manifest, spec, model_dir
+    )
     acceptance = load_acceptance(
         args.antfly_run_root,
         manifest,
         spec,
         model_dir,
         adapter_dir,
+        categorical_diagnostic=args.categorical_diagnostic,
     )
+    controller_unit = getattr(args, "adaptive_kl_controller_unit", "source-contract")
+    if controller_unit != "source-contract" and not args.categorical_diagnostic:
+        raise MultiTokenParityError("adaptive KL controller overrides require categorical diagnostics")
+    controller_uses_completion_episode_horizon = (
+        controller_unit == "completion-episodes"
+        or acceptance.kl_trace_schema_version in {
+            "antfly_inference_grpo_kl_control_trace/v4",
+            KL_TRACE_SCHEMA_VERSION,
+        }
+    )
+    controller_observations_per_group = (
+        spec.group_size if controller_uses_completion_episode_horizon else 1
+    )
+    controller_advances_rejections = (
+        controller_unit == "completion-episodes"
+        or acceptance.kl_trace_schema_version in {
+            "antfly_inference_grpo_kl_control_trace/v3",
+            "antfly_inference_grpo_kl_control_trace/v4",
+            KL_TRACE_SCHEMA_VERSION,
+        }
+    )
+    sampling_contract = (categorical_contract(
+        acceptance.config, acceptance.train_report, acceptance.eval_report,
+    ) if args.categorical_diagnostic else None)
 
     lock = locked.load_lock(args.lock)
     mlx_contract = lock["mlx_reference"]
@@ -717,6 +1334,7 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
     ):
         raise MultiTokenParityError("MLX campaign must run on the locked Apple platform")
     runtime_root = args.mlx_runtime_root.expanduser().resolve()
+    progress("runtime-attestation")
     runtime_attestation = legacy.attest_wheel_runtime(
         runtime_root=runtime_root,
         wheel_path=args.mlx_wheel,
@@ -728,11 +1346,21 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
         "locked_source_revision": mlx_contract["source_revisions"]["mlx"],
         "source_revision_verified": False,
     }
-    mlx_lm_revision = microbenchmark.require_source_revision(
-        args.mlx_lm_source_root,
-        mlx_contract["source_revisions"]["mlx-lm"],
-        "MLX-LM",
-    )
+    mlx_lm_source_attestation = None
+    if args.mlx_lm_source_archive is not None:
+        mlx_lm_source_attestation = attest_mlx_lm_archive(
+            args.mlx_lm_source_root, args.mlx_lm_source_archive,
+            mlx_contract["source_revisions"]["mlx-lm"],
+        )
+        mlx_lm_revision = mlx_lm_source_attestation["revision"]
+        # Preserve the exact inventory and never import stale generated bytecode.
+        sys.dont_write_bytecode = True
+    else:
+        mlx_lm_revision = microbenchmark.require_source_revision(
+            args.mlx_lm_source_root,
+            mlx_contract["source_revisions"]["mlx-lm"],
+            "MLX-LM",
+        )
 
     import mlx.core as mx
     import mlx.nn as nn
@@ -768,14 +1396,16 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
         if not microbenchmark._path_is_within(source_path, mlx_lm_root):
             raise MultiTokenParityError(f"imported {label} escaped the attested checkout")
 
+    progress("dataset-validation")
     tokenizer = tokenizers_native.Tokenizer.from_file(str(model_dir / "tokenizer.json"))
     train_rows = load_rows(
-        Path(str(manifest["train_jsonl"])),
+        acceptance.train_dataset_path,
         expected_count=spec.train_groups,
-        expected_ids=manifest["train_source_ids"],
-        expected_indices=manifest["train_source_row_indices"],
+        expected_ids=acceptance.train_source_ids,
+        expected_indices=acceptance.train_source_row_indices,
         tokenizer=tokenizer,
         max_completion_tokens=spec.max_completion_tokens,
+        sequence_length=spec.profile.sequence_length,
     )
     eval_rows = load_rows(
         Path(str(manifest["eval_jsonl"])),
@@ -784,28 +1414,40 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
         expected_indices=manifest["eval_source_row_indices"],
         tokenizer=tokenizer,
         max_completion_tokens=spec.max_completion_tokens,
+        sequence_length=spec.profile.sequence_length,
     )
+    train_rows = legacy.rows_in_prompt_order(train_rows, [group.prompt_index for group in acceptance.train_trace])
+    eval_rows = legacy.rows_in_prompt_order(eval_rows, [group.prompt_index for group in acceptance.eval_trace])
     validate_trace_rewards(tokenizer, train_rows, acceptance.train_trace)
     validate_trace_rewards(tokenizer, eval_rows, acceptance.eval_trace)
+    execution_train_rows = train_rows[:executed_train_groups]
+    execution_train_trace = acceptance.train_trace[:executed_train_groups]
 
     adapter_manifest = load_json(
         adapter_dir / "antfly_finetune_manifest.json", "seed adapter manifest"
     )
     binding_fields = ("base_model_sha256", "tokenizer_sha256", "chat_template_sha256")
     prepared_summary = {key: adapter_manifest.get(key) for key in binding_fields}
+    progress("model-provenance")
     base_model_provenance = locked.zig_model_provenance(model_dir)
     if prepared_summary != base_model_provenance:
         raise MultiTokenParityError("seed adapter does not match the model")
     seed_adapter = locked.inspect_initial_adapter(
-        adapter_dir, lock, spec.model_key, TARGET_PRESET, prepared_summary
+        adapter_dir,
+        lock,
+        spec.model_key,
+        spec.profile.target_preset,
+        prepared_summary,
+        allow_missing_manifest_target_preset=True,
     )
     antfly_trained = locked.inspect_initial_adapter(
         acceptance.trained_adapter_dir,
         lock,
         spec.model_key,
-        TARGET_PRESET,
+        spec.profile.target_preset,
         prepared_summary,
-    )
+        allow_missing_manifest_target_preset=True,
+    ) if acceptance.trained_adapter_dir is not None else None
 
     mx.set_default_device(mx.gpu)
     mx.random.seed(42)
@@ -815,6 +1457,7 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
     campaign_started = time.perf_counter()
     try:
         load_started = time.perf_counter()
+        progress("model-load")
         model, _config = locked.load_locked_mlx_gemma4(
             model_dir,
             mx,
@@ -826,12 +1469,14 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
                 mlx_gemma4.ModelArgs,
             ),
         )
+        progress("model-materialization")
         mx.eval(model.parameters())
         mx.synchronize()
+        progress("adapter-installation")
         model.freeze()
         base_inventory = locked.require_bf16_base_model(model, mx)
         targets = locked.target_module_names(
-            model, lock, spec.model_key, TARGET_PRESET
+            model, lock, spec.model_key, spec.profile.target_preset
         )
         target_set = set(targets)
         module_updates = []
@@ -848,6 +1493,15 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
         model.update_modules(tree_unflatten(module_updates))
         trainable_inventory = locked.require_exact_trainables(model, targets, mx)
         locked.load_exact_initial_adapter(model, targets, seed_adapter, mx)
+        checkpoint_source_sha256 = None
+        if args.gradient_checkpointing:
+            from mlx_lm.tuner import trainer as checkpoint_source
+
+            checkpoint_path = Path(checkpoint_source.__file__ or "").resolve()
+            if not microbenchmark._path_is_within(checkpoint_path, mlx_lm_root):
+                raise MultiTokenParityError("MLX-LM checkpoint helper escaped the attested source")
+            checkpoint_source.grad_checkpoint(model.language_model.model.layers[0])
+            checkpoint_source_sha256 = sha256_file(checkpoint_path)
         model.train()
         mx.eval(model.state)
         mx.synchronize()
@@ -858,6 +1512,7 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
         mx.eval(*initial_trainables.values())
         mx.synchronize()
         load_seconds = time.perf_counter() - load_started
+        progress("model-ready")
 
         config_payload = load_json(model_dir / "config.json", "Gemma4 config")
         text_config = config_payload.get("text_config")
@@ -891,11 +1546,11 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
             if not 1 <= len(values) <= spec.max_completion_tokens:
                 raise MultiTokenParityError("completion length drifted")
             joined = list(row.prompt_token_ids) + values
-            if len(joined) > SEQUENCE_LENGTH:
+            if len(joined) > spec.profile.sequence_length:
                 raise MultiTokenParityError("completion exceeds the sequence contract")
             return (
                 mx.array(
-                    [joined + [0] * (SEQUENCE_LENGTH - len(joined))],
+                    [joined + [0] * (spec.profile.sequence_length - len(joined))],
                     dtype=mx.int32,
                 ),
                 mx.array(
@@ -921,6 +1576,19 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
                 mx.stack([values[2] for values in rows], axis=0),
             )
 
+        def forward(current_model: Any, tokens: Any) -> Any:
+            if args.activation_mode == "stock-bf16":
+                return current_model(tokens)
+            # Same explicit input staging used by the retained F32 numerical
+            # comparisons. Frozen checkpoint weights remain BF16.
+            text_model = current_model.language_model.model
+            embeddings = text_model.embed_tokens(tokens).astype(mx.float32)
+            per_layer = (
+                text_model._get_per_layer_inputs(tokens, embeddings).astype(mx.float32)
+                if text_model.hidden_size_per_layer_input else None
+            )
+            return current_model(tokens, input_embeddings=embeddings, per_layer_inputs=per_layer)
+
         def selected_logps(
             current_model: Any,
             tokens: Any,
@@ -928,7 +1596,7 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
             mask: Any,
             prompt_length: int,
         ) -> Any:
-            logits = current_model(tokens).astype(mx.float32)
+            logits = forward(current_model, tokens).astype(mx.float32)
             columns = []
             for step in range(spec.max_completion_tokens):
                 predictor = logits[:, prompt_length - 1 + step, :]
@@ -944,6 +1612,20 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
         def score_sequences(
             row: BoolQRow, sequences: Sequence[Sequence[int]]
         ) -> list[list[float]]:
+            if args.shared_single_token_scoring and sequences:
+                if any(len(sequence) != 1 for sequence in sequences):
+                    raise MultiTokenParityError("shared scoring received a multi-token completion")
+                # Every single-token completion uses the same causal predictor
+                # row. Preserve the physical batch=1/padding contract and gather
+                # all selected log probabilities from one forward pass.
+                tokens, _selected, _mask = padded_sequence(row, sequences[0])
+                logits = forward(model, tokens).astype(mx.float32)[0, len(row.prompt_token_ids) - 1, :]
+                logprobs = logits - mx.logsumexp(logits)
+                selected = mx.array([sequence[0] for sequence in sequences], dtype=mx.int32)
+                values = logprobs[selected]
+                mx.eval(values)
+                mx.synchronize()
+                return [[float(value)] for value in values.tolist()]
             # Keep every candidate score at batch=1. This matches Antfly's
             # completion path and avoids batch-dependent quantized Gemma4
             # logits observed in the initial multi-token parity probe.
@@ -969,15 +1651,13 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
         ) -> tuple[list[list[int]], list[list[float]]]:
             prompt = list(row.prompt_token_ids)
             prompt_batch = mx.array(
-                [prompt + [0] * (SEQUENCE_LENGTH - len(prompt))],
+                [prompt + [0] * (spec.profile.sequence_length - len(prompt))],
                 dtype=mx.int32,
             )
-            logits = model(prompt_batch).astype(mx.float32)[0, len(prompt) - 1, :]
-            candidate_ids = mx.argpartition(
-                -logits, kth=spec.group_size - 1
-            )[: spec.group_size]
-            order = mx.argsort(-logits[candidate_ids])
-            first_tokens = candidate_ids[order]
+            logits = forward(model, prompt_batch).astype(mx.float32)[0, len(prompt) - 1, :]
+            first_tokens = mx.array(
+                legacy.ranked_tokens(logits.tolist(), spec.group_size), dtype=mx.int32
+            )
             first_logprobs = logits - mx.logsumexp(logits)
             first_values = first_logprobs[first_tokens]
             mx.eval(first_tokens, first_values)
@@ -993,16 +1673,12 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
                 for completion_index in active_indices:
                     joined = prompt + sequences[completion_index]
                     tokens = mx.array(
-                        [joined + [0] * (SEQUENCE_LENGTH - len(joined))],
+                        [joined + [0] * (spec.profile.sequence_length - len(joined))],
                         dtype=mx.int32,
                     )
-                    predictor = model(tokens).astype(mx.float32)[0, row_index, :]
-                    ranked = mx.argpartition(
-                        -predictor, kth=spec.group_size - 1
-                    )[: spec.group_size]
-                    ranked_scores = predictor[ranked]
-                    ranked = ranked[mx.argsort(-ranked_scores)]
-                    chosen = ranked[completion_index % spec.group_size]
+                    predictor = forward(model, tokens).astype(mx.float32)[0, row_index, :]
+                    ranked = legacy.ranked_tokens(predictor.tolist(), spec.group_size)
+                    chosen = mx.array(ranked[completion_index % spec.group_size], dtype=mx.int32)
                     chosen_logp = predictor[chosen] - mx.logsumexp(predictor)
                     mx.eval(chosen, chosen_logp)
                     mx.synchronize()
@@ -1014,6 +1690,37 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
                     if token_id == eos_token_id:
                         active[completion_index] = False
             return sequences, logps
+
+        def rollout_group(row: BoolQRow, prompt_index: int, *, evaluation: bool = False,
+                          initial_prediction: dict[str, Any] | None = None):
+            if sampling_contract is None:
+                return ranked_group(row)
+            seed, policy = sampling_contract
+
+            def predict(prefix: Sequence[int]) -> list[float]:
+                if len(prefix) >= spec.profile.sequence_length:
+                    raise MultiTokenParityError("categorical prefix exceeds sequence contract")
+                tokens = mx.array(
+                    [list(prefix) + [0] * (spec.profile.sequence_length - len(prefix))], dtype=mx.int32,
+                )
+                logits = forward(model, tokens).astype(mx.float32)[0, len(prefix) - 1, :]
+                mx.eval(logits)
+                mx.synchronize()
+                values = logits.tolist()
+                if initial_prediction is not None and not initial_prediction:
+                    initial_prediction.update(
+                        source_id=row.source_id, prompt_index=prompt_index,
+                        prompt_token_ids=list(prefix), physical_sequence_length=spec.profile.sequence_length,
+                        predictor_position=len(prefix) - 1, logits=values,
+                    )
+                return values
+
+            return categorical_rollout_group(
+                predict, row.prompt_token_ids, run_seed=seed, epoch=0,
+                prompt_index=prompt_index, evaluation=evaluation, policy=policy,
+                group_size=spec.group_size, max_completion_tokens=spec.max_completion_tokens,
+                eos_token_id=eos_token_id,
+            )
 
         def flatten(values: Sequence[Sequence[float]]) -> list[float]:
             return [item for row in values for item in row]
@@ -1027,7 +1734,7 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
             kl_coef: float,
         ) -> Mapping[str, float]:
             advantages = normalized_advantages(
-                rewards, GRPO["advantage_epsilon"]
+                rewards, spec.profile.advantage_epsilon
             )
             pg_values: list[float] = []
             kl_values: list[float] = []
@@ -1075,7 +1782,7 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
 
         def make_optimizer() -> Any:
             return optim.AdamW(
-                learning_rate=LEARNING_RATE,
+                learning_rate=spec.profile.learning_rate,
                 betas=(OPTIMIZER["beta1"], OPTIMIZER["beta2"]),
                 eps=OPTIMIZER["epsilon"],
                 weight_decay=OPTIMIZER["weight_decay"],
@@ -1096,7 +1803,7 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
         ) -> tuple[Any, Any, Any, Any, Any, Any]:
             # Each differentiable completion forward is physically batch=1.
             # The group token count preserves Antfly's group-level reduction.
-            logits = current_model(tokens).astype(mx.float32)
+            logits = forward(current_model, tokens).astype(mx.float32)
             predictor_rows = prompt_length + mx.arange(
                 spec.max_completion_tokens, dtype=mx.int32
             ) - 1
@@ -1146,16 +1853,18 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
                 restore_trainables(policy_values)
 
         reference_started = time.perf_counter()
+        progress("reference-precompute")
         reset_to_initial()
-        trace_reference = [
-            score_sequences(row, group.sequences)
-            for row, group in zip(train_rows, acceptance.train_trace)
-        ]
+        trace_reference = []
+        for group_index, (row, group) in enumerate(zip(execution_train_rows, execution_train_trace)):
+            progress("reference-group", group_index=group_index)
+            trace_reference.append(score_sequences(row, group.sequences))
         reference_precompute_seconds = time.perf_counter() - reference_started
 
         def train_lane(
             mode: str,
         ) -> tuple[Mapping[str, Any], Mapping[str, Any] | None]:
+            progress("training-start", lane=mode)
             reset_to_initial()
             optimizer = make_optimizer()
             state = [model.state, optimizer.state, mx.random.state]
@@ -1196,6 +1905,10 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
                             completion_gradients,
                         )
                     )
+                    if args.completion_execution == "sequential":
+                        # Bound the live backward graph to one completion. Keep
+                        # the same ordered sum and update only after the group.
+                        mx.eval(gradients, completion_metrics)
                 assert gradients is not None
                 gradients, grad_norm = optim.clip_grad_norm(
                     gradients, OPTIMIZER["max_grad_norm"]
@@ -1213,16 +1926,28 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
                     grad_norm,
                 )
 
-            compiled_step = mx.compile(step, inputs=state, outputs=state)
+            compiled_step = (
+                step if args.completion_execution == "sequential"
+                else mx.compile(step, inputs=state, outputs=state)
+            )
             coefficient = GRPO["initial_kl_coef"]
             updates: list[dict[str, Any]] = []
+            skipped: list[dict[str, Any]] = []
+            initial_prediction: dict[str, Any] | None = (
+                {} if args.capture_initial_training_logits else None
+            )
             started_lane = time.perf_counter()
             for update_index, (row, expected) in enumerate(
-                zip(train_rows, acceptance.train_trace)
+                zip(execution_train_rows, execution_train_trace)
             ):
                 started = time.perf_counter()
-                native_sequences, native_old = ranked_group(row)
-                overlap = sequence_overlap(native_sequences, expected.sequences)
+                progress("training-rollout", lane=mode, group_index=update_index)
+                native_sequences, native_old = rollout_group(
+                    row, expected.prompt_index,
+                    initial_prediction=initial_prediction if update_index == 0 else None,
+                )
+                overlap = sequence_overlap(native_sequences, expected.sequences,
+                                           with_replacement=sampling_contract is not None)
                 if mode == "trace_replay":
                     sequences = [list(values) for values in expected.sequences]
                     rewards = list(expected.rewards)
@@ -1255,11 +1980,43 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
                 raw_mean_kl = mean_k3(
                     flatten(policy_before), flatten(reference_values)
                 )
-                if raw_mean_kl > GRPO["train_max_kl"]:
+                admission = group_admission(rewards, raw_mean_kl)
+                if sampling_contract is not None and admission != "admitted":
+                    next_coefficient = coefficient
+                    if admission == "budget-exceeded-skipped" and controller_advances_rejections:
+                        next_coefficient = adaptive_kl_update(
+                            coefficient,
+                            raw_mean_kl,
+                            controller_observations_per_group,
+                            min_kl_coef=spec.profile.min_kl_coef,
+                            max_kl_coef=spec.profile.max_kl_coef,
+                        )
+                    progress("training-skipped", lane=mode, group_index=update_index,
+                             reason=admission, optimizer_steps=len(updates))
+                    skipped.append({
+                        "group_index": update_index, "prompt_index": expected.prompt_index,
+                        "source_id": row.source_id, "optimizer_steps_before": len(updates),
+                        "status": admission, "completion_token_ids": sequences,
+                        "completion_tokens": sum(map(len, sequences)), "rewards": rewards,
+                        "mean_kl": raw_mean_kl, "kl_coef_before": coefficient,
+                        "kl_coef_after": next_coefficient,
+                        "sampling_rescore_max_abs_error": sampling_rescore_max_abs_error,
+                        "candidate_overlap_with_antfly": overlap,
+                        "seconds": time.perf_counter() - started,
+                    })
+                    coefficient = next_coefficient
+                    continue
+                if sampling_contract is None and raw_mean_kl > GRPO["train_max_kl"]:
                     raise MultiTokenParityError(
                         f"MLX {mode} group {update_index} exceeded the pre-update KL budget"
                     )
-                next_coefficient = adaptive_kl_update(coefficient, raw_mean_kl)
+                next_coefficient = adaptive_kl_update(
+                    coefficient,
+                    raw_mean_kl,
+                    controller_observations_per_group,
+                    min_kl_coef=spec.profile.min_kl_coef,
+                    max_kl_coef=spec.profile.max_kl_coef,
+                )
                 tokens, selected, mask = padded_sequences(row, sequences)
                 old_array = mx.zeros(
                     (spec.group_size, spec.max_completion_tokens),
@@ -1278,10 +2035,12 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
                 reference_array = mx.array(reference_host, dtype=mx.float32)
                 advantages = mx.array(
                     normalized_advantages(
-                        rewards, GRPO["advantage_epsilon"]
+                        rewards, spec.profile.advantage_epsilon
                     ),
                     dtype=mx.float32,
                 )
+                progress("training-update", lane=mode, group_index=update_index,
+                         optimizer_steps=len(updates))
                 outputs = compiled_step(
                     tokens,
                     selected,
@@ -1327,7 +2086,10 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
                     )
                 updates.append(
                     {
-                        "update_index": update_index,
+                        "update_index": len(updates),
+                        "group_index": update_index,
+                        "prompt_index": expected.prompt_index,
+                        "status": "admitted",
                         "source_id": row.source_id,
                         "target": row.target,
                         "completion_token_ids": sequences,
@@ -1347,9 +2109,21 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
                     }
                 )
                 coefficient = next_coefficient
+                progress("training-updated", lane=mode, group_index=update_index,
+                         optimizer_steps=len(updates))
             lane_seconds = time.perf_counter() - started_lane
+            groups = sorted(updates + skipped, key=lambda row: row["group_index"])
             adapter_comparison: Mapping[str, Any] | None = None
-            if mode == "trace_replay":
+            adapter_comparison_scope = (
+                "matched-full-horizon"
+                if executed_train_groups == spec.train_groups
+                else "unavailable-antfly-adapter-is-full-horizon"
+            )
+            if (
+                updates
+                and antfly_trained is not None
+                and executed_train_groups == spec.train_groups
+            ):
                 adapter_comparison = legacy._adapter_delta_comparison(
                     model=model,
                     initial_trainables=initial_trainables,
@@ -1358,43 +2132,60 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
                     mx=mx,
                     tree_flatten=tree_flatten,
                 )
+            adapter_output = None
+            if mode == "trace_replay" and trace_adapter_output is not None:
+                adapter_output = write_adapter_exclusive(
+                    trace_adapter_output,
+                    final_trainables=snapshot_trainables(),
+                    target_names=targets,
+                    adapter=seed_adapter,
+                    mx=mx,
+                )
             return (
                 {
                     "mode": mode,
+                    "initial_prediction": initial_prediction,
+                    "groups": len(groups),
                     "optimizer_steps": len(updates),
+                    "zero_reward_std_groups": sum(row["status"] == "zero-reward-std-skipped" for row in skipped),
+                    "kl_rejected_groups": sum(row["status"] == "budget-exceeded-skipped" for row in skipped),
+                    "adapter_delta_comparison_scope": adapter_comparison_scope,
+                    "adapter_output": adapter_output,
+                    "skipped_groups": skipped,
                     "seconds": lane_seconds,
                     "median_update_seconds": statistics.median(
                         row["seconds"] for row in updates
-                    ),
+                    ) if updates else None,
                     "mean_update_seconds": statistics.mean(
                         row["seconds"] for row in updates
-                    ),
+                    ) if updates else None,
                     "completion_tokens": sum(
-                        int(row["completion_tokens"]) for row in updates
+                        int(row["completion_tokens"]) for row in groups
                     ),
                     "mean_reward": statistics.mean(
-                        reward for row in updates for reward in row["rewards"]
+                        reward for row in groups for reward in row["rewards"]
                     ),
-                    "mean_loss": statistics.mean(row["loss"] for row in updates),
+                    "mean_loss": statistics.mean(row["loss"] for row in updates) if updates else None,
                     "mean_kl_loss": statistics.mean(
                         row["kl_loss"] for row in updates
-                    ),
-                    "mean_kl": statistics.mean(row["mean_kl"] for row in updates),
+                    ) if updates else None,
+                    "mean_kl": statistics.mean(row["mean_kl"] for row in updates) if updates else None,
                     "final_kl_coef": coefficient,
-                    "max_mean_kl": max(row["mean_kl"] for row in updates),
+                    "max_mean_kl": max(row["mean_kl"] for row in groups),
                     "candidate_overlap_with_antfly": summarize_overlaps(
-                        [row["candidate_overlap_with_antfly"] for row in updates]
+                        [row["candidate_overlap_with_antfly"] for row in groups]
                     ),
                     "updates": updates,
                 },
                 adapter_comparison,
             )
 
-        def evaluate_lane() -> Mapping[str, Any]:
+        def evaluate_lane(lane: str) -> Mapping[str, Any]:
             records: list[dict[str, Any]] = []
             started = time.perf_counter()
-            for row, expected in zip(eval_rows, acceptance.eval_trace):
-                sequences, sampling_logps = ranked_group(row)
+            for group_index, (row, expected) in enumerate(zip(eval_rows, acceptance.eval_trace)):
+                progress("evaluation-group", lane=lane, group_index=group_index)
+                sequences, sampling_logps = rollout_group(row, expected.prompt_index, evaluation=True)
                 policy_logps = score_sequences(row, sequences)
                 reference_logps = reference_score(row, sequences)
                 decoded = [decode_reward(tokenizer, values, row.target) for values in sequences]
@@ -1415,7 +2206,8 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
                         "decoded_completions": [value[0] for value in decoded],
                         "rewards": rewards,
                         "candidate_overlap_with_antfly": sequence_overlap(
-                            sequences, expected.sequences
+                            sequences, expected.sequences,
+                            with_replacement=sampling_contract is not None,
                         ),
                         **metrics,
                     }
@@ -1457,11 +2249,18 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
             }
 
         reset_to_initial()
-        baseline_evaluation = evaluate_lane()
-        trace_training, trace_adapter = train_lane("trace_replay")
-        trace_evaluation = evaluate_lane()
-        native_training, _native_adapter = train_lane("native_rollout")
-        native_evaluation = evaluate_lane()
+        baseline_evaluation = None if skip_evaluation else evaluate_lane("baseline")
+        trace_training = trace_adapter = trace_evaluation = None
+        native_training = native_evaluation = native_adapter = None
+        if "trace_replay" in lanes:
+            trace_training, trace_adapter = train_lane("trace_replay")
+            if not skip_evaluation:
+                trace_evaluation = evaluate_lane("trace_replay")
+        if "native_rollout" in lanes:
+            native_training, native_adapter = train_lane("native_rollout")
+            if not skip_evaluation:
+                native_evaluation = evaluate_lane("native_rollout")
+        progress("model-work-complete")
 
         memory = sampler.stop()
         sampler_active = False
@@ -1497,19 +2296,23 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
         )
     )
     antfly_eval_seconds = float(acceptance.eval_report.get("loop_seconds") or 0.0)
+    full_training_horizon = executed_train_groups == spec.train_groups
     performance = {
-        "antfly_train_accounted_seconds": antfly_train_seconds,
-        "mlx_native_train_seconds": native_training["seconds"],
+        "antfly_source_full_train_accounted_seconds": antfly_train_seconds,
+        "antfly_train_accounted_seconds": (
+            antfly_train_seconds if full_training_horizon else None
+        ),
+        "mlx_native_train_seconds": native_training["seconds"] if native_training else None,
         "antfly_to_mlx_train_time_ratio": (
             antfly_train_seconds / native_training["seconds"]
-            if native_training["seconds"] > 0.0
+            if native_training and native_training["seconds"] > 0.0
             else None
         ),
         "antfly_eval_loop_seconds": antfly_eval_seconds,
-        "mlx_native_eval_seconds": native_evaluation["seconds"],
+        "mlx_native_eval_seconds": native_evaluation["seconds"] if native_evaluation else None,
         "antfly_to_mlx_eval_time_ratio": (
             antfly_eval_seconds / native_evaluation["seconds"]
-            if native_evaluation["seconds"] > 0.0
+            if native_evaluation and native_evaluation["seconds"] > 0.0
             else None
         ),
     }
@@ -1522,7 +2325,7 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
             "kl_loss",
             "mean_kl",
         )
-    }
+    } if native_evaluation else None
     minimums = acceptance.eval_report.get("minimums")
     if not isinstance(minimums, dict):
         raise MultiTokenParityError("Antfly evaluation minimums are missing")
@@ -1533,53 +2336,91 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
         and native_evaluation["positive_reward_group_rate"]
         >= minimums["positive_reward_group_rate"]
         and native_evaluation["kl_loss"] <= minimums["max_kl_loss"]
-    )
-    trace_numerical_close = bool(
-        trace_adapter
-        and trace_adapter["delta_cosine_similarity"] >= 0.95
-        and trace_adapter["delta_l2_relative_difference"] <= 0.1
-    )
+    ) if native_evaluation else None
+    trace_numerical_close = (
+        all(legacy.adapter_update_checks(
+            trace_adapter, min_cosine=0.95, max_relative_error=0.1
+        ).values())
+        if trace_adapter is not None
+        else None
+    ) if trace_training else None
     native_behavior_close = (
         abs(evaluation_deltas["mean_reward"]) <= 1.0 / spec.group_size
         and abs(evaluation_deltas["top_rank_mean_reward"]) <= 1.0 / spec.eval_groups
         and native_passed
-    )
-    classification = (
-        "bounded-behavior-and-update-parity"
-        if trace_numerical_close and native_behavior_close
-        else "bounded-campaign-with-measured-drift"
+    ) if evaluation_deltas else None
+    classification = campaign_classification(
+        bool(trace_numerical_close), bool(native_behavior_close), categorical=args.categorical_diagnostic,
     )
     return {
-        "schema_version": RESULT_SCHEMA_VERSION,
-        "status": "completed",
+        "schema_version": ("antfly_gemma4_grpo_boolq_mlx_multitoken/v2"
+                           if args.categorical_diagnostic else RESULT_SCHEMA_VERSION),
+        "status": ("diagnostic-lane-completed" if len(lanes) == 1 else
+                   "diagnostic-completed" if args.categorical_diagnostic else "completed"),
         "scope": (
             f"real-pinned-boolq-{spec.model_key.lower()}-"
-            f"{spec.train_groups}x{spec.eval_groups}-group{spec.group_size}-"
+            f"{executed_train_groups}of{spec.train_groups}x{spec.eval_groups}-group{spec.group_size}-"
             f"max{spec.max_completion_tokens}-adaptive-kl"
-        ),
+        ) + (f"-{args.execution_lane}" if len(lanes) == 1 else ""),
         "classification": classification,
         "claim_boundary": {
+            "categorical_statistical_parity": False,
+            "production_acceptance": False,
             "broad_grpo_performance_parity": False,
             "long_horizon_quality_parity": False,
             "reason": (
-                "This is one deterministic BoolQ campaign with a bounded update horizon; "
+                "This is one seeded BoolQ campaign with a bounded update horizon; "
                 "it validates mechanics and matched local behavior only."
             ),
         },
         "contract": {
             "model_key": spec.model_key,
-            "target_preset": TARGET_PRESET,
-            "sequence_length": SEQUENCE_LENGTH,
+            "target_preset": spec.profile.target_preset,
+            "sequence_length": spec.profile.sequence_length,
             "train_groups": spec.train_groups,
+            "executed_train_groups": executed_train_groups,
             "eval_groups": spec.eval_groups,
+            "evaluation_executed": not skip_evaluation,
             "group_size": spec.group_size,
             "max_completion_tokens": spec.max_completion_tokens,
-            "learning_rate": LEARNING_RATE,
+            "learning_rate": spec.profile.learning_rate,
             "optimizer": OPTIMIZER,
-            "grpo": GRPO,
+            "grpo": {
+                **GRPO,
+                "advantage_epsilon": spec.profile.advantage_epsilon,
+                "min_kl_coef": spec.profile.min_kl_coef,
+                "max_kl_coef": spec.profile.max_kl_coef,
+            },
+            "recipe_profile": spec.recipe_profile,
+            "execution_lane": args.execution_lane,
+            "capture_initial_training_logits": args.capture_initial_training_logits,
+            "completion_execution": args.completion_execution,
+            "activation_mode": args.activation_mode,
+            "single_token_scoring": "shared-prompt" if args.shared_single_token_scoring else "per-completion",
+            "gradient_checkpointing": {
+                "enabled": args.gradient_checkpointing,
+                "source_sha256": checkpoint_source_sha256,
+            },
+            "kl_trace_schema_version": acceptance.kl_trace_schema_version,
+            "adaptive_kl_controller_unit": controller_unit,
+            "adaptive_kl_controller_observations_per_group": controller_observations_per_group,
+            "adaptive_kl_observation_policy": (
+                "all-kl-observed-groups-completion-episode-horizon"
+                if controller_uses_completion_episode_horizon
+                else (
+                    "all-kl-observed-groups-group-horizon"
+                    if acceptance.kl_trace_schema_version
+                    == "antfly_inference_grpo_kl_control_trace/v3"
+                    else "admitted-groups"
+                )
+            ),
             "reward_mode": "prefix-match",
             "reference_mode": "frozen-base-equivalent-seed-adapter",
-            "rollout_mode": "deterministic-rank-per-completion-each-token",
+            "rollout_mode": ("seeded-categorical-diagnostic" if sampling_contract
+                             else "deterministic-rank-per-completion-each-token"),
+            "sampling": acceptance.train_report.get("sampling"),
+            "sampling_seed": sampling_contract[0] if sampling_contract else None,
+            "sampling_helper_sha256": sha256_file(SCRIPT_DIR / "gemma4_grpo_sampling.py"),
             "loss_normalization": "mean-over-all-unmasked-completion-tokens",
         },
         "dataset": {
@@ -1587,15 +2428,17 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
             "revision": manifest["dataset"]["revision"],
             "manifest_path": str(args.dataset_manifest.expanduser().resolve()),
             "manifest_sha256": sha256_file(args.dataset_manifest.expanduser().resolve()),
+            "separate_manifest_bindings": manifest.get("campaign_manifest_bindings"),
             "train_jsonl_sha256": manifest["dataset"]["train"]["materialized_jsonl_sha256"],
+            "executed_train_jsonl_path": str(acceptance.train_dataset_path),
+            "executed_train_jsonl_sha256": sha256_file(acceptance.train_dataset_path),
             "eval_jsonl_sha256": manifest["dataset"]["evaluation"]["materialized_jsonl_sha256"],
         },
         "antfly": {
             "run_root": str(acceptance.root),
             "grpo_report_sha256": sha256_file(acceptance.root / "grpo_report.json"),
-            "evaluation_report_sha256": sha256_file(
-                acceptance.root / "grpo_evaluation_report.json"
-            ),
+            "evaluation_report_path": str(acceptance.eval_report_path),
+            "evaluation_report_sha256": sha256_file(acceptance.eval_report_path),
             "reward_trace_sha256": sha256_file(
                 acceptance.root / "grpo_reward_trace.jsonl"
             ),
@@ -1607,7 +2450,7 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
             ),
             "trained_adapter_checkpoint_sha256": sha256_file(
                 acceptance.trained_adapter_dir / "adapter_model.safetensors"
-            ),
+            ) if acceptance.trained_adapter_dir is not None else None,
             "training": {
                 key: acceptance.train_report[key]
                 for key in (
@@ -1630,13 +2473,14 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
                 "training": trace_training,
                 "evaluation": trace_evaluation,
                 "adapter_delta_comparison_with_antfly": trace_adapter,
-            },
+            } if trace_training else None,
             "native_rollout": {
                 "training": native_training,
                 "evaluation": native_evaluation,
+                "adapter_delta_comparison_with_antfly": native_adapter,
                 "evaluation_delta_from_antfly": evaluation_deltas,
                 "passed_antfly_quality_minimums": native_passed,
-            },
+            } if native_training else None,
             "performance": performance,
             "load_seconds": load_seconds,
             "reference_precompute_seconds": reference_precompute_seconds,
@@ -1648,6 +2492,7 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
             "seed_adapter_semantic_sha256": seed_adapter.semantic_sha256,
             "mlx_runtime_attestation": runtime_attestation,
             "mlx_lm_revision": mlx_lm_revision,
+            "mlx_lm_source_attestation": mlx_lm_source_attestation,
             "package_versions": actual_versions,
             "tokenizers_version": tokenizers_version,
             "python_version": actual_python,
@@ -1656,7 +2501,9 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
         "parity_assessment": {
             "classification": classification,
             "trace_numerical_close": trace_numerical_close,
-            "native_behavior_close": native_behavior_close,
+            "native_behavior_close": (native_behavior_close and not args.categorical_diagnostic
+                                      if native_training else None),
+            "single_seed_behavior_checks": native_behavior_close,
             "native_quality_gate": native_passed,
         },
         "base_model_provenance": base_model_provenance,
@@ -1670,17 +2517,60 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--model-dir", type=Path, required=True)
     result.add_argument("--adapter-dir", type=Path, required=True)
     result.add_argument("--dataset-manifest", type=Path, required=True)
+    result.add_argument("--evaluation-dataset-manifest", type=Path,
+                        help="Separately attested evaluation materialization; preserves the original training selection")
     result.add_argument("--antfly-run-root", type=Path, required=True)
     result.add_argument("--train-groups", type=int, required=True)
+    result.add_argument(
+        "--train-prefix-groups",
+        type=int,
+        help="Execute only this chronological prefix after validating the full source campaign; diagnostic-only",
+    )
     result.add_argument("--eval-groups", type=int, required=True)
+    result.add_argument(
+        "--skip-evaluation",
+        action="store_true",
+        help="Skip MLX baseline/final evaluation for a focused training replay; diagnostic-only",
+    )
+    result.add_argument("--recipe-profile", choices=tuple(RECIPE_PROFILES), default="qv-multitoken",
+                        help="Pinned comparison recipe; all-linear single-token requires group 16, max 1 and categorical diagnostics")
     result.add_argument("--group-size", type=int, default=4)
     result.add_argument("--max-completion-tokens", type=int, default=4)
+    result.add_argument("--completion-execution", choices=("compiled-group", "sequential"),
+                        default="compiled-group",
+                        help="Sequential evaluates each completion gradient before the next, preserving one ordered group update")
+    result.add_argument("--execution-lane", choices=("both", "trace-replay", "native-rollout"),
+                        default="both", help="Run independent diagnostic lanes in separate guarded processes")
+    result.add_argument("--capture-initial-training-logits", action="store_true",
+                        help="Retain the first training predictor row per executed lane; categorical diagnostics only")
+    result.add_argument("--activation-mode", choices=("stock-bf16", "aligned-f32"),
+                        default="stock-bf16",
+                        help="Aligned F32 stages text/per-layer embeddings in F32 with frozen BF16 weights; diagnostic only")
+    result.add_argument("--gradient-checkpointing", action="store_true",
+                        help="Use the pinned MLX-LM layer checkpoint helper to bound backward activation memory")
+    result.add_argument("--shared-single-token-scoring", action="store_true",
+                        help="Score one-token completions from their shared causal predictor row at the same physical shape")
     result.add_argument("--mlx-runtime-root", type=Path, required=True)
     result.add_argument("--mlx-wheel", type=Path, required=True)
     result.add_argument("--mlx-metal-wheel", type=Path, required=True)
     result.add_argument("--mlx-lm-source-root", type=Path, required=True)
+    result.add_argument("--mlx-lm-source-archive", type=Path,
+                        help="Use a clean extraction of the pinned upstream archive instead of a Git checkout")
     result.add_argument("--lock", type=Path, default=locked.LOCK_PATH)
     result.add_argument("--output", type=Path, required=True)
+    result.add_argument(
+        "--trace-adapter-output",
+        type=Path,
+        help="Exclusively persist the final trace-replay adapter as canonical Safetensors",
+    )
+    result.add_argument("--categorical-diagnostic", action="store_true",
+                        help="Compare current categorical reports without issuing parity/acceptance claims")
+    result.add_argument(
+        "--adaptive-kl-controller-unit",
+        choices=("source-contract", "completion-episodes"),
+        default="source-contract",
+        help="Diagnostic override for replaying legacy evidence with the completion-episode horizon contract",
+    )
     return result
 
 

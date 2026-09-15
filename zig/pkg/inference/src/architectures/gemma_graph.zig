@@ -661,7 +661,10 @@ fn applyRopeAndHeadNorm(
     const active_rope_dim_u = config.layerRopeActiveDim(layer);
     const rotated_position_major = if (active_rope_dim_u > 0) blk: {
         const rope = try buildLayerRopeTables(bld, config, @intCast(seq_i), layer);
-        const merged = try bld.reshape(normed_position_major, Shape.init(.f32, &.{ seq_i * batch_i * num_heads_i, head_dim_i }));
+        // RoPE infers chunks per position from the logical row width. Keep
+        // every batch/head chunk for one position in the same row; flattening
+        // to [S*B*N, D] would rotate individual heads as consecutive tokens.
+        const merged = try bld.reshape(normed_position_major, Shape.init(.f32, &.{ seq_i, batch_i * num_heads_i * head_dim_i }));
         const rotated = try bld.rope(
             merged,
             rope.cos,
@@ -1081,6 +1084,18 @@ test "gemma graph RoPE uses position-major rows and restores attention layout" {
     try std.testing.expectEqual(@as(i64, 2), position_shape.dim(1));
     try std.testing.expectEqual(@as(i64, 3), position_shape.dim(2));
     try std.testing.expectEqual(@as(i64, 8), position_shape.dim(3));
+
+    var rope_count: usize = 0;
+    for (graph.nodes.items) |node| {
+        if (node.op != .fused_rope) continue;
+        rope_count += 1;
+        // Both native and Metal derive the position stride from this width.
+        // Two batches times three heads must share each of the four positions.
+        try std.testing.expectEqual(Shape.init(.f32, &.{ 4, 48 }), graph.node(node.inputs[0]).output_shape);
+        try std.testing.expectEqual(@as(u32, 4), node.op.fused_rope.seq_len);
+        try std.testing.expectEqual(@as(u32, 8), node.op.fused_rope.head_dim);
+    }
+    try std.testing.expectEqual(@as(usize, 1), rope_count);
 
     const output_node = graph.node(output);
     switch (output_node.op) {

@@ -1362,12 +1362,15 @@ def canonicalize_module_name(name: str) -> str:
                 result = result[len(prefix):]
                 changed = True
                 break
-    if result.startswith(("layers.", "per_layer_input.")):
-        result = "model." + result
     if result.endswith(".weight"):
         result = result[: -len(".weight")]
     for legacy, canonical in _PLE_ALIASES:
         result = result.replace(legacy, canonical)
+    # Root HF PLE aliases acquire the per_layer_input prefix only above.
+    # Normalize the root after alias expansion so wrapped and bare HF names
+    # share Antfly's identity and cannot evade duplicate-inventory checks.
+    if result.startswith(("layers.", "per_layer_input.")):
+        result = "model." + result
     if not result or ".." in result or result.startswith(".") or result.endswith("."):
         raise ContractError(f"could not canonicalize module name: {name!r}")
     return result
@@ -2183,7 +2186,12 @@ def write_json(path: Path, payload: Any) -> None:
         raise
 
 
-def _read_antfly_adapter_manifest(adapter_dir: Path) -> dict[str, Any] | None:
+def _read_antfly_adapter_manifest(
+    adapter_dir: Path,
+    *,
+    target_preset: str | None = None,
+    allow_missing_target_preset: bool = False,
+) -> dict[str, Any] | None:
     path = adapter_dir.expanduser().resolve() / "antfly_finetune_manifest.json"
     if not path.exists():
         return None
@@ -2246,7 +2254,16 @@ def _read_antfly_adapter_manifest(adapter_dir: Path) -> dict[str, Any] | None:
     if manifest["recursive_lora"] is not None:
         raise ContractError("recursive LoRA is outside the standard Gemma4 parity lane")
     if manifest["target_preset"] not in ("peft-qv", "text-all-linear"):
-        raise ContractError("manifest.target_preset is missing or unsupported")
+        if not (
+            allow_missing_target_preset
+            and manifest["target_preset"] is None
+            and target_preset in ("peft-qv", "text-all-linear")
+        ):
+            raise ContractError("manifest.target_preset is missing or unsupported")
+        # This recovery is only safe when the caller subsequently validates the
+        # adapter's complete tensor inventory against the named locked preset.
+        manifest["target_preset"] = target_preset
+        manifest["target_preset_attestation"] = "explicit-complete-inventory"
     return manifest
 
 
@@ -2303,7 +2320,12 @@ def _read_antfly_peft_export_manifest(adapter_dir: Path) -> dict[str, Any] | Non
     return manifest
 
 
-def read_adapter_config(adapter_dir: Path, *, target_preset: str | None = None) -> dict[str, Any]:
+def read_adapter_config(
+    adapter_dir: Path,
+    *,
+    target_preset: str | None = None,
+    allow_missing_manifest_target_preset: bool = False,
+) -> dict[str, Any]:
     path = adapter_dir.expanduser().resolve() / "adapter_config.json"
     config = dict(_require_mapping(load_json(path), "adapter_config"))
     required = ("peft_type", "task_type", "r", "lora_alpha", "target_modules")
@@ -2328,7 +2350,11 @@ def read_adapter_config(adapter_dir: Path, *, target_preset: str | None = None) 
     targets = [canonicalize_module_name(item) for item in _require_list(config["target_modules"], "adapter_config.target_modules")]
     if not targets or len(targets) != len(set(targets)):
         raise ContractError("adapter target modules must be non-empty and unique")
-    manifest = _read_antfly_adapter_manifest(adapter_dir)
+    manifest = _read_antfly_adapter_manifest(
+        adapter_dir,
+        target_preset=target_preset,
+        allow_missing_target_preset=allow_missing_manifest_target_preset,
+    )
     export_manifest = _read_antfly_peft_export_manifest(adapter_dir)
     if manifest is not None and export_manifest is not None:
         raise ContractError("adapter cannot contain both internal and PEFT export manifests")
@@ -2357,6 +2383,7 @@ def read_adapter_config(adapter_dir: Path, *, target_preset: str | None = None) 
             "adapter_checkpoint_size_bytes": manifest["adapter_checkpoint_size_bytes"],
             "manifest_sha256": prefixed_sha256(adapter_dir.expanduser().resolve() / "antfly_finetune_manifest.json"),
             "initialization_seed": manifest.get("initialization_seed"),
+            "target_preset_attestation": manifest.get("target_preset_attestation", "manifest"),
         }
     elif export_manifest is not None:
         if target_preset is not None and target_preset != export_manifest["target_preset"]:
@@ -2409,6 +2436,25 @@ def _adapter_key_layout(name: str) -> str:
     raise ContractError(f"unsupported adapter tensor key layout: {name}")
 
 
+def stock_peft_module_name(name: str) -> str:
+    """Restore HF module spelling without discarding the multimodal root."""
+    result = _require_string(name, "module name")
+    while result.startswith("base_model.model."):
+        result = result[len("base_model.model."):]
+    if result.endswith(".weight"):
+        result = result[:-len(".weight")]
+    for hf_name, antfly_name in _PLE_ALIASES:
+        if result == antfly_name or result.endswith("." + antfly_name):
+            result = result[:-len(antfly_name)] + hf_name
+            break
+    if result.startswith(("layers.", "language_model.", "per_layer_model_projection",
+                          "per_layer_input_gate", "per_layer_projection")):
+        result = "model." + result
+    if canonicalize_module_name(name) != canonicalize_module_name(result):
+        raise ContractError("stock PEFT module translation changed the canonical identity")
+    return result
+
+
 def antfly_to_stock_peft_tensor_name(name: str) -> str:
     """Translate one Antfly weight-qualified LoRA key to stock PEFT layout.
 
@@ -2420,8 +2466,11 @@ def antfly_to_stock_peft_tensor_name(name: str) -> str:
     """
     if _adapter_key_layout(name) != ANTFLY_ADAPTER_KEY_FORMAT:
         raise ContractError("Antfly-to-PEFT translation requires an Antfly tensor key")
-    module, role = canonicalize_adapter_tensor_name(name)
-    return f"base_model.model.{module}.{role}.weight"
+    match = _ADAPTER_NAME.fullmatch(name)
+    if match is None:
+        raise ContractError(f"unsupported adapter tensor name: {name}")
+    module = stock_peft_module_name(match.group("module"))
+    return f"base_model.model.{module}.lora_{match.group('role')}.weight"
 
 
 def inspect_adapter_artifact(adapter_dir: Path, *, target_preset: str | None = None) -> dict[str, Any]:

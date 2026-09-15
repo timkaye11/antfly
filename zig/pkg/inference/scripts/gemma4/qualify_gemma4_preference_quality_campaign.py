@@ -1073,6 +1073,29 @@ def _adapter_bootstrap_spec(adapter: Path) -> dict[str, Any]:
         targets.append(value)
     if len(set(targets)) != len(targets):
         raise ContractError("template adapter target_modules must be unique")
+    target_preset = None
+    manifest_path = adapter / "antfly_finetune_manifest.json"
+    if manifest_path.is_file():
+        manifest = _load_json(manifest_path, "template adapter manifest")
+        if (
+            manifest.get("schema_version")
+            not in ("antfly_gemma4_finetune/v2", "antfly_gemma4_finetune/v3")
+            or manifest.get("status") != "complete"
+        ):
+            raise ContractError("template adapter manifest is not a complete v2/v3 artifact")
+        target_preset = manifest.get("target_preset")
+        if target_preset not in ("peft-qv", "text-all-linear"):
+            raise ContractError("template adapter manifest target_preset is unsupported")
+        if (
+            manifest.get("target_modules") != targets
+            or _integer(manifest.get("rank"), "template adapter manifest.rank", 1)
+            != rank
+            or _finite(manifest.get("alpha"), "template adapter manifest.alpha")
+            != alpha
+        ):
+            raise ContractError(
+                "template adapter manifest semantics disagree with adapter config"
+            )
     if config.get("use_dora", False) is not False:
         raise ContractError("independent-initialization campaign does not admit DoRA")
     initializer = config.get("init_lora_weights", True)
@@ -1080,7 +1103,12 @@ def _adapter_bootstrap_spec(adapter: Path) -> dict[str, Any]:
         raise ContractError(
             "independent-initialization campaign requires standard LoRA initialization"
         )
-    return {"rank": rank, "alpha": alpha, "target_modules": targets}
+    return {
+        "rank": rank,
+        "alpha": alpha,
+        "target_modules": targets,
+        "target_preset": target_preset,
+    }
 
 
 def _bootstrap_seed_adapter(
@@ -1093,6 +1121,12 @@ def _bootstrap_seed_adapter(
     log_root: Path,
     timeout: float,
 ) -> dict[str, Any]:
+    target_preset = template_spec.get("target_preset")
+    target_arguments = (
+        ["--target-modules", ",".join(template_spec["target_modules"])]
+        if target_preset is None
+        else ["--target-preset", str(target_preset)]
+    )
     command = [
         str(binary),
         "inference",
@@ -1108,8 +1142,7 @@ def _bootstrap_seed_adapter(
         str(template_spec["rank"]),
         "--alpha",
         format(float(template_spec["alpha"]), ".17g"),
-        "--target-modules",
-        ",".join(template_spec["target_modules"]),
+        *target_arguments,
         "--initialization-seed",
         str(seed),
     ]
@@ -1127,6 +1160,8 @@ def _bootstrap_seed_adapter(
         manifest.get("initialization_seed"), "adapter manifest.initialization_seed"
     ) != seed:
         raise ContractError("seeded bootstrap manifest attests the wrong seed")
+    if manifest.get("target_preset") != target_preset:
+        raise ContractError("seeded bootstrap manifest drifted from the target preset")
     config = _load_json(
         adapter_path / "adapter_config.json", f"seed-{seed} initialized adapter config"
     )

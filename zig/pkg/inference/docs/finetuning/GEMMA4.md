@@ -2126,8 +2126,14 @@ larger observation writes a `budget-exceeded` record and aborts without
 admitting that group. Setting `adaptive_kl = true` additionally requires a
 positive `target_kl < train_max_kl` and `kl_horizon >= 1`. The bounded
 proportional controller uses the current beta for the current group and updates
-the coefficient for the next group, clamped to `min_kl_coef` / `max_kl_coef`
-(defaults `0.001` / `1.0`). GRPO v4 train reports and v2 evaluation reports
+the coefficient for the next group after every finite KL observation, including
+a hard-budget rejection. Its horizon is measured in sampled completion episodes,
+so each group contributes `group_size` controller steps. The result is clamped
+to `min_kl_coef` / `max_kl_coef`
+(defaults `0.001` / `1.0`). The next group always uses the updated coefficient,
+including after a rejected observation. GRPO v10 train reports expose this
+contract through v5 KL trace rows whose `objective_kl_coef` must exactly match
+`kl_coef_before`; a mismatch fails before optimizer mutation. GRPO evaluation reports
 carry raw `mean_kl`; the atomic `grpo_kl_control_trace.jsonl` binds every
 observation, decision, optimizer-step count, and before/after coefficient.
 The same admission path covers text and multimodal Gemma4 GRPO.
@@ -3905,8 +3911,2514 @@ the reviewed source changes remain uncommitted. Zero-paging acceptance therefore
 has not started; the Zig oracle also requires a clean source revision, and the
 HF/PEFT oracle needs an available CUDA host with the pinned environment. No
 quality, parity, or recovery gap is claimed closed by this preparation.
+
+### Qualification restart: committed build and checkpoint reader fix (2026-09-09)
+
+The user committed the reviewed changes as
+`e7edd66f399edef41691a71be1530a86722bf4d7`. The clean-source ReleaseFast Metal
+build passed with the pinned Zig 0.16.0 toolchain. Its executable SHA-256 is
+`4a0f8d0f2aa9175bffa58729b17f8cb8b95dd463ed637a5bd1cc65abef651d7e`.
+Both locked E2B/E4B model snapshots were restored and hash-verified; both
+model-specific oracle datasets and both rank-16 target presets were prepared.
+
+The pinned stock PEFT 0.19.1 export/load/save/reload smoke passed against that
+binary, preserving the tiny fixture's logits exactly at both boundaries.
+This establishes adapter interoperability for the smoke's scope, not real
+Gemma4 training parity or general PEFT feature parity.
+
+The first real E2B q/v one-step Metal oracle exposed a reader defect:
+`RealAutodiffTrainer` serializes checkpoint weights and optimizer slots as
+flat F32 vectors, but the Python oracle expected matrix-shaped storage.
+The reader now checks the exact flat element count and dtype, then reshapes
+using the independently validated adapter dimensions. The regression fixture
+now matches the actual writer. Wrong-rank, wrong-length, and wrong-dtype slots
+remain rejected; numerical tolerances are unchanged. The corrected fixture
+failed before the fix, and all 26 oracle-related Python tests passed afterward.
+The broader Python suite passed all 724 tests: 723 in the sandbox and the one
+loopback-server test on a separate permitted rerun after its bind was blocked.
+
+A retained real E2B Metal diagnostic validated the corrected reader and
+packaged all 100 adapter tensors and 500 trace tensors, including raw gradients
+and optimizer state. Its one-step loss was `1.4149742126464844` and raw gradient
+norm was `2.37408334452001`. These values are capture evidence, not a quality
+or parity pass. The diagnostic uses the committed executable and records the
+modified Python reader's digest; it does not publish an immutable oracle
+`COMPLETE.json`.
+
+The matching native diagnostic was terminated by its resource guard after
+12.57 seconds when observed host swap grew by 2,001.06 MiB. No native trace or
+native/Metal comparison completed. The 24 GiB M4 Pro began this qualification
+with 689.75 MiB of swap already in use, so the frozen zero-paging quality and
+acceptance campaigns remain unrun, and the reserved final holdout remains
+unevaluated. Continue native/Metal captures on a host with sufficient memory;
+the separately pinned HF/PEFT numerical reference, full-length accepted-adapter
+resume, and hosted CI also remain outstanding. Antfly CUDA implementation is
+outside this qualification's requested scope.
+
+Durable build/preparation records, the PEFT smoke, and both raw diagnostics
+are under `/Users/tim/Documents/af/antfly-qualification/20260909/`. The reader
+fix and this status update must be included in the next source revision before
+producing immutable oracle bundles with the corrected exporter.
 Run plans, reconstructed recipes, source-ID exclusion checks, and current
 preflight evidence are under
 `.benchmark-results/gemma4-qualification-20260909/QUALIFICATION.md`. Numerical
 outputs are planned outside the source tree at
 `/Users/tim/Documents/af/antfly-qualification/20260909/` as required by the oracle.
+
+
+### 2026-09-09 MLX drift investigation (diagnostic, not acceptance)
+
+Restored the pinned MLX-LM source at
+`ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd` and ran it with MLX/MLX-Metal
+0.31.2 on this Mac. These wheel-based runs lack the release build attestation.
+They do not replace the locked CUDA/BF16 HF/PEFT oracle or zero-paging GRPO
+acceptance. The reserved final BoolQ split remains unevaluated.
+
+The fresh E2B `peft-qv` comparison binds the same restored Google weights,
+prepared token IDs and labels, and rank-16/alpha-32 initial adapter to the
+committed-source Metal capture. The first adapter has zero B matrices. The
+forward mismatch therefore precedes an optimizer update:
+
+| Execution | Initial mean supervised CE |
+| --- | ---: |
+| Antfly Metal, committed binary | 1.41497421 |
+| MLX stock BF16 activations | 0.92414445 |
+| MLX F32 activation diagnostic | 0.92415619 |
+| Pinned Transformers 5.5.2, CPU BF16 base forward | 0.93010724 |
+
+The independent HF CPU check is a base-forward diagnostic, not a PEFT training
+or release-oracle pass. Its sampled logits agree with stock MLX at cosine
+0.99972751 and relative vector error 0.02456654. Against Antfly, the MLX F32
+activation run has sampled-logit cosine 0.59124101, relative vector error
+0.97956205, and maximum absolute difference 33.54383945. Its raw-gradient
+cosine is -0.01134146 and relative vector error is 1.04546500.
+
+With AdamW bias correction explicitly enabled, the F32 MLX update has cosine
+0.00467156 and relative vector error 1.41129308. The difference between update
+norms is only 0.00054805. The historical field
+`delta_l2_relative_difference` measured this magnitude-only difference; it
+was never the relative vector distance. The comparators now additionally emit
+`delta_vector_l2_relative_error` and `delta_vector_l2_error`, preserving the
+historical field and all existing gate thresholds. Equal-norm orthogonal and
+opposite-vector regressions protect the distinction.
+
+Disabling BF16 embedding-row staging did not change Antfly's loss or raw
+gradient norm. Padding the MLX F32 forward to 512 tokens likewise
+did not resolve the logit mismatch. That padded run was terminated by the
+swap-growth guard during gradient evaluation; its forward result is usable,
+but no completed gradient or optimizer result is claimed. The first stock MLX
+diagnostic accidentally used MLX's default uncorrected AdamW; only its forward
+and raw gradients are valid comparisons. Its optimizer results are excluded.
+
+A derived one-layer pretrained fixture, with the first PLE slice and original
+sliding-attention semantics retained, fits native and Metal. One-step initial
+losses were 20.70525932 (native) and 20.70529556 (Metal), versus 22.22519684
+(HF BF16) and 22.23039627 (HF F32). A four-token intermediate-value capture then localized the issue to RoPE
+position assignment. The graph passed `[S*B*N, D]` rows to a backend contract
+that infers heads per token from row width. Both native and Metal consequently
+rotated individual heads as consecutive positions. The fix passes
+`[S, B*N*D]`, preserving the position-major layout and restoring the original
+attention shape afterward. A multi-batch/multi-head graph regression checks that contract; a numerical
+regression exercises the actual native RoPE boundary and checks every head
+against explicit token-position rotations. The four-token native prefix
+rerun reduced the final-hidden absolute-sum discrepancy against HF F32 from
+23.22117684 to 0.00116684. These are stage fingerprints, not exhaustive tensor
+parity; full-model comparisons are recorded below. The fixture is diagnostic and cannot
+qualify the full E2B model.
+
+Evidence is retained under
+`/Users/tim/Documents/af/antfly-qualification/20260909/diagnostics/`, including
+`e2b-qv-step1-metal`, `mlx-e2b-qv-step1-f32-bias-corrected`,
+`hf-e2b-base-cpu`, and `e2b-prefix-1/disjoint`. Reproduction scripts and guarded
+execution logs are under `.benchmark-results/gemma4-qualification-20260909/`.
+The legacy GRPO comparison's ranked sampler differs from the current seeded
+categorical sampler; no native-rollout parity refresh is claimed from these
+SFT diagnostics. Full E4B GRPO acceptance remains pending. The original numerical mismatch
+was an observed correctness blocker, not merely missing evidence.
+
+
+The layout-only full E2B rerun reduced initial CE to **0.92412513**, versus
+MLX F32 **0.92415619**. Sampled-logit cosine improved to **0.9999999275**,
+relative vector error to **0.00038125**, and maximum absolute difference to
+**0.02382123**. Gradients still differed (cosine **0.79235790**, relative
+vector error **0.65790286**), motivating a separate backward-path check.
+
+That check exposed an independent inverse-RoPE defect: autodiff negated the
+sine input, but native and Metal reconstruct rotation angles from attributes
+and ignore the sine table. The analytic gradient regression failed with
+`actual +0.84147096` versus `expected -0.84147096` at token position one.
+Autodiff now negates `freq_scale` as well as the sine table, so both runtime
+representations encode the inverse angle. The focused native regression then
+passed (12 linked checks). Full-model results with both fixes follow below.
+
+
+With **both fixes**, the same E2B one-step Metal capture versus retained MLX
+F32 activations produces:
+
+| Metric | Before fixes | Both fixes |
+| --- | ---: | ---: |
+| Mean supervised CE (MLX: 0.92415619) | 1.41497421 | 0.92412513 |
+| Sampled-logit cosine | 0.59124101 | 0.99999993 |
+| Raw-gradient cosine | -0.01134146 | 0.99995060 |
+| Raw-gradient relative vector error | 1.04546500 | 0.01057247 |
+| Update cosine | 0.00467156 | 0.99511984 |
+| Update relative vector error | 1.41129308 | 0.09879426 |
+
+This is a substantial correction, **not a locked numerical-parity pass**.
+The F32 activation variant is a diagnostic precision alignment. A fresh stock
+MLX BF16 step with explicit AdamW bias correction has loss 0.92414445,
+sampled-logit cosine 0.99986742, gradient cosine 0.99222286, and update cosine
+0.92838995. Its gradient and update relative vector errors remain 0.13117116
+and 0.37843476. Reporting only the near-identical losses or update norms would
+hide those differences.
+
+An independent NumPy F32 AdamW replay using the **Zig raw gradients** matches
+the captured first update at relative vector error **2.04816e-7**, maximum
+absolute difference **9.31323e-10**. Comparing Zig and MLX F32 gradients,
+3,899 of 1,449,984 nonzero gradient elements have opposite signs (0.26890%);
+those coordinates account for **99.3000%** of the squared update discrepancy.
+Their median absolute Zig gradient is 6.51317e-7, versus 7.37123e-5 across
+nonzero coordinates. This directly identifies first-step Adam amplification
+of small gradient differences as the remaining update-error mechanism for
+this fixture. It does not qualify later optimizer steps or explain every
+source of the remaining forward/gradient rounding difference.
+
+The final diagnostic executable is ReleaseFast Metal, SHA-256
+`bdf64c876fff11855429c7ce0033e2d9a0d5d3d0105cf364c53c73557f687678`, based
+on `e7edd66f399edef41691a71be1530a86722bf4d7` with the retained uncommitted
+Zig patch SHA-256
+`871e507c3a73ecd263b6521695d6fb6e04d1a2739106123c2ac9199cd5bf50fd`.
+The raw output is `diagnostics/e2b-qv-step1-metal-rope-layout-vjp-fixed`.
+At that checkpoint, the build's recorded Zig patch matched the Zig diff. No immutable
+oracle completion was produced.
+
+Validation after both fixes: required-device Metal Debug **317 passed,
+two optional skips**; no-Metal Debug **276 passed, 24 skips**; Python
+**728 passed**; ML library tests passed. The initial strict-device invocation
+omitted its required embedded-revision flag and rejected the CLI test; the
+correctly configured rerun passed. The inverse-RoPE analytic regression
+failed with the original VJP and passed after the fix. Formatting and Git
+whitespace/conflict checks pass. No Git mutation was performed.
+
+E4B full-recipe GRPO acceptance, the current categorical-sampler MLX rollout
+comparison, the complete 1/2/8-step native/Metal/HF matrix, and accepted-adapter
+full-length recovery remain pending. The latest stock-MLX preflight had
+3,315.75 MiB swap in use, so this Mac remains outside frozen zero-paging
+acceptance admission. The final holdout remains unevaluated.
+
+
+The final derived-prefix rerun with both fixes completed on both backends:
+initial CE was **22.23034477 native**, **22.23071098 Metal**, and
+**22.23039627 HF F32**. Native/Metal adapter-update cosine was **0.99873925**,
+with **0.05021295** relative vector error. This confirms the large forward
+mismatch is corrected on the native path too, while preserving visibility
+into the residual update discrepancy. The one-layer fixture does not replace
+the full native E2B/E4B numerical matrix.
+
+The investigation handoff, reproduction scripts, source snapshots and patches,
+validation logs, binary identities, and artifact hash manifest are retained at
+`/Users/tim/Documents/af/antfly-qualification/20260909/drift-investigation/`.
+
+## F32 staging correction and refreshed references (2026-09-09)
+
+This follow-up identifies two additional precision defects after the RoPE
+corrections above. **One-step E2B numerical agreement is substantially better;
+production promotion and the full numerical matrix remain unqualified.**
+
+A full 35-layer E2B CPU HF/PEFT reference fits on this Mac with frozen BF16
+weight storage and F32 operators. Sparse embedding-row conversion avoids
+copying the large embedding tables. The reference uses torch 2.10.0,
+transformers 5.5.2, PEFT 0.19.1, the locked Google E2B revision, the exact 100
+initial q/v LoRA tensors, and explicit bias-corrected AdamW. This is an
+independent F32 correctness diagnostic, not the locked CUDA/BF16 oracle.
+
+Intermediate captures localized the first material error to Metal's BF16
+linear SIMD kernels: they silently converted F32 activations to F16. The
+first q projection matched an independent F16-rounded-input calculation at
+6.44e-9 relative error, versus 6.57e-5 for the F32-input calculation. Backward
+kernels similarly rounded gradients; CCE could also store gradient logits in
+F16. These conversions can erase small gradients and turn finite F32 values
+outside F16's exponent range into infinities and NaNs.
+
+The BF16 linear kernels now retain F32 operands in forward, backward, packed,
+row-tail, and fused gate/up variants. Their two staging tiles use 16 KiB, and
+all corresponding host dispatch allocations were updated. Frozen weights
+remain stored in BF16. CCE retains F32 gradient logits by default; the old
+buffer is an explicit `TERMITE_METAL_ENABLE_LINEAR_CCE_F16_GRAD` experiment,
+with the existing disable switch taking precedence. It is not the default
+numerical contract. The separate F16-weight backward dispatch retains its
+original scratch allocation.
+
+A required-device regression covers aligned and tail rows, fractional F32
+activations, gradients below F16's subnormal range, and finite values above
+its range. The original kernel produced NaNs. The corrected kernel passes.
+An analytic uniform-logit CCE case separately checks tiny loss gradients:
+the default passes, while explicitly enabling the old F16 buffer fails.
+
+Across the full model, final normalized hidden-state relative error against
+HF fell from **8.97822e-4 to 5.08460e-6**, about **177x smaller**. Full arrays
+were retained for linear, normalization, rotary and block outputs; these
+are not just first-value fingerprints.
+
+The fresh training capture uses the complete E2B model, q/v rank 16 and
+alpha 32, seed 42, **154 physical/actual tokens** and 71 supervised tokens.
+The original prepared artifact declares a 512-token maximum. A derived
+160-token maximum preserved all 1,024 examples exactly, and successful runs
+with both artifacts produced **all 500 trace tensors bitwise identically**,
+including identical probes and loss. Both run the same 154-row graph.
+Initial losses are **0.92415500 Antfly**, **0.92415243 HF**, and
+**0.92415619 MLX F32**.
+
+Correction to earlier investigation descriptions: oracle admission sets
+`training_max_seq_len` to the selected example's `num_input_tokens`, not the
+prepared maximum. Changing the prepared bound did not reduce graph memory.
+Names containing `160` and `512` identify prepared bounds, not physical
+execution shapes. The successful original-artifact rerun is the primary
+one-step numerical result.
+
+| One-step comparison | Sampled-logit relative error | Raw-gradient relative error | Update-vector relative error |
+| --- | ---: | ---: | ---: |
+| Before this fix vs HF F32 | 0.038102% | 0.997023% | 9.579454% |
+| After this fix vs HF F32 | 0.000405% | 0.039145% | 1.404868% |
+| After this fix vs MLX F32 | 0.000434% | 0.027452% | 0.986330% |
+| Independent HF F32 vs MLX F32 | 0.000321% | 0.065706% | 1.907193% |
+
+Relative vector errors use the reference direction recorded in each JSON.
+After the fix, HF raw-gradient cosine is **0.9999999391**, maximum absolute
+gradient difference **1.88313e-5**, and update cosine **0.9999013173**.
+MLX raw-gradient cosine is **0.9999999661** and update cosine
+**0.9999513573**. The Antfly differences are smaller than the HF/MLX
+cross-framework gradient and update differences for this fixture. This is
+not a claim of bitwise equivalence or a formal locked tolerance PASS.
+
+**Stock BF16 MLX remains a different numerical lane:** retained stock
+references give 13.09917% raw-gradient and 37.94638% update-vector error.
+The close numbers above require explicitly aligned F32 computation. Neither
+this comparison nor the small loss differences establish stock HF/PEFT BF16
+parity, real-model native CPU parity, or downstream GRPO quality.
+
+The primary original-artifact one-step capture completed in 26.22 seconds,
+with peak process RSS 11,758,336 KiB. Swap was 2,904.50 MiB before execution,
+sampled peak 6,851.44 MiB and 3,296.81 MiB afterward; it stayed within the
+bounded 4 GiB paging-growth allowance. The identical derived-artifact run
+also completed, at 12,978,448 KiB peak RSS; its peak swap was not retained.
+These wall times are diagnostic execution time, **not throughput measurements**.
+Earlier attempts hit the tighter 1 GiB paging-growth guard. The two-step
+capture hit its 4 GiB guard: sampled peak swap 7,527.69 MiB, growth
+4,239.44 MiB, exit -15. No two-step parity result was published. The
+eight-step capture and prepared HF longer-trajectory scripts were not run.
+
+Validation after the precision fix: **318 required-device Metal tests
+passed, two optional skips; native Debug 276 passed, 24 skips; all 728 Python
+tests passed; ReleaseFast Metal
+build passed.** The Python suite's first invocation failed only because the
+sandbox denied its loopback-port bind; the permitted rerun passed. An early
+shader iteration had a vector-cast compilation error and skipped device
+execution; it is excluded. Only the corrected, required-device runs above
+count. Temporary real-model graph hooks were removed from shipping source.
+
+The release diagnostic binary SHA-256 is
+`390ace476e00b83bf4f4de8bc3b3ed9e81c10d914fcab71ec94e6fda24e3a1b3`,
+based on `e7edd66f399edef41691a71be1530a86722bf4d7` with source-patch SHA-256
+`fe19a5427e3c29eddf73a64e95bc8809a712346acd715988bb729f5e3a8197fd`.
+The successful raw capture is
+`diagnostics/e2b-qv-step1-metal-f32-staging-fixed-512-paging-diagnostic`.
+No immutable oracle COMPLETE or acceptance PASS was produced.
+
+Retained source, binary, intermediate arrays, HF/MLX comparisons, scripts,
+validation logs, and exclusions are under
+`/Users/tim/Documents/af/antfly-qualification/20260909/residual-investigation/`,
+with a verified SHA-256 inventory in `MANIFEST.json`. The earlier
+`drift-investigation/` archive remains intact. The first broad activation
+capture and aborted raw captures are excluded regardless of partial output.
+
+The complete 1/2/8-step native/Metal/HF matrix, stock BF16 qualification,
+full E4B GRPO acceptance, current categorical-sampler MLX rollout comparison,
+accepted-adapter full-length recovery, controlled performance and hosted CI
+remain pending. The frozen final holdout remains unevaluated. Nonzero paging
+continues to block the frozen acceptance campaign; CUDA implementation
+remains outside this work's scope.
+
+## Full parity follow-up: embedding residency and CCE range (2026-09-09)
+
+**Full parity and production acceptance remain unproven.** This follow-up
+fixes native embedding residency and CCE exponent-range correctness, preserves
+sparse embedding forwards through autodiff, and bounds oracle logit workspace.
+CUDA implementation remains outside scope. The reserved final holdout has
+not been scored.
+
+Native embedding borrowing recognized only legacy `model.embed_tokens.weight`
+and `wte.weight` names. Gemma4's `model.language_model` and normalized
+per-layer embedding names therefore expanded entire BF16 tables to F32.
+The loader now preserves their BF16 backing storage. A regression checks both
+resident and lazy stores, fused lookup and lowered gather, repeated IDs,
+exact row values, and the absence of a full F32 allocation. Before this fix,
+the full native capture exceeded its 4 GiB swap-growth guard in 16.6 seconds.
+The first loader-fixed attempt had no swap growth but timed out at 180 seconds.
+The longer retest retained the same 18 GiB RSS / 4 GiB swap-growth limits:
+it completed and validated in 753.4 seconds with no swap growth; peak RSS 13.43 GiB and peak swap 3038.00 MiB (baseline 3038.00 MiB).
+The successful capture contains all 100 adapter tensors and 500 trace tensors,
+with loss 0.9241400361 and raw-gradient norm 0.6976542280. Its complete one-step
+comparisons are:
+
+| Comparison | Gradient relative error | Update-vector relative error |
+| --- | ---: | ---: |
+| Native versus HF F32 (HF reference) | 0.049805% | 1.685759% |
+| Native versus MLX F32 (MLX reference) | 0.021730% | 0.760342% |
+| Earlier Metal versus native (native reference) | 0.016634% | 0.733851% |
+
+Native uses the loader-only binary
+`25336ec8ba0f65316d2bb66d9dc7e0812753256216b316a1b935e4423fb525d2`
+and source patch `6154bdc47d07460ac09f53445bf6684c63901df44a102daed5d7a5badde36afb`.
+It predates the sparse-forward/capture-bound build. The direct Metal comparison
+uses the prior F32-staging capture and records both build identities. These
+complete captures close a diagnostic evidence gap, without attesting the final
+source or a full trajectory. No swap growth is not equivalent to a zero-paging
+host; this CPU run is not a native/Metal throughput benchmark.
+
+Autodiff now preserves the sparse embedding forward and supplies its
+scatter-add VJP directly. The prior general Metal gather prepared the entire
+BF16 table. An analytic repeated-token regression checks the retained forward,
+loss, and accumulated table gradient. Real-model memory benefit and trajectory
+agreement remain unqualified; the combined Metal capture exceeded its guard.
+
+Large-row CCE backward also silently built an F16 mirror of BF16 weights.
+The analytic test uses the finite, exactly representable BF16 weight 69632:
+the old mirror returns `-inf` instead of `-0.0054399166`. The default now uses
+the BF16 path. `TERMITE_METAL_ENABLE_LINEAR_CCE_F16_MPS_BACKWARD=1` explicitly
+enables the old experiment; its existing disable flag takes precedence.
+The negative control fails as expected, while the default passes. The large-row
+dispatch requires at least 128 rows and is not exercised by the 71-row E2B
+fixture. This closes that default conversion; it does not qualify unrelated
+inference or experimental kernels.
+
+Oracle logit capture now limits each full-vocabulary projection to 16 MiB
+(or one row when a single row exceeds that budget). CCE training streams
+vocabulary tiles, so its 512-row chunk setting was an unsuitable capture
+workspace bound. E2B capture now projects at most 16 rows per call instead
+of all 71 supervised rows. Every requested probe and all 154 physical input
+tokens remain present. This bound did not resolve total Metal paging:
+the latest shipping-source attempt exceeded 4 GiB swap growth in 26.5 seconds.
+A separate `vmmap` snapshot measured **19.7 GiB physical footprint**, including
+large heap and GPU allocations. The sampling and allocation-calltree captures
+returned no usable call stacks, so the allocation source is not localized.
+No further memory bound was relaxed, and no partial capture is counted as PASS.
+
+Independent full E2B HF/PEFT F32 and MLX F32 trajectories completed at both
+2 and 8 optimizer steps, using the same initial adapter and prepared example.
+These are CPU HF/PEFT versus MLX GPU diagnostics, not the locked CUDA/BF16 oracle.
+All 100 adapter tensors, initial values, shapes and probe identities were checked.
+Relative vector errors below use HF as the reference:
+
+| HF/PEFT versus MLX | Step 2 | Step 8 |
+| --- | ---: | ---: |
+| Sampled-logit relative error | 0.013974% | 0.201805% |
+| Raw-gradient relative error | 0.207068% | 5.590517% |
+| Cumulative update-vector relative error | 1.843557% | 0.850340% |
+| HF loss | 0.87873411 | 0.01052650 |
+| MLX loss | 0.87851971 | 0.01052698 |
+
+Nearly equal final losses do not imply equal gradients. These trajectories
+evolve independently. To separate state divergence from operator differences,
+both frameworks then loaded the exact same HF step-8 adapter. That common-state
+comparison has sampled-logit relative error **0.000284%** (maximum absolute
+error 0.000152), raw-gradient relative error **0.558960%**, and fresh-Adam
+update-vector relative error **6.157790%**. Losses are 0.0050749755 / 0.0050827451.
+The reduced gradient disagreement is evidence of trajectory amplification,
+with a residual at identical weights. This snapshot uses fresh optimizer state;
+it is **not a ninth continuation step**. Independent F32 AdamW replay reproduces
+each framework's updates closely (relative error 2.30e-7 for HF, 6.67e-6 for MLX).
+Only 4,411 of 2,678,784 gradient components (0.1647%) change sign; those account
+for 94.37% of squared update disagreement. Their median HF gradient magnitude
+is 3.75e-8, versus 8.73e-6 over active components. This attributes most update
+amplification to near-zero gradient signs rather than mismatched optimizer
+formulas; it does not remove the residual forward/backward gap. No threshold
+was changed or matrix PASS issued. HF reference captures had no swap growth; MLX captures paged and
+cannot support clean memory or performance qualification.
+
+The prior successful shipping Metal one-step diagnostic still belongs to the
+F32-staging build (`390ace476e00b83bf4f4de8bc3b3ed9e81c10d914fcab71ec94e6fda24e3a1b3`):
+its raw-gradient relative errors were 0.039145% versus HF and 0.027452% versus
+aligned MLX F32. Those results do not attest the newer builds. Stock BF16 MLX
+remains a separate, materially divergent comparison.
+
+Current-source validation: required-device Metal Debug **322 passed, 2 optional
+skips**; native Debug **279 passed, 24 skips**; shared ML library tests passed;
+focused Python oracle/contract/resume tests **77 passed**. The prior full Python
+728-test result was not rerun. An initial Metal invocation omitted the required
+embedded source revision and failed only that CLI attestation test; the full
+corrected invocation passed. The explicit F16 negative control fails as intended.
+ReleaseFast Metal build, Zig formatting, whitespace and unresolved-conflict
+checks passed. No Git mutation was performed.
+
+Current build identity:
+
+- Source HEAD: `e7edd66f399edef41691a71be1530a86722bf4d7`, dirty tracked source.
+- Shipping-source patch SHA256: `9d9887ffc17c69461d9afda431a44aca40ec6c1730ec0d95724ed0701d4476fb`.
+- Binary SHA256: `d8d17bdf8428ebb9a773dd08d202a93a0aee253136d36ed19649eb5b7d56918a`.
+- Final source patch and binary hashes were rechecked against build metadata.
+
+Reports, source snapshots, exact runners, failed attempts, references and all
+three build-stage binaries are retained under
+`/Users/tim/Documents/af/antfly-qualification/20260909/full-parity-investigation/`.
+`MANIFEST.json` records SHA256 for each copied artifact. The previous
+`drift-investigation/` and `residual-investigation/` archives remain unchanged.
+The machine still has nonzero paging. Remaining gates are a completed
+current-source native/Metal 1/2/8-step matrix, stock BF16 and E4B numerical
+comparisons, current categorical-sampler MLX GRPO comparison, E4B GRPO acceptance,
+reserved holdout, zero-paging performance/memory evidence, accepted-adapter recovery refresh and hosted CI.
+
+### 2026-09-10 parity continuation: memory, CCE and stock PEFT fixes
+
+This continuation supersedes the preceding current-status statements; the older
+captures and failures remain historical evidence. The Metal/HF/MLX diagnostic
+matrix now contains E2B and E4B, `peft-qv` and `text-all-linear`, and independent
+1/2/8-step trajectories. Full numerical parity and production acceptance remain
+unqualified. These runs use one locked prepared example (154 physical tokens,
+71 supervised tokens, prepared maximum 512), BF16 frozen weights with F32-aligned
+activations/operators, rank 16, alpha 32, seed 42 and the locked AdamW recipe.
+CPU HF/PEFT F32 and activation-aligned MLX F32 are diagnostic references; they
+do not replace the locked CUDA/BF16 oracle or stock BF16 MLX qualification.
+
+The continuation fixes four independently reproduced defects:
+
+- Deferred forward Metal dots now retain native BF16/F16 frozen weights. The
+  generic dot previously made both a full F32 host peer and a device clone.
+  A direct unplanned-dot regression failed before the dispatch fix and passes
+  afterward. The initial E2B one-step trace remained bitwise identical across
+  all 500 tensors; both models now finish the bounded Metal matrix.
+- Cold live-logit evaluation now binds persistent resident adapter weights
+  before training starts. Transient host allocations could collide with cached
+  device bindings. A regression observes repeated nonzero device updates with
+  stale host copies and no optimizer allocation. At common trained E2B q/v
+  weights, sampled-logit error versus MLX fell from 5.08% to 0.000299%.
+- Tiled CCE retains the row maximum separately from the logarithmic exponential
+  sum, computes shifted loss/gradients, and compensates tile summation. For an
+  analytic large-offset fixture, the previous loss was 0.00048828125 versus an
+  expected 0.00046083788; the fixed kernel passes the unchanged 2e-7 tolerance.
+  Splitting the state without compensated summation still failed. This fixes
+  an actual numerical defect but does not explain the residual common-state HF
+  gradient difference in the real q/v model.
+- Canonicalization expands root PLE aliases before adding `model.`. Both PEFT
+  exporters preserve the real multimodal root and translate PLE names in tensor
+  keys and configuration. The Zig manifest hashes the resulting destination
+  configuration. Neither exporter changes the tensor payload values.
+
+Stock `PeftModel.from_pretrained` loading passed **all eight cases**: Python and
+public Zig exporters, both models and both presets. Tests use trained step-8
+adapters with every LoRA B tensor nonzero and verify every loaded float32 value,
+shape and target: E2B q/v 100 tensors, E2B full 552, E4B q/v 132, E4B full 686.
+The actual pinned `Gemma4ForConditionalGeneration` loads frozen text weights
+from the checkpoint; unused modality weights stay meta. This establishes export
+and stock loading compatibility, not forward quality or reverse PEFT-to-Antfly
+round-trip qualification. Packages: torch 2.10.0, transformers 5.5.2, PEFT 0.19.1.
+
+Independent Metal versus HF results below are **percent relative L2 error**;
+the update column compares cumulative parameter updates from the initial adapter.
+
+| Model | Preset | Steps | Gradient error | Update error |
+| --- | --- | ---: | ---: | ---: |
+| E2B | q/v | 1 | 0.039036% | 1.403575% |
+| E2B | q/v | 2 | 0.160232% | 1.433394% |
+| E2B | q/v | 8 | 2.220013% | 0.648025% |
+| E4B | q/v | 1 | 0.004026% | 0.183772% |
+| E4B | q/v | 2 | 0.014960% | 0.422064% |
+| E4B | q/v | 8 | 0.399732% | 0.177634% |
+| E2B | full | 1 | 0.023339% | 0.622435% |
+| E2B | full | 2 | 2.367138% | 2.099288% |
+| E2B | full | 8 | 96.586537% | 14.412970% |
+| E4B | full | 1 | 0.003871% | 0.170286% |
+| E4B | full | 2 | 0.035521% | 0.330731% |
+| E4B | full | 8 | 29.312955% | 1.931189% |
+
+Against aligned MLX, full-preset eight-step gradient/update errors are
+2.946032% / 0.925510% for E2B and 19.484668% / 1.135896% for E4B. Similar
+training losses do not establish parity: E2B full step-8 sampled-logit error
+versus HF is 34.3954%, despite losses 0.0332142 and 0.0328521.
+
+Applying the unchanged `hf-zig-bf16` numeric values to these F32 diagnostics
+identifies the following out-of-bound per-target states (gradient, updated
+weight, Adam m and v). This is triage, not the locked BF16 validator or a PASS.
+
+| Model | Preset | Compared per step | Exceeded at 1 / 2 / 8 steps |
+| --- | --- | ---: | ---: |
+| E2B | q/v | 400 | 12 / 7 / 98 |
+| E4B | q/v | 528 | 0 / 0 / 1 |
+| E2B | full | 2208 | 9 / 114 / 2203 |
+| E4B | full | 2744 | 0 / 0 / 1815 |
+
+At identical HF step-8 full-preset weights with a **fresh optimizer**, the latest
+Metal build versus HF has gradient errors 0.012216% (E2B) and 0.076140% (E4B),
+and sampled-logit errors 0.000181% and 0.000105%. All 2208 / 2744 per-target
+states remain within the diagnostic bounds at these common snapshots. Fresh
+update-vector errors are 0.238889% / 1.695014%; comparison of updated weights
+has a different denominator. E2B versus MLX at the same full-preset snapshot
+has gradient error 0.007973% and fresh-update error 0.082041%. These results
+support substantial trajectory amplification; they are not ninth continuation
+steps and do not eliminate the remaining numerical differences.
+
+An independent algebraic F32 Adam replay uses each capture's raw gradients and
+recorded preclip norm, including the unchanged clipping epsilon. Across both
+full presets at the initial and common-trained snapshots, replay update errors
+are at most 2.53e-7 relative L2 for Metal and 2.28e-7 for HF. At initial E2B
+weights, only 1243 of 15,204,352 active gradient components change sign, yet
+they contribute 69.97% of squared update disagreement. E4B has 241 of
+21,331,872 active components changing sign, contributing 54.72%. At the common
+E4B snapshot, the corresponding share is 81.30%. This rules against an Adam
+formula mismatch in these first-step cases; it does not prove that every
+subsequent step is correct. The retained report is
+`parity-continuation-full-adam-amplification.json`.
+
+Lower-memory reference methods retain their numerical evidence:
+
+- HF frozen-linear F32 rematerialization is bitwise identical across all 600
+  E2B one-step tensors. Output-head rematerialization additionally matches all
+  3312 E2B full-preset one-step tensors and admits E4B full step 8 under 16 GiB.
+- MLX layer checkpointing matches all 600 E2B q/v two-step tensors exactly.
+  Streaming output and releasing validated Python adapter objects preserve the
+  entire E2B full-preset eight-step tensor file byte-for-byte. The resulting
+  E4B full-preset 1/2/8 references complete without swap growth.
+- Failed reference attempts remain excluded even if they wrote a complete
+  tensor file. This includes earlier E4B HF/MLX memory-bound attempts and the
+  latest auxiliary E4B common-snapshot MLX attempt (+1465.13 MiB swap). The
+  main independent MLX matrix is complete. A subsequent isolated-validation
+  retry closes the auxiliary comparison as described below.
+
+The common-snapshot runner now performs heavyweight adapter/capture validation
+in a separately guarded CPU process, then checks a hash-bound proof before MLX
+loads. All original validation and exact model adapter loading checks remain.
+The E2B common-reference tensor file is byte-identical to the previous method
+(SHA256 `74899c5171fb4714f99ef8b1f943e8714407490e5c160a25c61b3ff68719ce90`).
+The E4B retry completes in 22.80 seconds, peak sampled RSS 8,196,960 KiB and
+586.07 MiB swap growth, within the unchanged 16 GiB / 1 GiB guards. At identical
+trained full-preset weights, E4B Metal versus MLX gradient error is 0.006388%,
+fresh-update error 0.154427% and sampled-logit error 0.000109%. The prior failed
+attempt remains excluded; the successful retry is numerical evidence only.
+
+Model jobs ran serially. Metal/native diagnostics retain 18 GiB sampled RSS and
+4 GiB swap-growth guards; HF/MLX retain 16 GiB and 1 GiB growth guards. The host
+had pre-existing swap throughout. These runs cannot qualify zero-paging memory
+or performance. The reserved final 254-example holdout remains untouched.
+
+The latest-build native E2B q/v one-step refresh completed in 751.36 seconds,
+with peak sampled RSS 14,546,416 KiB and no swap growth (2844.31 MiB initially,
+2692.12 MiB finally). All 500 trace tensors are byte-identical to the earlier
+loader-fixed native capture: SHA256
+`3cae501ac12a8823416ecefa5d582257ba977a67485d05cf88bde05795aaa854`.
+Gradient/update-vector errors are 0.049805% / 1.685759% versus HF and
+0.021730% / 0.760342% versus aligned MLX. Against the current Metal trajectory
+build, 24 of 400 per-target states exceed the unchanged native/Metal numeric
+bounds; all are updated LoRA B weights. This refresh closes source freshness
+for one native cell, not the complete native matrix. A three-second stack
+sample placed all 173 active-thread samples in the scalar F64 generic-dot
+loop at `native_compute.zig:38220`; this is diagnostic localization, not a
+zero-paging performance measurement.
+
+Current validation: actual-device Metal Debug **326 passed, 2 optional skips**;
+native Debug **280 passed, 26 skips**; full Gemma4 Python discovery **730 passed**.
+The initial sandbox Python run failed only because its fake HTTP server could
+not bind localhost; the complete authorized rerun passed. ReleaseFast built.
+
+Build/source identities (dirty source, HEAD
+`e7edd66f399edef41691a71be1530a86722bf4d7`):
+
+- Full numerical trajectory build (`stable-cce-fixed`): binary SHA256
+  `ca89f6bf48c89bfa601ab9d6118c7ffeee5a57d8b405dd051cef9e256b6b76ee`,
+  compiled-source patch SHA256
+  `7c23b02c153afcbdcb6977f89b6aa737e1d6ddfded69b42203662f4df31ce07e`.
+- Latest export/common-snapshot build (`peft-namespace-fixed`): binary SHA256
+  `88be734cfcea017b36f9552b8a918a18cafc245c206357b5c254b6534a9dc418`,
+  compiled-source patch SHA256
+  `26f5eb715504eb0b92cd3b087ff9d5f1c6e76f1acf2abd84471cc537a91feb30`.
+  Its additional compiled changes affect PEFT export. Python source snapshots
+  are retained separately; the compiled-source patch is not an all-file digest.
+
+Reproduction runners and comparisons live in
+`.benchmark-results/gemma4-qualification-20260909/`. In particular,
+`parity-continuation-all-hf-numeric-bounds.json` retains every checked target
+state, `parity-continuation-{stable,all-linear}-*-vs-*.json` records numerical
+comparisons, and `parity-continuation-final-common-*-vs-*.json` records common
+snapshots. Stock loading reports live under
+`/Users/tim/Documents/af/antfly-qualification/20260909/diagnostics/parity-continuation-stock-peft-*/`.
+`/Users/tim/Documents/af/antfly-qualification/20260909/parity-continuation-investigation/`
+retains exact runners, source, builds, successful and excluded raw captures with
+a SHA256 manifest; previous sealed archives stay intact. The manifest digest is
+recorded separately in `parity-continuation-archive-receipt.json` in the results
+directory, avoiding a self-referential archive digest.
+
+Remaining gates: independent-trajectory numerical failures; completion of the
+current native matrix; stock BF16 parity and the locked HF/BF16 reference;
+categorical-sampler MLX GRPO comparison; E4B GRPO acceptance and reserved final
+holdout; reverse PEFT adapter recovery qualification; accepted-adapter recovery
+refresh; zero-paging performance/memory evidence and hosted CI. CUDA implementation
+remains outside scope. No tolerance was loosened or oracle COMPLETE / acceptance
+PASS published.
+
+### 2026-09-10 native matrix and chronological GRPO replay continuation
+
+The native reference now uses a packed F64 kernel for large rank-2 dots,
+including dense, native-storage and strided-view operands. Each SIMD lane
+computes an independent output in the same left-to-right F64 accumulation order
+as the scalar implementation; there is no reduction across lanes or F32
+intermediate rounding. Eight output columns share a panel of `64 * k` bytes.
+Existing source-tensor BLAS dispatch retains its previous behavior. Exact tests
+cover both operand orientations, strided views, odd row/column tails, BF16/F16
+storage, and a cancellation case whose correct F64 result is 1 but whose F32
+result is 0. Representative kernel diagnostics show 8.0–9.5x speedups with zero
+output-bit differences. These timings do not qualify real-model performance.
+
+The first optimization only covered transposed dense/source weights. Its live
+model profile exposed a remaining scalar strided-view path. That attempt was
+intentionally stopped after 376.76 seconds and is excluded from parity evidence;
+it did not trigger the resource guard and did not publish a complete trace.
+The final implementation covers that path too. The serial native E2B/E4B,
+q/v/full, 1/2/8-step matrix retains the 18 GiB sampled RSS, 4 GiB swap-growth and
+900-second per-capture limits. Its first cell must reproduce the sealed native
+E2B trace byte-for-byte before the remaining cells can start. Live results are
+recorded in `native-f64-strided-campaign-status.json` in the existing results
+directory; a running cell is not a completed comparison.
+
+Both single-token and multi-token MLX GRPO comparison runners now preserve the
+chronological group order recorded in Antfly reward traces. The previous loader
+sorted groups by original dataset prompt index, silently undoing epoch shuffling.
+The runners bind each chronological group to its original prompt and reject
+interleaved optimizer groups. New shuffled-order regressions fail before the fix;
+all 30 focused comparison tests pass afterward. The categorical-sampler guard
+remains: correct ordering alone does not qualify the retired ranked sampler.
+
+Current source validation: native Debug **282 passed, 26 skipped**; required-device
+Metal Debug **328 passed, 2 optional skips**; full Gemma4 Python **733 passed**.
+ReleaseFast and source/binary identity checks pass. The current compiled-source
+patch includes the new untracked helper file explicitly, in addition to tracked
+changes:
+
+- Binary SHA256: `c82c30aa5c844e6bc59ca4910287b0eb60cf48259e393b597bbe8f127caaaa1c`.
+- Compiled-source patch SHA256: `b3993194335aed256945bd71e98d53be6e825c73b5d58e15df61a67aca272164`.
+- `native_f64_dot.zig` SHA256: `e63ca701578933f16e2c6058b6758643aa3959d3dde6c4de84d5fdb9f1fa2299`.
+- HEAD remains `e7edd66f399edef41691a71be1530a86722bf4d7`; source is dirty.
+
+These changes enable missing reference measurements and correct GRPO replay;
+they do not waive the independently measured trajectory failures, stock BF16
+qualification, categorical rollout comparison, acceptance/holdout, recovery,
+zero-paging or hosted-CI gates documented above. No Git mutation was performed.
+
+<!-- native-matrix-results:start -->
+
+The real-model preservation gate passed: all 500 E2B q/v trace tensors are
+byte-identical to the sealed native reference (trace SHA256
+`3cae501ac12a8823416ecefa5d582257ba977a67485d05cf88bde05795aaa854`).
+Diagnostic one-step wall time fell from 751.36 to 96.70 seconds (7.77x),
+without swap growth. Pre-existing swap excludes these timings from release
+performance evidence.
+
+Completed native cells: **6/12**. These are independent F32-aligned
+trajectories; relative errors use the named HF or MLX reference.
+
+| Model / preset | Steps | Native/HF gradient error | Native/MLX gradient error | Native/HF update error |
+| --- | ---: | ---: | ---: | ---: |
+| E2B / qv | 1 | 0.0498% | 0.0217% | 1.6858% |
+| E2B / qv | 2 | 0.1889% | 0.0754% | 1.6688% |
+| E2B / qv | 8 | 4.0760% | 1.5552% | 0.7568% |
+| E2B / all-linear | 1 | 0.0286% | 0.0154% | 0.8366% |
+| E2B / all-linear | 2 | 2.3661% | 0.0755% | 2.3128% |
+| E2B / all-linear | 8 | 96.4793% | 2.9548% | 14.3841% |
+
+Unfinished or excluded cells: [{"model": "e4b", "preset": "qv", "steps": 1, "status": "failed"}].
+
+`native-f64-strided-{hf,native-metal}-bounds-summary.json` records per-target
+failures against the unchanged numerical values. Passing capture validation is
+not a numerical-parity PASS. References and current native builds are attested
+separately. The trajectory failures remain open.
+
+The host-side categorical sampler now reproduces Zig 0.16 Xoshiro256++ and its
+F64 uniform draws, v2 group/completion seed derivation, F32 logit differences,
+F64 CDF accumulation, temperature/top-k/nucleus filtering, stable token-ID ties,
+and evaluation's greedy first completion. Executing verbatim production Zig
+sampling functions generated **384 bit-identical random draws and 1,920 matching
+token selections** across five policies. The source-bound fixture is reproducible;
+13 primitive tests include rare extra RNG draws, EOS-independent streams,
+shuffled prompt identity and invalid inputs. These are primitive diagnostics;
+the categorical acceptance guard remains until skipped-group and behavioral
+qualification are implemented. Both legacy rollout runners now use stable
+ranked tie selection through the shared helper.
+
+Both GRPO classifiers now require actual adapter-update vector distance at their
+existing relative-error limits (5% single-token / 10% multi-token), in addition
+to magnitude and direction. The previous magnitude-only gate falsely accepted
+same-length rotated updates, missing vector metrics and NaNs in the new field.
+The negative regression failed three cases before the fix. An actual-MLX tensor
+check confirms that a 10% vector error with negligible magnitude difference is
+rejected while identical updates pass. Missing, non-finite or invalid vector
+metrics fail closed. Historical magnitude-only output fields are retained.
+
+Final Python validation: **748 passed in 67.346 seconds**; 44 GRPO/MLX runner
+tests and 13 sampling primitive tests pass. The full test count supersedes the
+733-test intermediate run above. For this sampler/vector-gate stage, compiled Zig source and binary hashes
+remained unchanged; subsequent native storage builds are recorded separately below.
+Sampler evidence is indexed in `grpo-sampling-status.json`.
+
+<!-- native-matrix-results:end -->
+
+### Native E4B frozen-weight memory follow-up
+
+The first E4B q/v native capture using `native-f64-strided-fixed` was stopped by
+the unchanged 18 GiB sampled-RSS guard after 138.43 seconds (peak RSS 19,710,880
+KiB; peak swap 5,856.94 MiB from a 2,510.69 MiB baseline). It produced no complete
+trace and is excluded. The six successful E2B cells and excluded E4B attempt,
+Python sampler/vector-gate fixes, source and binaries were sealed in
+`/Users/tim/Documents/af/antfly-qualification/20260909/native-matrix-investigation`:
+424 files, manifest SHA256
+`05962acd857f2d010614dc0cf0ee7f37892ebba8f19dc4098c912f7f676216a5`.
+
+Native Gemma4 backend creation now opts into source-backed frozen rank-2
+BF16/F16 handles, extending the embedding storage policy to linear weights.
+This prevents retained training parameter handles from owning persistent full
+F32 copies. Individual operators still own temporary F32 views; the bound is
+the largest needed matrix, not a promise of zero conversion. The dense dot's
+F64 reduction and eager F32 GEMM shape remain unchanged. Native inference's
+ordinary loading policy is unchanged. The biased source-linear path now keeps
+its bias through GEMM's beta=1 instead of calling the overwriting no-bias helper.
+Regression coverage checks resident/lazy handles, BF16/F16, both contraction
+layouts and biased/unbiased linear output bytes. The model checks below belong
+to these new builds; the preceding six-cell matrix retains its older build identity.
+
+The first source-backed build (`native-frozen-linear-fixed`, binary SHA256
+`ba50e107ae16fef4c22721f422bf70ec27f238d3e1ad8b8d7f5644b5b9375a40`, compiled
+patch `8a768cb71f387ec5f48e8a10919a569e35e217b9519a3b492df9d07f2b6fce9e`)
+passed the E2B gate: all 500 trace tensors remain byte-identical, peak RSS fell
+from 14.6 to 10.2 GiB, and there was no swap growth. Its E4B attempt stayed below
+the RSS cap but crossed the swap-growth limit after 61.08 seconds. A separate
+allocation-profile attempt under unchanged limits also failed after 60.90
+seconds. Both are excluded. The retained vmmap summaries distinguish about
+8.7 GiB of resident clean file mappings from about 3 GiB of dirty heap during
+probing; they do not establish accepted E4B training memory.
+
+The follow-up `native-frozen-reclaim` variant extends the existing
+completed-operation mapped-page reclamation hook to resident source-backed
+handles, using the source tensor name for the tensor-store range lookup.
+It also covers lowered dot, transpose and gather consumers. The mapping and
+parameter handles stay valid; only consumed clean pages are eligible for
+reclamation. A regression verifies the source-name binding, repeated reads,
+and exclusion of ordinary native and non-mapped handles. Results are recorded
+in `native-frozen-reclaim-status.json` and `native-frozen-reclaim-gate-status.json`.
+
+The final resident-mapping build passed **284 native tests (26 skips)** and
+**330 required-device Metal tests (2 optional skips)**, followed by ReleaseFast.
+Binary SHA256 `d7d5aed0ea83457dc45c16e4f8b83b5a23aa1dc6bc2a94d2af0e12b669ef232c`;
+compiled patch SHA256
+`0bc59922901a0fb5d00001e98fdb8c0c04649fc3adb82007ee391ae0b78c572d`.
+The source identity, formatting, whitespace and unresolved-conflict audits pass.
+Python remains **748 passed**; no Python implementation changed after that run.
+
+E2B q/v one step completed in 102.746 seconds, with peak sampled RSS 11,749,520
+KiB and zero swap growth from a 2,601.00 MiB baseline. The entire 500-tensor trace
+is byte-identical to the sealed earlier native trace (SHA256
+`3cae501ac12a8823416ecefa5d582257ba977a67485d05cf88bde05795aaa854`).
+Its gradient/update relative L2 errors remain 0.049805%/1.685759% against CPU
+HF/PEFT F32 and 0.021730%/0.760342% against aligned MLX F32. These aggregate
+numbers do not override the earlier per-target diagnostic failures.
+
+E4B q/v one step stopped after 58.948 seconds with exit -15. Peak sampled RSS was
+15,002,224 KiB, below 18 GiB, but swap grew from 2,561.00 to 6,743.19 MiB:
+**4,182.19 MiB growth exceeded the unchanged 4,096 MiB cap**. No complete trace
+was produced; this attempt is excluded. Resident-page advice and source-backed
+storage therefore do not establish native E4B memory qualification. No further
+unchanged-source retries were launched. All model jobs are terminal, the reserved
+254-example holdout remains untouched, and no oracle COMPLETE or acceptance PASS
+was published. The E4B native matrix, independent-trajectory numerical failures,
+stock BF16 reference, end-to-end categorical GRPO behavior, E4B acceptance,
+adapter recovery, zero-paging qualification and hosted CI remain open.
+
+The frozen-weight builds, exact-trace check, failed attempts, allocation profiles,
+source snapshots and current PR description are retained separately in
+`/Users/tim/Documents/af/antfly-qualification/20260909/native-frozen-weight-investigation`.
+Its manifest digest and file count are recorded in
+`.benchmark-results/gemma4-qualification-20260909/native-frozen-weight-archive-receipt.json`;
+the archive hash-binds the preceding native-matrix evidence and preserves all
+excluded attempts. These archives are diagnostics, not release qualification.
+
+
+### 2026-09-10 gradient-norm precision follow-up
+
+The second-step optimizer audit replays 14 retained pairs: native E2B q/v and
+full presets, plus Metal, HF and aligned MLX for both models and presets. Each
+pair uses its own saved step-1 weights/moments and step-2 raw gradients; initial
+losses match exactly, native request bindings and training options match, and
+reference initial adapter tensors match exactly. This tests the second step,
+not the unobserved intervening steps 3-8. Native F32-beta arithmetic reproduces
+both saved moments exactly and incremental updates within 1.998e-7 relative L2.
+The Python-scalar-beta replay reproduces HF updates within 1.526e-7. The initial
+formula variant used Python scalar beta complements for every backend; its
+small native discrepancy disappears when using the native F32 beta semantics.
+No optimizer hyperparameter or tolerance was changed. Full results and both
+controls are retained in `second-step-optimizer-replay.json`.
+
+The audit exposed a separate Metal clipping issue: the production
+`termite_training_sumsq_f32` shader used a single thread to add every squared
+value sequentially in F32. On the exact production shader, a vector beginning
+with 1 followed by 1,048,576 values of alternating +/-1e-4 produced squared sum
+1 instead of 1.01048575947 (1.037695% relative error). A 257-element case also
+failed the predeclared 2e-7 relative bound. The replacement uses 256 lanes,
+compensated local sums and a balanced reduction tree, compiled through the
+precise-math library. Both single-input and batched dispatches provide their
+own threadgroup scratch. The corrected shader passes the same analytic bounds;
+the million-element case has 8.756e-9 relative error.
+
+Replaying the **same saved real-model gradients** through both production
+shaders isolates the reduction from all model arithmetic:
+
+| Step-2 full preset | Tensors | F64 reference norm | Old norm relative error | Corrected norm relative error |
+| --- | ---: | ---: | ---: | ---: |
+| E2B | 552 | 12.0020461540 | 1.817873e-6 | 1.098551e-8 |
+| E4B | 686 | 4.0824963298 | 1.822980e-5 | 4.975231e-9 |
+
+The old norm errors agree with clipping-scale discrepancies independently
+inferred from saved first moments. These are reduction and optimizer-state
+checks; updated full trajectories still require fresh model captures. Shader
+source, F64 controls, tensor payloads, input-source hashes and results are in
+`training-sumsq-before`, `training-sumsq-after`,
+`training-sumsq-real-gradients`, and `training-sumsq-root-cause.json`.
+
+A separate native page-allocation experiment preserved all 500 E2B trace tensors
+exactly (104.757 seconds, no swap growth), but E4B still exceeded the unchanged
+4 GiB swap-growth limit after 64.855 seconds: 5,194.81 MiB growth, peak RSS
+14,922,224 KiB. The incomplete capture is excluded. The experiment was removed
+from shipping source because it did not improve E4B admission; the preceding
+source-backed resident-mapping implementation was restored byte-for-byte.
+Experimental source, patch, binary and results remain retained under
+`native-frozen-pages-*`; binary SHA256
+`7162300be13eb54a10a50079a515d0defd6af2f4dffcc5e660e7e2be2830e547`,
+patch SHA256 `ab3a9d20c1698eaf6f88991276167e9e9ffd5fb6cba1a93a99b6bfb18b09e1dd`.
+No allocator environment settings or process-wide purge were introduced.
+
+<!-- training-sumsq-results:start -->
+The corrected build passed **284 native tests (26 skips)** and **331 required-device
+Metal tests (2 optional skips)**, including the integrated analytic single/batched
+norm regression. Python remains **748 passed**; no shipping Python source changed
+after that run. ReleaseFast and compiled-source identity checks pass.
+
+Binary SHA256 `12546440265368956e0806d2f3866ed4e568330f11cb6c04167951798359ba79`;
+compiled patch SHA256 `976f909f086d7e5aa97a2a1bde81169fd420544c2cadd9886b8c516c92528a94`.
+
+Fresh independent trajectories below use unchanged F32 diagnostic references and
+unchanged resource limits. All errors are **percent relative L2**; updates are
+cumulative from the exact initial adapter. They are not stock BF16 qualification.
+
+| Model | Preset | Steps | HF gradient | HF update | MLX gradient | MLX update |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| E2B | all-linear | 1 | 0.023339% | 0.622435% | 0.020048% | 0.476215% |
+| E2B | all-linear | 2 | 2.367092% | 2.098454% | 0.113366% | 1.035204% |
+| E2B | all-linear | 8 | 96.584720% | 14.410316% | 2.978692% | 0.930807% |
+| E4B | all-linear | 1 | 0.003871% | 0.170286% | 0.002915% | 0.136007% |
+| E4B | all-linear | 2 | 0.035437% | 0.330417% | 0.023666% | 0.318632% |
+| E4B | all-linear | 8 | 29.508488% | 1.936556% | 21.898395% | 1.253675% |
+| E2B | qv | 1 | 0.039036% | 1.403575% | 0.027572% | 0.990024% |
+| E2B | qv | 2 | 0.160232% | 1.433394% | 0.109306% | 1.009484% |
+| E2B | qv | 8 | 2.326447% | 0.648633% | 3.198099% | 0.457820% |
+| E4B | qv | 1 | 0.004026% | 0.183772% | 0.002587% | 0.181795% |
+| E4B | qv | 2 | 0.014960% | 0.422063% | 0.023118% | 0.443063% |
+| E4B | qv | 8 | 0.389547% | 0.177452% | 0.340878% | 0.198202% |
+
+Completed 12 of the 12 planned cells. Campaign terminal state:
+`diagnostic-matrix-captured`. Per-target bounds remain unchanged:
+
+| Model | Preset | Step | States outside diagnostic bounds |
+| --- | --- | ---: | ---: |
+| E2B | all-linear | 1 | 9 / 2208 |
+| E2B | all-linear | 2 | 114 / 2208 |
+| E2B | all-linear | 8 | 2203 / 2208 |
+| E4B | all-linear | 1 | 0 / 2744 |
+| E4B | all-linear | 2 | 0 / 2744 |
+| E4B | all-linear | 8 | 1803 / 2744 |
+| E2B | qv | 1 | 12 / 400 |
+| E2B | qv | 2 | 7 / 400 |
+| E2B | qv | 8 | 98 / 400 |
+| E4B | qv | 1 | 0 / 528 |
+| E4B | qv | 2 | 0 / 528 |
+| E4B | qv | 8 | 1 / 528 |
+
+The fresh second-step replay reduces the inferred clipping-scale discrepancy to
+at most 1.267e-7 across all four Metal model/preset pairs, versus 1.825e-5 before.
+Its F32-beta first-moment replay errors are at most 1.748e-7. Residual second-moment
+and incremental-update replay errors remain up to 1.626e-5 and 8.246e-6;
+these paired independent captures do not yet prove all Metal optimizer states
+or all intermediate steps. `training-sumsq-second-step-optimizer-replay.json`
+retains those limits rather than collapsing the result into an optimizer PASS.
+
+The corrected reduction closes the demonstrated clipping precision defect. It
+does not waive remaining independent-trajectory failures, native E4B coverage,
+stock BF16/HF oracle, categorical GRPO behavior, E4B acceptance, reserved holdout,
+adapter recovery, zero-paging qualification or hosted CI. No numerical tolerance
+was loosened, no reserved holdout was scored, and no acceptance PASS was issued.
+
+Evidence is retained in `training-sumsq-*` and sealed separately in
+`/Users/tim/Documents/af/antfly-qualification/20260909/training-norm-investigation`.
+The manifest receipt is `training-sumsq-archive-receipt.json`; prior evidence is
+hash-bound without modifying the older archives.
+<!-- training-sumsq-results:end -->
+
+
+### 2026-09-10 precise Metal AdamW follow-up
+
+The residual second-moment discrepancy was reproduced directly in the production
+`termite_training_adamw_f32` shader with identical supplied tensors and scalar
+parameters. Compiling that shader through the ordinary fast-math library gave
+2.0014e-5 second-moment relative L2 error on 32,768 controlled values; compiling
+the same source with precise math reduced it to 1.8764e-8. First-moment errors
+were 1.2597e-7 / 3.4413e-8 and incremental-update errors were 3.5965e-6 /
+2.5011e-7, respectively. This isolates compiler arithmetic from model execution
+and does not depend on paired runs having identical hidden intermediate states.
+
+A reduced eight-element fixture uses gradients +/-2.1, +/-3, +/-1.3 and +/-1e-4,
+prior m=0.009, prior v=8e-6 and gradient scale 0.244949072599411. The old shader's
+variance error reaches 5.0550e-5 relative; precise compilation matches every
+expected F32 variance value exactly. The integrated regression uses an independent
+F64 control over the actual F32 parameters, verifies m/v at 5e-7 relative, weights
+at 2e-9 absolute, and zeroed gradients through both single and batched APIs.
+These new regression bounds do not change any oracle or campaign tolerance.
+
+Only the AdamW pipeline's math-library selection changes. The optimizer formula,
+hyperparameters, norm correction, clipping threshold and checkpoint layout stay
+the same. The required-device Metal suite passed **332 tests, 2 optional skips**.
+Native code is byte-identical to the preceding audited build (284 tests passed,
+26 skipped); shipping Python remains unchanged from its 748-test pass.
+Probe inputs, exact shader source, fast/precise outputs and hashes are retained
+in `optimizer-shader-math-probe`.
+
+<!-- precise-adam-results:start -->
+Native code retains its **284-test pass (26 skips)**; the corrected build passed **332 required-device
+Metal tests (2 optional skips)**, including the integrated analytic single/batched
+AdamW regression. Python remains **748 passed**; no shipping Python source changed
+after that run. ReleaseFast and compiled-source identity checks pass.
+
+Binary SHA256 `46620bf9dba98f4708a0a529980d52ee9bc7cf7ffdcae944534b6e199f85279b`;
+compiled patch SHA256 `5abb24ace25ecfd7be87b7192b17f58ce6fac8d796a5201449723c15d95edda9`.
+
+Fresh independent trajectories below use unchanged F32 diagnostic references and
+unchanged resource limits. All errors are **percent relative L2**; updates are
+cumulative from the exact initial adapter. They are not stock BF16 qualification.
+
+| Model | Preset | Steps | HF gradient | HF update | MLX gradient | MLX update |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| E2B | all-linear | 1 | 0.023339% | 0.622435% | 0.020048% | 0.476215% |
+| E2B | all-linear | 2 | 2.367102% | 2.097940% | 0.113980% | 1.036690% |
+| E2B | all-linear | 8 | 96.577096% | 14.409863% | 2.985211% | 0.933048% |
+| E4B | all-linear | 1 | 0.003871% | 0.170286% | 0.002915% | 0.136007% |
+| E4B | all-linear | 2 | 0.035500% | 0.330446% | 0.023635% | 0.318414% |
+| E4B | all-linear | 8 | 28.889947% | 1.916215% | 20.341833% | 1.176305% |
+| E2B | qv | 1 | 0.039036% | 1.403575% | 0.027572% | 0.990024% |
+| E2B | qv | 2 | 0.160219% | 1.432765% | 0.109327% | 1.010626% |
+| E2B | qv | 8 | 2.550247% | 0.650022% | 2.977879% | 0.455724% |
+| E4B | qv | 1 | 0.004026% | 0.183772% | 0.002587% | 0.181795% |
+| E4B | qv | 2 | 0.015092% | 0.423047% | 0.023042% | 0.440718% |
+| E4B | qv | 8 | 0.401481% | 0.178079% | 0.324882% | 0.197156% |
+
+Completed 12 of the 12 planned cells. Campaign terminal state:
+`diagnostic-matrix-captured`. Per-target bounds remain unchanged:
+
+| Model | Preset | Step | States outside diagnostic bounds |
+| --- | --- | ---: | ---: |
+| E2B | all-linear | 1 | 9 / 2208 |
+| E2B | all-linear | 2 | 114 / 2208 |
+| E2B | all-linear | 8 | 2203 / 2208 |
+| E4B | all-linear | 1 | 0 / 2744 |
+| E4B | all-linear | 2 | 0 / 2744 |
+| E4B | all-linear | 8 | 1806 / 2744 |
+| E2B | qv | 1 | 12 / 400 |
+| E2B | qv | 2 | 7 / 400 |
+| E2B | qv | 8 | 99 / 400 |
+| E4B | qv | 1 | 0 / 528 |
+| E4B | qv | 2 | 0 / 528 |
+| E4B | qv | 8 | 1 / 528 |
+
+Replaying the second update from captured first-step moments and second-step
+gradients confirms the correction across all four model/preset combinations.
+The control uses the actual F32 beta values and clipping scale; errors below are
+**relative L2 (fractions, not percentages)**. This verifies the captured update,
+not uncaptured steps 3–8 or full trajectory parity.
+
+| Model | Preset | First moment | Variance | Incremental update |
+| --- | --- | ---: | ---: | ---: |
+| E2B | qv | 2.6618e-08 | 1.0980e-08 | 2.7225e-07 |
+| E2B | all-linear | 3.2739e-08 | 2.0859e-08 | 2.6832e-07 |
+| E4B | qv | 2.8552e-08 | 2.2008e-09 | 3.0146e-07 |
+| E4B | all-linear | 3.2965e-08 | 3.6316e-08 | 2.7564e-07 |
+
+Precise AdamW compilation closes the demonstrated variance-update precision defect. It
+does not waive remaining independent-trajectory failures, native E4B coverage,
+stock BF16/HF oracle, categorical GRPO behavior, E4B acceptance, reserved holdout,
+adapter recovery, zero-paging qualification or hosted CI. No numerical tolerance
+was loosened, no reserved holdout was scored, and no acceptance PASS was issued.
+
+Evidence is retained in `precise-adam-*` and sealed separately in
+`/Users/tim/Documents/af/antfly-qualification/20260909/optimizer-precision-investigation`.
+The manifest receipt is `precise-adam-archive-receipt.json`; prior evidence is
+hash-bound without modifying the older archives.
+<!-- precise-adam-results:end -->
+
+
+### 2026-09-10 categorical rollout and skipped-update integration
+
+The multi-token MLX comparison runner now accepts current seeded categorical
+reports through `--categorical-diagnostic`. It validates the explicit sampling
+policy, training seed, v8 prompt-order contract and v4 evaluation policy. Sampling
+uses original dataset prompt indices after reordering, independent completion
+streams, a shared prompt forward, and greedy completion zero only in evaluation.
+EOS remains included; the supported recipe keeps budget-truncated completions
+unmasked. Policy log-probabilities are scored without temperature or filtering.
+
+The new path accepts duplicate completions and counts their multiplicities when
+measuring overlap. A real MLX train-loop probe reproduced the previous distinct-
+completion guard failure before this correction. Equal-reward groups and groups
+over the raw KL budget now skip Adam without advancing its step or KL coefficient.
+The KL trace validator checks chronological group/prompt IDs, optimizer step IDs,
+admission decisions, coefficient continuity, reward-derived skips and report
+counts. An exact F32 budget-boundary regression covers admission at the limit.
+All-skipped lanes return zero updates and absent update metrics, without dividing
+by zero or comparing an unmodified adapter as a successful update.
+
+This is deliberately a diagnostic artifact contract. The new v2 result has
+`status=diagnostic-completed` and `classification=categorical-diagnostic-only`;
+it cannot return the historical bounded-parity classification even when the
+single-seed thresholds pass. Failed Antfly evaluation reports can be inspected
+only through this diagnostic mode. The default acceptance guard remains in place.
+The existing bounded recipe is unchanged: q/v, rank 16/alpha 32, length 128,
+learning rate 1e-7, one epoch, 2–8 completions and a 2–32-token budget. It does not
+yet cover the release recipe's all-linear, group-16, single-token campaign or the
+legacy single-token MLX runner.
+
+Four serial real-model rollout probes cover E2B/E4B and stock BF16/aligned F32
+MLX forwards. Each uses the exact seed adapter and locked prepared diagnostic
+prompt, seeds 17/991, train/evaluation domains, four completions and three tokens.
+The retained full-vocabulary logits are replayed through verbatim production Zig
+sampling and normalization functions using Zig 0.16. **All 192 tokens and their
+192 F32 log-probabilities match exactly.** This isolates the sampling contract on
+identical input logits; it is not native-versus-MLX forward or training parity.
+Independent full-sequence MLX rescoring remains inside the unchanged 1e-4 bound:
+
+| Model | Activation | Exact selections / scores | Max rescore error | Sampled RSS | Swap growth |
+| --- | --- | ---: | ---: | ---: | ---: |
+| E2B | aligned F32 | 48 / 48 | 3.3004e-07 | 5041.4 MiB | 0.00 MiB |
+| E4B | aligned F32 | 48 / 48 | 9.4298e-07 | 6181.0 MiB | 917.25 MiB |
+| E2B | stock BF16 | 48 / 48 | 4.7684e-07 | 6639.8 MiB | 0.00 MiB |
+| E4B | stock BF16 | 48 / 48 | 7.1526e-07 | 4812.0 MiB | 0.00 MiB |
+
+All probes completed within 900 seconds, 16 GiB sampled RSS and 1 GiB swap growth.
+Every run started with nonzero swap. These are numerical diagnostics; no memory,
+performance or zero-paging qualification is claimed. The captured logits and
+helper hashes are retained, including both activation paths and independent Zig
+replays. Frozen model weights and prepared-source identities were verified.
+
+The production nested train loop also ran with controlled completions/gradients
+and actual MLX compiled accumulation, clipping and AdamW. Both trace replay and
+native rollout pass mixed-group and all-skipped cases (four cases total). Mixed
+runs produce exactly two Adam steps, with parameter values and all optimizer
+state bit-identical to a two-update control. Zero-variation and KL-rejected groups
+preserve the coefficient; the F32 KL boundary is admitted. All-skipped runs keep
+parameters, optimizer step and coefficient unchanged. This verifies the loop's
+state transitions with controlled model outputs, not real-model GRPO gradients.
+
+<!-- categorical-validation:start -->
+Gemma4 Python: **758 tests passed** on the final source. The initial sandboxed
+run hit one loopback-bind permission error; the isolated retest and final full
+suite passed with loopback access. Source audit confirms the compiled Zig patch
+and ReleaseFast binary still match the precise-Adam build. Unresolved-conflict,
+whitespace and Zig-format checks pass. No Zig implementation changed in this
+categorical follow-up; its earlier 332 Metal and 284 native test passes are
+carried forward.
+<!-- categorical-validation:end -->
+
+Evidence: `.benchmark-results/gemma4-qualification-20260909/categorical-runner-status.json`,
+`categorical-mlx-update-state.json`, `categorical-production-replay-summary.json`
+and `categorical-stock-production-replay-summary.json`. Source-bound diagnostic
+scripts, full logits, excluded failed probe logs and final test logs are retained.
+The separate `categorical-rollout-investigation` archive binds the preceding
+`optimizer-precision-investigation` manifest
+`928f55c52251cc276df8aedf71ae7b5819c257db1f9a716be6039f0f70241b5a`.
+
+Full independent trajectory failures remain unchanged: full-preset eight-step
+Metal/HF gradient errors are 96.5771% E2B and 28.8899% E4B. Native E4B coverage,
+locked HF/stock BF16 numerical qualification, optimizer-backed real-model
+categorical campaigns, statistical behavior, E4B GRPO quality acceptance, the
+reserved holdout, reverse adapter import/recovery, zero-paging qualification and
+hosted CI remain open. The reserved 254 examples were not read or scored. CUDA
+implementation remains outside scope. No tolerance was loosened or acceptance
+PASS published.
+
+
+### 2026-09-10 precise parallel training RMSNorm follow-up
+
+The full-trajectory investigation identified a separate forward precision defect.
+The default Metal RMSNorm row kernel serially accumulates F32 squares. Replaying
+that exact kernel on retained E2B embedding activations reproduces the earlier
+first-layer RMSNorm drift: 1.8215372e-6 relative L2 versus the saved HF output.
+Precise compilation alone leaves 1.7521467e-6 error. The existing parallel row
+kernel, compiled precisely, reduces that error to 8.4371117e-8. Against an
+independent F64 control, error falls from 1.7105782e-6 to 5.9091236e-8.
+
+An analytic row with one large element and 1535 values of 1e-4 reproduces loss
+of small squared contributions: the serial result has 6.3201941e-6 relative L2
+error versus F64, while the parallel result has 2.6379716e-8. The source-bound
+probe retains all four combinations of serial/parallel and fast/precise math,
+including the control that shows precise compilation alone is insufficient.
+
+Gemma4 training now requests a precise 256-lane row reduction explicitly through
+its Metal compute backend. The device API reuses the existing access tracking,
+frame ownership and bounds checks; the precision request fails if the precise
+pipeline is unavailable. Three optional inference norm fusions decline this
+training request so the ordinary precise norm fallback can execute. Inference
+defaults are unchanged. The public legacy device entry point keeps its ABI and
+behavior. Native arithmetic and the AdamW recipe are unchanged.
+
+The new required-device regression checks F64-derived normalized outputs at
+widths 128, 1536 and 2560, including signs and non-unit norm weights. It passes
+the 2e-7 relative bound; the reproduced serial error exceeds that bound.
+Required-device Metal Debug: **333 passed, 2 optional skips**.
+
+A separate HF self-control repeats the unchanged recipe at 1/2/8 steps. All
+3312 arrays at each captured step are bit-identical with the original six-thread
+reference, including gradients, weights and optimizer state. Running with one
+CPU thread changes the eight-step gradient by 1.165219% and cumulative update
+by 0.112575%. This measures some reduction-order sensitivity, but is far below
+the outstanding 96.58% Metal/HF full-preset gradient difference and cannot
+justify waiving it. The three byte-identical six-thread captures were replaced
+with verified APFS clones of their references; paths, contents, hashes and
+timestamps are preserved. The clone receipt records 1,897,478,736 shared bytes.
+
+<!-- training-rmsnorm-results:start -->
+ReleaseFast and source/binary identity checks pass. The native-only Debug build
+passed **284 tests (26 skips)**. The prior **758-test Python pass** is carried
+forward: every changed shipping script and fixture remains hash-identical to the
+sealed categorical-runner source; no Python implementation changed here.
+
+Binary SHA256 `b6587c5b9b166fbbc98fed6eb2e19a3a018f249b5fe562b59a8e8206da1d34b4`;
+compiled patch SHA256 `d91c2472382bb095eac5f5b181649f10c41d0deaba343c5ab5e42c686cb16f1f`.
+
+Completed 12 / 12 planned cells; terminal campaign state
+`diagnostic-matrix-captured`. References, recipes and tolerances are unchanged.
+All errors below are **percent relative L2**; updates are cumulative from the
+exact initial adapter. HF CPU F32 and aligned MLX are diagnostic references.
+
+| Model | Preset | Steps | HF gradient | HF update | MLX gradient | MLX update |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| E2B | all-linear | 1 | 0.023176% | 0.595130% | 0.022688% | 0.505020% |
+| E2B | all-linear | 2 | 2.368048% | 2.070529% | 0.122138% | 1.087040% |
+| E2B | all-linear | 8 | 96.522230% | 14.400830% | 3.219215% | 0.999742% |
+| E4B | all-linear | 1 | 0.003807% | 0.165992% | 0.002635% | 0.131526% |
+| E4B | all-linear | 2 | 0.035186% | 0.330624% | 0.022701% | 0.312394% |
+| E4B | all-linear | 8 | 29.935476% | 2.212523% | 7.961315% | 0.776499% |
+| E2B | qv | 1 | 0.036678% | 1.351174% | 0.030092% | 1.051475% |
+| E2B | qv | 2 | 0.155219% | 1.370880% | 0.116927% | 1.084301% |
+| E2B | qv | 8 | 2.253734% | 0.619507% | 3.268900% | 0.494194% |
+| E4B | qv | 1 | 0.003923% | 0.167720% | 0.002312% | 0.176397% |
+| E4B | qv | 2 | 0.010845% | 0.286552% | 0.021304% | 0.517671% |
+| E4B | qv | 8 | 0.289726% | 0.119526% | 0.500604% | 0.223024% |
+
+Per-target states outside the unchanged diagnostic bounds:
+
+| Model | Preset | Steps | Exceeded / compared |
+| --- | --- | ---: | ---: |
+| E2B | all-linear | 1 | 8 / 2208 |
+| E2B | all-linear | 2 | 110 / 2208 |
+| E2B | all-linear | 8 | 2203 / 2208 |
+| E4B | all-linear | 1 | 0 / 2744 |
+| E4B | all-linear | 2 | 0 / 2744 |
+| E4B | all-linear | 8 | 1907 / 2744 |
+| E2B | qv | 1 | 10 / 400 |
+| E2B | qv | 2 | 5 / 400 |
+| E2B | qv | 8 | 97 / 400 |
+| E4B | qv | 1 | 0 / 528 |
+| E4B | qv | 2 | 0 / 528 |
+| E4B | qv | 8 | 0 / 528 |
+
+E4B q/v Metal/HF CPU F32 is within every unchanged per-target bound at steps 1, 2 and 8.
+In particular, step eight improves from one failed state to **0 / 528**.
+This closes the measured F32 diagnostic target-state gap for that preset;
+it does not qualify stock BF16 or independent all-linear trajectories. The
+additional scalar and per-position probe audit also has no failures for E4B q/v:
+144 checks at step one, 145 at step two and 151 at step eight. It covers the full
+captured loss history, raw gradient norm, sampled logits and logsumexp values
+using the existing profile functions and limits. This still samples logits and
+checks one prepared training example, not the full quality dataset.
+
+Independent second-update replay uses the captured first-step weights/moments,
+second-step gradients, recorded clipping scale and actual F32 beta values.
+The errors below are **relative L2 fractions**, not percentages. They verify
+these captured updates, not uncaptured optimizer steps 3–8.
+
+| Model | Preset | First moment | Variance | Incremental update |
+| --- | --- | ---: | ---: | ---: |
+| E2B | qv | 8.8791e-08 | 1.7619e-07 | 2.7783e-07 |
+| E2B | all-linear | 3.6045e-08 | 1.4804e-08 | 2.6824e-07 |
+| E4B | qv | 2.8687e-08 | 2.3553e-09 | 3.0125e-07 |
+| E4B | all-linear | 3.2922e-08 | 3.7233e-08 | 2.7562e-07 |
+
+The current full-preset first-step amplification audit still finds opposite-sign
+gradients in 1,189 / 15,204,352 active E2B components and 237 / 21,331,872 E4B
+components. Those positions account for 69.37% and 51.43% of squared update
+difference respectively. Algebraic first-step Adam replay agrees with each
+framework's captured update within 2e-7 relative L2. These observations locate
+substantial initial amplification at near-zero gradients; they do not establish
+the cause of every subsequent trajectory difference.
+
+An additional HF control extends the physical tensor from 154 to 160 rows with
+causal tail padding and ignored labels. Original tokens, supervised labels,
+adapter, six-thread CPU execution and AdamW recipe are unchanged. Its eight-step
+gradient/update drift against the 154-row reference is **0.418578% / 0.040194%**.
+This is a sensitivity experiment, not a replacement oracle or a changed gate.
+Only the final eight-step tensor state is retained for this padding control.
+
+The RMSNorm precision defect is corrected, but full independent trajectory
+parity remains unqualified. Existing paging excludes memory/performance acceptance.
+Native E4B coverage, locked HF/stock BF16 numerical qualification, real-model
+categorical campaigns and statistical behavior, E4B GRPO quality acceptance,
+reserved holdout, reverse adapter import/recovery, zero-paging qualification and
+hosted CI remain open. CUDA implementation remains outside scope. No numerical
+tolerance was changed, reserved holdout scored, or acceptance PASS issued.
+
+Evidence is sealed in `training-rmsnorm-investigation`, with receipt
+`training-rmsnorm-archive-receipt.json`. The archive binds the preceding
+`categorical-rollout-investigation` manifest
+`6ee92bb24743996991a7e902a137245c7a8ecf1a2f6d6ffef047aeb30160e6d2`.
+Raw captures, controls, source/binary snapshots and excluded attempts are retained.
+<!-- training-rmsnorm-results:end -->
+
+### 2026-09-10 backward isolation and full GRPO recipe coverage
+
+The next numerical control captures selected RMSNorm inputs and upstream
+loss derivatives from the unchanged HF CPU F32 E2B all-linear first step.
+All **552 adapter gradients remain byte-identical** to the retained reference,
+so the hooks do not alter this captured training computation. The control
+covers 20 norm operations in layers 0, 17 and 34 and the final norm. Frozen
+operations without a backward graph are not included.
+
+Both production Metal RMSNorm backward reductions were replayed verbatim, each
+with fast and precise compilation. The default SIMD-group kernel's worst
+relative L2 error across those inputs is **1.3448e-7 versus isolated HF autograd**
+and **7.6377e-8 versus an independent F64 derivative**. There are no sign
+reversals against the F64 control. Precise compilation improves 16/20 cases
+against F64, but is not uniformly better; it is not established as a fix for
+the outstanding trajectory divergence. The rollback tree was checked separately
+and is not confused with the default SIMD-group dispatch. Native serial F32
+emulation reaches 8.1908e-7 error; that emulation is not a native-runtime capture.
+No RMSNorm backward implementation was changed on this evidence.
+
+The MLX campaign runner now exposes two explicit, pinned recipe profiles:
+
+| Profile | Targets | Group | Completion budget | Sequence length | Learning rate | Advantage epsilon |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `qv-multitoken` (default) | `peft-qv` | 2–8 | 2–32 | 128 | 1e-7 | 1e-4 |
+| `all-linear-single-token` | `text-all-linear` | 16 | 1 | 160 | 5e-8 | 1e-8 |
+
+Select the full profile with
+`--recipe-profile all-linear-single-token --group-size 16 --max-completion-tokens 1 --categorical-diagnostic`
+on `run_gemma4_grpo_boolq_mlx_multitoken.py`, alongside its existing attested
+runtime, dataset, seed adapter and Antfly campaign arguments. It requires
+categorical reports, explicit all-linear targets and the pinned temperature 2,
+top-p 1, top-k 32 policy. Profile values flow through materialization checks,
+row admission, model target selection, physical padding, advantages, AdamW and
+the output contract. Full-profile results remain diagnostics and cannot publish
+statistical parity or production acceptance. The historical default is retained.
+
+Validation: **760 Gemma4 Python tests passed**. Contract fixtures exercise both
+profiles, shuffled duplicate completions, failed-quality diagnostic evidence,
+recipe mismatches, fixed group/token budgets and the 159-token prompt boundary
+that reserves one position in a 160-token sequence. Source-bound probes execute
+the production padding functions, optimizer factory and nested compiled MLX
+training loop for both profiles. All eight mixed/all-skipped and trace/native
+cases pass. Mixed groups produce two admitted Adam updates with weights and
+complete optimizer state byte-identical to their controls. All-skipped groups
+leave weights, optimizer step and KL coefficient unchanged. Model scoring and
+gradients are controlled in these loop probes; they do not establish real-model
+GRPO gradient or quality acceptance. An initial probe's incorrect expected tensor
+shape failed before training; its source and log remain excluded and retained.
+
+No compiled Zig/Metal source changed in this follow-up. The sealed precise
+RMSNorm build, its 333 Metal / 284 native test passes and the 12-cell diagnostic
+matrix remain applicable. E2B q/v and both independent all-linear trajectories
+still fail; E4B q/v's measured HF CPU F32 case remains within bounds. Full
+optimizer-backed real-model categorical campaigns, E4B GRPO quality acceptance,
+stock BF16/locked HF numerical qualification, native E4B coverage, reverse adapter
+import/recovery, zero-paging qualification and hosted CI remain open. The reserved
+254-example holdout remains untouched; CUDA implementation remains out of scope.
+
+Evidence: `.benchmark-results/gemma4-qualification-20260909/recipe-profile-status.json`,
+`rmsnorm-backward-simdgroup-probe/report.json`, `recipe-profile-python-tests.log`
+and the two `recipe-profile-mlx-update-state-*.json` reports. The separate
+`backward-and-recipe-investigation` archive binds the previous
+`training-rmsnorm-investigation` manifest
+`1c6f93b015d1a86b81012fcc86a94c3c9f422c952b112c55f85c9d24d94e1a13`.
+
+### 2026-09-10 optimizer-backed GRPO integration and failed-run evidence
+
+The retained all-linear/group-16/one-token recipe was exercised on original
+training prefixes and the first two fresh diagnostic evaluation rows. These
+small integration cases are not the 1960-row training / 256-row diagnostic
+campaign and do not replace the reserved acceptance holdout. Learning rate,
+clipping, sampling, reward computation and quality thresholds are unchanged.
+
+The first two training groups have no within-group reward variation. The CLI
+correctly returns `NoGrpoLearningSignal`. A 16-group prefix instead completes
+two optimizer steps, skips 14 zero-variation groups and then fails the absolute
+evaluation gate: mean reward 0.46875 and positive-reward group rate 0.5, below
+the unchanged 0.75 group-rate minimum. This exposed an evidence-retention defect:
+the terminal evaluator returned before `grpo_report.json` could be written.
+
+The GRPO loop now writes the evaluation and training summaries before returning
+the quality error. Accepted-adapter publication requires **both** absolute and
+baseline-relative gates. A real rerun verifies two optimizer steps in the saved
+report, `evaluation.passed=false`, `trained_adapter_dir=null`, and no
+`adapter-trained` directory. Reward traces, KL-controller traces and evaluation
+metrics are byte-identical before/after this control-flow change. The child
+still returns `GrpoEvaluationGateFailed`; neither the threshold nor the adapter
+publication gate was bypassed.
+
+Required-device Metal Debug: **333 passed, 2 skips**; native-only Debug:
+**284 passed, 26 skips**. ReleaseFast completes with binary SHA256
+`2420d0f9c1956b9dcf98e27a46232d750a9a62bbc9f7ff6bdfdf5b4920b9744a`
+and compiled patch SHA256
+`c9c091579c6dbd338f73181937e8dab4c4b5f49c656060d2cb80b78c68853036`.
+The numerical kernels are unchanged from the prior RMSNorm matrix. The real
+E2B rerun finishes in 58.37 diagnostic seconds, with sampled peak RSS 10,093,328
+KiB and no growth from 2,101.81 MiB existing swap. This is not zero-paging
+qualification or a performance result.
+
+The production MLX loader now binds the original training manifest and the
+separately materialized evaluation manifest through
+`--evaluation-dataset-manifest`. It checks each source manifest independently,
+requires matching dataset revision, tokenizer and dependency identities, checks
+cross-source disjointness, and records both manifest digests and selection
+policies. The 128-token training admission limit remains distinct from the
+160-token evaluation admission and physical execution lengths. No rows or
+source manifests are relabeled to imply a new materialization.
+
+Real serialized reports also exposed fixture gaps: categorical sampling includes
+an algorithm and stream-derivation identity, F32 clip bounds serialize as
+0.20000000298023224, and omitted `normalize_advantage` serializes as null with a
+true default. The loader now checks these actual representations and rejects
+unknown sampling identities, altered clip values and explicit false advantage
+normalization. `failed-quality-gate` is admitted only as diagnostic evidence.
+When an explicit failed quality summary has no accepted adapter, diagnostic
+replay/rollout may proceed but adapter-vector parity remains unavailable; a
+missing adapter cannot be silently accepted for a successful quality report.
+
+The first MLX preflight correctly failed source attestation: the retained source
+was an extracted archive, and Git reported the parent Antfly revision. A fresh
+archive fetched from the official pinned MLX-LM commit matches the retained
+archive SHA256
+`67e1a52f9b86551a24eab1aa2681c26a391819925bb10d14792b96a88303ebc7`.
+`--mlx-lm-source-archive` now supports that explicitly pinned archive, verifying
+all 212 source files and the complete directory inventory. Unknown revisions,
+changed archives/files, symlinks, escaping members and generated bytecode caches
+are rejected. Archive execution suppresses bytecode writes. The existing Git
+checkout path remains available. Installed MLX 0.31.2 runtime files also match
+the exact pinned MLX and MLX-Metal wheel contents; no Git state was modified.
+
+<!-- full-recipe-integration-results:start -->
+Final Python validation: **766 tests passed**, with source hashes verified
+unchanged across the suite. The actual failed-quality E2B report passes the
+production loader using both original dataset manifests and no accepted adapter.
+
+The matched stock-BF16 MLX run passes wheel/source/dataset/report admission but
+stops after 157.99 seconds at the **2 GiB free-disk guard**. Its last sample has
+1,874,395,136 free bytes (1.75 GiB), below 2,147,483,648. Sampled peak RSS is
+5,428,704 KiB, below 16 GiB. Swap grows 970.19 MiB from 2,101.81 MiB, below the
+1 GiB growth cap; the disk limit triggers first. No completed MLX campaign
+result exists. The full Python suite starts more than 100 seconds after this
+model process exits, so it does not cause that resource stop. No guard was
+relaxed, incomplete capture promoted, or statistical/quality PASS emitted.
+
+Current disk headroom prevents further admitted model runs. The inference
+`.zig-cache` occupies about 40 GiB (39 GiB in object entries), but cache/evidence
+preservation constraints require approval before deletion. Existing binary,
+source and raw diagnostic evidence are retained independently. Cache cleanup
+alone would not satisfy the separate zero-paging qualification requirement.
+
+The new `full-recipe-integration-investigation` archive retains the source,
+binary, tests, original failed attempts, failed-quality reports/traces, source
+archive/wheel attestations, and MLX resource samples. It binds the previous
+`backward-and-recipe-investigation` manifest
+`6619dfe1d664979ae71d6290f347e5fcc1b1f67c938da5d76adf96cf29441f2d`.
+Full independent numerical parity, complete E4B GRPO quality/statistical
+acceptance, native E4B coverage, locked HF/stock BF16 qualification, accepted
+adapter recovery, reserved holdout, zero-paging performance/memory and hosted CI
+remain open. CUDA implementation remains outside scope.
+<!-- full-recipe-integration-results:end -->
+
+### 2026-09-10 parity resume: observable MLX attempts
+
+The disk preflight still reports approximately 1.3 GiB free, below the unchanged
+2 GiB diagnostic reserve. No further model job was launched and the request to
+remove the approximately 40 GiB inference build cache remains pending. The
+retained source, executable and failed-run evidence remain available in the
+separate `full-recipe-integration-investigation` archive.
+
+The MLX campaign now flushes structured progress events to stderr before input
+and runtime validation, provenance hashing, model loading/materialization,
+adapter installation, reference scoring, rollout, and optimizer updates. Events
+include elapsed time, lane and group where applicable. They do not constitute
+completed results or acceptance evidence. This addresses the empty log from the
+prior resource stop; its exact execution stage remains unknown.
+
+The retry wrapper
+`.benchmark-results/gemma4-qualification-20260909/run_full_recipe_mlx_stage_retry.py`
+requires a distinct attempt suffix and creates log/execution artifacts exclusively,
+preserving previous failures. It retains the 900-second, 16 GiB RSS, 1 GiB swap
+growth and 2 GiB free-disk limits and records which resource limit triggered.
+The focused campaign/source-attestation suite passes **27 tests** after the
+logging change; `git diff --check` passes and no unresolved conflict paths exist.
+The earlier 766-test suite applies to the previously sealed source revision.
+No numerical tolerance, optimizer computation, quality threshold or publication
+gate changed. Full numerical and E4B GRPO acceptance gaps remain open.
+
+### 2026-09-10 approved cache cleanup and completed E2B GRPO comparison
+
+Explicitly approved removal of `zig/pkg/inference/.zig-cache` recovered
+42,420,445,184 bytes (39.5 GiB). The preserved executable and separate archive
+hashes were checked before deletion. Other caches, source, models and diagnostic
+evidence were retained. `approved-inference-cache-cleanup.json` records the action.
+
+The first resumed MLX attempt was stopped when review found final result
+serialization still dereferenced an absent accepted adapter. The nullable digest
+now matches failed-quality admission; an advertised checkpoint must still exist.
+The next attempt reached its first optimizer update and exceeded the unchanged
+1 GiB swap-growth guard. Both excluded attempts and their distinct causes remain
+recorded.
+
+`--completion-execution sequential` now evaluates each completion's gradient
+before proceeding to the next. Accumulation order, clipping and one optimizer
+update per admitted group are preserved. The default remains `compiled-group`.
+Source-bound controls cover both recipe profiles and modes: mixed/skipped cases
+retain exact Adam state, and a nonlinear model's weights, optimizer state and
+metrics are byte-identical across eight updates (192 compared arrays).
+
+The real E2B stock-BF16 sequential comparison completes in 365.17 diagnostic
+seconds with sampled peak RSS 8,926,896 KiB and 0.13 MiB swap growth from
+3,383.25 MiB existing swap. Replay and native rollout both match all 256 Antfly
+training completion tokens, update at group indices 10 and 14, skip 14 groups,
+and reject none for KL. Final report serialization succeeds with no accepted
+Antfly adapter. This closes the execution/evidence gap for this small case.
+
+Held-out behavior still differs: MLX mean reward is 0.4375 versus Antfly 0.46875;
+both have top-ranked reward 0.5 and positive-group rate 0.5. MLX's evaluation
+token difference is already present at baseline. Its post-training KL loss is
+6.8528961565e-5 versus Antfly 1.9728758904e-10. This result is explicitly
+`categorical-diagnostic-only`, with no adapter-vector, quality or statistical
+parity claim. It uses 16 original training rows and two fresh diagnostic rows.
+
+The optional `--activation-mode aligned-f32` uses the retained numerical
+comparison method: F32 text/per-layer input embeddings with frozen BF16 weights.
+It is admitted only for categorical diagnostics. Its first sequential attempt
+stops at the swap guard during backward; `--gradient-checkpointing` exposes the
+pinned MLX-LM layer helper for a further bounded attempt. Source hash and execution
+options are recorded. Stock BF16 and aligned F32 remain distinct reference lanes.
+
+<!-- cache-cleared-grpo-final-results:start -->
+The optional `--shared-single-token-scoring` path gathers one-token completion
+scores from the shared causal predictor row, retaining physical batch 1 and
+sequence length 160. BF16/F32 causal-model controls match all 96 selected scores
+exactly at prompt lengths 1, 17 and 159 while reducing 16 scoring forwards to one.
+Multi-token input is rejected. The original per-completion path remains the
+default, and real training retains its differentiable-rescore error checks.
+
+With shared scoring and pinned checkpointing, the aligned-F32 E2B comparison
+completes in 130.94 seconds, with sampled peak RSS 8,150,368 KiB and no growth
+from 2,546.44 MiB swap. Replay and native rollout both match all 256 training and
+32 evaluation completion tokens, the two updates, 14 skips, and reward metrics.
+Native-rollout KL loss is 2.0152669190e-10 versus Zig 1.9728758904e-10; replay is
+1.8271487151e-10. Maximum differentiable-rescore error is 2.4587e-7 in native
+rollout and zero in replay. The E2B quality gate still fails in both frameworks,
+and no accepted E2B adapter exists for vector comparison. This closes the
+observed token/behavior discrepancy for this small precision-aligned case.
+
+The original E4B 16-group integration reaches terminal two-row evaluation but
+hits the 180-second limit while serializing a candidate adapter. A partial
+SafeTensors file remains inside an unpublished staging directory. Gemma4 bundle
+publication now uses the existing buffered SafeTensors writer instead of issuing
+an individual write for each four-byte float. The writer preserves tensor bytes,
+aligns the payload and flushes/syncs before atomic publication. Post-publication
+change validation reuses canonical tensor identity, so metadata, order and
+supported PEFT namespace differences cannot make unchanged weights appear trained.
+
+The corrected E4B run completes in **155.52 seconds**, with sampled peak RSS
+15,649,888 KiB and no growth from 2,634.44 MiB existing swap. It performs all
+16 optimizer updates, writes its complete GRPO report and publishes the adapter.
+Mean reward improves from 0.15625 to 0.1875, top-ranked reward is 0.5,
+positive-group rate is 1.0, and KL loss is 7.4133022281e-6. Both absolute and
+baseline-relative gates pass for these **two diagnostic evaluation rows**.
+Training, KL-control and final evaluation traces are byte-identical to the prior
+attempt. Baseline traces differ only in their configuration digest, which binds
+the distinct baseline trace/exchange paths under each output root. Evaluation
+metrics are exactly equal. This is not the full 1960/256/reserved-holdout campaign.
+
+ReleaseFast binary SHA256:
+`707daaa63bbf578c487ab7efc5d6024b93a1076c92cac406f050356383ff4bf0`;
+compiled patch SHA256:
+`e2819ef44745441febae8966207e19b2b9fba02fd7747f895a45feccfe74d01a`.
+E4B GRPO report SHA256:
+`34f4de9d571d483fe9c8bb3c67a87ed650108c845544f778b3a57431341ee975`;
+published adapter checkpoint SHA256:
+`7cef793db70bcea9afbc209b2b2508934f2dc38beb683c6db85961f6f91e04ca`.
+
+The matched stock-BF16 E4B MLX comparison completes in 672.84 seconds, sampled
+peak RSS 8,512,192 KiB, with no growth from 2,546.44 MiB swap. Across 686 adapter
+tensors, replay delta cosine is 0.9983599 and vector relative-L2 error is
+0.0572903 (5.73%), within the existing bounded diagnostic check. Native rollout
+passes the small absolute quality gate with mean reward 0.1875 and positive-group
+rate 1.0. Tokens still differ: mean training multiset recall is 0.8828125 and
+evaluation recall is 0.875. Evaluation KL loss is 2.3552683878e-4. Classification
+remains `categorical-diagnostic-only`.
+
+The aligned-F32 E4B comparison completes as two independently guarded processes:
+`--execution-lane trace-replay` and `--execution-lane native-rollout`. Each restores
+the same initial adapter and fresh optimizer; explicit categorical sampling seeds
+are unchanged. Individual lanes require categorical diagnostic mode, emit
+`diagnostic-lane-completed`, and use null for unmeasured lane results/checks.
+The default `both` behavior is preserved. The earlier combined attempt was
+explicitly stopped because its projected total exceeded the 900-second guard;
+it is excluded and retains its stop reason. No time or memory guard was raised.
+
+Replay completes in 549.17 seconds (6,914,016 KiB sampled peak RSS, 484.50 MiB
+swap growth from 2,473.69 MiB); independent rollout completes in 546.92 seconds
+(8,806,928 KiB RSS, no growth from 2,902.19 MiB swap). Both complete all 16 updates,
+reject no groups for KL, and pass the unchanged absolute and baseline-relative
+checks on the two diagnostic evaluation rows. The pairing receipt verifies exact
+model, data, seed-adapter, source and runtime identities, plus identical baseline
+results apart from timing.
+
+Across **686 adapter tensors**, aligned replay update relative-L2 error is
+**0.0002383601 (0.023836%)**, versus stock BF16's 5.73%; cosine is
+**0.9999999728**, maximum absolute delta difference is 6.9362e-8, and update norm
+relative difference is 5.8850e-7. This is a comparison on forced Antfly completion
+traces; independent-rollout adapter-vector distance is not measured.
+
+Independent MLX rollout matches **255/256 training tokens and all 32 evaluation
+tokens**. The only mismatch is group 0, prompt index 14, completion index 4:
+MLX token 2717 versus Zig token 507; both receive zero reward. It occurs before
+any optimizer update. The corresponding forward logits were not captured, so
+this does not establish a rounding or sampling-boundary cause. Subsequent sampled
+groups match in both replay and independent rollout. Mean evaluation reward is
+0.1875 versus baseline 0.15625 in both frameworks, top-ranked reward is 0.5,
+and positive-group rate is 1.0. MLX replay/native KL losses are
+7.4210485168e-6 / 7.4380689799e-6 versus Zig 7.4133022281e-6.
+Maximum differentiable-rescore error is zero in replay and 9.5367e-7 in independent
+rollout. No exact-token or general numerical parity claim is issued.
+
+The newly published E4B checkpoint also passes a fresh stock-PEFT load check:
+343 target modules, **686 exact F32 tensors**, and 343 nonzero trained B tensors.
+The check maps the pinned HF text weights and loads the Python-translated adapter
+using unmodified PEFT; unused modality weights remain meta. It completes in
+18.14 seconds with sampled peak RSS 3,661,840 KiB and no swap growth. This verifies
+loading and values, not forward quality, reverse import, or checkpoint recovery.
+See `cache-cleared-e4b-aligned-lane-comparison.json`,
+`cache-cleared-e4b-token-difference.json`, and
+`cache-cleared-e4b-published-stock-peft/report.json`.
+
+Required-device Metal validation passes **334 tests with two skips**; native-only
+validation passes **285 with 26 skips**. These include buffer-boundary/signed-zero
+preservation and unchanged-weight rejection despite header/order/namespace changes.
+An initial test fixture misused an ownership-taking writer and aborted; its source
+and log are retained, and the corrected fixture passes. The final Python suite
+passes **770 tests in 70.47 seconds**, with identical full-checkout hashes before
+and after execution and matching Python source hashes. The earlier final-suite
+attempt had one harness error while this document was being edited; that harness
+checks full-checkout identity, making the edit a likely cause, but its original
+child stderr was not retained. The isolated test and frozen-checkout full rerun
+pass. The excluded attempt, timestamp evidence and subsequent logs remain archived.
+An earlier Python attempt also required host access for a localhost-bind test.
+No numerical tolerance or quality threshold was relaxed.
+
+All these model runs are local diagnostics with pre-existing swap. Full independent
+numerical trajectories, full E4B GRPO/statistical acceptance, accepted-adapter
+recovery, native E4B coverage, locked HF/stock BF16 qualification, zero-paging
+memory/performance and hosted CI remain open. The reserved holdout is untouched.
+See `cache-cleared-status.json` and distinct execution reports under
+`.benchmark-results/gemma4-qualification-20260909/`. The completed evidence is
+sealed in `/Users/tim/Documents/af/antfly-qualification/20260909/cache-cleared-grpo-investigation`,
+with a per-file SHA-256 manifest, the final executable/source, the exact pre-lane
+runner source used by the completed E2B aligned/E4B stock comparisons, and the
+published E4B/translated PEFT artifacts. `cache-cleared-archive-receipt.json`
+records the manifest hash. The prior integration archive remains unchanged.
+<!-- cache-cleared-grpo-final-results:end -->
+
+### 2026-09-10 MLX-first predictor and common-optimizer-state investigation
+
+MLX is the active on-Mac numerical reference. HF/PEFT comparisons and CUDA work
+are deferred by request. This section supersedes the preceding unmeasured
+independent-rollout adapter distance and unexplained initial-token mismatch.
+It adds diagnostic evidence; full statistical acceptance remains open.
+
+The MLX campaign can now optionally retain the first training predictor row with
+`--capture-initial-training-logits`, admitted only in categorical diagnostic mode.
+It captures the original logits, prompt IDs/index, source identity, physical
+sequence length and predictor position, without changing sampling. Later
+completion forwards cannot overwrite it. Final adapter-vector comparison now
+also runs for independent rollout when an accepted Antfly adapter is available.
+Neither addition changes numerical tolerances or the diagnostic classification.
+Runner SHA256: `147082eff0626402a5b50147f37b6fd60fab8e58be2597976a088bb6074b91ab`.
+
+An isolated snapshot of 3837 Zig-tree source files adds a single diagnostic hook
+at the original E4B training predictor. It writes the raw F32 row, prompt, copied
+PRNG draws and production-sampled tokens, then exits with the deliberate
+`DiagnosticPredictorCaptured` error before the first update. Shipping Zig source
+and the previously verified ReleaseFast binary are unchanged. The probe's
+40.26-second run reproduces all 16 original group-zero tokens and all 16 random
+draws exactly. Its intentional exit is capture evidence, not a training pass.
+The first sandboxed build failed to create a compiler-cache manifest; the same
+source/arguments built with host access. Both build records are retained.
+
+The refreshed independent aligned-F32 E4B MLX lane completes in 554.99 diagnostic
+seconds, with sampled peak RSS 6,778,400 KiB and no growth from 2844.69 MiB swap.
+It completes 16 updates, matches **255/256 training and 32/32 evaluation tokens**,
+and passes the unchanged quality minimums on the same two diagnostic rows:
+mean reward 0.1875, top-ranked reward 0.5, positive-group rate 1.0, and KL loss
+7.4380689799e-6. Across **686 adapter tensors**, independent update-vector
+relative-L2 error is **0.0404199885 (4.0420%)**, cosine **0.9991838985**, and maximum
+absolute delta difference **5.78684e-7**. The prior replay result remains
+**0.023836%** on forced Zig completion traces. Independent and replay results
+measure different trajectories and are reported separately.
+
+The first refreshed MLX attempt stopped after 14.50 seconds at the unchanged
+1 GiB swap-growth guard, before any update or predictor capture. It is excluded.
+After the host settled, one retry completed under the same 900-second, 16 GiB
+RSS, 1 GiB swap-growth and 2 GiB free-disk limits. Logs and execution records for
+both attempts are preserved.
+
+The captured initial row identifies the one-token mismatch precisely:
+
+| Initial predictor, group 0 / prompt 14 | Zig | Aligned-F32 MLX |
+| --- | ---: | ---: |
+| Token 507 logit | 15.6763658524 | 15.6764316559 |
+| Token 2717 logit | 15.6764192581 | 15.6764259338 |
+| Rank 24 / rank 25 (one-based) | 2717 / 507 | 507 / 2717 |
+| Completion 4 token | 507 | 2717 |
+
+Both have the same top-32 set, but these adjacent candidates swap order. The
+identical random draw **0.969369504498047** lands in rank 25's interval in both
+runs, approximately **[0.9664584, 0.9712862)**; it is not close to the interval
+boundary. Thus the changed token is caused by the near-tied logits exchanging
+rank, rather than a PRNG or CDF-boundary discrepancy. Full-row relative-L2 error
+is **5.42315e-6**, RMS difference **3.23678e-5**, and maximum absolute difference
+**1.68800e-4**. The row has 262144 logits, 85 prompt tokens, and physical sequence
+length 160. Verbatim production Zig sampling functions and the Python sampler
+both reproduce all 16 recorded draws/tokens on each captured row. No logit
+rounding or tie tolerance was introduced to force token agreement.
+
+A separate E2B all-linear diagnostic starts both implementations from identical
+**MLX step-two weights, Adam first/second moments, and optimizer step 2**. The
+production Zig CLI generates valid epoch-boundary checkpoints for a three-epoch
+run. The retained epoch-two checkpoint supplies its original fingerprint,
+trainer/RNG counters and zero gradient accumulators; only its weights and moments
+are replaced with verified MLX tensors. The normal `--resume` path validates it
+and executes exactly epoch three. No oracle admission check is bypassed.
+
+The original first training example is prepared with physical length 154 and
+71 supervised tokens; its IDs and labels exactly match the retained numerical
+fixture. A distinct one-record evaluation fixture satisfies CLI disjointness.
+This is numerical instrumentation, not a quality data set. Both frameworks use
+all-linear/r16/a32, learning rate 0.001, AdamW betas 0.9/0.999, epsilon 1e-8,
+weight decay 0.01, gradient clip 1, accumulation 1, seed 42 and F32 activations
+with frozen BF16 base weights. MLX restores and checks every weight/moment array
+and the step counter before updating, with pinned layer checkpointing.
+
+Across **552 adapter tensors**, the common-state one-update comparison is:
+
+| Quantity | Zig versus MLX |
+| --- | ---: |
+| Loss | 0.4549368322 versus 0.4549361765 |
+| Absolute loss difference | 6.55651e-7 |
+| Update-vector relative-L2 error | **0.0006823248 (0.0682325%)** |
+| Update cosine | 0.9999997672 |
+| Final weight relative-L2 error | 0.0001011656 |
+| Adam first-moment relative-L2 error | 0.0001701098 |
+| Adam second-moment relative-L2 error | 6.97587e-5 |
+
+The normal Zig resume finishes in 11.79 seconds with sampled peak RSS
+8,709,456 KiB and no swap growth. MLX finishes in 14.24 wrapper seconds with
+6,561,776 KiB RSS and 266.50 MiB swap growth. Both start with existing swap and
+remain excluded from memory/performance qualification.
+
+The largest coordinate difference is layer 27 `gate_proj` LoRA B at canonical
+flat index 192840. Its first moment becomes -7.44368e-9 in Zig versus -4.08135e-8
+in MLX, from identical initial state. Applying the AdamW equation to each run's
+own retained moments reproduces its final weight within 2.7e-9, versus the
+observed cross-framework weight difference 7.27151e-4. This points to sensitivity
+to differences in very small backward values. It is an algebraic diagnostic,
+not proof of global optimizer parity; raw Zig gradients are not captured by
+the normal resume path. The smaller common-state error also supports accumulated
+trajectory drift as a contributor to the independent multi-step discrepancies.
+
+Evidence lives under `.benchmark-results/gemma4-qualification-20260909/`:
+`mlx-first-predictor-comparison/report.json`, its
+`production-sampler-receipt.json`, `mlx-first-common-state/comparison.json`, and
+`coordinate-diagnostics.json`. Wrappers, source inventory, isolated hook/binary,
+raw tensors, exact initial checkpoint, successful runs and excluded attempts
+are retained. `mlx-first-source-audit.json` records final local validation;
+`mlx-first-archive-receipt.json` identifies the separate sealed evidence archive.
+
+Remaining MLX work is to trace small backward-value differences at common state,
+refresh independent multi-step comparisons after any justified fix, and complete
+the full GRPO quality/statistical campaign. E2B's existing small quality failure
+is still open; E4B's two-row pass does not establish general acceptance. The
+1960/256 multi-seed campaign and reserved 254-example holdout are not consumed by
+these diagnostics. No full numerical-parity or production-ready claim is made.
+
+The final Python suite passes **772 tests in 70.19 seconds**, with identical
+checkout hashes before and after execution and matching Python source digests.
+The unchanged compiled Zig source retains its verified **334 Metal passes / two
+skips** and **285 native passes / 26 skips**. The final source audit confirms
+no unresolved conflicts or whitespace errors.
+
+### 2026-09-10 MLX-first backward-gradient localization
+
+This follow-up measures raw gradients before clipping and AdamW, using the same
+E2B step-two weights/moments/counters and 154-token, 71-supervised-token example
+as the common-state comparison above. All changes are confined to isolated
+source snapshots and diagnostic scripts. Shipping numerical code is unchanged;
+HF/PEFT and CUDA remain deferred.
+
+The first isolated Metal probe captures **552 raw-gradient tensors** immediately
+before clipping. Its resumed checkpoint matches all **2763 prior checkpoint
+arrays bit-for-bit**, including weights, moments, accumulators and counters.
+Raw-gradient relative-L2 error versus the unchanged MLX reference is
+**0.0002645960 (0.0264596%)**, cosine **0.9999999677**, and maximum absolute
+error **0.0001340210**. The previously measured one-update error remains
+**0.0682325%**. The probe completes in 28.20 seconds with sampled peak RSS
+9,534,880 KiB and no growth from 2569.94 MiB existing swap.
+
+At layer 27 `gate_proj` LoRA B, canonical index 192840 (output 12052, rank 8),
+the directly captured raw gradient is **1.29624505e-6** in Zig versus
+**-4.27576566e-7** in MLX. Thus the moment discrepancy observed earlier is
+already present before clipping/AdamW. Across **26,333,184 coordinates**, 2355
+have opposite nonzero gradient signs. Those coordinates contribute 20.43% of
+squared update error. Coordinates whose raw-gradient magnitude is at most
+1e-5 in both implementations contribute **78.90%** of squared update error;
+the largest 20 individual coordinates contribute 24.57%. These are diagnostic
+concentration measurements, not relaxed parity criteria.
+
+A custom identity/VJP tap captures MLX's actual layer-27 LoRA-B reduction
+operands while preserving all **3312 retained reference arrays bit-for-bit**.
+The selected gradient is the sum of 154 products. Their absolute sum is
+0.0014805743; their float64 sum is **-4.27624947e-7**, versus MLX's actual
+**-4.27576566e-7**. MLX's own reduction error is **4.83813e-11**, over 35,000
+times smaller than the **1.72382e-6** cross-framework gradient difference at
+this coordinate. Cancellation is present, but MLX's final summation alone does
+not explain the observed gap. This run completes in 14.18 wrapper seconds,
+with sampled peak RSS 6,375,984 KiB and no swap growth.
+
+Two bounded controls preserve the reference and quality contracts:
+
+- Disabling the selected BF16 backward matrix implementations produces exactly
+  the same 552 raw-gradient arrays and final checkpoint. It establishes no
+  improvement and does not prove those switches changed the active route.
+- Replacing only MLX's GELU VJP evaluation order with the analytic tanh derivative
+  preserves the pinned forward loss. Gradient error changes only from 0.0264596%
+  to 0.0264480%; update error slightly worsens to **0.0682691%**. This modified
+  derivative is an explanatory ablation, not a new stock-MLX reference or fix.
+
+The attempted decomposed Zig GELU backward path fails closed with
+`StrictMetalInterpreterFallback`; no numerical result is admitted from it.
+A subsequent optional LoRA-region operand hook produces no operand capture,
+although its 26.19-second resumed update preserves the original checkpoint
+bit-for-bit. That attempt is excluded from operand analysis. Its source and
+execution records are retained. No strict-execution check is bypassed.
+
+The final isolated probe retains the two inputs of the actual layer-27 LoRA-B
+gradient dot product as additional graph outputs. It completes in **26.20
+seconds**, sampled peak RSS **9,585,232 KiB**, with no growth from 2497.94 MiB
+swap. All **552 raw-gradient arrays and 2763 checkpoint arrays remain bitwise
+identical** to the baseline capture. The initial build's use of a nonexistent
+`Shape.rank` field was corrected to the existing `Shape.rank()` accessor;
+the failed source/log and successful retry are retained.
+
+Comparing the two actual operand sets gives a direct decomposition:
+
+| Measured surface | Zig versus unchanged MLX |
+| --- | ---: |
+| Forward low-rank input relative-L2 error | 3.16683e-6 |
+| Incoming gradient relative-L2 error | **0.0002619351 (0.0261935%)** |
+| Layer-27 LoRA-B raw-gradient relative-L2 error | 0.0003959590 |
+| Zig reduction versus its own float64 product sum, relative-L2 | 2.00123e-7 |
+| MLX reduction versus its own float64 product sum, relative-L2 | 1.93672e-7 |
+
+At the worst update coordinate, the observed gradient gap is **1.72382161e-6**.
+Float64 cross-substitution attributes **1.72475464e-6** to the differing incoming
+gradient, **-8.56542e-10** to the forward operand, and **4.41121e-12** to their
+interaction. Zig's and MLX's own reduction errors are **-3.25184e-11** and
+**4.83813e-11** respectively. These contributions reconstruct the observed gap
+within 1e-15. The numerical discrepancy is therefore already present in the
+backward signal entering this LoRA-B reduction; changing the final summation
+would not address its principal source.
+
+This closes the missing raw-gradient/operand evidence and localizes the next
+investigation to the backward chain feeding that projection. It does **not**
+identify a faulty upstream operator or establish a numerical fix. The tested
+GELU derivative-order change is not promoted. The next useful capture is the
+MLP/normalization backward inputs preceding this signal, followed by independent
+multi-step reruns only after a justified implementation change. Full GRPO
+acceptance remains separate and open; the reserved holdout is untouched.
+
+Reproduction wrappers and results are under
+`.benchmark-results/gemma4-qualification-20260909/`: `run_mlx_backward_probe.py`,
+`run_mlx_backward_layer27.py`, `run_mlx_backward_analytic_gelu.py`, and
+`run_mlx_backward_graph_operands.py`, with bounded guard wrappers for MLX.
+`mlx-backward/graph-operands/operand-decomposition.json` binds the actual tensors,
+`mlx-backward/sensitivity.json` records the coordinate analysis, and
+`mlx-backward/capture-identity-final.json` verifies bitwise capture fidelity.
+`mlx-backward-status.json` and `mlx-backward-source-audit.json` summarize scope
+and validation; `mlx-backward-archive-receipt.json` identifies the separate
+sealed archive. All model jobs ran serially under the unchanged guards with
+pre-existing swap; no memory/performance or full statistical claim is issued.
+
+Shipping Zig and Python sources still match the previously validated binary and
+**334 Metal / 285 native / 772 Python** passing-test evidence. Those suites are
+not rerun for isolated diagnostic-only source changes. The new validation is
+real-model execution, exact checkpoint/gradient fidelity, operand reconstruction,
+and a fresh source/conflict/whitespace audit.
+
+
+### 2026-09-10 MLX-first MLP/normalization and loss-head localization
+
+The next common-state E2B diagnostic follows the backward signal through the
+layer-27 MLP and 41 normalization operations (five per layer for layers 27–34,
+plus the final norm). The same step-two checkpoint, 154-token training example,
+71 supervised tokens, recipe and pinned aligned-F32 MLX reference are retained.
+Shipping numerical code is unchanged. This closes a localization question; it
+does not reduce the retained 0.0264596% raw-gradient or 0.0682325% one-update gap.
+
+An isolated graph-output probe retains **216 tensors**. The metadata-only run
+and tensor-capture run both preserve all **552 raw gradients and 2763 checkpoint
+arrays bitwise**. The corrected MLX capture preserves all **3312 original
+reference arrays bitwise**. Node IDs are bound to the captured 10,352-node graph
+and checked before execution. Complete source, node metadata and build identity
+are retained; these hard-coded diagnostic hooks are not shipping code.
+
+Float64 local derivatives use each implementation's actual captured operands:
+
+| Local backward check | Zig relative-L2 error versus own F64 | MLX relative-L2 error versus own F64 |
+| --- | ---: | ---: |
+| Worst of 41 RMSNorm VJPs | 9.87508e-8 | 7.36117e-8 |
+| Layer-27 gated GELU, gate derivative | 1.05803e-7 | 6.54135e-8 |
+| Layer-27 gated GELU, up derivative | 8.27932e-8 | 6.81612e-8 |
+| Layer-27 down projection, including LoRA | 7.16632e-7 | 7.16029e-7 |
+
+The down-projection F64 control reads the exact BF16 base tensor and common
+LoRA weights. All captured normalization weights agree exactly. These local
+errors are far smaller than the roughly 2.6e-4 incoming-gradient discrepancy;
+no MLP or normalization arithmetic change is supported by these measurements.
+
+The final normalization's incoming gradient already differs by **5.17239e-5**.
+An isolated MLX loss-head replay reproduces its captured gradient bitwise. Feeding
+the same Zig final-normalized inputs to MLX leaves **5.06671e-5** relative error
+against Zig, while changing only the inputs within MLX has **7.86022e-6** effect.
+The remaining head discrepancy therefore cannot be attributed solely to forward
+activation drift.
+
+A CPU F64 control streams the exact tied BF16 vocabulary weights in 8192-row
+tiles, applies the configured softcap, stable cross-entropy and backward
+projection over all **262,144 vocabulary entries and 71 supervised rows**:
+
+| Loss-head backward control | Relative-L2 error versus F64 |
+| --- | ---: |
+| Zig on its own captured inputs | **5.77420e-5** |
+| MLX on the same Zig inputs | **8.38806e-6** |
+| MLX on its own captured inputs | **8.03859e-6** |
+| F64 effect of changing only the captured inputs | 6.61257e-6 |
+
+This makes the **tiled loss-head backward path** the next concrete target:
+separate raw-logit projection, softcap/softmax derivatives and BF16
+vocabulary-projection accumulation on identical inputs. It does not yet
+identify which of those operations needs a fix, or establish that fixing this
+head alone will close independent training-trajectory parity.
+
+Instrumentation failures are retained and excluded appropriately. The initial
+MLX export failed on BF16-to-NumPy serialization. Casting only exported values
+to F32 resolved that issue, but the first broad input taps regrouped the shared
+MLP input gradients and changed 2652 reference arrays. Removing gate/up input
+taps restored full bitwise fidelity. Only the first broad run's loss-head
+control is reused: all five final-norm operand/weight arrays are verified
+bitwise identical to the corrected capture, and the MLX head replay is exact.
+The first CPU F64 script had a syntax error before execution; its corrected
+retry is the admitted result.
+
+The Metal stage run completes in **26.17 seconds**, sampled peak RSS
+**8,880,304 KiB**, without growth from 2489.94 MiB existing swap. The corrected
+MLX run completes in **14.26 seconds**, sampled peak RSS **7,623,392 KiB**,
+without growth from 3338.88 MiB swap. The earlier broad MLX capture/head control
+stays within its guard but grows swap by **984.94 MiB**. The CPU F64 control
+completes in 1.02 internal seconds / 2.03 wrapper seconds; it finishes between
+RSS samples, so its recorded zero sampled RSS is **not memory qualification**.
+All runs remain numerical diagnostics, not zero-paging or performance evidence.
+
+`mlx-mlp-source-audit.json` confirms unchanged shipping source/binary and the
+previous **334 Metal / 285 native / 772 Python** test evidence; these suites
+were not rerun for isolated capture changes. No conflicts or whitespace errors
+remain. The report is `mlx-mlp-status.json`; evidence is sealed in
+`mlx-mlp-investigation`, bound by `mlx-mlp-archive-receipt.json` to the preceding
+`mlx-backward-investigation` archive. Full MLX trajectory parity, broad GRPO
+acceptance and the reserved holdout remain open. HF/PEFT stays deferred and
+CUDA implementation remains outside this scope.
+
+
+### 2026-09-10 compensated loss-head backward fix and E4B trajectory blocker
+
+This follow-up **fixes a loss-head backward numerical defect**, but it does not
+close full MLX parity. E2B improves; E4B improves at steps one and two but its
+independent eight-step comparison worsens. That E4B result remains an explicit
+promotion blocker. The current implementation and all results, including that
+regression, are retained for review.
+
+The standalone probe calls the original Metal runtime's CCE projection,
+statistics, probability-gradient and backward-product implementations using the
+actual E2B final-normalized inputs and tied BF16 weights. Its hidden gradient
+matches the full training capture **bitwise**. At the default 65,536-entry tile,
+relative-L2 error against the full F64 head is 5.77420e-5. Replaying only its
+actual probability gradients through an F64 matrix product leaves an own-reduction
+error of **5.75268e-5**. Logit-projection and softcap/CE effects on the hidden
+gradient are only 2.36480e-6 and 2.59746e-7 respectively. Thus the long backward
+matrix sum dominates this measured defect.
+
+An 8192-entry tile control first reduces common-state raw-gradient error from
+0.0264596% to 0.00151352% and update error to 0.00301196%. That is a localization
+control. The shipping fix retains the existing tile policy and forward math:
+
+- CCE backward tiles wider than 4096 use dedicated precise kernels. SIMD
+  products accumulate 256-term blocks and compensate their merge. Small-row
+  scalar products compensate each term.
+- The kernels reuse the existing threadgroup scratch and output buffers.
+  Ordinary linear backward dispatch, frozen BF16 storage, F16/MPS opt-in
+  experiments, optimizer settings, manifests and quality thresholds remain
+  unchanged. The existing SIMD disable control selects the compensated scalar
+  path, including for larger batches.
+- Both new pipelines are checked during runtime creation and CCE admission,
+  released with the runtime, and identified in existing dense-linear traces.
+
+The final numerical candidate preserves **all raw logits, loss, cached state
+and probability gradients bitwise**. Its own backward-reduction error falls to
+**3.18223e-7 (about 181 times lower)** and total F64 head error to
+**2.43943e-6 (about 24 times lower)**. For comparison, stock aligned-F32 MLX on
+the same captured Zig inputs has 8.38806e-6 error against F64. This is a local
+numerical accuracy result, not a claim of complete MLX training parity.
+
+The initial 1024-term candidate still left excessive small-row cancellation.
+The final kernels pass the exact-zero hidden-gradient fixture with identical
+vocabulary rows for batch sizes **1, 3, 17, 64, 65, 71, 128 and 129**, hidden
+dimension 5 and vocabulary 65,545. This covers both row paths and the nine-entry
+vocabulary tail. Original maximum absolute error reaches **8.08829e-5**; the
+final maximum is **7.04866e-7**, within a 1e-6 allowance for F32 exp/log
+normalization. The same cases pass with SIMD disabled, and traces confirm the
+compensated scalar route. A matching regression is part of the required-device
+Metal suite, which passes **335 tests, 2 optional skips** after integration and
+again after preserving the SIMD control.
+
+The normal production CLI resumes from the identical MLX E2B step-two weights,
+Adam moments and counters. All checkpoint counters/accumulators remain exact,
+and the forward loss stays **0.45493683218955994 bitwise**. Across 552 tensors,
+one-update relative-L2 error falls from **0.0682325% to 0.00969259%**, about
+**7.04 times lower**. This run captures a normal checkpoint, not raw gradients.
+
+Independent all-linear trajectories retain the original initial adapters,
+example, optimizer and pinned aligned-F32 MLX references:
+
+| Model / steps | Raw-gradient error before → after | Update-vector error before → after |
+| --- | ---: | ---: |
+| E2B / 8 | 3.21921% → **1.50205%** | 0.999742% → **0.340642%** |
+| E4B / 1 | 0.00263524% → **0.00175556%** | 0.131526% → **0.0744023%** |
+| E4B / 2 | 0.0227013% → **0.0106306%** | 0.312394% → **0.198880%** |
+| E4B / 8 | 7.96131% → **23.9561%** | 0.776499% → **1.13938%** |
+
+The E4B eight-step worsening is not dismissed or converted into a PASS. Its
+first-step gradient comparison uses the same initial state and improves, as
+does step two, while later independently updated trajectories diverge further.
+At E4B step one, coordinates whose raw gradients are at most 1e-5 in both
+implementations contribute **99.9931%** of squared update error. At step two,
+that fraction is **95.4542%**; **683 opposite-sign coordinates** contribute
+**82.2140%**. These measurements identify tiny-gradient update sensitivity as
+the next investigation target; they do not establish an AdamW arithmetic bug
+or justify changing epsilon, clipping, learning rate or tolerances.
+
+All current model runs complete within the existing 180-second / 18-GiB RSS /
+4-GiB swap-growth / 2-GiB disk guards. Exact resource samples are recorded in
+`loss-head-status.json` and the individual executions. Existing swap remains,
+so these are numerical diagnostics, not zero-paging performance qualification.
+The full 1960/256 multi-seed GRPO campaign and reserved holdout remain unrun;
+previous small GRPO quality results belong to the preceding binary and have
+not been refreshed for this loss-head change.
+
+`loss-head-source-audit.json` binds the final compiled patch and binary to the
+335-test Metal pass. Python source hashes still match the retained **772-test**
+pass; that suite was not rerun. Native math is unchanged. Conflicts and both
+staged/unstaged whitespace checks are clean. Wrapper-description corrections
+are recorded separately in `loss-head-scope-clarifications.json`, preserving
+executed scripts and their hashes. Full evidence and the current PR description
+are sealed in `loss-head-backward-investigation`, with receipt
+`loss-head-archive-receipt.json` binding the preceding `mlx-mlp-investigation`
+archive. HF/PEFT remains deferred; CUDA implementation remains outside scope.
+
+
+### 2026-09-10 tiny-gradient sensitivity and long forward projection fix
+
+This follow-up isolates the E4B sensitivity and improves its independent
+trajectory, but **does not close the full-parity blocker**. The integrated
+change compensates long BF16 forward projections on the existing 32-row SIMD
+route. The independently tested candidate improves E2B as well as E4B; the
+older E4B result before the loss-head change is still better at eight steps.
+
+The diagnostics retain the original example (154 physical / 71 supervised
+tokens), initial rank-16/alpha-32 all-linear adapters, seed 42, BF16 frozen
+weights, aligned-F32 pinned MLX and AdamW settings. No epsilon, learning rate,
+clipping policy, parity tolerance or quality threshold changes. These are
+one-example SFT numerical controls, **not GRPO acceptance**.
+
+**Optimizer sensitivity is measured, rather than inferred from small gradients.**
+An F64 first-step AdamW reconstruction covers all 38,879,232 E4B coordinates.
+Using the actual differing gradients explains essentially all update-error
+energy; the residual is 0.0080604%. A separate actual-GPU replay covers 174,978
+selected coordinates. Each implementation reproduces its own captured weights
+bitwise. Given identical raw gradients and clipping scale, production Metal
+and pinned MLX differ by at most 7.10133e-9 in the resulting weights. This does
+not support changing the optimizer to address the observed trajectory gap.
+
+A causal control replaces MLX's first-step weights and Adam moments with the
+exact shipping Metal state, then runs steps two through eight entirely in MLX.
+That intervention alone produces 1.29441% update error versus uninterrupted
+MLX. Shipping Metal versus the intervened continuation is only 0.180598%.
+This identifies early state sensitivity as a major cause of later divergence;
+the intervened run is explicitly **not a replacement golden reference**.
+
+The instrumented Metal capture is nonperturbing: all 686 raw-gradient arrays
+and 3432 checkpoint arrays match shipping bitwise. Across five worst LoRA-B
+targets, local final-dot errors versus F64 are about 2e-7, while incoming branch
+cotangents differ by about 1.7e-5 to 2e-5. Replacing both implementations' local
+dots with F64 preserves all five worst sign mismatches. The remaining signal
+therefore arrives from upstream. E4B's loss-head replay also matches the full
+capture bitwise; its own backward reduction error is 2.06943e-7. Its measured
+projection and input effects are larger.
+
+**The selected fix reduces forward accumulation error.** Actual E4B layer-19
+MLP down-projection operands have a 10,240-term reduction. Relative-L2 error
+against F64 is 1.61594e-6 for the previous Metal kernel, 1.07763e-6 for stock
+MLX on those same operands, and 2.06726e-7 for the new kernel: a 7.82-fold Metal
+accuracy improvement. The precise kernel forms 256-term SIMD partial sums and
+compensates their merge, reusing the existing 16-KiB staging allocation. Both
+ordinary forward entry points select it when their 32-row BF16 SIMD route is
+active and the input width exceeds 4096. Existing m64 dispatch and SIMD disable
+controls remain intact. Runtime admission, diagnostics and teardown include
+the new pipeline. The cancellation regression covers rows 128, 129 and 154,
+input width 8193 and output width 129, including row, input and output tails.
+Its initial 65-column fixture correctly failed because that width selects the
+unchanged scalar route; the corrected fixture targets the actual SIMD contract.
+
+A separate compensated ordinary-backward candidate improves its isolated F64
+product by 6.44 times but worsens E4B's eight-step update error to 1.14838%.
+It is **rejected and excluded from shipping source**; its negative evidence is
+retained. Local accuracy alone is insufficient for selecting a training fix.
+
+Comparison results, relative-L2 percentages (independent eight-step rows
+refreshed on the final binary; first-step/common-state rows use the validated
+candidate):
+
+| Model / scope | Raw-gradient error before → after | Update-vector error before → after |
+| --- | ---: | ---: |
+| E4B / step 1 | 0.00175556% → 0.00195003% | 0.0744023% → 0.0720630% |
+| E4B / independent step 8 | 23.9561% → 9.45365% | 1.13938% → 0.967597% |
+| E2B / independent step 8 | 1.50205% → 0.458272% | 0.340642% → 0.153303% |
+| E4B / identical MLX step-7 state, one CLI update | not captured | 0.00189961% → 0.00150343% |
+
+The common-state run uses normal admitted checkpoint resume, including all
+weights, moments, counters and zero accumulators. It captures a checkpoint,
+not raw gradients. Its maximum update discrepancy is 8.47154e-7. The earlier
+pre-loss-head independent E4B errors were 7.96131% / 0.776499%; the new forward
+fix **has not fully recovered that older result**. First-step loss also changes
+with the forward fix; this is not a claim of bitwise-preserved forward math.
+
+**E4B MLX reference refreshes now finish within the memory guards.** Three
+initial attempts hit the swap-growth guard and remain recorded as excluded.
+The successful fixed-token diagnostic caches the exact frozen token/PLE
+embedding gathers and releases the unused 5.25-GiB PLE table. The trainable
+per-layer projection remains in the normal forward graph. Both refreshed
+one-step and eight-step runs reproduce all 4116 saved stock-reference arrays
+bitwise, finish in 26.3 / 40.4 seconds, peak at about 5.7 / 6.1 GiB RSS, and
+show no sampled swap growth. This optimization applies only to these fixed
+inputs; it is not general MLX backend or performance qualification.
+
+The final ReleaseFast binary (`ad2b31256bf73c9f03e78d1abcedc0e0030e3539d9cf47bf2043bbd2448b2cdf`)
+passes **336 required-device Metal tests, 2 optional skips**. Fresh independent
+E2B and E4B eight-step runs reproduce the candidate's complete loss history
+and all gradient/update/Adam summary metrics exactly. Their full trace files
+also match the candidate byte-for-byte (`tiny-final-trace-identity.json`).
+E2B completes in 22.24
+seconds at 6.87 GiB sampled peak RSS; E4B completes in 52.55 seconds at
+14.28 GiB. Both pass capture validation and packaging with no sampled swap
+growth. The tested source patch is
+`f9aaba7d198715e19b9283d57f66cef0cfd781b9a2c3f82d009f48c56d4c5226`.
+Python source hashes still match the retained 772-test pass; that suite was
+not rerun. Native math is unchanged and its earlier results remain historical.
+Unresolved-conflict and staged/unstaged whitespace audits are clean.
+
+Final integrated-build verification and immutable evidence bindings are
+recorded in `tiny-gradient-status.json`, `tiny-gradient-source-audit.json` and
+`tiny-gradient-archive-receipt.json`. The archive `tiny-gradient-investigation`
+retains successful and excluded attempts, exact operands, F64 controls,
+optimizer replay, causal intervention, source, binaries and wrapper scope
+corrections, and binds the preceding `loss-head-backward-investigation` archive.
+
+Existing swap remains, so all numerical runs are excluded from zero-paging
+performance qualification. Full MLX trajectory parity, full 1960/256 multi-seed
+GRPO, reserved-holdout acceptance, recovery/native E4B coverage and hosted CI
+remain open. Earlier small GRPO results belong to earlier binaries and have
+not been refreshed here. HF/PEFT remains deferred; CUDA is outside scope.
+
+
+### 2026-09-10 earliest E4B divergence: initial RMSNorm rounding
+
+The next investigation **locates the first remaining differences from identical
+inputs and weights**. The attention input and per-layer-input (PLE) branches
+both first show nonzero forward-output differences at RMSNorm. These are
+small F32 rounding differences; this evidence does not establish a remaining
+normalization formula bug or explain the entire independent trajectory gap.
+Shipping mathematical source, optimizer settings and tolerances are unchanged.
+
+The same fixed example, initial adapters and pinned aligned-F32 MLX are used.
+Both isolated Metal captures retain all **686 raw-gradient arrays and 3432
+checkpoint arrays** exactly; those files also match the shipping-equivalent
+forward candidate byte-for-byte. The successful MLX capture compares all
+**4116 actual arrays** bitwise with the unchanged stock reference and saves
+individual array hashes without duplicating the complete reference file.
+The isolated source snapshots differ from shipping only in graph output
+retention and diagnostic saving. This rules out instrumentation drift before
+interpreting the saved operands.
+
+The first attention RMSNorm and the PLE projection are parallel consumers of
+scaled token embeddings; there is no unique serial order between these branches.
+Measured initial stages are:
+
+| Stage | Metal versus MLX |
+| --- | ---: |
+| Token embedding lookup | bitwise identical |
+| Token embedding scaling | bitwise identical |
+| Scaled frozen PLE token embeddings | bitwise identical |
+| Layer-0 input RMSNorm | 2.17332e-8 relative L2; 19209 / 394240 coordinates differ |
+| PLE base projection and complete projection output | bitwise identical |
+| Scaled PLE projection / RMSNorm input | bitwise identical |
+| PLE projection RMSNorm | 4.15873e-8 relative L2 |
+
+The PLE low-rank intermediate differs by 1.81142e-7 relative L2. Its initial
+LoRA-B factor is zero, so the branch contribution and complete forward
+projection still match exactly. That intermediate remains relevant to the
+LoRA-B gradient; matching forward outputs alone does not prove backward parity.
+
+**Exact-input F64 controls classify the measured errors.** Standalone production
+Metal RMSNorm reproduces the full capture bitwise; stock MLX fast RMSNorm on
+the same input and frozen weight reproduces its full capture bitwise. Their
+errors against F64 are **5.92378e-8 / 5.85825e-8** respectively. All observed MLX
+outputs can be reconstructed with the same two F32 multiplications, using the
+same per-row inverse as Metal for 144 rows, one representable F32 step lower
+for eight rows and one step higher for two rows. This is an inference from
+observed outputs, not direct access to MLX's internal reduction statistics.
+
+The parallel PLE base projection has **7.68566e-7** error against F64 in both
+implementations, with bitwise-identical outputs. It is not a source of their
+initial forward disagreement. PLE RMSNorm errors against each implementation's
+own F64 normalization are **5.25547e-8 / 5.40489e-8**; its input is identical.
+These results are consistent with F32 rounding at normalization, rather than
+a missing weight, scaling factor, or different initial embedding.
+
+**A concrete compiler precision distinction is verified.** Production sets
+`MTLCompileOptions.mathMode = MTLMathModeSafe`, but leaves
+`mathFloatingPointFunctions = MTLMathFloatingPointFunctionsFast`. The observed
+option values are 0/0, consistent with the retained SDK header. A statistics
+probe using these exact options reproduces production bitwise. Changing only
+the function option to `Precise` (0/1) preserves every sum, mean and denominator
+but changes reciprocal square roots in three rows, affecting 5867 output
+coordinates. Replaying those changed inverses reproduces the complete output
+difference. Safe arithmetic and precise math functions are separate settings.
+The explicit-precision control is **not integrated or qualified as a training
+fix**. Earlier statistics probes using `fastMathEnabled = NO` did not reproduce
+production; their outputs and failed fidelity assertion are retained and are
+not interpreted as production internal statistics.
+
+**Causal controls show why the first difference is not the whole explanation.**
+One fixed-input MLX step is repeated with Metal's exact initial RMSNorm output,
+then with both initial RMSNorm outputs matched. The two-normalization control
+uses stopped-gradient output corrections, verifies inputs/outputs bitwise,
+and preserves stock MLX backward through the trainable PLE projection. These
+are labeled interventions, not replacement references:
+
+| MLX comparison with unchanged Metal step | Gradient relative L2 | Update relative L2 |
+| --- | ---: | ---: |
+| Stock MLX | 0.00195003% | 0.0720630% |
+| First input RMSNorm forward output matched | 0.00213512% | 0.0770754% |
+| Both initial RMSNorm forward outputs matched | 0.00204047% | 0.0742755% |
+
+The interventions themselves shift MLX's update by **0.0555848% / 0.0615617%**
+relative to stock MLX. Small rounding differences demonstrably affect updates,
+but matching these two early outputs does not close the overall gradient or
+update gap. A useful next control is matching subsequent layer-boundary state
+and backward inputs, then separating RMSNorm backward and attention/MLP
+arithmetic. Choosing a global precision setting solely to match this initial
+fixture would be premature.
+
+The original MLX attempt stops at the existing **2-GiB free-disk guard** and
+remains excluded even though its completed tensor bytes match the reference.
+Byte-verified independent APFS clones reclaim duplicate physical storage
+without removing logical artifacts. The successful MLX retry completes in
+**28.27 seconds**, at **5.93 GiB sampled peak RSS**, with **504.50 MiB swap
+growth**, within its unchanged guard. The two Metal captures complete in
+**46.55 / 46.49 seconds**; the extended capture peaks at **14.58 GiB RSS** with
+no sampled swap growth. The one-/two-normalization interventions complete in
+**28.27 / 30.33 seconds** with no sampled swap growth. Existing swap excludes
+all of these runs from zero-paging or performance qualification. A recorded
+zero sampled RSS for a short standalone probe means it finished between samples.
+
+Source audit retains the prior **336 Metal / 772 Python** passing evidence;
+these suites were not rerun because shipping code is unchanged. No unresolved
+conflicts or whitespace errors remain. Details, exact source/binary hashes,
+per-array digests, actual operands, F64 controls, excluded attempts and scope
+corrections are bound by `early-divergence-status.json` and sealed in
+`early-divergence-investigation`. Receipt `early-divergence-archive-receipt.json`
+binds the preceding `tiny-gradient-investigation` archive. Full independent
+MLX parity and GRPO acceptance remain open; the reserved holdout is untouched.
+HF/PEFT remains deferred and CUDA implementation stays outside scope.
+
+
+### 2026-09-10 E4B RMSNorm backward: nine matched-input controls
+
+**RMSNorm backward is not the dominant source of the measured step-one drift
+at these nine sites.** The isolated capture and pinned aligned-F32 MLX use the
+same original example, weights, adapters and AdamW settings as the preceding
+investigation. Shipping mathematical source and binary are unchanged. This
+is a one-example SFT arithmetic diagnostic, not a new GRPO acceptance result.
+
+The capture's full raw-gradient, trainer-checkpoint and adapter files match
+the shipping-equivalent baseline byte-for-byte (686 gradient / 3432 checkpoint
+arrays). The MLX hooks preserve all **4116 reference arrays bitwise**. Hooks
+retain each norm's forward input/output and backward input/cotangent/output;
+MLX uses an identity output VJP to retain the incoming cotangent. Every frozen
+norm weight is checked against its exact BF16 model tensor. Standalone
+production Metal backward reproduces all nine captured outputs **bitwise**.
+MLX backward is evaluated using its stock fast-RMSNorm VJP on those same
+operands, with both backends' input sets tested independently.
+
+Relative L2 below is a fraction, not a percentage. The full-path column uses
+each backend's own captured inputs; the matched-input column uses the same
+Metal-captured input, weight and cotangent for both implementations.
+
+| Site | Full-path backward difference | Matched-input Metal–MLX | Metal vs own F64 | MLX vs same F64 |
+| --- | ---: | ---: | ---: | ---: |
+| Final norm | 6.73132e-06 | 6.79590e-08 | 5.18775e-08 | 5.63595e-08 |
+| Shared PLE projection norm | 2.18423e-05 | 6.46254e-08 | 4.74432e-08 | 5.02334e-08 |
+| Layer 0 post-attention | 1.17689e-05 | 6.39263e-08 | 4.92327e-08 | 5.03963e-08 |
+| Layer 0 pre-FFN | 1.20577e-05 | 6.59490e-08 | 5.50858e-08 | 5.83087e-08 |
+| Layer 0 post-FFN | 1.23914e-05 | 7.09921e-08 | 5.20314e-08 | 4.59423e-08 |
+| Layer 0 PLE post-norm | 1.29828e-05 | 6.18428e-08 | 4.71538e-08 | 5.15217e-08 |
+| Layer 0 query norm | 1.28622e-05 | 5.47914e-08 | 4.99253e-08 | 4.98927e-08 |
+| Layer 0 key norm | 1.10933e-05 | 7.08921e-08 | 6.59532e-08 | 7.31955e-08 |
+| Layer 19 post-FFN | 2.02578e-05 | 7.88939e-08 | 5.00042e-08 | 6.68040e-08 |
+
+Replacing both local backward calculations with F64, while preserving their
+actual different inputs/cotangents, retains **99.765–100.152% of the original
+gap's L2 magnitude** across the sites. The difference between the observed
+and F64 gap vectors is **0.272–1.077% of the observed gap norm**. These are
+local counterfactuals, not whole-model F64 training or a trajectory intervention.
+The shared PLE norm has bitwise-identical forward inputs, but its incoming
+cotangent already differs by **2.329e-5** relative L2. Its backward operation
+therefore propagates disagreement received from the rest of the graph.
+
+Production backward uses the ordinary Metal shader library. Replaying its
+same kernels with `mathMode=Safe`, and then additionally precise math
+functions, does **not** consistently improve accuracy against F64. These
+controls are retained; neither setting is integrated as a fix. The next
+bounded target is the layer-19 MLP activation/product chain and its backward
+operands, adjacent to the previously sensitive down-projection gradient.
+That should separate nonlinear amplification of forward differences from
+new local backward error. The current evidence does not establish an
+attention/MLP bug or rule out differences at unmeasured sites/steps.
+
+The Metal capture completes in **46.49 s**, sampled peak RSS **14.36 GiB**,
+with no sampled swap growth; pinned MLX completes in **30.35 s**, peak RSS
+**6.75 GiB**, with **260.37 MiB swap growth**. Both pass their original model
+execution guards. Standalone Metal/MLX controls complete in **6.06 / 2.04 s**
+without sampled swap growth. Existing swap still excludes performance and
+zero-paging qualification. Zero sampled RSS for the short MLX replay means
+it finished between samples. Initial Metal and standalone preflight attempts
+stop before process launch because free disk is below 3 GiB. Storage receipts
+retain byte-verified APFS clones; newly generated F64 scratch is losslessly
+compressed with round-trip SHA verification. The small standalone MLX replay
+uses an explicit output-sized preflight reserve: the unchanged 2-GiB stop
+floor plus 35,323,904 output bytes and 128 MiB margin. Model preflights, runtime
+stop limits, numerical tolerances and quality gates are unchanged.
+
+Reproduction is recorded by `build_norm_backward_capture.py`,
+`run_norm_backward_metal.py`, `guard_norm_backward_mlx.py`,
+`prepare_norm_backward_control.py`, `compact_norm_backward_truth.py`,
+`guard_norm_backward_control.py`, `guard_norm_backward_control_mlx.py` and
+`analyze_norm_backward.py`. `norm-backward-status.json` binds source/binary
+hashes, capture fidelity, per-array reference hashes, arithmetic comparisons,
+execution guards and scope clarifications. The sealed
+`norm-backward-investigation` archive binds the preceding
+`early-divergence-investigation` manifest.
+
+Read-only source/conflict/whitespace checks retain the prior **336 Metal /
+772 Python** passing evidence; suites are not rerun for this documentation
+and isolated diagnostic work. Full independent MLX trajectory parity, full
+1960/256 multi-seed GRPO, reserved-holdout acceptance, recovery/native E4B
+coverage, zero-paging performance and hosted CI remain open. The reserved
+holdout is untouched; HF/PEFT remains deferred and CUDA stays outside scope.
+
+
+### 2026-09-10 layer-19 GEGLU: inherited gradient drift dominates
+
+**The measured layer-19 GELU/product forward and backward arithmetic is
+healthy against matched-input MLX and F64.** This closes another local
+arithmetic evidence gap without establishing full independent trajectory
+parity. Shipping code, optimizer settings, tolerances and quality gates are
+unchanged. This remains one fixed-example, initial-state E4B SFT arithmetic
+work; it is not a GRPO or held-out acceptance campaign.
+
+An isolated source snapshot retains the layer-19 MLP input, gate/up projection
+outputs, GELU/product, down-projection boundary and backward operands. The
+first default-fusion capture stops with `MissingValue` and yields no valid
+training evidence. The diagnostic retry disables the gated-GELU forward and
+backward fusions, FFN-GELU backward runtime region, and gated-FFN graph fusion.
+It passes capture validation and its complete **686 raw-gradient arrays,
+3432 checkpoint arrays, and adapter file match the production-equivalent
+baseline byte-for-byte**. Thus the rollback permits inspection without
+changing the observed step. Default-fusion capture of these added intermediate
+outputs remains a diagnostic limitation; no shipping fusion change is made.
+
+Pinned MLX preserves its original compiled `geglu` function. Identity output
+VJP taps capture its product cotangent and gate/up gradients; all **4116
+reference arrays remain bitwise identical**. Every inspected native output
+replays bitwise with production Metal APIs. MLX compiled product and both
+backward outputs replay bitwise from its actual captured operands. Fused and
+unfused standalone Metal backward outputs also match bitwise on both input
+sets. The separately replayed MLX GELU value is not claimed to be an observed
+internal intermediate of compiled GEGLU.
+
+All relative L2 values below are fractions, not percentages. Matched-input
+controls use the same native-captured gate, up projection and product
+cotangent for both implementations; the report also checks the MLX operand
+set independently. F64 uses the tanh GELU approximation and analytic
+derivative with the captured F32 operands converted exactly to float64.
+
+| Stage | Full-path difference | Matched-input Metal–MLX | Metal vs F64 | MLX vs F64 |
+| --- | ---: | ---: | ---: | ---: |
+| GELU forward (separate MLX replay) | not captured inside MLX fusion | 6.54341e-08 | 6.04774e-08 | 4.90207e-08 |
+| Gated product | 3.58280e-06 | 6.16974e-08 | 6.33876e-08 | 5.41920e-08 |
+| Gate gradient | 2.18682e-05 | 8.00218e-08 | 6.47283e-08 | 6.44983e-08 |
+| Up gradient | 2.26583e-05 | 6.45052e-08 | 6.41552e-08 | 5.42676e-08 |
+
+The MLP input already differs by **3.73456e-6** relative L2; the gate/up
+projections differ by **2.87414e-6 / 3.47006e-6**. The gradient arriving at the
+down-projection output differs by **2.02578e-5**, and the gradient arriving at
+the gated product differs by **1.99507e-5**. Replacing just local GEGLU
+arithmetic with F64 retains **99.9239%** of the product gap's L2 magnitude and
+**100.0153% / 100.0375%** of the gate/up gradient gap magnitudes. The residual
+between observed and F64 gap vectors is **2.2057% / 0.4056% / 0.3667%** of
+those respective observed gap norms. These are local counterfactuals with
+different captured operands retained, not whole-model F64 trajectories.
+
+Holding the other inputs at the MLX values gives this local F64 attribution:
+
+| Changed operands | Gate-gradient difference | Up-gradient difference |
+| --- | ---: | ---: |
+| Forward gate/up values only | 5.35775e-6 | 4.95488e-6 |
+| Incoming product cotangent only | 2.14048e-5 | 2.19122e-5 |
+| Both | 2.18715e-5 | 2.26668e-5 |
+
+The differences are vectors, so these norms are not additive percentages of
+causation. They show inherited cotangent drift dominates this local check;
+forward-state differences add smaller nonlinear effects. Matched-input
+Metal/MLX and F64 comparisons show no sign reversals at the inspected GEGLU
+outputs/gradient coordinates. This does not rule out tiny cancellation-driven
+LoRA-gradient sign changes in later matrix reductions.
+
+An explicit precise-math-function control reduces native GELU forward error
+against F64 from **6.04774e-8 to 4.90089e-8**, and gate-gradient error from
+**6.47283e-8 to 6.16320e-8** on the native operand set. This is a small local
+rounding improvement; it has not been qualified as a whole-trajectory fix and
+is not integrated. The next bounded experiment is a complete layer-19 MLP
+replay with identical boundary input and incoming gradient, including its
+projection products, to isolate the block's contribution from earlier state
+drift. Existing evidence does not identify an attention or MLP formula bug.
+
+The successful Metal capture completes in **40.44 s**, sampled peak RSS
+**14.74 GiB**, with no sampled swap growth. MLX completes in **30.34 s**, peak
+RSS **7.56 GiB**, with **396.56 MiB swap growth**. Standalone Metal/MLX replays
+complete in **6.06 / 2.03 s** with no sampled swap growth. All pass the original
+3-GiB disk preflight and runtime guards; existing swap excludes zero-paging
+and performance qualification. A zero sampled RSS for the short MLX replay
+means it completed between samples.
+
+To restore disk headroom before the build, idle compiler objects receive
+transparent lossless APFS compression. Every original path and logical byte
+is retained and SHA-verified before/after replacement; no cache entry or
+sealed evidence is deleted. A sandbox compression attempt creates an invalid
+zero-length staging file and fails its hash check before replacing the
+original; the host retry succeeds. These storage receipts and the excluded
+capture attempt remain explicit in the evidence.
+
+Reproduction: `build_mlp19_capture.py`, `run_mlp19_metal_unfused.py`,
+`guard_mlp19_mlx.py`, `prepare_mlp19_control.py`, `guard_mlp19_control.py`,
+`guard_mlp19_control_mlx.py`, and `analyze_mlp19.py`. The status, operands,
+compiler controls, execution guards, exact source/binary hashes and per-array
+MLX digests are sealed in `mlp19-investigation`, chained to
+`norm-backward-investigation` manifest
+`f4d3aa58d7abf091fcc86539c9581f17637223d6b7930a7356b19212a3e6f9d1`.
+
+Source/conflict/whitespace audit retains the prior **336 Metal / 772 Python**
+passing evidence; those suites are not rerun because shipping math is
+unchanged. Diagnostic scripts compile. Full independent MLX trajectory
+parity, full 1960/256 multi-seed GRPO and reserved-holdout acceptance,
+recovery/native E4B coverage, zero-paging performance and hosted CI remain
+open. The reserved holdout is untouched. HF/PEFT remains deferred and CUDA
+implementation remains outside scope.
+
+The next producer target is the layer-19 backward residual add (`node 9403`).
+Its two inputs are the MLP-output gradient (`node 9374`) and the residual-path
+gradient (`node 9402`). Existing whole-block evidence shows the add output
+drift is inherited from those branches: the native-boundary cotangent differs
+by **2.02578e-5 relative L2**, while the matched-boundary block remains
+bitwise consistent. The dedicated Metal capture completed in 44.47 s with
+`target_tensor_count=686`; the retained tensors satisfy `node9403 ==
+node9374 + node9402` exactly (`max_abs=0`, `relative_l2=0`). This validates the
+add arithmetic and shows no new producer defect. A fresh guarded end-to-end
+MLX capture now confirms relative-L2 drift of **1.72255e-5** at node 9374,
+**1.88070e-5** at node 9402, and **1.72201e-5** at their node-9403 sum. MLX
+also reconstructs the add bitwise. Node 9374 dominates the absolute error, so
+its scalar-multiply input at node 9373 was traced next. Fresh MLX/Metal results
+show **1.72245e-5** relative-L2 drift at node 9373 and **1.72255e-5** after the
+scalar multiply at node 9374, clearing that multiply. Node 9373 is an exact add
+on both backends. Its layer-20 residual branch at node 9278 has **1.71519e-5**
+drift and dominates absolute error; its attention branch at node 9372 has
+**2.04834e-5** drift but a 3.37x smaller L2 norm. Node 9278 is an exact add on
+both backends. Its feed-forward residual input at node 9237 differs by
+**1.62185e-5** relative L2, while the pre-feed-forward branch at node 9277
+differs by **1.96164e-5**. Splitting node 9237 again shows node 9208 carries
+effectively all absolute disagreement (`difference_l2=1.23803e-5`); the
+per-layer gate branch at node 9236 contributes only `1.23512e-7`. Node 9208 is
+a scalar multiply of node 9207. This continues the upstream drift without
+identifying an incorrect add, scalar multiply, RMSNorm, or MLP implementation.
+
+A fresh final-boundary capture localizes the first measured backward difference
+to the fused loss-head cotangent at node 6350: **6.29780e-6 relative L2** with
+`max_abs=1.21363e-8`. Its scatter and reshape through node 6352 are bitwise
+exact, including zero nonsupervised rows. Final RMSNorm backward reaches
+**6.73134e-6** at node 6354. Existing matched-input controls bound the local
+compensated loss-head error at **2.43943e-6** and final-norm backward near
+`7e-8`; most of the fresh full-path disagreement therefore arrives in differing
+forward hidden states. No backward operation measured in this trace provides a
+justified shipping fix.
+
+The follow-up whole-block replay uses the exact layer-19 boundary input and
+incoming gradient from each backend. On those backend-native boundaries, the
+block's input-gradient difference is **2.20977e-5 relative L2**. Replaying the
+complete gate projection, up projection, GEGLU product, down projection and
+input VJP with the same boundary tensors makes the Metal and MLX block outputs
+bitwise consistent with their respective reference replays; the Metal replay
+also matches the captured native input gradient bitwise. This isolates the
+remaining difference to the boundary state and cotangent arriving from earlier
+layers, rather than the layer-19 block's local arithmetic. The block controls
+complete in **4.09 s / 2.03 s** (Metal / MLX), with no sampled swap growth; they
+are standalone diagnostics and do not qualify full-model parity or performance.

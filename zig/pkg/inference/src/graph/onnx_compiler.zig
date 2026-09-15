@@ -181,7 +181,11 @@ pub fn compilePartition(
     try synthesizeLinearDecompositions(&subgraph.graph, .{ .preserve_gqa = options.semantic_decoder_entrypoint });
     const synthesized_ns = if (profile_enabled) nowNs() else 0;
 
-    var lowered_export = try ml.graph.lower.lower(allocator, &subgraph.graph);
+    var lowered_export = try ml.graph.lower.lowerWithOptions(
+        allocator,
+        &subgraph.graph,
+        .{ .lower_gqa = true },
+    );
     defer lowered_export.deinit();
     const lowered_ns = if (profile_enabled) nowNs() else 0;
 
@@ -1581,7 +1585,7 @@ test "synthesizeLinearDecompositions lowers grouped-query attention to portable 
     try synthesizeLinearDecompositions(&graph, .{});
     try std.testing.expect(graph.node(gqa).vjp_alternate != ml.graph.null_node);
 
-    var lowered = try ml.graph.lower.lower(allocator, &graph);
+    var lowered = try ml.graph.lower.lowerWithOptions(allocator, &graph, .{ .lower_gqa = true });
     defer lowered.deinit();
     const bytes = try onnx_graph.exportGraph(allocator, &lowered.graph, .{ .lower_fused = false });
     defer allocator.free(bytes);

@@ -69,10 +69,11 @@ pub const AdaptiveKLConfig = struct {
 };
 
 /// Proportional KL controller used by the original RLHF/PPO recipe and TRL.
-/// `horizon` is measured in admitted optimizer groups in Antfly. Callers use
+/// `horizon` is measured in KL-observed completion episodes. Callers use
 /// the coefficient returned by `value` for the current group, then call
 /// `update` with that group's unweighted mean K3 divergence to obtain the
-/// coefficient for the next group.
+/// coefficient for the next group. A hard-budget rejection still advances the
+/// controller, while leaving model and optimizer state untouched.
 pub const AdaptiveKLController = struct {
     value: f32,
     config: AdaptiveKLConfig,
@@ -90,14 +91,14 @@ pub const AdaptiveKLController = struct {
         return .{ .value = initial_coef, .config = config };
     }
 
-    pub fn update(self: *AdaptiveKLController, current_mean_kl: f32, admitted_groups: usize) !f32 {
-        if (!std.math.isFinite(current_mean_kl) or current_mean_kl < 0.0 or admitted_groups == 0) {
+    pub fn update(self: *AdaptiveKLController, current_mean_kl: f32, observed_completions: usize) !f32 {
+        if (!std.math.isFinite(current_mean_kl) or current_mean_kl < 0.0 or observed_completions == 0) {
             return error.InvalidAdaptiveKlObservation;
         }
         const ratio = @as(f64, current_mean_kl) / @as(f64, self.config.target);
         const proportional_error = std.math.clamp(ratio - 1.0, -0.2, 0.2);
         const multiplier = 1.0 + proportional_error *
-            @as(f64, @floatFromInt(admitted_groups)) / @as(f64, self.config.horizon);
+            @as(f64, @floatFromInt(observed_completions)) / @as(f64, self.config.horizon);
         if (!std.math.isFinite(multiplier) or multiplier <= 0.0) {
             return error.InvalidAdaptiveKlUpdate;
         }
@@ -878,9 +879,9 @@ test "adaptive KL controller is bounded and updates the next-group coefficient" 
         .min_coef = 0.001,
         .max_coef = 0.05,
     });
-    const below_target = try controller.update(0.0, 1);
-    try testing.expectApproxEqAbs(@as(f32, 0.03992), below_target, 1e-7);
-    const above_target = try controller.update(1.0, 1);
+    const below_target = try controller.update(0.0, 16);
+    try testing.expectApproxEqAbs(@as(f32, 0.03872), below_target, 1e-7);
+    const above_target = try controller.update(1.0, 16);
     try testing.expect(above_target > below_target);
 
     var upper = try AdaptiveKLController.init(0.05, .{

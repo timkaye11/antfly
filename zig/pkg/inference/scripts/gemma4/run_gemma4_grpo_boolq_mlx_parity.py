@@ -33,9 +33,11 @@ import zipfile
 from dataclasses import dataclass
 from email.parser import Parser
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence, TypeVar
 
 import materialize_gemma4_grpo_boolq as boolq_materializer
+from gemma4_drift_metrics import summarize_squares
+from gemma4_grpo_sampling import ranked_tokens
 
 
 SCRIPT_PATH = Path(__file__).resolve()
@@ -52,6 +54,8 @@ GRPO_REPORT_SCHEMA_VERSIONS = frozenset(
         "antfly_inference_finetune_grpo_report/v6",
         "antfly_inference_finetune_grpo_report/v7",
         "antfly_inference_finetune_grpo_report/v8",
+        "antfly_inference_finetune_grpo_report/v9",
+        "antfly_inference_finetune_grpo_report/v10",
     }
 )
 GRPO_EVAL_SCHEMA_VERSIONS = frozenset(
@@ -62,7 +66,13 @@ GRPO_EVAL_SCHEMA_VERSIONS = frozenset(
         "antfly_inference_finetune_grpo_evaluation/v4",
     }
 )
-GRPO_KL_TRACE_SCHEMA_VERSION = "antfly_inference_grpo_kl_control_trace/v2"
+GRPO_KL_TRACE_SCHEMA_VERSION = "antfly_inference_grpo_kl_control_trace/v5"
+GRPO_KL_TRACE_SCHEMA_VERSIONS = frozenset({
+    "antfly_inference_grpo_kl_control_trace/v2",
+    "antfly_inference_grpo_kl_control_trace/v3",
+    "antfly_inference_grpo_kl_control_trace/v4",
+    GRPO_KL_TRACE_SCHEMA_VERSION,
+})
 GRPO_TRAINING_ORDER = {
     "algorithm": "seeded-fisher-yates-per-epoch/v1",
     "stream_derivation": "run-seed-order-domain-epoch-dataset-size/v1",
@@ -273,6 +283,24 @@ def attest_wheel_runtime(
     }
 
 
+def adapter_update_checks(
+    metrics: Mapping[str, Any], *, min_cosine: float, max_relative_error: float
+) -> Mapping[str, bool]:
+    """Require vector distance as well as the historical magnitude comparison."""
+    def bounded(name: str, lower: float, upper: float) -> bool:
+        value = metrics.get(name)
+        return (
+            isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and lower <= value <= upper
+        )
+
+    return {
+        "adapter_delta_direction": bounded("delta_cosine_similarity", min_cosine, 1.0),
+        "adapter_delta_norm": bounded("delta_l2_relative_difference", 0.0, max_relative_error),
+        "adapter_delta_vector": bounded("delta_vector_l2_relative_error", 0.0, max_relative_error),
+    }
+
+
 def assess_parity(
     *,
     antfly_evaluation: Mapping[str, float],
@@ -333,10 +361,11 @@ def assess_parity(
         native_evaluation["kl_loss"] - antfly_evaluation["kl_loss"]
     )
     numerical_checks = {
-        "adapter_delta_direction": trace_adapter["delta_cosine_similarity"]
-        >= NUMERICAL_PARITY_LIMITS["min_adapter_delta_cosine_similarity"],
-        "adapter_delta_norm": trace_adapter["delta_l2_relative_difference"]
-        <= NUMERICAL_PARITY_LIMITS["max_adapter_delta_l2_relative_difference"],
+        **adapter_update_checks(
+            trace_adapter,
+            min_cosine=NUMERICAL_PARITY_LIMITS["min_adapter_delta_cosine_similarity"],
+            max_relative_error=NUMERICAL_PARITY_LIMITS["max_adapter_delta_l2_relative_difference"],
+        ),
         "adapter_delta_elementwise": trace_adapter["delta_max_abs_difference"]
         <= NUMERICAL_PARITY_LIMITS["max_adapter_delta_abs_difference"],
         "evaluation_kl": evaluation_kl_delta
@@ -375,6 +404,9 @@ def assess_parity(
                 "adapter_delta_l2_relative_difference": trace_adapter[
                     "delta_l2_relative_difference"
                 ],
+                "adapter_delta_vector_l2_relative_error": trace_adapter.get(
+                    "delta_vector_l2_relative_error"
+                ),
                 "adapter_delta_max_abs_difference": trace_adapter[
                     "delta_max_abs_difference"
                 ],
@@ -485,6 +517,7 @@ def load_trace(
 ) -> tuple[TraceGroup, ...]:
     trace_path = path.expanduser().resolve()
     groups: dict[int, list[TraceCompletion]] = {}
+    previous_prompt: int | None = None
     try:
         lines = trace_path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError) as exc:
@@ -515,15 +548,30 @@ def load_trace(
         reward = _finite_float(row.get("aggregate_reward"), "aggregate_reward")
         if reward not in (0.0, 1.0):
             raise BoolQParityContractError("BoolQ trace reward must be binary")
+        if prompt_index in groups and prompt_index != previous_prompt:
+            raise BoolQParityContractError(f"{phase} reward trace optimizer groups are interleaved")
         groups.setdefault(prompt_index, []).append(TraceCompletion(tokens[0], reward))
+        previous_prompt = prompt_index
     if sorted(groups) != list(range(expected_groups)):
         raise BoolQParityContractError(f"{phase} reward trace prompt groups are incomplete")
     result = tuple(
-        TraceGroup(index, tuple(groups[index])) for index in range(expected_groups)
+        TraceGroup(index, tuple(completions)) for index, completions in groups.items()
     )
     if any(len(group.completions) != group_size for group in result):
         raise BoolQParityContractError(f"{phase} reward trace group size drifted")
     return result
+
+
+_RowT = TypeVar("_RowT")
+
+
+def rows_in_prompt_order(
+    rows: Sequence[_RowT], indices: Sequence[int]
+) -> list[_RowT]:
+    """Bind chronological updates to their original dataset prompt identities."""
+    if len(indices) != len(rows) or set(indices) != set(range(len(rows))):
+        raise BoolQParityContractError("reward trace is not a permutation of the BoolQ rows")
+    return [rows[index] for index in indices]
 
 
 def require_antfly_reference_contract(
@@ -556,6 +604,8 @@ def require_v4_kl_control(root: Path, train_report: Mapping[str, Any]) -> None:
         "antfly_inference_finetune_grpo_report/v6",
         "antfly_inference_finetune_grpo_report/v7",
         "antfly_inference_finetune_grpo_report/v8",
+        "antfly_inference_finetune_grpo_report/v9",
+        "antfly_inference_finetune_grpo_report/v10",
     }:
         return
     mean_kl = train_report.get("mean_kl")
@@ -568,6 +618,14 @@ def require_v4_kl_control(root: Path, train_report: Mapping[str, Any]) -> None:
         or not isinstance(telemetry, dict)
     ):
         raise BoolQParityContractError("Antfly GRPO v4 KL telemetry is missing")
+    if (
+        train_report.get("schema_version") in {
+            "antfly_inference_finetune_grpo_report/v9",
+            "antfly_inference_finetune_grpo_report/v10",
+        }
+        and telemetry.get("kl_horizon_unit") != "completion-episodes"
+    ):
+        raise BoolQParityContractError("Antfly GRPO adaptive KL horizon unit drifted")
     trace_path = root / "grpo_kl_control_trace.jsonl"
     reported_path = Path(str(telemetry.get("trace_path", ""))).resolve()
     if reported_path != trace_path or not trace_path.is_file():
@@ -590,7 +648,7 @@ def require_v4_kl_control(root: Path, train_report: Mapping[str, Any]) -> None:
         observed = row.get("mean_kl")
         budget = row.get("train_max_kl")
         if (
-            row.get("schema_version") != GRPO_KL_TRACE_SCHEMA_VERSION
+            row.get("schema_version") not in GRPO_KL_TRACE_SCHEMA_VERSIONS
             or row.get("group_index") != index
             or row.get("optimizer_steps_before") != index
             or row.get("status") != "admitted"
@@ -605,6 +663,26 @@ def require_v4_kl_control(root: Path, train_report: Mapping[str, Any]) -> None:
             or float(observed) > float(budget)
         ):
             raise BoolQParityContractError("Antfly GRPO v4 KL admission trace drifted")
+        if (
+            row.get("schema_version") in {
+                "antfly_inference_grpo_kl_control_trace/v4",
+                GRPO_KL_TRACE_SCHEMA_VERSION,
+            }
+            and row.get("observed_completions") != FIXED_GROUP_SIZE
+        ):
+            raise BoolQParityContractError("Antfly GRPO KL completion count drifted")
+        if row.get("schema_version") == GRPO_KL_TRACE_SCHEMA_VERSION:
+            objective = row.get("objective_kl_coef")
+            before = row.get("kl_coef_before")
+            if (
+                isinstance(objective, bool)
+                or not isinstance(objective, (int, float))
+                or not math.isfinite(float(objective))
+                or objective != before
+            ):
+                raise BoolQParityContractError(
+                    "Antfly GRPO KL objective/controller coefficient drifted"
+                )
 
 
 def require_native_rollout_sampler_compatibility(
@@ -630,7 +708,11 @@ def load_acceptance(root: Path, manifest: Mapping[str, Any]) -> AcceptanceEviden
     if train_report.get("schema_version") not in GRPO_REPORT_SCHEMA_VERSIONS:
         raise BoolQParityContractError("Antfly GRPO report schema drifted")
     if (
-        train_report.get("schema_version") == "antfly_inference_finetune_grpo_report/v8"
+        train_report.get("schema_version") in {
+            "antfly_inference_finetune_grpo_report/v8",
+            "antfly_inference_finetune_grpo_report/v9",
+            "antfly_inference_finetune_grpo_report/v10",
+        }
         and train_report.get("training_order") != GRPO_TRAINING_ORDER
     ):
         raise BoolQParityContractError("Antfly GRPO training-order contract drifted")
@@ -646,6 +728,8 @@ def load_acceptance(root: Path, manifest: Mapping[str, Any]) -> AcceptanceEviden
     if train_report.get("schema_version") in {
         "antfly_inference_finetune_grpo_report/v7",
         "antfly_inference_finetune_grpo_report/v8",
+        "antfly_inference_finetune_grpo_report/v9",
+        "antfly_inference_finetune_grpo_report/v10",
     }:
         if (
             train_report.get("optimizer_groups") != FIXED_TRAIN_GROUPS
@@ -927,6 +1011,7 @@ def _adapter_delta_comparison(
     antfly_squares = []
     dots = []
     max_differences = []
+    difference_squares = []
     for name in names:
         initial = initial_trainables[name]
         mlx_delta = (final_trainables[name] - initial).astype(mx.float32)
@@ -935,16 +1020,24 @@ def _adapter_delta_comparison(
         antfly_squares.append((antfly_delta * antfly_delta).sum())
         dots.append((mlx_delta * antfly_delta).sum())
         max_differences.append(mx.abs(mlx_delta - antfly_delta).max())
-    mx.eval(*mlx_squares, *antfly_squares, *dots, *max_differences)
+        difference_squares.append(((mlx_delta - antfly_delta) ** 2).sum())
+    mx.eval(*mlx_squares, *antfly_squares, *dots, *max_differences, *difference_squares)
     mlx_norm = math.sqrt(sum(float(value.item()) for value in mlx_squares))
     antfly_norm = math.sqrt(sum(float(value.item()) for value in antfly_squares))
     dot = sum(float(value.item()) for value in dots)
-    cosine = dot / (mlx_norm * antfly_norm) if mlx_norm and antfly_norm else 0.0
+    distances = summarize_squares(
+        antfly_norm ** 2, mlx_norm ** 2, dot,
+        sum(float(value.item()) for value in difference_squares),
+        max(float(value.item()) for value in max_differences),
+    )
     return {
         "mlx_delta_l2": mlx_norm,
         "antfly_delta_l2": antfly_norm,
         "delta_l2_relative_difference": abs(mlx_norm - antfly_norm) / antfly_norm if antfly_norm else None,
-        "delta_cosine_similarity": cosine,
+        # Keep the historical magnitude-only field above for compatibility.
+        "delta_vector_l2_relative_error": distances["relative_l2_error"],
+        "delta_vector_l2_error": distances["difference_l2"],
+        "delta_cosine_similarity": distances["cosine"],
         "delta_max_abs_difference": max(float(value.item()) for value in max_differences),
         "tensor_count": len(names),
     }
@@ -1051,6 +1144,10 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
         expected_indices=manifest["eval_source_row_indices"],
         tokenizer=tokenizer,
     )
+    # v8 trains in epoch-shuffled order. Replaying sorted prompt indices would
+    # compare a different optimizer trajectory even with identical candidates.
+    train_rows = rows_in_prompt_order(train_rows, [group.prompt_index for group in acceptance.train_trace])
+    eval_rows = rows_in_prompt_order(eval_rows, [group.prompt_index for group in acceptance.eval_trace])
     _validate_trace_rewards(tokenizer, train_rows, acceptance.train_trace)
     _validate_trace_rewards(tokenizer, eval_rows, acceptance.eval_trace)
 
@@ -1140,9 +1237,9 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
         def ranked_group(current_model: Any, tokens: Any, row_index: Any) -> tuple[Any, Any]:
             logits = current_model(tokens).astype(mx.float32)
             predictor = mx.take(logits, row_index, axis=1)[0, 0, :]
-            candidate_ids = mx.argpartition(-predictor, kth=FIXED_GROUP_SIZE - 1)[:FIXED_GROUP_SIZE]
-            order = mx.argsort(-predictor[candidate_ids])
-            selected = candidate_ids[order]
+            selected = mx.array(
+                ranked_tokens(predictor.tolist(), FIXED_GROUP_SIZE), dtype=mx.int32
+            )
             logprobs = predictor - mx.logsumexp(predictor)
             selected_lp = logprobs[selected]
             return selected, selected_lp

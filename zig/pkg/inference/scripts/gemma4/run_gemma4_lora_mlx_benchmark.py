@@ -899,6 +899,8 @@ def inspect_initial_adapter(
     model_key: str,
     target_preset: str,
     prepared_summary: Mapping[str, Any],
+    *,
+    allow_missing_manifest_target_preset: bool = False,
 ) -> AdapterArtifact:
     """Inspect F32 Safetensors without importing NumPy, Safetensors, or MLX."""
     root = adapter_dir.expanduser().absolute()
@@ -916,7 +918,11 @@ def inspect_initial_adapter(
         if manifest_path.is_symlink() or not manifest_path.is_file():
             raise ContractError("initial adapter manifest must be a regular non-symlink file")
         _load_strict_json_file(manifest_path, "initial adapter manifest")
-    semantics = read_adapter_config(root, target_preset=target_preset)
+    semantics = read_adapter_config(
+        root,
+        target_preset=target_preset,
+        allow_missing_manifest_target_preset=allow_missing_manifest_target_preset,
+    )
     gate = lock["performance_gate"]
     if semantics["r"] != gate["rank"] or float(semantics["lora_alpha"]) != float(gate["alpha"]):
         raise ContractError("initial adapter rank/alpha differ from the locked performance matrix")

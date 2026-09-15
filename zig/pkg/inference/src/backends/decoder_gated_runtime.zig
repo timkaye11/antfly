@@ -6874,7 +6874,7 @@ test "direct gemma runtime preserves per-layer sliding attention policy" {
         .family = .gemma,
         .num_hidden_layers = 6,
         .sliding_window = 512,
-        .sliding_window_pattern = 5,
+        .sliding_window_pattern = 6,
     };
 
     try std.testing.expectEqual(@as(usize, 512), configuredLayerSlidingWindow(config, 0, false));

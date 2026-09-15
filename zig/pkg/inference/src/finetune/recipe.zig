@@ -1165,7 +1165,7 @@ const GrpoTrainingOrderSummary = struct {
 };
 
 const GrpoReport = struct {
-    schema_version: []const u8 = "antfly_inference_finetune_grpo_report/v8",
+    schema_version: []const u8 = "antfly_inference_finetune_grpo_report/v10",
     execution_mode: []const u8,
     dataset_format: []const u8,
     completions: usize,
@@ -1527,6 +1527,7 @@ const GrpoKlControlTelemetry = struct {
     train_max_kl: f32,
     target_kl: ?f32,
     kl_horizon: ?f32,
+    kl_horizon_unit: ?[]const u8,
     initial_kl_coef: f32,
     final_kl_coef: f32,
     min_kl_coef: ?f32,
@@ -1539,15 +1540,17 @@ const GrpoKlControlTelemetry = struct {
 };
 
 const GrpoKlTraceRecord = struct {
-    schema_version: []const u8 = "antfly_inference_grpo_kl_control_trace/v2",
+    schema_version: []const u8 = "antfly_inference_grpo_kl_control_trace/v5",
     group_index: usize,
     epoch_index: usize,
     prompt_index: usize,
     optimizer_steps_before: u64,
+    observed_completions: usize,
     status: []const u8,
     budget_policy: []const u8,
     mean_kl: f32,
     weighted_kl_loss: f32,
+    objective_kl_coef: f32,
     train_max_kl: f32,
     target_kl: ?f32,
     kl_coef_before: f32,
@@ -1641,28 +1644,35 @@ const GrpoKlControl = struct {
         epoch_index: usize,
         prompt_index: usize,
         optimizer_steps_before: u64,
+        observed_completions: usize,
         mean_kl: f32,
         weighted_kl_loss: f32,
+        objective_kl_coef: f32,
     ) !?f32 {
-        if (!std.math.isFinite(mean_kl) or mean_kl < 0.0 or
-            !std.math.isFinite(weighted_kl_loss))
+        if (observed_completions == 0 or
+            !std.math.isFinite(mean_kl) or mean_kl < 0.0 or
+            !std.math.isFinite(weighted_kl_loss) or
+            !std.math.isFinite(objective_kl_coef) or objective_kl_coef < 0.0)
         {
             return error.NonFiniteGrpoKlObservation;
         }
         const coefficient_before = self.current_kl_coef;
-        const admitted = mean_kl <= self.resolved.train_max_kl;
-        var coefficient_after = coefficient_before;
-        if (admitted) {
-            self.max_observed_mean_kl = @max(self.max_observed_mean_kl, mean_kl);
-            if (self.controller) |*controller| {
-                coefficient_after = try controller.update(mean_kl, 1);
-            }
+        if (@as(u32, @bitCast(objective_kl_coef)) != @as(u32, @bitCast(coefficient_before))) {
+            return error.GrpoKlControllerObjectiveMismatch;
         }
+        const admitted = mean_kl <= self.resolved.train_max_kl;
+        self.max_observed_mean_kl = @max(self.max_observed_mean_kl, mean_kl);
+        var coefficient_after = coefficient_before;
+        if (self.controller) |*controller| {
+            coefficient_after = try controller.update(mean_kl, observed_completions);
+        }
+        self.current_kl_coef = coefficient_after;
         try self.append(GrpoKlTraceRecord{
             .group_index = group_index,
             .epoch_index = epoch_index,
             .prompt_index = prompt_index,
             .optimizer_steps_before = optimizer_steps_before,
+            .observed_completions = observed_completions,
             .status = if (admitted)
                 "admitted"
             else if (self.resolved.budget_policy == .skip_group)
@@ -1672,6 +1682,7 @@ const GrpoKlControl = struct {
             .budget_policy = @tagName(self.resolved.budget_policy),
             .mean_kl = mean_kl,
             .weighted_kl_loss = weighted_kl_loss,
+            .objective_kl_coef = objective_kl_coef,
             .train_max_kl = self.resolved.train_max_kl,
             .target_kl = self.resolved.target_kl,
             .kl_coef_before = coefficient_before,
@@ -1690,8 +1701,34 @@ const GrpoKlControl = struct {
             return null;
         }
         self.admitted_groups += 1;
-        self.current_kl_coef = coefficient_after;
         return coefficient_after;
+    }
+
+    /// Observe one completed rollout group and synchronize the coefficient
+    /// used by the next objective before the caller handles admission.
+    fn observeAndSyncObjective(
+        self: *GrpoKlControl,
+        config: *grpo.GRPOConfig,
+        group_index: usize,
+        epoch_index: usize,
+        prompt_index: usize,
+        optimizer_steps_before: u64,
+        observed_completions: usize,
+        mean_kl: f32,
+        weighted_kl_loss: f32,
+    ) !bool {
+        const decision = try self.observe(
+            group_index,
+            epoch_index,
+            prompt_index,
+            optimizer_steps_before,
+            observed_completions,
+            mean_kl,
+            weighted_kl_loss,
+            config.kl_coef,
+        );
+        config.kl_coef = self.current_kl_coef;
+        return decision != null;
     }
 
     fn append(self: *GrpoKlControl, record: GrpoKlTraceRecord) !void {
@@ -1720,6 +1757,7 @@ const GrpoKlControl = struct {
             .train_max_kl = self.resolved.train_max_kl,
             .target_kl = self.resolved.target_kl,
             .kl_horizon = self.resolved.kl_horizon,
+            .kl_horizon_unit = if (self.resolved.adaptive) "completion-episodes" else null,
             .initial_kl_coef = self.initial_kl_coef,
             .final_kl_coef = self.current_kl_coef,
             .min_kl_coef = self.resolved.min_kl_coef,
@@ -5195,6 +5233,13 @@ fn gemmaPreferenceRunFingerprint(
         preferenceHashOptionalF32(&hasher, policy.grpo_epsilon_high);
         preferenceHashOptionalBool(&hasher, policy.grpo_mask_truncated_completions);
         preferenceHashOptionalField(&hasher, policy.grpo_train_max_kl_policy);
+        if (policy.grpo_adaptive_kl orelse false) {
+            // The controller horizon is denominated in sampled completion
+            // episodes. This domain tag prevents a checkpoint created by the
+            // former one-unit-per-group controller from resuming under the
+            // corrected update rate.
+            preferenceHashField(&hasher, "grpo-adaptive-kl-objective-sync/v2");
+        }
     }
     preferenceHashOptionalF32(&hasher, policy.grpo_clip_epsilon);
     preferenceHashOptionalF32(&hasher, policy.grpo_kl_coef);
@@ -5514,19 +5559,54 @@ fn validatePublishedAdapterChanged(
     defer allocator.free(trained.digest);
     if (trained.entries == 0) return error.EmptyTrainedAdapter;
 
-    // Directory metadata can change even when serialization accidentally
-    // republishes the original adapter weights. Compare the actual PEFT
-    // payloads so the post-publication gate proves the trained tensor bytes
-    // differ from bootstrap, complementing the pre-publication host digest.
+    // Header formatting and tensor order can change even if serialization
+    // republishes the original weights. Use the existing canonical tensor
+    // identity, complementing the pre-publication host digest.
     const bootstrap_payload_path = try std.fs.path.join(allocator, &.{ bootstrap_dir, "adapter_model.safetensors" });
     defer allocator.free(bootstrap_payload_path);
     const trained_payload_path = try std.fs.path.join(allocator, &.{ trained_dir, "adapter_model.safetensors" });
     defer allocator.free(trained_payload_path);
-    const bootstrap_payload_digest = try sha256FileAlloc(allocator, io, bootstrap_payload_path);
-    defer allocator.free(bootstrap_payload_digest);
-    const trained_payload_digest = try sha256FileAlloc(allocator, io, trained_payload_path);
-    defer allocator.free(trained_payload_digest);
-    if (std.mem.eql(u8, bootstrap_payload_digest, trained_payload_digest)) return error.UnchangedTrainedAdapter;
+    if (try train_eval_gemma4_lora_bundle.adapterPayloadsEqual(
+        allocator,
+        io,
+        bootstrap_payload_path,
+        trained_payload_path,
+    )) return error.UnchangedTrainedAdapter;
+}
+
+test "gemma4 published adapter change gate ignores headers order and PEFT aliases" {
+    const allocator = std.testing.allocator;
+    const io = compat.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const bootstrap = try std.fs.path.join(allocator, &.{ root, "bootstrap" });
+    defer allocator.free(bootstrap);
+    const trained = try std.fs.path.join(allocator, &.{ root, "trained" });
+    defer allocator.free(trained);
+    try compat.cwd().createDirPath(io, bootstrap);
+    try compat.cwd().createDirPath(io, trained);
+    const bootstrap_path = try std.fs.path.join(allocator, &.{ bootstrap, "adapter_model.safetensors" });
+    defer allocator.free(bootstrap_path);
+    const trained_path = try std.fs.path.join(allocator, &.{ trained, "adapter_model.safetensors" });
+    defer allocator.free(trained_path);
+    const a = [_]f32{ 1.0, -2.0 };
+    var b = [_]f32{ 0.0, 0.0 };
+    const checkpoint = @import("safetensors_checkpoint.zig");
+    try checkpoint.save(allocator, bootstrap_path, &.{
+        .{ .name = "model.layers.0.self_attn.q_proj.weight.lora_A.weight", .shape = &.{ 1, 2 }, .data = &a },
+        .{ .name = "model.layers.0.self_attn.q_proj.weight.lora_B.weight", .shape = &.{ 2, 1 }, .data = &b },
+    });
+    const reordered = [_]checkpoint.NamedTensor{
+        .{ .name = "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_B.default.weight", .shape = &.{ 2, 1 }, .data = &b },
+        .{ .name = "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_A.default.weight", .shape = &.{ 1, 2 }, .data = &a },
+    };
+    try checkpoint.save(allocator, trained_path, &reordered);
+    try std.testing.expectError(error.UnchangedTrainedAdapter, validatePublishedAdapterChanged(allocator, io, bootstrap, trained));
+    b[1] = 0.125;
+    try checkpoint.save(allocator, trained_path, &reordered);
+    try validatePublishedAdapterChanged(allocator, io, bootstrap, trained);
 }
 
 fn trainerLoRAParameterDigest(trainer: *const real_autodiff.RealAutodiffTrainer) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
@@ -11358,18 +11438,21 @@ fn runOptimizerBackedGemmaGrpo(
                 if (gradient != 0.0) saw_nonzero_policy_gradient = true;
             }
 
-            const next_kl_coef = (try kl_control.observe(
+            const kl_admitted = try kl_control.observeAndSyncObjective(
+                &cfg,
                 logical_group_index,
                 epoch_idx,
                 prompt_idx,
                 trainer.optimizerSteps(),
+                completions.items.len,
                 loss_result.mean_kl,
                 loss_result.kl_loss,
-            )) orelse {
+            );
+            if (!kl_admitted) {
                 kl_rejected_groups += 1;
                 if (benchmark_enabled) return error.GrpoBenchmarkKlRejectedGroup;
                 continue;
-            };
+            }
 
             total_loss += loss_result.loss;
             total_pg_loss += loss_result.pg_loss;
@@ -11473,7 +11556,6 @@ fn runOptimizerBackedGemmaGrpo(
                     .policy_reference_max_abs_error = group_policy_reference_max_abs_error,
                 });
             }
-            cfg.kl_coef = next_kl_coef;
         }
         const completed_epochs = epoch_idx + 1;
         const checkpoint_every = if (recipe.checkpoint) |checkpoint| checkpoint.every_epochs else null;
@@ -11738,7 +11820,9 @@ fn runOptimizerBackedGemmaGrpo(
             max_completion_tokens,
             backend_kind,
             evaluation_report_path,
-            true,
+            // Retain the full training summary before returning the gate error.
+            // Adapter publication below still requires both quality gates.
+            false,
         );
     };
 
@@ -11748,7 +11832,8 @@ fn runOptimizerBackedGemmaGrpo(
     } else null;
     const baseline_relative_passed = if (baseline_relative) |summary| summary.passed else true;
 
-    if (baseline_relative_passed) {
+    const quality_passed = evaluation.passed and baseline_relative_passed;
+    if (quality_passed) {
         try gemma4_real_autodiff.saveTrainerAsGemmaBundle(allocator, &trainer, base_model_dir, bootstrap_dir, trained_dir);
         try validatePublishedAdapterChanged(allocator, io, bootstrap_dir, trained_dir);
     }
@@ -11889,8 +11974,9 @@ fn runOptimizerBackedGemmaGrpo(
         .baseline_evaluation = baseline_evaluation,
         .baseline_relative = baseline_relative,
         .evaluation = evaluation,
-        .trained_adapter_dir = if (baseline_relative_passed) trained_dir else null,
+        .trained_adapter_dir = if (quality_passed) trained_dir else null,
     });
+    if (!evaluation.passed) return error.GrpoEvaluationGateFailed;
     if (!baseline_relative_passed) return error.GrpoBaselineRelativeEvaluationGateFailed;
     print("grpo report: {s}\ntrained adapter: {s}\n", .{ report_path, trained_dir });
 }
@@ -12842,14 +12928,17 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
             for (loss_result.grad_new_logps) |gradient| {
                 if (gradient != 0.0) saw_nonzero_policy_gradient = true;
             }
-            const next_kl_coef = (try kl_control.observe(
+            const kl_admitted = try kl_control.observeAndSyncObjective(
+                &cfg,
                 total_groups,
                 epoch_idx,
                 prompt_idx,
                 trainer.optimizerSteps(),
+                completions.items.len,
                 loss_result.mean_kl,
                 loss_result.kl_loss,
-            )) orelse return error.Gemma4MultimodalGrpoKlSkipNotSupported;
+            );
+            if (!kl_admitted) return error.Gemma4MultimodalGrpoKlSkipNotSupported;
             try scalePreferenceUnitGradients(loss_result.grad_new_logps, group_size);
 
             total_loss += loss_result.loss;
@@ -12877,7 +12966,6 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
                 _ = try trainer.step(input.trainer_input);
                 token_offset += completion.tokens.len;
             }
-            cfg.kl_coef = next_kl_coef;
         }
     }
 
@@ -13851,7 +13939,7 @@ test "gemma4 GRPO KL control persists admitted and rejected pre-update decisions
     };
 
     var admitted = try GrpoKlControl.init(allocator, std.testing.io, control_recipe);
-    const coefficient_after = (try admitted.observe(0, 0, 0, 0, 0.0, 0.0)).?;
+    const coefficient_after = (try admitted.observe(0, 0, 0, 0, 16, 0.0, 0.0, 0.04)).?;
     try std.testing.expect(coefficient_after < 0.04);
     try admitted.finish();
     try std.testing.expectEqual(@as(usize, 1), admitted.telemetry().admitted_groups);
@@ -13866,14 +13954,49 @@ test "gemma4 GRPO KL control persists admitted and rejected pre-update decisions
 
     var rejected = try GrpoKlControl.init(allocator, std.testing.io, control_recipe);
     defer rejected.deinit();
-    try std.testing.expectEqual(@as(?f32, null), try rejected.observe(0, 0, 0, 0, 0.1001, 0.004004));
+    try std.testing.expectEqual(@as(?f32, null), try rejected.observe(0, 0, 0, 0, 16, 0.1001, 0.004004, 0.04));
     try rejected.finish();
     try std.testing.expectEqual(@as(usize, 0), rejected.telemetry().admitted_groups);
     try std.testing.expectEqual(@as(usize, 1), rejected.telemetry().rejected_groups);
+    try std.testing.expect(rejected.telemetry().final_kl_coef > 0.04);
+    try std.testing.expectEqual(@as(f32, 0.1001), rejected.telemetry().max_observed_mean_kl);
     try std.testing.expect(rejected.telemetry().trace_digest != null);
     const rejected_trace = try readFileMax(allocator, std.testing.io, rejected.trace_path, 64 * 1024);
     defer allocator.free(rejected_trace);
     try std.testing.expect(std.mem.indexOf(u8, rejected_trace, "\"status\":\"budget-exceeded-skipped\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rejected_trace, "\"schema_version\":\"antfly_inference_grpo_kl_control_trace/v5\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rejected_trace, "\"observed_completions\":16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rejected_trace, "\"objective_kl_coef\":") != null);
+    try std.testing.expectError(
+        error.GrpoKlControllerObjectiveMismatch,
+        rejected.observe(1, 0, 1, 0, 16, 0.05, 0.002, 0.04),
+    );
+
+    var synchronized = try GrpoKlControl.init(allocator, std.testing.io, control_recipe);
+    defer synchronized.deinit();
+    var synchronized_config = grpo.GRPOConfig{ .kl_coef = 0.04 };
+    try std.testing.expect(!try synchronized.observeAndSyncObjective(
+        &synchronized_config,
+        0,
+        0,
+        0,
+        0,
+        16,
+        0.1001,
+        0.004004,
+    ));
+    try std.testing.expectEqual(synchronized.current_kl_coef, synchronized_config.kl_coef);
+    try std.testing.expect(synchronized_config.kl_coef > 0.04);
+    try std.testing.expect(try synchronized.observeAndSyncObjective(
+        &synchronized_config,
+        1,
+        0,
+        1,
+        0,
+        16,
+        0.05,
+        synchronized_config.kl_coef * 0.05,
+    ));
 
     var abort_recipe = control_recipe;
     abort_recipe.grpo.train_max_kl_policy = "abort";
@@ -13881,7 +14004,7 @@ test "gemma4 GRPO KL control persists admitted and rejected pre-update decisions
     defer aborted.deinit();
     try std.testing.expectError(
         error.GrpoTrainKlBudgetExceeded,
-        aborted.observe(0, 0, 0, 0, 0.1001, 0.004004),
+        aborted.observe(0, 0, 0, 0, 16, 0.1001, 0.004004, 0.04),
     );
 }
 
@@ -13906,7 +14029,7 @@ test "gemma4 GRPO KL checkpoint restores an exact adaptive continuation" {
 
     var uninterrupted = try GrpoKlControl.init(allocator, std.testing.io, control_recipe);
     defer uninterrupted.deinit();
-    _ = try uninterrupted.observe(0, 0, 0, 0, 0.005, 0.0002);
+    _ = try uninterrupted.observe(0, 0, 0, 0, 16, 0.005, 0.0002, 0.04);
 
     var resumed = try GrpoKlControl.init(allocator, std.testing.io, control_recipe);
     defer resumed.deinit();
@@ -13918,8 +14041,8 @@ test "gemma4 GRPO KL checkpoint restores an exact adaptive continuation" {
         uninterrupted.trace.items,
     );
 
-    const uninterrupted_next = try uninterrupted.observe(1, 1, 0, 1, 0.02, 0.0008);
-    const resumed_next = try resumed.observe(1, 1, 0, 1, 0.02, 0.0008);
+    const uninterrupted_next = try uninterrupted.observe(1, 1, 0, 1, 16, 0.02, 0.0008, uninterrupted.current_kl_coef);
+    const resumed_next = try resumed.observe(1, 1, 0, 1, 16, 0.02, 0.0008, resumed.current_kl_coef);
     try std.testing.expectEqual(uninterrupted_next, resumed_next);
     try std.testing.expectEqual(uninterrupted.current_kl_coef, resumed.current_kl_coef);
     try std.testing.expectEqual(uninterrupted.admitted_groups, resumed.admitted_groups);

@@ -4387,6 +4387,27 @@ pub fn decoderRuntimeApplyRmsNormWeightDevice(
     hidden_size: usize,
     eps: f32,
 ) !?MetalTensor {
+    return decoderRuntimeApplyRmsNormWeightDeviceMode(self, input, weight, hidden_size, eps, false);
+}
+
+pub fn decoderRuntimeApplyRmsNormWeightDevicePrecise(
+    self: anytype,
+    input: MetalTensor,
+    weight: MetalTensor,
+    hidden_size: usize,
+    eps: f32,
+) !?MetalTensor {
+    return decoderRuntimeApplyRmsNormWeightDeviceMode(self, input, weight, hidden_size, eps, true);
+}
+
+fn decoderRuntimeApplyRmsNormWeightDeviceMode(
+    self: anytype,
+    input: MetalTensor,
+    weight: MetalTensor,
+    hidden_size: usize,
+    eps: f32,
+    precise: bool,
+) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (!input.isDevice() or !weight.isDevice()) return null;
@@ -4397,7 +4418,11 @@ pub fn decoderRuntimeApplyRmsNormWeightDevice(
 
     var output = try MetalTensor.deviceAllocate(runtime, rows * hidden_size * @sizeOf(f32), .private, input.shape());
     errdefer output.deinit();
-    const rc = termite_metal_decode_runtime_apply_rms_norm_weight_device(
+    const apply = if (precise)
+        &termite_metal_decode_runtime_apply_rms_norm_weight_device_precise
+    else
+        &termite_metal_decode_runtime_apply_rms_norm_weight_device;
+    const rc = apply(
         runtime,
         input.deviceHandle(),
         input.deviceByteOffset(),
@@ -19650,6 +19675,18 @@ pub extern fn termite_metal_decode_runtime_apply_rms_norm_rows_device(
     output_offset: usize,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_apply_rms_norm_weight_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    weight_handle: ?*anyopaque,
+    weight_offset: usize,
+    rows: usize,
+    hidden_size: usize,
+    eps: f32,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_apply_rms_norm_weight_device_precise(
     runtime: ?*RawMetalDecodeRuntime,
     input_handle: ?*anyopaque,
     input_offset: usize,
@@ -46485,4 +46522,327 @@ test "metal native graph planner reserves gated ffn scratch up front" {
     try std.testing.expectEqual(snapshot.graph_plan_count, reused_snapshot.graph_plan_count);
     try std.testing.expectEqual(snapshot.graph_plan_slots, reused_snapshot.graph_plan_slots);
     try std.testing.expectEqual(snapshot.graph_plan_allocations, reused_snapshot.graph_plan_allocations);
+}
+
+test "gemma4 metal BF16 linear preserves F32 activations and small input gradients" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) {
+        if (@import("antfly_platform").env.getenvBoolDefault("TERMITE_REQUIRE_METAL_TESTS", false)) return error.MetalDeviceRequired;
+        return error.SkipZigTest;
+    }
+    const provider_mod = @import("metal_native_provider.zig");
+    var provider = try provider_mod.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.MetalRuntimeRequired;
+    const allocator = std.testing.allocator;
+    const dim = 128;
+    var weights = [_]u16{0} ** (dim * dim);
+    for (0..dim) |i| weights[i * dim + i] = 0x3f80;
+    const zeros = [_]f32{0} ** dim;
+    var bias = try MetalTensor.ownedCloneFrom(&zeros, &.{dim});
+    defer bias.deinit();
+    var dummy_data = [_]f32{0};
+    const dummy = MetalTensor.borrowed(&dummy_data, 1, &.{0});
+    var stats: ops.NativeQuantTimingStats = .{};
+    try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+        .slot = 0,
+        .weight = dummy,
+        .bias = bias,
+        .quantized_storage = null,
+        .in_dim = dim,
+        .out_dim = dim,
+        .retain_dense_fallback = false,
+        .dense_bf16_bytes = std.mem.sliceAsBytes(&weights),
+        .dense_bf16_no_copy_safe = false,
+    }, &stats));
+    // Exercise the M64 aligned route and the M32 row-tail route. Values below
+    // the F16 subnormal range expose lost gradient signal; fractional values
+    // expose hidden activation rounding, and 70000 exposes F16 overflow.
+    const values = [_]f32{ 1.0003, -0.9997, 2e-8, -2e-8, 70000, -70000 };
+    for ([_]usize{ 128, 129 }) |rows| {
+        const data = try allocator.alloc(f32, rows * dim);
+        defer allocator.free(data);
+        for (data, 0..) |*v, i| v.* = values[i % values.len];
+        var input = try testDeviceTensorFromSlice(runtime, data, &.{ @intCast(rows), dim });
+        defer input.deinit();
+        var forward = (try decoderRuntimeApplyLinear(&provider, .{ .slot = 0, .input = input, .in_dim = dim, .out_dim = dim })) orelse return error.UnexpectedNull;
+        defer forward.deinit();
+        const actual = try tensorHostSlice(&forward);
+        for (data, actual) |expected, value| try std.testing.expectApproxEqAbs(expected, value, @abs(expected) * 2e-6);
+        var backward = (try decoderRuntimeApplyLinearBackwardInputBf16(&provider, .{ .rows = rows, .slot = 0, .input = input, .in_dim = dim, .out_dim = dim })) orelse return error.UnexpectedNull;
+        defer backward.deinit();
+        const grad = try tensorHostSlice(&backward);
+        for (data, grad) |expected, value| try std.testing.expectApproxEqAbs(expected, value, @abs(expected) * 2e-6);
+        // Uniform logits make each non-target dLogit analytically smaller
+        // than the F16 subnormal range. This checks CCE's own gradient buffer,
+        // independently of the linear kernels' activation staging.
+        @memset(data, 0);
+        var hidden = try testDeviceTensorFromSlice(runtime, data, &.{ @intCast(rows), dim });
+        defer hidden.deinit();
+        const labels_data = try allocator.alloc(f32, rows);
+        defer allocator.free(labels_data);
+        @memset(labels_data, 0);
+        var labels = try testDeviceTensorFromSlice(runtime, labels_data, &.{@intCast(rows)});
+        defer labels.deinit();
+        var upstream = try testDeviceTensorFromSlice(runtime, &.{1e-5}, &.{1});
+        defer upstream.deinit();
+        var cce = (try decoderRuntimeLinearCceBf16BackwardDevice(&provider, 0, hidden, labels, upstream, rows, dim, dim, dim, 0, -100, &.{ @intCast(rows), dim })) orelse return error.UnexpectedNull;
+        defer cce.tensor.deinit();
+        const cce_grad = try tensorHostSlice(&cce.tensor);
+        for (cce_grad, 0..) |value, i| {
+            const expected = (1.0 / @as(f32, dim) - @as(f32, if (i % dim == 0) 1 else 0)) * 1e-5 / @as(f32, @floatFromInt(rows));
+            try std.testing.expectApproxEqAbs(expected, value, @abs(expected) * 1e-5);
+        }
+    }
+}
+
+test "gemma4 large-row CCE backward preserves the BF16 weight exponent range" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) {
+        if (@import("antfly_platform").env.getenvBoolDefault("TERMITE_REQUIRE_METAL_TESTS", false)) return error.MetalDeviceRequired;
+        return error.SkipZigTest;
+    }
+    const provider_mod = @import("metal_native_provider.zig");
+    var provider = try provider_mod.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.MetalRuntimeRequired;
+    const allocator = std.testing.allocator;
+    const rows = 128;
+    const dim = 512;
+    const vocab = 65536;
+    const weights = try allocator.alloc(u16, dim * vocab);
+    defer allocator.free(weights);
+    @memset(weights, 0);
+    // 69632 is exact BF16, finite F32, and outside F16's finite range.
+    weights[0] = 0x4788;
+    const zeros = try allocator.alloc(f32, vocab);
+    defer allocator.free(zeros);
+    @memset(zeros, 0);
+    var bias = try MetalTensor.ownedCloneFrom(zeros, &.{vocab});
+    defer bias.deinit();
+    var dummy_data = [_]f32{0};
+    const dummy = MetalTensor.borrowed(&dummy_data, 1, &.{0});
+    var stats: ops.NativeQuantTimingStats = .{};
+    try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+        .slot = 0,
+        .weight = dummy,
+        .bias = bias,
+        .quantized_storage = null,
+        .in_dim = dim,
+        .out_dim = vocab,
+        .retain_dense_fallback = false,
+        .dense_bf16_bytes = std.mem.sliceAsBytes(weights),
+        .dense_bf16_no_copy_safe = false,
+    }, &stats));
+    var hidden = try testDeviceTensorFromSlice(runtime, zeros, &.{ rows, dim });
+    defer hidden.deinit();
+    var labels = try testDeviceTensorFromSlice(runtime, zeros[0..rows], &.{rows});
+    defer labels.deinit();
+    var upstream = try testDeviceTensorFromSlice(runtime, &.{1e-5}, &.{1});
+    defer upstream.deinit();
+    var cce = (try decoderRuntimeLinearCceBf16BackwardDevice(&provider, 0, hidden, labels, upstream, rows, dim, vocab, 4096, 0, -100, &.{ rows, dim })) orelse return error.UnexpectedNull;
+    defer cce.tensor.deinit();
+    const actual = try tensorHostSlice(&cce.tensor);
+    for (actual, 0..) |value, i| {
+        const expected: f32 = if (i % dim == 0) (1.0 / @as(f32, vocab) - 1.0) * 1e-5 / @as(f32, rows) * 69632.0 else 0;
+        try std.testing.expectApproxEqAbs(expected, value, @max(@abs(expected) * 1e-5, 1e-12));
+    }
+}
+
+test "gemma4 tiled CCE preserves loss and gradients under a large common logit shift" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) {
+        if (@import("antfly_platform").env.getenvBoolDefault("TERMITE_REQUIRE_METAL_TESTS", false)) return error.MetalDeviceRequired;
+        return error.SkipZigTest;
+    }
+    const provider_mod = @import("metal_native_provider.zig");
+    var provider = try provider_mod.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.MetalRuntimeRequired;
+    const allocator = std.testing.allocator;
+    const rows = 3;
+    const dim = 2;
+    const vocab = 4097;
+    const weights = try allocator.alloc(u16, dim * vocab);
+    defer allocator.free(weights);
+    for (0..vocab) |i| {
+        weights[i * dim] = 0x3f80; // Exact BF16 1.
+        weights[i * dim + 1] = if (i == 0) 0 else 0xc180; // Exact BF16 -16.
+    }
+    const zeros = try allocator.alloc(f32, vocab);
+    defer allocator.free(zeros);
+    @memset(zeros, 0);
+    var bias = try MetalTensor.ownedCloneFrom(zeros, &.{vocab});
+    defer bias.deinit();
+    var dummy_data = [_]f32{0};
+    const dummy = MetalTensor.borrowed(&dummy_data, 1, &.{0});
+    var stats: ops.NativeQuantTimingStats = .{};
+    try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+        .slot = 0,
+        .weight = dummy,
+        .bias = bias,
+        .quantized_storage = null,
+        .in_dim = dim,
+        .out_dim = vocab,
+        .retain_dense_fallback = false,
+        .dense_bf16_bytes = std.mem.sliceAsBytes(weights),
+        .dense_bf16_no_copy_safe = false,
+    }, &stats));
+    // Both signs of a common shift must leave probabilities unchanged.
+    // The third row is ignored and contributes neither loss nor gradient.
+    var hidden = try testDeviceTensorFromSlice(runtime, &.{ 1024, 1, -1024, 1, 1024, 1 }, &.{ rows, dim });
+    defer hidden.deinit();
+    var labels = try testDeviceTensorFromSlice(runtime, &.{ 0, 0, -100 }, &.{rows});
+    defer labels.deinit();
+    var upstream = try testDeviceTensorFromSlice(runtime, &.{1}, &.{1});
+    defer upstream.deinit();
+    const tail: f64 = @as(f64, vocab - 1) * @exp(@as(f64, -16));
+    const expected_loss: f32 = @floatCast(@log(1 + tail));
+    const expected_grad: f32 = @floatCast(-16 * tail / (1 + tail) / 2);
+    for ([_]usize{ 4096, 257 }) |tile_vocab| {
+        var loss = (try decoderRuntimeLinearCceBf16LossDevice(&provider, 0, hidden, labels, rows, dim, vocab, tile_vocab, 0, -100, &.{1})) orelse return error.UnexpectedNull;
+        defer loss.deinit();
+        try std.testing.expectApproxEqAbs(expected_loss, (try tensorHostSlice(&loss))[0], 2e-7);
+        var backward = (try decoderRuntimeLinearCceBf16BackwardDevice(&provider, 0, hidden, labels, upstream, rows, dim, vocab, tile_vocab, 0, -100, &.{ rows, dim })) orelse return error.UnexpectedNull;
+        defer backward.tensor.deinit();
+        const actual = try tensorHostSlice(&backward.tensor);
+        for ([_]f32{ 0, expected_grad, 0, expected_grad, 0, 0 }, actual) |expected, value| {
+            try std.testing.expectApproxEqAbs(expected, value, 2e-7);
+        }
+    }
+}
+
+test "gemma4 Metal precise training RMSNorm retains small row contributions" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) {
+        if (@import("antfly_platform").env.getenvBoolDefault("TERMITE_REQUIRE_METAL_TESTS", false)) return error.MetalDeviceRequired;
+        return error.SkipZigTest;
+    }
+    const provider_mod = @import("metal_native_provider.zig");
+    var provider = try provider_mod.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.MetalRuntimeRequired;
+    const allocator = std.testing.allocator;
+    const rows = 3;
+    const eps: f32 = 1e-6;
+    for ([_]usize{ 128, 1536, 2560 }) |dim| {
+        const values = try allocator.alloc(f32, rows * dim);
+        defer allocator.free(values);
+        @memset(values, 1e-4);
+        for ([_]f32{ 1, -1, 2 }, 0..) |first, row| values[row * dim] = first;
+        const weights = try allocator.alloc(f32, dim);
+        defer allocator.free(weights);
+        for (weights, 0..) |*weight, i| weight.* = if (i % 2 == 0) 1 else -0.5;
+        var input = try testDeviceTensorFromSlice(runtime, values, &.{ rows, @intCast(dim) });
+        defer input.deinit();
+        var weight = try testDeviceTensorFromSlice(runtime, weights, &.{@intCast(dim)});
+        defer weight.deinit();
+        var output = (try decoderRuntimeApplyRmsNormWeightDevicePrecise(&provider, input, weight, dim, eps)) orelse return error.MetalRmsNormUnavailable;
+        defer output.deinit();
+        const actual = try tensorHostSlice(&output);
+        for (0..rows) |row| {
+            var sum: f64 = 0;
+            for (values[row * dim ..][0..dim]) |value| sum += @as(f64, value) * value;
+            const inv = 1.0 / @sqrt(sum / @as(f64, @floatFromInt(dim)) + eps);
+            for (0..dim) |i| {
+                const expected: f32 = @floatCast(@as(f64, values[row * dim + i]) * inv * weights[i]);
+                try std.testing.expectApproxEqRel(expected, actual[row * dim + i], 2e-7);
+            }
+        }
+    }
+}
+
+test "gemma4 Metal training norm preserves small squared gradients in single and batched reductions" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) {
+        if (@import("antfly_platform").env.getenvBoolDefault("TERMITE_REQUIRE_METAL_TESTS", false)) return error.MetalDeviceRequired;
+        return error.SkipZigTest;
+    }
+    const provider_mod = @import("metal_native_provider.zig");
+    var provider = try provider_mod.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.MetalRuntimeRequired;
+    const allocator = std.testing.allocator;
+    const count = 1024 * 1024 + 1;
+    const values = try allocator.alloc(f32, count);
+    defer allocator.free(values);
+    values[0] = 1.0;
+    for (values[1..], 0..) |*value, i| value.* = if (i % 2 == 0) 1e-4 else -1e-4;
+    var input = try testDeviceTensorFromSlice(runtime, values, &.{count});
+    defer input.deinit();
+    var batch = try testDeviceTensorFromSlice(runtime, &.{ -1, -1, -1 }, &.{3});
+    defer batch.deinit();
+    const counts = [_]usize{ 1, 257, count };
+    for (counts) |n| {
+        var single = try testDeviceTensorFromSlice(runtime, &.{-1}, &.{1});
+        defer single.deinit();
+        try std.testing.expect(try decoderRuntimeTrainingSumSquaresF32(&provider, input, single, n));
+        const expected: f32 = @floatCast(1.0 + @as(f64, @floatFromInt(n - 1)) * @as(f64, values[1]) * @as(f64, values[1]));
+        try std.testing.expectApproxEqRel(expected, (try tensorHostSlice(&single))[0], 2e-7);
+    }
+    // Aliased read-only inputs are safe; each dispatch writes its own output
+    // slot. This exercises the concurrent batch encoder and partial ranges.
+    const inputs = [_]MetalTensor{ input, input, input };
+    try std.testing.expect(try decoderRuntimeTrainingSumSquaresManyF32(&provider, &inputs, &counts, batch));
+    const observed = try tensorHostSlice(&batch);
+    for (counts, observed) |n, actual| {
+        const expected: f32 = @floatCast(1.0 + @as(f64, @floatFromInt(n - 1)) * @as(f64, values[1]) * @as(f64, values[1]));
+        try std.testing.expectApproxEqRel(expected, actual, 2e-7);
+    }
+}
+
+test "gemma4 Metal AdamW preserves small variance contributions in single and batched updates" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) {
+        if (@import("antfly_platform").env.getenvBoolDefault("TERMITE_REQUIRE_METAL_TESTS", false)) return error.MetalDeviceRequired;
+        return error.SkipZigTest;
+    }
+    const provider_mod = @import("metal_native_provider.zig");
+    var provider = try provider_mod.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.MetalRuntimeRequired;
+    const gradients = [_]f32{ 2.1, -2.1, 3.0, -3.0, 1.3, -1.3, 1e-4, -1e-4 };
+    const count = gradients.len;
+    const initial_w = [_]f32{0.01} ** count;
+    const initial_m = [_]f32{0.009} ** count;
+    const initial_v = [_]f32{8e-6} ** count;
+    const options = TrainingAdamWOptions{
+        .lr = 0.001,
+        .beta1 = 0.9,
+        .beta2 = 0.999,
+        .eps = 1e-8,
+        .weight_decay = 0.01,
+        .bias_correction1 = 1.0 - std.math.pow(f32, 0.9, 2),
+        .bias_correction2 = 1.0 - std.math.pow(f32, 0.999, 2),
+        .grad_scale = 0.244949072599411,
+    };
+    for ([_]bool{ false, true }) |batched| {
+        var w = try testDeviceTensorFromSlice(runtime, &initial_w, &.{count});
+        defer w.deinit();
+        var g = try testDeviceTensorFromSlice(runtime, &gradients, &.{count});
+        defer g.deinit();
+        var m = try testDeviceTensorFromSlice(runtime, &initial_m, &.{count});
+        defer m.deinit();
+        var v = try testDeviceTensorFromSlice(runtime, &initial_v, &.{count});
+        defer v.deinit();
+        if (batched) {
+            const batch = [_]TrainingAdamWBatch{.{ .weight = w, .grad = g, .m = m, .v = v, .elem_count = count, .bias_correction1 = options.bias_correction1, .bias_correction2 = options.bias_correction2 }};
+            try std.testing.expect(try decoderRuntimeTrainingAdamWManyF32(&provider, &batch, .{ .lr = options.lr, .beta1 = options.beta1, .beta2 = options.beta2, .eps = options.eps, .weight_decay = options.weight_decay, .grad_scale = options.grad_scale }));
+        } else {
+            try std.testing.expect(try decoderRuntimeTrainingAdamWF32(&provider, w, g, m, v, count, options));
+        }
+        const actual_w = try tensorHostSlice(&w);
+        const actual_g = try tensorHostSlice(&g);
+        const actual_m = try tensorHostSlice(&m);
+        const actual_v = try tensorHostSlice(&v);
+        for (gradients, 0..) |raw, i| {
+            // F64 arithmetic is the independent control, using the actual F32
+            // hyperparameters and scaled gradient supplied to the shader.
+            const scaled: f32 = raw * options.grad_scale;
+            const gradient: f64 = scaled;
+            const beta1: f64 = options.beta1;
+            const beta2: f64 = options.beta2;
+            const expected_m = beta1 * initial_m[i] + (1.0 - beta1) * gradient;
+            const expected_v = beta2 * initial_v[i] + (1.0 - beta2) * gradient * gradient;
+            const expected_w = initial_w[i] - @as(f64, options.lr) * ((expected_m / options.bias_correction1) / (@sqrt(expected_v / options.bias_correction2) + options.eps) + @as(f64, options.weight_decay) * initial_w[i]);
+            try std.testing.expectApproxEqRel(@as(f32, @floatCast(expected_m)), actual_m[i], 5e-7);
+            try std.testing.expectApproxEqRel(@as(f32, @floatCast(expected_v)), actual_v[i], 5e-7);
+            try std.testing.expectApproxEqAbs(@as(f32, @floatCast(expected_w)), actual_w[i], 2e-9);
+            try std.testing.expectEqual(@as(f32, 0.0), actual_g[i]);
+        }
+    }
 }

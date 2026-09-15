@@ -112,11 +112,11 @@ class CaptureFixture:
             "__trainer_state_v2": _encode_u64_fields([2, 1, 1, 1, 0, 1, 42, 1, 0, 1, 123, 0, 1, 2, 3, 4, 0, 0]),
         }
         for source_name, slot in ((SOURCE_A, SLOT_A), (SOURCE_B, SLOT_B)):
-            checkpoint[f"weight::{slot}"] = self.updated[source_name]
-            checkpoint[f"adam_m::{slot}"] = np.full(self.updated[source_name].shape, 0.1, dtype=np.float32)
-            checkpoint[f"adam_v::{slot}"] = np.full(self.updated[source_name].shape, 0.01, dtype=np.float32)
+            checkpoint[f"weight::{slot}"] = self.updated[source_name].reshape(-1)
+            checkpoint[f"adam_m::{slot}"] = np.full(self.updated[source_name].size, 0.1, dtype=np.float32)
+            checkpoint[f"adam_v::{slot}"] = np.full(self.updated[source_name].size, 0.01, dtype=np.float32)
             checkpoint[f"adam_step::{slot}"] = np.asarray([1], dtype=np.float32)
-            checkpoint[f"grad_accum::{slot}"] = np.zeros(self.updated[source_name].shape, dtype=np.float32)
+            checkpoint[f"grad_accum::{slot}"] = np.zeros(self.updated[source_name].size, dtype=np.float32)
         save_file(checkpoint, str(self.capture_dir / "trainer_checkpoint.safetensors"))
         predictor = 1
         token_ids = oracle._stable_probe_token_ids(3, 17, predictor, self.seed)
@@ -311,6 +311,26 @@ class ZigOracleExporterTests(unittest.TestCase):
             fixture.refresh_capture()
             with self.assertRaisesRegex(ContractError, "counters differ"):
                 fixture.validate()
+
+    def test_capture_rejects_invalid_flat_checkpoint_slots(self) -> None:
+        from safetensors import safe_open
+
+        for prefix in ("weight", "adam_m", "adam_v", "grad_accum"):
+            for invalid in (
+                np.zeros((1, 2), dtype=np.float32),
+                np.zeros(3, dtype=np.float32),
+                np.zeros(2, dtype=np.float64),
+            ):
+                with self.subTest(prefix=prefix, shape=invalid.shape, dtype=invalid.dtype), tempfile.TemporaryDirectory() as temporary:
+                    fixture = CaptureFixture(Path(temporary))
+                    checkpoint_path = fixture.capture_dir / "trainer_checkpoint.safetensors"
+                    with safe_open(str(checkpoint_path), framework="np", device="cpu") as source:
+                        tensors = {name: source.get_tensor(name) for name in source.keys()}
+                    tensors[f"{prefix}::{SLOT_A}"] = invalid
+                    save_file(tensors, str(checkpoint_path))
+                    fixture.refresh_capture()
+                    with self.assertRaisesRegex(ContractError, "tensor metadata differs"):
+                        fixture.validate()
 
     def test_capture_rejects_unexpected_publication_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

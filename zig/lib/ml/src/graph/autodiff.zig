@@ -697,7 +697,7 @@ fn applyVjp(
 
         // ── Data movement ────────────────────────────────────────────
 
-        .gather => {
+        .gather, .fused_embedding_lookup => {
             // d/d(table)(gather(table, indices)) = scatter_add(adj, indices)
             const table_shape = g.node(ins[0]).output_shape;
             const grad = try b.graph.addNode(.{
@@ -759,9 +759,14 @@ fn applyVjp(
             const sin_id = ins[2];
 
             const neg_sin = try b.neg(sin_id);
+            // Runtime backends may reconstruct the angle from attributes
+            // instead of consuming the tables. Encode the inverse rotation
+            // in both representations so their VJP agrees.
+            var inverse_attrs = attrs;
+            inverse_attrs.freq_scale = -attrs.freq_scale;
             const input_shape = g.node(input_id).output_shape;
             const grad_input = try b.graph.addNode(.{
-                .op = .{ .fused_rope = attrs },
+                .op = .{ .fused_rope = inverse_attrs },
                 .output_shape = input_shape,
                 .inputs = .{ adj, cos_id, neg_sin, null_node },
                 .num_inputs = 3,

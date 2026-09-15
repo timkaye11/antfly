@@ -1131,6 +1131,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     provider: if (false) ?mlx_quant.Provider else void =
         if (false) null else {},
     provider_impl: *ProviderImpl,
+    // Training trajectories amplify serial F32 RMS reduction error. Keep the
+    // precise parallel path scoped to callers that explicitly require it.
+    precise_training_rms_norm: bool = false,
     owned_native_provider: bool = false,
     backend_kv_cache: std.AutoHashMapUnmanaged(BackendKvCacheKey, BackendKvCacheEntry) = .empty,
     cyclic_page_table_cache: runtime_root.kv.storage_runtime.CyclicPageTableCache = .{},
@@ -2952,6 +2955,20 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (buf.native_dense_bytes == null or buf.native_dense_dtype == null or buf.data.len != 0) return buf;
         if (buf.native_dense_host_cache) |cache| return toBuf(cache);
         const shape = buf.logical_shape orelse return error.InvalidTensorShape;
+        // Include native-storage promotion in the existing host-materialization
+        // diagnostic: frozen BF16 weights can otherwise acquire a large F32
+        // peer without passing through the device-download trace below.
+        if (host_materialize_trace_count < traceHostMaterializeLimit()) {
+            host_materialize_trace_count += 1;
+            std.debug.print(
+                "metal_native_dense_materialize: caller=0x{x} bytes={d} dtype={s} shape={any}\n",
+                .{ @returnAddress(), buf.native_dense_bytes.?.len, @tagName(buf.native_dense_dtype.?), shape },
+            );
+            std.debug.dumpCurrentStackTrace(.{
+                .first_address = @returnAddress(),
+                .allow_unsafe_unwind = false,
+            });
+        }
         const shape_i32 = try buf.allocator.alloc(i32, shape.len);
         defer buf.allocator.free(shape_i32);
         for (shape, 0..) |dim, i| shape_i32[i] = std.math.cast(i32, dim) orelse return error.InvalidTensorShape;
@@ -12226,7 +12243,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const partial_rows = std.math.mul(usize, tile_count, rows) catch return null;
         const partial_elems = std.math.mul(usize, partial_rows, 3) catch return null;
         const scratch_elems = std.math.add(usize, logits_elems, partial_elems) catch return null;
-        const with_state = std.math.add(usize, scratch_elems, rows + 2) catch return null;
+        // Two row arrays (maximum and shifted log-normalizer), valid count,
+        // and scalar loss output match the runtime's CCE workspace.
+        const state_rows = std.math.mul(usize, rows, 2) catch return null;
+        const state_elems = std.math.add(usize, state_rows, 2) catch return null;
+        const with_state = std.math.add(usize, scratch_elems, state_elems) catch return null;
         const bytes = std.math.mul(usize, with_state, @sizeOf(f32)) catch return null;
         return std.math.cast(u64, bytes);
     }
@@ -13650,6 +13671,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const n: usize = @intCast(n_i64);
         const k: usize = @intCast(k_i64);
 
+        // Lowered linears use this contraction after the executor defers W's
+        // transpose. Preserve native BF16/F16 storage just as linearNoBias
+        // does; ownedDeviceMetalTensorFromCt would otherwise retain a full
+        // F32 host peer and upload another full-sized weight for every call.
+        // Ordinary F32 dots retain their existing accumulation/dispatch path.
+        const rhs_buf = toBuf(rhs);
+        if (lhs_contracting[0] == 1 and rhs_contracting[0] == 1 and
+            rhs_buf.native_dense_bytes != null and !hasHostView(rhs_buf) and
+            (rhs_buf.native_dense_dtype == .bf16 or rhs_buf.native_dense_dtype == .f16))
+        {
+            return try linearNoBiasOpWithPlannedDispatch(self, lhs, rhs, m, k, n, null);
+        }
+
         var lhs_mt = try self.ownedDeviceMetalTensorFromCt(lhs);
         defer lhs_mt.deinit();
         var rhs_mt = try self.ownedDeviceMetalTensorFromCt(rhs);
@@ -14395,13 +14429,23 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     defer input_mt.deinit();
                     var weight_mt = try self.ownedDeviceMetalTensorFromCt(weight);
                     defer weight_mt.deinit();
-                    if (try metal_runtime.decoderRuntimeApplyRmsNormWeightDevice(
-                        self.provider_impl,
-                        input_mt,
-                        weight_mt,
-                        dim,
-                        eps,
-                    )) |tensor| {
+                    const normalized = if (self.precise_training_rms_norm)
+                        try metal_runtime.decoderRuntimeApplyRmsNormWeightDevicePrecise(
+                            self.provider_impl,
+                            input_mt,
+                            weight_mt,
+                            dim,
+                            eps,
+                        )
+                    else
+                        try metal_runtime.decoderRuntimeApplyRmsNormWeightDevice(
+                            self.provider_impl,
+                            input_mt,
+                            weight_mt,
+                            dim,
+                            eps,
+                        );
+                    if (normalized) |tensor| {
                         if (traceGatedDeviceRequested()) std.debug.print("metal-rms-device-success rows={d} dim={d}\n", .{ rows, dim });
                         if (input_metal.ndim() == 2) return self.ctFromOwnedMetalTensor(tensor);
                         var flat_tensor = tensor;
@@ -14434,6 +14478,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         eps: f32,
     ) anyerror!?ops.RmsNormTripleResult {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (self.precise_training_rms_norm) return null;
         if (!a4bHighMemoryFeatureEnabled(
             "TERMITE_METAL_ENABLE_A4B_PARALLEL_FFN_NORMS",
             "TERMITE_METAL_DISABLE_A4B_PARALLEL_FFN_NORMS",
@@ -14592,6 +14637,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         eps: f32,
     ) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (self.precise_training_rms_norm) return null;
         if (!a4bHighMemoryFeatureEnabled(
             "TERMITE_METAL_ENABLE_A4B_RMS_NORM_ADD_FUSION",
             "TERMITE_METAL_DISABLE_A4B_RMS_NORM_ADD_FUSION",
@@ -15745,6 +15791,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         scale: f32,
     ) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (self.precise_training_rms_norm) return null;
         if (!a4bHighMemoryFeatureEnabled(
             "TERMITE_METAL_ENABLE_A4B_HEAD_NORM_ROPE_FUSION",
             "TERMITE_METAL_DISABLE_A4B_HEAD_NORM_ROPE_FUSION",
@@ -37368,6 +37415,74 @@ test "metal_compute: frozen linear cross entropy loss and d_hidden match native"
     try std.testing.expectEqual(@as(u64, 0), route_stats.linear_cce_backward_calls);
 }
 
+test "gemma4 metal_compute: long CCE backward preserves cancellation across row and vocabulary tails" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const in_dim = 5;
+    const vocab_size = 65545;
+    const words = try allocator.alloc(u16, vocab_size * in_dim);
+    defer allocator.free(words);
+    @memset(words, 0x3f80); // Every frozen vocabulary row is exactly one.
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var cb = metal_compute.computeBackend();
+    const weight_buf = try allocator.create(MetalCompute.Buf);
+    weight_buf.* = .{
+        .data = &.{},
+        .allocator = allocator,
+        .owned = false,
+        .logical_shape = try allocator.dupe(i64, &.{ vocab_size, in_dim }),
+        .native_dense_bytes = try allocator.dupe(u8, std.mem.sliceAsBytes(words)),
+        .native_dense_dtype = .bf16,
+        .native_dense_bytes_owned = true,
+    };
+    const weight: CT = @ptrCast(weight_buf);
+    defer cb.free(weight);
+    const upstream = try auditDeviceTensor(&metal_compute, &cb, &.{0.625}, &.{1});
+    defer cb.free(upstream);
+    var training_scope = training_executor_policy.ProductEnableScope.acquire();
+    defer training_scope.deinit();
+
+    for ([_]usize{ 1, 3, 17, 64, 65, 71, 128, 129 }) |rows| {
+        const hidden = try allocator.alloc(f32, rows * in_dim);
+        defer allocator.free(hidden);
+        @memset(hidden, 0);
+        const labels = try allocator.alloc(f32, rows);
+        defer allocator.free(labels);
+        for (labels, 0..) |*label, i| label.* = if (i % 2 == 0) 0 else vocab_size - 1;
+        const hidden_ct = try auditDeviceTensor(&metal_compute, &cb, hidden, &.{ @intCast(rows), in_dim });
+        defer cb.free(hidden_ct);
+        const labels_ct = try auditDeviceTensor(&metal_compute, &cb, labels, &.{@intCast(rows)});
+        defer cb.free(labels_ct);
+        const grad = try cb.linearCrossEntropyBackward(&.{
+            .hidden = hidden_ct,
+            .weight = weight,
+            .labels = labels_ct,
+            .upstream = upstream,
+            .rows = rows,
+            .in_dim = in_dim,
+            .vocab_size = vocab_size,
+            .logit_softcap = 2.5,
+            .ignore_index = -100,
+            .frozen_weight = true,
+            .hidden_shape = &.{ @intCast(rows), in_dim },
+        });
+        defer cb.free(grad);
+        const values = try cb.toFloat32(grad, allocator);
+        defer allocator.free(values);
+        // Identical vocabulary rows make the loss independent of hidden.
+        // Allow F32 exp/log normalization error, but not loss of thousands
+        // of positive tail contributions after the negative target term.
+        for (values) |value| try std.testing.expectApproxEqAbs(@as(f32, 0), value, 1e-6);
+    }
+    try std.testing.expectEqual(@as(u64, 8), cb.trainingRuntimeStats().linear_cce_backward_calls);
+}
+
 test "gemma4 metal_compute: BF16 cut cross entropy crosses vocabulary tile boundary" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
@@ -38689,6 +38804,57 @@ test "metal_compute: rank-4 LoRA backward stays on device inside frame" {
     try std.testing.expectEqualSlices(f32, &.{ 1.5, 0.5, -3, 4, 2.5, -1.5, 2, 2 }, grad_after_a);
     try std.testing.expectEqualSlices(f32, &.{ 11.5, 15.5, 19.5, -5.5, -6.5, -7.5, 5, 4, 3, 12, 18, 24 }, grad_a);
     try std.testing.expectEqualSlices(f32, &.{ 1, 4, 7, 10, -4, -2, 0, 2 }, grad_b);
+}
+
+test "gemma4 metal_compute: long BF16 forward projection preserves cancellation and tails" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const in_dim = 8193;
+    // The SIMD route requires at least 128 output columns; 129 also exercises
+    // a partial 64-column tile.
+    const out_dim = 129;
+    const words = try allocator.alloc(u16, out_dim * in_dim);
+    defer allocator.free(words);
+    @memset(words, 0x3f80);
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var cb = metal_compute.computeBackend();
+    const weight_buf = try allocator.create(MetalCompute.Buf);
+    weight_buf.* = .{
+        .data = &.{}, .allocator = allocator, .owned = false,
+        .logical_shape = try allocator.dupe(i64, &.{out_dim, in_dim}),
+        .native_dense_bytes = try allocator.dupe(u8, std.mem.sliceAsBytes(words)),
+        .native_dense_dtype = .bf16, .native_dense_bytes_owned = true,
+    };
+    const weight: CT = @ptrCast(weight_buf);
+    defer cb.free(weight);
+    const biases = [_]f32{0} ** out_dim;
+    const bias = try auditDeviceTensor(&metal_compute, &cb, &biases, &.{out_dim});
+    defer cb.free(bias);
+    const tiny: f32 = 0.001 * 0x1p-25;
+    const expected: f32 = @floatCast(@as(f64, tiny) * (in_dim - 2));
+    for ([_]usize{128, 129, 154}) |rows| {
+        const data = try allocator.alloc(f32, rows * in_dim);
+        defer allocator.free(data);
+        @memset(data, tiny);
+        for (0..rows) |row| {
+            data[row * in_dim] = 0.001;
+            data[(row + 1) * in_dim - 1] = -0.001;
+        }
+        const upstream = try auditDeviceTensor(&metal_compute, &cb, data, &.{@intCast(rows), in_dim});
+        defer cb.free(upstream);
+        const grad = try cb.linear(upstream, weight, bias, rows, in_dim, out_dim);
+        defer cb.free(grad);
+        try std.testing.expect(MetalCompute.debugHasDeviceTensor(&cb, grad));
+        const values = try cb.toFloat32(grad, allocator);
+        defer allocator.free(values);
+        // An F64 sum of these exactly represented operands retains the tiny
+        // middle terms. Plain long F32 accumulation loses the entire signal.
+        for (values) |value| try std.testing.expectApproxEqAbs(expected, value, 1e-8);
+    }
 }
 
 test "metal_compute: native BF16 frozen linear backward input stays on device" {

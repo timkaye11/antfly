@@ -17,6 +17,8 @@ SPEC.loader.exec_module(gate)
 class IncrementalKvParityGateTests(unittest.TestCase):
     def test_accepts_epoch_shuffled_report_schema_v8(self) -> None:
         self.assertIn("antfly_inference_finetune_grpo_report/v8", gate.TRAIN_SCHEMAS)
+        self.assertIn("antfly_inference_finetune_grpo_report/v9", gate.TRAIN_SCHEMAS)
+        self.assertIn("antfly_inference_finetune_grpo_report/v10", gate.TRAIN_SCHEMAS)
 
     def test_v8_requires_the_qualified_training_order(self) -> None:
         report = {

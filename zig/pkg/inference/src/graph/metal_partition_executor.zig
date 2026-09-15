@@ -19239,7 +19239,7 @@ fn testCompiledParameterWeightOwnership(allocator: std.mem.Allocator, lazy: bool
 
     // Both parameters die at the same consumer. The compiled executor's
     // pointer-deduplicating cleanup must release both acquisitions.
-    const freed = try freeExpiredInputs(allocator, &graph, &cb, &values, &devices, sum, 0, &last_use, null, .empty, .empty, .{});
+    const freed = try freeExpiredInputs(allocator, &graph, &cb, &values, &devices, sum, 0, &last_use, null, null, .empty, .empty, .{});
     try std.testing.expectEqual(@as(usize, 2), freed.count);
     try std.testing.expect(values[first] == null and values[second] == null);
     const actual = try cb.toFloat32(borrowed.?, allocator);
@@ -26789,4 +26789,77 @@ test "metal partition executor owned lifecycle deinitializes cleanly" {
     const exec = try MetalPartitionExecutor.create(allocator, &g, &cb);
     const pe = exec.partitionExecutor();
     pe.deinitExecutor();
+}
+
+test "gemma4 metal deferred forward linear preserves native BF16 and F16 storage" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const rows = 2;
+    const in_dim = 4;
+    const out_dim = 3;
+    const weight_name = "model.layers.0.self_attn.q_proj.weight";
+    const DType = @import("../backends/tensor.zig").DType;
+    for ([_]DType{ .bf16, .f16 }) |dtype| {
+        var g = Graph.init(allocator);
+        defer g.deinit();
+        var b = ml.graph.Builder.init(&g);
+        const input_id = try b.parameter("input", ml.graph.Shape.init(.f32, &.{ rows, in_dim }));
+        const weight_id = try b.parameter(weight_name, ml.graph.Shape.init(.f32, &.{ out_dim, in_dim }));
+        const weight_t = try b.transpose(weight_id, &.{ 1, 0 });
+        const output_id = try b.matmul(input_id, weight_t);
+        try g.markOutput(output_id);
+
+        const weight_values = [_]f32{ 1, 2, 0, -1, 0, 1, 3, 2, 2, -1, 1, 0.5 };
+        var weight_words: [weight_values.len]u16 = undefined;
+        for (weight_values, &weight_words) |value, *word| {
+            word.* = if (dtype == .bf16) @truncate(@as(u32, @bitCast(value)) >> 16) else @bitCast(@as(f16, @floatCast(value)));
+        }
+        var weight_shape = [_]i64{ out_dim, in_dim };
+        var weight_store = initEmptyMetalWeightStore(allocator);
+        defer deinitEmptyMetalWeightStore(&weight_store, allocator);
+        try weight_store.lazy_weights.put(allocator, weight_name, .{
+            .tensor_ref = undefined,
+            .host_loaded = .{ .tensor = .{
+                .data = std.mem.sliceAsBytes(&weight_words),
+                .dtype = dtype,
+                .shape = &weight_shape,
+                .name = weight_name,
+                .allocator = allocator,
+                .owns_data = false,
+                .owns_shape = false,
+            } },
+            .active_tier = .host,
+            .loaded_bytes = @sizeOf(@TypeOf(weight_words)),
+        });
+        var metal_compute = try metal_compute_mod.MetalCompute.init(allocator, &weight_store, null);
+        defer metal_compute.deinit();
+        var cb = metal_compute.computeBackend();
+        if (!cb.decoderRuntimeReady()) return error.SkipZigTest;
+        const input_host = try cb.fromFloat32Shape(&.{ 1, 2, -1, 0.5, -2, 3, 0.5, -1 }, &.{ rows, in_dim });
+        defer cb.free(input_host);
+        const input = (try makeMetalDeviceResident(&cb, input_host)) orelse return error.SkipZigTest;
+        defer cb.free(input);
+        const weight = try cb.acquireWeight(weight_name);
+        defer cb.free(weight);
+        const values = try allocator.alloc(?CT, g.nodeCount());
+        defer allocator.free(values);
+        @memset(values, null);
+        values[input_id] = input;
+        values[weight_id] = weight;
+
+        // Autodiff's unplanned deferred transpose must not demote native
+        // weights to generic F32 dot operands. Check both values and dispatch.
+        const before = cb.debugTimingSnapshot().provider;
+        const node = g.node(output_id);
+        const output = (try executeRuntimeDotGeneral(&g, &cb, values, node.getInputs(), node.op.dot_general, null)) orelse return error.UnsupportedOperation;
+        defer cb.free(output);
+        try std.testing.expect(isMetalDeviceResident(&cb, output));
+        const after = cb.debugTimingSnapshot().provider;
+        try std.testing.expectEqual(before.decoder_runtime_prepare_linear_calls + 1, after.decoder_runtime_prepare_linear_calls);
+        const actual = try cb.toFloat32(output, allocator);
+        defer allocator.free(actual);
+        for ([_]f32{ 4.5, 0, -0.75, 5, 2.5, -7 }, actual) |expected, value| try std.testing.expectApproxEqAbs(expected, value, 1e-5);
+    }
 }

@@ -620,7 +620,7 @@ Every non-dry run also writes:
 
 Direct DPO and GRPO adapters also write `artifacts.report_path`, or `<artifacts.root>/dpo_report.json` / `<artifacts.root>/grpo_report.json` when no explicit report path is provided.
 Their report schemas are `antfly_inference_finetune_dpo_report/v7` and
-`antfly_inference_finetune_grpo_report/v8`; both bind the resolved
+`antfly_inference_finetune_grpo_report/v10`; both bind the resolved
 `execution_mode` and `dataset_format`. Training reports additionally name the
 published adapter directory, while score reports leave it null. The normalized
 training report fingerprints both the bootstrap and trained adapter trees for
@@ -878,7 +878,13 @@ Use `dataset.format = "text-grpo"` to treat `prompt` as user content and apply t
 The hard KL budget applies even when adaptive control is disabled. Adaptive
 mode uses the current `kl_coef` for the admitted group, then updates the
 coefficient for the next group with a bounded proportional error around
-`target_kl`; it does not retroactively change the current loss. Partial
+`target_kl`. `kl_horizon` is measured in sampled completion episodes, so one
+group advances the controller by `group_size`; a hard-budget rejection advances
+this controller state while model and optimizer state remain untouched. The
+updated coefficient is applied to the next group even when the observation was
+rejected. The v5 KL trace records `objective_kl_coef` and fails closed if it
+differs from `kl_coef_before`, making this state transition auditable. It does
+not retroactively change the rejected group's loss. Partial
 adaptive configurations fail validation, `target_kl` must remain below
 `train_max_kl`, and no rejected group may mutate optimizer state.
 

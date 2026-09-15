@@ -30,6 +30,7 @@ from gemma4_oracle_contract import (
     STOCK_PEFT_KEY_FORMAT,
     TRACE_SCHEMA_VERSION,
     antfly_to_stock_peft_tensor_name,
+    stock_peft_module_name,
     build_evidence_ledger,
     canonicalize_adapter_tensor_name,
     hardware_fingerprint,
@@ -182,7 +183,11 @@ def translate_antfly_adapter_to_stock_peft(
     from safetensors.torch import save_file
 
     destination_dir.mkdir()
-    shutil.copy2(source_dir.resolve() / "adapter_config.json", destination_dir / "adapter_config.json")
+    config = json.loads((source_dir.resolve() / "adapter_config.json").read_text())
+    config["target_modules"] = [stock_peft_module_name(name) for name in config["target_modules"]]
+    if len(config["target_modules"]) != len(set(config["target_modules"])):
+        raise ContractError("stock PEFT target module translation collision")
+    write_json(destination_dir / "adapter_config.json", config)
     source_checkpoint = source_dir.resolve() / "adapter_model.safetensors"
     translated_tensors: dict[str, Any] = {}
     key_map: dict[str, str] = {}

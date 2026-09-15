@@ -30,7 +30,6 @@ const Graph = graph_mod.Graph;
 const Node = node_mod.Node;
 const NodeId = node_mod.NodeId;
 const null_node = node_mod.null_node;
-const OpCode = node_mod.OpCode;
 const Shape = shape_mod.Shape;
 
 pub const LowerResult = struct {
@@ -45,12 +44,28 @@ pub const LowerResult = struct {
     }
 };
 
+pub const LowerOptions = struct {
+    /// Replace fused grouped-query attention with its proven primitive
+    /// alternate when one is available. The default keeps the fused node so
+    /// autodiff can use its custom VJP and runtime backends can use their
+    /// specialized kernels.
+    lower_gqa: bool = false,
+};
+
 /// Lower a graph by replacing fused ops (that have vjp_alternate) with
 /// their decomposed primitive subgraphs. Returns a new graph where lowerable
 /// fused ops are replaced by their primitive equivalents.
 ///
 /// The returned id_map translates old node IDs to new node IDs.
 pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
+    return lowerWithOptions(allocator, graph, .{});
+}
+
+pub fn lowerWithOptions(
+    allocator: std.mem.Allocator,
+    graph: *const Graph,
+    options: LowerOptions,
+) !LowerResult {
     const count = graph.nodeCount();
 
     // Step 1: Build a "redirect" map. For each fused node with vjp_alternate,
@@ -62,13 +77,17 @@ pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
     }
     for (0..count) |i| {
         const n = graph.node(@intCast(i));
-        if (n.op == .fused_gelu or n.op == .fused_gelu_exact or n.op == .fused_softmax) continue;
+        // Embedding lookup has the same scatter-add VJP as gather. Keep its
+        // sparse forward: a general device gather can make an entire frozen
+        // BF16 table resident when only a few token rows are needed.
+        if (n.op == .fused_gelu or n.op == .fused_gelu_exact or n.op == .fused_softmax or
+            n.op == .fused_embedding_lookup) continue;
         // Fused disentangled attention keeps its fused forward kernel and is
         // differentiated by a custom VJP rule (not vjp_alternate lowering).
         if (n.op == .fused_disentangled_attention or
             n.op == .fused_disentangled_attention_backward or
-            n.op == .fused_gqa_causal_attention or
-            n.op == .fused_gqa_causal_attention_backward)
+            n.op == .fused_gqa_causal_attention_backward or
+            (n.op == .fused_gqa_causal_attention and !options.lower_gqa))
         {
             continue;
         }
@@ -92,7 +111,7 @@ pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
     for (0..count) |i| {
         if (!reachable[i]) continue;
         const n = graph.node(@intCast(i));
-        if (n.op != .fused_gqa_causal_attention or n.vjp_alternate == null_node) continue;
+        if (options.lower_gqa or n.op != .fused_gqa_causal_attention or n.vjp_alternate == null_node) continue;
         markReachable(graph, reachable, redirect, n.vjp_alternate);
     }
 
@@ -149,7 +168,7 @@ pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
                 }
             }
         }
-        if (n.op == .fused_gqa_causal_attention and n.vjp_alternate != null_node) {
+        if (!options.lower_gqa and n.op == .fused_gqa_causal_attention and n.vjp_alternate != null_node) {
             const alternate = redirect[n.vjp_alternate];
             if (alternate < count and reachable[alternate]) {
                 // Synthetic ordering edge: the execution rewrite replaces
@@ -194,7 +213,7 @@ pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
                     }
                 }
             }
-            if (n.op == .fused_gqa_causal_attention and n.vjp_alternate != null_node) {
+            if (!options.lower_gqa and n.op == .fused_gqa_causal_attention and n.vjp_alternate != null_node) {
                 const alternate = redirect[n.vjp_alternate];
                 if (alternate == old_id) {
                     in_degree[succ_pos] -= 1;
@@ -233,7 +252,7 @@ pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
             }
         }
 
-        new_node.vjp_alternate = if (old_node.op == .fused_gqa_causal_attention and
+        new_node.vjp_alternate = if (!options.lower_gqa and old_node.op == .fused_gqa_causal_attention and
             old_node.vjp_alternate != null_node)
             id_map[old_node.vjp_alternate]
         else
@@ -386,4 +405,43 @@ test "lower preserves parameter names" {
     }
     try std.testing.expect(found_input);
     try std.testing.expect(found_weight);
+}
+
+test "lower optionally replaces fused grouped-query attention" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const q = try b.parameter("q", Shape.init(.f32, &.{ 3, 8 }));
+    const k = try b.parameter("k", Shape.init(.f32, &.{ 3, 4 }));
+    const v = try b.parameter("v", Shape.init(.f32, &.{ 3, 4 }));
+    const alternate = try b.add(q, q);
+    const gqa = try g.addNode(.{
+        .op = .{ .fused_gqa_causal_attention = .{
+            .batch = 1,
+            .seq_len = 3,
+            .num_heads = 4,
+            .num_kv_heads = 2,
+            .head_dim = 2,
+        } },
+        .output_shape = Shape.init(.f32, &.{ 3, 8 }),
+        .inputs = .{ q, k, v, null_node },
+        .num_inputs = 3,
+        .vjp_alternate = alternate,
+    });
+    try g.markOutput(gqa);
+
+    var preserved = try lower(allocator, &g);
+    defer preserved.deinit();
+    try std.testing.expect(
+        preserved.graph.node(preserved.graph.outputs.items[0]).op == .fused_gqa_causal_attention,
+    );
+
+    var lowered = try lowerWithOptions(allocator, &g, .{ .lower_gqa = true });
+    defer lowered.deinit();
+    try std.testing.expect(lowered.graph.node(lowered.graph.outputs.items[0]).op == .add);
+    for (0..lowered.graph.nodeCount()) |i| {
+        try std.testing.expect(lowered.graph.node(@intCast(i)).op != .fused_gqa_causal_attention);
+    }
 }

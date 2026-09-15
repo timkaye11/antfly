@@ -2208,6 +2208,21 @@ const BenchmarkSemanticTensor = struct {
     data_end: u64,
 };
 
+/// Compare tensor identities and values independently of SafeTensors header
+/// formatting, tensor order, or supported PEFT namespace aliases.
+pub fn adapterPayloadsEqual(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    left_path: []const u8,
+    right_path: []const u8,
+) !bool {
+    var left = try inspectBenchmarkAdapterSemantics(allocator, io, left_path);
+    defer left.deinit(allocator);
+    var right = try inspectBenchmarkAdapterSemantics(allocator, io, right_path);
+    defer right.deinit(allocator);
+    return std.mem.eql(u8, left.semantic_sha256, right.semantic_sha256);
+}
+
 fn inspectBenchmarkAdapterSemantics(
     allocator: std.mem.Allocator,
     io: std.Io,

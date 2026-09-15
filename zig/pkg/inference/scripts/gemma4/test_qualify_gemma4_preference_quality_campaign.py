@@ -542,7 +542,24 @@ class PreferenceQualityCampaignTest(unittest.TestCase):
                     "rank": 8,
                     "alpha": 16.0,
                     "target_modules": ["model.layers.0.self_attn.q_proj"],
+                    "target_preset": None,
                 },
+            )
+            (adapter / "antfly_finetune_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": "antfly_gemma4_finetune/v3",
+                        "status": "complete",
+                        "target_preset": "peft-qv",
+                        "target_modules": config["target_modules"],
+                        "rank": 8,
+                        "alpha": 16.0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                "peft-qv", campaign._adapter_bootstrap_spec(adapter)["target_preset"]
             )
             config["init_lora_weights"] = "eva"
             (adapter / "adapter_config.json").write_text(
@@ -605,6 +622,62 @@ class PreferenceQualityCampaignTest(unittest.TestCase):
                 evidence["adapter_model_sha256"],
                 "sha256:" + hashlib.sha256(payload).hexdigest(),
             )
+
+    def test_seed_bootstrap_preserves_manifest_target_preset(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            adapter = root / "adapter-seed-17"
+            target_modules = ["model.layers.0.self_attn.q_proj"]
+            payload = b"seeded-adapter"
+
+            def fake_run(command, _env, _log_root, _timeout):
+                self.assertEqual(command[command.index("--target-preset") + 1], "peft-qv")
+                self.assertNotIn("--target-modules", command)
+                adapter.mkdir()
+                (adapter / "adapter_model.safetensors").write_bytes(payload)
+                (adapter / "adapter_config.json").write_text(
+                    json.dumps(
+                        {
+                            "r": 8,
+                            "lora_alpha": 16.0,
+                            "target_modules": target_modules,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (adapter / "antfly_finetune_manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "schema_version": "antfly_gemma4_finetune/v3",
+                            "status": "complete",
+                            "adapter_checkpoint_sha256": hashlib.sha256(payload).hexdigest(),
+                            "adapter_checkpoint_size_bytes": len(payload),
+                            "initialization_seed": 17,
+                            "target_preset": "peft-qv",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return {"command": command, "returncode": 0}
+
+            with mock.patch.object(campaign, "_run", side_effect=fake_run):
+                evidence = campaign._bootstrap_seed_adapter(
+                    Path("/fake/antfly"),
+                    Path("/model"),
+                    {
+                        "rank": 8,
+                        "alpha": 16.0,
+                        "target_modules": target_modules,
+                        "target_preset": "peft-qv",
+                    },
+                    17,
+                    adapter,
+                    {},
+                    root / "bootstrap-seed-17",
+                    1.0,
+                )
+
+            self.assertEqual(evidence["initialization_seed"], 17)
 
     def test_dataset_path_uses_runtime_precedence_and_rejects_conflicts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

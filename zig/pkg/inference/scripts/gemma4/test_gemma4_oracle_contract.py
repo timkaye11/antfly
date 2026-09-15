@@ -228,6 +228,37 @@ class Gemma4OracleContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ContractError, "unsupported adapter tensor name"):
             canonicalize_adapter_tensor_name("model.layers.0.self_attn.q_proj.weight")
 
+    def test_root_ple_aliases_share_one_identity_across_hf_and_antfly(self) -> None:
+        expected = "model.per_layer_input.per_layer_model_proj"
+        for prefix in ("", "model.", "model.language_model.", "base_model.model.",
+                       "base_model.model.model.language_model."):
+            for module in ("per_layer_model_projection", "per_layer_input.per_layer_model_proj"):
+                with self.subTest(prefix=prefix, module=module):
+                    self.assertEqual(expected, contract.canonicalize_module_name(prefix + module))
+                    self.assertEqual(
+                        (expected, "lora_A"),
+                        canonicalize_adapter_tensor_name(prefix + module + ".lora_A.weight"),
+                    )
+        with self.assertRaisesRegex(ContractError, "duplicate canonical"):
+            contract.canonical_adapter_inventory([
+                "per_layer_model_projection.lora_A.weight",
+                "model.per_layer_input.per_layer_model_proj.lora_A.weight",
+            ])
+
+    def test_stock_peft_translation_preserves_multimodal_root_and_hf_ple_names(self) -> None:
+        for source, destination in (
+            ("model.language_model.layers.0.self_attn.q_proj", "model.language_model.layers.0.self_attn.q_proj"),
+            ("model.language_model.layers.0.per_layer_input.inp_gate", "model.language_model.layers.0.per_layer_input_gate"),
+            ("model.language_model.layers.0.per_layer_input.proj", "model.language_model.layers.0.per_layer_projection"),
+            ("model.language_model.per_layer_input.per_layer_model_proj", "model.language_model.per_layer_model_projection"),
+            ("model.per_layer_input.per_layer_model_proj", "model.per_layer_model_projection"),
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(
+                    "base_model.model." + destination + ".lora_B.weight",
+                    antfly_to_stock_peft_tensor_name(source + ".weight.lora_B.weight"),
+                )
+
     def test_target_preset_requires_the_complete_model_inventory(self) -> None:
         with self.assertRaisesRegex(ContractError, "incomplete target inventory"):
             validate_target_inventory(
@@ -388,6 +419,21 @@ class Gemma4OracleContractTest(unittest.TestCase):
             seeded = read_adapter_config(adapter)
             self.assertEqual("antfly-finetune-manifest/v3", seeded["policy_source"])
             self.assertEqual(17, seeded["provenance"]["initialization_seed"])
+
+            manifest_payload["target_preset"] = None
+            manifest_path.write_text(json.dumps(manifest_payload), encoding="utf-8")
+            with self.assertRaisesRegex(ContractError, "target_preset is missing"):
+                read_adapter_config(adapter, target_preset="peft-qv")
+            recovered = read_adapter_config(
+                adapter,
+                target_preset="peft-qv",
+                allow_missing_manifest_target_preset=True,
+            )
+            self.assertEqual("peft-qv", recovered["target_preset"])
+            self.assertEqual(
+                "explicit-complete-inventory",
+                recovered["provenance"]["target_preset_attestation"],
+            )
 
             manifest_path.unlink()
             with self.assertRaisesRegex(ContractError, "requires an explicit target preset"):

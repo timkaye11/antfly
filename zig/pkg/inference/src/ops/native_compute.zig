@@ -41,6 +41,7 @@ const tier_shared_mod = runtime.tier.shared;
 const gguf_tensor_types = @import("../gguf/tensor_types.zig");
 const quant_codec = @import("../gguf/quant_codec.zig");
 const tensor_mod = @import("../backends/tensor.zig");
+const native_f64_dot = @import("native_f64_dot.zig");
 const large_tensor_log_threshold: usize = 5_000_000;
 const native_aarch64_dotprod = builtin.cpu.arch == .aarch64 and std.Target.aarch64.featureSetHas(builtin.cpu.features, .dotprod);
 
@@ -3741,7 +3742,16 @@ fn convertTensorRowsToF32(
 
 fn shouldBorrowEmbeddingTensor(name: []const u8) bool {
     return std.mem.eql(u8, name, "model.embed_tokens.weight") or
+        std.mem.eql(u8, name, "model.language_model.embed_tokens.weight") or
+        std.mem.eql(u8, name, "model.per_layer_input.per_layer_token_embd.weight") or
+        std.mem.eql(u8, name, "model.language_model.per_layer_input.per_layer_token_embd.weight") or
         std.mem.eql(u8, name, "wte.weight");
+}
+
+fn shouldBorrowWeightTensor(self: *const NativeCompute, name: []const u8, tensor: *const tensor_mod.Tensor) bool {
+    return shouldBorrowEmbeddingTensor(name) or
+        (self.borrow_frozen_linear_weights and tensor.shape.len == 2 and
+            (tensor.dtype == .bf16 or tensor.dtype == .f16));
 }
 
 const WeightF32View = struct {
@@ -3795,6 +3805,15 @@ fn linearNoBiasSourceTensorChunked(
     if (tensor.shape[0] != out_dim or tensor.shape[1] != in_dim) return error.ShapeMismatch;
     if (tensor.dtype != .f32 and tensor.dtype != .f16 and tensor.dtype != .bf16) {
         return error.UnsupportedTensorType;
+    }
+
+    if (self.borrow_frozen_linear_weights and !shouldBorrowEmbeddingTensor(tensor.name)) {
+        // Preserve the previous eager F32 GEMM's shape and accumulation.
+        // Only this temporary view's lifetime changes, not its arithmetic.
+        const view = try tensorF32View(self, tensor);
+        defer if (view.owned) |owned| self.allocator.free(owned);
+        try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, input, view.data, 0.0, output);
+        return;
     }
 
     // Fast path: f16 weights, naturally aligned, can be consumed directly by
@@ -3941,6 +3960,10 @@ pub const NativeCompute = struct {
     run_budget: ?*run_memory.RunBudget = null,
     weight_reservations: std.StringHashMapUnmanaged(ReservationState) = .empty,
     weight_handles: std.StringHashMapUnmanaged(CT) = .empty,
+    /// Gemma4 autodiff retains all parameter handles across the training graph.
+    /// Keep frozen rank-2 BF16/F16 weights in source storage; operations own
+    /// temporary F32 views. Ordinary native inference retains its policy.
+    borrow_frozen_linear_weights: bool = false,
     /// Optional Io for parallel GEMM dispatch.  When non-null, sgemm calls
     /// route through linalg's Io-aware variants and parallel work is
     /// scheduled on the runtime's thread pool.  When null, sgemm uses the
@@ -4662,8 +4685,19 @@ fn maybeDiscardLazyEntryFileCacheAfterUse(
 }
 
 fn maybeDiscardMappedWeightAfterUse(self: *NativeCompute, weight: CT) void {
-    const entry = toBuf(weight).lazy_entry orelse return;
-    _ = maybeDiscardLazyEntryFileCacheAfterUse(self.data, entry);
+    const buf = toBuf(weight);
+    if (buf.lazy_entry) |entry| {
+        _ = maybeDiscardLazyEntryFileCacheAfterUse(self.data, entry);
+        return;
+    }
+    if (!self.borrow_frozen_linear_weights) return;
+    const source = buf.source_tensor orelse return;
+    if (source.mmap_source_bytes == null) return;
+    const tensor_store = self.data.tensor_store orelse return;
+    // The operation has completed, even if its immutable parameter handle is
+    // retained by a graph. Reclaim only the consumed clean mapping range;
+    // later readers fault the same bytes back through the live tensor store.
+    tensor_store.discardTensorFileCache(source.name);
 }
 
 fn acquireWeightReservation(self: *NativeCompute, name: []const u8, bytes: usize) !?run_memory.Reservation {
@@ -4738,10 +4772,10 @@ fn checkedF32Bytes(len: usize) usize {
         std.math.maxInt(usize);
 }
 
-fn loadedWeightHandleBytes(loaded: *const LoadedWeight, name: []const u8, cached_bytes: usize) usize {
+fn loadedWeightHandleBytes(self: *const NativeCompute, loaded: *const LoadedWeight, name: []const u8, cached_bytes: usize) usize {
     if (loaded.quantized_storage != null or
         loaded.tensor.dtype == .f32 or
-        shouldBorrowEmbeddingTensor(name))
+        shouldBorrowWeightTensor(self, name, &loaded.tensor))
     {
         return cached_bytes;
     }
@@ -4848,7 +4882,7 @@ fn loadWeight(self: *NativeCompute, name: []const u8) !CT {
             const tensor = try makeBufFromWeightView(self, view, name, null, null);
             return finishWeight(self, tensor, name, checkedF32Bytes(view.data.len), w.tensor.shape);
         }
-        if (shouldBorrowEmbeddingTensor(name)) {
+        if (shouldBorrowWeightTensor(self, name, &w.tensor)) {
             const tensor = try self.makeBufWithEntry(empty_f32[0..], false, name, null, null, &w.tensor);
             return finishWeight(self, tensor, name, w.tensor.data.len, w.tensor.shape);
         }
@@ -4882,7 +4916,7 @@ fn loadWeight(self: *NativeCompute, name: []const u8) !CT {
         const reservation = try acquireWeightReservation(
             self,
             name,
-            loadedWeightHandleBytes(loaded, name, entry.loaded_bytes),
+            loadedWeightHandleBytes(self, loaded, name, entry.loaded_bytes),
         );
         errdefer if (reservation != null) releaseWeightReservation(self, name);
         entry.pin_count += 1;
@@ -4901,7 +4935,7 @@ fn loadWeight(self: *NativeCompute, name: []const u8) !CT {
             const tensor = try makeBufFromWeightView(self, view, name, entry, null);
             return finishLazyWeightLocked(self, tensor, reservation, loaded.tensor.shape);
         }
-        if (shouldBorrowEmbeddingTensor(name)) {
+        if (shouldBorrowWeightTensor(self, name, &loaded.tensor)) {
             const tensor = try self.makeBufWithEntry(empty_f32[0..], false, name, entry, null, &loaded.tensor);
             return finishLazyWeightLocked(self, tensor, reservation, loaded.tensor.shape);
         }
@@ -5841,7 +5875,11 @@ fn linearOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_di
     }
 
     if (weight_buf.source_tensor) |tensor| {
-        try linearNoBiasSourceTensorChunked(self, getData(input), tensor, output, rows, in_dim, out_dim);
+        // Preserve the dense biased GEMM, including beta=1. The no-bias
+        // source helper overwrites its destination and would discard bias.
+        const view = try tensorF32View(self, tensor);
+        defer if (view.owned) |owned| self.allocator.free(owned);
+        try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, getData(input), view.data, 1.0, output);
     } else if (weight_buf.lazy_entry) |entry| {
         if (weight_buf.data.len == 0 and canFallbackDenseBudgetPressure(weight_buf.name, entry)) {
             try linearNoBiasLazyEntryChunked(self, getData(input), entry, output, rows, in_dim, out_dim);
@@ -37847,6 +37885,7 @@ fn primReshapeOp(ctx: *anyopaque, input: CT, new_shape: []const i64) anyerror!CT
 
 fn primTransposeOp(ctx: *anyopaque, input: CT, perm: []const u8, input_shape: []const i64) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, input);
     const input_buf = toBuf(input);
     const effective_input_shape = storedOrDeclaredShape(input, input_shape);
     var resolved_shape_buf: [8]i64 = undefined;
@@ -38068,6 +38107,8 @@ fn primBroadcastInDimOp(ctx: *anyopaque, input: CT, target_shape: []const i64, b
 
 fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, rhs_shape: []const i64, lhs_contracting: []const u8, rhs_contracting: []const u8, lhs_batch: []const u8, rhs_batch: []const u8) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, lhs);
+    defer maybeDiscardMappedWeightAfterUse(self, rhs);
     const lhs_buf = toBuf(lhs);
     const lhs_len = tensorLogicalElementCount(lhs, lhs_shape) orelse lhs_buf.data.len;
     var rhs_resolved_shape_buf: [8]i64 = undefined;
@@ -38154,7 +38195,9 @@ fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, r
             errdefer if (raw_output) |raw| self.allocator.free(raw);
             @memset(output, 0.0);
 
-            if (lc == 1 and rc == 0) {
+            // Newly borrowed linear weights must retain the dense path's
+            // F64 reduction, not enter the older embedding BLAS/F32 path.
+            if (lc == 1 and rc == 0 and (!self.borrow_frozen_linear_weights or shouldBorrowEmbeddingTensor(rhs_buf.name))) {
                 if (lhs_buf.view_strides == null and rhs_buf.view_strides == null) {
                     const lhs_data = getData(lhs);
                     if (toBuf(rhs).source_tensor) |rhs_tensor| {
@@ -38170,8 +38213,11 @@ fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, r
             if (lhs_buf.view_strides == null and rhs_buf.view_strides == null and rhs_buf.source_tensor == null) {
                 const lhs_data = getData(lhs);
                 const rhs_dense = getData(rhs);
-                // General 2D dot: C[i,j] = sum_k A[..] * B[..]
-                for (0..m) |i| {
+                // SIMD lanes preserve independent F64 accumulations. Keep
+                // the existing BLAS/F32 source path above unchanged.
+                if (m >= 2 and n >= 8 and k >= 16) {
+                    try native_f64_dot.rank2(self.allocator, lhs_data, if (lc == 1) k else 1, if (lc == 1) 1 else m, rhs_dense, if (rc == 1) k else 1, if (rc == 1) 1 else n, output, m, k, n);
+                } else for (0..m) |i| {
                     for (0..n) |j| {
                         var acc: f64 = 0.0;
                         for (0..k) |ki| {
@@ -38199,7 +38245,9 @@ fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, r
             if (rhs_buf.source_tensor) |rhs_tensor| {
                 const rhs_view = try tensorF32View(self, rhs_tensor);
                 defer if (rhs_view.owned) |owned| self.allocator.free(owned);
-                for (0..m) |i| {
+                if (m >= 2 and n >= 8 and k >= 16) {
+                    try native_f64_dot.rank2(self.allocator, lhs_base, lhs_strides[1 - lc], lhs_strides[lc], rhs_view.data, if (rc == 1) k else 1, if (rc == 1) 1 else n, output, m, k, n);
+                } else for (0..m) |i| {
                     for (0..n) |j| {
                         var acc: f64 = 0.0;
                         for (0..k) |ki| {
@@ -38210,6 +38258,8 @@ fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, r
                         output[i * n + j] = @floatCast(acc);
                     }
                 }
+            } else if (m >= 2 and n >= 8 and k >= 16) {
+                try native_f64_dot.rank2(self.allocator, lhs_base, lhs_strides[1 - lc], lhs_strides[lc], rhs_base, rhs_strides[1 - rc], rhs_strides[rc], output, m, k, n);
             } else {
                 for (0..m) |i| {
                     for (0..n) |j| {
@@ -38786,6 +38836,7 @@ fn primScatterAddOp(ctx: *anyopaque, input: CT, indices: CT, input_shape: []cons
 
 fn primGatherOp(ctx: *anyopaque, input: CT, indices: CT, axis: u8, input_shape: []const i64) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, input);
     const idx_data = getData(indices);
     const effective_input_shape = storedOrDeclaredShape(input, input_shape);
     const source_tensor = toBuf(input).source_tensor;
@@ -48783,6 +48834,63 @@ test "ComputeBackend crossAttention call site matches masked reference" {
     try expectApproxEqSlice(ref, getData(out_ct), 1e-4);
 }
 
+test "gemma4 native transposed-weight dot retains F64 results for dense and native storage" {
+    const allocator = std.testing.allocator;
+    var store = WeightStore{ .allocator = allocator, .resident_weights = .empty, .lazy_weights = .empty };
+    var compute = NativeCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    const m = 3;
+    const k = 17;
+    const n = 13;
+    var lhs_data: [m * k]f32 = undefined;
+    var lhs_transposed: [m * k]f32 = undefined;
+    var rhs_data: [n * k]f32 = undefined;
+    var rhs_words: [n * k]u16 = undefined;
+    var rhs_shape = [_]i64{ n, k };
+    for (&lhs_data, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 31)) - 15)) / 7.0;
+    for (&rhs_data, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 47)) - 23)) / 4.0;
+    for (0..m) |row| for (0..k) |ki| {
+        lhs_transposed[ki * m + row] = lhs_data[row * k + ki];
+    };
+    for ([_]tensor_mod.DType{ .f32, .bf16, .f16 }) |dtype| {
+        for (rhs_data, &rhs_words) |value, *word| word.* = if (dtype == .f16) @bitCast(@as(f16, @floatCast(value))) else @truncate(@as(u32, @bitCast(value)) >> 16);
+        const rhs = if (dtype == .f32)
+            try compute.makeBuf(&rhs_data, false)
+        else
+            try compute.makeBufWithOwnedSourceTensor(.{
+                .data = std.mem.sliceAsBytes(&rhs_words),
+                .dtype = dtype,
+                .shape = &rhs_shape,
+                .name = "rhs",
+                .allocator = allocator,
+                .owns_data = false,
+                .owns_shape = false,
+            });
+        defer freeTensor(&compute, rhs);
+        for ([_]u8{ 0, 1 }) |lc| {
+            const lhs = try compute.makeBuf(if (lc == 1) &lhs_data else &lhs_transposed, false);
+            defer freeTensor(&compute, lhs);
+            const actual = try primDotGeneralOp(&compute, lhs, rhs, if (lc == 1) &.{ m, k } else &.{ k, m }, &rhs_shape, &.{lc}, &.{1}, &.{}, &.{});
+            defer freeTensor(&compute, actual);
+            try std.testing.expectEqualSlices(i64, &.{ m, n }, tensorStoredShape(actual).?);
+            if (dtype == .f32) {
+                const shaped_rhs = try compute.withLogicalShape(rhs, &rhs_shape);
+                const rhs_view = try primTransposeOp(&compute, shaped_rhs, &.{ 1, 0 }, &rhs_shape);
+                defer freeTensor(&compute, rhs_view);
+                try std.testing.expect(toBuf(rhs_view).view_strides != null);
+                const view_result = try primDotGeneralOp(&compute, lhs, rhs_view, if (lc == 1) &.{ m, k } else &.{ k, m }, &.{ k, n }, &.{lc}, &.{0}, &.{}, &.{});
+                defer freeTensor(&compute, view_result);
+                try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(getData(actual)), std.mem.sliceAsBytes(getData(view_result)));
+            }
+            for (0..m) |row| for (0..n) |column| {
+                var expected: f64 = 0.0;
+                for (0..k) |ki| expected += @as(f64, lhs_data[row * k + ki]) * @as(f64, rhs_data[column * k + ki]);
+                try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, @floatCast(expected)))), @as(u32, @bitCast(getData(actual)[row * n + column])));
+            };
+        }
+    }
+}
+
 test "dot_general flattens lhs suffix for shared rhs source tensor" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
@@ -49836,4 +49944,198 @@ test "gather source-backed 2d table with unshaped vector indices" {
         1, 2,
         7, 8,
     }, getData(out_ct));
+}
+
+test "gemma4 native embedding handles preserve BF16 storage for fused and lowered lookup" {
+    const allocator = std.testing.allocator;
+    const names = [_][]const u8{
+        "model.embed_tokens.weight",
+        "model.language_model.embed_tokens.weight",
+        "model.per_layer_input.per_layer_token_embd.weight",
+        "model.language_model.per_layer_input.per_layer_token_embd.weight",
+    };
+    for (names) |name| {
+        for ([_]bool{ false, true }) |lazy| {
+            var bytes = [_]u8{ 0x80, 0x3f, 0x20, 0xc0, 0x00, 0x3f, 0x40, 0x40 };
+            var shape = [_]i64{ 2, 2 };
+            const weight = LoadedWeight{ .tensor = .{
+                .data = &bytes,
+                .shape = &shape,
+                .dtype = .bf16,
+                .name = name,
+                .allocator = allocator,
+                .owns_data = false,
+                .owns_shape = false,
+            } };
+            var store = WeightStore{ .allocator = allocator, .resident_weights = .empty, .lazy_weights = .empty };
+            defer store.resident_weights.deinit(allocator);
+            defer store.lazy_weights.deinit(allocator);
+            if (lazy) {
+                try store.lazy_weights.put(allocator, name, .{
+                    .tensor_ref = .{ .name = name },
+                    .loaded = weight,
+                    .loaded_bytes = bytes.len,
+                });
+            } else {
+                try store.resident_weights.put(allocator, name, weight);
+            }
+            var compute = NativeCompute.init(allocator, &store, null);
+            defer store.prefetch.deinit();
+            defer compute.deinit();
+            const table = try getWeight(&compute, name);
+            defer freeTensor(&compute, table);
+            // Loading an embedding must not allocate a full F32 table.
+            try std.testing.expectEqual(@as(usize, 0), toBuf(table).data.len);
+            try std.testing.expect(toBuf(table).source_tensor != null);
+            const selected = try embeddingLookup(&compute, table, &.{ 1, 0, 1 }, 3, 2);
+            defer freeTensor(&compute, selected);
+            const expected = [_]f32{ 0.5, 3.0, 1.0, -2.5, 0.5, 3.0 };
+            try std.testing.expectEqualSlices(f32, &expected, getData(selected));
+            const ids = try fromFloat32ShapeOp(&compute, &.{ 1, 0, 1 }, &.{3});
+            defer freeTensor(&compute, ids);
+            const gathered = try primGatherOp(&compute, table, ids, 0, &shape);
+            defer freeTensor(&compute, gathered);
+            try std.testing.expectEqualSlices(f32, &expected, getData(gathered));
+            try std.testing.expectEqual(@as(usize, 0), toBuf(table).data.len);
+        }
+    }
+}
+
+test "gemma4 native frozen linear handles borrow storage and preserve dense numerics" {
+    const allocator = std.testing.allocator;
+    const name = "model.language_model.layers.0.self_attn.q_proj.weight";
+    const m = 3;
+    const k = 17;
+    const n = 13;
+    var inputs: [m * k]f32 = undefined;
+    var words: [k * n]u16 = undefined;
+    for (&inputs, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 31)) - 15)) / 7.0;
+    for ([_]tensor_mod.DType{ .bf16, .f16 }) |dtype| {
+        for (&words, 0..) |*word, i| {
+            const value = @as(f32, @floatFromInt(@as(i32, @intCast(i % 47)) - 23)) / 4.0;
+            word.* = if (dtype == .f16) @bitCast(@as(f16, @floatCast(value))) else @truncate(@as(u32, @bitCast(value)) >> 16);
+        }
+        for ([_]u8{ 0, 1 }) |rc| {
+            var shape = if (rc == 0) [_]i64{ k, n } else [_]i64{ n, k };
+            const weight = LoadedWeight{ .tensor = .{
+                .data = std.mem.sliceAsBytes(&words),
+                .shape = &shape,
+                .dtype = dtype,
+                .name = name,
+                .allocator = allocator,
+                .owns_data = false,
+                .owns_shape = false,
+            } };
+            for ([_]bool{ false, true }) |lazy| {
+                var store = WeightStore{ .allocator = allocator, .resident_weights = .empty, .lazy_weights = .empty };
+                defer store.resident_weights.deinit(allocator);
+                defer store.lazy_weights.deinit(allocator);
+                if (lazy) {
+                    try store.lazy_weights.put(allocator, name, .{ .tensor_ref = .{ .name = name }, .loaded = weight, .loaded_bytes = words.len * 2 });
+                } else {
+                    try store.resident_weights.put(allocator, name, weight);
+                }
+                var compute = NativeCompute.init(allocator, &store, null);
+                defer store.prefetch.deinit();
+                defer compute.deinit();
+                const dense = try acquireWeight(&compute, name);
+                defer freeTensor(&compute, dense);
+                try std.testing.expectEqual(@as(usize, words.len * 4), loadedWeightHandleBytes(&compute, &weight, name, words.len * 2));
+                compute.borrow_frozen_linear_weights = true;
+                const borrowed = try getWeight(&compute, name);
+                defer freeTensor(&compute, borrowed);
+                try std.testing.expectEqual(@as(usize, 0), toBuf(borrowed).data.len);
+                try std.testing.expect(toBuf(borrowed).source_tensor != null);
+                try std.testing.expectEqual(@as(usize, words.len * 2), loadedWeightHandleBytes(&compute, &weight, name, words.len * 2));
+                const input = try fromFloat32ShapeOp(&compute, &inputs, &.{ m, k });
+                defer freeTensor(&compute, input);
+                const expected = try primDotGeneralOp(&compute, input, dense, &.{ m, k }, &shape, &.{1}, &.{rc}, &.{}, &.{});
+                defer freeTensor(&compute, expected);
+                const actual = try primDotGeneralOp(&compute, input, borrowed, &.{ m, k }, &shape, &.{1}, &.{rc}, &.{}, &.{});
+                defer freeTensor(&compute, actual);
+                try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(getData(expected)), std.mem.sliceAsBytes(getData(actual)));
+                if (rc == 1) {
+                    const eager_dense = try linearNoBiasOp(&compute, input, dense, m, k, n);
+                    defer freeTensor(&compute, eager_dense);
+                    const eager_borrowed = try linearNoBiasOp(&compute, input, borrowed, m, k, n);
+                    defer freeTensor(&compute, eager_borrowed);
+                    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(getData(eager_dense)), std.mem.sliceAsBytes(getData(eager_borrowed)));
+                    const bias_values = [_]f32{0.25} ** n;
+                    const bias = try fromFloat32ShapeOp(&compute, &bias_values, &.{n});
+                    defer freeTensor(&compute, bias);
+                    const biased_dense = try linearOp(&compute, input, dense, bias, m, k, n);
+                    defer freeTensor(&compute, biased_dense);
+                    const biased_borrowed = try linearOp(&compute, input, borrowed, bias, m, k, n);
+                    defer freeTensor(&compute, biased_borrowed);
+                    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(getData(biased_dense)), std.mem.sliceAsBytes(getData(biased_borrowed)));
+                }
+                try std.testing.expectEqual(@as(usize, 0), toBuf(borrowed).data.len);
+            }
+        }
+    }
+}
+
+test "gemma4 frozen resident mmap weights reclaim after use and remain readable" {
+    const allocator = std.testing.allocator;
+    const Trace = struct {
+        calls: usize = 0,
+        name: []const u8 = "",
+        fn discard(ctx: *anyopaque, name: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            self.name = name;
+        }
+    };
+    var trace = Trace{};
+    // Only the discard hook is used: this fixture supplies an already loaded
+    // source handle, and never asks the store to load or destroy a tensor.
+    const callbacks = tensor_store_mod.TensorStore.VTable{
+        .kind = undefined,
+        .weightSource = undefined,
+        .describeTensor = undefined,
+        .describeTensorRange = undefined,
+        .loadTensorRef = undefined,
+        .loadQuantizedStorageRef = undefined,
+        .discardTensorFileCache = Trace.discard,
+        .preserveFileCacheOnDeinit = undefined,
+        .ggufFile = undefined,
+        .deinit = undefined,
+    };
+    var store = WeightStore{ .allocator = allocator, .resident_weights = .empty, .lazy_weights = .empty, .tensor_store = .{ .ptr = &trace, .vtable = &callbacks } };
+    var compute = NativeCompute.init(allocator, &store, null);
+    defer store.prefetch.deinit();
+    defer compute.deinit();
+    var words = [_]u16{ 0x3f80, 0x4000, 0x4040, 0x4080 };
+    var shape = [_]i64{ 2, 2 };
+    var source = tensor_mod.Tensor{
+        .data = std.mem.sliceAsBytes(&words),
+        .dtype = .bf16,
+        .shape = &shape,
+        .name = "original.source.weight",
+        .allocator = allocator,
+        .owns_data = false,
+        .owns_shape = false,
+        .mmap_source_bytes = std.mem.sliceAsBytes(&words),
+    };
+    const weight = try compute.makeBufWithEntry(empty_f32[0..], false, "canonical.weight", null, null, &source);
+    defer freeTensor(&compute, weight);
+    const input = try fromFloat32ShapeOp(&compute, &.{ 1, 1 }, &.{ 1, 2 });
+    defer freeTensor(&compute, input);
+    maybeDiscardMappedWeightAfterUse(&compute, weight);
+    try std.testing.expectEqual(@as(usize, 0), trace.calls);
+    compute.borrow_frozen_linear_weights = true;
+    for (0..2) |iteration| {
+        const out = try linearNoBiasOp(&compute, input, weight, 1, 2, 2);
+        defer freeTensor(&compute, out);
+        try std.testing.expectEqualSlices(f32, &.{ 3, 7 }, getData(out));
+        try std.testing.expectEqual(iteration + 1, trace.calls);
+        try std.testing.expectEqualStrings(source.name, trace.name);
+    }
+    const dot = try primDotGeneralOp(&compute, input, weight, &.{ 1, 2 }, &shape, &.{1}, &.{1}, &.{}, &.{});
+    defer freeTensor(&compute, dot);
+    try std.testing.expectEqualSlices(f32, &.{ 3, 7 }, getData(dot));
+    try std.testing.expectEqual(@as(usize, 3), trace.calls);
+    source.mmap_source_bytes = null;
+    maybeDiscardMappedWeightAfterUse(&compute, weight);
+    try std.testing.expectEqual(@as(usize, 3), trace.calls);
 }

@@ -23,6 +23,8 @@ TRAIN_SCHEMAS = {
     "antfly_inference_finetune_grpo_report/v6",
     "antfly_inference_finetune_grpo_report/v7",
     "antfly_inference_finetune_grpo_report/v8",
+    "antfly_inference_finetune_grpo_report/v9",
+    "antfly_inference_finetune_grpo_report/v10",
 }
 GRPO_TRAINING_ORDER = {
     "algorithm": "seeded-fisher-yates-per-epoch/v1",
@@ -118,7 +120,11 @@ class ParityError(RuntimeError):
 def require_training_order_contract(report: Mapping[str, Any], label: str) -> None:
     if (
         report.get("schema_version")
-        == "antfly_inference_finetune_grpo_report/v8"
+        in {
+            "antfly_inference_finetune_grpo_report/v8",
+            "antfly_inference_finetune_grpo_report/v9",
+            "antfly_inference_finetune_grpo_report/v10",
+        }
         and report.get("training_order") != GRPO_TRAINING_ORDER
     ):
         raise ParityError(f"{label} GRPO training-order contract drifted")
@@ -272,8 +278,10 @@ def validate(
         "antfly_inference_finetune_grpo_report/v6",
         "antfly_inference_finetune_grpo_report/v7",
         "antfly_inference_finetune_grpo_report/v8",
+        "antfly_inference_finetune_grpo_report/v9",
+        "antfly_inference_finetune_grpo_report/v10",
     }:
-        raise ParityError("candidate train report must use an incremental-KV v5-v8 schema")
+        raise ParityError("candidate train report must use an incremental-KV v5-v10 schema")
     require_training_order_contract(baseline_train, "baseline")
     require_training_order_contract(candidate_train, "candidate")
     if baseline_eval.get("schema_version") not in EVAL_SCHEMAS:

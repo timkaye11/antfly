@@ -24,10 +24,12 @@ const runtime = @import("../runtime/root.zig");
 const real_autodiff = @import("real_autodiff_trainer.zig");
 const gemma4 = @import("gemma4.zig");
 const artifact_publication = @import("artifact_publication.zig");
+const safetensors_checkpoint = @import("safetensors_checkpoint.zig");
 const compat = @import("../io/compat.zig");
 const graph_input_binder = @import("graph_input_binder.zig");
 const weight_source_mod = @import("../models/weight_source.zig");
 const metal_compute_mod = @import("../ops/metal_compute.zig");
+const native_compute_mod = @import("../ops/native_compute.zig");
 const SafetensorsSource = weight_source_mod.SafetensorsSource;
 const session_factory = @import("../architectures/session_factory.zig");
 const Session = @import("../backends/session.zig").Session;
@@ -926,6 +928,16 @@ pub fn loadBackendForModelDir(
     errdefer session.close();
     const compute_backend = try session_factory.getComputeBackend(session, allocator);
     errdefer compute_backend.deinit();
+    if (backend_kind == .native) {
+        const native: *native_compute_mod.NativeCompute = @ptrCast(@alignCast(compute_backend.ptr));
+        native.borrow_frozen_linear_weights = true;
+    }
+    if (build_options.enable_metal) {
+        if (backend_kind == .metal) {
+            const metal: *metal_compute_mod.MetalCompute = @ptrCast(@alignCast(compute_backend.ptr));
+            metal.precise_training_rms_norm = true;
+        }
+    }
     return .{
         .kind = backend_kind,
         .compute_backend = compute_backend,
@@ -3825,6 +3837,14 @@ fn bindTrainerLogitsTrainables(
             try runtime_inputs.put(allocator, slot.node_id, value);
         }
     } else {
+        // A cold forward has not gone through runStep's resident-weight
+        // setup yet. Keep live adapter bindings owned by the trainer across
+        // repeated logit calls, rather than rebinding temporary host copies
+        // whose allocation identities can be reused by linear slot caches.
+        // The optimizer subsequently adopts these same weight handles.
+        if (trainer.compute_backend.kind() == .metal) {
+            try trainer.ensureResidentLoraWeightsForRuntime();
+        }
         try bindLogitsTrainableSlots(allocator, trainer, trainer.lora_params.items, runtime_inputs, owned_values);
     }
     try bindLogitsTrainableSlots(allocator, trainer, trainer.regular_params.items, runtime_inputs, owned_values);
@@ -4163,7 +4183,7 @@ pub fn captureSupervisedLogitProbes(
     ctx.require_compiled_logits_output = trainer.compute_backend.kind() == .metal;
     defer ctx.require_compiled_logits_output = previous_compiled_requirement;
 
-    const chunk_rows: usize = sparseLossChunkRows();
+    const chunk_rows = oracleLogitProbeChunkRows(vocab_size, sparseLossChunkRows());
     var start: usize = 0;
     while (start < supervised_count) {
         const end = @min(start + chunk_rows, supervised_count);
@@ -4213,6 +4233,23 @@ pub fn captureSupervisedLogitProbes(
         start = end;
     }
     return .{ .allocator = allocator, .rows = probes };
+}
+
+fn oracleLogitProbeChunkRows(vocab_size: usize, loss_chunk_rows: usize) usize {
+    std.debug.assert(vocab_size > 0 and loss_chunk_rows > 0);
+    // CCE training streams vocabulary tiles, but capture materializes a full
+    // vocabulary row before selecting its few probe values. Its workspace
+    // must therefore have its own bound rather than inherit the loss batch.
+    // Keep at least one row for vocabularies larger than this byte budget.
+    const max_logit_bytes = 16 * 1024 * 1024;
+    return @min(loss_chunk_rows, @max(1, max_logit_bytes / @sizeOf(f32) / vocab_size));
+}
+
+test "gemma4 oracle logit capture bounds vocabulary workspace independently of CCE" {
+    try std.testing.expectEqual(@as(usize, 16), oracleLogitProbeChunkRows(262144, 512));
+    try std.testing.expectEqual(@as(usize, 1), oracleLogitProbeChunkRows(262144, 1));
+    try std.testing.expectEqual(@as(usize, 512), oracleLogitProbeChunkRows(128, 512));
+    try std.testing.expectEqual(@as(usize, 1), oracleLogitProbeChunkRows(std.math.maxInt(usize), 512));
 }
 
 fn stableOracleProbeTokenIds(
@@ -4694,11 +4731,7 @@ fn logProbAtTokenWithNormalizer(logits: []const f32, token_id: usize, log_z: f64
     return @as(f32, @floatCast(@as(f64, logits[token_id]) - log_z));
 }
 
-const WriteTensorF32 = struct {
-    name: []const u8,
-    shape: []const usize,
-    data: []const f32,
-};
+const WriteTensorF32 = safetensors_checkpoint.NamedTensor;
 
 const GemmaBundleWriteSpec = struct {
     base_model_name_or_path: []const u8,
@@ -4736,7 +4769,7 @@ fn writeAndPublishGemmaBundle(
     const adapter_manifest_path = try std.fs.path.join(allocator, &.{ publication.staging_dir, gemma4.adapter_manifest_file_name });
     defer allocator.free(adapter_manifest_path);
 
-    try writeHeaderAndTensorsF32(allocator, adapter_checkpoint_path, tensors);
+    try safetensors_checkpoint.save(allocator, adapter_checkpoint_path, tensors);
     const adapter_write_options = gemma4.AdapterConfigWriteOptions{
         .base_model_name_or_path = spec.base_model_name_or_path,
         .base_model_sha256 = spec.base_model_sha256,
@@ -4800,42 +4833,6 @@ fn dimsToUsize(allocator: std.mem.Allocator, dims: []const i32) ![]usize {
     return out;
 }
 
-fn writeHeaderAndTensorsF32(allocator: std.mem.Allocator, path: []const u8, tensors: []const WriteTensorF32) !void {
-    _ = allocator;
-    var header_buf: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
-    defer header_buf.deinit();
-    const writer = &header_buf.writer;
-    try writer.writeByte('{');
-    var offset: u64 = 0;
-    for (tensors, 0..) |tensor, idx| {
-        if (idx != 0) try writer.writeByte(',');
-        const byte_len = tensor.data.len * @sizeOf(f32);
-        try writer.print("\"{s}\":{{\"dtype\":\"F32\",\"shape\":[", .{tensor.name});
-        for (tensor.shape, 0..) |dim, dim_idx| {
-            if (dim_idx != 0) try writer.writeByte(',');
-            try writer.print("{}", .{dim});
-        }
-        try writer.print("],\"data_offsets\":[{},{}]}}", .{ offset, offset + byte_len });
-        offset += byte_len;
-    }
-    try writer.writeByte('}');
-
-    var file = try compat.cwd().createFile(compat.io(), path, .{ .truncate = true });
-    defer file.close(compat.io());
-    var len_buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &len_buf, header_buf.written().len, .little);
-    try file.writeStreamingAll(compat.io(), &len_buf);
-    try file.writeStreamingAll(compat.io(), header_buf.written());
-    for (tensors) |tensor| {
-        for (tensor.data) |item| {
-            const bits: u32 = @bitCast(item);
-            var bits_buf: [4]u8 = undefined;
-            std.mem.writeInt(u32, &bits_buf, bits, .little);
-            try file.writeStreamingAll(compat.io(), &bits_buf);
-        }
-    }
-}
-
 fn copySupportingArtifactIfPresent(
     allocator: std.mem.Allocator,
     maybe_src_path: ?[]const u8,
@@ -4850,7 +4847,7 @@ fn copySupportingArtifactIfPresent(
     try compat.cwd().writeFile(compat.io(), .{ .sub_path = dst_path, .data = contents });
 }
 
-test "gemma4 bundle publication preserves immutable output and publishes fresh directory" {
+test "gemma4 bundle publication preserves immutable output and buffered tensor bytes" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4870,13 +4867,17 @@ test "gemma4 bundle publication preserves immutable output and publishes fresh d
 
     const missing_support_path = try std.fs.path.join(allocator, &.{ root, "missing-tokenizer-config.json" });
     defer allocator.free(missing_support_path);
-    const a_data = [_]f32{ 1.0, 2.0 };
+    // Cross the shared writer's 64 KiB buffer and preserve signed zero too.
+    const a_data = try allocator.alloc(f32, 16 * 1024 + 3);
+    defer allocator.free(a_data);
+    for (a_data, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index)) * -0.25;
+    a_data[0] = @bitCast(@as(u32, 0x80000000));
     const b_data = [_]f32{ 0.0, 0.0 };
     const tensors = [_]WriteTensorF32{
         .{
             .name = "model.layers.0.self_attn.q_proj.weight.lora_A.weight",
-            .shape = &.{ 1, 2 },
-            .data = &a_data,
+            .shape = &.{ 1, a_data.len },
+            .data = a_data,
         },
         .{
             .name = "model.layers.0.self_attn.q_proj.weight.lora_B.weight",
@@ -4934,6 +4935,19 @@ test "gemma4 bundle publication preserves immutable output and publishes fresh d
     try std.testing.expect(inspection.has_adapter_weights);
     try std.testing.expectEqual(@as(?usize, 1), inspection.lora_rank);
     try std.testing.expectEqualStrings("base-model", inspection.base_model_name_or_path.?);
+    const written = try c_file.readFile(allocator, inspection.adapter_checkpoint_path.?);
+    defer allocator.free(written);
+    const header_len = std.mem.readInt(u64, written[0..8], .little);
+    const payload_offset: usize = @intCast(8 + header_len);
+    try std.testing.expectEqual(@as(usize, 0), payload_offset % 8);
+    try std.testing.expectEqual((a_data.len + b_data.len) * @sizeOf(f32), written.len - payload_offset);
+    var offset = payload_offset;
+    for (tensors) |tensor| {
+        for (tensor.data) |value| {
+            try std.testing.expectEqual(@as(u32, @bitCast(value)), std.mem.readInt(u32, written[offset..][0..4], .little));
+            offset += 4;
+        }
+    }
 }
 
 test "gemma4 makeTrainerInputForExample builds bounded sparse causal targets" {
@@ -6023,4 +6037,210 @@ test "gemma4 compiled DPO pair input keeps causal streams and metadata separate"
     try std.testing.expectEqualSlices(f32, &.{ 10.0, 11.0, 0.0, 0.0 }, batched.targets[rejected_base..][0..4]);
     try std.testing.expectEqualSlices(f32, &.{ 11.0, 13.0, 0.0, 0.0 }, batched.targets[rejected_base + 4 ..][0..4]);
     try std.testing.expectEqualSlices(f32, &.{ 12.0, 17.0, 0.0, 0.0 }, batched.targets[rejected_base + 8 ..][0..4]);
+}
+
+test "gemma4 graph RoPE rotates all batch and head chunks at the token position" {
+    const native = @import("../ops/native_compute.zig");
+    const allocator = std.testing.allocator;
+    var store = native.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = native.NativeCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var bld = Builder.init(&graph);
+    // Inject normalized Q values at the RoPE boundary, retaining the shape
+    // generated by Gemma's real graph. No pretrained weights are required.
+    const q_values = try bld.parameter("normalized_q", Shape.init(.f32, &.{1}));
+    const ids = try bld.parameter("ids", Shape.init(.f32, &.{ 2, 4 }));
+    _ = try gemma_graph.buildForwardGraph(&bld, .{
+        .family = .gemma,
+        .hidden_size = 24,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 3,
+        .num_key_value_heads = 3,
+        .attention_head_dim = 8,
+        .intermediate_size = 32,
+        .vocab_size = 16,
+        .position_encoding = .rope,
+        .norm_type = .rms_norm,
+        .activation = .gelu_new,
+        .rope_theta = 10_000,
+    }, 2, 4, .{ .input_ids = ids, .rope_cos = ml.graph.null_node, .rope_sin = ml.graph.null_node });
+    var selected: ?NodeId = null;
+    for (graph.nodes.items, 0..) |node, i| {
+        if (node.op == .fused_rope) {
+            selected = @intCast(i);
+            break;
+        }
+    }
+    const rope_id = selected orelse return error.TestExpectedRope;
+    const input_shape = graph.node(graph.node(rope_id).inputs[0]).output_shape;
+    graph.nodeMut(q_values).output_shape = input_shape;
+    graph.nodeMut(rope_id).inputs[0] = q_values;
+    try graph.markOutput(rope_id);
+    var data = [_]f32{0} ** (4 * 2 * 3 * 8);
+    for (0..24) |chunk| data[chunk * 8] = 1;
+    const dims = [_]i32{ @intCast(input_shape.dim(0)), @intCast(input_shape.dim(1)) };
+    const input = try cb.fromFloat32Shape(&data, &dims);
+    defer cb.free(input);
+    var result = try interpreter.execute(allocator, &graph, &cb, .{ .runtime_inputs = &.{.{ .node_id = q_values, .value = input }} });
+    defer result.deinit(&cb);
+    const actual = try cb.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+    for (0..4) |position| {
+        const angle: f32 = @floatFromInt(position);
+        for (0..6) |batch_head| {
+            const base = (position * 6 + batch_head) * 8;
+            for (0..8) |dim| {
+                const expected: f32 = if (dim == 0) @cos(angle) else if (dim == 4) @sin(angle) else 0;
+                try std.testing.expectApproxEqAbs(expected, actual[base + dim], 1e-6);
+            }
+        }
+    }
+}
+
+test "gemma4 RoPE VJP applies the inverse rotation on the native backend" {
+    const native = @import("../ops/native_compute.zig");
+    const allocator = std.testing.allocator;
+    var store = native.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = native.NativeCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var bld = Builder.init(&graph);
+    const shape = Shape.init(.f32, &.{ 4, 48 });
+    const input = try bld.parameter("q", shape);
+    var cosines: [16]f32 = undefined;
+    var sines: [16]f32 = undefined;
+    for (0..4) |position| {
+        for (0..4) |pair| {
+            const angle = @as(f32, @floatFromInt(position)) / std.math.pow(f32, 10_000, @as(f32, @floatFromInt(pair)) / 4);
+            cosines[position * 4 + pair] = @cos(angle);
+            sines[position * 4 + pair] = @sin(angle);
+        }
+    }
+    const cos = try bld.tensorConst(&cosines, Shape.init(.f32, &.{ 4, 4 }));
+    const sin = try bld.tensorConst(&sines, Shape.init(.f32, &.{ 4, 4 }));
+    const rotated = try bld.rope(input, cos, sin, 4, 8, 8, 10_000);
+    var mask = [_]f32{0} ** 192;
+    for (0..24) |chunk| mask[chunk * 8] = 1;
+    const selected = try bld.mul(rotated, try bld.tensorConst(&mask, shape));
+    const loss = try bld.reshape(try bld.reduceSum(selected, &.{ 0, 1 }), Shape.scalar(.f32));
+    try graph.markOutput(loss);
+    var gradients = try ml.graph.autodiff.gradient(allocator, &graph, loss, &.{input});
+    defer gradients.deinit();
+    gradients.graph.outputs.clearRetainingCapacity();
+    try gradients.graph.markOutput(gradients.param_grads[0]);
+    const values = try cb.fromFloat32Shape(&mask, &.{ 4, 48 });
+    defer cb.free(values);
+    var result = try interpreter.execute(allocator, &gradients.graph, &cb, .{ .runtime_inputs = &.{.{ .node_id = gradients.id_map[input], .value = values }} });
+    defer result.deinit(&cb);
+    const actual = try cb.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+    // d(rotated_left)/d(left) = cos(position); d/d(right) = -sin(position).
+    for (0..4) |position| {
+        const angle: f32 = @floatFromInt(position);
+        for (0..6) |batch_head| {
+            const base = (position * 6 + batch_head) * 8;
+            for (0..8) |dim| {
+                const expected: f32 = if (dim == 0) @cos(angle) else if (dim == 4) -@sin(angle) else 0;
+                try std.testing.expectApproxEqAbs(expected, actual[base + dim], 1e-6);
+            }
+        }
+    }
+}
+
+test "gemma4 embedding VJP preserves sparse forward and accumulates repeated token rows" {
+    const native = @import("../ops/native_compute.zig");
+    const allocator = std.testing.allocator;
+    var store = native.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = native.NativeCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var bld = Builder.init(&graph);
+    const table = try bld.parameter("table", Shape.init(.f32, &.{ 3, 2 }));
+    const ids = try bld.tensorConst(&.{ 1, 0, 1 }, Shape.init(.f32, &.{3}));
+    const rows = try bld.embeddingLookup(table, ids, 3, 2);
+    const loss = try bld.reshape(try bld.reduceSum(rows, &.{ 0, 1 }), Shape.scalar(.f32));
+    try graph.markOutput(loss);
+    var gradients = try ml.graph.autodiff.gradient(allocator, &graph, loss, &.{table});
+    defer gradients.deinit();
+    try std.testing.expect(gradients.graph.node(gradients.id_map[rows]).op == .fused_embedding_lookup);
+    try gradients.graph.markOutput(gradients.param_grads[0]);
+    const values = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{ 3, 2 });
+    defer cb.free(values);
+    var result = try interpreter.execute(allocator, &gradients.graph, &cb, .{ .runtime_inputs = &.{.{ .node_id = gradients.id_map[table], .value = values }} });
+    defer result.deinit(&cb);
+    const actual_loss = try cb.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual_loss);
+    try std.testing.expectEqualSlices(f32, &.{17}, actual_loss);
+    const actual_gradient = try cb.toFloat32(result.outputs[1], allocator);
+    defer allocator.free(actual_gradient);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 1, 2, 2, 0, 0 }, actual_gradient);
+}
+
+test "gemma4 repeated live logit bindings retain nonzero adapter device updates before training" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    var training_scope = @import("../graph/training_executor_policy.zig").ProductEnableScope.acquire();
+    defer training_scope.deinit();
+    const allocator = std.testing.allocator;
+    var store = @import("../ops/gpu_hosted_store.zig").WeightStore{
+        .allocator = allocator,
+        .prefix = "",
+        .lazy_weights = .empty,
+    };
+    defer store.lazy_weights.deinit(allocator);
+    var compute = try metal_compute_mod.MetalCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    var trainer = try real_autodiff.RealAutodiffTrainer.init(allocator, &cb, .{
+        .lora = .{ .rank = 4, .alpha = 4, .target_patterns = &.{"linear.weight"} },
+    });
+    defer trainer.deinit();
+    const initial = [_]f32{ 2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 2 };
+    try trainer.lora_params.append(allocator, .{
+        .name = try allocator.dupe(u8, "linear.weight.lora_B"),
+        .weights = try allocator.dupe(f32, &initial),
+        .grad_accum = try allocator.alloc(f32, 0),
+        .node_id = 1,
+        .dims = try allocator.dupe(i32, &.{ 4, 4 }),
+    });
+    const input = try cb.trainingZeroF32(4, &.{ 1, 4 });
+    defer cb.free(input);
+    try cb.trainingOverwriteF32(input, &.{ 1, 2, 3, 4 }, &.{ 1, 4 });
+    var retained_weight: ?CT = null;
+    for (0..4) |iteration| {
+        const scale: f32 = @floatFromInt(iteration + 2);
+        if (retained_weight) |weight| {
+            var updated = [_]f32{0} ** 16;
+            for (0..4) |i| updated[i * 4 + i] = scale;
+            // Model the in-place device update observed by the live policy.
+            // The original host snapshot deliberately remains unchanged.
+            try cb.trainingOverwriteF32(weight, &updated, &.{ 4, 4 });
+        }
+        var bindings = std.AutoHashMapUnmanaged(NodeId, CT).empty;
+        defer bindings.deinit(allocator);
+        var owned = std.ArrayList(CT).empty;
+        defer {
+            for (owned.items) |value| cb.free(value);
+            owned.deinit(allocator);
+        }
+        try bindTrainerLogitsTrainables(allocator, &trainer, &bindings, &owned, null);
+        const weight = bindings.get(1) orelse return error.MissingWeight;
+        const resident = trainer.lora_params.items[0].eval_device_weight orelse return error.MissingResidentLogitWeight;
+        try std.testing.expectEqual(resident, weight);
+        if (retained_weight) |previous| try std.testing.expectEqual(previous, weight);
+        retained_weight = weight;
+        try std.testing.expect(trainer.lora_params.items[0].device == null);
+        const output = try cb.linearNoBias(input, weight, 1, 4, 4);
+        defer cb.free(output);
+        const actual = try cb.toFloat32(output, allocator);
+        defer allocator.free(actual);
+        for (actual, 0..) |value, i| try std.testing.expectApproxEqAbs(scale * @as(f32, @floatFromInt(i + 1)), value, 1e-5);
+    }
 }

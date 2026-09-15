@@ -1123,6 +1123,49 @@ pub fn freeBootstrapSummary(allocator: std.mem.Allocator, summary: *BootstrapSum
     summary.* = undefined;
 }
 
+fn stockPeftModulePathAlloc(allocator: std.mem.Allocator, module_path: []const u8) ![]u8 {
+    // Keep the checkpoint's text-only or multimodal root. Only the PLE
+    // module spelling differs between Antfly's graph and stock HF Gemma4.
+    const aliases = [_][2][]const u8{
+        .{ "per_layer_input.per_layer_model_proj", "per_layer_model_projection" },
+        .{ "per_layer_input.inp_gate", "per_layer_input_gate" },
+        .{ "per_layer_input.proj", "per_layer_projection" },
+    };
+    for (aliases) |pair| {
+        if (!std.mem.endsWith(u8, module_path, pair[0])) continue;
+        const prefix_len = module_path.len - pair[0].len;
+        if (prefix_len != 0 and module_path[prefix_len - 1] != '.') continue;
+        return std.fmt.allocPrint(allocator, "{s}{s}", .{ module_path[0..prefix_len], pair[1] });
+    }
+    return allocator.dupe(u8, module_path);
+}
+
+fn stockPeftAdapterConfigAlloc(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, source, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidAdapterConfig;
+    const targets = parsed.value.object.getPtr("target_modules") orelse return error.MissingAdapterTargets;
+    if (targets.* != .array) return error.InvalidAdapterTargets;
+    var changed = false;
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(allocator);
+    for (targets.array.items) |*target| {
+        if (target.* != .string) return error.InvalidAdapterTargets;
+        const translated = try stockPeftModulePathAlloc(parsed.arena.allocator(), target.string);
+        changed = changed or !std.mem.eql(u8, target.string, translated);
+        target.* = .{ .string = translated };
+        const entry = try seen.getOrPut(allocator, translated);
+        if (entry.found_existing) return error.PeftExportTargetModuleCollision;
+    }
+    // Preserve byte-for-byte config compatibility when no alias changes.
+    if (!changed) return allocator.dupe(u8, source);
+    var buffer: std.Io.Writer.Allocating = .init(allocator);
+    defer buffer.deinit();
+    try std.json.Stringify.value(parsed.value, .{ .whitespace = .indent_2 }, &buffer.writer);
+    try buffer.writer.writeByte('\n');
+    return allocator.dupe(u8, buffer.written());
+}
+
 /// Export one validated Antfly Gemma 4 LoRA artifact into the tensor-key
 /// layout consumed directly by stock Hugging Face PEFT. The source artifact is
 /// never mutated, tensor payload bytes are preserved exactly, and the complete
@@ -1176,7 +1219,9 @@ pub fn exportPeftAdapter(
     for (source_names, 0..) |source_name, idx| {
         const parsed = parseLoRAAdapterTensorName(source_name) orelse return error.UnsupportedPeftExportTensor;
         if (parsed.loop_index != null) return error.Gemma4PeftExportRecursiveLoRANotSupported;
-        const module_path = tensorModulePath(parsed.base_tensor_base_name) orelse return error.InvalidLoRATargetTensorName;
+        const source_module_path = tensorModulePath(parsed.base_tensor_base_name) orelse return error.InvalidLoRATargetTensorName;
+        const module_path = try stockPeftModulePathAlloc(allocator, source_module_path);
+        defer allocator.free(module_path);
         const role = switch (parsed.kind) {
             .a => "lora_A",
             .b => "lora_B",
@@ -1212,6 +1257,8 @@ pub fn exportPeftAdapter(
 
     const source_config = try c_file.readFile(allocator, source_config_path);
     defer allocator.free(source_config);
+    const destination_config = try stockPeftAdapterConfigAlloc(allocator, source_config);
+    defer allocator.free(destination_config);
     var source_checkpoint = try c_file.MmapRegion.init(allocator, source_checkpoint_path);
     defer source_checkpoint.deinit();
     const source_checkpoint_sha256 = try sha256HexAlloc(allocator, source_checkpoint.data);
@@ -1231,13 +1278,13 @@ pub fn exportPeftAdapter(
     try writeHeaderAndRawTensors(allocator, staging_checkpoint_path, translated);
     try safetensors.validateArtifactSet(allocator, staging_checkpoint_path, null);
     try validatePeftExportCheckpoint(allocator, staging_checkpoint_path, translated);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = staging_config_path, .data = source_config });
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = staging_config_path, .data = destination_config });
 
     var destination_checkpoint = try c_file.MmapRegion.init(allocator, staging_checkpoint_path);
     defer destination_checkpoint.deinit();
     const destination_checkpoint_sha256 = try sha256HexAlloc(allocator, destination_checkpoint.data);
     errdefer allocator.free(destination_checkpoint_sha256);
-    const adapter_config_sha256 = try sha256HexAlloc(allocator, source_config);
+    const adapter_config_sha256 = try sha256HexAlloc(allocator, destination_config);
     defer allocator.free(adapter_config_sha256);
     try writePeftExportManifestJson(allocator, staging_manifest_path, .{
         .schema_version = peft_export_manifest_schema_v1,
@@ -8017,4 +8064,35 @@ test "gemma4 moe expert preset targets only expert parameter tensors" {
     try std.testing.expectEqualStrings("moe_expert", targets[0].module_name);
     try std.testing.expectEqual(@as(usize, 2), targets[0].output_dim);
     try std.testing.expectEqual(@as(usize, 3), targets[0].input_dim);
+}
+
+test "gemma4 PEFT export restores HF PLE names in tensors and target configuration" {
+    const allocator = std.testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "model.language_model.layers.3.per_layer_input.inp_gate", "model.language_model.layers.3.per_layer_input_gate" },
+        .{ "model.language_model.layers.3.per_layer_input.proj", "model.language_model.layers.3.per_layer_projection" },
+        .{ "model.language_model.per_layer_input.per_layer_model_proj", "model.language_model.per_layer_model_projection" },
+        .{ "model.per_layer_input.per_layer_model_proj", "model.per_layer_model_projection" },
+        .{ "model.language_model.layers.3.self_attn.q_proj", "model.language_model.layers.3.self_attn.q_proj" },
+    };
+    for (cases) |pair| {
+        const actual = try stockPeftModulePathAlloc(allocator, pair[0]);
+        defer allocator.free(actual);
+        try std.testing.expectEqualStrings(pair[1], actual);
+    }
+    const source =
+        \\{"r":16,"lora_alpha":32,"custom":{"keep":true},"target_modules":["model.language_model.layers.3.per_layer_input.inp_gate","model.language_model.per_layer_input.per_layer_model_proj"]}
+    ;
+    const config = try stockPeftAdapterConfigAlloc(allocator, source);
+    defer allocator.free(config);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, config, .{});
+    defer parsed.deinit();
+    const targets = parsed.value.object.get("target_modules").?.array.items;
+    try std.testing.expectEqualStrings(cases[0][1], targets[0].string);
+    try std.testing.expectEqualStrings(cases[2][1], targets[1].string);
+    try std.testing.expectEqual(@as(i64, 16), parsed.value.object.get("r").?.integer);
+    try std.testing.expect(parsed.value.object.get("custom").?.object.get("keep").?.bool);
+    try std.testing.expectError(error.PeftExportTargetModuleCollision, stockPeftAdapterConfigAlloc(allocator,
+        \\{"target_modules":["model.per_layer_input.per_layer_model_proj","model.per_layer_model_projection"]}
+    ));
 }
