@@ -4,18 +4,24 @@
 name: Antfly Operator Tests
 
 on:
+  workflow_call:
+    inputs:
+      pr_number:
+        type: string
+        default: ''
+      head_sha:
+        type: string
+        default: ''
+      base_sha:
+        type: string
+        default: ''
+      check_id:
+        type: string
+        default: ''
+      comment_id:
+        type: string
+        default: ''
   push:
-    branches: ["main"]
-    paths:
-      - 'go/pkg/operator/**'
-      - 'go/pkg/sdk/admin/**'
-      - 'go/pkg/sdk/go.mod'
-      - 'go/pkg/sdk/go.sum'
-      - 'specs/openapi/**'
-      - 'scripts/ci/toolchain-policy.json'
-      - '.github/actions/load-toolchain-policy/action.yml'
-      - '.github/workflows/antfly-operator-go.yml'
-  pull_request:
     branches: ["main"]
     paths:
       - 'go/pkg/operator/**'
@@ -30,22 +36,45 @@ on:
 
 permissions:
   contents: read
+  checks: read
+  pull-requests: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  group: operator-${{ inputs.pr_number || github.ref }}
   cancel-in-progress: true
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  admission:
+    uses: ./.github/workflows/pr-ci-admission.yml
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ inputs.head_sha }}
+      base_sha: ${{ inputs.base_sha }}
+      check_id: ${{ inputs.check_id }}
+      comment_id: ${{ inputs.comment_id }}
+      suite: operator
+
   test:
+    if: >-
+      ${{ !cancelled() &&
+      success() &&
+      needs.admission.result == 'success' &&
+      (inputs.pr_number == '' ||
+      github.run_attempt == 1) }}
+    needs: admission
     runs-on: arc-antfly-standard
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: go/pkg/operator
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
 
       - name: Load pinned toolchain policy
         id: toolchain
@@ -76,6 +105,27 @@ jobs:
 
       - name: Run tests
         run: make test
+
+      # This is a required step, not an env-gated unit test: execute the
+      # reconciler's generated command against the supported release on CPU.
+      # Update the version AND checksum when advancing the runtime baseline.
+      - name: Test generated inference command against released runtime
+        env:
+          RUNTIME_VERSION: '0.2.1'
+          RUNTIME_SHA256: '2378190c86966626e5a6a101918f66f0f175c8f7482a85415fc446a2a09427d7'
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          runtime_dir="$(mktemp -d)"
+          archive="antfly_${RUNTIME_VERSION}_Linux_x86_64_gnu.tar.gz"
+          curl --fail --location --retry 3 --max-time 180 \
+            "https://github.com/antflydb/antfly/releases/download/v${RUNTIME_VERSION}/${archive}" \
+            --output "${runtime_dir}/${archive}"
+          printf '%s  %s\n' "$RUNTIME_SHA256" "${runtime_dir}/${archive}" | sha256sum --check --strict
+          tar -xzf "${runtime_dir}/${archive}" -C "$runtime_dir"
+          ANTFLY_RUNTIME_BIN="${runtime_dir}/antfly" GOWORK=off go test \
+            -tags runtimeintegration ./controllers/inference \
+            -run '^TestInferenceRuntimeContract$' -count=1 -v -timeout=20m
 
       - name: Run lint
         run: make lint

@@ -1274,7 +1274,7 @@ pub const DecoderRuntimeDecodeContract = enum(u8) {
     /// frame. This text-only GGUF has no per-layer embedding channel.
     gemma4_a4b_shared_kv,
     gliner_deberta_encoder,
-    qwen3_dense_text_embedding,
+    qwen3_dense_text_prefill,
 };
 
 pub const DecoderRuntimeDecodeMode = enum(u8) {
@@ -1437,6 +1437,8 @@ pub const DecoderRuntimeGraphCommandPlanFrameRequest = struct {
     ple_vectors: ?CT = null,
     layers: []const DecoderRuntimeLayerSpec,
     output_hidden: *?CT,
+    /// Borrowed synchronous request control; check between encoded layers.
+    execution_control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
 };
 
 pub const DebertaEncoderLayerSpec = struct {

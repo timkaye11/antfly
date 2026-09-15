@@ -37,6 +37,10 @@ pub const CreateTableRequestErrorDisposition = enum {
 pub fn classifyCreateTableRequestError(err: anyerror) CreateTableRequestErrorDisposition {
     return switch (err) {
         error.InvalidCreateTableRequest,
+        error.InvalidTableStorageSettings,
+        error.VectorStoreRequiresLocalSingleShardTable,
+        error.ImmutableTableStorageSettings,
+        error.VectorStoreRequiresEmptyTable,
         error.CreateTableShardCountOutOfRange,
         error.InvalidCreateTableSchemaRequest,
         error.TableEnrichmentsRequireArtifactEndpoint,
@@ -85,6 +89,11 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
         if (schema_value != .null) try tables_api.validateCreateSchemaVersion(schema_value, false);
     }
 
+    const storage_settings: ?@import("../common/table_storage.zig").Settings = if (raw_root.get("storage")) |value|
+        try @import("../common/table_storage.zig").Settings.parse(value)
+    else
+        null;
+
     // Use typed OpenAPI parsing for scalar fields (num_shards, description, schema,
     // replication_sources). For indexes, parse from the raw body to preserve
     // type-specific fields (external, dimension, edge_types, etc.) that the
@@ -105,6 +114,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
     defer parsed.deinit();
 
     var req: tables_api.CreateTableRequest = .{};
+    req.storage = storage_settings;
     errdefer req.deinit(alloc);
 
     if (parsed.value.num_shards) |num_shards| {
@@ -228,6 +238,12 @@ pub fn encodeCreateTableRequest(alloc: std.mem.Allocator, req: tables_api.Create
     try out.append(alloc, '{');
     var first = true;
 
+    if (req.storage) |storage| {
+        const encoded = try std.json.Stringify.valueAlloc(alloc, storage, .{});
+        defer alloc.free(encoded);
+        try appendRawJsonField(alloc, &out, "storage", encoded, &first);
+    }
+
     if (req.num_shards) |num_shards| {
         try appendField(alloc, &out, "num_shards", .{ .integer = num_shards }, &first);
     }
@@ -246,6 +262,30 @@ pub fn encodeCreateTableRequest(alloc: std.mem.Allocator, req: tables_api.Create
 
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+test "table storage creation intent survives public and internal forwarding" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "{}", "{\"storage\":{}}", "{\"storage\":{\"dense_embeddings\":\"primary_lsm\"}}", "{\"storage\":{\"dense_embeddings\":\"vector_store\"}}" }, 0..) |body, index| {
+        var request = try parseCreateTableRequest(alloc, body);
+        defer request.deinit(alloc);
+        if (index == 0) {
+            try std.testing.expect(request.storage == null);
+        } else {
+            const expected: @import("../common/table_storage.zig").DenseEmbeddings = if (index == 3) .vector_store else .primary_lsm;
+            try std.testing.expectEqual(expected, request.storage.?.dense_embeddings);
+        }
+        const public = try encodeCreateTableRequest(alloc, request);
+        defer alloc.free(public);
+        var public_decoded = try tables_api.parseStoredCreateTableRequest(alloc, public);
+        defer public_decoded.deinit(alloc);
+        try std.testing.expectEqualDeep(request.storage, public_decoded.storage);
+        const internal = try tables_api.encodeStoredCreateTableRequestAlloc(alloc, request);
+        defer alloc.free(internal);
+        var internal_decoded = try tables_api.parseStoredCreateTableRequest(alloc, internal);
+        defer internal_decoded.deinit(alloc);
+        try std.testing.expectEqualDeep(request.storage, internal_decoded.storage);
+    }
 }
 
 pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
@@ -603,6 +643,7 @@ fn validatePublicNestedIndexFields(object: anytype, index_type: public_index_con
 
     const graph_shapes = .{
         .{ "algebraic_planning", public_index_contract.CreatedObjectShape.graph_algebraic_planning },
+        .{ "metrics", public_index_contract.CreatedObjectShape.graph_metrics },
     };
     inline for (graph_shapes) |field_shape| {
         const value = if (@hasField(Object, "map")) object.map.get(field_shape[0]) else object.get(field_shape[0]);
@@ -637,6 +678,8 @@ fn validatePublicArtifactSources(value: std.json.Value, shape: public_index_cont
 }
 
 fn validatePublicCreatedShape(value: std.json.Value, shape: public_index_contract.CreatedObjectShape) !void {
+    if (shape == .graph_metric_filter and value == .object and
+        publicRelationshipFieldActive(value.object, "mode") and publicRelationshipFieldActive(value.object, "types")) return error.InvalidCreateIndexRequest;
     if (!public_index_contract.createdValueMatchesShape(shape, value)) return error.InvalidCreateIndexRequest;
     switch (value) {
         .object => |object| {
@@ -1275,6 +1318,31 @@ test "table contract canonicalizes generated optional null fields" {
         "{\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"},\"title_body\":{\"name\":\"title_body\",\"type\":\"embeddings\",\"dimension\":3,\"template\":\"{{title}} {{body}}\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"antfly-embed-v1\",\"api_url\":\"http://127.0.0.1:8080/ai/v1\"}}}",
         indexes.value,
     );
+}
+
+test "table contract preserves graph metric configuration and rejects malformed nested values" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{"type":"graph","metrics":{"rank":{"kind":"pagerank","max_iterations":20,"edge_filter":{"mode":null,"types":["selected"]}}}}
+    ;
+    const config = try parseCreateIndexRequest(alloc, "graph_idx", body);
+    defer alloc.free(config);
+    try ant_json.testing.expectEqualJsonText(alloc,
+        \\{"name":"graph_idx","type":"graph","metrics":{"rank":{"kind":"pagerank","max_iterations":20,"edge_filter":{"types":["selected"]}}}}
+    , config);
+    for ([_][]const u8{
+        "{\"metrics\":[]}",
+        "{\"metrics\":{\"rank\":{\"kind\":\"bogus\"}}}",
+        "{\"metrics\":{\"rank\":{\"max_iterations\":0}}}",
+        "{\"metrics\":{\"rank\":{\"damping\":1}}}",
+        "{\"metrics\":{\"rank\":{\"secret\":true}}}",
+        "{\"metrics\":{\"rank\":{\"edge_filter\":{\"types\":[]}}}}",
+        "{\"metrics\":{\"rank\":{\"edge_filter\":{\"mode\":\"all\",\"types\":[\"selected\"]}}}}",
+    }) |fields| {
+        const invalid = try std.fmt.allocPrint(alloc, "{{\"type\":\"graph\",{s}", .{fields[1..]});
+        defer alloc.free(invalid);
+        try std.testing.expectError(error.InvalidCreateIndexRequest, parseCreateIndexRequest(alloc, "graph_idx", invalid));
+    }
 }
 
 test "table contract preserves typed artifact-backed graph configuration" {

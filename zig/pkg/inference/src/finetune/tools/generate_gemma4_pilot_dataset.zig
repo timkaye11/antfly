@@ -13,7 +13,6 @@
 // limitations under the License.
 
 const std = @import("std");
-const compat = @import("inference_internal").io.compat;
 
 const prompts = [_][]const u8{
     "Return the project code name for sample",
@@ -51,7 +50,7 @@ pub fn main(init: std.process.Init) !void {
     const start_index = try std.fmt.parseUnsigned(usize, start_index_arg, 10);
     if (count == 0) return error.InvalidPilotExampleCount;
 
-    const file = try compat.cwd().createFile(compat.io(), out_path, .{ .truncate = true });
+    const file = try std.Io.Dir.cwd().createFile(init.io, out_path, .{ .truncate = true });
     defer file.close(init.io);
 
     var buf: [4096]u8 = undefined;

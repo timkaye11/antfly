@@ -19,7 +19,7 @@ const compat = inference.io.compat;
 const c_file = inference.util.c_file;
 const gemma4_train_command = inference.finetune.gemma4_train_command;
 
-const bootstrap_gemma4_lora = @import("../tools/bootstrap_gemma4_lora.zig");
+const bootstrap_gemma4_lora = @import("../tools/bootstrap_gemma4_lora.zig").Command(@import("inference_internal"));
 const generate_gemma4_multimodal_pilot_dataset = @import("../tools/generate_gemma4_multimodal_pilot_dataset.zig");
 const generate_gemma4_pilot_dataset = @import("../tools/generate_gemma4_pilot_dataset.zig");
 const materialize_gemma4_teacher_targets = @import("../tools/materialize_gemma4_teacher_targets.zig");

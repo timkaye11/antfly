@@ -13,71 +13,82 @@
 // limitations under the License.
 
 const std = @import("std");
-const inference = @import("inference_internal");
-const finetune = inference.finetune.gemma4;
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
-    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
-    defer args.deinit();
-    _ = args.next();
+    return Command(@import("inference_finetune_assets")).main(init);
+}
 
-    var eval_program: ?[]const u8 = null;
-    var positional = std.ArrayListUnmanaged([]const u8).empty;
-    defer positional.deinit(allocator);
+// Reuse the parser and implementation in the combined CLI without creating a
+// second instance of model and tensor types inside its inference module.
+pub fn Command(comptime assets: type) type {
+    return struct {
+        const inference = assets;
+        const finetune = inference.finetune.gemma4;
 
-    while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--eval")) {
-            eval_program = args.next() orelse return usageError();
-        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            return usageError();
-        } else {
-            try positional.append(allocator, arg);
+        pub fn main(init: std.process.Init) !void {
+            const allocator = init.gpa;
+            var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+            defer args.deinit();
+            _ = args.next();
+
+            var eval_program: ?[]const u8 = null;
+            var positional = std.ArrayListUnmanaged([]const u8).empty;
+            defer positional.deinit(allocator);
+
+            while (args.next()) |arg| {
+                if (std.mem.eql(u8, arg, "--eval")) {
+                    eval_program = args.next() orelse return usageError();
+                } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+                    return usageError();
+                } else {
+                    try positional.append(allocator, arg);
+                }
+            }
+
+            if (positional.items.len != 3) return usageError();
+            try validateEvalAdmission(eval_program);
+            const base_model_dir = positional.items[0];
+            const adapter_model_dir = positional.items[1];
+            const out_dir = positional.items[2];
+
+            var summary = try finetune.materializeMergedModel(allocator, base_model_dir, adapter_model_dir, out_dir);
+            defer finetune.freeMaterializeSummary(allocator, &summary);
+
+            try printJson(init, summary);
         }
-    }
 
-    if (positional.items.len != 3) return usageError();
-    try validateEvalAdmission(eval_program);
-    const base_model_dir = positional.items[0];
-    const adapter_model_dir = positional.items[1];
-    const out_dir = positional.items[2];
+        fn validateEvalAdmission(eval_program: ?[]const u8) !void {
+            if (eval_program != null) return error.MaterializeEvalRequiresStagedEvaluator;
+        }
 
-    var summary = try finetune.materializeMergedModel(allocator, base_model_dir, adapter_model_dir, out_dir);
-    defer finetune.freeMaterializeSummary(allocator, &summary);
+        test "gemma4 materialize eval fails closed before publication" {
+            try validateEvalAdmission(null);
+            try std.testing.expectError(
+                error.MaterializeEvalRequiresStagedEvaluator,
+                validateEvalAdmission("eval-program"),
+            );
+        }
 
-    try printJson(init, summary);
-}
+        fn printJson(init: std.process.Init, value: anytype) !void {
+            const stdout = std.Io.File.stdout();
+            var buf: [4096]u8 = undefined;
+            var writer = stdout.writer(init.io, &buf);
+            try std.json.Stringify.value(value, .{ .whitespace = .indent_2 }, &writer.interface);
+            try writer.interface.writeByte('\n');
+            try writer.interface.flush();
+        }
 
-fn validateEvalAdmission(eval_program: ?[]const u8) !void {
-    if (eval_program != null) return error.MaterializeEvalRequiresStagedEvaluator;
-}
-
-test "gemma4 materialize eval fails closed before publication" {
-    try validateEvalAdmission(null);
-    try std.testing.expectError(
-        error.MaterializeEvalRequiresStagedEvaluator,
-        validateEvalAdmission("eval-program"),
-    );
-}
-
-fn printJson(init: std.process.Init, value: anytype) !void {
-    const stdout = std.Io.File.stdout();
-    var buf: [4096]u8 = undefined;
-    var writer = stdout.writer(init.io, &buf);
-    try std.json.Stringify.value(value, .{ .whitespace = .indent_2 }, &writer.interface);
-    try writer.interface.writeByte('\n');
-    try writer.interface.flush();
-}
-
-fn usageError() error{InvalidArguments} {
-    std.debug.print(
-        \\usage: materialize-gemma4-lora <base_model_dir> <adapter_model_dir> <out_dir>
-        \\       materialize-gemma4-lora [--eval <program>] <base_model_dir> <adapter_model_dir> <out_dir>
-        \\example: materialize-gemma4-lora /tmp/gemma4-base /tmp/gemma4-lora /tmp/gemma4-merged
-        \\
-        \\--eval is currently rejected: evaluation must target the staged artifact
-        \\and succeed before immutable publication.
-        \\
-    , .{});
-    return error.InvalidArguments;
+        fn usageError() error{InvalidArguments} {
+            std.debug.print(
+                \\usage: materialize-gemma4-lora <base_model_dir> <adapter_model_dir> <out_dir>
+                \\       materialize-gemma4-lora [--eval <program>] <base_model_dir> <adapter_model_dir> <out_dir>
+                \\example: materialize-gemma4-lora /tmp/gemma4-base /tmp/gemma4-lora /tmp/gemma4-merged
+                \\
+                \\--eval is currently rejected: evaluation must target the staged artifact
+                \\and succeed before immutable publication.
+                \\
+            , .{});
+            return error.InvalidArguments;
+        }
+    };
 }

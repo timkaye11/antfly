@@ -4318,7 +4318,7 @@ fn shouldKeepResidentGptEmbeddingQuantizedOnly(
 ) bool {
     return switch (config.family) {
         .gemma => isCudaResidentEmbeddingQuantType(tensor_type),
-        .llama, .mistral, .qwen2, .bitnet => std.meta.eql(tensor_type, gguf_mod.tensor_types.TensorType{ .known = .Q8_0 }),
+        .llama, .mistral, .qwen2, .qwen3, .bitnet => std.meta.eql(tensor_type, gguf_mod.tensor_types.TensorType{ .known = .Q8_0 }),
         else => false,
     };
 }
@@ -4335,6 +4335,24 @@ fn shouldKeepResidentGptWeightQuantizedOnly(
     key: []const u8,
     tensor_type: ?gguf_mod.tensor_types.TensorType,
 ) bool {
+    // Qwen3's resident CPU/GPU paths can consume these Q8 matrices directly.
+    // Keep other formats and auxiliary tensors on their existing load policy
+    // until their quantized-only execution paths have been qualified.
+    if (config.family == .qwen3) {
+        const tt = tensor_type orelse return false;
+        if (!std.meta.eql(tt, gguf_mod.tensor_types.TensorType{ .known = .Q8_0 })) return false;
+        if (std.mem.eql(u8, key, "model.embed_tokens.weight") or
+            std.mem.eql(u8, key, "lm_head.weight") or
+            std.mem.eql(u8, key, "cls.output.weight")) return true;
+        if (!std.mem.startsWith(u8, key, "model.layers.")) return false;
+        return std.mem.endsWith(u8, key, ".self_attn.q_proj.weight") or
+            std.mem.endsWith(u8, key, ".self_attn.k_proj.weight") or
+            std.mem.endsWith(u8, key, ".self_attn.v_proj.weight") or
+            std.mem.endsWith(u8, key, ".self_attn.o_proj.weight") or
+            std.mem.endsWith(u8, key, ".mlp.gate_proj.weight") or
+            std.mem.endsWith(u8, key, ".mlp.up_proj.weight") or
+            std.mem.endsWith(u8, key, ".mlp.down_proj.weight");
+    }
     return switch (config.family) {
         .llama, .mistral, .qwen2, .gemma, .bitnet => blk: {
             if (isGptEmbeddingTableKey(key)) {
@@ -6275,6 +6293,8 @@ const arch_vtable = Session.VTable{
     .runResidentWithControl = &archRunResidentWithControl,
     .inputInfo = &archInputInfo,
     .outputInfo = &archOutputInfo,
+    .independentBatchRows = &archIndependentBatchRows,
+    .runGeometry = &archRunGeometry,
     .backend = &archBackend,
     .close = &archClose,
 };
@@ -6540,6 +6560,7 @@ fn makeComputeBackend(
                 NativeCompute.initWithIo(allocator, &self.backend_data.native, run_budget, io_handle)
             else
                 NativeCompute.init(allocator, &self.backend_data.native, run_budget);
+            compute.borrow_bf16_linear_weights = self.arch_config == .gpt and self.arch_config.gpt.family == .qwen3;
             break :blk compute.computeBackend();
         },
         .metal => try makeGpuHostedComputeBackend(self, allocator, run_budget),
@@ -7327,6 +7348,10 @@ pub fn attachSharedPrefetchState(session: Session, shared_prefetch: *runtime.tie
     }
 }
 
+fn isQwen3GenerativeRerankerFamily(family: gpt_arch.ModelFamily) bool {
+    return family == .qwen3 or family == .qwen3_vl;
+}
+
 fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) ![]Tensor {
     return archRunImpl(ptr, inputs, allocator, null);
 }
@@ -7613,12 +7638,12 @@ fn archRunImpl(
             const seq_len: usize = @intCast(input_ids_tensor.shape[1]);
             const input_ids = input_ids_tensor.asInt64();
 
-            if (self.task == .classifier and (cfg.family == .qwen3_vl or cfg.family == .qwen3)) {
+            if (self.task == .classifier and isQwen3GenerativeRerankerFamily(cfg.family)) {
                 if (inputs.len < 2 or !std.mem.eql(u8, inputs[1].name, "attention_mask")) {
                     return error.MissingInputs;
                 }
                 const attention_mask = inputs[1].asInt64();
-                const logits = try gpt_arch.qwen3VlRerankerLogits(
+                const logits = try gpt_arch.qwen3RerankerLogits(
                     &cb,
                     allocator,
                     cfg,
@@ -8381,6 +8406,106 @@ fn maybeApplyPooler(
     return try cb.toFloat32(activated_ct, allocator);
 }
 
+fn archRunGeometry(ptr: *anyopaque, inputs: @import("../backends/session.zig").ShapeInputs, batch: usize) !?@import("../backends/session.zig").RunGeometry {
+    const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    if (inputs.len() == 0) return null;
+    const first = inputs.get(0);
+    if (first.shape.len < 2 or first.shape[1] <= 0) return null;
+    const input_seq: usize = @intCast(first.shape[1]);
+    var sequence = input_seq;
+    var output_seq = input_seq;
+    var workspace_bytes: usize = 0;
+    const width: usize = switch (self.arch_config) {
+        .bert => |cfg| blk: {
+            if (self.task == .classifier) output_seq = 1;
+            break :blk if (self.task == .classifier or self.task == .recognizer) cfg.num_labels else cfg.hidden_size;
+        },
+        .deberta => |cfg| blk: {
+            if (self.task == .classifier) output_seq = 1;
+            break :blk if (self.task == .classifier or self.task == .recognizer) cfg.num_labels else cfg.hidden_size;
+        },
+        .modern_bert => |cfg| cfg.hidden_size,
+        .nomic_bert => |cfg| cfg.hidden_size,
+        .t5 => |cfg| cfg.d_model,
+        .gpt => |cfg| blk: {
+            if (self.task == .classifier and (cfg.family == .qwen3 or cfg.family == .qwen3_vl)) {
+                output_seq = 1;
+                break :blk 1;
+            }
+            break :blk cfg.hidden_size;
+        },
+        .whisper => |cfg| blk: {
+            if (first.dtype == .f32 and std.mem.eql(u8, first.name, "input_features")) {
+                if (first.shape.len != 3 or first.shape[2] <= 0) return error.InvalidInputShape;
+                sequence = @intCast(first.shape[2]);
+                output_seq = (std.math.add(usize, sequence, 1) catch return error.ResourceLimitExceeded) / 2;
+                workspace_bytes = try whisperStageWorkspace(batch, output_seq, output_seq, cfg.d_model, cfg.encoder_attention_heads, cfg.encoder_ffn_dim);
+                break :blk cfg.d_model;
+            }
+            const hidden = inputs.named("encoder_hidden_states") orelse return error.InvalidInputShape;
+            if (hidden.shape.len != 3 or hidden.shape[1] <= 0) return error.InvalidInputShape;
+            sequence = @max(input_seq, @as(usize, @intCast(hidden.shape[1])));
+            workspace_bytes = try whisperStageWorkspace(batch, input_seq, sequence, cfg.d_model, cfg.decoder_attention_heads, cfg.decoder_ffn_dim);
+            break :blk cfg.vocab_size;
+        },
+        else => return null,
+    };
+    const elements = std.math.mul(usize, batch, std.math.mul(usize, output_seq, width) catch return error.ResourceLimitExceeded) catch return error.ResourceLimitExceeded;
+    const bytes = std.math.mul(usize, elements, @sizeOf(f32)) catch return error.ResourceLimitExceeded;
+    return .{ .sequence = sequence, .output_bytes = std.math.add(usize, bytes, 3 * @sizeOf(i64)) catch return error.ResourceLimitExceeded, .workspace_bytes = workspace_bytes };
+}
+
+fn whisperStageWorkspace(batch: usize, queries: usize, keys: usize, hidden: usize, heads: usize, ffn: usize) !usize {
+    // Attention score/probability storage, FFN intermediates, and K/V/frontend
+    // storage are sequential peaks, not one copy per transformer layer.
+    const mul = std.math.mul;
+    const add = std.math.add;
+    const scores = try mul(usize, try mul(usize, try mul(usize, queries, keys), heads), 3);
+    const activations = try mul(usize, queries, try add(usize, try mul(usize, hidden, 6), try mul(usize, ffn, 3)));
+    const context = try mul(usize, try mul(usize, keys, hidden), 6);
+    return mul(usize, try mul(usize, batch, @max(scores, @max(activations, context))), @sizeOf(f32)) catch error.ResourceLimitExceeded;
+}
+
+test "native stage geometry resolves Whisper encoder and decoder output residency" {
+    var arch: ArchSession = undefined;
+    arch.arch_config = .{ .whisper = .{} };
+    arch.task = .generic;
+    const input = Tensor{ .data = &.{}, .dtype = .f32, .shape = &.{ 1, 80, 3000 }, .name = "input_features", .allocator = std.testing.allocator, .owns_data = false, .owns_shape = false };
+    const encoder = (try archRunGeometry(&arch, .{ .tensors = &.{input} }, 8)).?;
+    try std.testing.expectEqual(@as(usize, 3000), encoder.sequence);
+    try std.testing.expectEqual(@as(usize, 8 * 1500 * 384 * 4 + 24), encoder.output_bytes);
+    var ids = input;
+    ids.dtype = .i64;
+    ids.shape = &.{ 1, 3 };
+    ids.name = "input_ids";
+    var hidden = input;
+    hidden.shape = &.{ 1, 1500, 384 };
+    hidden.name = "encoder_hidden_states";
+    const decoder = (try archRunGeometry(&arch, .{ .tensors = &.{ ids, hidden } }, 8)).?;
+    try std.testing.expectEqual(@as(usize, 1500), decoder.sequence);
+    try std.testing.expectEqual(@as(usize, 8 * 3 * 51865 * 4 + 24), decoder.output_bytes);
+}
+
+fn archIndependentBatchRows(ptr: *anyopaque, inputs: []const Tensor) bool {
+    const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    // Only stateless forward stages are qualified here. Native generation
+    // caches and resident multimodal stages use their own scheduler contracts.
+    return switch (self.arch_config) {
+        .bert, .deberta, .modern_bert, .nomic_bert => inputs.len >= 2 and
+            inputs[0].dtype == .i64 and inputs[0].shape.len == 2 and
+            inputs[1].dtype == .i64 and inputs[1].shape.len == 2,
+        .whisper => if (inputs.len == 1)
+            inputs[0].dtype == .f32 and inputs[0].shape.len == 3 and std.mem.eql(u8, inputs[0].name, "input_features")
+        else
+            inputs.len == 2 and inputs[0].dtype == .i64 and inputs[0].shape.len == 2 and
+                inputs[1].dtype == .f32 and inputs[1].shape.len == 3,
+        .t5 => inputs.len == 2 and inputs[0].dtype == .i64 and inputs[0].shape.len == 2 and
+            inputs[1].dtype == .i64 and inputs[1].shape.len == 2,
+        .gpt => self.task == .classifier and (self.arch_config.gpt.family == .qwen3 or self.arch_config.gpt.family == .qwen3_vl),
+        else => false,
+    };
+}
+
 fn archInputInfo(ptr: *anyopaque) []const TensorInfo {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
     return switch (self.arch_config) {
@@ -8412,7 +8537,7 @@ fn archInputInfo(ptr: *anyopaque) []const TensorInfo {
 fn archOutputInfo(ptr: *anyopaque) []const TensorInfo {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
     if (self.task == .classifier and self.arch_config == .gpt and
-        self.arch_config.gpt.family == .qwen3_vl)
+        isQwen3GenerativeRerankerFamily(self.arch_config.gpt.family))
     {
         return &.{
             .{ .name = "logits", .dtype = .f32, .shape = &.{ -1, 1 } },
@@ -8666,6 +8791,12 @@ test "Qwen3-VL reranker BF16 budget covers mapped and backend weight domains" {
         manifest,
         .{ .gpt = .{ .family = .qwen2 } },
     ));
+}
+
+test "Qwen3 text and vision families share generative reranker session output" {
+    try std.testing.expect(isQwen3GenerativeRerankerFamily(.qwen3));
+    try std.testing.expect(isQwen3GenerativeRerankerFamily(.qwen3_vl));
+    try std.testing.expect(!isQwen3GenerativeRerankerFamily(.qwen2));
 }
 
 test "Qwen3-VL reranker GGUF budget reserves image projector host envelope" {
@@ -9407,6 +9538,39 @@ test "Gemma resident embeddings retain CUDA-supported quantized formats" {
 
     const llama_cfg: gpt_mod.Config = .{ .family = .llama };
     try std.testing.expect(!shouldKeepResidentGptEmbeddingQuantizedOnly(llama_cfg, .{ .known = .Q6_K }));
+}
+
+test "Qwen3 resident quantized-only policy covers Q8 embedding projections and reranker head" {
+    const config: gpt_mod.Config = .{ .family = .qwen3 };
+    const q8: gguf_mod.tensor_types.TensorType = .{ .known = .Q8_0 };
+    try std.testing.expect(shouldKeepResidentGptEmbeddingQuantizedOnly(config, q8));
+    try std.testing.expect(!shouldKeepResidentGptEmbeddingQuantizedOnly(config, .{ .known = .Q4_K }));
+    for ([_][]const u8{
+        "model.embed_tokens.weight",
+        "lm_head.weight",
+        "cls.output.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.k_proj.weight",
+        "model.layers.0.self_attn.v_proj.weight",
+        "model.layers.27.self_attn.o_proj.weight",
+        "model.layers.27.mlp.gate_proj.weight",
+        "model.layers.27.mlp.up_proj.weight",
+        "model.layers.27.mlp.down_proj.weight",
+    }) |key| {
+        try std.testing.expect(shouldKeepResidentGptWeightQuantizedOnly(config, key, q8));
+        try std.testing.expect(!shouldKeepResidentGptWeightQuantizedOnly(config, key, .{ .known = .Q4_K }));
+        try std.testing.expect(!shouldKeepResidentGptWeightQuantizedOnly(config, key, .{ .known = .BF16 }));
+        try std.testing.expect(!shouldKeepResidentGptWeightQuantizedOnly(config, key, null));
+    }
+    for ([_][]const u8{
+        "model.layers.0.input_layernorm.weight",
+        "model.layers.0.self_attn.q_norm.weight",
+        "model.layers.0.self_attn.q_proj.bias",
+        "model.layers.0.block_sparse_moe.experts.0.w1.weight",
+        "model.layers.0.block_sparse_moe.gate.weight",
+        "model.per_layer_input.per_layer_token_embd.weight",
+        "visual.blocks.0.self_attn.q_proj.weight",
+    }) |key| try std.testing.expect(!shouldKeepResidentGptWeightQuantizedOnly(config, key, q8));
 }
 
 test "serving policy does not disable existing gguf weight mappings" {

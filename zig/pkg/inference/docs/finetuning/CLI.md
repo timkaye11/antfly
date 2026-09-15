@@ -36,7 +36,26 @@ There is no legacy-compatibility requirement for the existing many-step
 `zig build <finetune-tool>` surface. The refactor should optimize for the
 long-term shape, not alias preservation.
 
-## Remaining Refactor Work
+## Status
+
+The unified dispatcher described in "Target CLI" below is implemented:
+`src/finetune/cli/root.zig` holds a `<domain, action, subject>` command table
+(`command_registry.zig` plus the table in `root.zig`) that routes to the
+existing tool `main()` functions, `src/main.zig` wires the top-level
+`finetune` command to it (`inference.finetune_cli.main`), and legacy
+`zig build <tool-name>` names still work as compatibility wrappers over the
+same table.
+
+The typed `Options`/`Result`/`run()` programmatic contract, the shared
+`RunContext`/`ArtifactWriter` types, and the deeper source reorganization
+into `core/`, `data/`, `adapters/`, `trainers/`, `families/`, and
+`workflows/` directories described below are still a target design, not
+implemented: `src/finetune/` today has only `cli/`, `eval/`, `test/`,
+`tools/`, `train/`, and `assets/` as real subdirectories, and model-family
+code (`gemma4.zig`, `gliner2.zig`, etc.) remains flat rather than split by
+responsibility. See "Open work" at the end.
+
+## Current Problem
 
 Some older family paths still mix several concerns:
 
@@ -214,7 +233,7 @@ Use this matrix as the PR gate for declaring the unified CLI production ready.
 | Gemma4 text DPO / GRPO LoRA | text or rendered-text preference/prompt JSONL; GRPO supports decoded-text and token reward targets | bootstrap/inspect/validate plus immutable stock-key PEFT export | optimizer-backed live-logprob DPO/GRPO with pair/group-safe accumulation; compiled-graph zero-LoRA references and parity gates; content-addressed epoch recovery; fresh-backend terminal eval; GRPO hard/adaptive KL control; strict no-update and no-reward-advantage gates; packed-GGUF preference QLoRA fail-closed | PEFT adapter export | strict Metal E2B/E4B real process-kill/resume; byte-exact adapters/training/discrete traces, with explicitly bounded terminal GRPO KL floats; three-seed/eight-epoch absolute floors pass for E2B/E4B DPO and E2B GRPO, while E4B GRPO misses its top-rank floor; baseline-relative quality, independent initialization, repeated performance distributions, and required CI remain open |
 | Gemma4 multimodal LoRA | historical diagnostic preparation only | bootstrap/inspect | public train/eval rejects projector/media | diagnostic only | unsupported production lane |
 | ColQwen2 / Qwen2VL | multimodal prepared inputs | bootstrap/inspect | LoRA train/eval bundle | LoRA merge | native/BLAS CPU smoke |
-| Qwen3.5 / Chandra OCR text-only | text SFT/DPO/GRPO JSONL; dynamic image preparation pending | bootstrap/inspect | Qwen autodiff trainer for text SFT/DPO/GRPO | adapter save; merged materialization pending | native/BLAS CPU smoke required, MLX/Metal smoke pending |
+| Qwen3.5 / Chandra OCR text-only | text SFT/DPO/GRPO JSONL; dynamic image preparation pending | bootstrap/inspect | Qwen autodiff trainer for text SFT/DPO/GRPO | adapter save; merged materialization pending | native/BLAS CPU smoke required, Metal smoke pending |
 | GLiNER2 | dataset inspect + boundary caches | bootstrap/inspect | LoRA, autodiff, boundary heads | LoRA merge | native/BLAS CPU smoke |
 | LayoutLMv3 | document token/sequence data | bootstrap/inspect | token and sequence train/eval | checkpoint materialize | native/BLAS CPU smoke |
 | Reranker | dataset inspect + pooled/top-layer caches | bootstrap/inspect | head and LoRA surrogate paths | head and LoRA materialize | native/BLAS CPU smoke |
