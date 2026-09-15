@@ -3,7 +3,7 @@
  "id": "gliner2",
  "family": "gliner",
  "displayName": "GLiNER2 Base",
- "tagline": "Schema-conditioned entity extraction on a DeBERTa-v3 base encoder: bidirectional relative attention, fused Metal operations and a head that scores candidate spans against labels.",
+ "tagline": "Give it text and a list of labels, and one pass of a DeBERTa encoder scores every candidate span against every label — extraction without generation, fused into a handful of Metal kernels.",
  "stats": {
   "layers": 12,
   "hidden": 768,
@@ -34,7 +34,7 @@
    "source": {
     "path": "zig/pkg/inference/src/architectures/deberta_graph.zig",
     "anchor": "pub fn buildForwardGraph(",
-    "line": 97
+    "line": 179
    },
    "repeat": {
     "count": 12,
@@ -51,7 +51,7 @@
    "source": {
     "path": "zig/pkg/inference/src/architectures/gliner_head.zig",
     "anchor": "fn extractWordEmbeddings(",
-    "line": 357
+    "line": 438
    },
    "headType": "span"
   }
@@ -177,7 +177,7 @@
      "source": {
       "path": "zig/pkg/inference/src/models/deberta.zig",
       "anchor": "pub fn relativePositionBucket(",
-      "line": 108
+      "line": 122
      },
      "kernelRouteIds": [],
      "kernels": [],
@@ -277,7 +277,7 @@
      "source": {
       "path": "zig/pkg/inference/src/architectures/deberta_graph.zig",
       "anchor": "pub fn fusedDisentangledAttentionEnabledForProduction(",
-      "line": 316
+      "line": 430
      },
      "kernelRouteIds": [],
      "kernels": [
@@ -513,7 +513,7 @@
      "source": {
       "path": "zig/pkg/inference/src/architectures/gliner_head.zig",
       "anchor": "fn extractWordEmbeddings(",
-      "line": 357
+      "line": 438
      },
      "kernelRouteIds": [],
      "kernels": [
@@ -551,12 +551,12 @@
       ]
      },
      "attrs": {
-      "note": "positions where input_ids == entity_token_id — the schema's label names, encoded in the same pass as the text"
+      "note": "positions where input_ids match the entity marker (and, for other tasks, classification/relation marker ids) — the schema's label names, encoded in the same pass as the text"
      },
      "source": {
       "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig",
       "anchor": "pub fn gatherLabelEmbeddings(",
-      "line": 350
+      "line": 352
      },
      "kernelRouteIds": [],
      "kernels": [],
@@ -602,7 +602,7 @@
      "source": {
       "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig",
       "anchor": "pub fn spanMarkerForward(",
-      "line": 369
+      "line": 371
      },
      "kernelRouteIds": [],
      "kernels": [],
@@ -726,7 +726,7 @@
      "source": {
       "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig",
       "anchor": "pub fn downscaledTransformer(",
-      "line": 534
+      "line": 536
      },
      "kernelRouteIds": [],
      "kernels": [
@@ -774,7 +774,7 @@
      "source": {
       "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig",
       "anchor": "pub fn scoreSpansAgainstLabels(",
-      "line": 333
+      "line": 335
      },
      "kernelRouteIds": [],
      "kernels": [],
@@ -944,7 +944,7 @@
   }
  },
  "sources": {
-  "gitCommit": "26e332ed8c335d75eecd875548c6c36bcb47d183",
-  "generatedAt": "2026-09-09T21:41:47.835Z"
+  "gitCommit": "05dc2b75e20e0bfca168746f94639713568be9d0",
+  "generatedAt": "2026-09-15T04:23:49.128Z"
  }
 }

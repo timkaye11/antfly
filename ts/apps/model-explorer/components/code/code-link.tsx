@@ -19,20 +19,21 @@ export function CodeLink({ link, label, className }: { link: SourceLink; label?:
   const href = permalinkFor(link);
   const text = label ?? `${basename(link.path)}${link.line !== undefined ? `:${link.line}` : ""}`;
 
-  const pill = (
-    <a
-      href={href}
-      target="_blank"
-      rel="noreferrer"
-      className={cn(
-        "inline-flex items-center gap-1 rounded-sm border bg-muted/40 px-1.5 py-px font-mono text-[11px] text-foreground/80 transition-colors hover:border-primary/60 hover:text-foreground",
-        className,
-      )}
-      title={`${link.path}:${link.line ?? ""}`}
-    >
+  const pillClass = cn(
+    "inline-flex items-center gap-1 rounded-sm border bg-muted/40 px-1.5 py-px font-mono text-[11px] text-foreground/80 transition-colors hover:border-primary/60 hover:text-foreground",
+    className,
+  );
+  // Without a permalink base there is nothing to open: render a span, not a
+  // dead <a href={undefined}> that looks clickable but does nothing.
+  const pill = href ? (
+    <a href={href} target="_blank" rel="noreferrer" className={pillClass} title={`${link.path}:${link.line ?? ""}`}>
       {text}
       <ExternalLink className="size-2.5 opacity-60" />
     </a>
+  ) : (
+    <span className={pillClass} title={`${link.path}:${link.line ?? ""}`}>
+      {text}
+    </span>
   );
 
   if (!snippet) return pill;

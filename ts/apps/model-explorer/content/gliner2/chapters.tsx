@@ -109,7 +109,7 @@ export function Gliner2Chapters({ spec }: ChaptersProps) {
           </p>
           <p>
             Relative-position <em>indices</em> repeat along diagonals; the scores also depend on the query
-            or key content, so their diagonals need not be equal. The score-gather formulation uses a
+            or key content, so their diagonals need not be equal. The score-gather formulation uses a{" "}
             <code>[T × (2T−1)]</code> product per side and gathers by <code>qi−ki+T−1</code>.
             The fused graph path instead consumes content and relative projections directly.
           </p>
@@ -119,7 +119,8 @@ export function Gliner2Chapters({ spec }: ChaptersProps) {
         </Scene>
         <Scene id="buckets" graphic={<LogBucketFigure />}>
           <p>
-            <strong>Distance is bucketed.</strong> <code>position_buckets = {String(spec.stats.relBuckets)}</code>
+            <strong>Distance is bucketed.</strong>{" "}
+            <code>position_buckets = {String(spec.stats.relBuckets)}</code>{" "}
             is the signed-distance offset; the relative embedding table has 512 rows. Distances within
             ±128 map exactly; larger magnitudes use logarithmic buckets, shifted by 256 into table indices. Word order nearby is
             preserved precisely; far context blurs gracefully. And because position lives entirely inside
@@ -230,7 +231,12 @@ export function Gliner2Chapters({ spec }: ChaptersProps) {
             Batching creates wider matrix operations, but padding, sequence length and head work affect
             efficiency. The CPU/GPU crossover is hardware- and workload-dependent; this walkthrough does
             not establish a performance threshold. Entity extraction is the path illustrated here;
-            classification and relation extraction use additional task-specific pipeline logic.
+            classification and relation extraction use additional task-specific pipeline logic. Its
+            successor,{" "}
+            <Link className="text-primary underline" href="/models/gliner25">
+              GLiNER2.5
+            </Link>
+            , replaces the span grid with boundary proposals and a shared candidate pool.
           </p>
           <p className="text-xs">
             The spine in full: <Link className="text-primary underline" href="/runtime">runtime walkthrough →</Link>

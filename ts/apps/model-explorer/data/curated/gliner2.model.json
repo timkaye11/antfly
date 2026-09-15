@@ -2,7 +2,7 @@
   "id": "gliner2",
   "family": "gliner",
   "displayName": "GLiNER2 Base",
-  "tagline": "Schema-conditioned entity extraction on a DeBERTa-v3 base encoder: bidirectional relative attention, fused Metal operations and a head that scores candidate spans against labels.",
+  "tagline": "Give it text and a list of labels, and one pass of a DeBERTa encoder scores every candidate span against every label — extraction without generation, fused into a handful of Metal kernels.",
   "stats": {
     "layers": 12,
     "hidden": 768,
@@ -487,7 +487,7 @@
             "anchor": "pub fn gatherLabelEmbeddings("
           },
           "attrs": {
-            "note": "positions where input_ids == entity_token_id — the schema's label names, encoded in the same pass as the text"
+            "note": "positions where input_ids match the entity marker (and, for other tasks, classification/relation marker ids) — the schema's label names, encoded in the same pass as the text"
           },
           "backend": "metal"
         },

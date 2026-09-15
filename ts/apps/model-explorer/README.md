@@ -1,6 +1,6 @@
 # Antfly Model Explorer
 
-A static, interactive companion to Antfly Inference. The model walkthroughs explain selected Gemma 4, GLiNER2, Qwen3-Embedding and Qwen3-VL paths. They are curated teaching diagrams, not traces of a running model or a complete compatibility catalog.
+A static, interactive companion to Antfly Inference. The model walkthroughs explain selected Gemma4, GLiNER2, GLiNER2.5, Qwen3 Embedding and Qwen3-VL paths. They are curated teaching diagrams, not traces of a running model or a complete compatibility catalog.
 
 ## Run and share
 
@@ -34,5 +34,7 @@ Generated files in `data/generated/` are checked in so readers do not need to ru
 Generation defaults to the local `HEAD`. Before sharing from an unpublished app branch, pin an already published source revision with `pnpm generate --source-ref origin/main` (or an explicit published SHA). The same source-byte verification applies, so a different implementation cannot be substituted just to obtain a public URL. Confirm the selected revision is accessible on GitHub; local Git history alone does not prove publication.
 
 Review scope, 9 September 2026: generated diagrams, inventories and source snippets are pinned to `26e332ed8c335d75eecd875548c6c36bcb47d183`, matching this checkout's inference implementation. The later published commit `aa44bddd1dd8befb5d0aec8bdb6c304054b89149` adds [qualified cross-request scheduling and tensor-forward fusion](https://github.com/antflydb/antfly/blob/aa44bddd1dd8befb5d0aec8bdb6c304054b89149/zig/pkg/inference/BATCHING.md#L95) and [shared Metal provider leases through execution and teardown](https://github.com/antflydb/antfly/blob/aa44bddd1dd8befb5d0aec8bdb6c304054b89149/zig/pkg/inference/src/ops/metal_compute.zig#L4319). These newer serving contracts are covered by a dated runtime note, not the generated snapshot. The reviewed delta preserves the selected Gemma/Qwen/GLiNER architecture math and KV/kernel explanations; its tokenizer change adds allocation-failure cleanup. This review does not qualify the new batching implementation or its performance.
+
+Update, 14 September 2026: the GLiNER2.5 pages postdate the 9 September review and are pinned, with everything else, to the local merge commit `05dc2b75e20e0bfca168746f94639713568be9d0` (currently 72 op kinds, 431 Metal kernels, 25 routes, 1,475 environment-name references, 154 snippets; 23 exported pages across 6 model walkthroughs). The 9 September review does not cover the GLiNER2.5 content.
 
 The regression tests cover invalid graph references, Sankey cycles, frame/barrier integrity, source bounds, enum anchor accuracy, incomplete schedule extraction, and static route/path handling. They do not execute inference or qualify model performance. Before sharing, also inspect navigation, deep links, keyboard interaction, dark mode and narrow layouts in the exported site.

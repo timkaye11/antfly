@@ -158,15 +158,30 @@ function classifyKernel(name: string): KernelInventoryEntry["family"] {
   return "other";
 }
 
+/**
+ * Blank out `//` and `/* *\/` comments with spaces so declaration scans cannot
+ * match commented-out code. Offsets and newlines are preserved for lineOf().
+ */
+function blankComments(src: string): string {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "))
+    .replace(/\/\/[^\n]*/g, (m) => " ".repeat(m.length));
+}
+
 /** Scan metal_kernels.m + generated/*.metal for `kernel void <name>`. */
 export function extractKernelInventory(): KernelInventoryEntry[] {
   const seen = new Map<string, KernelInventoryEntry>();
 
   const mContent = readRepoFile(KERNELS_M);
+  // Markers live inside comments, so locate them on the raw text; match
+  // kernel declarations on the comment-blanked text (same offsets).
   const beginMarker = mContent.indexOf("quant-kernel-codegen:begin generated quant kernels");
   const endMarker = mContent.indexOf("quant-kernel-codegen:end generated quant kernels");
+  if ((beginMarker >= 0) !== (endMarker >= 0) || (beginMarker >= 0 && endMarker < beginMarker)) {
+    throw new Error(`unpaired quant-kernel-codegen markers in ${KERNELS_M}`);
+  }
   const kernelRe = /kernel void ([a-zA-Z0-9_]+)/g;
-  for (const m of mContent.matchAll(kernelRe)) {
+  for (const m of blankComments(mContent).matchAll(kernelRe)) {
     const name = m[1];
     if (seen.has(name)) continue;
     const inGenerated = beginMarker >= 0 && m.index > beginMarker && m.index < endMarker;
@@ -183,7 +198,7 @@ export function extractKernelInventory(): KernelInventoryEntry[] {
     const rel = `${GENERATED_DIR}/${file}`;
     const content = readRepoFile(rel);
     const re = /kernel void ([a-zA-Z0-9_]+)/g;
-    for (const g of content.matchAll(re)) {
+    for (const g of blankComments(content).matchAll(re)) {
       const name = g[1];
       const entry: KernelInventoryEntry = {
         name,
@@ -196,7 +211,7 @@ export function extractKernelInventory(): KernelInventoryEntry[] {
     }
   }
 
-  const inventory = [...seen.values()].sort((a, b) => a.name.localeCompare(b.name));
+  const inventory = [...seen.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   if (inventory.length < 300)
     throw new Error(`suspiciously few kernels found: ${inventory.length}`);
   return inventory;
@@ -216,7 +231,7 @@ export function extractEnvFlags(): EnvFlagGate[] {
   const byName = new Map<string, { links: SourceLink[]; count: number }>();
   const walk = (relDir: string) => {
     for (const entry of readdirSync(join(repoRoot, relDir), { withFileTypes: true }).sort((a, b) =>
-      a.name.localeCompare(b.name)
+      a.name < b.name ? -1 : a.name > b.name ? 1 : 0
     )) {
       const rel = `${relDir}/${entry.name}`;
       if (entry.isDirectory()) {
@@ -224,7 +239,9 @@ export function extractEnvFlags(): EnvFlagGate[] {
         walk(rel);
       } else if (entry.name.endsWith(".zig") || entry.name.endsWith(".m")) {
         const content = readRepoFile(rel);
-        const re = /(?:TERMITE|ANTFLY)_[A-Z0-9][A-Z0-9_]{3,}/g;
+        // Both-side boundaries: prefix string literals like
+        // "TERMITE_METAL_DISABLE_" must not register (truncated or otherwise).
+        const re = /(?<![A-Z0-9_])(?:TERMITE|ANTFLY)_[A-Z0-9][A-Z0-9_]{2,}[A-Z0-9](?![A-Z0-9_])/g;
         for (const m of content.matchAll(re)) {
           const name = m[0];
           const rec = byName.get(name) ?? { links: [], count: 0 };
@@ -245,7 +262,7 @@ export function extractEnvFlags(): EnvFlagGate[] {
       occurrences: rec.count,
       sources: rec.links,
     }))
-    .sort((a, b) => a.name.localeCompare(b.name));
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   if (flags.length < 200) throw new Error(`suspiciously few env flags found: ${flags.length}`);
   return flags;
 }

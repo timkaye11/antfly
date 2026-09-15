@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { KernelFamily } from "./kernel.ts";
 import { ModelId, SCHEMA_VERSION } from "./model-spec.ts";
 import { SourceLink } from "./source-link.ts";
 
@@ -10,7 +11,8 @@ import { SourceLink } from "./source-link.ts";
 export const PlannedOpSpan = z.object({
   label: z.string(),
   kernel: z.string().optional(),
-  family: z.string(),
+  /** Typed so a typo'd family fails validation instead of rendering gray. */
+  family: KernelFamily,
   estBytes: z.number().nonnegative().optional(),
   gpuNanos: z.number().nonnegative().optional(),
 });

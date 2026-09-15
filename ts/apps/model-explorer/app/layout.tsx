@@ -7,7 +7,7 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: { default: "Antfly Model Explorer", template: "%s · Antfly Model Explorer" },
   description:
-    "How data flows through Antfly's Zig inference runtime — GLiNER2, Gemma4 E2B/E4B, Qwen3 Embedding, and Qwen3-VL, from tokenization to Metal kernels.",
+    "How data flows through Antfly's Zig inference runtime — Gemma4 E2B/E4B, GLiNER2, GLiNER2.5, Qwen3 Embedding, and Qwen3-VL, from tokenization to Metal kernels.",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

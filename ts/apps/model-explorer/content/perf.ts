@@ -8,7 +8,7 @@ import type { BytesBreakdownEntry, JourneyEntry, PerfSample } from "@/lib/schema
 export const PERF_PLAN = "zig/pkg/inference/GEMMA4_PERF_PLAN.md";
 
 /** §1 comparison — E4B Q4_0, single prompt, 64 tokens, temp 0, serial. */
-export const comparisonSamples: PerfSample[] = [
+const rawComparisonSamples: PerfSample[] = [
   {
     metric: "tok_s",
     phase: "decode",
@@ -54,10 +54,13 @@ export const comparisonSamples: PerfSample[] = [
 ];
 
 // Every imported comparison keeps its provenance and limitations attached.
-for (const sample of comparisonSamples) {
-  sample.source ??= comparisonSamples[0].source;
-  sample.caveat ??= "Historical planning-note observation; not a current benchmark or matched ranking.";
-}
+// Built as a new array — never mutate module-scope exports in place.
+export const comparisonSamples: PerfSample[] = rawComparisonSamples.map((sample) => ({
+  ...sample,
+  source: sample.source ?? rawComparisonSamples[0].source,
+  caveat:
+    sample.caveat ?? "Historical planning-note observation; not a current benchmark or matched ranking.",
+}));
 
 export const rooflineCeiling = {
   value: 96,

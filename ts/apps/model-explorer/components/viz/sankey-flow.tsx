@@ -71,7 +71,8 @@ export function SankeyFlow({
         const source = link.source as SankeyNodeDatum;
         const target = link.target as SankeyNodeDatum;
         const active =
-          hovered === null || hovered === source.id || hovered === target.id;
+          (hovered === null || hovered === source.id || hovered === target.id) &&
+          (!highlight || highlight.includes(source.id) || highlight.includes(target.id));
         return (
           <path
             key={`${source.id}:${target.id}:${link.label ?? ""}:${link.value}`}
@@ -98,12 +99,13 @@ export function SankeyFlow({
             onMouseLeave={() => setHovered(null)}
             onFocus={() => setHovered(node.id)}
             onBlur={() => setHovered(null)}
-            onClick={() => setHovered(node.id)}
+            onClick={() => setHovered((h) => (h === node.id ? null : node.id))}
             onKeyDown={(event) => {
               if (event.key === "Enter" || event.key === " ") {
                 event.preventDefault();
-                setHovered(node.id);
+                setHovered((h) => (h === node.id ? null : node.id));
               }
+              if (event.key === "Escape") setHovered(null);
             }}
             className="cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-primary"
           >

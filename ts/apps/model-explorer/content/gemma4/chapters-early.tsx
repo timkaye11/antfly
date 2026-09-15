@@ -73,7 +73,7 @@ export function Gemma4EarlyChapters({ spec }: ChaptersProps) {
         title="Embeddings, and then embeddings again (PLE)"
         intro={
           <p>
-            Gemma-4 looks its tokens up twice: once for the hidden state, and once for a per-layer
+            Gemma4 looks its tokens up twice: once for the hidden state, and once for a per-layer
             embedding lane that supplies a distinct learned input to each layer.
           </p>
         }
@@ -87,7 +87,7 @@ export function Gemma4EarlyChapters({ spec }: ChaptersProps) {
         </Scene>
         <Scene id="ple" graphic={<PleRibbonFigure layers={layers} />}>
           <p>
-            <strong>Then the second lookup.</strong> Gemma-4's per-layer embeddings (PLE) run a
+            <strong>Then the second lookup.</strong> Gemma4's per-layer embeddings (PLE) run a
             token lookup alongside a projection of the initial hidden state. The projection is
             normalized in 256-wide chunks and combined with the scaled token embeddings. The
             resulting vector is sliced across all {layers} layers, each receiving its own gated
@@ -132,7 +132,7 @@ export function Gemma4EarlyChapters({ spec }: ChaptersProps) {
         title="Attention: windows, groups, and norms in the right places"
         intro={
           <p>
-            One attention block, taken apart: Gemma-4 puts RMS norms on the Q and K heads
+            One attention block, taken apart: Gemma4 puts RMS norms on the Q and K heads
             themselves; eligible Metal routes fuse each head norm with its RoPE operation.
           </p>
         }
@@ -269,7 +269,7 @@ export function Gemma4EarlyChapters({ spec }: ChaptersProps) {
         intro={
           <p>
             To be clear: {spec.displayName} is dense — every FFN runs for every token. But the same
-            runtime serves Gemma-4's 26B-A4B mixture-of-experts variant, and its machinery leaks
+            runtime serves Gemma4's 26B-A4B mixture-of-experts variant, and its machinery leaks
             useful ideas back into the dense path.
           </p>
         }

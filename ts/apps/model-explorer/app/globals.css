@@ -39,6 +39,7 @@
   --kfam-text-attention: #046343;
   --kfam-text-fusion: #775000;
   --kfam-text-sampling: #0e6176;
+  --kfam-text-kv: #9d174d;
   /* dtype/precision ramp: f32 -> f16/bf16 -> q8 -> q4 -> sub-4-bit */
   --dtype-f32: oklch(0.55 0.16 255);
   --dtype-f16: oklch(0.68 0.12 245);
@@ -69,6 +70,7 @@
   --kfam-text-attention: #6ee7b7;
   --kfam-text-fusion: #fcd34d;
   --kfam-text-sampling: #67e8f9;
+  --kfam-text-kv: #f0abfc;
   --dtype-f32: oklch(0.65 0.14 255);
   --dtype-f16: oklch(0.74 0.1 245);
   --dtype-q8: oklch(0.78 0.13 85);

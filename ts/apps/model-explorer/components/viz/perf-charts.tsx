@@ -73,8 +73,11 @@ export function ComparisonBars({
 export function JourneyChart({ entries, className }: { entries: JourneyEntry[]; className?: string }) {
   const landed = entries.filter((e) => !e.refuted);
   const values = landed.map((e) => e.value);
-  const min = Math.min(...values) * 0.92;
-  const max = Math.max(...values) * 1.05;
+  // Guard degenerate data: empty → ±Infinity, single/equal values → max===min.
+  const rawMin = values.length ? Math.min(...values) : 0;
+  const rawMax = values.length ? Math.max(...values) : 1;
+  const min = rawMin * 0.92;
+  const max = rawMax * 1.05 > min ? rawMax * 1.05 : min + 1;
   const W = 720;
   const H = 220;
   const PAD = { l: 40, r: 16, t: 16, b: 8 };
@@ -96,7 +99,8 @@ export function JourneyChart({ entries, className }: { entries: JourneyEntry[]; 
         {landed.map((e, i) => (
           <Tooltip key={e.label}>
             <TooltipTrigger asChild>
-              <g className="cursor-default">
+              {/* biome-ignore lint/a11y/noInteractiveElementToNoninteractiveRole: Focus exposes an informational tooltip; this point has no button action. */}
+              <g className="cursor-default" tabIndex={0} role="img" aria-label={`${e.label}: ${e.value} tok/s`}>
                 <circle cx={x(i)} cy={y(e.value)} r={5} fill="var(--primary)" />
                 <text
                   x={x(i)}
@@ -180,7 +184,8 @@ function WaterfallRow({
   note?: string;
 }) {
   const bar = (
-    <div className="flex items-center gap-3">
+    // Focusable when a note tooltip is attached, so its content is keyboard-reachable.
+    <div className="flex items-center gap-3" tabIndex={note ? 0 : undefined}>
       <span className={cn("w-52 shrink-0 truncate text-right text-xs", ghost ? "text-destructive/80" : landed ? "text-emerald-600 dark:text-emerald-400" : "text-muted-foreground")}>
         {label}
       </span>
@@ -221,6 +226,10 @@ export function BytesBar({ entries, className }: { entries: BytesBreakdownEntry[
               <TooltipTrigger asChild>
                 <div
                   className="h-full"
+                  role="img"
+                  // biome-ignore lint/a11y/noNoninteractiveTabindex: Focus exposes an informational tooltip; this segment has no button action.
+                  tabIndex={0}
+                  aria-label={`${e.label}: ${e.mbPerToken.toFixed(0)} MB/token`}
                   style={{ width: `${(e.mbPerToken / total) * 100}%`, background: colors[i % colors.length], opacity: 0.8 }}
                 />
               </TooltipTrigger>

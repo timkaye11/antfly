@@ -2,7 +2,7 @@
   "id": "qwen3-vl",
   "family": "qwen3",
   "displayName": "Qwen3-VL 2B Instruct",
-  "tagline": "Pixels are tokens too: a 24-block vision tower with two-axis RoPE and DeepStack taps feeds a 28-layer Qwen3 decoder whose positions tick on three clocks (m-RoPE).",
+  "tagline": "Reads images and text together: a 24-block vision tower turns pixels into tokens that feed the same Qwen3 decoder, with every position tracked on three axes at once (m-RoPE).",
   "stats": {
     "layers": 28,
     "hidden": 2048,

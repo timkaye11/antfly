@@ -15,9 +15,11 @@ import { useTheme } from "next-themes";
 import { useEffect, useState } from "react";
 
 const MODELS = [
-  { slug: "gemma4-e4b", name: "Gemma4 E2B/E4B", hook: "PLE + variant-specific iSWA + shared KV" },
+  { slug: "gemma4-e4b", name: "Gemma4 E4B", hook: "PLE + variant-specific iSWA + shared KV" },
+  { slug: "gemma4-e2b", name: "Gemma4 E2B", hook: "the compact variant: 4:1 iSWA, 20 shared-KV layers" },
   { slug: "gliner2", name: "GLiNER2", hook: "disentangled attention + span head" },
-  { slug: "qwen3-embedding", name: "Qwen3 Embedding", hook: "last-token pooling at 8k" },
+  { slug: "gliner25", name: "GLiNER2.5", hook: "boundary proposals + shared candidate pool" },
+  { slug: "qwen3-embedding", name: "Qwen3 Embedding", hook: "last-token pooling, 8k-qualified" },
   { slug: "qwen3-vl", name: "Qwen3-VL", hook: "pixels → m-RoPE" },
 ];
 
@@ -52,7 +54,7 @@ export function SiteNav() {
 
   return (
     <header className="sticky top-0 z-50 border-b bg-background/90 backdrop-blur">
-      <div className="mx-auto flex h-14 max-w-7xl items-center gap-1 px-4">
+      <nav aria-label="Site" className="mx-auto flex h-14 max-w-7xl items-center gap-1 px-4">
         <Link href="/" className="mr-4 font-semibold tracking-tight">
           Antfly <span className="text-muted-foreground">Model Explorer</span>
         </Link>
@@ -75,10 +77,14 @@ export function SiteNav() {
           </DropdownMenuContent>
         </DropdownMenu>
         <Button variant={active("/runtime") ? "outline" : "ghost"} size="sm" asChild>
-          <Link href="/runtime">Runtime</Link>
+          <Link href="/runtime" aria-current={active("/runtime") ? "page" : undefined}>
+            Runtime
+          </Link>
         </Button>
         <Button variant={active("/explore") ? "outline" : "ghost"} size="sm" asChild>
-          <Link href="/explore/gemma4-e4b">Explorer</Link>
+          <Link href="/explore/gemma4-e4b" aria-current={active("/explore") ? "page" : undefined}>
+            DAG explorer
+          </Link>
         </Button>
 
         <DropdownMenu>
@@ -96,7 +102,9 @@ export function SiteNav() {
           </DropdownMenuContent>
         </DropdownMenu>
         <Button variant={active("/legend") ? "outline" : "ghost"} size="sm" asChild>
-          <Link href="/legend">Legend</Link>
+          <Link href="/legend" aria-current={active("/legend") ? "page" : undefined}>
+            Legend
+          </Link>
         </Button>
         </div>
         <div className="site-mobile-nav ml-auto">
@@ -117,7 +125,7 @@ export function SiteNav() {
         <div className={cn("ml-1 md:ml-auto")}>
           <ThemeToggle />
         </div>
-      </div>
+      </nav>
     </header>
   );
 }

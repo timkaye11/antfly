@@ -125,6 +125,7 @@ const MODEL_CHOICES = [
   { value: "qwen3-embedding", label: "qwen3-embedding" },
   { value: "qwen3-vl", label: "qwen3-vl" },
   { value: "gliner2", label: "gliner2" },
+  { value: "gliner25", label: "gliner25" },
 ] as const;
 
 /* ------------------------------------------------------------------ */
@@ -148,7 +149,7 @@ export function KvClient(props: KvClientProps) {
 function KvInner({ snippets, gitCommit, permalinkBase }: KvClientProps) {
   const [model, setModel] = useQueryState(
     "model",
-    parseAsStringLiteral(["gemma4", "qwen3-embedding", "qwen3-vl", "gliner2"] as const).withDefault(
+    parseAsStringLiteral(["gemma4", "qwen3-embedding", "qwen3-vl", "gliner2", "gliner25"] as const).withDefault(
       "gemma4"
     )
   );
@@ -194,6 +195,19 @@ function KvInner({ snippets, gitCommit, permalinkBase }: KvClientProps) {
               autoregressive decode. GLiNER2 runs its DeBERTa encoder over the whole input in one
               bidirectional pass and emits spans. It computes temporary keys and values for
               attention, but has no autoregressive decode loop or persistent paged decode KV cache.
+            </p>
+          </div>
+        ) : model === "gliner25" ? (
+          <div className="max-w-2xl rounded-lg border bg-muted/20 p-6">
+            <h2 className="text-lg font-semibold">GLiNER2.5 windows long documents — still no KV cache</h2>
+            <p className="mt-2 text-sm text-muted-foreground">
+              Like GLiNER2, GLiNER2.5 is an encoder: no autoregressive loop, no persistent paged
+              decode KV cache. Where GLiNER2 stopped at a single 512-token pass, a GLiNER2.5 pass
+              takes up to 4,096 body words (as many as 16,384 tokens); longer documents — up to
+              131,072 words — are tiled into overlapping 4,096-word windows with the schema header
+              re-encoded in front of each. Temporary attention keys and values exist per window,
+              and on the optimized Metal path the per-layer relative-position projections stay
+              resident for the session — but nothing is retained between windows or requests.
             </p>
           </div>
         ) : (

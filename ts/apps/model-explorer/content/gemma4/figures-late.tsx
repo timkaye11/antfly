@@ -13,20 +13,20 @@ import {
   SamplerGlyph,
   WeightGlyph,
 } from "@/components/viz/glyphs";
-import { kernels } from "@/lib/data";
+import type { KernelCensus } from "@/content/registry";
 import type { KernelRoute } from "@/lib/schema";
 
 /* ------------------------------------------------------------------ */
 /* Ch 8 — kernels are compiled, not written                            */
 /* ------------------------------------------------------------------ */
 
-export function CompilerPipelineFigure() {
+export function CompilerPipelineFigure({ routedSourceFiles }: { routedSourceFiles: number }) {
   const stages = [
     { label: "schedule table", sub: "format × row_bucket × epilogue", color: "var(--kfam-matvec)" },
     { label: "renderer", sub: "one MSL skeleton", color: "var(--kfam-fusion)" },
     {
       label: "generated .metal",
-      sub: `${new Set(kernels.routes.map((r) => r.generatedFile).filter(Boolean)).size} routed source files`,
+      sub: `${routedSourceFiles} routed source files`,
       color: "var(--kfam-mmsg)",
     },
   ];
@@ -159,30 +159,24 @@ export function ScheduleRowFigure({ route }: { route?: KernelRoute }) {
   );
 }
 
-const censusCounts = new Map<string, number>();
-for (const kernel of kernels.inventory) {
-  censusCounts.set(kernel.family, (censusCounts.get(kernel.family) ?? 0) + 1);
-}
-const CENSUS = [...censusCounts]
-  .map(([family, count]) => ({
-    family,
-    count,
-    color:
-      (
-        {
-          matvec: "var(--kfam-matvec)",
-          attention: "var(--kfam-attention)",
-          fusion: "var(--kfam-fusion)",
-          sampling: "var(--kfam-sampling)",
-          moe: "var(--kfam-moe)",
-          kv: "var(--kfam-kv)",
-          mm_sg: "var(--kfam-mmsg)",
-        } as Record<string, string>
-      )[family] ?? "var(--muted-foreground)",
-  }))
-  .sort((a, b) => b.count - a.count);
+const FAMILY_COLORS: Record<string, string> = {
+  matvec: "var(--kfam-matvec)",
+  attention: "var(--kfam-attention)",
+  fusion: "var(--kfam-fusion)",
+  sampling: "var(--kfam-sampling)",
+  moe: "var(--kfam-moe)",
+  kv: "var(--kfam-kv)",
+  mm_sg: "var(--kfam-mmsg)",
+};
 
-export function KernelCensusFigure() {
+export function KernelCensusFigure({ census }: { census: KernelCensus }) {
+  const CENSUS = Object.entries(census.byFamily)
+    .map(([family, count]) => ({
+      family,
+      count,
+      color: FAMILY_COLORS[family] ?? "var(--muted-foreground)",
+    }))
+    .sort((a, b) => b.count - a.count);
   const max = CENSUS[0]?.count ?? 1;
   const rowH = 22;
   const H = CENSUS.length * rowH + 30;
@@ -191,7 +185,7 @@ export function KernelCensusFigure() {
   return (
     <Figure
       viewBox={`0 0 480 ${H}`}
-      title={`${kernels.inventory.length} extracted Metal entry points, by family`}
+      title={`${census.total} extracted Metal entry points, by family`}
       caption="Families with a page-wide color keep it; the long tail stays neutral. Counts from the generated kernel inventory."
     >
       {CENSUS.map((c, i) => {
@@ -261,7 +255,7 @@ export function LmHeadZoomFigure({ isE4b }: { isE4b: boolean }) {
     <Figure
       viewBox="0 0 480 240"
       title="historical E4B weight-size estimate, zoomed on the tail"
-      caption={`One matvec against all 262,144 vocab rows: [${isE4b ? 2560 : 1536} × 262144]. On E4B that is 550 MB per token — 19.5% of all weight traffic.`}
+      caption={`One matvec against all 262,144 vocab rows: [${isE4b ? 2560 : 1536} × 262144]. On E4B that is 550 MB per token — about 19.5% of the historical weight-size estimate (not measured traffic).`}
     >
       {placed.map((s) => (
         <g key={s.label}>
@@ -577,7 +571,7 @@ export function MtpSideBySideFigure({ isE4b }: { isE4b: boolean }) {
   return (
     <Figure
       viewBox="0 0 480 300"
-      title="two runtimes, one KV cache"
+      title="two models, one KV cache"
       caption={`The 4-layer, hidden-256 drafter owns no K/V projections at all — its layers cross-attend the main model's KV banks (sliding donor layer ${donors[0]}, full-attention donor ${donors[1]}).`}
     >
       {/* main model stack */}

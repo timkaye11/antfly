@@ -750,12 +750,92 @@
    }
   },
   {
+   "name": "dt_dkdv",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 44775,
+    "anchor": "kernel void dt_dkdv"
+   }
+  },
+  {
+   "name": "dt_dq",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 44742,
+    "anchor": "kernel void dt_dq"
+   }
+  },
+  {
+   "name": "dt_forward",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 44650,
+    "anchor": "kernel void dt_forward"
+   }
+  },
+  {
+   "name": "dt_relative",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 44813,
+    "anchor": "kernel void dt_relative"
+   }
+  },
+  {
+   "name": "dt_rows",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 44699,
+    "anchor": "kernel void dt_rows"
+   }
+  },
+  {
+   "name": "dt_validate_control",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 44634,
+    "anchor": "kernel void dt_validate_control"
+   }
+  },
+  {
+   "name": "dt_validate_f32",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 44629,
+    "anchor": "kernel void dt_validate_f32"
+   }
+  },
+  {
+   "name": "dt_zero",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 44645,
+    "anchor": "kernel void dt_zero"
+   }
+  },
+  {
    "name": "termite_apply_activation_1x",
    "family": "other",
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8533,
+    "line": 8784,
     "anchor": "kernel void termite_apply_activation_1x"
    }
   },
@@ -765,7 +845,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8662,
+    "line": 8913,
     "anchor": "kernel void termite_apply_activation_multiply_1x"
    }
   },
@@ -775,7 +855,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8667,
+    "line": 8918,
     "anchor": "kernel void termite_apply_activation_multiply_f16_output"
    }
   },
@@ -785,7 +865,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9016,
+    "line": 9267,
     "anchor": "kernel void termite_apply_add_1x"
    }
   },
@@ -795,7 +875,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7412,
+    "line": 7434,
     "anchor": "kernel void termite_apply_add_layer_norm_1x"
    }
   },
@@ -805,7 +885,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7424,
+    "line": 7446,
     "anchor": "kernel void termite_apply_add_layer_norm_rows"
    }
   },
@@ -815,8 +895,28 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9022,
+    "line": 9273,
     "anchor": "kernel void termite_apply_add_scale_1x"
+   }
+  },
+  {
+   "name": "termite_apply_bf16_gate_up_mm_m64_n32",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8182,
+    "anchor": "kernel void termite_apply_bf16_gate_up_mm_m64_n32"
+   }
+  },
+  {
+   "name": "termite_apply_bf16_gate_up_mm_m64_n32_vec4",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8112,
+    "anchor": "kernel void termite_apply_bf16_gate_up_mm_m64_n32_vec4"
    }
   },
   {
@@ -825,7 +925,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8657,
+    "line": 8908,
     "anchor": "kernel void termite_apply_bias_activation_2d"
    }
   },
@@ -835,7 +935,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7432,
+    "line": 7454,
     "anchor": "kernel void termite_apply_bias_add_layer_norm_1x"
    }
   },
@@ -845,7 +945,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7444,
+    "line": 7466,
     "anchor": "kernel void termite_apply_bias_add_layer_norm_rows"
    }
   },
@@ -855,7 +955,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9070,
+    "line": 9321,
     "anchor": "kernel void termite_apply_divide_1x"
    }
   },
@@ -865,7 +965,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8537,
+    "line": 8788,
     "anchor": "kernel void termite_apply_gelu_backward_1x"
    }
   },
@@ -875,7 +975,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7616,
+    "line": 7638,
     "anchor": "kernel void termite_apply_head_rms_rope"
    }
   },
@@ -885,7 +985,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7374,
+    "line": 7396,
     "anchor": "kernel void termite_apply_layer_norm_1x"
    }
   },
@@ -895,7 +995,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7386,
+    "line": 7408,
     "anchor": "kernel void termite_apply_layer_norm_rows"
    }
   },
@@ -905,7 +1005,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9076,
+    "line": 9327,
     "anchor": "kernel void termite_apply_less_than_1x"
    }
   },
@@ -915,7 +1015,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7746,
+    "line": 7768,
     "anchor": "kernel void termite_apply_linear_1x"
    }
   },
@@ -925,7 +1025,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7753,
+    "line": 7775,
     "anchor": "kernel void termite_apply_linear_1x_reduce"
    }
   },
@@ -935,7 +1035,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7771,
+    "line": 7793,
     "anchor": "kernel void termite_apply_linear_1x_reduce_simd"
    }
   },
@@ -945,7 +1045,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8166,
+    "line": 8417,
     "anchor": "kernel void termite_apply_linear_argmax_1x"
    }
   },
@@ -955,7 +1055,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7802,
+    "line": 7824,
     "anchor": "kernel void termite_apply_linear_bf16_1x"
    }
   },
@@ -965,8 +1065,28 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7809,
+    "line": 7831,
     "anchor": "kernel void termite_apply_linear_bf16_1x_reduce"
+   }
+  },
+  {
+   "name": "termite_apply_linear_bf16_mm_m64_n32",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8299,
+    "anchor": "kernel void termite_apply_linear_bf16_mm_m64_n32"
+   }
+  },
+  {
+   "name": "termite_apply_linear_bf16_mm_m64_n32_vec4",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8234,
+    "anchor": "kernel void termite_apply_linear_bf16_mm_m64_n32_vec4"
    }
   },
   {
@@ -975,7 +1095,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8119,
+    "line": 8370,
     "anchor": "kernel void termite_apply_linear_bf16_multi_row"
    }
   },
@@ -985,7 +1105,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8130,
+    "line": 8381,
     "anchor": "kernel void termite_apply_linear_bf16_multi_row_reduce"
    }
   },
@@ -995,7 +1115,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8146,
+    "line": 8397,
     "anchor": "kernel void termite_apply_linear_bf16_multi_row_shared_reduce"
    }
   },
@@ -1005,7 +1125,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8090,
+    "line": 8341,
     "anchor": "kernel void termite_apply_linear_bf16_multi_row_tiled32_m16"
    }
   },
@@ -1015,7 +1135,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6423,
+    "line": 6445,
     "anchor": "kernel void termite_apply_linear_bias_2d"
    }
   },
@@ -1025,7 +1145,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7780,
+    "line": 7802,
     "anchor": "kernel void termite_apply_linear_f16_1x"
    }
   },
@@ -1035,7 +1155,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7787,
+    "line": 7809,
     "anchor": "kernel void termite_apply_linear_f16_1x_reduce"
    }
   },
@@ -1045,7 +1165,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8066,
+    "line": 8088,
     "anchor": "kernel void termite_apply_linear_f16_multi_row"
    }
   },
@@ -1055,7 +1175,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8077,
+    "line": 8099,
     "anchor": "kernel void termite_apply_linear_f16_multi_row_reduce"
    }
   },
@@ -1065,7 +1185,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7847,
+    "line": 7869,
     "anchor": "kernel void termite_apply_linear_multi_row"
    }
   },
@@ -1075,28 +1195,8 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7858,
+    "line": 7880,
     "anchor": "kernel void termite_apply_linear_multi_row_reduce"
-   }
-  },
-  {
-   "name": "termite_apply_linear_multi_row_tiled_activation_f32",
-   "family": "matvec",
-   "generated": false,
-   "source": {
-    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7909,
-    "anchor": "kernel void termite_apply_linear_multi_row_tiled_activation_f32"
-   }
-  },
-  {
-   "name": "termite_apply_linear_multi_row_tiled_f32",
-   "family": "matvec",
-   "generated": false,
-   "source": {
-    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7874,
-    "anchor": "kernel void termite_apply_linear_multi_row_tiled_f32"
    }
   },
   {
@@ -1105,7 +1205,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7979,
+    "line": 8001,
     "anchor": "kernel void termite_apply_linear_multi_row_tiled32_activation_f32"
    }
   },
@@ -1115,7 +1215,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7944,
+    "line": 7966,
     "anchor": "kernel void termite_apply_linear_multi_row_tiled32_f32"
    }
   },
@@ -1125,7 +1225,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8037,
+    "line": 8059,
     "anchor": "kernel void termite_apply_linear_multi_row_tiled32_m16_activation_f32"
    }
   },
@@ -1135,8 +1235,28 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8008,
+    "line": 8030,
     "anchor": "kernel void termite_apply_linear_multi_row_tiled32_m16_f32"
+   }
+  },
+  {
+   "name": "termite_apply_linear_multi_row_tiled_activation_f32",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7931,
+    "anchor": "kernel void termite_apply_linear_multi_row_tiled_activation_f32"
+   }
+  },
+  {
+   "name": "termite_apply_linear_multi_row_tiled_f32",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7896,
+    "anchor": "kernel void termite_apply_linear_multi_row_tiled_f32"
    }
   },
   {
@@ -1145,7 +1265,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7823,
+    "line": 7845,
     "anchor": "kernel void termite_apply_linear_pair_1x_reduce"
    }
   },
@@ -1155,7 +1275,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10155,
+    "line": 10661,
     "anchor": "kernel void termite_apply_mrope"
    }
   },
@@ -1165,18 +1285,8 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9081,
+    "line": 9332,
     "anchor": "kernel void termite_apply_multiply_1x"
-   }
-  },
-  {
-   "name": "termite_apply_multiply_add_1x",
-   "family": "other",
-   "generated": false,
-   "source": {
-    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9030,
-    "anchor": "kernel void termite_apply_multiply_add_1x"
    }
   },
   {
@@ -1185,8 +1295,18 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9034,
+    "line": 9285,
     "anchor": "kernel void termite_apply_multiply_add2_1x"
+   }
+  },
+  {
+   "name": "termite_apply_multiply_add_1x",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9281,
+    "anchor": "kernel void termite_apply_multiply_add_1x"
    }
   },
   {
@@ -1195,7 +1315,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7557,
+    "line": 7579,
     "anchor": "kernel void termite_apply_parallel_ffn_post_residual_simd4"
    }
   },
@@ -1205,7 +1325,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7452,
+    "line": 7474,
     "anchor": "kernel void termite_apply_rms_norm_1x"
    }
   },
@@ -1215,7 +1335,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7461,
+    "line": 7483,
     "anchor": "kernel void termite_apply_rms_norm_1x_reduce"
    }
   },
@@ -1225,7 +1345,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7646,
+    "line": 7668,
     "anchor": "kernel void termite_apply_rms_norm_add_1x"
    }
   },
@@ -1235,7 +1355,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7677,
+    "line": 7699,
     "anchor": "kernel void termite_apply_rms_norm_add_1x_f16_input"
    }
   },
@@ -1245,7 +1365,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7657,
+    "line": 7679,
     "anchor": "kernel void termite_apply_rms_norm_add_1x_sumsq"
    }
   },
@@ -1255,7 +1375,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7688,
+    "line": 7710,
     "anchor": "kernel void termite_apply_rms_norm_add_scale_1x"
    }
   },
@@ -1265,7 +1385,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7667,
+    "line": 7689,
     "anchor": "kernel void termite_apply_rms_norm_add_scale_1x_sumsq"
    }
   },
@@ -1275,7 +1395,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7699,
+    "line": 7721,
     "anchor": "kernel void termite_apply_rms_norm_add_scale_rows"
    }
   },
@@ -1285,7 +1405,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7711,
+    "line": 7733,
     "anchor": "kernel void termite_apply_rms_norm_add_scale_simd4"
    }
   },
@@ -1295,7 +1415,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7480,
+    "line": 7502,
     "anchor": "kernel void termite_apply_rms_norm_rows"
    }
   },
@@ -1305,7 +1425,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7490,
+    "line": 7512,
     "anchor": "kernel void termite_apply_rms_norm_rows_reduce"
    }
   },
@@ -1315,7 +1435,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7502,
+    "line": 7524,
     "anchor": "kernel void termite_apply_rms_norm_rows_simd4_reduce"
    }
   },
@@ -1325,7 +1445,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7528,
+    "line": 7550,
     "anchor": "kernel void termite_apply_rms_norm_rows_triple_simd4_reduce"
    }
   },
@@ -1335,7 +1455,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10122,
+    "line": 10628,
     "anchor": "kernel void termite_apply_rope"
    }
   },
@@ -1345,7 +1465,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10185,
+    "line": 10691,
     "anchor": "kernel void termite_apply_rope_pair"
    }
   },
@@ -1355,7 +1475,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9087,
+    "line": 9338,
     "anchor": "kernel void termite_apply_scale_1x"
    }
   },
@@ -1365,7 +1485,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9026,
+    "line": 9277,
     "anchor": "kernel void termite_apply_scaled_add_scale_1x"
    }
   },
@@ -1375,7 +1495,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8672,
+    "line": 8923,
     "anchor": "kernel void termite_apply_softmax_rows"
    }
   },
@@ -1385,7 +1505,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9065,
+    "line": 9316,
     "anchor": "kernel void termite_apply_subtract_1x"
    }
   },
@@ -1395,7 +1515,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9090,
+    "line": 9341,
     "anchor": "kernel void termite_apply_where_select_1x"
    }
   },
@@ -1405,7 +1525,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9482,
+    "line": 9988,
     "anchor": "kernel void termite_argmax_axis_f32"
    }
   },
@@ -1415,7 +1535,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8178,
+    "line": 8429,
     "anchor": "kernel void termite_argmax_logits_1x"
    }
   },
@@ -1425,7 +1545,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8189,
+    "line": 8440,
     "anchor": "kernel void termite_argmax_logits_partials"
    }
   },
@@ -1435,7 +1555,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8244,
+    "line": 8495,
     "anchor": "kernel void termite_argmax_logits_reduce"
    }
   },
@@ -1445,7 +1565,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8294,
+    "line": 8545,
     "anchor": "kernel void termite_argmax_logits_reduce_tg"
    }
   },
@@ -1455,7 +1575,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8219,
+    "line": 8470,
     "anchor": "kernel void termite_argmax_logits_suppress_partials"
    }
   },
@@ -1465,7 +1585,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10197,
+    "line": 10703,
     "anchor": "kernel void termite_attention_f32"
    }
   },
@@ -1475,7 +1595,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10261,
+    "line": 10767,
     "anchor": "kernel void termite_attention_f32_decode_1x_hd64"
    }
   },
@@ -1485,7 +1605,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10406,
+    "line": 10912,
     "anchor": "kernel void termite_attention_f32_dense_causal_sg"
    }
   },
@@ -1495,7 +1615,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10469,
+    "line": 10975,
     "anchor": "kernel void termite_attention_f32_dense_causal_sg_q16"
    }
   },
@@ -1505,7 +1625,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10533,
+    "line": 11099,
     "anchor": "kernel void termite_attention_f32_dense_causal_sg_q16_f16kv"
    }
   },
@@ -1515,8 +1635,18 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10598,
+    "line": 11110,
     "anchor": "kernel void termite_attention_f32_dense_causal_sg_q16_f16kv_gqa2"
+   }
+  },
+  {
+   "name": "termite_attention_f32_dense_causal_sg_q16_f16kv_hd128",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11102,
+    "anchor": "kernel void termite_attention_f32_dense_causal_sg_q16_f16kv_hd128"
    }
   },
   {
@@ -1525,7 +1655,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10394,
+    "line": 10900,
     "anchor": "kernel void termite_attention_f32_prefill_tiled"
    }
   },
@@ -1535,7 +1665,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8990,
+    "line": 9241,
     "anchor": "kernel void termite_broadcast_f32"
    }
   },
@@ -1545,7 +1675,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8982,
+    "line": 9233,
     "anchor": "kernel void termite_broadcast_last_dim_f32_2d"
    }
   },
@@ -1555,7 +1685,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10372,
+    "line": 10878,
     "anchor": "kernel void termite_compressed_attention_hybrid_attention"
    }
   },
@@ -1565,7 +1695,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10349,
+    "line": 10855,
     "anchor": "kernel void termite_compressed_attention_select_compressed"
    }
   },
@@ -1575,7 +1705,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10296,
+    "line": 10802,
     "anchor": "kernel void termite_compressed_attention_store_component"
    }
   },
@@ -1585,7 +1715,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10289,
+    "line": 10795,
     "anchor": "kernel void termite_compressed_attention_store_local"
    }
   },
@@ -1595,7 +1725,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10302,
+    "line": 10808,
     "anchor": "kernel void termite_compressed_attention_update_component"
    }
   },
@@ -1605,7 +1735,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7471,
+    "line": 7493,
     "anchor": "kernel void termite_compute_rms_inv_scale_1x"
    }
   },
@@ -1615,7 +1745,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9413,
+    "line": 9664,
     "anchor": "kernel void termite_concat_lastdim_f32_2d"
    }
   },
@@ -1625,7 +1755,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10071,
+    "line": 10577,
     "anchor": "kernel void termite_conv1d_f32"
    }
   },
@@ -1635,7 +1765,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10076,
+    "line": 10582,
     "anchor": "kernel void termite_conv2d_f32"
    }
   },
@@ -1645,7 +1775,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9490,
+    "line": 9996,
     "anchor": "kernel void termite_convert_dtype_f32"
    }
   },
@@ -1655,7 +1785,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9398,
+    "line": 9649,
     "anchor": "kernel void termite_copy_bytes"
    }
   },
@@ -1665,7 +1795,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9760,
+    "line": 10266,
     "anchor": "kernel void termite_deberta_attention_pack_f32"
    }
   },
@@ -1675,7 +1805,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9457,
+    "line": 9708,
     "anchor": "kernel void termite_deberta_embeddings_f32"
    }
   },
@@ -1685,7 +1815,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9765,
+    "line": 10271,
     "anchor": "kernel void termite_deberta_relative_score_accumulate_f32"
    }
   },
@@ -1695,7 +1825,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9914,
+    "line": 10420,
     "anchor": "kernel void termite_deberta_relative_score_gemm_f32"
    }
   },
@@ -1705,7 +1835,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9920,
+    "line": 10426,
     "anchor": "kernel void termite_deberta_relative_score_softmax_pv_f32"
    }
   },
@@ -1715,7 +1845,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9449,
+    "line": 9700,
     "anchor": "kernel void termite_dense_pair_direct_f32_2d"
    }
   },
@@ -1725,7 +1855,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9435,
+    "line": 9686,
     "anchor": "kernel void termite_dense_pair_split_bias_f32_2d"
    }
   },
@@ -1735,7 +1865,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9430,
+    "line": 9681,
     "anchor": "kernel void termite_dense_pair_split_f32_2d"
    }
   },
@@ -1745,7 +1875,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9440,
+    "line": 9691,
     "anchor": "kernel void termite_dense_qkv_direct_f32_2d"
    }
   },
@@ -1755,7 +1885,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9424,
+    "line": 9675,
     "anchor": "kernel void termite_dense_qkv_split_bias_f32_2d"
    }
   },
@@ -1765,7 +1895,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9418,
+    "line": 9669,
     "anchor": "kernel void termite_dense_qkv_split_f32_2d"
    }
   },
@@ -1775,7 +1905,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9895,
+    "line": 10401,
     "anchor": "kernel void termite_disentangled_relative_attention_bwd_dq_dk_f32"
    }
   },
@@ -1785,7 +1915,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9905,
+    "line": 10411,
     "anchor": "kernel void termite_disentangled_relative_attention_bwd_dqr_dkr_f32"
    }
   },
@@ -1795,7 +1925,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9888,
+    "line": 10394,
     "anchor": "kernel void termite_disentangled_relative_attention_bwd_dv_f32"
    }
   },
@@ -1805,7 +1935,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9856,
+    "line": 10362,
     "anchor": "kernel void termite_disentangled_relative_attention_bwd_scores_f32"
    }
   },
@@ -1815,7 +1945,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9768,
+    "line": 10274,
     "anchor": "kernel void termite_disentangled_relative_attention_f32"
    }
   },
@@ -1825,7 +1955,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9812,
+    "line": 10318,
     "anchor": "kernel void termite_disentangled_relative_attention_f32_flash4"
    }
   },
@@ -1835,7 +1965,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9787,
+    "line": 10293,
     "anchor": "kernel void termite_disentangled_relative_attention_f32_tg"
    }
   },
@@ -1845,7 +1975,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9946,
+    "line": 10452,
     "anchor": "kernel void termite_dot_general_2d_f32"
    }
   },
@@ -1855,7 +1985,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9951,
+    "line": 10457,
     "anchor": "kernel void termite_dot_general_2d_f32_reduce"
    }
   },
@@ -1865,7 +1995,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9986,
+    "line": 10492,
     "anchor": "kernel void termite_dot_general_2d_f32_small_m_rows4_cols16"
    }
   },
@@ -1875,7 +2005,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9967,
+    "line": 10473,
     "anchor": "kernel void termite_dot_general_2d_f32_small_m_rows4_cols4"
    }
   },
@@ -1885,7 +2015,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9977,
+    "line": 10483,
     "anchor": "kernel void termite_dot_general_2d_f32_small_m_rows4_cols8"
    }
   },
@@ -1895,7 +2025,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9958,
+    "line": 10464,
     "anchor": "kernel void termite_dot_general_2d_f32_small_m_tile"
    }
   },
@@ -1905,7 +2035,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10056,
+    "line": 10562,
     "anchor": "kernel void termite_dot_general_batched_f32"
    }
   },
@@ -1915,7 +2045,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9996,
+    "line": 10502,
     "anchor": "kernel void termite_dot_general_rank1_outer_f32"
    }
   },
@@ -1925,7 +2055,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9999,
+    "line": 10505,
     "anchor": "kernel void termite_dot_general_rank1_reduce_f32"
    }
   },
@@ -1935,7 +2065,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10091,
+    "line": 10597,
     "anchor": "kernel void termite_embed_absolute_position"
    }
   },
@@ -1945,7 +2075,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10097,
+    "line": 10603,
     "anchor": "kernel void termite_embedding_lookup"
    }
   },
@@ -1955,7 +2085,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10106,
+    "line": 10612,
     "anchor": "kernel void termite_embedding_lookup_bf16"
    }
   },
@@ -1965,7 +2095,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10114,
+    "line": 10620,
     "anchor": "kernel void termite_embedding_lookup_f16"
    }
   },
@@ -1975,7 +2105,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9371,
+    "line": 9622,
     "anchor": "kernel void termite_encode_f16_convert"
    }
   },
@@ -1985,7 +2115,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10081,
+    "line": 10587,
     "anchor": "kernel void termite_encode_int8_per_head"
    }
   },
@@ -1995,7 +2125,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9363,
+    "line": 9614,
     "anchor": "kernel void termite_encode_polar4_key"
    }
   },
@@ -2005,7 +2135,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9366,
+    "line": 9617,
     "anchor": "kernel void termite_encode_turbo3_key"
    }
   },
@@ -2015,7 +2145,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8557,
+    "line": 8808,
     "anchor": "kernel void termite_ffn_gelu_backward_rank1_branches"
    }
   },
@@ -2025,7 +2155,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8632,
+    "line": 8883,
     "anchor": "kernel void termite_ffn_gelu_backward_rank1_first_branch"
    }
   },
@@ -2035,7 +2165,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8608,
+    "line": 8859,
     "anchor": "kernel void termite_ffn_gelu_backward_rank1_first_output"
    }
   },
@@ -2045,7 +2175,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8584,
+    "line": 8835,
     "anchor": "kernel void termite_ffn_gelu_backward_rank1_output"
    }
   },
@@ -2055,7 +2185,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9748,
+    "line": 10254,
     "anchor": "kernel void termite_florence_channel_apply_f32"
    }
   },
@@ -2065,7 +2195,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9736,
+    "line": 10242,
     "anchor": "kernel void termite_florence_channel_scores_f32"
    }
   },
@@ -2075,7 +2205,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9742,
+    "line": 10248,
     "anchor": "kernel void termite_florence_channel_softmax_f32"
    }
   },
@@ -2085,7 +2215,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6795,
+    "line": 6817,
     "anchor": "kernel void termite_florence_q4_k_mm_matrix_m64_n64"
    }
   },
@@ -2095,7 +2225,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6834,
+    "line": 6856,
     "anchor": "kernel void termite_florence_q4_k_mm_matrix_m64_n64_in_f16"
    }
   },
@@ -2105,7 +2235,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6788,
+    "line": 6810,
     "anchor": "kernel void termite_florence_q4_k_mm_nr4"
    }
   },
@@ -2115,7 +2245,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9721,
+    "line": 10227,
     "anchor": "kernel void termite_florence_window_pack_f32"
    }
   },
@@ -2125,7 +2255,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9729,
+    "line": 10235,
     "anchor": "kernel void termite_florence_window_unpack_f32"
    }
   },
@@ -2135,7 +2265,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9407,
+    "line": 9658,
     "anchor": "kernel void termite_gather_axis0_add_bias_f32_2d"
    }
   },
@@ -2145,8 +2275,18 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9401,
+    "line": 9652,
     "anchor": "kernel void termite_gather_axis0_f32_2d"
+   }
+  },
+  {
+   "name": "termite_gliner_boundary_f32",
+   "family": "gliner",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9719,
+    "anchor": "kernel void termite_gliner_boundary_f32"
    }
   },
   {
@@ -2155,7 +2295,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9474,
+    "line": 9980,
     "anchor": "kernel void termite_gliner_gru_combine_f32"
    }
   },
@@ -2165,7 +2305,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9467,
+    "line": 9973,
     "anchor": "kernel void termite_gliner_word_embeddings_f32"
    }
   },
@@ -2175,7 +2315,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7357,
+    "line": 7379,
     "anchor": "kernel void termite_i2_s_linear"
    }
   },
@@ -2185,7 +2325,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7368,
+    "line": 7390,
     "anchor": "kernel void termite_i2_s_linear_i8"
    }
   },
@@ -2195,7 +2335,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7361,
+    "line": 7383,
     "anchor": "kernel void termite_i2_s_pair_linear"
    }
   },
@@ -2205,7 +2345,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7371,
+    "line": 7393,
     "anchor": "kernel void termite_i2_s_pair_linear_i8"
    }
   },
@@ -2215,7 +2355,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6123,
+    "line": 6145,
     "anchor": "kernel void termite_i8_s_linear"
    }
   },
@@ -2225,7 +2365,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9319,
+    "line": 9570,
     "anchor": "kernel void termite_iq2_xs_linear"
    }
   },
@@ -2235,7 +2375,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9270,
+    "line": 9521,
     "anchor": "kernel void termite_iq4_nl_linear"
    }
   },
@@ -2245,7 +2385,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9275,
+    "line": 9526,
     "anchor": "kernel void termite_iq4_nl_linear_1x_reduce"
    }
   },
@@ -2255,7 +2395,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9283,
+    "line": 9534,
     "anchor": "kernel void termite_iq4_xs_linear"
    }
   },
@@ -2265,7 +2405,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9289,
+    "line": 9540,
     "anchor": "kernel void termite_iq4_xs_linear_1x_reduce"
    }
   },
@@ -2275,7 +2415,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7407,
+    "line": 7429,
     "anchor": "kernel void termite_layer_norm_bwd_dgdb"
    }
   },
@@ -2285,7 +2425,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7394,
+    "line": 7416,
     "anchor": "kernel void termite_layer_norm_bwd_dx"
    }
   },
@@ -2295,7 +2435,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8287,
+    "line": 8538,
     "anchor": "kernel void termite_lm_head_q6_k_rescore_top8"
    }
   },
@@ -2305,7 +2445,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8281,
+    "line": 8532,
     "anchor": "kernel void termite_lm_head_top8_reduce"
    }
   },
@@ -2315,7 +2455,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8259,
+    "line": 8510,
     "anchor": "kernel void termite_lm_head_top8_suppress_partials"
    }
   },
@@ -2325,7 +2465,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10006,
+    "line": 10512,
     "anchor": "kernel void termite_lora_after_a_f32"
    }
   },
@@ -2335,7 +2475,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10012,
+    "line": 10518,
     "anchor": "kernel void termite_lora_finish_f32"
    }
   },
@@ -2345,7 +2485,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10043,
+    "line": 10549,
     "anchor": "kernel void termite_lora_grad_a_f32"
    }
   },
@@ -2355,7 +2495,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10036,
+    "line": 10542,
     "anchor": "kernel void termite_lora_grad_after_a_f32"
    }
   },
@@ -2365,7 +2505,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10026,
+    "line": 10532,
     "anchor": "kernel void termite_lora_grad_b_f32"
    }
   },
@@ -2375,7 +2515,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10031,
+    "line": 10537,
     "anchor": "kernel void termite_lora_grad_b_transposed_f32"
    }
   },
@@ -2385,7 +2525,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10048,
+    "line": 10554,
     "anchor": "kernel void termite_lora_rank1_grad_b_after_a_f32"
    }
   },
@@ -2395,7 +2535,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10018,
+    "line": 10524,
     "anchor": "kernel void termite_lora_rank1_linear_f32"
    }
   },
@@ -2405,7 +2545,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8868,
+    "line": 9119,
     "anchor": "kernel void termite_mapped_page_touch"
    }
   },
@@ -2415,7 +2555,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8875,
+    "line": 9126,
     "anchor": "kernel void termite_mapped_selected_expert_page_touch"
    }
   },
@@ -2425,7 +2565,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8939,
+    "line": 9190,
     "anchor": "kernel void termite_masked_bce_with_logits_backward"
    }
   },
@@ -2435,7 +2575,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8913,
+    "line": 9164,
     "anchor": "kernel void termite_masked_bce_with_logits_loss"
    }
   },
@@ -2445,7 +2585,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6205,
+    "line": 6227,
     "anchor": "kernel void termite_moe_merged_gate_up_activation"
    }
   },
@@ -2455,7 +2595,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8822,
+    "line": 9073,
     "anchor": "kernel void termite_moe_route_map_slots"
    }
   },
@@ -2465,7 +2605,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8700,
+    "line": 8951,
     "anchor": "kernel void termite_moe_route_select"
    }
   },
@@ -2475,7 +2615,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8781,
+    "line": 9032,
     "anchor": "kernel void termite_moe_route_select_tg"
    }
   },
@@ -2485,7 +2625,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8782,
+    "line": 9033,
     "anchor": "kernel void termite_moe_route_select_tg_map"
    }
   },
@@ -2495,7 +2635,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8787,
+    "line": 9038,
     "anchor": "kernel void termite_moe_route_select_tg_register"
    }
   },
@@ -2505,7 +2645,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8812,
+    "line": 9063,
     "anchor": "kernel void termite_moe_route_select_tg_register_v2"
    }
   },
@@ -2515,7 +2655,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6208,
+    "line": 6230,
     "anchor": "kernel void termite_moe_scatter_add"
    }
   },
@@ -2525,7 +2665,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8854,
+    "line": 9105,
     "anchor": "kernel void termite_moe_slot_q4_0_down"
    }
   },
@@ -2535,7 +2675,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8843,
+    "line": 9094,
     "anchor": "kernel void termite_moe_slot_q4_0_gate_up"
    }
   },
@@ -2545,7 +2685,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8861,
+    "line": 9112,
     "anchor": "kernel void termite_moe_slot_reduce"
    }
   },
@@ -2555,7 +2695,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8968,
+    "line": 9219,
     "anchor": "kernel void termite_multiply_reduce_last_dim_rows"
    }
   },
@@ -2565,7 +2705,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9297,
+    "line": 9548,
     "anchor": "kernel void termite_mxfp4_linear"
    }
   },
@@ -2575,7 +2715,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9303,
+    "line": 9554,
     "anchor": "kernel void termite_mxfp4_linear_1x_reduce"
    }
   },
@@ -2585,7 +2725,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8901,
+    "line": 9152,
     "anchor": "kernel void termite_nomic_pool_normalize"
    }
   },
@@ -2595,7 +2735,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9312,
+    "line": 9563,
     "anchor": "kernel void termite_nvfp4_linear"
    }
   },
@@ -2605,7 +2745,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10688,
+    "line": 11200,
     "anchor": "kernel void termite_paged_attention_kv"
    }
   },
@@ -2615,7 +2755,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10701,
+    "line": 11213,
     "anchor": "kernel void termite_paged_attention_kv_1x"
    }
   },
@@ -2625,7 +2765,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10808,
+    "line": 11320,
     "anchor": "kernel void termite_paged_attention_kv_decode_gqa_split_reduce"
    }
   },
@@ -2635,7 +2775,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10781,
+    "line": 11293,
     "anchor": "kernel void termite_paged_attention_kv_decode_gqa_split_stage"
    }
   },
@@ -2645,7 +2785,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10714,
+    "line": 11226,
     "anchor": "kernel void termite_paged_attention_kv_prefill_sg"
    }
   },
@@ -2655,7 +2795,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9380,
+    "line": 9631,
     "anchor": "kernel void termite_paged_f16_kv_seed"
    }
   },
@@ -2665,7 +2805,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9374,
+    "line": 9625,
     "anchor": "kernel void termite_paged_f32_kv_seed"
    }
   },
@@ -2675,7 +2815,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9386,
+    "line": 9637,
     "anchor": "kernel void termite_paged_f32_v_seed"
    }
   },
@@ -2685,7 +2825,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10814,
+    "line": 11326,
     "anchor": "kernel void termite_polar4_attention_span"
    }
   },
@@ -2695,7 +2835,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9347,
+    "line": 9598,
     "anchor": "kernel void termite_polar4_key_scores"
    }
   },
@@ -2705,7 +2845,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6118,
+    "line": 6140,
     "anchor": "kernel void termite_q1_0_linear"
    }
   },
@@ -2715,7 +2855,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9095,
+    "line": 9346,
     "anchor": "kernel void termite_q2_k_linear"
    }
   },
@@ -2725,7 +2865,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9100,
+    "line": 9351,
     "anchor": "kernel void termite_q3_k_linear"
    }
   },
@@ -2735,7 +2875,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6272,
+    "line": 6294,
     "anchor": "kernel void termite_q4_0_activation_rhs_1x_reduce"
    }
   },
@@ -2745,7 +2885,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6278,
+    "line": 6300,
     "anchor": "kernel void termite_q4_0_activation_rhs_1x_reduce_out_f16"
    }
   },
@@ -2755,7 +2895,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7245,
+    "line": 7267,
     "anchor": "kernel void termite_q4_0_cpy_f32_to_q"
    }
   },
@@ -2765,7 +2905,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7242,
+    "line": 7264,
     "anchor": "kernel void termite_q4_0_cpy_q_to_f32"
    }
   },
@@ -2775,7 +2915,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7236,
+    "line": 7258,
     "anchor": "kernel void termite_q4_0_get_rows"
    }
   },
@@ -2785,7 +2925,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6128,
+    "line": 6150,
     "anchor": "kernel void termite_q4_0_linear"
    }
   },
@@ -2795,7 +2935,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6309,
+    "line": 6331,
     "anchor": "kernel void termite_q4_0_linear_1x_packed_t4_nsg4"
    }
   },
@@ -2805,7 +2945,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6284,
+    "line": 6306,
     "anchor": "kernel void termite_q4_0_linear_1x_reduce"
    }
   },
@@ -2815,7 +2955,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6335,
+    "line": 6357,
     "anchor": "kernel void termite_q4_0_linear_1x_reduce_in_f16"
    }
   },
@@ -2825,7 +2965,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6355,
+    "line": 6377,
     "anchor": "kernel void termite_q4_0_linear_1x_reduce_in_f16_out_f16"
    }
   },
@@ -2835,7 +2975,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6341,
+    "line": 6363,
     "anchor": "kernel void termite_q4_0_linear_1x_reduce_in_f16_small"
    }
   },
@@ -2845,7 +2985,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6347,
+    "line": 6369,
     "anchor": "kernel void termite_q4_0_linear_1x_reduce_in_f16_sumsq"
    }
   },
@@ -2855,7 +2995,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6296,
+    "line": 6318,
     "anchor": "kernel void termite_q4_0_linear_1x_reduce_nr4_nsg4"
    }
   },
@@ -2865,7 +3005,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6303,
+    "line": 6325,
     "anchor": "kernel void termite_q4_0_linear_1x_reduce_nr4_nsg4_nq8"
    }
   },
@@ -2875,7 +3015,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6315,
+    "line": 6337,
     "anchor": "kernel void termite_q4_0_linear_1x_reduce_nr8_nsg4"
    }
   },
@@ -2885,7 +3025,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6329,
+    "line": 6351,
     "anchor": "kernel void termite_q4_0_linear_1x_reduce_out_f16"
    }
   },
@@ -2895,7 +3035,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6290,
+    "line": 6312,
     "anchor": "kernel void termite_q4_0_linear_1x_reduce_small"
    }
   },
@@ -2905,7 +3045,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6321,
+    "line": 6343,
     "anchor": "kernel void termite_q4_0_linear_1x_reduce_sumsq"
    }
   },
@@ -2915,7 +3055,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6133,
+    "line": 6155,
     "anchor": "kernel void termite_q4_0_linear_id"
    }
   },
@@ -2925,7 +3065,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6153,
+    "line": 6175,
     "anchor": "kernel void termite_q4_0_linear_id_a4b_down"
    }
   },
@@ -2935,7 +3075,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6165,
+    "line": 6187,
     "anchor": "kernel void termite_q4_0_linear_id_a4b_down_nq8"
    }
   },
@@ -2945,7 +3085,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6177,
+    "line": 6199,
     "anchor": "kernel void termite_q4_0_linear_id_a4b_down_reduce"
    }
   },
@@ -2955,7 +3095,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6146,
+    "line": 6168,
     "anchor": "kernel void termite_q4_0_linear_id_a4b_gate_up"
    }
   },
@@ -2965,7 +3105,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6881,
+    "line": 6903,
     "anchor": "kernel void termite_q4_0_linear_mm_sg"
    }
   },
@@ -2975,7 +3115,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6923,
+    "line": 6945,
     "anchor": "kernel void termite_q4_0_linear_mm_sg_aligned"
    }
   },
@@ -2985,7 +3125,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6944,
+    "line": 6966,
     "anchor": "kernel void termite_q4_0_linear_mm_sg_aligned_tail"
    }
   },
@@ -2995,7 +3135,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6902,
+    "line": 6924,
     "anchor": "kernel void termite_q4_0_linear_mm_sg_unrolled"
    }
   },
@@ -3005,7 +3145,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6858,
+    "line": 6880,
     "anchor": "kernel void termite_q4_0_linear_r2_ext"
    }
   },
@@ -3015,7 +3155,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6868,
+    "line": 6890,
     "anchor": "kernel void termite_q4_0_linear_r2_ext4"
    }
   },
@@ -3025,7 +3165,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6859,
+    "line": 6881,
     "anchor": "kernel void termite_q4_0_linear_r4_ext"
    }
   },
@@ -3035,7 +3175,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6869,
+    "line": 6891,
     "anchor": "kernel void termite_q4_0_linear_r4_ext4"
    }
   },
@@ -3045,7 +3185,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6860,
+    "line": 6882,
     "anchor": "kernel void termite_q4_0_linear_r8_ext"
    }
   },
@@ -3055,7 +3195,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6870,
+    "line": 6892,
     "anchor": "kernel void termite_q4_0_linear_r8_ext4"
    }
   },
@@ -3065,7 +3205,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6246,
+    "line": 6268,
     "anchor": "kernel void termite_q4_0_pair_activation_1x_packed_t4_nsg2"
    }
   },
@@ -3075,7 +3215,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6252,
+    "line": 6274,
     "anchor": "kernel void termite_q4_0_pair_activation_1x_reduce"
    }
   },
@@ -3085,7 +3225,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6231,
+    "line": 6253,
     "anchor": "kernel void termite_q4_0_pair_activation_1x_reduce_nr4_nsg2"
    }
   },
@@ -3095,7 +3235,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6237,
+    "line": 6259,
     "anchor": "kernel void termite_q4_0_pair_activation_1x_reduce_nr4_nsg2_nq8"
    }
   },
@@ -3105,7 +3245,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6233,
+    "line": 6255,
     "anchor": "kernel void termite_q4_0_pair_activation_1x_reduce_nr4_nsg4"
    }
   },
@@ -3115,7 +3255,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6232,
+    "line": 6254,
     "anchor": "kernel void termite_q4_0_pair_activation_1x_reduce_nr8_nsg2"
    }
   },
@@ -3125,7 +3265,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6234,
+    "line": 6256,
     "anchor": "kernel void termite_q4_0_pair_activation_1x_reduce_nr8_nsg4"
    }
   },
@@ -3135,7 +3275,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6258,
+    "line": 6280,
     "anchor": "kernel void termite_q4_0_pair_activation_1x_reduce_out_f16"
    }
   },
@@ -3145,7 +3285,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6198,
+    "line": 6220,
     "anchor": "kernel void termite_q4_0_pair_activation_id"
    }
   },
@@ -3155,7 +3295,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6981,
+    "line": 7003,
     "anchor": "kernel void termite_q4_0_pair_activation_mm_m32_n32_aligned"
    }
   },
@@ -3165,7 +3305,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6982,
+    "line": 7004,
     "anchor": "kernel void termite_q4_0_pair_activation_mm_m32_n32_tail"
    }
   },
@@ -3175,7 +3315,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6974,
+    "line": 6996,
     "anchor": "kernel void termite_q4_0_pair_activation_mm_m32_n64_aligned"
    }
   },
@@ -3185,7 +3325,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6975,
+    "line": 6997,
     "anchor": "kernel void termite_q4_0_pair_activation_mm_m32_n64_tail"
    }
   },
@@ -3195,7 +3335,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7217,
+    "line": 7239,
     "anchor": "kernel void termite_q4_0_pair_activation_multiply_r2_ext"
    }
   },
@@ -3205,7 +3345,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7218,
+    "line": 7240,
     "anchor": "kernel void termite_q4_0_pair_activation_multiply_r3_ext"
    }
   },
@@ -3215,7 +3355,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7219,
+    "line": 7241,
     "anchor": "kernel void termite_q4_0_pair_activation_multiply_r4_ext"
    }
   },
@@ -3225,7 +3365,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7220,
+    "line": 7242,
     "anchor": "kernel void termite_q4_0_pair_activation_multiply_r5_ext"
    }
   },
@@ -3235,7 +3375,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6264,
+    "line": 6286,
     "anchor": "kernel void termite_q4_0_pair_activation_rms_scale_1x_reduce_out_f16"
    }
   },
@@ -3245,7 +3385,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6211,
+    "line": 6233,
     "anchor": "kernel void termite_q4_0_pair_linear"
    }
   },
@@ -3255,7 +3395,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6217,
+    "line": 6239,
     "anchor": "kernel void termite_q4_0_pair_linear_1x_reduce"
    }
   },
@@ -3265,7 +3405,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6187,
+    "line": 6209,
     "anchor": "kernel void termite_q4_0_pair_linear_id"
    }
   },
@@ -3275,7 +3415,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7239,
+    "line": 7261,
     "anchor": "kernel void termite_q4_0_set_rows"
    }
   },
@@ -3285,7 +3425,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7257,
+    "line": 7279,
     "anchor": "kernel void termite_q4_1_cpy_f32_to_q"
    }
   },
@@ -3295,7 +3435,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7254,
+    "line": 7276,
     "anchor": "kernel void termite_q4_1_cpy_q_to_f32"
    }
   },
@@ -3305,7 +3445,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7248,
+    "line": 7270,
     "anchor": "kernel void termite_q4_1_get_rows"
    }
   },
@@ -3315,7 +3455,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6361,
+    "line": 6383,
     "anchor": "kernel void termite_q4_1_linear"
    }
   },
@@ -3325,7 +3465,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6366,
+    "line": 6388,
     "anchor": "kernel void termite_q4_1_linear_1x_reduce"
    }
   },
@@ -3335,7 +3475,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7251,
+    "line": 7273,
     "anchor": "kernel void termite_q4_1_set_rows"
    }
   },
@@ -3345,7 +3485,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9175,
+    "line": 9426,
     "anchor": "kernel void termite_q4_k_activation_rhs_1x_reduce"
    }
   },
@@ -3355,7 +3495,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7293,
+    "line": 7315,
     "anchor": "kernel void termite_q4_k_cpy_f32_to_q"
    }
   },
@@ -3365,7 +3505,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7290,
+    "line": 7312,
     "anchor": "kernel void termite_q4_k_cpy_q_to_f32"
    }
   },
@@ -3375,7 +3515,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7284,
+    "line": 7306,
     "anchor": "kernel void termite_q4_k_get_rows"
    }
   },
@@ -3385,7 +3525,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9105,
+    "line": 9356,
     "anchor": "kernel void termite_q4_k_linear"
    }
   },
@@ -3395,7 +3535,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9110,
+    "line": 9361,
     "anchor": "kernel void termite_q4_k_linear_1x_reduce"
    }
   },
@@ -3405,7 +3545,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9122,
+    "line": 9373,
     "anchor": "kernel void termite_q4_k_linear_1x_reduce_v2"
    }
   },
@@ -3415,7 +3555,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9159,
+    "line": 9410,
     "anchor": "kernel void termite_q4_k_pair_activation_1x_reduce"
    }
   },
@@ -3425,7 +3565,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9167,
+    "line": 9418,
     "anchor": "kernel void termite_q4_k_pair_activation_1x_reduce_out_f16"
    }
   },
@@ -3435,7 +3575,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9145,
+    "line": 9396,
     "anchor": "kernel void termite_q4_k_pair_linear"
    }
   },
@@ -3445,7 +3585,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9151,
+    "line": 9402,
     "anchor": "kernel void termite_q4_k_pair_linear_1x_reduce"
    }
   },
@@ -3455,7 +3595,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7287,
+    "line": 7309,
     "anchor": "kernel void termite_q4_k_set_rows"
    }
   },
@@ -3465,7 +3605,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7269,
+    "line": 7291,
     "anchor": "kernel void termite_q5_0_cpy_f32_to_q"
    }
   },
@@ -3475,7 +3615,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7266,
+    "line": 7288,
     "anchor": "kernel void termite_q5_0_cpy_q_to_f32"
    }
   },
@@ -3485,7 +3625,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7260,
+    "line": 7282,
     "anchor": "kernel void termite_q5_0_get_rows"
    }
   },
@@ -3495,7 +3635,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6374,
+    "line": 6396,
     "anchor": "kernel void termite_q5_0_linear"
    }
   },
@@ -3505,7 +3645,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6379,
+    "line": 6401,
     "anchor": "kernel void termite_q5_0_linear_1x_reduce"
    }
   },
@@ -3515,7 +3655,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7263,
+    "line": 7285,
     "anchor": "kernel void termite_q5_0_set_rows"
    }
   },
@@ -3525,7 +3665,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7281,
+    "line": 7303,
     "anchor": "kernel void termite_q5_1_cpy_f32_to_q"
    }
   },
@@ -3535,7 +3675,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7278,
+    "line": 7300,
     "anchor": "kernel void termite_q5_1_cpy_q_to_f32"
    }
   },
@@ -3545,7 +3685,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7272,
+    "line": 7294,
     "anchor": "kernel void termite_q5_1_get_rows"
    }
   },
@@ -3555,7 +3695,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6387,
+    "line": 6409,
     "anchor": "kernel void termite_q5_1_linear"
    }
   },
@@ -3565,7 +3705,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6392,
+    "line": 6414,
     "anchor": "kernel void termite_q5_1_linear_1x_reduce"
    }
   },
@@ -3575,7 +3715,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7275,
+    "line": 7297,
     "anchor": "kernel void termite_q5_1_set_rows"
    }
   },
@@ -3585,7 +3725,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7305,
+    "line": 7327,
     "anchor": "kernel void termite_q5_k_cpy_f32_to_q"
    }
   },
@@ -3595,7 +3735,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7302,
+    "line": 7324,
     "anchor": "kernel void termite_q5_k_cpy_q_to_f32"
    }
   },
@@ -3605,7 +3745,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7296,
+    "line": 7318,
     "anchor": "kernel void termite_q5_k_get_rows"
    }
   },
@@ -3615,7 +3755,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9183,
+    "line": 9434,
     "anchor": "kernel void termite_q5_k_linear"
    }
   },
@@ -3625,7 +3765,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9188,
+    "line": 9439,
     "anchor": "kernel void termite_q5_k_linear_1x_reduce"
    }
   },
@@ -3635,7 +3775,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7299,
+    "line": 7321,
     "anchor": "kernel void termite_q5_k_set_rows"
    }
   },
@@ -3645,7 +3785,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7317,
+    "line": 7339,
     "anchor": "kernel void termite_q6_k_cpy_f32_to_q"
    }
   },
@@ -3655,7 +3795,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7314,
+    "line": 7336,
     "anchor": "kernel void termite_q6_k_cpy_q_to_f32"
    }
   },
@@ -3665,7 +3805,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7308,
+    "line": 7330,
     "anchor": "kernel void termite_q6_k_get_rows"
    }
   },
@@ -3675,7 +3815,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6817,
+    "line": 6839,
     "anchor": "kernel void termite_q6_k_high_row_mm_matrix_m64_n64"
    }
   },
@@ -3685,7 +3825,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9196,
+    "line": 9447,
     "anchor": "kernel void termite_q6_k_linear"
    }
   },
@@ -3695,7 +3835,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9201,
+    "line": 9452,
     "anchor": "kernel void termite_q6_k_linear_1x_reduce"
    }
   },
@@ -3705,7 +3845,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9256,
+    "line": 9507,
     "anchor": "kernel void termite_q6_k_linear_1x_reduce_in_f16"
    }
   },
@@ -3715,7 +3855,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9237,
+    "line": 9488,
     "anchor": "kernel void termite_q6_k_linear_1x_reduce_nbodd"
    }
   },
@@ -3725,7 +3865,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9238,
+    "line": 9489,
     "anchor": "kernel void termite_q6_k_linear_1x_reduce_nbodd_nr1"
    }
   },
@@ -3735,7 +3875,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9239,
+    "line": 9490,
     "anchor": "kernel void termite_q6_k_linear_1x_reduce_nbodd_nr4_nsg1"
    }
   },
@@ -3745,7 +3885,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9240,
+    "line": 9491,
     "anchor": "kernel void termite_q6_k_linear_1x_reduce_nbodd_nr4_nsg2"
    }
   },
@@ -3755,7 +3895,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9241,
+    "line": 9492,
     "anchor": "kernel void termite_q6_k_linear_1x_reduce_nbodd_nr6_nsg1"
    }
   },
@@ -3765,7 +3905,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9242,
+    "line": 9493,
     "anchor": "kernel void termite_q6_k_linear_1x_reduce_nbodd_nr8_nsg1"
    }
   },
@@ -3775,7 +3915,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9211,
+    "line": 9462,
     "anchor": "kernel void termite_q6_k_linear_1x_reduce_nsg4"
    }
   },
@@ -3785,7 +3925,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9218,
+    "line": 9469,
     "anchor": "kernel void termite_q6_k_linear_1x_reduce_nsg8"
    }
   },
@@ -3795,7 +3935,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9249,
+    "line": 9500,
     "anchor": "kernel void termite_q6_k_linear_r2_reduce"
    }
   },
@@ -3805,7 +3945,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9264,
+    "line": 9515,
     "anchor": "kernel void termite_q6_k_pair_linear"
    }
   },
@@ -3815,7 +3955,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7311,
+    "line": 7333,
     "anchor": "kernel void termite_q6_k_set_rows"
    }
   },
@@ -3825,7 +3965,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7221,
+    "line": 7243,
     "anchor": "kernel void termite_q8_0_activation_multiply_1r_ext"
    }
   },
@@ -3835,7 +3975,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7227,
+    "line": 7249,
     "anchor": "kernel void termite_q8_0_activation_multiply_1x_reduce4"
    }
   },
@@ -3845,7 +3985,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7329,
+    "line": 7351,
     "anchor": "kernel void termite_q8_0_cpy_f32_to_q"
    }
   },
@@ -3855,7 +3995,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7326,
+    "line": 7348,
     "anchor": "kernel void termite_q8_0_cpy_q_to_f32"
    }
   },
@@ -3865,7 +4005,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7320,
+    "line": 7342,
     "anchor": "kernel void termite_q8_0_get_rows"
    }
   },
@@ -3875,7 +4015,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7078,
+    "line": 7100,
     "anchor": "kernel void termite_q8_0_kv_pair_mm_sg"
    }
   },
@@ -3885,7 +4025,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7079,
+    "line": 7101,
     "anchor": "kernel void termite_q8_0_kv_pair_mm_sg_tail"
    }
   },
@@ -3895,7 +4035,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6417,
+    "line": 6439,
     "anchor": "kernel void termite_q8_0_linear"
    }
   },
@@ -3905,7 +4045,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7090,
+    "line": 7112,
     "anchor": "kernel void termite_q8_0_linear_mm"
    }
   },
@@ -3915,7 +4055,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7099,
+    "line": 7121,
     "anchor": "kernel void termite_q8_0_linear_mm_in_f16"
    }
   },
@@ -3925,7 +4065,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6990,
+    "line": 7012,
     "anchor": "kernel void termite_q8_0_linear_mm_sg"
    }
   },
@@ -3935,7 +4075,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7054,
+    "line": 7076,
     "anchor": "kernel void termite_q8_0_linear_mm_sg_m64"
    }
   },
@@ -3945,7 +4085,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7065,
+    "line": 7087,
     "anchor": "kernel void termite_q8_0_linear_mm_sg_m64_in_f16"
    }
   },
@@ -3955,7 +4095,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7066,
+    "line": 7088,
     "anchor": "kernel void termite_q8_0_linear_mm_sg_m64_in_f16_tail"
    }
   },
@@ -3965,7 +4105,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7055,
+    "line": 7077,
     "anchor": "kernel void termite_q8_0_linear_mm_sg_m64_tail"
    }
   },
@@ -3975,7 +4115,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7036,
+    "line": 7058,
     "anchor": "kernel void termite_q8_0_linear_mm_sg_v2"
    }
   },
@@ -3985,7 +4125,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7038,
+    "line": 7060,
     "anchor": "kernel void termite_q8_0_linear_mm_sg_v2_in_f16"
    }
   },
@@ -3995,7 +4135,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7039,
+    "line": 7061,
     "anchor": "kernel void termite_q8_0_linear_mm_sg_v2_in_f16_tail"
    }
   },
@@ -4005,7 +4145,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7037,
+    "line": 7059,
     "anchor": "kernel void termite_q8_0_linear_mm_sg_v2_tail"
    }
   },
@@ -4015,7 +4155,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6447,
+    "line": 6469,
     "anchor": "kernel void termite_q8_0_linear_mmv"
    }
   },
@@ -4025,7 +4165,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6456,
+    "line": 6478,
     "anchor": "kernel void termite_q8_0_linear_mmv_in_f16"
    }
   },
@@ -4035,7 +4175,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6480,
+    "line": 6502,
     "anchor": "kernel void termite_q8_0_linear_r2_ext"
    }
   },
@@ -4045,7 +4185,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6481,
+    "line": 6503,
     "anchor": "kernel void termite_q8_0_linear_r3_ext"
    }
   },
@@ -4055,7 +4195,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6482,
+    "line": 6504,
     "anchor": "kernel void termite_q8_0_linear_r4_ext"
    }
   },
@@ -4065,7 +4205,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6483,
+    "line": 6505,
     "anchor": "kernel void termite_q8_0_linear_r5_ext"
    }
   },
@@ -4075,7 +4215,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6465,
+    "line": 6487,
     "anchor": "kernel void termite_q8_0_linear_rms_scale_mmv"
    }
   },
@@ -4085,7 +4225,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7088,
+    "line": 7110,
     "anchor": "kernel void termite_q8_0_pair_activation_mm_sg_v2"
    }
   },
@@ -4095,7 +4235,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7089,
+    "line": 7111,
     "anchor": "kernel void termite_q8_0_pair_activation_mm_sg_v2_out_f16"
    }
   },
@@ -4105,7 +4245,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7172,
+    "line": 7194,
     "anchor": "kernel void termite_q8_0_pair_activation_multiply_1r_ext"
    }
   },
@@ -4115,7 +4255,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7163,
+    "line": 7185,
     "anchor": "kernel void termite_q8_0_pair_activation_multiply_1x_reduce4"
    }
   },
@@ -4125,7 +4265,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7108,
+    "line": 7130,
     "anchor": "kernel void termite_q8_0_pair_activation_multiply_mm"
    }
   },
@@ -4135,7 +4275,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7117,
+    "line": 7139,
     "anchor": "kernel void termite_q8_0_pair_activation_multiply_mm_out_f16"
    }
   },
@@ -4145,7 +4285,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7196,
+    "line": 7218,
     "anchor": "kernel void termite_q8_0_pair_activation_multiply_r2_ext"
    }
   },
@@ -4155,7 +4295,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7197,
+    "line": 7219,
     "anchor": "kernel void termite_q8_0_pair_activation_multiply_r3_ext"
    }
   },
@@ -4165,7 +4305,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7198,
+    "line": 7220,
     "anchor": "kernel void termite_q8_0_pair_activation_multiply_r4_ext"
    }
   },
@@ -4175,7 +4315,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7199,
+    "line": 7221,
     "anchor": "kernel void termite_q8_0_pair_activation_multiply_r5_ext"
    }
   },
@@ -4185,7 +4325,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7178,
+    "line": 7200,
     "anchor": "kernel void termite_q8_0_pair_activation_multiply_rms_scale_1r_ext"
    }
   },
@@ -4195,7 +4335,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7184,
+    "line": 7206,
     "anchor": "kernel void termite_q8_0_pair_activation_multiply_rms_scale_1r_ext_out_f16"
    }
   },
@@ -4205,7 +4345,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6428,
+    "line": 6450,
     "anchor": "kernel void termite_q8_0_pair_linear"
    }
   },
@@ -4215,7 +4355,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7126,
+    "line": 7148,
     "anchor": "kernel void termite_q8_0_pair_linear_mmv"
    }
   },
@@ -4225,7 +4365,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7141,
+    "line": 7163,
     "anchor": "kernel void termite_q8_0_pair_linear_r2_ext"
    }
   },
@@ -4235,7 +4375,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7142,
+    "line": 7164,
     "anchor": "kernel void termite_q8_0_pair_linear_r3_ext"
    }
   },
@@ -4245,7 +4385,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7143,
+    "line": 7165,
     "anchor": "kernel void termite_q8_0_pair_linear_r4_ext"
    }
   },
@@ -4255,7 +4395,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7144,
+    "line": 7166,
     "anchor": "kernel void termite_q8_0_pair_linear_r5_ext"
    }
   },
@@ -4265,7 +4405,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7145,
+    "line": 7167,
     "anchor": "kernel void termite_q8_0_qkv_linear_mmv"
    }
   },
@@ -4275,7 +4415,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7323,
+    "line": 7345,
     "anchor": "kernel void termite_q8_0_set_rows"
    }
   },
@@ -4285,7 +4425,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7341,
+    "line": 7363,
     "anchor": "kernel void termite_q8_1_cpy_f32_to_q"
    }
   },
@@ -4295,7 +4435,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7338,
+    "line": 7360,
     "anchor": "kernel void termite_q8_1_cpy_q_to_f32"
    }
   },
@@ -4305,7 +4445,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7332,
+    "line": 7354,
     "anchor": "kernel void termite_q8_1_get_rows"
    }
   },
@@ -4315,7 +4455,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6434,
+    "line": 6456,
     "anchor": "kernel void termite_q8_1_linear"
    }
   },
@@ -4325,7 +4465,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 6439,
+    "line": 6461,
     "anchor": "kernel void termite_q8_1_linear_1x_reduce"
    }
   },
@@ -4335,7 +4475,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7335,
+    "line": 7357,
     "anchor": "kernel void termite_q8_1_set_rows"
    }
   },
@@ -4345,7 +4485,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7344,
+    "line": 7366,
     "anchor": "kernel void termite_q8_k_linear"
    }
   },
@@ -4355,7 +4495,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7349,
+    "line": 7371,
     "anchor": "kernel void termite_q8_k_linear_1x_reduce"
    }
   },
@@ -4365,7 +4505,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 7365,
+    "line": 7387,
     "anchor": "kernel void termite_quantize_rows_i8"
    }
   },
@@ -4375,7 +4515,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9002,
+    "line": 9253,
     "anchor": "kernel void termite_reduce_axis_f32"
    }
   },
@@ -4385,7 +4525,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8880,
+    "line": 9131,
     "anchor": "kernel void termite_reduce_last_dim_rows"
    }
   },
@@ -4395,7 +4535,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8317,
+    "line": 8568,
     "anchor": "kernel void termite_sample_gumbel_partials"
    }
   },
@@ -4405,7 +4545,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8346,
+    "line": 8597,
     "anchor": "kernel void termite_sample_logits_1x"
    }
   },
@@ -4415,7 +4555,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8440,
+    "line": 8691,
     "anchor": "kernel void termite_sample_topk_partials"
    }
   },
@@ -4425,7 +4565,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 8469,
+    "line": 8720,
     "anchor": "kernel void termite_sample_topk_reduce"
    }
   },
@@ -4435,7 +4575,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10061,
+    "line": 10567,
     "anchor": "kernel void termite_scatter_add_axis0_f32"
    }
   },
@@ -4445,7 +4585,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9495,
+    "line": 10001,
     "anchor": "kernel void termite_sdpa_f32"
    }
   },
@@ -4455,7 +4595,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9672,
+    "line": 10178,
     "anchor": "kernel void termite_sdpa_f32_bert_prefill_s256_hd64_q8"
    }
   },
@@ -4465,7 +4605,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9663,
+    "line": 10169,
     "anchor": "kernel void termite_sdpa_f32_florence_window_hd32"
    }
   },
@@ -4475,7 +4615,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9698,
+    "line": 10204,
     "anchor": "kernel void termite_sdpa_f32_nomic_q8"
    }
   },
@@ -4485,7 +4625,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9527,
+    "line": 10033,
     "anchor": "kernel void termite_sdpa_f32_tg"
    }
   },
@@ -4495,7 +4635,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9607,
+    "line": 10113,
     "anchor": "kernel void termite_sdpa_f32_vision_hd64_flash_q16"
    }
   },
@@ -4505,7 +4645,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9637,
+    "line": 10143,
     "anchor": "kernel void termite_sdpa_f32_vision_hd64_flash_q32"
    }
   },
@@ -4515,7 +4655,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9584,
+    "line": 10090,
     "anchor": "kernel void termite_sdpa_f32_vision_hd64_q32"
    }
   },
@@ -4525,7 +4665,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9561,
+    "line": 10067,
     "anchor": "kernel void termite_sdpa_f32_vision_hd64_q8"
    }
   },
@@ -4535,7 +4675,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9391,
+    "line": 9642,
     "anchor": "kernel void termite_slice_last_dim_f32_2d"
    }
   },
@@ -4545,7 +4685,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9324,
+    "line": 9575,
     "anchor": "kernel void termite_tl1_linear"
    }
   },
@@ -4555,7 +4695,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9335,
+    "line": 9586,
     "anchor": "kernel void termite_tl2_linear"
    }
   },
@@ -4565,7 +4705,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9038,
+    "line": 9289,
     "anchor": "kernel void termite_training_accumulate_f32"
    }
   },
@@ -4575,7 +4715,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9043,
+    "line": 9294,
     "anchor": "kernel void termite_training_adamw_f32"
    }
   },
@@ -4585,7 +4725,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9056,
+    "line": 9307,
     "anchor": "kernel void termite_training_sumsq_f32"
    }
   },
@@ -4595,7 +4735,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9928,
+    "line": 10434,
     "anchor": "kernel void termite_transpose_f32"
    }
   },
@@ -4605,7 +4745,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9934,
+    "line": 10440,
     "anchor": "kernel void termite_transpose_last2_tiled_f32"
    }
   },
@@ -4615,7 +4755,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 10879,
+    "line": 11391,
     "anchor": "kernel void termite_turbo3_attention_span"
    }
   },
@@ -4625,7 +4765,7 @@
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m",
-    "line": 9352,
+    "line": 9603,
     "anchor": "kernel void termite_turbo3_key_scores"
    }
   }

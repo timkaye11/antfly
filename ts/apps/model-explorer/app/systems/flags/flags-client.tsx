@@ -19,9 +19,14 @@ const PREFIXES = [
   ["TERMITE_METAL_", "metal"],
   ["TERMITE_", "termite (other)"],
   ["ANTFLY_GEMMA4_", "gemma4 / MTP"],
+  // Substring bucket: GLiNER names span TERMITE_METAL_*GLINER*, *DEBERTA*
+  // and ANTFLY_GLINER25_*, so a prefix can't collect them.
+  ["*GLINER", "gliner / deberta"],
   ["ANTFLY_CUDA_", "cuda"],
   ["ANTFLY_", "antfly (other)"],
 ] as const;
+
+const GLINER_RE = /GLINER|DEBERTA|DISENTANGLED/;
 
 export function FlagsClient(props: { flags: FlagRow[]; gitCommit: string; permalinkBase?: string }) {
   return (
@@ -38,9 +43,11 @@ function FlagsInner({ flags, gitCommit, permalinkBase }: { flags: FlagRow[]; git
   const filtered = useMemo(() => {
     const needle = q.toUpperCase();
     return flags.filter((f) => {
-      if (prefix !== "all") {
+      if (prefix === "*GLINER") {
+        if (!GLINER_RE.test(f.name)) return false;
+      } else if (prefix !== "all") {
         if (!f.name.startsWith(prefix)) return false;
-        // Keep the buckets disjoint: "TERMITE_" excludes "TERMITE_METAL_", etc.
+        // Keep the prefix buckets disjoint: "TERMITE_" excludes "TERMITE_METAL_", etc.
         if (prefix === "TERMITE_" && f.name.startsWith("TERMITE_METAL_")) return false;
         if (prefix === "ANTFLY_" && (f.name.startsWith("ANTFLY_GEMMA4_") || f.name.startsWith("ANTFLY_CUDA_"))) return false;
       }
@@ -80,7 +87,7 @@ function FlagsInner({ flags, gitCommit, permalinkBase }: { flags: FlagRow[]; git
           aria-label="Filter environment names"
           value={q}
           onChange={(e) => setQ(e.target.value)}
-          placeholder="Filter flags… (e.g. PIPELINED, GQA_SPLIT, MTP)"
+          placeholder="Filter flags… (e.g. PIPELINED, GQA_SPLIT, MTP, GLINER)"
           className="max-w-md font-mono text-sm"
         />
 

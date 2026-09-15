@@ -71,7 +71,12 @@ export function mergeCuratedModels(ctx: MergeContext): ModelSpec[] {
   const specs: ModelSpec[] = [];
   for (const file of readdirSync(CURATED_DIR).sort()) {
     if (!file.endsWith(".model.json")) continue;
-    const raw = JSON.parse(readFileSync(join(CURATED_DIR, file), "utf8"));
+    let raw: Record<string, unknown> & { variants?: Array<Record<string, unknown>> };
+    try {
+      raw = JSON.parse(readFileSync(join(CURATED_DIR, file), "utf8"));
+    } catch (err) {
+      throw new Error(`${file}: ${(err as Error).message}`);
+    }
     const variants: Array<Record<string, unknown>> = raw.variants ?? [
       { id: raw.id, displayName: raw.displayName, tagline: raw.tagline, stats: raw.stats },
     ];
@@ -104,7 +109,12 @@ export function mergeCuratedModels(ctx: MergeContext): ModelSpec[] {
         const count = repeatOverrides[stage.id];
         if (count !== undefined && stage.repeat) stage.repeat.count = count;
       }
-      const spec = ModelSpec.parse(candidate);
+      let spec: ModelSpec;
+      try {
+        spec = ModelSpec.parse(candidate);
+      } catch (err) {
+        throw new Error(`${file}/${String(variant.id)}: ${(err as Error).message}`);
+      }
       validateSpec(spec, ctx, file);
       specs.push(spec);
     }

@@ -3,12 +3,13 @@
  "id": "gemma4-e2b",
  "family": "gemma",
  "displayName": "Gemma4 E2B",
- "tagline": "35 layers, hidden 1536; 4:1 sliding/global attention and 20 shared-KV tail layers.",
+ "tagline": "The smaller Gemma4: a 35-layer decoder where most layers watch a nearby window, every fifth layer sees the whole context, and the last 20 reuse KV that earlier layers wrote instead of writing their own.",
  "stats": {
   "vocab": 262144,
   "queryHeads": 8,
   "quant": "QAT Q4_0 weights (mixed tensor formats)",
   "tokenizer": "SentencePiece",
+  "scope": "Historical decode measurements on pinned Apple-silicon setups; estimates and recorded campaigns, not current serving guarantees.",
   "layers": 35,
   "hidden": 1536,
   "kvOwners": 15,
@@ -36,7 +37,7 @@
    "source": {
     "path": "zig/pkg/inference/src/architectures/gpt.zig",
     "anchor": "pub fn computePleVectors(",
-    "line": 11135
+    "line": 11455
    }
   },
   {
@@ -217,7 +218,7 @@
      "source": {
       "path": "zig/pkg/inference/src/architectures/gpt.zig",
       "anchor": "pub fn computePleVectors(",
-      "line": 11135
+      "line": 11455
      },
      "kernelRouteIds": [],
      "kernels": [
@@ -415,7 +416,7 @@
      "source": {
       "path": "zig/pkg/inference/src/architectures/gpt.zig",
       "anchor": "pub fn maybeApplyQKHeadNormRope(",
-      "line": 6858
+      "line": 7178
      },
      "kernelRouteIds": [],
      "kernels": [
@@ -754,7 +755,7 @@
      "source": {
       "path": "zig/pkg/inference/src/architectures/gpt.zig",
       "anchor": "pub fn applyPle(",
-      "line": 11344
+      "line": 11664
      },
      "kernelRouteIds": [],
      "kernels": [],
@@ -911,7 +912,7 @@
      "source": {
       "path": "zig/pkg/inference/src/backends/metal_kernels.m",
       "anchor": "kernel void termite_sample_gumbel_partials(",
-      "line": 8317
+      "line": 8568
      },
      "kernelRouteIds": [],
      "kernels": [
@@ -1146,7 +1147,7 @@
   ]
  },
  "sources": {
-  "gitCommit": "26e332ed8c335d75eecd875548c6c36bcb47d183",
-  "generatedAt": "2026-09-09T21:41:47.835Z"
+  "gitCommit": "05dc2b75e20e0bfca168746f94639713568be9d0",
+  "generatedAt": "2026-09-15T04:23:49.128Z"
  }
 }

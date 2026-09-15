@@ -4,6 +4,7 @@
  * Bespoke figures for Gemma4 chapters 2–6 (tokens, PLE, attention, KV, A4B).
  * Everything draws with the shared glyph vocabulary from components/viz/glyphs.
  */
+import { useId } from "react";
 import {
   ActivationGlyph,
   AttentionGlyph,
@@ -197,6 +198,7 @@ export function EmbedLookupFigure({ hidden }: { hidden: number }) {
 }
 
 export function PleRibbonFigure({ layers }: { layers: number }) {
+  const markerId = useId();
   const stackTop = 60;
   const rowH = 10;
   const shown = Math.min(layers, 14); // draw a compressed stack; label the true count
@@ -208,6 +210,11 @@ export function PleRibbonFigure({ layers }: { layers: number }) {
       title="the second embedding: a per-layer lane"
       caption={`A second lookup feeds a thin per-layer ribbon that runs beside all ${layers} layers and taps each one — combined with a normalized projection of the initial hidden state.`}
     >
+      <defs>
+        <marker id={markerId} markerWidth={7} markerHeight={7} refX={6} refY={3.5} orient="auto">
+          <path d="M 0 0 L 7 3.5 L 0 7 z" fill="var(--kfam-fusion)" />
+        </marker>
+      </defs>
       {/* main embedding into the stack */}
       <EmbeddingGlyph x={30} y={stackTop - 44} w={100} h={36} label="embed_tokens" dtype="q4_0" />
       <FlowArrow x1={80} y1={stackTop - 6} x2={80} y2={stackTop + 8} />
@@ -258,7 +265,7 @@ export function PleRibbonFigure({ layers }: { layers: number }) {
               y2={y + (rowH - 3) / 2}
               stroke="var(--kfam-fusion)"
               strokeWidth={1.25}
-              markerEnd="url(#arrowhead)"
+              markerEnd={`url(#${markerId})`}
             />
           </g>
         );

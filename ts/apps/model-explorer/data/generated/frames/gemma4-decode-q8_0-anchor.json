@@ -7,7 +7,7 @@
  "source": {
   "path": "zig/pkg/inference/METAL.md",
   "anchor": "`10979 236888 2088 740`, reports `planned_scopes=36`,",
-  "line": 288
+  "line": 290
  },
  "mode": "planned",
  "stats": {

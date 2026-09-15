@@ -334,5 +334,153 @@
   "runtime-execution-control": {
     "path": "zig/pkg/inference/src/execution_control.zig",
     "anchor": "pub const InferenceExecutionControl"
+  },
+  "gliner25-detect-arch": {
+    "path": "zig/pkg/inference/src/models/gliner_boundary.zig",
+    "anchor": "pub fn detectArchitecture("
+  },
+  "gliner25-runtime-withheld": {
+    "path": "zig/pkg/inference/src/models/gliner_boundary.zig",
+    "anchor": "pub const runtime_available = false;"
+  },
+  "gliner25-qualification-empty": {
+    "path": "zig/pkg/inference/src/models/gliner_boundary_qualification.zig",
+    "anchor": "const production_entries: []const Entry = &.{};"
+  },
+  "gliner25-qualification-require": {
+    "path": "zig/pkg/inference/src/models/gliner_boundary_qualification.zig",
+    "anchor": "pub fn require("
+  },
+  "gliner25-manifest-gate": {
+    "path": "zig/pkg/inference/src/models/manifest.zig",
+    "anchor": "return boundary and gliner_boundary.runtime_available and gliner_qualification.hasPublishedProfiles();"
+  },
+  "gliner25-markers": {
+    "path": "zig/pkg/inference/src/pipelines/gliner_boundary_processor.zig",
+    "anchor": "const marker_names = [_][]const u8{"
+  },
+  "gliner25-prompt-build": {
+    "path": "zig/pkg/inference/src/pipelines/gliner_boundary_processor.zig",
+    "anchor": "fn addGroup("
+  },
+  "gliner25-enum-prefix": {
+    "path": "zig/pkg/inference/src/pipelines/gliner_boundary_processor.zig",
+    "anchor": "fn addEnumPrefix("
+  },
+  "gliner25-word-ranges": {
+    "path": "zig/pkg/inference/src/pipelines/gliner_boundary_processor.zig",
+    "anchor": "pub fn sourceWordRanges("
+  },
+  "gliner25-normalizer": {
+    "path": "zig/lib/tokenizer/src/unicode_normalizer.zig",
+    "anchor": "pub const Profile = struct {"
+  },
+  "gliner25-extraction-parse": {
+    "path": "zig/pkg/inference/src/extractors/extraction_v2.zig",
+    "anchor": "pub fn parseJson("
+  },
+  "gliner25-executor-preflight": {
+    "path": "zig/pkg/inference/src/extractors/gliner_boundary_executor.zig",
+    "anchor": "pub fn preflight("
+  },
+  "gliner25-engine-native": {
+    "path": "zig/pkg/inference/src/architectures/gliner_boundary_engine.zig",
+    "anchor": "pub fn encodeNative("
+  },
+  "gliner25-engine-device": {
+    "path": "zig/pkg/inference/src/architectures/gliner_boundary_engine_device.zig",
+    "anchor": "pub fn encodeDevice("
+  },
+  "gliner25-resident-constants": {
+    "path": "zig/pkg/inference/src/architectures/gliner_boundary_engine_device.zig",
+    "anchor": "pub fn prepareResidentConstants("
+  },
+  "gliner25-boundary-encoder": {
+    "path": "zig/pkg/inference/src/architectures/gliner_boundary_head.zig",
+    "anchor": "fn encodeBoundaries("
+  },
+  "gliner25-proposer-marginals": {
+    "path": "zig/pkg/inference/src/architectures/gliner_boundary_head.zig",
+    "anchor": "fn computeMarginals("
+  },
+  "gliner25-shared-pool-film": {
+    "path": "zig/pkg/inference/src/architectures/gliner_boundary_head.zig",
+    "anchor": "fn scoreSharedPool("
+  },
+  "gliner25-head-forward": {
+    "path": "zig/pkg/inference/src/architectures/gliner_boundary_head.zig",
+    "anchor": "pub fn forwardNative("
+  },
+  "gliner25-rotary-endpoints": {
+    "path": "zig/pkg/inference/src/architectures/gliner_boundary_head.zig",
+    "anchor": "fn rotateEndpoints("
+  },
+  "gliner25-decode-query": {
+    "path": "zig/pkg/inference/src/pipelines/gliner_boundary_decode.zig",
+    "anchor": "pub fn decodeQuery("
+  },
+  "gliner25-overlap-policy": {
+    "path": "zig/pkg/inference/src/pipelines/gliner_boundary_decode.zig",
+    "anchor": "pub fn resolveOverlaps("
+  },
+  "gliner25-offset-units": {
+    "path": "zig/pkg/inference/src/pipelines/gliner_boundary_decode.zig",
+    "anchor": "pub const OffsetUnit = enum { utf8_bytes, unicode_codepoints, utf16_codeunits };"
+  },
+  "gliner25-longdoc-plan": {
+    "path": "zig/pkg/inference/src/pipelines/gliner_boundary_long_document.zig",
+    "anchor": "pub fn plan("
+  },
+  "gliner25-longdoc-merge": {
+    "path": "zig/pkg/inference/src/pipelines/gliner_boundary_long_document.zig",
+    "anchor": "pub fn mergeMentions("
+  },
+  "gliner25-task-classify": {
+    "path": "zig/pkg/inference/src/architectures/gliner_boundary_tasks.zig",
+    "anchor": "pub fn classifyNative("
+  },
+  "gliner25-task-relations": {
+    "path": "zig/pkg/inference/src/architectures/gliner_boundary_tasks.zig",
+    "anchor": "pub fn scoreRelationsNative("
+  },
+  "gliner25-task-records": {
+    "path": "zig/pkg/inference/src/architectures/gliner_boundary_tasks.zig",
+    "anchor": "pub fn scoreRecordNative("
+  },
+  "gliner25-device-kinds": {
+    "path": "zig/pkg/inference/src/ops/gliner_boundary_device_ops.zig",
+    "anchor": "pub const Kind = enum(u32) {"
+  },
+  "gliner25-mega-kernel": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "anchor": "kernel void termite_gliner_boundary_f32("
+  },
+  "gliner25-precision-policy": {
+    "path": "zig/pkg/inference/src/models/gliner_boundary_artifact.zig",
+    "anchor": "pub fn targetType("
+  },
+  "gliner25-peft-inject": {
+    "path": "zig/pkg/inference/src/finetune/gliner_boundary_peft_graph.zig",
+    "anchor": "pub fn inject("
+  },
+  "gliner25-peft-kinds": {
+    "path": "zig/pkg/inference/src/finetune/gliner_boundary_peft_graph.zig",
+    "anchor": "pub const Kind = enum { lora, dora };"
+  },
+  "gliner25-stop-gradient": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "anchor": "stop_gradient: void,"
+  },
+  "gliner25-adamw-renorm": {
+    "path": "zig/pkg/inference/src/finetune/seeded_gradient_trainer.zig",
+    "anchor": "matching GLiNER2.5's _renormalize_partial_accumulation. Parameters absent"
+  },
+  "gliner25-hungarian-match": {
+    "path": "zig/pkg/inference/src/finetune/gliner_boundary_matching.zig",
+    "anchor": "pub fn match("
+  },
+  "gliner25-train-entry": {
+    "path": "zig/pkg/inference/src/finetune/train/train_gliner25.zig",
+    "anchor": "pub fn main("
   }
 }

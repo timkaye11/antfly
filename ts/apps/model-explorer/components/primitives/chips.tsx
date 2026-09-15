@@ -1,6 +1,7 @@
 "use client";
 
 import { cn, Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@antfly/design-system";
+import Link from "next/link";
 import type { TensorShape } from "@/lib/schema";
 
 /** dtype/quant string -> precision-ramp CSS var (see globals.css). */
@@ -73,9 +74,10 @@ export function EnvFlagChip({
     <TooltipProvider>
       <Tooltip>
         <TooltipTrigger asChild>
-          <button
-            type="button"
-            aria-label={`${name}${defaultOn === undefined ? "" : ` (${defaultOn ? "default on" : "default off"})`}`}
+          {/* A real destination (the flags index) — previously a no-op button. */}
+          <Link
+            href={`/systems/flags?q=${encodeURIComponent(name)}`}
+            aria-label={`${name}${defaultOn === undefined ? "" : ` (${defaultOn ? "default on" : "default off"})`} — view in the flags index`}
             className={cn(
               "inline-flex max-w-full items-center gap-1 rounded-sm border bg-muted/50 px-1.5 py-px font-mono text-[10px] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary",
               className,
@@ -87,7 +89,7 @@ export function EnvFlagChip({
               />
             )}
             <span className="truncate">{name}</span>
-          </button>
+          </Link>
         </TooltipTrigger>
         <TooltipContent className="font-mono text-xs">
           {name}

@@ -80,7 +80,7 @@ export function Qwen3VlChapters({ spec }: ChaptersProps) {
         <Scene id="deepstack" graphic={<VisionTowerFigure step={2} />}>
           <p>
             <strong>DeepStack.</strong> After zero-based vision blocks 5, 11 and 17, features exit sideways through
-            dedicated merger heads and are <em>added after decoder layers 0, 1 and 2</em>
+            dedicated merger heads and are <em>added after decoder layers 0, 1 and 2</em>{" "}
             at visual-token positions during prefill — mid-level texture and layout information that the top of the tower
             would have abstracted away. If Gemma4's PLE ribbon looked familiar, it should: this is the same
             visual grammar — a side lane feeding the main stack — carrying different physics.
@@ -161,7 +161,7 @@ export function Qwen3VlChapters({ spec }: ChaptersProps) {
           </p>
           <p>
             The projector has its own architecture implementation, while the decoder reuses shared GPT
-            execution. Admission validates the actual artifact route and backend capabilities.
+            execution. Admission validates the actual artifact route and backend capabilities.{" "}
             <CodeLink link={L("qwen3vl-family-gate")} />
           </p>
           <p>

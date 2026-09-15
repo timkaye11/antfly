@@ -21,7 +21,7 @@ import { Gemma4EarlyChapters } from "./chapters-early";
 import { Gemma4LateChapters } from "./chapters-late";
 import { ColdOpenFigure, GraphToFrameFigure, LayerStackFigure } from "./figures";
 
-export function Gemma4Chapters({ spec, routes, frames }: ChaptersProps) {
+export function Gemma4Chapters({ spec, routes, frames, kernelCensus }: ChaptersProps) {
   const isE4b = spec.id === "gemma4-e4b";
   const tokS = String(spec.stats.tokS ?? "");
 
@@ -120,14 +120,14 @@ export function Gemma4Chapters({ spec, routes, frames }: ChaptersProps) {
         >
           <p>
             <strong>Follow the bytes.</strong> This is the performance plan's historical E4B Q4_0
-            weight-size estimate, also shown here for comparison when E2B is selected: FFN 65.7%,
+            weight-size estimate (the E2B page shows the same estimate for comparison): FFN 65.7%,
             Q6_K LM head 19.5%, attention projections 11.7%. It predates optional repacking and is
             not measured GPU traffic or a per-model live profile.
           </p>
         </Scene>
       </ScrollyChapter>
 
-      <Gemma4EarlyChapters spec={spec} routes={routes} frames={frames} />
+      <Gemma4EarlyChapters spec={spec} routes={routes} frames={frames} kernelCensus={kernelCensus} />
 
       {/* ── Ch 7 · From graph to frames ──────────────────────────── */}
       <ScrollyChapter
@@ -223,7 +223,7 @@ export function Gemma4Chapters({ spec, routes, frames }: ChaptersProps) {
         </Scene>
       </ScrollyChapter>
 
-      <Gemma4LateChapters spec={spec} routes={routes} frames={frames} />
+      <Gemma4LateChapters spec={spec} routes={routes} frames={frames} kernelCensus={kernelCensus} />
 
       {/* ── Ch 12 · Scoreboard ───────────────────────────────────── */}
       <ScrollyChapter
@@ -263,7 +263,7 @@ export function Gemma4Chapters({ spec, routes, frames }: ChaptersProps) {
           }
         >
           <p>
-            <strong>The initial comparison</strong> recorded E4B Q4_0, 64-token circus results on an
+            <strong>The initial comparison</strong> recorded E4B Q4_0, 64-token benchmark-suite results on an
             M4 Pro. Its internal and end-to-end timing boundaries differ, and peer runtime settings
             were not fully reconciled. Treat these as historical observations; they do not establish
             a current ranking or prove another runtime omitted model work.

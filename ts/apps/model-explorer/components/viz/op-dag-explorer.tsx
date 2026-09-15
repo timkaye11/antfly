@@ -25,6 +25,7 @@ import {
   ReactFlow,
 } from "@xyflow/react";
 import { Search, X } from "lucide-react";
+import Link from "next/link";
 import { useTheme } from "next-themes";
 import { parseAsString, parseAsStringLiteral, useQueryState } from "nuqs";
 import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
@@ -228,12 +229,12 @@ function Inspector({
             <div className="space-y-2">
               {op.kernels.map((k) => (
                 <div key={k}>
-                  <a
+                  <Link
                     href={`/systems/kernels?q=${encodeURIComponent(k)}`}
                     className="font-mono text-xs text-primary hover:underline"
                   >
                     {k}
-                  </a>
+                  </Link>
                 </div>
               ))}
               {routes.map((r) => (
@@ -343,7 +344,7 @@ function OpDagExplorerInner({
   );
   const { resolvedTheme } = useTheme();
   const activePhase = phase === "prefill" && spec.graphs.prefill ? "prefill" : "decode";
-  const forwardOnly = spec.id === "gliner2" || spec.id === "qwen3-embedding";
+  const forwardOnly = spec.id === "gliner2" || spec.id === "gliner25" || spec.id === "qwen3-embedding";
   const [colorBy, setColorBy] = useQueryState(
     "colorBy",
     parseAsStringLiteral(["dtype", "backend", "kernel"] as const).withDefault("dtype")
@@ -418,10 +419,11 @@ function OpDagExplorerInner({
         e.preventDefault();
         setSearchOpen((v) => !v);
       }
+      if (e.key === "Escape") setSelectedId(null);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [setSelectedId]);
 
   return (
     <div className={cn("relative", className)} style={{ height, minHeight: 480 }}>

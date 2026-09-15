@@ -79,10 +79,14 @@ export function SpineStrip({
             >
               {stage.label}
               {isModified && (
-                <span
-                  className="absolute -top-0.5 -right-0.5 size-2 rounded-full bg-primary"
-                  title="This model page covers this topic"
-                />
+                <>
+                  <span
+                    className="absolute -top-0.5 -right-0.5 size-2 rounded-full bg-primary"
+                    title="This model page covers this topic"
+                    aria-hidden
+                  />
+                  <span className="sr-only">(covered on this page)</span>
+                </>
               )}
             </Link>
           </span>

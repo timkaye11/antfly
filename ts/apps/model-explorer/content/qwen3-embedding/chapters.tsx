@@ -88,12 +88,12 @@ export function Qwen3EmbeddingChapters({ spec }: ChaptersProps) {
           <p>
             <strong>Why the last token?</strong> In a causal model, only the final position has attended to
             everything before it — every earlier hidden state is blind to what follows. Mean pooling would mix positions with different visible prefixes; this model
-            was trained for last-token pooling. The pipeline selects the last <em>non-padding</em>
+            was trained for last-token pooling. The pipeline selects the last <em>non-padding</em>{" "}
             position in each row, which is the EOS after task formatting and any configured truncation.
           </p>
           <p>
             Pooling is part of each model's contract. Antfly resolves it from metadata or the model
-            manifest; the same pipeline also implements mean and CLS pooling for models that request them.
+            manifest; the same pipeline also implements mean and CLS pooling for models that request them.{" "}
             <CodeLink link={L("embed-pooling-strategy")} />
           </p>
         </Scene>
@@ -116,7 +116,7 @@ export function Qwen3EmbeddingChapters({ spec }: ChaptersProps) {
           <p>
             A plausible vector can still represent the wrong input. Compare exact model artifacts,
             task prefixes, token IDs, EOS placement, active sequence length, pooling and normalization
-            before interpreting cosine agreement. The runtime reads <code>qwen3.context_length</code>
+            before interpreting cosine agreement. The runtime reads <code>qwen3.context_length</code>{" "}
             when present and resolves sequence limits from model configuration; a generic
             512-token encoder default is not the Qwen3 contract.
           </p>
@@ -146,7 +146,7 @@ export function Qwen3EmbeddingChapters({ spec }: ChaptersProps) {
             Several optimizations target this workload. <strong>Batched FFN</strong> runs the feed-forward
             projections as matrix operations over token rows; fused gate/up kernels reuse activation
             tiles and can include the SiLU/multiply epilogue. Q8_0 weights use shape-dependent simdgroup
-            matmul routes, including SG-v2 and M64 schedules.
+            matmul routes, including SG-v2 and M64 schedules.{" "}
             <strong>Simdgroup flash attention</strong>: <code>sg_q16</code> tiles with online softmax,
             never materializing the <code>[T, T]</code> score matrix. <strong>F16-KV direct load</strong>:
             the attention kernel reads K/V in f16 natively, halving K/V storage bytes relative to f32 when that route is selected.

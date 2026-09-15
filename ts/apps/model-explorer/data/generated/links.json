@@ -4,22 +4,22 @@
   "gpt-forward": {
    "path": "zig/pkg/inference/src/architectures/gpt.zig",
    "anchor": "pub fn forward(",
-   "line": 651
+   "line": 652
   },
   "gpt-forward-greedy": {
    "path": "zig/pkg/inference/src/architectures/gpt.zig",
    "anchor": "pub fn forwardGreedyLastToken(",
-   "line": 916
+   "line": 917
   },
   "gpt-compute-ple": {
    "path": "zig/pkg/inference/src/architectures/gpt.zig",
    "anchor": "pub fn computePleVectors(",
-   "line": 11135
+   "line": 11455
   },
   "gpt-qk-head-norm": {
    "path": "zig/pkg/inference/src/architectures/gpt.zig",
    "anchor": "pub fn maybeApplyQKHeadNormRope(",
-   "line": 6858
+   "line": 7178
   },
   "config-sliding-pattern": {
    "path": "zig/pkg/inference/src/models/gpt.zig",
@@ -69,17 +69,17 @@
   "runtime-begin-frame": {
    "path": "zig/pkg/inference/src/backends/metal_runtime.zig",
    "anchor": "pub fn beginFrame(runtime: ?*RawMetalDecodeRuntime) FrameError!void {",
-   "line": 17200
+   "line": 17766
   },
   "runtime-submit-frame": {
    "path": "zig/pkg/inference/src/backends/metal_runtime.zig",
    "anchor": "pub fn submitFrame(runtime: ?*RawMetalDecodeRuntime) FrameError!void {",
-   "line": 17218
+   "line": 17784
   },
   "runtime-wait-frame": {
    "path": "zig/pkg/inference/src/backends/metal_runtime.zig",
    "anchor": "pub fn waitFrame(runtime: ?*RawMetalDecodeRuntime) FrameError!void {",
-   "line": 17238
+   "line": 17804
   },
   "executor-pipelined-decode": {
    "path": "zig/pkg/inference/src/graph/metal_executor.zig",
@@ -94,7 +94,7 @@
   "moe-mapped-route": {
    "path": "zig/pkg/inference/src/ops/metal_compute.zig",
    "anchor": "const A4bMappedMoeRoute = enum {",
-   "line": 51
+   "line": 52
   },
   "mtp-draft-request": {
    "path": "zig/pkg/inference/src/architectures/gemma4_mtp.zig",
@@ -134,37 +134,37 @@
   "kernel-gumbel": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
    "anchor": "kernel void termite_sample_gumbel_partials(",
-   "line": 8317
+   "line": 8568
   },
   "kernel-head-rms-rope": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
    "anchor": "kernel void termite_apply_head_rms_rope(",
-   "line": 7616
+   "line": 7638
   },
   "server-generate": {
    "path": "zig/pkg/inference/src/server/server.zig",
    "anchor": "fn generateContent(",
-   "line": 7492
+   "line": 10727
   },
   "server-embeddings": {
    "path": "zig/pkg/inference/src/server/server.zig",
    "anchor": "fn generateEmbeddings(",
-   "line": 6717
+   "line": 9733
   },
   "server-rerank": {
    "path": "zig/pkg/inference/src/server/server.zig",
    "anchor": "fn rerankPrompts(",
-   "line": 7144
+   "line": 10289
   },
   "server-chat": {
    "path": "zig/pkg/inference/src/server/server.zig",
    "anchor": "fn chatCompletions(",
-   "line": 10326
+   "line": 14281
   },
   "ops-compute-backend": {
    "path": "zig/pkg/inference/src/ops/ops.zig",
    "anchor": "pub const ComputeBackend = struct {",
-   "line": 1321
+   "line": 1324
   },
   "node-primitive-op": {
    "path": "zig/lib/ml/src/graph/node.zig",
@@ -229,52 +229,52 @@
   "gliner-deberta-graph": {
    "path": "zig/pkg/inference/src/architectures/deberta_graph.zig",
    "anchor": "pub fn buildForwardGraph(",
-   "line": 97
+   "line": 179
   },
   "gliner-rel-bucket": {
    "path": "zig/pkg/inference/src/models/deberta.zig",
    "anchor": "pub fn relativePositionBucket(",
-   "line": 108
+   "line": 122
   },
   "gliner-fused-attn-gate": {
    "path": "zig/pkg/inference/src/architectures/deberta_graph.zig",
    "anchor": "pub fn fusedDisentangledAttentionEnabledForProduction(",
-   "line": 316
+   "line": 430
   },
   "gliner-fused-attn-kernel": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
    "anchor": "kernel void termite_disentangled_relative_attention_f32(",
-   "line": 9768
+   "line": 10274
   },
   "gliner-fused-attn-bwd-kernel": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
    "anchor": "kernel void termite_disentangled_relative_attention_bwd_scores_f32(",
-   "line": 9856
+   "line": 10362
   },
   "gliner-word-embeddings-kernel": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
    "anchor": "kernel void termite_gliner_word_embeddings_f32(",
-   "line": 9467
+   "line": 9973
   },
   "gliner-gru-combine-kernel": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
    "anchor": "kernel void termite_gliner_gru_combine_f32(",
-   "line": 9474
+   "line": 9980
   },
   "gliner-span-marker": {
    "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig",
    "anchor": "pub fn spanMarkerForward(",
-   "line": 369
+   "line": 371
   },
   "gliner-label-gather": {
    "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig",
    "anchor": "pub fn gatherLabelEmbeddings(",
-   "line": 350
+   "line": 352
   },
   "gliner-score-spans": {
    "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig",
    "anchor": "pub fn scoreSpansAgainstLabels(",
-   "line": 333
+   "line": 335
   },
   "gliner-pipeline": {
    "path": "zig/pkg/inference/src/pipelines/gliner.zig",
@@ -289,22 +289,22 @@
   "embed-pooling-strategy": {
    "path": "zig/pkg/inference/src/pipelines/embedding.zig",
    "anchor": "pub const PoolingStrategy = enum {",
-   "line": 57
+   "line": 88
   },
   "embed-pipeline": {
    "path": "zig/pkg/inference/src/pipelines/embedding.zig",
    "anchor": "pub const EmbeddingPipeline = struct {",
-   "line": 249
+   "line": 282
   },
   "kernel-q8-mm-sg": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
    "anchor": "kernel void termite_q8_0_linear_mm_sg(",
-   "line": 6990
+   "line": 7012
   },
   "kernel-sg-q16-f16kv-gqa2": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
    "anchor": "kernel void termite_attention_f32_dense_causal_sg_q16_f16kv_gqa2(",
-   "line": 10598
+   "line": 11110
   },
   "qwen3vl-projector": {
    "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
@@ -349,12 +349,12 @@
   "qwen3vl-mrope-kernel": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
    "anchor": "kernel void termite_apply_mrope(",
-   "line": 10155
+   "line": 10661
   },
   "qwen3vl-reranker-score": {
    "path": "zig/pkg/inference/src/architectures/qwen3vl_reranker.zig",
    "anchor": "pub fn scoreYesNoLogits(",
-   "line": 146
+   "line": 219
   },
   "qwen3vl-support-doc": {
    "path": "zig/pkg/inference/QWEN3VL_SUPPORT.md",
@@ -379,27 +379,27 @@
   "embed-eos": {
    "path": "zig/pkg/inference/src/pipelines/embedding.zig",
    "anchor": "fn ensureTrailingEos(",
-   "line": 660
+   "line": 696
   },
   "qwen3-embed-graph": {
    "path": "zig/pkg/inference/src/pipelines/embedding.zig",
    "anchor": "fn tryEmbedTextResidentQwen3Graph(",
-   "line": 1505
+   "line": 1890
   },
   "gliner-serving-head": {
    "path": "zig/pkg/inference/src/architectures/gliner_head.zig",
    "anchor": "fn extractWordEmbeddings(",
-   "line": 357
+   "line": 438
   },
   "gemma-lm-head-repack": {
    "path": "zig/pkg/inference/src/backends/metal_runtime.zig",
    "anchor": "fn lmHeadQ4RepackFormat() ?gguf_tensor_types.KnownTensorType {",
-   "line": 9779
+   "line": 10344
   },
   "gemma-sampling-fallback": {
    "path": "zig/pkg/inference/src/pipelines/generation.zig",
    "anchor": "// Fallback: same fused forward, host-side sampling from the",
-   "line": 6888
+   "line": 6914
   },
   "gemma-mtp-ledger": {
    "path": "zig/pkg/inference/GEMMA4_PERF_PLAN.md",
@@ -420,6 +420,191 @@
    "path": "zig/pkg/inference/src/execution_control.zig",
    "anchor": "pub const InferenceExecutionControl",
    "line": 104
+  },
+  "gliner25-detect-arch": {
+   "path": "zig/pkg/inference/src/models/gliner_boundary.zig",
+   "anchor": "pub fn detectArchitecture(",
+   "line": 201
+  },
+  "gliner25-runtime-withheld": {
+   "path": "zig/pkg/inference/src/models/gliner_boundary.zig",
+   "anchor": "pub const runtime_available = false;",
+   "line": 17
+  },
+  "gliner25-qualification-empty": {
+   "path": "zig/pkg/inference/src/models/gliner_boundary_qualification.zig",
+   "anchor": "const production_entries: []const Entry = &.{};",
+   "line": 136
+  },
+  "gliner25-qualification-require": {
+   "path": "zig/pkg/inference/src/models/gliner_boundary_qualification.zig",
+   "anchor": "pub fn require(",
+   "line": 182
+  },
+  "gliner25-manifest-gate": {
+   "path": "zig/pkg/inference/src/models/manifest.zig",
+   "anchor": "return boundary and gliner_boundary.runtime_available and gliner_qualification.hasPublishedProfiles();",
+   "line": 492
+  },
+  "gliner25-markers": {
+   "path": "zig/pkg/inference/src/pipelines/gliner_boundary_processor.zig",
+   "anchor": "const marker_names = [_][]const u8{",
+   "line": 189
+  },
+  "gliner25-prompt-build": {
+   "path": "zig/pkg/inference/src/pipelines/gliner_boundary_processor.zig",
+   "anchor": "fn addGroup(",
+   "line": 439
+  },
+  "gliner25-enum-prefix": {
+   "path": "zig/pkg/inference/src/pipelines/gliner_boundary_processor.zig",
+   "anchor": "fn addEnumPrefix(",
+   "line": 496
+  },
+  "gliner25-word-ranges": {
+   "path": "zig/pkg/inference/src/pipelines/gliner_boundary_processor.zig",
+   "anchor": "pub fn sourceWordRanges(",
+   "line": 47
+  },
+  "gliner25-normalizer": {
+   "path": "zig/lib/tokenizer/src/unicode_normalizer.zig",
+   "anchor": "pub const Profile = struct {",
+   "line": 15
+  },
+  "gliner25-extraction-parse": {
+   "path": "zig/pkg/inference/src/extractors/extraction_v2.zig",
+   "anchor": "pub fn parseJson(",
+   "line": 347
+  },
+  "gliner25-executor-preflight": {
+   "path": "zig/pkg/inference/src/extractors/gliner_boundary_executor.zig",
+   "anchor": "pub fn preflight(",
+   "line": 72
+  },
+  "gliner25-engine-native": {
+   "path": "zig/pkg/inference/src/architectures/gliner_boundary_engine.zig",
+   "anchor": "pub fn encodeNative(",
+   "line": 357
+  },
+  "gliner25-engine-device": {
+   "path": "zig/pkg/inference/src/architectures/gliner_boundary_engine_device.zig",
+   "anchor": "pub fn encodeDevice(",
+   "line": 236
+  },
+  "gliner25-resident-constants": {
+   "path": "zig/pkg/inference/src/architectures/gliner_boundary_engine_device.zig",
+   "anchor": "pub fn prepareResidentConstants(",
+   "line": 214
+  },
+  "gliner25-boundary-encoder": {
+   "path": "zig/pkg/inference/src/architectures/gliner_boundary_head.zig",
+   "anchor": "fn encodeBoundaries(",
+   "line": 327
+  },
+  "gliner25-proposer-marginals": {
+   "path": "zig/pkg/inference/src/architectures/gliner_boundary_head.zig",
+   "anchor": "fn computeMarginals(",
+   "line": 406
+  },
+  "gliner25-shared-pool-film": {
+   "path": "zig/pkg/inference/src/architectures/gliner_boundary_head.zig",
+   "anchor": "fn scoreSharedPool(",
+   "line": 490
+  },
+  "gliner25-head-forward": {
+   "path": "zig/pkg/inference/src/architectures/gliner_boundary_head.zig",
+   "anchor": "pub fn forwardNative(",
+   "line": 246
+  },
+  "gliner25-rotary-endpoints": {
+   "path": "zig/pkg/inference/src/architectures/gliner_boundary_head.zig",
+   "anchor": "fn rotateEndpoints(",
+   "line": 718
+  },
+  "gliner25-decode-query": {
+   "path": "zig/pkg/inference/src/pipelines/gliner_boundary_decode.zig",
+   "anchor": "pub fn decodeQuery(",
+   "line": 180
+  },
+  "gliner25-overlap-policy": {
+   "path": "zig/pkg/inference/src/pipelines/gliner_boundary_decode.zig",
+   "anchor": "pub fn resolveOverlaps(",
+   "line": 43
+  },
+  "gliner25-offset-units": {
+   "path": "zig/pkg/inference/src/pipelines/gliner_boundary_decode.zig",
+   "anchor": "pub const OffsetUnit = enum { utf8_bytes, unicode_codepoints, utf16_codeunits };",
+   "line": 239
+  },
+  "gliner25-longdoc-plan": {
+   "path": "zig/pkg/inference/src/pipelines/gliner_boundary_long_document.zig",
+   "anchor": "pub fn plan(",
+   "line": 191
+  },
+  "gliner25-longdoc-merge": {
+   "path": "zig/pkg/inference/src/pipelines/gliner_boundary_long_document.zig",
+   "anchor": "pub fn mergeMentions(",
+   "line": 622
+  },
+  "gliner25-task-classify": {
+   "path": "zig/pkg/inference/src/architectures/gliner_boundary_tasks.zig",
+   "anchor": "pub fn classifyNative(",
+   "line": 97
+  },
+  "gliner25-task-relations": {
+   "path": "zig/pkg/inference/src/architectures/gliner_boundary_tasks.zig",
+   "anchor": "pub fn scoreRelationsNative(",
+   "line": 157
+  },
+  "gliner25-task-records": {
+   "path": "zig/pkg/inference/src/architectures/gliner_boundary_tasks.zig",
+   "anchor": "pub fn scoreRecordNative(",
+   "line": 291
+  },
+  "gliner25-device-kinds": {
+   "path": "zig/pkg/inference/src/ops/gliner_boundary_device_ops.zig",
+   "anchor": "pub const Kind = enum(u32) {",
+   "line": 246
+  },
+  "gliner25-mega-kernel": {
+   "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+   "anchor": "kernel void termite_gliner_boundary_f32(",
+   "line": 9719
+  },
+  "gliner25-precision-policy": {
+   "path": "zig/pkg/inference/src/models/gliner_boundary_artifact.zig",
+   "anchor": "pub fn targetType(",
+   "line": 46
+  },
+  "gliner25-peft-inject": {
+   "path": "zig/pkg/inference/src/finetune/gliner_boundary_peft_graph.zig",
+   "anchor": "pub fn inject(",
+   "line": 314
+  },
+  "gliner25-peft-kinds": {
+   "path": "zig/pkg/inference/src/finetune/gliner_boundary_peft_graph.zig",
+   "anchor": "pub const Kind = enum { lora, dora };",
+   "line": 15
+  },
+  "gliner25-stop-gradient": {
+   "path": "zig/lib/ml/src/graph/node.zig",
+   "anchor": "stop_gradient: void,",
+   "line": 535
+  },
+  "gliner25-adamw-renorm": {
+   "path": "zig/pkg/inference/src/finetune/seeded_gradient_trainer.zig",
+   "anchor": "matching GLiNER2.5's _renormalize_partial_accumulation. Parameters absent",
+   "line": 540
+  },
+  "gliner25-hungarian-match": {
+   "path": "zig/pkg/inference/src/finetune/gliner_boundary_matching.zig",
+   "anchor": "pub fn match(",
+   "line": 488
+  },
+  "gliner25-train-entry": {
+   "path": "zig/pkg/inference/src/finetune/train/train_gliner25.zig",
+   "anchor": "pub fn main(",
+   "line": 8
   }
  }
 }

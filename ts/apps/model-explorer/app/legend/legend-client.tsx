@@ -43,6 +43,12 @@ const KERNEL_FAMILIES = [
   ["moe", "var(--kfam-moe)", "expert routing, scatter, slot arena"],
   ["sampling", "var(--kfam-sampling)", "token selection and candidate reduction routes"],
   ["kv", "var(--kfam-kv)", "KV seed / compress (polar4, turbo3)"],
+  ["gliner", "var(--kfam-attention)", "DeBERTa / GLiNER span and boundary-head kernels (shares the attention hue)"],
+  ["vision", "var(--kfam-mmsg)", "vision tower: patchify, window pack, conv (shares the mm_sg hue)"],
+  ["norm_rope", "var(--kfam-fusion)", "standalone norm / RoPE kernels (shares the fusion hue)"],
+  ["training", "var(--muted-foreground)", "backward passes, optimizers, gradient utilities"],
+  ["data_movement", "var(--muted-foreground)", "copies, transposes, dtype conversion, embedding gathers"],
+  ["other", "var(--muted-foreground)", "everything the family rules don't claim"],
 ] as const;
 
 function Swatch({ color, label, note }: { color: string; label: string; note: string }) {
@@ -64,6 +70,9 @@ export function LegendClient() {
           A guide to the explorer's schematic shapes and palettes. The operation explorer can color
           nodes by activation dtype, illustrated backend, or operation family. Chapter illustrations
           also use colors to distinguish functional stages; their captions define the context.
+          Decoder models flow through embedding → decoder → KV → sampling stages; encoder models
+          (GLiNER2, GLiNER2.5, Qwen3 Embedding) end in head and pooling stages instead — no KV
+          cache, no sampler.
         </p>
       </header>
 

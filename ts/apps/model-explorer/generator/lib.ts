@@ -69,10 +69,33 @@ export interface AnchorResult {
   healed: boolean;
 }
 
+const isWordChar = (ch: string | undefined) => ch !== undefined && /[A-Za-z0-9_]/.test(ch);
+
+/**
+ * True when `text` contains `anchor` at an identifier boundary: an anchor
+ * whose first/last character is a word character must not continue an
+ * identifier on that side (so anchor "add," never matches "lazy_add,").
+ */
+export function containsAnchor(text: string, anchor: string): boolean {
+  const anchorStartsWord = isWordChar(anchor[0]);
+  const anchorEndsWord = isWordChar(anchor[anchor.length - 1]);
+  let from = 0;
+  for (;;) {
+    const at = text.indexOf(anchor, from);
+    if (at < 0) return false;
+    const okLeft = !anchorStartsWord || !isWordChar(text[at - 1]);
+    const okRight = !anchorEndsWord || !isWordChar(text[at + anchor.length]);
+    if (okLeft && okRight) return true;
+    from = at + 1;
+  }
+}
+
 /**
  * Verify that `anchor` appears at `line` in the file; if not, search for a
- * unique occurrence and heal the line number. Throws if the anchor is gone
- * or ambiguous.
+ * unique occurrence and heal the line number. Matching is identifier-boundary
+ * aware, so a superstring line (e.g. "lazy_add," for anchor "add,") neither
+ * satisfies nor silently heals the link. Throws if the anchor is gone or
+ * ambiguous.
  */
 export function verifyAnchor(
   relPath: string,
@@ -81,12 +104,12 @@ export function verifyAnchor(
 ): AnchorResult {
   const content = readRepoFile(relPath);
   const lines = content.split("\n");
-  if (line !== undefined && lines[line - 1]?.includes(anchor)) {
+  if (line !== undefined && lines[line - 1] !== undefined && containsAnchor(lines[line - 1], anchor)) {
     return { line, healed: false };
   }
   const hits: number[] = [];
   for (let i = 0; i < lines.length; i++) {
-    if (lines[i].includes(anchor)) hits.push(i + 1);
+    if (containsAnchor(lines[i], anchor)) hits.push(i + 1);
   }
   if (hits.length === 1) return { line: hits[0], healed: true };
   if (hits.length === 0) {

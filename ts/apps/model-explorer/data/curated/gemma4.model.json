@@ -6,13 +6,14 @@
     "vocab": 262144,
     "queryHeads": 8,
     "quant": "QAT Q4_0 weights (mixed tensor formats)",
-    "tokenizer": "SentencePiece"
+    "tokenizer": "SentencePiece",
+    "scope": "Historical decode measurements on pinned Apple-silicon setups; estimates and recorded campaigns, not current serving guarantees."
   },
   "variants": [
     {
       "id": "gemma4-e2b",
       "displayName": "Gemma4 E2B",
-      "tagline": "35 layers, hidden 1536; 4:1 sliding/global attention and 20 shared-KV tail layers.",
+      "tagline": "The smaller Gemma4: a 35-layer decoder where most layers watch a nearby window, every fifth layer sees the whole context, and the last 20 reuse KV that earlier layers wrote instead of writing their own.",
       "stats": {
         "layers": 35,
         "hidden": 1536,
@@ -98,7 +99,7 @@
     {
       "id": "gemma4-e4b",
       "displayName": "Gemma4 E4B",
-      "tagline": "42 layers, hidden 2560; 5:1 sliding/global attention and 18 shared-KV tail layers.",
+      "tagline": "The larger Gemma4: the same design at 42 layers — every sixth layer global, 18 tail layers sharing KV — trading speed for a wider, deeper stack.",
       "stats": {
         "layers": 42,
         "hidden": 2560,

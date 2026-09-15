@@ -153,7 +153,7 @@ function HttpDoorsFigure() {
 }
 
 function SessionFactoryFigure() {
-  const families = ["gemma", "qwen3", "qwen3_vl", "gliner2 / deberta", "bert …"];
+  const families = ["gemma", "qwen3", "qwen3_vl", "gliner2 / deberta", "gliner2.5 / boundary", "bert …"];
   return (
     <Figure
       viewBox="0 0 460 250"
@@ -170,7 +170,7 @@ function SessionFactoryFigure() {
         accent
       />
       {families.map((f, i) => {
-        const y = 12 + i * 46;
+        const y = 12 + i * 40;
         return (
           <g key={f}>
             <FlowArrow x1={160} y1={123} x2={280} y2={y + 16} />
@@ -699,6 +699,7 @@ export function RuntimeClient({
               items={[
                 { slug: "gemma4-e4b", label: "gemma4", note: "chat + generate" },
                 { slug: "gliner2", label: "gliner2", note: "extraction" },
+                { slug: "gliner25", label: "gliner25", note: "extraction_v2 — serving gated by qualification" },
                 { slug: "qwen3-embedding", label: "qwen3-embedding", note: "embeddings" },
                 { slug: "qwen3-vl", label: "qwen3-vl", note: "multimodal chat" },
               ]}
@@ -747,6 +748,7 @@ export function RuntimeClient({
               items={[
                 { slug: "gemma4-e4b", label: "gemma4", note: "gpt/gemma family" },
                 { slug: "gliner2", label: "gliner2", note: "deberta encoder" },
+                { slug: "gliner25", label: "gliner25", note: "deberta encoder + boundary head" },
                 { slug: "qwen3-embedding", label: "qwen3-embedding" },
                 { slug: "qwen3-vl", label: "qwen3-vl", note: "vision tower + decoder" },
               ]}
@@ -774,6 +776,7 @@ export function RuntimeClient({
               items={[
                 { slug: "gemma4-e4b", label: "gemma4", note: "SentencePiece, 262k vocab" },
                 { slug: "gliner2", label: "gliner2", note: "SentencePiece via DeBERTa-v3" },
+                { slug: "gliner25", label: "gliner25", note: "SentencePiece Unigram + strict normalizer" },
                 { slug: "qwen3-embedding", label: "qwen3-embedding", note: "BPE" },
                 { slug: "qwen3-vl", label: "qwen3-vl", note: "BPE + image placeholder tokens" },
               ]}
@@ -803,6 +806,7 @@ export function RuntimeClient({
               items={[
                 { slug: "gemma4-e4b", label: "gemma4", note: "windowed attention + shared KV" },
                 { slug: "gliner2", label: "gliner2", note: "disentangled_relative_attention" },
+                { slug: "gliner25", label: "gliner25", note: "disentangled attention via boundary mega-kernel" },
                 { slug: "qwen3-embedding", label: "qwen3-embedding", note: "gqa attention" },
                 { slug: "qwen3-vl", label: "qwen3-vl", note: "patch projection + GQA" },
               ]}
@@ -855,6 +859,8 @@ export function RuntimeClient({
             <ModelUses
               items={[
                 { slug: "gemma4-e4b", label: "gemma4", note: "pipelined decode frames" },
+                { slug: "gliner2", label: "gliner2", note: "encoder — no decode frames" },
+                { slug: "gliner25", label: "gliner25", note: "encoder — no decode frames" },
                 {
                   slug: "qwen3-embedding",
                   label: "qwen3-embedding",
@@ -894,6 +900,7 @@ export function RuntimeClient({
               items={[
                 { slug: "gemma4-e4b", label: "gemma4" },
                 { slug: "gliner2", label: "gliner2", note: "fastest backend is batch-dependent" },
+                { slug: "gliner25", label: "gliner25", note: "Metal device path + native FP32 reference" },
                 { slug: "qwen3-embedding", label: "qwen3-embedding" },
                 { slug: "qwen3-vl", label: "qwen3-vl" },
               ]}
@@ -930,13 +937,14 @@ export function RuntimeClient({
                   label: "gemma4",
                   note: "shared-KV tail; eligible split retention",
                 },
+                { slug: "gliner2", label: "gliner2", note: "encoder — no persistent decode KV" },
+                { slug: "gliner25", label: "gliner25", note: "encoder — windowed long docs, no persistent KV" },
                 {
                   slug: "qwen3-embedding",
                   label: "qwen3-embedding",
                   note: "temporary attention tensors, no decode cache",
                 },
                 { slug: "qwen3-vl", label: "qwen3-vl", note: "image-token prefill burst" },
-                { slug: "gliner2", label: "gliner2", note: "encoder — no persistent decode KV" },
               ]}
             />
           </Scene>
@@ -964,12 +972,14 @@ export function RuntimeClient({
                   label: "gemma4",
                   note: "eligible device sampling; optional MTP",
                 },
-                { slug: "qwen3-vl", label: "qwen3-vl", note: "decode after vision prefill" },
+                { slug: "gliner2", label: "gliner2", note: "no sampler — span decoding" },
+                { slug: "gliner25", label: "gliner25", note: "no sampler — boundary decoding" },
                 {
                   slug: "qwen3-embedding",
                   label: "qwen3-embedding",
                   note: "no sampling — pooled hidden state",
                 },
+                { slug: "qwen3-vl", label: "qwen3-vl", note: "decode after vision prefill" },
               ]}
             />
           </Scene>

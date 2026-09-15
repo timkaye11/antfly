@@ -3,7 +3,7 @@
  "id": "qwen3-embedding",
  "family": "qwen3",
  "displayName": "Qwen3 Embedding 0.6B",
- "tagline": "A 28-layer causal Qwen3 stack produces a normalized 1,024-dimensional embedding: task formatting, trailing EOS and last-active-token pooling replace text generation.",
+ "tagline": "Turns text into a single 1,024-number vector for search and similarity: one causal pass of a Qwen3 decoder, then the last token's hidden state is pooled and normalized — no text is generated.",
  "stats": {
   "layers": 28,
   "hidden": 1024,
@@ -34,7 +34,7 @@
    "source": {
     "path": "zig/pkg/inference/src/pipelines/embedding.zig",
     "anchor": "fn tryEmbedTextResidentQwen3Graph(",
-    "line": 1505
+    "line": 1890
    },
    "repeat": {
     "count": 28
@@ -57,7 +57,7 @@
    "source": {
     "path": "zig/pkg/inference/src/pipelines/embedding.zig",
     "anchor": "pub const PoolingStrategy = enum {",
-    "line": 57
+    "line": 88
    },
    "method": "last-token"
   },
@@ -636,7 +636,7 @@
      "source": {
       "path": "zig/pkg/inference/src/pipelines/embedding.zig",
       "anchor": "pub const PoolingStrategy = enum {",
-      "line": 57
+      "line": 88
      },
      "kernelRouteIds": [],
      "kernels": [],
@@ -878,7 +878,7 @@
   }
  },
  "sources": {
-  "gitCommit": "26e332ed8c335d75eecd875548c6c36bcb47d183",
-  "generatedAt": "2026-09-09T21:41:47.835Z"
+  "gitCommit": "05dc2b75e20e0bfca168746f94639713568be9d0",
+  "generatedAt": "2026-09-15T04:23:49.128Z"
  }
 }

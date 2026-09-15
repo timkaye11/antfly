@@ -8,7 +8,6 @@ import Link from "next/link";
 import { CodeLink } from "@/components/code/code-link";
 import { QuantChip } from "@/components/primitives/chips";
 import { Divergence, Scene, ScrollyChapter } from "@/components/scrollytelling/scrolly";
-import { kernels } from "@/lib/data";
 import { L } from "@/lib/links";
 import type { ChaptersProps } from "../registry";
 import {
@@ -32,7 +31,7 @@ function KernelChip({ name }: { name: string }) {
   );
 }
 
-export function Gemma4LateChapters({ spec, routes }: ChaptersProps) {
+export function Gemma4LateChapters({ spec, routes, kernelCensus }: ChaptersProps) {
   const isE4b = spec.id === "gemma4-e4b";
   const q4kRoute = routes.find((r) => r.id === "q4_k/rows_2_8/none");
 
@@ -51,10 +50,10 @@ export function Gemma4LateChapters({ spec, routes }: ChaptersProps) {
           </p>
         }
       >
-        <Scene id="pipeline" graphic={<CompilerPipelineFigure />}>
+        <Scene id="pipeline" graphic={<CompilerPipelineFigure routedSourceFiles={kernelCensus.routedSourceFiles} />}>
           <p>
             One schedule table describes every route as <code>format × row_bucket × epilogue</code>{" "}
-            plus tuning knobs; one renderer expands each row through a shared MSL skeleton into a
+            plus tuning knobs; one renderer expands each row through a shared MSL skeleton into
             checked-in <code>.metal</code> files. The command{" "}
             <code>zig build quant-kernel-codegen -- --check</code> checks regeneration consistency.
             This describes the static code-generation path; the repository also has an optional
@@ -74,9 +73,9 @@ export function Gemma4LateChapters({ spec, routes }: ChaptersProps) {
             is not its launch configuration.
           </p>
         </Scene>
-        <Scene id="census" graphic={<KernelCensusFigure />}>
+        <Scene id="census" graphic={<KernelCensusFigure census={kernelCensus} />}>
           <p>
-            The generated inventory contains {kernels.inventory.length} extracted Metal entry
+            The generated inventory contains {kernelCensus.total} extracted Metal entry
             points. This source census includes generated and hand-written kernels across inference,
             training, and supporting operations; it is not the dispatch count for one model.
           </p>
@@ -126,7 +125,7 @@ export function Gemma4LateChapters({ spec, routes }: ChaptersProps) {
           <p>
             <strong>An opt-in greedy optimization:</strong> keep the original Q6_K head and create a{" "}
             <QuantChip format="q4_k" /> copy in a streaming load-time pass. The tuned{" "}
-            <KernelChip name="termite_q4_k_linear_1x_reduce_v2" /> MMV nominates candidates;
+            <KernelChip name="termite_q4_k_linear_1x_reduce_v2" /> MMV nominates candidates;{" "}
             <KernelChip name="termite_lm_head_q6_k_rescore_top8" /> rescores them with original
             weights. Full-logit and sampling callers retain Q6_K. The extra copy uses more resident
             memory, so <code>TERMITE_METAL_ENABLE_LM_HEAD_Q4_REPACK=q4_k</code> remains opt-in.
@@ -159,7 +158,7 @@ export function Gemma4LateChapters({ spec, routes }: ChaptersProps) {
       >
         <Scene id="onchip" graphic={<GpuSamplingFigure />}>
           <p>
-            Greedy selection reduces logits to an argmax. Temperature sampling can use
+            Greedy selection reduces logits to an argmax. Temperature sampling can use{" "}
             <KernelChip name="termite_sample_gumbel_partials" /> followed by a reduction that writes
             a token id to a device buffer. Bounded top-k/top-p routes have their own eligibility
             checks. The Q4_K head's top-8 Q6_K rescore is a separate greedy optimization, not a
@@ -208,7 +207,7 @@ export function Gemma4LateChapters({ spec, routes }: ChaptersProps) {
         title="MTP: a draft model that reads the main model's mind"
         intro={
           <p>
-            Gemma-4 ships an official speculative drafter — a 4-layer, hidden-256 stack that does
+            Gemma4 ships an official speculative drafter — a 4-layer, hidden-256 stack that does
             not build an independent target-style KV cache. It borrows the main model's.
           </p>
         }

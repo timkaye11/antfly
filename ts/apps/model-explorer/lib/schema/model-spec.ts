@@ -5,6 +5,7 @@ export const SCHEMA_VERSION = 1;
 
 export const ModelId = z.enum([
   "gliner2",
+  "gliner25",
   "gemma4-e2b",
   "gemma4-e4b",
   "qwen3-embedding",
@@ -45,7 +46,11 @@ export const OpNode = z.object({
   kernels: z.array(z.string()).default([]),
   envFlagNames: z.array(z.string()).default([]),
   backend: z.enum(["metal", "native", "both"]).default("metal"),
-  /** Ops folded into this node by fusion (renders the zipper border). */
+  /**
+   * Descriptive labels for work folded into this node (renders the zipper
+   * border). Free-form by design — entries like "c2c" or "swiglu" are prose,
+   * not validated op-vocabulary names; use `opKind` for the validated op.
+   */
   fusedOps: z.array(z.string()).default([]),
   /** Optional precomputed layout position (hero graphs). */
   position: z.object({ x: z.number(), y: z.number() }).optional(),

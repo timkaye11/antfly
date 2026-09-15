@@ -45,3 +45,7 @@ The local build used Node 25.2.1 and the workspace-managed pnpm 11.10.0. The wor
 The app is an educational companion with selected representative paths. It is not a live runtime trace, exhaustive model compatibility catalog, or new numerical/performance qualification. Separate Qwen3 text-generation/text-reranker walkthroughs and GLiNER classification/relation diagrams remain outside this tour; the compatibility link makes the broader serving policy available.
 
 No inference kernels or model weights changed, and no model workloads or hardware benchmarks were run. Historical performance values remain historical. For local review, run `pnpm preview` after building; for sharing, publish the generated `out/` directory with the static routing behavior documented in `README.md`. This branch already tracks the export directory, so its generated output is refreshed locally along with source changes.
+
+## Addendum — 14 September 2026
+
+The GLiNER2.5 (gliner_boundary) pages, the merged `gliner2pointfive` sources, and the subsequent review-fix rounds postdate this review; the counts and page totals above describe the 9 September state. The current snapshot is pinned to local merge commit `05dc2b75e20e0bfca168746f94639713568be9d0` and indexes 72 op enum members, 431 Metal kernels, 25 schedule routes, 1,475 textual environment-name references, and 154 snippets, exporting 23 pages. The GLiNER2.5 chapters were fact-checked against the gliner_boundary implementation in that merge, but are not covered by the 9 September accessibility and hydration sweep.

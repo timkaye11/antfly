@@ -28,6 +28,11 @@ export function validateFrame(raw: unknown, kernels: KernelInventoryEntry[]): Fr
   if (frame.source) {
     const result = verifySourceLink(frame.source);
     if (result?.healed) {
+      if (frame.source.line !== undefined) {
+        console.warn(
+          `  warn: healed anchor for frame ${frame.id}: ${frame.source.path}:${frame.source.line} -> :${result.line}`
+        );
+      }
       if (frame.source.endLine !== undefined && frame.source.line !== undefined)
         frame.source.endLine += result.line - frame.source.line;
       frame.source.line = result.line;

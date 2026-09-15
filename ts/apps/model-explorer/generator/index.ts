@@ -138,9 +138,14 @@ function check(files: Map<string, string>): number {
       continue;
     }
     const existing = readFileSync(target, "utf8");
-    const a = JSON.stringify(JSON.parse(existing));
-    const b = JSON.stringify(JSON.parse(content));
-    if (a !== b) {
+    let same: boolean;
+    try {
+      same = JSON.stringify(JSON.parse(existing)) === JSON.stringify(JSON.parse(content));
+    } catch {
+      // A corrupted on-disk file is drift, not a crash.
+      same = false;
+    }
+    if (!same) {
       console.error(`DRIFT    ${name}`);
       drift++;
     }
@@ -149,6 +154,7 @@ function check(files: Map<string, string>): number {
   const walk = (dir: string, prefix: string) => {
     if (!existsSync(dir)) return;
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name.startsWith(".")) continue; // .DS_Store and editor droppings
       const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
       if (entry.isDirectory()) walk(join(dir, entry.name), rel);
       else if (!files.has(rel)) {

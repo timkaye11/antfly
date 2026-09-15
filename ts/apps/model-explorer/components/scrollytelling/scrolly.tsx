@@ -53,22 +53,53 @@ export interface ScrollyChapterProps {
 }
 
 /**
+ * Which graphic copy is live: the pinned pane (desktop, motion OK) or the
+ * inline per-scene copy (mobile / reduced motion). `null` until mounted —
+ * both copies render then, matching the prerendered HTML, and CSS hides one.
+ * After mount only one copy stays mounted, so stateful figures don't run
+ * twice (hidden play-intervals, divergent state across the breakpoint).
+ */
+function usePaneGate(): boolean | null {
+  const [pane, setPane] = useState<boolean | null>(null);
+  useEffect(() => {
+    const wide = window.matchMedia("(min-width: 64rem)");
+    const reduced = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const update = () => setPane(wide.matches && !reduced.matches);
+    update();
+    wide.addEventListener("change", update);
+    reduced.addEventListener("change", update);
+    return () => {
+      wide.removeEventListener("change", update);
+      reduced.removeEventListener("change", update);
+    };
+  }, []);
+  return pane;
+}
+
+/**
  * Distill-style scrollytelling: prose scrolls on the left, the active
  * scene's graphic is pinned (CSS sticky) on the right and crossfades as
  * scenes activate. Degrades to a stacked layout on small screens and
  * under prefers-reduced-motion (see .scrolly-graphic in globals.css).
  */
 export function ScrollyChapter({ id, number, title, intro, children, className }: ScrollyChapterProps) {
-  const scenes = useMemo(
-    () =>
-      Children.toArray(children).filter(
-        (c): c is ReactElement<SceneProps> => isValidElement(c) && c.type === Scene,
-      ),
-    [children],
-  );
+  const scenes = useMemo(() => {
+    const all = Children.toArray(children);
+    const kept = all.filter(
+      (c): c is ReactElement<SceneProps> => isValidElement(c) && c.type === Scene,
+    );
+    if (process.env.NODE_ENV !== "production" && kept.length !== all.length) {
+      console.warn(
+        `ScrollyChapter "${id}": ${all.length - kept.length} non-Scene child(ren) dropped — wrap chapter content in <Scene>.`,
+      );
+    }
+    return kept;
+  }, [children, id]);
 
+  const pane = usePaneGate();
   const [activeScene, setActiveScene] = useState<string | null>(scenes[0]?.props.id ?? null);
   const proseRefs = useRef(new Map<string, HTMLElement>());
+  const intersecting = useRef(new Set<Element>());
 
   const registerProse = useCallback((sceneId: string, el: HTMLElement | null) => {
     if (el) proseRefs.current.set(sceneId, el);
@@ -78,14 +109,23 @@ export function ScrollyChapter({ id, number, title, intro, children, className }
   useEffect(() => {
     const observer = new IntersectionObserver(
       (entries) => {
-        // Pick the entry closest to the viewport's upper-middle band.
-        const visible = entries.filter((e) => e.isIntersecting);
-        if (visible.length === 0) return;
-        let best: IntersectionObserverEntry | null = null;
-        for (const entry of visible) {
-          if (!best || entry.boundingClientRect.top < best.boundingClientRect.top) best = entry;
+        // Track the full set of intersecting sections (entries only carry the
+        // *changed* ones), then pick the topmost by its live rect — snapshot
+        // rects go stale on fast scrolls.
+        for (const entry of entries) {
+          if (entry.isIntersecting) intersecting.current.add(entry.target);
+          else intersecting.current.delete(entry.target);
         }
-        const sceneId = best?.target.getAttribute("data-scene");
+        let best: Element | null = null;
+        let bestTop = Number.POSITIVE_INFINITY;
+        for (const el of intersecting.current) {
+          const top = el.getBoundingClientRect().top;
+          if (top < bestTop) {
+            bestTop = top;
+            best = el;
+          }
+        }
+        const sceneId = best?.getAttribute("data-scene");
         if (sceneId) setActiveScene(sceneId);
       },
       { rootMargin: "-25% 0px -55% 0px" },
@@ -131,7 +171,7 @@ export function ScrollyChapter({ id, number, title, intro, children, className }
                     {scene.props.children}
                   </div>
                   {/* Mobile / reduced-motion: graphic inline under its prose */}
-                  <div className="scrolly-inline mt-6">{scene.props.graphic}</div>
+                  {pane !== true && <div className="scrolly-inline mt-6">{scene.props.graphic}</div>}
                 </div>
               ))}
             </div>
@@ -150,7 +190,7 @@ export function ScrollyChapter({ id, number, title, intro, children, className }
                         i === activeIndex ? "opacity-100" : "pointer-events-none opacity-0",
                       )}
                     >
-                      {scene.props.graphic}
+                      {pane !== false && scene.props.graphic}
                     </div>
                   ))}
                 </div>
