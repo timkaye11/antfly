@@ -4635,7 +4635,7 @@ fn gemmaPreferenceRunFingerprint(
     defer if (projector_digest) |digest| allocator.free(digest);
 
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    preferenceHashField(&hasher, "antfly.gemma4.preference.run/v5");
+    preferenceHashField(&hasher, "antfly.gemma4.preference.run/v6");
     preferenceHashField(&hasher, @tagName(task));
     preferenceHashField(&hasher, provenance.base_model_sha256);
     preferenceHashField(&hasher, provenance.tokenizer_sha256);
@@ -4695,9 +4695,8 @@ fn gemmaPreferenceRunFingerprint(
             policy.dpo_ipo_tau != null or
             policy.dpo_initial_adapter_reference != null))
     {
-        // Keep the established base-equivalent unsmoothed sigmoid identity
-        // byte-for-byte stable. Any new objective or non-base initial
-        // reference extends the domain and cannot resume an old checkpoint.
+        // Bind the explicit objective and non-base initial reference within
+        // fingerprint v6. Pre-v6 checkpoints lack the environment contract.
         preferenceHashField(&hasher, "dpo-objective-and-reference/v1");
         preferenceHashOptionalField(&hasher, policy.dpo_loss_type);
         preferenceHashOptionalF32(&hasher, policy.dpo_label_smoothing);
@@ -4713,7 +4712,7 @@ fn gemmaPreferenceRunFingerprint(
     if (task == .grpo) {
         // These extensions intentionally invalidate checkpoints produced by
         // the former rank-enumeration sampler or fixed per-epoch prompt order
-        // without perturbing DPO v5 identities.
+        // within the v6 fingerprint domain.
         preferenceHashField(&hasher, "stochastic-grpo-sampling/v1");
         preferenceHashField(&hasher, "deterministic-grpo-epoch-prompt-order/v1");
         preferenceHashOptionalF32(&hasher, policy.grpo_sampling_temperature);
@@ -4744,9 +4743,7 @@ fn gemmaPreferenceRunFingerprint(
     preferenceHashOptionalF32(&hasher, policy.grpo_advantage_eps);
     preferenceHashU64(&hasher, @intFromBool(policy.grpo_normalize_advantage orelse false));
     preferenceHashOptionalField(&hasher, policy.reward_configuration_digest);
-    // Preserve the established default-seed v5 identity so in-flight seed-42
-    // checkpoints remain resumable. Non-default seeds extend the domain and
-    // cannot be confused with either default or one another.
+    // Seed 42 is the v6 default; non-default seeds extend the domain.
     if (policy.seed != 42) {
         preferenceHashField(&hasher, "typed-training-seed/v1");
         preferenceHashU64(&hasher, policy.seed);
@@ -4890,6 +4887,10 @@ fn loadPreferenceCheckpointState(
     const state = parsed.value;
     const schema_v1 = std.mem.eql(u8, state.schema_version, preference_checkpoint_state_schema_v1);
     const schema_v2 = std.mem.eql(u8, state.schema_version, preference_checkpoint_state_schema_v2);
+    if (!std.ascii.eqlIgnoreCase(state.run_fingerprint_sha256, expected_fingerprint)) {
+        std.debug.print("preference resume identity mismatch (expected fingerprint v6): model, data, renderer, optimizer, evaluation acceptance, and numerical environment must match; pre-v6 checkpoints require a new run\n", .{});
+        return error.PreferenceCheckpointFingerprintMismatch;
+    }
     if ((!schema_v1 and !schema_v2) or
         (schema_v1 and state.examples_into_epoch != 0) or
         !std.mem.eql(u8, state.task, @tagName(task)) or
@@ -10910,7 +10911,7 @@ fn runOptimizerBackedGemmaGrpo(
 
             var ga = try grpo.scoreGroup(allocator, rewarder, completions.items);
             defer ga.deinit();
-            grpo.computeAdvantages(&ga, completions.items, cfg);
+            try grpo.computeAdvantages(&ga, completions.items, cfg);
             for (ga.advantages) |advantage| {
                 if (advantage != 0.0) saw_nonzero_reward_advantage = true;
             }
@@ -11847,7 +11848,7 @@ fn evaluateGemmaGrpoHeldout(
         defer advantages.deinit();
         truncated_completions += countTruncatedGrpoCompletions(completions.items);
         if (!grpo.rewardsHaveVariation(advantages.rewards)) zero_reward_std_groups += 1;
-        grpo.computeAdvantages(&advantages, completions.items, cfg);
+        try grpo.computeAdvantages(&advantages, completions.items, cfg);
         if (advantages.rewards.len == 0) return error.EmptyCompletionGroup;
         total_top_rank_reward += advantages.rewards[0];
         var group_has_positive_reward = false;
@@ -12197,7 +12198,7 @@ fn runOptimizerBackedQwen2Grpo(
 
             var ga = try grpo.scoreGroup(allocator, rewarder, completions.items);
             defer ga.deinit();
-            grpo.computeAdvantages(&ga, completions.items, cfg);
+            try grpo.computeAdvantages(&ga, completions.items, cfg);
 
             var loss_result = try grpo.grpoLoss(allocator, completions.items, flat_new_logps.items, ga.advantages, cfg);
             defer loss_result.deinit();
@@ -12267,6 +12268,8 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
     max_completion_tokens: usize,
     reward_mode: TextRewardMode,
 ) !void {
+    const sampling = try resolveGrpoSamplingConfig(recipe.grpo);
+    if (sampling.temperature != 1.0) return error.Gemma4MultimodalGrpoTemperatureNotSupported;
     if (recipe.grpo.mask_truncated_completions orelse false) {
         return error.Gemma4MultimodalGrpoTruncationMaskNotSupported;
     }
@@ -12432,7 +12435,7 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
 
             var ga = try grpo.scoreGroup(allocator, rewarder, completions.items);
             defer ga.deinit();
-            grpo.computeAdvantages(&ga, completions.items, cfg);
+            try grpo.computeAdvantages(&ga, completions.items, cfg);
             for (ga.advantages) |advantage| {
                 if (advantage != 0.0) saw_nonzero_reward_advantage = true;
             }
@@ -13648,7 +13651,7 @@ fn runDirectGrpo(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, repor
         };
         defer ga.deinit();
         @memset(ga.advantages, 0);
-        grpo.computeAdvantages(&ga, batch.completions, cfg);
+        try grpo.computeAdvantages(&ga, batch.completions, cfg);
         var result = try grpo.grpoLoss(allocator, batch.completions, batch.new_logps, ga.advantages, cfg);
         defer result.deinit();
         try writeJsonFile(allocator, io, report_path, GrpoReport{

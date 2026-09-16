@@ -100,13 +100,32 @@ const SlotBinding = struct {
     physical_base_tokens: usize = 0,
     written_tokens: usize = 0,
     position_offset: usize = 0,
+    pending_clone: ?*anyopaque = null,
+    pending_clone_tokens: usize = 0,
+
+    fn clearPendingClone(self: *SlotBinding) void {
+        if (comptime build_options.enable_metal) {
+            if (self.pending_clone) |receipt| metal_runtime.termite_metal_frame_receipt_release(receipt);
+        }
+        self.pending_clone = null;
+        self.pending_clone_tokens = 0;
+    }
+
+    fn readableTokens(self: SlotBinding) usize {
+        if (comptime !build_options.enable_metal) return self.written_tokens;
+        if (self.pending_clone) |receipt| {
+            if (metal_runtime.termite_metal_frame_receipt_status(receipt) == 1)
+                return @max(self.written_tokens, self.pending_clone_tokens);
+        }
+        return self.written_tokens;
+    }
 
     fn ownsSlot(self: SlotBinding) bool {
         return self.sequence_owned;
     }
 
     fn covers(self: SlotBinding, token_count: usize) bool {
-        return self.written_tokens >= token_count;
+        return self.readableTokens() >= token_count;
     }
 
     fn coversBeforePendingSuffix(self: SlotBinding, token_count: usize, pending_suffix_token_count: usize) bool {
@@ -115,14 +134,16 @@ const SlotBinding = struct {
     }
 
     fn commitWrite(self: *SlotBinding, total_token_count: usize, position_offset: usize) bool {
-        if (total_token_count < self.written_tokens or position_offset < self.position_offset) return false;
+        if (total_token_count < self.readableTokens() or position_offset < self.position_offset) return false;
+        self.clearPendingClone();
         self.written_tokens = total_token_count;
         self.position_offset = position_offset;
         return true;
     }
 
     fn truncateTo(self: *SlotBinding, retained_token_count: usize) void {
-        self.written_tokens = @min(self.written_tokens, retained_token_count);
+        self.written_tokens = @min(self.readableTokens(), retained_token_count);
+        self.clearPendingClone();
     }
 };
 
@@ -328,7 +349,13 @@ pub const MetalKvStorage = struct {
         key_row_bytes: usize,
         v_row_stride: usize,
     ) !void {
-        const current = self.slot_buffer_capacity_tokens[slot];
+        // A canceled frame can roll back a growth reservation. Read the
+        // actual backing capacities rather than trusting the cached target.
+        const info = try self.slotInfo(slot);
+        const value_element_bytes: usize = if (self.format == .f16) @sizeOf(u16) else @sizeOf(f32);
+        if (key_row_bytes == 0 or v_row_stride == 0) return error.InvalidKvShape;
+        const current = @min(info.encoded_key_capacity / key_row_bytes, info.v_capacity / (v_row_stride * value_element_bytes));
+        self.slot_buffer_capacity_tokens[slot] = current;
         if (required_tokens <= current) return;
         const target = if (ring_page_count > 0 or envFlagEnabled("TERMITE_METAL_DISABLE_GEOMETRIC_KV_GROWTH"))
             required_tokens
@@ -372,6 +399,8 @@ pub const MetalKvStorage = struct {
             if (key_count == 0) return;
             for (keys[0..key_count]) |key| {
                 if (self.slot_map.fetchRemove(key)) |removed| {
+                    var binding = removed.value;
+                    binding.clearPendingClone();
                     if (removed.value.ownsSlot()) self.reclaimSlot(removed.value.slot);
                 }
             }
@@ -801,7 +830,15 @@ pub const MetalKvStorage = struct {
                     break;
                 }
             }
-            destination_binding.written_tokens = clone.total_token_count;
+            destination_binding.written_tokens = @min(destination_binding.readableTokens(), aligned_prefix_tokens);
+            destination_binding.clearPendingClone();
+            if (metal_runtime.hasActiveFrame(self.runtime)) {
+                destination_binding.pending_clone = metal_runtime.termite_metal_decode_runtime_retain_active_frame_receipt(self.runtime) orelse return error.OutOfMemory;
+                destination_binding.pending_clone_tokens = clone.total_token_count;
+            } else {
+                // The non-frame copy path waits before returning.
+                destination_binding.written_tokens = clone.total_token_count;
+            }
             destination_binding.position_offset = source_binding.position_offset;
         }
     }
@@ -825,6 +862,8 @@ pub const MetalKvStorage = struct {
             _ = metal_runtime.termite_metal_decode_runtime_release_paged_kv_slot(self.runtime, slot);
             leased.* = false;
         }
+        var bindings = self.slot_map.valueIterator();
+        while (bindings.next()) |binding| binding.clearPendingClone();
         self.slot_map.deinit(allocator);
         self.global_layer_slots.deinit(allocator);
         self.cyclic_page_table_cache.deinit(allocator);
@@ -870,7 +909,7 @@ pub const MetalKvStorage = struct {
         const slot = binding.slot;
         if (binding.ring_page_count > 0) return error.RingKvRequiresPagedAttention;
         if (!binding.logical_contiguous) return error.DeviceReadFallback;
-        if (binding.written_tokens < gather.token_count) return error.DeviceReadFallback;
+        if (!binding.covers(gather.token_count)) return error.DeviceReadFallback;
         const info = try self.slotInfo(slot);
 
         const k_handle = info.encoded_key_handle orelse return error.DeviceReadFallback;
@@ -958,7 +997,7 @@ pub const MetalKvStorage = struct {
         const slot = binding.slot;
         if (binding.ring_page_count > 0) return error.RingKvRequiresPagedAttention;
         if (!binding.logical_contiguous) return error.DeviceReadFallback;
-        if (binding.written_tokens < gather.token_count) return error.DeviceReadFallback;
+        if (!binding.covers(gather.token_count)) return error.DeviceReadFallback;
         const info = try self.slotInfo(slot);
         if (info.key_row_bytes != token_width * @sizeOf(f32)) return error.DeviceReadFallback;
         if (info.v_row_stride != token_width) return error.DeviceReadFallback;
@@ -1513,12 +1552,29 @@ test "Metal paged KV clone uses materialized Gemma4 E2B layer geometry" {
     }
     storage.releaseRetainedBlocks(retained.items);
 
+    // An encoded then canceled copy must not publish readable coverage.
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_begin_frame(runtime));
+    try storage.cloneSequenceTailDevice(source_id, destination_ids[0], tail_tokens);
+    const canceled_key = SlotKey{ .sequence_id = destination_ids[0], .layer_index = 0 };
+    try std.testing.expect(!metal_storage.slot_map.get(canceled_key).?.covers(token_count));
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_cancel_frame(runtime));
+    try std.testing.expect(!metal_storage.slot_map.get(canceled_key).?.covers(token_count));
+    // A later successful frame cannot make the canceled receipt valid.
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_begin_frame(runtime));
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_submit_frame(runtime));
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_wait_frame(runtime));
+    try std.testing.expect(!metal_storage.slot_map.get(canceled_key).?.covers(token_count));
+
     try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_begin_frame(runtime));
     for (destination_ids) |destination_id| {
         try storage.cloneSequenceTailDevice(source_id, destination_id, tail_tokens);
     }
     try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_submit_frame(runtime));
     try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_wait_frame(runtime));
+
+    for (destination_ids) |destination_id| {
+        try std.testing.expect(metal_storage.slot_map.get(.{ .sequence_id = destination_id, .layer_index = 0 }).?.covers(token_count));
+    }
 
     // The production fan-out source is itself a non-contiguous candidate
     // sequence, not the canonical contiguous prompt. Exercise that second-hop

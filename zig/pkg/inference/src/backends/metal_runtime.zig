@@ -12453,6 +12453,7 @@ pub const RawRuntimeMemoryStats = extern struct {
     florence_window_sdpa_dispatches: u64 = 0,
     qwen3vl_vision_flash_q32_dispatches: u64 = 0,
     dense_causal_hd128_dispatches: u64 = 0,
+    dense_causal_gqa_pair_dispatches: u64 = 0,
     q6_k_linear_reduce: u64 = 0,
     q6_k_linear_reduce_rows_1: u64 = 0,
     q6_k_linear_reduce_rows_2_8: u64 = 0,
@@ -18183,6 +18184,9 @@ pub extern fn termite_metal_decode_runtime_lm_head_q4_q6_refine_ready(runtime: ?
 pub extern fn termite_metal_decode_runtime_reserve(runtime: ?*RawMetalDecodeRuntime, scratch_bytes: usize, token_bytes: usize) c_int;
 pub extern fn termite_metal_decode_runtime_begin_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_begin_prepared_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_retain_active_frame_receipt(runtime: ?*RawMetalDecodeRuntime) ?*anyopaque;
+pub extern fn termite_metal_frame_receipt_release(receipt: ?*anyopaque) void;
+pub extern fn termite_metal_frame_receipt_status(receipt: ?*const anyopaque) c_int;
 pub extern fn termite_metal_decode_runtime_submit_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_cancel_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_wait_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
@@ -47437,7 +47441,33 @@ test "gemma4 Metal AdamW preserves small variance contributions in single and ba
 }
 
 test "gemma4 dense attention simdgroup honors custom score scale" {
+    try testDenseAttentionScoreScale(false);
+}
+
+test "gemma4 paired GQA dense attention honors custom score scale" {
+    try testDenseAttentionScoreScale(true);
+}
+
+fn testDenseAttentionScoreScale(pair: bool) !void {
     if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    const env_names = [_][:0]const u8{
+        "TERMITE_METAL_ENABLE_DENSE_CAUSAL_SG_ATTENTION_GQA_PAIR",
+        "TERMITE_METAL_DISABLE_DENSE_CAUSAL_SG_ATTENTION_GQA_PAIR",
+    };
+    var saved: [2]?[:0]u8 = @splat(null);
+    for (env_names, 0..) |name, i| if (std.c.getenv(name)) |value| {
+        saved[i] = try std.testing.allocator.dupeZ(u8, std.mem.span(value));
+    };
+    defer for (env_names, saved) |name, value| {
+        if (value) |v| {
+            _ = setenv(name, v.ptr, 1);
+            std.testing.allocator.free(v);
+        } else {
+            _ = unsetenv(name);
+        }
+    };
+    try std.testing.expectEqual(@as(c_int, 0), setenv(env_names[0], if (pair) "1" else "0", 1));
+    try std.testing.expectEqual(@as(c_int, 0), unsetenv(env_names[1]));
     const provider_mod = @import("metal_native_provider.zig");
     var provider = try provider_mod.MetalNativeProvider.create();
     defer provider.deinitOwned();
@@ -47488,4 +47518,5 @@ test "gemma4 dense attention simdgroup honors custom score scale" {
             for (actual[row * 2 * hd ..][0 .. 2 * hd]) |value| try std.testing.expectApproxEqAbs(expected, value, 0.002);
         }
     }
+    try std.testing.expectEqual(@as(u64, if (pair) 2 else 0), runtimeMemorySnapshot(runtime).dense_causal_gqa_pair_dispatches);
 }

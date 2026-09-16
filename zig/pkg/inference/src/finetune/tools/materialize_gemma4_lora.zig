@@ -57,18 +57,6 @@ pub fn Command(comptime assets: type) type {
             try printJson(init, summary);
         }
 
-        fn validateEvalAdmission(eval_program: ?[]const u8) !void {
-            if (eval_program != null) return error.MaterializeEvalRequiresStagedEvaluator;
-        }
-
-        test "gemma4 materialize eval fails closed before publication" {
-            try validateEvalAdmission(null);
-            try std.testing.expectError(
-                error.MaterializeEvalRequiresStagedEvaluator,
-                validateEvalAdmission("eval-program"),
-            );
-        }
-
         fn printJson(init: std.process.Init, value: anytype) !void {
             const stdout = std.Io.File.stdout();
             var buf: [4096]u8 = undefined;
@@ -91,4 +79,16 @@ pub fn Command(comptime assets: type) type {
             return error.InvalidArguments;
         }
     };
+}
+
+fn validateEvalAdmission(eval_program: ?[]const u8) !void {
+    if (eval_program != null) return error.MaterializeEvalRequiresStagedEvaluator;
+}
+
+test "gemma4 materialize eval fails closed before publication" {
+    try validateEvalAdmission(null);
+    try std.testing.expectError(
+        error.MaterializeEvalRequiresStagedEvaluator,
+        validateEvalAdmission("eval-program"),
+    );
 }

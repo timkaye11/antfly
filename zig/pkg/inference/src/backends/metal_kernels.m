@@ -962,6 +962,31 @@ typedef struct termite_metal_completion_cache_list {
     size_t bytes;
 } termite_metal_completion_cache_list;
 
+// Small completion receipts retain no Metal buffers. KV metadata can refer to
+// an encoded copy without treating a canceled or failed frame as readable.
+typedef struct termite_metal_frame_receipt {
+    _Atomic uint32_t references;
+    _Atomic int status; // 0 pending, 1 successfully waited, -1 canceled/failed
+} termite_metal_frame_receipt;
+
+void termite_metal_frame_receipt_release(void *handle) {
+    termite_metal_frame_receipt *receipt = handle;
+    if (receipt != NULL && atomic_fetch_sub_explicit(&receipt->references, 1, memory_order_acq_rel) == 1) free(receipt);
+}
+
+int termite_metal_frame_receipt_status(const void *handle) {
+    const termite_metal_frame_receipt *receipt = handle;
+    return receipt == NULL ? -1 : atomic_load_explicit(&receipt->status, memory_order_acquire);
+}
+
+static void termite_metal_frame_receipt_finish(termite_metal_frame_receipt **slot, int status) {
+    termite_metal_frame_receipt *receipt = *slot;
+    if (receipt == NULL) return;
+    atomic_store_explicit(&receipt->status, status, memory_order_release);
+    *slot = NULL;
+    termite_metal_frame_receipt_release(receipt);
+}
+
 typedef struct termite_metal_decode_runtime {
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
@@ -1696,6 +1721,15 @@ typedef struct termite_metal_decode_runtime {
     id<MTLBuffer> attention_span_v_buffer;
     id<MTLBuffer> attention_span_encoded_key_buffers[TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY];
     id<MTLBuffer> attention_span_v_buffers[TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY];
+    // First pre-growth backing per slot in the active frame. Cancellation
+    // discards encoded preservation copies, so restore the original buffers.
+    id<MTLBuffer> active_kv_growth_keys[TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY];
+    id<MTLBuffer> active_kv_growth_values[TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY];
+    size_t active_kv_growth_key_capacities[TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY];
+    size_t active_kv_growth_value_capacities[TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY];
+    bool active_kv_growth_saved[TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY];
+    size_t active_kv_growth_slots[TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY];
+    size_t active_kv_growth_count;
     size_t token_embedding_table_bytes;
     size_t position_embedding_table_bytes;
     size_t generic_embedding_table_bytes;
@@ -1772,6 +1806,8 @@ typedef struct termite_metal_decode_runtime {
     // can await it; `submitted_frame_cb` holds the committed CB during
     // that window.
     id<MTLCommandBuffer> active_frame_cb;
+    termite_metal_frame_receipt *active_frame_receipt;
+    termite_metal_frame_receipt *submitted_frame_receipt;
     id<MTLCommandBuffer> submitted_frame_cb;
     uint64_t frame_begin_count;
     uint64_t frame_submit_count;
@@ -2066,6 +2102,7 @@ typedef struct termite_metal_decode_runtime {
     uint64_t florence_window_sdpa_dispatches;
     uint64_t qwen3vl_vision_flash_q32_dispatches;
     uint64_t dense_causal_hd128_dispatches;
+    uint64_t dense_causal_gqa_pair_dispatches;
     uint64_t q6_k_linear_reduce;
     uint64_t q6_k_linear_reduce_rows_1;
     uint64_t q6_k_linear_reduce_rows_2_8;
@@ -2744,6 +2781,7 @@ typedef struct termite_metal_decode_runtime_memory_stats {
     uint64_t florence_window_sdpa_dispatches;
     uint64_t qwen3vl_vision_flash_q32_dispatches;
     uint64_t dense_causal_hd128_dispatches;
+    uint64_t dense_causal_gqa_pair_dispatches;
     uint64_t q6_k_linear_reduce;
     uint64_t q6_k_linear_reduce_rows_1;
     uint64_t q6_k_linear_reduce_rows_2_8;
@@ -11999,7 +12037,7 @@ static NSString *termite_metal_shader_source(void) {
            "kernel void termite_attention_f32_dense_causal_sg_q16_f16kv_gqa2(device const float *q [[buffer(0)]], device const half *k [[buffer(1)]], device const half *v [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_attention_f32_params &p [[buffer(4)]], threadgroup char *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
            "    const uint hd = p.head_dim; const uint q0 = tg.x * 16u; const uint kv_h = tg.y;\n"
            "    if (q0 >= p.q_len || kv_h >= p.num_kv_heads || p.num_heads != 2u * p.num_kv_heads || hd % 32u != 0u || hd > 128u || p.has_bias != 0u || p.has_mask != 0u) return;\n"
-           "    const float scale = rsqrt(float(hd)); const uint kv_head_base = kv_h * hd; const uint h0 = kv_h * 2u;\n"
+           "    const float requested_scale = as_type<float>(p.reserved0); const float scale = requested_scale != 0.0f ? requested_scale : rsqrt(float(hd)); const uint kv_head_base = kv_h * hd; const uint h0 = kv_h * 2u;\n"
            "    const uint q_stride = p.num_heads * hd; const uint kv_stride = p.num_kv_heads * hd;\n"
            "    threadgroup half *sq = (threadgroup half *)shmem;\n"
            "    threadgroup half *skv = sq + 32u * hd;\n"
@@ -26908,6 +26946,8 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
             (void)termite_metal_decode_runtime_wait_frame(runtime);
         }
     }
+    termite_metal_frame_receipt_finish(&runtime->active_frame_receipt, -1);
+    termite_metal_frame_receipt_finish(&runtime->submitted_frame_receipt, -1);
     // Keep the process-wide row-staging guard active until this runtime has
     // no submitted or active work left. Releasing it earlier would let a peer
     // runtime re-enable staged mmap rows while commands from this owner are
@@ -30553,6 +30593,7 @@ int termite_metal_decode_runtime_apply_attention_f32_device(
             const BOOL use_hd128 = use_f16kv && !use_gqa2 && head_dim == 128u &&
                 runtime->attention_f32_dense_sg_q16_f16kv_hd128_pipeline != nil;
             if (use_hd128) runtime->dense_causal_hd128_dispatches += 1;
+            if (use_gqa2) runtime->dense_causal_gqa_pair_dispatches += 1;
             [encoder setComputePipelineState:(use_gqa2
                 ? runtime->attention_f32_dense_sg_q16_f16kv_gqa2_pipeline
                 : (use_f16kv
@@ -32409,6 +32450,28 @@ static int termite_metal_decode_runtime_copy_grown_buffer(
     return 0;
 }
 
+static void termite_metal_finish_active_kv_growth(termite_metal_decode_runtime *runtime, bool rollback) {
+    for (size_t i = 0; i < runtime->active_kv_growth_count; ++i) {
+        const size_t slot = runtime->active_kv_growth_slots[i];
+        if (rollback) {
+            runtime->attention_span_encoded_key_buffers[slot] = runtime->active_kv_growth_keys[slot];
+            runtime->attention_span_v_buffers[slot] = runtime->active_kv_growth_values[slot];
+            runtime->attention_span_encoded_key_capacities[slot] = runtime->active_kv_growth_key_capacities[slot];
+            runtime->attention_span_v_capacities[slot] = runtime->active_kv_growth_value_capacities[slot];
+            if (slot == 0) {
+                runtime->attention_span_encoded_key_buffer = runtime->attention_span_encoded_key_buffers[0];
+                runtime->attention_span_v_buffer = runtime->attention_span_v_buffers[0];
+                runtime->attention_span_encoded_key_capacity = runtime->attention_span_encoded_key_capacities[0];
+                runtime->attention_span_v_capacity = runtime->attention_span_v_capacities[0];
+            }
+        }
+        runtime->active_kv_growth_keys[slot] = nil;
+        runtime->active_kv_growth_values[slot] = nil;
+        runtime->active_kv_growth_saved[slot] = false;
+    }
+    runtime->active_kv_growth_count = 0;
+}
+
 static int termite_metal_decode_runtime_ensure_attention_span_slot_buffers(
     termite_metal_decode_runtime *runtime,
     size_t slot,
@@ -32417,6 +32480,17 @@ static int termite_metal_decode_runtime_ensure_attention_span_slot_buffers(
 ) {
     if (runtime == NULL || slot >= TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY) return -1;
     if (encoded_bytes == 0 || v_bytes == 0) return -2;
+    const bool grows = encoded_bytes > runtime->attention_span_encoded_key_capacities[slot] ||
+        v_bytes > runtime->attention_span_v_capacities[slot] ||
+        runtime->attention_span_encoded_key_buffers[slot] == nil || runtime->attention_span_v_buffers[slot] == nil;
+    if (grows && runtime->active_frame_cb != nil && !runtime->active_kv_growth_saved[slot]) {
+        runtime->active_kv_growth_keys[slot] = runtime->attention_span_encoded_key_buffers[slot];
+        runtime->active_kv_growth_values[slot] = runtime->attention_span_v_buffers[slot];
+        runtime->active_kv_growth_key_capacities[slot] = runtime->attention_span_encoded_key_capacities[slot];
+        runtime->active_kv_growth_value_capacities[slot] = runtime->attention_span_v_capacities[slot];
+        runtime->active_kv_growth_saved[slot] = true;
+        runtime->active_kv_growth_slots[runtime->active_kv_growth_count++] = slot;
+    }
     @autoreleasepool {
         if (encoded_bytes > runtime->attention_span_encoded_key_capacities[slot] ||
             runtime->attention_span_encoded_key_buffers[slot] == nil)
@@ -62549,6 +62623,19 @@ int termite_metal_decode_runtime_retain_active_frame_buffer(termite_metal_decode
     return termite_metal_decode_runtime_retain_frame_resource(runtime, buffer);
 }
 
+void *termite_metal_decode_runtime_retain_active_frame_receipt(termite_metal_decode_runtime *runtime) {
+    if (runtime == NULL || runtime->active_frame_cb == nil) return NULL;
+    if (runtime->active_frame_receipt == NULL) {
+        termite_metal_frame_receipt *receipt = calloc(1, sizeof(*receipt));
+        if (receipt == NULL) return NULL;
+        atomic_init(&receipt->references, 1); // runtime owns until wait/cancel
+        atomic_init(&receipt->status, 0);
+        runtime->active_frame_receipt = receipt;
+    }
+    atomic_fetch_add_explicit(&runtime->active_frame_receipt->references, 1, memory_order_relaxed);
+    return runtime->active_frame_receipt;
+}
+
 static int termite_metal_decode_runtime_begin_frame_internal(
     termite_metal_decode_runtime *runtime,
     bool prepared_request
@@ -62700,6 +62787,9 @@ int termite_metal_decode_runtime_submit_frame(termite_metal_decode_runtime *runt
     runtime->active_frame_encode_wait_nanos = 0;
     [cb commit];
     runtime->frame_submit_count = termite_metal_u64_saturating_add(runtime->frame_submit_count, 1);
+    termite_metal_finish_active_kv_growth(runtime, false);
+    runtime->submitted_frame_receipt = runtime->active_frame_receipt;
+    runtime->active_frame_receipt = NULL;
     runtime->submitted_frame_cb = cb;
     runtime->active_frame_cb = nil;
     runtime->submitted_frame_decode_gqa_split_scratch_slot =
@@ -62850,6 +62940,8 @@ int termite_metal_decode_runtime_cancel_frame(termite_metal_decode_runtime *runt
         }
         runtime->completion_cache_active_generation = 0;
     }
+    termite_metal_finish_active_kv_growth(runtime, true);
+    termite_metal_frame_receipt_finish(&runtime->active_frame_receipt, -1);
     runtime->active_frame_cb = nil;
     runtime->active_frame_encode_started_nanos = 0;
     runtime->active_frame_encode_wait_nanos = 0;
@@ -62900,6 +62992,7 @@ int termite_metal_decode_runtime_wait_frame(termite_metal_decode_runtime *runtim
         }
     }
     int status_code = (cb.status == MTLCommandBufferStatusCompleted) ? 0 : -3;
+    termite_metal_frame_receipt_finish(&runtime->submitted_frame_receipt, status_code == 0 ? 1 : -1);
     runtime->last_frame_gpu_nanos = status_code == 0 ? termite_metal_command_buffer_gpu_elapsed_nanos(cb) : 0;
     runtime->frame_gpu_nanos = termite_metal_u64_saturating_add(
         runtime->frame_gpu_nanos,
@@ -63643,6 +63736,7 @@ int termite_metal_decode_runtime_memory_snapshot(
     snapshot->florence_window_sdpa_dispatches = runtime->florence_window_sdpa_dispatches;
     snapshot->qwen3vl_vision_flash_q32_dispatches = runtime->qwen3vl_vision_flash_q32_dispatches;
     snapshot->dense_causal_hd128_dispatches = runtime->dense_causal_hd128_dispatches;
+    snapshot->dense_causal_gqa_pair_dispatches = runtime->dense_causal_gqa_pair_dispatches;
     snapshot->q6_k_linear_reduce = runtime->q6_k_linear_reduce;
     snapshot->q6_k_linear_reduce_rows_1 = runtime->q6_k_linear_reduce_rows_1;
     snapshot->q6_k_linear_reduce_rows_2_8 = runtime->q6_k_linear_reduce_rows_2_8;

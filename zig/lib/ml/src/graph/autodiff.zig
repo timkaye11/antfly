@@ -613,6 +613,18 @@ fn applyVjp(
                             try accumulate(b, adjoints, ins[1], grad_b);
                         }
                     }
+                } else {
+                    if (lhs_ax > 1 or rhs_ax > 1) return error.NoVjpRule;
+                    if (depends_on_wrt[ins[0]]) {
+                        const raw = try dotGeneral2DDirect(b, adj_for_dot, ins[1], 1, 1 - rhs_ax);
+                        const grad_a = if (lhs_ax == 0) try b.transpose(raw, &.{ 1, 0 }) else raw;
+                        try accumulate(b, adjoints, ins[0], grad_a);
+                    }
+                    if (depends_on_wrt[ins[1]]) {
+                        const raw = try dotGeneral2DDirect(b, ins[0], adj_for_dot, 1 - lhs_ax, 0);
+                        const grad_b = if (rhs_ax == 1) try b.transpose(raw, &.{ 1, 0 }) else raw;
+                        try accumulate(b, adjoints, ins[1], grad_b);
+                    }
                 }
             } else if (attrs.num_contracting == 1 and attrs.num_batch == 1 and a_shape.rank() == 3 and b_shape.rank() == 3 and
                 attrs.lhs_batch[0] == 0 and attrs.rhs_batch[0] == 0)
@@ -625,6 +637,7 @@ fn applyVjp(
                 // an attention-style batched-dot VJP.
                 const lc = attrs.lhs_contracting[0];
                 const rc = attrs.rhs_contracting[0];
+                if ((lc != 1 and lc != 2) or (rc != 1 and rc != 2)) return error.NoVjpRule;
                 const lb = attrs.lhs_batch[0];
                 const rb = attrs.rhs_batch[0];
 
@@ -691,7 +704,11 @@ fn applyVjp(
                             try batchedDotGeneralDirect(b, adj_for_dot, ins[0], 2, 2, a_free);
                         try accumulate(b, adjoints, ins[1], grad_b);
                     }
-                }
+                } else return error.NoVjpRule;
+            } else {
+                // An unsupported contraction must never look like a zero
+                // gradient for a requested trainable parameter.
+                return error.NoVjpRule;
             }
         },
 

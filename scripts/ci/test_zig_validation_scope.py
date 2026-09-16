@@ -69,6 +69,52 @@ class ZigValidationScopeTests(unittest.TestCase):
             {path.decode() for path in selected.split(b"\0") if path}, inputs
         )
 
+    def test_gemma_training_filter_covers_runtime_and_excludes_docs(self):
+        workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
+        command = workflow.split("if git diff --quiet", 2)[2].split(
+            "\n          then", 1
+        )[0]
+        pathspecs = shlex.split(command.split(" -- ", 1)[1].replace("\\\n", " "))
+        inputs = {
+            "zig/lib/platform/src/root.zig",
+            "zig/lib/jinja/src/jinja.zig",
+            "zig/pkg/inference/build/runtime.zig",
+            "zig/pkg/inference/build/tests.zig",
+            "zig/build.zig.zon",
+            "zig/pkg/inference/build.zig.zon",
+            "zig/pkg/inference/src/ops/metal/new_kernel.zig",
+            "zig/pkg/inference/src/backends/decoder_gated_runtime.zig",
+            "zig/pkg/inference/src/backends/decoder_gemma_serving_test.zig",
+            "scripts/ci/audit_gemma4_test_selection.py",
+        }
+        unrelated = {
+            "README.md",
+            "zig/pkg/inference/docs/finetuning/GEMMA4.md",
+            "zig/lib/ml/README.md",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run(["git", "init", "-q", temporary], check=True)
+            for name in inputs | unrelated:
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            selected = subprocess.check_output(
+                ["git", "ls-files", "-z", "--", *pathspecs], cwd=root
+            )
+        self.assertEqual(
+            {path.decode() for path in selected.split(b"\0") if path}, inputs
+        )
+
+    def test_merge_queue_uses_batch_base_before_conservative_fallback(self):
+        workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
+        self.assertIn('base="${{ github.event.merge_group.base_sha }}"', workflow)
+        self.assertLess(
+            workflow.index('base="${{ github.event.merge_group.base_sha }}"'),
+            workflow.index("if git diff --quiet"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

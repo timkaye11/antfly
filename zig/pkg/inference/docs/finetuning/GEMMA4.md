@@ -16,13 +16,13 @@
 > attestation, full E4B memory/performance and quality qualification,
 > repeated performance, and GGUF task-parity gates remain open.
 
-The September 15 review remediation changes training rendering, F16 backward,
+The September 15–16 review remediation changes training rendering, F16 backward,
 attention score scaling, reference snapshots, and resume identities. Earlier
 quality and performance results do not qualify these changes. See
 [the remediation ledger](GEMMA4_REVIEW_REMEDIATION.md) for current checks and
 remaining release gates.
 
-The fresh E4B diagnostic improves mean reward from 0.236328125 to 0.23828125
+The September 15 E4B diagnostic improves mean reward from 0.236328125 to 0.23828125
 and top-ranked reward from 0.28125 to 0.40625, with KL loss 3.82473e-5. Its
 trained adapter is published after all configured acceptance checks pass.
 The capture has no sampled swap growth, but the host already has swap in use;
@@ -81,6 +81,28 @@ experimental pending memory, cross-framework parity, and task-quality
 campaigns. Direct GGUF plus incremental-KV GRPO is rejected after exact token
 divergence. MLX-LM is a same-Mac performance reference, not an Antfly training
 backend.
+
+## Renderer and resume policy
+
+Prepared Gemma text uses the canonical non-thinking serving layout. Channel
+annotations and thought content are stripped from every assistant turn,
+including the target. Thinking-mode/reasoning-trace training is not supported;
+datasets requiring preserved reasoning traces need a separate renderer. A pending
+`<|tool_response>` delimiter remains in the rendered prompt but is excluded
+from assistant labels, as are completed tool observations. Empty Gemma input
+contains `<bos>` and has no label spans.
+
+Renderer provenance deliberately hashes the entire renderer source. This is a
+conservative cache-invalidation policy: even a comment edit requires prepared
+inputs to be refreshed. It avoids claiming semantic equivalence without a
+complete renderer behavior oracle.
+
+Preference checkpoints now use fingerprint domain v6, which binds the
+numerical environment as well as the model, input data, initialized adapter,
+optimizer, and evaluation acceptance contract. Pre-v6 checkpoints require a
+new run. Evaluation identity remains bound intentionally: resuming must not
+silently change the data or thresholds that authorize adapter publication.
+The AdamW default remains 0.01; this review does not change it.
 
 ## Implemented Scope
 
@@ -274,11 +296,13 @@ durable epoch-1 checkpoint and resumed epoch 2 in a fresh immutable directory.
 E2B published byte-identical adapter
 `sha256:ab17f813...618484`; E4B published
 `sha256:e338eb86...7341d`. Their post-boundary loss and gradient histories are
-exact, with no native/interpreter fallback. Reports are retained at
-`/private/tmp/antfly-gemma4-e2b-resume-acceptance-20260819-v3` and
-`/private/tmp/antfly-gemma4-e4b-resume-acceptance-20260819-v2`. Use
+exact, with no native/interpreter fallback. Historical report basenames are
+`antfly-gemma4-e2b-resume-acceptance-20260819-v3` and
+`antfly-gemma4-e4b-resume-acceptance-20260819-v2`; their original temporary
+locations are not durable qualification evidence. Use
 `scripts/gemma4/qualify_gemma4_metal_resume.py` to reproduce the gate; a direct GGUF
-requires the explicit `--experimental-gguf-qlora` admission flag.
+requires the internal `ANTFLY_EXPERIMENTAL_GEMMA4_GGUF_QLORA=1` environment
+admission. The public QLoRA recipe remains rejected.
 
 `--activation-checkpoint-interval N` enables graph activation recomputation at
 layer boundaries. It is a memory-control mechanism and is unrelated to durable
@@ -571,7 +595,7 @@ BF16 reference.
 Current checks, pending gates, and the MLX-first performance sequence are tracked
 in [the remediation ledger](GEMMA4_REVIEW_REMEDIATION.md). Older measurements,
 failed experiments, and dated qualification runs are preserved separately in
-[the historical notebook](GEMMA4_HISTORY.md); they do not qualify current source.
+[the historical evidence index](GEMMA4_HISTORY.md); they do not qualify current source.
 
 ## GRPO scoring policy
 

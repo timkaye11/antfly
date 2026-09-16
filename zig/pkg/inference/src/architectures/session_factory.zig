@@ -656,7 +656,10 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
     const all_names = try source.listNames(allocator);
     defer allocator.free(all_names);
     try maybeInferGptAttentionLayoutFromStore(allocator, store, all_names, &arch_config);
-    try refineArchConfigFromStore(allocator, store, all_names, &arch_config);
+    // These session paths historically derive other GPT families from config
+    // and loaded weights. Only Gemma4 needs early store metadata refinement.
+    if (requiresGemma4StoreRefinement(arch_config))
+        try refineArchConfigFromStore(allocator, store, all_names, &arch_config);
 
     var resident_weights = std.StringHashMapUnmanaged(LoadedWeight){};
     var lazy_weights = std.StringHashMapUnmanaged(LazyWeightEntry){};
@@ -928,7 +931,10 @@ pub fn createPjrtSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
     const all_names = try source.listNames(allocator);
     defer allocator.free(all_names);
     try maybeInferGptAttentionLayoutFromStore(allocator, store, all_names, &arch_config);
-    try refineArchConfigFromStore(allocator, store, all_names, &arch_config);
+    // These session paths historically derive other GPT families from config
+    // and loaded weights. Only Gemma4 needs early store metadata refinement.
+    if (requiresGemma4StoreRefinement(arch_config))
+        try refineArchConfigFromStore(allocator, store, all_names, &arch_config);
 
     var resident_weights = std.StringHashMapUnmanaged(LoadedWeight){};
     var lazy_weights = std.StringHashMapUnmanaged(LazyWeightEntry){};
@@ -3680,6 +3686,19 @@ fn refineArchConfigFromWeights(arch_config: *ArchConfig, weights: *const std.Str
         .gpt => |*cfg| refineGptConfigFromWeights(cfg, weights),
         else => {},
     }
+}
+
+fn requiresGemma4StoreRefinement(config: ArchConfig) bool {
+    return config == .gpt and config.gpt.family == .gemma and config.gpt.usesGemma4Channels();
+}
+
+test "gemma4 early native and PJRT store refinement excludes other GPT families" {
+    var config: ArchConfig = .{ .gpt = .{} };
+    try std.testing.expect(!requiresGemma4StoreRefinement(config));
+    config.gpt.family = .gemma;
+    try std.testing.expect(!requiresGemma4StoreRefinement(config));
+    config.gpt.gemma4_channel_protocol = true;
+    try std.testing.expect(requiresGemma4StoreRefinement(config));
 }
 
 fn refineArchConfigFromStore(

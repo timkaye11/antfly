@@ -16727,7 +16727,7 @@ fn executeRuntimeGqaCausalAttention(
     const bias = valueFor(values, if (num_inputs > 3) inputs[3] else null_node);
     const kv_heads = if (attrs.num_kv_heads != 0) attrs.num_kv_heads else attrs.num_heads;
 
-    if (num_inputs == 3 and (attrs.score_scale != 0.0 or attrs.sliding_window != 0)) {
+    if (attrs.training) {
         return cb.gqaCausalAttentionTraining(
             q,
             k,

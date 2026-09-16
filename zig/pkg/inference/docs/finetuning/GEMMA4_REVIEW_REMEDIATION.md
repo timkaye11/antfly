@@ -1,12 +1,84 @@
 # Gemma training review remediation and performance work
 
-Status: local PR verification complete, September 15, 2026. Fresh
+Status: local follow-up verification complete, September 16, 2026. September 15
 E2B/E4B Metal-versus-MLX captures are complete. E4B passes the configured
 single-seed quality gates; E2B fails the reward-improvement gate in both
 backends. GRPO remains experimental. These results support PR review, not
 full production promotion or a general performance claim.
 
-## Confirmed findings and changes
+## September 16 follow-up review
+
+The September 15 results below are retained historical evidence. The follow-up
+changes are based on `334fed88151e4d8eb3b08ff641943e9bef8b7746` and require their
+own verification; neither the earlier binary hash nor its MLX capture qualifies
+this changed worktree. The user owns the commit and submission.
+
+| Follow-up finding | Disposition |
+| --- | --- |
+| Every merge-queue batch runs the GPU gate | Diff against `merge_group.base_sha`; unrelated and documentation-only changes skip the job. Pathspec regression covers platform/build/runtime/serving dependencies. |
+| Missing fourth dense attention scale | Paired GQA kernel now honors the explicit scale; analytic regression also checks the paired dispatch counter. |
+| Renderer test unreachable and stale | Select the entire renderer test module, fix empty Gemma BOS expectation, and exclude an unanswered tool-response marker from target labels. |
+| Packed fused VJP unverified | Independent scalar GQA/RMSNorm evaluators support graph finite differences, including packed-gradient slicing, mixed heads, windows, custom scale, and frozen/trainable norm weights. |
+| Native BF16 borrowing lacks CPU logits check | Extend resident/lazy borrowed embedding regression through the tied output head, comparing explicit F32 weights and analytic logits. |
+| New broad native/PJRT store refinement | Restrict both early refinement sites to Gemma4 channel architecture; ordinary GPT/Gemma configurations retain their previous path. |
+| Brittle CI name selection | CI audits every added named inference test against qualified test-log names; missing selections fail. The serving target is explicitly invoked. |
+| Compiler memory budget | Pass `--maxrss 10737418240` to focused builds as well as the target estimate. This is Zig scheduling admission, not an operating-system RSS limit. |
+| Preference environment changes reused v5 | Bump fingerprint domain to v6 and explain incompatible restore failures; preserve the historical AdamW default of 0.01. |
+| Clone metadata committed during encoding | Per-frame completion receipts publish cloned coverage only after a successful wait. Canceling growth restores prior backing buffers; retry reads actual capacities. Regression covers cancel, unrelated successful frame, retry, and second-hop fan-out. |
+| Process-global training policy | Scope training policy and captured enablement to the owning thread; another thread cannot inherit it. Acquisition/release remain synchronous and thread-affine. |
+| GQA dispatch inferred from attributes | Add explicit training intent to graph attention attributes and route on that intent, including default scale/window. |
+| Missing dot-general gradients | Implement every rank-two single-contraction layout; unsupported layouts return `NoVjpRule` instead of dropping gradients. |
+| GRPO input edge cases | Validate reward/epsilon/clip inputs; count opaque sparse prompt IDs without overflow; constant groups with zero epsilon yield zero advantages. Invalid all-masked configurations fail closed. |
+| CCE dense allocation risk | Bound each fallback logits tensor to 64 MiB, checking overflow before allocation. Capture require-CCE and tile policy at backend creation. Larger unsupported shapes fail explicitly. |
+| Multimodal GRPO temperature mismatch | The public lane remains rejected pending multimodal evaluation; its internal legacy path now explicitly rejects non-unit temperature. No multimodal parity claim. |
+| Rejected option serialization | Remove layer-name, LLRD, and schedule-free fields from effective run reports; keep clear parser rejection. |
+| Docs and helper issues | Remove nonexistent public GGUF flag, personal paths, and misleading temporary evidence paths. Document missing numerical toggles. Share the remaining CUDA-gate hash implementation; fixture cache is per-work-directory and validation survives Python optimization. Add PEFT round-trip helper unit tests. |
+
+Intentional policies are now explicit: the canonical renderer is non-thinking
+and strips thought content, including from targets; reasoning-trace training is
+not supported. Hashing the whole renderer source deliberately invalidates
+prepared inputs even after comment edits. Evaluation data and acceptance
+settings remain in preference identity so resumed publication cannot silently
+change its contract. These are documented constraints, not parity fixes.
+
+The two remaining `sha256_file` definitions are thin adapters around the shared
+streaming implementation, preserving distinct prefixes/error contracts. JSON
+helpers with different canonicalization/error behavior are not interchangeable.
+A complete immutable low-level kernel policy and per-lane recipe extraction
+remain architecture work. The review's unspecified “everything in grpo.zig”
+and “four getenv sites” require concrete examples to claim complete closure;
+this pass fixes reproducible GRPO defects and the identified CCE hot reads.
+
+Follow-up local verification:
+
+- Debug, ReleaseSafe, and ReleaseFast required-Metal gates: **450 passed, two
+  optional real-model fixture skips** in each configuration (452 selected).
+- ML graph suite: **546/546**. Gemma Python suite: **787/787**.
+- Isolated graph gate: **24/24**; serving gate: **8/8**; CLI/server gate:
+  **9/9 selected**. CPU-only build executes both native BF16 logits and the
+  narrowed store-refinement regression successfully.
+- Branch-to-log audit: **340/340 added named tests selected**, no missing
+  tests, one explicitly reported optional GGUF fixture skip.
+- Public ReleaseFast CLI: **37/37 build steps**. Stock PEFT CPU load/save/reload
+  of the exported tiny structural fixture passes with **zero logit difference**;
+  this is export compatibility, not Gemma4 numerical qualification.
+- Five CI scope/audit tests, toolchain policy, workflow YAML parsing, all
+  85 checked Python files' Ruff formatting, changed Zig formatting, whitespace,
+  and conflict-marker checks pass.
+
+The optional public build initially rejected a 10 GiB scheduler budget before
+compiling: its existing full-application targets declare up to 20 GiB. Repeating
+with the workflow's normal serialized settings succeeds; the inference compiler
+reports 13 GiB peak RSS. The focused test targets retain their 10 GiB admission
+budget. This was a local invocation error, not a machine crash or failed test.
+
+Logs and source hashes are retained under
+`.benchmark-assets/gemma4-review-20260916/`. Hosted CI and new full-model MLX
+capture remain separate release evidence; September 15 captures are not
+relabeled as current.
+
+## September 15 confirmed findings and changes
+
 
 | Finding | Remediation | Verification status |
 | --- | --- | --- |
@@ -31,7 +103,7 @@ full production promotion or a general performance claim.
 | Publication rejects unknown directory-entry types | Resolve unknown type with no-follow stat | Unknown file/directory/symlink regression passes in ReleaseFast |
 | Focused ReleaseSafe compiler exceeds declared memory | Per-target 10 GiB allowance, based on 8.6 GB observed compile | ReleaseSafe compile and required Metal/oracle gate pass |
 
-## Current verification
+## September 15 verification
 
 The expanded required-Metal Debug, ReleaseSafe, and ReleaseFast gates each
 pass 431 tests with two optional real-model fixture skips; Debug reports no
@@ -72,7 +144,7 @@ entries, with mixed/all ignored labels, softcap enabled/disabled, and eight
 repetitions. Provenance hashing streams through 64 KiB rather than mapping
 whole model shards; byte-domain compatibility and boundary sizes are tested.
 
-## Fresh matched Metal and MLX evidence
+## September 15 matched Metal and MLX evidence
 
 Artifacts: `.benchmark-assets/gemma4-pr-20260915/`. Both models use locked
 BF16 weights, seed 17, 64 training groups, 32 heldout groups, 16 completions
@@ -167,7 +239,8 @@ Stock PEFT coverage is structural export compatibility only.
   campaign and the separate sealed holdout pass. The fresh E2B improvement
   gate remains open; the single-seed E4B pass does not qualify a distribution.
 - Repeat on a clean host for zero-paging release evidence. CCE fallback now
-  reports full-logits allocation; a bounded general fallback remains open.
+  rejects logits tensors larger than 64 MiB; scalable chunked fallback remains
+  future work.
 - Finish per-lane recipe execution/planning extraction and immutable low-level
   kernel policy. Schema and objective validation are extracted, six repeated
   failure-reporting paths are consolidated, and unreachable surrogate and

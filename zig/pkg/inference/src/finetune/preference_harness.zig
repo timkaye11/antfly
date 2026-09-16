@@ -455,7 +455,7 @@ pub fn grpoStep(
 
     var ga = try grpo.scoreGroup(allocator, rewarder, completions);
     defer ga.deinit();
-    grpo.computeAdvantages(&ga, completions, config.grpo);
+    try grpo.computeAdvantages(&ga, completions, config.grpo);
 
     var mean_reward: f32 = 0;
     if (ga.rewards.len > 0) {

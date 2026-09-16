@@ -334,7 +334,9 @@ fn renderGemma(
         }
         const continues = msg.role == .assistant and next_role == .assistant and (msg.tool_calls_json == null or has_response);
         if (pending_tool and !has_response) {
+            if (buf.items.len > span_start) try spans.append(allocator, .{ .start = span_start, .end = buf.items.len });
             try buf.appendSlice(allocator, "<|tool_response>");
+            span_start = buf.items.len;
         } else if (!continues and !(has_response and !has_content and next_role == null)) {
             try buf.appendSlice(allocator, gemma4_turn_end);
         }
@@ -745,13 +747,13 @@ test "gemma4 completion labels exclude role and include answer and turn end" {
     try std.testing.expectEqualSlices(i32, &.{ -100, 11, 12 }, labels);
 }
 
-test "empty messages renders empty string and empty spans" {
+test "empty messages preserves template BOS and empty spans" {
     const allocator = std.testing.allocator;
     const messages = [_]Message{};
     inline for (.{ TemplateKind.llama3, .gemma, .chatml, .alpaca }) |k| {
         var r = try render(allocator, k, &messages, .{});
         defer r.deinit();
-        try std.testing.expectEqual(@as(usize, 0), r.text.len);
+        try std.testing.expectEqualStrings(if (k == .gemma) gemma4_bos else "", r.text);
         try std.testing.expectEqual(@as(usize, 0), r.assistant_spans.len);
     }
 }
@@ -793,4 +795,17 @@ test "gemma4 training renderer matches canonical Jinja system tool and channel h
             }
         }
     }
+}
+
+test "gemma4 pending tool observation marker is never a completion label" {
+    const allocator = std.testing.allocator;
+    const messages = [_]Message{.{ .role = .assistant, .content = "", .tool_calls_json = "[{\"function\":{\"name\":\"lookup\",\"arguments\":{}}}]" }};
+    var rendered = try render(allocator, .gemma, &messages, .{});
+    defer rendered.deinit();
+    const marker = std.mem.indexOf(u8, rendered.text, "<|tool_response>").?;
+    try std.testing.expectEqual(@as(usize, 1), rendered.assistant_spans.len);
+    try std.testing.expectEqual(marker, rendered.assistant_spans[0].end);
+    const labels = try makeCompletionLabels(allocator, &.{ 1, 2 }, &.{ rendered.assistant_spans[0].start, marker }, rendered.assistant_spans, -100);
+    defer allocator.free(labels);
+    try std.testing.expectEqualSlices(i32, &.{ 1, -100 }, labels);
 }

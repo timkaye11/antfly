@@ -19,6 +19,8 @@ const common = @import("common.zig");
 // to avoid compiling every unrelated backend test into the focused binary.
 const gemma4_regression_filters = [_][]const u8{
     "gemma4",
+    "finetune.chat_template",
+    "finetune.grpo",
     "gemma graph",
     "buildForwardGraph",
     "preference environment",

@@ -139,6 +139,8 @@ jobs:
 
           if [[ "${{ inputs.pr_number != '' && 'pull_request' || github.event_name }}" == "pull_request" ]]; then
             base="${{ inputs.base_sha }}"
+          elif [[ "${{ github.event_name }}" == "merge_group" && -n "${{ github.event.merge_group.base_sha }}" ]]; then
+            base="${{ github.event.merge_group.base_sha }}"
           elif [[ "${{ inputs.pr_number != '' && 'pull_request' || github.event_name }}" == "push" && -n "${{ github.event.before }}" && "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
             base="${{ github.event.before }}"
           else
@@ -189,12 +191,21 @@ jobs:
           fi
 
           if git diff --quiet "$base" "${{ inputs.head_sha || github.sha }}" -- \
-            ':(glob)zig/lib/ml/**' \
+            ':(glob)zig/lib/**' \
+            zig/build.zig \
+            zig/build.zig.zon \
+            ':(glob)zig/build/**' \
+            ':(glob)zig/pkg/antfly/build/**' \
+            ':(glob)zig/pkg/antfly/src/inference_runtime/**' \
             zig/pkg/inference/build.zig \
-            ':(glob)zig/pkg/inference/build/finetune/**' \
+            zig/pkg/inference/build.zig.zon \
+            ':(glob)zig/pkg/inference/build/**' \
             zig/pkg/inference/src/architectures/gemma_graph.zig \
             zig/pkg/inference/src/architectures/session_factory.zig \
             ':(glob)zig/pkg/inference/src/backends/metal_*' \
+            ':(glob)zig/pkg/inference/src/backends/decoder_*' \
+            ':(glob)zig/pkg/inference/src/runtime/**' \
+            ':(glob)zig/pkg/inference/src/ops/metal/**' \
             zig/pkg/inference/src/finetune/artifact_publication.zig \
             zig/pkg/inference/src/finetune/chat_template.zig \
             ':(glob)zig/pkg/inference/src/finetune/cli/**' \
@@ -218,12 +229,16 @@ jobs:
             ':(glob)zig/pkg/inference/testdata/*grpo*' \
             ':(glob)zig/pkg/inference/testdata/*gemma4*' \
             ':(glob)zig/pkg/inference/testdata/gemma4_oracle/**' \
-            zig/pkg/inference/docs/finetuning/GEMMA4.md \
-            zig/pkg/inference/docs/finetuning/GEMMA4_ORACLE.md \
             zig/pkg/inference/src/inference_internal.zig \
             zig/pkg/inference/src/ops/metal_compute.zig \
             zig/pkg/inference/src/ops/native_compute.zig \
-            .github/workflows/zig-tests.yml
+            scripts/ci/audit_gemma4_test_selection.py \
+            scripts/ci/test_audit_gemma4_test_selection.py \
+            scripts/ci/test_zig_validation_scope.py \
+            scripts/ci/toolchain-policy.json \
+            .github/actions/load-toolchain-policy/action.yml \
+            .github/workflows/zig-tests.yml \
+            ':(exclude,glob)**/*.md'
           then
             echo "gemma4_training=false" >> "$GITHUB_OUTPUT"
           else
@@ -793,6 +808,7 @@ jobs:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
           submodules: true
+          fetch-depth: 0
 
       - name: Load pinned toolchain policy
         id: toolchain
@@ -819,6 +835,8 @@ jobs:
         working-directory: zig/pkg/inference
         run: |
           set -euo pipefail
+          python3 ../../../scripts/ci/test_zig_validation_scope.py
+          python3 ../../../scripts/ci/test_audit_gemma4_test_selection.py
           python3 scripts/gemma4/compare_gemma4_lora_hf_zig.py validate-lock
           python3 -m unittest discover -v -s scripts/gemma4 -p 'test_*.py'
           fixture_dir="$(mktemp -d "${RUNNER_TEMP}/gemma4-oracle-contract.XXXXXX")"
@@ -835,7 +853,9 @@ jobs:
       - name: Run Gemma4 Metal Debug gates
         working-directory: zig/pkg/inference
         run: |
-          zig build test-gemma4-finetune -j1 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=Debug -Dbenchmark-source-revision="$ANTFLY_BENCHMARK_SOURCE_REVISION" --summary all
+          set -euo pipefail
+          zig build test-gemma4-finetune -j1 --maxrss 10737418240 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=Debug -Dbenchmark-source-revision="$ANTFLY_BENCHMARK_SOURCE_REVISION" --summary all 2>&1 | tee "$RUNNER_TEMP/gemma4-focused.log"
+          zig build test-gemma4-serving -j1 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=Debug --summary all
           zig build test-gemma-graph -j1 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=Debug --summary all
           zig build test -j1 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=Debug -- \
             --test-filter "backend deinit destroys only explicitly owned wrappers" \
@@ -845,7 +865,10 @@ jobs:
             --test-filter "finetune contextual help covers the production Gemma4 path" \
             --test-filter "gemma4 prepare canonical flags normalize to the legacy adapter boundary" \
             --test-filter "gemma4 public prepare rejects media projection before command dispatch" \
-            --test-filter "server generate forwards only explicit thinking mode"
+            --test-filter "server generate forwards only explicit thinking mode" 2>&1 | tee "$RUNNER_TEMP/gemma4-cli.log"
+          python3 ../../../scripts/ci/audit_gemma4_test_selection.py \
+            --base "${{ inputs.base_sha || github.event.merge_group.base_sha || github.event.before }}" \
+            "$RUNNER_TEMP/gemma4-focused.log" "$RUNNER_TEMP/gemma4-cli.log"
 
       - name: Run ML graph unit tests
         working-directory: zig/lib/ml
@@ -854,13 +877,13 @@ jobs:
       - name: Run Gemma4 Metal ReleaseSafe gates
         working-directory: zig/pkg/inference
         run: |
-          zig build test-gemma4-finetune -j1 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=ReleaseSafe -Dbenchmark-source-revision="$ANTFLY_BENCHMARK_SOURCE_REVISION" --summary all
+          zig build test-gemma4-finetune -j1 --maxrss 10737418240 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=ReleaseSafe -Dbenchmark-source-revision="$ANTFLY_BENCHMARK_SOURCE_REVISION" --summary all
           zig build test-gemma-graph -j1 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=ReleaseSafe --summary all
 
       - name: Run packaged-optimization Metal lifecycle smoke
         working-directory: zig/pkg/inference
         run: |
-          zig build test-gemma4-finetune -j1 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=ReleaseFast -Dbenchmark-source-revision="$ANTFLY_BENCHMARK_SOURCE_REVISION" --summary all
+          zig build test-gemma4-finetune -j1 --maxrss 10737418240 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=ReleaseFast -Dbenchmark-source-revision="$ANTFLY_BENCHMARK_SOURCE_REVISION" --summary all
 
       - name: Build public CLI for PEFT interchange check
         working-directory: zig

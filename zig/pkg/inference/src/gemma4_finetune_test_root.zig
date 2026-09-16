@@ -26,5 +26,7 @@ test "gemma4 finetune embedded regressions are linked into the focused gate" {
     std.testing.refAllDecls(gemma4_bf16_cli);
     std.testing.refAllDecls(metal_compute);
     std.testing.refAllDecls(recipe);
+    std.testing.refAllDecls(@import("finetune/chat_template.zig"));
+    _ = @import("finetune/tools/materialize_gemma4_lora.zig");
     std.testing.refAllDecls(gemma_serving);
 }

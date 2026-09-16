@@ -257,6 +257,8 @@ pub const AttentionAttrs = struct {
     /// Zero selects the backend's conventional 1/sqrt(head_dim) scale.
     /// Training graphs can provide the model's exact score scale explicitly.
     score_scale: f32 = 0.0,
+    /// Explicit execution contract; independent of scale/window defaults.
+    training: bool = false,
     /// Zero means full causal attention; otherwise retain only this many
     /// causal key positions, including the current token.
     sliding_window: u32 = 0,

@@ -144,17 +144,16 @@ pub fn scoreGroup(
     const advantages = try allocator.alloc(f32, completions.len);
     errdefer allocator.free(advantages);
 
-    var max_prompt: usize = 0;
-    var any = false;
+    var num_groups: usize = 0;
     for (completions, 0..) |c, i| {
         rewards[i] = try rewarder.score(c.prompt_idx, c.tokens);
+        if (!std.math.isFinite(rewards[i])) return error.NonFiniteGrpoReward;
         advantages[i] = 0;
-        if (!any or c.prompt_idx > max_prompt) {
-            max_prompt = c.prompt_idx;
-            any = true;
-        }
+        const seen = for (completions[0..i]) |prior| {
+            if (prior.prompt_idx == c.prompt_idx) break true;
+        } else false;
+        if (!seen) num_groups += 1;
     }
-    const num_groups: usize = if (any) max_prompt + 1 else 0;
 
     return GroupAdvantages{
         .allocator = allocator,
@@ -168,7 +167,10 @@ pub fn computeAdvantages(
     ga: *GroupAdvantages,
     completions: []const Completion,
     config: GRPOConfig,
-) void {
+) !void {
+    if (ga.rewards.len != completions.len or ga.advantages.len != completions.len) return error.AdvLenMismatch;
+    if (!std.math.isFinite(config.advantage_eps) or config.advantage_eps < 0) return error.InvalidGrpoAdvantageEpsilon;
+    for (ga.rewards) |reward| if (!std.math.isFinite(reward)) return error.NonFiniteGrpoReward;
     const n = completions.len;
     if (n == 0) return;
 
@@ -191,8 +193,14 @@ pub fn computeAdvantages(
         );
     }
 
-    var g: usize = 0;
-    while (g < ga.num_groups) : (g += 1) {
+    // Group identifiers are opaque dataset indices, not dense array offsets.
+    // Work is bounded by completion count even for usize-max prompt IDs.
+    for (completions, 0..) |group, first| {
+        const g = group.prompt_idx;
+        const seen = for (completions[0..first]) |prior| {
+            if (prior.prompt_idx == g) break true;
+        } else false;
+        if (seen) continue;
         var count: usize = 0;
         var sum: f64 = 0;
         for (completions, 0..) |c, i| {
@@ -229,7 +237,7 @@ pub fn computeAdvantages(
                 if (reward_scale != .none) {
                     if (reward_scale == .batch) std_val = batch_std;
                     const denom = std_val + @as(f64, config.advantage_eps);
-                    ga.advantages[i] = @floatCast(centered / denom);
+                    ga.advantages[i] = if (denom == 0) 0 else @floatCast(centered / denom);
                 } else {
                     ga.advantages[i] = @floatCast(centered);
                 }
@@ -305,6 +313,22 @@ pub fn grpoLoss(
         if (!std.math.isFinite(advantage)) return error.NonFiniteGrpoAdvantage;
     }
 
+    const eps_low = config.clip_epsilon;
+    const eps_high = config.epsilon_high orelse eps_low;
+    if (!std.math.isFinite(eps_low) or eps_low <= 0.0 or eps_low > 1.0 or
+        !std.math.isFinite(eps_high) or eps_high <= 0.0 or eps_high > 1.0)
+    {
+        return error.InvalidGrpoClipEpsilon;
+    }
+    if (config.loss_type == .dr_grpo) {
+        if (config.max_completion_tokens == 0) return error.InvalidMaxCompletionTokens;
+        for (completions) |completion| {
+            if (completion.tokens.len > config.max_completion_tokens) {
+                return error.CompletionExceedsConfiguredMaximum;
+            }
+        }
+    }
+
     const grad = try allocator.alloc(f32, total_tokens);
     errdefer allocator.free(grad);
     @memset(grad, 0);
@@ -322,21 +346,6 @@ pub fn grpoLoss(
     }
 
     const n_f: f32 = @floatFromInt(active_tokens);
-    const eps_low = config.clip_epsilon;
-    const eps_high = config.epsilon_high orelse eps_low;
-    if (!std.math.isFinite(eps_low) or eps_low <= 0.0 or eps_low > 1.0 or
-        !std.math.isFinite(eps_high) or eps_high <= 0.0 or eps_high > 1.0)
-    {
-        return error.InvalidGrpoClipEpsilon;
-    }
-    if (config.loss_type == .dr_grpo) {
-        if (config.max_completion_tokens == 0) return error.InvalidMaxCompletionTokens;
-        for (completions) |completion| {
-            if (completion.tokens.len > config.max_completion_tokens) {
-                return error.CompletionExceedsConfiguredMaximum;
-            }
-        }
-    }
     const kl = config.kl_coef;
 
     var pg_sum: f64 = 0;
@@ -501,7 +510,7 @@ test "computeAdvantages equal rewards -> zero" {
     defer ga.deinit();
 
     const cfg = GRPOConfig{};
-    computeAdvantages(&ga, &comps, cfg);
+    try computeAdvantages(&ga, &comps, cfg);
     for (ga.advantages) |a| try testing.expectApproxEqAbs(@as(f32, 0), a, 1e-6);
 }
 
@@ -555,7 +564,7 @@ test "computeAdvantages uses unbiased reward standard deviation" {
     defer ga.deinit();
 
     const cfg = GRPOConfig{};
-    computeAdvantages(&ga, &comps, cfg);
+    try computeAdvantages(&ga, &comps, cfg);
     const expected = @as(f32, @floatCast(1.0 / @sqrt(2.0)));
     try testing.expectApproxEqAbs(-expected, ga.advantages[0], 1e-4);
     try testing.expectApproxEqAbs(expected, ga.advantages[1], 1e-4);
@@ -581,7 +590,7 @@ test "uniform reward groups are explicitly zero variance without NaN" {
     };
     defer advantages.deinit();
     @memset(advantages.advantages, std.math.nan(f32));
-    computeAdvantages(&advantages, &completions, .{});
+    try computeAdvantages(&advantages, &completions, .{});
     for (advantages.advantages) |advantage| {
         try testing.expectEqual(@as(f32, 0.0), advantage);
         try testing.expect(std.math.isFinite(advantage));
@@ -606,10 +615,10 @@ test "computeAdvantages supports batch and none reward scaling" {
     };
     defer advantages.deinit();
 
-    computeAdvantages(&advantages, &completions, .{ .scale_rewards = .none });
+    try computeAdvantages(&advantages, &completions, .{ .scale_rewards = .none });
     try testing.expectEqualSlices(f32, &.{ -1.0, 1.0, -2.0, 2.0 }, advantages.advantages);
 
-    computeAdvantages(&advantages, &completions, .{ .scale_rewards = .batch });
+    try computeAdvantages(&advantages, &completions, .{ .scale_rewards = .batch });
     const batch_std = @sqrt(@as(f32, 131.0 / 3.0));
     try testing.expectApproxEqAbs(-1.0 / (batch_std + 1e-4), advantages.advantages[0], 1e-6);
     try testing.expectApproxEqAbs(2.0 / (batch_std + 1e-4), advantages.advantages[3], 1e-6);
@@ -938,4 +947,26 @@ test "grpoLoss finite-difference gradient check" {
         const num = (lp - lm) / (2.0 * h);
         try testing.expectApproxEqAbs(num, res.grad_new_logps[i], 5e-3);
     }
+}
+
+test "gemma4 GRPO sparse prompt IDs and zero epsilon are bounded and finite" {
+    const allocator = testing.allocator;
+    var reward = ConstRewardCtx{ .value = 1 };
+    const completions = [_]Completion{
+        .{ .prompt_idx = std.math.maxInt(usize), .tokens = &.{1}, .old_logps = &.{-1}, .ref_logps = &.{-1} },
+        .{ .prompt_idx = 12, .tokens = &.{1}, .old_logps = &.{-1}, .ref_logps = &.{-1} },
+    };
+    var ga = try scoreGroup(allocator, .{ .ctx = &reward, .call = constReward }, &completions);
+    defer ga.deinit();
+    try testing.expectEqual(@as(usize, 2), ga.num_groups);
+    try computeAdvantages(&ga, &completions, .{ .advantage_eps = 0 });
+    try testing.expectEqualSlices(f32, &.{ 0, 0 }, ga.advantages);
+    ga.rewards[0] = std.math.nan(f32);
+    try testing.expectError(error.NonFiniteGrpoReward, computeAdvantages(&ga, &completions, .{}));
+}
+
+test "gemma4 GRPO validates config even when every completion is masked" {
+    const completion = [_]Completion{.{ .prompt_idx = 0, .tokens = &.{1}, .old_logps = &.{-1}, .ref_logps = &.{-1}, .truncated = true }};
+    try testing.expectError(error.InvalidGrpoClipEpsilon, grpoLoss(testing.allocator, &completion, &.{-1}, &.{0}, .{ .mask_truncated_completions = true, .clip_epsilon = std.math.nan(f32) }));
+    try testing.expectError(error.InvalidMaxCompletionTokens, grpoLoss(testing.allocator, &completion, &.{-1}, &.{0}, .{ .mask_truncated_completions = true, .loss_type = .dr_grpo }));
 }

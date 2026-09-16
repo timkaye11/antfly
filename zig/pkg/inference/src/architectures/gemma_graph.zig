@@ -542,6 +542,7 @@ fn selfAttention(
                 .num_kv_heads = config.effectiveKVHeadsForLayer(parameter_layer),
                 .head_dim = head_dim_u,
                 .score_scale = score_scale,
+                .training = true,
                 .sliding_window = if (config.layerUsesSlidingAttention(layer)) config.sliding_window else 0,
             } },
             .output_shape = Shape.init(.f32, &.{ total_i, q_dim_i }),

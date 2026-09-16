@@ -50311,6 +50311,16 @@ test "gemma4 native embedding handles preserve BF16 storage for fused and lowere
             const gathered = try primGatherOp(&compute, table, ids, 0, &shape);
             defer freeTensor(&compute, gathered);
             try std.testing.expectEqualSlices(f32, &expected, getData(gathered));
+            // The same borrowed embedding is also the tied output head. Check
+            // CPU logits against an explicitly materialized F32 table.
+            const f32_table = try fromFloat32ShapeOp(&compute, &.{ 1.0, -2.5, 0.5, 3.0 }, &.{ 2, 2 });
+            defer freeTensor(&compute, f32_table);
+            const logits = try linearNoBiasOp(&compute, selected, table, 3, 2, 2);
+            defer freeTensor(&compute, logits);
+            const dense_logits = try linearNoBiasOp(&compute, gathered, f32_table, 3, 2, 2);
+            defer freeTensor(&compute, dense_logits);
+            try std.testing.expectEqualSlices(f32, getData(dense_logits), getData(logits));
+            try std.testing.expectEqualSlices(f32, &.{ -7.0, 9.25, 7.25, -7.0, -7.0, 9.25 }, getData(logits));
             try std.testing.expectEqual(@as(usize, 0), toBuf(table).data.len);
         }
     }

@@ -32,6 +32,8 @@ import subprocess
 import sys
 from typing import Any
 
+from gemma4_files import sha256_file
+
 
 RELEASE_SCHEMA = "antfly.gemma4_cuda_l4_release_gate.v2"
 RELEASE_SCOPE = "target_only"
@@ -233,14 +235,6 @@ def canonical_sha256(value: object) -> str:
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
-
-
-def sha256_file(path: pathlib.Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        while chunk := source.read(8 * 1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def path_provenance(path: pathlib.Path) -> dict[str, Any]:

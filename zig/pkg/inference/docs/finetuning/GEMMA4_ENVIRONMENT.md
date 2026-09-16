@@ -130,3 +130,22 @@ likelihoods and gradients. Top-k/top-p remain rollout filters; see the
 | `ANTFLY_GEMMA4_GRPO_INCREMENTAL_KV_CLONE_PROMPT_TAIL` | 0 or 1 |
 | `ANTFLY_GEMMA4_GRPO_INCREMENTAL_KV_SHADOW_EXACT` | 0 or 1 |
 | `ANTFLY_GEMMA4_GRPO_SPARSE_MULTI_TOKEN` | 0 or 1 |
+
+
+## Direct-command controls outside preference admission
+
+| Control | Effect and admission |
+| --- | --- |
+| `TERMITE_ENABLE_CUT_LINEAR_CROSS_ENTROPY=1` | Request cut cross entropy in the direct trainer and require its Metal route; unsupported fallback fails. Rejected as a preference override. |
+| `TERMITE_METAL_REQUIRE_LINEAR_CCE=1` | Require the bounded BF16 CCE route in the direct command; rejected as a preference override. |
+| `ANTFLY_EXPERIMENTAL_GEMMA4_GGUF_QLORA=1` | Admit the internal direct-GGUF research command; public QLoRA recipes remain rejected. Qualification sanitizes this control. |
+| `TERMITE_METAL_ENABLE_DENSE_CAUSAL_SG_ATTENTION_GQA_PAIR=1` | Opt into the paired dense attention kernel; disabled by the matching `TERMITE_METAL_DISABLE_DENSE_CAUSAL_SG_ATTENTION_GQA_PAIR=1`. Neither is an admitted preference override. |
+| `TERMITE_METAL_TRACE_QUANT_BACKWARD=1` | Diagnostic dispatch tracing; reads occur at dispatch and do not select numerical kernels. Rejected as a preference override. |
+
+Dense loss-head fallback is limited to 64 MiB per logits/dLogits tensor.
+Requests exceeding that bound fail with `MetalLinearCrossEntropyFallbackTooLarge`
+before allocating logits. Use supported BF16 CCE or smaller sparse-loss chunks.
+This is a per-tensor bound, not a whole-process memory guarantee. The CCE
+requirement and vocabulary tile limit are captured at backend construction.
+Product training-executor policy is captured at the outermost thread-local
+training scope; scopes must be acquired and released on the same thread.

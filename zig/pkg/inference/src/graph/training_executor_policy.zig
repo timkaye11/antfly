@@ -18,33 +18,39 @@ const platform = @import("antfly_platform");
 // Product entrypoints use a scoped reference instead of mutating process
 // environment. The legacy environment switch remains available for internal
 // experiments and existing standalone training tools.
-var product_enable_refs: std.atomic.Value(u32) = .init(0);
+// Scopes belong to the synchronous training caller. Other request threads
+// must not inherit its execution policy. Capture environment admission once
+// at the outermost scope, rather than reading it for every graph operation.
+threadlocal var product_enable_refs: u32 = 0;
+threadlocal var scoped_enabled: bool = false;
 
 pub const ProductEnableScope = struct {
     active: bool = true,
 
     pub fn acquire() ProductEnableScope {
-        const previous = product_enable_refs.fetchAdd(1, .acq_rel);
-        std.debug.assert(previous != std.math.maxInt(u32));
+        std.debug.assert(product_enable_refs != std.math.maxInt(u32));
+        if (product_enable_refs == 0)
+            scoped_enabled = !platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false);
+        product_enable_refs += 1;
         return .{};
     }
 
     pub fn deinit(self: *ProductEnableScope) void {
         if (!self.active) return;
-        const previous = product_enable_refs.fetchSub(1, .acq_rel);
-        std.debug.assert(previous > 0);
+        std.debug.assert(product_enable_refs > 0);
+        product_enable_refs -= 1;
         self.active = false;
     }
 };
 
 pub fn productEnabled() bool {
-    return product_enable_refs.load(.acquire) != 0;
+    return product_enable_refs != 0;
 }
 
 pub fn enabled() bool {
+    if (productEnabled()) return scoped_enabled;
     if (platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false)) return false;
-    return productEnabled() or
-        platform.env.getenvBoolDefault("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR", false);
+    return platform.env.getenvBoolDefault("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR", false);
 }
 
 test "product training executor enablement is scoped and nestable" {
@@ -56,5 +62,22 @@ test "product training executor enablement is scoped and nestable" {
     var inner = ProductEnableScope.acquire();
     try std.testing.expect(productEnabled());
     inner.deinit();
+    try std.testing.expect(productEnabled());
+}
+
+test "gemma4 training executor scopes do not cross request threads" {
+    var outer = ProductEnableScope.acquire();
+    defer outer.deinit();
+    const Worker = struct {
+        fn run() void {
+            std.debug.assert(!productEnabled());
+            var local = ProductEnableScope.acquire();
+            std.debug.assert(productEnabled());
+            local.deinit();
+            std.debug.assert(!productEnabled());
+        }
+    };
+    const worker = try std.Thread.spawn(.{}, Worker.run, .{});
+    worker.join();
     try std.testing.expect(productEnabled());
 }

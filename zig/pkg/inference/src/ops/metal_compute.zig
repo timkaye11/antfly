@@ -717,6 +717,14 @@ fn enableContiguousSliceDeviceView() bool {
 const linear_cce_default_tile_vocab: usize = 65536;
 const linear_cce_max_tile_vocab: usize = 65536;
 
+// Dense fallback can need both logits and dLogits. Bound each allocation
+// before dispatch rather than silently allocating hundreds of MiB.
+fn validateDenseLossFallback(rows: usize, vocab: usize) !void {
+    const elements = std.math.mul(usize, rows, vocab) catch return error.MetalLinearCrossEntropyFallbackTooLarge;
+    const bytes = std.math.mul(usize, elements, @sizeOf(f32)) catch return error.MetalLinearCrossEntropyFallbackTooLarge;
+    if (bytes > 64 * 1024 * 1024) return error.MetalLinearCrossEntropyFallbackTooLarge;
+}
+
 fn resolvedLinearCceTileVocab(vocab_size: usize) usize {
     const requested = getenvUsize("TERMITE_METAL_LINEAR_CCE_TILE_VOCAB") orelse linear_cce_default_tile_vocab;
     const positive = if (requested == 0) linear_cce_default_tile_vocab else requested;
@@ -1169,6 +1177,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// avoids allocating a duplicate slot for every frozen projection.
     dynamic_quantized_weight_slots: std.AutoHashMapUnmanaged(DynamicLinearSlotKey, usize) = .empty,
     linear_cce_fallback_warned: bool = false,
+    linear_cce_required: bool = false,
+    linear_cce_tile_limit: usize = 65536,
     eager_quant_mirrors_preferred: bool = false,
     dynamic_layer_norm_slots: std.AutoHashMapUnmanaged(DynamicLayerNormSlotKey, usize) = .empty,
     dynamic_rms_norm_slots: std.AutoHashMapUnmanaged(DynamicRmsNormSlotKey, usize) = .empty,
@@ -1289,6 +1299,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .owned_native_provider = true,
                 .io = io,
             };
+            compute.captureTrainingPolicy();
             compute.captureRuntimeFrameBaselines();
             return compute;
         }
@@ -1312,8 +1323,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .shared_provider_lease_io = lock_io,
             .io = io,
         };
+        compute.captureTrainingPolicy();
         compute.captureRuntimeFrameBaselines();
         return compute;
+    }
+
+    fn captureTrainingPolicy(self: *MetalCompute) void {
+        self.linear_cce_required = getenvBool("TERMITE_ENABLE_CUT_LINEAR_CROSS_ENTROPY") or getenvBool("TERMITE_METAL_REQUIRE_LINEAR_CCE");
+        self.linear_cce_tile_limit = resolvedLinearCceTileVocab(std.math.maxInt(u32));
     }
 
     fn captureRuntimeFrameBaselines(self: *MetalCompute) void {
@@ -12358,7 +12375,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer hidden_mt.deinit();
         var labels_mt = self.ownedDeviceMetalTensorFromCt(request.labels) catch return null;
         defer labels_mt.deinit();
-        const tile_vocab_size = linearCceTileVocab(request.vocab_size);
+        const tile_vocab_size = @min(request.vocab_size, self.linear_cce_tile_limit);
         const tensor = (try metal_runtime.decoderRuntimeLinearCceBf16LossDevice(
             self.provider_impl,
             slot,
@@ -12388,12 +12405,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (try shapeNumel(request.output_shape) != 1) return error.ShapeMismatch;
 
         if (try self.linearCrossEntropyCceBf16Loss(request, output_shape)) |output| return output;
-        if (getenvBool("TERMITE_ENABLE_CUT_LINEAR_CROSS_ENTROPY") or
-            getenvBool("TERMITE_METAL_REQUIRE_LINEAR_CCE"))
-        {
+        if (self.linear_cce_required) {
             return error.RequiredMetalLinearCceUnavailable;
         }
 
+        try validateDenseLossFallback(request.rows, request.vocab_size);
         if (!self.linear_cce_fallback_warned) {
             self.linear_cce_fallback_warned = true;
             std.log.warn("Metal linear cross entropy materializes full logits: rows={d} vocab={d} dtype={s} logits_bytes={d}; require TERMITE_METAL_REQUIRE_LINEAR_CCE=1 to reject this fallback", .{
@@ -12514,7 +12530,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer upstream_mt.deinit();
         const hidden_shape = try self.i32ShapeFromI64(request.hidden_shape);
         defer self.allocator.free(hidden_shape);
-        const tile_vocab_size = linearCceTileVocab(request.vocab_size);
+        const tile_vocab_size = @min(request.vocab_size, self.linear_cce_tile_limit);
         const result = (try metal_runtime.decoderRuntimeLinearCceBf16BackwardDevice(
             self.provider_impl,
             slot,
@@ -12546,11 +12562,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         try validateLinearCrossEntropyBackwardRequest(request);
         if (try self.linearCrossEntropyCceBf16Backward(request)) |output| return output;
-        if (getenvBool("TERMITE_ENABLE_CUT_LINEAR_CROSS_ENTROPY") or
-            getenvBool("TERMITE_METAL_REQUIRE_LINEAR_CCE"))
-        {
+        if (self.linear_cce_required) {
             return error.RequiredMetalLinearCceUnavailable;
         }
+        try validateDenseLossFallback(request.rows, request.vocab_size);
         const logits = try linearNoBiasOp(ctx, request.hidden, request.weight, request.rows, request.in_dim, request.vocab_size);
         defer freeOp(ctx, logits);
 
@@ -41104,4 +41119,10 @@ test "metal decoder runtime consumes effective RoPE theta once" {
     layer.rope_active_dim = 128;
     layer.rope_theta = std.math.pow(f32, 1_000_000.0, 0.25);
     try std.testing.expectApproxEqAbs(layer.rope_theta, decoderRuntimeLayerRopeTheta(&layer), 1e-6);
+}
+
+test "gemma4 dense loss fallback rejects unbounded and overflowing allocations" {
+    try validateDenseLossFallback(64, 262144);
+    try std.testing.expectError(error.MetalLinearCrossEntropyFallbackTooLarge, validateDenseLossFallback(65, 262144));
+    try std.testing.expectError(error.MetalLinearCrossEntropyFallbackTooLarge, validateDenseLossFallback(std.math.maxInt(usize), 2));
 }

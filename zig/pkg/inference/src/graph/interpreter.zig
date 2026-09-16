@@ -2720,7 +2720,7 @@ pub fn executeNode(
         },
 
         .fused_gqa_causal_attention => |attrs| {
-            if (n.num_inputs == 3 and (attrs.score_scale != 0.0 or attrs.sliding_window != 0)) {
+            if (attrs.training) {
                 if (try cb.gqaCausalAttentionTraining(
                     V.get(ins[0]),
                     V.get(ins[1]),

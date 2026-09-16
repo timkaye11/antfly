@@ -87,11 +87,12 @@ pub fn main() !void {
         "-O",
         "ReleaseFast",
         "--global-cache-dir",
-        "/tmp/antfly-zig-global-cache",
+        str(args.work_dir / "zig-global-cache"),
     ]
     result = subprocess.run(command, capture_output=True, text=True, check=True)
     rows = [json.loads(line) for line in result.stderr.splitlines()]
-    assert len(rows) == 384
+    if len(rows) != 384:
+        raise ValueError(f"sampling fixture expected 384 rows, received {len(rows)}")
     fixture = {
         "schema_version": "antfly_gemma4_grpo_sampling_fixture/v1",
         "zig_version": version,

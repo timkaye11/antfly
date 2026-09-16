@@ -540,6 +540,39 @@ fn evalNode(
             return out;
         },
 
+        .fused_rms_norm, .fused_rms_norm_backward => |attrs| {
+            const x = getVal(node_vals, ins[0]);
+            const w = getVal(node_vals, ins[1]);
+            const dim: usize = attrs.dim;
+            if (dim == 0 or x.len % dim != 0 or w.len != dim) return error.InvalidShape;
+            const backward = n.op == .fused_rms_norm_backward;
+            const out = try allocator.alloc(f32, out_elems);
+            @memset(out, 0);
+            const dy = if (backward) getVal(node_vals, ins[2]) else x;
+            for (0..x.len / dim) |row| {
+                var ss: f64 = attrs.eps;
+                var dot: f64 = 0;
+                for (0..dim) |j| {
+                    const i = row * dim + j;
+                    ss += @as(f64, x[i]) * x[i] / @as(f64, @floatFromInt(dim));
+                    dot += @as(f64, dy[i]) * w[j] * x[i];
+                }
+                const inv = 1 / @sqrt(ss);
+                for (0..dim) |j| {
+                    const i = row * dim + j;
+                    if (backward) {
+                        out[i] = @floatCast(inv * (@as(f64, dy[i]) * w[j] - x[i] * dot * inv * inv / @as(f64, @floatFromInt(dim))));
+                        if (attrs.backward_weight_grad) out[x.len + j] += @floatCast(@as(f64, dy[i]) * x[i] * inv);
+                    } else out[i] = @floatCast(@as(f64, x[i]) * inv * w[j]);
+                }
+            }
+            return out;
+        },
+
+        .fused_gqa_causal_attention, .fused_gqa_causal_attention_backward => |attrs| {
+            return evalGqaReference(allocator, getVal(node_vals, ins[0]), getVal(node_vals, ins[1]), getVal(node_vals, ins[2]), if (n.op == .fused_gqa_causal_attention_backward) getVal(node_vals, ins[3]) else null, attrs);
+        },
+
         .fused_linear_cross_entropy_loss => |attrs| {
             return evalLinearCrossEntropy(
                 allocator,
@@ -712,6 +745,72 @@ fn evalLinearCrossEntropy(
     }
     result[0] /= normalizer;
     return result;
+}
+
+// Deliberately scalar and independent of backend attention dispatch. The
+// backward returns the packed layout consumed by the graph VJP's slices.
+fn evalGqaReference(allocator: std.mem.Allocator, q: []const f32, k: []const f32, v: []const f32, dy: ?[]const f32, a: node_mod.AttentionAttrs) ![]f32 {
+    const bs: usize = a.batch;
+    const seq: usize = a.seq_len;
+    const heads: usize = a.num_heads;
+    const kv: usize = a.num_kv_heads;
+    const dim: usize = a.head_dim;
+    if (bs == 0 or seq == 0 or kv == 0 or heads % kv != 0 or dim == 0 or
+        (a.kv_seq_len != 0 and a.kv_seq_len != seq) or q.len != bs * seq * heads * dim or k.len != bs * seq * kv * dim or v.len != k.len) return error.InvalidShape;
+    const out = try allocator.alloc(f32, if (dy != null) q.len + k.len + v.len else q.len);
+    errdefer allocator.free(out);
+    @memset(out, 0);
+    const prob = try allocator.alloc(f64, seq);
+    defer allocator.free(prob);
+    const dp = try allocator.alloc(f64, seq);
+    defer allocator.free(dp);
+    const scale: f64 = if (a.score_scale != 0) a.score_scale else 1 / @sqrt(@as(f64, @floatFromInt(dim)));
+    for (0..bs) |b| for (0..seq) |t| for (0..heads) |h| {
+        const qi = ((b * seq + t) * heads + h) * dim;
+        const kh = h / (heads / kv);
+        const start = if (a.sliding_window == 0 or t + 1 <= a.sliding_window) 0 else t + 1 - a.sliding_window;
+        var max_score = -std.math.inf(f64);
+        for (start..t + 1) |u| {
+            const ki = ((b * seq + u) * kv + kh) * dim;
+            var score: f64 = 0;
+            for (0..dim) |d| score += @as(f64, q[qi + d]) * k[ki + d];
+            prob[u] = score * scale;
+            max_score = @max(max_score, prob[u]);
+        }
+        var denom: f64 = 0;
+        for (start..t + 1) |u| {
+            prob[u] = @exp(prob[u] - max_score);
+            denom += prob[u];
+        }
+        for (start..t + 1) |u| prob[u] /= denom;
+        if (dy) |grad| {
+            var mean_dp: f64 = 0;
+            for (start..t + 1) |u| {
+                const ki = ((b * seq + u) * kv + kh) * dim;
+                dp[u] = 0;
+                for (0..dim) |d| {
+                    dp[u] += @as(f64, grad[qi + d]) * v[ki + d];
+                    out[q.len + k.len + ki + d] += @floatCast(prob[u] * grad[qi + d]);
+                }
+                mean_dp += prob[u] * dp[u];
+            }
+            for (start..t + 1) |u| {
+                const ki = ((b * seq + u) * kv + kh) * dim;
+                const ds = prob[u] * (dp[u] - mean_dp) * scale;
+                for (0..dim) |d| {
+                    out[qi + d] += @floatCast(ds * k[ki + d]);
+                    out[q.len + ki + d] += @floatCast(ds * q[qi + d]);
+                }
+            }
+        } else {
+            for (0..dim) |d| {
+                var value: f64 = 0;
+                for (start..t + 1) |u| value += prob[u] * v[((b * seq + u) * kv + kh) * dim + d];
+                out[qi + d] = @floatCast(value);
+            }
+        }
+    };
+    return out;
 }
 
 // ── gather / scatter_add reference semantics ──────────────────────────
@@ -2041,5 +2140,115 @@ test "grad_check fused_rope half-swap rotation" {
             );
             return error.GradientMismatch;
         }
+    }
+}
+
+test "grad_check fused GQA packed VJP slices for grouped heads windows and scale" {
+    const allocator = std.testing.allocator;
+    for ([_]u32{ 0, 1, 2 }) |window| {
+        var g = Graph.init(allocator);
+        defer g.deinit();
+        var b = Builder.init(&g);
+        const q = try b.parameter("q", Shape.init(.f32, &.{ 6, 8 }));
+        const k = try b.parameter("k", Shape.init(.f32, &.{ 6, 4 }));
+        const v = try b.parameter("v", Shape.init(.f32, &.{ 6, 4 }));
+        const y = try g.addNode(.{ .op = .{ .fused_gqa_causal_attention = .{ .batch = 2, .seq_len = 3, .num_heads = 4, .num_kv_heads = 2, .head_dim = 2, .score_scale = 0.37, .sliding_window = window } }, .output_shape = Shape.init(.f32, &.{ 6, 8 }), .inputs = .{ q, k, v, null_node }, .num_inputs = 3 });
+        var qv: [48]f32 = undefined;
+        var kv: [24]f32 = undefined;
+        var vv: [24]f32 = undefined;
+        var weights: [48]f32 = undefined;
+        for (&qv, &weights, 0..) |*x, *w, i| {
+            x.* = @as(f32, @floatFromInt(i % 11)) / 11 - 0.4;
+            w.* = @as(f32, @floatFromInt(i % 7)) / 7 - 0.3;
+        }
+        for (&kv, &vv, 0..) |*x, *z, i| {
+            x.* = @as(f32, @floatFromInt(i % 13)) / 13 - 0.5;
+            z.* = @as(f32, @floatFromInt(i % 5)) / 5 - 0.2;
+        }
+        const weighted = try b.mul(y, try b.tensorConst(&weights, Shape.init(.f32, &.{ 6, 8 })));
+        const loss = try b.reduceSum(weighted, &.{ 0, 1 });
+        try g.markOutput(loss);
+        const err = try checkGradients(allocator, &g, loss, &.{ q, k, v }, &.{ &qv, &kv, &vv }, 1e-2);
+        try std.testing.expect(err < tolerance);
+    }
+}
+
+test "grad_check fused RMSNorm packed VJP frozen and trainable weights" {
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |train_weight| {
+        var g = Graph.init(allocator);
+        defer g.deinit();
+        var b = Builder.init(&g);
+        b.fuse_rms_norm_backward = true;
+        const x = try b.parameter("x", Shape.init(.f32, &.{ 2, 2, 3 }));
+        const w = try b.parameter("w", Shape.init(.f32, &.{3}));
+        const y = try b.rmsNorm(x, w, 3, 1e-3);
+        const loss = try b.reduceSum(try b.mul(y, y), &.{ 0, 1, 2 });
+        try g.markOutput(loss);
+        const xv = [_]f32{ 0.2, -0.5, 0.7, 0.9, -0.3, 0.1, 0.4, 0.8, -0.6, -0.2, 0.3, 0.5 };
+        const wv = [_]f32{ 0.7, 1.2, -0.4 };
+        const wrt = [_]NodeId{ x, w };
+        const err = try checkGradients(allocator, &g, loss, wrt[0..if (train_weight) @as(usize, 2) else 1], &.{ &xv, &wv }, 1e-3);
+        try std.testing.expect(err < tolerance);
+    }
+}
+
+test "grad_check dot_general VJP supports every 2D contracting axis" {
+    const allocator = std.testing.allocator;
+    for ([_]u8{ 0, 1 }) |lc| for ([_]u8{ 0, 1 }) |rc| {
+        var g = Graph.init(allocator);
+        defer g.deinit();
+        var b = Builder.init(&g);
+        const a = try b.parameter("a", Shape.init(.f32, if (lc == 0) &.{ 3, 2 } else &.{ 2, 3 }));
+        const z = try b.parameter("z", Shape.init(.f32, if (rc == 0) &.{ 3, 4 } else &.{ 4, 3 }));
+        var attrs = node_mod.DotGeneralAttrs{};
+        attrs.num_contracting = 1;
+        attrs.lhs_contracting[0] = lc;
+        attrs.rhs_contracting[0] = rc;
+        const y = try g.addNode(.{ .op = .{ .dot_general = attrs }, .inputs = .{ a, z, null_node, null_node }, .num_inputs = 2, .output_shape = Shape.init(.f32, &.{ 2, 4 }) });
+        const loss = try b.reduceSum(try b.mul(y, y), &.{ 0, 1 });
+        try g.markOutput(loss);
+        const av = [_]f32{ 0.2, 0.5, -0.3, 0.8, -0.1, 0.4 };
+        const zv = [_]f32{ 0.1, -0.2, 0.3, 0.5, 0.6, -0.1, 0.2, 0.4, -0.5, 0.7, 0.8, -0.3 };
+        try std.testing.expect(try checkGradients(allocator, &g, loss, &.{ a, z }, &.{ &av, &zv }, 1e-3) < tolerance);
+    };
+}
+
+test "grad_check unsupported dot VJP fails instead of dropping requested gradients" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+    const a = try b.parameter("a", Shape.init(.f32, &.{2}));
+    const z = try b.parameter("z", Shape.init(.f32, &.{3}));
+    const y = try g.addNode(.{ .op = .{ .dot_general = .{} }, .inputs = .{ a, z, null_node, null_node }, .num_inputs = 2, .output_shape = Shape.init(.f32, &.{ 2, 3 }) });
+    const loss = try b.reduceSum(y, &.{ 0, 1 });
+    try g.markOutput(loss);
+    try std.testing.expectError(error.NoVjpRule, autodiff_mod.gradient(allocator, &g, loss, &.{ a, z }));
+}
+
+test "grad_check malformed batched dot contractions fail explicitly" {
+    const allocator = std.testing.allocator;
+    for ([_]usize{ 3, 4 }) |rank| {
+        var g = Graph.init(allocator);
+        defer g.deinit();
+        var b = Builder.init(&g);
+        const dims = [_]i64{ 2, 2, 2, 2 };
+        const shape = Shape.init(.f32, dims[0..rank]);
+        const a = try b.parameter("a", shape);
+        const z = try b.parameter("z", shape);
+        var attrs = node_mod.DotGeneralAttrs{};
+        attrs.num_contracting = 1;
+        attrs.num_batch = @intCast(rank - 2);
+        attrs.lhs_batch[1] = 1;
+        attrs.rhs_batch[1] = 1;
+        // Contracting the batch axis is invalid, never a missing/zero VJP.
+        attrs.lhs_contracting[0] = 0;
+        attrs.rhs_contracting[0] = @intCast(rank - 1);
+        const y = try g.addNode(.{ .op = .{ .dot_general = attrs }, .inputs = .{ a, z, null_node, null_node }, .num_inputs = 2, .output_shape = shape });
+        const axes = [_]u8{ 0, 1, 2, 3 };
+        const loss = try b.reduceSum(y, axes[0..rank]);
+        try g.markOutput(loss);
+        try std.testing.expectError(error.NoVjpRule, autodiff_mod.gradient(allocator, &g, loss, &.{ a, z }));
     }
 }
