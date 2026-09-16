@@ -119,15 +119,17 @@
           "prefixItems": [
             { "allOf": [{ "$ref": "#/$defs/producerSourceFile" }, { "properties": { "relative_path": { "const": "zig/pkg/inference/scripts/gemma4/bench_gemma4_lora_mlx_zig.py" } } }] },
             { "allOf": [{ "$ref": "#/$defs/producerSourceFile" }, { "properties": { "relative_path": { "const": "zig/pkg/inference/scripts/gemma4/build_and_attest_gemma4_mlx.py" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/producerSourceFile" }, { "properties": { "relative_path": { "const": "zig/pkg/inference/scripts/gemma4/gemma4_files.py" } } }] },
             { "allOf": [{ "$ref": "#/$defs/producerSourceFile" }, { "properties": { "relative_path": { "const": "zig/pkg/inference/scripts/gemma4/gemma4_oracle.lock.json" } } }] },
             { "allOf": [{ "$ref": "#/$defs/producerSourceFile" }, { "properties": { "relative_path": { "const": "zig/pkg/inference/scripts/gemma4/gemma4_oracle_contract.py" } } }] },
             { "allOf": [{ "$ref": "#/$defs/producerSourceFile" }, { "properties": { "relative_path": { "const": "zig/pkg/inference/scripts/gemma4/requirements-gemma4-mlx-reference.txt" } } }] },
             { "allOf": [{ "$ref": "#/$defs/producerSourceFile" }, { "properties": { "relative_path": { "const": "zig/pkg/inference/scripts/gemma4/run_antfly_gemma4_lora_benchmark.py" } } }] },
             { "allOf": [{ "$ref": "#/$defs/producerSourceFile" }, { "properties": { "relative_path": { "const": "zig/pkg/inference/scripts/gemma4/run_gemma4_lora_benchmark_campaign.py" } } }] },
-            { "allOf": [{ "$ref": "#/$defs/producerSourceFile" }, { "properties": { "relative_path": { "const": "zig/pkg/inference/scripts/gemma4/run_gemma4_lora_mlx_benchmark.py" } } }] }
+            { "allOf": [{ "$ref": "#/$defs/producerSourceFile" }, { "properties": { "relative_path": { "const": "zig/pkg/inference/scripts/gemma4/run_gemma4_lora_mlx_benchmark.py" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/producerSourceFile" }, { "properties": { "relative_path": { "const": "zig/pkg/inference/src/finetune/chat_template.zig" } } }] }
           ],
-          "minItems": 8,
-          "maxItems": 8
+          "minItems": 10,
+          "maxItems": 10
         },
         "manifest_sha256": { "$ref": "#/$defs/sha256" }
       }

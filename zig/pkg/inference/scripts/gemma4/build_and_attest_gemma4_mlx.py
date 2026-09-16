@@ -247,13 +247,17 @@ def _run_text(
 def dependency_tree_regular_paths(root: Path) -> tuple[Path, ...]:
     root = _canonical_path(root, "dependency root", kind="directory")
     paths: list[Path] = []
-    for directory, directory_names, file_names in os.walk(root, topdown=True, followlinks=False):
+    for directory, directory_names, file_names in os.walk(
+        root, topdown=True, followlinks=False
+    ):
         base = Path(directory)
         retained_directories: list[str] = []
         for name in sorted(directory_names):
             candidate = base / name
             if candidate.is_symlink():
-                raise ContractError(f"dependency tree contains symbolic link: {candidate}")
+                raise ContractError(
+                    f"dependency tree contains symbolic link: {candidate}"
+                )
             if name == ".git":
                 continue
             retained_directories.append(name)
@@ -261,12 +265,16 @@ def dependency_tree_regular_paths(root: Path) -> tuple[Path, ...]:
         for name in sorted(file_names):
             candidate = base / name
             if candidate.is_symlink():
-                raise ContractError(f"dependency tree contains symbolic link: {candidate}")
+                raise ContractError(
+                    f"dependency tree contains symbolic link: {candidate}"
+                )
             if name == ".git":
                 continue
             info = candidate.stat()
             if not stat.S_ISREG(info.st_mode):
-                raise ContractError(f"dependency tree contains special file: {candidate}")
+                raise ContractError(
+                    f"dependency tree contains special file: {candidate}"
+                )
             paths.append(candidate)
     if not paths:
         raise ContractError(f"dependency tree is empty: {root}")
@@ -285,8 +293,12 @@ def dependency_tree_identity(root: Path) -> dict[str, Any]:
     for candidate in dependency_tree_regular_paths(root):
         info = candidate.stat()
         relative_text = candidate.relative_to(root).as_posix()
-        executable = 1 if info.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH) else 0
-        entries.append((relative_text, executable, info.st_size, prefixed_sha256(candidate)))
+        executable = (
+            1 if info.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH) else 0
+        )
+        entries.append(
+            (relative_text, executable, info.st_size, prefixed_sha256(candidate))
+        )
     entries.sort(key=lambda entry: entry[0])
     encoded = json.dumps(
         entries,
@@ -310,7 +322,9 @@ def _validate_dependency_pin(name: str, value: Any) -> DependencyPin:
     for sentinel in DEPENDENCY_SENTINELS[name]:
         candidate = path / sentinel
         if candidate.is_symlink() or not candidate.is_file():
-            raise ContractError(f"dependencies.{name}: missing regular source file {sentinel}")
+            raise ContractError(
+                f"dependencies.{name}: missing regular source file {sentinel}"
+            )
     return DependencyPin(
         name=name,
         path=path,
@@ -325,14 +339,20 @@ def _validate_tool_pin(name: str, value: Any) -> ToolPin:
     if not os.access(path, os.X_OK):
         raise ContractError(f"tools.{name}.path must be executable")
     if path.read_bytes()[:4] not in _MACHO_MAGICS:
-        raise ContractError(f"tools.{name}.path must be a native Mach-O executable, not a wrapper")
+        raise ContractError(
+            f"tools.{name}.path must be a native Mach-O executable, not a wrapper"
+        )
     if name == "cmake" and path.name != "cmake":
         raise ContractError("tools.cmake.path must name the cmake executable")
     if name == "ninja" and path.name != "ninja":
         raise ContractError("tools.ninja.path must name the ninja executable")
     if name == "python" and path != Path(sys.executable).resolve(strict=True):
-        raise ContractError("tools.python.path must equal the interpreter running this command")
-    return ToolPin(name=name, path=path, sha256=_sha256(raw["sha256"], f"tools.{name}.sha256"))
+        raise ContractError(
+            "tools.python.path must equal the interpreter running this command"
+        )
+    return ToolPin(
+        name=name, path=path, sha256=_sha256(raw["sha256"], f"tools.{name}.sha256")
+    )
 
 
 def load_build_inputs(path: Path) -> BuildInputs:
@@ -371,20 +391,30 @@ def load_build_inputs(path: Path) -> BuildInputs:
     metal_toolchain_identifier = _string(
         raw["metal_toolchain_identifier"], "metal_toolchain_identifier"
     )
-    if re.fullmatch(
-        r"com\.apple\.dt\.toolchain\.Metal\.[0-9]+(?:\.[0-9]+)+",
-        metal_toolchain_identifier,
-    ) is None:
+    if (
+        re.fullmatch(
+            r"com\.apple\.dt\.toolchain\.Metal\.[0-9]+(?:\.[0-9]+)+",
+            metal_toolchain_identifier,
+        )
+        is None
+    ):
         raise ContractError("metal_toolchain_identifier is malformed")
-    developer_dir = _canonical_path(raw["developer_dir"], "developer_dir", kind="directory")
+    developer_dir = _canonical_path(
+        raw["developer_dir"], "developer_dir", kind="directory"
+    )
     user_home = _canonical_path(raw["user_home"], "user_home", kind="directory")
     account_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(strict=True)
     if user_home != account_home:
-        raise ContractError(f"user_home {user_home} != current account home {account_home}")
+        raise ContractError(
+            f"user_home {user_home} != current account home {account_home}"
+        )
 
     dependencies_raw = _mapping(raw["dependencies"], "dependencies")
     require_exact_keys(dependencies_raw, DEPENDENCY_NAMES, where="dependencies")
-    dependencies = tuple(_validate_dependency_pin(name, dependencies_raw[name]) for name in DEPENDENCY_NAMES)
+    dependencies = tuple(
+        _validate_dependency_pin(name, dependencies_raw[name])
+        for name in DEPENDENCY_NAMES
+    )
     if len({pin.path for pin in dependencies}) != len(dependencies):
         raise ContractError("dependency source roots must be distinct")
 
@@ -435,7 +465,9 @@ def verify_pinned_source(source_arg: Path, lock: Mapping[str, Any]) -> dict[str,
     if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
         raise ContractError("MLX source revision is not a full lowercase commit")
     if revision != expected_revision:
-        raise ContractError(f"MLX source revision {revision} != locked {expected_revision}")
+        raise ContractError(
+            f"MLX source revision {revision} != locked {expected_revision}"
+        )
     top = Path(_git(source, "rev-parse", "--show-toplevel")).resolve(strict=True)
     if top != source:
         raise ContractError(f"MLX source must name the checkout root, found {top}")
@@ -460,14 +492,18 @@ def verify_pinned_source(source_arg: Path, lock: Mapping[str, Any]) -> dict[str,
     version_text = version_header.read_text(encoding="utf-8")
     parts: list[str] = []
     for name in ("MAJOR", "MINOR", "PATCH"):
-        match = re.search(rf"^#define MLX_VERSION_{name} ([0-9]+)$", version_text, re.MULTILINE)
+        match = re.search(
+            rf"^#define MLX_VERSION_{name} ([0-9]+)$", version_text, re.MULTILINE
+        )
         if match is None:
             raise ContractError(f"MLX source version header is missing {name}")
         parts.append(match.group(1))
     version = ".".join(parts)
     expected_version = lock["mlx_reference"]["packages"]["mlx"]
     if version != expected_version:
-        raise ContractError(f"MLX source version {version} != locked {expected_version}")
+        raise ContractError(
+            f"MLX source version {version} != locked {expected_version}"
+        )
     return {
         "path": str(source),
         "revision": revision,
@@ -476,7 +512,9 @@ def verify_pinned_source(source_arg: Path, lock: Mapping[str, Any]) -> dict[str,
     }
 
 
-def resolve_build_paths(source: Path, output_arg: Path, *, must_exist: bool) -> BuildPaths:
+def resolve_build_paths(
+    source: Path, output_arg: Path, *, must_exist: bool
+) -> BuildPaths:
     output_unresolved = output_arg.expanduser().absolute()
     if output_unresolved.is_symlink():
         raise ContractError("build output may not be a symbolic link")
@@ -489,7 +527,9 @@ def resolve_build_paths(source: Path, output_arg: Path, *, must_exist: bool) -> 
     for component in relative_output.parts[:-1]:
         current = current / component
         if current.is_symlink() or (current.exists() and not current.is_dir()):
-            raise ContractError(f"build output parent must be a regular directory: {current}")
+            raise ContractError(
+                f"build output parent must be a regular directory: {current}"
+            )
     output = output_unresolved.resolve(strict=False)
     if not output.is_relative_to(source):
         raise ContractError("build output escapes the pinned MLX checkout")
@@ -533,7 +573,9 @@ def resolve_build_paths(source: Path, output_arg: Path, *, must_exist: bool) -> 
 def _verify_dependency_locations(inputs: BuildInputs, source: Path) -> None:
     for pin in inputs.dependencies:
         if pin.path.is_relative_to(source) or source.is_relative_to(pin.path):
-            raise ContractError(f"dependency {pin.name} must be outside the MLX checkout")
+            raise ContractError(
+                f"dependency {pin.name} must be outside the MLX checkout"
+            )
 
 
 def ignored_untracked_files(source: Path) -> tuple[Path, ...]:
@@ -554,7 +596,10 @@ def ignored_untracked_files(source: Path) -> tuple[Path, ...]:
         env=_git_environment(),
     )
     if completed.returncode != 0:
-        detail = completed.stderr.decode("utf-8", errors="replace").strip() or "no diagnostic"
+        detail = (
+            completed.stderr.decode("utf-8", errors="replace").strip()
+            or "no diagnostic"
+        )
         raise ContractError(f"could not inventory ignored MLX files: {detail}")
     paths: list[Path] = []
     for raw in completed.stdout.split(b"\0"):
@@ -608,10 +653,14 @@ def remove_generated_install_trees(paths: BuildPaths) -> list[str]:
         if not target.exists() and not target.is_symlink():
             continue
         if target.is_symlink() or not target.is_dir():
-            raise ContractError(f"generated MLX install tree is not a regular directory: {target}")
+            raise ContractError(
+                f"generated MLX install tree is not a regular directory: {target}"
+            )
         relative = target.relative_to(paths.source).as_posix()
         if _git(paths.source, "ls-files", "--", relative):
-            raise ContractError(f"refusing to remove tracked MLX install tree: {relative}")
+            raise ContractError(
+                f"refusing to remove tracked MLX install tree: {relative}"
+            )
         ignored = subprocess.run(
             (
                 str(GIT_PATH),
@@ -629,16 +678,24 @@ def remove_generated_install_trees(paths: BuildPaths) -> list[str]:
             env=_git_environment(),
         )
         if ignored.returncode != 0:
-            raise ContractError(f"generated MLX install tree is not Git-ignored: {relative}")
+            raise ContractError(
+                f"generated MLX install tree is not Git-ignored: {relative}"
+            )
         for candidate in target.rglob("*"):
             if candidate.is_symlink():
-                raise ContractError(f"generated MLX install tree contains symbolic link: {candidate}")
+                raise ContractError(
+                    f"generated MLX install tree contains symbolic link: {candidate}"
+                )
             info = candidate.stat()
             if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
-                raise ContractError(f"generated MLX install tree contains special file: {candidate}")
+                raise ContractError(
+                    f"generated MLX install tree contains special file: {candidate}"
+                )
         shutil.rmtree(target)
         if target.exists() or target.is_symlink():
-            raise ContractError(f"failed to remove generated MLX install tree: {target}")
+            raise ContractError(
+                f"failed to remove generated MLX install tree: {target}"
+            )
         removed.append(relative)
     return removed
 
@@ -680,7 +737,9 @@ def resolve_bare_build_commands(
     for name, expected in expected_commands.items():
         found = shutil.which(name, path=path_value)
         if found is None:
-            raise ContractError(f"required bare build command is absent from closed PATH: {name}")
+            raise ContractError(
+                f"required bare build command is absent from closed PATH: {name}"
+            )
         actual = Path(found).resolve(strict=True)
         expected_resolved = expected.resolve(strict=True)
         if actual != expected_resolved:
@@ -699,7 +758,7 @@ def _python_build_environment_identity(
     environment: Mapping[str, str],
     source: Path,
 ) -> dict[str, Any]:
-    probe = r'''
+    probe = r"""
 import hashlib
 import importlib.metadata as metadata
 import json
@@ -743,7 +802,7 @@ print(json.dumps({
         "setuptools": distribution_identity("setuptools"),
     },
 }, sort_keys=True, separators=(",", ":")))
-'''
+"""
     probe_environment = {
         **environment,
         "PYTHONDONTWRITEBYTECODE": "1",
@@ -760,18 +819,30 @@ print(json.dumps({
     except json.JSONDecodeError as exc:
         raise ContractError("pinned build Python emitted malformed provenance") from exc
     if not isinstance(identity, Mapping) or set(identity) != {
-        "executable", "version", "prefix", "base_prefix", "build_frontend", "packages"
+        "executable",
+        "version",
+        "prefix",
+        "base_prefix",
+        "build_frontend",
+        "packages",
     }:
-        raise ContractError("pinned build Python emitted an incomplete provenance identity")
+        raise ContractError(
+            "pinned build Python emitted an incomplete provenance identity"
+        )
     if Path(_string(identity["executable"], "python.executable")) != python_path:
         raise ContractError("pinned build Python executed a different interpreter")
-    if not isinstance(identity["packages"], Mapping) or set(identity["packages"]) != {"setuptools"}:
+    if not isinstance(identity["packages"], Mapping) or set(identity["packages"]) != {
+        "setuptools"
+    }:
         raise ContractError("pinned build Python must expose its setuptools identity")
     build_frontend = identity["build_frontend"]
     if not isinstance(build_frontend, Mapping) or set(build_frontend) != {
-        "bdist_wheel_path", "bdist_wheel_sha256"
+        "bdist_wheel_path",
+        "bdist_wheel_sha256",
     }:
-        raise ContractError("pinned build Python must expose its bdist_wheel module identity")
+        raise ContractError(
+            "pinned build Python must expose its bdist_wheel module identity"
+        )
     return dict(identity)
 
 
@@ -801,35 +872,54 @@ def inspect_toolchain(
     for pin in inputs.tools:
         actual_sha256 = prefixed_sha256(pin.path)
         if actual_sha256 != pin.sha256:
-            raise ContractError(f"tool {pin.name} digest {actual_sha256} != pinned {pin.sha256}")
+            raise ContractError(
+                f"tool {pin.name} digest {actual_sha256} != pinned {pin.sha256}"
+            )
         tools[pin.name] = {
             "path": str(pin.path),
             "sha256": actual_sha256,
-            "version_output": _run_text((str(pin.path), *TOOL_VERSION_ARGV[pin.name]), env=tool_env),
+            "version_output": _run_text(
+                (str(pin.path), *TOOL_VERSION_ARGV[pin.name]), env=tool_env
+            ),
         }
     system_tools: dict[str, Any] = {}
-    system_tool_paths = {"xcodebuild": Path("/usr/bin/xcodebuild"), **SYSTEM_BUILD_COMMANDS}
+    system_tool_paths = {
+        "xcodebuild": Path("/usr/bin/xcodebuild"),
+        **SYSTEM_BUILD_COMMANDS,
+    }
     for name, path in system_tool_paths.items():
         if path.is_symlink() or not path.is_file():
             raise ContractError(f"required system tool is not a regular file: {path}")
         system_tools[name] = {"path": str(path), "sha256": prefixed_sha256(path)}
-    sdk_version = _run_text(("/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-version"), env=tool_env)
+    sdk_version = _run_text(
+        ("/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-version"), env=tool_env
+    )
     if sdk_version != inputs.macos_sdk_version:
         raise ContractError(
             f"selected macOS SDK {sdk_version!r} != pinned {inputs.macos_sdk_version!r}"
         )
     require_jaccl_inventory_sdk_version(sdk_version)
     sdk_path = Path(
-        _run_text(("/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-path"), env=tool_env)
+        _run_text(
+            ("/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-path"), env=tool_env
+        )
     ).resolve(strict=True)
     xcode_version = _run_text(("/usr/bin/xcodebuild", "-version"), env=tool_env)
     selected_xcode_tools: dict[str, Any] = {}
     for name in SELECTED_XCODE_TOOLS:
         selected = Path(
-            _run_text(("/usr/bin/xcrun", "--sdk", "macosx", "--find", name), env=tool_env)
+            _run_text(
+                ("/usr/bin/xcrun", "--sdk", "macosx", "--find", name), env=tool_env
+            )
         ).resolve(strict=True)
-        if selected.is_symlink() or not selected.is_file() or not os.access(selected, os.X_OK):
-            raise ContractError(f"xcrun selected an invalid {name} executable: {selected}")
+        if (
+            selected.is_symlink()
+            or not selected.is_file()
+            or not os.access(selected, os.X_OK)
+        ):
+            raise ContractError(
+                f"xcrun selected an invalid {name} executable: {selected}"
+            )
         selected_xcode_tools[name] = {
             "path": str(selected),
             "sha256": prefixed_sha256(selected),
@@ -842,8 +932,13 @@ def inspect_toolchain(
             )
     python_path = next(pin.path for pin in inputs.tools if pin.name == "python")
     python_identity = _python_build_environment_identity(python_path, tool_env, source)
-    if ".".join(python_identity["version"].split(".")[:2]) != lock["mlx_reference"]["python"]:
-        raise ContractError("pinned build Python child version differs from the oracle lock")
+    if (
+        ".".join(python_identity["version"].split(".")[:2])
+        != lock["mlx_reference"]["python"]
+    ):
+        raise ContractError(
+            "pinned build Python child version differs from the oracle lock"
+        )
     return {
         "platform": platform.system(),
         "machine": platform.machine(),
@@ -863,7 +958,9 @@ def inspect_toolchain(
 
 def _require_no_whitespace(path: Path, where: str) -> None:
     if any(character.isspace() for character in str(path)):
-        raise ContractError(f"{where} may not contain whitespace because MLX setup.py splits CMAKE_ARGS")
+        raise ContractError(
+            f"{where} may not contain whitespace because MLX setup.py splits CMAKE_ARGS"
+        )
 
 
 def build_command(
@@ -956,12 +1053,16 @@ def build_command(
 
 def _relevant_native_paths(package_root: Path) -> set[Path]:
     if package_root.is_symlink() or not package_root.is_dir():
-        raise ContractError(f"MLX Python package root is not a regular directory: {package_root}")
+        raise ContractError(
+            f"MLX Python package root is not a regular directory: {package_root}"
+        )
     library_root = package_root / "lib"
     paths: set[Path] = set()
     for candidate in package_root.glob("*.so"):
         if candidate.is_symlink():
-            raise ContractError(f"MLX native runtime contains symbolic link: {candidate}")
+            raise ContractError(
+                f"MLX native runtime contains symbolic link: {candidate}"
+            )
         if candidate.is_file():
             paths.add(candidate.absolute())
     if library_root.exists():
@@ -969,7 +1070,9 @@ def _relevant_native_paths(package_root: Path) -> set[Path]:
             raise ContractError("MLX package lib path must be a regular directory")
         for candidate in library_root.rglob("*"):
             if candidate.is_symlink():
-                raise ContractError(f"MLX native runtime contains symbolic link: {candidate}")
+                raise ContractError(
+                    f"MLX native runtime contains symbolic link: {candidate}"
+                )
             if candidate.is_file() and candidate.suffix in (".dylib", ".metallib"):
                 paths.add(candidate.absolute())
     return paths
@@ -991,16 +1094,26 @@ def discover_native_inventory(
     relevant = _relevant_native_paths(package_root)
     core_candidates = sorted(package_root.glob("core.*.so"))
     if len(core_candidates) != 1:
-        raise ContractError(f"expected exactly one built mlx.core extension, found {len(core_candidates)}")
+        raise ContractError(
+            f"expected exactly one built mlx.core extension, found {len(core_candidates)}"
+        )
     expected = {
         "jaccl-runtime-dylib": package_root / "lib" / "libjaccl.dylib",
         "metal-library": package_root / "lib" / "mlx.metallib",
         "python-extension": core_candidates[0],
         "runtime-dylib": package_root / "lib" / "libmlx.dylib",
     }
-    expected_paths = {path.absolute() for path in expected.values() if path.is_file() and not path.is_symlink()}
+    expected_paths = {
+        path.absolute()
+        for path in expected.values()
+        if path.is_file() and not path.is_symlink()
+    }
     if len(expected_paths) != len(expected) or relevant != expected_paths:
-        missing = sorted(str(path) for path in expected.values() if not path.is_file() or path.is_symlink())
+        missing = sorted(
+            str(path)
+            for path in expected.values()
+            if not path.is_file() or path.is_symlink()
+        )
         extra = sorted(str(path) for path in relevant - expected_paths)
         raise ContractError(
             "MLX native runtime differs from the closed four-artifact inventory "
@@ -1031,7 +1144,9 @@ def discover_native_inventory(
 def _file_identity(path: Path, *, relative_to: Path | None = None) -> dict[str, Any]:
     if path.is_symlink() or not path.is_file():
         raise ContractError(f"expected regular non-symlink file: {path}")
-    relative_path = path.name if relative_to is None else path.relative_to(relative_to).as_posix()
+    relative_path = (
+        path.name if relative_to is None else path.relative_to(relative_to).as_posix()
+    )
     return {
         "relative_path": relative_path,
         "size_bytes": path.stat().st_size,
@@ -1043,8 +1158,15 @@ def atomic_publish_json(path: Path, payload: Mapping[str, Any]) -> None:
     """Publish canonical JSON atomically without ever replacing a target."""
     if path.parent.is_symlink() or not path.parent.is_dir():
         raise ContractError("publication parent must be a regular directory")
-    data = (json.dumps(payload, sort_keys=True, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    data = (
+        json.dumps(
+            payload, sort_keys=True, indent=2, ensure_ascii=False, allow_nan=False
+        )
+        + "\n"
+    ).encode("utf-8")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
     temporary = Path(temporary_name)
     linked = False
     try:
@@ -1056,7 +1178,9 @@ def atomic_publish_json(path: Path, payload: Mapping[str, Any]) -> None:
         try:
             os.link(temporary, path, follow_symlinks=False)
         except FileExistsError as exc:
-            raise ContractError(f"refusing to replace existing evidence: {path}") from exc
+            raise ContractError(
+                f"refusing to replace existing evidence: {path}"
+            ) from exc
         linked = True
         try:
             directory_descriptor = os.open(path.parent, os.O_RDONLY)
@@ -1100,7 +1224,9 @@ def atomic_publish_json(path: Path, payload: Mapping[str, Any]) -> None:
                 f"published JSON failed read-back and cleanup failed: {cleanup_exc}"
             ) from cleanup_exc
         detail = "" if readback_error is None else f": {readback_error}"
-        raise ContractError(f"published JSON failed exact read-back verification: {path}{detail}")
+        raise ContractError(
+            f"published JSON failed exact read-back verification: {path}{detail}"
+        )
 
 
 def _create_output(paths: BuildPaths) -> None:
@@ -1109,11 +1235,15 @@ def _create_output(paths: BuildPaths) -> None:
     for component in paths.output.parent.relative_to(paths.source).parts:
         current = current / component
         if current.is_symlink() or not current.is_dir():
-            raise ContractError(f"build output parent must be a regular directory: {current}")
+            raise ContractError(
+                f"build output parent must be a regular directory: {current}"
+            )
     try:
         os.mkdir(paths.output, 0o755)
     except FileExistsError as exc:
-        raise ContractError("build output already exists; builds are no-replace") from exc
+        raise ContractError(
+            "build output already exists; builds are no-replace"
+        ) from exc
     (paths.output / "tmp").mkdir(mode=0o700)
 
 
@@ -1122,7 +1252,9 @@ def _execute_build(command: Mapping[str, Any], log_path: Path) -> tuple[int, int
     try:
         descriptor = os.open(log_path, flags, 0o444)
     except FileExistsError as exc:
-        raise ContractError(f"refusing to replace existing build log: {log_path}") from exc
+        raise ContractError(
+            f"refusing to replace existing build log: {log_path}"
+        ) from exc
     started = time.time_ns()
     try:
         with os.fdopen(descriptor, "wb") as log:
@@ -1250,10 +1382,18 @@ def _validate_receipt_shape(receipt: Mapping[str, Any]) -> None:
         where="receipt.build_result",
     )
     if result["exit_code"] != 0:
-        raise ContractError("MLX native build receipt does not record successful completion")
+        raise ContractError(
+            "MLX native build receipt does not record successful completion"
+        )
     for field in ("started_unix_ns", "finished_unix_ns"):
-        if isinstance(result[field], bool) or not isinstance(result[field], int) or result[field] <= 0:
-            raise ContractError(f"receipt.build_result.{field} must be a positive integer")
+        if (
+            isinstance(result[field], bool)
+            or not isinstance(result[field], int)
+            or result[field] <= 0
+        ):
+            raise ContractError(
+                f"receipt.build_result.{field} must be a positive integer"
+            )
     if result["finished_unix_ns"] < result["started_unix_ns"]:
         raise ContractError("MLX native build receipt timestamps are reversed")
     outputs = _mapping(receipt["outputs"], "receipt.outputs")
@@ -1289,13 +1429,21 @@ def verify_published_build(
     dependencies: Sequence[Mapping[str, Any]],
     toolchain: Mapping[str, Any],
 ) -> dict[str, Any]:
-    for path, name in ((paths.receipt, "receipt"), (paths.attestation, "attestation"), (paths.log, "build log")):
+    for path, name in (
+        (paths.receipt, "receipt"),
+        (paths.attestation, "attestation"),
+        (paths.log, "build log"),
+    ):
         if path.is_symlink() or not path.is_file():
-            raise ContractError(f"MLX native build {name} must be a regular non-symlink file")
+            raise ContractError(
+                f"MLX native build {name} must be a regular non-symlink file"
+            )
     receipt = _mapping(load_json(paths.receipt), "MLX native build receipt")
     _validate_receipt_shape(receipt)
     expected_command = build_command(paths, source_identity, inputs, toolchain)
-    expected_inventory = discover_native_inventory(paths.package_root, lock["mlx_reference"]["native_runtime"])
+    expected_inventory = discover_native_inventory(
+        paths.package_root, lock["mlx_reference"]["native_runtime"]
+    )
     native_paths = tuple(
         paths.package_root / artifact["relative_path"]
         for artifact in expected_inventory["artifacts"]
@@ -1327,15 +1475,23 @@ def verify_published_build(
     }
     for field, expected in expected_receipt_values.items():
         if receipt[field] != expected:
-            raise ContractError(f"MLX native build receipt {field} differs from current inputs")
-    if receipt["build_result"]["log"] != _file_identity(paths.log, relative_to=paths.output):
+            raise ContractError(
+                f"MLX native build receipt {field} differs from current inputs"
+            )
+    if receipt["build_result"]["log"] != _file_identity(
+        paths.log, relative_to=paths.output
+    ):
         raise ContractError("MLX native build log identity differs from receipt")
 
     attestation = _mapping(load_json(paths.attestation), "MLX native build attestation")
     _validate_attestation_shape(attestation)
-    expected_attestation = _attestation(lock, source_identity, expected_inventory, paths.receipt)
+    expected_attestation = _attestation(
+        lock, source_identity, expected_inventory, paths.receipt
+    )
     if attestation != expected_attestation:
-        raise ContractError("MLX native build attestation differs from receipt/runtime/lock")
+        raise ContractError(
+            "MLX native build attestation differs from receipt/runtime/lock"
+        )
     verify_pinned_source(paths.source, lock)
     return {
         "ok": True,
@@ -1365,16 +1521,22 @@ def verify_attestation_bundle(
     """
     attestation_unresolved = attestation_arg.expanduser().absolute()
     if attestation_unresolved.is_symlink() or not attestation_unresolved.is_file():
-        raise ContractError("MLX native build attestation must be a regular non-symlink file")
+        raise ContractError(
+            "MLX native build attestation must be a regular non-symlink file"
+        )
     attestation_path = attestation_unresolved.resolve(strict=True)
     if attestation_path.name != ATTESTATION_NAME:
-        raise ContractError(f"MLX native build attestation must be named {ATTESTATION_NAME}")
+        raise ContractError(
+            f"MLX native build attestation must be named {ATTESTATION_NAME}"
+        )
 
     source_identity = verify_pinned_source(source_arg, lock)
     source = Path(source_identity["path"])
     paths = resolve_build_paths(source, attestation_path.parent, must_exist=True)
     if paths.attestation != attestation_path:
-        raise ContractError("MLX native build attestation is not the fixed file in its build output")
+        raise ContractError(
+            "MLX native build attestation is not the fixed file in its build output"
+        )
     if paths.receipt.is_symlink() or not paths.receipt.is_file():
         raise ContractError(
             f"MLX native build receipt must be the regular sibling {RECEIPT_NAME}"
@@ -1407,10 +1569,7 @@ def verify_attestation_bundle(
         SCRIPT_PATH,
         LOCK_PATH,
         *(pin.path for pin in inputs.tools),
-        *(
-            Path(identity["path"])
-            for identity in toolchain["system_tools"].values()
-        ),
+        *(Path(identity["path"]) for identity in toolchain["system_tools"].values()),
         *(
             Path(identity["path"])
             for identity in toolchain["selected_xcode_tools"].values()
@@ -1471,7 +1630,9 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     toolchain_after = inspect_toolchain(inputs, lock, paths.source)
     if toolchain_after != toolchain:
         raise ContractError("MLX native toolchain drifted during build")
-    inventory = discover_native_inventory(paths.package_root, lock["mlx_reference"]["native_runtime"])
+    inventory = discover_native_inventory(
+        paths.package_root, lock["mlx_reference"]["native_runtime"]
+    )
     native_paths = tuple(
         paths.package_root / artifact["relative_path"]
         for artifact in inventory["artifacts"]
@@ -1494,7 +1655,9 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         finished_unix_ns=finished,
     )
     atomic_publish_json(paths.receipt, receipt)
-    atomic_publish_json(paths.attestation, _attestation(lock, source_identity, inventory, paths.receipt))
+    atomic_publish_json(
+        paths.attestation, _attestation(lock, source_identity, inventory, paths.receipt)
+    )
     return verify_published_build(
         paths,
         lock,
@@ -1542,7 +1705,12 @@ def build_parser() -> argparse.ArgumentParser:
             required=True,
             help="New (build) or existing (verify) Git-ignored directory inside the MLX checkout.",
         )
-        command.add_argument("--inputs", type=Path, required=True, help="Strict local dependency/tool pin manifest.")
+        command.add_argument(
+            "--inputs",
+            type=Path,
+            required=True,
+            help="Strict local dependency/tool pin manifest.",
+        )
     file_digest = subparsers.add_parser(
         "file-digest",
         help="compute the SHA-256 used to pin one build executable",

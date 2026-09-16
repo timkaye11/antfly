@@ -21,7 +21,7 @@ from gemma4_oracle_contract import (
 )
 
 
-FAKE_RUNNER = r'''#!/usr/bin/env python3
+FAKE_RUNNER = r"""#!/usr/bin/env python3
 import hashlib
 import json
 import os
@@ -171,25 +171,29 @@ payload = {
     },
 }
 telemetry_path.write_text(json.dumps(payload), encoding="utf-8")
-'''
+"""
 
-FAKE_INCOMPATIBLE_RUNNER = r'''#!/bin/sh
+FAKE_INCOMPATIBLE_RUNNER = r"""#!/bin/sh
 if [ "$1" = "inference" ] && [ "$2" = "version" ]; then
   echo "antfly inference v1.2.3-test"
   exit 0
 fi
 exit 2
-'''
+"""
 
 
 def phase_evidence(index: int) -> dict[str, int]:
     return {
         field: (
-            1 if index == 0 and field in (
+            1
+            if index == 0
+            and field
+            in (
                 "compile_ns",
                 "graph_executor_plan_build_ns",
                 "graph_executor_buffer_plan_build_ns",
-            ) else 0
+            )
+            else 0
         )
         for field in runner.PHASE_EVIDENCE_FIELDS
     }
@@ -197,16 +201,18 @@ def phase_evidence(index: int) -> dict[str, int]:
 
 def command_plan_evidence(index: int, grad_accum: int) -> dict[str, int]:
     evidence = {field: 0 for field in runner.COMMAND_PLAN_EVIDENCE_FIELDS}
-    evidence.update({
-        "graph_executor_partitions": grad_accum,
-        "graph_executor_command_dispatches": 3 * grad_accum,
-        "graph_executor_planned_dispatches": 2 * grad_accum,
-        "graph_executor_plan_cache_hits": grad_accum - (1 if index == 0 else 0),
-        "graph_executor_plan_cache_misses": 1 if index == 0 else 0,
-        "metal_command_dot_general_dispatches": grad_accum,
-        "metal_command_elementwise_dispatches": grad_accum,
-        "metal_command_other_dispatches": grad_accum,
-    })
+    evidence.update(
+        {
+            "graph_executor_partitions": grad_accum,
+            "graph_executor_command_dispatches": 3 * grad_accum,
+            "graph_executor_planned_dispatches": 2 * grad_accum,
+            "graph_executor_plan_cache_hits": grad_accum - (1 if index == 0 else 0),
+            "graph_executor_plan_cache_misses": 1 if index == 0 else 0,
+            "metal_command_dot_general_dispatches": grad_accum,
+            "metal_command_elementwise_dispatches": grad_accum,
+            "metal_command_other_dispatches": grad_accum,
+        }
+    )
     return evidence
 
 
@@ -220,7 +226,9 @@ def benchmark_producer_source(source_revision: str = "b" * 40) -> dict:
     ]
     relative_path = runner.ANTFLY_RUNNER_RELATIVE_PATH
     source_sha256 = next(
-        item["source_sha256"] for item in files if item["relative_path"] == relative_path
+        item["source_sha256"]
+        for item in files
+        if item["relative_path"] == relative_path
     )
     source_tree = "c" * 40
     return {
@@ -277,13 +285,15 @@ class AntflyGemma4BenchmarkRunnerTest(unittest.TestCase):
         )
         self.patches = self.stack.start()
         self.addCleanup(self.stack.stop)
-        self.patches["capture_darwin_system_memory_snapshot"].side_effect = lambda *, before_measured: SimpleNamespace(
-            page_size=4096,
-            pageins=10,
-            pageouts=20,
-            swapins=30,
-            swapouts=40,
-            pressure_available_percent=80.0 if before_measured else 79.0,
+        self.patches["capture_darwin_system_memory_snapshot"].side_effect = (
+            lambda *, before_measured: SimpleNamespace(
+                page_size=4096,
+                pageins=10,
+                pageouts=20,
+                swapins=30,
+                swapouts=40,
+                pressure_available_percent=80.0 if before_measured else 79.0,
+            )
         )
 
     def fixture(
@@ -308,24 +318,28 @@ class AntflyGemma4BenchmarkRunnerTest(unittest.TestCase):
         eval_path = root / "eval.json"
         eval_path.write_text("{}", encoding="utf-8")
         executable = root / "antfly"
-        executable.write_text(FAKE_RUNNER if compatible else FAKE_INCOMPATIBLE_RUNNER, encoding="utf-8")
+        executable.write_text(
+            FAKE_RUNNER if compatible else FAKE_INCOMPATIBLE_RUNNER, encoding="utf-8"
+        )
         executable.chmod(0o755)
 
         def process_footprint(_pid: int) -> int:
             if any(root.rglob("post-measured-work-started")):
-                raise AssertionError("process footprint sampled after the measured optimizer window")
+                raise AssertionError(
+                    "process footprint sampled after the measured optimizer window"
+                )
             return 987654321
 
         self.patches["darwin_phys_footprint_bytes"].side_effect = process_footprint
 
         revision = "b" * 40
         self.patches["source_identity"].return_value = (source.resolve(), revision)
-        self.patches["attest_benchmark_producer_source"].return_value = benchmark_producer_source(
-            revision
-        )
-        self.patches["diagnostic_producer_source"].return_value = benchmark_diagnostic_producer_source(
-            revision
-        )
+        self.patches[
+            "attest_benchmark_producer_source"
+        ].return_value = benchmark_producer_source(revision)
+        self.patches[
+            "diagnostic_producer_source"
+        ].return_value = benchmark_diagnostic_producer_source(revision)
         model_revision = lock["models"]["gemma-4-E2B-it"]["revision"]
         self.patches["verify_model_directory"].return_value = {
             "model_key": "gemma-4-E2B-it",
@@ -354,22 +368,37 @@ class AntflyGemma4BenchmarkRunnerTest(unittest.TestCase):
             base_model_sha256="5" * 64,
             tokenizer_sha256="6" * 64,
             chat_template_sha256="7" * 64,
-            snapshot=((train.name, train_info.st_dev, train_info.st_ino, train_info.st_size, train_info.st_mtime_ns),),
+            snapshot=(
+                (
+                    train.name,
+                    train_info.st_dev,
+                    train_info.st_ino,
+                    train_info.st_size,
+                    train_info.st_mtime_ns,
+                ),
+            ),
         )
-        self.patches["load_prepared_example"].return_value = ({
-            "base_model_sha256": "5" * 64,
-            "tokenizer_sha256": "6" * 64,
-            "chat_template_sha256": "7" * 64,
-            "source_dataset_sha256": "8" * 64,
-        }, {})
-        canonical_modules = tuple(sorted(
-            [f"model.layers.{index}.self_attn.q_proj" for index in range(35)]
-            + [f"model.layers.{index}.self_attn.v_proj" for index in range(15)]
-        ))
+        self.patches["load_prepared_example"].return_value = (
+            {
+                "base_model_sha256": "5" * 64,
+                "tokenizer_sha256": "6" * 64,
+                "chat_template_sha256": "7" * 64,
+                "source_dataset_sha256": "8" * 64,
+            },
+            {},
+        )
+        canonical_modules = tuple(
+            sorted(
+                [f"model.layers.{index}.self_attn.q_proj" for index in range(35)]
+                + [f"model.layers.{index}.self_attn.v_proj" for index in range(15)]
+            )
+        )
         self.patches["adapter_binding"].return_value = runner.AdapterBinding(
             semantic_sha256="sha256:" + "9" * 64,
             tensor_count=2 * len(canonical_modules),
-            target_inventory_sha256=runner.canonical_target_inventory_sha256(canonical_modules),
+            target_inventory_sha256=runner.canonical_target_inventory_sha256(
+                canonical_modules
+            ),
             canonical_modules=canonical_modules,
             rank=16,
             alpha=32.0,
@@ -389,24 +418,42 @@ class AntflyGemma4BenchmarkRunnerTest(unittest.TestCase):
             "metal_device": "Apple M4 Max",
         }
         argv = [
-            "--antfly", str(executable),
-            "--source-root", str(source),
-            "--model-key", "gemma-4-E2B-it",
-            "--model-dir", str(model),
-            "--adapter-dir", str(adapter),
-            "--train-prepared", str(train),
-            "--eval-prepared", str(eval_path),
-            "--example-index", "0",
-            "--target-preset", "peft-qv",
-            "--sequence-length", "128",
-            "--grad-accum", "1",
-            "--campaign-id", "campaign-1",
-            "--run-id", "antfly-0",
-            "--repetition", "0",
-            "--sequence-index", "0",
-            "--metal-device", "Apple M4 Max",
-            "--timeout-seconds", "10",
-            "--output", str(root / "sample.json"),
+            "--antfly",
+            str(executable),
+            "--source-root",
+            str(source),
+            "--model-key",
+            "gemma-4-E2B-it",
+            "--model-dir",
+            str(model),
+            "--adapter-dir",
+            str(adapter),
+            "--train-prepared",
+            str(train),
+            "--eval-prepared",
+            str(eval_path),
+            "--example-index",
+            "0",
+            "--target-preset",
+            "peft-qv",
+            "--sequence-length",
+            "128",
+            "--grad-accum",
+            "1",
+            "--campaign-id",
+            "campaign-1",
+            "--run-id",
+            "antfly-0",
+            "--repetition",
+            "0",
+            "--sequence-index",
+            "0",
+            "--metal-device",
+            "Apple M4 Max",
+            "--timeout-seconds",
+            "10",
+            "--output",
+            str(root / "sample.json"),
         ]
         if diagnostic_only:
             argv.append("--diagnostic-only")
@@ -428,7 +475,9 @@ class AntflyGemma4BenchmarkRunnerTest(unittest.TestCase):
 
             sample = validate_sample(args.output, lock, LOCK_PATH)
             self.assertEqual("antfly-zig-metal", sample.payload["framework"])
-            self.assertEqual("1.2.3-test", payload["implementation"]["antfly"]["version"])
+            self.assertEqual(
+                "1.2.3-test", payload["implementation"]["antfly"]["version"]
+            )
             self.assertEqual(
                 benchmark_producer_source(),
                 payload["implementation"]["producer_source"],
@@ -440,8 +489,16 @@ class AntflyGemma4BenchmarkRunnerTest(unittest.TestCase):
             self.assertEqual(20, len(payload["metrics"]["step_seconds"]))
             self.assertEqual(128, payload["metrics"]["input_tokens"])
             self.assertEqual(32, payload["metrics"]["supervised_tokens"])
-            self.assertEqual(987654321, payload["metrics"]["memory"]["process_peak_phys_footprint_bytes"])
-            self.assertEqual(-1.0, payload["metrics"]["memory"]["system_deltas"]["pressure_available_percent_delta"])
+            self.assertEqual(
+                987654321,
+                payload["metrics"]["memory"]["process_peak_phys_footprint_bytes"],
+            )
+            self.assertEqual(
+                -1.0,
+                payload["metrics"]["memory"]["system_deltas"][
+                    "pressure_available_percent_delta"
+                ],
+            )
             self.assertEqual(
                 [mock.call(before_measured=True), mock.call(before_measured=False)],
                 self.patches["capture_darwin_system_memory_snapshot"].call_args_list,
@@ -452,7 +509,9 @@ class AntflyGemma4BenchmarkRunnerTest(unittest.TestCase):
     def test_missing_zig_telemetry_interface_fails_closed_without_output(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             args, _lock = self.fixture(Path(name), compatible=False)
-            with self.assertRaisesRegex(runner.BenchmarkInterfaceUnavailable, "Required Zig change") as raised:
+            with self.assertRaisesRegex(
+                runner.BenchmarkInterfaceUnavailable, "Required Zig change"
+            ) as raised:
                 runner.run(args)
             self.assertIn("complete optimizer window", str(raised.exception))
             self.assertFalse(args.output.exists())
@@ -469,10 +528,14 @@ class AntflyGemma4BenchmarkRunnerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
             args, lock = self.fixture(root, diagnostic_only=True)
-            with mock.patch.object(runner, "enforce_system_memory_gates") as memory_gate:
+            with mock.patch.object(
+                runner, "enforce_system_memory_gates"
+            ) as memory_gate:
                 payload = runner.run(args)
 
-            self.assertEqual(runner.DIAGNOSTIC_SAMPLE_SCHEMA_VERSION, payload["schema_version"])
+            self.assertEqual(
+                runner.DIAGNOSTIC_SAMPLE_SCHEMA_VERSION, payload["schema_version"]
+            )
             self.assertFalse(payload["diagnostic"]["release_eligible"])
             self.assertFalse(payload["diagnostic"]["release_gates_enforced"])
             self.assertEqual({}, payload["diagnostic"]["environment_overrides"])
@@ -502,7 +565,9 @@ class AntflyGemma4BenchmarkRunnerTest(unittest.TestCase):
                 runner.run(args)
             self.assertFalse(args.output.exists())
 
-    def test_diagnostic_environment_override_is_scoped_propagated_and_recorded(self) -> None:
+    def test_diagnostic_environment_override_is_scoped_propagated_and_recorded(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
             override = "TERMITE_METAL_DISABLE_GEMMA4_BF16_MLP_FUSION=1"
@@ -534,18 +599,24 @@ class AntflyGemma4BenchmarkRunnerTest(unittest.TestCase):
                 runner.run(args)
             self.assertFalse(args.output.exists())
 
-    def test_diagnostic_environment_override_cannot_weaken_strict_metal_contract(self) -> None:
+    def test_diagnostic_environment_override_cannot_weaken_strict_metal_contract(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as name:
             args, _lock = self.fixture(
                 Path(name),
                 diagnostic_only=True,
                 diagnostic_env=("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR=0",),
             )
-            with self.assertRaisesRegex(ContractError, "cannot replace locked strict-Metal variable"):
+            with self.assertRaisesRegex(
+                ContractError, "cannot replace locked strict-Metal variable"
+            ):
                 runner.run(args)
             self.assertFalse(args.output.exists())
 
-    def test_diagnostic_environment_override_rejects_non_termite_and_duplicates(self) -> None:
+    def test_diagnostic_environment_override_rejects_non_termite_and_duplicates(
+        self,
+    ) -> None:
         with self.assertRaisesRegex(ContractError, "only TERMITE_"):
             runner.diagnostic_environment_overrides(["PATH=/tmp"], diagnostic_only=True)
         with self.assertRaisesRegex(ContractError, "repeats TERMITE_METAL_TEST"):
@@ -581,7 +652,9 @@ class AntflyAdapterBindingTest(unittest.TestCase):
                 tensors={(module, "lora_A"): object(), (module, "lora_B"): object()},
             )
             lock = {"performance_gate": {"rank": 16, "alpha": 32.0}}
-            with mock.patch.object(runner, "inspect_initial_adapter", return_value=artifact):
+            with mock.patch.object(
+                runner, "inspect_initial_adapter", return_value=artifact
+            ):
                 binding = runner.adapter_binding(root, lock, "model", "peft-qv", {})
             self.assertEqual((module,), binding.canonical_modules)
             self.assertEqual("sha256:" + "d" * 64, binding.semantic_sha256)
@@ -602,7 +675,11 @@ class AntflySourceIdentityTest(unittest.TestCase):
                     return self.git_result(stdout=str(root) + "\n")
                 if command[-2:] == ["rev-parse", "HEAD"]:
                     return self.git_result(stdout="b" * 40 + "\n")
-                if command[-3:] == ["status", "--porcelain=v1", "--untracked-files=all"]:
+                if command[-3:] == [
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                ]:
                     return self.git_result()
                 raise AssertionError(f"unexpected git command: {command}")
 
@@ -646,7 +723,11 @@ class AntflySourceIdentityTest(unittest.TestCase):
                     return self.git_result(stdout=str(root) + "\n")
                 if command[-2:] == ["rev-parse", "HEAD"]:
                     return self.git_result(stdout="b" * 40 + "\n")
-                if command[-3:] == ["status", "--porcelain=v1", "--untracked-files=all"]:
+                if command[-3:] == [
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                ]:
                     return self.git_result(stdout="?? untracked-file\n")
                 raise AssertionError(f"unexpected git command: {command}")
 
@@ -657,7 +738,9 @@ class AntflySourceIdentityTest(unittest.TestCase):
                 with self.assertRaisesRegex(ContractError, "including untracked files"):
                     runner.source_identity(root)
 
-    def test_diagnostic_identity_records_dirty_checkout_without_claiming_cleanliness(self) -> None:
+    def test_diagnostic_identity_records_dirty_checkout_without_claiming_cleanliness(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name).resolve()
             for relative_path in BENCHMARK_PRODUCER_RELATIVE_PATHS:
@@ -670,14 +753,22 @@ class AntflySourceIdentityTest(unittest.TestCase):
             def git(command: tuple[str, ...], **kwargs: object) -> SimpleNamespace:
                 arguments = command[3:]
                 if arguments == ("rev-parse", "--show-toplevel"):
-                    return SimpleNamespace(stdout=str(root) + "\n", stderr="", returncode=0)
+                    return SimpleNamespace(
+                        stdout=str(root) + "\n", stderr="", returncode=0
+                    )
                 if arguments == ("rev-parse", "HEAD"):
-                    return SimpleNamespace(stdout="b" * 40 + "\n", stderr="", returncode=0)
+                    return SimpleNamespace(
+                        stdout="b" * 40 + "\n", stderr="", returncode=0
+                    )
                 if arguments == ("rev-parse", "HEAD^{tree}"):
-                    return SimpleNamespace(stdout="c" * 40 + "\n", stderr="", returncode=0)
+                    return SimpleNamespace(
+                        stdout="c" * 40 + "\n", stderr="", returncode=0
+                    )
                 if arguments == ("status", "--porcelain=v1", "--untracked-files=all"):
                     self.assertFalse(kwargs["text"])
-                    return SimpleNamespace(stdout=dirty_status, stderr=b"", returncode=0)
+                    return SimpleNamespace(
+                        stdout=dirty_status, stderr=b"", returncode=0
+                    )
                 raise AssertionError(f"unexpected git command: {command}")
 
             with (
@@ -688,8 +779,13 @@ class AntflySourceIdentityTest(unittest.TestCase):
 
             self.assertFalse(source["source_clean"])
             self.assertEqual(1, source["dirty_entry_count"])
-            self.assertEqual("sha256:" + __import__("hashlib").sha256(dirty_status).hexdigest(), source["working_tree_status_sha256"])
-            self.assertEqual(runner.DIAGNOSTIC_SOURCE_SCHEMA_VERSION, source["schema_version"])
+            self.assertEqual(
+                "sha256:" + __import__("hashlib").sha256(dirty_status).hexdigest(),
+                source["working_tree_status_sha256"],
+            )
+            self.assertEqual(
+                runner.DIAGNOSTIC_SOURCE_SCHEMA_VERSION, source["schema_version"]
+            )
 
 
 class AntflyExecutableVersionTest(unittest.TestCase):
@@ -749,29 +845,37 @@ class AntflyTelemetryValidationTest(unittest.TestCase):
         }
         steps = []
         for index in range(25):
-            steps.append({
-                "index": index,
-                "phase": "cold" if index == 0 else "first" if index == 1 else "warmup" if index < 5 else "measured",
-                "duration_ns": 10,
-                "input_tokens": 512,
-                "supervised_tokens": 12,
-                "optimizer_stepped": True,
-                "explicit_device_sync": True,
-                "strict_metal_evidence": {
-                    "optimizer_backend": "metal",
-                    "metal_optimizer_steps": 1,
-                    "graph_executor_steps": 4,
-                    "graph_executor_fallback_steps": 0,
-                    "native_partitions": 0,
-                    "unsupported_ops": 0,
-                    "interpreter_fallbacks": 0,
-                    "runtime_region_fallbacks": 0,
-                    "true_host_outputs": 0,
-                    "host_gradient_tensors": 0,
-                },
-                "phase_evidence": phase_evidence(index),
-                "command_plan_evidence": command_plan_evidence(index, 4),
-            })
+            steps.append(
+                {
+                    "index": index,
+                    "phase": "cold"
+                    if index == 0
+                    else "first"
+                    if index == 1
+                    else "warmup"
+                    if index < 5
+                    else "measured",
+                    "duration_ns": 10,
+                    "input_tokens": 512,
+                    "supervised_tokens": 12,
+                    "optimizer_stepped": True,
+                    "explicit_device_sync": True,
+                    "strict_metal_evidence": {
+                        "optimizer_backend": "metal",
+                        "metal_optimizer_steps": 1,
+                        "graph_executor_steps": 4,
+                        "graph_executor_fallback_steps": 0,
+                        "native_partitions": 0,
+                        "unsupported_ops": 0,
+                        "interpreter_fallbacks": 0,
+                        "runtime_region_fallbacks": 0,
+                        "true_host_outputs": 0,
+                        "host_gradient_tensors": 0,
+                    },
+                    "phase_evidence": phase_evidence(index),
+                    "command_plan_evidence": command_plan_evidence(index, 4),
+                }
+            )
         telemetry = {
             "schema_version": runner.TELEMETRY_SCHEMA_VERSION,
             "producer": {
@@ -818,7 +922,9 @@ class AntflyTelemetryValidationTest(unittest.TestCase):
         request, telemetry = self.telemetry()
         telemetry["timings"]["optimizer_steps"][4]["explicit_device_sync"] = False
         with tempfile.TemporaryDirectory() as name:
-            with self.assertRaisesRegex(ContractError, "not a synchronized complete optimizer step"):
+            with self.assertRaisesRegex(
+                ContractError, "not a synchronized complete optimizer step"
+            ):
                 self.validate(Path(name), request, telemetry)
 
     def test_rejects_cold_window_after_prior_graph_execution(self) -> None:
@@ -828,7 +934,9 @@ class AntflyTelemetryValidationTest(unittest.TestCase):
             with self.assertRaisesRegex(ContractError, "first graph execution"):
                 self.validate(Path(name), request, telemetry)
 
-    def test_rejects_product_version_mismatch_independently_of_source_revision(self) -> None:
+    def test_rejects_product_version_mismatch_independently_of_source_revision(
+        self,
+    ) -> None:
         request, telemetry = self.telemetry()
         telemetry["producer"]["version"] = "different-product-version"
         with tempfile.TemporaryDirectory() as name:
@@ -846,24 +954,34 @@ class AntflyTelemetryValidationTest(unittest.TestCase):
         request, telemetry = self.telemetry()
         telemetry["memory"]["source"] = "sampled-ps-rss"
         with tempfile.TemporaryDirectory() as name:
-            with self.assertRaisesRegex(ContractError, "lifetime maximum physical footprint"):
+            with self.assertRaisesRegex(
+                ContractError, "lifetime maximum physical footprint"
+            ):
                 self.validate(Path(name), request, telemetry)
 
     def test_rejects_any_strict_metal_fallback(self) -> None:
         request, telemetry = self.telemetry()
-        telemetry["timings"]["optimizer_steps"][8]["strict_metal_evidence"]["true_host_outputs"] = 1
+        telemetry["timings"]["optimizer_steps"][8]["strict_metal_evidence"][
+            "true_host_outputs"
+        ] = 1
         with tempfile.TemporaryDirectory() as name:
-            with self.assertRaisesRegex(ContractError, "forbidden strict-Metal fallback"):
+            with self.assertRaisesRegex(
+                ContractError, "forbidden strict-Metal fallback"
+            ):
                 self.validate(Path(name), request, telemetry)
 
-    def test_rejects_legacy_telemetry_without_phase_and_command_plan_evidence(self) -> None:
+    def test_rejects_legacy_telemetry_without_phase_and_command_plan_evidence(
+        self,
+    ) -> None:
         request, telemetry = self.telemetry()
         telemetry["schema_version"] = "antfly_gemma4_lora_benchmark_telemetry/v2"
         for step in telemetry["timings"]["optimizer_steps"]:
             step.pop("phase_evidence")
             step.pop("command_plan_evidence")
         with tempfile.TemporaryDirectory() as name:
-            with self.assertRaisesRegex(ContractError, "unsupported Antfly benchmark telemetry schema"):
+            with self.assertRaisesRegex(
+                ContractError, "unsupported Antfly benchmark telemetry schema"
+            ):
                 self.validate(Path(name), request, telemetry)
 
     def test_rejects_warm_command_plan_cache_miss(self) -> None:
@@ -878,7 +996,9 @@ class AntflyTelemetryValidationTest(unittest.TestCase):
     def test_rejects_command_family_over_attribution(self) -> None:
         request, telemetry = self.telemetry()
         command = telemetry["timings"]["optimizer_steps"][5]["command_plan_evidence"]
-        command["metal_command_other_dispatches"] = command["graph_executor_command_dispatches"]
+        command["metal_command_other_dispatches"] = command[
+            "graph_executor_command_dispatches"
+        ]
         with tempfile.TemporaryDirectory() as name:
             with self.assertRaisesRegex(ContractError, "command attribution exceeds"):
                 self.validate(Path(name), request, telemetry)
@@ -889,10 +1009,14 @@ class AntflyTelemetryValidationTest(unittest.TestCase):
             "metal_gemma4_bf16_gate_up_fused_calls"
         )
         with tempfile.TemporaryDirectory() as name:
-            with self.assertRaisesRegex(ContractError, "metal_gemma4_bf16_gate_up_fused_calls"):
+            with self.assertRaisesRegex(
+                ContractError, "metal_gemma4_bf16_gate_up_fused_calls"
+            ):
                 self.validate(Path(name), request, telemetry)
 
-    def test_rejects_command_plan_without_gemma4_bf16_gate_up_backward_input_sum_attribution(self) -> None:
+    def test_rejects_command_plan_without_gemma4_bf16_gate_up_backward_input_sum_attribution(
+        self,
+    ) -> None:
         request, telemetry = self.telemetry()
         telemetry["timings"]["optimizer_steps"][5]["command_plan_evidence"].pop(
             "metal_gemma4_bf16_gate_up_backward_input_sum_fused_calls"
@@ -906,7 +1030,9 @@ class AntflyTelemetryValidationTest(unittest.TestCase):
 
 
 class AntflyPreparedWorkloadBindingTest(unittest.TestCase):
-    def test_exact_selected_row_is_repeated_for_every_accumulation_microstep(self) -> None:
+    def test_exact_selected_row_is_repeated_for_every_accumulation_microstep(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
             prepared = root / "prepared.json"
@@ -929,8 +1055,12 @@ class AntflyPreparedWorkloadBindingTest(unittest.TestCase):
                 }
 
             with (
-                mock.patch.object(runner, "load_prepared_example", side_effect=example) as loader,
-                mock.patch.object(runner, "verify_prepared_source_dataset") as source_check,
+                mock.patch.object(
+                    runner, "load_prepared_example", side_effect=example
+                ) as loader,
+                mock.patch.object(
+                    runner, "verify_prepared_source_dataset"
+                ) as source_check,
             ):
                 binding = runner.prepared_binding(
                     prepared,
@@ -971,10 +1101,14 @@ class AntflyPreparedWorkloadBindingTest(unittest.TestCase):
                 "rendered_chat_sha256": "f" * 64,
             }
             with (
-                mock.patch.object(runner, "load_prepared_example", return_value=(summary, selected)),
+                mock.patch.object(
+                    runner, "load_prepared_example", return_value=(summary, selected)
+                ),
                 mock.patch.object(runner, "verify_prepared_source_dataset"),
             ):
-                with self.assertRaisesRegex(ContractError, "must equal the benchmark cell"):
+                with self.assertRaisesRegex(
+                    ContractError, "must equal the benchmark cell"
+                ):
                     runner.prepared_binding(
                         prepared,
                         sequence_length=128,

@@ -39,7 +39,11 @@ from gemma4_oracle_contract import (
 
 def emit(payload: Any, output: Path | None) -> None:
     if output is None:
-        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False))
+        print(
+            json.dumps(
+                payload, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False
+            )
+        )
     else:
         write_json(output, payload)
 
@@ -153,17 +157,27 @@ def command_compare_adapters(args: argparse.Namespace) -> dict[str, Any]:
     tolerance = lock["tolerance_profiles"][args.profile]
     reference_root = args.reference.expanduser().resolve().parent
     candidate_root = args.candidate.expanduser().resolve().parent
-    reference_publication_sha, reference_files = validate_evidence_ledger(reference_root / "trace.json")
-    candidate_publication_sha, candidate_files = validate_evidence_ledger(candidate_root / "trace.json")
+    reference_publication_sha, reference_files = validate_evidence_ledger(
+        reference_root / "trace.json"
+    )
+    candidate_publication_sha, candidate_files = validate_evidence_ledger(
+        candidate_root / "trace.json"
+    )
     for label, adapter_dir, files in (
         ("reference", args.reference.expanduser().resolve(), reference_files),
         ("candidate", args.candidate.expanduser().resolve(), candidate_files),
     ):
         prefix = adapter_dir.name + "/"
         if not any(path.startswith(prefix) for path in files):
-            raise ContractError(f"{label} adapter is not committed by its COMPLETE.json ledger")
-    reference = inspect_adapter_artifact(args.reference, target_preset=args.reference_target_preset)
-    candidate = inspect_adapter_artifact(args.candidate, target_preset=args.candidate_target_preset)
+            raise ContractError(
+                f"{label} adapter is not committed by its COMPLETE.json ledger"
+            )
+    reference = inspect_adapter_artifact(
+        args.reference, target_preset=args.reference_target_preset
+    )
+    candidate = inspect_adapter_artifact(
+        args.candidate, target_preset=args.candidate_target_preset
+    )
     validate_target_inventory(
         lock,
         args.model_key,
@@ -197,16 +211,18 @@ def command_compare_adapters(args: argparse.Namespace) -> dict[str, Any]:
             and metrics.rel_l2 <= tolerance["state_rel_l2"]
             and metrics.cosine >= tolerance["state_cosine_min"]
         )
-        tensor_rows.append({
-            "canonical_name": identity[0],
-            "role": identity[1],
-            "shape": left["shape"],
-            "rel_l2": metrics.rel_l2,
-            "cosine": metrics.cosine,
-            "max_abs": metrics.max_abs,
-            "max_abs_limit": tolerance["state_max_abs"],
-            "ok": ok,
-        })
+        tensor_rows.append(
+            {
+                "canonical_name": identity[0],
+                "role": identity[1],
+                "shape": left["shape"],
+                "rel_l2": metrics.rel_l2,
+                "cosine": metrics.cosine,
+                "max_abs": metrics.max_abs,
+                "max_abs_limit": tolerance["state_max_abs"],
+                "ok": ok,
+            }
+        )
         if not ok:
             failures.append(f"payload differs for {identity[0]}:{identity[1]}")
     return {
@@ -223,10 +239,12 @@ def command_compare_adapters(args: argparse.Namespace) -> dict[str, Any]:
             "adapter_model_sha256": candidate["adapter_model_sha256"],
             "publication_manifest_sha256": candidate_publication_sha,
         },
-        "byte_hashes_equal": reference["adapter_model_sha256"] == candidate["adapter_model_sha256"],
+        "byte_hashes_equal": reference["adapter_model_sha256"]
+        == candidate["adapter_model_sha256"],
         "reference_key_layout": reference["key_layout"],
         "candidate_key_layout": candidate["key_layout"],
-        "canonical_name_normalization_applied": reference["key_layout"] != candidate["key_layout"],
+        "canonical_name_normalization_applied": reference["key_layout"]
+        != candidate["key_layout"],
         "direct_bidirectional_interoperability_proven": False,
         "semantics_equal": semantics_equal,
         "inventory_equal": inventory_equal,
@@ -238,18 +256,28 @@ def command_compare_adapters(args: argparse.Namespace) -> dict[str, Any]:
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     root.add_argument("--lock", type=Path, default=LOCK_PATH)
-    root.add_argument("--output", type=Path, help="write a new JSON result instead of stdout")
+    root.add_argument(
+        "--output", type=Path, help="write a new JSON result instead of stdout"
+    )
     commands = root.add_subparsers(dest="command", required=True)
 
-    validate_lock = commands.add_parser("validate-lock", help="validate lock and requirements synchronization")
+    validate_lock = commands.add_parser(
+        "validate-lock", help="validate lock and requirements synchronization"
+    )
     validate_lock.set_defaults(handler=command_validate_lock)
 
-    validate_model = commands.add_parser("validate-model", help="hash and validate a local pinned model snapshot")
-    validate_model.add_argument("--model-key", required=True, choices=("gemma-4-E2B-it", "gemma-4-E4B-it"))
+    validate_model = commands.add_parser(
+        "validate-model", help="hash and validate a local pinned model snapshot"
+    )
+    validate_model.add_argument(
+        "--model-key", required=True, choices=("gemma-4-E2B-it", "gemma-4-E4B-it")
+    )
     validate_model.add_argument("--model-dir", type=Path, required=True)
     validate_model.set_defaults(handler=command_validate_model)
 
-    validate_prepared = commands.add_parser("validate-prepared", help="validate one exact text-only prepared example")
+    validate_prepared = commands.add_parser(
+        "validate-prepared", help="validate one exact text-only prepared example"
+    )
     validate_prepared.add_argument("--prepared", type=Path, required=True)
     validate_prepared.add_argument(
         "--source-dataset",
@@ -276,10 +304,18 @@ def parser() -> argparse.ArgumentParser:
     )
     compare.set_defaults(handler=command_compare)
 
-    inspect_adapter = commands.add_parser("inspect-adapter", help="validate one PEFT-format adapter")
+    inspect_adapter = commands.add_parser(
+        "inspect-adapter", help="validate one PEFT-format adapter"
+    )
     inspect_adapter.add_argument("--adapter", type=Path, required=True)
-    inspect_adapter.add_argument("--model-key", required=True, choices=("gemma-4-E2B-it", "gemma-4-E4B-it"))
-    inspect_adapter.add_argument("--target-preset", choices=("peft-qv", "text-all-linear"), help="required policy for a stock PEFT adapter without an Antfly manifest")
+    inspect_adapter.add_argument(
+        "--model-key", required=True, choices=("gemma-4-E2B-it", "gemma-4-E4B-it")
+    )
+    inspect_adapter.add_argument(
+        "--target-preset",
+        choices=("peft-qv", "text-all-linear"),
+        help="required policy for a stock PEFT adapter without an Antfly manifest",
+    )
     inspect_adapter.set_defaults(handler=command_inspect_adapter)
 
     compare_adapters = commands.add_parser(
@@ -288,14 +324,20 @@ def parser() -> argparse.ArgumentParser:
     )
     compare_adapters.add_argument("--reference", type=Path, required=True)
     compare_adapters.add_argument("--candidate", type=Path, required=True)
-    compare_adapters.add_argument("--model-key", required=True, choices=("gemma-4-E2B-it", "gemma-4-E4B-it"))
+    compare_adapters.add_argument(
+        "--model-key", required=True, choices=("gemma-4-E2B-it", "gemma-4-E4B-it")
+    )
     compare_adapters.add_argument(
         "--profile",
         default="hf-zig-bf16",
         choices=("tiny-f32", "native-metal-bf16", "hf-zig-bf16", "resume"),
     )
-    compare_adapters.add_argument("--reference-target-preset", choices=("peft-qv", "text-all-linear"))
-    compare_adapters.add_argument("--candidate-target-preset", choices=("peft-qv", "text-all-linear"))
+    compare_adapters.add_argument(
+        "--reference-target-preset", choices=("peft-qv", "text-all-linear")
+    )
+    compare_adapters.add_argument(
+        "--candidate-target-preset", choices=("peft-qv", "text-all-linear")
+    )
     compare_adapters.set_defaults(handler=command_compare_adapters)
     return root
 

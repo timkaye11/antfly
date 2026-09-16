@@ -26,9 +26,7 @@ from typing import Any, Mapping, Sequence
 SCRIPT_PATH = Path(__file__).resolve()
 SCRIPT_DIR = SCRIPT_PATH.parent
 DEFAULT_CASE_PATH = (
-    SCRIPT_DIR.parent.parent
-    / "testdata"
-    / "gemma4_grpo_e2b_seq128_benchmark.json"
+    SCRIPT_DIR.parent.parent / "testdata" / "gemma4_grpo_e2b_seq128_benchmark.json"
 )
 CASE_SCHEMA_VERSION = "antfly_gemma4_grpo_benchmark_case/v1"
 RESULT_SCHEMA_VERSION = "antfly_gemma4_grpo_mlx_benchmark/v1"
@@ -272,30 +270,40 @@ def load_case(path: Path) -> BenchmarkCase:
     reward_tokens: list[RewardToken] = []
     for idx, row in enumerate(token_contract):
         if not isinstance(row, dict):
-            raise GrpoBenchmarkContractError(f"reward.token_contract[{idx}] is not an object")
-        _require_exact_keys(row, {"token_id", "decoded_text", "reward"}, f"reward.token_contract[{idx}]")
-        token_id = _token_ids([row["token_id"]], f"reward.token_contract[{idx}].token_id")[0]
+            raise GrpoBenchmarkContractError(
+                f"reward.token_contract[{idx}] is not an object"
+            )
+        _require_exact_keys(
+            row, {"token_id", "decoded_text", "reward"}, f"reward.token_contract[{idx}]"
+        )
+        token_id = _token_ids(
+            [row["token_id"]], f"reward.token_contract[{idx}].token_id"
+        )[0]
         if not isinstance(row["decoded_text"], str) or not row["decoded_text"]:
             raise GrpoBenchmarkContractError(
                 f"reward.token_contract[{idx}].decoded_text must be non-empty"
             )
-        reward_value = _finite_float(row["reward"], f"reward.token_contract[{idx}].reward")
+        reward_value = _finite_float(
+            row["reward"], f"reward.token_contract[{idx}].reward"
+        )
         if reward_value < 0.0:
             raise GrpoBenchmarkContractError("rewards cannot be negative")
-        reward_tokens.append(
-            RewardToken(token_id, row["decoded_text"], reward_value)
-        )
+        reward_tokens.append(RewardToken(token_id, row["decoded_text"], reward_value))
     if tuple(item.token_id for item in reward_tokens) != expected_ids:
         raise GrpoBenchmarkContractError(
             "reward token order must equal the expected ranked token order"
         )
     if len({item.reward for item in reward_tokens}) < 2:
-        raise GrpoBenchmarkContractError("the reward contract must produce an advantage")
+        raise GrpoBenchmarkContractError(
+            "the reward contract must produce an advantage"
+        )
 
     prompt_ids = _token_ids(payload["prompt_token_ids"], "prompt_token_ids")
     sequence_length = _positive_int(payload["sequence_length"], "sequence_length")
     if len(prompt_ids) + completion_tokens > sequence_length:
-        raise GrpoBenchmarkContractError("prompt plus completion exceeds sequence_length")
+        raise GrpoBenchmarkContractError(
+            "prompt plus completion exceeds sequence_length"
+        )
 
     digest = "sha256:" + hashlib.sha256(_canonical_case_payload(payload)).hexdigest()
     return BenchmarkCase(
@@ -437,13 +445,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         args.mlx_lm_source_root, revisions["mlx-lm"], "MLX-LM"
     )
     if platform.system() != mlx_contract["required_platform"]:
-        raise GrpoBenchmarkContractError("MLX benchmark must run on the locked platform")
+        raise GrpoBenchmarkContractError(
+            "MLX benchmark must run on the locked platform"
+        )
     if platform.machine() != mlx_contract["required_machine"]:
         raise GrpoBenchmarkContractError("MLX benchmark must run on the locked machine")
     if case.protocol["warmup"] != mlx_contract["warmup_steps"]:
         raise GrpoBenchmarkContractError("case warmup count differs from the MLX lock")
     if case.protocol["measured"] != mlx_contract["measured_steps"]:
-        raise GrpoBenchmarkContractError("case measured count differs from the MLX lock")
+        raise GrpoBenchmarkContractError(
+            "case measured count differs from the MLX lock"
+        )
 
     import mlx.core as mx
     import mlx.nn as nn
@@ -466,10 +478,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "mlx": str(mx.__version__),
             "mlx-lm": str(mlx_lm_version),
         },
-        {
-            name: mlx_contract["packages"][name]
-            for name in RUNTIME_PACKAGE_NAMES
-        },
+        {name: mlx_contract["packages"][name] for name in RUNTIME_PACKAGE_NAMES},
     )
 
     mlx_lm_root = args.mlx_lm_source_root.expanduser().resolve()
@@ -489,12 +498,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     adapter_dir = args.adapter_dir.expanduser().resolve()
     try:
         manifest = json.loads(
-            (adapter_dir / "antfly_finetune_manifest.json").read_text(
-                encoding="utf-8"
-            )
+            (adapter_dir / "antfly_finetune_manifest.json").read_text(encoding="utf-8")
         )
     except (OSError, json.JSONDecodeError) as exc:
-        raise GrpoBenchmarkContractError(f"could not load adapter manifest: {exc}") from exc
+        raise GrpoBenchmarkContractError(
+            f"could not load adapter manifest: {exc}"
+        ) from exc
     if not isinstance(manifest, dict):
         raise GrpoBenchmarkContractError("adapter manifest must be an object")
     binding_fields = (
@@ -512,7 +521,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         not isinstance(value, str) or len(value) != 64
         for value in prepared_summary.values()
     ):
-        raise GrpoBenchmarkContractError("adapter manifest model bindings are malformed")
+        raise GrpoBenchmarkContractError(
+            "adapter manifest model bindings are malformed"
+        )
     base_model_provenance = locked.zig_model_provenance(model_dir)
     for field in binding_fields:
         if prepared_summary[field] != base_model_provenance[field]:
@@ -526,9 +537,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         case.target_preset,
         prepared_summary,
     )
-    if adapter.semantics["r"] != case.rank or float(
-        adapter.semantics["lora_alpha"]
-    ) != case.alpha:
+    if (
+        adapter.semantics["r"] != case.rank
+        or float(adapter.semantics["lora_alpha"]) != case.alpha
+    ):
         raise GrpoBenchmarkContractError("case rank/alpha differ from the adapter")
 
     mx.set_default_device(mx.gpu)
@@ -561,9 +573,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         prediction_row = len(case.prompt_token_ids) - 1
 
         reference_started = time.perf_counter()
-        reference_logits = model(prompt_input)[:, prediction_row, :].astype(
-            mx.float32
-        )[0]
+        reference_logits = model(prompt_input)[:, prediction_row, :].astype(mx.float32)[
+            0
+        ]
         reference_logprobs = reference_logits - mx.logsumexp(reference_logits)
         mx.eval(reference_logprobs)
         mx.synchronize()
@@ -618,9 +630,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
             return mx.take_along_axis(logprobs, selected[:, None], axis=-1)[:, 0]
 
-        def group_selected_logps(
-            current_model: Any, tokens: Any, selected: Any
-        ) -> Any:
+        def group_selected_logps(current_model: Any, tokens: Any, selected: Any) -> Any:
             # Keep each completion at batch=1, matching Antfly's two physical
             # micro-batches. The pinned MLX Gemma4 E2B graph is not numerically
             # batch-shape invariant enough for the strict sampling/rescore gate.
@@ -647,11 +657,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             new_logps = group_selected_logps(current_model, tokens, selected)
             ratio = mx.exp(new_logps - old_logps)
             pg_unclipped = ratio * advantages
-            pg_clipped = mx.clip(
-                ratio,
-                1.0 - case.clip_epsilon,
-                1.0 + case.clip_epsilon,
-            ) * advantages
+            pg_clipped = (
+                mx.clip(
+                    ratio,
+                    1.0 - case.clip_epsilon,
+                    1.0 + case.clip_epsilon,
+                )
+                * advantages
+            )
             pg_tokens = -mx.minimum(pg_unclipped, pg_clipped)
             diff = reference - new_logps
             kl_tokens = case.kl_coef * (mx.exp(diff) - diff - 1.0)
@@ -692,9 +705,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             policy_logits = model(prompt_input)[:, prediction_row, :].astype(
                 mx.float32
             )[0]
-            candidate_ids = mx.argpartition(
-                -policy_logits, kth=case.group_size - 1
-            )[: case.group_size]
+            candidate_ids = mx.argpartition(-policy_logits, kth=case.group_size - 1)[
+                : case.group_size
+            ]
             candidate_logits = policy_logits[candidate_ids]
             order = mx.argsort(-candidate_logits)
             selected = candidate_ids[order]
@@ -705,7 +718,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             mx.synchronize()
 
             token_ids = [int(value) for value in selected.tolist()]
-            if update_index == 0 and tuple(token_ids) != case.expected_initial_token_ids:
+            if (
+                update_index == 0
+                and tuple(token_ids) != case.expected_initial_token_ids
+            ):
                 raise GrpoBenchmarkContractError(
                     "MLX initial ranked completion tokens differ from the locked case: "
                     f"expected={case.expected_initial_token_ids}, actual={tuple(token_ids)}"
@@ -794,7 +810,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             update["policy_reference_max_abs_error"] > 1e-5
             for update in [first, *warmup, *measured]
         ):
-            raise GrpoBenchmarkContractError("MLX policy did not move after optimization")
+            raise GrpoBenchmarkContractError(
+                "MLX policy did not move after optimization"
+            )
 
         final_trainables = dict(tree_flatten(model.trainable_parameters()))
         delta_squares = [

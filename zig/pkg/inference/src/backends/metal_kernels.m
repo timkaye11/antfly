@@ -8911,19 +8911,19 @@ static NSString *termite_metal_shader_source(void) {
            "    uint first_col = tg.x * tile_n; uint first_row = tg.y * tile_m;\n"
            "    if (first_col >= p.in_dim || first_row >= p.rows) return;\n"
            "    uint valid_cols = min(tile_n, p.in_dim - first_col); uint valid_rows = min(tile_m, p.rows - first_row);\n"
-           "    threadgroup half *sa = (threadgroup half *)(shmem); threadgroup half *sb = (threadgroup half *)(shmem + 4096u);\n"
+           "    threadgroup float *sa = (threadgroup float *)(shmem); threadgroup float *sb = (threadgroup float *)(shmem + 8192u);\n"
            "    constexpr short NL0 = 2; constexpr short NL1 = 4;\n"
            "    short local_col = short(min(uint(tiitg) / uint(NL0), valid_cols - 1u)); short local_row = short(min(uint(tiitg) / uint(NL1), valid_rows - 1u));\n"
            "    short half_k = short(tiitg) % NL0; short input_k8 = 8 * (short(tiitg) % NL1);\n"
-           "    simdgroup_half8x8 ma[4]; simdgroup_half8x8 mb[2]; simdgroup_float8x8 mc[8];\n"
+           "    simdgroup_float8x8 ma[4]; simdgroup_float8x8 mb[2]; simdgroup_float8x8 mc[8];\n"
            "    for (short i = 0; i < 8; ++i) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
            "    for (uint k0 = 0u; k0 < p.out_dim; k0 += tile_k) {\n"
-           "        half4x4 weight_values; for (short i = 0; i < 16; ++i) { uint k = k0 + uint(half_k * 16 + i); weight_values[i / 4][i % 4] = k < p.out_dim ? weight[k * p.in_dim + first_col + uint(local_col)] : half(0.0f); }\n"
+           "        float4x4 weight_values; for (short i = 0; i < 16; ++i) { uint k = k0 + uint(half_k * 16 + i); weight_values[i / 4][i % 4] = k < p.out_dim ? weight[k * p.in_dim + first_col + uint(local_col)] : float(0.0f); }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        for (short i = 0; i < 16; ++i) { short sx = 2 * half_k + i / 8; short sy = (short(tiitg) / NL0) / 8; short lx = (short(tiitg) / NL0) % 8; short ly = i % 8; short ib = 8 * sx + sy; *(sa + 64 * ib + 8 * ly + lx) = weight_values[i / 4][i % 4]; }\n"
-           "        for (short i = 0; i < 8; ++i) { short sx = short(tiitg) % NL1; short sy = (short(tiitg) / NL1) / 8; short lx = i; short ly = (short(tiitg) / NL1) % 8; short ib = 4 * sx + sy; uint k = k0 + uint(input_k8 + i); *(sb + 64 * ib + 8 * ly + lx) = k < p.out_dim ? half(output_grad[(first_row + uint(local_row)) * p.out_dim + k]) : half(0.0f); }\n"
+           "        for (short i = 0; i < 8; ++i) { short sx = short(tiitg) % NL1; short sy = (short(tiitg) / NL1) / 8; short lx = i; short ly = (short(tiitg) / NL1) % 8; short ib = 4 * sx + sy; uint k = k0 + uint(input_k8 + i); *(sb + 64 * ib + 8 * ly + lx) = k < p.out_dim ? float(output_grad[(first_row + uint(local_row)) * p.out_dim + k]) : float(0.0f); }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        threadgroup const half *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const half *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u);\n"
+           "        threadgroup const float *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const float *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u);\n"
            "        for (short ik = 0; ik < 4; ++ik) { simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 4; ++i) simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 2; ++i) simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 8; ++i) simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]); lsma += 8 * 64; lsmb += 4 * 64; }\n"
            "    }\n"
            "    uint sg_col = 32u * (uint(sgitg) & 1u); uint sg_row = 16u * (uint(sgitg) >> 1u);\n"
@@ -10194,6 +10194,7 @@ static NSString *termite_metal_shader_source(void) {
            "        if (tid == 0u) shmem[0] = termite_linear_ce_label_state(labels[row], p);\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        float state = shmem[0];\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        if (state <= 0.0f) { if (tid == 0u && state < 0.0f) invalid_label = true; continue; }\n"
            "        uint base = row * p.vocab_size;\n"
            "        float local_max = -INFINITY;\n"
@@ -10201,6 +10202,7 @@ static NSString *termite_metal_shader_source(void) {
            "        shmem[tid] = local_max; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) { if (tid < stride) shmem[tid] = max(shmem[tid], shmem[tid + stride]); threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
            "        float row_max = shmem[0];\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        float local_sum = 0.0f;\n"
            "        for (uint vocab = tid; vocab < p.vocab_size; vocab += threads) local_sum += exp(termite_linear_ce_logit(logits[base + vocab], p.logit_softcap) - row_max);\n"
            "        shmem[tid] = local_sum; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
@@ -10217,9 +10219,11 @@ static NSString *termite_metal_shader_source(void) {
            "    shmem[tid] = local_valid; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) { if (tid < stride) shmem[tid] += shmem[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
            "    float valid_rows = shmem[0];\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    shmem[tid] = local_invalid; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) { if (tid < stride) shmem[tid] += shmem[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
            "    float invalid_rows = shmem[0]; float state = termite_linear_ce_label_state(labels[row], p); uint base = row * p.vocab_size;\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    if (invalid_rows > 0.0f) { for (uint vocab = tid; vocab < p.vocab_size; vocab += threads) output[base + vocab] = NAN; return; }\n"
            "    if (state == 0.0f || valid_rows == 0.0f) { for (uint vocab = tid; vocab < p.vocab_size; vocab += threads) output[base + vocab] = 0.0f; return; }\n"
            "    float local_max = -INFINITY;\n"
@@ -10227,6 +10231,7 @@ static NSString *termite_metal_shader_source(void) {
            "    shmem[tid] = local_max; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) { if (tid < stride) shmem[tid] = max(shmem[tid], shmem[tid + stride]); threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
            "    float row_max = shmem[0]; float local_sum = 0.0f;\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    for (uint vocab = tid; vocab < p.vocab_size; vocab += threads) local_sum += exp(termite_linear_ce_logit(logits[base + vocab], p.logit_softcap) - row_max);\n"
            "    shmem[tid] = local_sum; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) { if (tid < stride) shmem[tid] += shmem[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
@@ -11796,7 +11801,7 @@ static NSString *termite_metal_shader_source(void) {
            "kernel void termite_attention_f32_dense_causal_sg(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_attention_f32_params &p [[buffer(4)]], threadgroup char *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
            "    const uint hd = p.head_dim; const uint q0 = tg.x * 8u; const uint h = tg.y;\n"
            "    if (q0 >= p.q_len || h >= p.num_heads || p.num_kv_heads == 0u || hd % 32u != 0u || p.has_bias != 0u || p.has_mask != 0u) return;\n"
-           "    const float scale = rsqrt(float(hd)); const uint heads_per_group = p.num_heads / p.num_kv_heads; const uint kv_head_base = (h / heads_per_group) * hd;\n"
+           "    const float requested_scale = as_type<float>(p.reserved0); const float scale = requested_scale != 0.0f ? requested_scale : rsqrt(float(hd)); const uint heads_per_group = p.num_heads / p.num_kv_heads; const uint kv_head_base = (h / heads_per_group) * hd;\n"
            "    const uint q_stride = p.num_heads * hd; const uint kv_stride = p.num_kv_heads * hd;\n"
            "    threadgroup half *sq = (threadgroup half *)shmem;\n"
            "    threadgroup half *skv = sq + 8u * hd;\n"
@@ -11859,7 +11864,7 @@ static NSString *termite_metal_shader_source(void) {
            "kernel void termite_attention_f32_dense_causal_sg_q16(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_attention_f32_params &p [[buffer(4)]], threadgroup char *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
            "    const uint hd = p.head_dim; const uint q0 = tg.x * 16u; const uint h = tg.y;\n"
            "    if (q0 >= p.q_len || h >= p.num_heads || p.num_kv_heads == 0u || hd % 32u != 0u || hd > 128u || p.has_bias != 0u || p.has_mask != 0u) return;\n"
-           "    const float scale = rsqrt(float(hd)); const uint heads_per_group = p.num_heads / p.num_kv_heads; const uint kv_head_base = (h / heads_per_group) * hd;\n"
+           "    const float requested_scale = as_type<float>(p.reserved0); const float scale = requested_scale != 0.0f ? requested_scale : rsqrt(float(hd)); const uint heads_per_group = p.num_heads / p.num_kv_heads; const uint kv_head_base = (h / heads_per_group) * hd;\n"
            "    const uint q_stride = p.num_heads * hd; const uint kv_stride = p.num_kv_heads * hd;\n"
            "    threadgroup half *sq = (threadgroup half *)shmem;\n"
            "    threadgroup half *skv = sq + 16u * hd;\n"
@@ -11923,7 +11928,7 @@ static NSString *termite_metal_shader_source(void) {
            "template<uint HD> inline void termite_attention_f32_dense_causal_sg_q16_f16kv_impl(device const float *q, device const half *k, device const half *v, device float *output, constant termite_metal_attention_f32_params &p, threadgroup char *shmem, ushort tid, ushort lane, ushort sgitg, uint2 tg) {\n"
            "    const uint hd = HD == 0u ? p.head_dim : HD; const uint q0 = tg.x * 16u; const uint h = tg.y;\n"
            "    if (q0 >= p.q_len || h >= p.num_heads || p.num_kv_heads == 0u || hd % 32u != 0u || hd > 128u || p.has_bias != 0u || p.has_mask != 0u) return;\n"
-           "    const float scale = rsqrt(float(hd)); const uint heads_per_group = p.num_heads / p.num_kv_heads; const uint kv_head_base = (h / heads_per_group) * hd;\n"
+           "    const float requested_scale = as_type<float>(p.reserved0); const float scale = requested_scale != 0.0f ? requested_scale : rsqrt(float(hd)); const uint heads_per_group = p.num_heads / p.num_kv_heads; const uint kv_head_base = (h / heads_per_group) * hd;\n"
            "    const uint q_stride = p.num_heads * hd; const uint kv_stride = p.num_kv_heads * hd;\n"
            "    threadgroup half *sq = (threadgroup half *)shmem;\n"
            "    threadgroup half *skv = sq + 16u * hd;\n"
@@ -34647,7 +34652,7 @@ int termite_metal_decode_runtime_apply_linear_backward_input_bf16_device(
         const BOOL use_simdgroup = !use_f16_weight && rows >= 128u && in_dim >= 128u && out_dim >= 128u && termite_metal_bf16_backward_simdgroup_enabled() && runtime->linear_backward_input_bf16_simdgroup_pipeline != nil;
         const BOOL use_f16_simdgroup = use_f16_weight && rows >= 128u && in_dim >= 128u && out_dim >= 128u;
         const size_t m64_prefix_rows = rows & ~(size_t)63u;
-        const BOOL use_simdgroup_m64_prefix_tail = m64_prefix_rows >= 128u && m64_prefix_rows < rows &&
+        const BOOL use_simdgroup_m64_prefix_tail = !use_f16_weight && m64_prefix_rows >= 128u && m64_prefix_rows < rows &&
             in_dim >= 128u && out_dim >= 65536u &&
             (in_dim & 63u) == 0u && (out_dim & 31u) == 0u &&
             termite_metal_bf16_backward_simdgroup_enabled() &&
@@ -34729,7 +34734,7 @@ int termite_metal_decode_runtime_apply_linear_backward_input_bf16_device(
             [encoder dispatchThreadgroups:MTLSizeMake(in_dim / 64u, rows / 64u, 1)
                    threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
         } else if (use_simdgroup || use_f16_simdgroup) {
-            [encoder setThreadgroupMemoryLength:(use_f16_simdgroup ? 8192u : 16384u) atIndex:0];
+            [encoder setThreadgroupMemoryLength:16384u atIndex:0];
             [encoder dispatchThreadgroups:MTLSizeMake((in_dim + 63u) / 64u, (rows + 31u) / 32u, 1)
                    threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
         } else if (use_tiled32_m16) {

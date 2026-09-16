@@ -18,6 +18,8 @@ only the Python standard library.
 
 from __future__ import annotations
 
+from gemma4_files import sha256_file
+
 import argparse
 import array
 from collections import Counter
@@ -67,12 +69,14 @@ GRPO_EVAL_SCHEMA_VERSIONS = frozenset(
     }
 )
 GRPO_KL_TRACE_SCHEMA_VERSION = "antfly_inference_grpo_kl_control_trace/v5"
-GRPO_KL_TRACE_SCHEMA_VERSIONS = frozenset({
-    "antfly_inference_grpo_kl_control_trace/v2",
-    "antfly_inference_grpo_kl_control_trace/v3",
-    "antfly_inference_grpo_kl_control_trace/v4",
-    GRPO_KL_TRACE_SCHEMA_VERSION,
-})
+GRPO_KL_TRACE_SCHEMA_VERSIONS = frozenset(
+    {
+        "antfly_inference_grpo_kl_control_trace/v2",
+        "antfly_inference_grpo_kl_control_trace/v3",
+        "antfly_inference_grpo_kl_control_trace/v4",
+        GRPO_KL_TRACE_SCHEMA_VERSION,
+    }
+)
 GRPO_TRAINING_ORDER = {
     "algorithm": "seeded-fisher-yates-per-epoch/v1",
     "stream_derivation": "run-seed-order-domain-epoch-dataset-size/v1",
@@ -80,9 +84,7 @@ GRPO_TRAINING_ORDER = {
 }
 ANTFLY_LEGACY_REFERENCE_MODE = "compiled-zero-lora"
 ANTFLY_BATCHED_REFERENCE_MODE = "compiled-zero-lora-shared-prompt-candidate-row"
-ANTFLY_PHASED_EVALUATION_ORDER = (
-    "policy-sampling-pass-then-frozen-reference-pass"
-)
+ANTFLY_PHASED_EVALUATION_ORDER = "policy-sampling-pass-then-frozen-reference-pass"
 FIXED_MODEL_KEY = "gemma-4-E2B-it"
 FIXED_TARGET_PRESET = "peft-qv"
 FIXED_SEQUENCE_LENGTH = 128
@@ -166,14 +168,6 @@ class AcceptanceEvidence:
     train_trace: tuple[TraceGroup, ...]
     eval_trace: tuple[TraceGroup, ...]
     trained_adapter_dir: Path
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def attest_wheel_runtime(
@@ -287,17 +281,24 @@ def adapter_update_checks(
     metrics: Mapping[str, Any], *, min_cosine: float, max_relative_error: float
 ) -> Mapping[str, bool]:
     """Require vector distance as well as the historical magnitude comparison."""
+
     def bounded(name: str, lower: float, upper: float) -> bool:
         value = metrics.get(name)
         return (
-            isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(value) and lower <= value <= upper
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and lower <= value <= upper
         )
 
     return {
         "adapter_delta_direction": bounded("delta_cosine_similarity", min_cosine, 1.0),
-        "adapter_delta_norm": bounded("delta_l2_relative_difference", 0.0, max_relative_error),
-        "adapter_delta_vector": bounded("delta_vector_l2_relative_error", 0.0, max_relative_error),
+        "adapter_delta_norm": bounded(
+            "delta_l2_relative_difference", 0.0, max_relative_error
+        ),
+        "adapter_delta_vector": bounded(
+            "delta_vector_l2_relative_error", 0.0, max_relative_error
+        ),
     }
 
 
@@ -344,9 +345,9 @@ def assess_parity(
         <= BEHAVIORAL_PARITY_LIMITS["max_native_mean_reward_abs_delta"],
         "native_top_rank_mean_reward": native_top_rank_delta
         <= BEHAVIORAL_PARITY_LIMITS["max_top_rank_mean_reward_abs_delta"],
-        "native_candidate_recall": native_evaluation[
-            "candidate_overlap_with_antfly"
-        ]["mean_recall"]
+        "native_candidate_recall": native_evaluation["candidate_overlap_with_antfly"][
+            "mean_recall"
+        ]
         >= BEHAVIORAL_PARITY_LIMITS["min_candidate_recall"],
         "native_top1": native_evaluation["candidate_overlap_with_antfly"][
             "top1_match_rate"
@@ -364,7 +365,9 @@ def assess_parity(
         **adapter_update_checks(
             trace_adapter,
             min_cosine=NUMERICAL_PARITY_LIMITS["min_adapter_delta_cosine_similarity"],
-            max_relative_error=NUMERICAL_PARITY_LIMITS["max_adapter_delta_l2_relative_difference"],
+            max_relative_error=NUMERICAL_PARITY_LIMITS[
+                "max_adapter_delta_l2_relative_difference"
+            ],
         ),
         "adapter_delta_elementwise": trace_adapter["delta_max_abs_difference"]
         <= NUMERICAL_PARITY_LIMITS["max_adapter_delta_abs_difference"],
@@ -463,7 +466,9 @@ def load_materialization(path: Path) -> Mapping[str, Any]:
         raise BoolQParityContractError(str(exc)) from exc
     dataset = manifest.get("dataset")
     if not isinstance(dataset, dict) or dataset.get("repo_id") != "google/boolq":
-        raise BoolQParityContractError("materialization is not the pinned BoolQ dataset")
+        raise BoolQParityContractError(
+            "materialization is not the pinned BoolQ dataset"
+        )
     revision = dataset.get("revision")
     if (
         not isinstance(revision, str)
@@ -483,8 +488,13 @@ def load_materialization(path: Path) -> Mapping[str, Any]:
     if not isinstance(policy, dict) or any(
         policy.get(key) != value for key, value in expected_policy.items()
     ):
-        raise BoolQParityContractError("BoolQ selection policy differs from the parity contract")
-    for section, manifest_key in (("train", "train_jsonl"), ("evaluation", "eval_jsonl")):
+        raise BoolQParityContractError(
+            "BoolQ selection policy differs from the parity contract"
+        )
+    for section, manifest_key in (
+        ("train", "train_jsonl"),
+        ("evaluation", "eval_jsonl"),
+    ):
         record = dataset.get(section)
         if not isinstance(record, dict):
             raise BoolQParityContractError(f"dataset.{section} must be an object")
@@ -496,15 +506,21 @@ def load_materialization(path: Path) -> Mapping[str, Any]:
             f"dataset.{section}.materialized_jsonl_sha256",
         )
         if sha256_file(jsonl_path) != expected:
-            raise BoolQParityContractError(f"materialized {section} JSONL SHA-256 drifted")
+            raise BoolQParityContractError(
+                f"materialized {section} JSONL SHA-256 drifted"
+            )
     train_ids = manifest.get("train_source_ids")
     eval_ids = manifest.get("eval_source_ids")
     if not isinstance(train_ids, list) or not isinstance(eval_ids, list):
         raise BoolQParityContractError("materialization source identities are missing")
     if len(train_ids) < FIXED_TRAIN_GROUPS or len(eval_ids) != FIXED_EVAL_GROUPS:
-        raise BoolQParityContractError("materialization row counts differ from the fixed campaign")
+        raise BoolQParityContractError(
+            "materialization row counts differ from the fixed campaign"
+        )
     if set(train_ids) & set(eval_ids):
-        raise BoolQParityContractError("BoolQ train/evaluation source identities overlap")
+        raise BoolQParityContractError(
+            "BoolQ train/evaluation source identities overlap"
+        )
     return manifest
 
 
@@ -521,7 +537,9 @@ def load_trace(
     try:
         lines = trace_path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError) as exc:
-        raise BoolQParityContractError(f"could not load {phase} reward trace: {exc}") from exc
+        raise BoolQParityContractError(
+            f"could not load {phase} reward trace: {exc}"
+        ) from exc
     for line_index, line in enumerate(lines):
         try:
             row = json.loads(line)
@@ -529,13 +547,22 @@ def load_trace(
             raise BoolQParityContractError(
                 f"{phase} reward trace line {line_index + 1} is invalid JSON"
             ) from exc
-        if not isinstance(row, dict) or row.get("schema_version") != TRACE_SCHEMA_VERSION:
+        if (
+            not isinstance(row, dict)
+            or row.get("schema_version") != TRACE_SCHEMA_VERSION
+        ):
             raise BoolQParityContractError(f"{phase} reward trace schema drifted")
         if row.get("phase") != phase or row.get("call_index") != line_index:
             raise BoolQParityContractError(f"{phase} reward trace order drifted")
         prompt_index = row.get("prompt_index")
-        if isinstance(prompt_index, bool) or not isinstance(prompt_index, int) or prompt_index < 0:
-            raise BoolQParityContractError(f"{phase} reward trace prompt index is invalid")
+        if (
+            isinstance(prompt_index, bool)
+            or not isinstance(prompt_index, int)
+            or prompt_index < 0
+        ):
+            raise BoolQParityContractError(
+                f"{phase} reward trace prompt index is invalid"
+            )
         tokens = row.get("completion_tokens")
         if (
             not isinstance(tokens, list)
@@ -544,16 +571,22 @@ def load_trace(
             or not isinstance(tokens[0], int)
             or tokens[0] < 0
         ):
-            raise BoolQParityContractError(f"{phase} reward trace is not one-token GRPO")
+            raise BoolQParityContractError(
+                f"{phase} reward trace is not one-token GRPO"
+            )
         reward = _finite_float(row.get("aggregate_reward"), "aggregate_reward")
         if reward not in (0.0, 1.0):
             raise BoolQParityContractError("BoolQ trace reward must be binary")
         if prompt_index in groups and prompt_index != previous_prompt:
-            raise BoolQParityContractError(f"{phase} reward trace optimizer groups are interleaved")
+            raise BoolQParityContractError(
+                f"{phase} reward trace optimizer groups are interleaved"
+            )
         groups.setdefault(prompt_index, []).append(TraceCompletion(tokens[0], reward))
         previous_prompt = prompt_index
     if sorted(groups) != list(range(expected_groups)):
-        raise BoolQParityContractError(f"{phase} reward trace prompt groups are incomplete")
+        raise BoolQParityContractError(
+            f"{phase} reward trace prompt groups are incomplete"
+        )
     result = tuple(
         TraceGroup(index, tuple(completions)) for index, completions in groups.items()
     )
@@ -565,12 +598,12 @@ def load_trace(
 _RowT = TypeVar("_RowT")
 
 
-def rows_in_prompt_order(
-    rows: Sequence[_RowT], indices: Sequence[int]
-) -> list[_RowT]:
+def rows_in_prompt_order(rows: Sequence[_RowT], indices: Sequence[int]) -> list[_RowT]:
     """Bind chronological updates to their original dataset prompt identities."""
     if len(indices) != len(rows) or set(indices) != set(range(len(rows))):
-        raise BoolQParityContractError("reward trace is not a permutation of the BoolQ rows")
+        raise BoolQParityContractError(
+            "reward trace is not a permutation of the BoolQ rows"
+        )
     return [rows[index] for index in indices]
 
 
@@ -619,7 +652,8 @@ def require_v4_kl_control(root: Path, train_report: Mapping[str, Any]) -> None:
     ):
         raise BoolQParityContractError("Antfly GRPO v4 KL telemetry is missing")
     if (
-        train_report.get("schema_version") in {
+        train_report.get("schema_version")
+        in {
             "antfly_inference_finetune_grpo_report/v9",
             "antfly_inference_finetune_grpo_report/v10",
         }
@@ -629,7 +663,9 @@ def require_v4_kl_control(root: Path, train_report: Mapping[str, Any]) -> None:
     trace_path = root / "grpo_kl_control_trace.jsonl"
     reported_path = Path(str(telemetry.get("trace_path", ""))).resolve()
     if reported_path != trace_path or not trace_path.is_file():
-        raise BoolQParityContractError("Antfly GRPO v4 KL trace escaped the acceptance root")
+        raise BoolQParityContractError(
+            "Antfly GRPO v4 KL trace escaped the acceptance root"
+        )
     if telemetry.get("trace_digest") != "sha256:" + sha256_file(trace_path):
         raise BoolQParityContractError("Antfly GRPO v4 KL trace digest drifted")
     try:
@@ -639,7 +675,9 @@ def require_v4_kl_control(root: Path, train_report: Mapping[str, Any]) -> None:
             if line.strip()
         ]
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise BoolQParityContractError(f"could not load Antfly GRPO KL trace: {exc}") from exc
+        raise BoolQParityContractError(
+            f"could not load Antfly GRPO KL trace: {exc}"
+        ) from exc
     if len(rows) != FIXED_TRAIN_GROUPS:
         raise BoolQParityContractError("Antfly GRPO v4 KL trace group count drifted")
     for index, row in enumerate(rows):
@@ -664,7 +702,8 @@ def require_v4_kl_control(root: Path, train_report: Mapping[str, Any]) -> None:
         ):
             raise BoolQParityContractError("Antfly GRPO v4 KL admission trace drifted")
         if (
-            row.get("schema_version") in {
+            row.get("schema_version")
+            in {
                 "antfly_inference_grpo_kl_control_trace/v4",
                 GRPO_KL_TRACE_SCHEMA_VERSION,
             }
@@ -700,7 +739,9 @@ def require_native_rollout_sampler_compatibility(
 
 def load_acceptance(root: Path, manifest: Mapping[str, Any]) -> AcceptanceEvidence:
     evidence_root = root.expanduser().resolve()
-    config = _load_json(evidence_root / "training_config.json", "Antfly training config")
+    config = _load_json(
+        evidence_root / "training_config.json", "Antfly training config"
+    )
     train_report = _load_json(evidence_root / "grpo_report.json", "Antfly GRPO report")
     eval_report = _load_json(
         evidence_root / "grpo_evaluation_report.json", "Antfly GRPO evaluation report"
@@ -708,7 +749,8 @@ def load_acceptance(root: Path, manifest: Mapping[str, Any]) -> AcceptanceEviden
     if train_report.get("schema_version") not in GRPO_REPORT_SCHEMA_VERSIONS:
         raise BoolQParityContractError("Antfly GRPO report schema drifted")
     if (
-        train_report.get("schema_version") in {
+        train_report.get("schema_version")
+        in {
             "antfly_inference_finetune_grpo_report/v8",
             "antfly_inference_finetune_grpo_report/v9",
             "antfly_inference_finetune_grpo_report/v10",
@@ -716,15 +758,22 @@ def load_acceptance(root: Path, manifest: Mapping[str, Any]) -> AcceptanceEviden
         and train_report.get("training_order") != GRPO_TRAINING_ORDER
     ):
         raise BoolQParityContractError("Antfly GRPO training-order contract drifted")
-    if train_report.get("execution_mode") != "train" or train_report.get("dataset_format") != "rendered-text-grpo":
-        raise BoolQParityContractError("Antfly evidence is not optimizer-backed rendered GRPO")
+    if (
+        train_report.get("execution_mode") != "train"
+        or train_report.get("dataset_format") != "rendered-text-grpo"
+    ):
+        raise BoolQParityContractError(
+            "Antfly evidence is not optimizer-backed rendered GRPO"
+        )
     expected_counts = {
         "groups": FIXED_TRAIN_GROUPS,
         "completions": FIXED_TRAIN_GROUPS * FIXED_GROUP_SIZE,
         "optimizer_steps": FIXED_TRAIN_GROUPS,
     }
     if any(train_report.get(key) != value for key, value in expected_counts.items()):
-        raise BoolQParityContractError("Antfly training counts differ from the fixed campaign")
+        raise BoolQParityContractError(
+            "Antfly training counts differ from the fixed campaign"
+        )
     if train_report.get("schema_version") in {
         "antfly_inference_finetune_grpo_report/v7",
         "antfly_inference_finetune_grpo_report/v8",
@@ -741,7 +790,8 @@ def load_acceptance(root: Path, manifest: Mapping[str, Any]) -> AcceptanceEviden
             or train_report.get("loss_type") != "bnpo"
             or train_report.get("scale_rewards") != "group"
             or float(train_report.get("epsilon_low", 0.0)) != FIXED_GRPO["clip_epsilon"]
-            or float(train_report.get("epsilon_high", 0.0)) != FIXED_GRPO["clip_epsilon"]
+            or float(train_report.get("epsilon_high", 0.0))
+            != FIXED_GRPO["clip_epsilon"]
             or train_report.get("max_completion_tokens") != FIXED_MAX_COMPLETION_TOKENS
             or train_report.get("mask_truncated_completions") is not False
             or train_report.get("num_iterations") != 1
@@ -761,12 +811,17 @@ def load_acceptance(root: Path, manifest: Mapping[str, Any]) -> AcceptanceEviden
                 abs_tol=1e-7,
             )
         ):
-            raise BoolQParityContractError("Antfly truncated-completion telemetry drifted")
+            raise BoolQParityContractError(
+                "Antfly truncated-completion telemetry drifted"
+            )
     if train_report.get("policy_backend") != "metal":
         raise BoolQParityContractError("Antfly parity evidence must use Metal")
     if eval_report.get("schema_version") not in GRPO_EVAL_SCHEMA_VERSIONS:
         raise BoolQParityContractError("Antfly GRPO evaluation schema drifted")
-    if eval_report.get("status") != "passed" or eval_report.get("groups") != FIXED_EVAL_GROUPS:
+    if (
+        eval_report.get("status") != "passed"
+        or eval_report.get("groups") != FIXED_EVAL_GROUPS
+    ):
         raise BoolQParityContractError("Antfly held-out campaign did not pass")
     if eval_report.get("mask_truncated_completions") is not False:
         raise BoolQParityContractError("Antfly evaluation truncation policy drifted")
@@ -789,14 +844,19 @@ def load_acceptance(root: Path, manifest: Mapping[str, Any]) -> AcceptanceEviden
 
     recipe = config.get("recipe")
     if not isinstance(recipe, dict):
-        raise BoolQParityContractError("Antfly training config has no normalized recipe")
+        raise BoolQParityContractError(
+            "Antfly training config has no normalized recipe"
+        )
     dataset = recipe.get("dataset")
     adapter = recipe.get("adapter")
     optimizer = recipe.get("optimizer")
     grpo = recipe.get("grpo")
     evaluation = recipe.get("eval")
     model = recipe.get("model")
-    if not all(isinstance(item, dict) for item in (dataset, adapter, optimizer, grpo, evaluation, model)):
+    if not all(
+        isinstance(item, dict)
+        for item in (dataset, adapter, optimizer, grpo, evaluation, model)
+    ):
         raise BoolQParityContractError("Antfly normalized recipe is incomplete")
     if model.get("family") != "gemma4":
         raise BoolQParityContractError("Antfly model family is not gemma4")
@@ -807,8 +867,14 @@ def load_acceptance(root: Path, manifest: Mapping[str, Any]) -> AcceptanceEviden
         or evaluation.get("max_examples") != FIXED_EVAL_GROUPS
         or dataset.get("max_seq_len") != FIXED_SEQUENCE_LENGTH
     ):
-        raise BoolQParityContractError("Antfly recipe is not bound to the pinned BoolQ split")
-    if adapter.get("rank") != 16 or float(adapter.get("alpha", 0.0)) != 32.0 or adapter.get("target_preset") != FIXED_TARGET_PRESET:
+        raise BoolQParityContractError(
+            "Antfly recipe is not bound to the pinned BoolQ split"
+        )
+    if (
+        adapter.get("rank") != 16
+        or float(adapter.get("alpha", 0.0)) != 32.0
+        or adapter.get("target_preset") != FIXED_TARGET_PRESET
+    ):
         raise BoolQParityContractError("Antfly adapter contract drifted")
     if (
         abs(float(optimizer.get("learning_rate", 0.0)) - FIXED_LEARNING_RATE) > 1.0e-14
@@ -820,7 +886,8 @@ def load_acceptance(root: Path, manifest: Mapping[str, Any]) -> AcceptanceEviden
     if (
         grpo.get("group_size") != FIXED_GROUP_SIZE
         or grpo.get("max_completion_tokens") != FIXED_MAX_COMPLETION_TOKENS
-        or abs(float(grpo.get("clip_epsilon", 0.0)) - FIXED_GRPO["clip_epsilon"]) > 1.0e-6
+        or abs(float(grpo.get("clip_epsilon", 0.0)) - FIXED_GRPO["clip_epsilon"])
+        > 1.0e-6
         or abs(float(grpo.get("kl_coef", 0.0)) - FIXED_GRPO["kl_coef"]) > 1.0e-6
         or grpo.get("normalize_advantage") is not True
         or grpo.get("loss_type") not in (None, "bnpo")
@@ -836,20 +903,31 @@ def load_acceptance(root: Path, manifest: Mapping[str, Any]) -> AcceptanceEviden
     eval_telemetry = eval_report.get("reward_pipeline")
     if not isinstance(telemetry, dict) or not isinstance(eval_telemetry, dict):
         raise BoolQParityContractError("Antfly reward telemetry is missing")
-    for trace_path, trace_record in ((train_trace_path, telemetry), (eval_trace_path, eval_telemetry)):
+    for trace_path, trace_record in (
+        (train_trace_path, telemetry),
+        (eval_trace_path, eval_telemetry),
+    ):
         digest = trace_record.get("trace_digest")
         if digest != "sha256:" + sha256_file(trace_path):
             raise BoolQParityContractError("Antfly reward trace digest drifted")
-    trained_adapter_dir = Path(str(train_report.get("trained_adapter_dir", ""))).resolve()
+    trained_adapter_dir = Path(
+        str(train_report.get("trained_adapter_dir", ""))
+    ).resolve()
     if trained_adapter_dir.parent != evidence_root or not trained_adapter_dir.is_dir():
-        raise BoolQParityContractError("Antfly trained adapter escaped the acceptance root")
+        raise BoolQParityContractError(
+            "Antfly trained adapter escaped the acceptance root"
+        )
     return AcceptanceEvidence(
         root=evidence_root,
         training_config=config,
         train_report=train_report,
         eval_report=eval_report,
-        train_trace=load_trace(train_trace_path, phase="train", expected_groups=FIXED_TRAIN_GROUPS),
-        eval_trace=load_trace(eval_trace_path, phase="evaluation", expected_groups=FIXED_EVAL_GROUPS),
+        train_trace=load_trace(
+            train_trace_path, phase="train", expected_groups=FIXED_TRAIN_GROUPS
+        ),
+        eval_trace=load_trace(
+            eval_trace_path, phase="evaluation", expected_groups=FIXED_EVAL_GROUPS
+        ),
         trained_adapter_dir=trained_adapter_dir,
     )
 
@@ -871,9 +949,13 @@ def exact_match_ci(decoded_text: str, target: str) -> float:
     return 1.0 if decoded_text.strip().lower() == target.strip().lower() else 0.0
 
 
-def candidate_overlap(actual: Sequence[int], expected: Sequence[int]) -> Mapping[str, Any]:
+def candidate_overlap(
+    actual: Sequence[int], expected: Sequence[int]
+) -> Mapping[str, Any]:
     if not actual or len(actual) != len(expected):
-        raise BoolQParityContractError("candidate groups must be non-empty and equal-length")
+        raise BoolQParityContractError(
+            "candidate groups must be non-empty and equal-length"
+        )
     actual_counts = Counter(actual)
     expected_counts = Counter(expected)
     overlap = sum((actual_counts & expected_counts).values())
@@ -888,14 +970,22 @@ def candidate_overlap(actual: Sequence[int], expected: Sequence[int]) -> Mapping
 
 def summarize_overlaps(rows: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
     if not rows:
-        raise BoolQParityContractError("cannot summarize empty candidate-overlap evidence")
+        raise BoolQParityContractError(
+            "cannot summarize empty candidate-overlap evidence"
+        )
     return {
         "groups": len(rows),
         "mean_overlap": statistics.mean(float(row["overlap"]) for row in rows),
         "mean_recall": statistics.mean(float(row["recall"]) for row in rows),
-        "exact_set_rate": statistics.mean(1.0 if row["exact_set"] else 0.0 for row in rows),
-        "exact_order_rate": statistics.mean(1.0 if row["exact_order"] else 0.0 for row in rows),
-        "top1_match_rate": statistics.mean(1.0 if row["top1_match"] else 0.0 for row in rows),
+        "exact_set_rate": statistics.mean(
+            1.0 if row["exact_set"] else 0.0 for row in rows
+        ),
+        "exact_order_rate": statistics.mean(
+            1.0 if row["exact_order"] else 0.0 for row in rows
+        ),
+        "top1_match_rate": statistics.mean(
+            1.0 if row["top1_match"] else 0.0 for row in rows
+        ),
     }
 
 
@@ -911,7 +1001,9 @@ def write_json_exclusive(path: Path, payload: Mapping[str, Any]) -> None:
             os.fsync(handle.fileno())
         os.link(temp_path, destination)
     except FileExistsError as exc:
-        raise BoolQParityContractError(f"parity output already exists: {destination}") from exc
+        raise BoolQParityContractError(
+            f"parity output already exists: {destination}"
+        ) from exc
     finally:
         temp_path.unlink(missing_ok=True)
 
@@ -928,19 +1020,42 @@ def _load_rows(
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError) as exc:
-        raise BoolQParityContractError(f"could not load materialized BoolQ JSONL: {exc}") from exc
+        raise BoolQParityContractError(
+            f"could not load materialized BoolQ JSONL: {exc}"
+        ) from exc
     for line_index, line in enumerate(lines):
         try:
             payload = json.loads(line)
         except json.JSONDecodeError as exc:
-            raise BoolQParityContractError(f"BoolQ JSONL line {line_index + 1} is invalid") from exc
-        if not isinstance(payload, dict) or set(payload) != {"prompt", "target", "metadata"}:
+            raise BoolQParityContractError(
+                f"BoolQ JSONL line {line_index + 1} is invalid"
+            ) from exc
+        if not isinstance(payload, dict) or set(payload) != {
+            "prompt",
+            "target",
+            "metadata",
+        }:
             raise BoolQParityContractError("BoolQ JSONL row schema drifted")
-        prompt, target, metadata = payload["prompt"], payload["target"], payload["metadata"]
-        if not isinstance(prompt, str) or not prompt or target not in ("yes", "no") or not isinstance(metadata, dict):
+        prompt, target, metadata = (
+            payload["prompt"],
+            payload["target"],
+            payload["metadata"],
+        )
+        if (
+            not isinstance(prompt, str)
+            or not prompt
+            or target not in ("yes", "no")
+            or not isinstance(metadata, dict)
+        ):
             raise BoolQParityContractError("BoolQ JSONL row is malformed")
-        token_ids = tuple(int(value) for value in tokenizer.encode(prompt, add_special_tokens=False).ids)
-        target_ids = tuple(int(value) for value in tokenizer.encode(target, add_special_tokens=False).ids)
+        token_ids = tuple(
+            int(value)
+            for value in tokenizer.encode(prompt, add_special_tokens=False).ids
+        )
+        target_ids = tuple(
+            int(value)
+            for value in tokenizer.encode(target, add_special_tokens=False).ids
+        )
         if (
             not token_ids
             or len(token_ids) + FIXED_MAX_COMPLETION_TOKENS > FIXED_SEQUENCE_LENGTH
@@ -964,7 +1079,9 @@ def _load_rows(
     selected = tuple(rows[:expected_count])
     if [row.source_id for row in selected] != list(expected_ids[:expected_count]):
         raise BoolQParityContractError("BoolQ source identity order drifted")
-    if [row.source_row_index for row in selected] != list(expected_indices[:expected_count]):
+    if [row.source_row_index for row in selected] != list(
+        expected_indices[:expected_count]
+    ):
         raise BoolQParityContractError("BoolQ source row order drifted")
     return selected
 
@@ -974,12 +1091,16 @@ def _decode_reward(tokenizer: Any, token_id: int, target: str) -> tuple[str, flo
     return decoded, exact_match_ci(decoded, target)
 
 
-def _validate_trace_rewards(tokenizer: Any, rows: Sequence[BoolQRow], trace: Sequence[TraceGroup]) -> None:
+def _validate_trace_rewards(
+    tokenizer: Any, rows: Sequence[BoolQRow], trace: Sequence[TraceGroup]
+) -> None:
     if len(rows) != len(trace):
         raise BoolQParityContractError("BoolQ rows and reward trace groups differ")
     for row, group in zip(rows, trace):
         for completion in group.completions:
-            _decoded, reward = _decode_reward(tokenizer, completion.token_id, row.target)
+            _decoded, reward = _decode_reward(
+                tokenizer, completion.token_id, row.target
+            )
             if reward != completion.reward:
                 raise BoolQParityContractError(
                     f"Antfly reward trace cannot be reproduced for prompt {group.prompt_index} token {completion.token_id}"
@@ -997,13 +1118,13 @@ def _adapter_delta_comparison(
 ) -> Mapping[str, Any]:
     final_trainables = dict(tree_flatten(model.trainable_parameters()))
     loaded = mx.load(str(antfly_trained.checkpoint))
-    mlx_targets = {
-        locked.canonicalize_module_name(name): name for name in target_names
-    }
+    mlx_targets = {locked.canonicalize_module_name(name): name for name in target_names}
     antfly_final: dict[str, Any] = {}
     for (module, role), descriptor in antfly_trained.tensors.items():
         suffix = "lora_a" if role == "lora_A" else "lora_b"
-        antfly_final[f"{mlx_targets[module]}.{suffix}"] = loaded[descriptor.source_name].T
+        antfly_final[f"{mlx_targets[module]}.{suffix}"] = loaded[
+            descriptor.source_name
+        ].T
     names = sorted(initial_trainables)
     if set(final_trainables) != set(names) or set(antfly_final) != set(names):
         raise BoolQParityContractError("adapter comparison inventory drifted")
@@ -1026,19 +1147,25 @@ def _adapter_delta_comparison(
     antfly_norm = math.sqrt(sum(float(value.item()) for value in antfly_squares))
     dot = sum(float(value.item()) for value in dots)
     distances = summarize_squares(
-        antfly_norm ** 2, mlx_norm ** 2, dot,
+        antfly_norm**2,
+        mlx_norm**2,
+        dot,
         sum(float(value.item()) for value in difference_squares),
         max(float(value.item()) for value in max_differences),
     )
     return {
         "mlx_delta_l2": mlx_norm,
         "antfly_delta_l2": antfly_norm,
-        "delta_l2_relative_difference": abs(mlx_norm - antfly_norm) / antfly_norm if antfly_norm else None,
+        "delta_l2_relative_difference": abs(mlx_norm - antfly_norm) / antfly_norm
+        if antfly_norm
+        else None,
         # Keep the historical magnitude-only field above for compatibility.
         "delta_vector_l2_relative_error": distances["relative_l2_error"],
         "delta_vector_l2_error": distances["difference_l2"],
         "delta_cosine_similarity": distances["cosine"],
-        "delta_max_abs_difference": max(float(value.item()) for value in max_differences),
+        "delta_max_abs_difference": max(
+            float(value.item()) for value in max_differences
+        ),
         "tensor_count": len(names),
     }
 
@@ -1084,8 +1211,13 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
     mlx_lm_revision = microbenchmark.require_source_revision(
         args.mlx_lm_source_root, revisions["mlx-lm"], "MLX-LM"
     )
-    if platform.system() != mlx_contract["required_platform"] or platform.machine() != mlx_contract["required_machine"]:
-        raise BoolQParityContractError("MLX parity must run on the locked Apple platform")
+    if (
+        platform.system() != mlx_contract["required_platform"]
+        or platform.machine() != mlx_contract["required_machine"]
+    ):
+        raise BoolQParityContractError(
+            "MLX parity must run on the locked Apple platform"
+        )
 
     import mlx.core as mx
     import mlx.nn as nn
@@ -1098,7 +1230,9 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
     mlx_root = args.mlx_source_root.expanduser().resolve()
     core_path = Path(mx.__file__ or "").resolve()
     if not microbenchmark._path_is_within(core_path, mlx_root):
-        raise BoolQParityContractError(f"imported MLX is outside the attested checkout: {core_path}")
+        raise BoolQParityContractError(
+            f"imported MLX is outside the attested checkout: {core_path}"
+        )
     microbenchmark.install_mlx_lm_source_namespace(args.mlx_lm_source_root)
     from mlx_lm._version import __version__ as mlx_lm_version
     from mlx_lm.models import gemma4 as mlx_gemma4
@@ -1113,22 +1247,35 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
     )
     tokenizers_version = str(tokenizers_native.__version__)
     if tokenizers_version != manifest.get("dependency_versions", {}).get("tokenizers"):
-        raise BoolQParityContractError("tokenizers version differs from the materializer")
+        raise BoolQParityContractError(
+            "tokenizers version differs from the materializer"
+        )
     mlx_lm_root = args.mlx_lm_source_root.expanduser().resolve()
     for label, source_path in (
         ("MLX-LM Gemma4", Path(mlx_gemma4.__file__ or "").resolve()),
-        ("MLX-LM LoRA", Path(sys.modules[LoRALinear.__module__].__file__ or "").resolve()),
+        (
+            "MLX-LM LoRA",
+            Path(sys.modules[LoRALinear.__module__].__file__ or "").resolve(),
+        ),
     ):
         if not microbenchmark._path_is_within(source_path, mlx_lm_root):
-            raise BoolQParityContractError(f"imported {label} is outside the attested checkout")
+            raise BoolQParityContractError(
+                f"imported {label} is outside the attested checkout"
+            )
 
     model_dir = args.model_dir.expanduser().resolve()
     adapter_dir = args.adapter_dir.expanduser().resolve()
     if Path(str(manifest.get("model_dir", ""))).resolve() != model_dir:
-        raise BoolQParityContractError("materialization model directory differs from --model-dir")
+        raise BoolQParityContractError(
+            "materialization model directory differs from --model-dir"
+        )
     tokenizer_path = model_dir / "tokenizer.json"
-    if sha256_file(tokenizer_path) != manifest.get("tokenizer_files", {}).get("tokenizer.json"):
-        raise BoolQParityContractError("runtime tokenizer differs from the materialization")
+    if sha256_file(tokenizer_path) != manifest.get("tokenizer_files", {}).get(
+        "tokenizer.json"
+    ):
+        raise BoolQParityContractError(
+            "runtime tokenizer differs from the materialization"
+        )
     tokenizer = Tokenizer.from_file(str(tokenizer_path))
     train_rows = _load_rows(
         Path(str(manifest["train_jsonl"])),
@@ -1146,12 +1293,18 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
     )
     # v8 trains in epoch-shuffled order. Replaying sorted prompt indices would
     # compare a different optimizer trajectory even with identical candidates.
-    train_rows = rows_in_prompt_order(train_rows, [group.prompt_index for group in acceptance.train_trace])
-    eval_rows = rows_in_prompt_order(eval_rows, [group.prompt_index for group in acceptance.eval_trace])
+    train_rows = rows_in_prompt_order(
+        train_rows, [group.prompt_index for group in acceptance.train_trace]
+    )
+    eval_rows = rows_in_prompt_order(
+        eval_rows, [group.prompt_index for group in acceptance.eval_trace]
+    )
     _validate_trace_rewards(tokenizer, train_rows, acceptance.train_trace)
     _validate_trace_rewards(tokenizer, eval_rows, acceptance.eval_trace)
 
-    adapter_manifest = _load_json(adapter_dir / "antfly_finetune_manifest.json", "seed adapter manifest")
+    adapter_manifest = _load_json(
+        adapter_dir / "antfly_finetune_manifest.json", "seed adapter manifest"
+    )
     binding_fields = ("base_model_sha256", "tokenizer_sha256", "chat_template_sha256")
     prepared_summary = {key: adapter_manifest.get(key) for key in binding_fields}
     base_model_provenance = locked.zig_model_provenance(model_dir)
@@ -1179,14 +1332,21 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
         model, _config = locked.load_locked_mlx_gemma4(
             model_dir,
             mx,
-            load_config_fn=lambda path: json.loads((path / "config.json").read_text(encoding="utf-8")),
-            get_model_classes_fn=lambda **_kwargs: (mlx_gemma4.Model, mlx_gemma4.ModelArgs),
+            load_config_fn=lambda path: json.loads(
+                (path / "config.json").read_text(encoding="utf-8")
+            ),
+            get_model_classes_fn=lambda **_kwargs: (
+                mlx_gemma4.Model,
+                mlx_gemma4.ModelArgs,
+            ),
         )
         mx.eval(model.parameters())
         mx.synchronize()
         model.freeze()
         base_inventory = locked.require_bf16_base_model(model, mx)
-        targets = locked.target_module_names(model, lock, FIXED_MODEL_KEY, FIXED_TARGET_PRESET)
+        targets = locked.target_module_names(
+            model, lock, FIXED_MODEL_KEY, FIXED_TARGET_PRESET
+        )
         target_set = set(targets)
         module_updates = []
         for name, module in model.named_modules():
@@ -1209,7 +1369,8 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
         mx.eval(model.state)
         mx.synchronize()
         initial_trainables = {
-            name: mx.array(value) for name, value in tree_flatten(model.trainable_parameters())
+            name: mx.array(value)
+            for name, value in tree_flatten(model.trainable_parameters())
         }
         mx.eval(*initial_trainables.values())
         load_seconds = time.perf_counter() - load_started
@@ -1228,13 +1389,17 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
                 mx.array([len(row.prompt_token_ids) - 1], dtype=mx.int32),
             )
 
-        def selected_logps(current_model: Any, tokens: Any, row_index: Any, selected: Any) -> Any:
+        def selected_logps(
+            current_model: Any, tokens: Any, row_index: Any, selected: Any
+        ) -> Any:
             logits = current_model(tokens).astype(mx.float32)
             predictor = mx.take(logits, row_index, axis=1)[:, 0, :]
             logprobs = predictor - mx.logsumexp(predictor, axis=-1, keepdims=True)
             return mx.take_along_axis(logprobs, selected[None, :], axis=-1)[0]
 
-        def ranked_group(current_model: Any, tokens: Any, row_index: Any) -> tuple[Any, Any]:
+        def ranked_group(
+            current_model: Any, tokens: Any, row_index: Any
+        ) -> tuple[Any, Any]:
             logits = current_model(tokens).astype(mx.float32)
             predictor = mx.take(logits, row_index, axis=1)[0, 0, :]
             selected = mx.array(
@@ -1256,11 +1421,14 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
             new_logps = selected_logps(current_model, tokens, row_index, selected)
             ratio = mx.exp(new_logps - old_logps)
             pg_unclipped = ratio * advantages
-            pg_clipped = mx.clip(
-                ratio,
-                1.0 - FIXED_GRPO["clip_epsilon"],
-                1.0 + FIXED_GRPO["clip_epsilon"],
-            ) * advantages
+            pg_clipped = (
+                mx.clip(
+                    ratio,
+                    1.0 - FIXED_GRPO["clip_epsilon"],
+                    1.0 + FIXED_GRPO["clip_epsilon"],
+                )
+                * advantages
+            )
             pg_tokens = -mx.minimum(pg_unclipped, pg_clipped)
             diff = reference - new_logps
             kl_tokens = FIXED_GRPO["kl_coef"] * (mx.exp(diff) - diff - 1.0)
@@ -1281,7 +1449,9 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
                 bias_correction=True,
             )
 
-        def full_reference_logprobs(rows: Sequence[BoolQRow]) -> list[array.array[float]]:
+        def full_reference_logprobs(
+            rows: Sequence[BoolQRow],
+        ) -> list[array.array[float]]:
             result: list[array.array[float]] = []
             for row in rows:
                 tokens, row_index = prompt_tensor(row)
@@ -1306,7 +1476,10 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
                 mx.synchronize()
                 token_ids = [int(value) for value in selected.tolist()]
                 policy_logps = [float(value) for value in logps.tolist()]
-                decoded_rewards = [_decode_reward(tokenizer, token_id, row.target) for token_id in token_ids]
+                decoded_rewards = [
+                    _decode_reward(tokenizer, token_id, row.target)
+                    for token_id in token_ids
+                ]
                 records.append(
                     {
                         "source_id": row.source_id,
@@ -1314,7 +1487,9 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
                         "completion_token_ids": token_ids,
                         "decoded_completions": [item[0] for item in decoded_rewards],
                         "rewards": [item[1] for item in decoded_rewards],
-                        "candidate_overlap": candidate_overlap(token_ids, expected.token_ids),
+                        "candidate_overlap": candidate_overlap(
+                            token_ids, expected.token_ids
+                        ),
                     }
                 )
                 selected_logprobs.append(policy_logps)
@@ -1332,7 +1507,9 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
             for record, reference in zip(records, reference_logps):
                 policy = record["policy_logps"]
                 rewards = record["rewards"]
-                advantages = normalized_advantages(rewards, FIXED_GRPO["advantage_epsilon"])
+                advantages = normalized_advantages(
+                    rewards, FIXED_GRPO["advantage_epsilon"]
+                )
                 pg_tokens = [-advantage for advantage in advantages]
                 kl_tokens = []
                 for policy_lp, reference_lp in zip(policy, reference):
@@ -1379,7 +1556,9 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
             [float(base[token_id]) for token_id in group.token_ids]
             for base, group in zip(train_base_logprobs, acceptance.train_trace)
         ]
-        baseline_records, baseline_policy_logps = evaluate_policy(eval_rows, acceptance.eval_trace)
+        baseline_records, baseline_policy_logps = evaluate_policy(
+            eval_rows, acceptance.eval_trace
+        )
         for record, policy in zip(baseline_records, baseline_policy_logps):
             record["policy_logps"] = policy
         baseline = add_reference_metrics(baseline_records, baseline_policy_logps)
@@ -1462,7 +1641,9 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
                 loss, pg_loss, kl_loss, clip_fraction, rescored, grad_norm = outputs
                 mx.eval(*outputs, model.state, optimizer.state)
                 mx.synchronize()
-                sampling_rescore_error = float(mx.max(mx.abs(rescored - old_logps)).item())
+                sampling_rescore_error = float(
+                    mx.max(mx.abs(rescored - old_logps)).item()
+                )
                 values = [
                     float(loss.item()),
                     float(pg_loss.item()),
@@ -1471,9 +1652,13 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
                     float(grad_norm.item()),
                 ]
                 if not all(math.isfinite(value) for value in values):
-                    raise BoolQParityContractError("MLX GRPO produced a non-finite metric")
+                    raise BoolQParityContractError(
+                        "MLX GRPO produced a non-finite metric"
+                    )
                 if update_index == 0 and sampling_rescore_error > 1.0e-4:
-                    raise BoolQParityContractError("MLX zero-update sampling/rescore parity failed")
+                    raise BoolQParityContractError(
+                        "MLX zero-update sampling/rescore parity failed"
+                    )
                 update_rows.append(
                     {
                         "update_index": update_index,
@@ -1532,28 +1717,36 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
         # Trace-replay lane: exact Antfly candidates and frozen reference rows.
         reset_to_initial()
         trace_train, trace_adapter = train_lane("trace_replay")
-        trace_eval_records, trace_eval_policy = evaluate_policy(eval_rows, acceptance.eval_trace)
+        trace_eval_records, trace_eval_policy = evaluate_policy(
+            eval_rows, acceptance.eval_trace
+        )
         trace_eval_reference = [
             [float(base[token_id]) for token_id in record["completion_token_ids"]]
             for base, record in zip(eval_base_logprobs, trace_eval_records)
         ]
         for record, policy in zip(trace_eval_records, trace_eval_policy):
             record["policy_logps"] = policy
-        trace_evaluation = add_reference_metrics(trace_eval_records, trace_eval_reference)
+        trace_evaluation = add_reference_metrics(
+            trace_eval_records, trace_eval_reference
+        )
 
         # Native lane: ranked candidates come from the evolving MLX policy;
         # their immutable reference values are gathered from the host-backed
         # zero-LoRA distributions computed before either lane mutated adapters.
         reset_to_initial()
         native_train, native_adapter = train_lane("native_rollout")
-        native_eval_records, native_eval_policy = evaluate_policy(eval_rows, acceptance.eval_trace)
+        native_eval_records, native_eval_policy = evaluate_policy(
+            eval_rows, acceptance.eval_trace
+        )
         native_eval_reference = [
             [float(base[token_id]) for token_id in record["completion_token_ids"]]
             for base, record in zip(eval_base_logprobs, native_eval_records)
         ]
         for record, policy in zip(native_eval_records, native_eval_policy):
             record["policy_logps"] = policy
-        native_evaluation = add_reference_metrics(native_eval_records, native_eval_reference)
+        native_evaluation = add_reference_metrics(
+            native_eval_records, native_eval_reference
+        )
 
         memory = sampler.stop()
         sampler_active = False
@@ -1589,8 +1782,10 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
         raise BoolQParityContractError("Antfly evaluation minimums are missing")
     native_passed = (
         native_evaluation["mean_reward"] >= minimums["mean_reward"]
-        and native_evaluation["top_rank_mean_reward"] >= minimums["top_rank_mean_reward"]
-        and native_evaluation["positive_reward_group_rate"] >= minimums["positive_reward_group_rate"]
+        and native_evaluation["top_rank_mean_reward"]
+        >= minimums["top_rank_mean_reward"]
+        and native_evaluation["positive_reward_group_rate"]
+        >= minimums["positive_reward_group_rate"]
         and native_evaluation["kl_loss"] <= minimums["max_kl_loss"]
     )
     parity_assessment = assess_parity(
@@ -1614,9 +1809,15 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
             "repo_id": manifest["dataset"]["repo_id"],
             "revision": manifest["dataset"]["revision"],
             "manifest_path": str(args.dataset_manifest.expanduser().resolve()),
-            "manifest_sha256": sha256_file(args.dataset_manifest.expanduser().resolve()),
-            "train_jsonl_sha256": manifest["dataset"]["train"]["materialized_jsonl_sha256"],
-            "eval_jsonl_sha256": manifest["dataset"]["evaluation"]["materialized_jsonl_sha256"],
+            "manifest_sha256": sha256_file(
+                args.dataset_manifest.expanduser().resolve()
+            ),
+            "train_jsonl_sha256": manifest["dataset"]["train"][
+                "materialized_jsonl_sha256"
+            ],
+            "eval_jsonl_sha256": manifest["dataset"]["evaluation"][
+                "materialized_jsonl_sha256"
+            ],
             "train_groups": FIXED_TRAIN_GROUPS,
             "eval_groups": FIXED_EVAL_GROUPS,
         },
@@ -1650,7 +1851,14 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
             ),
             "training": {
                 key: acceptance.train_report[key]
-                for key in ("groups", "completions", "loss", "pg_loss", "kl_loss", "mean_reward")
+                for key in (
+                    "groups",
+                    "completions",
+                    "loss",
+                    "pg_loss",
+                    "kl_loss",
+                    "mean_reward",
+                )
             },
             "evaluation": antfly_eval,
         },
@@ -1686,7 +1894,8 @@ def run(args: argparse.Namespace) -> Mapping[str, Any]:
             "mlx_core_path": str(core_path),
         },
         "base_model_provenance": base_model_provenance,
-        "runner_sha256": "sha256:" + hashlib.sha256(SCRIPT_PATH.read_bytes()).hexdigest(),
+        "runner_sha256": "sha256:"
+        + hashlib.sha256(SCRIPT_PATH.read_bytes()).hexdigest(),
     }
 
 
@@ -1715,7 +1924,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         payload = run(args)
         write_json_exclusive(args.output, payload)
-    except (BoolQParityContractError, microbenchmark.GrpoBenchmarkContractError, locked.ContractError) as exc:
+    except (
+        BoolQParityContractError,
+        microbenchmark.GrpoBenchmarkContractError,
+        locked.ContractError,
+    ) as exc:
         print(f"Gemma4 BoolQ GRPO MLX parity contract error: {exc}", file=sys.stderr)
         return 2
     print(

@@ -140,7 +140,9 @@ class IncrementalKvParityGateTests(unittest.TestCase):
                 require_active_batching=True,
             )
 
-    def test_requires_one_segmented_canonical_prompt_tail_and_clone_fanout_when_requested(self) -> None:
+    def test_requires_one_segmented_canonical_prompt_tail_and_clone_fanout_when_requested(
+        self,
+    ) -> None:
         report = {
             "incremental_kv": {
                 "groups": 8,

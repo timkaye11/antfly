@@ -62,22 +62,33 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
                 phase["compile_ns"] = 1
                 phase["graph_executor_plan_build_ns"] = 1
                 phase["graph_executor_buffer_plan_build_ns"] = 1
-            command.update({
-                "graph_executor_partitions": grad_accum,
-                "graph_executor_command_dispatches": 3 * grad_accum,
-                "graph_executor_planned_dispatches": 2 * grad_accum,
-                "graph_executor_plan_cache_hits": grad_accum - (1 if index == 0 else 0),
-                "graph_executor_plan_cache_misses": 1 if index == 0 else 0,
-                "metal_command_dot_general_dispatches": grad_accum,
-                "metal_command_elementwise_dispatches": grad_accum,
-                "metal_command_other_dispatches": grad_accum,
-            })
-            steps.append({
-                "index": index,
-                "phase": "cold" if index == 0 else "first" if index == 1 else "warmup" if index < 5 else "measured",
-                "phase_evidence": phase,
-                "command_plan_evidence": command,
-            })
+            command.update(
+                {
+                    "graph_executor_partitions": grad_accum,
+                    "graph_executor_command_dispatches": 3 * grad_accum,
+                    "graph_executor_planned_dispatches": 2 * grad_accum,
+                    "graph_executor_plan_cache_hits": grad_accum
+                    - (1 if index == 0 else 0),
+                    "graph_executor_plan_cache_misses": 1 if index == 0 else 0,
+                    "metal_command_dot_general_dispatches": grad_accum,
+                    "metal_command_elementwise_dispatches": grad_accum,
+                    "metal_command_other_dispatches": grad_accum,
+                }
+            )
+            steps.append(
+                {
+                    "index": index,
+                    "phase": "cold"
+                    if index == 0
+                    else "first"
+                    if index == 1
+                    else "warmup"
+                    if index < 5
+                    else "measured",
+                    "phase_evidence": phase,
+                    "command_plan_evidence": command,
+                }
+            )
         return {
             "schema_version": ZIG_EXECUTION_EVIDENCE_SCHEMA_VERSION,
             "optimizer_steps": steps,
@@ -96,7 +107,8 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
                 "source_sha256": (
                     prefixed_sha256(CAMPAIGN_ORCHESTRATOR_PATH)
                     if relative_path == ORCHESTRATOR_RELATIVE_PATH
-                    else "sha256:" + hashlib.sha256(relative_path.encode("utf-8")).hexdigest()
+                    else "sha256:"
+                    + hashlib.sha256(relative_path.encode("utf-8")).hexdigest()
                 ),
             }
             for relative_path in BENCHMARK_PRODUCER_RELATIVE_PATHS
@@ -134,7 +146,9 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
             ),
             key=lambda tensor: tensor["name"],
         )
-        base_tensors = [{"name": "model.embed_tokens.weight", "dtype": "bfloat16", "shape": [2, 2]}]
+        base_tensors = [
+            {"name": "model.embed_tokens.weight", "dtype": "bfloat16", "shape": [2, 2]}
+        ]
 
         def inventory(tensors: list[dict], evidence_kind: str, dtype: str) -> dict:
             return {
@@ -174,13 +188,17 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
                 "sequence_index": payload["sequence_index"],
                 "command_sha256": implementation["command_sha256"],
                 "semantic_contract_sha256": payload["semantic_contract"]["sha256"],
-                "sample_payload_sha256": canonical_precision_sample_binding_sha256(payload),
+                "sample_payload_sha256": canonical_precision_sample_binding_sha256(
+                    payload
+                ),
             },
             "runner": copy.deepcopy(implementation["producer_source"]),
             "native_runtime": {
                 "mlx_source_revision": mlx["source_revision"],
                 "mlx_lm_source_revision": implementation["mlx_lm"]["source_revision"],
-                "native_artifact_inventory_sha256": mlx["native_artifact_inventory"]["sha256"],
+                "native_artifact_inventory_sha256": mlx["native_artifact_inventory"][
+                    "sha256"
+                ],
                 "build_attestation_sha256": attestation["sha256"],
                 "build_command_sha256": attestation["build_command_sha256"],
                 "precision_policy_sha256": attestation["precision_policy_sha256"],
@@ -190,10 +208,14 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
             "comparison_policy": precision["comparison_policy"],
             "observations": {
                 "base_model_storage": inventory(
-                    base_tensors, "materialized-parameter-inventory", "bfloat16",
+                    base_tensors,
+                    "materialized-parameter-inventory",
+                    "bfloat16",
                 ),
                 "lora_parameter_storage": inventory(
-                    lora_tensors, "materialized-trainable-parameter-inventory", "float32",
+                    lora_tensors,
+                    "materialized-trainable-parameter-inventory",
+                    "float32",
                 ),
                 "gradient_storage": {
                     "evidence_kind": "compiled-gradient-tree-inventory",
@@ -202,7 +224,9 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
                     "stages": [
                         {
                             "stage": stage,
-                            "inventory_sha256": canonical_tensor_inventory_sha256(lora_tensors),
+                            "inventory_sha256": canonical_tensor_inventory_sha256(
+                                lora_tensors
+                            ),
                             "tensors": lora_tensors,
                         }
                         for stage in ("raw", "accumulated", "clipped")
@@ -224,13 +248,23 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
             },
         }
 
-    def write_sample(self, path: Path, payload: dict, *, evidence: dict | None = None) -> None:
+    def write_sample(
+        self, path: Path, payload: dict, *, evidence: dict | None = None
+    ) -> None:
         payload.pop("precision_evidence", None)
         if payload["framework"] == "mlx-lm":
-            evidence = self.precision_evidence(payload) if evidence is None else evidence
+            evidence = (
+                self.precision_evidence(payload) if evidence is None else evidence
+            )
             evidence_path = path.with_name(path.name + ".precision.json")
             encoded = (
-                json.dumps(evidence, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False)
+                json.dumps(
+                    evidence,
+                    indent=2,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
                 + "\n"
             ).encode("utf-8")
             evidence_path.write_bytes(encoded)
@@ -277,7 +311,9 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
                     "sha256": "sha256:" + "8" * 64,
                 },
             ]
-            native_inventory_sha256 = canonical_mlx_native_artifact_inventory_sha256(native_artifacts)
+            native_inventory_sha256 = canonical_mlx_native_artifact_inventory_sha256(
+                native_artifacts
+            )
             implementation = {
                 "command_sha256": "sha256:"
                 + hashlib.sha256(
@@ -286,7 +322,9 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
                 "producer_source": self.producer_source(framework),
                 "mlx": {
                     "version": self.lock["mlx_reference"]["packages"]["mlx"],
-                    "source_revision": self.lock["mlx_reference"]["source_revisions"]["mlx"],
+                    "source_revision": self.lock["mlx_reference"]["source_revisions"][
+                        "mlx"
+                    ],
                     "source_clean": True,
                     "native_artifact_inventory": {
                         "schema_version": "antfly_mlx_native_artifact_inventory/v2",
@@ -298,16 +336,22 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
                         "schema_version": "antfly_mlx_native_build_attestation/v1",
                         "path": "/src/mlx/native-build-attestation.json",
                         "sha256": "sha256:" + "9" * 64,
-                        "source_revision": self.lock["mlx_reference"]["source_revisions"]["mlx"],
+                        "source_revision": self.lock["mlx_reference"][
+                            "source_revisions"
+                        ]["mlx"],
                         "source_clean": True,
                         "native_artifact_inventory_sha256": native_inventory_sha256,
                         "build_command_sha256": "sha256:" + "a" * 64,
-                        "precision_policy_sha256": self.lock["mlx_reference"]["native_runtime"]["precision_policy_sha256"],
+                        "precision_policy_sha256": self.lock["mlx_reference"][
+                            "native_runtime"
+                        ]["precision_policy_sha256"],
                     },
                 },
                 "mlx_lm": {
                     "version": self.lock["mlx_reference"]["packages"]["mlx-lm"],
-                    "source_revision": self.lock["mlx_reference"]["source_revisions"]["mlx-lm"],
+                    "source_revision": self.lock["mlx_reference"]["source_revisions"][
+                        "mlx-lm"
+                    ],
                     "source_clean": True,
                 },
                 "python": {
@@ -343,7 +387,10 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
             "repetition": repetition,
             "sequence_index": sequence_index,
             "implementation": implementation,
-            "process": {"pid": 1000 + sequence_index, "started_unix_ns": 1_000_000 + sequence_index},
+            "process": {
+                "pid": 1000 + sequence_index,
+                "started_unix_ns": 1_000_000 + sequence_index,
+            },
             "hardware": {
                 "platform": "Darwin",
                 "machine": "arm64",
@@ -370,7 +417,9 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
                     "source_dataset_sha256": "2" * 64,
                     "source_record_sha256": "3" * 64,
                     "rendered_chat_sha256": "4" * 64,
-                    "workload_sha256": benchmark_workload_sha256([input_ids], [labels], [attention_mask]),
+                    "workload_sha256": benchmark_workload_sha256(
+                        [input_ids], [labels], [attention_mask]
+                    ),
                 },
                 "initial_adapter": {
                     "schema_version": "antfly_gemma4_initial_adapter_semantics/v1",
@@ -407,9 +456,12 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
                     "process_peak_phys_footprint_bytes": peak_memory,
                     "sampler_interval_ms": 10,
                     "sampler_sample_count": 100,
-                    "framework_allocator_peak_bytes": 8_000 if framework == "mlx-lm" else None,
+                    "framework_allocator_peak_bytes": 8_000
+                    if framework == "mlx-lm"
+                    else None,
                     "framework_allocator_peak_source": (
-                        "mlx-metal-get-peak-memory" if framework == "mlx-lm"
+                        "mlx-metal-get-peak-memory"
+                        if framework == "mlx-lm"
                         else "antfly-metal-allocator-unavailable"
                     ),
                     "system_deltas": {
@@ -424,7 +476,9 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
         }
         if framework == "antfly-zig-metal":
             payload["metrics"]["execution_evidence"] = self.zig_execution_evidence()
-        payload["semantic_contract"] = expected_semantic_contract(self.lock, payload["case"])
+        payload["semantic_contract"] = expected_semantic_contract(
+            self.lock, payload["case"]
+        )
         return payload
 
     def campaign(self, root: Path) -> list:
@@ -432,10 +486,16 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
         samples = []
         sequence_index = 0
         for repetition in range(5):
-            order = ("antfly-zig-metal", "mlx-lm") if repetition % 2 == 0 else ("mlx-lm", "antfly-zig-metal")
+            order = (
+                ("antfly-zig-metal", "mlx-lm")
+                if repetition % 2 == 0
+                else ("mlx-lm", "antfly-zig-metal")
+            )
             for framework in order:
                 path = root / f"{sequence_index:02d}-{framework}.json"
-                self.write_sample(path, self.sample(framework, repetition, sequence_index))
+                self.write_sample(
+                    path, self.sample(framework, repetition, sequence_index)
+                )
                 samples.append(validate_sample(path, self.lock, LOCK_PATH))
                 sequence_index += 1
         return samples
@@ -455,63 +515,84 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
             argv = [
                 sys.executable,
                 str(Path(__file__).resolve().parent / runner_name),
-                "--fixture", framework,
-                "--campaign-id", payload["campaign_id"],
-                "--run-id", payload["run_id"],
-                "--repetition", str(payload["repetition"]),
-                "--sequence-index", str(sequence_index),
-                "--output", str(sample.path),
+                "--fixture",
+                framework,
+                "--campaign-id",
+                payload["campaign_id"],
+                "--run-id",
+                payload["run_id"],
+                "--repetition",
+                str(payload["repetition"]),
+                "--sequence-index",
+                str(sequence_index),
+                "--output",
+                str(sample.path),
             ]
             started = payload["process"]["started_unix_ns"]
-            runs.append({
-                "cell_id": "e2b-peft-qv-s128-ga1",
-                "framework": framework,
-                "repetition": payload["repetition"],
-                "sequence_index": sequence_index,
-                "run_id": payload["run_id"],
-                "argv": argv,
-                "argv_sha256": canonical_argv_sha256(argv),
-                "started_unix_ns": started,
-                "completed_unix_ns": started + 1,
-                "sample": {
-                    "relative_path": sample.path.relative_to(root).as_posix(),
-                    "sha256": prefixed_sha256(sample.path),
-                    "size_bytes": sample.path.stat().st_size,
-                },
-            })
+            runs.append(
+                {
+                    "cell_id": "e2b-peft-qv-s128-ga1",
+                    "framework": framework,
+                    "repetition": payload["repetition"],
+                    "sequence_index": sequence_index,
+                    "run_id": payload["run_id"],
+                    "argv": argv,
+                    "argv_sha256": canonical_argv_sha256(argv),
+                    "started_unix_ns": started,
+                    "completed_unix_ns": started + 1,
+                    "sample": {
+                        "relative_path": sample.path.relative_to(root).as_posix(),
+                        "sha256": prefixed_sha256(sample.path),
+                        "size_bytes": sample.path.stat().st_size,
+                    },
+                }
+            )
         path = root / "COMPLETE.json"
         path.write_text(
-            json.dumps({
-                "schema_version": MANIFEST_SCHEMA_VERSION,
-                "status": "complete",
-                "campaign_id": samples[0].payload["campaign_id"],
-                "created_unix_ns": runs[0]["started_unix_ns"],
-                "completed_unix_ns": runs[-1]["completed_unix_ns"],
-                "plan": {
-                    "sha256": "sha256:" + "1" * 64,
-                    "cell_count": 1,
-                    "repetitions_per_cell": 5,
-                },
-                "orchestrator": {
-                    "schema_version": ORCHESTRATOR_SCHEMA_VERSION,
-                    "relative_path": ORCHESTRATOR_RELATIVE_PATH,
-                    "source_sha256": prefixed_sha256(CAMPAIGN_ORCHESTRATOR_PATH),
-                },
-                "run_count": len(runs),
-                "runs": runs,
-            }) + "\n",
+            json.dumps(
+                {
+                    "schema_version": MANIFEST_SCHEMA_VERSION,
+                    "status": "complete",
+                    "campaign_id": samples[0].payload["campaign_id"],
+                    "created_unix_ns": runs[0]["started_unix_ns"],
+                    "completed_unix_ns": runs[-1]["completed_unix_ns"],
+                    "plan": {
+                        "sha256": "sha256:" + "1" * 64,
+                        "cell_count": 1,
+                        "repetitions_per_cell": 5,
+                    },
+                    "orchestrator": {
+                        "schema_version": ORCHESTRATOR_SCHEMA_VERSION,
+                        "relative_path": ORCHESTRATOR_RELATIVE_PATH,
+                        "source_sha256": prefixed_sha256(CAMPAIGN_ORCHESTRATOR_PATH),
+                    },
+                    "run_count": len(runs),
+                    "runs": runs,
+                }
+            )
+            + "\n",
             encoding="utf-8",
         )
         return path
 
-    def test_partial_same_mac_campaign_passes_with_five_fresh_paired_processes(self) -> None:
+    def test_partial_same_mac_campaign_passes_with_five_fresh_paired_processes(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            result = compare_campaign(self.campaign(Path(tmp)), self.lock, require_full_matrix=False)
+            result = compare_campaign(
+                self.campaign(Path(tmp)), self.lock, require_full_matrix=False
+            )
         self.assertTrue(result["ok"], result["failures"])
         self.assertEqual(1, result["cell_count"])
         self.assertGreater(result["geomean_throughput_ratio"], 1.0)
         self.assertEqual(
-            ["antfly-zig-metal", "mlx-lm", "antfly-zig-metal", "mlx-lm", "antfly-zig-metal"],
+            [
+                "antfly-zig-metal",
+                "mlx-lm",
+                "antfly-zig-metal",
+                "mlx-lm",
+                "antfly-zig-metal",
+            ],
             result["cells"][0]["execution_order"],
         )
 
@@ -527,15 +608,23 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
                 campaign_manifest_path=manifest,
             )
             self.assertTrue(result["ok"], result["failures"])
-            self.assertEqual(prefixed_sha256(manifest), result["campaign_manifest"]["sha256"])
+            self.assertEqual(
+                prefixed_sha256(manifest), result["campaign_manifest"]["sha256"]
+            )
 
-    def test_command_invocation_digests_are_unique_but_not_campaign_identity(self) -> None:
+    def test_command_invocation_digests_are_unique_but_not_campaign_identity(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             samples = self.campaign(Path(tmp))
             identity = samples[-1].payload["implementation"]
             original_command = identity["command_sha256"]
-            identity["command_sha256"] = samples[0].payload["implementation"]["command_sha256"]
-            with self.assertRaisesRegex(ContractError, "unique command invocation digest"):
+            identity["command_sha256"] = samples[0].payload["implementation"][
+                "command_sha256"
+            ]
+            with self.assertRaisesRegex(
+                ContractError, "unique command invocation digest"
+            ):
                 compare_campaign(samples, self.lock, require_full_matrix=False)
 
             identity["command_sha256"] = original_command
@@ -550,9 +639,13 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             samples = self.campaign(Path(tmp))
             mlx = samples[-1].payload["implementation"]["mlx"]
-            mlx["native_artifact_inventory"]["loaded_core_path"] = "/another/root/core.so"
+            mlx["native_artifact_inventory"]["loaded_core_path"] = (
+                "/another/root/core.so"
+            )
             mlx["build_attestation"]["path"] = "/another/root/attestation.json"
-            samples[-1].payload["implementation"]["python"]["executable"] = "/another/python"
+            samples[-1].payload["implementation"]["python"]["executable"] = (
+                "/another/python"
+            )
             result = compare_campaign(samples, self.lock, require_full_matrix=False)
             self.assertTrue(result["ok"], result["failures"])
 
@@ -574,7 +667,9 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
             incomplete["implementation"]["producer_source"]["files"].pop()
             path = root / "incomplete-source.json"
             self.write_sample(path, incomplete)
-            with self.assertRaisesRegex(ContractError, "source inventory is incomplete"):
+            with self.assertRaisesRegex(
+                ContractError, "source inventory is incomplete"
+            ):
                 validate_sample(path, self.lock, LOCK_PATH)
 
             unrelated = self.sample("antfly-zig-metal", 0, 1)
@@ -623,23 +718,29 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
             dirty["implementation"]["mlx"]["source_clean"] = False
             path = root / "dirty.json"
             self.write_sample(path, dirty)
-            with self.assertRaisesRegex(ContractError, "mlx source checkout must be clean"):
+            with self.assertRaisesRegex(
+                ContractError, "mlx source checkout must be clean"
+            ):
                 validate_sample(path, self.lock, LOCK_PATH)
 
             wrong_python = self.sample("mlx-lm", 0, 0)
             wrong_python["implementation"]["python"]["version"] = "3.11.9"
             path = root / "python.json"
             self.write_sample(path, wrong_python)
-            with self.assertRaisesRegex(ContractError, "Python major/minor is not pinned"):
+            with self.assertRaisesRegex(
+                ContractError, "Python major/minor is not pinned"
+            ):
                 validate_sample(path, self.lock, LOCK_PATH)
 
-    def test_mlx_native_artifact_inventory_and_build_attestation_fail_closed(self) -> None:
+    def test_mlx_native_artifact_inventory_and_build_attestation_fail_closed(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             drifted = self.sample("mlx-lm", 0, 0)
-            drifted["implementation"]["mlx"]["native_artifact_inventory"]["artifacts"][0]["sha256"] = (
-                "sha256:" + "0" * 64
-            )
+            drifted["implementation"]["mlx"]["native_artifact_inventory"]["artifacts"][
+                0
+            ]["sha256"] = "sha256:" + "0" * 64
             path = root / "drifted-native.json"
             self.write_sample(path, drifted)
             with self.assertRaisesRegex(ContractError, "inventory digest mismatch"):
@@ -651,14 +752,20 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
             ] = "sha256:" + "0" * 64
             path = root / "stale-attestation.json"
             self.write_sample(path, stale_attestation)
-            with self.assertRaisesRegex(ContractError, "does not bind the native artifact inventory"):
+            with self.assertRaisesRegex(
+                ContractError, "does not bind the native artifact inventory"
+            ):
                 validate_sample(path, self.lock, LOCK_PATH)
 
             incomplete = self.sample("mlx-lm", 0, 0)
-            incomplete["implementation"]["mlx"]["native_artifact_inventory"]["artifacts"].pop()
+            incomplete["implementation"]["mlx"]["native_artifact_inventory"][
+                "artifacts"
+            ].pop()
             path = root / "incomplete-native.json"
             self.write_sample(path, incomplete)
-            with self.assertRaisesRegex(ContractError, "exact sorted Metal runtime roles"):
+            with self.assertRaisesRegex(
+                ContractError, "exact sorted Metal runtime roles"
+            ):
                 validate_sample(path, self.lock, LOCK_PATH)
 
     def test_release_campaign_rejects_unproven_precision_policy(self) -> None:
@@ -695,7 +802,9 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
             escaped_payload = self.sample("mlx-lm", 0, 1)
             escaped = root / "escaped.json"
             self.write_sample(escaped, escaped_payload)
-            escaped_payload["precision_evidence"]["relative_path"] = "../escaped.precision.json"
+            escaped_payload["precision_evidence"]["relative_path"] = (
+                "../escaped.precision.json"
+            )
             escaped.write_text(json.dumps(escaped_payload), encoding="utf-8")
             with self.assertRaisesRegex(ContractError, "one sibling file name"):
                 validate_sample(escaped, self.lock, LOCK_PATH)
@@ -712,32 +821,44 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
         mutations = (
             (
                 "runner-hash",
-                lambda evidence: evidence["runner"].__setitem__("source_sha256", "sha256:" + "0" * 64),
+                lambda evidence: evidence["runner"].__setitem__(
+                    "source_sha256", "sha256:" + "0" * 64
+                ),
                 "entrypoint digest differs",
             ),
             (
                 "native-attestation",
-                lambda evidence: evidence["native_runtime"].__setitem__("build_attestation_sha256", "sha256:" + "0" * 64),
+                lambda evidence: evidence["native_runtime"].__setitem__(
+                    "build_attestation_sha256", "sha256:" + "0" * 64
+                ),
                 "native runtime binding",
             ),
             (
                 "promoted-activation",
-                lambda evidence: evidence["verified"].__setitem__("activation_dtype", "bfloat16"),
+                lambda evidence: evidence["verified"].__setitem__(
+                    "activation_dtype", "bfloat16"
+                ),
                 "verified precision fields",
             ),
             (
                 "missing-gradient-stage",
-                lambda evidence: evidence["observations"]["gradient_storage"]["stages"].pop(),
+                lambda evidence: evidence["observations"]["gradient_storage"][
+                    "stages"
+                ].pop(),
                 "raw, accumulated, and clipped",
             ),
             (
                 "missing-optimizer-moment",
-                lambda evidence: evidence["observations"]["optimizer_moment_storage"]["moments"].pop(),
+                lambda evidence: evidence["observations"]["optimizer_moment_storage"][
+                    "moments"
+                ].pop(),
                 "optimizer m/v inventory",
             ),
             (
                 "false-loss-reduction",
-                lambda evidence: evidence["observations"]["loss"].__setitem__("reduction_input_dtype", "bfloat16"),
+                lambda evidence: evidence["observations"]["loss"].__setitem__(
+                    "reduction_input_dtype", "bfloat16"
+                ),
                 "loss tensor/reduction-input",
             ),
         )
@@ -777,7 +898,9 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
                 validate_sample(path, self.lock, LOCK_PATH)
 
             cache_drift = self.sample("antfly-zig-metal", 0, 0)
-            command = cache_drift["metrics"]["execution_evidence"]["optimizer_steps"][2]["command_plan_evidence"]
+            command = cache_drift["metrics"]["execution_evidence"]["optimizer_steps"][
+                2
+            ]["command_plan_evidence"]
             command["graph_executor_plan_cache_hits"] = 0
             command["graph_executor_plan_cache_misses"] = 1
             path = root / "cache-drift.json"
@@ -786,26 +909,39 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
                 validate_sample(path, self.lock, LOCK_PATH)
 
             missing_route_counter = self.sample("antfly-zig-metal", 0, 0)
-            command = missing_route_counter["metrics"]["execution_evidence"]["optimizer_steps"][2]["command_plan_evidence"]
+            command = missing_route_counter["metrics"]["execution_evidence"][
+                "optimizer_steps"
+            ][2]["command_plan_evidence"]
             command.pop("metal_gemma4_bf16_gate_up_fused_calls")
             path = root / "missing-route-counter.json"
             path.write_text(json.dumps(missing_route_counter), encoding="utf-8")
-            with self.assertRaisesRegex(ContractError, "missing=metal_gemma4_bf16_gate_up_fused_calls"):
+            with self.assertRaisesRegex(
+                ContractError, "missing=metal_gemma4_bf16_gate_up_fused_calls"
+            ):
                 validate_sample(path, self.lock, LOCK_PATH)
 
             missing_backward_route_counter = self.sample("antfly-zig-metal", 0, 0)
-            command = missing_backward_route_counter["metrics"]["execution_evidence"]["optimizer_steps"][2]["command_plan_evidence"]
+            command = missing_backward_route_counter["metrics"]["execution_evidence"][
+                "optimizer_steps"
+            ][2]["command_plan_evidence"]
             command.pop("metal_gemma4_bf16_gate_up_backward_input_sum_fused_calls")
             path = root / "missing-backward-route-counter.json"
-            path.write_text(json.dumps(missing_backward_route_counter), encoding="utf-8")
-            with self.assertRaisesRegex(ContractError, "missing=metal_gemma4_bf16_gate_up_backward_input_sum_fused_calls"):
+            path.write_text(
+                json.dumps(missing_backward_route_counter), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                ContractError,
+                "missing=metal_gemma4_bf16_gate_up_backward_input_sum_fused_calls",
+            ):
                 validate_sample(path, self.lock, LOCK_PATH)
 
             legacy = self.sample("antfly-zig-metal", 0, 0)
             legacy["schema_version"] = "antfly_gemma4_lora_benchmark_sample/v4"
             path = root / "legacy.json"
             path.write_text(json.dumps(legacy), encoding="utf-8")
-            with self.assertRaisesRegex(ContractError, "unsupported benchmark sample schema"):
+            with self.assertRaisesRegex(
+                ContractError, "unsupported benchmark sample schema"
+            ):
                 validate_sample(path, self.lock, LOCK_PATH)
 
     def test_mlx_sample_cannot_carry_zig_execution_evidence(self) -> None:
@@ -820,11 +956,23 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
 
     def test_initial_adapter_canonical_f32_digest_binds_values_and_roles(self) -> None:
         tensors = [
-            {"module": "model.layers.0.self_attn.q_proj", "role": "lora_A", "shape": [1, 2], "values": [-0.5, 0.25]},
-            {"module": "model.layers.0.self_attn.q_proj", "role": "lora_B", "shape": [2, 1], "values": [0.0, 0.0]},
+            {
+                "module": "model.layers.0.self_attn.q_proj",
+                "role": "lora_A",
+                "shape": [1, 2],
+                "values": [-0.5, 0.25],
+            },
+            {
+                "module": "model.layers.0.self_attn.q_proj",
+                "role": "lora_B",
+                "shape": [2, 1],
+                "values": [0.0, 0.0],
+            },
         ]
         digest = canonical_initial_adapter_sha256(tensors)
-        self.assertEqual(digest, canonical_initial_adapter_sha256(list(reversed(tensors))))
+        self.assertEqual(
+            digest, canonical_initial_adapter_sha256(list(reversed(tensors)))
+        )
         changed = copy.deepcopy(tensors)
         changed[0]["values"][0] = -0.25
         self.assertNotEqual(digest, canonical_initial_adapter_sha256(changed))
@@ -844,7 +992,9 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
                 validate_sample(path, self.lock, LOCK_PATH)
 
             wrong_precision = self.sample("antfly-zig-metal", 0, 0)
-            wrong_precision["semantic_contract"]["precision"]["activation_dtype"] = "bfloat16"
+            wrong_precision["semantic_contract"]["precision"]["activation_dtype"] = (
+                "bfloat16"
+            )
             path = root / "precision.json"
             self.write_sample(path, wrong_precision)
             with self.assertRaisesRegex(ContractError, "semantic contract differs"):
@@ -875,7 +1025,9 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
                 validate_sample(path, self.lock, LOCK_PATH)
 
             pressured = self.sample("mlx-lm", 0, 0)
-            pressured["metrics"]["memory"]["system_deltas"]["pressure_available_percent_delta"] = -5.1
+            pressured["metrics"]["memory"]["system_deltas"][
+                "pressure_available_percent_delta"
+            ] = -5.1
             path = root / "pressure.json"
             self.write_sample(path, pressured)
             with self.assertRaisesRegex(ContractError, "pressure drop"):
@@ -883,7 +1035,9 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
 
     def test_workload_digest_binds_ordered_model_inputs(self) -> None:
         masks = [[1, 1], [1, 1]]
-        first = benchmark_workload_sha256([[1, 2], [3, 4]], [[-100, 2], [-100, 4]], masks)
+        first = benchmark_workload_sha256(
+            [[1, 2], [3, 4]], [[-100, 2], [-100, 4]], masks
+        )
         self.assertEqual(
             first,
             benchmark_workload_sha256([[1, 2], [3, 4]], [[-100, 2], [-100, 4]], masks),
@@ -898,7 +1052,9 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
         )
         self.assertNotEqual(
             first,
-            benchmark_workload_sha256([[1, 2], [3, 4]], [[-100, 2], [-100, 4]], [[1, 1], [1, 0]]),
+            benchmark_workload_sha256(
+                [[1, 2], [3, 4]], [[-100, 2], [-100, 4]], [[1, 1], [1, 0]]
+            ),
         )
         with self.assertRaisesRegex(ContractError, "equal, non-empty"):
             benchmark_workload_sha256([[1]], [], [[1]])
@@ -909,20 +1065,26 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
             samples = self.campaign(root)
             changed = copy.deepcopy(samples[-1].payload)
             changed["case"]["prepared"]["workload_sha256"] = "sha256:" + "9" * 64
-            changed["semantic_contract"] = expected_semantic_contract(self.lock, changed["case"])
+            changed["semantic_contract"] = expected_semantic_contract(
+                self.lock, changed["case"]
+            )
             path = root / "changed-workload.json"
             self.write_sample(path, changed)
             samples[-1] = validate_sample(path, self.lock, LOCK_PATH)
             with self.assertRaisesRegex(ContractError, "mix semantic case identities"):
                 compare_campaign(samples, self.lock, require_full_matrix=False)
 
-    def test_paired_frameworks_require_identical_initial_adapter_semantics(self) -> None:
+    def test_paired_frameworks_require_identical_initial_adapter_semantics(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             samples = self.campaign(root)
             changed = copy.deepcopy(samples[-1].payload)
             changed["case"]["initial_adapter"]["semantic_sha256"] = "sha256:" + "8" * 64
-            changed["semantic_contract"] = expected_semantic_contract(self.lock, changed["case"])
+            changed["semantic_contract"] = expected_semantic_contract(
+                self.lock, changed["case"]
+            )
             path = root / "changed-adapter.json"
             self.write_sample(path, changed)
             samples[-1] = validate_sample(path, self.lock, LOCK_PATH)
@@ -938,7 +1100,9 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
             path = root / "changed-token-count.json"
             self.write_sample(path, changed)
             samples[-1] = validate_sample(path, self.lock, LOCK_PATH)
-            with self.assertRaisesRegex(ContractError, "paired input/supervised token counts differ"):
+            with self.assertRaisesRegex(
+                ContractError, "paired input/supervised token counts differ"
+            ):
                 compare_campaign(samples, self.lock, require_full_matrix=False)
 
     def test_input_tokens_cover_the_complete_optimizer_step(self) -> None:
@@ -953,16 +1117,27 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
     def test_json_schemas_track_structural_validator_contract(self) -> None:
         script_dir = Path(__file__).parent
         sample_schema = json.loads(
-            (script_dir / "gemma4_mlx_benchmark.schema.json").read_text(encoding="utf-8")
+            (script_dir / "gemma4_mlx_benchmark.schema.json").read_text(
+                encoding="utf-8"
+            )
         )
         implementation = sample_schema["properties"]["implementation"]
         self.assertIn("producer_source", implementation["required"])
-        self.assertEqual("#/$defs/producerSource", implementation["properties"]["producer_source"]["$ref"])
+        self.assertEqual(
+            "#/$defs/producerSource",
+            implementation["properties"]["producer_source"]["$ref"],
+        )
 
         producer = sample_schema["$defs"]["producerSource"]
         producer_fields = {
-            "schema_version", "relative_path", "source_revision", "source_tree",
-            "source_clean", "source_sha256", "files", "manifest_sha256",
+            "schema_version",
+            "relative_path",
+            "source_revision",
+            "source_tree",
+            "source_clean",
+            "source_sha256",
+            "files",
+            "manifest_sha256",
         }
         self.assertFalse(producer["additionalProperties"])
         self.assertEqual(producer_fields, set(producer["required"]))
@@ -984,8 +1159,12 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
             ["antfly"],
             framework_rule["then"]["properties"]["implementation"]["not"]["required"],
         )
-        mlx_memory = framework_rule["then"]["properties"]["metrics"]["properties"]["memory"]["properties"]
-        antfly_memory = framework_rule["else"]["properties"]["metrics"]["properties"]["memory"]["properties"]
+        mlx_memory = framework_rule["then"]["properties"]["metrics"]["properties"][
+            "memory"
+        ]["properties"]
+        antfly_memory = framework_rule["else"]["properties"]["metrics"]["properties"][
+            "memory"
+        ]["properties"]
         self.assertEqual(
             ["execution_evidence"],
             framework_rule["then"]["properties"]["metrics"]["not"]["required"],
@@ -994,7 +1173,10 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
             ["execution_evidence"],
             framework_rule["else"]["properties"]["metrics"]["required"],
         )
-        self.assertEqual("mlx-metal-get-peak-memory", mlx_memory["framework_allocator_peak_source"]["const"])
+        self.assertEqual(
+            "mlx-metal-get-peak-memory",
+            mlx_memory["framework_allocator_peak_source"]["const"],
+        )
         self.assertIsNone(antfly_memory["framework_allocator_peak_bytes"]["const"])
         self.assertEqual(
             "antfly-metal-allocator-unavailable",
@@ -1014,19 +1196,38 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
         mlx_reference = self.lock["mlx_reference"]
         mlx_source = sample_schema["$defs"]["mlxNativeSource"]["properties"]
         mlx_lm_source = sample_schema["$defs"]["packageSource"]["properties"]
-        self.assertEqual(mlx_reference["packages"]["mlx"], mlx_source["version"]["const"])
-        self.assertEqual(mlx_reference["source_revisions"]["mlx"], mlx_source["source_revision"]["const"])
-        self.assertEqual(mlx_reference["packages"]["mlx-lm"], mlx_lm_source["version"]["const"])
-        self.assertEqual(mlx_reference["source_revisions"]["mlx-lm"], mlx_lm_source["source_revision"]["const"])
+        self.assertEqual(
+            mlx_reference["packages"]["mlx"], mlx_source["version"]["const"]
+        )
+        self.assertEqual(
+            mlx_reference["source_revisions"]["mlx"],
+            mlx_source["source_revision"]["const"],
+        )
+        self.assertEqual(
+            mlx_reference["packages"]["mlx-lm"], mlx_lm_source["version"]["const"]
+        )
+        self.assertEqual(
+            mlx_reference["source_revisions"]["mlx-lm"],
+            mlx_lm_source["source_revision"]["const"],
+        )
         build_attestation = mlx_source["build_attestation"]["properties"]
-        self.assertEqual(mlx_reference["source_revisions"]["mlx"], build_attestation["source_revision"]["const"])
+        self.assertEqual(
+            mlx_reference["source_revisions"]["mlx"],
+            build_attestation["source_revision"]["const"],
+        )
         self.assertEqual(
             mlx_reference["native_runtime"]["precision_policy_sha256"],
             build_attestation["precision_policy_sha256"]["const"],
         )
-        self.assertIn("^3\\.12", sample_schema["$defs"]["pythonRuntime"]["properties"]["version"]["pattern"])
+        self.assertIn(
+            "^3\\.12",
+            sample_schema["$defs"]["pythonRuntime"]["properties"]["version"]["pattern"],
+        )
         execution = sample_schema["$defs"]["zigExecutionEvidence"]
-        self.assertEqual("antfly_gemma4_zig_execution_evidence/v2", execution["properties"]["schema_version"]["const"])
+        self.assertEqual(
+            "antfly_gemma4_zig_execution_evidence/v2",
+            execution["properties"]["schema_version"]["const"],
+        )
         self.assertEqual(25, execution["properties"]["optimizer_steps"]["minItems"])
         self.assertEqual(
             set(ZIG_PHASE_EVIDENCE_FIELDS),
@@ -1037,10 +1238,19 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
             set(sample_schema["$defs"]["zigCommandPlanEvidence"]["required"]),
         )
 
-        system_deltas = sample_schema["properties"]["metrics"]["properties"]["memory"]["properties"]["system_deltas"]["properties"]
+        system_deltas = sample_schema["properties"]["metrics"]["properties"]["memory"][
+            "properties"
+        ]["system_deltas"]["properties"]
         memory_contract = self.lock["benchmark_contract"]["memory"]
-        for field in ("swapins_bytes", "swapouts_bytes", "pageins_bytes", "pageouts_bytes"):
-            self.assertEqual(memory_contract[f"maximum_{field}"], system_deltas[field]["const"])
+        for field in (
+            "swapins_bytes",
+            "swapouts_bytes",
+            "pageins_bytes",
+            "pageouts_bytes",
+        ):
+            self.assertEqual(
+                memory_contract[f"maximum_{field}"], system_deltas[field]["const"]
+            )
         self.assertEqual(
             memory_contract["minimum_pressure_available_percent_delta"],
             system_deltas["pressure_available_percent_delta"]["minimum"],
@@ -1049,7 +1259,9 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
         semantic = sample_schema["properties"]["semantic_contract"]
         for field in ("optimizer", "determinism", "runtime", "memory"):
             definition_name = "benchmark" + field.title()
-            self.assertEqual(f"#/$defs/{definition_name}", semantic["properties"][field]["$ref"])
+            self.assertEqual(
+                f"#/$defs/{definition_name}", semantic["properties"][field]["$ref"]
+            )
             definition = sample_schema["$defs"][definition_name]
             expected = dict(self.lock["benchmark_contract"][field])
             if field == "optimizer":
@@ -1063,21 +1275,32 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
                 elif key == "betas":
                     self.assertEqual(
                         value,
-                        [item["const"] for item in definition["properties"][key]["prefixItems"]],
+                        [
+                            item["const"]
+                            for item in definition["properties"][key]["prefixItems"]
+                        ],
                     )
                 else:
                     self.assertEqual(value, definition["properties"][key]["const"])
 
         precision_schema = json.loads(
-            (script_dir / "gemma4_mlx_precision_evidence.schema.json").read_text(encoding="utf-8")
+            (script_dir / "gemma4_mlx_precision_evidence.schema.json").read_text(
+                encoding="utf-8"
+            )
         )
-        self.assertEqual("#/$defs/producerSource", precision_schema["properties"]["runner"]["$ref"])
+        self.assertEqual(
+            "#/$defs/producerSource", precision_schema["properties"]["runner"]["$ref"]
+        )
         precision_paths = [
             item["allOf"][1]["properties"]["relative_path"]["const"]
-            for item in precision_schema["$defs"]["producerSource"]["properties"]["files"]["prefixItems"]
+            for item in precision_schema["$defs"]["producerSource"]["properties"][
+                "files"
+            ]["prefixItems"]
         ]
         self.assertEqual(list(BENCHMARK_PRODUCER_RELATIVE_PATHS), precision_paths)
-        precision_native = precision_schema["properties"]["native_runtime"]["properties"]
+        precision_native = precision_schema["properties"]["native_runtime"][
+            "properties"
+        ]
         self.assertEqual(
             mlx_reference["source_revisions"]["mlx"],
             precision_native["mlx_source_revision"]["const"],
@@ -1090,13 +1313,23 @@ class Gemma4MlxBenchmarkContractTest(unittest.TestCase):
             mlx_reference["native_runtime"]["precision_policy_sha256"],
             precision_native["precision_policy_sha256"]["const"],
         )
-        base_dtype = precision_schema["properties"]["observations"]["properties"]["base_model_storage"]["allOf"][1]["properties"]["tensors"]["items"]["properties"]["dtype"]["const"]
-        lora_dtype = precision_schema["properties"]["observations"]["properties"]["lora_parameter_storage"]["allOf"][1]["properties"]["tensors"]["items"]["properties"]["dtype"]["const"]
-        gradient_dtype = precision_schema["$defs"]["gradientStage"]["properties"]["tensors"]["items"]["allOf"][1]["properties"]["dtype"]["const"]
-        self.assertEqual(("bfloat16", "float32", "float32"), (base_dtype, lora_dtype, gradient_dtype))
+        base_dtype = precision_schema["properties"]["observations"]["properties"][
+            "base_model_storage"
+        ]["allOf"][1]["properties"]["tensors"]["items"]["properties"]["dtype"]["const"]
+        lora_dtype = precision_schema["properties"]["observations"]["properties"][
+            "lora_parameter_storage"
+        ]["allOf"][1]["properties"]["tensors"]["items"]["properties"]["dtype"]["const"]
+        gradient_dtype = precision_schema["$defs"]["gradientStage"]["properties"][
+            "tensors"
+        ]["items"]["allOf"][1]["properties"]["dtype"]["const"]
+        self.assertEqual(
+            ("bfloat16", "float32", "float32"), (base_dtype, lora_dtype, gradient_dtype)
+        )
 
         publication_schema = json.loads(
-            (script_dir / "gemma4_oracle_publication.schema.json").read_text(encoding="utf-8")
+            (script_dir / "gemma4_oracle_publication.schema.json").read_text(
+                encoding="utf-8"
+            )
         )
         self.assertTrue(publication_schema["properties"]["files"]["uniqueItems"])
 

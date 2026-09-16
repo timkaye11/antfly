@@ -84,12 +84,18 @@ class Gemma4DpoMlxBenchmarkTest(unittest.TestCase):
         self.assertEqual(case.sequence_length, len(ids))
         self.assertEqual(case.sequence_length, len(labels))
         self.assertEqual(list(case.prompt_token_ids), ids[:completion_index])
-        self.assertEqual(list(case.chosen_token_ids), ids[completion_index : completion_index + 1])
+        self.assertEqual(
+            list(case.chosen_token_ids), ids[completion_index : completion_index + 1]
+        )
         self.assertTrue(all(label == -100 for label in labels[:completion_index]))
-        self.assertEqual(list(case.chosen_token_ids), labels[completion_index : completion_index + 1])
+        self.assertEqual(
+            list(case.chosen_token_ids), labels[completion_index : completion_index + 1]
+        )
         self.assertTrue(all(label == -100 for label in labels[completion_index + 1 :]))
 
-    def test_pair_sequence_length_is_shared_bounded_and_matches_antfly_rounding(self) -> None:
+    def test_pair_sequence_length_is_shared_bounded_and_matches_antfly_rounding(
+        self,
+    ) -> None:
         case = benchmark.load_case(benchmark.DEFAULT_CASE_PATH)
         example = case.examples[0]
         required = len(example.prompt_token_ids) + max(
@@ -176,9 +182,7 @@ class Gemma4DpoMlxBenchmarkTest(unittest.TestCase):
         payload = self.load_payload()
         payload["protocol"]["measured"] = 19
         with tempfile.TemporaryDirectory() as temp:
-            with self.assertRaisesRegex(
-                benchmark.DpoBenchmarkContractError, "fixed"
-            ):
+            with self.assertRaisesRegex(benchmark.DpoBenchmarkContractError, "fixed"):
                 benchmark.load_case(self.write_case(payload, Path(temp)))
 
     def test_case_rejects_identical_preferences(self) -> None:
@@ -207,7 +211,9 @@ class Gemma4DpoMlxBenchmarkTest(unittest.TestCase):
             )
             self.assertEqual(benchmark.DATASET_CASE_SCHEMA_VERSION, case.schema_version)
             self.assertEqual(5, len(case.examples))
-            self.assertEqual([0, 1, 2, 3, 4], [item.source_row_index for item in case.examples])
+            self.assertEqual(
+                [0, 1, 2, 3, 4], [item.source_row_index for item in case.examples]
+            )
             self.assertEqual(
                 "HuggingFaceH4/ultrafeedback_binarized", case.dataset["repo_id"]
             )
@@ -374,9 +380,7 @@ class Gemma4DpoMlxBenchmarkTest(unittest.TestCase):
                 expected,
                 benchmark.require_source_revision(Path("/tmp/mlx"), expected, "MLX"),
             )
-        verify.assert_called_once_with(
-            Path("/tmp/mlx"), expected, source_name="MLX"
-        )
+        verify.assert_called_once_with(Path("/tmp/mlx"), expected, source_name="MLX")
 
         with mock.patch.object(
             benchmark.locked,

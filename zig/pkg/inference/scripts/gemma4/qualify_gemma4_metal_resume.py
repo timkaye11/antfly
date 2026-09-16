@@ -113,7 +113,9 @@ def _model_artifact(path: Path) -> Path:
     mode = resolved.stat().st_mode
     if stat.S_ISREG(mode) and resolved.suffix.lower() == ".gguf":
         return resolved
-    raise ContractError(f"model artifact: expected a model directory or GGUF file: {resolved}")
+    raise ContractError(
+        f"model artifact: expected a model directory or GGUF file: {resolved}"
+    )
 
 
 def _sha256(path: Path) -> str:
@@ -140,7 +142,11 @@ def _tree_snapshot(root: Path) -> list[dict[str, Any]]:
         snapshot.append(
             {
                 "path": "." if path == root else path.relative_to(root).as_posix(),
-                "kind": "symlink" if path.is_symlink() else "directory" if path.is_dir() else "file",
+                "kind": "symlink"
+                if path.is_symlink()
+                else "directory"
+                if path.is_dir()
+                else "file",
                 "size": info.st_size,
                 "mtime_ns": info.st_mtime_ns,
                 "inode": info.st_ino,
@@ -151,7 +157,9 @@ def _tree_snapshot(root: Path) -> list[dict[str, Any]]:
 
 
 def _snapshot_digest(snapshot: Sequence[Mapping[str, Any]]) -> str:
-    payload = json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    payload = json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
     return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
@@ -165,23 +173,37 @@ def inspect_training_checkpoint(path: Path) -> dict[str, Any]:
         if len(prefix) != 8:
             raise ContractError("training checkpoint: truncated SafeTensors prefix")
         header_size = struct.unpack("<Q", prefix)[0]
-        if header_size == 0 or header_size > 64 * 1024 * 1024 or 8 + header_size > file_size:
-            raise ContractError("training checkpoint: invalid SafeTensors header length")
+        if (
+            header_size == 0
+            or header_size > 64 * 1024 * 1024
+            or 8 + header_size > file_size
+        ):
+            raise ContractError(
+                "training checkpoint: invalid SafeTensors header length"
+            )
         raw_header = handle.read(header_size)
         if len(raw_header) != header_size:
             raise ContractError("training checkpoint: truncated SafeTensors header")
         try:
-            header = _mapping(json.loads(raw_header.decode("utf-8").rstrip(" ")), "checkpoint header")
+            header = _mapping(
+                json.loads(raw_header.decode("utf-8").rstrip(" ")), "checkpoint header"
+            )
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ContractError(f"training checkpoint: invalid SafeTensors header: {exc}") from exc
+            raise ContractError(
+                f"training checkpoint: invalid SafeTensors header: {exc}"
+            ) from exc
         descriptor = _mapping(header.get(CHECKPOINT_TENSOR), CHECKPOINT_TENSOR)
-        if descriptor.get("dtype") != "F32" or descriptor.get("shape") != [CHECKPOINT_FLOAT_COUNT]:
+        if descriptor.get("dtype") != "F32" or descriptor.get("shape") != [
+            CHECKPOINT_FLOAT_COUNT
+        ]:
             raise ContractError(f"{CHECKPOINT_TENSOR}: unexpected dtype or shape")
         offsets = descriptor.get("data_offsets")
         if (
             not isinstance(offsets, list)
             or len(offsets) != 2
-            or any(isinstance(item, bool) or not isinstance(item, int) for item in offsets)
+            or any(
+                isinstance(item, bool) or not isinstance(item, int) for item in offsets
+            )
             or offsets[0] < 0
             or offsets[1] - offsets[0] != CHECKPOINT_FLOAT_COUNT * 4
             or 8 + header_size + offsets[1] > file_size
@@ -195,7 +217,12 @@ def inspect_training_checkpoint(path: Path) -> dict[str, Any]:
         field = 0
         for chunk_index in range(4):
             value = values[field_index * 4 + chunk_index]
-            if not math.isfinite(value) or value < 0 or value > 65535 or value != math.floor(value):
+            if (
+                not math.isfinite(value)
+                or value < 0
+                or value > 65535
+                or value != math.floor(value)
+            ):
                 raise ContractError(f"{CHECKPOINT_TENSOR}: invalid encoded integer")
             field |= int(value) << (chunk_index * 16)
         fields.append(field)
@@ -251,7 +278,9 @@ def _run_to_completion(
                 timeout=timeout_seconds,
             )
         except subprocess.TimeoutExpired as exc:
-            raise ContractError(f"training command exceeded {timeout_seconds:g}s") from exc
+            raise ContractError(
+                f"training command exceeded {timeout_seconds:g}s"
+            ) from exc
     elapsed = time.monotonic() - started
     if result.returncode != 0:
         raise ContractError(
@@ -308,14 +337,18 @@ def _run_and_interrupt(
                 process.kill()
                 returncode = process.wait(timeout=15)
             if returncode == 0:
-                raise ContractError("interruption target completed successfully before SIGTERM took effect")
+                raise ContractError(
+                    "interruption target completed successfully before SIGTERM took effect"
+                )
         finally:
             if process.poll() is None:
                 process.kill()
                 process.wait(timeout=15)
     final_state = inspect_training_checkpoint(checkpoint_path)
     if final_state["sha256"] != state["sha256"]:
-        raise ContractError("checkpoint changed after the observed interruption boundary")
+        raise ContractError(
+            "checkpoint changed after the observed interruption boundary"
+        )
     if final_state["accumulation_micro_batches"] != 0:
         raise ContractError("checkpoint is not at a gradient-accumulation boundary")
     if final_state["next_example_index"] != 0 or final_state["order_cursor"] != 0:
@@ -332,7 +365,9 @@ def _run_and_interrupt(
 
 
 def _training_report(output_dir: Path, where: str) -> Mapping[str, Any]:
-    path = _regular_file(output_dir / "training_report.json", f"{where} training report")
+    path = _regular_file(
+        output_dir / "training_report.json", f"{where} training report"
+    )
     payload = _load_json(path, f"{where} training report")
     report = _mapping(payload.get("report"), f"{where}.report")
     if payload.get("task") != "gemma4_lora_train_eval":
@@ -390,17 +425,28 @@ def _validate_outputs(
         raise ContractError("uninterrupted report has the wrong epoch count")
     if _integer(resumed.get("epochs"), "resumed.epochs", 1) != total_epochs:
         raise ContractError("resumed report has the wrong epoch count")
-    resume_contract = _mapping(resumed.get("checkpoint_resume"), "resumed.checkpoint_resume")
+    resume_contract = _mapping(
+        resumed.get("checkpoint_resume"), "resumed.checkpoint_resume"
+    )
     if resume_contract.get("enabled") is not True:
         raise ContractError("resumed report does not attest checkpoint recovery")
-    if _integer(resume_contract.get("start_epoch"), "resumed start_epoch") != expected_resume_epoch:
+    if (
+        _integer(resume_contract.get("start_epoch"), "resumed start_epoch")
+        != expected_resume_epoch
+    ):
         raise ContractError("resumed report recovered from the wrong epoch")
 
     uninterrupted_history_raw = uninterrupted.get("epoch_history")
     resumed_history_raw = resumed.get("epoch_history")
-    if not isinstance(uninterrupted_history_raw, list) or len(uninterrupted_history_raw) != total_epochs:
+    if (
+        not isinstance(uninterrupted_history_raw, list)
+        or len(uninterrupted_history_raw) != total_epochs
+    ):
         raise ContractError("uninterrupted report has an incomplete epoch history")
-    if not isinstance(resumed_history_raw, list) or len(resumed_history_raw) != total_epochs - expected_resume_epoch:
+    if (
+        not isinstance(resumed_history_raw, list)
+        or len(resumed_history_raw) != total_epochs - expected_resume_epoch
+    ):
         raise ContractError("resumed report has an incomplete recovery suffix")
     uninterrupted_history = [
         _mapping(item, f"uninterrupted.epoch_history[{index}]")
@@ -415,7 +461,9 @@ def _validate_outputs(
     for index, epoch in enumerate(resumed_history):
         _strict_metal_epoch(epoch, f"resumed.epoch_history[{index}]")
     expected_suffix = [
-        _trajectory_view(epoch, f"uninterrupted.epoch_history[{expected_resume_epoch + index}]")
+        _trajectory_view(
+            epoch, f"uninterrupted.epoch_history[{expected_resume_epoch + index}]"
+        )
         for index, epoch in enumerate(uninterrupted_history[expected_resume_epoch:])
     ]
     actual_suffix = [
@@ -423,16 +471,22 @@ def _validate_outputs(
         for index, epoch in enumerate(resumed_history)
     ]
     if actual_suffix != expected_suffix:
-        raise ContractError("post-resume optimizer trajectory differs from uninterrupted execution")
+        raise ContractError(
+            "post-resume optimizer trajectory differs from uninterrupted execution"
+        )
 
     uninterrupted_adapter = _regular_file(
         uninterrupted_dir / "adapter_model.safetensors", "uninterrupted adapter"
     )
-    resumed_adapter = _regular_file(resumed_dir / "adapter_model.safetensors", "resumed adapter")
+    resumed_adapter = _regular_file(
+        resumed_dir / "adapter_model.safetensors", "resumed adapter"
+    )
     uninterrupted_sha = _sha256(uninterrupted_adapter)
     resumed_sha = _sha256(resumed_adapter)
     if resumed_sha != uninterrupted_sha:
-        raise ContractError("resumed final adapter is not byte-identical to uninterrupted output")
+        raise ContractError(
+            "resumed final adapter is not byte-identical to uninterrupted output"
+        )
     for relative in (
         "adapter_config.json",
         "antfly_finetune_manifest.json",
@@ -535,7 +589,10 @@ def _command(
     ]
     if args.activation_checkpoint_interval:
         command.extend(
-            ["--activation-checkpoint-interval", str(args.activation_checkpoint_interval)]
+            [
+                "--activation-checkpoint-interval",
+                str(args.activation_checkpoint_interval),
+            ]
         )
     if resume:
         command.append("--resume")
@@ -561,9 +618,13 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
     if args.timeout_seconds <= 0 or args.poll_seconds <= 0:
         raise ContractError("timeouts must be positive")
     if args.model.is_file() and not args.experimental_gguf_qlora:
-        raise ContractError("direct GGUF qualification requires --experimental-gguf-qlora")
+        raise ContractError(
+            "direct GGUF qualification requires --experimental-gguf-qlora"
+        )
     if args.experimental_gguf_qlora and not args.model.is_file():
-        raise ContractError("--experimental-gguf-qlora requires a direct GGUF model file")
+        raise ContractError(
+            "--experimental-gguf-qlora requires a direct GGUF model file"
+        )
 
     output_root = args.output_dir.expanduser().resolve()
     if output_root.exists():
@@ -577,7 +638,9 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
     interrupted_checkpoint = output_root / "interrupted-state.safetensors"
 
     immutable_roots = {"model": args.model, "adapter": args.adapter}
-    snapshots_before = {name: _tree_snapshot(path) for name, path in immutable_roots.items()}
+    snapshots_before = {
+        name: _tree_snapshot(path) for name, path in immutable_roots.items()
+    }
     input_evidence = {
         "binary": {"path": str(args.binary), "sha256": _sha256(args.binary)},
         "model": {
@@ -590,11 +653,20 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
             "path": str(args.adapter),
             "snapshot_sha256": _snapshot_digest(snapshots_before["adapter"]),
             "checkpoint_sha256": _sha256(
-                _regular_file(args.adapter / "adapter_model.safetensors", "seed adapter checkpoint")
+                _regular_file(
+                    args.adapter / "adapter_model.safetensors",
+                    "seed adapter checkpoint",
+                )
             ),
         },
-        "train_prepared": {"path": str(args.train_prepared), "sha256": _sha256(args.train_prepared)},
-        "eval_prepared": {"path": str(args.eval_prepared), "sha256": _sha256(args.eval_prepared)},
+        "train_prepared": {
+            "path": str(args.train_prepared),
+            "sha256": _sha256(args.train_prepared),
+        },
+        "eval_prepared": {
+            "path": str(args.eval_prepared),
+            "sha256": _sha256(args.eval_prepared),
+        },
     }
     env = os.environ.copy()
     env.update(STRICT_METAL_ENV)
@@ -637,7 +709,9 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
         args.poll_seconds,
     )
     if interrupted_dir.exists():
-        raise ContractError("interrupted command published its immutable output directory")
+        raise ContractError(
+            "interrupted command published its immutable output directory"
+        )
 
     resumed_command = _command(
         args,

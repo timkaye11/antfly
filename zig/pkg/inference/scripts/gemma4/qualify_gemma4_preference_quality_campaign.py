@@ -224,10 +224,7 @@ def _grpo_training_coverage(
         report.get("kl_rejected_groups"), "report.kl_rejected_groups"
     )
     if (
-        optimizer_groups
-        + zero_groups
-        + all_truncated_groups
-        + kl_rejected_groups
+        optimizer_groups + zero_groups + all_truncated_groups + kl_rejected_groups
         != expected_units
     ):
         raise ContractError("GRPO admitted and skipped groups do not cover the horizon")
@@ -279,9 +276,7 @@ def _require_grpo_kl_admissions(
     kl_control: Mapping[str, Any], optimizer_groups: int | float
 ) -> None:
     expected = _integer(optimizer_groups, "GRPO optimizer groups", 1)
-    admitted = _integer(
-        kl_control.get("admitted_groups"), "kl_control.admitted_groups"
-    )
+    admitted = _integer(kl_control.get("admitted_groups"), "kl_control.admitted_groups")
     if admitted != expected:
         raise ContractError(
             "KL controller admitted-group count does not match optimizer groups"
@@ -296,8 +291,7 @@ def _one_sided_exact_sign_test_p_value(wins: int, losses: int) -> float:
     if discordant == 0:
         return 1.0
     numerator = sum(
-        math.comb(discordant, successes)
-        for successes in range(wins, discordant + 1)
+        math.comb(discordant, successes) for successes in range(wins, discordant + 1)
     )
     return numerator / (1 << discordant)
 
@@ -369,9 +363,8 @@ def _paired_prompt_reward_test(
         "losses": losses,
         "ties": ties,
         "net_reward": evaluation_total - baseline_total,
-        "mean_reward_improvement": (
-            evaluation_total - baseline_total
-        ) / len(baseline_rewards),
+        "mean_reward_improvement": (evaluation_total - baseline_total)
+        / len(baseline_rewards),
         "one_sided_exact_p_value": p_value,
         "maximum_p_value": maximum_p_value,
         "directional_passed": wins > losses,
@@ -415,8 +408,7 @@ def _multi_seed_paired_prompt_reward_test(
         if seed in normalized:
             raise ContractError("multi-seed GRPO paired test contains a duplicate seed")
         deltas = [
-            _finite(delta, f"seed {seed} prompt reward delta")
-            for delta in raw_deltas
+            _finite(delta, f"seed {seed} prompt reward delta") for delta in raw_deltas
         ]
         if not deltas:
             raise ContractError("multi-seed GRPO paired test has no prompt deltas")
@@ -442,8 +434,7 @@ def _multi_seed_paired_prompt_reward_test(
     assert groups is not None
     seed_count = len(normalized)
     prompt_deltas = [
-        math.fsum(deltas[prompt_index] for deltas in normalized.values())
-        / seed_count
+        math.fsum(deltas[prompt_index] for deltas in normalized.values()) / seed_count
         for prompt_index in range(groups)
     ]
     wins = sum(delta > 0.0 for delta in prompt_deltas)
@@ -462,16 +453,13 @@ def _multi_seed_paired_prompt_reward_test(
         "losses": losses,
         "ties": ties,
         "net_group_reward": net_group_reward,
-        "mean_completion_reward_improvement": net_group_reward
-        / (groups * group_size),
+        "mean_completion_reward_improvement": net_group_reward / (groups * group_size),
         "one_sided_exact_p_value": p_value,
         "maximum_p_value": maximum_p_value,
         "all_seeds_directional": all_seeds_directional,
         "per_seed": per_seed,
         "passed": (
-            all_seeds_directional
-            and wins > losses
-            and p_value <= maximum_p_value
+            all_seeds_directional and wins > losses and p_value <= maximum_p_value
         ),
         "independent_unit": "evaluation-prompt",
         "seed_aggregation": "arithmetic-mean-of-prompt-group-reward-deltas",
@@ -507,9 +495,13 @@ def _load_grpo_evaluation_rewards(
                         f"{where} row {line_number}: invalid JSON: {exc}"
                     ) from exc
                 if row.get("schema_version") != "antfly_inference_grpo_reward_trace/v1":
-                    raise ContractError(f"{where} row {line_number}: unsupported schema")
+                    raise ContractError(
+                        f"{where} row {line_number}: unsupported schema"
+                    )
                 if row.get("phase") != "evaluation":
-                    raise ContractError(f"{where} row {line_number}: wrong reward phase")
+                    raise ContractError(
+                        f"{where} row {line_number}: wrong reward phase"
+                    )
                 call_index = _integer(
                     row.get("call_index"), f"{where} row {line_number}.call_index"
                 )
@@ -519,7 +511,10 @@ def _load_grpo_evaluation_rewards(
                 )
                 if call_index in rewards_by_call:
                     raise ContractError(f"{where}: duplicate call_index {call_index}")
-                if call_index >= expected_rows or prompt_index != call_index // group_size:
+                if (
+                    call_index >= expected_rows
+                    or prompt_index != call_index // group_size
+                ):
                     raise ContractError(
                         f"{where}: call/prompt order does not match the seeded group contract"
                     )
@@ -540,7 +535,9 @@ def _load_grpo_evaluation_rewards(
 def _reported_reward_trace(
     report: Mapping[str, Any], expected_path: Path, where: str
 ) -> Path:
-    reward_pipeline = _mapping(report.get("reward_pipeline"), f"{where}.reward_pipeline")
+    reward_pipeline = _mapping(
+        report.get("reward_pipeline"), f"{where}.reward_pipeline"
+    )
     evidence = resume_qualifier._require_reported_artifact(
         reward_pipeline.get("trace_path"),
         reward_pipeline.get("trace_digest"),
@@ -601,10 +598,13 @@ def _paired_grpo_evaluation_evidence(
     ):
         mean_reward = math.fsum(rewards) / len(rewards)
         top_rank_mean_reward = math.fsum(rewards[::group_size]) / groups
-        positive_reward_group_rate = sum(
-            any(reward > 0.0 for reward in rewards[start : start + group_size])
-            for start in range(0, len(rewards), group_size)
-        ) / groups
+        positive_reward_group_rate = (
+            sum(
+                any(reward > 0.0 for reward in rewards[start : start + group_size])
+                for start in range(0, len(rewards), group_size)
+            )
+            / groups
+        )
         for field, computed in (
             ("mean_reward", mean_reward),
             ("top_rank_mean_reward", top_rank_mean_reward),
@@ -649,16 +649,16 @@ def _multi_seed_grpo_evaluation_evidence(
     expected_groups: int,
     maximum_p_value: float,
 ) -> dict[str, Any]:
-    expected_groups = _integer(
-        expected_groups, "expected GRPO evaluation groups", 1
-    )
+    expected_groups = _integer(expected_groups, "expected GRPO evaluation groups", 1)
     prompt_deltas_by_seed: dict[int, list[float]] = {}
     trace_pairs: list[dict[str, Any]] = []
     group_size: int | None = None
     for run in runs:
         seed = _integer(run.get("seed"), "campaign run seed")
         if seed in prompt_deltas_by_seed:
-            raise ContractError("multi-seed GRPO paired evidence contains a duplicate seed")
+            raise ContractError(
+                "multi-seed GRPO paired evidence contains a duplicate seed"
+            )
         quality = _mapping(run.get("quality"), f"seed {seed} quality")
         paired = _mapping(
             quality.get("paired_evaluation"), f"seed {seed} paired evaluation"
@@ -723,9 +723,7 @@ def _multi_seed_grpo_evaluation_evidence(
         losses = sum(delta < 0.0 for delta in prompt_deltas)
         ties = groups - wins - losses
         for field, computed in (("wins", wins), ("losses", losses), ("ties", ties)):
-            if _integer(
-                paired.get(field), f"seed {seed} paired {field}"
-            ) != computed:
+            if _integer(paired.get(field), f"seed {seed} paired {field}") != computed:
                 raise ContractError(
                     f"seed {seed} paired trace disagrees with recorded {field}"
                 )
@@ -775,11 +773,7 @@ def _verify_bounded_requirement(
     *,
     allow_negative: bool = False,
 ) -> None:
-    reported_minimum = (
-        _finite
-        if allow_negative
-        else _nonnegative
-    )(
+    reported_minimum = (_finite if allow_negative else _nonnegative)(
         baseline_relative.get(f"{field_prefix}_required_improvement"),
         f"baseline_relative.{field_prefix}_required_improvement",
     )
@@ -792,13 +786,9 @@ def _verify_bounded_requirement(
         raise ContractError(
             f"baseline_relative.{field_prefix} effective requirement mismatch"
         )
-    reported_saturated = baseline_relative.get(
-        f"{field_prefix}_requirement_saturated"
-    )
+    reported_saturated = baseline_relative.get(f"{field_prefix}_requirement_saturated")
     if not isinstance(reported_saturated, bool) or reported_saturated != saturated:
-        raise ContractError(
-            f"baseline_relative.{field_prefix} saturation mismatch"
-        )
+        raise ContractError(f"baseline_relative.{field_prefix} saturation mismatch")
 
 
 def _load_json(path: Path, where: str) -> Mapping[str, Any]:
@@ -982,7 +972,9 @@ def _parse_seeds(value: str) -> list[int]:
     try:
         seeds = [int(item.strip(), 10) for item in value.split(",") if item.strip()]
     except ValueError as exc:
-        raise argparse.ArgumentTypeError("seeds must be comma-separated u64 values") from exc
+        raise argparse.ArgumentTypeError(
+            "seeds must be comma-separated u64 values"
+        ) from exc
     if len(seeds) < 3 or len(set(seeds)) != len(seeds):
         raise argparse.ArgumentTypeError("at least three unique seeds are required")
     if any(seed < 0 or seed > (1 << 64) - 1 for seed in seeds):
@@ -1082,10 +1074,14 @@ def _adapter_bootstrap_spec(adapter: Path) -> dict[str, Any]:
             not in ("antfly_gemma4_finetune/v2", "antfly_gemma4_finetune/v3")
             or manifest.get("status") != "complete"
         ):
-            raise ContractError("template adapter manifest is not a complete v2/v3 artifact")
+            raise ContractError(
+                "template adapter manifest is not a complete v2/v3 artifact"
+            )
         target_preset = manifest.get("target_preset")
         if target_preset not in ("peft-qv", "text-all-linear"):
-            raise ContractError("template adapter manifest target_preset is unsupported")
+            raise ContractError(
+                "template adapter manifest target_preset is unsupported"
+            )
         if (
             manifest.get("target_modules") != targets
             or _integer(manifest.get("rank"), "template adapter manifest.rank", 1)
@@ -1156,9 +1152,12 @@ def _bootstrap_seed_adapter(
         raise ContractError("seeded bootstrap did not publish a v3 adapter manifest")
     if manifest.get("status") != "complete":
         raise ContractError("seeded bootstrap manifest is incomplete")
-    if _integer(
-        manifest.get("initialization_seed"), "adapter manifest.initialization_seed"
-    ) != seed:
+    if (
+        _integer(
+            manifest.get("initialization_seed"), "adapter manifest.initialization_seed"
+        )
+        != seed
+    ):
         raise ContractError("seeded bootstrap manifest attests the wrong seed")
     if manifest.get("target_preset") != target_preset:
         raise ContractError("seeded bootstrap manifest drifted from the target preset")
@@ -1226,7 +1225,9 @@ def _variant(
     return recipe
 
 
-def _run(command: Sequence[str], env: Mapping[str, str], root: Path, timeout: float) -> dict[str, Any]:
+def _run(
+    command: Sequence[str], env: Mapping[str, str], root: Path, timeout: float
+) -> dict[str, Any]:
     stdout_path = root.with_suffix(".stdout.log")
     stderr_path = root.with_suffix(".stderr.log")
     started = time.monotonic()
@@ -1245,7 +1246,9 @@ def _run(command: Sequence[str], env: Mapping[str, str], root: Path, timeout: fl
     elapsed = time.monotonic() - started
     if completed.returncode != 0:
         tail = stderr_path.read_bytes()[-6000:].decode(errors="replace")
-        raise ContractError(f"training failed with {completed.returncode}; stderr tail:\n{tail}")
+        raise ContractError(
+            f"training failed with {completed.returncode}; stderr tail:\n{tail}"
+        )
     return {
         "command": list(command),
         "returncode": completed.returncode,
@@ -1278,7 +1281,10 @@ def _validate_run(
     )
     if report.get("schema_version") != expected_schema:
         raise ContractError(f"{task} report has unsupported schema")
-    if report.get("execution_mode") != "train" or report.get("policy_backend") != "metal":
+    if (
+        report.get("execution_mode") != "train"
+        or report.get("policy_backend") != "metal"
+    ):
         raise ContractError("campaign run was not optimizer-backed Metal training")
     if compiled_sampling:
         if report.get("sampling_mode") != resume_qualifier.COMPILED_GRPO_SAMPLING_MODE:
@@ -1316,9 +1322,17 @@ def _validate_run(
             optimizer_groups + gradient_accumulation_steps - 1
         ) // gradient_accumulation_steps
         minimum_micro_batch_units = optimizer_groups
-    if _integer(report.get("optimizer_steps"), "report.optimizer_steps", 1) != realized_optimizer_steps:
-        raise ContractError("report.optimizer_steps does not cover the admitted long horizon")
-    if _integer(report.get("micro_batch_steps"), "report.micro_batch_steps", 1) < minimum_micro_batch_units:
+    if (
+        _integer(report.get("optimizer_steps"), "report.optimizer_steps", 1)
+        != realized_optimizer_steps
+    ):
+        raise ContractError(
+            "report.optimizer_steps does not cover the admitted long horizon"
+        )
+    if (
+        _integer(report.get("micro_batch_steps"), "report.micro_batch_steps", 1)
+        < minimum_micro_batch_units
+    ):
         raise ContractError("report.micro_batch_steps is shorter than the long horizon")
 
     training_report_path = run_root / "training_report.json"
@@ -1339,10 +1353,18 @@ def _validate_run(
     realized_optimizer = _mapping(
         realized_recipe.get("optimizer"), "outer training recipe.optimizer"
     )
-    if _integer(realized_optimizer.get("epochs"), "realized optimizer.epochs", 1) != expected_epochs:
+    if (
+        _integer(realized_optimizer.get("epochs"), "realized optimizer.epochs", 1)
+        != expected_epochs
+    ):
         raise ContractError("outer training report attests the wrong epoch horizon")
-    if _integer(realized_optimizer.get("seed"), "realized optimizer.seed") != expected_seed:
-        raise ContractError("outer training report attests the wrong typed training seed")
+    if (
+        _integer(realized_optimizer.get("seed"), "realized optimizer.seed")
+        != expected_seed
+    ):
+        raise ContractError(
+            "outer training report attests the wrong typed training seed"
+        )
     realized_adapter = _mapping(
         realized_recipe.get("adapter"), "outer training recipe.adapter"
     )
@@ -1351,17 +1373,27 @@ def _validate_run(
         not isinstance(realized_adapter_path, str)
         or Path(realized_adapter_path).resolve() != expected_seed_adapter_path.resolve()
     ):
-        raise ContractError("outer training report attests the wrong initialized adapter")
-    if _integer(
-        realized_adapter.get("initialization_seed"),
-        "realized adapter.initialization_seed",
-    ) != expected_seed:
-        raise ContractError("outer training report attests the wrong initialization seed")
+        raise ContractError(
+            "outer training report attests the wrong initialized adapter"
+        )
+    if (
+        _integer(
+            realized_adapter.get("initialization_seed"),
+            "realized adapter.initialization_seed",
+        )
+        != expected_seed
+    ):
+        raise ContractError(
+            "outer training report attests the wrong initialization seed"
+        )
     realized_dataset = _mapping(
         realized_recipe.get("dataset"), "outer training recipe.dataset"
     )
     realized_train = realized_dataset.get("train_path") or realized_dataset.get("path")
-    if not isinstance(realized_train, str) or Path(realized_train).resolve() != expected_train_path.resolve():
+    if (
+        not isinstance(realized_train, str)
+        or Path(realized_train).resolve() != expected_train_path.resolve()
+    ):
         raise ContractError("outer training report attests the wrong seeded dataset")
 
     manifest_path = run_root / "recipe_run_manifest.json"
@@ -1383,10 +1415,7 @@ def _validate_run(
     trained = resume_qualifier._adapter_tree_evidence(
         run_root / "adapter-trained", "trained adapter"
     )
-    if (
-        trained["adapter_model_sha256"]
-        == expected_seed_adapter["adapter_model_sha256"]
-    ):
+    if trained["adapter_model_sha256"] == expected_seed_adapter["adapter_model_sha256"]:
         raise ContractError("trained adapter is byte-identical to the seed adapter")
 
     common_metrics = {
@@ -1411,7 +1440,9 @@ def _validate_run(
             **common_metrics,
             "eval_loss": _nonnegative(evaluation.get("loss"), "evaluation.loss"),
             "train_accuracy": _probability(report.get("accuracy"), "report.accuracy"),
-            "eval_accuracy": _probability(evaluation.get("accuracy"), "evaluation.accuracy"),
+            "eval_accuracy": _probability(
+                evaluation.get("accuracy"), "evaluation.accuracy"
+            ),
             "eval_reward_margin": _finite(
                 evaluation.get("mean_reward_margin"), "evaluation.mean_reward_margin"
             ),
@@ -1451,7 +1482,9 @@ def _validate_run(
         if metrics["eval_loss"] > quality_gates["max_eval_loss"]:
             raise ContractError("held-out DPO loss exceeds the campaign ceiling")
         if metrics["eval_reward_margin"] < quality_gates["min_eval_reward_margin"]:
-            raise ContractError("held-out DPO reward margin is below the campaign floor")
+            raise ContractError(
+                "held-out DPO reward margin is below the campaign floor"
+            )
         accuracy_required, accuracy_saturated = _bounded_increase_requirement(
             metrics["baseline_eval_accuracy"],
             quality_gates["min_eval_accuracy_improvement"],
@@ -1491,9 +1524,7 @@ def _validate_run(
         evaluation_group_size = _integer(
             realized_grpo.get("group_size"), "realized GRPO group_size", 1
         )
-        evaluation_groups = _integer(
-            evaluation.get("groups"), "evaluation.groups", 1
-        )
+        evaluation_groups = _integer(evaluation.get("groups"), "evaluation.groups", 1)
         if evaluation_groups != _integer(
             quality_gates["expected_eval_groups"],
             "expected GRPO evaluation groups",
@@ -1504,9 +1535,7 @@ def _validate_run(
             )
         metrics = {
             **common_metrics,
-            "train_optimizer_groups": int(
-                grpo_training_coverage["optimizer_groups"]
-            ),
+            "train_optimizer_groups": int(grpo_training_coverage["optimizer_groups"]),
             "train_optimizer_group_rate": float(
                 grpo_training_coverage["optimizer_group_rate"]
             ),
@@ -1519,7 +1548,9 @@ def _validate_run(
             "train_kl_rejected_group_rate": float(
                 grpo_training_coverage["kl_rejected_group_rate"]
             ),
-            "train_mean_reward": _finite(report.get("mean_reward"), "report.mean_reward"),
+            "train_mean_reward": _finite(
+                report.get("mean_reward"), "report.mean_reward"
+            ),
             "train_mean_kl": _nonnegative(report.get("mean_kl"), "report.mean_kl"),
             "eval_mean_reward": _finite(
                 evaluation.get("mean_reward"), "evaluation.mean_reward"
@@ -1535,7 +1566,9 @@ def _validate_run(
             "eval_kl_loss": _nonnegative(
                 evaluation.get("kl_loss"), "evaluation.kl_loss"
             ),
-            "eval_mean_kl": _nonnegative(evaluation.get("mean_kl"), "evaluation.mean_kl"),
+            "eval_mean_kl": _nonnegative(
+                evaluation.get("mean_kl"), "evaluation.mean_kl"
+            ),
             "baseline_eval_mean_reward": _finite(
                 baseline.get("mean_reward"), "baseline_evaluation.mean_reward"
             ),
@@ -1568,10 +1601,20 @@ def _validate_run(
         }
         if metrics["eval_mean_reward"] < quality_gates["min_eval_mean_reward"]:
             raise ContractError("held-out GRPO mean reward is below the campaign floor")
-        if metrics["eval_top_rank_mean_reward"] < quality_gates["min_eval_top_rank_mean_reward"]:
-            raise ContractError("held-out GRPO top-rank reward is below the campaign floor")
-        if metrics["eval_positive_reward_group_rate"] < quality_gates["min_eval_positive_reward_group_rate"]:
-            raise ContractError("held-out GRPO positive-group rate is below the campaign floor")
+        if (
+            metrics["eval_top_rank_mean_reward"]
+            < quality_gates["min_eval_top_rank_mean_reward"]
+        ):
+            raise ContractError(
+                "held-out GRPO top-rank reward is below the campaign floor"
+            )
+        if (
+            metrics["eval_positive_reward_group_rate"]
+            < quality_gates["min_eval_positive_reward_group_rate"]
+        ):
+            raise ContractError(
+                "held-out GRPO positive-group rate is below the campaign floor"
+            )
         if metrics["eval_kl_loss"] > quality_gates["max_eval_kl_loss"]:
             raise ContractError("held-out GRPO KL loss exceeds the campaign ceiling")
         positive_group_noninferiority = _grpo_positive_group_noninferiority(
@@ -1611,15 +1654,13 @@ def _validate_run(
             ),
         ):
             if metrics[metric_name] < quality_gates[gate_name]:
-                raise ContractError(f"held-out GRPO {metric_name} is below the baseline-relative floor")
-        positive_rate_required, positive_rate_saturated = (
-            _bounded_increase_requirement(
-                metrics["baseline_eval_positive_reward_group_rate"],
-                quality_gates[
-                    "min_eval_positive_reward_group_rate_improvement"
-                ],
-                1.0,
-            )
+                raise ContractError(
+                    f"held-out GRPO {metric_name} is below the baseline-relative floor"
+                )
+        positive_rate_required, positive_rate_saturated = _bounded_increase_requirement(
+            metrics["baseline_eval_positive_reward_group_rate"],
+            quality_gates["min_eval_positive_reward_group_rate_improvement"],
+            1.0,
         )
         _verify_bounded_requirement(
             baseline_relative,
@@ -1648,15 +1689,9 @@ def _validate_run(
         )
         metrics.update(
             {
-                "eval_paired_prompt_reward_wins": int(
-                    paired_evaluation["wins"]
-                ),
-                "eval_paired_prompt_reward_losses": int(
-                    paired_evaluation["losses"]
-                ),
-                "eval_paired_prompt_reward_ties": int(
-                    paired_evaluation["ties"]
-                ),
+                "eval_paired_prompt_reward_wins": int(paired_evaluation["wins"]),
+                "eval_paired_prompt_reward_losses": int(paired_evaluation["losses"]),
+                "eval_paired_prompt_reward_ties": int(paired_evaluation["ties"]),
                 "eval_paired_prompt_reward_one_sided_p_value": float(
                     paired_evaluation["one_sided_exact_p_value"]
                 ),
@@ -1669,12 +1704,20 @@ def _validate_run(
         incremental = report.get("incremental_kv")
         if incremental is not None:
             incremental = _mapping(incremental, "report.incremental_kv")
-            if _integer(incremental.get("groups"), "incremental_kv.groups") != expected_units:
-                raise ContractError("incremental-KV telemetry does not cover the long horizon")
-            if _integer(
-                incremental.get("host_logit_fallbacks"),
-                "incremental_kv.host_logit_fallbacks",
-            ) != 0:
+            if (
+                _integer(incremental.get("groups"), "incremental_kv.groups")
+                != expected_units
+            ):
+                raise ContractError(
+                    "incremental-KV telemetry does not cover the long horizon"
+                )
+            if (
+                _integer(
+                    incremental.get("host_logit_fallbacks"),
+                    "incremental_kv.host_logit_fallbacks",
+                )
+                != 0
+            ):
                 raise ContractError("incremental-KV campaign used host-logit fallback")
 
     return {
@@ -1715,7 +1758,9 @@ def _metric_summary(runs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
 
 
 def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
-    binary = resume_qualifier._regular_file(args.binary, "antfly binary", executable=True)
+    binary = resume_qualifier._regular_file(
+        args.binary, "antfly binary", executable=True
+    )
     recipe_path = resume_qualifier._regular_file(args.recipe, "base recipe")
     base = json.loads(json.dumps(_load_json(recipe_path, "base recipe")))
     task = base.get("recipe")
@@ -1756,12 +1801,16 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
             Path(reference_value), "reference model"
         )
         if reference != model:
-            raise ContractError("preference campaign requires model and reference paths to match")
+            raise ContractError(
+                "preference campaign requires model and reference paths to match"
+            )
         model_config["reference_path"] = str(reference)
     model_config["path"] = str(model)
     adapter_config["path"] = str(template_adapter)
     if model.is_file() and not args.allow_direct_gguf_training:
-        raise ContractError("direct GGUF campaign requires --allow-direct-gguf-training")
+        raise ContractError(
+            "direct GGUF campaign requires --allow-direct-gguf-training"
+        )
     if args.allow_direct_gguf_training and not model.is_file():
         raise ContractError("--allow-direct-gguf-training requires a direct GGUF model")
     if compiled_sampling and args.allow_direct_gguf_training:
@@ -1882,8 +1931,12 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
             {
                 "accuracy": quality_gates["min_eval_accuracy"],
                 "max_loss": quality_gates["max_eval_loss"],
-                "min_accuracy_improvement": quality_gates["min_eval_accuracy_improvement"],
-                "min_reward_margin_improvement": quality_gates["min_eval_reward_margin_improvement"],
+                "min_accuracy_improvement": quality_gates[
+                    "min_eval_accuracy_improvement"
+                ],
+                "min_reward_margin_improvement": quality_gates[
+                    "min_eval_reward_margin_improvement"
+                ],
                 "min_loss_improvement": quality_gates["min_eval_loss_improvement"],
             }
         )
@@ -1913,24 +1966,18 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
             1,
         )
         _probability(
-            quality_gates[
-                "max_multi_seed_paired_prompt_reward_sign_test_p_value"
-            ],
+            quality_gates["max_multi_seed_paired_prompt_reward_sign_test_p_value"],
             "maximum multi-seed GRPO paired prompt reward sign-test p-value",
         )
         if (
-            quality_gates[
-                "max_multi_seed_paired_prompt_reward_sign_test_p_value"
-            ]
+            quality_gates["max_multi_seed_paired_prompt_reward_sign_test_p_value"]
             == 0.0
         ):
             raise ContractError(
                 "maximum multi-seed GRPO paired prompt reward sign-test p-value must be positive"
             )
         if (
-            quality_gates[
-                "max_multi_seed_paired_prompt_reward_sign_test_p_value"
-            ]
+            quality_gates["max_multi_seed_paired_prompt_reward_sign_test_p_value"]
             > MAX_GRPO_PAIRED_SIGN_TEST_P_VALUE
         ):
             raise ContractError(
@@ -1940,10 +1987,7 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
             quality_gates["min_optimizer_group_rate"],
             "minimum GRPO optimizer-group rate",
         )
-        if (
-            quality_gates["min_optimizer_group_rate"]
-            < MIN_GRPO_OPTIMIZER_GROUP_RATE
-        ):
+        if quality_gates["min_optimizer_group_rate"] < MIN_GRPO_OPTIMIZER_GROUP_RATE:
             raise ContractError(
                 "GRPO optimizer-group floor cannot relax the production minimum"
             )
@@ -1965,11 +2009,19 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
             {
                 "mean_reward": quality_gates["min_eval_mean_reward"],
                 "top_rank_mean_reward": quality_gates["min_eval_top_rank_mean_reward"],
-                "positive_reward_group_rate": quality_gates["min_eval_positive_reward_group_rate"],
+                "positive_reward_group_rate": quality_gates[
+                    "min_eval_positive_reward_group_rate"
+                ],
                 "max_kl_loss": quality_gates["max_eval_kl_loss"],
-                "min_mean_reward_improvement": quality_gates["min_eval_mean_reward_improvement"],
-                "min_top_rank_mean_reward_improvement": quality_gates["min_eval_top_rank_mean_reward_improvement"],
-                "min_positive_reward_group_rate_improvement": quality_gates["min_eval_positive_reward_group_rate_improvement"],
+                "min_mean_reward_improvement": quality_gates[
+                    "min_eval_mean_reward_improvement"
+                ],
+                "min_top_rank_mean_reward_improvement": quality_gates[
+                    "min_eval_top_rank_mean_reward_improvement"
+                ],
+                "min_positive_reward_group_rate_improvement": quality_gates[
+                    "min_eval_positive_reward_group_rate_improvement"
+                ],
             }
         )
         base["eval"]["grpo_minimums"] = grpo_minimums
@@ -2007,9 +2059,7 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
     effective_contract_env = dict(resume_qualifier.STRICT_METAL_ENV)
     if compiled_sampling:
         env[resume_qualifier.COMPILED_GRPO_SAMPLING_ENV] = "1"
-        effective_contract_env[
-            resume_qualifier.COMPILED_GRPO_SAMPLING_ENV
-        ] = "1"
+        effective_contract_env[resume_qualifier.COMPILED_GRPO_SAMPLING_ENV] = "1"
 
     runs: list[dict[str, Any]] = []
     initialized_adapters: list[dict[str, Any]] = []
@@ -2044,8 +2094,13 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
             seed_name = f"seed-{seed}"
             seeded_train = inputs_root / f"{seed_name}.jsonl"
             _write_bytes(seeded_train, _permuted_rows(selected_rows, seed))
-            if _row_multiset_sha256(_jsonl_rows(seeded_train)) != selected_row_multiset_sha256:
-                raise ContractError("seeded dataset changed the selected training-row multiset")
+            if (
+                _row_multiset_sha256(_jsonl_rows(seeded_train))
+                != selected_row_multiset_sha256
+            ):
+                raise ContractError(
+                    "seeded dataset changed the selected training-row multiset"
+                )
             dataset_digest = resume_qualifier._sha256(seeded_train)
             if dataset_digest in dataset_digests:
                 raise ContractError("two seeds produced the same training-row order")
@@ -2120,7 +2175,9 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
 
         adapter_digests = {run["quality"]["adapter_model_sha256"] for run in runs}
         if len(adapter_digests) != len(runs):
-            raise ContractError("distinct training seeds produced duplicate final adapters")
+            raise ContractError(
+                "distinct training seeds produced duplicate final adapters"
+            )
         for name, path in immutable_roots.items():
             if resume_qualifier._tree_snapshot(path) != snapshots_before[name]:
                 raise ContractError(f"immutable {name} changed during campaign")
@@ -2180,7 +2237,9 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
                     "snapshot_sha256": resume_qualifier._snapshot_digest(
                         snapshots_before[name]
                     ),
-                    "sha256": resume_qualifier._sha256(path) if path.is_file() else None,
+                    "sha256": resume_qualifier._sha256(path)
+                    if path.is_file()
+                    else None,
                 }
                 for name, path in immutable_roots.items()
             },

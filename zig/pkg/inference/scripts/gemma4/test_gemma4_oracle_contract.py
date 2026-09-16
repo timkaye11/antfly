@@ -79,9 +79,13 @@ class Gemma4OracleContractTest(unittest.TestCase):
             for revision in self.lock[environment]["source_revisions"].values():
                 self.assertRegex(revision, r"^[0-9a-f]{40}$")
 
-    def test_same_mac_lock_freezes_precision_optimizer_and_runtime_semantics(self) -> None:
+    def test_same_mac_lock_freezes_precision_optimizer_and_runtime_semantics(
+        self,
+    ) -> None:
         benchmark = self.lock["benchmark_contract"]
-        self.assertEqual("bfloat16", benchmark["precision"]["verified"]["base_model_storage_dtype"])
+        self.assertEqual(
+            "bfloat16", benchmark["precision"]["verified"]["base_model_storage_dtype"]
+        )
         self.assertEqual(
             {
                 "base_model_storage_dtype": "bfloat16",
@@ -112,13 +116,19 @@ class Gemma4OracleContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ContractError, "frozen same-Mac contract"):
             contract.validate_lock(drifted)
         stale_native_policy = copy.deepcopy(self.lock)
-        stale_native_policy["mlx_reference"]["native_runtime"]["precision_policy_sha256"] = "sha256:" + "0" * 64
+        stale_native_policy["mlx_reference"]["native_runtime"][
+            "precision_policy_sha256"
+        ] = "sha256:" + "0" * 64
         with self.assertRaisesRegex(ContractError, "precision policy digest differs"):
             contract.validate_lock(stale_native_policy)
 
-    def test_benchmark_producer_attestation_closes_clean_committed_source_tree(self) -> None:
+    def test_benchmark_producer_attestation_closes_clean_committed_source_tree(
+        self,
+    ) -> None:
         repository_root = Path(contract.__file__).resolve().parents[5]
-        entrypoint_relative = "zig/pkg/inference/scripts/gemma4/run_gemma4_lora_mlx_benchmark.py"
+        entrypoint_relative = (
+            "zig/pkg/inference/scripts/gemma4/run_gemma4_lora_mlx_benchmark.py"
+        )
         entrypoint = repository_root / entrypoint_relative
         revision = "b" * 40
         source_tree = "d" * 40
@@ -148,7 +158,9 @@ class Gemma4OracleContractTest(unittest.TestCase):
                     raise AssertionError(f"unexpected git command: {arguments!r}")
                 if not text_mode and isinstance(stdout, str):
                     stdout = stdout.encode("utf-8")
-                return mock.Mock(stdout=stdout, stderr=b"" if not text_mode else "", returncode=0)
+                return mock.Mock(
+                    stdout=stdout, stderr=b"" if not text_mode else "", returncode=0
+                )
 
             return run
 
@@ -164,7 +176,9 @@ class Gemma4OracleContractTest(unittest.TestCase):
             [item["relative_path"] for item in attestation["files"]],
         )
 
-        with mock.patch.object(contract.subprocess, "run", side_effect=git_result(dirty=True)):
+        with mock.patch.object(
+            contract.subprocess, "run", side_effect=git_result(dirty=True)
+        ):
             with self.assertRaisesRegex(ContractError, "completely clean"):
                 contract.attest_benchmark_producer_source(
                     entrypoint,
@@ -196,19 +210,26 @@ class Gemma4OracleContractTest(unittest.TestCase):
                 else:
                     spec["git_blob_sha1"] = git_blob_sha1(path)
             verified = verify_model_directory(synthetic, "gemma-4-E2B-it", model_dir)
-            self.assertRegex(verified["local_artifact_sha256"], r"^sha256:[0-9a-f]{64}$")
+            self.assertRegex(
+                verified["local_artifact_sha256"], r"^sha256:[0-9a-f]{64}$"
+            )
             (model_dir / "config.json").write_text("changed", encoding="utf-8")
             with self.assertRaisesRegex(ContractError, "size|git_blob_sha1"):
                 verify_model_directory(synthetic, "gemma-4-E2B-it", model_dir)
 
-    def test_stock_peft_and_antfly_tensor_keys_have_one_canonical_identity(self) -> None:
+    def test_stock_peft_and_antfly_tensor_keys_have_one_canonical_identity(
+        self,
+    ) -> None:
         stock = "base_model.model.model.language_model.model.layers.3.self_attn.q_proj.lora_A.default.weight"
         antfly = "model.layers.3.self_attn.q_proj.weight.lora_A.weight"
         self.assertEqual(
             ("model.layers.3.self_attn.q_proj", "lora_A"),
             canonicalize_adapter_tensor_name(stock),
         )
-        self.assertEqual(canonicalize_adapter_tensor_name(stock), canonicalize_adapter_tensor_name(antfly))
+        self.assertEqual(
+            canonicalize_adapter_tensor_name(stock),
+            canonicalize_adapter_tensor_name(antfly),
+        )
         self.assertEqual(
             canonicalize_adapter_tensor_name(antfly),
             canonicalize_adapter_tensor_name(
@@ -223,35 +244,68 @@ class Gemma4OracleContractTest(unittest.TestCase):
             antfly_to_stock_peft_tensor_name(stock)
         self.assertEqual(
             ("model.per_layer_input.per_layer_model_proj", "lora_B"),
-            canonicalize_adapter_tensor_name("model.per_layer_model_projection.lora_B.weight"),
+            canonicalize_adapter_tensor_name(
+                "model.per_layer_model_projection.lora_B.weight"
+            ),
         )
         with self.assertRaisesRegex(ContractError, "unsupported adapter tensor name"):
             canonicalize_adapter_tensor_name("model.layers.0.self_attn.q_proj.weight")
 
     def test_root_ple_aliases_share_one_identity_across_hf_and_antfly(self) -> None:
         expected = "model.per_layer_input.per_layer_model_proj"
-        for prefix in ("", "model.", "model.language_model.", "base_model.model.",
-                       "base_model.model.model.language_model."):
-            for module in ("per_layer_model_projection", "per_layer_input.per_layer_model_proj"):
+        for prefix in (
+            "",
+            "model.",
+            "model.language_model.",
+            "base_model.model.",
+            "base_model.model.model.language_model.",
+        ):
+            for module in (
+                "per_layer_model_projection",
+                "per_layer_input.per_layer_model_proj",
+            ):
                 with self.subTest(prefix=prefix, module=module):
-                    self.assertEqual(expected, contract.canonicalize_module_name(prefix + module))
+                    self.assertEqual(
+                        expected, contract.canonicalize_module_name(prefix + module)
+                    )
                     self.assertEqual(
                         (expected, "lora_A"),
-                        canonicalize_adapter_tensor_name(prefix + module + ".lora_A.weight"),
+                        canonicalize_adapter_tensor_name(
+                            prefix + module + ".lora_A.weight"
+                        ),
                     )
         with self.assertRaisesRegex(ContractError, "duplicate canonical"):
-            contract.canonical_adapter_inventory([
-                "per_layer_model_projection.lora_A.weight",
-                "model.per_layer_input.per_layer_model_proj.lora_A.weight",
-            ])
+            contract.canonical_adapter_inventory(
+                [
+                    "per_layer_model_projection.lora_A.weight",
+                    "model.per_layer_input.per_layer_model_proj.lora_A.weight",
+                ]
+            )
 
-    def test_stock_peft_translation_preserves_multimodal_root_and_hf_ple_names(self) -> None:
+    def test_stock_peft_translation_preserves_multimodal_root_and_hf_ple_names(
+        self,
+    ) -> None:
         for source, destination in (
-            ("model.language_model.layers.0.self_attn.q_proj", "model.language_model.layers.0.self_attn.q_proj"),
-            ("model.language_model.layers.0.per_layer_input.inp_gate", "model.language_model.layers.0.per_layer_input_gate"),
-            ("model.language_model.layers.0.per_layer_input.proj", "model.language_model.layers.0.per_layer_projection"),
-            ("model.language_model.per_layer_input.per_layer_model_proj", "model.language_model.per_layer_model_projection"),
-            ("model.per_layer_input.per_layer_model_proj", "model.per_layer_model_projection"),
+            (
+                "model.language_model.layers.0.self_attn.q_proj",
+                "model.language_model.layers.0.self_attn.q_proj",
+            ),
+            (
+                "model.language_model.layers.0.per_layer_input.inp_gate",
+                "model.language_model.layers.0.per_layer_input_gate",
+            ),
+            (
+                "model.language_model.layers.0.per_layer_input.proj",
+                "model.language_model.layers.0.per_layer_projection",
+            ),
+            (
+                "model.language_model.per_layer_input.per_layer_model_proj",
+                "model.language_model.per_layer_model_projection",
+            ),
+            (
+                "model.per_layer_input.per_layer_model_proj",
+                "model.per_layer_model_projection",
+            ),
         ):
             with self.subTest(source=source):
                 self.assertEqual(
@@ -345,18 +399,21 @@ class Gemma4OracleContractTest(unittest.TestCase):
             summary, selected = load_prepared_example(prepared, 0)
             self.assertEqual("gemma4_prepared/v6", selected["schema_version"])
             self.assertEqual("group-1", selected["source_group_id"])
-            self.assertEqual(fingerprint_dataset_source(source, "train"), summary["source_dataset_sha256"])
+            self.assertEqual(
+                fingerprint_dataset_source(source, "train"),
+                summary["source_dataset_sha256"],
+            )
 
             payload = json.loads(prepared.read_text(encoding="utf-8"))
-            payload["summary"]["prepared_examples_sha256"] = fingerprint_prepared_examples_v2(
-                payload["summary"]["examples"]
+            payload["summary"]["prepared_examples_sha256"] = (
+                fingerprint_prepared_examples_v2(payload["summary"]["examples"])
             )
             prepared.write_text(json.dumps(payload), encoding="utf-8")
             with self.assertRaisesRegex(ContractError, "prepared_examples_sha256"):
                 load_prepared_example(prepared, 0)
 
-            payload["summary"]["prepared_examples_sha256"] = fingerprint_prepared_examples_v3(
-                payload["summary"]["examples"]
+            payload["summary"]["prepared_examples_sha256"] = (
+                fingerprint_prepared_examples_v3(payload["summary"]["examples"])
             )
             payload["summary"]["examples"][0]["source_record_sha256"] = "3" * 64
             prepared.write_text(json.dumps(payload), encoding="utf-8")
@@ -370,19 +427,24 @@ class Gemma4OracleContractTest(unittest.TestCase):
             checkpoint_bytes = b"synthetic-adapter-checkpoint"
             checkpoint_path = adapter / "adapter_model.safetensors"
             checkpoint_path.write_bytes(checkpoint_bytes)
-            (adapter / "adapter_config.json").write_text(json.dumps({
-                "base_model_name_or_path": "google/gemma-4-E2B-it",
-                "peft_type": "LORA",
-                "task_type": "CAUSAL_LM",
-                "r": 1,
-                "lora_alpha": 2.0,
-                "lora_dropout": 0.0,
-                "target_modules": [module],
-                "use_dora": False,
-                "use_rslora": False,
-                "modules_to_save": None,
-                "init_lora_weights": True,
-            }), encoding="utf-8")
+            (adapter / "adapter_config.json").write_text(
+                json.dumps(
+                    {
+                        "base_model_name_or_path": "google/gemma-4-E2B-it",
+                        "peft_type": "LORA",
+                        "task_type": "CAUSAL_LM",
+                        "r": 1,
+                        "lora_alpha": 2.0,
+                        "lora_dropout": 0.0,
+                        "target_modules": [module],
+                        "use_dora": False,
+                        "use_rslora": False,
+                        "modules_to_save": None,
+                        "init_lora_weights": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
             manifest_path = adapter / "antfly_finetune_manifest.json"
             manifest_payload = {
                 "schema_version": "antfly_gemma4_finetune/v2",
@@ -409,7 +471,9 @@ class Gemma4OracleContractTest(unittest.TestCase):
             self.assertEqual("peft-qv", result["target_preset"])
             self.assertEqual("antfly-finetune-manifest/v2", result["policy_source"])
             self.assertEqual("a" * 64, result["provenance"]["base_model_sha256"])
-            self.assertEqual(ANTFLY_ADAPTER_KEY_FORMAT, result["provenance"]["tensor_key_format"])
+            self.assertEqual(
+                ANTFLY_ADAPTER_KEY_FORMAT, result["provenance"]["tensor_key_format"]
+            )
             with self.assertRaisesRegex(ContractError, "conflicts"):
                 read_adapter_config(adapter, target_preset="text-all-linear")
 
@@ -436,33 +500,46 @@ class Gemma4OracleContractTest(unittest.TestCase):
             )
 
             manifest_path.unlink()
-            with self.assertRaisesRegex(ContractError, "requires an explicit target preset"):
+            with self.assertRaisesRegex(
+                ContractError, "requires an explicit target preset"
+            ):
                 read_adapter_config(adapter)
             stock = read_adapter_config(adapter, target_preset="peft-qv")
             self.assertEqual("explicit-lock-policy", stock["policy_source"])
 
             config_path = adapter / "adapter_config.json"
-            (adapter / "antfly_peft_export.json").write_text(json.dumps({
-                "schema_version": "antfly_gemma4_peft_export/v1",
-                "status": "complete",
-                "source_artifact_family_version": "gemma4_lora/v1alpha1",
-                "source_tensor_key_format": ANTFLY_ADAPTER_KEY_FORMAT,
-                "destination_tensor_key_format": "stock-peft/v1",
-                "source_adapter_model_sha256": "d" * 64,
-                "destination_adapter_model_sha256": sha256_file(checkpoint_path),
-                "destination_adapter_model_size_bytes": len(checkpoint_bytes),
-                "adapter_config_sha256": sha256_file(config_path),
-                "base_model_name_or_path": "google/gemma-4-E2B-it",
-                "base_model_sha256": "a" * 64,
-                "tokenizer_sha256": "b" * 64,
-                "chat_template_sha256": "c" * 64,
-                "target_preset": "peft-qv",
-                "tensor_count": 2,
-            }), encoding="utf-8")
+            (adapter / "antfly_peft_export.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": "antfly_gemma4_peft_export/v1",
+                        "status": "complete",
+                        "source_artifact_family_version": "gemma4_lora/v1alpha1",
+                        "source_tensor_key_format": ANTFLY_ADAPTER_KEY_FORMAT,
+                        "destination_tensor_key_format": "stock-peft/v1",
+                        "source_adapter_model_sha256": "d" * 64,
+                        "destination_adapter_model_sha256": sha256_file(
+                            checkpoint_path
+                        ),
+                        "destination_adapter_model_size_bytes": len(checkpoint_bytes),
+                        "adapter_config_sha256": sha256_file(config_path),
+                        "base_model_name_or_path": "google/gemma-4-E2B-it",
+                        "base_model_sha256": "a" * 64,
+                        "tokenizer_sha256": "b" * 64,
+                        "chat_template_sha256": "c" * 64,
+                        "target_preset": "peft-qv",
+                        "tensor_count": 2,
+                    }
+                ),
+                encoding="utf-8",
+            )
             exported = read_adapter_config(adapter)
             self.assertEqual("antfly-peft-export/v1", exported["policy_source"])
-            self.assertEqual("stock-peft/v1", exported["provenance"]["tensor_key_format"])
-            self.assertEqual("d" * 64, exported["provenance"]["source_adapter_checkpoint_sha256"])
+            self.assertEqual(
+                "stock-peft/v1", exported["provenance"]["tensor_key_format"]
+            )
+            self.assertEqual(
+                "d" * 64, exported["provenance"]["source_adapter_checkpoint_sha256"]
+            )
             self.assertEqual(2, exported["provenance"]["tensor_count"])
             with self.assertRaisesRegex(ContractError, "conflicts"):
                 read_adapter_config(adapter, target_preset="text-all-linear")
@@ -471,7 +548,9 @@ class Gemma4OracleContractTest(unittest.TestCase):
             with self.assertRaisesRegex(ContractError, "size does not match"):
                 read_adapter_config(adapter)
 
-    def synthetic_trace(self, prepared: dict, *, antfly: bool, delta: float = 0.0) -> dict:
+    def synthetic_trace(
+        self, prepared: dict, *, antfly: bool, delta: float = 0.0
+    ) -> dict:
         module = "model.layers.0.self_attn.q_proj"
         entries = {}
         targets = []
@@ -495,20 +574,28 @@ class Gemma4OracleContractTest(unittest.TestCase):
             logical = {}
             for state, state_values in values[role].items():
                 name = f"{module}:{role}:{state}"
-                entries[name] = {"shape": [1, 2] if role == "lora_A" else [2, 1], "dtype": "float64", "values": state_values}
+                entries[name] = {
+                    "shape": [1, 2] if role == "lora_A" else [2, 1],
+                    "dtype": "float64",
+                    "values": state_values,
+                }
                 logical[state] = name
             if antfly:
                 source = f"{module}.weight.{role}.weight"
             else:
                 source = f"base_model.model.model.language_model.{module}.{role}.default.weight"
-            targets.append({
-                "canonical_name": module,
-                "source_name": source,
-                "role": role,
-                "shape": [1, 2] if role == "lora_A" else [2, 1],
-                "gradient_expectation": "zero-by-zero-b-initialization" if role == "lora_A" else "active",
-                "logical_tensors": logical,
-            })
+            targets.append(
+                {
+                    "canonical_name": module,
+                    "source_name": source,
+                    "role": role,
+                    "shape": [1, 2] if role == "lora_A" else [2, 1],
+                    "gradient_expectation": "zero-by-zero-b-initialization"
+                    if role == "lora_A"
+                    else "active",
+                    "logical_tensors": logical,
+                }
+            )
         model = self.lock["models"]["gemma-4-E2B-it"]
         return {
             "schema_version": "antfly_gemma4_lora_trace/v1",
@@ -550,13 +637,15 @@ class Gemma4OracleContractTest(unittest.TestCase):
                 "grad_norm": math.hypot(0.3 + delta, 0.4),
                 "supervised_tokens": 1,
             },
-            "logit_probes": [{
-                "predictor_position": 1,
-                "target_token_id": 3,
-                "token_ids": [0, 3],
-                "values": [0.25 + delta, 1.25],
-                "logsumexp": 2.0 + delta,
-            }],
+            "logit_probes": [
+                {
+                    "predictor_position": 1,
+                    "target_token_id": 3,
+                    "token_ids": [0, 3],
+                    "values": [0.25 + delta, 1.25],
+                    "logsumexp": 2.0 + delta,
+                }
+            ],
             "target_tensors": targets,
             "tensor_store": {"format": "inline-f64/v1", "entries": entries},
             "artifact": {
@@ -573,21 +662,33 @@ class Gemma4OracleContractTest(unittest.TestCase):
                 "adapter_model_sha256": "sha256:" + ("e" if antfly else "f") * 64,
                 "tensor_inventory": [f"{module}:lora_A", f"{module}:lora_B"],
                 "key_layout": ANTFLY_ADAPTER_KEY_FORMAT if antfly else "stock-peft/v1",
-                "policy_source": "antfly-finetune-manifest/v2" if antfly else "explicit-lock-policy",
+                "policy_source": "antfly-finetune-manifest/v2"
+                if antfly
+                else "explicit-lock-policy",
             },
         }
 
-    def test_trace_comparison_normalizes_layout_but_does_not_claim_direct_interop(self) -> None:
+    def test_trace_comparison_normalizes_layout_but_does_not_claim_direct_interop(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             prepared_path, _ = self.write_prepared(root)
             _, prepared = load_prepared_example(prepared_path, 0)
             reference_path = root / "hf.json"
             candidate_path = root / "zig.json"
-            reference_path.write_text(json.dumps(self.synthetic_trace(prepared, antfly=False)), encoding="utf-8")
-            candidate_path.write_text(json.dumps(self.synthetic_trace(prepared, antfly=True, delta=1e-8)), encoding="utf-8")
+            reference_path.write_text(
+                json.dumps(self.synthetic_trace(prepared, antfly=False)),
+                encoding="utf-8",
+            )
+            candidate_path.write_text(
+                json.dumps(self.synthetic_trace(prepared, antfly=True, delta=1e-8)),
+                encoding="utf-8",
+            )
             synthetic_lock = copy.deepcopy(self.lock)
-            synthetic_lock["target_inventory"]["gemma-4-E2B-it"]["peft-qv"] = {"q_proj": 1}
+            synthetic_lock["target_inventory"]["gemma-4-E2B-it"]["peft-qv"] = {
+                "q_proj": 1
+            }
             with self.assertRaisesRegex(ContractError, "explicit test code"):
                 validate_trace(reference_path, synthetic_lock, lock_path=self.lock_path)
             reference = validate_trace(
@@ -629,7 +730,9 @@ class Gemma4OracleContractTest(unittest.TestCase):
             prepared_path, _ = self.write_prepared(root)
             _, prepared = load_prepared_example(prepared_path, 0)
             synthetic_lock = copy.deepcopy(self.lock)
-            synthetic_lock["target_inventory"]["gemma-4-E2B-it"]["peft-qv"] = {"q_proj": 1}
+            synthetic_lock["target_inventory"]["gemma-4-E2B-it"]["peft-qv"] = {
+                "q_proj": 1
+            }
             payload = self.synthetic_trace(prepared, antfly=False)
             payload["artifact"]["policy_source"] = "antfly-peft-export/v1"
             trace_path = root / "trace.json"
@@ -651,7 +754,9 @@ class Gemma4OracleContractTest(unittest.TestCase):
             prepared_path, _ = self.write_prepared(root)
             _, prepared = load_prepared_example(prepared_path, 0)
             synthetic_lock = copy.deepcopy(self.lock)
-            synthetic_lock["target_inventory"]["gemma-4-E2B-it"]["peft-qv"] = {"q_proj": 1}
+            synthetic_lock["target_inventory"]["gemma-4-E2B-it"]["peft-qv"] = {
+                "q_proj": 1
+            }
             trace_path = root / "trace.json"
 
             wrong_norm = self.synthetic_trace(prepared, antfly=True)
@@ -669,7 +774,9 @@ class Gemma4OracleContractTest(unittest.TestCase):
             first_entry = next(iter(wrong_dtype["tensor_store"]["entries"].values()))
             first_entry["dtype"] = "float32"
             trace_path.write_text(json.dumps(wrong_dtype), encoding="utf-8")
-            with self.assertRaisesRegex(ContractError, "inline-f64/v1 requires dtype=float64"):
+            with self.assertRaisesRegex(
+                ContractError, "inline-f64/v1 requires dtype=float64"
+            ):
                 validate_trace(
                     trace_path,
                     synthetic_lock,
@@ -692,7 +799,7 @@ class Gemma4OracleContractTest(unittest.TestCase):
                 {"trace.json", "reference_adapter/adapter_config.json"},
                 set(files),
             )
-            trace_path.write_text("{\"tampered\":true}\n", encoding="utf-8")
+            trace_path.write_text('{"tampered":true}\n', encoding="utf-8")
             with self.assertRaisesRegex(ContractError, "digest/size mismatch"):
                 validate_evidence_ledger(trace_path)
             trace_path.write_text("{}\n", encoding="utf-8")
@@ -732,23 +839,28 @@ class Gemma4OracleContractTest(unittest.TestCase):
             trace_path.write_text("{}\n", encoding="utf-8")
             store_path = root / "trace.safetensors"
             store_path.write_bytes(b"synthetic")
-            store = TensorStore(trace_path, {
-                "format": "safetensors/v1",
-                "path": store_path.name,
-                "sha256": prefixed_sha256(store_path),
-                "entries": {
-                    "logical": {
-                        "shape": [1],
-                        "dtype": "float32",
-                        "storage_key": "tensor_0",
-                    }
+            store = TensorStore(
+                trace_path,
+                {
+                    "format": "safetensors/v1",
+                    "path": store_path.name,
+                    "sha256": prefixed_sha256(store_path),
+                    "entries": {
+                        "logical": {
+                            "shape": [1],
+                            "dtype": "float32",
+                            "storage_key": "tensor_0",
+                        }
+                    },
                 },
-            })
+            )
             with mock.patch.dict(sys.modules, {"safetensors": fake_module}):
                 with self.assertRaisesRegex(ContractError, "Safetensors dtype"):
                     store.get("logical")
 
-    def test_publication_moves_complete_marker_last_into_a_no_replace_directory(self) -> None:
+    def test_publication_moves_complete_marker_last_into_a_no_replace_directory(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             staging = root / "staging"
@@ -764,7 +876,9 @@ class Gemma4OracleContractTest(unittest.TestCase):
             second_staging = root / "second-staging"
             second_staging.mkdir()
             (second_staging / "trace.json").write_text("{}\n", encoding="utf-8")
-            write_json(second_staging / "COMPLETE.json", build_evidence_ledger(second_staging))
+            write_json(
+                second_staging / "COMPLETE.json", build_evidence_ledger(second_staging)
+            )
             with self.assertRaisesRegex(ContractError, "refusing to replace"):
                 publish_staging(second_staging, output)
 
@@ -774,12 +888,16 @@ class Gemma4OracleContractTest(unittest.TestCase):
             prepared_path, _ = self.write_prepared(root)
             _, prepared = load_prepared_example(prepared_path, 0)
             synthetic_lock = copy.deepcopy(self.lock)
-            synthetic_lock["target_inventory"]["gemma-4-E2B-it"]["peft-qv"] = {"q_proj": 1}
+            synthetic_lock["target_inventory"]["gemma-4-E2B-it"]["peft-qv"] = {
+                "q_proj": 1
+            }
             payload = self.synthetic_trace(prepared, antfly=False)
             payload["producer"]["name"] = "hf-peft"
             trace_path = root / "trace.json"
             trace_path.write_text(json.dumps(payload), encoding="utf-8")
-            with self.assertRaisesRegex(ContractError, "complete oracle evidence requires"):
+            with self.assertRaisesRegex(
+                ContractError, "complete oracle evidence requires"
+            ):
                 validate_trace(trace_path, synthetic_lock, lock_path=self.lock_path)
 
     def test_max_abs_gate_catches_a_single_coordinate_outlier(self) -> None:
@@ -788,13 +906,17 @@ class Gemma4OracleContractTest(unittest.TestCase):
             prepared_path, _ = self.write_prepared(root)
             _, prepared = load_prepared_example(prepared_path, 0)
             synthetic_lock = copy.deepcopy(self.lock)
-            synthetic_lock["target_inventory"]["gemma-4-E2B-it"]["peft-qv"] = {"q_proj": 1}
+            synthetic_lock["target_inventory"]["gemma-4-E2B-it"]["peft-qv"] = {
+                "q_proj": 1
+            }
             synthetic_lock["tolerance_profiles"]["tiny-f32"]["state_max_abs"] = 0.01
             synthetic_lock["tolerance_profiles"]["tiny-f32"]["state_rel_l2"] = 10.0
             synthetic_lock["tolerance_profiles"]["tiny-f32"]["state_cosine_min"] = -1.0
             reference_payload = self.synthetic_trace(prepared, antfly=False)
             candidate_payload = self.synthetic_trace(prepared, antfly=True)
-            updated = candidate_payload["target_tensors"][1]["logical_tensors"]["updated"]
+            updated = candidate_payload["target_tensors"][1]["logical_tensors"][
+                "updated"
+            ]
             candidate_payload["tensor_store"]["entries"][updated]["values"][0] += 0.1
             reference_path = root / "reference.json"
             candidate_path = root / "candidate.json"

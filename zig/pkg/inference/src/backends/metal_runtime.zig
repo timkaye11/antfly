@@ -3436,6 +3436,9 @@ pub fn decoderRuntimeApplyAttentionF32(self: anytype, request: anytype) !?MetalT
         output.deinit();
     }
 
+    if (@hasField(@TypeOf(request), "allow_host_fallback")) {
+        if (!request.allow_host_fallback) return null;
+    }
     const output = try std.heap.c_allocator.alloc(f32, request.q_len * request.num_heads * request.head_dim);
     errdefer std.heap.c_allocator.free(output);
     var q = request.q;
@@ -47128,6 +47131,59 @@ test "gemma4 metal BF16 linear preserves F32 activations and small input gradien
     }
 }
 
+test "gemma4 metal F16 backward preserves F32 gradients and rejects BF16 prefix routing" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) {
+        if (@import("antfly_platform").env.getenvBoolDefault("TERMITE_REQUIRE_METAL_TESTS", false)) return error.MetalDeviceRequired;
+        return error.SkipZigTest;
+    }
+    const provider_mod = @import("metal_native_provider.zig");
+    var provider = try provider_mod.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.MetalRuntimeRequired;
+    const allocator = std.testing.allocator;
+    const dim = 128;
+    const out_dim = 65536;
+    const weights = try allocator.alloc(u16, dim * out_dim);
+    defer allocator.free(weights);
+    @memset(weights, 0);
+    for (0..dim) |i| weights[i * dim + i] = 0x3c00;
+    const zeros = [_]f32{0} ** out_dim;
+    var bias = try MetalTensor.ownedCloneFrom(&zeros, &.{out_dim});
+    defer bias.deinit();
+    var dummy_data = [_]f32{0};
+    const dummy = MetalTensor.borrowed(&dummy_data, 1, &.{0});
+    var stats: ops.NativeQuantTimingStats = .{};
+    try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+        .slot = 0,
+        .weight = dummy,
+        .bias = bias,
+        .quantized_storage = null,
+        .in_dim = dim,
+        .out_dim = out_dim,
+        .retain_dense_fallback = false,
+        .dense_f16_bytes = std.mem.sliceAsBytes(weights),
+        .dense_bf16_no_copy_safe = false,
+    }, &stats));
+    // Exercise the M64 aligned route and the M32 row-tail route. Values below
+    // the F16 subnormal range expose lost gradient signal; fractional values
+    // expose hidden activation rounding, and 70000 exposes F16 overflow.
+    const values = [_]f32{ 1.0003, -0.9997, 2e-8, -2e-8, 70000, -70000 };
+    for ([_]usize{ 128, 193 }) |rows| {
+        const data = try allocator.alloc(f32, rows * out_dim);
+        defer allocator.free(data);
+        for (data, 0..) |*v, i| v.* = values[i % values.len];
+        var input = try testDeviceTensorFromSlice(runtime, data, &.{ @intCast(rows), out_dim });
+        defer input.deinit();
+        var backward = (try decoderRuntimeApplyLinearBackwardInputBf16(&provider, .{ .rows = rows, .slot = 0, .input = input, .in_dim = dim, .out_dim = out_dim })) orelse return error.UnexpectedNull;
+        defer backward.deinit();
+        const grad = try tensorHostSlice(&backward);
+        for (grad, 0..) |value, i| {
+            const expected = data[(i / dim) * out_dim + i % dim];
+            try std.testing.expectApproxEqAbs(expected, value, @abs(expected) * 2e-6);
+        }
+    }
+}
+
 test "gemma4 large-row CCE backward preserves the BF16 weight exponent range" {
     if (!build_options.enable_metal or !metalDeviceAvailable()) {
         if (@import("antfly_platform").env.getenvBoolDefault("TERMITE_REQUIRE_METAL_TESTS", false)) return error.MetalDeviceRequired;
@@ -47376,6 +47432,60 @@ test "gemma4 Metal AdamW preserves small variance contributions in single and ba
             try std.testing.expectApproxEqRel(@as(f32, @floatCast(expected_v)), actual_v[i], 5e-7);
             try std.testing.expectApproxEqAbs(@as(f32, @floatCast(expected_w)), actual_w[i], 2e-9);
             try std.testing.expectEqual(@as(f32, 0.0), actual_g[i]);
+        }
+    }
+}
+
+test "gemma4 dense attention simdgroup honors custom score scale" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    const provider_mod = @import("metal_native_provider.zig");
+    var provider = try provider_mod.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const hd = 32;
+    for ([_]usize{ 8, 16, 33 }) |rows| {
+        const q = try allocator.alloc(f32, rows * 2 * hd);
+        defer allocator.free(q);
+        const k = try allocator.alloc(f32, rows * hd);
+        defer allocator.free(k);
+        const v = try allocator.alloc(f32, rows * hd);
+        defer allocator.free(v);
+        @memset(q, 0.5);
+        for (0..rows) |row| {
+            @memset(k[row * hd ..][0..hd], if (row % 2 == 0) 0.25 else -0.25);
+            @memset(v[row * hd ..][0..hd], if (row == 0) 1 else 0);
+        }
+        var qt = try testDeviceTensorFromSlice(runtime, q, &.{ @intCast(rows), 2 * hd });
+        defer qt.deinit();
+        var kt = try testDeviceTensorFromSlice(runtime, k, &.{ @intCast(rows), hd });
+        defer kt.deinit();
+        var vt = try testDeviceTensorFromSlice(runtime, v, &.{ @intCast(rows), hd });
+        defer vt.deinit();
+        const scale: f32 = 0.75;
+        var output = (try decoderRuntimeApplyAttentionF32(&provider, .{
+            .q = qt,
+            .k = kt,
+            .v = vt,
+            .q_len = rows,
+            .kv_len = rows,
+            .num_heads = 2,
+            .num_kv_heads = 1,
+            .head_dim = hd,
+            .query_position_offset = @as(usize, 0),
+            .kv_position_offset = @as(usize, 0),
+            .sliding_window = @as(usize, 0),
+            .score_scale = scale,
+            .allow_host_fallback = false,
+        })) orelse return error.UnexpectedNull;
+        defer output.deinit();
+        try std.testing.expect(output.isDevice());
+        const actual = try tensorHostSlice(&output);
+        for (0..rows) |row| {
+            var denominator: f64 = 0;
+            for (0..row + 1) |key| denominator += @exp(@as(f64, if (key % 2 == 0) 0 else -2 * hd * 0.5 * 0.25 * scale));
+            const expected: f32 = @floatCast(1 / denominator);
+            for (actual[row * 2 * hd ..][0 .. 2 * hd]) |value| try std.testing.expectApproxEqAbs(expected, value, 0.002);
         }
     }
 }

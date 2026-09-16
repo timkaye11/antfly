@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const build_options = @import("build_options");
+const build_info = @import("build_info");
 const platform = @import("antfly_platform");
 const common_config = @import("../common/config.zig");
 const preload_model_spec = @import("../common/preload_model_spec.zig");
@@ -998,7 +998,7 @@ fn parseHostPort(base_uri: []const u8) !struct { host: []const u8, port: u16 } {
 }
 
 fn printVersion() void {
-    std.debug.print("antfly inference v{s}\n", .{build_options.antfly_version});
+    std.debug.print("antfly inference v{s}\n", .{build_info.version()});
 }
 
 fn printUsage() void {

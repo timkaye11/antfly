@@ -191,6 +191,7 @@ pub const AntflyRootImports = struct {
         const options = b.addOptions();
         options.addOption(bool, "bench_minimal_deps", false);
         mod.addOptions("build_options", options);
+        mod.addImport("build_info", self.build_info.module);
         mod.addImport("antfly_platform", self.platform);
         inline for (.{
             "httpx",              "common_openapi",  "inference_config_openapi", "logging_openapi",

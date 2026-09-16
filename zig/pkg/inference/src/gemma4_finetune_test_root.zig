@@ -18,6 +18,7 @@ const gemma4_train_command = @import("finetune/gemma4_train_command.zig");
 const gemma4_bf16_cli = @import("finetune/test/test_gemma4_bf16_cli.zig");
 const metal_compute = @import("ops/metal_compute.zig");
 const recipe = @import("finetune/recipe.zig");
+const gemma_serving = @import("backends/decoder_gemma_serving_test.zig");
 
 test "gemma4 finetune embedded regressions are linked into the focused gate" {
     std.testing.refAllDecls(gemma_graph);
@@ -25,4 +26,5 @@ test "gemma4 finetune embedded regressions are linked into the focused gate" {
     std.testing.refAllDecls(gemma4_bf16_cli);
     std.testing.refAllDecls(metal_compute);
     std.testing.refAllDecls(recipe);
+    std.testing.refAllDecls(gemma_serving);
 }

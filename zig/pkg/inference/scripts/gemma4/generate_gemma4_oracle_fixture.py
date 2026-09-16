@@ -18,7 +18,13 @@ import sys
 from pathlib import Path
 from typing import Any, Mapping
 
-from gemma4_oracle_contract import ContractError, load_json, prefixed_sha256, require_exact_keys, write_json
+from gemma4_oracle_contract import (
+    ContractError,
+    load_json,
+    prefixed_sha256,
+    require_exact_keys,
+    write_json,
+)
 
 
 DEFAULT_SPEC = (
@@ -33,7 +39,13 @@ CITIES = ("Accra", "Lima", "Osaka", "Reykjavik", "Tunis", "Zürich")
 
 
 def canonical_json(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
 
 
 def digest_atom(seed: int, split: str, index: int, case_name: str) -> str:
@@ -74,7 +86,9 @@ def load_cases(path: Path) -> list[dict[str, Any]]:
         unknown = set(raw_case) - allowed
         missing = {"name", "messages"} - set(raw_case)
         if unknown or missing:
-            raise ContractError(f"cases[{index}] field mismatch (missing={sorted(missing)}, unknown={sorted(unknown)})")
+            raise ContractError(
+                f"cases[{index}] field mismatch (missing={sorted(missing)}, unknown={sorted(unknown)})"
+            )
         name = raw_case["name"]
         if not isinstance(name, str) or not name or name in names:
             raise ContractError(f"cases[{index}] has an invalid or duplicate name")
@@ -82,13 +96,18 @@ def load_cases(path: Path) -> list[dict[str, Any]]:
         messages = raw_case["messages"]
         if not isinstance(messages, list) or not messages:
             raise ContractError(f"cases[{index}] must contain messages")
-        if not any(isinstance(message, Mapping) and message.get("role") == "assistant" for message in messages):
+        if not any(
+            isinstance(message, Mapping) and message.get("role") == "assistant"
+            for message in messages
+        ):
             raise ContractError(f"cases[{index}] has no assistant supervision")
         cases.append(dict(raw_case))
     return cases
 
 
-def generate_rows(spec_path: Path, seed: int, counts: Mapping[str, int]) -> tuple[bytes, dict[str, Any]]:
+def generate_rows(
+    spec_path: Path, seed: int, counts: Mapping[str, int]
+) -> tuple[bytes, dict[str, Any]]:
     cases = load_cases(spec_path)
     rows: list[dict[str, Any]] = []
     row_hashes: list[str] = []
@@ -99,7 +118,9 @@ def generate_rows(spec_path: Path, seed: int, counts: Mapping[str, int]) -> tupl
             raise ContractError(f"{split} count must be positive")
         # A split-specific rotation ensures all case families appear without
         # sharing an example or group identity across partitions.
-        rotation = int(hashlib.sha256(f"{seed}:{split}".encode()).hexdigest()[:8], 16) % len(cases)
+        rotation = int(
+            hashlib.sha256(f"{seed}:{split}".encode()).hexdigest()[:8], 16
+        ) % len(cases)
         for index in range(count):
             case = cases[(rotation + index) % len(cases)]
             atom = digest_atom(seed, split, index, case["name"])
@@ -129,14 +150,23 @@ def generate_rows(spec_path: Path, seed: int, counts: Mapping[str, int]) -> tupl
             if "tools" in case:
                 row["tools"] = substitute(case["tools"], replacements)
             rows.append(row)
-            row_hashes.append(hashlib.sha256(canonical_json(row).encode("utf-8")).hexdigest())
+            row_hashes.append(
+                hashlib.sha256(canonical_json(row).encode("utf-8")).hexdigest()
+            )
     lines = [canonical_json(row) for row in rows]
     data = ("\n".join(lines) + "\n").encode("utf-8")
     split_groups = {
-        split: sorted(row["metadata"]["group_id"] for row in rows if row["split"] == split)
+        split: sorted(
+            row["metadata"]["group_id"] for row in rows if row["split"] == split
+        )
         for split in SPLITS
     }
-    if any(set(split_groups[left]) & set(split_groups[right]) for left in SPLITS for right in SPLITS if left < right):
+    if any(
+        set(split_groups[left]) & set(split_groups[right])
+        for left in SPLITS
+        for right in SPLITS
+        if left < right
+    ):
         raise ContractError("generated split groups overlap")
     manifest = {
         "schema_version": "antfly_gemma4_oracle_fixture_manifest/v1",
@@ -148,7 +178,8 @@ def generate_rows(spec_path: Path, seed: int, counts: Mapping[str, int]) -> tupl
         "row_count": len(rows),
         "row_sha256": row_hashes,
         "split_group_sha256": {
-            split: "sha256:" + hashlib.sha256("\n".join(split_groups[split]).encode()).hexdigest()
+            split: "sha256:"
+            + hashlib.sha256("\n".join(split_groups[split]).encode()).hexdigest()
             for split in SPLITS
         },
     }
@@ -177,36 +208,58 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--train-count", type=int, default=32)
     result.add_argument("--eval-count", type=int, default=8)
     result.add_argument("--test-count", type=int, default=8)
-    result.add_argument("--check", action="store_true", help="verify existing output and manifest without writing")
+    result.add_argument(
+        "--check",
+        action="store_true",
+        help="verify existing output and manifest without writing",
+    )
     return result
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
-    manifest_path = args.manifest or args.output.with_suffix(args.output.suffix + ".manifest.json")
+    manifest_path = args.manifest or args.output.with_suffix(
+        args.output.suffix + ".manifest.json"
+    )
     try:
         data, manifest = generate_rows(
             args.spec.resolve(),
             args.seed,
-            {"train": args.train_count, "eval": args.eval_count, "test": args.test_count},
+            {
+                "train": args.train_count,
+                "eval": args.eval_count,
+                "test": args.test_count,
+            },
         )
-        expected_manifest = (json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+        expected_manifest = (
+            json.dumps(
+                manifest, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False
+            )
+            + "\n"
+        ).encode("utf-8")
         if args.check:
             if args.output.read_bytes() != data:
                 raise ContractError(f"generated fixture drifted: {args.output}")
             if manifest_path.read_bytes() != expected_manifest:
-                raise ContractError(f"generated fixture manifest drifted: {manifest_path}")
+                raise ContractError(
+                    f"generated fixture manifest drifted: {manifest_path}"
+                )
         else:
             write_exclusive(args.output, data)
             write_json(manifest_path, manifest)
-        print(json.dumps({
-            "ok": True,
-            "check": args.check,
-            "output": str(args.output.resolve()),
-            "manifest": str(manifest_path.resolve()),
-            "dataset_sha256": manifest["dataset_sha256"],
-            "row_count": manifest["row_count"],
-        }, sort_keys=True))
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "check": args.check,
+                    "output": str(args.output.resolve()),
+                    "manifest": str(manifest_path.resolve()),
+                    "dataset_sha256": manifest["dataset_sha256"],
+                    "row_count": manifest["row_count"],
+                },
+                sort_keys=True,
+            )
+        )
         return 0
     except (ContractError, OSError) as exc:
         print(f"Gemma4 fixture generation failed closed: {exc}", file=sys.stderr)

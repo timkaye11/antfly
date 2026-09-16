@@ -881,8 +881,10 @@ test "capture blocks preserve scope and whitespace without leaking captured outp
     try std.testing.expectEqualStrings("beforeafter|AB|True", result);
 }
 
+pub const gemma4_canonical_template = @embedFile("testdata/gemma4_canonical_template.txt");
+
 test "canonical Gemma4 template preserves thinking modes and tool history" {
-    var template = try Template.initHuggingFace(std.testing.allocator, @embedFile("testdata/gemma4_canonical_template.txt"));
+    var template = try Template.initHuggingFace(std.testing.allocator, gemma4_canonical_template);
     defer template.deinit();
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

@@ -137,14 +137,20 @@ class BoolQGrpoMlxParityTests(unittest.TestCase):
                 for index, prompt in enumerate((1, 1, 0, 0))
             ]
             path.write_text("".join(json.dumps(row) + "\n" for row in rows))
-            trace = parity.load_trace(path, phase="train", expected_groups=2, group_size=2)
+            trace = parity.load_trace(
+                path, phase="train", expected_groups=2, group_size=2
+            )
             self.assertEqual([1, 0], [group.prompt_index for group in trace])
             source = [
                 parity.BoolQRow("first", "yes", (10,), "train", 17, "first-id"),
                 parity.BoolQRow("second", "no", (20,), "train", 42, "second-id"),
             ]
-            ordered = parity.rows_in_prompt_order(source, [group.prompt_index for group in trace])
-            self.assertEqual(["second-id", "first-id"], [row.source_id for row in ordered])
+            ordered = parity.rows_in_prompt_order(
+                source, [group.prompt_index for group in trace]
+            )
+            self.assertEqual(
+                ["second-id", "first-id"], [row.source_id for row in ordered]
+            )
 
             class Tokenizer:
                 def decode(self, tokens: list[int], **_kwargs: object) -> str:
@@ -152,7 +158,9 @@ class BoolQGrpoMlxParityTests(unittest.TestCase):
 
             parity._validate_trace_rewards(Tokenizer(), ordered, trace)
             with self.assertRaises(parity.BoolQParityContractError):
-                parity.rows_in_prompt_order(source, [trace[0].prompt_index, trace[0].prompt_index])
+                parity.rows_in_prompt_order(
+                    source, [trace[0].prompt_index, trace[0].prompt_index]
+                )
 
     def test_trace_rejects_interleaved_optimizer_groups(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -209,9 +217,7 @@ class BoolQGrpoMlxParityTests(unittest.TestCase):
             "eval_source_ids": eval_ids,
             "evaluation_exclusion_manifests": [],
         }
-        payload["semantic_sha256"] = (
-            parity.boolq_materializer.canonical_sha256(payload)
-        )
+        payload["semantic_sha256"] = parity.boolq_materializer.canonical_sha256(payload)
         path = root / "manifest.json"
         path.write_text(json.dumps(payload), encoding="utf-8")
         return path
@@ -244,8 +250,8 @@ class BoolQGrpoMlxParityTests(unittest.TestCase):
             payload = json.loads(path.read_text(encoding="utf-8"))
             payload["schema_version"] = parity.boolq_materializer.SCHEMA_VERSION_V1
             payload.pop("semantic_sha256")
-            payload["semantic_sha256"] = (
-                parity.boolq_materializer.canonical_sha256(payload)
+            payload["semantic_sha256"] = parity.boolq_materializer.canonical_sha256(
+                payload
             )
             path.write_text(json.dumps(payload), encoding="utf-8")
             parity.load_materialization(path)
@@ -344,7 +350,9 @@ class BoolQGrpoMlxParityTests(unittest.TestCase):
                 "mlx/lib/mlx.metallib": b"metal",
             }
 
-            def write_wheel(path: Path, package: str, members: dict[str, bytes]) -> None:
+            def write_wheel(
+                path: Path, package: str, members: dict[str, bytes]
+            ) -> None:
                 with zipfile.ZipFile(path, "w") as archive:
                     archive.writestr(
                         f"{package.replace('-', '_')}-0.31.2.dist-info/METADATA",
@@ -381,8 +389,13 @@ class BoolQGrpoMlxParityTests(unittest.TestCase):
 
     def test_same_length_rotated_updates_do_not_pass_vector_parity(self) -> None:
         evaluation = {
-            "mean_reward": 0.5, "top_rank_mean_reward": 0.75, "kl_loss": 0.0,
-            "candidate_overlap_with_antfly": {"mean_recall": 1.0, "top1_match_rate": 1.0},
+            "mean_reward": 0.5,
+            "top_rank_mean_reward": 0.75,
+            "kl_loss": 0.0,
+            "candidate_overlap_with_antfly": {
+                "mean_recall": 1.0,
+                "top1_match_rate": 1.0,
+            },
         }
         adapter = {
             "delta_cosine_similarity": 0.995,
@@ -394,19 +407,25 @@ class BoolQGrpoMlxParityTests(unittest.TestCase):
             with self.subTest(vector_error=vector_error):
                 adapter["delta_vector_l2_relative_error"] = vector_error
                 assessment = parity.assess_parity(
-                    antfly_evaluation=evaluation, baseline_evaluation=evaluation,
+                    antfly_evaluation=evaluation,
+                    baseline_evaluation=evaluation,
                     native_evaluation=evaluation,
-                    trace_training={"candidate_overlap_with_antfly": {"exact_set_rate": 1.0}},
-                    trace_adapter=adapter, native_quality_passed=True,
+                    trace_training={
+                        "candidate_overlap_with_antfly": {"exact_set_rate": 1.0}
+                    },
+                    trace_adapter=adapter,
+                    native_quality_passed=True,
                 )
                 self.assertFalse(assessment["numerical"]["passed"])
         adapter["delta_vector_l2_relative_error"] = 0.01
         adapter["delta_cosine_similarity"] = 0.99995
         assessment = parity.assess_parity(
-            antfly_evaluation=evaluation, baseline_evaluation=evaluation,
+            antfly_evaluation=evaluation,
+            baseline_evaluation=evaluation,
             native_evaluation=evaluation,
             trace_training={"candidate_overlap_with_antfly": {"exact_set_rate": 1.0}},
-            trace_adapter=adapter, native_quality_passed=True,
+            trace_adapter=adapter,
+            native_quality_passed=True,
         )
         self.assertTrue(assessment["numerical"]["passed"])
 
@@ -428,9 +447,7 @@ class BoolQGrpoMlxParityTests(unittest.TestCase):
             "kl_loss": 5.947e-4,
             "candidate_overlap_with_antfly": overlap,
         }
-        trace_training = {
-            "candidate_overlap_with_antfly": {"exact_set_rate": 1.0}
-        }
+        trace_training = {"candidate_overlap_with_antfly": {"exact_set_rate": 1.0}}
         adapter = {
             "delta_cosine_similarity": 0.572,
             "delta_l2_relative_difference": 0.0146,

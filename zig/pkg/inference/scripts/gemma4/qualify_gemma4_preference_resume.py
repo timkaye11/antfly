@@ -47,9 +47,7 @@ STATE_SCHEMA_VERSION_V2 = "antfly_gemma4_preference_checkpoint_state/v2"
 STATE_SCHEMA_VERSIONS = (STATE_SCHEMA_VERSION_V1, STATE_SCHEMA_VERSION_V2)
 ADAPTER_MANIFEST_SCHEMA_V2 = "antfly_gemma4_finetune/v2"
 ADAPTER_MANIFEST_SCHEMA_V3 = "antfly_gemma4_finetune/v3"
-CANONICAL_EVALUATION_POLICY = (
-    "terminal-device-drained-host-weight-snapshot-fresh-backend-private-buffer-reuse-disabled"
-)
+CANONICAL_EVALUATION_POLICY = "terminal-device-drained-host-weight-snapshot-fresh-backend-private-buffer-reuse-disabled"
 GRPO_TERMINAL_METAL_ABS_TOLERANCES = {
     "kl_loss": 1e-6,
     "mean_kl": 1e-5,
@@ -120,7 +118,9 @@ def _load_environment_policy() -> tuple[
             if len(fields) != 4:
                 raise RuntimeError(f"invalid {directive} entry at {where}")
         else:
-            raise RuntimeError(f"unknown environment-policy directive at {where}: {directive}")
+            raise RuntimeError(
+                f"unknown environment-policy directive at {where}: {directive}"
+            )
 
         if directive == "sanitize-prefix":
             if fields[1] in sanitize_prefixes:
@@ -163,9 +163,13 @@ def _load_environment_policy() -> tuple[
 
     for name, value in strict.items():
         if name not in allowed or not canonical(name, value):
-            raise RuntimeError(f"strict binding is not canonically allowed: {name}={value}")
+            raise RuntimeError(
+                f"strict binding is not canonically allowed: {name}={value}"
+            )
     if not sanitize_prefixes or not strict:
-        raise RuntimeError("environment policy must define sanitization and strict bindings")
+        raise RuntimeError(
+            "environment policy must define sanitization and strict bindings"
+        )
 
     digest = "sha256:" + hashlib.sha256(policy_bytes).hexdigest()
     return tuple(sanitize_prefixes), frozenset(sanitize_names), strict, digest
@@ -393,7 +397,9 @@ def _expected_sha256(value: Any, where: str) -> str | None:
     if not isinstance(value, str):
         raise ContractError(f"{where}: expected a SHA-256 digest")
     digest = value.removeprefix("sha256:").lower()
-    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+    if len(digest) != 64 or any(
+        character not in "0123456789abcdef" for character in digest
+    ):
         raise ContractError(f"{where}: expected 64 hexadecimal SHA-256 digits")
     return f"sha256:{digest}"
 
@@ -407,13 +413,19 @@ def _load_json(path: Path, where: str) -> Mapping[str, Any]:
 
 def _tree_snapshot(root: Path) -> list[dict[str, Any]]:
     resolved = root.expanduser().resolve(strict=True)
-    paths = [resolved] if resolved.is_file() else [resolved, *sorted(resolved.rglob("*"))]
+    paths = (
+        [resolved] if resolved.is_file() else [resolved, *sorted(resolved.rglob("*"))]
+    )
     result: list[dict[str, Any]] = []
     for path in paths:
         info = path.lstat()
         entry = {
             "path": "." if path == resolved else path.relative_to(resolved).as_posix(),
-            "kind": "symlink" if path.is_symlink() else "directory" if path.is_dir() else "file",
+            "kind": "symlink"
+            if path.is_symlink()
+            else "directory"
+            if path.is_dir()
+            else "file",
             "size": info.st_size,
             "mtime_ns": info.st_mtime_ns,
             "inode": info.st_ino,
@@ -445,7 +457,9 @@ def _adapter_tree_evidence(root: Path, where: str) -> dict[str, Any]:
     try:
         root_mode = candidate.lstat().st_mode
     except OSError as exc:
-        raise ContractError(f"{where}: cannot stat adapter directory: {candidate}: {exc}") from exc
+        raise ContractError(
+            f"{where}: cannot stat adapter directory: {candidate}: {exc}"
+        ) from exc
     if stat.S_ISLNK(root_mode) or not stat.S_ISDIR(root_mode):
         raise ContractError(f"{where}: adapter root must be a non-symlink directory")
     resolved = candidate.resolve(strict=True)
@@ -454,11 +468,15 @@ def _adapter_tree_evidence(root: Path, where: str) -> dict[str, Any]:
         mode = path.lstat().st_mode
         relative = path.relative_to(resolved).as_posix()
         if stat.S_ISLNK(mode):
-            raise ContractError(f"{where}: adapter artifact must not be a symlink: {relative}")
+            raise ContractError(
+                f"{where}: adapter artifact must not be a symlink: {relative}"
+            )
         if stat.S_ISDIR(mode):
             continue
         if not stat.S_ISREG(mode):
-            raise ContractError(f"{where}: adapter artifact is not a regular file: {relative}")
+            raise ContractError(
+                f"{where}: adapter artifact is not a regular file: {relative}"
+            )
         files[relative] = {
             "size_bytes": path.stat().st_size,
             "sha256": _sha256(path),
@@ -470,7 +488,9 @@ def _adapter_tree_evidence(root: Path, where: str) -> dict[str, Any]:
     }
     missing = sorted(required - set(files))
     if missing:
-        raise ContractError(f"{where}: adapter artifact is incomplete: missing={missing}")
+        raise ContractError(
+            f"{where}: adapter artifact is incomplete: missing={missing}"
+        )
     _load_json(resolved / "adapter_config.json", f"{where} adapter_config.json")
     manifest = _load_json(
         resolved / "antfly_finetune_manifest.json",
@@ -496,9 +516,11 @@ def _adapter_tree_evidence(root: Path, where: str) -> dict[str, Any]:
             f"{where} adapter manifest.initialization_seed",
         )
     checkpoint = files["adapter_model.safetensors"]
-    if manifest.get("adapter_checkpoint_sha256") != checkpoint["sha256"].removeprefix(
-        "sha256:"
-    ) or manifest.get("adapter_checkpoint_size_bytes") != checkpoint["size_bytes"]:
+    if (
+        manifest.get("adapter_checkpoint_sha256")
+        != checkpoint["sha256"].removeprefix("sha256:")
+        or manifest.get("adapter_checkpoint_size_bytes") != checkpoint["size_bytes"]
+    ):
         raise ContractError(f"{where}: adapter manifest does not bind checkpoint bytes")
     return {
         "root": str(resolved),
@@ -519,8 +541,14 @@ def inspect_training_checkpoint(path: Path) -> dict[str, Any]:
         if len(prefix) != 8:
             raise ContractError("training checkpoint: truncated SafeTensors prefix")
         header_size = struct.unpack("<Q", prefix)[0]
-        if header_size == 0 or header_size > 64 * 1024 * 1024 or 8 + header_size > file_size:
-            raise ContractError("training checkpoint: invalid SafeTensors header length")
+        if (
+            header_size == 0
+            or header_size > 64 * 1024 * 1024
+            or 8 + header_size > file_size
+        ):
+            raise ContractError(
+                "training checkpoint: invalid SafeTensors header length"
+            )
         raw_header = handle.read(header_size)
         try:
             header = _mapping(
@@ -528,15 +556,21 @@ def inspect_training_checkpoint(path: Path) -> dict[str, Any]:
                 "checkpoint header",
             )
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ContractError(f"training checkpoint: invalid SafeTensors header: {exc}") from exc
+            raise ContractError(
+                f"training checkpoint: invalid SafeTensors header: {exc}"
+            ) from exc
         descriptor = _mapping(header.get(CHECKPOINT_TENSOR), CHECKPOINT_TENSOR)
-        if descriptor.get("dtype") != "F32" or descriptor.get("shape") != [CHECKPOINT_FLOAT_COUNT]:
+        if descriptor.get("dtype") != "F32" or descriptor.get("shape") != [
+            CHECKPOINT_FLOAT_COUNT
+        ]:
             raise ContractError(f"{CHECKPOINT_TENSOR}: unexpected dtype or shape")
         offsets = descriptor.get("data_offsets")
         if (
             not isinstance(offsets, list)
             or len(offsets) != 2
-            or any(isinstance(item, bool) or not isinstance(item, int) for item in offsets)
+            or any(
+                isinstance(item, bool) or not isinstance(item, int) for item in offsets
+            )
             or offsets[0] < 0
             or offsets[1] - offsets[0] != CHECKPOINT_FLOAT_COUNT * 4
             or 8 + header_size + offsets[1] > file_size
@@ -550,7 +584,12 @@ def inspect_training_checkpoint(path: Path) -> dict[str, Any]:
         field = 0
         for chunk_index in range(4):
             value = values[field_index * 4 + chunk_index]
-            if not math.isfinite(value) or value < 0 or value > 65535 or value != math.floor(value):
+            if (
+                not math.isfinite(value)
+                or value < 0
+                or value > 65535
+                or value != math.floor(value)
+            ):
                 raise ContractError(f"{CHECKPOINT_TENSOR}: invalid encoded integer")
             field |= int(value) << (chunk_index * 16)
         fields.append(field)
@@ -589,10 +628,14 @@ def inspect_training_checkpoint(path: Path) -> dict[str, Any]:
 
 def inspect_preference_checkpoint(path: Path, task: str) -> dict[str, Any]:
     trainer = inspect_training_checkpoint(path)
-    digest_bytes = b"".join(int(word).to_bytes(8, "little") for word in trainer["rng_state"])
+    digest_bytes = b"".join(
+        int(word).to_bytes(8, "little") for word in trainer["rng_state"]
+    )
     digest = digest_bytes.hex()
     state_path = Path(f"{path}.preference-state-{digest}.json")
-    state = _load_json(_regular_file(state_path, "preference checkpoint sidecar"), "checkpoint sidecar")
+    state = _load_json(
+        _regular_file(state_path, "preference checkpoint sidecar"), "checkpoint sidecar"
+    )
     if _sha256(state_path) != f"sha256:{digest}":
         raise ContractError("checkpoint sidecar digest does not match trainer progress")
     schema_version = state.get("schema_version")
@@ -607,28 +650,57 @@ def inspect_preference_checkpoint(path: Path, task: str) -> dict[str, Any]:
     if trainer["order_seed"] != CHECKPOINT_MAGIC[task]:
         raise ContractError("trainer checkpoint has the wrong preference-task marker")
     if trainer["next_example_index"] != 0 or trainer["order_cursor"] != 0:
-        raise ContractError("trainer checkpoint has unsupported preference progress cursors")
-    for field in ("epoch_index", "micro_batch_steps", "optimizer_steps", "accumulation_micro_batches"):
+        raise ContractError(
+            "trainer checkpoint has unsupported preference progress cursors"
+        )
+    for field in (
+        "epoch_index",
+        "micro_batch_steps",
+        "optimizer_steps",
+        "accumulation_micro_batches",
+    ):
         if _integer(state.get(field), f"checkpoint sidecar.{field}") != trainer[field]:
-            raise ContractError(f"checkpoint sidecar {field} does not match trainer checkpoint")
-    if (state.get(task) is None) or (state.get("grpo" if task == "dpo" else "dpo") is not None):
+            raise ContractError(
+                f"checkpoint sidecar {field} does not match trainer checkpoint"
+            )
+    if (state.get(task) is None) or (
+        state.get("grpo" if task == "dpo" else "dpo") is not None
+    ):
         raise ContractError("checkpoint sidecar contains the wrong task aggregate")
     aggregate = _mapping(state.get(task), f"checkpoint sidecar.{task}")
-    aggregate_count = aggregate.get("examples_seen" if task == "dpo" else "total_groups")
-    if _integer(aggregate_count, "checkpoint sidecar aggregate count") != trainer["examples_seen"]:
-        raise ContractError("checkpoint aggregate count does not match trainer progress")
+    aggregate_count = aggregate.get(
+        "examples_seen" if task == "dpo" else "total_groups"
+    )
+    if (
+        _integer(aggregate_count, "checkpoint sidecar aggregate count")
+        != trainer["examples_seen"]
+    ):
+        raise ContractError(
+            "checkpoint aggregate count does not match trainer progress"
+        )
     incremental_kv = aggregate.get("incremental_kv") if task == "grpo" else None
     if incremental_kv is not None:
-        incremental_kv = dict(_mapping(incremental_kv, "checkpoint sidecar.grpo.incremental_kv"))
-        if _integer(
-            incremental_kv.get("groups"),
-            "checkpoint sidecar.grpo.incremental_kv.groups",
-        ) != trainer["examples_seen"]:
-            raise ContractError("checkpoint incremental-KV group count does not match progress")
+        incremental_kv = dict(
+            _mapping(incremental_kv, "checkpoint sidecar.grpo.incremental_kv")
+        )
+        if (
+            _integer(
+                incremental_kv.get("groups"),
+                "checkpoint sidecar.grpo.incremental_kv.groups",
+            )
+            != trainer["examples_seen"]
+        ):
+            raise ContractError(
+                "checkpoint incremental-KV group count does not match progress"
+            )
         if incremental_kv.get("cache_dtype") != "f32":
             raise ContractError("checkpoint incremental-KV dtype is not f32")
     fingerprint = state.get("run_fingerprint_sha256")
-    if not isinstance(fingerprint, str) or not fingerprint.startswith("sha256:") or len(fingerprint) != 71:
+    if (
+        not isinstance(fingerprint, str)
+        or not fingerprint.startswith("sha256:")
+        or len(fingerprint) != 71
+    ):
         raise ContractError("checkpoint sidecar has an invalid run fingerprint")
     return {
         **trainer,
@@ -728,12 +800,17 @@ def _run_to_completion(
                 timeout=timeout_seconds,
             )
         except subprocess.TimeoutExpired as exc:
-            raise ContractError(f"training command exceeded {timeout_seconds:g}s") from exc
+            raise ContractError(
+                f"training command exceeded {timeout_seconds:g}s"
+            ) from exc
     if result.returncode != 0:
         raise ContractError(
             f"training command failed with {result.returncode}; stderr tail:\n{_tail(stderr_path)}"
         )
-    return {"returncode": result.returncode, "elapsed_seconds": time.monotonic() - started}
+    return {
+        "returncode": result.returncode,
+        "elapsed_seconds": time.monotonic() - started,
+    }
 
 
 def _run_and_interrupt(
@@ -796,14 +873,21 @@ def _run_and_interrupt(
                 process.kill()
                 returncode = process.wait(timeout=15)
             if returncode == 0:
-                raise ContractError("interruption target completed before SIGTERM took effect")
+                raise ContractError(
+                    "interruption target completed before SIGTERM took effect"
+                )
         finally:
             if process.poll() is None:
                 process.kill()
                 process.wait(timeout=15)
     final_state = inspect_preference_checkpoint(checkpoint_path, task)
-    if final_state["sha256"] != state["sha256"] or final_state["state_sha256"] != state["state_sha256"]:
-        raise ContractError("checkpoint generation changed after the observed interruption boundary")
+    if (
+        final_state["sha256"] != state["sha256"]
+        or final_state["state_sha256"] != state["state_sha256"]
+    ):
+        raise ContractError(
+            "checkpoint generation changed after the observed interruption boundary"
+        )
     if final_state["next_example_index"] != 0 or final_state["order_cursor"] != 0:
         raise ContractError("trainer progress carries stray non-sidecar cursor state")
     if final_state["examples_into_epoch"] != expected_examples:
@@ -819,7 +903,9 @@ def _run_and_interrupt(
     )
 
 
-def _write_json(path: Path, payload: Mapping[str, Any], *, exclusive: bool = True) -> None:
+def _write_json(
+    path: Path, payload: Mapping[str, Any], *, exclusive: bool = True
+) -> None:
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
     mode = "x" if exclusive else "w"
     try:
@@ -877,18 +963,27 @@ def _recipe_variant(
 
 def _semantic_report_view(report: Mapping[str, Any], task: str) -> dict[str, Any]:
     if report.get("evaluation_execution_policy") != CANONICAL_EVALUATION_POLICY:
-        raise ContractError("preference report does not attest canonical held-out evaluation")
+        raise ContractError(
+            "preference report does not attest canonical held-out evaluation"
+        )
     numerical_policy = dict(
         _mapping(report.get("metal_numerical_policy"), "report.metal_numerical_policy")
     )
-    if numerical_policy.get("schema_version") != "antfly_gemma4_metal_numerical_policy/v2":
-        raise ContractError("preference report has an unsupported Metal numerical policy")
+    if (
+        numerical_policy.get("schema_version")
+        != "antfly_gemma4_metal_numerical_policy/v2"
+    ):
+        raise ContractError(
+            "preference report has an unsupported Metal numerical policy"
+        )
     fingerprint_flags = _integer(
         numerical_policy.get("fingerprint_flags"),
         "report.metal_numerical_policy.fingerprint_flags",
     )
     if fingerprint_flags > (1 << 64) - 1:
-        raise ContractError("report.metal_numerical_policy.fingerprint_flags exceeds u64")
+        raise ContractError(
+            "report.metal_numerical_policy.fingerprint_flags exceeds u64"
+        )
     _integer(
         numerical_policy.get("sparse_loss_chunk_rows"),
         "report.metal_numerical_policy.sparse_loss_chunk_rows",
@@ -915,7 +1010,9 @@ def _semantic_report_view(report: Mapping[str, Any], task: str) -> dict[str, Any
         )
     for field in METAL_NUMERICAL_POLICY_BOOLEAN_FIELDS:
         if not isinstance(numerical_policy[field], bool):
-            raise ContractError(f"report.metal_numerical_policy.{field}: expected boolean")
+            raise ContractError(
+                f"report.metal_numerical_policy.{field}: expected boolean"
+            )
     common = {
         "execution_mode": report.get("execution_mode"),
         "dataset_format": report.get("dataset_format"),
@@ -923,8 +1020,12 @@ def _semantic_report_view(report: Mapping[str, Any], task: str) -> dict[str, Any
             report.get("training_seed", 42), "report.training_seed"
         ),
         "policy_backend": report.get("policy_backend"),
-        "optimizer_steps": _integer(report.get("optimizer_steps"), "report.optimizer_steps", 1),
-        "micro_batch_steps": _integer(report.get("micro_batch_steps"), "report.micro_batch_steps", 1),
+        "optimizer_steps": _integer(
+            report.get("optimizer_steps"), "report.optimizer_steps", 1
+        ),
+        "micro_batch_steps": _integer(
+            report.get("micro_batch_steps"), "report.micro_batch_steps", 1
+        ),
         "initial_logprob_parity": report.get("initial_logprob_parity"),
         "metal_numerical_policy": numerical_policy,
         "evaluation_execution_policy": report.get("evaluation_execution_policy"),
@@ -959,13 +1060,17 @@ def _semantic_report_view(report: Mapping[str, Any], task: str) -> dict[str, Any
             },
             "policy_scoring_mode": report.get("policy_scoring_mode"),
             "training_microbatch_mode": report.get("training_microbatch_mode"),
-            "initial_bucket_signature_parity": report.get("initial_bucket_signature_parity"),
+            "initial_bucket_signature_parity": report.get(
+                "initial_bucket_signature_parity"
+            ),
             "sequence_length_policy": report.get("sequence_length_policy"),
             "evaluation": evaluation,
         }
     kl_control = dict(_mapping(report.get("kl_control"), "report.kl_control"))
     kl_control.pop("trace_path", None)
-    reward_pipeline = dict(_mapping(report.get("reward_pipeline"), "report.reward_pipeline"))
+    reward_pipeline = dict(
+        _mapping(report.get("reward_pipeline"), "report.reward_pipeline")
+    )
     reward_pipeline.pop("trace_path", None)
     groups = _integer(report.get("groups"), "report.groups", 1)
     optimizer_groups = _integer(
@@ -1036,7 +1141,9 @@ def _semantic_report_view(report: Mapping[str, Any], task: str) -> dict[str, Any
         _mapping(report.get("training_order"), "report.training_order")
     )
     if training_order != GRPO_TRAINING_ORDER:
-        raise ContractError("report.training_order does not match the qualified GRPO order")
+        raise ContractError(
+            "report.training_order does not match the qualified GRPO order"
+        )
     loss_type = report.get("loss_type")
     if loss_type not in {"grpo", "bnpo", "dr_grpo", "dapo"}:
         raise ContractError("report.loss_type is unsupported")
@@ -1152,7 +1259,9 @@ def _compare_semantic_reports(
             "fields": fields,
         }
     if actual_exact != expected_exact:
-        raise ContractError("resumed semantic trajectory differs from uninterrupted execution")
+        raise ContractError(
+            "resumed semantic trajectory differs from uninterrupted execution"
+        )
     return comparison
 
 
@@ -1160,7 +1269,10 @@ def _require_exact_final_checkpoint_parity(
     uninterrupted: Mapping[str, Any], resumed: Mapping[str, Any]
 ) -> dict[str, str]:
     checkpoint_sha256 = uninterrupted.get("sha256")
-    if not isinstance(checkpoint_sha256, str) or resumed.get("sha256") != checkpoint_sha256:
+    if (
+        not isinstance(checkpoint_sha256, str)
+        or resumed.get("sha256") != checkpoint_sha256
+    ):
         raise ContractError(
             "resumed final training checkpoint is not byte-identical to uninterrupted execution"
         )
@@ -1204,10 +1316,13 @@ def _require_final_report_checkpoint_consistency(
         raise ContractError(
             f"final report {horizon_field} does not match checkpoint examples_seen"
         )
-    if _integer(
-        checkpoint.get("accumulation_micro_batches"),
-        "final checkpoint.accumulation_micro_batches",
-    ) != 0:
+    if (
+        _integer(
+            checkpoint.get("accumulation_micro_batches"),
+            "final checkpoint.accumulation_micro_batches",
+        )
+        != 0
+    ):
         raise ContractError("final checkpoint contains unflushed accumulated gradients")
     binding[horizon_field] = reported_horizon
     binding["examples_seen"] = durable_horizon
@@ -1227,7 +1342,9 @@ def _require_adapter_tree_contract(
 ) -> None:
     trained = _mapping(trained_files, "trained adapter tree")
     if set(seed_files) != set(trained):
-        raise ContractError("trained adapter file inventory differs from the seed adapter")
+        raise ContractError(
+            "trained adapter file inventory differs from the seed adapter"
+        )
     mutable = {"adapter_model.safetensors", "antfly_finetune_manifest.json"}
     for relative_path, evidence in seed_files.items():
         if relative_path in mutable:
@@ -1280,15 +1397,26 @@ def _validate_report_artifacts(
     if evaluation_path != expected_evaluation_path.expanduser().resolve(strict=True):
         raise ContractError("main report names the wrong standalone evaluation report")
     evaluation = dict(_load_json(evaluation_path, "standalone evaluation report"))
-    expected_schema = f"antfly_inference_finetune_{task}_evaluation/v{'3' if task == 'dpo' else '4'}"
+    expected_schema = (
+        f"antfly_inference_finetune_{task}_evaluation/v{'3' if task == 'dpo' else '4'}"
+    )
     if evaluation.get("schema_version") != expected_schema:
         raise ContractError(f"expected {expected_schema} standalone evaluation report")
-    if evaluation.get("status") != "passed" or evaluation.get("policy_backend") != "metal":
-        raise ContractError("standalone evaluation report did not pass strict Metal admission")
+    if (
+        evaluation.get("status") != "passed"
+        or evaluation.get("policy_backend") != "metal"
+    ):
+        raise ContractError(
+            "standalone evaluation report did not pass strict Metal admission"
+        )
     if evaluation.get("execution_policy") != CANONICAL_EVALUATION_POLICY:
-        raise ContractError("standalone evaluation report has the wrong execution policy")
+        raise ContractError(
+            "standalone evaluation report has the wrong execution policy"
+        )
     if evaluation.get("metal_numerical_policy") != report.get("metal_numerical_policy"):
-        raise ContractError("standalone evaluation report numerical policy differs from training")
+        raise ContractError(
+            "standalone evaluation report numerical policy differs from training"
+        )
     summary_fields = (
         ("examples", "loss", "mean_reward_margin", "accuracy")
         if task == "dpo"
@@ -1319,7 +1447,9 @@ def _validate_report_artifacts(
     }
     if task == "grpo":
         kl_control = _mapping(report.get("kl_control"), "report.kl_control")
-        reward_pipeline = _mapping(report.get("reward_pipeline"), "report.reward_pipeline")
+        reward_pipeline = _mapping(
+            report.get("reward_pipeline"), "report.reward_pipeline"
+        )
         evaluation_reward = _mapping(
             evaluation.get("reward_pipeline"),
             "evaluation.reward_pipeline",
@@ -1369,39 +1499,65 @@ def _validate_outputs(
     expected_resume_examples: int = 0,
     compiled_sampling: bool = False,
 ) -> dict[str, Any]:
-    uninterrupted = _load_json(uninterrupted_root / f"{task}_report.json", "uninterrupted report")
+    uninterrupted = _load_json(
+        uninterrupted_root / f"{task}_report.json", "uninterrupted report"
+    )
     resumed = _load_json(resumed_root / f"{task}_report.json", "resumed report")
     expected_schema = (
-        DPO_REPORT_SCHEMA_VERSION
-        if task == "dpo"
-        else GRPO_REPORT_SCHEMA_VERSION
+        DPO_REPORT_SCHEMA_VERSION if task == "dpo" else GRPO_REPORT_SCHEMA_VERSION
     )
-    if uninterrupted.get("schema_version") != expected_schema or resumed.get("schema_version") != expected_schema:
+    if (
+        uninterrupted.get("schema_version") != expected_schema
+        or resumed.get("schema_version") != expected_schema
+    ):
         raise ContractError(f"expected {expected_schema} reports")
-    if uninterrupted.get("policy_backend") != "metal" or resumed.get("policy_backend") != "metal":
+    if (
+        uninterrupted.get("policy_backend") != "metal"
+        or resumed.get("policy_backend") != "metal"
+    ):
         raise ContractError("preference run did not use the strict Metal policy")
-    uninterrupted_resume = _mapping(uninterrupted.get("checkpoint_resume"), "uninterrupted checkpoint summary")
-    resumed_resume = _mapping(resumed.get("checkpoint_resume"), "resumed checkpoint summary")
+    uninterrupted_resume = _mapping(
+        uninterrupted.get("checkpoint_resume"), "uninterrupted checkpoint summary"
+    )
+    resumed_resume = _mapping(
+        resumed.get("checkpoint_resume"), "resumed checkpoint summary"
+    )
     fingerprint = uninterrupted_resume.get("run_fingerprint_sha256")
     if resumed_resume.get("run_fingerprint_sha256") != fingerprint:
-        raise ContractError("resumed run fingerprint differs from uninterrupted execution")
+        raise ContractError(
+            "resumed run fingerprint differs from uninterrupted execution"
+        )
     if resumed_resume.get("enabled") is not True:
         raise ContractError("resumed report does not attest checkpoint recovery")
-    if _integer(resumed_resume.get("start_epoch"), "resumed start_epoch") != expected_resume_epoch:
+    if (
+        _integer(resumed_resume.get("start_epoch"), "resumed start_epoch")
+        != expected_resume_epoch
+    ):
         raise ContractError("resumed report recovered the wrong epoch")
-    if _integer(
-        resumed_resume.get("start_examples_into_epoch", 0),
-        "resumed start_examples_into_epoch",
-    ) != expected_resume_examples:
+    if (
+        _integer(
+            resumed_resume.get("start_examples_into_epoch", 0),
+            "resumed start_examples_into_epoch",
+        )
+        != expected_resume_examples
+    ):
         raise ContractError("resumed report recovered the wrong mid-epoch cursor")
-    if Path(str(resumed_resume.get("checkpoint_path"))).resolve() != checkpoint_path.resolve():
+    if (
+        Path(str(resumed_resume.get("checkpoint_path"))).resolve()
+        != checkpoint_path.resolve()
+    ):
         raise ContractError("resumed report names the wrong checkpoint")
     checkpoint = inspect_preference_checkpoint(checkpoint_path, task)
-    if Path(str(resumed_resume.get("checkpoint_state_path"))).resolve() != Path(checkpoint["state_path"]):
+    if Path(str(resumed_resume.get("checkpoint_state_path"))).resolve() != Path(
+        checkpoint["state_path"]
+    ):
         raise ContractError("resumed report names the wrong checkpoint sidecar")
     if resumed_resume.get("checkpoint_state_sha256") != checkpoint["state_sha256"]:
         raise ContractError("resumed report has the wrong checkpoint sidecar digest")
-    if _integer(resumed_resume.get("checkpoint_epoch"), "resumed checkpoint_epoch") != checkpoint["epoch_index"]:
+    if (
+        _integer(resumed_resume.get("checkpoint_epoch"), "resumed checkpoint_epoch")
+        != checkpoint["epoch_index"]
+    ):
         raise ContractError("resumed report has the wrong durable checkpoint epoch")
     if fingerprint != checkpoint["run_fingerprint_sha256"]:
         raise ContractError("resumed report and checkpoint fingerprints differ")
@@ -1494,7 +1650,10 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
     task = base_recipe.get("recipe")
     if task not in ("dpo", "grpo"):
         raise ContractError("base recipe must be optimizer-backed dpo or grpo")
-    if _mapping(base_recipe.get("execution"), "recipe.execution").get("mode") != "train":
+    if (
+        _mapping(base_recipe.get("execution"), "recipe.execution").get("mode")
+        != "train"
+    ):
         raise ContractError("base recipe must set execution.mode=train")
     if base_recipe.get("backend") != "metal":
         raise ContractError("base recipe must set backend=metal")
@@ -1511,7 +1670,9 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
         # `interrupt_after_examples` examples of it are durably checkpointed.
         # This is the only admissible interruption for a one-epoch trajectory.
         if args.epochs < 1 or not 0 <= args.interrupt_after_epoch < args.epochs:
-            raise ContractError("mid-epoch interrupt epoch must be between 0 and epochs-1")
+            raise ContractError(
+                "mid-epoch interrupt epoch must be between 0 and epochs-1"
+            )
     elif args.epochs < 2 or not 0 < args.interrupt_after_epoch < args.epochs:
         raise ContractError("interrupt epoch must be between 1 and epochs-1")
     if args.timeout_seconds <= 0 or args.poll_seconds <= 0:
@@ -1545,7 +1706,9 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
             raise ContractError("qualification requires a pinned reference model path")
         reference = _closed_immutable_path(Path(reference_value), "reference model")
         if reference != model:
-            raise ContractError("preference qualification requires model and reference paths to match")
+            raise ContractError(
+                "preference qualification requires model and reference paths to match"
+            )
         model_config["reference_path"] = str(reference)
     model_config["path"] = str(model)
     direct_gguf_training = args.direct_gguf_training or args.experimental_gguf_qlora
@@ -1582,9 +1745,7 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
             }
         )
         base_recipe["runtime"] = runtime
-    _apply_compiled_sampling_recipe_contract(
-        base_recipe, task, compiled_sampling
-    )
+    _apply_compiled_sampling_recipe_contract(base_recipe, task, compiled_sampling)
     adapter_config = dict(_mapping(base_recipe.get("adapter"), "recipe.adapter"))
     adapter_value = adapter_config.get("path")
     if not isinstance(adapter_value, str):
@@ -1683,7 +1844,9 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
         "train_dataset": train_path,
         "eval_dataset": eval_path,
     }
-    snapshots_before = {name: _tree_snapshot(path) for name, path in immutable_roots.items()}
+    snapshots_before = {
+        name: _tree_snapshot(path) for name, path in immutable_roots.items()
+    }
     binary_sha256 = _sha256(binary)
     base_recipe_sha256 = _sha256(base_recipe_path)
     seed_adapter_evidence = _adapter_tree_evidence(adapter, "seed adapter")
@@ -1773,9 +1936,7 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
         compiled_sampling,
     )
     parity.update(exact_checkpoint_parity)
-    semantic_report = _mapping(
-        parity.get("semantic_report"), "parity.semantic_report"
-    )
+    semantic_report = _mapping(parity.get("semantic_report"), "parity.semantic_report")
     parity["final_checkpoint_counter_binding"] = {
         "uninterrupted": _require_final_report_checkpoint_consistency(
             semantic_report,
@@ -1793,7 +1954,10 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
             raise ContractError(
                 "compiled-sampling qualification did not execute the compiled GRPO sampling mode"
             )
-        if semantic_report.get("policy_logprob_mode") != COMPILED_GRPO_POLICY_LOGPROB_MODE:
+        if (
+            semantic_report.get("policy_logprob_mode")
+            != COMPILED_GRPO_POLICY_LOGPROB_MODE
+        ):
             raise ContractError(
                 "compiled-sampling qualification did not use canonical eager policy log-probs"
             )
@@ -1821,10 +1985,13 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
         ("interrupted_boundary", interrupted_state),
         ("resumed_final", resumed_state),
     ):
-        if _integer(
-            checkpoint_state.get("trainer_seed"),
-            f"{checkpoint_name}.trainer_seed",
-        ) != report_training_seed:
+        if (
+            _integer(
+                checkpoint_state.get("trainer_seed"),
+                f"{checkpoint_name}.trainer_seed",
+            )
+            != report_training_seed
+        ):
             raise ContractError(
                 f"{checkpoint_name} trainer seed differs from the final report"
             )
@@ -1838,18 +2005,33 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
             "parity.semantic_report.groups",
             1,
         )
-        if _integer(semantic_incremental.get("groups"), "incremental_kv.groups") != expected_groups:
-            raise ContractError("incremental-KV telemetry does not cover the whole resumed run")
-        if _integer(
-            semantic_incremental.get("host_logit_fallbacks"),
-            "incremental_kv.host_logit_fallbacks",
-        ) != 0:
-            raise ContractError("incremental-KV qualification used a host-logit fallback")
-        if _integer(
-            semantic_incremental.get("resident_ranked_token_selections"),
-            "incremental_kv.resident_ranked_token_selections",
-        ) != 0:
-            raise ContractError("incremental-KV qualification used the retired ranked sampler")
+        if (
+            _integer(semantic_incremental.get("groups"), "incremental_kv.groups")
+            != expected_groups
+        ):
+            raise ContractError(
+                "incremental-KV telemetry does not cover the whole resumed run"
+            )
+        if (
+            _integer(
+                semantic_incremental.get("host_logit_fallbacks"),
+                "incremental_kv.host_logit_fallbacks",
+            )
+            != 0
+        ):
+            raise ContractError(
+                "incremental-KV qualification used a host-logit fallback"
+            )
+        if (
+            _integer(
+                semantic_incremental.get("resident_ranked_token_selections"),
+                "incremental_kv.resident_ranked_token_selections",
+            )
+            != 0
+        ):
+            raise ContractError(
+                "incremental-KV qualification used the retired ranked sampler"
+            )
         expected_completions = _integer(
             parity.get("semantic_report", {}).get("completions"),
             "parity.semantic_report.completions",
@@ -1860,11 +2042,16 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
             "parity.semantic_report.tokens",
             expected_completions,
         )
-        expected_sampling_rows = expected_tokens - expected_completions + expected_groups
-        if _integer(
-            semantic_incremental.get("host_logit_sampling_rows"),
-            "incremental_kv.host_logit_sampling_rows",
-        ) != expected_sampling_rows:
+        expected_sampling_rows = (
+            expected_tokens - expected_completions + expected_groups
+        )
+        if (
+            _integer(
+                semantic_incremental.get("host_logit_sampling_rows"),
+                "incremental_kv.host_logit_sampling_rows",
+            )
+            != expected_sampling_rows
+        ):
             raise ContractError(
                 "incremental-KV categorical-sampling row accounting drifted"
             )
@@ -1895,8 +2082,13 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
         seed_adapter_evidence["files"],
         parity.get("adapter_tree"),
     )
-    if parity.get("adapter_manifest_identity") != seed_adapter_evidence["manifest_identity"]:
-        raise ContractError("trained adapter changed the seed adapter identity contract")
+    if (
+        parity.get("adapter_manifest_identity")
+        != seed_adapter_evidence["manifest_identity"]
+    ):
+        raise ContractError(
+            "trained adapter changed the seed adapter identity contract"
+        )
 
     for name, path in immutable_roots.items():
         if _tree_snapshot(path) != snapshots_before[name]:
@@ -1919,7 +2111,8 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
             "direct_gguf_training": direct_gguf_training,
             "experimental_direct_gguf_qlora": args.experimental_gguf_qlora,
             "incremental_kv": args.incremental_kv,
-            "incremental_kv_batch_active": args.incremental_kv and not args.incremental_kv_serial,
+            "incremental_kv_batch_active": args.incremental_kv
+            and not args.incremental_kv_serial,
             "incremental_kv_clone_prompt_tail": args.incremental_kv_clone_prompt_tail,
             "incremental_kv_shadow_exact": args.incremental_kv_shadow_exact,
             "compiled_sampling": compiled_sampling,

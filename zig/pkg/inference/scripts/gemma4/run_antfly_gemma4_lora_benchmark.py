@@ -68,7 +68,9 @@ COMMAND_DIGEST_DOMAIN = "antfly_gemma4_lora_benchmark_command/v1"
 COLD_STEP_COUNT = 1
 FIRST_STEADY_STEP_COUNT = 1
 SCRIPT_PATH = Path(__file__).resolve()
-ANTFLY_RUNNER_RELATIVE_PATH = "zig/pkg/inference/scripts/gemma4/run_antfly_gemma4_lora_benchmark.py"
+ANTFLY_RUNNER_RELATIVE_PATH = (
+    "zig/pkg/inference/scripts/gemma4/run_antfly_gemma4_lora_benchmark.py"
+)
 DIAGNOSTIC_SAMPLE_SCHEMA_VERSION = "antfly_gemma4_zig_diagnostic_sample/v2"
 DIAGNOSTIC_SOURCE_SCHEMA_VERSION = "antfly_gemma4_diagnostic_producer_source/v1"
 DIAGNOSTIC_RELEASE_BLOCKER = "diagnostic-mode-never-release-evidence"
@@ -262,7 +264,9 @@ def _tree_snapshot(root: Path) -> tuple[tuple[str, int, int, int, int], ...]:
     if not resolved.is_dir():
         raise ContractError(f"artifact is not a directory: {resolved}")
     rows: list[tuple[str, int, int, int, int]] = []
-    for path in sorted(resolved.rglob("*"), key=lambda item: item.relative_to(resolved).as_posix()):
+    for path in sorted(
+        resolved.rglob("*"), key=lambda item: item.relative_to(resolved).as_posix()
+    ):
         info = path.lstat()
         relative = path.relative_to(resolved).as_posix()
         if stat.S_ISLNK(info.st_mode):
@@ -271,15 +275,21 @@ def _tree_snapshot(root: Path) -> tuple[tuple[str, int, int, int, int], ...]:
             continue
         if not stat.S_ISREG(info.st_mode):
             raise ContractError(f"artifact contains a non-regular entry: {relative}")
-        rows.append((relative, info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns))
+        rows.append(
+            (relative, info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+        )
     if not rows:
         raise ContractError(f"artifact directory is empty: {resolved}")
     return tuple(rows)
 
 
-def _assert_snapshot_unchanged(root: Path, expected: tuple[tuple[str, int, int, int, int], ...], where: str) -> None:
+def _assert_snapshot_unchanged(
+    root: Path, expected: tuple[tuple[str, int, int, int, int], ...], where: str
+) -> None:
     if _tree_snapshot(root) != expected:
-        raise ContractError(f"{where} changed while the benchmark subprocess was running")
+        raise ContractError(
+            f"{where} changed while the benchmark subprocess was running"
+        )
 
 
 def source_identity(source_root: Path) -> tuple[Path, str]:
@@ -299,13 +309,19 @@ def source_identity(source_root: Path) -> tuple[Path, str]:
         else None
     )
     if resolved_top_level != root:
-        raise ContractError("Antfly --source-root must be the benchmark wrapper's Git checkout root")
+        raise ContractError(
+            "Antfly --source-root must be the benchmark wrapper's Git checkout root"
+        )
     try:
         wrapper_relative = SCRIPT_PATH.relative_to(root).as_posix()
     except ValueError as exc:
-        raise ContractError("Antfly benchmark wrapper is outside --source-root") from exc
+        raise ContractError(
+            "Antfly benchmark wrapper is outside --source-root"
+        ) from exc
     if wrapper_relative != ANTFLY_RUNNER_RELATIVE_PATH:
-        raise ContractError("Antfly benchmark wrapper path differs from the admitted source path")
+        raise ContractError(
+            "Antfly benchmark wrapper path differs from the admitted source path"
+        )
     head = subprocess.run(
         ["git", "-C", str(root), "rev-parse", "HEAD"],
         check=False,
@@ -315,7 +331,9 @@ def source_identity(source_root: Path) -> tuple[Path, str]:
     )
     revision = head.stdout.strip() if head.returncode == 0 else ""
     if _HEX40.fullmatch(revision) is None:
-        raise ContractError(f"could not resolve a full Antfly source commit from {root}")
+        raise ContractError(
+            f"could not resolve a full Antfly source commit from {root}"
+        )
     status_result = subprocess.run(
         ["git", "-C", str(root), "status", "--porcelain=v1", "--untracked-files=all"],
         check=False,
@@ -324,22 +342,27 @@ def source_identity(source_root: Path) -> tuple[Path, str]:
         stderr=subprocess.PIPE,
     )
     if status_result.returncode != 0 or status_result.stdout:
-        raise ContractError("Antfly benchmark source checkout must be clean, including untracked files")
+        raise ContractError(
+            "Antfly benchmark source checkout must be clean, including untracked files"
+        )
     return root, revision
 
 
 def _diagnostic_source_manifest_sha256(manifest_input: Mapping[str, Any]) -> str:
-    return "sha256:" + hashlib.sha256(
-        DIAGNOSTIC_SOURCE_SCHEMA_VERSION.encode("utf-8")
-        + b"\0"
-        + json.dumps(
-            manifest_input,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        ).encode("utf-8")
-    ).hexdigest()
+    return (
+        "sha256:"
+        + hashlib.sha256(
+            DIAGNOSTIC_SOURCE_SCHEMA_VERSION.encode("utf-8")
+            + b"\0"
+            + json.dumps(
+                manifest_input,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+    )
 
 
 def diagnostic_producer_source(source_root: Path) -> dict[str, Any]:
@@ -365,15 +388,23 @@ def diagnostic_producer_source(source_root: Path) -> dict[str, Any]:
                 f"could not bind diagnostic Antfly benchmark source: {str(detail).strip()}"
             ) from exc
 
-    resolved_top_level = Path(git("rev-parse", "--show-toplevel").stdout.strip()).resolve(strict=True)
+    resolved_top_level = Path(
+        git("rev-parse", "--show-toplevel").stdout.strip()
+    ).resolve(strict=True)
     if resolved_top_level != root:
-        raise ContractError("Antfly --source-root must be the diagnostic wrapper's Git checkout root")
+        raise ContractError(
+            "Antfly --source-root must be the diagnostic wrapper's Git checkout root"
+        )
     try:
         relative_entrypoint = SCRIPT_PATH.relative_to(root).as_posix()
     except ValueError as exc:
-        raise ContractError("diagnostic Antfly benchmark wrapper is outside --source-root") from exc
+        raise ContractError(
+            "diagnostic Antfly benchmark wrapper is outside --source-root"
+        ) from exc
     if relative_entrypoint != ANTFLY_RUNNER_RELATIVE_PATH:
-        raise ContractError("diagnostic Antfly benchmark wrapper path differs from the admitted source path")
+        raise ContractError(
+            "diagnostic Antfly benchmark wrapper path differs from the admitted source path"
+        )
 
     revision = git("rev-parse", "HEAD").stdout.strip()
     source_tree = git("rev-parse", "HEAD^{tree}").stdout.strip()
@@ -388,10 +419,12 @@ def diagnostic_producer_source(source_root: Path) -> dict[str, Any]:
             raise ContractError(
                 f"diagnostic Antfly producer source must be a regular file: {relative_path}"
             )
-        files.append({
-            "relative_path": relative_path,
-            "source_sha256": prefixed_sha256(path),
-        })
+        files.append(
+            {
+                "relative_path": relative_path,
+                "source_sha256": prefixed_sha256(path),
+            }
+        )
     entrypoint_sha256 = next(
         item["source_sha256"]
         for item in files
@@ -482,7 +515,15 @@ def prepared_binding(
     workload = benchmark_workload_sha256(input_rows, label_rows, mask_rows)
     artifact_sha = prefixed_sha256(resolved)
     file_info = resolved.stat()
-    snapshot = ((resolved.name, file_info.st_dev, file_info.st_ino, file_info.st_size, file_info.st_mtime_ns),)
+    snapshot = (
+        (
+            resolved.name,
+            file_info.st_dev,
+            file_info.st_ino,
+            file_info.st_size,
+            file_info.st_mtime_ns,
+        ),
+    )
     return PreparedBinding(
         case={
             "schema_version": example["schema_version"],
@@ -504,12 +545,18 @@ def prepared_binding(
     )
 
 
-def _assert_file_snapshot_unchanged(path: Path, snapshot: tuple[tuple[str, int, int, int, int], ...], where: str) -> None:
+def _assert_file_snapshot_unchanged(
+    path: Path, snapshot: tuple[tuple[str, int, int, int, int], ...], where: str
+) -> None:
     resolved = path.expanduser().resolve(strict=True)
     info = resolved.stat()
-    current = ((resolved.name, info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns),)
+    current = (
+        (resolved.name, info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns),
+    )
     if current != snapshot:
-        raise ContractError(f"{where} changed while the benchmark subprocess was running")
+        raise ContractError(
+            f"{where} changed while the benchmark subprocess was running"
+        )
 
 
 def adapter_binding(
@@ -520,16 +567,24 @@ def adapter_binding(
     prepared_summary: Mapping[str, Any],
 ) -> AdapterBinding:
     root = path.expanduser().resolve(strict=True)
-    artifact = inspect_initial_adapter(root, lock, model_key, target_preset, prepared_summary)
+    artifact = inspect_initial_adapter(
+        root, lock, model_key, target_preset, prepared_summary
+    )
     config = artifact.semantics
     if config["policy_source"] not in (
         "antfly-finetune-manifest/v2",
         "antfly-finetune-manifest/v3",
     ):
-        raise ContractError("Antfly benchmark requires a provenance-bound Antfly adapter manifest")
+        raise ContractError(
+            "Antfly benchmark requires a provenance-bound Antfly adapter manifest"
+        )
     gate = _mapping(lock["performance_gate"], "performance_gate")
-    if config["r"] != gate["rank"] or float(config["lora_alpha"]) != float(gate["alpha"]):
-        raise ContractError("adapter rank/alpha differ from the locked performance matrix")
+    if config["r"] != gate["rank"] or float(config["lora_alpha"]) != float(
+        gate["alpha"]
+    ):
+        raise ContractError(
+            "adapter rank/alpha differ from the locked performance matrix"
+        )
     provenance = _mapping(config["provenance"], "adapter provenance")
     canonical_modules = tuple(sorted({module for module, _role in artifact.tensors}))
     return AdapterBinding(
@@ -554,20 +609,33 @@ def _host_identity(metal_device: str) -> dict[str, Any]:
     fields = ("platform", "machine", "chip", "memory_bytes", "os_version", "os_build")
     missing = [field for field in fields if field not in host]
     if missing:
-        raise ContractError(f"could not resolve required Darwin hardware identity: {missing}")
+        raise ContractError(
+            f"could not resolve required Darwin hardware identity: {missing}"
+        )
     result = {field: host[field] for field in fields}
     result["metal_device"] = metal_device
     return result
 
 
 def _canonical_json_sha256(domain: str, payload: Any) -> str:
-    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
-    digest = hashlib.sha256(domain.encode("ascii") + b"\0" + serialized.encode("utf-8")).hexdigest()
+    serialized = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    digest = hashlib.sha256(
+        domain.encode("ascii") + b"\0" + serialized.encode("utf-8")
+    ).hexdigest()
     return f"sha256:{digest}"
 
 
 def _write_private_json(path: Path, payload: Any) -> None:
-    data = (json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
+    data = (
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        + "\n"
+    ).encode("utf-8")
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "wb") as output:
         output.write(data)
@@ -609,7 +677,9 @@ class _ChildProcessMemorySampler:
     def _sample(self) -> None:
         value = self.probe(self.pid)
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise ContractError("process-memory sampler produced an invalid physical footprint")
+            raise ContractError(
+                "process-memory sampler produced an invalid physical footprint"
+            )
         self.samples.append(value)
 
     def _loop(self) -> None:
@@ -628,7 +698,9 @@ class _ChildProcessMemorySampler:
 
     def start(self) -> None:
         self._sample()
-        self.thread = threading.Thread(target=self._loop, name="antfly-gemma4-memory-sampler", daemon=True)
+        self.thread = threading.Thread(
+            target=self._loop, name="antfly-gemma4-memory-sampler", daemon=True
+        )
         self.thread.start()
 
     def cancel(self) -> None:
@@ -639,9 +711,13 @@ class _ChildProcessMemorySampler:
     def stop(self) -> ProcessMemoryMeasurement:
         self.cancel()
         if self.failure is not None:
-            raise ContractError(f"process-memory sampler failed: {self.failure}") from self.failure
+            raise ContractError(
+                f"process-memory sampler failed: {self.failure}"
+            ) from self.failure
         if len(self.samples) < 2:
-            raise ContractError("process-memory sampler produced fewer than two samples")
+            raise ContractError(
+                "process-memory sampler produced fewer than two samples"
+            )
         return ProcessMemoryMeasurement(max(self.samples), len(self.samples))
 
 
@@ -661,7 +737,9 @@ def _write_exact_control_byte(descriptor: int, value: bytes, where: str) -> None
     try:
         written = os.write(descriptor, value)
     except OSError as exc:
-        raise ContractError(f"benchmark control channel failed while sending {where}: {exc}") from exc
+        raise ContractError(
+            f"benchmark control channel failed while sending {where}: {exc}"
+        ) from exc
     if written != 1:
         raise ContractError(f"benchmark control channel short-wrote {where}")
 
@@ -694,20 +772,28 @@ def _run_child(
                 (b"B", b"b", True),
                 (b"A", b"a", False),
             ):
-                observed = _read_exact_control_byte(signal_read, f"{expected.decode()} signal")
+                observed = _read_exact_control_byte(
+                    signal_read, f"{expected.decode()} signal"
+                )
                 if observed != expected:
                     raise ContractError(
                         f"benchmark control channel expected {expected!r}, received {observed!r}"
                     )
                 signals_seen.append(observed)
                 snapshots.append(
-                    capture_darwin_system_memory_snapshot(before_measured=before_measured)
+                    capture_darwin_system_memory_snapshot(
+                        before_measured=before_measured
+                    )
                 )
                 if not before_measured:
                     if sampler is None:
-                        raise ContractError("process-memory sampler was not initialized")
+                        raise ContractError(
+                            "process-memory sampler was not initialized"
+                        )
                     process_measurements.append(sampler.stop())
-                _write_exact_control_byte(ack_write, acknowledgement, f"{acknowledgement.decode()} ACK")
+                _write_exact_control_byte(
+                    ack_write, acknowledgement, f"{acknowledgement.decode()} ACK"
+                )
             while True:
                 try:
                     trailing = os.read(signal_read, 1)
@@ -740,7 +826,9 @@ def _run_child(
             signal_write = -1
             os.close(ack_read)
             ack_read = -1
-            sampler = _ChildProcessMemorySampler(process.pid, lambda: process.poll() is None)
+            sampler = _ChildProcessMemorySampler(
+                process.pid, lambda: process.poll() is None
+            )
             try:
                 sampler.start()
             except BaseException as exc:
@@ -771,12 +859,16 @@ def _run_child(
                     os.killpg(process.pid, signal.SIGKILL)
                 finally:
                     process.wait()
-                raise ContractError(f"Antfly benchmark subprocess exceeded {timeout} seconds") from exc
+                raise ContractError(
+                    f"Antfly benchmark subprocess exceeded {timeout} seconds"
+                ) from exc
 
         sampler.cancel()
         control_thread.join(timeout=5)
         if control_thread.is_alive():
-            control_failure.append(ContractError("benchmark control reader did not reach EOF"))
+            control_failure.append(
+                ContractError("benchmark control reader did not reach EOF")
+            )
         measurement_error: str | None = None
         process_memory: ProcessMemoryMeasurement | None = None
         system_deltas: dict[str, int | float] | None = None
@@ -793,7 +885,9 @@ def _run_child(
                 )
             process_memory = process_measurements[0]
             if len(snapshots) != 2:
-                raise ContractError("benchmark control channel did not bracket measured optimizer steps")
+                raise ContractError(
+                    "benchmark control channel did not bracket measured optimizer steps"
+                )
             system_deltas = darwin_system_memory_deltas(snapshots[0], snapshots[1])
         except BaseException as exc:
             measurement_error = str(exc)
@@ -829,8 +923,14 @@ def _validate_telemetry(
     _exact_keys(
         telemetry,
         (
-            "schema_version", "producer", "bindings", "protocol", "runtime",
-            "measurement_control", "timings", "memory",
+            "schema_version",
+            "producer",
+            "bindings",
+            "protocol",
+            "runtime",
+            "measurement_control",
+            "timings",
+            "memory",
         ),
         "telemetry",
     )
@@ -841,8 +941,15 @@ def _validate_telemetry(
     _exact_keys(
         producer,
         (
-            "pid", "backend", "strict_metal_execution", "version", "metal_device", "executable_sha256",
-            "source_revision", "request_sha256", "command_sha256",
+            "pid",
+            "backend",
+            "strict_metal_execution",
+            "version",
+            "metal_device",
+            "executable_sha256",
+            "source_revision",
+            "request_sha256",
+            "command_sha256",
         ),
         "telemetry.producer",
     )
@@ -850,16 +957,24 @@ def _validate_telemetry(
         raise ContractError("telemetry producer PID is not the fresh subprocess PID")
     if producer["backend"] != "metal" or producer["strict_metal_execution"] is not True:
         raise ContractError("telemetry did not attest strict Metal execution")
-    expected_implementation = _mapping(request["implementation"], "request.implementation")
+    expected_implementation = _mapping(
+        request["implementation"], "request.implementation"
+    )
     _sha256_text = producer["executable_sha256"]
     if not isinstance(_sha256_text, str) or _SHA256.fullmatch(_sha256_text) is None:
         raise ContractError("telemetry producer executable SHA-256 is malformed")
-    if not isinstance(producer["source_revision"], str) or _HEX40.fullmatch(producer["source_revision"]) is None:
+    if (
+        not isinstance(producer["source_revision"], str)
+        or _HEX40.fullmatch(producer["source_revision"]) is None
+    ):
         raise ContractError("telemetry producer source revision is malformed")
     for field in ("version", "metal_device", "executable_sha256", "source_revision"):
         if producer[field] != expected_implementation[field]:
             raise ContractError(f"telemetry producer {field} differs from the request")
-    if producer["request_sha256"] != request_sha256 or producer["command_sha256"] != command_sha256:
+    if (
+        producer["request_sha256"] != request_sha256
+        or producer["command_sha256"] != command_sha256
+    ):
         raise ContractError("telemetry request/command digest differs from the runner")
     for field in ("bindings", "protocol", "runtime", "measurement_control"):
         if telemetry[field] != request[field]:
@@ -870,30 +985,48 @@ def _validate_telemetry(
     _exact_keys(
         timings,
         (
-            "load_ns", "cold_step_was_first_graph_execution",
-            "cold_compile_and_step_ns", "cold_compile_ns",
-            "first_steady_step_ns", "warmup_step_ns", "measured_step_ns",
+            "load_ns",
+            "cold_step_was_first_graph_execution",
+            "cold_compile_and_step_ns",
+            "cold_compile_ns",
+            "first_steady_step_ns",
+            "warmup_step_ns",
+            "measured_step_ns",
             "optimizer_steps",
         ),
         "telemetry.timings",
     )
     _integer(timings["load_ns"], "telemetry.timings.load_ns")
     if timings["cold_step_was_first_graph_execution"] is not True:
-        raise ContractError("telemetry did not prove the cold optimizer window was the first graph execution")
+        raise ContractError(
+            "telemetry did not prove the cold optimizer window was the first graph execution"
+        )
     cold_duration = _integer(
         timings["cold_compile_and_step_ns"],
         "telemetry.timings.cold_compile_and_step_ns",
         1,
     )
-    cold_compile = _integer(timings["cold_compile_ns"], "telemetry.timings.cold_compile_ns", 1)
+    cold_compile = _integer(
+        timings["cold_compile_ns"], "telemetry.timings.cold_compile_ns", 1
+    )
     if cold_compile > cold_duration:
-        raise ContractError("telemetry cold compile duration exceeds its optimizer window")
-    _integer(timings["first_steady_step_ns"], "telemetry.timings.first_steady_step_ns", 1)
+        raise ContractError(
+            "telemetry cold compile duration exceeds its optimizer window"
+        )
+    _integer(
+        timings["first_steady_step_ns"], "telemetry.timings.first_steady_step_ns", 1
+    )
     warmup_durations = timings["warmup_step_ns"]
     measured_durations = timings["measured_step_ns"]
-    if not isinstance(warmup_durations, list) or len(warmup_durations) != protocol["warmup_steps"]:
+    if (
+        not isinstance(warmup_durations, list)
+        or len(warmup_durations) != protocol["warmup_steps"]
+    ):
         raise ContractError("telemetry must contain exactly three warmup durations")
-    if not isinstance(measured_durations, list) or len(measured_durations) != protocol["measured_steps"]:
+    if (
+        not isinstance(measured_durations, list)
+        or len(measured_durations) != protocol["measured_steps"]
+    ):
         raise ContractError("telemetry must contain exactly twenty measured durations")
     for index, value in enumerate(warmup_durations):
         _integer(value, f"telemetry.timings.warmup_step_ns[{index}]", 1)
@@ -909,79 +1042,141 @@ def _validate_telemetry(
         + protocol["measured_steps"]
     )
     if len(steps) != expected_count:
-        raise ContractError(f"telemetry contains {len(steps)} optimizer steps; expected {expected_count}")
+        raise ContractError(
+            f"telemetry contains {len(steps)} optimizer steps; expected {expected_count}"
+        )
 
     bindings = _mapping(request["bindings"], "request.bindings")
-    expected_input = bindings["sequence_length"] * bindings["grad_accum"] * bindings["microbatch"]
+    expected_input = (
+        bindings["sequence_length"] * bindings["grad_accum"] * bindings["microbatch"]
+    )
     expected_supervised = bindings["supervised_tokens"]
     for index, raw_step in enumerate(steps):
         step = _mapping(raw_step, f"telemetry step {index}")
         _exact_keys(
             step,
             (
-                "index", "phase", "duration_ns", "input_tokens", "supervised_tokens",
-                "optimizer_stepped", "explicit_device_sync", "strict_metal_evidence",
-                "phase_evidence", "command_plan_evidence",
+                "index",
+                "phase",
+                "duration_ns",
+                "input_tokens",
+                "supervised_tokens",
+                "optimizer_stepped",
+                "explicit_device_sync",
+                "strict_metal_evidence",
+                "phase_evidence",
+                "command_plan_evidence",
             ),
             f"telemetry step {index}",
         )
         if step["index"] != index:
-            raise ContractError("telemetry optimizer-step indexes must be contiguous from zero")
+            raise ContractError(
+                "telemetry optimizer-step indexes must be contiguous from zero"
+            )
         warmup_start = protocol["cold_optimizer_steps"] + protocol["first_steady_steps"]
         measured_start = warmup_start + protocol["warmup_steps"]
         expected_phase = (
-            "cold" if index == 0 else
-            "first" if index == 1 else
-            "warmup" if index < measured_start else
-            "measured"
+            "cold"
+            if index == 0
+            else "first"
+            if index == 1
+            else "warmup"
+            if index < measured_start
+            else "measured"
         )
         if step["phase"] != expected_phase:
             raise ContractError(f"telemetry step {index} has the wrong phase")
         _integer(step["duration_ns"], f"telemetry step {index}.duration_ns", 1)
-        if step["input_tokens"] != expected_input or step["supervised_tokens"] != expected_supervised:
-            raise ContractError(f"telemetry step {index} token totals differ from the bound workload")
-        if step["optimizer_stepped"] is not True or step["explicit_device_sync"] is not True:
-            raise ContractError(f"telemetry step {index} is not a synchronized complete optimizer step")
-        evidence = _mapping(step["strict_metal_evidence"], f"telemetry step {index}.strict_metal_evidence")
+        if (
+            step["input_tokens"] != expected_input
+            or step["supervised_tokens"] != expected_supervised
+        ):
+            raise ContractError(
+                f"telemetry step {index} token totals differ from the bound workload"
+            )
+        if (
+            step["optimizer_stepped"] is not True
+            or step["explicit_device_sync"] is not True
+        ):
+            raise ContractError(
+                f"telemetry step {index} is not a synchronized complete optimizer step"
+            )
+        evidence = _mapping(
+            step["strict_metal_evidence"],
+            f"telemetry step {index}.strict_metal_evidence",
+        )
         _exact_keys(
             evidence,
             (
-                "optimizer_backend", "metal_optimizer_steps", "graph_executor_steps",
-                "graph_executor_fallback_steps", "native_partitions", "unsupported_ops",
-                "interpreter_fallbacks", "runtime_region_fallbacks", "true_host_outputs",
+                "optimizer_backend",
+                "metal_optimizer_steps",
+                "graph_executor_steps",
+                "graph_executor_fallback_steps",
+                "native_partitions",
+                "unsupported_ops",
+                "interpreter_fallbacks",
+                "runtime_region_fallbacks",
+                "true_host_outputs",
                 "host_gradient_tensors",
             ),
             f"telemetry step {index}.strict_metal_evidence",
         )
         for field in (
-            "metal_optimizer_steps", "graph_executor_steps", "graph_executor_fallback_steps",
-            "native_partitions", "unsupported_ops", "interpreter_fallbacks",
-            "runtime_region_fallbacks", "true_host_outputs", "host_gradient_tensors",
+            "metal_optimizer_steps",
+            "graph_executor_steps",
+            "graph_executor_fallback_steps",
+            "native_partitions",
+            "unsupported_ops",
+            "interpreter_fallbacks",
+            "runtime_region_fallbacks",
+            "true_host_outputs",
+            "host_gradient_tensors",
         ):
-            _integer(evidence[field], f"telemetry step {index}.strict_metal_evidence.{field}")
-        if evidence["optimizer_backend"] != "metal" or evidence["metal_optimizer_steps"] != 1:
-            raise ContractError(f"telemetry step {index} did not use one Metal optimizer update")
+            _integer(
+                evidence[field], f"telemetry step {index}.strict_metal_evidence.{field}"
+            )
+        if (
+            evidence["optimizer_backend"] != "metal"
+            or evidence["metal_optimizer_steps"] != 1
+        ):
+            raise ContractError(
+                f"telemetry step {index} did not use one Metal optimizer update"
+            )
         if evidence["graph_executor_steps"] != bindings["grad_accum"]:
-            raise ContractError(f"telemetry step {index} did not execute every accumulated microbatch")
+            raise ContractError(
+                f"telemetry step {index} did not execute every accumulated microbatch"
+            )
         zero_fields = (
-            "graph_executor_fallback_steps", "native_partitions", "unsupported_ops",
-            "interpreter_fallbacks", "runtime_region_fallbacks", "true_host_outputs",
+            "graph_executor_fallback_steps",
+            "native_partitions",
+            "unsupported_ops",
+            "interpreter_fallbacks",
+            "runtime_region_fallbacks",
+            "true_host_outputs",
             "host_gradient_tensors",
         )
         if any(evidence[field] != 0 for field in zero_fields):
-            raise ContractError(f"telemetry step {index} contains a forbidden strict-Metal fallback")
+            raise ContractError(
+                f"telemetry step {index} contains a forbidden strict-Metal fallback"
+            )
 
-        phase_evidence = _mapping(step["phase_evidence"], f"telemetry step {index}.phase_evidence")
+        phase_evidence = _mapping(
+            step["phase_evidence"], f"telemetry step {index}.phase_evidence"
+        )
         _exact_keys(
             phase_evidence,
             PHASE_EVIDENCE_FIELDS,
             f"telemetry step {index}.phase_evidence",
         )
         for field in PHASE_EVIDENCE_FIELDS:
-            _integer(phase_evidence[field], f"telemetry step {index}.phase_evidence.{field}")
+            _integer(
+                phase_evidence[field], f"telemetry step {index}.phase_evidence.{field}"
+            )
         expected_compile_ns = cold_compile if index == 0 else 0
         if phase_evidence["compile_ns"] != expected_compile_ns:
-            raise ContractError(f"telemetry step {index} phase compile duration differs from the summary")
+            raise ContractError(
+                f"telemetry step {index} phase compile duration differs from the summary"
+            )
 
         command_evidence = _mapping(
             step["command_plan_evidence"],
@@ -993,66 +1188,117 @@ def _validate_telemetry(
             f"telemetry step {index}.command_plan_evidence",
         )
         for field in COMMAND_PLAN_EVIDENCE_FIELDS:
-            _integer(command_evidence[field], f"telemetry step {index}.command_plan_evidence.{field}")
+            _integer(
+                command_evidence[field],
+                f"telemetry step {index}.command_plan_evidence.{field}",
+            )
         if command_evidence["graph_executor_partitions"] < bindings["grad_accum"]:
-            raise ContractError(f"telemetry step {index} command plan omitted graph partitions")
+            raise ContractError(
+                f"telemetry step {index} command plan omitted graph partitions"
+            )
         command_dispatches = command_evidence["graph_executor_command_dispatches"]
         if command_dispatches == 0:
-            raise ContractError(f"telemetry step {index} command plan omitted graph dispatches")
+            raise ContractError(
+                f"telemetry step {index} command plan omitted graph dispatches"
+            )
         if command_evidence["graph_executor_planned_dispatches"] > command_dispatches:
-            raise ContractError(f"telemetry step {index} planned dispatches exceed graph dispatches")
-        if sum(command_evidence[field] for field in COMMAND_ATTRIBUTION_FIELDS) > command_dispatches:
-            raise ContractError(f"telemetry step {index} command attribution exceeds graph dispatches")
+            raise ContractError(
+                f"telemetry step {index} planned dispatches exceed graph dispatches"
+            )
+        if (
+            sum(command_evidence[field] for field in COMMAND_ATTRIBUTION_FIELDS)
+            > command_dispatches
+        ):
+            raise ContractError(
+                f"telemetry step {index} command attribution exceeds graph dispatches"
+            )
         cce_forward = command_evidence["metal_linear_cce_forward_calls"]
         cce_backward = command_evidence["metal_linear_cce_backward_calls"]
         cce_state_events = (
             command_evidence["metal_linear_cce_forward_state_hits"]
             + command_evidence["metal_linear_cce_forward_state_misses"]
         )
-        if cce_state_events != cce_backward or cce_backward != cce_forward or command_evidence["metal_linear_cce_forward_state_misses"] != 0:
-            raise ContractError(f"telemetry step {index} linear CCE route evidence is inconsistent")
-        if (command_evidence["metal_linear_cce_peak_scratch_bytes"] != 0) != (cce_forward != 0):
-            raise ContractError(f"telemetry step {index} linear CCE scratch evidence is inconsistent")
+        if (
+            cce_state_events != cce_backward
+            or cce_backward != cce_forward
+            or command_evidence["metal_linear_cce_forward_state_misses"] != 0
+        ):
+            raise ContractError(
+                f"telemetry step {index} linear CCE route evidence is inconsistent"
+            )
+        if (command_evidence["metal_linear_cce_peak_scratch_bytes"] != 0) != (
+            cce_forward != 0
+        ):
+            raise ContractError(
+                f"telemetry step {index} linear CCE scratch evidence is inconsistent"
+            )
         cache_hits = command_evidence["graph_executor_plan_cache_hits"]
         cache_misses = command_evidence["graph_executor_plan_cache_misses"]
         if cache_hits + cache_misses != bindings["grad_accum"]:
-            raise ContractError(f"telemetry step {index} command plan has the wrong cache lookup count")
+            raise ContractError(
+                f"telemetry step {index} command plan has the wrong cache lookup count"
+            )
         expected_cache_misses = 1 if index == 0 else 0
         if cache_misses != expected_cache_misses:
-            raise ContractError(f"telemetry step {index} command plan has an unexpected cache miss count")
+            raise ContractError(
+                f"telemetry step {index} command plan has an unexpected cache miss count"
+            )
         plan_was_built = cache_misses != 0
-        if ((phase_evidence["graph_executor_plan_build_ns"] != 0) != plan_was_built or
-                (phase_evidence["graph_executor_buffer_plan_build_ns"] != 0) != plan_was_built):
-            raise ContractError(f"telemetry step {index} plan-build phases differ from cache evidence")
+        if (phase_evidence["graph_executor_plan_build_ns"] != 0) != plan_was_built or (
+            phase_evidence["graph_executor_buffer_plan_build_ns"] != 0
+        ) != plan_was_built:
+            raise ContractError(
+                f"telemetry step {index} plan-build phases differ from cache evidence"
+            )
 
     if steps[0]["duration_ns"] != timings["cold_compile_and_step_ns"]:
-        raise ContractError("telemetry cold summary differs from the optimizer-step record")
+        raise ContractError(
+            "telemetry cold summary differs from the optimizer-step record"
+        )
     if steps[1]["duration_ns"] != timings["first_steady_step_ns"]:
-        raise ContractError("telemetry first-steady summary differs from the optimizer-step record")
-    if [step["duration_ns"] for step in steps[warmup_start:measured_start]] != warmup_durations:
-        raise ContractError("telemetry warmup summary differs from the optimizer-step records")
+        raise ContractError(
+            "telemetry first-steady summary differs from the optimizer-step record"
+        )
+    if [
+        step["duration_ns"] for step in steps[warmup_start:measured_start]
+    ] != warmup_durations:
+        raise ContractError(
+            "telemetry warmup summary differs from the optimizer-step records"
+        )
     if [step["duration_ns"] for step in steps[measured_start:]] != measured_durations:
-        raise ContractError("telemetry measured summary differs from the optimizer-step records")
+        raise ContractError(
+            "telemetry measured summary differs from the optimizer-step records"
+        )
 
     memory = _mapping(telemetry["memory"], "telemetry.memory")
     _exact_keys(memory, ("peak_bytes", "source"), "telemetry.memory")
     _integer(memory["peak_bytes"], "telemetry.memory.peak_bytes", 1)
     if memory["source"] != PEAK_MEMORY_SOURCE:
-        raise ContractError("telemetry peak memory is not Darwin lifetime maximum physical footprint")
+        raise ContractError(
+            "telemetry peak memory is not Darwin lifetime maximum physical footprint"
+        )
     return telemetry
 
 
-def _atomic_publish_sample(output: Path, payload: Mapping[str, Any], lock: Mapping[str, Any], lock_path: Path) -> None:
+def _atomic_publish_sample(
+    output: Path, payload: Mapping[str, Any], lock: Mapping[str, Any], lock_path: Path
+) -> None:
     target = output.expanduser().resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists():
-        raise ContractError(f"refusing to replace existing benchmark evidence: {target}")
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.staging-", dir=target.parent)
+        raise ContractError(
+            f"refusing to replace existing benchmark evidence: {target}"
+        )
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.staging-", dir=target.parent
+    )
     temporary = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "wb") as staging:
             os.fchmod(staging.fileno(), 0o644)
-            data = (json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n").encode("utf-8")
+            data = (
+                json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
+            ).encode("utf-8")
             staging.write(data)
             staging.flush()
             os.fsync(staging.fileno())
@@ -1060,7 +1306,9 @@ def _atomic_publish_sample(output: Path, payload: Mapping[str, Any], lock: Mappi
         try:
             os.link(temporary, target)
         except FileExistsError as exc:
-            raise ContractError(f"refusing to replace existing benchmark evidence: {target}") from exc
+            raise ContractError(
+                f"refusing to replace existing benchmark evidence: {target}"
+            ) from exc
         directory_fd = os.open(target.parent, os.O_RDONLY)
         try:
             os.fsync(directory_fd)
@@ -1075,12 +1323,16 @@ def _atomic_publish_diagnostic(output: Path, payload: Mapping[str, Any]) -> None
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists():
         raise ContractError(f"refusing to replace existing diagnostic output: {target}")
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.staging-", dir=target.parent)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.staging-", dir=target.parent
+    )
     temporary = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "wb") as staging:
             os.fchmod(staging.fileno(), 0o644)
-            data = (json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n").encode("utf-8")
+            data = (
+                json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
+            ).encode("utf-8")
             staging.write(data)
             staging.flush()
             os.fsync(staging.fileno())
@@ -1088,7 +1340,9 @@ def _atomic_publish_diagnostic(output: Path, payload: Mapping[str, Any]) -> None
         try:
             os.link(temporary, target)
         except FileExistsError as exc:
-            raise ContractError(f"refusing to replace existing diagnostic output: {target}") from exc
+            raise ContractError(
+                f"refusing to replace existing diagnostic output: {target}"
+            ) from exc
         directory_fd = os.open(target.parent, os.O_RDONLY)
         try:
             os.fsync(directory_fd)
@@ -1152,8 +1406,14 @@ def assemble_sample(
 ) -> dict[str, Any]:
     """Central sample assembly point; telemetry validation happens beforehand."""
     timings = _mapping(telemetry["timings"], "telemetry.timings")
-    if child.process_memory is None or child.system_deltas is None or child.measurement_error is not None:
-        raise ContractError(f"required process/system memory evidence is unavailable: {child.measurement_error}")
+    if (
+        child.process_memory is None
+        or child.system_deltas is None
+        or child.measurement_error is not None
+    ):
+        raise ContractError(
+            f"required process/system memory evidence is unavailable: {child.measurement_error}"
+        )
     case = _case_payload(args, model, adapter, train)
     return {
         "schema_version": BENCHMARK_SAMPLE_SCHEMA_VERSION,
@@ -1180,9 +1440,13 @@ def assemble_sample(
         "protocol": dict(protocol),
         "metrics": {
             "load_seconds": timings["load_ns"] / 1_000_000_000,
-            "cold_compile_and_step_seconds": timings["cold_compile_and_step_ns"] / 1_000_000_000,
-            "first_steady_step_seconds": timings["first_steady_step_ns"] / 1_000_000_000,
-            "step_seconds": [duration / 1_000_000_000 for duration in timings["measured_step_ns"]],
+            "cold_compile_and_step_seconds": timings["cold_compile_and_step_ns"]
+            / 1_000_000_000,
+            "first_steady_step_seconds": timings["first_steady_step_ns"]
+            / 1_000_000_000,
+            "step_seconds": [
+                duration / 1_000_000_000 for duration in timings["measured_step_ns"]
+            ],
             "input_tokens": train.input_tokens,
             "supervised_tokens": train.supervised_tokens,
             "execution_evidence": {
@@ -1230,9 +1494,21 @@ def validate_diagnostic_payload(raw: Mapping[str, Any]) -> dict[str, Any]:
     _exact_keys(
         payload,
         (
-            "schema_version", "framework", "oracle_lock_sha256", "campaign_id", "run_id",
-            "repetition", "sequence_index", "diagnostic", "implementation", "process",
-            "hardware", "case", "semantic_contract", "protocol", "metrics",
+            "schema_version",
+            "framework",
+            "oracle_lock_sha256",
+            "campaign_id",
+            "run_id",
+            "repetition",
+            "sequence_index",
+            "diagnostic",
+            "implementation",
+            "process",
+            "hardware",
+            "case",
+            "semantic_contract",
+            "protocol",
+            "metrics",
         ),
         "Antfly diagnostic payload",
     )
@@ -1244,8 +1520,11 @@ def validate_diagnostic_payload(raw: Mapping[str, Any]) -> dict[str, Any]:
     _exact_keys(
         diagnostic,
         (
-            "release_eligible", "release_gates_enforced", "release_blockers",
-            "publication_contract", "environment_overrides",
+            "release_eligible",
+            "release_gates_enforced",
+            "release_blockers",
+            "publication_contract",
+            "environment_overrides",
         ),
         "Antfly diagnostic payload.diagnostic",
     )
@@ -1262,7 +1541,9 @@ def validate_diagnostic_payload(raw: Mapping[str, Any]) -> dict[str, Any]:
         "Antfly diagnostic payload.diagnostic.environment_overrides",
     )
 
-    implementation = _mapping(payload["implementation"], "Antfly diagnostic implementation")
+    implementation = _mapping(
+        payload["implementation"], "Antfly diagnostic implementation"
+    )
     producer = _mapping(
         implementation.get("producer_source"),
         "Antfly diagnostic implementation.producer_source",
@@ -1270,25 +1551,43 @@ def validate_diagnostic_payload(raw: Mapping[str, Any]) -> dict[str, Any]:
     _exact_keys(
         producer,
         (
-            "schema_version", "relative_path", "source_revision", "source_tree", "source_clean",
-            "working_tree_status_sha256", "files", "dirty_entry_count", "source_sha256",
+            "schema_version",
+            "relative_path",
+            "source_revision",
+            "source_tree",
+            "source_clean",
+            "working_tree_status_sha256",
+            "files",
+            "dirty_entry_count",
+            "source_sha256",
             "manifest_sha256",
         ),
         "Antfly diagnostic producer source",
     )
     if producer["schema_version"] != DIAGNOSTIC_SOURCE_SCHEMA_VERSION:
-        raise ContractError("Antfly diagnostic payload omitted diagnostic source identity")
+        raise ContractError(
+            "Antfly diagnostic payload omitted diagnostic source identity"
+        )
     if producer["relative_path"] != ANTFLY_RUNNER_RELATIVE_PATH:
         raise ContractError("Antfly diagnostic payload producer entrypoint differs")
     if not isinstance(producer["source_clean"], bool):
-        raise ContractError("Antfly diagnostic producer source cleanliness is not boolean")
-    if not isinstance(producer["dirty_entry_count"], int) or producer["dirty_entry_count"] < 0:
+        raise ContractError(
+            "Antfly diagnostic producer source cleanliness is not boolean"
+        )
+    if (
+        not isinstance(producer["dirty_entry_count"], int)
+        or producer["dirty_entry_count"] < 0
+    ):
         raise ContractError("Antfly diagnostic producer dirty-entry count is invalid")
     if _SHA256.fullmatch(str(producer["working_tree_status_sha256"])) is None:
         raise ContractError("Antfly diagnostic producer status digest is malformed")
-    antfly = _mapping(implementation.get("antfly"), "Antfly diagnostic implementation.antfly")
+    antfly = _mapping(
+        implementation.get("antfly"), "Antfly diagnostic implementation.antfly"
+    )
     if antfly.get("source_clean") is not producer["source_clean"]:
-        raise ContractError("Antfly diagnostic implementation source cleanliness differs")
+        raise ContractError(
+            "Antfly diagnostic implementation source cleanliness differs"
+        )
 
     manifest_input = {
         "relative_path": producer["relative_path"],
@@ -1298,7 +1597,9 @@ def validate_diagnostic_payload(raw: Mapping[str, Any]) -> dict[str, Any]:
         "working_tree_status_sha256": producer["working_tree_status_sha256"],
         "files": producer["files"],
     }
-    if producer["manifest_sha256"] != _diagnostic_source_manifest_sha256(manifest_input):
+    if producer["manifest_sha256"] != _diagnostic_source_manifest_sha256(
+        manifest_input
+    ):
         raise ContractError("Antfly diagnostic producer manifest digest differs")
     return payload
 
@@ -1313,7 +1614,9 @@ def _validate_diagnostic_environment_mapping(
         if not isinstance(name, str) or _TERMITE_ENV_NAME.fullmatch(name) is None:
             raise ContractError(f"{where}: only TERMITE_[A-Z0-9_]+ names are allowed")
         if name in STRICT_METAL_ENV:
-            raise ContractError(f"{where}: cannot replace locked strict-Metal variable {name}")
+            raise ContractError(
+                f"{where}: cannot replace locked strict-Metal variable {name}"
+            )
         if not isinstance(value, str) or "\x00" in value:
             raise ContractError(f"{where}.{name}: expected a NUL-free string")
         result[name] = value
@@ -1359,13 +1662,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             expected_entrypoint=ANTFLY_RUNNER_RELATIVE_PATH,
         )
         if producer_source["source_revision"] != source_revision:
-            raise ContractError("Antfly wrapper provenance differs from the executable source checkout")
+            raise ContractError(
+                "Antfly wrapper provenance differs from the executable source checkout"
+            )
 
     gate = _mapping(lock["performance_gate"], "performance_gate")
     if args.sequence_length not in gate["primary_sequence_lengths"]:
         raise ContractError("sequence length is outside the locked performance matrix")
     if args.grad_accum not in gate["gradient_accumulation"]:
-        raise ContractError("gradient accumulation is outside the locked performance matrix")
+        raise ContractError(
+            "gradient accumulation is outside the locked performance matrix"
+        )
     if args.target_preset not in ("peft-qv", "text-all-linear"):
         raise ContractError("target preset is outside the locked performance matrix")
 
@@ -1378,17 +1685,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         example_index=args.example_index,
         source_dataset=args.train_source_dataset,
     )
-    eval_summary, _eval_example = load_prepared_example(args.eval_prepared.expanduser().resolve(strict=True), 0)
+    eval_summary, _eval_example = load_prepared_example(
+        args.eval_prepared.expanduser().resolve(strict=True), 0
+    )
     verify_prepared_source_dataset(eval_summary, args.eval_source_dataset)
-    eval_artifact_sha = prefixed_sha256(args.eval_prepared.expanduser().resolve(strict=True))
+    eval_artifact_sha = prefixed_sha256(
+        args.eval_prepared.expanduser().resolve(strict=True)
+    )
     eval_info = args.eval_prepared.expanduser().resolve(strict=True).stat()
-    eval_snapshot = ((
-        args.eval_prepared.expanduser().resolve(strict=True).name,
-        eval_info.st_dev,
-        eval_info.st_ino,
-        eval_info.st_size,
-        eval_info.st_mtime_ns,
-    ),)
+    eval_snapshot = (
+        (
+            args.eval_prepared.expanduser().resolve(strict=True).name,
+            eval_info.st_dev,
+            eval_info.st_ino,
+            eval_info.st_size,
+            eval_info.st_mtime_ns,
+        ),
+    )
     adapter = adapter_binding(
         args.adapter_dir,
         lock,
@@ -1401,15 +1714,29 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         },
     )
 
-    provenance_triplet = (train.base_model_sha256, train.tokenizer_sha256, train.chat_template_sha256)
-    if provenance_triplet != (adapter.base_model_sha256, adapter.tokenizer_sha256, adapter.chat_template_sha256):
+    provenance_triplet = (
+        train.base_model_sha256,
+        train.tokenizer_sha256,
+        train.chat_template_sha256,
+    )
+    if provenance_triplet != (
+        adapter.base_model_sha256,
+        adapter.tokenizer_sha256,
+        adapter.chat_template_sha256,
+    ):
         raise ContractError("training prepared artifact and adapter provenance differ")
     if provenance_triplet != (
-        eval_summary["base_model_sha256"], eval_summary["tokenizer_sha256"], eval_summary["chat_template_sha256"],
+        eval_summary["base_model_sha256"],
+        eval_summary["tokenizer_sha256"],
+        eval_summary["chat_template_sha256"],
     ):
-        raise ContractError("training and evaluation prepared artifacts have different model provenance")
+        raise ContractError(
+            "training and evaluation prepared artifacts have different model provenance"
+        )
     if train.case["source_dataset_sha256"] == eval_summary["source_dataset_sha256"]:
-        raise ContractError("benchmark train and evaluation prepared artifacts must come from disjoint sources")
+        raise ContractError(
+            "benchmark train and evaluation prepared artifacts must come from disjoint sources"
+        )
 
     hardware = _host_identity(args.metal_device)
     protocol = {
@@ -1463,8 +1790,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     output = args.output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists():
-        raise ContractError(f"refusing to replace existing benchmark evidence: {output}")
-    with tempfile.TemporaryDirectory(prefix=".antfly-gemma4-bench-", dir=output.parent) as temporary_name:
+        raise ContractError(
+            f"refusing to replace existing benchmark evidence: {output}"
+        )
+    with tempfile.TemporaryDirectory(
+        prefix=".antfly-gemma4-bench-", dir=output.parent
+    ) as temporary_name:
         temporary = Path(temporary_name)
         request_path = temporary / "request.json"
         telemetry_path = temporary / "telemetry.json"
@@ -1482,32 +1813,52 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         training_contract = _mapping(lock["training_contract"], "training_contract")
         command = [
-            str(executable), "inference", "finetune", "train", "gemma4-lora",
-            "--model", str(Path(model["directory"])),
-            "--adapter", str(args.adapter_dir.expanduser().resolve(strict=True)),
-            "--train-prepared", str(args.train_prepared.expanduser().resolve(strict=True)),
-            "--eval-prepared", str(args.eval_prepared.expanduser().resolve(strict=True)),
-            "--out", str(run_output),
-            "--backend", "metal",
-            "--trainer", "autodiff",
-            "--lr", str(training_contract["learning_rate"]),
-            "--max-grad-norm", str(training_contract["max_grad_norm"]),
-            "--seed", str(training_contract["seed"]),
-            "--max-examples", str(args.grad_accum),
-            "--eval-max-examples", "1",
-            "--grad-accum", str(args.grad_accum),
-            "--epochs", str(step_count),
-            "--benchmark-request", str(request_path),
-            "--benchmark-telemetry-out", str(telemetry_path),
+            str(executable),
+            "inference",
+            "finetune",
+            "train",
+            "gemma4-lora",
+            "--model",
+            str(Path(model["directory"])),
+            "--adapter",
+            str(args.adapter_dir.expanduser().resolve(strict=True)),
+            "--train-prepared",
+            str(args.train_prepared.expanduser().resolve(strict=True)),
+            "--eval-prepared",
+            str(args.eval_prepared.expanduser().resolve(strict=True)),
+            "--out",
+            str(run_output),
+            "--backend",
+            "metal",
+            "--trainer",
+            "autodiff",
+            "--lr",
+            str(training_contract["learning_rate"]),
+            "--max-grad-norm",
+            str(training_contract["max_grad_norm"]),
+            "--seed",
+            str(training_contract["seed"]),
+            "--max-examples",
+            str(args.grad_accum),
+            "--eval-max-examples",
+            "1",
+            "--grad-accum",
+            str(args.grad_accum),
+            "--epochs",
+            str(step_count),
+            "--benchmark-request",
+            str(request_path),
+            "--benchmark-telemetry-out",
+            str(telemetry_path),
         ]
         command_identity = {
-                "argv": command,
-                "strict_environment": STRICT_METAL_ENV,
-                "measurement_control": MEASUREMENT_CONTROL,
-                "request_sha256": request_sha,
-                "initial_adapter_semantic_sha256": adapter.semantic_sha256,
-                "train_prepared_sha256": train.artifact_sha256,
-                "eval_prepared_sha256": eval_artifact_sha,
+            "argv": command,
+            "strict_environment": STRICT_METAL_ENV,
+            "measurement_control": MEASUREMENT_CONTROL,
+            "request_sha256": request_sha,
+            "initial_adapter_semantic_sha256": adapter.semantic_sha256,
+            "train_prepared_sha256": train.artifact_sha256,
+            "eval_prepared_sha256": eval_artifact_sha,
         }
         if environment_overrides:
             command_identity["diagnostic_environment_overrides"] = environment_overrides
@@ -1540,7 +1891,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             suffix = f"\nchild stderr tail:\n{detail}" if detail else ""
             raise BenchmarkInterfaceUnavailable(
                 "Antfly did not complete and publish the required benchmark telemetry; "
-                "no sample was emitted. Required Zig change: " + REQUIRED_ZIG_CHANGE + suffix
+                "no sample was emitted. Required Zig change: "
+                + REQUIRED_ZIG_CHANGE
+                + suffix
             )
         telemetry = _validate_telemetry(
             telemetry_path,
@@ -1550,7 +1903,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             pid=child.pid,
         )
         if child.measurement_error is not None:
-            raise ContractError(f"benchmark measurement control failed closed: {child.measurement_error}")
+            raise ContractError(
+                f"benchmark measurement control failed closed: {child.measurement_error}"
+            )
         assert child.system_deltas is not None
         if not args.diagnostic_only:
             enforce_system_memory_gates(lock, child.system_deltas)
@@ -1560,17 +1915,29 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         # timestamp snapshots avoid hashing multi-gigabyte weights twice.
         if prefixed_sha256(executable) != executable_sha:
             raise ContractError("Antfly executable changed during the benchmark")
-        _assert_snapshot_unchanged(Path(model["directory"]), model_snapshot, "locked model artifact")
-        _assert_snapshot_unchanged(args.adapter_dir, adapter.snapshot, "adapter artifact")
-        _assert_file_snapshot_unchanged(args.train_prepared, train.snapshot, "training prepared artifact")
-        _assert_file_snapshot_unchanged(args.eval_prepared, eval_snapshot, "evaluation prepared artifact")
+        _assert_snapshot_unchanged(
+            Path(model["directory"]), model_snapshot, "locked model artifact"
+        )
+        _assert_snapshot_unchanged(
+            args.adapter_dir, adapter.snapshot, "adapter artifact"
+        )
+        _assert_file_snapshot_unchanged(
+            args.train_prepared, train.snapshot, "training prepared artifact"
+        )
+        _assert_file_snapshot_unchanged(
+            args.eval_prepared, eval_snapshot, "evaluation prepared artifact"
+        )
         if args.diagnostic_only:
             if diagnostic_producer_source(source_root) != producer_source:
-                raise ContractError("Antfly diagnostic producer source changed during the benchmark")
+                raise ContractError(
+                    "Antfly diagnostic producer source changed during the benchmark"
+                )
         else:
             _, source_revision_after = source_identity(source_root)
             if source_revision_after != source_revision:
-                raise ContractError("Antfly source revision changed during the benchmark")
+                raise ContractError(
+                    "Antfly source revision changed during the benchmark"
+                )
 
         sample = assemble_sample(
             args=args,
@@ -1602,14 +1969,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--lock", type=Path, default=LOCK_PATH)
-    result.add_argument("--antfly", type=Path, required=True, help="installed Antfly executable")
+    result.add_argument(
+        "--antfly", type=Path, required=True, help="installed Antfly executable"
+    )
     result.add_argument(
         "--source-root",
         type=Path,
         required=True,
         help="source checkout used to build the executable; must be clean unless --diagnostic-only is set",
     )
-    result.add_argument("--model-key", required=True, choices=("gemma-4-E2B-it", "gemma-4-E4B-it"))
+    result.add_argument(
+        "--model-key", required=True, choices=("gemma-4-E2B-it", "gemma-4-E4B-it")
+    )
     result.add_argument("--model-dir", type=Path, required=True)
     result.add_argument("--adapter-dir", type=Path, required=True)
     result.add_argument("--train-prepared", type=Path, required=True)
@@ -1617,8 +1988,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--example-index", required=True, type=int)
     result.add_argument("--train-source-dataset", type=Path)
     result.add_argument("--eval-source-dataset", type=Path)
-    result.add_argument("--target-preset", required=True, choices=("peft-qv", "text-all-linear"))
-    result.add_argument("--sequence-length", required=True, type=int, choices=(128, 512, 2048))
+    result.add_argument(
+        "--target-preset", required=True, choices=("peft-qv", "text-all-linear")
+    )
+    result.add_argument(
+        "--sequence-length", required=True, type=int, choices=(128, 512, 2048)
+    )
     result.add_argument("--grad-accum", required=True, type=int, choices=(1, 4))
     result.add_argument("--campaign-id", required=True)
     result.add_argument("--run-id", required=True)
@@ -1651,7 +2026,12 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
-        if args.repetition < 0 or args.sequence_index < 0 or args.example_index < 0 or args.timeout_seconds <= 0:
+        if (
+            args.repetition < 0
+            or args.sequence_index < 0
+            or args.example_index < 0
+            or args.timeout_seconds <= 0
+        ):
             raise ContractError(
                 "repetition/sequence-index/example-index must be non-negative and timeout must be positive"
             )

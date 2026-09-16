@@ -19,7 +19,9 @@ class FakeTokenizer:
 
     def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
         if add_special_tokens:
-            raise AssertionError("parity tokenization must not add hidden special tokens")
+            raise AssertionError(
+                "parity tokenization must not add hidden special tokens"
+            )
         return self.values[text]
 
 
@@ -51,9 +53,7 @@ class Gemma4DpoHfMaterializerTest(unittest.TestCase):
         self.assertEqual(
             "<bos><|turn>user\nAnswer with one word: yes or no?"
             "<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
-            materializer.render_gemma4_user_prompt(
-                materializer.CONTRACT_PROBE_PROMPT
-            ),
+            materializer.render_gemma4_user_prompt(materializer.CONTRACT_PROBE_PROMPT),
         )
 
     def test_selection_is_stratified_then_restored_to_source_order(self) -> None:
@@ -69,7 +69,9 @@ class Gemma4DpoHfMaterializerTest(unittest.TestCase):
             candidates, sequence_length=512
         )
         self.assertEqual([3, 4, 7, 8, 11], [item.source_row_index for item in selected])
-        self.assertEqual([70, 250, 170, 370, 450], [item.total_tokens for item in selected])
+        self.assertEqual(
+            [70, 250, 170, 370, 450], [item.total_tokens for item in selected]
+        )
 
     def test_selection_rejects_weak_or_unbalanced_preferences(self) -> None:
         self.assertFalse(
@@ -191,7 +193,9 @@ class Gemma4DpoHfMaterializerTest(unittest.TestCase):
             (model / "tokenizer.json").write_text("{}", encoding="utf-8")
             (model / "tokenizer_config.json").write_text("{}", encoding="utf-8")
             selected = [
-                example(row=index, prompt_tokens=40, chosen_tokens=32, rejected_tokens=32)
+                example(
+                    row=index, prompt_tokens=40, chosen_tokens=32, rejected_tokens=32
+                )
                 for index in range(5)
             ]
             output = root / "out"
@@ -211,7 +215,9 @@ class Gemma4DpoHfMaterializerTest(unittest.TestCase):
                 manifest["dataset"]["source_file_sha256"],
             )
             self.assertEqual("gemma-4-E2B-it", manifest["model_key"])
-            self.assertEqual(5, len(json.loads((output / "mlx_case.json").read_text())["examples"]))
+            self.assertEqual(
+                5, len(json.loads((output / "mlx_case.json").read_text())["examples"])
+            )
 
             e4_output = root / "e4-out"
             e4_manifest = materializer.write_outputs(

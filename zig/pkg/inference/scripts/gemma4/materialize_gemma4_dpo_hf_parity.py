@@ -9,6 +9,8 @@ the optional materialization dependencies.
 
 from __future__ import annotations
 
+from gemma4_files import sha256_file
+
 import argparse
 import hashlib
 import json
@@ -22,9 +24,7 @@ from typing import Any, Iterable, Mapping, Sequence
 SCRIPT_PATH = Path(__file__).resolve()
 SCRIPT_DIR = SCRIPT_PATH.parent
 DEFAULT_TOKENIZER_CONTRACT = (
-    SCRIPT_DIR.parent.parent
-    / "testdata"
-    / "gemma4_dpo_e2b_seq128_benchmark.json"
+    SCRIPT_DIR.parent.parent / "testdata" / "gemma4_dpo_e2b_seq128_benchmark.json"
 )
 OUTPUT_SCHEMA_VERSION = "antfly_gemma4_dpo_benchmark_dataset/v1"
 MANIFEST_SCHEMA_VERSION = "antfly.hf_dpo_parity_materialization/v1"
@@ -59,14 +59,6 @@ class TokenizedPreference:
         return len(self.prompt_token_ids) + max(
             len(self.chosen_token_ids), len(self.rejected_token_ids)
         )
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def canonical_sha256(payload: Mapping[str, Any]) -> str:
@@ -132,7 +124,9 @@ def tokenize_source_row(
     chosen_ids = tuple(tokenizer.encode(chosen_text, add_special_tokens=False))
     rejected_ids = tuple(tokenizer.encode(rejected_text, add_special_tokens=False))
     if not prompt_ids or not chosen_ids or not rejected_ids:
-        raise MaterializationError(f"row {source_row_index} tokenized to an empty field")
+        raise MaterializationError(
+            f"row {source_row_index} tokenized to an empty field"
+        )
     return TokenizedPreference(
         source_row_index=source_row_index,
         source_id=source_id,
@@ -217,8 +211,12 @@ def validate_tokenizer_contract(tokenizer: Any, path: Path) -> None:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise MaterializationError(f"could not read tokenizer contract: {exc}") from exc
-    if payload.get("rendered_prompt") != render_gemma4_user_prompt(CONTRACT_PROBE_PROMPT):
-        raise MaterializationError("Gemma4 prompt renderer drifted from the locked case")
+    if payload.get("rendered_prompt") != render_gemma4_user_prompt(
+        CONTRACT_PROBE_PROMPT
+    ):
+        raise MaterializationError(
+            "Gemma4 prompt renderer drifted from the locked case"
+        )
     checks = (
         (
             payload["rendered_prompt"],
@@ -293,7 +291,9 @@ def write_outputs(
                 },
             }
             handle.write(
-                json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                json.dumps(
+                    row, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                )
                 + "\n"
             )
 
@@ -356,14 +356,15 @@ def write_outputs(
         encoding="utf-8",
     )
 
-    tokenizer_files = [model_dir / "tokenizer.json", model_dir / "tokenizer_config.json"]
+    tokenizer_files = [
+        model_dir / "tokenizer.json",
+        model_dir / "tokenizer_config.json",
+    ]
     manifest = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "dataset": case_payload["dataset"],
         "model_dir": str(model_dir),
-        "tokenizer_files": {
-            path.name: sha256_file(path) for path in tokenizer_files
-        },
+        "tokenizer_files": {path.name: sha256_file(path) for path in tokenizer_files},
         "sequence_length": sequence_length,
         "model_key": model_key,
         "selected_source_row_indices": [item.source_row_index for item in examples],
@@ -383,11 +384,15 @@ def write_outputs(
 
 def materialize(args: argparse.Namespace) -> dict[str, Any]:
     if args.dataset_id != EXPECTED_DATASET_ID or args.split != EXPECTED_SPLIT:
-        raise MaterializationError("this parity contract is locked to UltraFeedback test_prefs")
+        raise MaterializationError(
+            "this parity contract is locked to UltraFeedback test_prefs"
+        )
     if not re.fullmatch(r"[0-9a-f]{40}", args.revision):
         raise MaterializationError("revision must be a full lowercase Git commit")
     if args.sequence_length != 512:
-        raise MaterializationError("the real-data parity contract requires sequence_length=512")
+        raise MaterializationError(
+            "the real-data parity contract requires sequence_length=512"
+        )
     if args.bucket_occurrence < 0:
         raise MaterializationError("bucket occurrence must be nonnegative")
 

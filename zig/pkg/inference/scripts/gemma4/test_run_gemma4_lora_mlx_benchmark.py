@@ -35,7 +35,7 @@ from run_gemma4_lora_mlx_benchmark import (
     DIAGNOSTIC_SAMPLE_SCHEMA_VERSION,
     DIAGNOSTIC_SOURCE_SCHEMA_VERSION,
     OFFLINE_ENVIRONMENT,
-    PREPARED_CHAT_TEMPLATE_IDENTITY,
+    PREPARED_CHAT_TEMPLATE_PATH,
     AdapterArtifact,
     AdapterTensor,
     DarwinProcessMemorySampler,
@@ -120,7 +120,9 @@ class Gemma4MlxRunnerTest(unittest.TestCase):
         }
 
     @staticmethod
-    def write_safetensors(path: Path, tensors: list[tuple[str, tuple[int, int], list[float]]]) -> None:
+    def write_safetensors(
+        path: Path, tensors: list[tuple[str, tuple[int, int], list[float]]]
+    ) -> None:
         offset = 0
         header: dict[str, dict] = {}
         payload = bytearray()
@@ -209,8 +211,10 @@ class Gemma4MlxRunnerTest(unittest.TestCase):
         return recorder.finalize()
 
     def test_import_does_not_require_mlx(self) -> None:
-        source = Path(__file__).with_name("run_gemma4_lora_mlx_benchmark.py").read_text(
-            encoding="utf-8"
+        source = (
+            Path(__file__)
+            .with_name("run_gemma4_lora_mlx_benchmark.py")
+            .read_text(encoding="utf-8")
         )
         prefix = source.split("def verify_mlx_environment", 1)[0]
         self.assertNotIn("import mlx\n", prefix)
@@ -225,7 +229,10 @@ class Gemma4MlxRunnerTest(unittest.TestCase):
                 os.environ[name] = "0"
             os.environ["DYLD_LIBRARY_PATH"] = "/untrusted"
             force_offline_environment()
-            self.assertEqual(OFFLINE_ENVIRONMENT, {name: os.environ[name] for name in OFFLINE_ENVIRONMENT})
+            self.assertEqual(
+                OFFLINE_ENVIRONMENT,
+                {name: os.environ[name] for name in OFFLINE_ENVIRONMENT},
+            )
             self.assertNotIn("DYLD_LIBRARY_PATH", os.environ)
             self.assertTrue(sys.dont_write_bytecode)
         finally:
@@ -240,7 +247,9 @@ class Gemma4MlxRunnerTest(unittest.TestCase):
                 else:
                     os.environ[name] = value
 
-    def test_workload_binds_all_gradient_accumulation_rows_and_causal_tokens(self) -> None:
+    def test_workload_binds_all_gradient_accumulation_rows_and_causal_tokens(
+        self,
+    ) -> None:
         workload = build_workload(
             {"input_ids": [7, 8, 9, 10], "labels": [-100, -100, 9, 10]},
             sequence_length=4,
@@ -257,7 +266,9 @@ class Gemma4MlxRunnerTest(unittest.TestCase):
         )
         self.assertNotEqual(workload.digest, changed.digest)
 
-    def test_workload_rejects_padding_truncation_and_empty_causal_supervision(self) -> None:
+    def test_workload_rejects_padding_truncation_and_empty_causal_supervision(
+        self,
+    ) -> None:
         with self.assertRaisesRegex(ContractError, "may not pad or truncate"):
             build_workload(
                 {"input_ids": [1, 2], "labels": [-100, 2]},
@@ -271,7 +282,9 @@ class Gemma4MlxRunnerTest(unittest.TestCase):
                 grad_accum=1,
             )
 
-    def test_measurement_executes_compile_first_warmup_and_exact_measured_steps(self) -> None:
+    def test_measurement_executes_compile_first_warmup_and_exact_measured_steps(
+        self,
+    ) -> None:
         calls = {"execute": 0, "sync": 0, "clock": 0}
         boundaries: list[tuple[str, int]] = []
 
@@ -294,7 +307,9 @@ class Gemma4MlxRunnerTest(unittest.TestCase):
             measured_steps=20,
             clock=clock,
             result_is_finite=lambda value: value == 1.0,
-            after_cold=lambda _value: boundaries.append(("cold-audit", calls["execute"])),
+            after_cold=lambda _value: boundaries.append(
+                ("cold-audit", calls["execute"])
+            ),
             before_measured=lambda: boundaries.append(("start", calls["execute"])),
             after_measured=lambda: boundaries.append(("end", calls["execute"])),
         )
@@ -363,7 +378,9 @@ class Gemma4MlxRunnerTest(unittest.TestCase):
                 tree_flatten_fn=lambda value: value,
             )
 
-    def test_optimizer_state_audit_rejects_missing_extra_misnamed_and_wrong_shape(self) -> None:
+    def test_optimizer_state_audit_rejects_missing_extra_misnamed_and_wrong_shape(
+        self,
+    ) -> None:
         class Array:
             def __init__(self, dtype: object, shape: tuple[int, ...] = (2, 2)) -> None:
                 self.dtype = dtype
@@ -384,16 +401,35 @@ class Gemma4MlxRunnerTest(unittest.TestCase):
         mutations = (
             ("missing", valid[:-1], "inventory drift"),
             ("extra", [*valid, ("extra", Array("f32"))], "inventory drift"),
-            ("misnamed", [*valid[:2], ("a.m", Array("f32")), ("a.velocity", Array("f32"))], "inventory drift"),
-            ("shape", [*valid[:2], ("a.m", Array("f32", (1, 4))), ("a.v", Array("f32"))], "shape differs"),
-            ("learning-rate", [("step", Array("u64", ())), ("learning_rate", Array("bf16", ())), *valid[2:]], "learning-rate state"),
+            (
+                "misnamed",
+                [*valid[:2], ("a.m", Array("f32")), ("a.velocity", Array("f32"))],
+                "inventory drift",
+            ),
+            (
+                "shape",
+                [*valid[:2], ("a.m", Array("f32", (1, 4))), ("a.v", Array("f32"))],
+                "shape differs",
+            ),
+            (
+                "learning-rate",
+                [
+                    ("step", Array("u64", ())),
+                    ("learning_rate", Array("bf16", ())),
+                    *valid[2:],
+                ],
+                "learning-rate state",
+            ),
         )
         for name, state, message in mutations:
             with self.subTest(name=name):
                 optimizer = argparse.Namespace(state=state)
                 with self.assertRaisesRegex(ContractError, message):
                     require_f32_optimizer_state(
-                        Model(), optimizer, mx, tree_flatten_fn=lambda value: value,
+                        Model(),
+                        optimizer,
+                        mx,
+                        tree_flatten_fn=lambda value: value,
                     )
 
     def test_gradient_inventory_audit_rejects_name_dtype_and_shape_drift(self) -> None:
@@ -429,7 +465,9 @@ class Gemma4MlxRunnerTest(unittest.TestCase):
                         tree_flatten_fn=lambda value: value,
                     )
 
-    def test_precision_recorder_rejects_incomplete_and_changing_observations(self) -> None:
+    def test_precision_recorder_rejects_incomplete_and_changing_observations(
+        self,
+    ) -> None:
         recorder = PrecisionEvidenceRecorder()
         tensor = [{"name": "a", "dtype": "float32", "shape": [1]}]
         recorder.record_gradient("raw", tensor)
@@ -440,7 +478,9 @@ class Gemma4MlxRunnerTest(unittest.TestCase):
                 "raw", [{"name": "a", "dtype": "float32", "shape": [2]}]
             )
 
-    def test_runner_source_attestation_requires_tracked_clean_exact_source(self) -> None:
+    def test_runner_source_attestation_requires_tracked_clean_exact_source(
+        self,
+    ) -> None:
         from unittest.mock import patch
 
         source = self.producer_source()
@@ -473,10 +513,14 @@ class Gemma4MlxRunnerTest(unittest.TestCase):
             def validator(path: Path) -> None:
                 validated.append(json.loads(path.read_text(encoding="utf-8")))
 
-            published = atomic_publish_json(output, {"b": 2, "a": 1}, validator=validator)
+            published = atomic_publish_json(
+                output, {"b": 2, "a": 1}, validator=validator
+            )
             self.assertEqual(output.resolve(), published)
             self.assertEqual([{"a": 1, "b": 2}], validated)
-            self.assertEqual({"a": 1, "b": 2}, json.loads(output.read_text(encoding="utf-8")))
+            self.assertEqual(
+                {"a": 1, "b": 2}, json.loads(output.read_text(encoding="utf-8"))
+            )
             self.assertEqual(0o644, stat.S_IMODE(output.stat().st_mode))
             self.assertEqual([], list(root.glob(".*.tmp")))
             with self.assertRaisesRegex(ContractError, "refusing to replace"):
@@ -498,21 +542,35 @@ class Gemma4MlxRunnerTest(unittest.TestCase):
     def test_zig_model_provenance_binds_model_tokenizer_and_chat_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "config.json").write_text('{"model_type":"gemma4"}\n', encoding="utf-8")
+            (root / "config.json").write_text(
+                '{"model_type":"gemma4"}\n', encoding="utf-8"
+            )
             (root / "model.safetensors").write_bytes(b"model")
             (root / "tokenizer.json").write_bytes(b"tokenizer")
             (root / "tokenizer_config.json").write_bytes(b"config")
             first = zig_model_provenance(root)
             self.assertEqual(
-                hashlib.sha256(PREPARED_CHAT_TEMPLATE_IDENTITY).hexdigest(),
+                hashlib.sha256(PREPARED_CHAT_TEMPLATE_PATH.read_bytes()).hexdigest(),
                 first["chat_template_sha256"],
             )
             require_prepared_model_binding(first, root)
+            changed_renderer = root / "changed-renderer.zig"
+            changed_renderer.write_bytes(
+                PREPARED_CHAT_TEMPLATE_PATH.read_bytes() + b"\n// renderer change\n"
+            )
+            with mock.patch(
+                "run_gemma4_lora_mlx_benchmark.PREPARED_CHAT_TEMPLATE_PATH",
+                changed_renderer,
+            ):
+                with self.assertRaisesRegex(ContractError, "chat_template_sha256"):
+                    require_prepared_model_binding(first, root)
             (root / "model.safetensors").write_bytes(b"changed")
             with self.assertRaisesRegex(ContractError, "base_model_sha256"):
                 require_prepared_model_binding(first, root)
 
-    def test_initial_adapter_inspection_binds_f32_values_and_canonical_pairs(self) -> None:
+    def test_initial_adapter_inspection_binds_f32_values_and_canonical_pairs(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config = {
@@ -524,12 +582,22 @@ class Gemma4MlxRunnerTest(unittest.TestCase):
                 "inference_mode": False,
                 "target_modules": ["q_proj"],
             }
-            (root / "adapter_config.json").write_text(json.dumps(config), encoding="utf-8")
+            (root / "adapter_config.json").write_text(
+                json.dumps(config), encoding="utf-8"
+            )
             self.write_safetensors(
                 root / "adapter_model.safetensors",
                 [
-                    ("base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight", (2, 3), [1.0] * 6),
-                    ("base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight", (4, 2), [0.0] * 8),
+                    (
+                        "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
+                        (2, 3),
+                        [1.0] * 6,
+                    ),
+                    (
+                        "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight",
+                        (4, 2),
+                        [0.0] * 8,
+                    ),
                 ],
             )
             lock = {
@@ -538,8 +606,16 @@ class Gemma4MlxRunnerTest(unittest.TestCase):
             }
             artifact = inspect_initial_adapter(root, lock, "model", "peft-qv", {})
             self.assertEqual(2, len(artifact.tensors))
-            self.assertEqual({"model.layers.0.self_attn.q_proj"}, {key[0] for key in artifact.tensors})
-            self.assertTrue(all(tensor.data_sha256.startswith("sha256:") for tensor in artifact.tensors.values()))
+            self.assertEqual(
+                {"model.layers.0.self_attn.q_proj"},
+                {key[0] for key in artifact.tensors},
+            )
+            self.assertTrue(
+                all(
+                    tensor.data_sha256.startswith("sha256:")
+                    for tensor in artifact.tensors.values()
+                )
+            )
             self.assertEqual(
                 canonical_initial_adapter_sha256(
                     [
@@ -591,8 +667,16 @@ class Gemma4MlxRunnerTest(unittest.TestCase):
             self.write_safetensors(
                 root / "adapter_model.safetensors",
                 [
-                    ("model.layers.0.self_attn.q_proj.weight.lora_A.weight", (2, 3), [1.0] * 6),
-                    ("model.layers.0.self_attn.q_proj.weight.lora_B.weight", (4, 2), [0.0] * 8),
+                    (
+                        "model.layers.0.self_attn.q_proj.weight.lora_A.weight",
+                        (2, 3),
+                        [1.0] * 6,
+                    ),
+                    (
+                        "model.layers.0.self_attn.q_proj.weight.lora_B.weight",
+                        (4, 2),
+                        [0.0] * 8,
+                    ),
                 ],
             )
             semantics = {
@@ -612,7 +696,9 @@ class Gemma4MlxRunnerTest(unittest.TestCase):
                 return_value=semantics,
             ):
                 artifact = inspect_initial_adapter(root, lock, "model", "peft-qv", {})
-            self.assertEqual("antfly-finetune-manifest/v3", artifact.semantics["policy_source"])
+            self.assertEqual(
+                "antfly-finetune-manifest/v3", artifact.semantics["policy_source"]
+            )
             self.assertEqual(
                 {"model.layers.0.self_attn.q_proj"},
                 {module for module, _role in artifact.tensors},
@@ -638,7 +724,9 @@ Swapouts: 3.
 """
         page_size, counters = parse_vm_stat(vm_output)
         self.assertEqual(16384, page_size)
-        self.assertEqual({"Pageins": 100, "Pageouts": 4, "Swapins": 2, "Swapouts": 3}, counters)
+        self.assertEqual(
+            {"Pageins": 100, "Pageouts": 4, "Swapins": 2, "Swapouts": 3}, counters
+        )
         self.assertEqual(
             63.0,
             parse_memory_pressure_available_percent(
@@ -660,7 +748,9 @@ Swapouts: 3.
         with self.assertRaisesRegex(ContractError, "counter regressed"):
             darwin_system_memory_deltas(after, before)
 
-    def test_process_memory_sampler_reports_current_footprint_peak_and_count(self) -> None:
+    def test_process_memory_sampler_reports_current_footprint_peak_and_count(
+        self,
+    ) -> None:
         samples = iter((100, 250, 175))
         observed_pids: list[int] = []
         sampler = DarwinProcessMemorySampler(
@@ -737,7 +827,13 @@ Swapouts: 3.
         self.assertEqual({"worker": "payload"}, payload)
         self.assertEqual(ProcessMemoryMeasurement(1234, 9), process)
         self.assertEqual(-1.0, deltas["pressure_available_percent_delta"])
-        self.assertEqual([unittest.mock.call(before_measured=True), unittest.mock.call(before_measured=False)], snapshot.call_args_list)
+        self.assertEqual(
+            [
+                unittest.mock.call(before_measured=True),
+                unittest.mock.call(before_measured=False),
+            ],
+            snapshot.call_args_list,
+        )
 
     def test_control_channel_fails_closed_on_eof_and_duplicate_fields(self) -> None:
         import socket
@@ -746,8 +842,7 @@ Swapouts: 3.
         receiver = JsonControlChannel(receiver_socket)
         sender_socket.sendall(
             ('{"schema_version":"' + CONTROL_PROTOCOL_VERSION + '",').encode("utf-8")
-            +
-            b'"kind":"phase","kind":"result"}\n'
+            + b'"kind":"phase","kind":"result"}\n'
         )
         with self.assertRaisesRegex(ContractError, "duplicate JSON object key"):
             receiver.receive()
@@ -769,9 +864,7 @@ Swapouts: 3.
     def test_target_selection_requires_exact_locked_inventory(self) -> None:
         lock = {
             "target_presets": {"peft-qv": ["q_proj", "v_proj"]},
-            "target_inventory": {
-                "model": {"peft-qv": {"q_proj": 1, "v_proj": 1}}
-            },
+            "target_inventory": {"model": {"peft-qv": {"q_proj": 1, "v_proj": 1}}},
         }
         model = FakeModel(
             [
@@ -795,7 +888,9 @@ Swapouts: 3.
                 "peft-qv",
             )
 
-    def test_checkpoint_coverage_admits_only_exact_unused_shared_kv_weights(self) -> None:
+    def test_checkpoint_coverage_admits_only_exact_unused_shared_kv_weights(
+        self,
+    ) -> None:
         config = {
             "text_config": {
                 "num_hidden_layers": 3,
@@ -830,7 +925,9 @@ Swapouts: 3.
                 config, used, used | ignored | {"unexpected.weight"}
             )
 
-    def test_native_runtime_attestation_binds_closed_loaded_artifact_inventory(self) -> None:
+    def test_native_runtime_attestation_binds_closed_loaded_artifact_inventory(
+        self,
+    ) -> None:
         from unittest.mock import patch
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -916,12 +1013,16 @@ Swapouts: 3.
                 "attestation_sha256": digest(attestation_path),
                 "bound_paths": [str(attestation_path)],
             }
-            with patch(
-                "run_gemma4_lora_mlx_benchmark.inspect.getfile", return_value=str(core)
-            ), patch(
-                "run_gemma4_lora_mlx_benchmark.loaded_dyld_image_paths",
-                return_value=(core.resolve(), jaccl.resolve(), dylib.resolve()),
-            ) as dyld_images:
+            with (
+                patch(
+                    "run_gemma4_lora_mlx_benchmark.inspect.getfile",
+                    return_value=str(core),
+                ),
+                patch(
+                    "run_gemma4_lora_mlx_benchmark.loaded_dyld_image_paths",
+                    return_value=(core.resolve(), jaccl.resolve(), dylib.resolve()),
+                ) as dyld_images,
+            ):
                 verified = verify_mlx_native_runtime(
                     args,
                     lock,
@@ -929,13 +1030,17 @@ Swapouts: 3.
                     mx,
                     bundle,
                 )
-                self.assertEqual(inventory_sha, verified["native_artifact_inventory"]["sha256"])
+                self.assertEqual(
+                    inventory_sha, verified["native_artifact_inventory"]["sha256"]
+                )
                 self.assertEqual(
                     str(core.resolve()),
                     verified["native_artifact_inventory"]["loaded_core_path"],
                 )
                 (package_root / "lib" / "unbound.dylib").write_bytes(b"extra")
-                with self.assertRaisesRegex(ContractError, "closed four-artifact inventory"):
+                with self.assertRaisesRegex(
+                    ContractError, "closed four-artifact inventory"
+                ):
                     verify_mlx_native_runtime(
                         args,
                         lock,
@@ -972,17 +1077,25 @@ Swapouts: 3.
                         bundle,
                     )
 
-    def test_dyld_image_paths_admit_sealed_system_cache_but_resolve_real_files(self) -> None:
+    def test_dyld_image_paths_admit_sealed_system_cache_but_resolve_real_files(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             real = Path(tmp) / "libmlx.dylib"
             real.write_bytes(b"mlx")
-            self.assertEqual(real.resolve(), canonicalize_loaded_dyld_image_path(str(real), 1))
-        cached = Path("/System/Library/Frameworks/NotARealFramework.framework/NotARealFramework")
+            self.assertEqual(
+                real.resolve(), canonicalize_loaded_dyld_image_path(str(real), 1)
+            )
+        cached = Path(
+            "/System/Library/Frameworks/NotARealFramework.framework/NotARealFramework"
+        )
         self.assertEqual(cached, canonicalize_loaded_dyld_image_path(str(cached), 2))
         with self.assertRaisesRegex(ContractError, "not absolute"):
             canonicalize_loaded_dyld_image_path("relative/libmlx.dylib", 3)
 
-    def test_preimport_build_admission_propagates_missing_forged_and_stale_receipts(self) -> None:
+    def test_preimport_build_admission_propagates_missing_forged_and_stale_receipts(
+        self,
+    ) -> None:
         from unittest.mock import patch
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -991,7 +1104,9 @@ Swapouts: 3.
             mlx_lm = root / "mlx-lm"
             mlx.mkdir()
             mlx_lm.mkdir()
-            args = argparse.Namespace(mlx_build_attestation=mlx / "build" / "antfly-native-build.json")
+            args = argparse.Namespace(
+                mlx_build_attestation=mlx / "build" / "antfly-native-build.json"
+            )
             checkout = {"path": str(mlx), "revision": "a" * 40}
             mlx_lm_checkout = {"path": str(mlx_lm), "revision": "b" * 40}
             for failure in (
@@ -999,12 +1114,16 @@ Swapouts: 3.
                 "forged receipt digest",
                 "stale receipt inputs",
             ):
-                with self.subTest(bundle_failure=failure), patch(
-                    "build_and_attest_gemma4_mlx.ignored_untracked_files",
-                    return_value=(),
-                ), patch(
-                    "build_and_attest_gemma4_mlx.verify_attestation_bundle",
-                    side_effect=ContractError(failure),
+                with (
+                    self.subTest(bundle_failure=failure),
+                    patch(
+                        "build_and_attest_gemma4_mlx.ignored_untracked_files",
+                        return_value=(),
+                    ),
+                    patch(
+                        "build_and_attest_gemma4_mlx.verify_attestation_bundle",
+                        side_effect=ContractError(failure),
+                    ),
                 ):
                     with self.assertRaisesRegex(ContractError, failure):
                         verify_mlx_native_build_before_import(
@@ -1059,26 +1178,31 @@ Swapouts: 3.
         original_path = list(sys.path)
         original_dont_write_bytecode = sys.dont_write_bytecode
         try:
-            with patch.dict(sys.modules, modules), patch(
-                "run_gemma4_lora_mlx_benchmark.verify_source_checkout",
-                side_effect=(
-                    {"path": str(root / "mlx"), "revision": "a" * 40},
-                    {"path": str(root / "mlx-lm"), "revision": "b" * 40},
+            with (
+                patch.dict(sys.modules, modules),
+                patch(
+                    "run_gemma4_lora_mlx_benchmark.verify_source_checkout",
+                    side_effect=(
+                        {"path": str(root / "mlx"), "revision": "a" * 40},
+                        {"path": str(root / "mlx-lm"), "revision": "b" * 40},
+                    ),
                 ),
-            ), patch(
-                "run_gemma4_lora_mlx_benchmark.verify_requirements_match_lock"
-            ), patch(
-                "run_gemma4_lora_mlx_benchmark.verify_packages",
-                return_value={"mlx": "0.31.2", "mlx-lm": "0.31.3"},
-            ), patch(
-                "run_gemma4_lora_mlx_benchmark.verify_mlx_native_build_before_import",
-                side_effect=admit,
-            ), patch(
-                "run_gemma4_lora_mlx_benchmark.verify_import_source"
-            ), patch(
-                "run_gemma4_lora_mlx_benchmark.verify_mlx_native_runtime",
-                return_value={"admitted": True},
-            ), patch("builtins.__import__", side_effect=recording_import):
+                patch("run_gemma4_lora_mlx_benchmark.verify_requirements_match_lock"),
+                patch(
+                    "run_gemma4_lora_mlx_benchmark.verify_packages",
+                    return_value={"mlx": "0.31.2", "mlx-lm": "0.31.3"},
+                ),
+                patch(
+                    "run_gemma4_lora_mlx_benchmark.verify_mlx_native_build_before_import",
+                    side_effect=admit,
+                ),
+                patch("run_gemma4_lora_mlx_benchmark.verify_import_source"),
+                patch(
+                    "run_gemma4_lora_mlx_benchmark.verify_mlx_native_runtime",
+                    return_value={"admitted": True},
+                ),
+                patch("builtins.__import__", side_effect=recording_import),
+            ):
                 environment = verify_mlx_environment(args, lock)
             self.assertTrue(environment["admitted"])
             self.assertEqual("bundle", events[0])
@@ -1190,7 +1314,9 @@ Swapouts: 3.
                 "sha256": "sha256:" + "7" * 64,
             },
         ]
-        native_inventory_sha = canonical_mlx_native_artifact_inventory_sha256(native_artifacts)
+        native_inventory_sha = canonical_mlx_native_artifact_inventory_sha256(
+            native_artifacts
+        )
         environment["native_artifact_inventory"] = {
             "schema_version": "antfly_mlx_native_artifact_inventory/v2",
             "sha256": native_inventory_sha,
@@ -1205,7 +1331,9 @@ Swapouts: 3.
             "source_clean": True,
             "native_artifact_inventory_sha256": native_inventory_sha,
             "build_command_sha256": "sha256:" + "9" * 64,
-            "precision_policy_sha256": lock["mlx_reference"]["native_runtime"]["precision_policy_sha256"],
+            "precision_policy_sha256": lock["mlx_reference"]["native_runtime"][
+                "precision_policy_sha256"
+            ],
         }
         metrics = {
             "load_seconds": 1.0,

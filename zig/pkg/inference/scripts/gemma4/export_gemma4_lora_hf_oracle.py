@@ -72,7 +72,9 @@ def validate_target_preset(
 ) -> str:
     preset = semantics.get("target_preset")
     if preset not in lock["target_presets"]:
-        raise ContractError("adapter_config.json must record peft-qv or text-all-linear")
+        raise ContractError(
+            "adapter_config.json must record peft-qv or text-all-linear"
+        )
     validate_target_inventory(lock, model_key, str(preset), semantics["target_modules"])
     return str(preset)
 
@@ -88,30 +90,42 @@ def parameter_inventory(model: Any) -> dict[tuple[str, str], tuple[str, Any]]:
             continue
         identity = canonicalize_adapter_tensor_name(name)
         if identity in result:
-            raise ContractError(f"PEFT model has duplicate canonical parameter {identity}")
+            raise ContractError(
+                f"PEFT model has duplicate canonical parameter {identity}"
+            )
         result[identity] = (name, parameter)
     if unexpected_trainables:
-        raise ContractError(f"non-LoRA parameters are trainable: {unexpected_trainables}")
+        raise ContractError(
+            f"non-LoRA parameters are trainable: {unexpected_trainables}"
+        )
     if not result:
         raise ContractError("PEFT model exposed no trainable LoRA parameters")
     modules: dict[str, set[str]] = {}
     for module, role in result:
         modules.setdefault(module, set()).add(role)
     if any(roles != {"lora_A", "lora_B"} for roles in modules.values()):
-        raise ContractError("PEFT model does not expose a complete A/B pair for every target")
+        raise ContractError(
+            "PEFT model does not expose a complete A/B pair for every target"
+        )
     return result
 
 
 def tensor_values(tensor: Any) -> list[float]:
-    values = [float(value) for value in tensor.detach().float().cpu().reshape(-1).tolist()]
+    values = [
+        float(value) for value in tensor.detach().float().cpu().reshape(-1).tolist()
+    ]
     if any(not math.isfinite(value) for value in values):
         raise ContractError("captured tensor contains a non-finite value")
     return values
 
 
-def stable_probe_token_ids(target: int, vocab_size: int, predictor_position: int, seed: int) -> list[int]:
+def stable_probe_token_ids(
+    target: int, vocab_size: int, predictor_position: int, seed: int
+) -> list[int]:
     if not 0 <= target < vocab_size:
-        raise ContractError(f"supervised token {target} is outside vocabulary size {vocab_size}")
+        raise ContractError(
+            f"supervised token {target} is outside vocabulary size {vocab_size}"
+        )
     candidates = [0, 1, 2, target, vocab_size - 1]
     state = (seed ^ (predictor_position * 0x9E3779B1)) & 0xFFFFFFFF
     for _ in range(4):
@@ -124,7 +138,9 @@ def logit_probes(logits: Any, labels: list[int], seed: int) -> list[dict[str, An
     import torch
 
     if logits.ndim != 3 or logits.shape[0] != 1:
-        raise ContractError(f"expected logits [1,sequence,vocab], found {tuple(logits.shape)}")
+        raise ContractError(
+            f"expected logits [1,sequence,vocab], found {tuple(logits.shape)}"
+        )
     vocab_size = int(logits.shape[-1])
     result: list[dict[str, Any]] = []
     detached = logits.detach().float().cpu()[0]
@@ -135,13 +151,15 @@ def logit_probes(logits: Any, labels: list[int], seed: int) -> list[dict[str, An
         predictor = label_position - 1
         row = detached[predictor]
         token_ids = stable_probe_token_ids(target, vocab_size, predictor, seed)
-        result.append({
-            "predictor_position": predictor,
-            "target_token_id": target,
-            "token_ids": token_ids,
-            "values": [float(row[token_id].item()) for token_id in token_ids],
-            "logsumexp": float(torch.logsumexp(row, dim=-1).item()),
-        })
+        result.append(
+            {
+                "predictor_position": predictor,
+                "target_token_id": target,
+                "token_ids": token_ids,
+                "values": [float(row[token_id].item()) for token_id in token_ids],
+                "logsumexp": float(torch.logsumexp(row, dim=-1).item()),
+            }
+        )
     return result
 
 
@@ -176,15 +194,22 @@ def translate_antfly_adapter_to_stock_peft(
     """
     if source_artifact["key_layout"] != ANTFLY_ADAPTER_KEY_FORMAT:
         raise ContractError("only an Antfly internal-key adapter may be translated")
-    if source_artifact["provenance"].get("tensor_key_format") != ANTFLY_ADAPTER_KEY_FORMAT:
-        raise ContractError("Antfly adapter sidecar does not authorize internal-key translation")
+    if (
+        source_artifact["provenance"].get("tensor_key_format")
+        != ANTFLY_ADAPTER_KEY_FORMAT
+    ):
+        raise ContractError(
+            "Antfly adapter sidecar does not authorize internal-key translation"
+        )
 
     from safetensors import safe_open
     from safetensors.torch import save_file
 
     destination_dir.mkdir()
     config = json.loads((source_dir.resolve() / "adapter_config.json").read_text())
-    config["target_modules"] = [stock_peft_module_name(name) for name in config["target_modules"]]
+    config["target_modules"] = [
+        stock_peft_module_name(name) for name in config["target_modules"]
+    ]
     if len(config["target_modules"]) != len(set(config["target_modules"])):
         raise ContractError("stock PEFT target module translation collision")
     write_json(destination_dir / "adapter_config.json", config)
@@ -196,23 +221,30 @@ def translate_antfly_adapter_to_stock_peft(
         for source_name in source.keys():
             destination_name = antfly_to_stock_peft_tensor_name(source_name)
             if destination_name in translated_tensors:
-                raise ContractError(f"Antfly key translation collision: {destination_name}")
-            translated_tensors[destination_name] = source.get_tensor(source_name).contiguous()
+                raise ContractError(
+                    f"Antfly key translation collision: {destination_name}"
+                )
+            translated_tensors[destination_name] = source.get_tensor(
+                source_name
+            ).contiguous()
             key_map[source_name] = destination_name
     save_file(
         translated_tensors,
         str(destination_dir / "adapter_model.safetensors"),
         metadata=metadata,
     )
-    write_json(destination_dir / "antfly_oracle_translation.json", {
-        "schema_version": "antfly_to_stock_peft_translation/v1",
-        "source_adapter_model_sha256": source_artifact["adapter_model_sha256"],
-        "source_tensor_key_format": ANTFLY_ADAPTER_KEY_FORMAT,
-        "destination_tensor_key_format": STOCK_PEFT_KEY_FORMAT,
-        "target_preset": target_preset,
-        "key_map": key_map,
-        "reverse_interoperability_proven": False,
-    })
+    write_json(
+        destination_dir / "antfly_oracle_translation.json",
+        {
+            "schema_version": "antfly_to_stock_peft_translation/v1",
+            "source_adapter_model_sha256": source_artifact["adapter_model_sha256"],
+            "source_tensor_key_format": ANTFLY_ADAPTER_KEY_FORMAT,
+            "destination_tensor_key_format": STOCK_PEFT_KEY_FORMAT,
+            "target_preset": target_preset,
+            "key_map": key_map,
+            "reverse_interoperability_proven": False,
+        },
+    )
     translated = inspect_adapter_artifact(destination_dir, target_preset=target_preset)
     if translated["key_layout"] != STOCK_PEFT_KEY_FORMAT:
         raise ContractError("translated adapter did not produce stock PEFT keys")
@@ -222,13 +254,19 @@ def translate_antfly_adapter_to_stock_peft(
         left = source_artifact["tensors"][identity]
         right = translated["tensors"][identity]
         if left["shape"] != right["shape"] or left["dtype"] != right["dtype"]:
-            raise ContractError(f"translated adapter changed tensor metadata for {identity}")
+            raise ContractError(
+                f"translated adapter changed tensor metadata for {identity}"
+            )
         if vector_metrics(left["values"], right["values"]).max_abs != 0:
-            raise ContractError(f"translated adapter changed tensor values for {identity}")
+            raise ContractError(
+                f"translated adapter changed tensor values for {identity}"
+            )
     return translated
 
 
-def load_model(args: argparse.Namespace, lock: Mapping[str, Any], adapter_dir: Path) -> tuple[Any, Any, Any]:
+def load_model(
+    args: argparse.Namespace, lock: Mapping[str, Any], adapter_dir: Path
+) -> tuple[Any, Any, Any]:
     # Force offline behavior before importing/loading Hugging Face code.  This
     # turns a missing local file into an error instead of a network side effect.
     os.environ["HF_HUB_OFFLINE"] = "1"
@@ -242,7 +280,9 @@ def load_model(args: argparse.Namespace, lock: Mapping[str, Any], adapter_dir: P
     from peft import PeftModel
     from transformers import AutoModelForMultimodalLM
 
-    verify_import_source(transformers, args.transformers_source, source_name="Transformers")
+    verify_import_source(
+        transformers, args.transformers_source, source_name="Transformers"
+    )
     verify_import_source(peft, args.peft_source, source_name="PEFT")
 
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
@@ -256,7 +296,9 @@ def load_model(args: argparse.Namespace, lock: Mapping[str, Any], adapter_dir: P
         str(args.model_dir.resolve()),
         local_files_only=True,
         torch_dtype=dtype,
-        attn_implementation=lock["python_oracle"]["execution"]["attention_implementation"],
+        attn_implementation=lock["python_oracle"]["execution"][
+            "attention_implementation"
+        ],
     )
     model = PeftModel.from_pretrained(
         base,
@@ -270,7 +312,9 @@ def load_model(args: argparse.Namespace, lock: Mapping[str, Any], adapter_dir: P
     model.eval()
     for module in model.modules():
         if isinstance(module, torch.nn.Dropout) and module.p != 0.0:
-            raise ContractError(f"nonzero dropout module remained in parity model: p={module.p}")
+            raise ContractError(
+                f"nonzero dropout module remained in parity model: p={module.p}"
+            )
     return torch, transformers, model
 
 
@@ -291,7 +335,9 @@ def fsync_tree(root: Path) -> None:
         if path.is_file():
             fsync_path(path)
     directories = [path for path in paths if path.is_dir()]
-    for directory in sorted(directories, key=lambda path: len(path.parts), reverse=True):
+    for directory in sorted(
+        directories, key=lambda path: len(path.parts), reverse=True
+    ):
         fsync_path(directory)
     fsync_path(root)
 
@@ -304,12 +350,17 @@ def publish_staging(staging: Path, output: Path) -> None:
     try:
         target.mkdir()
     except FileExistsError as exc:
-        raise ContractError(f"refusing to replace existing oracle output: {target}") from exc
+        raise ContractError(
+            f"refusing to replace existing oracle output: {target}"
+        ) from exc
     fsync_path(target.parent)
     # The directory reservation is no-replace. Readers treat COMPLETE.json as
     # the commit marker and must ignore an interrupted directory without it.
     complete = staging / "COMPLETE.json"
-    children = sorted((child for child in staging.iterdir() if child != complete), key=lambda child: child.name)
+    children = sorted(
+        (child for child in staging.iterdir() if child != complete),
+        key=lambda child: child.name,
+    )
     try:
         for child in children:
             child.rename(target / child.name)
@@ -342,7 +393,9 @@ def export(args: argparse.Namespace) -> dict[str, Any]:
     sys.dont_write_bytecode = True
     trajectory = lock["training_contract"]
     if args.steps not in trajectory["steps"]:
-        raise ContractError(f"the locked trajectory admits exactly {trajectory['steps']} steps")
+        raise ContractError(
+            f"the locked trajectory admits exactly {trajectory['steps']} steps"
+        )
     if args.learning_rate <= 0 or not math.isfinite(args.learning_rate):
         raise ContractError("learning rate must be finite and positive")
     if args.eps <= 0 or not math.isfinite(args.eps):
@@ -373,16 +426,22 @@ def export(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     verified_model = verify_model_directory(lock, args.model_key, args.model_dir)
-    prepared_summary, prepared = load_prepared_example(args.prepared, args.example_index)
+    prepared_summary, prepared = load_prepared_example(
+        args.prepared, args.example_index
+    )
     verify_prepared_source_dataset(prepared_summary, args.source_dataset)
-    source_adapter = inspect_adapter_artifact(args.adapter, target_preset=args.target_preset)
+    source_adapter = inspect_adapter_artifact(
+        args.adapter, target_preset=args.target_preset
+    )
     preset = validate_target_preset(lock, args.model_key, source_adapter["semantics"])
     rank = source_adapter["semantics"]["r"]
     alpha = float(source_adapter["semantics"]["lora_alpha"])
 
     translation_applied = source_adapter["key_layout"] == ANTFLY_ADAPTER_KEY_FORMAT
     if translation_applied:
-        with tempfile.TemporaryDirectory(prefix="antfly-gemma4-peft-translation-") as translated_tmp:
+        with tempfile.TemporaryDirectory(
+            prefix="antfly-gemma4-peft-translation-"
+        ) as translated_tmp:
             translated_dir = Path(translated_tmp) / "adapter"
             translated_adapter = translate_antfly_adapter_to_stock_peft(
                 args.adapter,
@@ -394,7 +453,9 @@ def export(args: argparse.Namespace) -> dict[str, Any]:
         hf_load_key_layout = translated_adapter["key_layout"]
     else:
         if source_adapter["key_layout"] != STOCK_PEFT_KEY_FORMAT:
-            raise ContractError(f"unsupported HF load key layout: {source_adapter['key_layout']}")
+            raise ContractError(
+                f"unsupported HF load key layout: {source_adapter['key_layout']}"
+            )
         torch, transformers, model = load_model(args, lock, args.adapter)
         hf_load_key_layout = source_adapter["key_layout"]
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -403,16 +464,22 @@ def export(args: argparse.Namespace) -> dict[str, Any]:
     if set(parameters) != set(source_adapter["tensors"]):
         missing = sorted(set(source_adapter["tensors"]) - set(parameters))
         extra = sorted(set(parameters) - set(source_adapter["tensors"]))
-        raise ContractError(f"loaded PEFT target inventory differs (missing={missing}, extra={extra})")
+        raise ContractError(
+            f"loaded PEFT target inventory differs (missing={missing}, extra={extra})"
+        )
     for identity, (_, parameter) in parameters.items():
         if parameter.dtype != torch.float32:
-            raise ContractError(f"{identity}: LoRA parameter must remain float32, found {parameter.dtype}")
+            raise ContractError(
+                f"{identity}: LoRA parameter must remain float32, found {parameter.dtype}"
+            )
         loaded = tensor_values(parameter)
         source = source_adapter["tensors"][identity]["values"]
         if vector_metrics(source, loaded).max_abs != 0:
             raise ContractError(f"PEFT changed adapter values while loading {identity}")
 
-    input_ids = torch.tensor([prepared["input_ids"]], dtype=torch.long, device=args.device)
+    input_ids = torch.tensor(
+        [prepared["input_ids"]], dtype=torch.long, device=args.device
+    )
     labels = torch.tensor([prepared["labels"]], dtype=torch.long, device=args.device)
     attention_mask = torch.ones_like(input_ids, dtype=torch.long)
     optimizer = torch.optim.AdamW(
@@ -422,7 +489,10 @@ def export(args: argparse.Namespace) -> dict[str, Any]:
         eps=args.eps,
         weight_decay=args.weight_decay,
     )
-    initial = {identity: parameter.detach().float().cpu().clone() for identity, (_, parameter) in parameters.items()}
+    initial = {
+        identity: parameter.detach().float().cpu().clone()
+        for identity, (_, parameter) in parameters.items()
+    }
     final_raw_gradients: dict[tuple[str, str], Any] = {}
     loss_history: list[float] = []
     final_grad_norm = 0.0
@@ -450,7 +520,9 @@ def export(args: argparse.Namespace) -> dict[str, Any]:
             if not torch.isfinite(gradient).all():
                 raise ContractError(f"step {step}: non-finite gradient for {identity}")
             final_raw_gradients[identity] = gradient
-            grad_sq = math.fsum((grad_sq, float(torch.sum(gradient.double().square()).item())))
+            grad_sq = math.fsum(
+                (grad_sq, float(torch.sum(gradient.double().square()).item()))
+            )
         final_grad_norm = math.sqrt(grad_sq)
         if final_grad_norm == 0:
             raise ContractError(f"step {step}: all adapter gradients are zero")
@@ -473,13 +545,19 @@ def export(args: argparse.Namespace) -> dict[str, Any]:
 
     output = args.output_dir.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=f".{output.name}.staging-", dir=output.parent) as tmp:
+    with tempfile.TemporaryDirectory(
+        prefix=f".{output.name}.staging-", dir=output.parent
+    ) as tmp:
         staging = Path(tmp)
         reference_adapter_dir = staging / "reference_adapter"
         model.save_pretrained(reference_adapter_dir, safe_serialization=True)
-        saved_adapter = inspect_adapter_artifact(reference_adapter_dir, target_preset=preset)
+        saved_adapter = inspect_adapter_artifact(
+            reference_adapter_dir, target_preset=preset
+        )
         if set(saved_adapter["tensors"]) != set(parameters):
-            raise ContractError("saved PEFT adapter inventory changed after the optimizer step")
+            raise ContractError(
+                "saved PEFT adapter inventory changed after the optimizer step"
+            )
 
         storage_tensors: dict[str, Any] = {}
         entries: dict[str, dict[str, Any]] = {}
@@ -513,33 +591,54 @@ def export(args: argparse.Namespace) -> dict[str, Any]:
             b_initial_zero = False
             if role == "lora_A" and args.steps == 1:
                 b_initial = initial.get((module, "lora_B"))
-                b_initial_zero = b_initial is not None and bool(torch.count_nonzero(b_initial).item() == 0)
-            gradient_expectation = "zero-by-zero-b-initialization" if b_initial_zero else "active"
-            gradient_nonzero = bool(torch.count_nonzero(final_raw_gradients[identity]).item() != 0)
+                b_initial_zero = b_initial is not None and bool(
+                    torch.count_nonzero(b_initial).item() == 0
+                )
+            gradient_expectation = (
+                "zero-by-zero-b-initialization" if b_initial_zero else "active"
+            )
+            gradient_nonzero = bool(
+                torch.count_nonzero(final_raw_gradients[identity]).item() != 0
+            )
             if gradient_expectation == "active" and not gradient_nonzero:
-                raise ContractError(f"active target has an all-zero gradient: {identity}")
+                raise ContractError(
+                    f"active target has an all-zero gradient: {identity}"
+                )
             if gradient_expectation != "active" and gradient_nonzero:
-                raise ContractError(f"zero-initialization expectation failed: {identity}")
-            target_rows.append({
-                "canonical_name": module,
-                "source_name": source_name,
-                "role": role,
-                "shape": list(parameter.shape),
-                "gradient_expectation": gradient_expectation,
-                "logical_tensors": logical,
-            })
+                raise ContractError(
+                    f"zero-initialization expectation failed: {identity}"
+                )
+            target_rows.append(
+                {
+                    "canonical_name": module,
+                    "source_name": source_name,
+                    "role": role,
+                    "shape": list(parameter.shape),
+                    "gradient_expectation": gradient_expectation,
+                    "logical_tensors": logical,
+                }
+            )
             inventory.append(f"{module}:{role}")
 
         from safetensors.torch import save_file
 
         tensor_path = staging / "trace.safetensors"
-        save_file(storage_tensors, str(tensor_path), metadata={"format": "antfly_gemma4_lora_trace/v1"})
+        save_file(
+            storage_tensors,
+            str(tensor_path),
+            metadata={"format": "antfly_gemma4_lora_trace/v1"},
+        )
         trace = {
             "schema_version": TRACE_SCHEMA_VERSION,
             "producer": {
                 "name": "hf-peft",
-                "version": ";".join(f"{name}={version}" for name, version in sorted(package_versions.items())),
-                "source_revision": lock["python_oracle"]["source_revisions"]["transformers"],
+                "version": ";".join(
+                    f"{name}={version}"
+                    for name, version in sorted(package_versions.items())
+                ),
+                "source_revision": lock["python_oracle"]["source_revisions"][
+                    "transformers"
+                ],
                 "hardware": host,
             },
             "oracle_lock_sha256": lock_digest(args.lock),
@@ -621,14 +720,34 @@ def export(args: argparse.Namespace) -> dict[str, Any]:
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--lock", type=Path, default=LOCK_PATH)
-    result.add_argument("--model-key", required=True, choices=("gemma-4-E2B-it", "gemma-4-E4B-it"))
+    result.add_argument(
+        "--model-key", required=True, choices=("gemma-4-E2B-it", "gemma-4-E4B-it")
+    )
     result.add_argument("--model-dir", type=Path, required=True)
     result.add_argument("--adapter", type=Path, required=True)
-    result.add_argument("--transformers-source", type=Path, required=True, help="clean checkout at the locked Transformers commit and active import source")
-    result.add_argument("--peft-source", type=Path, required=True, help="clean checkout at the locked PEFT commit and active import source")
-    result.add_argument("--target-preset", choices=("peft-qv", "text-all-linear"), help="required for a stock PEFT adapter without an Antfly manifest")
+    result.add_argument(
+        "--transformers-source",
+        type=Path,
+        required=True,
+        help="clean checkout at the locked Transformers commit and active import source",
+    )
+    result.add_argument(
+        "--peft-source",
+        type=Path,
+        required=True,
+        help="clean checkout at the locked PEFT commit and active import source",
+    )
+    result.add_argument(
+        "--target-preset",
+        choices=("peft-qv", "text-all-linear"),
+        help="required for a stock PEFT adapter without an Antfly manifest",
+    )
     result.add_argument("--prepared", type=Path, required=True)
-    result.add_argument("--source-dataset", type=Path, help="override the recorded source dataset path while verifying its v6 digest")
+    result.add_argument(
+        "--source-dataset",
+        type=Path,
+        help="override the recorded source dataset path while verifying its v6 digest",
+    )
     result.add_argument("--example-index", type=int, default=0)
     result.add_argument("--output-dir", type=Path, required=True)
     result.add_argument("--device", choices=("cpu", "cuda"), default="cuda")

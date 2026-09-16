@@ -11,8 +11,7 @@ from typing import Any
 
 # Official codeload archive for the same revision pinned by gemma4_oracle.lock.json.
 MLX_LM_ARCHIVE_SHA256 = {
-    "ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd":
-        "67e1a52f9b86551a24eab1aa2681c26a391819925bb10d14792b96a88303ebc7",
+    "ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd": "67e1a52f9b86551a24eab1aa2681c26a391819925bb10d14792b96a88303ebc7",
 }
 
 
@@ -29,7 +28,9 @@ def attest_mlx_lm_archive(root: Path, archive: Path, revision: str) -> dict[str,
     root = root.resolve()
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     if digest != expected_digest:
-        raise SourceArchiveError("MLX-LM archive SHA-256 differs from the pinned revision")
+        raise SourceArchiveError(
+            "MLX-LM archive SHA-256 differs from the pinned revision"
+        )
     prefix = f"mlx-lm-{revision}"
     inventory: dict[str, str] = {}
     directories: set[str] = set()
@@ -37,18 +38,29 @@ def attest_mlx_lm_archive(root: Path, archive: Path, revision: str) -> dict[str,
     with tarfile.open(archive, "r:gz") as source:
         for member in source.getmembers():
             path = PurePosixPath(member.name)
-            if path.is_absolute() or not path.parts or path.parts[0] != prefix or ".." in path.parts:
-                raise SourceArchiveError("MLX-LM archive member escapes its pinned root")
+            if (
+                path.is_absolute()
+                or not path.parts
+                or path.parts[0] != prefix
+                or ".." in path.parts
+            ):
+                raise SourceArchiveError(
+                    "MLX-LM archive member escapes its pinned root"
+                )
             relative = PurePosixPath(*path.parts[1:]).as_posix()
             if relative in seen:
                 raise SourceArchiveError("MLX-LM archive repeats a path")
             seen.add(relative)
             local = root.joinpath(*path.parts[1:])
             if local.is_symlink() or not local.resolve().is_relative_to(root):
-                raise SourceArchiveError("MLX-LM source contains a symlink or escaped path")
+                raise SourceArchiveError(
+                    "MLX-LM source contains a symlink or escaped path"
+                )
             if member.isdir():
                 if not local.is_dir():
-                    raise SourceArchiveError(f"MLX-LM source directory missing: {relative}")
+                    raise SourceArchiveError(
+                        f"MLX-LM source directory missing: {relative}"
+                    )
                 if relative != ".":
                     directories.add(relative)
             elif member.isfile():
@@ -60,7 +72,9 @@ def attest_mlx_lm_archive(root: Path, archive: Path, revision: str) -> dict[str,
                     raise SourceArchiveError(f"MLX-LM source file changed: {relative}")
                 inventory[relative] = expected
             else:
-                raise SourceArchiveError("MLX-LM archive contains an unsupported member")
+                raise SourceArchiveError(
+                    "MLX-LM archive contains an unsupported member"
+                )
     actual_files: set[str] = set()
     actual_directories: set[str] = set()
     for local in root.rglob("*"):
@@ -74,7 +88,9 @@ def attest_mlx_lm_archive(root: Path, archive: Path, revision: str) -> dict[str,
         else:
             raise SourceArchiveError("MLX-LM source contains an unsupported file")
     if actual_files != set(inventory) or actual_directories != directories:
-        raise SourceArchiveError("MLX-LM source inventory differs from the archive; use a clean extraction without bytecode caches")
+        raise SourceArchiveError(
+            "MLX-LM source inventory differs from the archive; use a clean extraction without bytecode caches"
+        )
     encoded = json.dumps(inventory, sort_keys=True, separators=(",", ":")).encode()
     return {
         "mode": "pinned-upstream-archive",

@@ -26,9 +26,16 @@ def summarize_squares(
         "reference_l2": reference_norm,
         "candidate_l2": candidate_norm,
         "difference_l2": difference_norm,
-        "relative_l2_error": difference_norm / reference_norm if reference_norm else (0.0 if not candidate_norm else None),
-        "relative_norm_difference": abs(candidate_norm - reference_norm) / reference_norm if reference_norm else (0.0 if not candidate_norm else None),
-        "cosine": max(-1.0, min(1.0, dot / denominator)) if denominator else (1.0 if not reference_norm and not candidate_norm else None),
+        "relative_l2_error": difference_norm / reference_norm
+        if reference_norm
+        else (0.0 if not candidate_norm else None),
+        "relative_norm_difference": abs(candidate_norm - reference_norm)
+        / reference_norm
+        if reference_norm
+        else (0.0 if not candidate_norm else None),
+        "cosine": max(-1.0, min(1.0, dot / denominator))
+        if denominator
+        else (1.0 if not reference_norm and not candidate_norm else None),
         "max_abs": max_abs,
     }
 
@@ -44,7 +51,9 @@ def compare_vectors(reference: Any, candidate: Any) -> dict[str, float | None]:
         raise ValueError("non-finite vector")
     delta = right - left
     return summarize_squares(
-        float(np.sum(left * left)), float(np.sum(right * right)),
-        float(np.sum(left * right)), float(np.sum(delta * delta)),
+        float(np.sum(left * left)),
+        float(np.sum(right * right)),
+        float(np.sum(left * right)),
+        float(np.sum(delta * delta)),
         float(np.max(np.abs(delta))),
     )

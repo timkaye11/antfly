@@ -10,6 +10,8 @@ contending for the same GPU.
 
 from __future__ import annotations
 
+from gemma4_files import sha256_file
+
 import argparse
 import csv
 import dataclasses
@@ -409,14 +411,6 @@ class ServerSpec:
 
 def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
-
-
-def sha256_file(path: pathlib.Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        while chunk := source.read(8 * 1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def write_json(path: pathlib.Path, value: object) -> None:

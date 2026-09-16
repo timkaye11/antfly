@@ -21,8 +21,7 @@ class PreferenceQualityCampaignTest(unittest.TestCase):
 
     def test_seeded_row_order_is_stable_distinct_and_content_preserving(self) -> None:
         rows = [
-            json.dumps({"row": index}, sort_keys=True).encode()
-            for index in range(8)
+            json.dumps({"row": index}, sort_keys=True).encode() for index in range(8)
         ]
         first = campaign._permuted_rows(rows, 17)
         self.assertEqual(first, campaign._permuted_rows(rows, 17))
@@ -95,7 +94,9 @@ class PreferenceQualityCampaignTest(unittest.TestCase):
         self.assertFalse(result["directional_passed"])
         self.assertFalse(result["passed"])
 
-    def test_grpo_per_seed_direction_does_not_require_independent_significance(self) -> None:
+    def test_grpo_per_seed_direction_does_not_require_independent_significance(
+        self,
+    ) -> None:
         result = campaign._paired_prompt_reward_test(
             [0.0] * 36,
             [1.0] * 23 + [-1.0] * 13,
@@ -103,9 +104,7 @@ class PreferenceQualityCampaignTest(unittest.TestCase):
             maximum_p_value=0.05,
         )
         self.assertEqual((result["wins"], result["losses"]), (23, 13))
-        self.assertAlmostEqual(
-            result["one_sided_exact_p_value"], 0.06624908198136836
-        )
+        self.assertAlmostEqual(result["one_sided_exact_p_value"], 0.06624908198136836)
         self.assertTrue(result["directional_passed"])
         self.assertFalse(result["significance_passed"])
         self.assertFalse(result["passed"])
@@ -120,16 +119,16 @@ class PreferenceQualityCampaignTest(unittest.TestCase):
             group_size=2,
             maximum_p_value=0.05,
         )
-        self.assertLessEqual(
-            campaign._one_sided_exact_sign_test_p_value(12, 3), 0.05
-        )
+        self.assertLessEqual(campaign._one_sided_exact_sign_test_p_value(12, 3), 0.05)
         self.assertEqual(result["groups"], 5)
         self.assertEqual((result["wins"], result["losses"]), (4, 1))
         self.assertEqual(result["one_sided_exact_p_value"], 0.1875)
         self.assertTrue(result["all_seeds_directional"])
         self.assertFalse(result["passed"])
 
-    def test_grpo_multi_seed_gate_requires_directional_seeds_and_significance(self) -> None:
+    def test_grpo_multi_seed_gate_requires_directional_seeds_and_significance(
+        self,
+    ) -> None:
         passing = campaign._multi_seed_paired_prompt_reward_test(
             {
                 17: [1.0] * 6 + [0.0] * 2,
@@ -273,7 +272,9 @@ class PreferenceQualityCampaignTest(unittest.TestCase):
                     maximum_p_value=0.05,
                 )
 
-    def test_grpo_quality_defaults_use_paired_gain_and_one_group_noninferiority(self) -> None:
+    def test_grpo_quality_defaults_use_paired_gain_and_one_group_noninferiority(
+        self,
+    ) -> None:
         args = campaign.parse_args(
             [
                 "--binary",
@@ -286,13 +287,9 @@ class PreferenceQualityCampaignTest(unittest.TestCase):
         )
         self.assertEqual(args.min_grpo_eval_mean_reward_improvement, 1e-6)
         self.assertEqual(args.min_grpo_eval_top_rank_mean_reward_improvement, 0.0)
-        self.assertIsNone(
-            args.min_grpo_eval_positive_reward_group_rate_improvement
-        )
+        self.assertIsNone(args.min_grpo_eval_positive_reward_group_rate_improvement)
         self.assertIsNone(args.max_grpo_eval_positive_reward_group_regressions)
-        self.assertEqual(
-            args.max_grpo_paired_prompt_reward_sign_test_p_value, 0.05
-        )
+        self.assertEqual(args.max_grpo_paired_prompt_reward_sign_test_p_value, 0.05)
 
     def test_grpo_positive_group_noninferiority_is_count_bounded(self) -> None:
         self.assertEqual(
@@ -335,7 +332,9 @@ class PreferenceQualityCampaignTest(unittest.TestCase):
         with self.assertRaisesRegex(campaign.ContractError, "group-count rate"):
             campaign._rate_count(0.5, 3, "test rate")
 
-    def test_long_horizon_is_bound_to_training_units_not_prompt_repetition(self) -> None:
+    def test_long_horizon_is_bound_to_training_units_not_prompt_repetition(
+        self,
+    ) -> None:
         self.assertEqual(campaign._long_horizon_units("dpo", 5, 8), (40, 40))
         self.assertEqual(campaign._long_horizon_units("grpo", 512, 1), (512, 512))
         self.assertEqual(campaign._long_horizon_units("grpo", 128, 4), (512, 512))
@@ -344,7 +343,9 @@ class PreferenceQualityCampaignTest(unittest.TestCase):
         with self.assertRaisesRegex(campaign.ContractError, "must be positive"):
             campaign._long_horizon_units("dpo", 40, 0)
 
-    def test_grpo_training_coverage_rejects_nominal_horizon_without_signal(self) -> None:
+    def test_grpo_training_coverage_rejects_nominal_horizon_without_signal(
+        self,
+    ) -> None:
         sparse = {
             "optimizer_groups": 7,
             "zero_reward_std_groups": 249,
@@ -475,7 +476,9 @@ class PreferenceQualityCampaignTest(unittest.TestCase):
         self.assertEqual(variant["dataset"]["path"], "/seeded.jsonl")
         self.assertEqual(variant["dataset"]["train_path"], "/seeded.jsonl")
 
-    def test_compiled_sampling_cli_forces_incremental_runtime_out_of_variants(self) -> None:
+    def test_compiled_sampling_cli_forces_incremental_runtime_out_of_variants(
+        self,
+    ) -> None:
         args = campaign.parse_args(
             [
                 "--binary",
@@ -523,7 +526,9 @@ class PreferenceQualityCampaignTest(unittest.TestCase):
         ):
             self.assertNotIn(field, variant["runtime"])
 
-    def test_template_adapter_bootstrap_spec_is_strict_and_peft_compatible(self) -> None:
+    def test_template_adapter_bootstrap_spec_is_strict_and_peft_compatible(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             adapter = Path(temporary)
             config = {
@@ -576,7 +581,9 @@ class PreferenceQualityCampaignTest(unittest.TestCase):
             payload = b"seeded-adapter"
 
             def fake_run(command, _env, _log_root, _timeout):
-                self.assertEqual(command[command.index("--initialization-seed") + 1], "17")
+                self.assertEqual(
+                    command[command.index("--initialization-seed") + 1], "17"
+                )
                 adapter.mkdir()
                 (adapter / "adapter_model.safetensors").write_bytes(payload)
                 (adapter / "adapter_config.json").write_text(
@@ -631,7 +638,9 @@ class PreferenceQualityCampaignTest(unittest.TestCase):
             payload = b"seeded-adapter"
 
             def fake_run(command, _env, _log_root, _timeout):
-                self.assertEqual(command[command.index("--target-preset") + 1], "peft-qv")
+                self.assertEqual(
+                    command[command.index("--target-preset") + 1], "peft-qv"
+                )
                 self.assertNotIn("--target-modules", command)
                 adapter.mkdir()
                 (adapter / "adapter_model.safetensors").write_bytes(payload)
@@ -650,7 +659,9 @@ class PreferenceQualityCampaignTest(unittest.TestCase):
                         {
                             "schema_version": "antfly_gemma4_finetune/v3",
                             "status": "complete",
-                            "adapter_checkpoint_sha256": hashlib.sha256(payload).hexdigest(),
+                            "adapter_checkpoint_sha256": hashlib.sha256(
+                                payload
+                            ).hexdigest(),
                             "adapter_checkpoint_size_bytes": len(payload),
                             "initialization_seed": 17,
                             "target_preset": "peft-qv",
@@ -696,12 +707,16 @@ class PreferenceQualityCampaignTest(unittest.TestCase):
                 "eval": {"path": str(evaluation)},
             }
             self.assertEqual(campaign._dataset_path(recipe, "train"), train.resolve())
-            self.assertEqual(campaign._dataset_path(recipe, "eval"), evaluation.resolve())
+            self.assertEqual(
+                campaign._dataset_path(recipe, "eval"), evaluation.resolve()
+            )
             recipe["eval"]["path"] = str(alternate)
             with self.assertRaisesRegex(campaign.ContractError, "conflicting eval"):
                 campaign._dataset_path(recipe, "eval")
 
-    def test_failed_run_evidence_surfaces_bounded_metrics_and_artifact_digests(self) -> None:
+    def test_failed_run_evidence_surfaces_bounded_metrics_and_artifact_digests(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             run_root = Path(temporary) / "seed-42"
             run_root.mkdir()
@@ -738,7 +753,7 @@ class PreferenceQualityCampaignTest(unittest.TestCase):
             baseline_reward_path = (
                 run_root / "grpo_baseline_evaluation_reward_trace.jsonl"
             )
-            baseline_reward_path.write_text("{\"reward\":1}\n", encoding="utf-8")
+            baseline_reward_path.write_text('{"reward":1}\n', encoding="utf-8")
             stderr_path = run_root.with_suffix(".stderr.log")
             stderr_path.write_text("quality gate failed\n", encoding="utf-8")
 
@@ -747,17 +762,13 @@ class PreferenceQualityCampaignTest(unittest.TestCase):
             self.assertEqual(evidence["seed"], 42)
             artifacts = evidence["artifacts"]
             self.assertEqual(
-                artifacts["task_report"]["summary"]["baseline_relative"][
-                    "passed"
-                ],
+                artifacts["task_report"]["summary"]["baseline_relative"]["passed"],
                 False,
             )
             self.assertIsNone(
                 artifacts["task_report"]["summary"]["trained_adapter_dir"]
             )
-            self.assertNotIn(
-                "unbounded_detail", artifacts["task_report"]["summary"]
-            )
+            self.assertNotIn("unbounded_detail", artifacts["task_report"]["summary"])
             self.assertEqual(
                 artifacts["evaluation_report"]["summary"]["mean_reward"], 0.5
             )
@@ -767,13 +778,11 @@ class PreferenceQualityCampaignTest(unittest.TestCase):
             )
             self.assertEqual(
                 artifacts["baseline_evaluation_reward_trace"]["sha256"],
-                "sha256:"
-                + hashlib.sha256(b'{"reward":1}\n').hexdigest(),
+                "sha256:" + hashlib.sha256(b'{"reward":1}\n').hexdigest(),
             )
             self.assertEqual(
                 artifacts["stderr_log"]["sha256"],
-                "sha256:"
-                + hashlib.sha256(b"quality gate failed\n").hexdigest(),
+                "sha256:" + hashlib.sha256(b"quality gate failed\n").hexdigest(),
             )
             self.assertNotIn("baseline_evaluation_report", artifacts)
 
@@ -789,13 +798,14 @@ class PreferenceQualityCampaignTest(unittest.TestCase):
             self.assertIsNotNone(evidence)
             assert evidence is not None
             self.assertEqual(evidence["size_bytes"], 2)
-            self.assertIn("exceeds failure-summary input limit", evidence["summary_error"])
+            self.assertIn(
+                "exceeds failure-summary input limit", evidence["summary_error"]
+            )
             self.assertNotIn("summary", evidence)
 
     def test_metric_summary_reports_worst_case_and_population_spread(self) -> None:
         runs = [
-            {"quality": {"metrics": {"eval_loss": value}}}
-            for value in (1.0, 2.0, 3.0)
+            {"quality": {"metrics": {"eval_loss": value}}} for value in (1.0, 2.0, 3.0)
         ]
         summary = campaign._metric_summary(runs)["eval_loss"]
         self.assertEqual(summary["mean"], 2.0)

@@ -54,8 +54,6 @@ pub const RenderOptions = struct {
 
 const gemma4_bos = "<bos>";
 const gemma4_turn_end = "<turn|>\n";
-const gemma4_thought_prompt = "<|channel>thought\n<channel|>";
-const gemma4_final_channel = "<|channel>final\n<channel|>";
 const gemma4_tool_string_delimiter = "<|\"|>";
 
 pub const RenderError = error{
@@ -253,6 +251,8 @@ fn renderLlama3(
     };
 }
 
+// Match the canonical serving template's text/tool subset. Tool observations
+// share the assistant turn but never enter completion-only loss spans.
 fn renderGemma(
     allocator: std.mem.Allocator,
     messages: []const Message,
@@ -262,92 +262,89 @@ fn renderGemma(
     errdefer buf.deinit(allocator);
     var spans: std.ArrayList(AssistantSpan) = .empty;
     errdefer spans.deinit(allocator);
-
-    if (messages.len > 0) {
-        try buf.appendSlice(allocator, gemma4_bos);
-    }
-
-    // Gather system content to prepend onto the first user turn.
-    var pending_system: std.ArrayList(u8) = .empty;
-    defer pending_system.deinit(allocator);
-
-    for (messages) |msg| {
-        switch (msg.role) {
-            .system => {
-                if (pending_system.items.len > 0) {
-                    try pending_system.append(allocator, '\n');
-                }
-                try pending_system.appendSlice(allocator, msg.content);
-            },
-            .user => {
-                try buf.appendSlice(allocator, "<|turn>user\n");
-                if (pending_system.items.len > 0) {
-                    try buf.appendSlice(allocator, pending_system.items);
-                    try buf.appendSlice(allocator, "\n\n");
-                    pending_system.clearRetainingCapacity();
-                }
-                try buf.appendSlice(allocator, std.mem.trim(u8, msg.content, &std.ascii.whitespace));
-                try buf.appendSlice(allocator, gemma4_turn_end);
-            },
-            .assistant => {
-                // Match inference: every model turn starts in the private
-                // thought channel. These bytes are prompt context and must not
-                // be included in completion-only loss.
-                try buf.appendSlice(allocator, "<|turn>model\n");
-                try buf.appendSlice(allocator, gemma4_thought_prompt);
-                const span_start = buf.items.len;
-
-                const content = std.mem.trim(u8, msg.content, &std.ascii.whitespace);
-                const has_thought_prompt = std.mem.startsWith(u8, content, gemma4_thought_prompt);
-                const normalized_content = if (has_thought_prompt)
-                    content[gemma4_thought_prompt.len..]
-                else
-                    content;
-
-                if (msg.tool_calls_json) |tool_calls_json| {
-                    // Tool calls stay in the private channel. Final answers
-                    // transition to the public channel below.
-                    if (normalized_content.len > 0) {
-                        try buf.appendSlice(allocator, normalized_content);
-                        try buf.append(allocator, '\n');
-                    }
-                    try appendGemmaToolCalls(allocator, &buf, tool_calls_json);
-                } else if (has_thought_prompt or std.mem.startsWith(u8, normalized_content, "<|channel>")) {
-                    // Preserve datasets that already carry explicit Gemma 4
-                    // channels while avoiding a duplicate thought prompt.
-                    try buf.appendSlice(allocator, normalized_content);
-                } else {
-                    try buf.appendSlice(allocator, gemma4_final_channel);
-                    try buf.appendSlice(allocator, normalized_content);
-                }
-                try buf.appendSlice(allocator, gemma4_turn_end);
-                try spans.append(allocator, .{ .start = span_start, .end = buf.items.len });
-            },
-            .tool => {
-                // Inference renders tool results as ordinary tool turns. The
-                // associated name/id are API metadata, not prompt text.
-                try buf.appendSlice(allocator, "<|turn>tool\n");
-                try buf.appendSlice(allocator, std.mem.trim(u8, msg.content, &std.ascii.whitespace));
-                try buf.appendSlice(allocator, gemma4_turn_end);
-            },
+    try buf.appendSlice(allocator, gemma4_bos);
+    var previous_role: ?Role = null;
+    var pending_tool = false;
+    for (messages, 0..) |msg, index| {
+        if (msg.role == .tool) continue;
+        pending_tool = false;
+        if (msg.role != .assistant or previous_role != .assistant) {
+            try buf.appendSlice(allocator, "<|turn>");
+            try buf.appendSlice(allocator, if (msg.role == .assistant) "model" else roleStr(msg.role));
+            try buf.append(allocator, '\n');
         }
+        var span_start = buf.items.len;
+        var has_response = false;
+        if (msg.role == .assistant) {
+            if (msg.tool_calls_json) |calls| {
+                try appendGemmaToolCalls(allocator, &buf, calls);
+                var next = index + 1;
+                while (next < messages.len and messages[next].role == .tool) : (next += 1) {
+                    const response = messages[next];
+                    if (!has_response and buf.items.len > span_start) {
+                        try spans.append(allocator, .{ .start = span_start, .end = buf.items.len });
+                    }
+                    has_response = true;
+                    var parsed = try parseGemmaToolJson(allocator, calls);
+                    defer parsed.deinit();
+                    var name = response.name orelse "unknown";
+                    if (parsed.value == .array) for (parsed.value.array.items) |call| {
+                        if (call != .object) continue;
+                        const id = call.object.get("id") orelse continue;
+                        if (id == .string and response.tool_call_id != null and std.mem.eql(u8, id.string, response.tool_call_id.?)) {
+                            const function = call.object.get("function") orelse continue;
+                            if (function == .object) if (function.object.get("name")) |v| {
+                                if (v == .string) name = v.string;
+                            };
+                        }
+                    };
+                    if (!validGemmaToolIdentifier(name)) return error.InvalidGemmaToolIdentifier;
+                    try buf.appendSlice(allocator, "<|tool_response>response:");
+                    try buf.appendSlice(allocator, name);
+                    try buf.appendSlice(allocator, "{value:");
+                    try appendGemmaToolArgument(allocator, &buf, .{ .string = response.content });
+                    try buf.appendSlice(allocator, "}<tool_response|>");
+                    span_start = buf.items.len;
+                }
+                pending_tool = true;
+            }
+        }
+        const content_start = buf.items.len;
+        if (msg.role == .assistant) {
+            // Canonical strip_thinking removes channel annotations and private
+            // content through the next channel terminator.
+            var parts = std.mem.splitSequence(u8, msg.content, "<channel|>");
+            while (parts.next()) |part| {
+                const end = std.mem.indexOf(u8, part, "<|channel>") orelse part.len;
+                try buf.appendSlice(allocator, part[0..end]);
+            }
+            const content = std.mem.trim(u8, buf.items[content_start..], &std.ascii.whitespace);
+            std.mem.copyForwards(u8, buf.items[content_start..], content);
+            buf.shrinkRetainingCapacity(content_start + content.len);
+        } else {
+            try buf.appendSlice(allocator, std.mem.trim(u8, msg.content, &std.ascii.whitespace));
+        }
+        const has_content = buf.items.len > content_start;
+        var next_role: ?Role = null;
+        for (messages[index + 1 ..]) |next| {
+            if (next.role != .tool) {
+                next_role = next.role;
+                break;
+            }
+        }
+        const continues = msg.role == .assistant and next_role == .assistant and (msg.tool_calls_json == null or has_response);
+        if (pending_tool and !has_response) {
+            try buf.appendSlice(allocator, "<|tool_response>");
+        } else if (!continues and !(has_response and !has_content and next_role == null)) {
+            try buf.appendSlice(allocator, gemma4_turn_end);
+        }
+        if (msg.role == .assistant and buf.items.len > span_start) {
+            try spans.append(allocator, .{ .start = span_start, .end = buf.items.len });
+        }
+        previous_role = msg.role;
     }
-
-    // If system content never landed on a user turn (no user messages),
-    // emit it as a synthetic user turn so nothing is silently dropped.
-    if (pending_system.items.len > 0) {
-        try buf.appendSlice(allocator, "<|turn>user\n");
-        try buf.appendSlice(allocator, pending_system.items);
-        try buf.appendSlice(allocator, gemma4_turn_end);
-        pending_system.clearRetainingCapacity();
-    }
-
-    if (options.add_generation_prompt) {
-        try buf.appendSlice(allocator, "<|turn>model\n");
-        try buf.appendSlice(allocator, gemma4_thought_prompt);
-    }
-
-    return RenderResult{
+    if (options.add_generation_prompt and !pending_tool) try buf.appendSlice(allocator, "<|turn>model\n");
+    return .{
         .allocator = allocator,
         .text = try buf.toOwnedSlice(allocator),
         .assistant_spans = try spans.toOwnedSlice(allocator),
@@ -501,14 +498,13 @@ test "gemma4 render matches inference wire format and assistant loss span" {
     defer result.deinit();
 
     const expected =
-        "<bos><|turn>user\nBe terse.\n\n2+2?<turn|>\n" ++
-        "<|turn>model\n<|channel>thought\n<channel|>" ++
-        "<|channel>final\n<channel|>4<turn|>\n";
+        "<bos><|turn>system\nBe terse.<turn|>\n<|turn>user\n2+2?<turn|>\n" ++
+        "<|turn>model\n4<turn|>\n";
     try std.testing.expectEqualStrings(expected, result.text);
     try std.testing.expectEqual(@as(usize, 1), result.assistant_spans.len);
     const span = result.assistant_spans[0];
     try std.testing.expectEqualStrings(
-        "<|channel>final\n<channel|>4<turn|>\n",
+        "4<turn|>\n",
         result.text[span.start..span.end],
     );
     try std.testing.expect(!std.mem.startsWith(
@@ -533,23 +529,11 @@ test "gemma4 render keeps tool calls private across a multi-turn loop" {
     var result = try render(allocator, .gemma, &messages, .{});
     defer result.deinit();
 
-    const expected =
-        "<bos><|turn>user\nlist files<turn|>\n" ++
-        "<|turn>model\n<|channel>thought\n<channel|>" ++
-        "Checking\n<|tool_call>call:shell{cmd:<|\"|>ls<|\"|>,force:true,z:2}<tool_call|><turn|>\n" ++
-        "<|turn>tool\nfile.txt<turn|>\n" ++
-        "<|turn>model\n<|channel>thought\n<channel|>" ++
-        "<|channel>final\n<channel|>Found file.txt<turn|>\n";
-    try std.testing.expectEqualStrings(expected, result.text);
-    try std.testing.expectEqual(@as(usize, 2), result.assistant_spans.len);
-    try std.testing.expectEqualStrings(
-        "Checking\n<|tool_call>call:shell{cmd:<|\"|>ls<|\"|>,force:true,z:2}<tool_call|><turn|>\n",
-        result.text[result.assistant_spans[0].start..result.assistant_spans[0].end],
-    );
-    try std.testing.expectEqualStrings(
-        "<|channel>final\n<channel|>Found file.txt<turn|>\n",
-        result.text[result.assistant_spans[1].start..result.assistant_spans[1].end],
-    );
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "<|turn>tool") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "<|tool_response>response:shell{") != null);
+    for (result.assistant_spans) |span| {
+        try std.testing.expect(std.mem.indexOf(u8, result.text[span.start..span.end], "<|tool_response>response:") == null);
+    }
 }
 
 test "gemma4 tool-call wire round trips through the inference parser" {
@@ -632,15 +616,7 @@ test "gemma4 render preserves explicit assistant channels without duplicating th
     var result = try render(allocator, .gemma, &messages, .{});
     defer result.deinit();
 
-    const expected =
-        "<bos><|turn>user\nExplain<turn|>\n" ++
-        "<|turn>model\n<|channel>thought\n<channel|>" ++
-        "reason<|channel>final\n<channel|>answer<turn|>\n";
-    try std.testing.expectEqualStrings(expected, result.text);
-    try std.testing.expectEqualStrings(
-        "reason<|channel>final\n<channel|>answer<turn|>\n",
-        result.text[result.assistant_spans[0].start..result.assistant_spans[0].end],
-    );
+    try std.testing.expectEqualStrings("<bos><|turn>user\nExplain<turn|>\n<|turn>model\nreasonanswer<turn|>\n", result.text);
 }
 
 test "chatml render with tool role" {
@@ -712,7 +688,7 @@ test "add_generation_prompt appends suffix without adding a span" {
         var r = try render(allocator, .gemma, &messages, .{ .add_generation_prompt = true });
         defer r.deinit();
         try std.testing.expectEqualStrings(
-            "<bos><|turn>user\nhi<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+            "<bos><|turn>user\nhi<turn|>\n<|turn>model\n",
             r.text,
         );
         try std.testing.expectEqual(@as(usize, 0), r.assistant_spans.len);
@@ -750,7 +726,7 @@ test "makeCompletionLabels masks tokens outside assistant spans" {
     try std.testing.expectEqual(@as(i32, -100), labels[5]);
 }
 
-test "gemma4 completion labels exclude role and thought prompt" {
+test "gemma4 completion labels exclude role and include answer and turn end" {
     const allocator = std.testing.allocator;
     const messages = [_]Message{
         .{ .role = .user, .content = "2+2?" },
@@ -760,23 +736,13 @@ test "gemma4 completion labels exclude role and thought prompt" {
     defer rendered.deinit();
 
     const role_offset = std.mem.indexOf(u8, rendered.text, "<|turn>model").?;
-    const thought_offset = std.mem.indexOf(u8, rendered.text, gemma4_thought_prompt).?;
-    const final_offset = std.mem.indexOf(u8, rendered.text, gemma4_final_channel).?;
-    const answer_offset = std.mem.indexOfPos(u8, rendered.text, final_offset + gemma4_final_channel.len, "4").?;
+    const answer_offset = std.mem.indexOfPos(u8, rendered.text, role_offset, "4").?;
     const turn_end_offset = std.mem.indexOfPos(u8, rendered.text, answer_offset + 1, "<turn|>").?;
-    const ids = [_]i32{ 10, 11, 12, 13, 14 };
-    const offsets = [_]usize{ role_offset, thought_offset, final_offset, answer_offset, turn_end_offset };
-
-    const labels = try makeCompletionLabels(
-        allocator,
-        &ids,
-        &offsets,
-        rendered.assistant_spans,
-        -100,
-    );
+    const ids = [_]i32{ 10, 11, 12 };
+    const offsets = [_]usize{ role_offset, answer_offset, turn_end_offset };
+    const labels = try makeCompletionLabels(allocator, &ids, &offsets, rendered.assistant_spans, -100);
     defer allocator.free(labels);
-
-    try std.testing.expectEqualSlices(i32, &.{ -100, -100, 12, 13, 14 }, labels);
+    try std.testing.expectEqualSlices(i32, &.{ -100, 11, 12 }, labels);
 }
 
 test "empty messages renders empty string and empty spans" {
@@ -787,5 +753,44 @@ test "empty messages renders empty string and empty spans" {
         defer r.deinit();
         try std.testing.expectEqual(@as(usize, 0), r.text.len);
         try std.testing.expectEqual(@as(usize, 0), r.assistant_spans.len);
+    }
+}
+
+test "gemma4 training renderer matches canonical Jinja system tool and channel history" {
+    const jinja = @import("jinja");
+    const allocator = std.testing.allocator;
+    var template = try jinja.Template.initHuggingFace(allocator, jinja.gemma4_canonical_template);
+    defer template.deinit();
+    const messages = [_]Message{
+        .{ .role = .system, .content = " Be terse. " },
+        .{ .role = .user, .content = " Find the code. " },
+        .{ .role = .assistant, .content = "Checking", .tool_calls_json = "[{\"id\":\"c1\",\"function\":{\"name\":\"lookup\",\"arguments\":{\"query\":\"code\",\"limit\":2}}}]" },
+        .{ .role = .tool, .content = "AZURE-731", .tool_call_id = "c1" },
+        .{ .role = .assistant, .content = "<|channel>thought\nprivate<channel|>Found it." },
+        .{ .role = .user, .content = "Thanks" },
+        .{ .role = .assistant, .content = "Done" },
+    };
+    const reference = [_]jinja.ChatMessage{
+        .{ .role = "system", .content = messages[0].content },
+        .{ .role = "user", .content = messages[1].content },
+        .{ .role = "assistant", .content = "Checking", .tool_calls = &.{.{ .id = "c1", .name = "lookup", .arguments = "{\"query\":\"code\",\"limit\":2}" }} },
+        .{ .role = "tool", .content = "AZURE-731", .tool_call_id = "c1" },
+        .{ .role = "assistant", .content = messages[4].content },
+        .{ .role = "user", .content = "Thanks" },
+        .{ .role = "assistant", .content = "Done" },
+    };
+    for (1..messages.len + 1) |end| {
+        for ([_]bool{ false, true }) |generation_prompt| {
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            var context = try jinja.chatTemplateContext(arena.allocator(), reference[0..end], .{ .bos_token = "<bos>", .add_generation_prompt = generation_prompt, .enable_thinking = false });
+            const expected = try template.render(arena.allocator(), &context);
+            var actual = try render(allocator, .gemma, messages[0..end], .{ .add_generation_prompt = generation_prompt });
+            defer actual.deinit();
+            try std.testing.expectEqualStrings(expected, actual.text);
+            for (actual.assistant_spans) |span| {
+                try std.testing.expect(std.mem.indexOf(u8, actual.text[span.start..span.end], "AZURE-731") == null);
+            }
+        }
     }
 }

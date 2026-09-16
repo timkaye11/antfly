@@ -67,6 +67,7 @@ from gemma4_oracle_contract import (
     lock_digest,
     prefixed_sha256,
     read_adapter_config,
+    sha256_file,
     validate_target_inventory,
     verify_import_source,
     verify_model_directory,
@@ -91,7 +92,9 @@ OFFLINE_ENVIRONMENT = {
     "TOKENIZERS_PARALLELISM": "false",
     "TRANSFORMERS_OFFLINE": "1",
 }
-PREPARED_CHAT_TEMPLATE_IDENTITY = b"antfly_gemma_chat/v1"
+PREPARED_CHAT_TEMPLATE_PATH = (
+    SCRIPT_DIR.parent.parent / "src/finetune/chat_template.zig"
+)
 MEMORY_SAMPLER_INTERVAL_MS = 10
 RUSAGE_INFO_V4 = 4
 INTERNAL_WORKER_FLAG = "--_antfly-gemma4-mlx-worker-fd"
@@ -100,7 +103,9 @@ MAX_CONTROL_MESSAGE_BYTES = 4 * 1024 * 1024
 CONTROL_IDLE_TIMEOUT_SECONDS = 4 * 60 * 60
 DIAGNOSTIC_SAMPLE_SCHEMA_VERSION = "antfly_gemma4_mlx_diagnostic_sample/v1"
 DIAGNOSTIC_SOURCE_SCHEMA_VERSION = "antfly_gemma4_diagnostic_producer_source/v1"
-DIAGNOSTIC_RELEASE_BLOCKER = "benchmark-producer-source-is-not-clean-committed-release-evidence"
+DIAGNOSTIC_RELEASE_BLOCKER = (
+    "benchmark-producer-source-is-not-clean-committed-release-evidence"
+)
 _PROCESS_CLAIMED = False
 _DARWIN_PHYS_FOOTPRINT_PROBE: Callable[[int], int] | None = None
 
@@ -220,7 +225,9 @@ class PrecisionEvidenceRecorder:
         }
         previous = self._gradient_stages.get(stage)
         if previous is not None and previous != observation:
-            raise ContractError(f"gradient precision observation {stage} changed within one run")
+            raise ContractError(
+                f"gradient precision observation {stage} changed within one run"
+            )
         self._gradient_stages[stage] = observation
 
     def finalize(self) -> dict[str, Any]:
@@ -238,13 +245,19 @@ class PrecisionEvidenceRecorder:
             "evidence_kind": "compiled-gradient-tree-inventory",
             "dtype": "float32",
             "tensor_count": lora_count,
-            "stages": [self._copy(self._gradient_stages[stage]) for stage in self._GRADIENT_STAGES],
+            "stages": [
+                self._copy(self._gradient_stages[stage])
+                for stage in self._GRADIENT_STAGES
+            ],
         }
         return {
             name: result[name]
             for name in (
-                "base_model_storage", "lora_parameter_storage", "gradient_storage",
-                "optimizer_moment_storage", "loss",
+                "base_model_storage",
+                "lora_parameter_storage",
+                "gradient_storage",
+                "optimizer_moment_storage",
+                "loss",
             )
         }
 
@@ -281,7 +294,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Emit one pinned, fresh-process MLX-LM Gemma4 LoRA benchmark sample."
     )
-    parser.add_argument("--model-key", required=True, choices=("gemma-4-E2B-it", "gemma-4-E4B-it"))
+    parser.add_argument(
+        "--model-key", required=True, choices=("gemma-4-E2B-it", "gemma-4-E4B-it")
+    )
     parser.add_argument("--model-dir", required=True, type=Path)
     parser.add_argument("--prepared", required=True, type=Path)
     parser.add_argument("--source-dataset", required=True, type=Path)
@@ -292,7 +307,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Local F32 PEFT or Antfly seed adapter whose exact A/B values initialize MLX.",
     )
     parser.add_argument("--example-index", required=True, type=_nonnegative_int)
-    parser.add_argument("--target-preset", required=True, choices=("peft-qv", "text-all-linear"))
+    parser.add_argument(
+        "--target-preset", required=True, choices=("peft-qv", "text-all-linear")
+    )
     parser.add_argument("--sequence-length", required=True, type=_positive_int)
     parser.add_argument("--grad-accum", required=True, type=_positive_int)
     parser.add_argument("--campaign-id", required=True, type=_campaign_identifier)
@@ -406,7 +423,9 @@ def _load_darwin_phys_footprint_probe() -> Callable[[int], int]:
             )
         footprint = int(info.ri_phys_footprint)
         if footprint <= 0:
-            raise ContractError("proc_pid_rusage reported a non-positive physical footprint")
+            raise ContractError(
+                "proc_pid_rusage reported a non-positive physical footprint"
+            )
         return footprint
 
     return probe
@@ -446,7 +465,9 @@ class DarwinProcessMemorySampler:
     def _sample(self) -> None:
         value = self._probe(self.pid)
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise ContractError("process-memory sampler produced an invalid physical footprint")
+            raise ContractError(
+                "process-memory sampler produced an invalid physical footprint"
+            )
         self._samples.append(value)
 
     def _sample_loop(self) -> None:
@@ -482,10 +503,14 @@ class DarwinProcessMemorySampler:
         self._stop.set()
         self._thread.join()
         if self._failure is not None:
-            raise ContractError(f"process-memory sampler failed: {self._failure}") from self._failure
+            raise ContractError(
+                f"process-memory sampler failed: {self._failure}"
+            ) from self._failure
         self._sample()
         if len(self._samples) < 2:
-            raise ContractError("process-memory sampler produced fewer than two samples")
+            raise ContractError(
+                "process-memory sampler produced fewer than two samples"
+            )
         return ProcessMemoryMeasurement(max(self._samples), len(self._samples))
 
 
@@ -543,25 +568,35 @@ def parse_memory_pressure_available_percent(output: str) -> float:
         flags=re.MULTILINE,
     )
     if len(matches) != 1:
-        raise ContractError("memory_pressure -Q did not report one available-memory percentage")
+        raise ContractError(
+            "memory_pressure -Q did not report one available-memory percentage"
+        )
     result = float(matches[0])
     if not math.isfinite(result) or not 0.0 <= result <= 100.0:
-        raise ContractError("memory_pressure -Q reported an invalid available-memory percentage")
+        raise ContractError(
+            "memory_pressure -Q reported an invalid available-memory percentage"
+        )
     return result
 
 
-def capture_darwin_system_memory_snapshot(*, before_measured: bool) -> DarwinSystemMemorySnapshot:
+def capture_darwin_system_memory_snapshot(
+    *, before_measured: bool
+) -> DarwinSystemMemorySnapshot:
     """Bracket measured steps tightly while collecting both Darwin sources."""
     if platform.system() != "Darwin":
         raise ContractError("system-memory snapshots require Darwin")
     if before_measured:
-        pressure_output = _run_memory_tool(("/usr/bin/memory_pressure", "-Q"), "memory_pressure -Q")
+        pressure_output = _run_memory_tool(
+            ("/usr/bin/memory_pressure", "-Q"), "memory_pressure -Q"
+        )
         vm_output = _run_memory_tool(("/usr/bin/vm_stat",), "vm_stat")
     else:
         # Read the monotonic VM counters immediately after the final measured
         # device sync, before memory_pressure itself can perturb them.
         vm_output = _run_memory_tool(("/usr/bin/vm_stat",), "vm_stat")
-        pressure_output = _run_memory_tool(("/usr/bin/memory_pressure", "-Q"), "memory_pressure -Q")
+        pressure_output = _run_memory_tool(
+            ("/usr/bin/memory_pressure", "-Q"), "memory_pressure -Q"
+        )
     page_size, counters = parse_vm_stat(vm_output)
     return DarwinSystemMemorySnapshot(
         page_size=page_size,
@@ -569,7 +604,9 @@ def capture_darwin_system_memory_snapshot(*, before_measured: bool) -> DarwinSys
         pageouts=counters["Pageouts"],
         swapins=counters["Swapins"],
         swapouts=counters["Swapouts"],
-        pressure_available_percent=parse_memory_pressure_available_percent(pressure_output),
+        pressure_available_percent=parse_memory_pressure_available_percent(
+            pressure_output
+        ),
     )
 
 
@@ -588,9 +625,13 @@ def darwin_system_memory_deltas(
     ):
         delta_pages = getattr(after, field) - getattr(before, field)
         if delta_pages < 0:
-            raise ContractError(f"Darwin {field} counter regressed during measured optimizer steps")
+            raise ContractError(
+                f"Darwin {field} counter regressed during measured optimizer steps"
+            )
         result[output_name] = delta_pages * before.page_size
-    pressure_delta = after.pressure_available_percent - before.pressure_available_percent
+    pressure_delta = (
+        after.pressure_available_percent - before.pressure_available_percent
+    )
     if not math.isfinite(pressure_delta) or not -100.0 <= pressure_delta <= 100.0:
         raise ContractError("available-memory pressure delta is invalid")
     result["pressure_available_percent_delta"] = pressure_delta
@@ -614,7 +655,9 @@ def enforce_system_memory_gates(
         deltas["pressure_available_percent_delta"]
         < memory_contract["minimum_pressure_available_percent_delta"]
     ):
-        raise ContractError("available-memory pressure degraded beyond the locked benchmark gate")
+        raise ContractError(
+            "available-memory pressure degraded beyond the locked benchmark gate"
+        )
 
 
 class JsonControlChannel:
@@ -637,38 +680,55 @@ class JsonControlChannel:
 
     def send(self, payload: Mapping[str, Any]) -> None:
         try:
-            encoded = json.dumps(
-                payload,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=False,
-                allow_nan=False,
-            ).encode("utf-8") + b"\n"
+            encoded = (
+                json.dumps(
+                    payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+                + b"\n"
+            )
         except (TypeError, ValueError) as exc:
-            raise ContractError(f"control message is not canonical JSON: {exc}") from exc
+            raise ContractError(
+                f"control message is not canonical JSON: {exc}"
+            ) from exc
         if len(encoded) > MAX_CONTROL_MESSAGE_BYTES:
             raise ContractError("control message exceeds the fixed size limit")
         try:
             self._channel.sendall(encoded)
         except OSError as exc:
-            raise ContractError(f"benchmark control channel write failed: {exc}") from exc
+            raise ContractError(
+                f"benchmark control channel write failed: {exc}"
+            ) from exc
 
     def receive(self) -> dict[str, Any]:
         while b"\n" not in self._buffer:
             if len(self._buffer) >= MAX_CONTROL_MESSAGE_BYTES:
                 raise ContractError("control message exceeds the fixed size limit")
             try:
-                chunk = self._channel.recv(min(64 * 1024, MAX_CONTROL_MESSAGE_BYTES - len(self._buffer)))
+                chunk = self._channel.recv(
+                    min(64 * 1024, MAX_CONTROL_MESSAGE_BYTES - len(self._buffer))
+                )
             except socket.timeout as exc:
                 timeout = self._receive_timeout_seconds
-                description = "the configured deadline" if timeout is None else f"{timeout:g} seconds"
+                description = (
+                    "the configured deadline"
+                    if timeout is None
+                    else f"{timeout:g} seconds"
+                )
                 raise ContractError(
                     f"benchmark control channel was idle for {description}"
                 ) from exc
             except OSError as exc:
-                raise ContractError(f"benchmark control channel read failed: {exc}") from exc
+                raise ContractError(
+                    f"benchmark control channel read failed: {exc}"
+                ) from exc
             if not chunk:
-                raise ContractError("benchmark worker closed the control channel unexpectedly")
+                raise ContractError(
+                    "benchmark worker closed the control channel unexpectedly"
+                )
             self._buffer.extend(chunk)
         raw, separator, remainder = self._buffer.partition(b"\n")
         assert separator
@@ -680,7 +740,9 @@ class JsonControlChannel:
                 parse_constant=_reject_nonfinite_json_number,
             )
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise ContractError(f"benchmark control message is invalid JSON: {exc}") from exc
+            raise ContractError(
+                f"benchmark control message is invalid JSON: {exc}"
+            ) from exc
         if not isinstance(payload, dict):
             raise ContractError("benchmark control message must be an object")
         if payload.get("schema_version") != CONTROL_PROTOCOL_VERSION:
@@ -707,7 +769,9 @@ class WorkerPhaseReporter:
             "phase": phase,
         }
         if acknowledgement != expected:
-            raise ContractError(f"benchmark coordinator sent an invalid {phase} acknowledgement")
+            raise ContractError(
+                f"benchmark coordinator sent an invalid {phase} acknowledgement"
+            )
 
 
 def _zig_hash_bytes(hasher: Any, value: bytes | str) -> None:
@@ -743,18 +807,24 @@ def _checkpoint_paths(model_dir: Path) -> list[Path]:
             raise ContractError("model.safetensors.index.json has no weight_map")
         relative_names = sorted(set(weight_map.values()))
         if any(not isinstance(name, str) or not name for name in relative_names):
-            raise ContractError("model.safetensors.index.json contains an invalid shard name")
+            raise ContractError(
+                "model.safetensors.index.json contains an invalid shard name"
+            )
         result: list[Path] = []
         for name in relative_names:
             relative = Path(name)
             if relative.is_absolute() or ".." in relative.parts:
-                raise ContractError("model.safetensors.index.json contains an unsafe shard path")
+                raise ContractError(
+                    "model.safetensors.index.json contains an unsafe shard path"
+                )
             result.append((model_dir / relative).resolve())
         return result
     checkpoint = model_dir / "model.safetensors"
     if checkpoint.is_file():
         return [checkpoint.resolve()]
-    raise ContractError("locked MLX model must expose model.safetensors or its shard index")
+    raise ContractError(
+        "locked MLX model must expose model.safetensors or its shard index"
+    )
 
 
 def zig_model_provenance(model_dir: Path) -> dict[str, str]:
@@ -767,7 +837,9 @@ def zig_model_provenance(model_dir: Path) -> dict[str, str]:
         _zig_hash_file(base, "config", config)
     else:
         _zig_hash_bytes(base, "config_absent")
-    for checkpoint in sorted(_checkpoint_paths(root), key=lambda path: (path.name, str(path))):
+    for checkpoint in sorted(
+        _checkpoint_paths(root), key=lambda path: (path.name, str(path))
+    ):
         _zig_hash_file(base, "safetensors", checkpoint)
     base_digest = base.hexdigest()
 
@@ -791,7 +863,7 @@ def zig_model_provenance(model_dir: Path) -> dict[str, str]:
     return {
         "base_model_sha256": base_digest,
         "tokenizer_sha256": tokenizer.hexdigest(),
-        "chat_template_sha256": hashlib.sha256(PREPARED_CHAT_TEMPLATE_IDENTITY).hexdigest(),
+        "chat_template_sha256": sha256_file(PREPARED_CHAT_TEMPLATE_PATH),
     }
 
 
@@ -799,7 +871,9 @@ def require_prepared_model_binding(summary: Mapping[str, Any], model_dir: Path) 
     actual = zig_model_provenance(model_dir)
     for field, digest in actual.items():
         if summary.get(field) != digest:
-            raise ContractError(f"prepared {field} does not match the locked local model")
+            raise ContractError(
+                f"prepared {field} does not match the locked local model"
+            )
 
 
 def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -842,16 +916,24 @@ def _read_f32_tensor_digest_and_finiteness(
             while remaining:
                 chunk = source.read(min(4 * 1024 * 1024, remaining))
                 if not chunk:
-                    raise ContractError(f"adapter tensor payload is truncated: {tensor_name}")
+                    raise ContractError(
+                        f"adapter tensor payload is truncated: {tensor_name}"
+                    )
                 if len(chunk) % 4:
-                    raise ContractError(f"adapter tensor payload is not aligned F32: {tensor_name}")
+                    raise ContractError(
+                        f"adapter tensor payload is not aligned F32: {tensor_name}"
+                    )
                 hasher.update(chunk)
                 for (value,) in struct.iter_unpack("<f", chunk):
                     if not math.isfinite(value):
-                        raise ContractError(f"adapter tensor contains non-finite data: {tensor_name}")
+                        raise ContractError(
+                            f"adapter tensor contains non-finite data: {tensor_name}"
+                        )
                 remaining -= len(chunk)
     except OSError as exc:
-        raise ContractError(f"could not read adapter tensor {tensor_name}: {exc}") from exc
+        raise ContractError(
+            f"could not read adapter tensor {tensor_name}: {exc}"
+        ) from exc
     return "sha256:" + hasher.hexdigest()
 
 
@@ -916,7 +998,9 @@ def inspect_initial_adapter(
     manifest_path = root / "antfly_finetune_manifest.json"
     if manifest_path.exists():
         if manifest_path.is_symlink() or not manifest_path.is_file():
-            raise ContractError("initial adapter manifest must be a regular non-symlink file")
+            raise ContractError(
+                "initial adapter manifest must be a regular non-symlink file"
+            )
         _load_strict_json_file(manifest_path, "initial adapter manifest")
     semantics = read_adapter_config(
         root,
@@ -924,25 +1008,42 @@ def inspect_initial_adapter(
         allow_missing_manifest_target_preset=allow_missing_manifest_target_preset,
     )
     gate = lock["performance_gate"]
-    if semantics["r"] != gate["rank"] or float(semantics["lora_alpha"]) != float(gate["alpha"]):
-        raise ContractError("initial adapter rank/alpha differ from the locked performance matrix")
+    if semantics["r"] != gate["rank"] or float(semantics["lora_alpha"]) != float(
+        gate["alpha"]
+    ):
+        raise ContractError(
+            "initial adapter rank/alpha differ from the locked performance matrix"
+        )
     if semantics["target_preset"] != target_preset:
-        raise ContractError("initial adapter target preset differs from the benchmark cell")
+        raise ContractError(
+            "initial adapter target preset differs from the benchmark cell"
+        )
     provenance = semantics.get("provenance")
     if provenance is not None:
         for field in ("base_model_sha256", "tokenizer_sha256", "chat_template_sha256"):
             if provenance.get(field) != prepared_summary.get(field):
-                raise ContractError(f"initial adapter {field} differs from the prepared/model identity")
+                raise ContractError(
+                    f"initial adapter {field} differs from the prepared/model identity"
+                )
 
-    if not isinstance(raw_config, Mapping) or raw_config.get("inference_mode") is not False:
+    if (
+        not isinstance(raw_config, Mapping)
+        or raw_config.get("inference_mode") is not False
+    ):
         raise ContractError("initial adapter must explicitly set inference_mode=false")
     if raw_config.get("fan_in_fan_out", False) is not False:
-        raise ContractError("initial adapter fan_in_fan_out must be false for Gemma4 linear layers")
+        raise ContractError(
+            "initial adapter fan_in_fan_out must be false for Gemma4 linear layers"
+        )
     if raw_config.get("bias", "none") != "none":
-        raise ContractError("initial adapter may not train or serialize non-LoRA bias parameters")
+        raise ContractError(
+            "initial adapter may not train or serialize non-LoRA bias parameters"
+        )
     checkpoint = root / "adapter_model.safetensors"
     if checkpoint.is_symlink() or not checkpoint.is_file():
-        raise ContractError("initial adapter checkpoint must be a regular non-symlink file")
+        raise ContractError(
+            "initial adapter checkpoint must be a regular non-symlink file"
+        )
     try:
         with checkpoint.open("rb") as source:
             raw_length = source.read(8)
@@ -955,7 +1056,9 @@ def inspect_initial_adapter(
             if len(raw_header) != header_length:
                 raise ContractError("adapter Safetensors header is truncated")
     except OSError as exc:
-        raise ContractError(f"could not read initial adapter checkpoint: {exc}") from exc
+        raise ContractError(
+            f"could not read initial adapter checkpoint: {exc}"
+        ) from exc
     try:
         header = json.loads(
             raw_header.decode("utf-8"),
@@ -974,14 +1077,22 @@ def inspect_initial_adapter(
     layouts: set[str] = set()
     for source_name, raw_descriptor in header.items():
         if source_name == "__metadata__":
-            if (
-                not isinstance(raw_descriptor, Mapping)
-                or any(not isinstance(key, str) or not isinstance(value, str) for key, value in raw_descriptor.items())
+            if not isinstance(raw_descriptor, Mapping) or any(
+                not isinstance(key, str) or not isinstance(value, str)
+                for key, value in raw_descriptor.items()
             ):
-                raise ContractError("Safetensors __metadata__ must map strings to strings")
+                raise ContractError(
+                    "Safetensors __metadata__ must map strings to strings"
+                )
             continue
-        if not isinstance(raw_descriptor, Mapping) or set(raw_descriptor) != {"dtype", "shape", "data_offsets"}:
-            raise ContractError(f"adapter tensor descriptor is not closed: {source_name}")
+        if not isinstance(raw_descriptor, Mapping) or set(raw_descriptor) != {
+            "dtype",
+            "shape",
+            "data_offsets",
+        }:
+            raise ContractError(
+                f"adapter tensor descriptor is not closed: {source_name}"
+            )
         if raw_descriptor["dtype"] != "F32":
             raise ContractError(f"initial adapter tensor must be F32: {source_name}")
         shape = raw_descriptor["shape"]
@@ -989,22 +1100,41 @@ def inspect_initial_adapter(
         if (
             not isinstance(shape, list)
             or len(shape) != 2
-            or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in shape)
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                for value in shape
+            )
         ):
-            raise ContractError(f"initial adapter tensor must have a positive rank-2 shape: {source_name}")
+            raise ContractError(
+                f"initial adapter tensor must have a positive rank-2 shape: {source_name}"
+            )
         if (
             not isinstance(offsets, list)
             or len(offsets) != 2
-            or any(isinstance(value, bool) or not isinstance(value, int) for value in offsets)
+            or any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in offsets
+            )
         ):
-            raise ContractError(f"initial adapter tensor offsets are malformed: {source_name}")
+            raise ContractError(
+                f"initial adapter tensor offsets are malformed: {source_name}"
+            )
         start, end = offsets
         expected_bytes = shape[0] * shape[1] * 4
-        if start < 0 or end <= start or end - start != expected_bytes or end > payload_size:
-            raise ContractError(f"initial adapter tensor byte range is invalid: {source_name}")
+        if (
+            start < 0
+            or end <= start
+            or end - start != expected_bytes
+            or end > payload_size
+        ):
+            raise ContractError(
+                f"initial adapter tensor byte range is invalid: {source_name}"
+            )
         identity = canonicalize_adapter_tensor_name(source_name)
         if identity in tensors:
-            raise ContractError(f"duplicate canonical initial adapter tensor: {identity}")
+            raise ContractError(
+                f"duplicate canonical initial adapter tensor: {identity}"
+            )
         role = identity[1]
         if role == "lora_A" and shape[0] != gate["rank"]:
             raise ContractError(f"initial LoRA A rank mismatch: {source_name}")
@@ -1022,37 +1152,54 @@ def inspect_initial_adapter(
         )
         ranges.append((start, end, source_name))
     if not tensors or len(layouts) != 1:
-        raise ContractError("initial adapter must contain one consistent tensor key layout")
+        raise ContractError(
+            "initial adapter must contain one consistent tensor key layout"
+        )
     ordered_ranges = sorted(ranges)
     expected_start = 0
     for start, end, name in ordered_ranges:
         if start != expected_start:
-            raise ContractError(f"initial adapter has a gap or overlap before tensor {name}")
+            raise ContractError(
+                f"initial adapter has a gap or overlap before tensor {name}"
+            )
         expected_start = end
     if expected_start != payload_size:
-        raise ContractError("initial adapter has uncommitted trailing tensor payload bytes")
+        raise ContractError(
+            "initial adapter has uncommitted trailing tensor payload bytes"
+        )
     manifest_backed = semantics["policy_source"] in (
         "antfly-finetune-manifest/v2",
         "antfly-finetune-manifest/v3",
     )
-    if (manifest_backed and layouts != {"antfly"}) or (not manifest_backed and layouts != {"stock-peft"}):
-        raise ContractError("initial adapter tensor key layout conflicts with its policy source")
+    if (manifest_backed and layouts != {"antfly"}) or (
+        not manifest_backed and layouts != {"stock-peft"}
+    ):
+        raise ContractError(
+            "initial adapter tensor key layout conflicts with its policy source"
+        )
 
     modules: dict[str, set[str]] = {}
     for module, role in tensors:
         modules.setdefault(module, set()).add(role)
     if any(roles != {"lora_A", "lora_B"} for roles in modules.values()):
-        raise ContractError("initial adapter must contain one A/B pair for every target module")
+        raise ContractError(
+            "initial adapter must contain one A/B pair for every target module"
+        )
     configured_targets = semantics["target_modules"]
     unmatched = [
         module
         for module in modules
-        if not any(module == target or module.endswith("." + target) for target in configured_targets)
+        if not any(
+            module == target or module.endswith("." + target)
+            for target in configured_targets
+        )
     ]
     unused = [
         target
         for target in configured_targets
-        if not any(module == target or module.endswith("." + target) for module in modules)
+        if not any(
+            module == target or module.endswith("." + target) for module in modules
+        )
     ]
     if unmatched or unused:
         raise ContractError(
@@ -1064,7 +1211,9 @@ def inspect_initial_adapter(
     bound_files = [config_path, checkpoint]
     if manifest_path.exists():
         bound_files.append(manifest_path)
-    semantic_sha256 = canonical_initial_adapter_file_sha256(checkpoint, data_start, tensors)
+    semantic_sha256 = canonical_initial_adapter_file_sha256(
+        checkpoint, data_start, tensors
+    )
     return AdapterArtifact(
         directory=root,
         checkpoint=checkpoint,
@@ -1077,7 +1226,9 @@ def inspect_initial_adapter(
     )
 
 
-def build_workload(example: Mapping[str, Any], sequence_length: int, grad_accum: int) -> Workload:
+def build_workload(
+    example: Mapping[str, Any], sequence_length: int, grad_accum: int
+) -> Workload:
     input_ids = tuple(example["input_ids"])
     labels = tuple(example["labels"])
     if len(input_ids) != sequence_length or len(labels) != sequence_length:
@@ -1107,26 +1258,40 @@ def build_workload(example: Mapping[str, Any], sequence_length: int, grad_accum:
     )
 
 
-def _load_surface_paths(lock: Mapping[str, Any], model_key: str, model_dir: Path) -> list[Path]:
+def _load_surface_paths(
+    lock: Mapping[str, Any], model_key: str, model_dir: Path
+) -> list[Path]:
     root = model_dir.expanduser().resolve()
     locked_files = lock["models"][model_key]["files"]
     paths = [root / relative for relative in locked_files]
     locked_checkpoints = {
-        path for path in paths if path.name.startswith("model") and path.suffix == ".safetensors"
+        path
+        for path in paths
+        if path.name.startswith("model") and path.suffix == ".safetensors"
     }
-    actual_checkpoints = {path.absolute() for path in root.glob("model*.safetensors") if path.is_file()}
+    actual_checkpoints = {
+        path.absolute() for path in root.glob("model*.safetensors") if path.is_file()
+    }
     if actual_checkpoints != locked_checkpoints:
-        raise ContractError("MLX model load surface contains an unlocked or missing model*.safetensors file")
+        raise ContractError(
+            "MLX model load surface contains an unlocked or missing model*.safetensors file"
+        )
     generation_config = root / "generation_config.json"
     if generation_config.exists() and "generation_config.json" not in locked_files:
-        raise ContractError("MLX model load surface contains an unlocked generation_config.json")
+        raise ContractError(
+            "MLX model load surface contains an unlocked generation_config.json"
+        )
     config = load_json(root / "config.json")
     if not isinstance(config, Mapping) or config.get("model_type") != "gemma4":
-        raise ContractError("locked MLX benchmark model config must declare model_type=gemma4")
+        raise ContractError(
+            "locked MLX benchmark model config must declare model_type=gemma4"
+        )
     custom_model = config.get("model_file")
     if custom_model is not None:
         if not isinstance(custom_model, str) or custom_model not in locked_files:
-            raise ContractError("MLX model config references an unlocked custom model_file")
+            raise ContractError(
+                "MLX model config references an unlocked custom model_file"
+            )
     for path in paths:
         if path.is_symlink():
             raise ContractError(f"locked model artifacts may not be symlinks: {path}")
@@ -1145,9 +1310,13 @@ def capture_file_identities(paths: Sequence[Path]) -> tuple[FileIdentity, ...]:
         try:
             stat = raw_path.stat()
         except OSError as exc:
-            raise ContractError(f"could not stat bound input {raw_path}: {exc}") from exc
+            raise ContractError(
+                f"could not stat bound input {raw_path}: {exc}"
+            ) from exc
         if not raw_path.is_file() or raw_path.is_symlink():
-            raise ContractError(f"bound input must be a regular non-symlink file: {raw_path}")
+            raise ContractError(
+                f"bound input must be a regular non-symlink file: {raw_path}"
+            )
         identities.append(
             FileIdentity(
                 path=raw_path,
@@ -1165,7 +1334,9 @@ def require_files_unchanged(identities: Sequence[FileIdentity]) -> None:
     for expected in identities:
         current = capture_file_identities((expected.path,))[0]
         if current != expected:
-            raise ContractError(f"bound benchmark input drifted during execution: {expected.path}")
+            raise ContractError(
+                f"bound benchmark input drifted during execution: {expected.path}"
+            )
 
 
 def preflight(args: argparse.Namespace) -> Preflight:
@@ -1174,7 +1345,9 @@ def preflight(args: argparse.Namespace) -> Preflight:
     if args.sequence_length not in gate["primary_sequence_lengths"]:
         raise ContractError("sequence length is outside the locked performance matrix")
     if args.grad_accum not in gate["gradient_accumulation"]:
-        raise ContractError("gradient accumulation is outside the locked performance matrix")
+        raise ContractError(
+            "gradient accumulation is outside the locked performance matrix"
+        )
     if args.target_preset not in lock["target_presets"]:
         raise ContractError("target preset is outside the locked performance matrix")
 
@@ -1291,20 +1464,32 @@ def verify_mlx_native_runtime(
     """Bind the loaded extension, runtime dylibs, Metal library, and build attestation."""
     native_contract = lock["mlx_reference"]["native_runtime"]
     if getattr(mx, "__name__", None) != native_contract["extension_module"]:
-        raise ContractError("loaded MLX core module differs from the locked native extension module")
+        raise ContractError(
+            "loaded MLX core module differs from the locked native extension module"
+        )
     try:
         unresolved_core = Path(inspect.getfile(mx)).expanduser().absolute()
     except (TypeError, OSError) as exc:
-        raise ContractError(f"could not locate the loaded MLX core extension: {exc}") from exc
+        raise ContractError(
+            f"could not locate the loaded MLX core extension: {exc}"
+        ) from exc
     if unresolved_core.is_symlink():
         raise ContractError("loaded MLX core extension may not be a symbolic link")
     core_path = unresolved_core.resolve(strict=True)
-    if not core_path.is_file() or not core_path.name.startswith("core.") or core_path.suffix != ".so":
-        raise ContractError(f"loaded mlx.core is not the expected native extension: {core_path}")
+    if (
+        not core_path.is_file()
+        or not core_path.name.startswith("core.")
+        or core_path.suffix != ".so"
+    ):
+        raise ContractError(
+            f"loaded mlx.core is not the expected native extension: {core_path}"
+        )
     package_root = core_path.parent
     library_root = package_root / "lib"
     if library_root.is_symlink() or not library_root.is_dir():
-        raise ContractError("loaded MLX package lib directory must be a regular non-symlink directory")
+        raise ContractError(
+            "loaded MLX package lib directory must be a regular non-symlink directory"
+        )
     expected_paths = {
         "jaccl-runtime-dylib": library_root / "libjaccl.dylib",
         "metal-library": library_root / "mlx.metallib",
@@ -1312,9 +1497,7 @@ def verify_mlx_native_runtime(
         "runtime-dylib": library_root / "libmlx.dylib",
     }
     relevant_paths = {
-        path.absolute()
-        for path in package_root.glob("*.so")
-        if path.is_file()
+        path.absolute() for path in package_root.glob("*.so") if path.is_file()
     }
     if library_root.is_dir():
         relevant_paths.update(
@@ -1322,9 +1505,15 @@ def verify_mlx_native_runtime(
             for path in library_root.rglob("*")
             if path.is_file() and path.suffix in (".dylib", ".metallib")
         )
-    expected_unresolved = {path.absolute() for path in expected_paths.values() if path.exists()}
-    if relevant_paths != expected_unresolved or len(expected_unresolved) != len(expected_paths):
-        missing = sorted(str(path) for path in expected_paths.values() if not path.is_file())
+    expected_unresolved = {
+        path.absolute() for path in expected_paths.values() if path.exists()
+    }
+    if relevant_paths != expected_unresolved or len(expected_unresolved) != len(
+        expected_paths
+    ):
+        missing = sorted(
+            str(path) for path in expected_paths.values() if not path.is_file()
+        )
         extra = sorted(str(path) for path in relevant_paths - expected_unresolved)
         raise ContractError(
             f"MLX native runtime surface differs from the closed four-artifact inventory "
@@ -1356,18 +1545,24 @@ def verify_mlx_native_runtime(
         expected_paths["runtime-dylib"].resolve(strict=True),
     }
     if not required_loaded_images.issubset(loaded_images):
-        missing_loaded = sorted(str(path) for path in required_loaded_images - loaded_images)
+        missing_loaded = sorted(
+            str(path) for path in required_loaded_images - loaded_images
+        )
         raise ContractError(
             "loaded MLX Mach-O images differ from the attested extension/runtime dylib "
             f"(missing={missing_loaded})"
         )
-    loaded_libmlx = sorted(path for path in loaded_images if path.name == "libmlx.dylib")
+    loaded_libmlx = sorted(
+        path for path in loaded_images if path.name == "libmlx.dylib"
+    )
     if loaded_libmlx != [expected_paths["runtime-dylib"].resolve(strict=True)]:
         raise ContractError(
             "worker loaded an unbound libmlx.dylib image "
             f"(loaded={[str(path) for path in loaded_libmlx]})"
         )
-    loaded_libjaccl = sorted(path for path in loaded_images if path.name == "libjaccl.dylib")
+    loaded_libjaccl = sorted(
+        path for path in loaded_images if path.name == "libjaccl.dylib"
+    )
     if loaded_libjaccl != [expected_paths["jaccl-runtime-dylib"].resolve(strict=True)]:
         raise ContractError(
             "worker loaded an unbound libjaccl.dylib image "
@@ -1380,8 +1575,12 @@ def verify_mlx_native_runtime(
     attestation_path = attestation_unresolved.resolve(strict=True)
     source_root = Path(mlx_checkout["path"]).resolve(strict=True)
     if not attestation_path.is_relative_to(source_root):
-        raise ContractError("MLX build attestation must reside inside the pinned MLX checkout")
-    raw_attestation = _load_strict_json_file(attestation_path, "MLX native build attestation")
+        raise ContractError(
+            "MLX build attestation must reside inside the pinned MLX checkout"
+        )
+    raw_attestation = _load_strict_json_file(
+        attestation_path, "MLX native build attestation"
+    )
     if not isinstance(raw_attestation, Mapping):
         raise ContractError("MLX native build attestation must be an object")
     expected_attestation_keys = {
@@ -1407,17 +1606,26 @@ def verify_mlx_native_runtime(
     }
     for field, expected in expected_values.items():
         if raw_attestation[field] != expected:
-            raise ContractError(f"MLX native build attestation {field} differs from runtime/lock")
+            raise ContractError(
+                f"MLX native build attestation {field} differs from runtime/lock"
+            )
     build_command_sha256 = raw_attestation["build_command_sha256"]
-    if not isinstance(build_command_sha256, str) or re.fullmatch(
-        r"sha256:[0-9a-f]{64}", build_command_sha256
-    ) is None:
-        raise ContractError("MLX native build attestation build_command_sha256 is malformed")
+    if (
+        not isinstance(build_command_sha256, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", build_command_sha256) is None
+    ):
+        raise ContractError(
+            "MLX native build attestation build_command_sha256 is malformed"
+        )
 
     if preverified_bundle["native_artifact_inventory_sha256"] != inventory_sha256:
-        raise ContractError("MLX native build receipt inventory differs from loaded runtime")
+        raise ContractError(
+            "MLX native build receipt inventory differs from loaded runtime"
+        )
     if preverified_bundle["attestation_sha256"] != prefixed_sha256(attestation_path):
-        raise ContractError("MLX native build attestation drifted after pre-import admission")
+        raise ContractError(
+            "MLX native build attestation drifted after pre-import admission"
+        )
     bundle_bound_paths = tuple(Path(path) for path in preverified_bundle["bound_paths"])
 
     attestation = dict(raw_attestation)
@@ -1441,7 +1649,9 @@ def verify_mlx_native_runtime(
     }
 
 
-def verify_mlx_environment(args: argparse.Namespace, lock: Mapping[str, Any]) -> dict[str, Any]:
+def verify_mlx_environment(
+    args: argparse.Namespace, lock: Mapping[str, Any]
+) -> dict[str, Any]:
     reference = lock["mlx_reference"]
     actual_python = f"{sys.version_info.major}.{sys.version_info.minor}"
     if actual_python != reference["python"]:
@@ -1479,7 +1689,9 @@ def verify_mlx_environment(args: argparse.Namespace, lock: Mapping[str, Any]) ->
         import mlx.utils as mlx_utils
         import mlx_lm
     except ImportError as exc:
-        raise ContractError(f"could not import the pinned MLX reference environment: {exc}") from exc
+        raise ContractError(
+            f"could not import the pinned MLX reference environment: {exc}"
+        ) from exc
     verify_import_source(mlx_utils, mlx_root, source_name="MLX Python support")
     verify_import_source(mlx_lm, mlx_lm_root, source_name="MLX-LM")
     native_runtime = verify_mlx_native_runtime(
@@ -1500,17 +1712,24 @@ def verify_mlx_environment(args: argparse.Namespace, lock: Mapping[str, Any]) ->
     }
 
 
-def target_module_names(model: Any, lock: Mapping[str, Any], model_key: str, preset: str) -> list[str]:
+def target_module_names(
+    model: Any, lock: Mapping[str, Any], model_key: str, preset: str
+) -> list[str]:
     suffixes = tuple(lock["target_presets"][preset])
     selected: list[tuple[str, str]] = []
     for name, _module in model.named_modules():
         if not name:
             continue
         canonical = canonicalize_module_name(name)
-        if any(canonical == suffix or canonical.endswith("." + suffix) for suffix in suffixes):
+        if any(
+            canonical == suffix or canonical.endswith("." + suffix)
+            for suffix in suffixes
+        ):
             selected.append((name, canonical))
     if not selected:
-        raise ContractError("MLX-LM model exposed no modules for the locked target preset")
+        raise ContractError(
+            "MLX-LM model exposed no modules for the locked target preset"
+        )
     canonical_names = [canonical for _name, canonical in selected]
     validate_target_inventory(lock, model_key, preset, canonical_names)
     return sorted(name for name, _canonical in selected)
@@ -1539,7 +1758,9 @@ def _tensor_inventory(
         try:
             shape = [int(dim) for dim in value.shape]
         except (AttributeError, TypeError, ValueError) as exc:
-            raise ContractError(f"{where} tensor {name} has no auditable shape") from exc
+            raise ContractError(
+                f"{where} tensor {name} has no auditable shape"
+            ) from exc
         if any(dim <= 0 for dim in shape):
             raise ContractError(f"{where} tensor {name} has a non-positive dimension")
         tensors.append({"name": name, "dtype": dtype_name, "shape": shape})
@@ -1642,7 +1863,9 @@ def require_f32_optimizer_state(
     trainable_by_name = {tensor["name"]: tensor for tensor in trainables}
     state = list(tree_flatten_fn(optimizer.state))
     if not state:
-        raise ContractError("MLX AdamW state was not materialized by the cold optimizer step")
+        raise ContractError(
+            "MLX AdamW state was not materialized by the cold optimizer step"
+        )
     names = [name for name, _value in state]
     if len(names) != len(set(names)):
         raise ContractError("MLX AdamW state contains duplicate flattened names")
@@ -1672,16 +1895,22 @@ def require_f32_optimizer_state(
         try:
             shape = [int(dim) for dim in value.shape]
         except (AttributeError, TypeError, ValueError) as exc:
-            raise ContractError(f"MLX AdamW state {name} has no auditable shape") from exc
+            raise ContractError(
+                f"MLX AdamW state {name} has no auditable shape"
+            ) from exc
         if shape != trainable_by_name[parameter_name]["shape"]:
-            raise ContractError(f"MLX AdamW state {name} shape differs from {parameter_name}")
-        moments.append({
-            "name": name,
-            "parameter_name": parameter_name,
-            "role": role,
-            "dtype": "float32",
-            "shape": shape,
-        })
+            raise ContractError(
+                f"MLX AdamW state {name} shape differs from {parameter_name}"
+            )
+        moments.append(
+            {
+                "name": name,
+                "parameter_name": parameter_name,
+                "role": role,
+                "dtype": "float32",
+                "shape": shape,
+            }
+        )
     return {
         "evidence_kind": "materialized-post-cold-adamw-moment-inventory",
         "dtype": "float32",
@@ -1704,14 +1933,20 @@ def load_exact_initial_adapter(
     try:
         loaded = mx.load(str(artifact.checkpoint))
     except Exception as exc:
-        raise ContractError(f"MLX could not load the initial adapter Safetensors: {exc}") from exc
+        raise ContractError(
+            f"MLX could not load the initial adapter Safetensors: {exc}"
+        ) from exc
     if set(loaded) != {tensor.source_name for tensor in artifact.tensors.values()}:
-        raise ContractError("MLX-loaded initial adapter tensor keys differ from the inspected header")
+        raise ContractError(
+            "MLX-loaded initial adapter tensor keys differ from the inspected header"
+        )
     mlx_targets = {canonicalize_module_name(name): name for name in target_names}
     if len(mlx_targets) != len(target_names) or set(mlx_targets) != {
         module for module, _role in artifact.tensors
     }:
-        raise ContractError("MLX target modules do not exactly match the canonical initial adapter modules")
+        raise ContractError(
+            "MLX target modules do not exactly match the canonical initial adapter modules"
+        )
 
     updates: list[tuple[str, Any]] = []
     expected_values: dict[str, Any] = {}
@@ -1720,7 +1955,9 @@ def load_exact_initial_adapter(
         module, role = identity
         source = loaded[descriptor.source_name]
         if source.dtype != mx.float32 or tuple(source.shape) != descriptor.shape:
-            raise ContractError(f"MLX changed initial adapter dtype/shape while loading {descriptor.source_name}")
+            raise ContractError(
+                f"MLX changed initial adapter dtype/shape while loading {descriptor.source_name}"
+            )
         finite_checks.append((descriptor.source_name, mx.isfinite(source).all()))
         mlx_suffix = "lora_a" if role == "lora_A" else "lora_b"
         destination = f"{mlx_targets[module]}.{mlx_suffix}"
@@ -1730,12 +1967,16 @@ def load_exact_initial_adapter(
     mx.eval(*(check for _name, check in finite_checks))
     nonfinite = [name for name, check in finite_checks if not bool(check.item())]
     if nonfinite:
-        raise ContractError(f"MLX-loaded initial adapter contains non-finite tensors: {nonfinite[:8]}")
+        raise ContractError(
+            f"MLX-loaded initial adapter contains non-finite tensors: {nonfinite[:8]}"
+        )
 
     try:
         model.update(tree_unflatten(updates), strict=True)
     except Exception as exc:
-        raise ContractError(f"could not install translated initial adapter tensors into MLX: {exc}") from exc
+        raise ContractError(
+            f"could not install translated initial adapter tensors into MLX: {exc}"
+        ) from exc
     mx.eval(model.trainable_parameters())
     actual = dict(tree_flatten(model.trainable_parameters()))
     equality_checks = [
@@ -1744,11 +1985,15 @@ def load_exact_initial_adapter(
         if name in actual
     ]
     if len(equality_checks) != len(expected_values):
-        raise ContractError("MLX trainable inventory is missing a translated initial adapter tensor")
+        raise ContractError(
+            "MLX trainable inventory is missing a translated initial adapter tensor"
+        )
     mx.eval(*(check for _name, check in equality_checks))
     changed = [name for name, check in equality_checks if not bool(check.item())]
     if changed:
-        raise ContractError(f"MLX initial adapter value translation was not exact: {changed[:8]}")
+        raise ContractError(
+            f"MLX initial adapter value translation was not exact: {changed[:8]}"
+        )
 
 
 def require_bf16_base_model(model: Any, mx: Any) -> dict[str, Any]:
@@ -1826,7 +2071,10 @@ def make_optimizer_step(
         for _ in range(grad_accum):
             loss, gradients = loss_and_grad(model, tokens, target_labels)
             raw_tensors = require_f32_gradient_inventory(
-                gradients, expected_gradient_tensors, mx, where="MLX raw gradients",
+                gradients,
+                expected_gradient_tensors,
+                mx,
+                where="MLX raw gradients",
             )
             precision_recorder.record_gradient("raw", raw_tensors)
             loss_total = loss if loss_total is None else loss_total + loss
@@ -1837,12 +2085,18 @@ def make_optimizer_step(
             )
         averaged = tree_map(lambda gradient: gradient / grad_accum, accumulated)
         accumulated_tensors = require_f32_gradient_inventory(
-            averaged, expected_gradient_tensors, mx, where="MLX accumulated gradients",
+            averaged,
+            expected_gradient_tensors,
+            mx,
+            where="MLX accumulated gradients",
         )
         precision_recorder.record_gradient("accumulated", accumulated_tensors)
         clipped, _raw_norm = optim.clip_grad_norm(averaged, max_grad_norm)
         clipped_tensors = require_f32_gradient_inventory(
-            clipped, expected_gradient_tensors, mx, where="MLX clipped gradients",
+            clipped,
+            expected_gradient_tensors,
+            mx,
+            where="MLX clipped gradients",
         )
         precision_recorder.record_gradient("clipped", clipped_tensors)
         optimizer.update(model, clipped)
@@ -1870,7 +2124,9 @@ def synchronized_step_seconds(
     synchronize()
     duration = clock() - started
     if not math.isfinite(duration) or duration <= 0:
-        raise ContractError("synchronized optimizer-step duration must be finite and positive")
+        raise ContractError(
+            "synchronized optimizer-step duration must be finite and positive"
+        )
     return duration, result
 
 
@@ -1938,7 +2194,10 @@ def expected_unused_shared_kv_parameter_names(config: Mapping[str, Any]) -> set[
         or num_shared >= num_layers
         or not isinstance(layer_types, list)
         or len(layer_types) != num_layers
-        or any(layer_type not in ("sliding_attention", "full_attention") for layer_type in layer_types)
+        or any(
+            layer_type not in ("sliding_attention", "full_attention")
+            for layer_type in layer_types
+        )
         or not isinstance(attention_k_eq_v, bool)
     ):
         raise ContractError("locked Gemma4 KV-sharing config is malformed")
@@ -1989,20 +2248,28 @@ def load_locked_mlx_gemma4(
     from mlx.utils import tree_flatten
 
     config = load_config_fn(model_dir)
-    if config.get("model_type") != "gemma4" or "quantization" in config or "quantization_config" in config:
+    if (
+        config.get("model_type") != "gemma4"
+        or "quantization" in config
+        or "quantization_config" in config
+    ):
         raise ContractError("MLX-LM benchmark requires an unquantized Gemma4 model")
     try:
         model_class, model_args_class = get_model_classes_fn(config=config)
         model = model_class(model_args_class.from_dict(config))
     except Exception as exc:
-        raise ContractError(f"pinned MLX-LM could not instantiate locked Gemma4: {exc}") from exc
+        raise ContractError(
+            f"pinned MLX-LM could not instantiate locked Gemma4: {exc}"
+        ) from exc
 
     weights: dict[str, Any] = {}
     for checkpoint in _checkpoint_paths(model_dir):
         try:
             shard = mx.load(str(checkpoint))
         except Exception as exc:
-            raise ContractError(f"MLX could not load locked Gemma4 checkpoint {checkpoint.name}: {exc}") from exc
+            raise ContractError(
+                f"MLX could not load locked Gemma4 checkpoint {checkpoint.name}: {exc}"
+            ) from exc
         duplicates = set(weights).intersection(shard)
         if duplicates:
             raise ContractError(
@@ -2011,11 +2278,17 @@ def load_locked_mlx_gemma4(
         weights.update(shard)
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
-    if not isinstance(weights, dict) or any(not isinstance(name, str) for name in weights):
-        raise ContractError("pinned MLX-LM Gemma4 sanitizer returned an invalid weight inventory")
+    if not isinstance(weights, dict) or any(
+        not isinstance(name, str) for name in weights
+    ):
+        raise ContractError(
+            "pinned MLX-LM Gemma4 sanitizer returned an invalid weight inventory"
+        )
 
     current = dict(tree_flatten(model.parameters()))
-    ignored = validate_mlx_gemma4_checkpoint_coverage(config, set(current), set(weights))
+    ignored = validate_mlx_gemma4_checkpoint_coverage(
+        config, set(current), set(weights)
+    )
     admitted = [(name, weights[name]) for name in current]
     wrong_dtype = [name for name, value in admitted if value.dtype != mx.bfloat16]
     if wrong_dtype:
@@ -2027,9 +2300,13 @@ def load_locked_mlx_gemma4(
         # strict=True still checks every used name and shape.
         model.load_weights(admitted, strict=True)
     except Exception as exc:
-        raise ContractError(f"locked Gemma4 checkpoint parameter shapes differ: {exc}") from exc
+        raise ContractError(
+            f"locked Gemma4 checkpoint parameter shapes differ: {exc}"
+        ) from exc
     if set(weights) - {name for name, _value in admitted} != ignored:
-        raise ContractError("locked Gemma4 ignored parameter inventory drifted during load")
+        raise ContractError(
+            "locked Gemma4 ignored parameter inventory drifted during load"
+        )
     return model, config
 
 
@@ -2055,7 +2332,9 @@ def run_mlx(
         from mlx_lm.tuner.utils import linear_to_lora_layers
         from mlx_lm.utils import _get_classes, load_config
     except ImportError as exc:
-        raise ContractError(f"pinned MLX-LM training API is unavailable: {exc}") from exc
+        raise ContractError(
+            f"pinned MLX-LM training API is unavailable: {exc}"
+        ) from exc
 
     benchmark_contract = preflight_result.lock["benchmark_contract"]
     optimizer_contract = benchmark_contract["optimizer"]
@@ -2070,7 +2349,9 @@ def run_mlx(
             get_model_classes_fn=_get_classes,
         )
     except Exception as exc:
-        raise ContractError(f"pinned MLX-LM could not load the locked local model: {exc}") from exc
+        raise ContractError(
+            f"pinned MLX-LM could not load the locked local model: {exc}"
+        ) from exc
     mx.eval(model.parameters())
     mx.synchronize()
     precision_recorder.record("base_model_storage", require_bf16_base_model(model, mx))
@@ -2182,7 +2463,9 @@ def command_digest(argv: Sequence[str]) -> str:
         "offline_environment": OFFLINE_ENVIRONMENT,
         "runner_sha256": prefixed_sha256(SCRIPT_PATH),
     }
-    encoded = json.dumps(descriptor, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    encoded = json.dumps(
+        descriptor, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
@@ -2220,14 +2503,17 @@ def diagnostic_runner_source() -> dict[str, Any]:
     try:
         relative_entrypoint = SCRIPT_PATH.relative_to(root).as_posix()
     except ValueError as exc:
-        raise ContractError("diagnostic benchmark producer is outside its Git checkout") from exc
+        raise ContractError(
+            "diagnostic benchmark producer is outside its Git checkout"
+        ) from exc
     if relative_entrypoint != MLX_RUNNER_RELATIVE_PATH:
         raise ContractError("diagnostic benchmark producer entrypoint differs")
     revision = git("rev-parse", "HEAD").stdout.strip()
     source_tree = git("rev-parse", "HEAD^{tree}").stdout.strip()
-    if re.fullmatch(r"[0-9a-f]{40}", revision) is None or re.fullmatch(
-        r"[0-9a-f]{40}", source_tree
-    ) is None:
+    if (
+        re.fullmatch(r"[0-9a-f]{40}", revision) is None
+        or re.fullmatch(r"[0-9a-f]{40}", source_tree) is None
+    ):
         raise ContractError("diagnostic benchmark producer revision/tree is malformed")
     status = git("status", "--porcelain=v1", "--untracked-files=all", text=False).stdout
     files: list[dict[str, str]] = []
@@ -2256,17 +2542,20 @@ def diagnostic_runner_source() -> dict[str, Any]:
         "working_tree_status_sha256": "sha256:" + hashlib.sha256(status).hexdigest(),
         "files": files,
     }
-    manifest_sha256 = "sha256:" + hashlib.sha256(
-        DIAGNOSTIC_SOURCE_SCHEMA_VERSION.encode("utf-8")
-        + b"\0"
-        + json.dumps(
-            manifest_input,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        ).encode("utf-8")
-    ).hexdigest()
+    manifest_sha256 = (
+        "sha256:"
+        + hashlib.sha256(
+            DIAGNOSTIC_SOURCE_SCHEMA_VERSION.encode("utf-8")
+            + b"\0"
+            + json.dumps(
+                manifest_input,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+    )
     return {
         "schema_version": DIAGNOSTIC_SOURCE_SCHEMA_VERSION,
         **manifest_input,
@@ -2304,7 +2593,9 @@ def build_precision_evidence(
         "native_runtime": {
             "mlx_source_revision": mlx["source_revision"],
             "mlx_lm_source_revision": implementation["mlx_lm"]["source_revision"],
-            "native_artifact_inventory_sha256": mlx["native_artifact_inventory"]["sha256"],
+            "native_artifact_inventory_sha256": mlx["native_artifact_inventory"][
+                "sha256"
+            ],
             "build_attestation_sha256": attestation["sha256"],
             "build_command_sha256": attestation["build_command_sha256"],
             "precision_policy_sha256": attestation["precision_policy_sha256"],
@@ -2319,7 +2610,10 @@ def build_precision_evidence(
 
 def canonical_json_bytes(payload: Mapping[str, Any]) -> bytes:
     return (
-        json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n"
+        json.dumps(
+            payload, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False
+        )
+        + "\n"
     ).encode("utf-8")
 
 
@@ -2336,7 +2630,8 @@ def precision_evidence_reference(
     return {
         "schema_version": PRECISION_EVIDENCE_REFERENCE_SCHEMA_VERSION,
         "relative_path": evidence_path.name,
-        "artifact_sha256": "sha256:" + hashlib.sha256(canonical_json_bytes(evidence)).hexdigest(),
+        "artifact_sha256": "sha256:"
+        + hashlib.sha256(canonical_json_bytes(evidence)).hexdigest(),
     }
 
 
@@ -2350,13 +2645,24 @@ def build_sample_payload(
     producer_source: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Central sample assembly seam; execution code is schema-independent."""
-    required_hardware = ("platform", "machine", "chip", "memory_bytes", "os_version", "os_build")
+    required_hardware = (
+        "platform",
+        "machine",
+        "chip",
+        "memory_bytes",
+        "os_version",
+        "os_build",
+    )
     missing = [field for field in required_hardware if not hardware.get(field)]
     if missing:
-        raise ContractError(f"could not establish benchmark hardware identity: {missing}")
+        raise ContractError(
+            f"could not establish benchmark hardware identity: {missing}"
+        )
     model_lock = preflight_result.lock["models"][args.model_key]
     prepared = preflight_result.prepared
-    canonical_modules = sorted({module for module, _role in preflight_result.adapter.tensors})
+    canonical_modules = sorted(
+        {module for module, _role in preflight_result.adapter.tensors}
+    )
     validate_target_inventory(
         preflight_result.lock,
         args.model_key,
@@ -2506,7 +2812,9 @@ def validate_diagnostic_payload(raw: Mapping[str, Any]) -> dict[str, Any]:
         "precision_observations",
     }
     if set(payload) != expected_keys:
-        raise ContractError("MLX diagnostic payload has incomplete or unexpected fields")
+        raise ContractError(
+            "MLX diagnostic payload has incomplete or unexpected fields"
+        )
     if payload["schema_version"] != DIAGNOSTIC_SAMPLE_SCHEMA_VERSION:
         raise ContractError("MLX diagnostic payload uses the wrong schema")
     if payload["framework"] != "mlx-lm":
@@ -2523,7 +2831,10 @@ def validate_diagnostic_payload(raw: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(implementation, Mapping):
         raise ContractError("MLX diagnostic payload omitted implementation identity")
     source = implementation.get("producer_source")
-    if not isinstance(source, Mapping) or source.get("schema_version") != DIAGNOSTIC_SOURCE_SCHEMA_VERSION:
+    if (
+        not isinstance(source, Mapping)
+        or source.get("schema_version") != DIAGNOSTIC_SOURCE_SCHEMA_VERSION
+    ):
         raise ContractError("MLX diagnostic payload omitted diagnostic source identity")
     if source.get("relative_path") != MLX_RUNNER_RELATIVE_PATH:
         raise ContractError("MLX diagnostic payload producer entrypoint differs")
@@ -2535,7 +2846,9 @@ def validate_diagnostic_payload(raw: Mapping[str, Any]) -> dict[str, Any]:
         "optimizer_moment_storage",
         "loss",
     }:
-        raise ContractError("MLX diagnostic payload precision observations are incomplete")
+        raise ContractError(
+            "MLX diagnostic payload precision observations are incomplete"
+        )
     metrics = payload.get("metrics")
     memory = metrics.get("memory") if isinstance(metrics, Mapping) else None
     if not isinstance(memory, Mapping) or set(memory) != {
@@ -2582,15 +2895,21 @@ def atomic_publish_json(
                 output.flush()
                 os.fsync(output.fileno())
         except OSError as exc:
-            raise ContractError(f"could not durably write temporary evidence: {exc}") from exc
+            raise ContractError(
+                f"could not durably write temporary evidence: {exc}"
+            ) from exc
         if validator is not None:
             validator(temporary)
         try:
             os.link(temporary, target, follow_symlinks=False)
         except FileExistsError as exc:
-            raise ContractError(f"refusing to replace existing evidence: {target}") from exc
+            raise ContractError(
+                f"refusing to replace existing evidence: {target}"
+            ) from exc
         except OSError as exc:
-            raise ContractError(f"could not atomically publish benchmark evidence: {exc}") from exc
+            raise ContractError(
+                f"could not atomically publish benchmark evidence: {exc}"
+            ) from exc
         try:
             directory_fd = os.open(parent, os.O_RDONLY)
             try:
@@ -2613,19 +2932,42 @@ def atomic_publish_json(
             pass
 
 
-def postflight(args: argparse.Namespace, preflight_result: Preflight, environment: Mapping[str, Any]) -> None:
+def postflight(
+    args: argparse.Namespace,
+    preflight_result: Preflight,
+    environment: Mapping[str, Any],
+) -> None:
     require_files_unchanged(preflight_result.bound_files)
     require_files_unchanged(environment["bound_file_identities"])
-    if prefixed_sha256(args.prepared.resolve()) != preflight_result.prepared["artifact_sha256"]:
+    if (
+        prefixed_sha256(args.prepared.resolve())
+        != preflight_result.prepared["artifact_sha256"]
+    ):
         raise ContractError("prepared artifact drifted during benchmark execution")
-    if prefixed_sha256(preflight_result.adapter.checkpoint) != preflight_result.adapter.checkpoint_sha256:
-        raise ContractError("initial adapter checkpoint drifted during benchmark execution")
-    if prefixed_sha256(preflight_result.adapter.directory / "adapter_config.json") != preflight_result.adapter.config_sha256:
+    if (
+        prefixed_sha256(preflight_result.adapter.checkpoint)
+        != preflight_result.adapter.checkpoint_sha256
+    ):
+        raise ContractError(
+            "initial adapter checkpoint drifted during benchmark execution"
+        )
+    if (
+        prefixed_sha256(preflight_result.adapter.directory / "adapter_config.json")
+        != preflight_result.adapter.config_sha256
+    ):
         raise ContractError("initial adapter config drifted during benchmark execution")
-    verify_prepared_source_dataset(preflight_result.prepared_summary, args.source_dataset)
+    verify_prepared_source_dataset(
+        preflight_result.prepared_summary, args.source_dataset
+    )
     reference = preflight_result.lock["mlx_reference"]
-    verify_source_checkout(args.mlx_source, reference["source_revisions"]["mlx"], source_name="MLX")
-    verify_source_checkout(args.mlx_lm_source, reference["source_revisions"]["mlx-lm"], source_name="MLX-LM")
+    verify_source_checkout(
+        args.mlx_source, reference["source_revisions"]["mlx"], source_name="MLX"
+    )
+    verify_source_checkout(
+        args.mlx_lm_source,
+        reference["source_revisions"]["mlx-lm"],
+        source_name="MLX-LM",
+    )
     preverified_bundle = verify_mlx_native_build_before_import(
         args,
         preflight_result.lock,
@@ -2642,18 +2984,29 @@ def postflight(args: argparse.Namespace, preflight_result: Preflight, environmen
     for field in ("native_artifact_inventory", "build_attestation"):
         if native_runtime[field] != environment[field]:
             raise ContractError(f"MLX {field} drifted during benchmark execution")
-    if verify_packages(preflight_result.lock, "mlx_reference") != environment["versions"]:
-        raise ContractError("MLX package environment drifted during benchmark execution")
+    if (
+        verify_packages(preflight_result.lock, "mlx_reference")
+        != environment["versions"]
+    ):
+        raise ContractError(
+            "MLX package environment drifted during benchmark execution"
+        )
 
 
-def build_worker_payload(argv: Sequence[str], reporter: WorkerPhaseReporter) -> dict[str, Any]:
+def build_worker_payload(
+    argv: Sequence[str], reporter: WorkerPhaseReporter
+) -> dict[str, Any]:
     claim_fresh_process()
     force_offline_environment()
     args = build_parser().parse_args(list(argv))
     if platform.system() != "Darwin" or platform.machine() != "arm64":
         raise ContractError("MLX-LM release benchmarks require Darwin arm64")
     prepared = preflight(args)
-    runner = diagnostic_runner_source() if args.diagnostic_only else runner_source_attestation()
+    runner = (
+        diagnostic_runner_source()
+        if args.diagnostic_only
+        else runner_source_attestation()
+    )
     precision_recorder = PrecisionEvidenceRecorder()
     environment, metrics = run_mlx(
         args,
@@ -2662,7 +3015,9 @@ def build_worker_payload(argv: Sequence[str], reporter: WorkerPhaseReporter) -> 
         before_measured=lambda: reporter.barrier("measured-optimizer-steps-start"),
         after_measured=lambda: reporter.barrier("measured-optimizer-steps-end"),
     )
-    payload_builder = build_diagnostic_payload if args.diagnostic_only else build_sample_payload
+    payload_builder = (
+        build_diagnostic_payload if args.diagnostic_only else build_sample_payload
+    )
     payload = payload_builder(
         args, prepared, environment, metrics, hardware_fingerprint(), argv, runner
     )
@@ -2698,7 +3053,9 @@ def worker_process_main(argv: Sequence[str], control_fd: int) -> int:
             "kind": "ack",
             "phase": "result",
         }:
-            raise ContractError("benchmark coordinator sent an invalid result acknowledgement")
+            raise ContractError(
+                "benchmark coordinator sent an invalid result acknowledgement"
+            )
         return 0
     except ContractError as exc:
         try:
@@ -2754,14 +3111,18 @@ def _coordinator_result(
         kind = message.get("kind")
         if kind == "error":
             if set(message) != {"schema_version", "kind", "message"}:
-                raise ContractError("benchmark worker emitted a malformed error message")
+                raise ContractError(
+                    "benchmark worker emitted a malformed error message"
+                )
             detail = message["message"]
             if not isinstance(detail, str) or not detail:
                 raise ContractError("benchmark worker emitted an empty error message")
             raise ContractError(f"MLX benchmark worker failed: {detail}")
         if kind == "phase":
             if set(message) != {"schema_version", "kind", "phase"}:
-                raise ContractError("benchmark worker emitted a malformed phase message")
+                raise ContractError(
+                    "benchmark worker emitted a malformed phase message"
+                )
             phase = message["phase"]
             if phase != expected_phase:
                 raise ContractError(
@@ -2782,9 +3143,13 @@ def _coordinator_result(
             )
             continue
         if kind != "result" or set(message) != {"schema_version", "kind", "payload"}:
-            raise ContractError("benchmark worker emitted an unexpected control message")
+            raise ContractError(
+                "benchmark worker emitted an unexpected control message"
+            )
         if expected_phase != "result" or before is None or after is None:
-            raise ContractError("benchmark worker returned without bracketing measured optimizer steps")
+            raise ContractError(
+                "benchmark worker returned without bracketing measured optimizer steps"
+            )
         payload = message["payload"]
         if not isinstance(payload, dict):
             raise ContractError("benchmark worker result payload must be an object")
@@ -2815,7 +3180,10 @@ def run(argv: Sequence[str]) -> Path:
         if target.exists() or target.is_symlink():
             raise ContractError(f"refusing to replace existing evidence: {target}")
     lock = load_lock(LOCK_PATH)
-    if lock["benchmark_contract"]["memory"]["sampler_interval_ms"] != MEMORY_SAMPLER_INTERVAL_MS:
+    if (
+        lock["benchmark_contract"]["memory"]["sampler_interval_ms"]
+        != MEMORY_SAMPLER_INTERVAL_MS
+    ):
         raise ContractError("process-memory sampler interval differs from the lock")
 
     parent_socket, child_socket = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -2836,7 +3204,9 @@ def run(argv: Sequence[str]) -> Path:
     except OSError as exc:
         parent_socket.close()
         child_socket.close()
-        raise ContractError(f"could not start fresh MLX benchmark worker: {exc}") from exc
+        raise ContractError(
+            f"could not start fresh MLX benchmark worker: {exc}"
+        ) from exc
     child_socket.close()
     sampler = DarwinProcessMemorySampler(
         pid=worker.pid,
@@ -2859,9 +3229,13 @@ def run(argv: Sequence[str]) -> Path:
         try:
             return_code = worker.wait(timeout=30)
         except subprocess.TimeoutExpired as exc:
-            raise ContractError("MLX benchmark worker did not exit after returning its result") from exc
+            raise ContractError(
+                "MLX benchmark worker did not exit after returning its result"
+            ) from exc
         if return_code != 0:
-            raise ContractError(f"MLX benchmark worker exited with status {return_code} after its result")
+            raise ContractError(
+                f"MLX benchmark worker exited with status {return_code} after its result"
+            )
     except BaseException:
         if sampler_started:
             sampler.cancel()
@@ -2870,13 +3244,23 @@ def run(argv: Sequence[str]) -> Path:
     finally:
         parent_socket.close()
 
-    if not isinstance(bundle, dict) or set(bundle) != {"sample", "precision_observations", "runner"}:
+    if not isinstance(bundle, dict) or set(bundle) != {
+        "sample",
+        "precision_observations",
+        "runner",
+    }:
         raise ContractError("MLX benchmark worker emitted an invalid evidence bundle")
     payload = bundle["sample"]
     observations = bundle["precision_observations"]
     runner = bundle["runner"]
-    if not isinstance(payload, dict) or not isinstance(observations, dict) or not isinstance(runner, dict):
-        raise ContractError("MLX benchmark worker evidence bundle values must be objects")
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(observations, dict)
+        or not isinstance(runner, dict)
+    ):
+        raise ContractError(
+            "MLX benchmark worker evidence bundle values must be objects"
+        )
     metrics = payload.get("metrics")
     if not isinstance(metrics, dict):
         raise ContractError("MLX benchmark worker omitted metrics")
@@ -2885,7 +3269,9 @@ def run(argv: Sequence[str]) -> Path:
         "framework_allocator_peak_bytes",
         "framework_allocator_peak_source",
     }:
-        raise ContractError("MLX benchmark worker emitted an invalid partial memory metric")
+        raise ContractError(
+            "MLX benchmark worker emitted an invalid partial memory metric"
+        )
     memory.update(
         {
             "process_peak_phys_footprint_bytes": process_memory.peak_phys_footprint_bytes,
@@ -2900,7 +3286,9 @@ def run(argv: Sequence[str]) -> Path:
         return atomic_publish_json(
             args.output,
             payload,
-            validator=lambda temporary: validate_diagnostic_payload(load_json(temporary)),
+            validator=lambda temporary: validate_diagnostic_payload(
+                load_json(temporary)
+            ),
         )
     evidence = build_precision_evidence(payload, observations, runner, lock)
     payload["precision_evidence"] = precision_evidence_reference(args.output, evidence)
@@ -2911,7 +3299,10 @@ def run(argv: Sequence[str]) -> Path:
         evidence_path,
         evidence,
         validator=lambda temporary: validate_precision_evidence_payload(
-            load_json(temporary), payload, lock, where=str(temporary),
+            load_json(temporary),
+            payload,
+            lock,
+            where=str(temporary),
         ),
     )
     return atomic_publish_json(

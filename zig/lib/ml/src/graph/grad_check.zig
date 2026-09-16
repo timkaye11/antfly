@@ -126,6 +126,36 @@ fn evalNode(
             return allocator.dupe(f32, view.data);
         },
 
+        .fused_gelu, .fused_gelu_backward => {
+            const a = getVal(node_vals, ins[0]);
+            const out = try allocator.alloc(f32, a.len);
+            for (out, a, 0..) |*o, v, i| {
+                const k: f32 = 0.7978845608;
+                const t = std.math.tanh(k * (v + 0.044715 * v * v * v));
+                o.* = if (n.op == .fused_gelu)
+                    0.5 * v * (1.0 + t)
+                else
+                    getVal(node_vals, ins[1])[i] * (0.5 * (1.0 + t) + 0.5 * v * (1.0 - t * t) * k * (1.0 + 3.0 * 0.044715 * v * v));
+            }
+            return out;
+        },
+
+        .fused_softmax => |attrs| {
+            const a = getVal(node_vals, ins[0]);
+            const dim: usize = attrs.dim;
+            if (dim == 0 or a.len % dim != 0) return error.InvalidSoftmaxShape;
+            const out = try allocator.alloc(f32, a.len);
+            for (0..a.len / dim) |row| {
+                const values = a[row * dim ..][0..dim];
+                var max_value = values[0];
+                for (values[1..]) |value| max_value = @max(max_value, value);
+                var sum: f64 = 0;
+                for (values) |value| sum += @exp(@as(f64, value - max_value));
+                for (values, 0..) |value, col| out[row * dim + col] = @floatCast(@exp(@as(f64, value - max_value)) / sum);
+            }
+            return out;
+        },
+
         .neg => {
             const a = getVal(node_vals, ins[0]);
             const out = try allocator.alloc(f32, a.len);
@@ -380,24 +410,28 @@ fn evalNode(
                 }
             }
 
-            // 2D matmul (no batch dims).
-            if (a_shape.rank() != 2 or b_shape.rank() != 2) {
-                const out = try allocator.alloc(f32, out_elems);
-                @memset(out, 0);
-                return out;
-            }
-            const M: usize = @intCast(a_shape.dim(0));
-            const K: usize = @intCast(a_shape.dim(1));
-            const N: usize = @intCast(b_shape.dim(1));
-            const out = try allocator.alloc(f32, M * N);
-            @memset(out, 0);
-            for (0..M) |m| {
-                for (0..N) |nn| {
+            // Honor the contracting axes used by optimized linear VJPs,
+            // including dW = dY^T @ X (axes 0/0).
+            if (a_shape.rank() != 2 or b_shape.rank() != 2 or attrs.num_batch != 0 or attrs.num_contracting != 1)
+                return error.UnsupportedGradientCheckDot;
+            const lc = attrs.lhs_contracting[0];
+            const rc = attrs.rhs_contracting[0];
+            if (lc > 1 or rc > 1 or a_shape.dim(lc) != b_shape.dim(rc)) return error.InvalidDotShape;
+            const m: usize = @intCast(a_shape.dim(1 - lc));
+            const k: usize = @intCast(a_shape.dim(lc));
+            const nn: usize = @intCast(b_shape.dim(1 - rc));
+            const a_cols: usize = @intCast(a_shape.dim(1));
+            const b_cols: usize = @intCast(b_shape.dim(1));
+            const out = try allocator.alloc(f32, m * nn);
+            for (0..m) |mi| {
+                for (0..nn) |ni| {
                     var sum: f32 = 0;
-                    for (0..K) |k| {
-                        sum += a[m * K + k] * b[k * N + nn];
+                    for (0..k) |ki| {
+                        const ai = if (lc == 1) mi * a_cols + ki else ki * a_cols + mi;
+                        const bi = if (rc == 0) ki * b_cols + ni else ni * b_cols + ki;
+                        sum += a[ai] * b[bi];
                     }
-                    out[m * N + nn] = sum;
+                    out[mi * nn + ni] = sum;
                 }
             }
             return out;
@@ -433,6 +467,18 @@ fn evalNode(
                 indices,
                 graph.node(ins[1]).output_shape,
                 attrs.axis,
+                n.output_shape,
+            );
+        },
+
+        .fused_embedding_lookup => {
+            return evalGatherRef(
+                allocator,
+                getVal(node_vals, ins[0]),
+                graph.node(ins[0]).output_shape,
+                getVal(node_vals, ins[1]),
+                graph.node(ins[1]).output_shape,
+                0,
                 n.output_shape,
             );
         },
@@ -567,12 +613,9 @@ fn evalNode(
 
         .parameter => unreachable, // should be pre-set
 
-        else => {
-            // Unsupported op — return zeros
-            const out = try allocator.alloc(f32, out_elems);
-            @memset(out, 0);
-            return out;
-        },
+        // Never let an unimplemented reference operation look like a valid
+        // zero objective or gradient in a numerical correctness check.
+        else => return error.UnsupportedGradientCheckOperation,
     }
 }
 

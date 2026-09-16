@@ -50,10 +50,16 @@ class BoolQMaterializerTest(unittest.TestCase):
         self.assertEqual([0, 1, 2, 3], [item.source_row_index for item in train])
         self.assertTrue(train[0].prompt.startswith("<bos><|turn>user\n"))
         self.assertTrue(train[0].prompt.endswith("<|channel>final\n<channel|>"))
-        self.assertEqual({"yes": 2, "no": 2}, {
-            label: sum(item.target == label for item in train) for label in ("yes", "no")
-        })
-        self.assertFalse({item.source_id for item in train} & {item.source_id for item in evaluation})
+        self.assertEqual(
+            {"yes": 2, "no": 2},
+            {
+                label: sum(item.target == label for item in train)
+                for label in ("yes", "no")
+            },
+        )
+        self.assertFalse(
+            {item.source_id for item in train} & {item.source_id for item in evaluation}
+        )
 
     def test_long_prompt_is_skipped_without_truncation(self) -> None:
         source = rows(6)
@@ -88,8 +94,7 @@ class BoolQMaterializerTest(unittest.TestCase):
         )
         self.assertEqual([4, 5, 6, 7], [item.source_row_index for item in rotated])
         self.assertFalse(
-            {item.source_id for item in first}
-            & {item.source_id for item in rotated}
+            {item.source_id for item in first} & {item.source_id for item in rotated}
         )
         with self.assertRaisesRegex(
             materializer.MaterializationError, "per-label skip"
@@ -124,8 +129,7 @@ class BoolQMaterializerTest(unittest.TestCase):
         )
         self.assertEqual([4, 5, 6, 7], [item.source_row_index for item in rotated])
         self.assertFalse(
-            {item.source_id for item in first}
-            & {item.source_id for item in rotated}
+            {item.source_id for item in first} & {item.source_id for item in rotated}
         )
 
     def test_exclusion_manifest_is_validated_and_digest_bound(self) -> None:
@@ -160,9 +164,7 @@ class BoolQMaterializerTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            excluded, evidence = materializer.load_excluded_eval_source_ids(
-                [exclusion]
-            )
+            excluded, evidence = materializer.load_excluded_eval_source_ids([exclusion])
             manifest = {
                 "schema_version": materializer.SCHEMA_VERSION,
                 "dataset": {
@@ -206,7 +208,9 @@ class BoolQMaterializerTest(unittest.TestCase):
             ):
                 materializer.load_excluded_eval_source_ids([alias])
 
-    def test_overlapping_exclusion_manifests_report_unique_and_evidence_counts(self) -> None:
+    def test_overlapping_exclusion_manifests_report_unique_and_evidence_counts(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             first = root / "first.json"
@@ -271,12 +275,20 @@ class BoolQMaterializerTest(unittest.TestCase):
             (model / "tokenizer.json").write_text("{}")
             (model / "tokenizer_config.json").write_text("{}")
             train = materializer.select_balanced(
-                rows(), split="train", tokenizer=FakeTokenizer(), examples=4,
-                max_seq_len=128, max_completion_tokens=1,
+                rows(),
+                split="train",
+                tokenizer=FakeTokenizer(),
+                examples=4,
+                max_seq_len=128,
+                max_completion_tokens=1,
             )
             evaluation = materializer.select_balanced(
-                rows(), split="validation", tokenizer=FakeTokenizer(), examples=4,
-                max_seq_len=128, max_completion_tokens=1,
+                rows(),
+                split="validation",
+                tokenizer=FakeTokenizer(),
+                examples=4,
+                max_seq_len=128,
+                max_completion_tokens=1,
             )
             output = root / "out"
             manifest = materializer.write_outputs(
@@ -297,7 +309,10 @@ class BoolQMaterializerTest(unittest.TestCase):
                 max_completion_tokens=1,
                 dependency_versions={"pyarrow": "test", "tokenizers": "test"},
             )
-            self.assertEqual(materializer.sha256_file(train_source), manifest["dataset"]["train"]["source_file_sha256"])
+            self.assertEqual(
+                materializer.sha256_file(train_source),
+                manifest["dataset"]["train"]["source_file_sha256"],
+            )
             self.assertEqual(
                 0,
                 manifest["dataset"]["selection_policy"][
@@ -345,10 +360,16 @@ class BoolQMaterializerTest(unittest.TestCase):
                     return SimpleNamespace(ids=[1, 2])
                 return super().encode(text, add_special_tokens=add_special_tokens)
 
-        with self.assertRaisesRegex(materializer.MaterializationError, "one tokenizer token"):
+        with self.assertRaisesRegex(
+            materializer.MaterializationError, "one tokenizer token"
+        ):
             materializer.select_balanced(
-                rows(), split="train", tokenizer=BadTokenizer(), examples=2,
-                max_seq_len=128, max_completion_tokens=1,
+                rows(),
+                split="train",
+                tokenizer=BadTokenizer(),
+                examples=2,
+                max_seq_len=128,
+                max_completion_tokens=1,
             )
 
 

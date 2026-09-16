@@ -21,7 +21,6 @@ const gemma4_real = @import("gemma4_real_autodiff.zig");
 const gemma4_mm_real = @import("gemma4_multimodal_real_autodiff.zig");
 const real_autodiff = @import("real_autodiff_trainer.zig");
 const safetensors_checkpoint = @import("safetensors_checkpoint.zig");
-const graph_bridge = @import("graph_bridge.zig");
 const gemma_graph = @import("../architectures/gemma_graph.zig");
 const training_executor_policy = @import("../graph/training_executor_policy.zig");
 const manifest_mod = @import("../models/manifest.zig");
@@ -35,12 +34,6 @@ const artifact_publication = @import("artifact_publication.zig");
 const path_isolation = @import("path_isolation.zig");
 const ops_mod = @import("../ops/ops.zig");
 const ComputeBackend = ops_mod.ComputeBackend;
-const pjrt_mod = if (build_options.enable_pjrt) @import("pjrt") else struct {
-    pub const pjrt = struct {
-        pub const Client = void;
-    };
-};
-
 const TrainerMode = enum { auto, surrogate, autodiff };
 
 pub const BackendKind = gemma4_real.BackendKind;
@@ -55,6 +48,7 @@ pub const TrainOptions = struct {
     eval_prepared_inputs_path: []const u8,
     out_dir: []const u8,
     learning_rate: f32 = 0.001,
+    weight_decay: f32 = 0.01,
     max_examples: usize = 32,
     eval_max_examples: usize = 0,
     epochs: usize = 1,
@@ -186,6 +180,7 @@ const AutodiffEpochSummary = struct {
 
 const CliOptions = struct {
     learning_rate: f32 = 0.001,
+    weight_decay: f32 = 0.01,
     max_examples: usize = 32,
     eval_max_examples: usize = 0,
     epochs: usize = 1,
@@ -243,6 +238,7 @@ const ReportContext = struct {
     prepared_inputs_path: []const u8,
     eval_prepared_inputs_path: ?[]const u8 = null,
     learning_rate: f32,
+    weight_decay: f32 = 0.01,
     max_examples: usize,
     eval_max_examples: usize,
     epochs: usize,
@@ -1281,6 +1277,10 @@ pub fn parseTrainArgs(argv: []const []const u8) !TrainOptions {
             i += 1;
             if (i >= argv.len) return usageError();
             opts.learning_rate = try std.fmt.parseFloat(f32, argv[i]);
+        } else if (std.mem.eql(u8, arg, "--weight-decay")) {
+            i += 1;
+            if (i >= argv.len) return usageError();
+            opts.weight_decay = try std.fmt.parseFloat(f32, argv[i]);
         } else if (std.mem.eql(u8, arg, "--max-examples")) {
             i += 1;
             if (i >= argv.len) return usageError();
@@ -1430,6 +1430,7 @@ pub fn parseTrainArgs(argv: []const []const u8) !TrainOptions {
         .eval_prepared_inputs_path = opts.eval_prepared_inputs_path.?,
         .out_dir = out_dir orelse return usageError(),
         .learning_rate = opts.learning_rate,
+        .weight_decay = opts.weight_decay,
         .max_examples = opts.max_examples,
         .eval_max_examples = opts.eval_max_examples,
         .epochs = opts.epochs,
@@ -1515,6 +1516,7 @@ fn trainWithSummary(allocator: std.mem.Allocator, io: std.Io, options: TrainOpti
         eval_prepared,
         .{
             .learning_rate = options.learning_rate,
+            .weight_decay = options.weight_decay,
             .max_examples = options.max_examples,
             .eval_max_examples = options.eval_max_examples,
             .epochs = options.epochs,
@@ -1543,6 +1545,7 @@ fn trainWithSummary(allocator: std.mem.Allocator, io: std.Io, options: TrainOpti
 
 fn validateTrainOptions(options: TrainOptions) !void {
     if (!std.math.isFinite(options.learning_rate) or options.learning_rate <= 0) return error.InvalidLearningRate;
+    if (!std.math.isFinite(options.weight_decay) or options.weight_decay < 0) return error.InvalidWeightDecay;
     if (options.epochs == 0) return error.InvalidEpochCount;
     if (options.grad_accum_steps == 0) return error.InvalidGradientAccumulation;
     if (!std.math.isFinite(options.max_grad_norm) or options.max_grad_norm < 0) return error.InvalidMaxGradNorm;
@@ -1803,7 +1806,8 @@ fn validateOracleRequestStatic(request: OracleRequestV1, options: TrainOptions) 
     {
         return error.InvalidOracleTrainingContract;
     }
-    if (options.learning_rate != @as(f32, @floatCast(training.learning_rate)) or
+    if (options.weight_decay != @as(f32, @floatCast(training.weight_decay)) or
+        options.learning_rate != @as(f32, @floatCast(training.learning_rate)) or
         options.max_examples != 1 or options.eval_max_examples != 1 or
         options.epochs != training.steps or options.max_grad_norm != @as(f32, @floatCast(training.max_grad_norm)) or
         options.grad_accum_steps != training.grad_accum_steps or options.seed != training.seed or
@@ -2018,6 +2022,7 @@ fn validateBenchmarkRequestStatic(request: BenchmarkRequestV1, options: TrainOpt
         return error.InvalidBenchmarkProtocol;
     }
     if (options.backend_kind != .metal or
+        options.weight_decay != @as(f32, 0.01) or
         options.learning_rate != @as(f32, 0.001) or
         options.max_grad_norm != @as(f32, 1.0) or
         options.seed != 42 or
@@ -2887,6 +2892,7 @@ fn resolveTrainerMode(requested: TrainerMode) TrainerMode {
 
 fn validateAutodiffTrainingOptions(opts: CliOptions) !void {
     if (!std.math.isFinite(opts.learning_rate) or opts.learning_rate <= 0) return error.InvalidLearningRate;
+    if (!std.math.isFinite(opts.weight_decay) or opts.weight_decay < 0) return error.InvalidWeightDecay;
     if (opts.epochs == 0) return error.InvalidEpochCount;
     if (opts.grad_accum_steps == 0) return error.InvalidGradientAccumulation;
     if (!std.math.isFinite(opts.max_grad_norm) or opts.max_grad_norm < 0) return error.InvalidMaxGradNorm;
@@ -3719,7 +3725,10 @@ test "gemma4 autodiff rejects a real DoRA bootstrap before backend and output mu
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "out/training_report.json", .{}));
 }
 
+const training_environment = @import("training_environment.zig");
+
 const AutodiffRunFingerprintInputs = struct {
+    numerical_environment_sha256: [32]u8,
     base_model_sha256: []const u8,
     tokenizer_sha256: []const u8,
     chat_template_sha256: []const u8,
@@ -3742,6 +3751,7 @@ const AutodiffRunFingerprintInputs = struct {
     recursive_shared_block_size: ?usize,
     recursive_loop_count: ?usize,
     learning_rate: f32,
+    weight_decay: f32 = 0.01,
     max_examples: usize,
     eval_max_examples: usize,
     epochs: usize,
@@ -3759,10 +3769,10 @@ const AutodiffRunFingerprintInputs = struct {
 
 fn autodiffRunFingerprint(inputs: AutodiffRunFingerprintInputs) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    // Preserve the established v2 identity for the unchanged fixed-shape
-    // policy so compatible in-flight checkpoints remain resumable. Only the
-    // opt-in bucketed policy extends the fingerprint domain.
-    hashRunField(&hasher, "antfly.gemma4.lora.autodiff.run.v2");
+    // Older checkpoints did not bind environment-selected backward kernels.
+    // Fail closed across that boundary, including when every override is unset.
+    hashRunField(&hasher, "antfly.gemma4.lora.autodiff.run.v3");
+    hashRunField(&hasher, &inputs.numerical_environment_sha256);
     hashRunField(&hasher, inputs.base_model_sha256);
     hashRunField(&hasher, inputs.tokenizer_sha256);
     hashRunField(&hasher, inputs.chat_template_sha256);
@@ -3786,6 +3796,7 @@ fn autodiffRunFingerprint(inputs: AutodiffRunFingerprintInputs) [std.crypto.hash
     hashRunOptionalU64(&hasher, inputs.recursive_shared_block_size);
     hashRunOptionalU64(&hasher, inputs.recursive_loop_count);
     hashRunU64(&hasher, @as(u32, @bitCast(inputs.learning_rate)));
+    hashRunU64(&hasher, @as(u32, @bitCast(inputs.weight_decay)));
     hashRunU64(&hasher, inputs.max_examples);
     hashRunU64(&hasher, inputs.eval_max_examples);
     hashRunU64(&hasher, inputs.epochs);
@@ -3877,6 +3888,7 @@ fn validateEpochBoundaryResume(
 
 test "gemma4 full run fingerprint binds trajectory inputs" {
     const base = AutodiffRunFingerprintInputs{
+        .numerical_environment_sha256 = @splat(0),
         .base_model_sha256 = "base",
         .tokenizer_sha256 = "tokenizer",
         .chat_template_sha256 = "chat",
@@ -3917,6 +3929,10 @@ test "gemma4 full run fingerprint binds trajectory inputs" {
     const repeated = autodiffRunFingerprint(base);
     try std.testing.expectEqualSlices(u8, &expected, &repeated);
     var changed = base;
+    changed.numerical_environment_sha256[0] = 1;
+    const changed_environment = autodiffRunFingerprint(changed);
+    try std.testing.expect(!std.mem.eql(u8, &expected, &changed_environment));
+    changed = base;
     changed.seed += 1;
     const changed_seed = autodiffRunFingerprint(changed);
     try std.testing.expect(!std.mem.eql(u8, &expected, &changed_seed));
@@ -4086,7 +4102,11 @@ fn runAutodiff(
     const adapter_checkpoint_path = adapter_inspect.adapter_checkpoint_path orelse return error.MissingAdapterCheckpoint;
     var adapter_checkpoint_fingerprint = try finetune.fingerprintProjectorFile(allocator, adapter_checkpoint_path);
     defer finetune.freeProjectorFingerprint(allocator, &adapter_checkpoint_fingerprint);
+    var numerical_environment = try training_environment.capture(allocator);
+    defer numerical_environment.deinit();
+    const numerical_environment_hex = std.fmt.bytesToHex(numerical_environment.sha256, .lower);
     const run_fingerprint = autodiffRunFingerprint(.{
+        .numerical_environment_sha256 = numerical_environment.sha256,
         .base_model_sha256 = provenance.base_model_sha256,
         .tokenizer_sha256 = provenance.tokenizer_sha256,
         .chat_template_sha256 = provenance.chat_template_sha256,
@@ -4109,6 +4129,7 @@ fn runAutodiff(
         .recursive_shared_block_size = recursive_shared_block_size,
         .recursive_loop_count = adapter_inspect.recursive_loop_count,
         .learning_rate = opts.learning_rate,
+        .weight_decay = opts.weight_decay,
         .max_examples = opts.max_examples,
         .eval_max_examples = opts.effectiveEvalMaxExamples(),
         .epochs = opts.epochs,
@@ -4150,7 +4171,7 @@ fn runAutodiff(
             .beta2 = @floatCast(admission.request().training.betas[1]),
             .eps = @floatCast(admission.request().training.eps),
             .weight_decay = @floatCast(admission.request().training.weight_decay),
-        } else .{},
+        } else .{ .weight_decay = opts.weight_decay },
         .lr_schedule = .{ .constant = opts.learning_rate },
         .max_grad_norm = opts.max_grad_norm,
         .grad_accum_steps = opts.grad_accum_steps,
@@ -4237,14 +4258,6 @@ fn runAutodiff(
         capture.load_ns = finished_ns - benchmark_load_started_ns;
     }
 
-    var start_epoch: usize = 0;
-    if (opts.resume_from_checkpoint) {
-        const checkpoint_path = opts.checkpoint_path orelse return error.CheckpointPathRequired;
-        const restored = try trainer.loadTrainingCheckpoint(checkpoint_path, &run_fingerprint);
-        start_epoch = try validateEpochBoundaryResume(restored, opts.seed, opts.epochs);
-    } else {
-        trainer.setTrainingProgress(trainingProgressForEpoch(opts.seed, 0, 0));
-    }
     const initialization_finished_ns = monotonicNowNs();
 
     // Normal training preserves the historical before/train/after evaluation
@@ -4279,6 +4292,19 @@ fn runAutodiff(
         initial_evaluation_wall_time_ns = monotonicElapsedNs(initial_evaluation_started_ns, monotonicNowNs());
     }
 
+    // The before metric always describes the immutable bootstrap adapter,
+    // including on resume. Only then replace weights with checkpoint state.
+    const restore_started_ns = monotonicNowNs();
+    var start_epoch: usize = 0;
+    if (opts.resume_from_checkpoint) {
+        const checkpoint_path = opts.checkpoint_path orelse return error.CheckpointPathRequired;
+        const restored = try trainer.loadTrainingCheckpoint(checkpoint_path, &run_fingerprint);
+        start_epoch = try validateEpochBoundaryResume(restored, opts.seed, opts.epochs);
+    } else {
+        trainer.setTrainingProgress(trainingProgressForEpoch(opts.seed, 0, 0));
+    }
+
+    const restore_wall_time_ns = monotonicElapsedNs(restore_started_ns, monotonicNowNs());
     const epoch_history = try allocator.alloc(AutodiffEpochSummary, opts.epochs - start_epoch);
     defer allocator.free(epoch_history);
     var repeated_benchmark_examples: ?[]finetune.PreparedExampleInput = null;
@@ -4506,6 +4532,10 @@ fn runAutodiff(
         .eval_prepared_inputs_path = eval_prepared_inputs_path,
         .saved_adapter_checkpoint = finetune.adapter_checkpoint_file_name,
         .run_fingerprint_sha256 = run_fingerprint_hex,
+        .numerical_environment = .{
+            .sha256 = &numerical_environment_hex,
+            .assignments = numerical_environment.assignments,
+        },
         .seed = opts.seed,
         .checkpoint_resume = .{
             .enabled = opts.resume_from_checkpoint,
@@ -4519,6 +4549,7 @@ fn runAutodiff(
             .capture_schema_version = if (oracle_admission != null) oracle_capture_schema_v1 else null,
         },
         .learning_rate = opts.learning_rate,
+        .optimizer = .{ .name = "adamw", .weight_decay = opts.weight_decay, .beta1 = @as(f32, 0.9), .beta2 = @as(f32, 0.999), .eps = @as(f32, 1e-8) },
         .max_examples = opts.max_examples,
         .eval_max_examples = opts.effectiveEvalMaxExamples(),
         .epochs = opts.epochs,
@@ -4535,7 +4566,7 @@ fn runAutodiff(
         .graph_cache = trainer.graphCacheStats(),
         .phase_timing = AutodiffPhaseTimingSummary{
             .initial_evaluation_placement = @tagName(initialEvaluationPlacement(benchmark_admission != null)),
-            .initialization_and_restore_wall_time_ns = monotonicElapsedNs(operation_started_ns, initialization_finished_ns),
+            .initialization_and_restore_wall_time_ns = monotonicElapsedNs(operation_started_ns, initialization_finished_ns) + restore_wall_time_ns,
             .initial_evaluation_wall_time_ns = initial_evaluation_wall_time_ns,
             .training_epochs_wall_time_ns = training_epochs_wall_time_ns,
             .adapter_save_wall_time_ns = adapter_save_wall_time_ns,
@@ -4614,6 +4645,7 @@ fn runAutodiff(
         .prepared_inputs_path = prepared_inputs_path,
         .eval_prepared_inputs_path = eval_prepared_inputs_path,
         .learning_rate = opts.learning_rate,
+        .weight_decay = opts.weight_decay,
         .max_examples = opts.max_examples,
         .eval_max_examples = opts.effectiveEvalMaxExamples(),
         .epochs = opts.epochs,
@@ -5057,161 +5089,6 @@ fn limitExampleSeqLen(
     return max_len;
 }
 
-fn runSurrogate(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    base_model_dir: []const u8,
-    adapter_model_dir: []const u8,
-    prepared_inputs_path: []const u8,
-    out_dir: []const u8,
-    prepared: finetune.PreparedInputsSummary,
-    opts: CliOptions,
-) !void {
-    if (prepared.examples_with_images > 0 or prepared.examples_with_audio > 0) return error.MultimodalRequiresAutodiffTrainer;
-
-    const backend_ptr: ?*const ComputeBackend = null;
-
-    var bundle = try finetune.loadLoRABundleScoped(allocator, base_model_dir, adapter_model_dir, opts.layer_name);
-    defer bundle.deinit();
-    var publication = try ImmutableRunPublication.init(allocator, io, out_dir);
-    defer publication.deinit();
-
-    const PjrtClientT = if (build_options.enable_pjrt) ?pjrt_mod.pjrt.Client else void;
-    var pjrt_client_storage: PjrtClientT = if (comptime build_options.enable_pjrt) null else {};
-    if (comptime build_options.enable_pjrt) {
-        pjrt_client_storage = pjrt_mod.pjrt.Client.initFromEnv(allocator) catch |err| blk: {
-            std.log.warn("PJRT client init failed ({s}); LoRA gradients will use CPU", .{@errorName(err)});
-            break :blk null;
-        };
-    }
-    defer if (comptime build_options.enable_pjrt) {
-        if (pjrt_client_storage) |*client| client.deinit();
-    };
-
-    const PjrtStepsT = if (build_options.enable_pjrt) ?[]?graph_bridge.LoRAPjrtTrainStep else void;
-    var pjrt_lora_steps: PjrtStepsT = if (comptime build_options.enable_pjrt) null else {};
-    if (comptime build_options.enable_pjrt) {
-        if (pjrt_client_storage) |*pjrt_client| {
-            const steps = try allocator.alloc(?graph_bridge.LoRAPjrtTrainStep, bundle.layers.len);
-            @memset(steps, null);
-            var compiled_count: usize = 0;
-            for (bundle.layers, 0..) |*layer, li| {
-                var layer_graph = graph_bridge.LoRALinearGraph.init(
-                    allocator,
-                    3,
-                    layer.input_dim,
-                    layer.output_dim,
-                    layer.rank,
-                    bundle.lora_alpha,
-                ) catch continue;
-                steps[li] = graph_bridge.compileLoRALinearPjrtStep(allocator, &layer_graph, pjrt_client) catch blk: {
-                    layer_graph.deinit();
-                    break :blk null;
-                };
-                if (steps[li] != null) {
-                    layer_graph.deinit();
-                    compiled_count += 1;
-                }
-            }
-            std.log.info("PJRT: compiled {d}/{d} LoRA layers", .{ compiled_count, bundle.layers.len });
-            pjrt_lora_steps = steps;
-        }
-    }
-    defer if (comptime build_options.enable_pjrt) {
-        if (pjrt_lora_steps) |steps| {
-            for (steps) |*step_opt| if (step_opt.*) |*step| step.deinit();
-            allocator.free(steps);
-        }
-    };
-
-    const before = try finetune.evaluatePreparedExamples(allocator, &bundle, prepared.examples, .{
-        .max_examples = opts.effectiveEvalMaxExamples(),
-        .layer_name = opts.layer_name,
-    });
-
-    const epoch_history = try allocator.alloc(finetune.TrainEpochSummary, opts.epochs);
-    defer allocator.free(epoch_history);
-    for (0..opts.epochs) |epoch_idx| {
-        epoch_history[epoch_idx] = try finetune.trainPreparedExamplesEpoch(allocator, &bundle, prepared.examples, .{
-            .learning_rate = opts.learning_rate,
-            .max_examples = opts.max_examples,
-            .layer_name = opts.layer_name,
-            .max_grad_norm = opts.max_grad_norm,
-            .grad_accum_steps = opts.grad_accum_steps,
-            .llrd_decay = opts.llrd_decay,
-            .use_schedule_free = opts.use_schedule_free,
-            .compute_backend = backend_ptr,
-            .pjrt_lora_steps = if (comptime build_options.enable_pjrt) pjrt_lora_steps else {},
-        });
-    }
-    const after = try finetune.evaluatePreparedExamples(allocator, &bundle, prepared.examples, .{
-        .max_examples = opts.effectiveEvalMaxExamples(),
-        .layer_name = opts.layer_name,
-    });
-
-    try publication.createStaging();
-    try finetune.saveLoRABundleToStaging(&bundle, publication.staging_dir);
-
-    const report_payload = .{
-        .artifact_family_version = finetune.artifact_family_version,
-        .trainer_kind = "surrogate_lora_turn_aware_v2",
-        .prepared_inputs_path = prepared_inputs_path,
-        .saved_adapter_checkpoint = finetune.adapter_checkpoint_file_name,
-        .learning_rate = opts.learning_rate,
-        .max_examples = opts.max_examples,
-        .eval_max_examples = opts.effectiveEvalMaxExamples(),
-        .epochs = opts.epochs,
-        .layer_name = opts.layer_name,
-        .max_grad_norm = opts.max_grad_norm,
-        .grad_accum_steps = opts.grad_accum_steps,
-        .activation_checkpoint_interval = opts.activation_checkpoint_interval,
-        .llrd_decay = opts.llrd_decay,
-        .use_schedule_free = opts.use_schedule_free,
-        .multimodal = .{
-            .enabled = false,
-            .gguf_projector_path = @as(?[]const u8, null),
-            .examples_with_media = @as(usize, 0),
-            .total_image_inputs = @as(usize, 0),
-            .total_audio_inputs = @as(usize, 0),
-            .total_image_soft_tokens = @as(usize, 0),
-            .total_audio_soft_tokens = @as(usize, 0),
-        },
-        .prepared_dataset = .{
-            .schema_version = prepared.schema_version,
-            .examples_seen = prepared.examples_seen,
-            .max_seq_len = prepared.max_seq_len,
-            .max_input_tokens = prepared.max_input_tokens,
-            .max_supervised_tokens = prepared.max_supervised_tokens,
-            .examples_with_tool_calls = prepared.examples_with_tool_calls,
-            .examples_with_tool_results = prepared.examples_with_tool_messages,
-            .examples_with_multiturn = prepared.examples_with_multiturn,
-            .examples_with_images = prepared.examples_with_images,
-            .examples_with_audio = prepared.examples_with_audio,
-            .examples_truncated = prepared.examples_truncated,
-            .max_turns_dropped = prepared.max_turns_dropped,
-        },
-        .before = before,
-        .epoch_history = epoch_history,
-        .after = after,
-    };
-    try writeRunOutputs(io, allocator, publication.staging_dir, base_model_dir, adapter_model_dir, "surrogate", report_payload, .{
-        .prepared_inputs_path = prepared_inputs_path,
-        .learning_rate = opts.learning_rate,
-        .max_examples = opts.max_examples,
-        .eval_max_examples = opts.effectiveEvalMaxExamples(),
-        .epochs = opts.epochs,
-        .layer_name = opts.layer_name,
-        .max_grad_norm = opts.max_grad_norm,
-        .grad_accum_steps = opts.grad_accum_steps,
-        .activation_checkpoint_interval = opts.activation_checkpoint_interval,
-        .llrd_decay = opts.llrd_decay,
-        .use_schedule_free = opts.use_schedule_free,
-        .backend_label = "surrogate",
-    }, true);
-    try writeRunCompletionManifest(io, allocator, publication.staging_dir);
-    try publication.publish();
-}
-
 const RunCompletionArtifact = struct {
     name: []const u8,
     sha256: []const u8,
@@ -5232,7 +5109,7 @@ fn writeRunCompletionManifest(io: std.Io, allocator: std.mem.Allocator, staging_
         names.deinit(allocator);
     }
     var iterator = dir.iterate();
-    while (try iterator.next(io)) |entry| switch (entry.kind) {
+    while (try iterator.next(io)) |entry| switch (try artifact_publication.resolveEntryKind(dir, io, entry.name, entry.kind)) {
         .file => {
             if (std.mem.eql(u8, entry.name, manifest_name)) continue;
             const owned_name = try allocator.dupe(u8, entry.name);
@@ -5361,6 +5238,7 @@ fn writeRunOutputs(
         .training = .{
             .trainer = trainer_name,
             .learning_rate = ctx.learning_rate,
+            .weight_decay = ctx.weight_decay,
             .max_examples = ctx.max_examples,
             .eval_max_examples = ctx.eval_max_examples,
             .epochs = ctx.epochs,
@@ -5449,6 +5327,7 @@ pub fn printTrainUsage() void {
         \\Flags:
         \\  --trainer auto|autodiff             Compatibility spelling; both select production autodiff
         \\  --lr, --learning-rate <f32>         Learning rate (default: 0.001)
+        \\  --weight-decay <f32>               AdamW decay on LoRA tensors (default: 0.01; use 0 for no decay)
         \\  --max-examples <usize>              Max examples per epoch (default: 32)
         \\  --eval-prepared <path>              Required disjoint prepared evaluation artifact
         \\  --eval-max-examples <usize>         Max examples for before/after eval (default: --max-examples)

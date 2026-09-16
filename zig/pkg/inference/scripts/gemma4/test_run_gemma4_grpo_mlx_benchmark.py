@@ -43,9 +43,7 @@ class Gemma4GrpoMlxBenchmarkTest(unittest.TestCase):
             case.reward_for_token(token_id)
             for token_id in case.expected_initial_token_ids
         ]
-        advantages = benchmark.normalized_advantages(
-            rewards, case.advantage_epsilon
-        )
+        advantages = benchmark.normalized_advantages(rewards, case.advantage_epsilon)
         self.assertEqual([1.0, 0.0], rewards)
         self.assertAlmostEqual(1.0, advantages[0], places=6)
         self.assertAlmostEqual(-1.0, advantages[1], places=6)
@@ -69,7 +67,9 @@ class Gemma4GrpoMlxBenchmarkTest(unittest.TestCase):
                 list(case.prompt_token_ids), row[: len(case.prompt_token_ids)]
             )
             self.assertEqual(token_id, row[len(case.prompt_token_ids)])
-            self.assertTrue(all(value == 0 for value in row[len(case.prompt_token_ids) + 1 :]))
+            self.assertTrue(
+                all(value == 0 for value in row[len(case.prompt_token_ids) + 1 :])
+            )
 
     def test_package_versions_are_exact(self) -> None:
         expected = {"mlx": "1", "mlx-lm": "2", "numpy": "3"}
@@ -97,9 +97,7 @@ class Gemma4GrpoMlxBenchmarkTest(unittest.TestCase):
         payload = self.load_payload()
         payload["protocol"]["measured"] = 19
         with tempfile.TemporaryDirectory() as temp:
-            with self.assertRaisesRegex(
-                benchmark.GrpoBenchmarkContractError, "fixed"
-            ):
+            with self.assertRaisesRegex(benchmark.GrpoBenchmarkContractError, "fixed"):
                 benchmark.load_case(self.write_case(payload, Path(temp)))
 
     def test_case_rejects_reward_order_drift(self) -> None:
@@ -150,13 +148,9 @@ class Gemma4GrpoMlxBenchmarkTest(unittest.TestCase):
         ) as verify:
             self.assertEqual(
                 expected,
-                benchmark.require_source_revision(
-                    Path("/tmp/mlx"), expected, "MLX"
-                ),
+                benchmark.require_source_revision(Path("/tmp/mlx"), expected, "MLX"),
             )
-        verify.assert_called_once_with(
-            Path("/tmp/mlx"), expected, source_name="MLX"
-        )
+        verify.assert_called_once_with(Path("/tmp/mlx"), expected, source_name="MLX")
 
         with mock.patch.object(
             benchmark.locked,
@@ -167,9 +161,7 @@ class Gemma4GrpoMlxBenchmarkTest(unittest.TestCase):
                 benchmark.GrpoBenchmarkContractError,
                 "clean MLX source revision",
             ):
-                benchmark.require_source_revision(
-                    Path("/tmp/mlx"), expected, "MLX"
-                )
+                benchmark.require_source_revision(Path("/tmp/mlx"), expected, "MLX")
 
     def test_import_surface_keeps_mlx_lazy(self) -> None:
         source = Path(benchmark.__file__).read_text(encoding="utf-8")

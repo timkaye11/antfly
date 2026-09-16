@@ -1168,6 +1168,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// does not consume bias. Indexing the same prepared slot by weight alone
     /// avoids allocating a duplicate slot for every frozen projection.
     dynamic_quantized_weight_slots: std.AutoHashMapUnmanaged(DynamicLinearSlotKey, usize) = .empty,
+    linear_cce_fallback_warned: bool = false,
     eager_quant_mirrors_preferred: bool = false,
     dynamic_layer_norm_slots: std.AutoHashMapUnmanaged(DynamicLayerNormSlotKey, usize) = .empty,
     dynamic_rms_norm_slots: std.AutoHashMapUnmanaged(DynamicRmsNormSlotKey, usize) = .empty,
@@ -2758,6 +2759,21 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         for (linear_keys[0..linear_count]) |key| {
             if (self.dynamic_linear_slots.fetchRemove(key)) |removed| {
+                // Multiple quantized views may alias this runtime slot. Retire
+                // every alias before the allocator can reuse the slot number.
+                while (true) {
+                    var alias_key: ?DynamicLinearSlotKey = null;
+                    var aliases = self.dynamic_quantized_weight_slots.iterator();
+                    while (aliases.next()) |entry| {
+                        if (entry.value_ptr.* == removed.value) {
+                            alias_key = entry.key_ptr.*;
+                            break;
+                        }
+                    }
+                    if (alias_key) |alias| {
+                        _ = self.dynamic_quantized_weight_slots.remove(alias);
+                    } else break;
+                }
                 metal_runtime.clearRawLinearSlot(self.provider_impl, removed.value);
             }
         }
@@ -4990,6 +5006,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self.finishPendingDebertaRelativeProjections(false);
         self.clearActivePrefillFramePlan();
         self.clearPendingPrefillKvDeviceSeeds();
+        self.pending_prefill_kv_device_seeds.deinit(self.allocator);
         self.resetBackendKvCache();
         self.cyclic_page_table_cache.deinit(self.allocator);
         if (self.attention_mask_device_cache) |*tensor| tensor.deinit();
@@ -12377,6 +12394,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return error.RequiredMetalLinearCceUnavailable;
         }
 
+        if (!self.linear_cce_fallback_warned) {
+            self.linear_cce_fallback_warned = true;
+            std.log.warn("Metal linear cross entropy materializes full logits: rows={d} vocab={d} dtype={s} logits_bytes={d}; require TERMITE_METAL_REQUIRE_LINEAR_CCE=1 to reject this fallback", .{
+                request.rows,                                     request.vocab_size, if (toBuf(request.weight).native_dense_dtype) |dtype| @tagName(dtype) else "f32-or-quantized",
+                request.rows * request.vocab_size * @sizeOf(f32),
+            });
+        }
         const logits = try linearNoBiasOp(ctx, request.hidden, request.weight, request.rows, request.in_dim, request.vocab_size);
         defer freeOp(ctx, logits);
         device_path: {
@@ -17080,6 +17104,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         const maybe_output = if (batch == 1)
             try metal_runtime.decoderRuntimeApplyAttentionF32(self.provider_impl, .{
+                .allow_host_fallback = false,
                 .q = q_mt,
                 .k = k_mt,
                 .v = v_mt,
@@ -31039,7 +31064,7 @@ test "metal_compute: dynamic norm slots survive repeated backend lifetimes" {
     }
 }
 
-test "metal_compute: transient component slots are retired and reclaimed" {
+test "gemma4 metal_compute: transient component slots and quantized aliases are retired and reclaimed" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
 
@@ -31070,7 +31095,14 @@ test "metal_compute: transient component slots are retired and reclaimed" {
     const first_weight = try cb.fromFloat32Shape(&weight_values, &weight_shape);
     const first_bias = try cb.fromFloat32Shape(&bias_values, &bias_shape);
     try std.testing.expectEqual(@as(?usize, 0), try metal_compute.ensureDynamicLinearSlot(first_weight, first_bias, 4, 4));
+    var keys = metal_compute.dynamic_linear_slots.keyIterator();
+    const first_key = keys.next().?.*;
+    try metal_compute.dynamic_quantized_weight_slots.put(allocator, first_key, 0);
+    var alias_key = first_key;
+    alias_key.quantized_storage = 123;
+    try metal_compute.dynamic_quantized_weight_slots.put(allocator, alias_key, 0);
     MetalCompute.releaseDynamicSlotsForTensor(&cb, first_weight);
+    try std.testing.expectEqual(@as(usize, 0), metal_compute.dynamic_quantized_weight_slots.count());
     try std.testing.expectEqual(@as(usize, 0), metal_compute.dynamic_linear_slots.count());
     try std.testing.expect(!metal_compute.provider_impl.raw_linear_slots_prepared[0]);
     cb.free(first_bias);
@@ -36459,7 +36491,7 @@ test "metal_compute: disentangled relative attention backward matches native at 
     }
 }
 
-test "metal_compute: fused GQA training forward and backward match native" {
+test "gemma4 metal_compute: fused GQA training forward and backward match native" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
 
@@ -37502,23 +37534,27 @@ test "metal_compute: masked bce with logits loss and backward match native" {
     try std.testing.expect(worst_grad <= 1e-5);
 }
 
-test "metal_compute: frozen linear cross entropy loss and d_hidden match native" {
+test "gemma4 metal_compute: frozen linear cross entropy loss and d_hidden match native" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
-    const rows: usize = 3;
+    const rows: usize = 259;
     const in_dim: usize = 5;
-    const vocab_size: usize = 7;
+    const vocab_size: usize = 521;
     var hidden: [rows * in_dim]f32 = undefined;
     var weight: [vocab_size * in_dim]f32 = undefined;
     auditFill(&hidden, 771, 1.5);
     auditFill(&weight, 772, 0.75);
     const upstream = [_]f32{0.625};
-    const label_sets = [_][rows]f32{
-        .{ 2.0, -100.0, 6.0 },
-        .{ -100.0, -100.0, -100.0 },
-    };
+    // Span multiple SIMD groups and vocabulary strides. Alternating ignored
+    // runs expose shared-memory reuse races between row reductions.
+    var label_sets: [2][rows]f32 = undefined;
+    for (0..rows) |row| {
+        label_sets[0][row] = if (row % 7 < 4) -100 else @floatFromInt((row * 23) % vocab_size);
+        label_sets[1][row] = -100;
+    }
+    const repeats = 8;
     const hidden_shape_i32 = [_]i32{ rows, in_dim };
     const weight_shape_i32 = [_]i32{ vocab_size, in_dim };
     const labels_shape_i32 = [_]i32{rows};
@@ -37585,51 +37621,53 @@ test "metal_compute: frozen linear cross entropy loss and d_hidden match native"
             });
             defer native_cb.free(n_grad);
 
-            const m_loss = try metal_cb.linearCrossEntropyLoss(&.{
-                .hidden = m_hidden,
-                .weight = m_weight,
-                .labels = m_labels,
-                .rows = rows,
-                .in_dim = in_dim,
-                .vocab_size = vocab_size,
-                .logit_softcap = softcap,
-                .ignore_index = -100,
-                .frozen_weight = true,
-                .output_shape = &scalar_shape_i64,
-            });
-            defer metal_cb.free(m_loss);
-            try std.testing.expect(MetalCompute.toBuf(m_loss).metal_tensor != null and MetalCompute.toBuf(m_loss).metal_tensor.?.isDevice());
-            const m_grad = try metal_cb.linearCrossEntropyBackward(&.{
-                .hidden = m_hidden,
-                .weight = m_weight,
-                .labels = m_labels,
-                .upstream = m_upstream,
-                .rows = rows,
-                .in_dim = in_dim,
-                .vocab_size = vocab_size,
-                .logit_softcap = softcap,
-                .ignore_index = -100,
-                .frozen_weight = true,
-                .hidden_shape = &hidden_shape_i64,
-            });
-            defer metal_cb.free(m_grad);
-            try std.testing.expect(MetalCompute.toBuf(m_grad).metal_tensor != null and MetalCompute.toBuf(m_grad).metal_tensor.?.isDevice());
+            for (0..repeats) |_| {
+                const m_loss = try metal_cb.linearCrossEntropyLoss(&.{
+                    .hidden = m_hidden,
+                    .weight = m_weight,
+                    .labels = m_labels,
+                    .rows = rows,
+                    .in_dim = in_dim,
+                    .vocab_size = vocab_size,
+                    .logit_softcap = softcap,
+                    .ignore_index = -100,
+                    .frozen_weight = true,
+                    .output_shape = &scalar_shape_i64,
+                });
+                defer metal_cb.free(m_loss);
+                try std.testing.expect(MetalCompute.toBuf(m_loss).metal_tensor != null and MetalCompute.toBuf(m_loss).metal_tensor.?.isDevice());
+                const m_grad = try metal_cb.linearCrossEntropyBackward(&.{
+                    .hidden = m_hidden,
+                    .weight = m_weight,
+                    .labels = m_labels,
+                    .upstream = m_upstream,
+                    .rows = rows,
+                    .in_dim = in_dim,
+                    .vocab_size = vocab_size,
+                    .logit_softcap = softcap,
+                    .ignore_index = -100,
+                    .frozen_weight = true,
+                    .hidden_shape = &hidden_shape_i64,
+                });
+                defer metal_cb.free(m_grad);
+                try std.testing.expect(MetalCompute.toBuf(m_grad).metal_tensor != null and MetalCompute.toBuf(m_grad).metal_tensor.?.isDevice());
 
-            const native_loss = try native_cb.toFloat32(n_loss, allocator);
-            defer allocator.free(native_loss);
-            const metal_loss = try metal_cb.toFloat32(m_loss, allocator);
-            defer allocator.free(metal_loss);
-            const native_grad = try native_cb.toFloat32(n_grad, allocator);
-            defer allocator.free(native_grad);
-            const metal_grad = try metal_cb.toFloat32(m_grad, allocator);
-            defer allocator.free(metal_grad);
-            try std.testing.expectApproxEqAbs(native_loss[0], metal_loss[0], 2e-5);
-            try std.testing.expect(auditMaxAbsDelta(native_grad, metal_grad) <= 3e-5);
+                const native_loss = try native_cb.toFloat32(n_loss, allocator);
+                defer allocator.free(native_loss);
+                const metal_loss = try metal_cb.toFloat32(m_loss, allocator);
+                defer allocator.free(metal_loss);
+                const native_grad = try native_cb.toFloat32(n_grad, allocator);
+                defer allocator.free(native_grad);
+                const metal_grad = try metal_cb.toFloat32(m_grad, allocator);
+                defer allocator.free(metal_grad);
+                try std.testing.expectApproxEqAbs(native_loss[0], metal_loss[0], 2e-5);
+                try std.testing.expect(auditMaxAbsDelta(native_grad, metal_grad) <= 3e-5);
+            }
         }
     }
     const route_stats = metal_cb.trainingRuntimeStats();
-    try std.testing.expectEqual(@as(u64, label_sets.len * 2), route_stats.linear_cross_entropy_forward_calls);
-    try std.testing.expectEqual(@as(u64, label_sets.len * 2), route_stats.linear_cross_entropy_backward_calls);
+    try std.testing.expectEqual(@as(u64, label_sets.len * 2 * repeats), route_stats.linear_cross_entropy_forward_calls);
+    try std.testing.expectEqual(@as(u64, label_sets.len * 2 * repeats), route_stats.linear_cross_entropy_backward_calls);
     try std.testing.expectEqual(@as(u64, 0), route_stats.linear_cce_forward_calls);
     try std.testing.expectEqual(@as(u64, 0), route_stats.linear_cce_backward_calls);
 }
@@ -39043,10 +39081,13 @@ test "gemma4 metal_compute: long BF16 forward projection preserves cancellation 
     var cb = metal_compute.computeBackend();
     const weight_buf = try allocator.create(MetalCompute.Buf);
     weight_buf.* = .{
-        .data = &.{}, .allocator = allocator, .owned = false,
-        .logical_shape = try allocator.dupe(i64, &.{out_dim, in_dim}),
+        .data = &.{},
+        .allocator = allocator,
+        .owned = false,
+        .logical_shape = try allocator.dupe(i64, &.{ out_dim, in_dim }),
         .native_dense_bytes = try allocator.dupe(u8, std.mem.sliceAsBytes(words)),
-        .native_dense_dtype = .bf16, .native_dense_bytes_owned = true,
+        .native_dense_dtype = .bf16,
+        .native_dense_bytes_owned = true,
     };
     const weight: CT = @ptrCast(weight_buf);
     defer cb.free(weight);
@@ -39055,7 +39096,7 @@ test "gemma4 metal_compute: long BF16 forward projection preserves cancellation 
     defer cb.free(bias);
     const tiny: f32 = 0.001 * 0x1p-25;
     const expected: f32 = @floatCast(@as(f64, tiny) * (in_dim - 2));
-    for ([_]usize{128, 129, 154}) |rows| {
+    for ([_]usize{ 128, 129, 154 }) |rows| {
         const data = try allocator.alloc(f32, rows * in_dim);
         defer allocator.free(data);
         @memset(data, tiny);
@@ -39063,7 +39104,7 @@ test "gemma4 metal_compute: long BF16 forward projection preserves cancellation 
             data[row * in_dim] = 0.001;
             data[(row + 1) * in_dim - 1] = -0.001;
         }
-        const upstream = try auditDeviceTensor(&metal_compute, &cb, data, &.{@intCast(rows), in_dim});
+        const upstream = try auditDeviceTensor(&metal_compute, &cb, data, &.{ @intCast(rows), in_dim });
         defer cb.free(upstream);
         const grad = try cb.linear(upstream, weight, bias, rows, in_dim, out_dim);
         defer cb.free(grad);

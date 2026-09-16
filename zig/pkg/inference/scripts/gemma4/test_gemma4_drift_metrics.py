@@ -21,7 +21,12 @@ class DriftMetricsTests(unittest.TestCase):
         self.assertEqual(compare_vectors([0], [0])["relative_l2_error"], 0)
 
     def test_shape_and_nonfinite_fail_closed(self):
-        for left, right in (([1], [[1]]), ([], []), ([float("nan")], [1]), ([1], [float("inf")])):
+        for left, right in (
+            ([1], [[1]]),
+            ([], []),
+            ([float("nan")], [1]),
+            ([1], [float("inf")]),
+        ):
             with self.subTest(left=left, right=right), self.assertRaises(ValueError):
                 compare_vectors(left, right)
 

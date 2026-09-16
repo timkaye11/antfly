@@ -26,9 +26,7 @@ from typing import Any, Mapping, Sequence
 SCRIPT_PATH = Path(__file__).resolve()
 SCRIPT_DIR = SCRIPT_PATH.parent
 DEFAULT_CASE_PATH = (
-    SCRIPT_DIR.parent.parent
-    / "testdata"
-    / "gemma4_dpo_e2b_seq128_benchmark.json"
+    SCRIPT_DIR.parent.parent / "testdata" / "gemma4_dpo_e2b_seq128_benchmark.json"
 )
 CASE_SCHEMA_VERSION = "antfly_gemma4_dpo_benchmark_case/v1"
 DATASET_CASE_SCHEMA_VERSION = "antfly_gemma4_dpo_benchmark_dataset/v1"
@@ -202,7 +200,9 @@ def _parse_example(
     if len(prompt_ids) + max(len(chosen_ids), len(rejected_ids)) > sequence_length:
         raise DpoBenchmarkContractError(f"{where} exceeds sequence_length")
     if chosen_ids == rejected_ids:
-        raise DpoBenchmarkContractError(f"{where} chosen and rejected tokens must differ")
+        raise DpoBenchmarkContractError(
+            f"{where} chosen and rejected tokens must differ"
+        )
     for value, label in (
         (payload["rendered_prompt"], "rendered_prompt"),
         (chosen["text"], "chosen.text"),
@@ -220,9 +220,7 @@ def _parse_example(
             payload["source_row_index"], f"{where}.source_row_index"
         )
         source_id = _sha256_string(payload["source_id"], f"{where}.source_id")
-        score_chosen = _finite_float(
-            payload["score_chosen"], f"{where}.score_chosen"
-        )
+        score_chosen = _finite_float(payload["score_chosen"], f"{where}.score_chosen")
         score_rejected = _finite_float(
             payload["score_rejected"], f"{where}.score_rejected"
         )
@@ -284,7 +282,9 @@ def _parse_dataset(payload: Any, source_path: Path) -> dict[str, Any]:
 
     relative_jsonl = Path(payload["materialized_jsonl"])
     if relative_jsonl.is_absolute() or ".." in relative_jsonl.parts:
-        raise DpoBenchmarkContractError("dataset.materialized_jsonl must be a local sibling")
+        raise DpoBenchmarkContractError(
+            "dataset.materialized_jsonl must be a local sibling"
+        )
     jsonl_path = (source_path.parent / relative_jsonl).resolve()
     try:
         actual_sha = hashlib.sha256(jsonl_path.read_bytes()).hexdigest()
@@ -320,8 +320,7 @@ def load_case(path: Path) -> BenchmarkCase:
     if schema_version == CASE_SCHEMA_VERSION:
         _require_exact_keys(
             payload,
-            common_keys
-            | {"rendered_prompt", "prompt_token_ids", "chosen", "rejected"},
+            common_keys | {"rendered_prompt", "prompt_token_ids", "chosen", "rejected"},
             "DPO case",
         )
     elif schema_version == DATASET_CASE_SCHEMA_VERSION:
@@ -373,8 +372,7 @@ def load_case(path: Path) -> BenchmarkCase:
         raise DpoBenchmarkContractError("protocol must be an object")
     _require_exact_keys(protocol, set(FIXED_PROTOCOL), "protocol")
     normalized_protocol = {
-        key: _positive_int(protocol[key], f"protocol.{key}")
-        for key in FIXED_PROTOCOL
+        key: _positive_int(protocol[key], f"protocol.{key}") for key in FIXED_PROTOCOL
     }
     if normalized_protocol != FIXED_PROTOCOL:
         raise DpoBenchmarkContractError(
@@ -418,7 +416,9 @@ def load_case(path: Path) -> BenchmarkCase:
         )
         source_rows = [item.source_row_index for item in examples]
         source_ids = [item.source_id for item in examples]
-        if source_rows != sorted(source_rows) or len(set(source_rows)) != len(source_rows):
+        if source_rows != sorted(source_rows) or len(set(source_rows)) != len(
+            source_rows
+        ):
             raise DpoBenchmarkContractError(
                 "DPO dataset examples must use unique source-order rows"
             )
@@ -516,7 +516,9 @@ def summarize_sequence_length_policy(
         "bucket_minimum": (
             None
             if bucket_quantum is None
-            else bucket_quantum if bucket_minimum is None else bucket_minimum
+            else bucket_quantum
+            if bucket_minimum is None
+            else bucket_minimum
         ),
         "pair_sequence_lengths": list(pair_lengths),
         "pairs": len(case.examples),
@@ -556,9 +558,7 @@ def dpo_evaluation_metrics(
         if not all(math.isfinite(value) for value in values):
             raise DpoBenchmarkContractError("DPO evaluation contains non-finite values")
         reward_margin = beta * ((pc - rc) - (pr - rr))
-        loss = max(0.0, -reward_margin) + math.log1p(
-            math.exp(-abs(reward_margin))
-        )
+        loss = max(0.0, -reward_margin) + math.log1p(math.exp(-abs(reward_margin)))
         rows.append(
             {
                 "index": index,
@@ -576,17 +576,13 @@ def dpo_evaluation_metrics(
     return {
         "examples": len(rows),
         "mean_loss": statistics.mean(row["loss"] for row in rows),
-        "mean_reward_margin": statistics.mean(
-            row["reward_margin"] for row in rows
-        ),
+        "mean_reward_margin": statistics.mean(row["reward_margin"] for row in rows),
         "accuracy": statistics.mean(1.0 if row["preferred"] else 0.0 for row in rows),
         "rows": rows,
     }
 
 
-def require_source_checkout(
-    root: Path, expected: str, label: str
-) -> dict[str, str]:
+def require_source_checkout(root: Path, expected: str, label: str) -> dict[str, str]:
     try:
         return locked.verify_source_checkout(
             root,
@@ -687,9 +683,7 @@ def write_adapter_exclusive(
 ) -> str:
     """Write final MLX trainables back to the exact PEFT/Antfly orientation."""
     destination = _new_output_path(path, "benchmark adapter output")
-    mlx_targets = {
-        locked.canonicalize_module_name(name): name for name in target_names
-    }
+    mlx_targets = {locked.canonicalize_module_name(name): name for name in target_names}
     if len(mlx_targets) != len(target_names):
         raise DpoBenchmarkContractError("MLX adapter target names are not canonical")
     serialized: dict[str, Any] = {}
@@ -711,9 +705,7 @@ def write_adapter_exclusive(
         f".{destination.stem}.{os.getpid()}.tmp.safetensors"
     )
     try:
-        mx.save_safetensors(
-            str(temp_path), serialized, metadata={"format": "pt"}
-        )
+        mx.save_safetensors(str(temp_path), serialized, metadata={"format": "pt"})
         os.link(temp_path, destination)
     except FileExistsError as exc:
         raise DpoBenchmarkContractError(
@@ -750,9 +742,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
     model_dir = args.model_dir.expanduser().resolve()
     try:
-        locked_model = locked.verify_model_directory(
-            lock, case.model_key, model_dir
-        )
+        locked_model = locked.verify_model_directory(lock, case.model_key, model_dir)
     except locked.ContractError as exc:
         raise DpoBenchmarkContractError(
             f"model directory differs from the locked {case.model_key} artifact: {exc}"
@@ -856,12 +846,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     adapter_dir = args.adapter_dir.expanduser().resolve()
     try:
         manifest = json.loads(
-            (adapter_dir / "antfly_finetune_manifest.json").read_text(
-                encoding="utf-8"
-            )
+            (adapter_dir / "antfly_finetune_manifest.json").read_text(encoding="utf-8")
         )
     except (OSError, json.JSONDecodeError) as exc:
-        raise DpoBenchmarkContractError(f"could not load adapter manifest: {exc}") from exc
+        raise DpoBenchmarkContractError(
+            f"could not load adapter manifest: {exc}"
+        ) from exc
     if not isinstance(manifest, dict):
         raise DpoBenchmarkContractError("adapter manifest must be an object")
     binding_fields = (
@@ -916,8 +906,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if case.dataset is not None:
         bound_input_paths.append(
             (
-                case.source_path.parent
-                / Path(case.dataset["materialized_jsonl"])
+                case.source_path.parent / Path(case.dataset["materialized_jsonl"])
             ).resolve()
         )
     if comparison_path is not None:
@@ -1059,9 +1048,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             reference_chosen: Any,
             reference_rejected: Any,
         ) -> Any:
-            policy_chosen = sequence_logp(
-                current_model, chosen_tokens, chosen_targets
-            )
+            policy_chosen = sequence_logp(current_model, chosen_tokens, chosen_targets)
             policy_rejected = sequence_logp(
                 current_model, rejected_tokens, rejected_targets
             )
@@ -1127,9 +1114,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             # MLX arrays are immutable; retaining these evaluated leaves pins the
             # exact post-cold-update state while subsequent optimizer steps
             # replace the model leaves.  Serialize only after timing completes.
-            first_update_trainables = dict(
-                tree_flatten(model.trainable_parameters())
-            )
+            first_update_trainables = dict(tree_flatten(model.trainable_parameters()))
             mx.eval(*first_update_trainables.values())
         first = execute()
         warmup = [execute() for _ in range(case.protocol["warmup"])]
@@ -1138,8 +1123,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise DpoBenchmarkContractError(
                 f"zero-adapter cold loss is not ln(2): {cold[1]}"
             )
-        if not any(abs(loss - cold[1]) > 1e-6 for _seconds, loss in [first, *warmup, *measured]):
-            raise DpoBenchmarkContractError("MLX policy did not move after optimization")
+        if not any(
+            abs(loss - cold[1]) > 1e-6 for _seconds, loss in [first, *warmup, *measured]
+        ):
+            raise DpoBenchmarkContractError(
+                "MLX policy did not move after optimization"
+            )
 
         final_trainables = dict(tree_flatten(model.trainable_parameters()))
         delta_squares = [
@@ -1154,9 +1143,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         adapter_delta_l2 = math.sqrt(
             sum(float(value.item()) for value in delta_squares)
         )
-        adapter_delta_max_abs = max(
-            float(value.item()) for value in delta_maxima
-        )
+        adapter_delta_max_abs = max(float(value.item()) for value in delta_maxima)
         memory = sampler.stop()
         sampler_active = False
     finally:
@@ -1186,18 +1173,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     post_training_evaluation = evaluate_current_model()
     comparison_adapter_evaluation: dict[str, Any] | None = None
     if comparison_path is not None:
-        comparison_sha256 = "sha256:" + hashlib.sha256(
-            comparison_path.read_bytes()
-        ).hexdigest()
+        comparison_sha256 = (
+            "sha256:" + hashlib.sha256(comparison_path.read_bytes()).hexdigest()
+        )
         comparison_artifact = replace(
             adapter,
             checkpoint=comparison_path,
             checkpoint_sha256=comparison_sha256,
         )
         try:
-            locked.load_exact_initial_adapter(
-                model, targets, comparison_artifact, mx
-            )
+            locked.load_exact_initial_adapter(model, targets, comparison_artifact, mx)
         except locked.ContractError as exc:
             raise DpoBenchmarkContractError(
                 f"could not load comparison adapter: {exc}"
@@ -1215,7 +1200,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if post_model != locked_model:
             raise locked.ContractError("locked model identity drifted during benchmark")
         if locked.verify_packages(lock, "mlx_reference") != package_versions:
-            raise locked.ContractError("MLX package environment drifted during benchmark")
+            raise locked.ContractError(
+                "MLX package environment drifted during benchmark"
+            )
         post_mlx_checkout = locked.verify_source_checkout(
             args.mlx_source_root,
             revisions["mlx"],
@@ -1241,9 +1228,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         for field in ("native_artifact_inventory", "build_attestation"):
             if post_native_runtime[field] != native_runtime[field]:
-                raise locked.ContractError(
-                    f"MLX {field} drifted during DPO benchmark"
-                )
+                raise locked.ContractError(f"MLX {field} drifted during DPO benchmark")
     except locked.ContractError as exc:
         raise DpoBenchmarkContractError(
             f"DPO benchmark input postflight failed: {exc}"
@@ -1372,9 +1357,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "base_model_provenance": base_model_provenance,
         "locked_model": locked_model,
         "mlx_native_runtime": {
-            "native_artifact_inventory": native_runtime[
-                "native_artifact_inventory"
-            ],
+            "native_artifact_inventory": native_runtime["native_artifact_inventory"],
             "build_attestation": native_runtime["build_attestation"],
         },
         "mlx_core_path": str(core_path),

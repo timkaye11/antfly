@@ -101,7 +101,10 @@ class CaptureFixture:
             },
         }
         _write_json(self.request_path, self.request)
-        self.targets = [self._target(SOURCE_A, SLOT_A, [1, 2]), self._target(SOURCE_B, SLOT_B, [2, 1])]
+        self.targets = [
+            self._target(SOURCE_A, SLOT_A, [1, 2]),
+            self._target(SOURCE_B, SLOT_B, [2, 1]),
+        ]
         self.gradients = {
             f"gradient::{SLOT_A}": np.zeros((1, 2), dtype=np.float32),
             f"gradient::{SLOT_B}": np.asarray([[0.25], [-0.5]], dtype=np.float32),
@@ -109,14 +112,22 @@ class CaptureFixture:
         save_file(self.gradients, str(self.capture_dir / "raw_gradients.safetensors"))
         checkpoint: dict[str, np.ndarray[Any, np.dtype[np.float32]]] = {
             "__trainer_counters": _encode_u64_fields([1, 1]),
-            "__trainer_state_v2": _encode_u64_fields([2, 1, 1, 1, 0, 1, 42, 1, 0, 1, 123, 0, 1, 2, 3, 4, 0, 0]),
+            "__trainer_state_v2": _encode_u64_fields(
+                [2, 1, 1, 1, 0, 1, 42, 1, 0, 1, 123, 0, 1, 2, 3, 4, 0, 0]
+            ),
         }
         for source_name, slot in ((SOURCE_A, SLOT_A), (SOURCE_B, SLOT_B)):
             checkpoint[f"weight::{slot}"] = self.updated[source_name].reshape(-1)
-            checkpoint[f"adam_m::{slot}"] = np.full(self.updated[source_name].size, 0.1, dtype=np.float32)
-            checkpoint[f"adam_v::{slot}"] = np.full(self.updated[source_name].size, 0.01, dtype=np.float32)
+            checkpoint[f"adam_m::{slot}"] = np.full(
+                self.updated[source_name].size, 0.1, dtype=np.float32
+            )
+            checkpoint[f"adam_v::{slot}"] = np.full(
+                self.updated[source_name].size, 0.01, dtype=np.float32
+            )
             checkpoint[f"adam_step::{slot}"] = np.asarray([1], dtype=np.float32)
-            checkpoint[f"grad_accum::{slot}"] = np.zeros(self.updated[source_name].size, dtype=np.float32)
+            checkpoint[f"grad_accum::{slot}"] = np.zeros(
+                self.updated[source_name].size, dtype=np.float32
+            )
         save_file(checkpoint, str(self.capture_dir / "trainer_checkpoint.safetensors"))
         predictor = 1
         token_ids = oracle._stable_probe_token_ids(3, 17, predictor, self.seed)
@@ -130,13 +141,17 @@ class CaptureFixture:
                 "loss_history": [1.25],
                 "raw_gradient_norm": math.sqrt(0.25**2 + 0.5**2),
                 "supervised_tokens": 1,
-                "logit_probes": [{
-                    "predictor_position": predictor,
-                    "target_token_id": 3,
-                    "token_ids": token_ids,
-                    "values": [float(index) / 10 for index in range(len(token_ids))],
-                    "logsumexp": 2.5,
-                }],
+                "logit_probes": [
+                    {
+                        "predictor_position": predictor,
+                        "target_token_id": 3,
+                        "token_ids": token_ids,
+                        "values": [
+                            float(index) / 10 for index in range(len(token_ids))
+                        ],
+                        "logsumexp": 2.5,
+                    }
+                ],
                 "targets": self.targets,
                 "execution": {
                     "optimizer_steps": 1,
@@ -167,7 +182,9 @@ class CaptureFixture:
         }
 
     @staticmethod
-    def _adapter(root: Path, tensors: dict[str, np.ndarray[Any, np.dtype[np.float32]]]) -> dict[str, Any]:
+    def _adapter(
+        root: Path, tensors: dict[str, np.ndarray[Any, np.dtype[np.float32]]]
+    ) -> dict[str, Any]:
         by_identity = {
             oracle.canonicalize_adapter_tensor_name(name): {
                 "source_name": name,
@@ -190,25 +207,45 @@ class CaptureFixture:
         checkpoint = self.capture_dir / "trainer_checkpoint.safetensors"
         candidate = self.candidate_dir / "adapter_model.safetensors"
         self.payload["artifacts"] = {
-            "raw_gradients": {"path": raw.name, "sha256": prefixed_sha256(raw), "size_bytes": raw.stat().st_size},
-            "trainer_checkpoint": {"path": checkpoint.name, "sha256": prefixed_sha256(checkpoint), "size_bytes": checkpoint.stat().st_size},
-            "candidate_adapter_model": {"sha256": prefixed_sha256(candidate), "size_bytes": candidate.stat().st_size},
+            "raw_gradients": {
+                "path": raw.name,
+                "sha256": prefixed_sha256(raw),
+                "size_bytes": raw.stat().st_size,
+            },
+            "trainer_checkpoint": {
+                "path": checkpoint.name,
+                "sha256": prefixed_sha256(checkpoint),
+                "size_bytes": checkpoint.stat().st_size,
+            },
+            "candidate_adapter_model": {
+                "sha256": prefixed_sha256(candidate),
+                "size_bytes": candidate.stat().st_size,
+            },
         }
         _write_json(self.capture_dir / "capture.json", self.payload)
         files = []
-        for name in ("capture.json", "raw_gradients.safetensors", "trainer_checkpoint.safetensors"):
+        for name in (
+            "capture.json",
+            "raw_gradients.safetensors",
+            "trainer_checkpoint.safetensors",
+        ):
             path = self.capture_dir / name
-            files.append({
-                "name": name,
-                "sha256": prefixed_sha256(path).removeprefix("sha256:"),
-                "size_bytes": path.stat().st_size,
-            })
-        _write_json(self.capture_dir / "run_manifest.json", {
-            "schema_version": oracle.RUN_MANIFEST_SCHEMA_VERSION,
-            "status": "complete",
-            "artifact_family_version": oracle.ARTIFACT_FAMILY_VERSION,
-            "artifacts": files,
-        })
+            files.append(
+                {
+                    "name": name,
+                    "sha256": prefixed_sha256(path).removeprefix("sha256:"),
+                    "size_bytes": path.stat().st_size,
+                }
+            )
+        _write_json(
+            self.capture_dir / "run_manifest.json",
+            {
+                "schema_version": oracle.RUN_MANIFEST_SCHEMA_VERSION,
+                "status": "complete",
+                "artifact_family_version": oracle.ARTIFACT_FAMILY_VERSION,
+                "artifacts": files,
+            },
+        )
 
     def validate(self) -> dict[str, Any]:
         return oracle.validate_zig_capture(
@@ -295,7 +332,9 @@ class ZigOracleExporterTests(unittest.TestCase):
             fixture = CaptureFixture(Path(temporary))
             fixture.payload["result"]["logit_probes"][0]["token_ids"][-1] = 13
             fixture.refresh_capture()
-            with self.assertRaisesRegex(ContractError, "deterministic token projection"):
+            with self.assertRaisesRegex(
+                ContractError, "deterministic token projection"
+            ):
                 fixture.validate()
 
     def test_capture_rejects_unbound_checkpoint_counter(self) -> None:
@@ -304,7 +343,9 @@ class ZigOracleExporterTests(unittest.TestCase):
             checkpoint_path = fixture.capture_dir / "trainer_checkpoint.safetensors"
             from safetensors import safe_open
 
-            with safe_open(str(checkpoint_path), framework="np", device="cpu") as source:
+            with safe_open(
+                str(checkpoint_path), framework="np", device="cpu"
+            ) as source:
                 tensors = {name: source.get_tensor(name) for name in source.keys()}
             tensors["__trainer_counters"] = _encode_u64_fields([2, 1])
             save_file(tensors, str(checkpoint_path))
@@ -321,15 +362,28 @@ class ZigOracleExporterTests(unittest.TestCase):
                 np.zeros(3, dtype=np.float32),
                 np.zeros(2, dtype=np.float64),
             ):
-                with self.subTest(prefix=prefix, shape=invalid.shape, dtype=invalid.dtype), tempfile.TemporaryDirectory() as temporary:
+                with (
+                    self.subTest(
+                        prefix=prefix, shape=invalid.shape, dtype=invalid.dtype
+                    ),
+                    tempfile.TemporaryDirectory() as temporary,
+                ):
                     fixture = CaptureFixture(Path(temporary))
-                    checkpoint_path = fixture.capture_dir / "trainer_checkpoint.safetensors"
-                    with safe_open(str(checkpoint_path), framework="np", device="cpu") as source:
-                        tensors = {name: source.get_tensor(name) for name in source.keys()}
+                    checkpoint_path = (
+                        fixture.capture_dir / "trainer_checkpoint.safetensors"
+                    )
+                    with safe_open(
+                        str(checkpoint_path), framework="np", device="cpu"
+                    ) as source:
+                        tensors = {
+                            name: source.get_tensor(name) for name in source.keys()
+                        }
                     tensors[f"{prefix}::{SLOT_A}"] = invalid
                     save_file(tensors, str(checkpoint_path))
                     fixture.refresh_capture()
-                    with self.assertRaisesRegex(ContractError, "tensor metadata differs"):
+                    with self.assertRaisesRegex(
+                        ContractError, "tensor metadata differs"
+                    ):
                         fixture.validate()
 
     def test_capture_rejects_unexpected_publication_file(self) -> None:

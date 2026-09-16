@@ -3742,7 +3742,7 @@ fn refineGemma4IntermediateSizesFromStore(
     all_names: [][]const u8,
     config: *gpt_mod.Config,
 ) !void {
-    if (config.family != .gemma or config.gemma4_mtp_assistant or config.num_hidden_layers == 0) return;
+    if (config.family != .gemma or !config.usesGemma4Channels() or config.gemma4_mtp_assistant or config.num_hidden_layers == 0) return;
 
     var name_buf: [256]u8 = undefined;
     const base_name = findGemma4MlpGateWeightName(all_names, config.*, 0, &name_buf) orelse return;
@@ -6659,6 +6659,9 @@ fn refineGptConfigFromManifestTensorMetadata(
     mf: manifest_mod.ModelManifest,
     config: *gpt_mod.Config,
 ) !void {
+    // Only Gemma4 needs checkpoint-only shared-tail dimensions here. Other
+    // config consumers (draft/ORT sessions included) retain config-only loads.
+    if (!config.usesGemma4Channels()) return;
     if (mf.usesGgufWeights()) return;
     if (mf.safetensors_path == null and mf.safetensors_index_path == null) return;
 
@@ -6670,7 +6673,7 @@ fn refineGptConfigFromManifestTensorMetadata(
     try refineGptConfigFromStore(allocator, store, all_names, config);
 }
 
-test "metadata-only GPT config loader reads config without weight artifacts" {
+test "gemma4 metadata-only GPT config loader reads config without weight artifacts" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6702,7 +6705,7 @@ test "metadata-only GPT config loader reads config without weight artifacts" {
     try std.testing.expectEqual(@as(u32, 262144), config.vocab_size);
 }
 
-test "metadata-only GPT config loader reconciles uniform Gemma4 tail from safetensors headers" {
+test "gemma4 metadata-only GPT config loader reconciles uniform tail from safetensors headers" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -9610,4 +9613,23 @@ test "unsupported families keep their gguf weight mapping" {
         "model.layers.0.self_attn.q_a_proj.weight",
         normalizeGgufGptWeightKey(.{ .family = .deepseek_v4 }, "blk.0.attn_q_a.weight", &buf).?,
     );
+}
+
+test "gemma4 metadata refinement does not open unrelated Gemma2 safetensors" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "config.json",
+        .data = "{\"model_type\":\"gemma2\",\"hidden_size\":8,\"num_hidden_layers\":1,\"num_attention_heads\":2,\"intermediate_size\":16,\"vocab_size\":32}",
+    });
+    // A config-only caller must not inspect an unrelated weight artifact.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = "not a safetensors header" });
+    const model_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(model_dir);
+    var manifest = try manifest_mod.loadListingFromDir(allocator, model_dir);
+    defer manifest.deinit();
+    const config = try loadGptConfigFromModelDir(allocator, model_dir, manifest);
+    try std.testing.expectEqual(@as(u32, 8), config.hidden_size);
+    try std.testing.expectEqual(@as(u32, 16), config.intermediate_size);
 }

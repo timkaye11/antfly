@@ -9,8 +9,9 @@ candidate must additionally prove that aligned prompt pages were reused.
 
 from __future__ import annotations
 
+from gemma4_files import sha256_file as _sha256_file
+
 import argparse
-import hashlib
 import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -141,14 +142,10 @@ def load_json(path: Path, label: str) -> Mapping[str, Any]:
 
 
 def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
     try:
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
+        return "sha256:" + _sha256_file(path)
     except OSError as exc:
         raise ParityError(f"could not hash {path}: {exc}") from exc
-    return "sha256:" + digest.hexdigest()
 
 
 def select_fields(report: Mapping[str, Any], fields: Sequence[str]) -> dict[str, Any]:
@@ -160,7 +157,9 @@ def select_fields(report: Mapping[str, Any], fields: Sequence[str]) -> dict[str,
 
 def require_equal(label: str, baseline: Any, candidate: Any) -> None:
     if baseline != candidate:
-        raise ParityError(f"{label} differs between full-prefix and incremental-KV runs")
+        raise ParityError(
+            f"{label} differs between full-prefix and incremental-KV runs"
+        )
 
 
 def require_incremental_telemetry(
@@ -193,15 +192,21 @@ def require_incremental_telemetry(
     for field in integer_fields:
         value = telemetry.get(field)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ParityError(f"{label} incremental KV telemetry field {field} is invalid")
+            raise ParityError(
+                f"{label} incremental KV telemetry field {field} is invalid"
+            )
     if telemetry["groups"] != expected_groups:
         raise ParityError(f"{label} incremental KV group count drifted")
     if telemetry["prompt_prefill_forwards"] != expected_groups:
-        raise ParityError(f"{label} did not execute exactly one canonical prompt prefill per group")
+        raise ParityError(
+            f"{label} did not execute exactly one canonical prompt prefill per group"
+        )
     if telemetry["decode_forwards"] == 0:
         raise ParityError(f"{label} did not execute incremental decode forwards")
     if telemetry["exact_logprob_rescore_forwards"] != expected_completions:
-        raise ParityError(f"{label} did not exactly rescore every incremental completion")
+        raise ParityError(
+            f"{label} did not exactly rescore every incremental completion"
+        )
     if telemetry["resident_ranked_token_selections"] != 0:
         raise ParityError(f"{label} used the retired deterministic ranked-token path")
     if telemetry["host_logit_fallbacks"] != 0:
@@ -215,13 +220,20 @@ def require_incremental_telemetry(
         raise ParityError(f"{label} completion/token geometry is invalid")
     if telemetry["host_logit_sampling_rows"] != expected_sampling_rows:
         raise ParityError(f"{label} host categorical-sampling row accounting drifted")
-    if telemetry["shared_prompt_tokens"] == 0 or telemetry["reused_candidate_prompt_tokens"] == 0:
+    if (
+        telemetry["shared_prompt_tokens"] == 0
+        or telemetry["reused_candidate_prompt_tokens"] == 0
+    ):
         raise ParityError(f"{label} did not reuse aligned prompt pages")
     if telemetry["cache_page_tokens"] != 16 or telemetry.get("cache_dtype") != "f32":
-        raise ParityError(f"{label} KV cache geometry is outside the qualified exactness lane")
+        raise ParityError(
+            f"{label} KV cache geometry is outside the qualified exactness lane"
+        )
     if require_active_batching:
         if telemetry.get("active_candidate_batching") is not True:
-            raise ParityError(f"{label} did not enable active-candidate decode batching")
+            raise ParityError(
+                f"{label} did not enable active-candidate decode batching"
+            )
         for field in ("decode_forward_candidates", "max_decode_batch_size"):
             value = telemetry.get(field)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -234,22 +246,33 @@ def require_incremental_telemetry(
             raise ParityError(f"{label} did not execute a multi-candidate decode batch")
     if require_prompt_tail_cloning:
         if telemetry.get("prompt_tail_cloning") is not True:
-            raise ParityError(f"{label} did not enable segmented prompt-tail clone fan-out")
+            raise ParityError(
+                f"{label} did not enable segmented prompt-tail clone fan-out"
+            )
         for field in ("prompt_tail_clone_candidates", "prompt_tail_clone_tokens"):
             value = telemetry.get(field)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ParityError(f"{label} prompt-tail clone field {field} is invalid")
         tail_groups = telemetry["prompt_tail_prefill_forwards"]
         if tail_groups <= 0 or tail_groups > expected_groups:
-            raise ParityError(f"{label} segmented prompt-tail group accounting is invalid")
+            raise ParityError(
+                f"{label} segmented prompt-tail group accounting is invalid"
+            )
         if telemetry["prompt_tail_prefill_candidates"] != tail_groups:
-            raise ParityError(f"{label} prompt-tail replay candidate accounting drifted")
+            raise ParityError(
+                f"{label} prompt-tail replay candidate accounting drifted"
+            )
         if expected_groups <= 0 or expected_completions % expected_groups != 0:
             raise ParityError(f"{label} completion-group geometry is invalid")
         clone_fanout = expected_completions // expected_groups - 1
         expected_clone_candidates = tail_groups * clone_fanout
-        if clone_fanout <= 0 or telemetry["prompt_tail_clone_candidates"] != expected_clone_candidates:
-            raise ParityError(f"{label} did not fan the segmented prompt-tail KV out to every remaining candidate")
+        if (
+            clone_fanout <= 0
+            or telemetry["prompt_tail_clone_candidates"] != expected_clone_candidates
+        ):
+            raise ParityError(
+                f"{label} did not fan the segmented prompt-tail KV out to every remaining candidate"
+            )
     return telemetry
 
 
@@ -263,8 +286,12 @@ def validate(
 ) -> dict[str, Any]:
     baseline_root = baseline_root.expanduser().resolve()
     candidate_root = candidate_root.expanduser().resolve()
-    baseline_train = load_json(baseline_root / "grpo_report.json", "baseline train report")
-    candidate_train = load_json(candidate_root / "grpo_report.json", "candidate train report")
+    baseline_train = load_json(
+        baseline_root / "grpo_report.json", "baseline train report"
+    )
+    candidate_train = load_json(
+        candidate_root / "grpo_report.json", "candidate train report"
+    )
     baseline_eval = load_json(
         baseline_root / "grpo_evaluation_report.json", "baseline evaluation report"
     )
@@ -281,7 +308,9 @@ def validate(
         "antfly_inference_finetune_grpo_report/v9",
         "antfly_inference_finetune_grpo_report/v10",
     }:
-        raise ParityError("candidate train report must use an incremental-KV v5-v10 schema")
+        raise ParityError(
+            "candidate train report must use an incremental-KV v5-v10 schema"
+        )
     require_training_order_contract(baseline_train, "baseline")
     require_training_order_contract(candidate_train, "candidate")
     if baseline_eval.get("schema_version") not in EVAL_SCHEMAS:
@@ -290,8 +319,13 @@ def validate(
         "antfly_inference_finetune_grpo_evaluation/v3",
         "antfly_inference_finetune_grpo_evaluation/v4",
     }:
-        raise ParityError("candidate evaluation report must use an incremental-KV v3/v4 schema")
-    if candidate_train.get("sampling_mode") != "shared-page-prompt-seeded-categorical-incremental-kv":
+        raise ParityError(
+            "candidate evaluation report must use an incremental-KV v3/v4 schema"
+        )
+    if (
+        candidate_train.get("sampling_mode")
+        != "shared-page-prompt-seeded-categorical-incremental-kv"
+    ):
         raise ParityError("candidate did not report the incremental KV sampling mode")
 
     require_equal(
@@ -331,7 +365,10 @@ def validate(
         exact_hashes[relative] = candidate_hash
 
     initial_parity = candidate_train.get("initial_logprob_parity")
-    if not isinstance(initial_parity, dict) or initial_parity.get("sampling_rescore_max_abs_error") != 0:
+    if (
+        not isinstance(initial_parity, dict)
+        or initial_parity.get("sampling_rescore_max_abs_error") != 0
+    ):
         raise ParityError("candidate sampling/rescore parity is not exact zero")
 
     return {
@@ -352,7 +389,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline-root", type=Path, required=True)
     parser.add_argument("--candidate-root", type=Path, required=True)
-    parser.add_argument("--model-key", choices=("gemma-4-E2B-it", "gemma-4-E4B-it"), required=True)
+    parser.add_argument(
+        "--model-key", choices=("gemma-4-E2B-it", "gemma-4-E4B-it"), required=True
+    )
     parser.add_argument(
         "--require-active-batching",
         action="store_true",

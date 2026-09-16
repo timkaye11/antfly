@@ -175,6 +175,13 @@ pub const LoadedBackend = struct {
 pub const GemmaAutodiffCtx = struct {
     graph_config: gemma_graph.Config,
     graph_options: gemma_graph.BuildOptions = .{},
+    /// Immutable scoring policy for this trainer. Sampling consumes raw logits;
+    /// GRPO likelihoods and their gradients use softmax(final_logits / T).
+    /// Top-k/top-p are rollout filters, not a renormalized training objective.
+    policy_temperature: f32 = 1.0,
+    sparse_loss_chunk_rows: u32 = default_sparse_loss_chunk_rows,
+    sparse_logits_cross_entropy_disabled: bool = false,
+    fused_linear_cross_entropy_default: bool = false,
     /// Set by the Metal training command after strict backend admission. Keep
     /// false for native/reference callers so their decomposed VJP remains an
     /// independent correctness control.
@@ -201,14 +208,18 @@ pub const GemmaAutodiffCtx = struct {
     dpo_pair_bucket_rows: ?u32 = null,
 
     pub fn init(graph_config: gemma_graph.Config) GemmaAutodiffCtx {
-        return .{ .graph_config = graph_config };
+        return .{
+            .graph_config = graph_config,
+            .sparse_loss_chunk_rows = sparseLossChunkRows(),
+            .sparse_logits_cross_entropy_disabled = sparseLogitsCrossEntropyDisabled(),
+            .fused_linear_cross_entropy_default = cutLinearCrossEntropyEnabled(),
+        };
     }
 
     pub fn initRecursive(graph_config: gemma_graph.Config, shared_block_size: usize) GemmaAutodiffCtx {
-        return .{
-            .graph_config = graph_config,
-            .graph_options = .{ .recursive_shared_block_size = @intCast(shared_block_size) },
-        };
+        var ctx = init(graph_config);
+        ctx.graph_options = .{ .recursive_shared_block_size = @intCast(shared_block_size) };
+        return ctx;
     }
 
     pub fn buildForward(
@@ -238,6 +249,8 @@ pub const GemmaAutodiffCtx = struct {
         targets: ml.graph.NodeId,
     ) anyerror!ml.graph.NodeId {
         const self: *GemmaAutodiffCtx = @ptrCast(@alignCast(ctx_opaque));
+        if (!std.math.isFinite(self.policy_temperature) or self.policy_temperature <= 0)
+            return error.InvalidGrpoSamplingTemperature;
         if (self.dpo_pair_bucket_rows) |bucket_rows| {
             return self.buildDpoPairLoss(bld, forward_output, targets, bucket_rows);
         }
@@ -246,7 +259,7 @@ pub const GemmaAutodiffCtx = struct {
             return self.buildSparseCausalLoss(bld, forward_output, targets);
         }
         const logits = try self.buildLogits(bld, forward_output);
-        return bld.crossEntropyLoss(logits, targets);
+        return bld.crossEntropyLoss(try self.applyPolicyTemperature(bld, logits), targets);
     }
 
     /// Whole-objective DPO builder used by RealAutodiffTrainer's coupled
@@ -446,7 +459,7 @@ pub const GemmaAutodiffCtx = struct {
         if (target_columns < sparse_target_columns) return error.InvalidTeacherDistillationTargets;
         const weighted_hard_targets = target_columns == weighted_hard_target_columns;
         const uniform_weighted_targets = target_columns == uniform_weighted_target_columns;
-        const fused_linear_ce_enabled = self.enable_fused_linear_cross_entropy orelse cutLinearCrossEntropyEnabled();
+        const fused_linear_ce_enabled = self.enable_fused_linear_cross_entropy orelse self.fused_linear_cross_entropy_default;
         if (uniform_weighted_targets and !fused_linear_ce_enabled) {
             return error.UniformWeightedTargetsRequireFusedLinearCrossEntropy;
         }
@@ -467,7 +480,7 @@ pub const GemmaAutodiffCtx = struct {
         const teacher_probs = if (teacher_top_k > 0) try bld.sliceLastDim(targets, 1 + teacher_top_k, target_columns) else null;
         const lm_head_w = try self.buildLmHeadWeight(bld, hidden_size);
 
-        const loss_chunk_rows = sparseLossChunkRows();
+        const loss_chunk_rows = self.sparse_loss_chunk_rows;
         if (teacher_top_k == 0 and !weighted_hard_targets and fused_linear_ce_enabled) {
             if (uniform_weighted_targets and supervised_rows > loss_chunk_rows) return error.UniformWeightedLossExceedsFusedChunk;
             // Gemma PEFT keeps the tied vocabulary projection frozen. The
@@ -481,11 +494,11 @@ pub const GemmaAutodiffCtx = struct {
                 const chunk_rows = end - start;
                 const hidden_chunk = try sliceRows2d(bld, supervised_hidden, start, end, hidden_size);
                 const label_chunk = try sliceRows2d(bld, labels.?, start, end, 1);
-                const chunk_loss = try bld.linearCrossEntropyLoss(hidden_chunk, lm_head_w, label_chunk, .{
+                const chunk_loss = try bld.linearCrossEntropyLoss(try self.applyPolicyTemperature(bld, hidden_chunk), lm_head_w, label_chunk, .{
                     .rows = chunk_rows,
                     .in_dim = hidden_size,
                     .vocab_size = self.graph_config.vocab_size,
-                    .logit_softcap = self.graph_config.final_logit_softcapping,
+                    .logit_softcap = self.graph_config.final_logit_softcapping / self.policy_temperature,
                     .ignore_index = -100,
                     .frozen_weight = true,
                 });
@@ -509,7 +522,7 @@ pub const GemmaAutodiffCtx = struct {
         // combined linear-CE backward-input kernel is trajectory-qualified.
         // Hard labels select the exact target log-probability sparsely;
         // teacher top-k retains its dense soft-target semantics.
-        const use_sparse_hard_labels = teacher_top_k == 0 and !sparseLogitsCrossEntropyDisabled();
+        const use_sparse_hard_labels = teacher_top_k == 0 and !self.sparse_logits_cross_entropy_disabled;
         const vocab_row = if (!use_sparse_hard_labels) blk: {
             const vocab_size: usize = @intCast(self.graph_config.vocab_size);
             const vocab_ids = try bld.graph.allocator.alloc(f32, vocab_size);
@@ -525,8 +538,9 @@ pub const GemmaAutodiffCtx = struct {
             const chunk_rows = end - start;
             const hidden_chunk = try sliceRows2d(bld, supervised_hidden, start, end, hidden_size);
             const raw_logits = try bld.linearNoBias(hidden_chunk, lm_head_w, chunk_rows, hidden_size, self.graph_config.vocab_size);
-            const logits = try self.applyFinalLogitSoftcap(bld, raw_logits);
-            if (supervised_rows <= loss_chunk_rows) self.lm_logits = logits;
+            const model_logits = try self.applyFinalLogitSoftcap(bld, raw_logits);
+            if (supervised_rows <= loss_chunk_rows) self.lm_logits = model_logits;
+            const logits = try self.applyPolicyTemperature(bld, model_logits);
             const chunk_loss = if (use_sparse_hard_labels) blk: {
                 const label_chunk = try sliceRows2d(bld, labels.?, start, end, 1);
                 if (weighted_hard_targets) {
@@ -577,6 +591,11 @@ pub const GemmaAutodiffCtx = struct {
         const logits = try self.applyFinalLogitSoftcap(bld, raw_logits);
         self.lm_logits = logits;
         return logits;
+    }
+
+    fn applyPolicyTemperature(self: *GemmaAutodiffCtx, bld: *Builder, values: NodeId) !NodeId {
+        if (self.policy_temperature == 1.0) return values;
+        return bld.div(values, try bld.scalarConst(.f32, self.policy_temperature));
     }
 
     fn applyFinalLogitSoftcap(self: *GemmaAutodiffCtx, bld: *Builder, logits: NodeId) !NodeId {
@@ -1448,7 +1467,7 @@ fn makeTrainerInputForExampleWeightedScheduled(
     // fused linear CE. Materialized logits need an explicit weight per row;
     // selecting the ordinary weighted layout there is both exact and prevents
     // the -100 padding label from reaching gather as a vocabulary index.
-    const fused_linear_ce_enabled = ctx.enable_fused_linear_cross_entropy orelse cutLinearCrossEntropyEnabled();
+    const fused_linear_ce_enabled = ctx.enable_fused_linear_cross_entropy orelse ctx.fused_linear_cross_entropy_default;
     const uniform_weighted_targets = uniform_logprob_coeff != null and
         requested_weighted_target_rows <= max_sparse_loss_chunk_rows and
         fused_linear_ce_enabled;
@@ -1716,7 +1735,7 @@ fn singleTokenCandidateLogprobsForPromptWithBindings(
         if (token_id < 0 or @as(usize, @intCast(token_id)) >= vocab_size) {
             return error.InputTokenOutOfRange;
         }
-        out_logp.* = logProbAtToken(logits, @intCast(token_id));
+        out_logp.* = logProbAtToken(logits, @intCast(token_id), ctx.policy_temperature);
     }
 }
 
@@ -1955,7 +1974,7 @@ fn tokenLogprobsForPromptCompletionGroupSparseRowsWithBindings(
     // the caller ignores padding logits, while the LM head retains the same
     // M family as the batch-1 sequence-wide sampler.
     const projection_row_count = @max(selected_row_count, rows);
-    if (projection_row_count > sparseLossChunkRows()) return false;
+    if (projection_row_count > ctx.sparse_loss_chunk_rows) return false;
 
     const joined = try allocator.alloc([]const i32, completions.len);
     defer allocator.free(joined);
@@ -1989,7 +2008,7 @@ fn tokenLogprobsForPromptCompletionGroupSparseRowsWithBindings(
         for (completion, output) |token_id, *out_logp| {
             if (token_id < 0 or @as(usize, @intCast(token_id)) >= vocab_size) return error.InputTokenOutOfRange;
             const row = logits[selected_idx * vocab_size ..][0..vocab_size];
-            out_logp.* = logProbAtToken(row, @intCast(token_id));
+            out_logp.* = logProbAtToken(row, @intCast(token_id), ctx.policy_temperature);
             selected_idx += 1;
         }
     }
@@ -2061,12 +2080,12 @@ fn tokenLogprobsForPromptCompletionWithBindings(
                     return error.CompiledGrpoCanonicalTokenParityFailed;
                 }
             }
-            out_logps[comp_idx] = logProbAtToken(row, @intCast(token_id));
+            out_logps[comp_idx] = logProbAtToken(row, @intCast(token_id), ctx.policy_temperature);
         }
         return;
     }
 
-    const max_rows_per_execution: usize = sparseLossChunkRows();
+    const max_rows_per_execution: usize = ctx.sparse_loss_chunk_rows;
     var start: usize = 0;
     while (start < completion.len) {
         const end = @min(start + max_rows_per_execution, completion.len);
@@ -2091,7 +2110,7 @@ fn tokenLogprobsForPromptCompletionWithBindings(
                     return error.CompiledGrpoCanonicalTokenParityFailed;
                 }
             }
-            out_logps[start + local_idx] = logProbAtToken(row, @intCast(token_id));
+            out_logps[start + local_idx] = logProbAtToken(row, @intCast(token_id), ctx.policy_temperature);
         }
         start = end;
     }
@@ -2121,7 +2140,7 @@ pub fn sampleCompletionRanked(
         const vocab_size: usize = @intCast(ctx.graph_config.vocab_size);
         const row = logits[(seq.items.len - 1) * vocab_size ..][0..vocab_size];
         const token_id = try selectRankedToken(allocator, row, rank);
-        const token_logp = logProbAtToken(row, token_id);
+        const token_logp = logProbAtToken(row, token_id, ctx.policy_temperature);
         try out_tokens.append(allocator, @intCast(token_id));
         try out_logps.append(allocator, token_logp);
         try seq.append(allocator, @intCast(token_id));
@@ -2927,7 +2946,7 @@ pub fn sampleCompletionGroup(
                 logits[0..vocab_size]
             else
                 logits[(prompt.len - 1) * vocab_size ..][0..vocab_size];
-            const log_z = logNormalizer(row);
+            const log_z = logNormalizer(row, ctx.policy_temperature);
             for (0..group_size) |completion_idx| {
                 var completion_sampling = sampling;
                 if (sampling.first_completion_greedy and completion_idx == 0) {
@@ -2940,7 +2959,7 @@ pub fn sampleCompletionGroup(
                     completion_sampling,
                     rngs[completion_idx].random().float(f64),
                 );
-                const token_logp = logProbAtTokenWithNormalizer(row, token_id, log_z);
+                const token_logp = logProbAtTokenWithNormalizer(row, token_id, log_z, ctx.policy_temperature);
                 try out_tokens[completion_idx].append(allocator, @intCast(token_id));
                 try out_logps[completion_idx].append(allocator, token_logp);
                 try sequences[completion_idx].append(allocator, @intCast(token_id));
@@ -2981,7 +3000,7 @@ pub fn sampleCompletionGroup(
                 completion_sampling,
                 rngs[completion_idx].random().float(f64),
             );
-            const token_logp = logProbAtToken(row, token_id);
+            const token_logp = logProbAtToken(row, token_id, ctx.policy_temperature);
             try out_tokens[completion_idx].append(allocator, @intCast(token_id));
             try out_logps[completion_idx].append(allocator, token_logp);
             try seq.append(allocator, @intCast(token_id));
@@ -3725,6 +3744,7 @@ fn putOwnedLogitsRuntimeInput(
 /// This gives preference objectives an exact frozen-base scorer without a
 /// second model allocation or temporary mutation of optimizer-owned weights.
 pub const FrozenBaseLoraBindings = struct {
+    is_snapshot: bool = false,
     allocator: std.mem.Allocator,
     compute_backend: *const ComputeBackend,
     values: []CT,
@@ -3754,7 +3774,7 @@ pub const FrozenBaseLoraBindings = struct {
     }
 
     /// Capture the trainer's current LoRA tensors into immutable device
-    /// bindings. DPO uses this when training continues from a non-zero SFT
+    /// bindings. Preference training uses this when it continues from a non-zero SFT
     /// adapter: the reference must be the initial policy, not the raw base and
     /// not the later, mutated live policy.
     pub fn initSnapshot(
@@ -3776,6 +3796,7 @@ pub const FrozenBaseLoraBindings = struct {
             .allocator = allocator,
             .compute_backend = trainer.compute_backend,
             .values = values,
+            .is_snapshot = true,
         };
     }
 
@@ -4183,7 +4204,7 @@ pub fn captureSupervisedLogitProbes(
     ctx.require_compiled_logits_output = trainer.compute_backend.kind() == .metal;
     defer ctx.require_compiled_logits_output = previous_compiled_requirement;
 
-    const chunk_rows = oracleLogitProbeChunkRows(vocab_size, sparseLossChunkRows());
+    const chunk_rows = oracleLogitProbeChunkRows(vocab_size, ctx.sparse_loss_chunk_rows);
     var start: usize = 0;
     while (start < supervised_count) {
         const end = @min(start + chunk_rows, supervised_count);
@@ -4352,7 +4373,7 @@ fn executeLogitsForInputIdBatchesConfigured(
         if (raw_input_ids.len > rows) return error.SequenceTooLong;
     }
     if (selected_predictor_rows) |predictor_rows| {
-        if (predictor_rows.len == 0 or predictor_rows.len > sparseLossChunkRows()) return error.InvalidLogitsRowSelection;
+        if (predictor_rows.len == 0 or predictor_rows.len > ctx.sparse_loss_chunk_rows) return error.InvalidLogitsRowSelection;
         for (predictor_rows) |row| {
             if (row >= total_rows) return error.InvalidLogitsRowSelection;
             const batch_idx = row / rows;
@@ -4711,24 +4732,24 @@ pub fn sampleGrpoTokenFromLogits(
     return filtered[retained_count - 1].token_id;
 }
 
-fn logProbAtToken(logits: []const f32, token_id: usize) f32 {
-    return logProbAtTokenWithNormalizer(logits, token_id, logNormalizer(logits));
+fn logProbAtToken(logits: []const f32, token_id: usize, temperature: f32) f32 {
+    return logProbAtTokenWithNormalizer(logits, token_id, logNormalizer(logits, temperature), temperature);
 }
 
-fn logNormalizer(logits: []const f32) f64 {
-    var max_logit = logits[0];
+fn logNormalizer(logits: []const f32, temperature: f32) f64 {
+    var max_logit = logits[0] / temperature;
     for (logits[1..]) |value| {
-        if (value > max_logit) max_logit = value;
+        if (value / temperature > max_logit) max_logit = value / temperature;
     }
     var sum_exp: f64 = 0.0;
     for (logits) |value| {
-        sum_exp += @exp(@as(f64, value - max_logit));
+        sum_exp += @exp(@as(f64, value / temperature - max_logit));
     }
     return @as(f64, max_logit) + @log(sum_exp);
 }
 
-fn logProbAtTokenWithNormalizer(logits: []const f32, token_id: usize, log_z: f64) f32 {
-    return @as(f32, @floatCast(@as(f64, logits[token_id]) - log_z));
+fn logProbAtTokenWithNormalizer(logits: []const f32, token_id: usize, log_z: f64, temperature: f32) f32 {
+    return @as(f32, @floatCast(@as(f64, logits[token_id] / temperature) - log_z));
 }
 
 const WriteTensorF32 = safetensors_checkpoint.NamedTensor;
@@ -5107,6 +5128,69 @@ test "gemma4 sparse causal loss graph projects only supervised rows" {
         }
     }
     try std.testing.expect(saw_tanh);
+}
+
+test "gemma4 tempered loss matches host scoring and finite differences for both heads" {
+    const native = @import("../ops/native_compute.zig");
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |fused| {
+        for ([_]f32{ 0.5, 1.0, 2.0 }) |temperature| {
+            for ([_]f32{ 0.0, 3.0 }) |softcap| {
+                var ctx = GemmaAutodiffCtx.init(.{
+                    .family = .gemma,
+                    .hidden_size = 2,
+                    .num_hidden_layers = 1,
+                    .num_attention_heads = 1,
+                    .num_key_value_heads = 1,
+                    .intermediate_size = 4,
+                    .vocab_size = 3,
+                    .weight_tying = false,
+                    .final_logit_softcapping = softcap,
+                });
+                ctx.policy_temperature = temperature;
+                ctx.enable_fused_linear_cross_entropy = fused;
+                var graph = Graph.init(allocator);
+                defer graph.deinit();
+                var bld = Builder.init(&graph);
+                const hidden = try bld.parameter("hidden", Shape.init(.f32, &.{ 1, 1, 2 }));
+                const targets = try bld.parameter("targets", Shape.init(.f32, &.{ 1, 2 }));
+                const loss = try GemmaAutodiffCtx.buildLoss(@ptrCast(&ctx), &bld, hidden, targets);
+                try graph.markOutput(loss);
+                const hidden_values = [_]f32{ 0.7, -0.3 };
+                const target_values = [_]f32{ 0, 1 };
+                const weights = [_]f32{ 0.2, -0.4, 0.6, 0.8, -0.5, 0.3 };
+                const values = [_][]const f32{ &hidden_values, &target_values, &weights };
+                const max_error = try ml.graph.grad_check.checkGradients(allocator, &graph, loss, &.{hidden}, &values, 1e-3);
+                if (max_error >= 3e-3) std.debug.print("temperature VJP: fused={} T={d} cap={d} error={d}\n", .{ fused, temperature, softcap, max_error });
+                try std.testing.expect(max_error < 3e-3);
+
+                var store = native.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+                var compute = native.NativeCompute.init(allocator, &store, null);
+                defer compute.deinit();
+                const cb = compute.computeBackend();
+                var inputs: [3]interpreter.RuntimeInput = undefined;
+                var count: usize = 0;
+                defer for (inputs[0..count]) |input| cb.free(input.value);
+                for (graph.nodes.items, 0..) |node, node_id| {
+                    if (node.op != .parameter) continue;
+                    var dims: [4]i32 = undefined;
+                    for (0..node.output_shape.rank()) |i| dims[i] = @intCast(node.output_shape.dim(@intCast(i)));
+                    inputs[count] = .{ .node_id = @intCast(node_id), .value = try cb.fromFloat32Shape(values[count], dims[0..node.output_shape.rank()]) };
+                    count += 1;
+                }
+                var result = try interpreter.execute(allocator, &graph, &cb, .{ .runtime_inputs = inputs[0..count] });
+                defer result.deinit(&cb);
+                const actual = try cb.toFloat32(result.outputs[0], allocator);
+                defer allocator.free(actual);
+                var logits: [3]f32 = undefined;
+                for (&logits, 0..) |*logit, i| {
+                    const dot = hidden_values[0] * weights[i * 2] + hidden_values[1] * weights[i * 2 + 1];
+                    logit.* = if (softcap > 0) softcap * std.math.tanh(dot / softcap) else dot;
+                }
+                try std.testing.expectApproxEqAbs(-logProbAtToken(&logits, 1, temperature), actual[0], 2e-6);
+            }
+        }
+    }
 }
 
 test "gemma4 sparse loss chunk parser enforces bounded positive rows" {

@@ -409,6 +409,8 @@ test "gemma4 BF16 strict Metal CLI self-enables executor and publishes one real 
         .examples = &eval_examples,
     });
 
+    const trainer_checkpoint_path = try std.fs.path.join(allocator, &.{ root, "trainer-state.safetensors" });
+    defer allocator.free(trainer_checkpoint_path);
     const args = [_][]const u8{
         base_dir,
         adapter_dir,
@@ -430,6 +432,12 @@ test "gemma4 BF16 strict Metal CLI self-enables executor and publishes one real 
         "1",
         "--grad-accum",
         "1",
+        "--checkpoint-path",
+        trainer_checkpoint_path,
+        "--checkpoint-every-epochs",
+        "1",
+        "--weight-decay",
+        "0",
     };
     try train_command.runFromArgsWithoutSummary(allocator, io, &args);
 
@@ -449,6 +457,48 @@ test "gemma4 BF16 strict Metal CLI self-enables executor and publishes one real 
     const published_after = try compat.cwd().readFileAlloc(io, output_adapter_path, allocator, .limited(1024 * 1024));
     defer allocator.free(published_after);
     try std.testing.expectEqualSlices(u8, published_before, published_after);
+
+    // Final-boundary recovery must export the same learned adapter and retain
+    // the original before metric, rather than reevaluating restored weights.
+    const resumed_dir = try std.fs.path.join(allocator, &.{ root, "resumed" });
+    defer allocator.free(resumed_dir);
+    var resume_args = args ++ [_][]const u8{"--resume"};
+    resume_args[3] = resumed_dir;
+    try train_command.runFromArgsWithoutSummary(allocator, io, &resume_args);
+    const resumed_adapter_path = try std.fs.path.join(allocator, &.{ resumed_dir, finetune.adapter_checkpoint_file_name });
+    defer allocator.free(resumed_adapter_path);
+    const resumed_adapter = try compat.cwd().readFileAlloc(io, resumed_adapter_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(resumed_adapter);
+    try std.testing.expectEqualSlices(u8, published_before, resumed_adapter);
+    const resumed_report_path = try std.fs.path.join(allocator, &.{ resumed_dir, "training_report.json" });
+    defer allocator.free(resumed_report_path);
+    const Report = struct {
+        report: struct {
+            before: gemma4_real.CausalLmMetrics,
+            optimizer: struct { weight_decay: f32 },
+            run_fingerprint_sha256: []const u8,
+        },
+    };
+    const first_bytes = try compat.cwd().readFileAlloc(io, report_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(first_bytes);
+    const resumed_bytes = try compat.cwd().readFileAlloc(io, resumed_report_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(resumed_bytes);
+    var first_report = try std.json.parseFromSlice(Report, allocator, first_bytes, .{ .ignore_unknown_fields = true });
+    defer first_report.deinit();
+    var resumed_report = try std.json.parseFromSlice(Report, allocator, resumed_bytes, .{ .ignore_unknown_fields = true });
+    defer resumed_report.deinit();
+    try std.testing.expectEqualDeep(first_report.value.report.before, resumed_report.value.report.before);
+    try std.testing.expectEqualStrings(first_report.value.report.run_fingerprint_sha256, resumed_report.value.report.run_fingerprint_sha256);
+    try std.testing.expectEqual(@as(f32, 0), resumed_report.value.report.optimizer.weight_decay);
+
+    const mismatched_dir = try std.fs.path.join(allocator, &.{ root, "wrong-numerics" });
+    defer allocator.free(mismatched_dir);
+    resume_args[3] = mismatched_dir;
+    {
+        var override = try EnvironmentOverride.set(allocator, "TERMITE_GEMMA4_SPARSE_LOSS_CHUNK_ROWS", "127");
+        defer override.deinit();
+        try std.testing.expectError(error.TrainingStateFingerprintMismatch, train_command.runFromArgsWithoutSummary(allocator, io, &resume_args));
+    }
 
     // Exercise the private request/capture boundary as an actual compiled
     // Metal step. The external Python packager independently validates and

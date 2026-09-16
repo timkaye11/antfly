@@ -11,6 +11,8 @@ the sampled completion may contain multiple tokens.
 
 from __future__ import annotations
 
+from gemma4_files import sha256_file
+
 import argparse
 import hashlib
 import json
@@ -61,14 +63,6 @@ class BoolQExample:
     target: str
     prompt_tokens: int
     target_tokens: int
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def canonical_sha256(payload: Mapping[str, Any]) -> str:
@@ -224,7 +218,9 @@ def validate_materialization_selection_contract(
                 f"v2 evaluation exclusion evidence {index} has an invalid path"
             )
         if path_value in seen_paths:
-            raise MaterializationError("v2 evaluation exclusion evidence repeats a path")
+            raise MaterializationError(
+                "v2 evaluation exclusion evidence repeats a path"
+            )
         seen_paths.add(path_value)
         if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
             raise MaterializationError(
@@ -413,7 +409,9 @@ def _write_jsonl(path: Path, examples: Sequence[BoolQExample]) -> None:
                 },
             }
             handle.write(
-                json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                json.dumps(
+                    payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                )
                 + "\n"
             )
 
@@ -448,7 +446,10 @@ def write_outputs(
     eval_ids = {example.source_id for example in eval_examples}
     if train_ids & eval_ids:
         raise MaterializationError("train and evaluation source identities overlap")
-    tokenizer_files = (model_dir / "tokenizer.json", model_dir / "tokenizer_config.json")
+    tokenizer_files = (
+        model_dir / "tokenizer.json",
+        model_dir / "tokenizer_config.json",
+    )
     for path in tokenizer_files:
         if not path.is_file():
             raise MaterializationError(f"missing tokenizer input: {path}")
@@ -486,8 +487,14 @@ def write_outputs(
                 "evaluation_exclusion_evidence_source_ids": exclusion_evidence_count,
                 "dataset_format": "rendered-text-grpo",
                 "response_channel": "final",
-                "labels": {"yes": len(train_examples) // 2, "no": len(train_examples) // 2},
-                "evaluation_labels": {"yes": len(eval_examples) // 2, "no": len(eval_examples) // 2},
+                "labels": {
+                    "yes": len(train_examples) // 2,
+                    "no": len(train_examples) // 2,
+                },
+                "evaluation_labels": {
+                    "yes": len(eval_examples) // 2,
+                    "no": len(eval_examples) // 2,
+                },
                 "rendered_prompt_truncation": "forbidden",
                 "target_tokens": 1,
                 "max_seq_len": max_seq_len,
@@ -500,8 +507,12 @@ def write_outputs(
         "eval_jsonl": str(eval_path),
         "train_source_ids": [example.source_id for example in train_examples],
         "eval_source_ids": [example.source_id for example in eval_examples],
-        "train_source_row_indices": [example.source_row_index for example in train_examples],
-        "eval_source_row_indices": [example.source_row_index for example in eval_examples],
+        "train_source_row_indices": [
+            example.source_row_index for example in train_examples
+        ],
+        "eval_source_row_indices": [
+            example.source_row_index for example in eval_examples
+        ],
         "train_prompt_tokens": [example.prompt_tokens for example in train_examples],
         "eval_prompt_tokens": [example.prompt_tokens for example in eval_examples],
         "evaluation_exclusion_manifests": list(eval_exclusion_evidence),
@@ -543,10 +554,12 @@ def materialize(args: argparse.Namespace) -> Mapping[str, Any]:
         import tokenizers
         from tokenizers import Tokenizer
     except ImportError as exc:
-        raise MaterializationError("materialization requires pyarrow and tokenizers") from exc
+        raise MaterializationError(
+            "materialization requires pyarrow and tokenizers"
+        ) from exc
     tokenizer = Tokenizer.from_file(str(model_dir / "tokenizer.json"))
-    excluded_eval_source_ids, eval_exclusion_evidence = (
-        load_excluded_eval_source_ids(args.exclude_eval_manifest)
+    excluded_eval_source_ids, eval_exclusion_evidence = load_excluded_eval_source_ids(
+        args.exclude_eval_manifest
     )
     train_table = pq.read_table(train_parquet)
     eval_table = pq.read_table(eval_parquet)

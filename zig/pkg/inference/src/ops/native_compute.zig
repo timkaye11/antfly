@@ -35753,11 +35753,11 @@ fn rmsNormBackwardFiniteDiffCase(rows: usize, dim: usize, eps: f32, seed: u64) !
     }
 }
 
-test "fused_rms_norm backward matches finite differences (single row)" {
+test "gemma4 fused_rms_norm backward matches finite differences (single row)" {
     try rmsNormBackwardFiniteDiffCase(1, 8, 1e-5, 0xA4B);
 }
 
-test "fused_rms_norm backward matches finite differences (multi-row)" {
+test "gemma4 fused_rms_norm backward matches finite differences (multi-row)" {
     try rmsNormBackwardFiniteDiffCase(5, 6, 1e-5, 0xC0FFEE);
 }
 
@@ -46702,7 +46702,7 @@ test "native Qwen3 quantized-only weight handle preserves shape and lookup witho
     }
 }
 
-test "native typed BF16 lazy weight stays pinned until all handles are freed" {
+test "gemma4 native typed BF16 lazy weight stays pinned until all handles are freed" {
     const allocator = std.testing.allocator;
     const name = "model.layers.0.mlp.up_proj.weight";
     var bits = [_]u16{ 0x3f80, 0x4000, 0x4040, 0x4080 };
@@ -50453,4 +50453,75 @@ test "gemma4 frozen resident mmap weights reclaim after use and remain readable"
     source.mmap_source_bytes = null;
     maybeDiscardMappedWeightAfterUse(&compute, weight);
     try std.testing.expectEqual(@as(usize, 3), trace.calls);
+}
+
+test "gemma4 fused GQA backward matches independent finite differences across batches and sliding windows" {
+    const allocator = std.testing.allocator;
+    var weights = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weights, null);
+    defer compute.deinit();
+    const batch = 2;
+    const seq = 3;
+    const heads = 2;
+    const dim = 2;
+    var q: [batch * seq * heads * dim]f32 = undefined;
+    var k: [batch * seq * dim]f32 = undefined;
+    var v: [batch * seq * dim]f32 = undefined;
+    var dy: [q.len]f32 = undefined;
+    for (&q, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 7)) * 0.13 - 0.4;
+    for (&k, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 5)) * 0.17 - 0.3;
+    for (&v, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 9)) * 0.11 - 0.5;
+    for (&dy, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 11)) * 0.07 - 0.35;
+    const qt = try compute.makeBuf(&q, false);
+    defer freeTensor(&compute, qt);
+    const kt = try compute.makeBuf(&k, false);
+    defer freeTensor(&compute, kt);
+    const vt = try compute.makeBuf(&v, false);
+    defer freeTensor(&compute, vt);
+    const dyt = try compute.makeBuf(&dy, false);
+    defer freeTensor(&compute, dyt);
+    const loss = struct {
+        fn evaluate(qq: []const f32, kk: []const f32, vv: []const f32, dd: []const f32, window: usize, scale: f32) f64 {
+            var result: f64 = 0;
+            for (0..batch) |b| for (0..seq) |row| for (0..heads) |head| {
+                const first = if (window != 0 and row + 1 > window) row + 1 - window else 0;
+                var probabilities: [seq]f64 = @splat(0);
+                var denominator: f64 = 0;
+                for (first..row + 1) |key| {
+                    var score: f64 = 0;
+                    for (0..dim) |d| score += @as(f64, qq[((b * seq + row) * heads + head) * dim + d]) * kk[(b * seq + key) * dim + d];
+                    probabilities[key] = @exp(score * scale);
+                    denominator += probabilities[key];
+                }
+                for (0..dim) |d| {
+                    var out: f64 = 0;
+                    for (first..row + 1) |key| out += probabilities[key] / denominator * vv[(b * seq + key) * dim + d];
+                    result += out * dd[((b * seq + row) * heads + head) * dim + d];
+                }
+            };
+            return result;
+        }
+    }.evaluate;
+    for ([_]usize{ 0, 1, 2 }) |window| {
+        const scale: f32 = 0.75;
+        const gradient = (try gqaCausalAttentionBackwardOp(&compute, qt, kt, vt, dyt, batch, seq, heads, 1, dim, window, scale)) orelse return error.UnsupportedOperation;
+        defer freeTensor(&compute, gradient);
+        const analytical = getData(gradient);
+        var offset: usize = 0;
+        for ([_][]f32{ &q, &k, &v }) |parameter| {
+            for (parameter, 0..) |*x, i| {
+                const original = x.*;
+                x.* = original + 0.001;
+                const plus_x = x.*;
+                const plus = loss(&q, &k, &v, &dy, window, scale);
+                x.* = original - 0.001;
+                const minus_x = x.*;
+                const minus = loss(&q, &k, &v, &dy, window, scale);
+                x.* = original;
+                const numerical: f32 = @floatCast((plus - minus) / (@as(f64, plus_x) - minus_x));
+                try std.testing.expectApproxEqAbs(numerical, analytical[offset + i], 0.00002);
+            }
+            offset += parameter.len;
+        }
+    }
 }

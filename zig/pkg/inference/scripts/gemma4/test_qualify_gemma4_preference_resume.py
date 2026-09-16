@@ -13,7 +13,7 @@ from pathlib import Path
 import qualify_gemma4_preference_resume as qualifier
 
 
-FAKE_ANTFLY = r'''#!/usr/bin/env python3
+FAKE_ANTFLY = r"""#!/usr/bin/env python3
 import hashlib
 import json
 import os
@@ -325,7 +325,7 @@ if task == "grpo":
         },
     })
 evaluation_report_path.write_text(json.dumps(evaluation_report))
-'''
+"""
 
 
 class PreferenceResumeQualificationTest(unittest.TestCase):
@@ -348,7 +348,9 @@ class PreferenceResumeQualificationTest(unittest.TestCase):
                 {
                     "schema_version": "antfly_gemma4_finetune/v2",
                     "status": "complete",
-                    "adapter_checkpoint_sha256": hashlib.sha256(seed_payload).hexdigest(),
+                    "adapter_checkpoint_sha256": hashlib.sha256(
+                        seed_payload
+                    ).hexdigest(),
                     "adapter_checkpoint_size_bytes": len(seed_payload),
                 }
             ),
@@ -397,7 +399,8 @@ class PreferenceResumeQualificationTest(unittest.TestCase):
             "execution": {"mode": "train"},
             "model": {"path": str(self.model), "family": "gemma4"},
             "dataset": {
-                "path": str(self.train), "eval_path": str(self.eval),
+                "path": str(self.train),
+                "eval_path": str(self.eval),
                 "format": "text-preference" if task == "dpo" else "text-grpo",
             },
             "adapter": {"path": str(self.adapter), "rank": 8, "alpha": 16},
@@ -439,9 +442,9 @@ class PreferenceResumeQualificationTest(unittest.TestCase):
             / "finetune"
             / "recipe.zig"
         ).read_text(encoding="utf-8")
-        body = recipe_source.split("const GemmaMetalNumericalPolicy = struct {", 1)[1].split(
-            "\n};", 1
-        )[0]
+        body = recipe_source.split("const GemmaMetalNumericalPolicy = struct {", 1)[
+            1
+        ].split("\n};", 1)[0]
         zig_boolean_fields = tuple(
             re.findall(r"^\s+([a-z0-9_]+): bool,\s*$", body, flags=re.MULTILINE)
         )
@@ -455,7 +458,10 @@ class PreferenceResumeQualificationTest(unittest.TestCase):
     def test_shared_environment_policy_sanitizes_correctness_switches(self) -> None:
         self.assertEqual(
             qualifier.ENVIRONMENT_POLICY_SHA256,
-            "sha256:" + hashlib.sha256(qualifier.ENVIRONMENT_POLICY_PATH.read_bytes()).hexdigest(),
+            "sha256:"
+            + hashlib.sha256(
+                qualifier.ENVIRONMENT_POLICY_PATH.read_bytes()
+            ).hexdigest(),
         )
         inherited = {
             "PATH": "/usr/bin",
@@ -474,10 +480,7 @@ class PreferenceResumeQualificationTest(unittest.TestCase):
         for name in inherited.keys() - {"PATH"}:
             self.assertNotIn(name, sanitized)
         self.assertEqual(
-            {
-                name: sanitized[name]
-                for name in qualifier.STRICT_METAL_ENV
-            },
+            {name: sanitized[name] for name in qualifier.STRICT_METAL_ENV},
             qualifier.STRICT_METAL_ENV,
         )
 
@@ -507,19 +510,25 @@ class PreferenceResumeQualificationTest(unittest.TestCase):
     def test_tree_snapshot_binds_regular_file_bytes(self) -> None:
         snapshot = qualifier._tree_snapshot(self.model)
         config = next(entry for entry in snapshot if entry["path"] == "config.json")
-        self.assertEqual(config["sha256"], qualifier._sha256(self.model / "config.json"))
+        self.assertEqual(
+            config["sha256"], qualifier._sha256(self.model / "config.json")
+        )
 
     def test_output_root_must_not_overlap_immutable_inputs(self) -> None:
         args = self.args("dpo")
         args.output_dir = self.model / "qualification"
-        with self.assertRaisesRegex(qualifier.ContractError, "overlaps immutable model"):
+        with self.assertRaisesRegex(
+            qualifier.ContractError, "overlaps immutable model"
+        ):
             qualifier.qualify(args)
 
     def test_final_adapter_must_differ_from_seed(self) -> None:
         seed = "sha256:" + "a" * 64
         trained = "sha256:" + "b" * 64
         self.assertEqual(qualifier._require_changed_adapter(seed, trained), trained)
-        with self.assertRaisesRegex(qualifier.ContractError, "byte-identical to the seed"):
+        with self.assertRaisesRegex(
+            qualifier.ContractError, "byte-identical to the seed"
+        ):
             qualifier._require_changed_adapter(seed, seed)
 
     def test_adapter_tree_allows_only_payload_and_manifest_to_change(self) -> None:
@@ -542,7 +551,9 @@ class PreferenceResumeQualificationTest(unittest.TestCase):
         report = qualifier.qualify(self.args("dpo"))
         self.assertEqual(report["status"], "pass")
         self.assertEqual(report["task"], "dpo")
-        self.assertEqual(report["checkpoints"]["interrupted_boundary"]["epoch_index"], 1)
+        self.assertEqual(
+            report["checkpoints"]["interrupted_boundary"]["epoch_index"], 1
+        )
         self.assertEqual(report["checkpoints"]["resumed_final"]["epoch_index"], 2)
         self.assertEqual(
             report["parity"]["training_checkpoint_sha256"],
@@ -563,11 +574,15 @@ class PreferenceResumeQualificationTest(unittest.TestCase):
         semantic = report["parity"]["semantic_report"]
         self.assertEqual(
             semantic["kl_control"]["trace_digest"],
-            report["parity"]["verified_artifacts"]["resumed"]["training_kl_trace"]["sha256"],
+            report["parity"]["verified_artifacts"]["resumed"]["training_kl_trace"][
+                "sha256"
+            ],
         )
         self.assertEqual(
             semantic["reward_pipeline"]["trace_digest"],
-            report["parity"]["verified_artifacts"]["resumed"]["training_reward_trace"]["sha256"],
+            report["parity"]["verified_artifacts"]["resumed"]["training_reward_trace"][
+                "sha256"
+            ],
         )
         self.assertEqual(
             report["parity"]["terminal_metal_float_comparison"]["mode"],
@@ -596,7 +611,9 @@ class PreferenceResumeQualificationTest(unittest.TestCase):
         final = report["checkpoints"]["resumed_final"]
         self.assertEqual(final["epoch_index"], 1)
         self.assertEqual(final["examples_into_epoch"], 0)
-        interrupted_recipe = json.loads(Path(report["recipes"]["interrupted"]).read_text())
+        interrupted_recipe = json.loads(
+            Path(report["recipes"]["interrupted"]).read_text()
+        )
         self.assertEqual(interrupted_recipe["checkpoint"]["every_examples"], 1)
         self.assertEqual(interrupted_recipe["checkpoint"]["every_epochs"], 1)
         self.assertEqual(
@@ -614,7 +631,9 @@ class PreferenceResumeQualificationTest(unittest.TestCase):
         )
         for artifact in retained.values():
             self.assertTrue(Path(artifact["path"]).is_file())
-            self.assertEqual(qualifier._sha256(Path(artifact["path"])), artifact["sha256"])
+            self.assertEqual(
+                qualifier._sha256(Path(artifact["path"])), artifact["sha256"]
+            )
 
     def test_dpo_mid_epoch_examples_resume_contract(self) -> None:
         args = self.args("dpo")
@@ -623,8 +642,12 @@ class PreferenceResumeQualificationTest(unittest.TestCase):
         args.interrupt_after_examples = 1
         report = qualifier.qualify(args)
         self.assertEqual(report["status"], "pass")
-        self.assertEqual(report["checkpoints"]["interrupted_boundary"]["examples_into_epoch"], 1)
-        self.assertEqual(report["checkpoints"]["resumed_final"]["examples_into_epoch"], 0)
+        self.assertEqual(
+            report["checkpoints"]["interrupted_boundary"]["examples_into_epoch"], 1
+        )
+        self.assertEqual(
+            report["checkpoints"]["resumed_final"]["examples_into_epoch"], 0
+        )
 
     def test_mid_epoch_compositions_fail_closed(self) -> None:
         one_epoch_boundary = self.args("grpo")
@@ -742,7 +765,9 @@ class PreferenceResumeQualificationTest(unittest.TestCase):
         generated = json.loads(Path(report["recipes"]["resumed"]).read_text())
         self.assertTrue(generated["runtime"]["grpo_incremental_kv"])
 
-    def test_grpo_compiled_sampling_resume_is_explicit_attested_and_non_incremental(self) -> None:
+    def test_grpo_compiled_sampling_resume_is_explicit_attested_and_non_incremental(
+        self,
+    ) -> None:
         args = self.args("grpo")
         args.compiled_sampling = True
         recipe = json.loads(args.recipe.read_text(encoding="utf-8"))
@@ -780,9 +805,7 @@ class PreferenceResumeQualificationTest(unittest.TestCase):
                 "uninterrupted": True,
                 "resumed": True,
             },
-            report["parity"][
-                "compiled_sampling_execution_cache_retirement"
-            ],
+            report["parity"]["compiled_sampling_execution_cache_retirement"],
         )
         generated = json.loads(Path(report["recipes"]["resumed"]).read_text())
         self.assertFalse(generated["runtime"]["grpo_incremental_kv"])
@@ -800,7 +823,9 @@ class PreferenceResumeQualificationTest(unittest.TestCase):
         incremental.compiled_sampling = True
         incremental.incremental_kv = True
         incremental.output_dir = self.root / "compiled-incremental-conflict"
-        with self.assertRaisesRegex(qualifier.ContractError, "conflicts with incremental-KV"):
+        with self.assertRaisesRegex(
+            qualifier.ContractError, "conflicts with incremental-KV"
+        ):
             qualifier.qualify(incremental)
 
     def test_direct_gguf_incremental_kv_composition_fails_closed(self) -> None:
@@ -818,7 +843,9 @@ class PreferenceResumeQualificationTest(unittest.TestCase):
         ):
             qualifier.qualify(args)
 
-    def test_grpo_terminal_metal_float_tolerance_is_narrow_and_fail_closed(self) -> None:
+    def test_grpo_terminal_metal_float_tolerance_is_narrow_and_fail_closed(
+        self,
+    ) -> None:
         expected = {"groups": 4, "evaluation": {"kl_loss": 1e-6, "mean_kl": 3e-5}}
         within = {"groups": 4, "evaluation": {"kl_loss": 1.9e-6, "mean_kl": 3.9e-5}}
         comparison = qualifier._compare_semantic_reports(expected, within, "grpo")
@@ -830,7 +857,9 @@ class PreferenceResumeQualificationTest(unittest.TestCase):
             qualifier._compare_semantic_reports(expected, outside, "grpo")
 
         discrete_drift = {"groups": 5, "evaluation": {"kl_loss": 1e-6, "mean_kl": 3e-5}}
-        with self.assertRaisesRegex(qualifier.ContractError, "semantic trajectory differs"):
+        with self.assertRaisesRegex(
+            qualifier.ContractError, "semantic trajectory differs"
+        ):
             qualifier._compare_semantic_reports(expected, discrete_drift, "grpo")
 
     def test_final_checkpoint_and_sidecar_must_be_byte_identical(self) -> None:
@@ -869,7 +898,9 @@ class PreferenceResumeQualificationTest(unittest.TestCase):
                 output / "uninterrupted",
                 output / "resumed",
                 "grpo",
-                output / "interrupted-unpublished" / "gemma4_grpo_trainer_state.safetensors",
+                output
+                / "interrupted-unpublished"
+                / "gemma4_grpo_trainer_state.safetensors",
                 1,
             )
 
@@ -883,7 +914,9 @@ class PreferenceResumeQualificationTest(unittest.TestCase):
                 output / "uninterrupted",
                 output / "resumed",
                 "dpo",
-                output / "interrupted-unpublished" / "gemma4_dpo_trainer_state.safetensors",
+                output
+                / "interrupted-unpublished"
+                / "gemma4_dpo_trainer_state.safetensors",
                 1,
             )
 

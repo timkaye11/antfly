@@ -13,6 +13,8 @@
 // limitations under the License.
 
 const std = @import("std");
+const schema = @import("recipe_schema.zig");
+const objectives = @import("recipe_objectives.zig");
 const build_info = @import("build_info");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
@@ -64,22 +66,14 @@ const print = std.debug.print;
 const default_lora_rank: usize = 16;
 const default_policy_lora_rank: usize = 8;
 const default_lora_alpha: f32 = 32.0;
-const default_grpo_max_completion_tokens: usize = 16;
+const default_grpo_max_completion_tokens = objectives.default_grpo_max_completion_tokens;
 const default_lora_target_preset = "all-linear";
 const default_gemma4_lora_target_preset = "text-all-linear";
 
 const qwen_attention_lora_target_modules = [_][]const u8{ "q_proj", "k_proj", "v_proj", "o_proj" };
 const qwen_mlp_lora_target_modules = [_][]const u8{ "gate_proj", "up_proj", "down_proj" };
 
-pub const RecipeKind = enum {
-    sft,
-    lora_sft,
-    qlora_sft,
-    dpo,
-    grpo,
-    reranker,
-    vlm_retrieval,
-};
+pub const RecipeKind = schema.RecipeKind;
 
 const PreferenceExecutionMode = enum {
     train,
@@ -203,544 +197,63 @@ const OwnedPreferenceTokenizer = struct {
     }
 };
 
-pub const ModelConfig = struct {
-    path: ?[]const u8 = null,
-    reference_path: ?[]const u8 = null,
-    name: ?[]const u8 = null,
-    family: ?[]const u8 = null,
-    projector_path: ?[]const u8 = null,
-    /// Explicitly admits a model whose selected training weights are a direct
-    /// GGUF artifact. Preference training otherwise rejects GGUF before any
-    /// optimizer or output mutation.
-    allow_direct_gguf_training: ?bool = null,
-};
+pub const ModelConfig = schema.ModelConfig;
 
-pub const DatasetConfig = struct {
-    path: ?[]const u8 = null,
-    train_path: ?[]const u8 = null,
-    eval_path: ?[]const u8 = null,
-    train_split: ?[]const u8 = "train",
-    eval_split: ?[]const u8 = null,
-    prepared_path: ?[]const u8 = null,
-    cache_path: ?[]const u8 = null,
-    train_cache_path: ?[]const u8 = null,
-    eval_cache_path: ?[]const u8 = null,
-    format: ?[]const u8 = null,
-    labels: ?[]const u8 = null,
-    max_examples: ?usize = null,
-    eval_max_examples: ?usize = null,
-    max_seq_len: ?usize = null,
-};
+pub const DatasetConfig = schema.DatasetConfig;
 
-pub const AdapterConfig = struct {
-    path: ?[]const u8 = null,
-    rank: ?usize = null,
-    alpha: ?f32 = null,
-    dropout: ?f32 = null,
-    layer_name: ?[]const u8 = null,
-    base_model_name_or_path: ?[]const u8 = null,
-    quantization: ?[]const u8 = null,
-    target_preset: ?[]const u8 = null,
-    target_modules: ?[]const []const u8 = null,
-    init_lora_weights: ?[]const u8 = null,
-    initialization_seed: ?u64 = null,
-    use_dora: ?bool = null,
-    scaling: ?[]const u8 = null,
-};
+pub const AdapterConfig = schema.AdapterConfig;
 
-pub const OptimizerConfig = struct {
-    /// Deterministic trainer/RNG seed. This is currently admitted by the
-    /// optimizer-backed Gemma4 DPO/GRPO recipe paths and is fingerprinted into
-    /// their durable checkpoint identity.
-    seed: ?u64 = null,
-    learning_rate: ?f32 = null,
-    weight_decay: ?f32 = null,
-    lr_scheduler: ?[]const u8 = null,
-    warmup_ratio: ?f32 = null,
-    warmup_steps: ?u32 = null,
-    num_cycles: ?f32 = null,
-    max_steps: ?usize = null,
-    epochs: ?usize = null,
-    micro_batch_size: ?usize = null,
-    gradient_accumulation_steps: ?u32 = null,
-    max_grad_norm: ?f32 = null,
-    schedule_free: ?bool = null,
-    llrd_decay: ?f32 = null,
-};
+pub const OptimizerConfig = schema.OptimizerConfig;
 
-pub const PreferenceConfig = struct {
-    /// `sigmoid` (default), `ipo`, or `simpo`. ORPO/CPO require a
-    /// differentiable auxiliary SFT term and KTO requires unpaired data, so
-    /// those names fail closed in the paired Gemma4 recipe path.
-    loss_type: ?[]const u8 = null,
-    beta: ?f32 = null,
-    label_smoothing: ?f32 = null,
-    simpo_gamma: ?f32 = null,
-    sft_lambda: ?f32 = null,
-    /// IPO regularization parameter. When omitted, `beta` supplies the
-    /// standard IPO tau value for compatibility with common trainer APIs.
-    ipo_tau: ?f32 = null,
-};
+pub const PreferenceConfig = schema.PreferenceConfig;
 
-const DpoLossType = enum {
-    sigmoid,
-    ipo,
-    simpo,
-};
+const DpoLossType = objectives.DpoLossType;
+const ResolvedDpoObjectiveConfig = objectives.ResolvedDpoObjectiveConfig;
+const resolveDpoObjectiveConfig = objectives.resolveDpoObjectiveConfig;
 
-const ResolvedDpoObjectiveConfig = struct {
-    loss_type: DpoLossType,
-    preference: preference_loss.PreferenceConfig,
+pub const GrpoSamplingConfig = schema.GrpoSamplingConfig;
 
-    fn logprobAggregation(self: ResolvedDpoObjectiveConfig) []const u8 {
-        return switch (self.loss_type) {
-            .sigmoid => "sum",
-            .ipo, .simpo => "completion-token-mean",
-        };
-    }
+pub const GrpoConfig = schema.GrpoConfig;
 
-    fn needsReference(self: ResolvedDpoObjectiveConfig) bool {
-        return self.loss_type != .simpo;
-    }
-};
+const ResolvedGrpoSamplingConfig = objectives.ResolvedGrpoSamplingConfig;
+const resolveGrpoSamplingConfig = objectives.resolveGrpoSamplingConfig;
+const ResolvedGrpoObjectiveConfig = objectives.ResolvedGrpoObjectiveConfig;
+const parseGrpoLossType = objectives.parseGrpoLossType;
+const parseGrpoRewardScale = objectives.parseGrpoRewardScale;
+const resolveGrpoObjectiveConfig = objectives.resolveGrpoObjectiveConfig;
+const resolveGrpoCoreConfig = objectives.resolveGrpoCoreConfig;
+const ResolvedGrpoKlControl = objectives.ResolvedGrpoKlControl;
+const resolveGrpoKlControl = objectives.resolveGrpoKlControl;
 
-fn resolveDpoObjectiveConfig(config: PreferenceConfig) !ResolvedDpoObjectiveConfig {
-    const raw_loss_type = config.loss_type orelse "sigmoid";
-    const loss_type: DpoLossType = if (eqlName(raw_loss_type, "sigmoid") or eqlName(raw_loss_type, "dpo"))
-        .sigmoid
-    else if (eqlName(raw_loss_type, "ipo"))
-        .ipo
-    else if (eqlName(raw_loss_type, "simpo") or eqlName(raw_loss_type, "sigmoid_norm"))
-        .simpo
-    else if (eqlAny(raw_loss_type, &.{ "orpo", "cpo", "kto" }))
-        return error.DpoLossTypeNotYetSupported
-    else
-        return error.InvalidDpoLossType;
+pub const RewardProviderConfig = schema.RewardProviderConfig;
 
-    const beta = config.beta orelse 0.1;
-    if (!std.math.isFinite(beta) or beta <= 0.0) return error.InvalidDpoBeta;
-    const label_smoothing = config.label_smoothing orelse 0.0;
-    if (!std.math.isFinite(label_smoothing) or label_smoothing < 0.0 or label_smoothing >= 0.5) {
-        return error.InvalidDpoLabelSmoothing;
-    }
-    if (loss_type != .sigmoid and label_smoothing != 0.0) {
-        return error.DpoLabelSmoothingRequiresSigmoid;
-    }
-    if (config.sft_lambda != null) return error.DpoSftAuxiliaryLossNotYetSupported;
+pub const RewardConfig = schema.RewardConfig;
 
-    const simpo_gamma = config.simpo_gamma orelse 0.5;
-    if (!std.math.isFinite(simpo_gamma) or simpo_gamma < 0.0) return error.InvalidSimpoGamma;
-    const ipo_tau = config.ipo_tau orelse beta;
-    if (!std.math.isFinite(ipo_tau) or ipo_tau <= 0.0) return error.InvalidIpoTau;
-    switch (loss_type) {
-        .sigmoid => if (config.simpo_gamma != null or config.ipo_tau != null) {
-            return error.DpoOptionNotUsedByLoss;
-        },
-        .ipo => if (config.simpo_gamma != null) return error.DpoOptionNotUsedByLoss,
-        .simpo => if (config.ipo_tau != null) return error.DpoOptionNotUsedByLoss,
-    }
+pub const EntityEvalMinimums = schema.EntityEvalMinimums;
 
-    return .{
-        .loss_type = loss_type,
-        .preference = .{
-            .kind = switch (loss_type) {
-                .sigmoid => .dpo,
-                .ipo => .ipo,
-                .simpo => .simpo,
-            },
-            .beta = beta,
-            .label_smoothing = label_smoothing,
-            .simpo_gamma = simpo_gamma,
-            .ipo_tau = ipo_tau,
-        },
-    };
-}
+pub const FullTaskEvalMinimums = schema.FullTaskEvalMinimums;
 
-pub const GrpoSamplingConfig = struct {
-    temperature: ?f32 = null,
-    top_p: ?f32 = null,
-    /// Zero disables top-k filtering.
-    top_k: ?usize = null,
-};
+pub const DpoEvalMinimums = schema.DpoEvalMinimums;
 
-pub const GrpoConfig = struct {
-    group_size: ?usize = null,
-    /// Lower PPO clip bound (`1 - clip_epsilon`).
-    clip_epsilon: ?f32 = null,
-    /// Optional asymmetric upper PPO clip bound (`1 + epsilon_high`).
-    epsilon_high: ?f32 = null,
-    kl_coef: ?f32 = null,
-    /// Fail before optimizer mutation when the unweighted mean token K3
-    /// divergence for a sampled group exceeds this bound. Defaults to 0.1.
-    train_max_kl: ?f32 = null,
-    /// `skip_group` (default) or `abort`.
-    train_max_kl_policy: ?[]const u8 = null,
-    /// Enables a proportional controller for `kl_coef`. The target and
-    /// horizon are required when this is true; coefficient bounds are
-    /// optional and default to [0.001, 1.0].
-    adaptive_kl: ?bool = null,
-    target_kl: ?f32 = null,
-    kl_horizon: ?f32 = null,
-    min_kl_coef: ?f32 = null,
-    max_kl_coef: ?f32 = null,
-    advantage_eps: ?f32 = null,
-    /// Legacy alias. False is equivalent to `scale_rewards = "none"`.
-    normalize_advantage: ?bool = null,
-    /// `group` (default), `batch`, or `none`.
-    scale_rewards: ?[]const u8 = null,
-    /// `grpo`, `bnpo` (default), `dr_grpo`, or `dapo`.
-    loss_type: ?[]const u8 = null,
-    max_completion_tokens: ?usize = null,
-    /// Exclude non-EOS completions that exhaust the generation budget from
-    /// the policy/KL loss while retaining them in reward normalization.
-    mask_truncated_completions: ?bool = null,
-    sampling: ?GrpoSamplingConfig = null,
-    reward_mode: ?[]const u8 = null,
-};
+pub const GrpoEvalMinimums = schema.GrpoEvalMinimums;
 
-const ResolvedGrpoSamplingConfig = struct {
-    temperature: f32,
-    top_p: f32,
-    top_k: usize,
-};
+pub const EvalConfig = schema.EvalConfig;
 
-fn resolveGrpoSamplingConfig(config: GrpoConfig) !ResolvedGrpoSamplingConfig {
-    const sampling = config.sampling orelse GrpoSamplingConfig{};
-    const temperature = sampling.temperature orelse 1.0;
-    const top_p = sampling.top_p orelse 1.0;
-    const top_k = sampling.top_k orelse 0;
-    if (!std.math.isFinite(temperature) or temperature <= 0.0) {
-        return error.InvalidGrpoSamplingTemperature;
-    }
-    if (!std.math.isFinite(top_p) or top_p <= 0.0 or top_p > 1.0) {
-        return error.InvalidGrpoSamplingTopP;
-    }
-    return .{ .temperature = temperature, .top_p = top_p, .top_k = top_k };
-}
+pub const CheckpointConfig = schema.CheckpointConfig;
 
-const ResolvedGrpoObjectiveConfig = struct {
-    loss_type: grpo.LossType,
-    scale_rewards: grpo.RewardScale,
-    epsilon_low: f32,
-    epsilon_high: f32,
-    max_completion_tokens: usize,
-    mask_truncated_completions: bool,
-};
+pub const RuntimeConfig = schema.RuntimeConfig;
 
-fn parseGrpoLossType(value: []const u8) !grpo.LossType {
-    return std.meta.stringToEnum(grpo.LossType, value) orelse
-        error.InvalidGrpoLossType;
-}
+pub const ExecutionConfig = schema.ExecutionConfig;
 
-fn parseGrpoRewardScale(value: []const u8) !grpo.RewardScale {
-    return std.meta.stringToEnum(grpo.RewardScale, value) orelse
-        error.InvalidGrpoRewardScale;
-}
+pub const ArtifactConfig = schema.ArtifactConfig;
 
-fn resolveGrpoObjectiveConfig(config: GrpoConfig, requested_gradient_accumulation_steps: u32) !ResolvedGrpoObjectiveConfig {
-    const epsilon_low = config.clip_epsilon orelse 0.2;
-    const epsilon_high = config.epsilon_high orelse epsilon_low;
-    if (!std.math.isFinite(epsilon_low) or epsilon_low <= 0.0 or epsilon_low > 1.0 or
-        !std.math.isFinite(epsilon_high) or epsilon_high <= 0.0 or epsilon_high > 1.0)
-    {
-        return error.InvalidGrpoClipEpsilon;
-    }
-    const loss_type = try parseGrpoLossType(config.loss_type orelse "bnpo");
-    if (loss_type == .dapo and requested_gradient_accumulation_steps != 1) {
-        // Exact DAPO normalization spans every active token in an accumulation
-        // window. The current product loop materializes one group at a time,
-        // so only a one-group window has a truthful global denominator.
-        return error.GrpoDapoRequiresUnitGradientAccumulation;
-    }
-    const legacy_normalize = config.normalize_advantage orelse true;
-    const scale_rewards = if (config.scale_rewards) |value|
-        try parseGrpoRewardScale(value)
-    else if (legacy_normalize)
-        grpo.RewardScale.group
-    else
-        grpo.RewardScale.none;
-    if (config.scale_rewards != null and !legacy_normalize and scale_rewards != .none) {
-        return error.ConflictingGrpoRewardScale;
-    }
-    const max_completion_tokens = config.max_completion_tokens orelse default_grpo_max_completion_tokens;
-    if (max_completion_tokens == 0) return error.InvalidMaxCompletionTokens;
-    return .{
-        .loss_type = loss_type,
-        .scale_rewards = scale_rewards,
-        .epsilon_low = epsilon_low,
-        .epsilon_high = epsilon_high,
-        .max_completion_tokens = max_completion_tokens,
-        .mask_truncated_completions = config.mask_truncated_completions orelse false,
-    };
-}
+pub const Recipe = schema.Recipe;
 
-fn resolveGrpoCoreConfig(recipe: Recipe) !grpo.GRPOConfig {
-    const objective = try resolveGrpoObjectiveConfig(
-        recipe.grpo,
-        recipe.optimizer.gradient_accumulation_steps orelse 1,
-    );
-    return .{
-        .group_size = recipe.grpo.group_size orelse 2,
-        .clip_epsilon = objective.epsilon_low,
-        .epsilon_high = objective.epsilon_high,
-        .kl_coef = recipe.grpo.kl_coef orelse 0.04,
-        .advantage_eps = recipe.grpo.advantage_eps orelse 1e-4,
-        .scale_rewards = objective.scale_rewards,
-        .loss_type = objective.loss_type,
-        .max_completion_tokens = objective.max_completion_tokens,
-        .mask_truncated_completions = objective.mask_truncated_completions,
-        .normalize_advantage = true,
-    };
-}
+pub const Step = schema.Step;
 
-const ResolvedGrpoKlControl = struct {
-    const BudgetPolicy = enum {
-        skip_group,
-        abort,
-    };
+pub const StepKind = schema.StepKind;
 
-    train_max_kl: f32,
-    budget_policy: BudgetPolicy,
-    adaptive: bool,
-    target_kl: ?f32,
-    kl_horizon: ?f32,
-    min_kl_coef: ?f32,
-    max_kl_coef: ?f32,
-};
-
-fn resolveGrpoKlControl(config: GrpoConfig) !ResolvedGrpoKlControl {
-    const train_max_kl = config.train_max_kl orelse 0.1;
-    if (!std.math.isFinite(train_max_kl) or train_max_kl <= 0.0) {
-        return error.InvalidGrpoTrainKlBudget;
-    }
-    const budget_policy = std.meta.stringToEnum(
-        ResolvedGrpoKlControl.BudgetPolicy,
-        config.train_max_kl_policy orelse "skip_group",
-    ) orelse return error.InvalidGrpoTrainKlPolicy;
-
-    const adaptive = config.adaptive_kl orelse false;
-    if (!adaptive) {
-        if (config.target_kl != null or config.kl_horizon != null or
-            config.min_kl_coef != null or config.max_kl_coef != null)
-        {
-            return error.IncompleteGrpoAdaptiveKlConfig;
-        }
-        return .{
-            .train_max_kl = train_max_kl,
-            .budget_policy = budget_policy,
-            .adaptive = false,
-            .target_kl = null,
-            .kl_horizon = null,
-            .min_kl_coef = null,
-            .max_kl_coef = null,
-        };
-    }
-
-    const target_kl = config.target_kl orelse return error.IncompleteGrpoAdaptiveKlConfig;
-    const kl_horizon = config.kl_horizon orelse return error.IncompleteGrpoAdaptiveKlConfig;
-    const min_kl_coef = config.min_kl_coef orelse 0.001;
-    const max_kl_coef = config.max_kl_coef orelse 1.0;
-    const initial_kl_coef = config.kl_coef orelse 0.04;
-    if (!std.math.isFinite(target_kl) or target_kl <= 0.0 or target_kl >= train_max_kl or
-        !std.math.isFinite(kl_horizon) or kl_horizon < 1.0 or
-        !std.math.isFinite(min_kl_coef) or min_kl_coef < 0.0 or
-        !std.math.isFinite(max_kl_coef) or max_kl_coef < min_kl_coef or
-        initial_kl_coef <= 0.0 or initial_kl_coef < min_kl_coef or initial_kl_coef > max_kl_coef)
-    {
-        return error.InvalidGrpoAdaptiveKlConfig;
-    }
-    return .{
-        .train_max_kl = train_max_kl,
-        .budget_policy = budget_policy,
-        .adaptive = true,
-        .target_kl = target_kl,
-        .kl_horizon = kl_horizon,
-        .min_kl_coef = min_kl_coef,
-        .max_kl_coef = max_kl_coef,
-    };
-}
-
-/// A GRPO reward is either a deterministic built-in verifier, a pinned generic
-/// executable, or a pinned model-backed executable. External providers receive
-/// a versioned JSON request path as their final argument and must print one JSON
-/// response to stdout. Model-backed providers additionally bind every model
-/// input and attest the identity and token count used for each score.
-pub const RewardProviderConfig = struct {
-    name: []const u8,
-    kind: []const u8,
-    mode: ?[]const u8 = null,
-    weight: f32 = 1.0,
-    executable_path: ?[]const u8 = null,
-    executable_sha256: ?[]const u8 = null,
-    args: ?[]const []const u8 = null,
-    timeout_ms: ?u32 = null,
-    min_reward: ?f32 = null,
-    max_reward: ?f32 = null,
-    model_path: ?[]const u8 = null,
-    model_sha256: ?[]const u8 = null,
-    tokenizer_path: ?[]const u8 = null,
-    tokenizer_sha256: ?[]const u8 = null,
-    chat_template_path: ?[]const u8 = null,
-    chat_template_sha256: ?[]const u8 = null,
-    calibration_dataset_path: ?[]const u8 = null,
-    calibration_dataset_sha256: ?[]const u8 = null,
-    max_input_tokens: ?usize = null,
-    max_batch_size: ?usize = null,
-};
-
-pub const RewardConfig = struct {
-    aggregation: ?[]const u8 = null,
-    failure_policy: ?[]const u8 = null,
-    providers: ?[]const RewardProviderConfig = null,
-    trace_path: ?[]const u8 = null,
-    evaluation_trace_path: ?[]const u8 = null,
-    exchange_dir: ?[]const u8 = null,
-    max_trace_bytes: ?usize = null,
-};
-
-pub const EntityEvalMinimums = struct {
-    precision: ?f64 = null,
-    recall: ?f64 = null,
-    f1: f64,
-    exact_match: f64,
-};
-
-/// Required quality gates for every structured task scored by the native
-/// GLiNER2 total-loss evaluator. Keeping these fields non-optional makes a
-/// partially specified gate set invalid at recipe parse time.
-pub const FullTaskEvalMinimums = struct {
-    classifications_micro_f1: f64,
-    classifications_exact_match: f64,
-    json_structures_micro_f1: f64,
-    json_structures_exact_match: f64,
-    relations_micro_f1: f64,
-    relations_exact_match: f64,
-    count_accuracy: f64,
-};
-
-pub const DpoEvalMinimums = struct {
-    accuracy: f64,
-    max_loss: f64,
-    min_accuracy_improvement: ?f64 = null,
-    min_reward_margin_improvement: ?f64 = null,
-    min_loss_improvement: ?f64 = null,
-};
-
-pub const GrpoEvalMinimums = struct {
-    mean_reward: f64,
-    top_rank_mean_reward: f64,
-    positive_reward_group_rate: f64,
-    max_kl_loss: f64,
-    min_mean_reward_improvement: ?f64 = null,
-    min_top_rank_mean_reward_improvement: ?f64 = null,
-    min_positive_reward_group_rate_improvement: ?f64 = null,
-};
-
-pub const EvalConfig = struct {
-    path: ?[]const u8 = null,
-    max_examples: ?usize = null,
-    split: ?[]const u8 = null,
-    every_epochs: ?u32 = null,
-    batch_size: ?u32 = null,
-    early_stopping_patience: ?u32 = null,
-    improvement_threshold: ?f64 = null,
-    /// Full-task structured scoring currently requires the Zig native
-    /// evaluator even when training itself runs through the Metal runtime.
-    backend: ?[]const u8 = null,
-    entity_minimums: ?EntityEvalMinimums = null,
-    full_task_minimums: ?FullTaskEvalMinimums = null,
-    dpo_minimums: ?DpoEvalMinimums = null,
-    grpo_minimums: ?GrpoEvalMinimums = null,
-};
-
-pub const CheckpointConfig = struct {
-    every_epochs: ?u32 = null,
-    /// Mid-epoch durable-checkpoint cadence for Gemma4 preference training,
-    /// counted in optimizer examples (DPO pairs or GRPO prompt groups) within
-    /// each epoch. Requires `every_epochs`, eager sampling, and no
-    /// incremental-KV; every other lane rejects it fail-closed.
-    every_examples: ?u32 = null,
-    keep_last: ?u32 = null,
-    resume_path: ?[]const u8 = null,
-};
-
-pub const RuntimeConfig = struct {
-    compiled_required: ?bool = null,
-    graph_cache_capacity: ?u8 = null,
-    /// Gemma4 SFT independently rounds each causal row. Gemma4 DPO rounds the
-    /// maximum chosen/rejected row so both halves of a preference pair retain
-    /// one compiled signature. Null preserves the fixed prepared maximum.
-    sequence_length_bucket_quantum: ?u32 = null,
-    /// Optional minimum row length; the CLI defaults to one quantum.
-    sequence_length_bucket_min: ?u32 = null,
-    /// Exact paged-KV token-selection lane for multi-token Gemma4 GRPO.
-    /// Cumulative sampler state is included in preference checkpoints; live
-    /// pages must be quiescent at every durable boundary.
-    grpo_incremental_kv: ?bool = null,
-    /// Batches active candidates at the same decode position.
-    grpo_incremental_kv_batch_active: ?bool = null,
-    /// Fans out the final segmented prompt page on device.
-    grpo_incremental_kv_clone_prompt_tail: ?bool = null,
-    /// Runs one exact legacy shadow group before optimizer mutation.
-    grpo_incremental_kv_shadow_exact: ?bool = null,
-};
-
-/// DPO and GRPO deliberately expose both optimizer-backed training and
-/// metrics-only scoring. Requiring the caller to name that intent prevents a
-/// missing dataset format or adapter field from silently changing the job's
-/// semantics.
-pub const ExecutionConfig = struct {
-    mode: ?[]const u8 = null,
-};
-
-pub const ArtifactConfig = struct {
-    root: ?[]const u8 = null,
-    manifest_path: ?[]const u8 = null,
-    prepared_path: ?[]const u8 = null,
-    adapter_dir: ?[]const u8 = null,
-    trained_adapter_dir: ?[]const u8 = null,
-    materialized_dir: ?[]const u8 = null,
-    validation_report_path: ?[]const u8 = null,
-    evaluation_report_path: ?[]const u8 = null,
-    reload_report_path: ?[]const u8 = null,
-    report_path: ?[]const u8 = null,
-};
-
-pub const Recipe = struct {
-    recipe: ?[]const u8 = null,
-    kind: ?[]const u8 = null,
-    model: ModelConfig = .{},
-    dataset: DatasetConfig = .{},
-    adapter: ?AdapterConfig = null,
-    optimizer: OptimizerConfig = .{},
-    preference: PreferenceConfig = .{},
-    grpo: GrpoConfig = .{},
-    reward: ?RewardConfig = null,
-    eval: ?EvalConfig = null,
-    checkpoint: ?CheckpointConfig = null,
-    runtime: ?RuntimeConfig = null,
-    execution: ExecutionConfig = .{},
-    artifacts: ArtifactConfig = .{},
-    backend: ?[]const u8 = null,
-    trainer: ?[]const u8 = null,
-};
-
-pub const Step = struct {
-    kind: StepKind = .command,
-    name: []const u8,
-    argv: []const []const u8,
-};
-
-pub const StepKind = enum {
-    command,
-    direct_sft,
-    direct_dpo,
-    direct_grpo,
-};
-
-pub const Plan = struct {
-    steps: []Step,
-};
+pub const Plan = schema.Plan;
 
 const RunStatus = enum {
     planned,
@@ -955,6 +468,8 @@ const DpoReport = struct {
     benchmark: ?DpoBenchmarkTelemetry = null,
     checkpoint_resume: ?PreferenceCheckpointResumeSummary = null,
     metal_numerical_policy: ?GemmaMetalNumericalPolicy = null,
+    numerical_environment_overrides: []const []const u8 = &.{},
+    optimizer_weight_decay: f32 = 0.01,
     evaluation_execution_policy: ?[]const u8 = null,
     baseline_evaluation: ?DpoEvaluationSummary = null,
     baseline_relative: ?DpoBaselineRelativeSummary = null,
@@ -1044,6 +559,8 @@ const DpoEvaluationReport = struct {
     policy_backend: []const u8,
     execution_policy: []const u8 = canonical_preference_evaluation_policy,
     metal_numerical_policy: ?GemmaMetalNumericalPolicy = null,
+    numerical_environment_overrides: []const []const u8 = &.{},
+    optimizer_weight_decay: f32 = 0.01,
     examples: usize,
     prompt_overlap_count: usize,
     loss: f32,
@@ -1152,6 +669,7 @@ const SftReport = struct {
 };
 
 const GrpoSamplingSummary = struct {
+    scoring: []const u8 = "temperature-scaled-full-vocabulary/v1",
     algorithm: []const u8 = "seeded-categorical-temperature-top-k-top-p",
     temperature: f32,
     top_p: f32,
@@ -1220,6 +738,8 @@ const GrpoReport = struct {
     checkpoint_resume: ?PreferenceCheckpointResumeSummary = null,
     reward_pipeline: ?RewardPipelineTelemetry = null,
     metal_numerical_policy: ?GemmaMetalNumericalPolicy = null,
+    numerical_environment_overrides: []const []const u8 = &.{},
+    optimizer_weight_decay: f32 = 0.01,
     evaluation_execution_policy: ?[]const u8 = null,
     baseline_evaluation: ?GrpoEvaluationSummary = null,
     baseline_relative: ?GrpoBaselineRelativeSummary = null,
@@ -1477,6 +997,8 @@ const GrpoEvaluationReport = struct {
     policy_backend: []const u8,
     execution_policy: []const u8 = canonical_preference_evaluation_policy,
     metal_numerical_policy: ?GemmaMetalNumericalPolicy = null,
+    numerical_environment_overrides: []const []const u8 = &.{},
+    optimizer_weight_decay: f32 = 0.01,
     groups: usize,
     completions: usize,
     tokens: usize,
@@ -2628,6 +2150,9 @@ fn makeRampF32(allocator: std.mem.Allocator, len: usize, scale: f32) ![]f32 {
 pub fn buildPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
     const kind = try parseKind(recipe.recipe orelse recipe.kind orelse return error.MissingRecipeKind);
     const family = recipe.model.family orelse try inferFamily(recipe);
+    if (kind != .dpo and kind != .grpo and recipe.execution.mode != null) {
+        return error.ExecutionModeOnlySupportedForPreference;
+    }
 
     if (recipe.optimizer.seed != null and
         (!(kind == .dpo or kind == .grpo) or !eqlAny(family, &.{ "gemma4", "gemma" })))
@@ -2670,6 +2195,7 @@ fn buildLoraSftPlan(allocator: std.mem.Allocator, recipe: Recipe, family: []cons
 }
 
 fn buildQwen35TextSftPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
+    try validateNativePreferenceOptions(recipe);
     _ = trainDatasetPath(recipe) orelse return error.MissingDatasetPath;
     return .{ .steps = try allocator.dupe(Step, &.{
         .{
@@ -2714,8 +2240,10 @@ fn validateGemma4LoraRecipeContract(recipe: Recipe, adapter: AdapterConfig) !voi
         }
     }
 
-    if (recipe.optimizer.weight_decay != null or
-        recipe.optimizer.lr_scheduler != null or
+    if (recipe.optimizer.weight_decay) |decay| {
+        if (!std.math.isFinite(decay) or decay < 0) return error.InvalidWeightDecay;
+    }
+    if (recipe.optimizer.lr_scheduler != null or
         recipe.optimizer.warmup_ratio != null or
         recipe.optimizer.warmup_steps != null or
         recipe.optimizer.num_cycles != null or
@@ -2954,8 +2482,10 @@ fn validateGemma4PreferenceTrainingRecipeContract(
     }
     try validateGemmaAdapterOptions(adapter);
 
-    if (recipe.optimizer.weight_decay != null or
-        recipe.optimizer.lr_scheduler != null or
+    if (recipe.optimizer.weight_decay) |decay| {
+        if (!std.math.isFinite(decay) or decay < 0) return error.InvalidWeightDecay;
+    }
+    if (recipe.optimizer.lr_scheduler != null or
         recipe.optimizer.warmup_ratio != null or
         recipe.optimizer.warmup_steps != null or
         recipe.optimizer.num_cycles != null or
@@ -3640,6 +3170,7 @@ fn buildGemma4LoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
         "--epochs",
         try fmtInt(allocator, recipe.optimizer.epochs orelse 1),
     });
+    if (recipe.optimizer.weight_decay) |decay| try appendMany(allocator, &train_argv, &.{ "--weight-decay", try fmtFloat(allocator, decay) });
     if (evalMaxExamples(recipe)) |max| try appendMany(allocator, &train_argv, &.{ "--eval-max-examples", try fmtInt(allocator, max) });
     if (recipe.optimizer.gradient_accumulation_steps) |steps_count| try appendMany(allocator, &train_argv, &.{ "--grad-accum", try fmtInt(allocator, steps_count) });
     if (recipe.optimizer.max_grad_norm) |norm| try appendMany(allocator, &train_argv, &.{ "--max-grad-norm", try fmtFloat(allocator, norm) });
@@ -3777,12 +3308,14 @@ fn buildGliner2LoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
 }
 
 fn buildLayoutLmv3LoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
+    try validateLegacyRecipeOptions(recipe, .layout);
     const model_path = recipe.model.path orelse return error.MissingModelPath;
     const train_path = trainDatasetPath(recipe) orelse return error.MissingDatasetPath;
     const eval_path = evalDatasetPath(recipe) orelse train_path;
     const bootstrap_dir = adapterBootstrapDir(recipe) orelse try defaultArtifactPath(allocator, recipe, "adapter-bootstrap");
     const trained_dir = recipe.artifacts.trained_adapter_dir orelse recipe.artifacts.adapter_dir orelse try defaultArtifactPath(allocator, recipe, "adapter-trained");
     const task = recipe.dataset.format orelse "sequence";
+    if (!eqlAny(task, &.{ "token", "sequence" })) return error.UnsupportedLayoutLmTask;
     const train_cmd = if (std.mem.eql(u8, task, "token")) "train-eval-layoutlmv3-lora-token" else "train-eval-layoutlmv3-lora-sequence";
     const adapter = recipe.adapter orelse AdapterConfig{};
 
@@ -3805,6 +3338,7 @@ fn buildLayoutLmv3LoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
 }
 
 fn buildRerankerPlan(allocator: std.mem.Allocator, recipe: Recipe, family: []const u8) !Plan {
+    try validateLegacyRecipeOptions(recipe, .reranker);
     if (eqlAny(family, &.{ "reranker", "text-reranker", "deberta", "modernbert" })) {
         const model_path = recipe.model.path orelse return error.MissingModelPath;
         const train_path = trainDatasetPath(recipe) orelse return error.MissingDatasetPath;
@@ -3838,6 +3372,7 @@ fn buildRerankerPlan(allocator: std.mem.Allocator, recipe: Recipe, family: []con
 }
 
 fn buildRerankerLoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
+    try validateLegacyRecipeOptions(recipe, .reranker);
     const model_path = recipe.model.path orelse return error.MissingModelPath;
     const train_path = trainDatasetPath(recipe) orelse return error.MissingDatasetPath;
     const eval_path = evalDatasetPath(recipe);
@@ -3875,6 +3410,7 @@ fn buildRerankerLoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
 }
 
 fn buildVlmRetrievalPlan(allocator: std.mem.Allocator, recipe: Recipe, family: []const u8) !Plan {
+    try validateLegacyRecipeOptions(recipe, .retrieval);
     if (!eqlAny(family, &.{ "colqwen2", "colqwen", "qwen2vl" })) return error.UnsupportedRecipeFamily;
     const model_path = recipe.model.path orelse return error.MissingModelPath;
     const dataset_path = recipe.dataset.path orelse return error.MissingDatasetRoot;
@@ -3940,6 +3476,50 @@ fn preferenceTrainingFamilySupported(family: []const u8) bool {
         isQwen35Family(family);
 }
 
+// Admission mirrors the arguments actually forwarded by the legacy shims.
+// A configured option must affect execution or fail before any artifacts exist.
+fn validateLegacyRecipeOptions(recipe: Recipe, lane: enum { layout, reranker, retrieval }) !void {
+    if (recipe.checkpoint != null or recipe.runtime != null or recipe.trainer != null)
+        return error.UnsupportedRecipeOption;
+    if (lane != .reranker and recipe.backend != null) return error.UnsupportedRecipeBackend;
+    inline for (std.meta.fields(OptimizerConfig)) |field| {
+        if (comptime !eqlAny(field.name, &.{ "learning_rate", "epochs" })) {
+            if (@field(recipe.optimizer, field.name) != null) return error.UnsupportedRecipeOptimizerOption;
+        }
+    }
+    if (recipe.eval) |evaluation| {
+        if (lane == .retrieval) return error.UnsupportedRecipeEvaluationOption;
+        inline for (std.meta.fields(EvalConfig)) |field| {
+            if (comptime !eqlAny(field.name, &.{ "path", "max_examples" })) {
+                if (@field(evaluation, field.name) != null) return error.UnsupportedRecipeEvaluationOption;
+            }
+        }
+    }
+    if (lane == .retrieval and (recipe.dataset.eval_path != null or recipe.dataset.eval_max_examples != null))
+        return error.UnsupportedRecipeEvaluationOption;
+}
+
+// These legacy lanes train on native and do not implement evaluation or
+// durable recovery. Reject requests before creating an output or loading a model.
+fn validateNativePreferenceOptions(recipe: Recipe) !void {
+    if (recipe.backend) |backend| {
+        if (!eqlName(backend, "native")) return error.UnsupportedPreferenceTrainingBackend;
+    }
+    if (recipe.checkpoint != null or recipe.eval != null or recipe.runtime != null or recipe.trainer != null or
+        recipe.dataset.eval_path != null or recipe.dataset.eval_max_examples != null or recipe.dataset.eval_split != null)
+    {
+        return error.UnsupportedPreferenceTrainingOption;
+    }
+    inline for (std.meta.fields(OptimizerConfig)) |field| {
+        if (comptime !eqlAny(field.name, &.{ "learning_rate", "epochs", "gradient_accumulation_steps", "max_grad_norm" })) {
+            if (@field(recipe.optimizer, field.name) != null) return error.UnsupportedPreferenceOptimizerOption;
+        }
+    }
+    if (recipe.adapter) |adapter| {
+        if (adapter.initialization_seed != null) return error.UnsupportedPreferenceTrainingOption;
+    }
+}
+
 fn validatePreferenceExecutionContract(recipe: Recipe, task: PreferenceTask, mode: PreferenceExecutionMode, format: []const u8) !void {
     const fixture_format = switch (task) {
         .dpo => std.mem.eql(u8, format, "scalar-logprobs"),
@@ -3963,6 +3543,7 @@ fn validatePreferenceExecutionContract(recipe: Recipe, task: PreferenceTask, mod
             _ = recipe.model.path orelse return error.MissingModelPath;
             const family = recipe.model.family orelse try inferFamily(recipe);
             if (!preferenceTrainingFamilySupported(family)) return error.UnsupportedPreferenceTrainingFamily;
+            if (!eqlAny(family, &.{ "gemma4", "gemma" })) try validateNativePreferenceOptions(recipe);
         },
         .score => {
             if (requestsAdapterTraining(recipe)) return error.AdapterTrainingRequiresTrainMode;
@@ -4114,85 +3695,24 @@ fn runPlan(
 
         print("finetune[{d}/{d}] {s}: ", .{ idx + 1, plan.steps.len, step.name });
         switch (step.kind) {
-            .direct_sft => {
+            .direct_sft, .direct_dpo, .direct_grpo => {
                 print("{s}\n", .{step.argv[0]});
-                const report_path = try sftReportPath(allocator, recipe);
-                defer allocator.free(report_path);
-                runDirectSft(allocator, io, recipe, report_path) catch |err| {
-                    step_manifests[idx].status = .failed;
-                    try writeRunManifest(allocator, io, manifest_path, .{
-                        .status = .failed,
-                        .recipe = recipe,
-                        .artifact_root = recipe.artifacts.root,
-                        .steps = step_manifests,
-                    });
-                    try writeTrainingReport(allocator, io, training_report_path, .{
-                        .status = .failed,
-                        .recipe = recipe,
-                        .artifact_root = recipe.artifacts.root,
-                        .steps = step_manifests,
-                        .metadata = try collectReportMetadata(allocator, io, recipe, plan, manifest_path, training_config_path, training_report_path, static_metadata),
-                    });
-                    return err;
+                const report_path = try switch (step.kind) {
+                    .direct_sft => sftReportPath(allocator, recipe),
+                    .direct_dpo => dpoReportPath(allocator, recipe),
+                    .direct_grpo => grpoReportPath(allocator, recipe),
+                    .command => unreachable,
                 };
-                step_manifests[idx].stdout_bytes = 0;
-                step_manifests[idx].stderr_bytes = 0;
-                step_manifests[idx].exit_code = 0;
-                step_manifests[idx].status = .succeeded;
-                if (idx + 1 == plan.steps.len) {
-                    try writeSucceededRunStatus(allocator, io, recipe, step_manifests, manifest_path, training_report_path, static_metadata);
-                }
-                continue;
-            },
-            .direct_dpo => {
-                print("{s}\n", .{step.argv[0]});
-                const report_path = try dpoReportPath(allocator, recipe);
                 defer allocator.free(report_path);
-                runDirectDpo(allocator, io, recipe, report_path) catch |err| {
-                    step_manifests[idx].status = .failed;
-                    try writeRunManifest(allocator, io, manifest_path, .{
-                        .status = .failed,
-                        .recipe = recipe,
-                        .artifact_root = recipe.artifacts.root,
-                        .steps = step_manifests,
-                    });
-                    try writeTrainingReport(allocator, io, training_report_path, .{
-                        .status = .failed,
-                        .recipe = recipe,
-                        .artifact_root = recipe.artifacts.root,
-                        .steps = step_manifests,
-                        .metadata = try collectReportMetadata(allocator, io, recipe, plan, manifest_path, training_config_path, training_report_path, static_metadata),
-                    });
-                    return err;
+                const execution = switch (step.kind) {
+                    .direct_sft => runDirectSft(allocator, io, recipe, report_path),
+                    .direct_dpo => runDirectDpo(allocator, io, recipe, report_path),
+                    .direct_grpo => runDirectGrpo(allocator, io, recipe, report_path),
+                    .command => unreachable,
                 };
-                step_manifests[idx].stdout_bytes = 0;
-                step_manifests[idx].stderr_bytes = 0;
-                step_manifests[idx].exit_code = 0;
-                step_manifests[idx].status = .succeeded;
-                if (idx + 1 == plan.steps.len) {
-                    try writeSucceededRunStatus(allocator, io, recipe, step_manifests, manifest_path, training_report_path, static_metadata);
-                }
-                continue;
-            },
-            .direct_grpo => {
-                print("{s}\n", .{step.argv[0]});
-                const report_path = try grpoReportPath(allocator, recipe);
-                defer allocator.free(report_path);
-                runDirectGrpo(allocator, io, recipe, report_path) catch |err| {
+                execution catch |err| {
                     step_manifests[idx].status = .failed;
-                    try writeRunManifest(allocator, io, manifest_path, .{
-                        .status = .failed,
-                        .recipe = recipe,
-                        .artifact_root = recipe.artifacts.root,
-                        .steps = step_manifests,
-                    });
-                    try writeTrainingReport(allocator, io, training_report_path, .{
-                        .status = .failed,
-                        .recipe = recipe,
-                        .artifact_root = recipe.artifacts.root,
-                        .steps = step_manifests,
-                        .metadata = try collectReportMetadata(allocator, io, recipe, plan, manifest_path, training_config_path, training_report_path, static_metadata),
-                    });
+                    try writeFailedRunStatus(allocator, io, recipe, plan, step_manifests, manifest_path, training_config_path, training_report_path, static_metadata);
                     return err;
                 };
                 step_manifests[idx].stdout_bytes = 0;
@@ -4249,19 +3769,7 @@ fn runPlan(
             .stderr_limit = .limited(16 * 1024 * 1024),
         }) catch |err| {
             step_manifests[idx].status = .failed;
-            try writeRunManifest(allocator, io, manifest_path, .{
-                .status = .failed,
-                .recipe = recipe,
-                .artifact_root = recipe.artifacts.root,
-                .steps = step_manifests,
-            });
-            try writeTrainingReport(allocator, io, training_report_path, .{
-                .status = .failed,
-                .recipe = recipe,
-                .artifact_root = recipe.artifacts.root,
-                .steps = step_manifests,
-                .metadata = try collectReportMetadata(allocator, io, recipe, plan, manifest_path, training_config_path, training_report_path, static_metadata),
-            });
+            try writeFailedRunStatus(allocator, io, recipe, plan, step_manifests, manifest_path, training_config_path, training_report_path, static_metadata);
             return err;
         };
         defer allocator.free(result.stdout);
@@ -4275,37 +3783,13 @@ fn runPlan(
                 step_manifests[idx].exit_code = code;
                 step_manifests[idx].status = if (code == 0) .succeeded else .failed;
                 if (code != 0) {
-                    try writeRunManifest(allocator, io, manifest_path, .{
-                        .status = .failed,
-                        .recipe = recipe,
-                        .artifact_root = recipe.artifacts.root,
-                        .steps = step_manifests,
-                    });
-                    try writeTrainingReport(allocator, io, training_report_path, .{
-                        .status = .failed,
-                        .recipe = recipe,
-                        .artifact_root = recipe.artifacts.root,
-                        .steps = step_manifests,
-                        .metadata = try collectReportMetadata(allocator, io, recipe, plan, manifest_path, training_config_path, training_report_path, static_metadata),
-                    });
+                    try writeFailedRunStatus(allocator, io, recipe, plan, step_manifests, manifest_path, training_config_path, training_report_path, static_metadata);
                     return error.FinetuneStepFailed;
                 }
             },
             else => {
                 step_manifests[idx].status = .failed;
-                try writeRunManifest(allocator, io, manifest_path, .{
-                    .status = .failed,
-                    .recipe = recipe,
-                    .artifact_root = recipe.artifacts.root,
-                    .steps = step_manifests,
-                });
-                try writeTrainingReport(allocator, io, training_report_path, .{
-                    .status = .failed,
-                    .recipe = recipe,
-                    .artifact_root = recipe.artifacts.root,
-                    .steps = step_manifests,
-                    .metadata = try collectReportMetadata(allocator, io, recipe, plan, manifest_path, training_config_path, training_report_path, static_metadata),
-                });
+                try writeFailedRunStatus(allocator, io, recipe, plan, step_manifests, manifest_path, training_config_path, training_report_path, static_metadata);
                 return error.FinetuneStepFailed;
             },
         }
@@ -4635,6 +4119,7 @@ fn appendGemmaBootstrapAdapterArgs(
     }
     if (adapter.layer_name) |layer| try appendMany(allocator, list, &.{ "--layer-name", layer });
     if (adapter.use_dora orelse false) try list.append(allocator, "--use-dora");
+    if (adapter.initialization_seed) |seed| try appendMany(allocator, list, &.{ "--initialization-seed", try fmtInt(allocator, seed) });
     if (adapter.init_lora_weights) |init| try appendMany(allocator, list, &.{ "--init-lora-weights", init });
 }
 
@@ -4731,7 +4216,7 @@ fn collectStaticMetadata(allocator: std.mem.Allocator, io: std.Io, recipe: Recip
         .optimizer = .{
             .seed = recipe.optimizer.seed,
             .learning_rate = recipe.optimizer.learning_rate,
-            .weight_decay = recipe.optimizer.weight_decay,
+            .weight_decay = recipe.optimizer.weight_decay orelse if (eqlAny(recipe.model.family orelse "", &.{ "gemma", "gemma4" })) @as(f32, 0.01) else null,
             .lr_scheduler = recipe.optimizer.lr_scheduler,
             .warmup_ratio = recipe.optimizer.warmup_ratio,
             .warmup_steps = recipe.optimizer.warmup_steps,
@@ -5185,6 +4670,7 @@ fn gemmaPreferenceRunFingerprint(
     preferenceHashU64(&hasher, policy.max_seq_len);
     preferenceHashU64(&hasher, policy.epochs);
     preferenceHashF32(&hasher, policy.learning_rate);
+    preferenceHashF32(&hasher, recipe.optimizer.weight_decay orelse 0.01);
     preferenceHashF32(&hasher, policy.max_grad_norm);
     preferenceHashU64(&hasher, policy.requested_gradient_accumulation_steps);
     preferenceHashU64(&hasher, policy.physical_micro_batches_per_unit);
@@ -5194,6 +4680,10 @@ fn gemmaPreferenceRunFingerprint(
     preferenceHashU64(&hasher, @intFromBool(policy.direct_gguf_base));
     preferenceHashU64(&hasher, @intFromBool(policy.fused_linear_cross_entropy));
     preferenceHashU64(&hasher, policy.execution_flags);
+    var environment = try @import("training_environment.zig").capture(allocator);
+    defer environment.deinit();
+    preferenceHashField(&hasher, "training-environment/v1");
+    preferenceHashField(&hasher, &environment.sha256);
     preferenceHashU64(&hasher, policy.metal_numerical_policy_flags);
     preferenceHashOptionalU64(&hasher, policy.metal_sparse_loss_chunk_rows);
     preferenceHashOptionalU64(&hasher, policy.metal_linear_cce_tile_vocab);
@@ -5229,7 +4719,7 @@ fn gemmaPreferenceRunFingerprint(
         preferenceHashOptionalF32(&hasher, policy.grpo_sampling_temperature);
         preferenceHashOptionalF32(&hasher, policy.grpo_sampling_top_p);
         preferenceHashOptionalU64(&hasher, policy.grpo_sampling_top_k);
-        preferenceHashField(&hasher, "grpo-objective/v1");
+        preferenceHashField(&hasher, "grpo-objective/temperature-scaled-v2");
         preferenceHashOptionalField(&hasher, policy.grpo_loss_type);
         preferenceHashOptionalField(&hasher, policy.grpo_scale_rewards);
         preferenceHashOptionalF32(&hasher, policy.grpo_epsilon_high);
@@ -9058,7 +8548,7 @@ fn runOptimizerBackedGemmaDpo(
 
     var trainer = try @import("real_autodiff_trainer.zig").RealAutodiffTrainer.init(allocator, backend.backendPtr(), .{
         .lora = lora_config,
-        .optimizer = .{},
+        .optimizer = .{ .weight_decay = recipe.optimizer.weight_decay orelse 0.01 },
         .lr_schedule = .{ .constant = recipe.optimizer.learning_rate orelse 0.0001 },
         .max_grad_norm = recipe.optimizer.max_grad_norm orelse 1.0,
         .grad_accum_steps = grad_accum_steps,
@@ -9129,6 +8619,8 @@ fn runOptimizerBackedGemmaDpo(
     if (in_frame_buffer_reuse_enabled) dpo_execution_flags |= @as(u64, 1) << 8;
     if (dpo_checkpoint_config != null) dpo_execution_flags |= @as(u64, 1) << 9;
     if (ctx.enable_fused_gqa_attention_backward) dpo_execution_flags |= @as(u64, 1) << 10;
+    var numerical_environment = try @import("training_environment.zig").capture(allocator);
+    defer numerical_environment.deinit();
     const metal_numerical_policy = resolveGemmaMetalNumericalPolicy(backend_kind, &ctx);
     const dpo_run_fingerprint = try gemmaPreferenceRunFingerprint(
         allocator,
@@ -9759,7 +9251,7 @@ fn runOptimizerBackedGemmaDpo(
             evaluation_backend.backendPtr(),
             .{
                 .lora = lora_config,
-                .optimizer = .{},
+                .optimizer = .{ .weight_decay = recipe.optimizer.weight_decay orelse 0.01 },
                 .lr_schedule = .{ .constant = recipe.optimizer.learning_rate orelse 0.0001 },
                 .max_grad_norm = recipe.optimizer.max_grad_norm orelse 1.0,
                 .grad_accum_steps = grad_accum_steps,
@@ -9956,6 +9448,8 @@ fn runOptimizerBackedGemmaDpo(
             .restored_accumulation_micro_batches = dpo_restored.accumulation_micro_batches,
         },
         .metal_numerical_policy = metal_numerical_policy,
+        .numerical_environment_overrides = numerical_environment.assignments,
+        .optimizer_weight_decay = recipe.optimizer.weight_decay orelse 0.01,
         .evaluation_execution_policy = canonical_preference_evaluation_policy,
         .baseline_evaluation = baseline_evaluation,
         .baseline_relative = baseline_relative,
@@ -10002,6 +9496,7 @@ fn evaluateGemmaDpoHeldout(
             .policy_adapter_digest = policy_adapter_digest,
             .policy_backend = @tagName(backend_kind),
             .metal_numerical_policy = resolveGemmaMetalNumericalPolicy(backend_kind, ctx),
+            .optimizer_weight_decay = recipe.optimizer.weight_decay orelse 0.01,
             .examples = samples.samples.len,
             .prompt_overlap_count = overlap_count,
             .loss = 0.0,
@@ -10172,6 +9667,7 @@ fn evaluateGemmaDpoHeldout(
         .policy_adapter_digest = policy_adapter_digest,
         .policy_backend = @tagName(backend_kind),
         .metal_numerical_policy = resolveGemmaMetalNumericalPolicy(backend_kind, ctx),
+        .optimizer_weight_decay = recipe.optimizer.weight_decay orelse 0.01,
         .examples = samples.samples.len,
         .prompt_overlap_count = 0,
         .loss = result.loss,
@@ -10625,7 +10121,7 @@ fn runOptimizerBackedGemmaGrpo(
     const grpo_graph_cache_capacity: u8 = if (batch_multi_token_group_backward or compiled_sampling_requested) 2 else 1;
     var trainer = try real_autodiff.RealAutodiffTrainer.init(allocator, backend.backendPtr(), .{
         .lora = lora_config,
-        .optimizer = .{},
+        .optimizer = .{ .weight_decay = recipe.optimizer.weight_decay orelse 0.01 },
         .lr_schedule = .{ .constant = recipe.optimizer.learning_rate orelse 0.0001 },
         .max_grad_norm = recipe.optimizer.max_grad_norm orelse 1.0,
         .grad_accum_steps = grad_accum_steps,
@@ -10671,6 +10167,7 @@ fn runOptimizerBackedGemmaGrpo(
     };
 
     var ctx = gemma4_real_autodiff.GemmaAutodiffCtx.init(graph_config);
+    ctx.policy_temperature = resolved_sampling.temperature;
     ctx.enable_fused_rms_norm_backward = backend_kind == .metal;
     ctx.enable_fused_gqa_attention_backward = backend_kind == .metal and gemma4_real_autodiff.fusedGqaAttentionExperimentEnabled(graph_config);
     ctx.enable_fused_linear_cross_entropy = backend_kind == .metal and
@@ -10682,6 +10179,13 @@ fn runOptimizerBackedGemmaGrpo(
     const bootstrap_example = try buildGemmaPreparedExampleFromTokens(allocator, bootstrap_prompt, &bootstrap_completion, max_seq_len);
     defer freeGemmaPreparedExample(allocator, &bootstrap_example);
     try gemma4_real_autodiff.initializeTrainerFromAdapterDir(allocator, &trainer, &ctx, bootstrap_dir, &bootstrap_example, @intCast(max_seq_len));
+    // Freeze the starting adapter before checkpoint restore mutates the live policy.
+    const reference_base_equivalent = gemmaLoraAdapterIsBaseEquivalent(&trainer);
+    var frozen_lora = if (reference_base_equivalent)
+        try gemma4_real_autodiff.FrozenBaseLoraBindings.init(allocator, &trainer)
+    else
+        try gemma4_real_autodiff.FrozenBaseLoraBindings.initSnapshot(allocator, &trainer);
+    defer frozen_lora.deinit();
 
     const incremental_kv_enabled = gemmaGrpoIncrementalKvEnabled(recipe);
     if (incremental_kv_enabled and compiled_sampling_requested) {
@@ -10720,6 +10224,9 @@ fn runOptimizerBackedGemmaGrpo(
     if (incremental_kv_shadow_exact) grpo_execution_flags |= @as(u64, 1) << 8;
     if (ctx.enable_fused_gqa_attention_backward) grpo_execution_flags |= @as(u64, 1) << 9;
     if (compiled_sampling_requested) grpo_execution_flags |= @as(u64, 1) << 10;
+    if (!reference_base_equivalent) grpo_execution_flags |= @as(u64, 1) << 11;
+    var numerical_environment = try @import("training_environment.zig").capture(allocator);
+    defer numerical_environment.deinit();
     const metal_numerical_policy = resolveGemmaMetalNumericalPolicy(backend_kind, &ctx);
     const grpo_run_fingerprint = try gemmaPreferenceRunFingerprint(
         allocator,
@@ -10775,6 +10282,49 @@ fn runOptimizerBackedGemmaGrpo(
     );
     const grpo_run_fingerprint_text = try formatSha256DigestAlloc(allocator, grpo_run_fingerprint);
     defer allocator.free(grpo_run_fingerprint_text);
+    // Baseline acceptance compares against the immutable initial adapter, including on resume.
+    const grpo_minimums = recipe.eval.?.grpo_minimums.?;
+    const grpo_baseline_report_path = if (grpo_minimums.min_mean_reward_improvement != null)
+        try preferenceBaselineEvaluationReportPath(allocator, recipe, .grpo)
+    else
+        null;
+    defer if (grpo_baseline_report_path) |path| allocator.free(path);
+    const grpo_baseline_reward_trace_path = if (grpo_baseline_report_path != null)
+        try defaultArtifactPath(allocator, recipe, "grpo_baseline_evaluation_reward_trace.jsonl")
+    else
+        null;
+    defer if (grpo_baseline_reward_trace_path) |path| allocator.free(path);
+    const grpo_baseline_exchange_dir = if (grpo_baseline_report_path != null)
+        try defaultArtifactPath(allocator, recipe, "grpo-baseline-reward-verifier-exchanges")
+    else
+        null;
+    defer if (grpo_baseline_exchange_dir) |path| allocator.free(path);
+    var baseline_recipe = recipe;
+    var baseline_reward = recipe.reward orelse RewardConfig{};
+    if (grpo_baseline_reward_trace_path) |path| baseline_reward.evaluation_trace_path = path;
+    if (grpo_baseline_exchange_dir) |path| baseline_reward.exchange_dir = path;
+    if (grpo_baseline_report_path != null) baseline_recipe.reward = baseline_reward;
+    const baseline_evaluation: ?GrpoEvaluationSummary = if (grpo_baseline_report_path) |path|
+        try evaluateGemmaGrpoHeldout(
+            allocator,
+            io,
+            baseline_recipe,
+            tokenizer_view,
+            prompt_batch.prompts,
+            &trainer,
+            &ctx,
+            null,
+            &frozen_lora,
+            max_seq_len,
+            group_size,
+            max_completion_tokens,
+            backend_kind,
+            path,
+            false,
+        )
+    else
+        null;
+
     const grpo_checkpoint_path = try preferenceCheckpointPath(allocator, recipe, .grpo);
     defer if (grpo_checkpoint_path) |path| allocator.free(path);
     const grpo_resume_enabled = if (recipe.checkpoint) |checkpoint| checkpoint.resume_path != null else false;
@@ -10871,8 +10421,6 @@ fn runOptimizerBackedGemmaGrpo(
         state.initial_base_equivalent_policy
     else
         current_base_equivalent_policy;
-    var frozen_lora = try gemma4_real_autodiff.FrozenBaseLoraBindings.init(allocator, &trainer);
-    defer frozen_lora.deinit();
     var reference_cache = GemmaGrpoReferenceCache.init(allocator, 1024);
     defer reference_cache.deinit();
     if (restored_grpo_aggregates) |state| {
@@ -10885,48 +10433,6 @@ fn runOptimizerBackedGemmaGrpo(
             return error.CompiledGrpoReferenceCacheCheckpointRequired;
         }
     }
-
-    const grpo_minimums = recipe.eval.?.grpo_minimums.?;
-    const grpo_baseline_report_path = if (grpo_minimums.min_mean_reward_improvement != null)
-        try preferenceBaselineEvaluationReportPath(allocator, recipe, .grpo)
-    else
-        null;
-    defer if (grpo_baseline_report_path) |path| allocator.free(path);
-    const grpo_baseline_reward_trace_path = if (grpo_baseline_report_path != null)
-        try defaultArtifactPath(allocator, recipe, "grpo_baseline_evaluation_reward_trace.jsonl")
-    else
-        null;
-    defer if (grpo_baseline_reward_trace_path) |path| allocator.free(path);
-    const grpo_baseline_exchange_dir = if (grpo_baseline_report_path != null)
-        try defaultArtifactPath(allocator, recipe, "grpo-baseline-reward-verifier-exchanges")
-    else
-        null;
-    defer if (grpo_baseline_exchange_dir) |path| allocator.free(path);
-    var baseline_recipe = recipe;
-    var baseline_reward = recipe.reward orelse RewardConfig{};
-    if (grpo_baseline_reward_trace_path) |path| baseline_reward.evaluation_trace_path = path;
-    if (grpo_baseline_exchange_dir) |path| baseline_reward.exchange_dir = path;
-    if (grpo_baseline_report_path != null) baseline_recipe.reward = baseline_reward;
-    const baseline_evaluation: ?GrpoEvaluationSummary = if (grpo_baseline_report_path) |path|
-        try evaluateGemmaGrpoHeldout(
-            allocator,
-            io,
-            baseline_recipe,
-            tokenizer_view,
-            prompt_batch.prompts,
-            &trainer,
-            &ctx,
-            null,
-            &frozen_lora,
-            max_seq_len,
-            group_size,
-            max_completion_tokens,
-            backend_kind,
-            path,
-            false,
-        )
-    else
-        null;
 
     var reward_pipeline = try RewardPipeline.init(
         allocator,
@@ -11735,7 +11241,7 @@ fn runOptimizerBackedGemmaGrpo(
             evaluation_backend.backendPtr(),
             .{
                 .lora = lora_config,
-                .optimizer = .{},
+                .optimizer = .{ .weight_decay = recipe.optimizer.weight_decay orelse 0.01 },
                 .lr_schedule = .{ .constant = recipe.optimizer.learning_rate orelse 0.0001 },
                 .max_grad_norm = recipe.optimizer.max_grad_norm orelse 1.0,
                 .grad_accum_steps = grad_accum_steps,
@@ -11773,6 +11279,7 @@ fn runOptimizerBackedGemmaGrpo(
         };
 
         var evaluation_ctx = gemma4_real_autodiff.GemmaAutodiffCtx.init(graph_config);
+        evaluation_ctx.policy_temperature = ctx.policy_temperature;
         evaluation_ctx.enable_fused_rms_norm_backward = ctx.enable_fused_rms_norm_backward;
         evaluation_ctx.enable_fused_gqa_attention_backward = ctx.enable_fused_gqa_attention_backward;
         evaluation_ctx.enable_fused_linear_cross_entropy = ctx.enable_fused_linear_cross_entropy;
@@ -11790,12 +11297,13 @@ fn runOptimizerBackedGemmaGrpo(
             &bootstrap_example,
             @intCast(max_seq_len),
         );
-        try evaluation_trainer.initializeTerminalEvaluationFromHostSnapshot(&trainer);
-        var evaluation_frozen_lora = try gemma4_real_autodiff.FrozenBaseLoraBindings.init(
-            allocator,
-            &evaluation_trainer,
-        );
+        // Snapshot the original adapter before installing terminal policy weights.
+        var evaluation_frozen_lora = if (reference_base_equivalent)
+            try gemma4_real_autodiff.FrozenBaseLoraBindings.init(allocator, &evaluation_trainer)
+        else
+            try gemma4_real_autodiff.FrozenBaseLoraBindings.initSnapshot(allocator, &evaluation_trainer);
         defer evaluation_frozen_lora.deinit();
+        try evaluation_trainer.initializeTerminalEvaluationFromHostSnapshot(&trainer);
         var evaluation_incremental_kv_sampler: ?gemma4_real_autodiff.GrpoIncrementalKvSampler = if (incremental_kv_requested)
             try gemma4_real_autodiff.GrpoIncrementalKvSampler.init(
                 allocator,
@@ -11934,7 +11442,9 @@ fn runOptimizerBackedGemmaGrpo(
         .incremental_kv = training_incremental_kv,
         .policy_rescore_seconds = total_policy_rescore_seconds,
         .backward_update_seconds = total_backward_update_seconds,
-        .reference_mode = if (batch_single_token_group_scoring)
+        .reference_mode = if (!reference_base_equivalent)
+            "compiled-initial-adapter-snapshot"
+        else if (batch_single_token_group_scoring)
             "compiled-zero-lora-shared-prompt-candidate-row"
         else if (batch_multi_token_group_scoring)
             "compiled-zero-lora-batched-completion-rows"
@@ -11972,6 +11482,8 @@ fn runOptimizerBackedGemmaGrpo(
         },
         .reward_pipeline = reward_pipeline.telemetry(),
         .metal_numerical_policy = metal_numerical_policy,
+        .numerical_environment_overrides = numerical_environment.assignments,
+        .optimizer_weight_decay = recipe.optimizer.weight_decay orelse 0.01,
         .evaluation_execution_policy = canonical_preference_evaluation_policy,
         .baseline_evaluation = baseline_evaluation,
         .baseline_relative = baseline_relative,
@@ -12032,6 +11544,7 @@ fn evaluateGemmaGrpoHeldout(
             .policy_adapter_digest = policy_adapter_digest,
             .policy_backend = @tagName(backend_kind),
             .metal_numerical_policy = resolveGemmaMetalNumericalPolicy(backend_kind, ctx),
+            .optimizer_weight_decay = recipe.optimizer.weight_decay orelse 0.01,
             .groups = 0,
             .completions = 0,
             .tokens = 0,
@@ -12046,7 +11559,7 @@ fn evaluateGemmaGrpoHeldout(
             .mean_kl = 0.0,
             .clip_fraction = 0.0,
             .minimums = minimums,
-            .reference_mode = "compiled-zero-lora",
+            .reference_mode = if (frozen_lora.is_snapshot) "compiled-initial-adapter-snapshot" else "compiled-zero-lora",
             .reward_pipeline = reward_pipeline.telemetry(),
         });
         return error.PreferenceTrainEvalPromptOverlap;
@@ -12380,6 +11893,7 @@ fn evaluateGemmaGrpoHeldout(
         .policy_adapter_digest = policy_adapter_digest,
         .policy_backend = @tagName(backend_kind),
         .metal_numerical_policy = resolveGemmaMetalNumericalPolicy(backend_kind, ctx),
+        .optimizer_weight_decay = recipe.optimizer.weight_decay orelse 0.01,
         .groups = total_groups,
         .completions = total_completions,
         .tokens = total_tokens,
@@ -12403,7 +11917,9 @@ fn evaluateGemmaGrpoHeldout(
         .mean_kl = @floatCast(mean_unweighted_kl),
         .clip_fraction = @floatCast(total_clip_fraction / group_denom),
         .minimums = minimums,
-        .reference_mode = if (batch_single_token_group_scoring)
+        .reference_mode = if (frozen_lora.is_snapshot)
+            "compiled-initial-adapter-snapshot"
+        else if (batch_single_token_group_scoring)
             "compiled-zero-lora-shared-prompt-candidate-row"
         else if (batch_multi_token_group_scoring)
             "compiled-zero-lora-batched-completion-rows"
@@ -13415,7 +12931,7 @@ fn validateGemmaPreferenceEnvironmentAssignment(name: []const u8, value: []const
 }
 
 fn validateGemmaPreferenceEnvironmentContract(backend_kind: gemma4_real_autodiff.BackendKind) !void {
-    if (backend_kind != .metal) return;
+    _ = backend_kind;
     const builtin = @import("builtin");
     if (comptime builtin.os.tag == .windows or !builtin.link_libc) return error.UnsupportedBackend;
 
@@ -15111,7 +14627,11 @@ test "gemma4 lora recipe rejects options the trainer cannot honor" {
 
     recipe = base;
     recipe.optimizer.weight_decay = 0;
-    try std.testing.expectError(error.UnsupportedGemma4OptimizerOption, buildPlan(std.heap.page_allocator, recipe));
+    const no_decay_plan = try buildPlan(std.heap.page_allocator, recipe);
+    defer freePlan(std.heap.page_allocator, no_decay_plan);
+    try expectArgValue(no_decay_plan.steps[no_decay_plan.steps.len - 1].argv, "--weight-decay", "0");
+    recipe.optimizer.weight_decay = -1;
+    try std.testing.expectError(error.InvalidWeightDecay, buildPlan(std.heap.page_allocator, recipe));
     recipe = base;
     recipe.optimizer.lr_scheduler = "cosine";
     try std.testing.expectError(error.UnsupportedGemma4OptimizerOption, buildPlan(std.heap.page_allocator, recipe));
@@ -15826,6 +15346,7 @@ test "gemma4 preference training preflight rejects ignored and conflicting optio
 
     var unsupported_seed = valid;
     unsupported_seed.recipe = "reranker";
+    unsupported_seed.execution.mode = null;
     unsupported_seed.optimizer.seed = 991;
     try std.testing.expectError(
         error.UnsupportedOptimizerSeed,
@@ -16939,4 +16460,47 @@ fn containsArg(args: []const []const u8, expected: []const u8) bool {
         if (std.mem.eql(u8, arg, expected)) return true;
     }
     return false;
+}
+
+test "gemma4 recipe rejects ignored execution and legacy native preference options" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.ExecutionModeOnlySupportedForPreference, buildPlan(allocator, .{
+        .kind = "lora-sft",
+        .model = .{ .family = "gemma4" },
+        .execution = .{ .mode = "score" },
+    }));
+    try std.testing.expectError(error.UnsupportedPreferenceTrainingBackend, validateNativePreferenceOptions(.{ .backend = "metal" }));
+    try std.testing.expectError(error.UnsupportedPreferenceTrainingOption, validateNativePreferenceOptions(.{ .checkpoint = .{} }));
+    try std.testing.expectError(error.UnsupportedPreferenceTrainingOption, validateNativePreferenceOptions(.{ .eval = .{} }));
+    try std.testing.expectError(error.UnsupportedPreferenceTrainingOption, validateNativePreferenceOptions(.{ .runtime = .{} }));
+    try std.testing.expectError(error.UnsupportedPreferenceOptimizerOption, validateNativePreferenceOptions(.{ .optimizer = .{ .weight_decay = 0.0 } }));
+    try validateNativePreferenceOptions(.{ .backend = "native", .optimizer = .{ .learning_rate = 0.001 } });
+}
+
+test "gemma4 recipe passes adapter initialization seed to bootstrap" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var args: std.ArrayList([]const u8) = .empty;
+    defer args.deinit(allocator);
+    try appendGemmaBootstrapAdapterArgs(allocator, &args, .{ .initialization_seed = 991 }, .lora_sft);
+    try expectArgValue(args.items, "--initialization-seed", "991");
+}
+
+test "gemma4 recipe legacy lanes fail closed on ignored optimizer and evaluation fields" {
+    var recipe = Recipe{};
+    recipe.optimizer.weight_decay = 0;
+    try std.testing.expectError(error.UnsupportedRecipeOptimizerOption, validateLegacyRecipeOptions(recipe, .layout));
+    try std.testing.expectError(error.UnsupportedPreferenceOptimizerOption, validateNativePreferenceOptions(recipe));
+    recipe.optimizer = .{};
+    recipe.eval = .{ .every_epochs = 1 };
+    try std.testing.expectError(error.UnsupportedRecipeEvaluationOption, validateLegacyRecipeOptions(recipe, .reranker));
+    recipe.eval = null;
+    recipe.dataset.eval_path = "heldout.jsonl";
+    try std.testing.expectError(error.UnsupportedRecipeEvaluationOption, validateLegacyRecipeOptions(recipe, .retrieval));
+    try std.testing.expectError(error.UnsupportedPreferenceTrainingOption, validateNativePreferenceOptions(recipe));
+    recipe.dataset.eval_path = null;
+    recipe.backend = "metal";
+    try std.testing.expectError(error.UnsupportedRecipeBackend, validateLegacyRecipeOptions(recipe, .layout));
+    try std.testing.expectError(error.UnsupportedPreferenceTrainingBackend, validateNativePreferenceOptions(recipe));
 }

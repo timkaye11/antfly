@@ -32,7 +32,13 @@ from build_and_attest_gemma4_mlx import (
     verify_pinned_source,
     verify_published_build,
 )
-from gemma4_oracle_contract import ContractError, LOCK_PATH, load_json, load_lock, prefixed_sha256
+from gemma4_oracle_contract import (
+    ContractError,
+    LOCK_PATH,
+    load_json,
+    load_lock,
+    prefixed_sha256,
+)
 
 
 class MlxNativeBuildAttesterTest(unittest.TestCase):
@@ -109,7 +115,9 @@ class MlxNativeBuildAttesterTest(unittest.TestCase):
         (library / "mlx.metallib").write_bytes(b"metal")
         return package
 
-    def init_mlx_repo(self, root: Path, *, ignored: str = "build/\n") -> tuple[Path, str]:
+    def init_mlx_repo(
+        self, root: Path, *, ignored: str = "build/\n"
+    ) -> tuple[Path, str]:
         source = (root / "mlx").resolve()
         source.mkdir()
         (source / ".gitignore").write_text(ignored, encoding="utf-8")
@@ -148,7 +156,9 @@ class MlxNativeBuildAttesterTest(unittest.TestCase):
         ).stdout.strip()
         return source, revision
 
-    def test_dependency_tree_is_closed_deterministic_and_ignores_git_metadata(self) -> None:
+    def test_dependency_tree_is_closed_deterministic_and_ignores_git_metadata(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             source = root / "dep"
@@ -164,16 +174,23 @@ class MlxNativeBuildAttesterTest(unittest.TestCase):
             (source / ".git" / "noise").write_text("ignored", encoding="utf-8")
             self.assertEqual(identity, dependency_tree_identity(source))
             first.chmod(0o755)
-            self.assertNotEqual(identity["tree_sha256"], dependency_tree_identity(source)["tree_sha256"])
+            self.assertNotEqual(
+                identity["tree_sha256"], dependency_tree_identity(source)["tree_sha256"]
+            )
             (source / "link").symlink_to(first)
             with self.assertRaisesRegex(ContractError, "symbolic link"):
                 dependency_tree_identity(source)
 
-    def test_build_inputs_are_strict_and_verify_explicit_tree_and_tool_pins(self) -> None:
+    def test_build_inputs_are_strict_and_verify_explicit_tree_and_tool_pins(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             manifest_path, inputs = self.make_inputs(Path(temporary).resolve())
             self.assertEqual(4, inputs.jobs)
-            self.assertEqual(("fmt", "json", "metal_cpp", "nanobind"), tuple(pin.name for pin in inputs.dependencies))
+            self.assertEqual(
+                ("fmt", "json", "metal_cpp", "nanobind"),
+                tuple(pin.name for pin in inputs.dependencies),
+            )
             raw = load_json(manifest_path)
             raw["unknown"] = True
             manifest_path.write_text(json.dumps(raw), encoding="utf-8")
@@ -196,7 +213,9 @@ class MlxNativeBuildAttesterTest(unittest.TestCase):
             with self.assertRaisesRegex(ContractError, "JACCL"):
                 load_build_inputs(manifest_path)
 
-    def test_build_command_is_fetch_disconnected_and_truthful_about_shell_and_network(self) -> None:
+    def test_build_command_is_fetch_disconnected_and_truthful_about_shell_and_network(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             _manifest_path, inputs = self.make_inputs(root)
@@ -213,13 +232,22 @@ class MlxNativeBuildAttesterTest(unittest.TestCase):
             toolchain = {"sdk_path": "/SDK"}
             source_identity = {"commit_unix_seconds": 123}
             command = build_command(paths, source_identity, inputs, toolchain)
-            self.assertEqual("antfly_mlx_native_build_command/v1", command["schema_version"])
+            self.assertEqual(
+                "antfly_mlx_native_build_command/v1", command["schema_version"]
+            )
             self.assertFalse(command["network_policy"]["top_level_shell"])
             self.assertTrue(command["network_policy"]["upstream_shell_commands"])
-            self.assertEqual("not_enforced", command["network_policy"]["network_isolation"])
+            self.assertEqual(
+                "not_enforced", command["network_policy"]["network_isolation"]
+            )
             self.assertTrue(command["network_policy"]["fetchcontent_disconnected"])
-            self.assertIn("-DFETCHCONTENT_FULLY_DISCONNECTED=ON", command["environment"]["CMAKE_ARGS"])
-            self.assertIn("-DMLX_BUILD_PYTHON_STUBS=OFF", command["environment"]["CMAKE_ARGS"])
+            self.assertIn(
+                "-DFETCHCONTENT_FULLY_DISCONNECTED=ON",
+                command["environment"]["CMAKE_ARGS"],
+            )
+            self.assertIn(
+                "-DMLX_BUILD_PYTHON_STUBS=OFF", command["environment"]["CMAKE_ARGS"]
+            )
             self.assertIn("-DMLX_BUILD_GGUF=OFF", command["environment"]["CMAKE_ARGS"])
             self.assertIn(
                 "-DCMAKE_CXX_FLAGS=--driver-mode=g++",
@@ -229,13 +257,17 @@ class MlxNativeBuildAttesterTest(unittest.TestCase):
                 "com.apple.dt.toolchain.Metal.32023.864",
                 command["environment"]["TOOLCHAINS"],
             )
-            self.assertIn("-DCMAKE_OSX_SYSROOT=/SDK", command["environment"]["CMAKE_ARGS"])
+            self.assertIn(
+                "-DCMAKE_OSX_SYSROOT=/SDK", command["environment"]["CMAKE_ARGS"]
+            )
             self.assertEqual("1", command["environment"]["PIP_NO_INDEX"])
             self.assertNotIn("HTTP_PROXY", command["environment"])
             self.assertEqual("setup.py", command["argv"][1])
             self.assertIn("--inplace", command["argv"])
 
-    def test_generated_install_cleanup_is_exact_ignored_and_rejects_symlinks(self) -> None:
+    def test_generated_install_cleanup_is_exact_ignored_and_rejects_symlinks(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             source, _revision = self.init_mlx_repo(
                 Path(temporary).resolve(),
@@ -282,7 +314,9 @@ class MlxNativeBuildAttesterTest(unittest.TestCase):
             shadow_dir.mkdir()
             expected = self.make_tool(expected_dir, "cmake")
             shadow = self.make_tool(shadow_dir, "cmake")
-            identity = resolve_bare_build_commands(str(expected_dir), {"cmake": expected})
+            identity = resolve_bare_build_commands(
+                str(expected_dir), {"cmake": expected}
+            )
             self.assertEqual(str(expected), identity["cmake"]["path"])
             with self.assertRaisesRegex(ContractError, "resolves to"):
                 resolve_bare_build_commands(
@@ -294,29 +328,44 @@ class MlxNativeBuildAttesterTest(unittest.TestCase):
         lock = load_lock(LOCK_PATH)
         with tempfile.TemporaryDirectory() as temporary:
             package = self.make_native_package(Path(temporary))
-            inventory = discover_native_inventory(package, lock["mlx_reference"]["native_runtime"])
+            inventory = discover_native_inventory(
+                package, lock["mlx_reference"]["native_runtime"]
+            )
             self.assertEqual(
-                ("jaccl-runtime-dylib", "metal-library", "python-extension", "runtime-dylib"),
+                (
+                    "jaccl-runtime-dylib",
+                    "metal-library",
+                    "python-extension",
+                    "runtime-dylib",
+                ),
                 tuple(item["role"] for item in inventory["artifacts"]),
             )
             self.assertRegex(inventory["sha256"], r"^sha256:[0-9a-f]{64}$")
             (package / "lib" / "unexpected.dylib").write_bytes(b"extra")
             with self.assertRaisesRegex(ContractError, "closed four-artifact"):
-                discover_native_inventory(package, lock["mlx_reference"]["native_runtime"])
+                discover_native_inventory(
+                    package, lock["mlx_reference"]["native_runtime"]
+                )
 
-    def test_native_inventory_rejects_symlinks_and_multiple_core_extensions(self) -> None:
+    def test_native_inventory_rejects_symlinks_and_multiple_core_extensions(
+        self,
+    ) -> None:
         lock = load_lock(LOCK_PATH)
         with tempfile.TemporaryDirectory() as temporary:
             package = self.make_native_package(Path(temporary))
             (package / "core.other.so").write_bytes(b"other")
             with self.assertRaisesRegex(ContractError, "exactly one"):
-                discover_native_inventory(package, lock["mlx_reference"]["native_runtime"])
+                discover_native_inventory(
+                    package, lock["mlx_reference"]["native_runtime"]
+                )
         with tempfile.TemporaryDirectory() as temporary:
             package = self.make_native_package(Path(temporary))
             library = package / "lib"
             (library / "link.dylib").symlink_to(library / "libmlx.dylib")
             with self.assertRaisesRegex(ContractError, "symbolic link"):
-                discover_native_inventory(package, lock["mlx_reference"]["native_runtime"])
+                discover_native_inventory(
+                    package, lock["mlx_reference"]["native_runtime"]
+                )
 
     def test_source_must_be_exact_clean_root_and_output_must_be_ignored(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -325,7 +374,9 @@ class MlxNativeBuildAttesterTest(unittest.TestCase):
             lock["mlx_reference"]["source_revisions"]["mlx"] = revision
             identity = verify_pinned_source(source, lock)
             self.assertEqual(revision, identity["revision"])
-            paths = resolve_build_paths(source, source / "build" / "attested", must_exist=False)
+            paths = resolve_build_paths(
+                source, source / "build" / "attested", must_exist=False
+            )
             self.assertEqual(source / "build" / "attested", paths.output)
             ignored_residue = source / "build" / "stale.o"
             ignored_residue.parent.mkdir()
@@ -337,9 +388,13 @@ class MlxNativeBuildAttesterTest(unittest.TestCase):
             with self.assertRaisesRegex(ContractError, "clean"):
                 verify_pinned_source(source, lock)
         with tempfile.TemporaryDirectory() as temporary:
-            source, _revision = self.init_mlx_repo(Path(temporary).resolve(), ignored="")
+            source, _revision = self.init_mlx_repo(
+                Path(temporary).resolve(), ignored=""
+            )
             with self.assertRaisesRegex(ContractError, "gitignore"):
-                resolve_build_paths(source, source / "build" / "attested", must_exist=False)
+                resolve_build_paths(
+                    source, source / "build" / "attested", must_exist=False
+                )
 
     def test_atomic_publication_is_validated_and_never_replaces(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -373,7 +428,9 @@ class MlxNativeBuildAttesterTest(unittest.TestCase):
                     atomic_publish_json(path, {"schema_version": "test/v1"})
             self.assertFalse(path.exists())
 
-    def test_post_write_verification_binds_receipt_runtime_lock_and_attestation(self) -> None:
+    def test_post_write_verification_binds_receipt_runtime_lock_and_attestation(
+        self,
+    ) -> None:
         lock = load_lock(LOCK_PATH)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -403,7 +460,9 @@ class MlxNativeBuildAttesterTest(unittest.TestCase):
             ]
             toolchain = {"sdk_path": "/SDK", "identity": "test"}
             command = build_command(paths, source_identity, inputs, toolchain)
-            inventory = discover_native_inventory(package, lock["mlx_reference"]["native_runtime"])
+            inventory = discover_native_inventory(
+                package, lock["mlx_reference"]["native_runtime"]
+            )
             receipt = _receipt(
                 lock_sha256=prefixed_sha256(LOCK_PATH),
                 source_identity=source_identity,
@@ -417,11 +476,17 @@ class MlxNativeBuildAttesterTest(unittest.TestCase):
                 finished_unix_ns=2,
             )
             atomic_publish_json(paths.receipt, receipt)
-            atomic_publish_json(paths.attestation, _attestation(lock, source_identity, inventory, paths.receipt))
-            with mock.patch(
-                "build_and_attest_gemma4_mlx.verify_pinned_source",
-                return_value=source_identity,
-            ), mock.patch("build_and_attest_gemma4_mlx.require_closed_ignored_files"):
+            atomic_publish_json(
+                paths.attestation,
+                _attestation(lock, source_identity, inventory, paths.receipt),
+            )
+            with (
+                mock.patch(
+                    "build_and_attest_gemma4_mlx.verify_pinned_source",
+                    return_value=source_identity,
+                ),
+                mock.patch("build_and_attest_gemma4_mlx.require_closed_ignored_files"),
+            ):
                 result = verify_published_build(
                     paths,
                     lock,
@@ -433,10 +498,13 @@ class MlxNativeBuildAttesterTest(unittest.TestCase):
             self.assertTrue(result["ok"])
             (package / "lib" / "libmlx.dylib").chmod(0o644)
             (package / "lib" / "libmlx.dylib").write_bytes(b"tampered")
-            with mock.patch(
-                "build_and_attest_gemma4_mlx.verify_pinned_source",
-                return_value=source_identity,
-            ), mock.patch("build_and_attest_gemma4_mlx.require_closed_ignored_files"):
+            with (
+                mock.patch(
+                    "build_and_attest_gemma4_mlx.verify_pinned_source",
+                    return_value=source_identity,
+                ),
+                mock.patch("build_and_attest_gemma4_mlx.require_closed_ignored_files"),
+            ):
                 with self.assertRaisesRegex(ContractError, "outputs"):
                     verify_published_build(
                         paths,
@@ -452,7 +520,9 @@ class MlxNativeBuildAttesterTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             receipt = Path(temporary) / "receipt.json"
             receipt.write_text("{}\n", encoding="utf-8")
-            source_identity = {"revision": lock["mlx_reference"]["source_revisions"]["mlx"]}
+            source_identity = {
+                "revision": lock["mlx_reference"]["source_revisions"]["mlx"]
+            }
             inventory = {"sha256": "sha256:" + "a" * 64}
             attestation = _attestation(lock, source_identity, inventory, receipt)
             self.assertEqual(
@@ -466,7 +536,9 @@ class MlxNativeBuildAttesterTest(unittest.TestCase):
                 },
                 set(attestation),
             )
-            self.assertEqual(prefixed_sha256(receipt), attestation["build_command_sha256"])
+            self.assertEqual(
+                prefixed_sha256(receipt), attestation["build_command_sha256"]
+            )
 
 
 if __name__ == "__main__":

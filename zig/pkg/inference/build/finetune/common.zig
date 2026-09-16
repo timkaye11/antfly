@@ -137,6 +137,7 @@ pub const CommandSpec = struct {
 };
 
 pub const TestSpec = struct {
+    compile_max_rss: ?usize = null,
     step_name: []const u8,
     root_source_file: []const u8,
     description: []const u8,
@@ -199,7 +200,7 @@ pub fn addCommand(ctx: Context, spec: CommandSpec) Command {
 pub fn addTest(ctx: Context, spec: TestSpec) *std.Build.Step {
     const b = ctx.b;
     const test_exe = b.addTest(.{
-        .max_rss = ctx.test_compile_max_rss,
+        .max_rss = spec.compile_max_rss orelse ctx.test_compile_max_rss,
         .root_module = b.createModule(.{
             .root_source_file = ctx.path(spec.root_source_file),
             .target = ctx.target,

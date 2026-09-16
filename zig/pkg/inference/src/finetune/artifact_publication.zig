@@ -169,6 +169,13 @@ pub const ImmutableDirectoryPublication = struct {
     }
 };
 
+pub fn resolveEntryKind(dir: std.Io.Dir, io: std.Io, name: []const u8, kind: std.Io.File.Kind) !std.Io.File.Kind {
+    return if (kind == .unknown)
+        (try dir.statFile(io, name, .{ .follow_symlinks = false })).kind
+    else
+        kind;
+}
+
 fn syncDirectoryTree(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -181,22 +188,25 @@ fn syncDirectoryTree(
     defer dir.close(io);
 
     var iterator = dir.iterate();
-    while (try iterator.next(io)) |entry| switch (entry.kind) {
-        .file => {
-            var file = try dir.openFile(io, entry.name, .{});
-            defer file.close(io);
-            try file.sync(io);
-        },
-        .directory => {
-            const child = try std.fs.path.join(allocator, &.{ path, entry.name });
-            defer allocator.free(child);
-            try syncDirectoryTree(allocator, io, child);
-        },
-        // A fine-tuning artifact must be self-contained. Following symlinks
-        // here would make durability and provenance depend on mutable paths
-        // outside the transaction.
-        else => return error.UnsupportedArtifactEntry,
-    };
+    while (try iterator.next(io)) |entry| {
+        const kind = try resolveEntryKind(dir, io, entry.name, entry.kind);
+        switch (kind) {
+            .file => {
+                var file = try dir.openFile(io, entry.name, .{});
+                defer file.close(io);
+                try file.sync(io);
+            },
+            .directory => {
+                const child = try std.fs.path.join(allocator, &.{ path, entry.name });
+                defer allocator.free(child);
+                try syncDirectoryTree(allocator, io, child);
+            },
+            // A fine-tuning artifact must be self-contained. Following symlinks
+            // here would make durability and provenance depend on mutable paths
+            // outside the transaction.
+            else => return error.UnsupportedArtifactEntry,
+        }
+    }
     try syncDirectoryHandle(&dir);
 }
 
@@ -300,4 +310,16 @@ test "mutable file publication atomically replaces a complete generation" {
     const rendered = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(1024));
     defer std.testing.allocator.free(rendered);
     try std.testing.expectEqualStrings("{\"generation\":2}", rendered);
+}
+
+test "gemma4 artifact publication resolves unknown directory entry types without following links" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "weights", .data = "payload" });
+    try tmp.dir.createDirPath(io, "nested");
+    try tmp.dir.symLink(io, "weights", "link", .{});
+    try std.testing.expectEqual(std.Io.File.Kind.file, try resolveEntryKind(tmp.dir, io, "weights", .unknown));
+    try std.testing.expectEqual(std.Io.File.Kind.directory, try resolveEntryKind(tmp.dir, io, "nested", .unknown));
+    try std.testing.expectEqual(std.Io.File.Kind.sym_link, try resolveEntryKind(tmp.dir, io, "link", .unknown));
 }

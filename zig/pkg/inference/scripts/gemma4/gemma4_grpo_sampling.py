@@ -1,8 +1,9 @@
 """Host-side Gemma4 rollout sampling matching the pinned Zig 0.16 contract.
 
-Sampling changes token selection only; callers must score selected tokens with
-unmodified policy logits. This primitive does not qualify a GRPO campaign.
+Policy scores use temperature-scaled logits. Top-k/top-p filter rollouts only;
+the training objective retains the full vocabulary normalizer. This primitive does not qualify a GRPO campaign.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -17,14 +18,18 @@ EVAL_DOMAIN = 0x4752504F4556414C
 
 
 def _u64(value: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MASK64:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value <= MASK64
+    ):
         raise ValueError("seed and logical indices must be unsigned 64-bit integers")
     return value
 
 
 def _f32(value: float) -> float:
     try:
-        return struct.unpack('<f', struct.pack('<f', value))[0]
+        return struct.unpack("<f", struct.pack("<f", value))[0]
     except OverflowError:
         return math.copysign(math.inf, value)
 
@@ -87,15 +92,21 @@ class ZigRandom:
                     leading_zeroes = 1022
                     break
         bits = ((1022 - leading_zeroes) << 52) | (word & ((1 << 52) - 1))
-        return struct.unpack('<d', struct.pack('<Q', bits))[0]
+        return struct.unpack("<d", struct.pack("<Q", bits))[0]
 
 
 def ranked_tokens(logits: Sequence[float], count: int) -> list[int]:
     """Stable descending F32 scores, with the lowest token ID winning ties."""
     values = _logits(logits)
-    if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= len(values):
+    if (
+        isinstance(count, bool)
+        or not isinstance(count, int)
+        or not 1 <= count <= len(values)
+    ):
         raise ValueError("invalid ranked token count")
-    return heapq.nsmallest(count, range(len(values)), key=lambda token: (-values[token], token))
+    return heapq.nsmallest(
+        count, range(len(values)), key=lambda token: (-values[token], token)
+    )
 
 
 def _logits(logits: Sequence[float]) -> list[float]:
@@ -118,8 +129,8 @@ class SamplingPolicy:
         if not math.isfinite(top_p) or not 0 < top_p <= 1:
             raise ValueError("invalid sampling top-p")
         _u64(self.top_k)
-        object.__setattr__(self, 'temperature', temperature)
-        object.__setattr__(self, 'top_p', top_p)
+        object.__setattr__(self, "temperature", temperature)
+        object.__setattr__(self, "top_p", top_p)
 
     def select(self, logits: Sequence[float], draw: float) -> int:
         values = _logits(logits)
@@ -131,9 +142,14 @@ class SamplingPolicy:
             candidates = list(range(len(values)))
         else:
             count = min(self.top_k, len(values)) if self.top_k else len(values)
-            candidates = heapq.nsmallest(count, range(len(values)), key=lambda token: (-values[token], token))
+            candidates = heapq.nsmallest(
+                count, range(len(values)), key=lambda token: (-values[token], token)
+            )
         maximum = max(values[token] for token in candidates)
-        weights = [math.exp(_f32(values[token] - maximum) / self.temperature) for token in candidates]
+        weights = [
+            math.exp(_f32(values[token] - maximum) / self.temperature)
+            for token in candidates
+        ]
         # Explicit left-to-right sums: Python 3.12 sum(float) compensates, whereas
         # Zig's categorical CDF uses ordinary F64 accumulation.
         total = 0.0
@@ -144,7 +160,7 @@ class SamplingPolicy:
             for index, weight in enumerate(weights):
                 cumulative += weight
                 if cumulative >= self.top_p * total:
-                    candidates, weights = candidates[:index + 1], weights[:index + 1]
+                    candidates, weights = candidates[: index + 1], weights[: index + 1]
                     break
             total = 0.0
             for weight in weights:
@@ -161,9 +177,19 @@ class SamplingPolicy:
 class CompletionSampler:
     """Independent stream per completion; early EOS cannot perturb siblings."""
 
-    def __init__(self, *, run_seed: int, epoch: int, prompt_index: int,
-                 completion_index: int, evaluation: bool, policy: SamplingPolicy):
-        seed = group_seed(run_seed, EVAL_DOMAIN if evaluation else TRAIN_DOMAIN, epoch, prompt_index)
+    def __init__(
+        self,
+        *,
+        run_seed: int,
+        epoch: int,
+        prompt_index: int,
+        completion_index: int,
+        evaluation: bool,
+        policy: SamplingPolicy,
+    ):
+        seed = group_seed(
+            run_seed, EVAL_DOMAIN if evaluation else TRAIN_DOMAIN, epoch, prompt_index
+        )
         self.random = ZigRandom(completion_seed(seed, completion_index))
         self.greedy = evaluation and completion_index == 0
         self.policy = policy
@@ -176,9 +202,16 @@ class CompletionSampler:
 
 def categorical_rollout_group(
     predict: Callable[[Sequence[int]], Sequence[float]],
-    prompt: Sequence[int], *, run_seed: int, epoch: int, prompt_index: int,
-    evaluation: bool, policy: SamplingPolicy, group_size: int,
-    max_completion_tokens: int, eos_token_id: int,
+    prompt: Sequence[int],
+    *,
+    run_seed: int,
+    epoch: int,
+    prompt_index: int,
+    evaluation: bool,
+    policy: SamplingPolicy,
+    group_size: int,
+    max_completion_tokens: int,
+    eos_token_id: int,
 ) -> tuple[list[list[int]], list[list[float]]]:
     """Shared prompt, independent streams, and unmodified policy log-probabilities.
 
@@ -186,18 +219,33 @@ def categorical_rollout_group(
     The caller owns padding and model execution. EOS is included in the result;
     a completion ending at the budget is retained for the caller's mask policy.
     """
-    if not prompt or any(isinstance(t, bool) or not isinstance(t, int) or t < 0 for t in prompt):
+    if not prompt or any(
+        isinstance(t, bool) or not isinstance(t, int) or t < 0 for t in prompt
+    ):
         raise ValueError("rollout prompt must contain nonnegative integer token IDs")
-    if (isinstance(group_size, bool) or not isinstance(group_size, int) or group_size < 2
-            or isinstance(max_completion_tokens, bool)
-            or not isinstance(max_completion_tokens, int) or max_completion_tokens < 1
-            or isinstance(eos_token_id, bool) or not isinstance(eos_token_id, int)
-            or eos_token_id < 0):
+    if (
+        isinstance(group_size, bool)
+        or not isinstance(group_size, int)
+        or group_size < 2
+        or isinstance(max_completion_tokens, bool)
+        or not isinstance(max_completion_tokens, int)
+        or max_completion_tokens < 1
+        or isinstance(eos_token_id, bool)
+        or not isinstance(eos_token_id, int)
+        or eos_token_id < 0
+    ):
         raise ValueError("invalid rollout shape or EOS token")
-    samplers = [CompletionSampler(
-        run_seed=run_seed, epoch=epoch, prompt_index=prompt_index,
-        completion_index=i, evaluation=evaluation, policy=policy,
-    ) for i in range(group_size)]
+    samplers = [
+        CompletionSampler(
+            run_seed=run_seed,
+            epoch=epoch,
+            prompt_index=prompt_index,
+            completion_index=i,
+            evaluation=evaluation,
+            policy=policy,
+        )
+        for i in range(group_size)
+    ]
     sequences: list[list[int]] = [[] for _ in samplers]
     logps: list[list[float]] = [[] for _ in samplers]
     first = _logits(predict(list(prompt)))
@@ -207,12 +255,16 @@ def categorical_rollout_group(
         for i, sampler in enumerate(samplers):
             if sequences[i] and sequences[i][-1] == eos_token_id:
                 continue
-            logits = first if step == 0 else _logits(predict(list(prompt) + sequences[i]))
+            logits = (
+                first if step == 0 else _logits(predict(list(prompt) + sequences[i]))
+            )
             if len(logits) != len(first):
                 raise ValueError("rollout vocabulary changed between tokens")
             token = sampler.select(logits)
-            # Same unmodified, F64-normalized policy score as Zig. Sampling
-            # temperature/top-p/top-k affect selection only.
+            # Match Zig's F32 temperature division and F64 normalization.
+            # Filtering (including the greedy evaluation anchor) does not
+            # renormalize the full-support training policy.
+            logits = [_f32(value / _f32(policy.temperature)) for value in logits]
             maximum = max(logits)
             total = 0.0
             for value in logits:

@@ -49,10 +49,16 @@ def parse_candidate(value: str) -> Candidate:
     return Candidate(label=label, path=Path(raw_path))
 
 
-def compare_evaluations(left: Mapping[str, Any], right: Mapping[str, Any]) -> dict[str, Any]:
+def compare_evaluations(
+    left: Mapping[str, Any], right: Mapping[str, Any]
+) -> dict[str, Any]:
     left_rows = left.get("rows")
     right_rows = right.get("rows")
-    if not isinstance(left_rows, list) or not isinstance(right_rows, list) or not left_rows:
+    if (
+        not isinstance(left_rows, list)
+        or not isinstance(right_rows, list)
+        or not left_rows
+    ):
         raise dpo.DpoBenchmarkContractError("candidate evaluation rows are malformed")
     if len(left_rows) != len(right_rows):
         raise dpo.DpoBenchmarkContractError("candidate evaluation row counts differ")
@@ -63,7 +69,9 @@ def compare_evaluations(left: Mapping[str, Any], right: Mapping[str, Any]) -> di
     decision_agreements = []
     for index, (left_row, right_row) in enumerate(zip(left_rows, right_rows)):
         if left_row.get("index") != index or right_row.get("index") != index:
-            raise dpo.DpoBenchmarkContractError("candidate evaluation row order drifted")
+            raise dpo.DpoBenchmarkContractError(
+                "candidate evaluation row order drifted"
+            )
         loss_deltas.append(abs(float(left_row["loss"]) - float(right_row["loss"])))
         reward_margin_deltas.append(
             abs(float(left_row["reward_margin"]) - float(right_row["reward_margin"]))
@@ -88,7 +96,8 @@ def compare_evaluations(left: Mapping[str, Any], right: Mapping[str, Any]) -> di
     right_mean_reward_margin = float(right["mean_reward_margin"])
     return {
         "examples": len(left_rows),
-        "preference_decision_agreement": sum(decision_agreements) / len(decision_agreements),
+        "preference_decision_agreement": sum(decision_agreements)
+        / len(decision_agreements),
         "accuracy_abs_delta": abs(float(left["accuracy"]) - float(right["accuracy"])),
         "mean_loss_abs_delta": abs(float(left["mean_loss"]) - right_mean_loss),
         "mean_loss_ratio": (
@@ -108,7 +117,8 @@ def compare_evaluations(left: Mapping[str, Any], right: Mapping[str, Any]) -> di
         "row_loss_max_abs": max(loss_deltas),
         "row_reward_margin_mae": sum(reward_margin_deltas) / len(reward_margin_deltas),
         "policy_chosen_logp_mae": sum(policy_chosen_deltas) / len(policy_chosen_deltas),
-        "policy_rejected_logp_mae": sum(policy_rejected_deltas) / len(policy_rejected_deltas),
+        "policy_rejected_logp_mae": sum(policy_rejected_deltas)
+        / len(policy_rejected_deltas),
     }
 
 
@@ -119,7 +129,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "adapter evaluation requires a provenance-bound dataset case"
         )
     if len(args.candidate) < 2:
-        raise dpo.DpoBenchmarkContractError("adapter evaluation requires at least two candidates")
+        raise dpo.DpoBenchmarkContractError(
+            "adapter evaluation requires at least two candidates"
+        )
     labels = [candidate.label for candidate in args.candidate]
     if len(set(labels)) != len(labels):
         raise dpo.DpoBenchmarkContractError("candidate labels must be unique")
@@ -168,9 +180,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     mlx_revision = mlx_checkout["revision"]
     mlx_lm_revision = mlx_lm_checkout["revision"]
     if platform.system() != mlx_contract["required_platform"]:
-        raise dpo.DpoBenchmarkContractError("MLX evaluation must run on the locked platform")
+        raise dpo.DpoBenchmarkContractError(
+            "MLX evaluation must run on the locked platform"
+        )
     if platform.machine() != mlx_contract["required_machine"]:
-        raise dpo.DpoBenchmarkContractError("MLX evaluation must run on the locked machine")
+        raise dpo.DpoBenchmarkContractError(
+            "MLX evaluation must run on the locked machine"
+        )
 
     try:
         dpo.locked.verify_requirements_match_lock(
@@ -244,9 +260,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     contract_dir = args.adapter_contract_dir.expanduser().resolve()
     try:
         manifest = json.loads(
-            (contract_dir / "antfly_finetune_manifest.json").read_text(
-                encoding="utf-8"
-            )
+            (contract_dir / "antfly_finetune_manifest.json").read_text(encoding="utf-8")
         )
     except (OSError, json.JSONDecodeError) as exc:
         raise dpo.DpoBenchmarkContractError(
@@ -291,15 +305,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         lora_source_path,
     ]
     bound_input_paths.append(
-        (
-            case.source_path.parent
-            / Path(case.dataset["materialized_jsonl"])
-        ).resolve()
+        (case.source_path.parent / Path(case.dataset["materialized_jsonl"])).resolve()
     )
     try:
-        bound_input_identities = dpo.locked.capture_file_identities(
-            bound_input_paths
-        )
+        bound_input_identities = dpo.locked.capture_file_identities(bound_input_paths)
     except dpo.locked.ContractError as exc:
         raise dpo.DpoBenchmarkContractError(
             f"could not bind immutable DPO evaluation inputs: {exc}"
@@ -387,16 +396,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if {name for name, _module in updates} != target_set:
             raise dpo.DpoBenchmarkContractError("incomplete LoRA target conversion")
         model.update_modules(tree_unflatten(updates))
-        trainable_inventory = dpo.locked.require_exact_trainables(
-            model, targets, mx
-        )
+        trainable_inventory = dpo.locked.require_exact_trainables(model, targets, mx)
         model.eval()
 
         evaluations: dict[str, Any] = {}
         for candidate, candidate_path in zip(args.candidate, candidate_paths):
-            candidate_sha256 = "sha256:" + hashlib.sha256(
-                candidate_path.read_bytes()
-            ).hexdigest()
+            candidate_sha256 = (
+                "sha256:" + hashlib.sha256(candidate_path.read_bytes()).hexdigest()
+            )
             artifact = replace(
                 adapter_contract,
                 checkpoint=candidate_path,
@@ -445,12 +452,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     try:
         dpo.locked.require_files_unchanged(bound_input_identities)
-        dpo.locked.require_files_unchanged(
-            native_runtime["bound_file_identities"]
-        )
-        post_model = dpo.locked.verify_model_directory(
-            lock, case.model_key, model_dir
-        )
+        dpo.locked.require_files_unchanged(native_runtime["bound_file_identities"])
+        post_model = dpo.locked.verify_model_directory(lock, case.model_key, model_dir)
         if post_model != locked_model:
             raise dpo.locked.ContractError(
                 "locked model identity drifted during evaluation"
@@ -523,9 +526,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "python_version": actual_python,
         "locked_model": locked_model,
         "mlx_native_runtime": {
-            "native_artifact_inventory": native_runtime[
-                "native_artifact_inventory"
-            ],
+            "native_artifact_inventory": native_runtime["native_artifact_inventory"],
             "build_attestation": native_runtime["build_attestation"],
         },
         "mlx_core_path": str(core_path),
@@ -567,7 +568,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload = run(args)
         dpo.write_json_exclusive(args.output, payload)
     except (dpo.DpoBenchmarkContractError, dpo.locked.ContractError) as exc:
-        print(f"Gemma4 DPO MLX adapter evaluation contract error: {exc}", file=sys.stderr)
+        print(
+            f"Gemma4 DPO MLX adapter evaluation contract error: {exc}", file=sys.stderr
+        )
         return 2
     print(json.dumps(payload, indent=2, sort_keys=True))
     return 0

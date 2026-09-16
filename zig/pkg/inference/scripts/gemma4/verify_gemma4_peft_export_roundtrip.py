@@ -36,8 +36,15 @@ REQUIREMENTS_PATH = SCRIPT_DIR / "requirements-gemma4-oracle.txt"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--antfly", type=Path, required=True, help="ReleaseFast Antfly executable")
-    parser.add_argument("--work-dir", type=Path, required=True, help="new directory for durable smoke artifacts")
+    parser.add_argument(
+        "--antfly", type=Path, required=True, help="ReleaseFast Antfly executable"
+    )
+    parser.add_argument(
+        "--work-dir",
+        type=Path,
+        required=True,
+        help="new directory for durable smoke artifacts",
+    )
     return parser.parse_args()
 
 
@@ -60,9 +67,13 @@ def run_antfly(executable: Path, arguments: list[str]) -> dict[str, Any]:
     try:
         payload = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
-        raise ContractError(f"Antfly command did not emit one JSON object: {arguments}") from exc
+        raise ContractError(
+            f"Antfly command did not emit one JSON object: {arguments}"
+        ) from exc
     if not isinstance(payload, dict):
-        raise ContractError(f"Antfly command emitted a non-object JSON value: {arguments}")
+        raise ContractError(
+            f"Antfly command emitted a non-object JSON value: {arguments}"
+        )
     return payload
 
 
@@ -77,8 +88,13 @@ def require_same_adapter(left: dict[str, Any], right: dict[str, Any]) -> None:
         destination = right["tensors"].get(identity)
         if destination is None:
             raise ContractError(f"stock PEFT save omitted adapter tensor {identity}")
-        if source["shape"] != destination["shape"] or source["dtype"] != destination["dtype"]:
-            raise ContractError(f"stock PEFT save changed tensor metadata for {identity}")
+        if (
+            source["shape"] != destination["shape"]
+            or source["dtype"] != destination["dtype"]
+        ):
+            raise ContractError(
+                f"stock PEFT save changed tensor metadata for {identity}"
+            )
         if source["values"] != destination["values"]:
             raise ContractError(f"stock PEFT save changed tensor values for {identity}")
 
@@ -123,18 +139,49 @@ def main() -> int:
     created.save_pretrained(base_dir, safe_serialization=True)
     del created
 
-    bootstrap = run_antfly(executable, [
-        "inference", "finetune", "adapter", "bootstrap", "gemma4",
-        "--model", str(base_dir), "--out", str(internal_dir),
-        "--rank", "2", "--alpha", "4", "--target-preset", "peft-qv",
-    ])
-    exported = run_antfly(executable, [
-        "inference", "finetune", "adapter", "export", "gemma4-peft",
-        "--model", str(base_dir), "--adapter", str(internal_dir), "--out", str(export_dir),
-    ])
+    bootstrap = run_antfly(
+        executable,
+        [
+            "inference",
+            "finetune",
+            "adapter",
+            "bootstrap",
+            "gemma4",
+            "--model",
+            str(base_dir),
+            "--out",
+            str(internal_dir),
+            "--rank",
+            "2",
+            "--alpha",
+            "4",
+            "--target-preset",
+            "peft-qv",
+            "--init-lora-weights",
+            "default",
+        ],
+    )
+    exported = run_antfly(
+        executable,
+        [
+            "inference",
+            "finetune",
+            "adapter",
+            "export",
+            "gemma4-peft",
+            "--model",
+            str(base_dir),
+            "--adapter",
+            str(internal_dir),
+            "--out",
+            str(export_dir),
+        ],
+    )
     export_artifact = inspect_adapter_artifact(export_dir)
     if export_artifact["key_layout"] != "stock-peft/v1":
-        raise ContractError("Antfly export did not use the stock PEFT tensor-key layout")
+        raise ContractError(
+            "Antfly export did not use the stock PEFT tensor-key layout"
+        )
     if export_artifact["policy_source"] != "antfly-peft-export/v1":
         raise ContractError("Antfly export provenance sidecar was not recognized")
 
@@ -147,19 +194,29 @@ def main() -> int:
         adapted_logits = adapted(input_ids=input_ids).logits.detach()
     load_max_abs = float((adapted_logits - base_logits).abs().max().item())
     if load_max_abs != 0.0:
-        raise ContractError(f"zero-delta PEFT load changed logits: max_abs={load_max_abs}")
+        raise ContractError(
+            f"zero-delta PEFT load changed logits: max_abs={load_max_abs}"
+        )
 
     adapted.save_pretrained(peft_resaved_dir, safe_serialization=True)
-    resaved_artifact = inspect_adapter_artifact(peft_resaved_dir, target_preset="peft-qv")
+    resaved_artifact = inspect_adapter_artifact(
+        peft_resaved_dir, target_preset="peft-qv"
+    )
     require_same_adapter(export_artifact, resaved_artifact)
 
-    fresh_base = LlamaForCausalLM.from_pretrained(base_dir, local_files_only=True).eval()
-    reloaded = PeftModel.from_pretrained(fresh_base, peft_resaved_dir, local_files_only=True).eval()
+    fresh_base = LlamaForCausalLM.from_pretrained(
+        base_dir, local_files_only=True
+    ).eval()
+    reloaded = PeftModel.from_pretrained(
+        fresh_base, peft_resaved_dir, local_files_only=True
+    ).eval()
     with torch.no_grad():
         reloaded_logits = reloaded(input_ids=input_ids).logits.detach()
     roundtrip_max_abs = float((reloaded_logits - adapted_logits).abs().max().item())
     if roundtrip_max_abs != 0.0:
-        raise ContractError(f"stock PEFT save/reload changed logits: max_abs={roundtrip_max_abs}")
+        raise ContractError(
+            f"stock PEFT save/reload changed logits: max_abs={roundtrip_max_abs}"
+        )
 
     report = {
         "schema_version": "antfly_gemma4_peft_export_roundtrip/v1",
@@ -173,8 +230,12 @@ def main() -> int:
         "packages": packages,
         "bootstrap": bootstrap,
         "export": exported,
-        "export_adapter_model_sha256": prefixed_sha256(export_dir / "adapter_model.safetensors"),
-        "stock_resaved_adapter_model_sha256": prefixed_sha256(peft_resaved_dir / "adapter_model.safetensors"),
+        "export_adapter_model_sha256": prefixed_sha256(
+            export_dir / "adapter_model.safetensors"
+        ),
+        "stock_resaved_adapter_model_sha256": prefixed_sha256(
+            peft_resaved_dir / "adapter_model.safetensors"
+        ),
         "tensor_count": len(export_artifact["inventory"]),
         "peft_load_max_abs_logit_difference": load_max_abs,
         "peft_save_reload_max_abs_logit_difference": roundtrip_max_abs,

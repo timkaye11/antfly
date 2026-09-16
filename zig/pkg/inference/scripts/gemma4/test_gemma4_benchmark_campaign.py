@@ -42,13 +42,18 @@ class CampaignFixture:
                             "commands": {
                                 "antfly-zig-metal": [
                                     sys.executable,
-                                    str(SCRIPT_DIR / "run_antfly_gemma4_lora_benchmark.py"),
+                                    str(
+                                        SCRIPT_DIR
+                                        / "run_antfly_gemma4_lora_benchmark.py"
+                                    ),
                                     "--fixture",
                                     "antfly",
                                 ],
                                 "mlx-lm": [
                                     sys.executable,
-                                    str(SCRIPT_DIR / "run_gemma4_lora_mlx_benchmark.py"),
+                                    str(
+                                        SCRIPT_DIR / "run_gemma4_lora_mlx_benchmark.py"
+                                    ),
                                     "--fixture",
                                     "mlx",
                                 ],
@@ -83,14 +88,19 @@ class CampaignFixture:
                     ),
                     "repetition": int(self.option(argv, "--repetition")),
                     "sequence_index": sequence_index,
-                    "process": {"pid": 1000 + sequence_index, "started_unix_ns": 111 + sequence_index * 20},
+                    "process": {
+                        "pid": 1000 + sequence_index,
+                        "started_unix_ns": 111 + sequence_index * 20,
+                    },
                     "case": {"fixture": "e2b-peft-qv-s128-ga1"},
                     "implementation": {
                         "producer_source": {
                             "files": [
                                 {
                                     "relative_path": ORCHESTRATOR_RELATIVE_PATH,
-                                    "source_sha256": prefixed_sha256(CAMPAIGN_ORCHESTRATOR_PATH),
+                                    "source_sha256": prefixed_sha256(
+                                        CAMPAIGN_ORCHESTRATOR_PATH
+                                    ),
                                 }
                             ]
                         }
@@ -122,20 +132,39 @@ class CampaignFixture:
 class Gemma4BenchmarkCampaignTest(unittest.TestCase):
     def test_manifest_schema_tracks_the_closed_ledger_shape(self) -> None:
         schema = json.loads(
-            (SCRIPT_DIR / "gemma4_benchmark_campaign.schema.json").read_text(encoding="utf-8")
+            (SCRIPT_DIR / "gemma4_benchmark_campaign.schema.json").read_text(
+                encoding="utf-8"
+            )
         )
-        self.assertEqual(MANIFEST_SCHEMA_VERSION, schema["properties"]["schema_version"]["const"])
+        self.assertEqual(
+            MANIFEST_SCHEMA_VERSION, schema["properties"]["schema_version"]["const"]
+        )
         self.assertEqual(
             {
-                "schema_version", "status", "campaign_id", "created_unix_ns",
-                "completed_unix_ns", "plan", "orchestrator", "run_count", "runs",
+                "schema_version",
+                "status",
+                "campaign_id",
+                "created_unix_ns",
+                "completed_unix_ns",
+                "plan",
+                "orchestrator",
+                "run_count",
+                "runs",
             },
             set(schema["required"]),
         )
         self.assertEqual(
             {
-                "cell_id", "framework", "repetition", "sequence_index", "run_id",
-                "argv", "argv_sha256", "started_unix_ns", "completed_unix_ns", "sample",
+                "cell_id",
+                "framework",
+                "repetition",
+                "sequence_index",
+                "run_id",
+                "argv",
+                "argv_sha256",
+                "started_unix_ns",
+                "completed_unix_ns",
+                "sample",
             },
             set(schema["properties"]["runs"]["items"]["required"]),
         )
@@ -144,7 +173,9 @@ class Gemma4BenchmarkCampaignTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             fixture = CampaignFixture(Path(temporary))
             manifest_path = fixture.execute()
-            manifest = verify_complete_campaign_manifest(manifest_path, fixture.samples())
+            manifest = verify_complete_campaign_manifest(
+                manifest_path, fixture.samples()
+            )
 
             self.assertEqual(MANIFEST_SCHEMA_VERSION, manifest["schema_version"])
             self.assertEqual("complete", manifest["status"])
@@ -163,20 +194,28 @@ class Gemma4BenchmarkCampaignTest(unittest.TestCase):
             with self.assertRaisesRegex(ContractError, "refusing to replace"):
                 fixture.execute()
 
-    def test_relabelled_sample_is_rejected_even_when_artifact_hash_is_updated(self) -> None:
+    def test_relabelled_sample_is_rejected_even_when_artifact_hash_is_updated(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = CampaignFixture(Path(temporary))
             manifest_path = fixture.execute()
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            sample_path = fixture.output / manifest["runs"][0]["sample"]["relative_path"]
+            sample_path = (
+                fixture.output / manifest["runs"][0]["sample"]["relative_path"]
+            )
             sample = json.loads(sample_path.read_text(encoding="utf-8"))
             sample["sequence_index"] = 3
             sample_path.write_text(json.dumps(sample) + "\n", encoding="utf-8")
             data = sample_path.read_bytes()
-            manifest["runs"][0]["sample"]["sha256"] = "sha256:" + hashlib.sha256(data).hexdigest()
+            manifest["runs"][0]["sample"]["sha256"] = (
+                "sha256:" + hashlib.sha256(data).hexdigest()
+            )
             manifest["runs"][0]["sample"]["size_bytes"] = len(data)
             manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
-            with self.assertRaisesRegex(ContractError, "sequence_index differs from launch evidence"):
+            with self.assertRaisesRegex(
+                ContractError, "sequence_index differs from launch evidence"
+            ):
                 verify_complete_campaign_manifest(manifest_path, fixture.samples())
 
     def test_relabelled_framework_is_rejected_against_runner_argv(self) -> None:
@@ -202,7 +241,12 @@ class Gemma4BenchmarkCampaignTest(unittest.TestCase):
             fixture = CampaignFixture(Path(temporary))
             manifest_path = fixture.execute()
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            manifest["runs"] = [manifest["runs"][0], manifest["runs"][2], manifest["runs"][1], manifest["runs"][3]]
+            manifest["runs"] = [
+                manifest["runs"][0],
+                manifest["runs"][2],
+                manifest["runs"][1],
+                manifest["runs"][3],
+            ]
             manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
             with self.assertRaisesRegex(ContractError, "immutable launch order"):
                 verify_complete_campaign_manifest(manifest_path, fixture.samples())
@@ -212,7 +256,9 @@ class Gemma4BenchmarkCampaignTest(unittest.TestCase):
             fixture = CampaignFixture(Path(temporary))
             manifest_path = fixture.execute()
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            manifest["runs"][1]["started_unix_ns"] = manifest["runs"][0]["completed_unix_ns"] - 1
+            manifest["runs"][1]["started_unix_ns"] = (
+                manifest["runs"][0]["completed_unix_ns"] - 1
+            )
             manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
             with self.assertRaisesRegex(ContractError, "overlapping"):
                 verify_complete_campaign_manifest(manifest_path, fixture.samples())

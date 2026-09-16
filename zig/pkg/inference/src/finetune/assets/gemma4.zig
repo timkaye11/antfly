@@ -488,7 +488,8 @@ pub const LoRAInitKind = enum {
     lora_ga,
 };
 
-const prepared_chat_template_identity = "antfly_gemma_chat/v1";
+// Bind prepared inputs to the actual renderer, including assistant label spans.
+const prepared_chat_template_identity = @embedFile("../chat_template.zig");
 
 pub fn sha256HexAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]const u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
@@ -512,15 +513,34 @@ fn hashBytes(hasher: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
 
 fn hashFileInto(
     hasher: *std.crypto.hash.sha2.Sha256,
-    allocator: std.mem.Allocator,
     role: []const u8,
     path: []const u8,
 ) !void {
-    var mapped = try c_file.MmapRegion.init(allocator, path);
-    defer mapped.deinit();
+    const io = compat.io();
+    var file = try compat.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    const size = std.math.cast(usize, (try file.stat(io)).size) orelse return error.FileTooLarge;
     hashBytes(hasher, role);
     hashBytes(hasher, std.fs.path.basename(path));
-    hashBytes(hasher, mapped.data);
+    // Keep the length-prefixed provenance domain unchanged, but do not fault
+    // an entire model mapping into the resident set alongside trainer weights.
+    hashLength(hasher, size);
+    var remaining = size;
+    var buffer: [64 * 1024]u8 = undefined;
+    while (remaining != 0) {
+        const n = file.readStreaming(io, &.{buffer[0..@min(buffer.len, remaining)]}) catch |err| switch (err) {
+            error.EndOfStream => return error.FileChangedDuringFingerprint,
+            else => return err,
+        };
+        if (n == 0) return error.FileChangedDuringFingerprint;
+        hasher.update(buffer[0..n]);
+        remaining -= n;
+    }
+    const extra = file.readStreaming(io, &.{buffer[0..1]}) catch |err| switch (err) {
+        error.EndOfStream => 0,
+        else => return err,
+    };
+    if (extra != 0) return error.FileChangedDuringFingerprint;
 }
 
 fn finishHashAlloc(
@@ -543,7 +563,7 @@ pub fn fingerprintGemma4Model(
     var base_hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hashBytes(&base_hasher, "gemma4_base_model/v1");
     if (paths.config_path) |path|
-        try hashFileInto(&base_hasher, allocator, "config", path)
+        try hashFileInto(&base_hasher, "config", path)
     else
         hashBytes(&base_hasher, "config_absent");
     if (paths.checkpoint_path) |checkpoint_path| {
@@ -562,9 +582,9 @@ pub fn fingerprintGemma4Model(
                 return if (order == .eq) std.mem.lessThan(u8, lhs, rhs) else order == .lt;
             }
         }.lessThan);
-        for (dependencies.paths) |path| try hashFileInto(&base_hasher, allocator, "safetensors", path);
+        for (dependencies.paths) |path| try hashFileInto(&base_hasher, "safetensors", path);
     } else if (paths.gguf_path) |path| {
-        try hashFileInto(&base_hasher, allocator, "gguf", path);
+        try hashFileInto(&base_hasher, "gguf", path);
     } else return error.MissingMergedCheckpoint;
     const base_digest = try finishHashAlloc(allocator, &base_hasher);
     errdefer allocator.free(base_digest);
@@ -583,7 +603,7 @@ pub fn fingerprintGemma4Model(
         const path = try std.fs.path.join(allocator, &.{ model_dir, file_name });
         defer allocator.free(path);
         if (!isRegularFilePath(path)) continue;
-        try hashFileInto(&tokenizer_hasher, allocator, "tokenizer_asset", path);
+        try hashFileInto(&tokenizer_hasher, "tokenizer_asset", path);
         tokenizer_file_count += 1;
     }
     if (tokenizer_file_count == 0) hashBytes(&tokenizer_hasher, base_digest);
@@ -753,7 +773,7 @@ pub fn inspectCheckpoint(allocator: std.mem.Allocator, input: []const u8) !Inspe
                 !std.mem.eql(u8, adapter_cfg.base_model_name_or_path.?, manifest.base_model_name_or_path) or
                 (adapter_cfg.use_dora orelse false) != manifest.use_dora or
                 (adapter_cfg.use_rslora orelse false) != manifest.use_rslora or
-                !optionalStringsEqual(configured_initializer, manifest.initializer))
+                !optionalStringsEqual(configured_initializer, canonicalInitializerName(manifest.initializer)))
             {
                 return error.AdapterManifestConfigMismatch;
             }
@@ -3488,7 +3508,7 @@ pub fn writeAdapterConfigJson(
         .fan_in_fan_out = false,
         .inference_mode = false,
         .init_lora_weights = if (options.init_lora_weights) |initializer|
-            std.json.Value{ .string = initializer }
+            if (std.mem.eql(u8, initializer, "default")) std.json.Value{ .bool = true } else std.json.Value{ .string = initializer }
         else
             std.json.Value{ .bool = true },
         .lora_alpha = options.alpha,
@@ -3874,10 +3894,15 @@ pub fn dupeOptionalString(allocator: std.mem.Allocator, value: ?[]const u8) !?[]
     return try allocator.dupe(u8, item);
 }
 
+fn canonicalInitializerName(value: ?[]const u8) ?[]const u8 {
+    const name = value orelse return null;
+    return if (std.mem.eql(u8, name, "default")) null else name;
+}
+
 fn adapterInitializerName(value: ?std.json.Value) !?[]const u8 {
     const init = value orelse return null;
     return switch (init) {
-        .string => |name| if (name.len > 0) name else error.InvalidLoRAInitializer,
+        .string => |name| if (name.len > 0) canonicalInitializerName(name) else error.InvalidLoRAInitializer,
         // PEFT writes `true` for its ordinary Kaiming/zero initialization.
         // The flag only controls creation of new adapter weights; an existing
         // checkpoint already contains those weights, so no named initializer
@@ -4009,6 +4034,31 @@ test "gemma4 adapter tensor admission rejects non-finite payloads" {
 pub fn optionalStringsEqual(lhs: ?[]const u8, rhs: ?[]const u8) bool {
     if (lhs == null or rhs == null) return lhs == null and rhs == null;
     return std.mem.eql(u8, lhs.?, rhs.?);
+}
+
+test "gemma4 streaming provenance preserves length-prefixed file identity across chunks" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "weights.bin" });
+    defer allocator.free(path);
+    const data = try allocator.alloc(u8, 2 * 64 * 1024 + 17);
+    defer allocator.free(data);
+    for (data, 0..) |*byte, index| byte.* = @truncate(index *% 37);
+    for ([_]usize{ 0, 1, 64 * 1024, data.len }) |size| {
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "weights.bin", .data = data[0..size] });
+        var expected = std.crypto.hash.sha2.Sha256.init(.{});
+        hashBytes(&expected, "safetensors");
+        hashBytes(&expected, "weights.bin");
+        hashBytes(&expected, data[0..size]);
+        var actual = std.crypto.hash.sha2.Sha256.init(.{});
+        try hashFileInto(&actual, "safetensors", path);
+        var expected_digest: [32]u8 = undefined;
+        var actual_digest: [32]u8 = undefined;
+        expected.final(&expected_digest);
+        actual.final(&actual_digest);
+        try std.testing.expectEqualSlices(u8, &expected_digest, &actual_digest);
+    }
 }
 
 test "findDecoderGgufPathInDir ignores projector ggufs and returns sole decoder" {
