@@ -67,8 +67,6 @@ const safetensors_checkpoint = @import("safetensors_checkpoint.zig");
 const safetensors = @import("../models/safetensors.zig");
 const system_memory = @import("../runtime/tier/memory.zig");
 
-var training_checkpoint_nonce: std.atomic.Value(u64) = .init(0);
-
 // ── Public callbacks ─────────────────────────────────────────────────────────
 
 /// Architecture-agnostic forward graph builder callback.
@@ -1705,19 +1703,43 @@ pub const RealAutodiffTrainer = struct {
         run_fingerprint: ?*const [32]u8,
         metrics_prefix_sha256: ?*const [32]u8,
     ) !void {
-        if (self.accum_count != 0) return error.CheckpointDuringGradientAccumulation;
-        return self.saveTrainingCheckpointInternal(path, run_fingerprint, metrics_prefix_sha256);
+        return self.saveTrainingStateWithExtensions(path, run_fingerprint, metrics_prefix_sha256, .{});
     }
 
-    /// Save a fully resumable checkpoint, including an incomplete gradient
-    /// accumulation window and caller-owned dataset/RNG progress.
+    /// Save an incomplete accumulation window with dataset and RNG progress.
     pub fn saveTrainingCheckpoint(
         self: *RealAutodiffTrainer,
         path: []const u8,
         run_fingerprint: ?*const [32]u8,
         metrics_prefix_sha256: ?*const [32]u8,
     ) !void {
-        return self.saveTrainingCheckpointInternal(path, run_fingerprint, metrics_prefix_sha256);
+        return self.saveTrainingCheckpointInternal(path, run_fingerprint, metrics_prefix_sha256, .{});
+    }
+
+    pub const CheckpointExtensions = struct {
+        tensors: []const safetensors_checkpoint.NamedTensor = &.{},
+        /// An external gradient owner supplies its complete accumulation state
+        /// in extension tensors and confirms the exact live microbatch count.
+        accumulation_count: ?u32 = null,
+        execution_control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
+        /// A resident caller must hold its mutation lease and completely
+        /// synchronize weights, moments and accumulators before selecting
+        /// this path. This avoids duplicate, unbounded device downloads.
+        use_synchronized_host_state: bool = false,
+    };
+
+    pub fn saveTrainingStateWithExtensions(
+        self: *RealAutodiffTrainer,
+        path: []const u8,
+        run_fingerprint: ?*const [32]u8,
+        metrics_prefix_sha256: ?*const [32]u8,
+        extensions: CheckpointExtensions,
+    ) !void {
+        if (extensions.execution_control) |control| try control.check();
+        if (extensions.accumulation_count) |count| {
+            if (count != self.accum_count or count >= self.config.grad_accum_steps or extensions.tensors.len == 0) return error.InvalidTrainingStateCounters;
+        } else if (self.accum_count != 0) return error.CheckpointDuringGradientAccumulation;
+        return self.saveTrainingCheckpointInternal(path, run_fingerprint, metrics_prefix_sha256, extensions);
     }
 
     fn saveTrainingCheckpointInternal(
@@ -1725,7 +1747,16 @@ pub const RealAutodiffTrainer = struct {
         path: []const u8,
         run_fingerprint: ?*const [32]u8,
         metrics_prefix_sha256: ?*const [32]u8,
+        extensions: CheckpointExtensions,
     ) !void {
+        if (extensions.execution_control) |control| try control.check();
+        for (extensions.tensors, 0..) |tensor, i| {
+            if (!std.mem.startsWith(u8, tensor.name, "__extension.")) return error.InvalidTrainingStateExtension;
+            for (extensions.tensors[0..i]) |previous| if (std.mem.eql(u8, previous.name, tensor.name)) return error.InvalidTrainingStateExtension;
+            var elements: usize = 1;
+            for (tensor.shape) |dimension| elements = std.math.mul(usize, elements, dimension) catch return error.CheckpointSizeMismatch;
+            if (elements != tensor.data.len) return error.CheckpointSizeMismatch;
+        }
         if (self.optimizer_step_count > self.step_count) return error.InvalidTrainingStateCounters;
         if (self.optimizer_step_count > std.math.maxInt(u32)) return error.CheckpointStepOverflow;
         const accumulation_steps = @max(self.config.grad_accum_steps, 1);
@@ -1790,23 +1821,17 @@ pub const RealAutodiffTrainer = struct {
                 .shape = &.{metrics_fingerprint_values.len},
             });
         }
-        try self.appendTrainingStateSlots(&tensors, &names, &shapes, &owned_data, self.lora_params.items, true);
-        try self.appendTrainingStateSlots(&tensors, &names, &shapes, &owned_data, self.regular_params.items, true);
+        try self.appendTrainingStateSlots(&tensors, &names, &shapes, &owned_data, self.lora_params.items, true, extensions.use_synchronized_host_state);
+        try self.appendTrainingStateSlots(&tensors, &names, &shapes, &owned_data, self.regular_params.items, true, extensions.use_synchronized_host_state);
+        try tensors.appendSlice(self.allocator, extensions.tensors);
 
-        // A sibling temporary keeps rename atomic while the process/nonce
-        // suffix prevents two trainers targeting the same checkpoint from
-        // truncating one another's in-progress write. The final rename is
-        // intentionally replace-capable: a mutable checkpoint name publishes
-        // the last complete, synced generation.
-        const temporary_path = try std.fmt.allocPrint(
-            self.allocator,
-            "{s}.tmp-{d}-{d}",
-            .{ path, std.posix.system.getpid(), training_checkpoint_nonce.fetchAdd(1, .monotonic) },
-        );
+        var random: [16]u8 = undefined;
+        try std.Io.randomSecure(compat.io(), &random);
+        const temporary_path = try std.fmt.allocPrint(self.allocator, "{s}.{s}.tmp", .{ path, std.fmt.bytesToHex(random, .lower) });
         defer self.allocator.free(temporary_path);
-        compat.cwd().deleteFile(compat.io(), temporary_path) catch {};
+        try safetensors_checkpoint.saveControlled(self.allocator, temporary_path, tensors.items, extensions.execution_control, true);
         errdefer compat.cwd().deleteFile(compat.io(), temporary_path) catch {};
-        try safetensors_checkpoint.save(self.allocator, temporary_path, tensors.items);
+        if (extensions.execution_control) |control| try control.check();
         try std.Io.Dir.rename(compat.cwd(), temporary_path, compat.cwd(), path, compat.io());
         try syncParentDirectory(path);
     }
@@ -1852,6 +1877,19 @@ pub const RealAutodiffTrainer = struct {
         defer self.allocator.free(absolute_path);
         var reader = try safetensors.MMapReader.openFileAbsolute(self.allocator, absolute_path);
         defer reader.deinit();
+        return self.loadTrainingCheckpointFromReader(&reader, expected_run_fingerprint);
+    }
+
+    /// Reuse one opened checkpoint for core and extension state. Higher-level
+    /// owners can validate and publish an atomic staged restore without
+    /// reopening a path that a concurrent checkpoint writer may replace.
+    pub fn loadTrainingStateFromReader(self: *RealAutodiffTrainer, reader: *safetensors.MMapReader, expected_run_fingerprint: ?*const [32]u8) !void {
+        _ = try self.loadTrainingCheckpointFromReader(reader, expected_run_fingerprint);
+    }
+
+    fn loadTrainingCheckpointFromReader(self: *RealAutodiffTrainer, reader: *safetensors.MMapReader, expected_run_fingerprint: ?*const [32]u8) !RestoredTrainingCheckpoint {
+        if (self.lora_params.items.len == 0 and self.regular_params.items.len == 0) return error.GraphNotBuilt;
+        if (self.step_count != 0 or self.optimizer_step_count != 0 or self.accum_count != 0 or self.optimizer_state.param_states.count() != 0) return error.TrainerAlreadyStarted;
 
         var counter_tensor = try reader.readTensor("__trainer_counters");
         defer counter_tensor.deinit();
@@ -1860,9 +1898,9 @@ pub const RealAutodiffTrainer = struct {
         const restored = try decodeTrainingStateCounters(counters);
         if (restored.optimizer_steps > restored.micro_batch_steps) return error.InvalidTrainingStateCounters;
         if (restored.optimizer_steps > std.math.maxInt(u32)) return error.CheckpointStepOverflow;
-        if (expected_run_fingerprint) |expected| try validateTrainingStateFingerprint(&reader, expected);
+        if (expected_run_fingerprint) |expected| try validateTrainingStateFingerprint(reader, expected);
 
-        const checkpoint_state_optional = try readTrainingCheckpointState(&reader);
+        const checkpoint_state_optional = try readTrainingCheckpointState(reader);
         const checkpoint_state = checkpoint_state_optional orelse TrainingCheckpointState{
             .micro_batch_steps = restored.micro_batch_steps,
             .optimizer_steps = restored.optimizer_steps,
@@ -1894,12 +1932,12 @@ pub const RealAutodiffTrainer = struct {
             checkpoint_state.conditional_family_count,
             checkpoint_state.conditional_family_present_mask,
         );
-        try self.validateTrainingStateSlots(&reader, self.lora_params.items, restored.optimizer_steps, checkpoint_state_optional != null);
-        try self.validateTrainingStateSlots(&reader, self.regular_params.items, restored.optimizer_steps, checkpoint_state_optional != null);
+        try self.validateTrainingStateSlots(reader, self.lora_params.items, restored.optimizer_steps, checkpoint_state_optional != null);
+        try self.validateTrainingStateSlots(reader, self.regular_params.items, restored.optimizer_steps, checkpoint_state_optional != null);
 
         try self.ensureHostGradientAccumulators();
-        try self.loadTrainingStateSlots(&reader, self.lora_params.items, restored.optimizer_steps, checkpoint_state_optional != null);
-        try self.loadTrainingStateSlots(&reader, self.regular_params.items, restored.optimizer_steps, checkpoint_state_optional != null);
+        try self.loadTrainingStateSlots(reader, self.lora_params.items, restored.optimizer_steps, checkpoint_state_optional != null);
+        try self.loadTrainingStateSlots(reader, self.regular_params.items, restored.optimizer_steps, checkpoint_state_optional != null);
         try self.restoreConditionalOptimizerFamilyPresentMask(
             checkpoint_state.conditional_family_count,
             checkpoint_state.conditional_family_present_mask,
@@ -2855,12 +2893,13 @@ pub const RealAutodiffTrainer = struct {
         owned_data: *std.ArrayListUnmanaged([]f32),
         slots: []const ParamSlot,
         include_grad_accum: bool,
+        use_synchronized_host_state: bool,
     ) !void {
         for (slots) |slot| {
             var weights: []const f32 = slot.weights;
             var moments: struct { m: []const f32, v: []const f32 } = undefined;
             var accumulated_gradient: []const f32 = slot.grad_accum;
-            if (slot.device) |device| {
+            if (if (use_synchronized_host_state) null else slot.device) |device| {
                 weights = try self.downloadTrainingStateTensor(owned_data, device.weight);
                 moments = .{
                     .m = try self.downloadTrainingStateTensor(owned_data, device.m),
@@ -2890,6 +2929,12 @@ pub const RealAutodiffTrainer = struct {
                 return error.CheckpointSizeMismatch;
             }
             const adam_step = try self.allocTrainingStateScalar(owned_data, slot.adam_step_count);
+            const step_bytes = try self.allocator.alloc(f32, 4);
+            var bytes_owned = true;
+            errdefer if (bytes_owned) self.allocator.free(step_bytes);
+            for (step_bytes, 0..) |*byte, i| byte.* = @floatFromInt((slot.adam_step_count >> @as(u5, @intCast(i * 8))) & 255);
+            try owned_data.append(self.allocator, step_bytes);
+            bytes_owned = false;
             try appendTrainingStateTensor(self.allocator, tensors, names, shapes, "weight", slot.name, weights);
             try appendTrainingStateTensor(self.allocator, tensors, names, shapes, "adam_m", slot.name, moments.m);
             try appendTrainingStateTensor(self.allocator, tensors, names, shapes, "adam_v", slot.name, moments.v);
@@ -2898,6 +2943,7 @@ pub const RealAutodiffTrainer = struct {
                 if (accumulated_gradient.len != slot.weights.len) return error.CheckpointSizeMismatch;
                 try appendTrainingStateTensor(self.allocator, tensors, names, shapes, "grad_accum", slot.name, accumulated_gradient);
             }
+            try appendTrainingStateTensor(self.allocator, tensors, names, shapes, "adam_step_u32", slot.name, step_bytes);
         }
     }
 
@@ -4412,6 +4458,21 @@ fn readTrainingStateStep(
     reader: *safetensors.MMapReader,
     parameter_name: []const u8,
 ) !?u32 {
+    const byte_name = try std.fmt.allocPrint(allocator, "adam_step_u32::{s}", .{parameter_name});
+    defer allocator.free(byte_name);
+    if (reader.header.tensors.contains(byte_name)) {
+        var tensor = try reader.readTensor(byte_name);
+        defer tensor.deinit();
+        if (tensor.dtype != .f32) return error.InvalidTrainingStateDType;
+        const values = tensor.asFloat32();
+        if (values.len != 4) return error.CheckpointSizeMismatch;
+        var result: u32 = 0;
+        for (values, 0..) |value, i| {
+            if (!std.math.isFinite(value) or value < 0 or value > 255 or value != @floor(value)) return error.InvalidTrainingStateCounters;
+            result |= @as(u32, @intFromFloat(value)) << @as(u5, @intCast(i * 8));
+        }
+        return result;
+    }
     const name = try std.fmt.allocPrint(allocator, "adam_step::{s}", .{parameter_name});
     defer allocator.free(name);
     var tensor = reader.readTensor(name) catch |err| switch (err) {
@@ -4422,8 +4483,8 @@ fn readTrainingStateStep(
     if (tensor.dtype != .f32) return error.InvalidTrainingStateDType;
     const source = tensor.asFloat32();
     if (source.len != 1) return error.CheckpointSizeMismatch;
-    // f32 only represents integers exactly below 2^24, and no real run gets
-    // near that many optimizer steps, so a larger value is corruption.
+    // Legacy scalar checkpoints did not preserve every bit above 2^24.
+    // Newly written checkpoints carry the exact four-byte encoding above.
     const max_exact_step: f32 = std.math.maxInt(u24);
     const value = source[0];
     if (!std.math.isFinite(value) or value < 0 or value != @floor(value) or value > max_exact_step) {

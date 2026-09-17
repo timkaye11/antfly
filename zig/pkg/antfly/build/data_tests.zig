@@ -36,6 +36,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const data_runtime_test_mod = options.data_runtime_test_mod;
     const data_storage_test_mod = options.data_storage_test_mod;
     const lib_data_runtime_default_filters = [_][]const u8{
+        "data ownership fallback requires a single store across all roles",
         "data runtime background worker capacity is reserved and closes with its owner",
         "failed full index enrichment does not make resident reads unavailable",
         "enrichment runtime status reports worker lifecycle diagnostics",
@@ -194,6 +195,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data raft batch forwarding bounds routing campaigns deadlines and deterministic fallback",
         "internal batch forwarding headers are all-or-none and strictly parsed",
         "metadata http client shares deadline and cancellation across retries",
+        "system catalog write validation cache follows revisions and bounds admission",
+        "system catalog peer publication avoids schema copies workload",
+        "system catalog read peer refresh forwards cancellation and remaining transport budget",
+        "system catalog read peer routing honors expired and canceled admission budgets",
+        "system catalog read peer routing retains healthy relocation views across publication and invalidation",
+        "system catalog remote reads survive elections without skipping peers or extending budgets",
+        "system catalog report failover preserves repair signals and stable peer order",
         "metadata capability client distinguishes advertised routing from N-1 absence",
         "data server wires configured HA executors into API server",
         "data server mirrors managed primary writes into HA replication log",
@@ -208,6 +216,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data server HA state change synchronously adopts promotion and rewires live HTTP executor",
         "data server promotion open failure preserves retryable standby",
         "data server resumes HA standby replication from durable progress after restart",
+        "data server setHAStandbyUpstream swaps the upstream a replication round uses",
         "data runtime records and backs off HA standby replication round failures",
         "data runtime HA replication HTTP budget covers base64 apply envelope",
         "data runtime HA apply window remains bounded for control-plane liveness",
@@ -215,6 +224,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data runtime HA apply window does not report caught up with pending or deferred WAL",
         "data server keeps upstream replication availability failures nonfatal",
         "data runtime records HA standby apply failures without stopping run round",
+        "remote metadata deadline ",
     };
     const lib_data_runtime_tests = @import("linked_tests.zig").add(b, .{
         .name = "data-runtime-tests",

@@ -31,9 +31,13 @@ function selectSuites(files, pr, config) {
 
 function validatePR(pr, repo) {
   if (pr.state !== 'open' || pr.draft) throw new Error('PR must be open and non-draft.');
-  if (pr.head.repo?.full_name !== repo || pr.base.repo.full_name !== repo) {
-    throw new Error('Self-hosted PR CI supports same-repository PRs only.');
+  if (pr.base.repo?.full_name !== repo) {
+    throw new Error('PR must target this repository.');
   }
+  if (!pr.head.repo?.full_name) throw new Error('PR head repository is unavailable.');
+  // Fork commits are fetched by immutable SHA through the base repository's
+  // PR object graph. Approval grants execution of that exact commit, regardless
+  // of its source repository; workflow definitions still come from main.
 }
 
 function validateSnapshot(pr, approval, config) {
@@ -58,11 +62,34 @@ async function main({github, context, core, mode, config, env = process.env}) {
   const getPR = async () => (await github.rest.pulls.get({...repo, pull_number: number})).data;
   const getCheck = async id => (await github.rest.checks.get({...repo, check_run_id: Number(id)})).data;
   const writeCheck = async (check, data, status, summary, conclusion) => {
+    const linkedRunId = data.run_id || data.dispatched_run_id;
+    const runUrl = linkedRunId
+      ? `${context.serverUrl || 'https://github.com'}/${repository}/actions/runs/${linkedRunId}`
+      : null;
     const body = {
       ...repo, check_run_id: check.id, status,
-      output: {title: CHECK, summary, text: JSON.stringify(data)},
+      output: {title: CHECK, summary: runUrl ? `${summary}\n\n[View CI run](${runUrl})` : summary,
+        text: JSON.stringify(data)},
     };
+    if (runUrl) body.details_url = runUrl;
     if (conclusion) body.conclusion = conclusion;
+    // Actions-created checks can remain in an older workflow check suite,
+    // invisible to the merge box after a newer controller run on the same SHA.
+    // Use a distinct commit-status context as the required gate. Unlike a check,
+    // it is selected by SHA/context, independent of Actions suite association.
+    const listingUrl = `${context.serverUrl || 'https://github.com'}/${repository}/actions/workflows/${WORKFLOW}?query=${encodeURIComponent(`PR CI #${number} /`)}`;
+    await github.rest.repos.createCommitStatus({
+      ...repo, sha: check.head_sha, context: 'PR CI gate',
+      state: status !== 'completed' ? 'pending'
+        : conclusion === 'success' ? 'success'
+        : conclusion === 'failure' ? 'failure' : 'error',
+      target_url: runUrl || listingUrl,
+      description: (status !== 'completed'
+        ? status === 'in_progress' ? 'CI running; view workflow jobs' : 'CI queued; view workflow runs'
+        : summary).slice(0, 140),
+    });
+    // Fail closed if gate publication fails: do not consume an approval or
+    // dispatch tests with a stale successful status from a previous attempt.
     await github.rest.checks.update(body);
   };
   const checkFor = async pr => {
@@ -146,6 +173,9 @@ async function main({github, context, core, mode, config, env = process.env}) {
     if (data.repository !== repository || data.number !== number || data.revoked ||
         data.comment_id !== Number(env.COMMENT_ID) || check.head_sha !== data.sha ||
         !data.suites?.length) throw new Error('Invalid approval record.');
+    if (data.dispatched_run_id && data.dispatched_run_id !== context.runId) {
+      throw new Error('Approval belongs to another dispatched run.');
+    }
     if (mode === 'admit' ? check.status !== 'queued' || data.run_id
       : check.status !== 'in_progress' || data.run_id !== context.runId) {
       throw new Error('Approval is expired, already used, or belongs to another run.');
@@ -168,13 +198,20 @@ async function main({github, context, core, mode, config, env = process.env}) {
     return;
   }
 
-  if (mode !== 'event' || !number) throw new Error('Invalid controller mode or PR number.');
-  if (context.eventName === 'workflow_run') {
-    const run = context.payload.workflow_run;
+  if (!['event', 'complete'].includes(mode) || !number) throw new Error('Invalid controller mode or PR number.');
+  if (mode === 'complete' || context.eventName === 'workflow_run') {
+    const run = mode === 'complete'
+      ? (await github.rest.actions.getWorkflowRun({...repo, run_id: context.runId})).data
+      : context.payload.workflow_run;
     const match = run.display_title.match(TITLE);
+    if (!match || Number(match[1]) !== number || (mode === 'complete' &&
+        (match[2] !== env.CHECK_ID || match[3] !== env.COMMENT_ID))) {
+      throw new Error('Completion does not match this approval.');
+    }
     const check = await getCheck(match[2]);
     const data = metadata(check);
-    if ((data.run_id && data.run_id !== run.id) || data.comment_id !== Number(match[3]) || data.revoked) return;
+    if ((data.dispatched_run_id && data.dispatched_run_id !== run.id) ||
+        (data.run_id && data.run_id !== run.id) || data.comment_id !== Number(match[3]) || data.revoked) return;
     try {
       if (run.path !== `.github/workflows/${WORKFLOW}` || run.event !== 'workflow_dispatch' ||
           run.head_branch !== context.payload.repository.default_branch || run.run_attempt !== 1) {
@@ -187,7 +224,8 @@ async function main({github, context, core, mode, config, env = process.env}) {
         ...repo, run_id: run.id, filter: 'latest', per_page: 100,
       });
       const result = jobs.find(j => j.name === 'PR CI result');
-      if (!data.run_id || run.conclusion !== 'success' || result?.conclusion !== 'success') {
+      const passed = mode === 'complete' ? env.RESULT === 'success' : run.conclusion === 'success';
+      if (!data.run_id || !passed || result?.conclusion !== 'success') {
         throw new Error(`CI did not pass (${run.conclusion}). Post a new approval to retry.`);
       }
       await writeCheck(check, data, 'completed',
@@ -240,10 +278,23 @@ async function main({github, context, core, mode, config, env = process.env}) {
     await cancel();
     const check = await save(pr, approval, `Approved by @${approval.approver}; waiting to start.`, true);
     try {
-      await github.rest.actions.createWorkflowDispatch({
+      const response = await github.rest.actions.createWorkflowDispatch({
         ...repo, workflow_id: WORKFLOW, ref: p.repository.default_branch,
+        headers: {'X-GitHub-Api-Version': '2022-11-28'},
+        return_run_details: true,
         inputs: {pr_number: String(number), check_id: String(check.id), comment_id: String(p.comment.id)},
       });
+      const runId = response?.data?.workflow_run_id;
+      if (runId !== undefined) {
+        if (!Number.isSafeInteger(runId) || runId <= 0) throw new Error('Invalid dispatched run ID.');
+        // This is a navigation/binding record, not proof of admission. The
+        // shared PR concurrency group keeps admission behind this update.
+        approval.dispatched_run_id = runId;
+        await writeCheck(check, approval, 'queued',
+          `Approved by @${approval.approver}; workflow queued, waiting for admission.`);
+      }
+      // Older GHES versions may still return 204; keep the listing fallback
+      // until their admission job supplies the exact run ID.
     } catch (error) {
       await writeCheck(check, {...approval, revoked: true}, 'completed', 'Dispatch failed; post a fresh approval.', 'failure');
       throw error;

@@ -18,6 +18,7 @@ function fixture() {
   const context = {repo: {owner: 'acme', repo: 'project'}, eventName: 'issue_comment',
     ref: 'refs/heads/main', runId: 91, apiUrl: 'https://api.github.com',
     payload: {action: 'created', repository, issue: {number: 7, pull_request: {}, labels: []}, comment}};
+  const statuses = [];
   const checks = [], dispatches = [], cancelled = [], runs = [], outputs = {}, notices = [];
   let permission = 'write';
   let files = [{filename: 'docs/guide.md'}];
@@ -41,7 +42,7 @@ function fixture() {
       },
     },
     issues: {getComment: async () => ({data: structuredClone(comment)})},
-    repos: {getCollaboratorPermissionLevel: async () => {
+    repos: {createCommitStatus: async body => {statuses.push(structuredClone(body));}, getCollaboratorPermissionLevel: async () => {
       if (typeof permission === 'number') throw Object.assign(new Error('Permission lookup failed'), {status: permission});
       return {data: {permission}};
     }},
@@ -50,11 +51,12 @@ function fixture() {
       cancelWorkflowRun: async ({run_id}) => {cancelled.push(run_id);},
       createWorkflowDispatch: async data => {dispatches.push(data);},
       listJobsForWorkflowRun: async () => jobs,
+      getWorkflowRun: async () => ({data: structuredClone(context.payload.workflow_run)}),
     },
   }, paginate: async (method, args) => method(args)};
   const core = {setOutput: (k,v) => {outputs[k]=v;}, notice: msg => notices.push(msg)};
   const env = {PR_NUMBER: '7', CHECK_ID: '1', COMMENT_ID: '17', HEAD_SHA: SHA, BASE_SHA: BASE};
-  return {pr, comment, context, checks, dispatches, cancelled, runs, outputs, env, github,
+  return {pr, comment, context, checks, statuses, notices, dispatches, cancelled, runs, outputs, env, github,
     permission: value => {permission = value;}, files: value => {files = value;},
     jobs: value => {jobs = value;},
     call: (mode='event') => main({github, context, core, mode, config, env}),
@@ -67,10 +69,11 @@ function fixture() {
   };
 }
 
-test('drafts, closed PRs, forks, bots, readers, and stale SHAs never dispatch', async t => {
+test('drafts, closed PRs, foreign targets, missing heads, bots, readers, and stale SHAs never dispatch', async t => {
   for (const change of [
     f => {f.pr.draft=true;}, f => {f.pr.state='closed';},
-    f => {f.pr.head.repo={full_name:'fork/project'};},
+    f => {f.pr.base.repo={full_name:'other/project'};},
+    f => {f.pr.head.repo=null;},
     f => {f.comment.user.type='Bot';}, f => {f.permission('read');},
     f => {f.comment.body='/ci run '+BASE;},
     f => {f.permission('triage');},
@@ -97,6 +100,42 @@ test('approval is consumed once, uses the default branch, and publishes on the P
   f.finish(); await f.call();
   assert.equal(f.checks[0].conclusion,'success');
   await assert.rejects(f.call('verify'),/expired/);
+});
+
+test('PR checks link to the admitted run through completion and revocation', async t => {
+  for (const outcome of ['success', 'failure', 'cancelled', 'revoked']) {
+    await t.test(outcome, async () => {
+      const f = fixture();
+      await f.call();
+      assert.equal(f.checks[0].details_url, undefined);
+      assert.ok(!f.checks[0].output.summary.includes('View CI run'));
+      await f.call('admit');
+      const url = 'https://github.com/acme/project/actions/runs/91';
+      const assertLink = () => {
+        assert.equal(f.checks[0].details_url, url);
+        assert.ok(f.checks[0].output.summary.endsWith(`[View CI run](${url})`));
+        assert.equal(JSON.parse(f.checks[0].output.text).run_id, 91);
+      };
+      assertLink();
+      if (outcome === 'revoked') {
+        f.context.payload.action = 'edited';
+      } else {
+        f.finish();
+        f.context.payload.workflow_run.conclusion = outcome;
+      }
+      await f.call();
+      assert.equal(f.checks[0].status, 'completed');
+      assertLink();
+    });
+  }
+});
+
+test('run links use the configured GitHub server', async () => {
+  const f = fixture();
+  f.context.serverUrl = 'https://github.example.com';
+  await f.call();
+  await f.call('admit');
+  assert.equal(f.checks[0].details_url, 'https://github.example.com/acme/project/actions/runs/91');
 });
 
 test('writers, maintainers, and admins approve using the default token, including outside collaborators', async t => {
@@ -174,6 +213,10 @@ test('a fresh approval revokes the old run; a late completion cannot pass it', a
   assert.deepEqual(f.cancelled,[91]);
   assert.equal(f.checks[0].conclusion,'action_required');
   assert.equal(f.checks[1].status,'queued');
+  assert.equal(f.checks[1].details_url, undefined);
+  assert.equal(f.statuses.at(-1).state, 'pending');
+  assert.ok(f.statuses.at(-1).target_url.includes('/actions/workflows/'));
+  assert.ok(!f.checks[1].output.summary.includes('View CI run'));
   f.finish(); await f.call();
   assert.equal(f.checks[1].status,'queued');
   assert.equal(JSON.parse(f.checks[1].output.text).comment_id,18);
@@ -256,6 +299,9 @@ test('path selection matches repository CI owners and does not enable optional t
   if (config.suites.some(s=>s.id==='zig')) {
     assert.deepEqual(selectSuites(['go/pkg/proxy/test.go'],f.pr,config),['policy','zig','sdks','proxy']);
     assert.ok(selectSuites(['specs/openapi/new.yaml'],f.pr,config).includes('operator'));
+    assert.ok(selectSuites(['go/pkg/operator/api/types.go'],f.pr,config).includes('operator'));
+    assert.ok(!selectSuites(['go/pkg/operator/work-log/README.md'],f.pr,config).includes('operator'));
+    assert.ok(!selectSuites(['go/pkg/proxy/docs/notes.mdx'],f.pr,config).includes('proxy'));
   } else {
     assert.deepEqual(selectSuites(['infra/src/test.go'],f.pr,config),['policy','infra']);
     assert.deepEqual(selectSuites(['ts/apps/dashboard/test.ts'],f.pr,config),['policy','vitest','playwright']);
@@ -283,7 +329,11 @@ test('every expensive worker is gated, pins its checkout, and disables automatic
     }
     const checkouts=text.match(/uses: actions\/checkout@[^\n]+\n[\s\S]*?(?=\n      -|$)/g)||[];
     for (const checkout of checkouts) {
-      assert.match(checkout,/ref: \$\{\{ inputs.head_sha \|\| github.sha \}\}/);
+      if (suite.id === 'policy' && /path: trusted-ci\n/.test(checkout)) {
+        assert.match(checkout,/ref: \$\{\{ github.workflow_sha \}\}/);
+      } else {
+        assert.match(checkout,/ref: \$\{\{ inputs.head_sha \|\| github.sha \}\}/);
+      }
       assert.match(checkout,/persist-credentials: false/);
     }
   }
@@ -295,6 +345,13 @@ test('every expensive worker is gated, pins its checkout, and disables automatic
       assert.doesNotMatch(text,/secrets: inherit/,file);
     }
   }
+});
+
+test('policy validates the executing workflow even when a release predates the controller', () => {
+  const text=fs.readFileSync(path.resolve(__dirname,'../workflows/pr-ci-policy.yml'),'utf8');
+  assert.match(text,/ref: \$\{\{ github.workflow_sha \}\}\n\s+path: trusted-ci/);
+  assert.match(text,/name: Test executing CI policy\n\s+working-directory: trusted-ci\n\s+run: node --test \.github\/scripts\/pr-ci.test.cjs/);
+  assert.match(text,/name: Test proposed CI policy when present\n\s+if: \$\{\{ hashFiles\('\.github\/scripts\/pr-ci.test.cjs'\) != '' \}\}\n\s+run: node --test \.github\/scripts\/pr-ci.test.cjs/);
 });
 
 // The live rollout first creates an action_required check before an approval.
@@ -313,4 +370,216 @@ test('approval after waiting or successful CI creates a fresh consumable check',
   await f.call(); assert.equal(f.dispatches[1].inputs.check_id,'3');
   f.env.CHECK_ID='3'; await f.call('admit'); await f.call('verify');
   await f.call(); assert.equal(f.dispatches.length,2);
+});
+
+test('trusted finalizer publishes without a workflow_run event and rechecks the result', async () => {
+  for (const success of [true, false]) {
+    const f=fixture(); await f.call(); await f.call('admit');
+    f.finish(); f.context.eventName='workflow_dispatch';
+    f.context.payload.workflow_run.conclusion=null;
+    f.env.RESULT=success?'success':'failure';
+    await f.call('complete');
+    assert.equal(f.checks[0].conclusion,success?'success':'failure');
+  }
+  const f=fixture(); await f.call(); await f.call('admit');
+  f.finish(); f.context.eventName='workflow_dispatch'; f.env.RESULT='success';
+  f.jobs([]); await f.call('complete');
+  assert.equal(f.checks[0].conclusion,'failure');
+});
+
+test('finalizer rejects other approval inputs and cannot restore a revoked check', async () => {
+  const f=fixture(); await f.call(); await f.call('admit'); f.finish();
+  f.context.eventName='workflow_dispatch'; f.env.RESULT='success'; f.env.CHECK_ID='2';
+  await assert.rejects(f.call('complete'),/does not match/);
+  f.env.CHECK_ID='1';
+  f.checks[0].output.text=JSON.stringify({...JSON.parse(f.checks[0].output.text),revoked:true});
+  await f.call('complete'); assert.notEqual(f.checks[0].conclusion,'success');
+});
+
+
+test('PR CI gate status links queued approval to listing and admitted run to jobs', async () => {
+  const f = fixture();
+  await f.call();
+  assert.deepEqual(f.statuses.at(-1), {
+    owner: 'acme', repo: 'project', sha: SHA, context: 'PR CI gate', state: 'pending',
+    target_url: 'https://github.com/acme/project/actions/workflows/pr-ci.yml?query=PR%20CI%20%237%20%2F',
+    description: 'CI queued; view workflow runs',
+  });
+  await f.call('admit');
+  assert.equal(f.statuses.at(-1).state, 'pending');
+  assert.equal(f.statuses.at(-1).target_url, 'https://github.com/acme/project/actions/runs/91');
+  f.finish(); await f.call();
+  assert.equal(f.statuses.at(-1).state, 'success');
+  assert.equal(f.statuses.at(-1).sha, SHA);
+});
+
+test('PR CI gate status reflects failure, dispatch failure, and invalidated approval', async t => {
+  for (const outcome of ['failure', 'dispatch failure', 'revoked']) await t.test(outcome, async () => {
+    const f = fixture();
+    if (outcome === 'dispatch failure') {
+      f.github.rest.actions.createWorkflowDispatch = async () => {throw new Error('dispatch failed');};
+      await assert.rejects(f.call(), /dispatch failed/);
+    } else {
+      await f.call(); await f.call('admit');
+      if (outcome === 'revoked') {
+        f.context.payload.action = 'edited';
+      } else {
+        f.finish(); f.context.payload.workflow_run.conclusion = 'failure';
+      }
+      await f.call();
+    }
+    assert.equal(f.statuses.at(-1).state, outcome === 'revoked' ? 'error' : 'failure');
+    assert.notEqual(f.checks.at(-1).conclusion, 'success');
+  });
+});
+
+test('PR CI gate supports enterprise URLs', async () => {
+  const f = fixture(); f.context.serverUrl = 'https://github.example.com';
+  await f.call();
+  assert.ok(f.statuses.at(-1).target_url.startsWith('https://github.example.com/'));
+  await f.call('admit');
+  assert.equal(f.statuses.at(-1).target_url, 'https://github.example.com/acme/project/actions/runs/91');
+});
+
+test('gate publication failure prevents dispatch and approval consumption', async () => {
+  const f = fixture();
+  f.github.rest.repos.createCommitStatus = async () => {throw new Error('permission denied');};
+  await assert.rejects(f.call(), /permission denied/);
+  assert.equal(f.dispatches.length, 0);
+  assert.equal(f.checks.at(-1).status, 'queued');
+  await assert.rejects(f.call('admit'), /permission denied/);
+  assert.equal(JSON.parse(f.checks.at(-1).output.text).run_id, undefined);
+});
+
+test('gate publication failure cannot publish a successful check', async () => {
+  const f = fixture(); await f.call(); await f.call('admit'); f.finish();
+  f.github.rest.repos.createCommitStatus = async () => {throw new Error('status unavailable');};
+  await assert.rejects(f.call(), /status unavailable/);
+  assert.equal(f.statuses.at(-1).state, 'pending');
+  assert.notEqual(f.checks.at(-1).conclusion, 'success');
+});
+
+test('gate invalidation replaces success on the same head', async () => {
+  const f = fixture(); await f.call(); await f.call('admit'); f.finish(); await f.call();
+  assert.equal(f.statuses.at(-1).state, 'success');
+  f.context.eventName = 'pull_request_target';
+  f.context.payload.action = 'converted_to_draft'; f.pr.draft = true;
+  await f.call();
+  assert.equal(f.statuses.at(-1).context, 'PR CI gate');
+  assert.equal(f.statuses.at(-1).sha, SHA);
+  assert.equal(f.statuses.at(-1).state, 'error');
+});
+
+
+test('dispatch returns an exact queued link without consuming admission', async () => {
+  const f = fixture();
+  f.github.rest.actions.createWorkflowDispatch = async body => {
+    f.dispatches.push(body);
+    return {data: {workflow_run_id: 91}};
+  };
+  await f.call();
+  assert.equal(f.dispatches[0].return_run_details, true);
+  assert.equal(f.statuses.at(-1).state, 'pending');
+  assert.equal(f.statuses.at(-1).target_url, 'https://github.com/acme/project/actions/runs/91');
+  assert.equal(f.statuses.at(-1).description, 'CI queued; view workflow runs');
+  assert.equal(f.checks.at(-1).status, 'queued');
+  assert.equal(JSON.parse(f.checks.at(-1).output.text).run_id, undefined);
+  assert.equal(JSON.parse(f.checks.at(-1).output.text).dispatched_run_id, 91);
+  await f.call(); assert.equal(f.dispatches.length, 1);
+  f.context.runId = 92;
+  await assert.rejects(f.call('admit'), /another dispatched run/);
+  f.context.runId = 91;
+  await f.call('admit');
+  assert.equal(f.checks.at(-1).status, 'in_progress');
+  f.finish(); await f.call();
+  assert.equal(f.statuses.at(-1).state, 'success');
+});
+
+test('queued dispatch cannot pass without admission or finish from another run', async () => {
+  const f = fixture();
+  f.github.rest.actions.createWorkflowDispatch = async () => ({data: {workflow_run_id: 91}});
+  await f.call(); f.finish(); f.context.payload.workflow_run.id = 92;
+  await f.call();
+  assert.equal(f.statuses.at(-1).state, 'pending');
+  f.context.payload.workflow_run.id = 91;
+  await f.call();
+  assert.equal(f.statuses.at(-1).state, 'failure');
+});
+
+test('invalid dispatch IDs fail closed', async () => {
+  for (const id of [null, 0, -1, '91', 1.5]) {
+    const f = fixture();
+    f.github.rest.actions.createWorkflowDispatch = async () => ({data: {workflow_run_id: id}});
+    await assert.rejects(f.call(), /Invalid dispatched run ID/);
+    assert.equal(f.statuses.at(-1).state, 'failure');
+  }
+});
+
+test('queued run link is replaced on a fresh approval', async () => {
+  const f = fixture();
+  let id = 91;
+  f.github.rest.actions.createWorkflowDispatch = async () => ({data: {workflow_run_id: id}});
+  await f.call();
+  f.comment.id = 18; id = 92;
+  await f.call();
+  assert.equal(f.statuses.at(-1).target_url, 'https://github.com/acme/project/actions/runs/92');
+  assert.equal(f.checks.at(-1).status, 'queued');
+});
+
+
+test('maintainer-approved fork PRs complete using the base repository and exact head SHA', async () => {
+  const f = fixture();
+  f.pr.head.repo = {full_name: 'contributor/project'};
+  await f.call();
+  assert.equal(f.dispatches.length, 1);
+  assert.equal(f.dispatches[0].owner, 'acme');
+  assert.equal(f.dispatches[0].repo, 'project');
+  assert.equal(f.dispatches[0].ref, 'main');
+  await f.call('admit');
+  assert.equal(f.outputs.head_sha, SHA);
+  await f.call('verify');
+  f.finish(); await f.call();
+  assert.equal(f.checks[0].conclusion, 'success');
+  assert.equal(f.statuses.at(-1).sha, SHA);
+  assert.equal(f.statuses.at(-1).repo, 'project');
+});
+
+test('fork authors without upstream write access cannot approve CI', async () => {
+  const f = fixture();
+  f.pr.head.repo = {full_name: 'contributor/project'};
+  f.comment.user.login = 'contributor';
+  f.permission('read');
+  await f.call();
+  assert.equal(f.dispatches.length, 0);
+  assert.match(f.notices[0], /write access/);
+});
+
+test('fork pushes invalidate approval at admission, verification, and completion', async t => {
+  for (const mode of ['admit', 'verify', 'complete']) await t.test(mode, async () => {
+    const f = fixture();
+    f.pr.head.repo = {full_name: 'contributor/project'};
+    await f.call();
+    if (mode !== 'admit') await f.call('admit');
+    f.pr.head.sha = 'c'.repeat(40);
+    if (mode === 'complete') {
+      f.finish(); await f.call();
+      assert.equal(f.checks[0].conclusion, 'failure');
+    } else {
+      await assert.rejects(f.call(mode), /Commit, base, or selected suites changed/);
+    }
+  });
+});
+
+
+test('PR orchestrator limits all called suites to read-only GitHub caches', () => {
+  const root = path.resolve(__dirname, '../workflows');
+  const orchestrator = fs.readFileSync(path.join(root, 'pr-ci.yml'), 'utf8');
+  assert.match(orchestrator, /^cache-mode: read$/m);
+  // A calling job could override the top-level limit; forbid broader access.
+  for (const file of ['pr-ci.yml', 'pr-ci-admission.yml', ...config.suites.map(s => s.workflow)]) {
+    const workflow = fs.readFileSync(path.join(root, file), 'utf8');
+    for (const match of workflow.matchAll(/^\s*cache-mode:\s*(.*?)\s*$/gm)) {
+      assert.ok(['read', 'none'].includes(match[1]), `${file} broadens PR cache access`);
+    }
+  }
 });

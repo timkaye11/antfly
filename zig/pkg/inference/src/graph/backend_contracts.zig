@@ -1491,6 +1491,7 @@ pub const DebertaEncoderLayerRequest = struct {
     num_attention_heads: usize,
     head_dim: usize,
     norm_eps: f32,
+    activation: DecoderRuntimeActivationKind = .gelu,
 };
 
 /// Prepared-slot layout for one NomicBERT encoder layer. Nomic's attention
