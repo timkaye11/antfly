@@ -13,8 +13,11 @@
 // limitations under the License.
 
 const std = @import("std");
+const schema = @import("recipe_schema.zig");
+const objectives = @import("recipe_objectives.zig");
 const build_info = @import("build_info");
 const build_options = @import("build_options");
+const platform = @import("antfly_platform");
 
 const grpo = @import("grpo.zig");
 const preference_loss = @import("preference_loss.zig");
@@ -40,202 +43,223 @@ const train_eval_colqwen2_lora_bundle = runners.train_eval_colqwen2_lora_bundle;
 const train_eval_reranker_lora_top_layer_cached_surrogate = runners.train_eval_reranker_lora_top_layer_cached_surrogate;
 const generation = @import("../pipelines/generation.zig");
 const model_manager_mod = @import("../server/model_manager.zig");
+const manifest_mod = @import("../models/manifest.zig");
 const backends = @import("../backends/backends.zig");
 const session_factory = @import("../architectures/session_factory.zig");
 const gpt_arch = @import("../architectures/gpt.zig");
+const gemma_graph = @import("../architectures/gemma_graph.zig");
 const native_backend_choice = @import("../native_backend_choice.zig");
 const tokenizer_mod = @import("inference_tokenizer");
+const hf_tokenizer_mod = @import("inference_hf_tokenizer");
+const sentencepiece_mod = tokenizer_mod.sentencepiece;
 const compat = @import("../io/compat.zig");
 const c_file = @import("../util/c_file.zig");
 const command_registry = @import("command_registry.zig");
 const ml = @import("ml");
 const peft = @import("peft.zig");
+const artifact_publication = @import("artifact_publication.zig");
+const gemma_preference_environment = @import("gemma4_preference_environment.zig");
+const path_isolation = @import("path_isolation.zig");
+const metal_compute_mod = @import("../ops/metal_compute.zig");
+const metal_partition_executor = @import("../graph/metal_partition_executor.zig");
 
 const print = std.debug.print;
 
 const default_lora_rank: usize = 16;
 const default_policy_lora_rank: usize = 8;
 const default_lora_alpha: f32 = 32.0;
+const default_grpo_max_completion_tokens = objectives.default_grpo_max_completion_tokens;
 const default_lora_target_preset = "all-linear";
+const default_gemma4_lora_target_preset = "text-all-linear";
 
 const qwen_attention_lora_target_modules = [_][]const u8{ "q_proj", "k_proj", "v_proj", "o_proj" };
 const qwen_mlp_lora_target_modules = [_][]const u8{ "gate_proj", "up_proj", "down_proj" };
 
-pub const RecipeKind = enum {
-    sft,
-    lora_sft,
-    qlora_sft,
+pub const RecipeKind = schema.RecipeKind;
+
+const PreferenceExecutionMode = enum {
+    train,
+    score,
+};
+
+const PreferenceTask = enum {
     dpo,
     grpo,
-    reranker,
-    vlm_retrieval,
 };
 
-pub const ModelConfig = struct {
-    path: ?[]const u8 = null,
-    reference_path: ?[]const u8 = null,
-    name: ?[]const u8 = null,
-    family: ?[]const u8 = null,
-    projector_path: ?[]const u8 = null,
+/// Tokenization and prompt rendering are the only inference-model services
+/// needed by optimizer-backed preference training. Keep that narrow contract
+/// explicit so training does not instantiate a second decoder session beside
+/// its dedicated autodiff backend.
+const PreferenceTokenizerView = struct {
+    tokenizer: tokenizer_mod.Tokenizer,
+    add_bos_token: bool,
+    /// Manifest EOS policy; DPO completions are terminated to match it.
+    add_eos_token: bool,
+    bos_token: []const u8,
+    chat_tmpl: ?*generation.ChatTemplate,
+
+    fn fromLoadedModel(model: *model_manager_mod.LoadedModel) @This() {
+        return .{
+            .tokenizer = model.getTokenizer(),
+            .add_bos_token = model.manifest.add_bos_token,
+            .add_eos_token = model.manifest.add_eos_token,
+            .bos_token = model.manifest.bos_token,
+            .chat_tmpl = model.chat_tmpl,
+        };
+    }
+
+    fn renderPrompt(self: @This(), allocator: std.mem.Allocator, prompt: []const u8) ![]u8 {
+        const messages = [_]generation.Message{
+            .{ .role = "user", .content = prompt },
+        };
+        if (self.chat_tmpl) |tmpl| return tmpl.apply(allocator, &messages, true);
+        return generation.formatMessages(allocator, &messages);
+    }
 };
 
-pub const DatasetConfig = struct {
-    path: ?[]const u8 = null,
-    train_path: ?[]const u8 = null,
-    eval_path: ?[]const u8 = null,
-    train_split: ?[]const u8 = "train",
-    eval_split: ?[]const u8 = null,
-    prepared_path: ?[]const u8 = null,
-    cache_path: ?[]const u8 = null,
-    train_cache_path: ?[]const u8 = null,
-    eval_cache_path: ?[]const u8 = null,
-    format: ?[]const u8 = null,
-    labels: ?[]const u8 = null,
-    max_examples: ?usize = null,
-    eval_max_examples: ?usize = null,
-    max_seq_len: ?usize = null,
+const OwnedPreferenceTokenizer = struct {
+    allocator: std.mem.Allocator,
+    manifest: manifest_mod.ModelManifest,
+    hf_tok: ?*hf_tokenizer_mod.HfTokenizer = null,
+    sp_tok: ?*sentencepiece_mod.Processor = null,
+    chat_tmpl: ?*generation.ChatTemplate = null,
+
+    fn init(allocator: std.mem.Allocator, model_dir: []const u8) !@This() {
+        const manifest = try manifest_mod.loadFromDir(allocator, model_dir);
+        var result = @This(){
+            .allocator = allocator,
+            .manifest = manifest,
+        };
+        var result_owned = true;
+        errdefer if (result_owned) result.deinit();
+
+        const tokenizer_type = if (model_manager_mod.shouldPreferSentencePieceOverride(manifest, model_dir, allocator))
+            manifest_mod.TokenizerType.sentencepiece
+        else
+            manifest.tokenizer_type orelse return error.NoTokenizerFound;
+        switch (tokenizer_type) {
+            .huggingface => result.hf_tok = try model_manager_mod.loadHuggingFaceTokenizerFromDirOrGguf(
+                allocator,
+                model_dir,
+                manifest.gguf_path,
+            ),
+            .sentencepiece => {
+                const tokenizer = try model_manager_mod.loadSentencePieceTokenizerFromDirOrGguf(
+                    allocator,
+                    model_dir,
+                    manifest.gguf_path,
+                );
+                result.sp_tok = tokenizer;
+                if (model_manager_mod.shouldEnableGemmaSentencePieceCompat(manifest, model_dir, allocator)) {
+                    tokenizer.setPreserveInlineSpecialsAfterLiteralBos(true);
+                }
+                try model_manager_mod.loadSentencePieceAddedTokens(model_dir, allocator, tokenizer);
+            },
+        }
+
+        if (manifest.chat_template) |source| {
+            const tmpl = try allocator.create(generation.ChatTemplate);
+            tmpl.* = generation.ChatTemplate.init(
+                allocator,
+                source,
+                manifest.bos_token,
+                manifest.eos_token,
+                manifest.unk_token,
+                manifest.pad_token,
+            ) catch |err| {
+                allocator.destroy(tmpl);
+                return err;
+            };
+            result.chat_tmpl = tmpl;
+        }
+
+        result_owned = false;
+        return result;
+    }
+
+    fn view(self: *@This()) PreferenceTokenizerView {
+        return .{
+            .tokenizer = if (self.hf_tok) |tokenizer| tokenizer.tokenizer() else self.sp_tok.?.tokenizer(),
+            .add_bos_token = self.manifest.add_bos_token,
+            .add_eos_token = self.manifest.add_eos_token,
+            .bos_token = self.manifest.bos_token,
+            .chat_tmpl = self.chat_tmpl,
+        };
+    }
+
+    fn deinit(self: *@This()) void {
+        if (self.chat_tmpl) |tmpl| {
+            tmpl.deinit();
+            self.allocator.destroy(tmpl);
+        }
+        if (self.hf_tok) |tokenizer| tokenizer.deinitSelf();
+        if (self.sp_tok) |tokenizer| {
+            tokenizer.deinit();
+            self.allocator.destroy(tokenizer);
+        }
+        self.manifest.deinit();
+        self.* = undefined;
+    }
 };
 
-pub const AdapterConfig = struct {
-    path: ?[]const u8 = null,
-    rank: ?usize = null,
-    alpha: ?f32 = null,
-    dropout: ?f32 = null,
-    layer_name: ?[]const u8 = null,
-    base_model_name_or_path: ?[]const u8 = null,
-    quantization: ?[]const u8 = null,
-    target_preset: ?[]const u8 = null,
-    target_modules: ?[]const []const u8 = null,
-    init_lora_weights: ?[]const u8 = null,
-    use_dora: ?bool = null,
-    scaling: ?[]const u8 = null,
-};
+pub const ModelConfig = schema.ModelConfig;
 
-pub const OptimizerConfig = struct {
-    learning_rate: ?f32 = null,
-    weight_decay: ?f32 = null,
-    lr_scheduler: ?[]const u8 = null,
-    warmup_ratio: ?f32 = null,
-    warmup_steps: ?u32 = null,
-    num_cycles: ?f32 = null,
-    max_steps: ?usize = null,
-    epochs: ?usize = null,
-    micro_batch_size: ?usize = null,
-    gradient_accumulation_steps: ?u32 = null,
-    max_grad_norm: ?f32 = null,
-    schedule_free: ?bool = null,
-    llrd_decay: ?f32 = null,
-};
+pub const DatasetConfig = schema.DatasetConfig;
 
-pub const PreferenceConfig = struct {
-    beta: ?f32 = null,
-    simpo_gamma: ?f32 = null,
-    sft_lambda: ?f32 = null,
-    ipo_tau: ?f32 = null,
-};
+pub const AdapterConfig = schema.AdapterConfig;
 
-pub const GrpoConfig = struct {
-    group_size: ?usize = null,
-    clip_epsilon: ?f32 = null,
-    kl_coef: ?f32 = null,
-    advantage_eps: ?f32 = null,
-    normalize_advantage: ?bool = null,
-    max_completion_tokens: ?usize = null,
-    reward_mode: ?[]const u8 = null,
-};
+pub const OptimizerConfig = schema.OptimizerConfig;
 
-pub const EntityEvalMinimums = struct {
-    precision: ?f64 = null,
-    recall: ?f64 = null,
-    f1: f64,
-    exact_match: f64,
-};
+pub const PreferenceConfig = schema.PreferenceConfig;
 
-/// Required quality gates for every structured task scored by the native
-/// GLiNER2 total-loss evaluator. Keeping these fields non-optional makes a
-/// partially specified gate set invalid at recipe parse time.
-pub const FullTaskEvalMinimums = struct {
-    classifications_micro_f1: f64,
-    classifications_exact_match: f64,
-    json_structures_micro_f1: f64,
-    json_structures_exact_match: f64,
-    relations_micro_f1: f64,
-    relations_exact_match: f64,
-    count_accuracy: f64,
-};
+const DpoLossType = objectives.DpoLossType;
+const ResolvedDpoObjectiveConfig = objectives.ResolvedDpoObjectiveConfig;
+const resolveDpoObjectiveConfig = objectives.resolveDpoObjectiveConfig;
 
-pub const EvalConfig = struct {
-    path: ?[]const u8 = null,
-    max_examples: ?usize = null,
-    split: ?[]const u8 = null,
-    every_epochs: ?u32 = null,
-    batch_size: ?u32 = null,
-    early_stopping_patience: ?u32 = null,
-    improvement_threshold: ?f64 = null,
-    /// Full-task structured scoring currently requires the Zig native
-    /// evaluator even when training itself runs through the Metal runtime.
-    backend: ?[]const u8 = null,
-    entity_minimums: ?EntityEvalMinimums = null,
-    full_task_minimums: ?FullTaskEvalMinimums = null,
-};
+pub const GrpoSamplingConfig = schema.GrpoSamplingConfig;
 
-pub const CheckpointConfig = struct {
-    every_epochs: ?u32 = null,
-    keep_last: ?u32 = null,
-    resume_path: ?[]const u8 = null,
-};
+pub const GrpoConfig = schema.GrpoConfig;
 
-pub const RuntimeConfig = struct {
-    compiled_required: ?bool = null,
-    graph_cache_capacity: ?u8 = null,
-};
+const ResolvedGrpoSamplingConfig = objectives.ResolvedGrpoSamplingConfig;
+const resolveGrpoSamplingConfig = objectives.resolveGrpoSamplingConfig;
+const ResolvedGrpoObjectiveConfig = objectives.ResolvedGrpoObjectiveConfig;
+const parseGrpoLossType = objectives.parseGrpoLossType;
+const parseGrpoRewardScale = objectives.parseGrpoRewardScale;
+const resolveGrpoObjectiveConfig = objectives.resolveGrpoObjectiveConfig;
+const resolveGrpoCoreConfig = objectives.resolveGrpoCoreConfig;
+const ResolvedGrpoKlControl = objectives.ResolvedGrpoKlControl;
+const resolveGrpoKlControl = objectives.resolveGrpoKlControl;
 
-pub const ArtifactConfig = struct {
-    root: ?[]const u8 = null,
-    manifest_path: ?[]const u8 = null,
-    prepared_path: ?[]const u8 = null,
-    adapter_dir: ?[]const u8 = null,
-    trained_adapter_dir: ?[]const u8 = null,
-    materialized_dir: ?[]const u8 = null,
-    validation_report_path: ?[]const u8 = null,
-    evaluation_report_path: ?[]const u8 = null,
-    reload_report_path: ?[]const u8 = null,
-    report_path: ?[]const u8 = null,
-};
+pub const RewardProviderConfig = schema.RewardProviderConfig;
 
-pub const Recipe = struct {
-    recipe: ?[]const u8 = null,
-    kind: ?[]const u8 = null,
-    model: ModelConfig = .{},
-    dataset: DatasetConfig = .{},
-    adapter: ?AdapterConfig = null,
-    optimizer: OptimizerConfig = .{},
-    preference: PreferenceConfig = .{},
-    grpo: GrpoConfig = .{},
-    eval: ?EvalConfig = null,
-    checkpoint: ?CheckpointConfig = null,
-    runtime: ?RuntimeConfig = null,
-    artifacts: ArtifactConfig = .{},
-    backend: ?[]const u8 = null,
-    trainer: ?[]const u8 = null,
-};
+pub const RewardConfig = schema.RewardConfig;
 
-pub const Step = struct {
-    kind: StepKind = .command,
-    name: []const u8,
-    argv: []const []const u8,
-};
+pub const EntityEvalMinimums = schema.EntityEvalMinimums;
 
-pub const StepKind = enum {
-    command,
-    direct_sft,
-    direct_dpo,
-    direct_grpo,
-};
+pub const FullTaskEvalMinimums = schema.FullTaskEvalMinimums;
 
-pub const Plan = struct {
-    steps: []Step,
-};
+pub const DpoEvalMinimums = schema.DpoEvalMinimums;
+
+pub const GrpoEvalMinimums = schema.GrpoEvalMinimums;
+
+pub const EvalConfig = schema.EvalConfig;
+
+pub const CheckpointConfig = schema.CheckpointConfig;
+
+pub const RuntimeConfig = schema.RuntimeConfig;
+
+pub const ExecutionConfig = schema.ExecutionConfig;
+
+pub const ArtifactConfig = schema.ArtifactConfig;
+
+pub const Recipe = schema.Recipe;
+
+pub const Step = schema.Step;
+
+pub const StepKind = schema.StepKind;
+
+pub const Plan = schema.Plan;
 
 const RunStatus = enum {
     planned,
@@ -303,6 +327,7 @@ const BackendMetadata = struct {
 };
 
 const OptimizerSummary = struct {
+    seed: ?u64,
     learning_rate: ?f32,
     weight_decay: ?f32,
     lr_scheduler: ?[]const u8,
@@ -348,6 +373,75 @@ const DirectoryDigest = struct {
     entries: usize,
 };
 
+const canonical_preference_evaluation_policy =
+    "terminal-device-drained-host-weight-snapshot-fresh-backend-private-buffer-reuse-disabled";
+
+/// Resolved trajectory-affecting Metal arithmetic policy. Several qualified
+/// kernels retain environment rollback switches; persisting and fingerprinting
+/// the resolved values prevents two numerically different runs from sharing a
+/// checkpoint identity merely because their JSON recipes are identical.
+const GemmaMetalNumericalPolicy = struct {
+    schema_version: []const u8 = "antfly_gemma4_metal_numerical_policy/v2",
+    fingerprint_flags: u64,
+    sparse_loss_chunk_rows: u32,
+    linear_cce_tile_vocab: usize,
+    fused_rms_norm_backward: bool,
+    fused_gqa_attention_backward: bool,
+    fused_linear_cross_entropy: bool,
+    sparse_logits_cross_entropy: bool,
+    bf16_tiled32_m16: bool,
+    bf16_simdgroup_mm: bool,
+    bf16_simdgroup_m64: bool,
+    bf16_forward_simdgroup_m64_packed: bool,
+    bf16_simdgroup_m64_prefix_tail: bool,
+    bf16_backward_tiled32_m16: bool,
+    bf16_backward_small_rows: bool,
+    bf16_backward_simdgroup_mm: bool,
+    bf16_backward_simdgroup_m64: bool,
+    bf16_backward_simdgroup_m64_coalesced: bool,
+    bf16_backward_simdgroup_m64_packed: bool,
+    rms_norm_backward_simdgroup: bool,
+    rms_norm_backward_residual_add: bool,
+    rms_norm_generated: bool,
+    linear_cce_f16_grad: bool,
+    linear_cce_logit_cache: bool,
+    linear_cce_f16_mps_backward: bool,
+    dense_mps_linear: bool,
+    gemma4_bf16_mlp_fusion: bool,
+    gemma4_gate_up_backward_input_sum: bool,
+    q4_0_linear_rms_add_sumsq: bool,
+    eager_rank1_dot_specialization: bool,
+    dense_device_dot_general: bool,
+    lora_forward_fused_branch: bool,
+    lora_forward_generic_rank16: bool,
+    lora_forward_rank1_fused: bool,
+    reference_quant_linear: bool,
+    quant_backward_force_barriers: bool,
+    contiguous_slice_device_view: bool,
+    partition_fused_patterns: bool,
+    partition_runtime_commands: bool,
+    runtime_region_plan: bool,
+    grouped_mps_dot: bool,
+    gather_promote_input: bool,
+    reduce_promote_input: bool,
+    lora_backward_runtime_region: bool,
+    low_rank_lora_backward_runtime_region: bool,
+    rank_adapter_backward_runtime_region: bool,
+    ffn_gelu_backward_runtime_region: bool,
+    gated_gelu_backward_runtime_region: bool,
+    gated_gelu_forward_fusion: bool,
+    masked_softmax_runtime_region: bool,
+    softmax_backward_runtime_region: bool,
+    graph_rank1_dot_specialization: bool,
+    raw_linear_bias_pair_runtime_region: bool,
+    raw_linear_runtime_regions_suppressed: bool,
+    gated_ffn_graph_fusion: bool,
+    gemma_gated_mlp_training_graph_fusion: bool,
+    attention_output_residual_graph_fusion: bool,
+    grouped_lora_a_r16: bool,
+    add3_fusion: bool,
+};
+
 const TrainableUpdateTelemetry = struct {
     tensor_count: usize,
     changed_tensor_count: usize,
@@ -357,21 +451,233 @@ const TrainableUpdateTelemetry = struct {
 const strict_cuda_device_execution_scope = "optimizer-steps-only;excludes-rollout-and-reference-scoring";
 
 const DpoReport = struct {
-    schema_version: []const u8 = "antfly_inference_finetune_dpo_report/v1",
+    schema_version: []const u8 = "antfly_inference_finetune_dpo_report/v7",
+    execution_mode: []const u8,
+    dataset_format: []const u8,
     examples: usize,
     loss: f32,
     mean_reward_margin: f32,
     accuracy: f32,
     beta: f32,
+    loss_type: []const u8 = "sigmoid",
+    logprob_aggregation: []const u8 = "sum",
+    label_smoothing: f32 = 0.0,
+    training_seed: u64 = 42,
     policy_backend: ?[]const u8 = null,
-    optimizer_backend: ?[]const u8 = null,
     optimizer_steps: ?u64 = null,
-    cuda_optimizer_steps: ?u64 = null,
     micro_batch_steps: ?u64 = null,
+    policy_scoring_mode: ?[]const u8 = null,
+    training_microbatch_mode: ?[]const u8 = null,
+    device_gradient_snapshot_mode: ?[]const u8 = null,
+    activation_checkpointing_mode: ?[]const u8 = null,
+    activation_checkpointing_layer_interval: ?u32 = null,
+    metal_buffer_reuse_mode: ?[]const u8 = null,
+    metal_completion_cache: ?DpoMetalCompletionCacheTelemetry = null,
+    reference_mode: ?[]const u8 = null,
+    reference_precompute_seconds: ?f64 = null,
+    initial_logprob_parity: ?DpoInitialLogprobParity = null,
+    initial_bucket_signature_parity: ?DpoInitialBucketSignatureParity = null,
+    sequence_length_policy: ?DpoPairLengthPolicyTelemetry = null,
+    graph_cache: ?DpoGraphCacheTelemetry = null,
+    benchmark: ?DpoBenchmarkTelemetry = null,
+    checkpoint_resume: ?PreferenceCheckpointResumeSummary = null,
+    metal_numerical_policy: ?GemmaMetalNumericalPolicy = null,
+    numerical_environment_overrides: []const []const u8 = &.{},
+    optimizer_weight_decay: f32 = 0.01,
+    evaluation_execution_policy: ?[]const u8 = null,
+    baseline_evaluation: ?DpoEvaluationSummary = null,
+    baseline_relative: ?DpoBaselineRelativeSummary = null,
+    evaluation: ?DpoEvaluationSummary = null,
+    trained_adapter_dir: ?[]const u8 = null,
+    // CUDA optimizer-lane telemetry (main: Gemma 4 CUDA preference training).
+    optimizer_backend: ?[]const u8 = null,
+    cuda_optimizer_steps: ?u64 = null,
     mean_grad_norm: ?f64 = null,
     trainable_update: ?TrainableUpdateTelemetry = null,
     device_execution_scope: ?[]const u8 = null,
     device_execution: ?real_autodiff.TrainingExecutionEvidence = null,
+};
+
+const DpoEvaluationSummary = struct {
+    report_path: []const u8,
+    examples: usize,
+    loss: f32,
+    mean_reward_margin: f32,
+    accuracy: f32,
+    passed: bool,
+};
+
+const DpoBaselineRelativeSummary = struct {
+    accuracy_improvement: f32,
+    accuracy_required_improvement: f32,
+    accuracy_requirement_saturated: bool,
+    reward_margin_improvement: f32,
+    loss_improvement: f32,
+    loss_required_improvement: f32,
+    loss_requirement_saturated: bool,
+    passed: bool,
+};
+
+const BoundedImprovementRequirement = struct {
+    effective_minimum: f32,
+    saturated: bool,
+};
+
+fn boundedIncreaseRequirement(baseline: f32, requested: f64, ceiling: f32) BoundedImprovementRequirement {
+    const headroom = @max(0.0, @as(f64, ceiling) - @as(f64, baseline));
+    return .{
+        .effective_minimum = @floatCast(@min(requested, headroom)),
+        .saturated = requested > headroom,
+    };
+}
+
+fn boundedDecreaseRequirement(baseline: f32, requested: f64, floor: f32) BoundedImprovementRequirement {
+    const headroom = @max(0.0, @as(f64, baseline) - @as(f64, floor));
+    return .{
+        .effective_minimum = @floatCast(@min(requested, headroom)),
+        .saturated = requested > headroom,
+    };
+}
+
+fn compareDpoToBaseline(
+    baseline: DpoEvaluationSummary,
+    evaluation: DpoEvaluationSummary,
+    minimums: DpoEvalMinimums,
+) DpoBaselineRelativeSummary {
+    const accuracy_improvement = evaluation.accuracy - baseline.accuracy;
+    const reward_margin_improvement = evaluation.mean_reward_margin - baseline.mean_reward_margin;
+    const loss_improvement = baseline.loss - evaluation.loss;
+    const accuracy_requirement = boundedIncreaseRequirement(
+        baseline.accuracy,
+        minimums.min_accuracy_improvement.?,
+        1.0,
+    );
+    const loss_requirement = boundedDecreaseRequirement(
+        baseline.loss,
+        minimums.min_loss_improvement.?,
+        0.0,
+    );
+    return .{
+        .accuracy_improvement = accuracy_improvement,
+        .accuracy_required_improvement = accuracy_requirement.effective_minimum,
+        .accuracy_requirement_saturated = accuracy_requirement.saturated,
+        .reward_margin_improvement = reward_margin_improvement,
+        .loss_improvement = loss_improvement,
+        .loss_required_improvement = loss_requirement.effective_minimum,
+        .loss_requirement_saturated = loss_requirement.saturated,
+        .passed = accuracy_improvement >= accuracy_requirement.effective_minimum and
+            reward_margin_improvement >= minimums.min_reward_margin_improvement.? and
+            loss_improvement >= loss_requirement.effective_minimum,
+    };
+}
+
+const DpoEvaluationReport = struct {
+    schema_version: []const u8 = "antfly_inference_finetune_dpo_evaluation/v3",
+    status: []const u8,
+    dataset_path: []const u8,
+    dataset_fingerprint: PathFingerprint,
+    policy_adapter_digest: []const u8,
+    policy_backend: []const u8,
+    execution_policy: []const u8 = canonical_preference_evaluation_policy,
+    metal_numerical_policy: ?GemmaMetalNumericalPolicy = null,
+    numerical_environment_overrides: []const []const u8 = &.{},
+    optimizer_weight_decay: f32 = 0.01,
+    examples: usize,
+    prompt_overlap_count: usize,
+    loss: f32,
+    mean_reward_margin: f32,
+    accuracy: f32,
+    loss_type: []const u8 = "sigmoid",
+    logprob_aggregation: []const u8 = "sum",
+    label_smoothing: f32 = 0.0,
+    minimums: DpoEvalMinimums,
+    reference_mode: []const u8,
+    sequence_length_policy: ?DpoPairLengthPolicyTelemetry = null,
+};
+
+const DpoPairLengthPolicyTelemetry = struct {
+    mode: []const u8,
+    scope: []const u8,
+    maximum_sequence_length: u32,
+    bucket_quantum: ?u32 = null,
+    bucket_minimum: ?u32 = null,
+    graph_cache_capacity: usize,
+    pairs: usize,
+    logical_branch_rows: usize,
+    scheduled_branch_rows: usize,
+    fixed_shape_branch_rows: usize,
+    padding_rows_avoided: usize,
+    padding_reduction_fraction: f64,
+    minimum_pair_sequence_length: u32,
+    maximum_pair_sequence_length: u32,
+    unique_pair_sequence_lengths: usize,
+    unique_pair_graph_signatures: ?usize = null,
+    weighted_target_row_policy: []const u8,
+};
+
+const DpoGraphCacheTelemetry = struct {
+    after_initialization: real_autodiff.RealAutodiffTrainer.GraphCacheStats,
+    after_reference_precompute: real_autodiff.RealAutodiffTrainer.GraphCacheStats,
+    after_initial_bucket_signature_parity: real_autodiff.RealAutodiffTrainer.GraphCacheStats,
+    after_training: real_autodiff.RealAutodiffTrainer.GraphCacheStats,
+    after_evaluation: real_autodiff.RealAutodiffTrainer.GraphCacheStats,
+};
+
+const DpoMetalCompletionCacheTelemetry = struct {
+    budget_policy: []const u8 = "metal-recommended-working-set-9/16;env-overridable",
+    enabled: bool,
+    max_bytes: u64,
+    available_bytes: u64,
+    available_slots: u64,
+    peak_bytes: u64,
+    peak_slots: u64,
+    requests: u64,
+    hits: u64,
+    misses: u64,
+    retired: u64,
+    evictions: u64,
+    completed_generation: u64,
+};
+
+const DpoInitialLogprobParity = struct {
+    policy_chosen_logp: f32,
+    policy_rejected_logp: f32,
+    reference_chosen_logp: f32,
+    reference_rejected_logp: f32,
+    max_abs_error: f32,
+    base_equivalent_policy: bool,
+};
+
+const DpoInitialBucketSignatureParity = struct {
+    graph_signatures_checked: usize,
+    representative_pair_index: usize,
+    policy_chosen_logp: f32,
+    policy_rejected_logp: f32,
+    reference_chosen_logp: f32,
+    reference_rejected_logp: f32,
+    max_abs_error: f32,
+    base_equivalent_policy: bool,
+};
+
+const DpoBenchmarkProtocol = struct {
+    cold: usize,
+    first: usize,
+    warmup: usize,
+    measured: usize,
+};
+
+const DpoBenchmarkTelemetry = struct {
+    protocol: DpoBenchmarkProtocol,
+    cold_seconds: f64,
+    cold_loss: f32,
+    first_seconds: f64,
+    first_loss: f32,
+    warmup_seconds: []const f64,
+    warmup_losses: []const f32,
+    measured_seconds: []const f64,
+    measured_losses: []const f32,
+    median_seconds: f64,
+    mean_seconds: f64,
 };
 
 const SftReport = struct {
@@ -383,18 +689,88 @@ const SftReport = struct {
     trained_adapter_dir: []const u8,
 };
 
+const GrpoSamplingSummary = struct {
+    scoring: []const u8 = "temperature-scaled-full-vocabulary/v1",
+    algorithm: []const u8 = "seeded-categorical-temperature-top-k-top-p",
+    temperature: f32,
+    top_p: f32,
+    top_k: usize,
+    stream_derivation: []const u8 = "run-seed-domain-epoch-dataset-prompt-index-completion/v2",
+    first_completion_greedy: bool,
+};
+
+const GrpoTrainingOrderSummary = struct {
+    algorithm: []const u8 = "seeded-fisher-yates-per-epoch/v1",
+    stream_derivation: []const u8 = "run-seed-order-domain-epoch-dataset-size/v1",
+    prompt_index_semantics: []const u8 = "original-dataset-index",
+};
+
 const GrpoReport = struct {
-    schema_version: []const u8 = "antfly_inference_finetune_grpo_report/v1",
+    schema_version: []const u8 = "antfly_inference_finetune_grpo_report/v10",
+    execution_mode: []const u8,
+    dataset_format: []const u8,
     completions: usize,
     tokens: usize,
     groups: usize,
+    optimizer_groups: ?usize = null,
+    zero_reward_std_groups: ?usize = null,
+    all_truncated_groups: ?usize = null,
+    kl_rejected_groups: ?usize = null,
+    frac_reward_zero_std: ?f32 = null,
+    truncated_completions: usize = 0,
+    frac_completions_truncated: f32 = 0.0,
+    mask_truncated_completions: bool = false,
+    frac_kl_rejected: ?f32 = null,
+    loss_type: []const u8 = "bnpo",
+    scale_rewards: []const u8 = "group",
+    epsilon_low: f32 = 0.2,
+    epsilon_high: f32 = 0.2,
+    max_completion_tokens: usize = default_grpo_max_completion_tokens,
+    num_iterations: usize = 1,
     informative_groups: usize = 0,
-    mean_reward: f32 = 0,
-    reward_std: f32 = 0,
     loss: f32,
     pg_loss: f32,
     kl_loss: f32,
+    mean_kl: ?f32 = null,
     clip_fraction: f32,
+    mean_reward: ?f32 = null,
+    reward_stddev: ?f32 = null,
+    training_seed: u64 = 42,
+    policy_backend: ?[]const u8 = null,
+    optimizer_steps: ?u64 = null,
+    micro_batch_steps: ?u64 = null,
+    training_order: ?GrpoTrainingOrderSummary = null,
+    sampling_mode: ?[]const u8 = null,
+    sampling: ?GrpoSamplingSummary = null,
+    policy_logprob_mode: ?[]const u8 = null,
+    policy_rescore_completions: ?usize = null,
+    training_microbatch_mode: ?[]const u8 = null,
+    training_microbatch_batch_size: ?usize = null,
+    training_physical_micro_batches_per_group: ?usize = null,
+    sampling_seconds: ?f64 = null,
+    incremental_kv: ?gemma4_real_autodiff.GrpoIncrementalKvTelemetry = null,
+    policy_rescore_seconds: ?f64 = null,
+    backward_update_seconds: ?f64 = null,
+    reference_mode: ?[]const u8 = null,
+    reference_scoring_seconds: ?f64 = null,
+    reference_cache: ?GrpoReferenceCacheTelemetry = null,
+    initial_logprob_parity: ?GrpoInitialLogprobParity = null,
+    kl_control: ?GrpoKlControlTelemetry = null,
+    benchmark: ?GrpoBenchmarkTelemetry = null,
+    checkpoint_resume: ?PreferenceCheckpointResumeSummary = null,
+    reward_pipeline: ?RewardPipelineTelemetry = null,
+    metal_numerical_policy: ?GemmaMetalNumericalPolicy = null,
+    numerical_environment_overrides: []const []const u8 = &.{},
+    optimizer_weight_decay: f32 = 0.01,
+    evaluation_execution_policy: ?[]const u8 = null,
+    baseline_evaluation: ?GrpoEvaluationSummary = null,
+    baseline_relative: ?GrpoBaselineRelativeSummary = null,
+    evaluation: ?GrpoEvaluationSummary = null,
+    trained_adapter_dir: ?[]const u8 = null,
+    // CUDA optimizer-lane and objective telemetry (main: Gemma 4 CUDA
+    // preference training). `reward_std` is the CUDA lane's name for
+    // `reward_stddev`; the CUDA smoke/benchmark qualification reads it.
+    reward_std: ?f32 = null,
     group_size: ?usize = null,
     clip_epsilon: ?f32 = null,
     kl_coef: ?f32 = null,
@@ -402,15 +778,588 @@ const GrpoReport = struct {
     advantage_standard_deviation_correction: ?u8 = null,
     reward_scaling: ?[]const u8 = null,
     loss_normalization: ?[]const u8 = null,
-    policy_backend: ?[]const u8 = null,
     optimizer_backend: ?[]const u8 = null,
-    optimizer_steps: ?u64 = null,
     cuda_optimizer_steps: ?u64 = null,
-    micro_batch_steps: ?u64 = null,
     mean_grad_norm: ?f64 = null,
     trainable_update: ?TrainableUpdateTelemetry = null,
     device_execution_scope: ?[]const u8 = null,
     device_execution: ?real_autodiff.TrainingExecutionEvidence = null,
+};
+
+const PreferenceCheckpointResumeSummary = struct {
+    enabled: bool,
+    start_epoch: usize,
+    /// Completed examples (DPO pairs or GRPO groups) inside `start_epoch`
+    /// that the restored checkpoint had already consumed; zero for an
+    /// epoch-boundary resume.
+    start_examples_into_epoch: usize = 0,
+    checkpoint_path: ?[]const u8,
+    checkpoint_state_path: ?[]const u8,
+    checkpoint_state_sha256: ?[]const u8,
+    checkpoint_epoch: ?usize,
+    checkpoint_every_epochs: ?u32,
+    checkpoint_every_examples: ?u32 = null,
+    run_fingerprint_sha256: []const u8,
+    restored_micro_batch_steps: u64,
+    restored_optimizer_steps: u64,
+    restored_accumulation_micro_batches: u32,
+    /// True when compiled sampling crossed a cache-empty checkpoint boundary.
+    /// Uninterrupted continuation retires live plans after publication; a
+    /// resumed process retires its bootstrap plan after restoring state.
+    compiled_sampling_execution_cache_retired: bool = false,
+};
+
+const DpoCheckpointAggregates = struct {
+    initial_adapter_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    examples_seen: usize,
+    total_loss: f64,
+    total_margin: f64,
+    total_accuracy: f64,
+    initial_logprob_parity: ?DpoInitialLogprobParity = null,
+    initial_bucket_signature_parity: ?DpoInitialBucketSignatureParity = null,
+};
+
+const GrpoReferenceCacheCheckpointEntry = struct {
+    prompt_idx: usize,
+    completion_tokens: []const i32,
+    reference_logps: []const f32,
+};
+
+const GrpoReferenceCacheCheckpoint = struct {
+    capacity: usize,
+    next_evict: usize,
+    hits: usize,
+    misses: usize,
+    entries: []const GrpoReferenceCacheCheckpointEntry,
+};
+
+const GrpoCheckpointAggregates = struct {
+    initial_adapter_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    total_loss: f64,
+    total_pg_loss: f64,
+    total_kl_loss: f64,
+    total_mean_kl: f64,
+    total_clip_fraction: f64,
+    total_groups: usize,
+    optimizer_groups: usize = 0,
+    zero_reward_std_groups: usize = 0,
+    all_truncated_groups: usize = 0,
+    kl_rejected_groups: usize = 0,
+    total_completions: usize,
+    truncated_completions: usize = 0,
+    total_tokens: usize,
+    total_reward: f64,
+    total_reward_squared: f64,
+    saw_nonzero_reward_advantage: bool,
+    saw_nonzero_policy_gradient: bool,
+    initial_sampling_rescore_max_abs_error: f32,
+    initial_policy_reference_max_abs_error: f32,
+    initial_base_equivalent_policy: bool,
+    captured_initial_logprob_parity: bool,
+    policy_rescore_completions: usize,
+    diagnostic_first_tokens: [8]i32,
+    diagnostic_policy_first_token_logps: [8]f32,
+    diagnostic_reference_first_token_logps: [8]f32,
+    diagnostic_first_token_count: usize,
+    kl_current_coef: f32,
+    kl_admitted_groups: usize,
+    kl_max_observed_mean: f32,
+    kl_trace: []const u8,
+    reward_call_index: usize,
+    reward_external_calls: usize,
+    reward_external_failures: usize,
+    reward_trace: []const u8,
+    /// Frozen-reference values are derived, but their exact f32 bytes are part
+    /// of the optimizer trajectory. Persist the bounded cache so a resumed
+    /// process does not recompute those values through a different Metal
+    /// allocation/session history.
+    reference_cache: ?GrpoReferenceCacheCheckpoint = null,
+    /// Cumulative exact-sampler counters. Live KV pages are intentionally not
+    /// serialized; checkpoints are admitted only after the sampler proves all
+    /// logical and device sequence lifetimes have ended.
+    incremental_kv: ?gemma4_real_autodiff.GrpoIncrementalKvTelemetry = null,
+};
+
+const preference_checkpoint_state_schema_v1 = "antfly_gemma4_preference_checkpoint_state/v1";
+const preference_checkpoint_state_schema_v2 = "antfly_gemma4_preference_checkpoint_state/v2";
+
+const PreferenceCheckpointState = struct {
+    schema_version: []const u8 = preference_checkpoint_state_schema_v2,
+    task: []const u8,
+    run_fingerprint_sha256: []const u8,
+    epoch_index: usize,
+    /// Completed optimizer examples (DPO pairs or GRPO prompt groups) inside
+    /// the in-progress epoch. Zero means the checkpoint sits on a durable
+    /// epoch boundary; schema v1 sidecars never carry a nonzero cursor.
+    examples_into_epoch: usize = 0,
+    micro_batch_steps: u64,
+    optimizer_steps: u64,
+    accumulation_micro_batches: u32,
+    dpo: ?DpoCheckpointAggregates = null,
+    grpo: ?GrpoCheckpointAggregates = null,
+};
+
+const LoadedPreferenceCheckpointState = struct {
+    parsed: std.json.Parsed(PreferenceCheckpointState),
+    path: []u8,
+
+    fn deinit(self: *LoadedPreferenceCheckpointState, allocator: std.mem.Allocator) void {
+        self.parsed.deinit();
+        allocator.free(self.path);
+        self.* = undefined;
+    }
+};
+
+const PreferenceCheckpointArtifactSummary = struct {
+    state_path: []u8,
+    state_sha256: []const u8,
+    epoch: usize,
+
+    fn deinit(self: *PreferenceCheckpointArtifactSummary, allocator: std.mem.Allocator) void {
+        allocator.free(self.state_path);
+        allocator.free(self.state_sha256);
+        self.* = undefined;
+    }
+};
+
+const RewardPipelineTelemetry = struct {
+    aggregation: []const u8,
+    failure_policy: []const u8,
+    providers: usize,
+    external_calls: usize,
+    external_failures: usize,
+    configuration_digest: []const u8,
+    trace_path: ?[]const u8 = null,
+    trace_digest: ?[]const u8 = null,
+};
+
+const GrpoEvaluationSummary = struct {
+    report_path: []const u8,
+    groups: usize,
+    completions: usize,
+    zero_reward_std_groups: usize = 0,
+    frac_reward_zero_std: f32 = 0.0,
+    truncated_completions: usize = 0,
+    frac_completions_truncated: f32 = 0.0,
+    mask_truncated_completions: bool = false,
+    mean_reward: f32,
+    top_rank_mean_reward: f32,
+    positive_reward_group_rate: f32,
+    reward_stddev: f32,
+    kl_loss: f32,
+    mean_kl: f32,
+    sampling_seconds: ?f64 = null,
+    reference_scoring_seconds: ?f64 = null,
+    reward_loss_seconds: ?f64 = null,
+    loop_seconds: ?f64 = null,
+    passed: bool,
+};
+
+const GrpoBaselineRelativeSummary = struct {
+    mean_reward_improvement: f32,
+    top_rank_mean_reward_improvement: f32,
+    positive_reward_group_rate_improvement: f32,
+    positive_reward_group_rate_required_improvement: f32,
+    positive_reward_group_rate_requirement_saturated: bool,
+    passed: bool,
+};
+
+fn grpoPositiveRewardGroupCount(summary: GrpoEvaluationSummary) ?usize {
+    if (summary.groups == 0 or
+        !std.math.isFinite(summary.positive_reward_group_rate) or
+        summary.positive_reward_group_rate < 0.0 or
+        summary.positive_reward_group_rate > 1.0)
+    {
+        return null;
+    }
+    const scaled = @as(f64, summary.positive_reward_group_rate) *
+        @as(f64, @floatFromInt(summary.groups));
+    const rounded = @round(scaled);
+    if (rounded < 0.0 or rounded > @as(f64, @floatFromInt(summary.groups))) {
+        return null;
+    }
+    return @intFromFloat(rounded);
+}
+
+fn passesGrpoPositiveGroupImprovement(
+    baseline: GrpoEvaluationSummary,
+    evaluation: GrpoEvaluationSummary,
+    required_improvement: f64,
+) bool {
+    const improvement = evaluation.positive_reward_group_rate - baseline.positive_reward_group_rate;
+    if (required_improvement >= 0.0) return improvement >= required_improvement;
+    if (baseline.groups != evaluation.groups) return false;
+    const baseline_groups = grpoPositiveRewardGroupCount(baseline) orelse return false;
+    const evaluation_groups = grpoPositiveRewardGroupCount(evaluation) orelse return false;
+    if (evaluation_groups >= baseline_groups) return true;
+    const requested_regressions = -required_improvement *
+        @as(f64, @floatFromInt(baseline.groups));
+    const permits_one_regression = requested_regressions >= 1.0 - 1e-6;
+    return permits_one_regression and baseline_groups - evaluation_groups == 1;
+}
+
+fn compareGrpoToBaseline(
+    baseline: GrpoEvaluationSummary,
+    evaluation: GrpoEvaluationSummary,
+    minimums: GrpoEvalMinimums,
+) GrpoBaselineRelativeSummary {
+    const mean_reward_improvement = evaluation.mean_reward - baseline.mean_reward;
+    const top_rank_mean_reward_improvement = evaluation.top_rank_mean_reward - baseline.top_rank_mean_reward;
+    const positive_reward_group_rate_improvement = evaluation.positive_reward_group_rate - baseline.positive_reward_group_rate;
+    const positive_reward_group_rate_requirement = boundedIncreaseRequirement(
+        baseline.positive_reward_group_rate,
+        minimums.min_positive_reward_group_rate_improvement.?,
+        1.0,
+    );
+    return .{
+        .mean_reward_improvement = mean_reward_improvement,
+        .top_rank_mean_reward_improvement = top_rank_mean_reward_improvement,
+        .positive_reward_group_rate_improvement = positive_reward_group_rate_improvement,
+        .positive_reward_group_rate_required_improvement = positive_reward_group_rate_requirement.effective_minimum,
+        .positive_reward_group_rate_requirement_saturated = positive_reward_group_rate_requirement.saturated,
+        .passed = mean_reward_improvement >= minimums.min_mean_reward_improvement.? and
+            top_rank_mean_reward_improvement >= minimums.min_top_rank_mean_reward_improvement.? and
+            passesGrpoPositiveGroupImprovement(
+                baseline,
+                evaluation,
+                positive_reward_group_rate_requirement.effective_minimum,
+            ),
+    };
+}
+
+const GrpoEvaluationReport = struct {
+    schema_version: []const u8 = "antfly_inference_finetune_grpo_evaluation/v4",
+    status: []const u8,
+    dataset_path: []const u8,
+    dataset_fingerprint: PathFingerprint,
+    policy_adapter_digest: []const u8,
+    policy_backend: []const u8,
+    execution_policy: []const u8 = canonical_preference_evaluation_policy,
+    metal_numerical_policy: ?GemmaMetalNumericalPolicy = null,
+    numerical_environment_overrides: []const []const u8 = &.{},
+    optimizer_weight_decay: f32 = 0.01,
+    groups: usize,
+    completions: usize,
+    tokens: usize,
+    zero_reward_std_groups: usize = 0,
+    frac_reward_zero_std: f32 = 0.0,
+    truncated_completions: usize = 0,
+    frac_completions_truncated: f32 = 0.0,
+    mask_truncated_completions: bool = false,
+    prompt_overlap_count: usize,
+    mean_reward: f32,
+    top_rank_mean_reward: f32,
+    positive_reward_group_rate: f32,
+    reward_stddev: f32,
+    loss: f32,
+    pg_loss: f32,
+    kl_loss: f32,
+    mean_kl: f32,
+    clip_fraction: f32,
+    minimums: GrpoEvalMinimums,
+    reference_mode: []const u8,
+    sampling: ?GrpoSamplingSummary = null,
+    execution_order: ?[]const u8 = null,
+    sampling_seconds: ?f64 = null,
+    incremental_kv: ?gemma4_real_autodiff.GrpoIncrementalKvTelemetry = null,
+    reference_scoring_seconds: ?f64 = null,
+    reward_loss_seconds: ?f64 = null,
+    loop_seconds: ?f64 = null,
+    reward_pipeline: ?RewardPipelineTelemetry = null,
+};
+
+const GrpoReferenceCacheTelemetry = struct {
+    capacity: usize,
+    entries: usize,
+    hits: usize,
+    misses: usize,
+};
+
+const GrpoInitialLogprobParity = struct {
+    sampling_rescore_max_abs_error: f32,
+    policy_reference_max_abs_error: f32,
+    base_equivalent_policy: bool,
+    completion_first_token_ids: []const i32,
+    policy_first_token_logps: []const f32,
+    reference_first_token_logps: []const f32,
+};
+
+const GrpoKlControlTelemetry = struct {
+    mode: []const u8,
+    budget_policy: []const u8,
+    train_max_kl: f32,
+    target_kl: ?f32,
+    kl_horizon: ?f32,
+    kl_horizon_unit: ?[]const u8,
+    initial_kl_coef: f32,
+    final_kl_coef: f32,
+    min_kl_coef: ?f32,
+    max_kl_coef: ?f32,
+    admitted_groups: usize,
+    rejected_groups: usize,
+    max_observed_mean_kl: f32,
+    trace_path: []const u8,
+    trace_digest: ?[]const u8,
+};
+
+const GrpoKlTraceRecord = struct {
+    schema_version: []const u8 = "antfly_inference_grpo_kl_control_trace/v5",
+    group_index: usize,
+    epoch_index: usize,
+    prompt_index: usize,
+    optimizer_steps_before: u64,
+    observed_completions: usize,
+    status: []const u8,
+    budget_policy: []const u8,
+    mean_kl: f32,
+    weighted_kl_loss: f32,
+    objective_kl_coef: f32,
+    train_max_kl: f32,
+    target_kl: ?f32,
+    kl_coef_before: f32,
+    kl_coef_after: f32,
+};
+
+const GrpoKlControl = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    resolved: ResolvedGrpoKlControl,
+    initial_kl_coef: f32,
+    current_kl_coef: f32,
+    controller: ?grpo.AdaptiveKLController,
+    trace_path: []const u8,
+    trace: std.ArrayList(u8) = .empty,
+    trace_digest: ?[]const u8 = null,
+    admitted_groups: usize = 0,
+    rejected_groups: usize = 0,
+    max_observed_mean_kl: f32 = 0.0,
+    finished: bool = false,
+
+    fn init(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe) !GrpoKlControl {
+        const resolved = try resolveGrpoKlControl(recipe.grpo);
+        const initial_kl_coef = recipe.grpo.kl_coef orelse 0.04;
+        const trace_path = try grpoKlTracePath(allocator, recipe);
+        errdefer allocator.free(trace_path);
+        const controller = if (resolved.adaptive)
+            try grpo.AdaptiveKLController.init(initial_kl_coef, .{
+                .target = resolved.target_kl.?,
+                .horizon = resolved.kl_horizon.?,
+                .min_coef = resolved.min_kl_coef.?,
+                .max_coef = resolved.max_kl_coef.?,
+            })
+        else
+            null;
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .resolved = resolved,
+            .initial_kl_coef = initial_kl_coef,
+            .current_kl_coef = initial_kl_coef,
+            .controller = controller,
+            .trace_path = trace_path,
+        };
+    }
+
+    fn deinit(self: *GrpoKlControl) void {
+        self.trace.deinit(self.allocator);
+        self.allocator.free(self.trace_path);
+        if (self.trace_digest) |digest| self.allocator.free(digest);
+        self.* = undefined;
+    }
+
+    fn restoreCheckpoint(
+        self: *GrpoKlControl,
+        current_kl_coef: f32,
+        admitted_groups: usize,
+        rejected_groups: usize,
+        max_observed_mean_kl: f32,
+        trace: []const u8,
+    ) !void {
+        if (self.finished or self.trace.items.len != 0 or self.admitted_groups != 0 or self.rejected_groups != 0 or
+            !std.math.isFinite(current_kl_coef) or current_kl_coef < 0.0 or
+            !std.math.isFinite(max_observed_mean_kl) or max_observed_mean_kl < 0.0 or
+            trace.len > 16 * 1024 * 1024)
+        {
+            return error.InvalidPreferenceCheckpointState;
+        }
+        if (self.resolved.adaptive) {
+            if (current_kl_coef < self.resolved.min_kl_coef.? or
+                current_kl_coef > self.resolved.max_kl_coef.?)
+            {
+                return error.InvalidPreferenceCheckpointState;
+            }
+            self.controller.?.value = current_kl_coef;
+        } else if (@as(u32, @bitCast(current_kl_coef)) != @as(u32, @bitCast(self.initial_kl_coef))) {
+            return error.InvalidPreferenceCheckpointState;
+        }
+        try self.trace.appendSlice(self.allocator, trace);
+        self.current_kl_coef = current_kl_coef;
+        self.admitted_groups = admitted_groups;
+        self.rejected_groups = rejected_groups;
+        self.max_observed_mean_kl = max_observed_mean_kl;
+    }
+
+    /// Admits or rejects one group before optimizer mutation and returns the
+    /// coefficient to use for the next group.
+    fn observe(
+        self: *GrpoKlControl,
+        group_index: usize,
+        epoch_index: usize,
+        prompt_index: usize,
+        optimizer_steps_before: u64,
+        observed_completions: usize,
+        mean_kl: f32,
+        weighted_kl_loss: f32,
+        objective_kl_coef: f32,
+    ) !?f32 {
+        if (observed_completions == 0 or
+            !std.math.isFinite(mean_kl) or mean_kl < 0.0 or
+            !std.math.isFinite(weighted_kl_loss) or
+            !std.math.isFinite(objective_kl_coef) or objective_kl_coef < 0.0)
+        {
+            return error.NonFiniteGrpoKlObservation;
+        }
+        const coefficient_before = self.current_kl_coef;
+        if (@as(u32, @bitCast(objective_kl_coef)) != @as(u32, @bitCast(coefficient_before))) {
+            return error.GrpoKlControllerObjectiveMismatch;
+        }
+        const admitted = mean_kl <= self.resolved.train_max_kl;
+        self.max_observed_mean_kl = @max(self.max_observed_mean_kl, mean_kl);
+        var coefficient_after = coefficient_before;
+        if (self.controller) |*controller| {
+            coefficient_after = try controller.update(mean_kl, observed_completions);
+        }
+        self.current_kl_coef = coefficient_after;
+        try self.append(GrpoKlTraceRecord{
+            .group_index = group_index,
+            .epoch_index = epoch_index,
+            .prompt_index = prompt_index,
+            .optimizer_steps_before = optimizer_steps_before,
+            .observed_completions = observed_completions,
+            .status = if (admitted)
+                "admitted"
+            else if (self.resolved.budget_policy == .skip_group)
+                "budget-exceeded-skipped"
+            else
+                "budget-exceeded-abort",
+            .budget_policy = @tagName(self.resolved.budget_policy),
+            .mean_kl = mean_kl,
+            .weighted_kl_loss = weighted_kl_loss,
+            .objective_kl_coef = objective_kl_coef,
+            .train_max_kl = self.resolved.train_max_kl,
+            .target_kl = self.resolved.target_kl,
+            .kl_coef_before = coefficient_before,
+            .kl_coef_after = coefficient_after,
+        });
+        if (!admitted) {
+            print(
+                "grpo rejected optimizer group {d}: raw mean KL {d:.8} exceeds train_max_kl {d:.8}; no optimizer mutation was admitted\n",
+                .{ group_index, mean_kl, self.resolved.train_max_kl },
+            );
+            if (self.resolved.budget_policy == .abort) {
+                try self.finish();
+                return error.GrpoTrainKlBudgetExceeded;
+            }
+            self.rejected_groups += 1;
+            return null;
+        }
+        self.admitted_groups += 1;
+        return coefficient_after;
+    }
+
+    /// Observe one completed rollout group and synchronize the coefficient
+    /// used by the next objective before the caller handles admission.
+    fn observeAndSyncObjective(
+        self: *GrpoKlControl,
+        config: *grpo.GRPOConfig,
+        group_index: usize,
+        epoch_index: usize,
+        prompt_index: usize,
+        optimizer_steps_before: u64,
+        observed_completions: usize,
+        mean_kl: f32,
+        weighted_kl_loss: f32,
+    ) !bool {
+        const decision = try self.observe(
+            group_index,
+            epoch_index,
+            prompt_index,
+            optimizer_steps_before,
+            observed_completions,
+            mean_kl,
+            weighted_kl_loss,
+            config.kl_coef,
+        );
+        config.kl_coef = self.current_kl_coef;
+        return decision != null;
+    }
+
+    fn append(self: *GrpoKlControl, record: GrpoKlTraceRecord) !void {
+        const rendered = try std.json.Stringify.valueAlloc(self.allocator, record, .{});
+        defer self.allocator.free(rendered);
+        const record_size = std.math.add(usize, rendered.len, 1) catch return error.GrpoKlTraceLimitExceeded;
+        const next_size = std.math.add(usize, self.trace.items.len, record_size) catch
+            return error.GrpoKlTraceLimitExceeded;
+        if (next_size > 16 * 1024 * 1024) return error.GrpoKlTraceLimitExceeded;
+        try self.trace.ensureTotalCapacity(self.allocator, next_size);
+        try self.trace.appendSlice(self.allocator, rendered);
+        try self.trace.append(self.allocator, '\n');
+    }
+
+    fn finish(self: *GrpoKlControl) !void {
+        if (self.finished) return;
+        try artifact_publication.writeFileAtomicReplace(self.allocator, self.io, self.trace_path, self.trace.items);
+        self.trace_digest = try sha256FileAlloc(self.allocator, self.io, self.trace_path);
+        self.finished = true;
+    }
+
+    fn telemetry(self: *const GrpoKlControl) GrpoKlControlTelemetry {
+        return .{
+            .mode = if (self.resolved.adaptive) "adaptive" else "fixed",
+            .budget_policy = @tagName(self.resolved.budget_policy),
+            .train_max_kl = self.resolved.train_max_kl,
+            .target_kl = self.resolved.target_kl,
+            .kl_horizon = self.resolved.kl_horizon,
+            .kl_horizon_unit = if (self.resolved.adaptive) "completion-episodes" else null,
+            .initial_kl_coef = self.initial_kl_coef,
+            .final_kl_coef = self.current_kl_coef,
+            .min_kl_coef = self.resolved.min_kl_coef,
+            .max_kl_coef = self.resolved.max_kl_coef,
+            .admitted_groups = self.admitted_groups,
+            .rejected_groups = self.rejected_groups,
+            .max_observed_mean_kl = self.max_observed_mean_kl,
+            .trace_path = self.trace_path,
+            .trace_digest = self.trace_digest,
+        };
+    }
+};
+
+const GrpoBenchmarkUpdate = struct {
+    seconds: f64,
+    loss: f32,
+    pg_loss: f32,
+    kl_loss: f32,
+    mean_reward: f32,
+    reward_stddev: f32,
+    completion_tokens: usize,
+    policy_reference_max_abs_error: f32,
+};
+
+const GrpoBenchmarkProtocol = struct {
+    cold: usize,
+    first: usize,
+    warmup: usize,
+    measured: usize,
+};
+
+const GrpoBenchmarkTelemetry = struct {
+    protocol: GrpoBenchmarkProtocol,
+    cold: GrpoBenchmarkUpdate,
+    first: GrpoBenchmarkUpdate,
+    warmup: []const GrpoBenchmarkUpdate,
+    measured: []const GrpoBenchmarkUpdate,
+    median_seconds: f64,
+    mean_seconds: f64,
 };
 
 /// Host snapshot used to prove that an optimizer-backed run changed the
@@ -529,7 +1478,9 @@ const SyntheticQwen2Assets = struct {
 const SyntheticGemmaAssets = struct {
     model_dir: []const u8,
     dpo_path: []const u8,
+    dpo_eval_path: []const u8,
     grpo_path: []const u8,
+    grpo_eval_path: []const u8,
 };
 
 const WriteTensorF32 = struct {
@@ -594,12 +1545,17 @@ pub fn loadRecipe(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !s
 
 fn runFastSmoke(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     var out_root: []const u8 = "/tmp/antfly-inference-finetune-smoke-fast";
+    var selected_case: ?[]const u8 = null;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--out-root")) {
             i += 1;
             if (i >= args.len) return usageError();
             out_root = args[i];
+        } else if (std.mem.eql(u8, args[i], "--case")) {
+            i += 1;
+            if (i >= args.len or selected_case != null) return usageError();
+            selected_case = args[i];
         } else {
             return usageError();
         }
@@ -622,7 +1578,6 @@ fn runFastSmoke(allocator: std.mem.Allocator, io: std.Io, args: []const []const 
         .{ .name = "grpo_text_dry_run", .recipe_path = "pkg/inference/testdata/recipe_grpo_text_native_fast.json", .mode = .dry_run },
         .{ .name = "grpo_text_gemma_dry_run", .recipe_path = "pkg/inference/testdata/recipe_grpo_text_gemma_fast.json", .mode = .dry_run },
         .{ .name = "grpo_rendered_text_gemma_dry_run", .recipe_path = "pkg/inference/testdata/recipe_grpo_rendered_text_gemma_fast.json", .mode = .dry_run },
-        .{ .name = "grpo_multimodal_gemma_dry_run", .recipe_path = "pkg/inference/testdata/recipe_grpo_multimodal_gemma_fast.json", .mode = .dry_run },
         .{ .name = "grpo_text_qwen2_dry_run", .recipe_path = "pkg/inference/testdata/recipe_grpo_text_qwen2_fast.json", .mode = .dry_run },
         .{ .name = "grpo_text_colqwen2_dry_run", .recipe_path = "pkg/inference/testdata/recipe_grpo_text_colqwen2_fast.json", .mode = .dry_run },
         .{ .name = "grpo_ci_text_dry_run", .recipe_path = "pkg/inference/testdata/recipe_grpo_text_ci_native_fast.json", .mode = .dry_run },
@@ -635,10 +1590,21 @@ fn runFastSmoke(allocator: std.mem.Allocator, io: std.Io, args: []const []const 
         .{ .name = "grpo_scalar_execute", .recipe_path = "pkg/inference/testdata/recipe_grpo_scalar.json", .mode = .execute },
     };
 
-    var results = try allocator.alloc(FastSmokeCaseResult, cases.len);
-    defer freeFastSmokeResults(allocator, results);
-    for (cases, 0..) |case, idx| {
-        results[idx] = try runFastSmokeCase(allocator, io, out_root, case);
+    var selected_count: usize = 0;
+    for (cases) |case| {
+        if (selected_case == null or std.mem.eql(u8, selected_case.?, case.name)) selected_count += 1;
+    }
+    if (selected_count == 0) return error.UnknownFastSmokeCase;
+
+    var results = try allocator.alloc(FastSmokeCaseResult, selected_count);
+    var initialized_results: usize = 0;
+    defer freeFastSmokeResults(allocator, results, initialized_results);
+    for (cases) |case| {
+        if (selected_case) |name| {
+            if (!std.mem.eql(u8, name, case.name)) continue;
+        }
+        results[initialized_results] = try runFastSmokeCase(allocator, io, out_root, case);
+        initialized_results += 1;
     }
 
     const overall = blk: {
@@ -650,7 +1616,7 @@ fn runFastSmoke(allocator: std.mem.Allocator, io: std.Io, args: []const []const 
     try writeJsonFile(allocator, io, summary_path, FastSmokeSummary{
         .status = overall,
         .output_root = out_root,
-        .cases = results,
+        .cases = results[0..initialized_results],
     });
     print("fast smoke summary: {s}\n", .{summary_path});
     if (overall != .succeeded) return error.FinetuneStepFailed;
@@ -758,8 +1724,9 @@ fn runFastSmokeCase(
     };
 }
 
-fn freeFastSmokeResults(allocator: std.mem.Allocator, results: []FastSmokeCaseResult) void {
-    for (results) |result| {
+fn freeFastSmokeResults(allocator: std.mem.Allocator, results: []FastSmokeCaseResult, initialized_results: usize) void {
+    std.debug.assert(initialized_results <= results.len);
+    for (results[0..initialized_results]) |result| {
         if (result.manifest_path) |path| allocator.free(path);
         if (result.training_report_path) |path| allocator.free(path);
     }
@@ -799,6 +1766,7 @@ fn normalizeFastSmokeRecipePaths(allocator: std.mem.Allocator, io: std.Io, recip
     recipe.dataset.cache_path = try resolveOptionalCwdPath(allocator, io, recipe.dataset.cache_path);
     recipe.dataset.train_cache_path = try resolveOptionalCwdPath(allocator, io, recipe.dataset.train_cache_path);
     recipe.dataset.eval_cache_path = try resolveOptionalCwdPath(allocator, io, recipe.dataset.eval_cache_path);
+    if (recipe.eval) |*eval| eval.path = try resolveOptionalCwdPath(allocator, io, eval.path);
 }
 
 fn resolveOptionalCwdPath(allocator: std.mem.Allocator, io: std.Io, maybe_path: ?[]const u8) !?[]const u8 {
@@ -807,23 +1775,39 @@ fn resolveOptionalCwdPath(allocator: std.mem.Allocator, io: std.Io, maybe_path: 
 }
 
 fn resolveCwdPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]const u8 {
+    return resolvePathFromDir(allocator, io, std.Io.Dir.cwd(), path);
+}
+
+fn resolvePathFromDir(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) ![]const u8 {
     if (path.len == 0 or std.fs.path.isAbsolute(path)) return try allocator.dupe(u8, path);
-    if (cwdPathExists(io, path)) return try allocator.dupe(u8, path);
+    if (dirPathExists(dir, io, path)) return try allocator.dupe(u8, path);
 
     const package_prefix = "pkg/inference/";
     if (std.mem.startsWith(u8, path, package_prefix)) {
         const package_relative = path[package_prefix.len..];
-        if (cwdPathExists(io, package_relative)) return try allocator.dupe(u8, package_relative);
+        if (dirPathExists(dir, io, package_relative)) return try allocator.dupe(u8, package_relative);
+
+        const repo_relative = try std.fs.path.join(allocator, &.{ "zig", path });
+        if (dirPathExists(dir, io, repo_relative)) return repo_relative;
+        allocator.free(repo_relative);
     } else {
-        const repo_relative = try std.fs.path.join(allocator, &.{ package_prefix[0 .. package_prefix.len - 1], path });
-        if (cwdPathExists(io, repo_relative)) return repo_relative;
+        const package_relative = try std.fs.path.join(allocator, &.{ package_prefix[0 .. package_prefix.len - 1], path });
+        if (dirPathExists(dir, io, package_relative)) return package_relative;
+        allocator.free(package_relative);
+
+        const repo_relative = try std.fs.path.join(allocator, &.{ "zig", package_prefix[0 .. package_prefix.len - 1], path });
+        if (dirPathExists(dir, io, repo_relative)) return repo_relative;
         allocator.free(repo_relative);
     }
     return try allocator.dupe(u8, path);
 }
 
 fn cwdPathExists(io: std.Io, path: []const u8) bool {
-    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return dirPathExists(std.Io.Dir.cwd(), io, path);
+}
+
+fn dirPathExists(dir: std.Io.Dir, io: std.Io, path: []const u8) bool {
+    dir.access(io, path, .{}) catch return false;
     return true;
 }
 
@@ -864,26 +1848,32 @@ fn setupFastSmokeCase(
         .synthetic_gemma_dpo_execute => blk: {
             const assets = try writeSyntheticGemmaSmokeAssets(allocator, io, case_root);
             allocator.free(assets.grpo_path);
+            allocator.free(assets.grpo_eval_path);
             break :blk .{
                 .model_path = assets.model_dir,
                 .reference_path = assets.model_dir,
                 .dataset_path = assets.dpo_path,
+                .eval_path = assets.dpo_eval_path,
                 .dataset_format = "rendered-text-preference",
                 .backend = "auto",
                 .max_examples = 1,
+                .eval_max_examples = 1,
                 .max_seq_len = 32,
             };
         },
         .synthetic_gemma_grpo_execute => blk: {
             const assets = try writeSyntheticGemmaSmokeAssets(allocator, io, case_root);
             allocator.free(assets.dpo_path);
+            allocator.free(assets.dpo_eval_path);
             break :blk .{
                 .model_path = assets.model_dir,
                 .reference_path = assets.model_dir,
                 .dataset_path = assets.grpo_path,
+                .eval_path = assets.grpo_eval_path,
                 .dataset_format = "rendered-text-grpo",
                 .backend = "auto",
                 .max_examples = 1,
+                .eval_max_examples = 1,
                 .max_seq_len = 32,
             };
         },
@@ -896,7 +1886,14 @@ fn applyFastSmokeRecipeOverrides(recipe: *Recipe, overrides: FastSmokeRecipeOver
     if (overrides.dataset_path) |value| recipe.dataset.path = value;
     if (overrides.dataset_format) |value| recipe.dataset.format = value;
     if (overrides.train_path) |value| recipe.dataset.train_path = value;
-    if (overrides.eval_path) |value| recipe.dataset.eval_path = value;
+    if (overrides.eval_path) |value| {
+        if (recipe.eval) |*eval| {
+            eval.path = value;
+            recipe.dataset.eval_path = null;
+        } else {
+            recipe.dataset.eval_path = value;
+        }
+    }
     if (overrides.labels) |value| recipe.dataset.labels = value;
     if (overrides.backend) |value| recipe.backend = value;
     if (overrides.max_examples) |value| recipe.dataset.max_examples = value;
@@ -955,13 +1952,13 @@ fn writeSyntheticGemmaSmokeAssets(allocator: std.mem.Allocator, io: std.Io, case
     try std.Io.Dir.cwd().createDirPath(io, model_dir);
 
     try writeOwnedTextFile(allocator, io, try std.fs.path.join(allocator, &.{ model_dir, "config.json" }),
-        \\{"model_type":"gemma4_text","hidden_size":32,"num_hidden_layers":1,"num_attention_heads":4,"num_key_value_heads":2,"attention_head_dim":8,"intermediate_size":64,"max_position_embeddings":32,"rope_theta":10000.0,"rms_norm_eps":1e-6,"tie_word_embeddings":true,"vocab_size":200000}
+        \\{"model_type":"gemma4_text","hidden_size":32,"num_hidden_layers":1,"num_attention_heads":4,"num_key_value_heads":2,"attention_head_dim":8,"intermediate_size":64,"max_position_embeddings":32,"rope_theta":10000.0,"rms_norm_eps":1e-6,"tie_word_embeddings":false,"vocab_size":13}
     );
 
-    try copySmokeArtifactFromQwenTokenizerBundle(allocator, io, model_dir, "tokenizer.json");
-    try copySmokeArtifactFromQwenTokenizerBundle(allocator, io, model_dir, "tokenizer_config.json");
+    try writeOwnedSyntheticPreferenceTokenizerArtifact(allocator, io, model_dir, "tokenizer.json");
+    try writeOwnedSyntheticPreferenceTokenizerArtifact(allocator, io, model_dir, "tokenizer_config.json");
     try writeOwnedTextFile(allocator, io, try std.fs.path.join(allocator, &.{ model_dir, "special_tokens_map.json" }),
-        \\{"bos_token":"<|endoftext|>","eos_token":"<|im_end|>","pad_token":"<|endoftext|>"}
+        \\{"bos_token":"<bos>","eos_token":"<eos>","pad_token":"<pad>"}
     );
 
     const checkpoint_path = try std.fs.path.join(allocator, &.{ model_dir, "model.safetensors" });
@@ -970,19 +1967,31 @@ fn writeSyntheticGemmaSmokeAssets(allocator: std.mem.Allocator, io: std.Io, case
 
     const dpo_path = try std.fs.path.join(allocator, &.{ assets_root, "dpo.jsonl" });
     errdefer allocator.free(dpo_path);
+    const dpo_eval_path = try std.fs.path.join(allocator, &.{ assets_root, "dpo_eval.jsonl" });
+    errdefer allocator.free(dpo_eval_path);
     const grpo_path = try std.fs.path.join(allocator, &.{ assets_root, "grpo.jsonl" });
     errdefer allocator.free(grpo_path);
+    const grpo_eval_path = try std.fs.path.join(allocator, &.{ assets_root, "grpo_eval.jsonl" });
+    errdefer allocator.free(grpo_eval_path);
     try writeTextFile(io, dpo_path,
         \\{"prompt":"Answer with one word: yes or no?\nAnswer:","chosen":" yes","rejected":" no"}
     );
     try writeTextFile(io, grpo_path,
         \\{"prompt":"Answer with one word: yes\nAnswer:","target":"yes"}
     );
+    try writeTextFile(io, dpo_eval_path,
+        \\{"prompt":"Answer yes\nAnswer:","chosen":" yes","rejected":" no"}
+    );
+    try writeTextFile(io, grpo_eval_path,
+        \\{"prompt":"Answer yes\nAnswer:","target":"yes"}
+    );
 
     return .{
         .model_dir = model_dir,
         .dpo_path = dpo_path,
+        .dpo_eval_path = dpo_eval_path,
         .grpo_path = grpo_path,
+        .grpo_eval_path = grpo_eval_path,
     };
 }
 
@@ -1004,6 +2013,10 @@ fn copySmokeArtifactFromQwenTokenizerBundle(
         return;
     }
 
+    try writeSyntheticPreferenceTokenizerArtifact(io, dst_path, file_name);
+}
+
+fn writeSyntheticPreferenceTokenizerArtifact(io: std.Io, dst_path: []const u8, file_name: []const u8) !void {
     if (std.mem.eql(u8, file_name, "tokenizer.json")) {
         try writeTextFile(io, dst_path,
             \\{
@@ -1078,7 +2091,7 @@ fn writeSyntheticQwen2Checkpoint(allocator: std.mem.Allocator, path: []const u8)
 fn writeSyntheticGemmaCheckpoint(allocator: std.mem.Allocator, path: []const u8) !void {
     const hidden: usize = 32;
     const intermediate: usize = 64;
-    const vocab: usize = 200000;
+    const vocab: usize = 13;
     const num_layers: usize = 1;
     const q_dim: usize = 32;
     const kv_dim: usize = 16;
@@ -1093,6 +2106,7 @@ fn writeSyntheticGemmaCheckpoint(allocator: std.mem.Allocator, path: []const u8)
     }
 
     try tensors.append(allocator, .{ .name = "model.embed_tokens.weight", .shape = &.{ vocab, hidden }, .data = try makeRampF32(allocator, vocab * hidden, 0.00001) });
+    try tensors.append(allocator, .{ .name = "lm_head.weight", .shape = &.{ vocab, hidden }, .data = try makeSyntheticGemmaPreferenceLmHead(allocator, vocab, hidden) });
     try tensors.append(allocator, .{ .name = "model.norm.weight", .shape = &.{hidden}, .data = try makeFilledF32(allocator, hidden, 1.0) });
 
     var layer: usize = 0;
@@ -1114,6 +2128,16 @@ fn writeSyntheticGemmaCheckpoint(allocator: std.mem.Allocator, path: []const u8)
     }
 
     try writeHeaderAndTensorsF32(allocator, path, tensors.items);
+}
+
+fn makeSyntheticGemmaPreferenceLmHead(allocator: std.mem.Allocator, vocab: usize, hidden: usize) ![]f32 {
+    const yes_token_id: usize = 8;
+    const no_token_id: usize = 12;
+    if (yes_token_id >= vocab or no_token_id >= vocab) return error.InvalidSyntheticTokenizer;
+    const data = try makeFilledF32(allocator, vocab * hidden, 0.0);
+    @memset(data[yes_token_id * hidden ..][0..hidden], 1.0);
+    @memset(data[no_token_id * hidden ..][0..hidden], 0.5);
+    return data;
 }
 
 fn appendOwnedQwenTensor(
@@ -1150,6 +2174,17 @@ fn appendOwnedGemmaTensor(
         .shape = shape,
         .data = data,
     });
+}
+
+fn writeOwnedSyntheticPreferenceTokenizerArtifact(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    out_dir: []const u8,
+    file_name: []const u8,
+) !void {
+    const path = try std.fs.path.join(allocator, &.{ out_dir, file_name });
+    defer allocator.free(path);
+    try writeSyntheticPreferenceTokenizerArtifact(io, path, file_name);
 }
 
 fn writeOwnedTextFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, contents: []const u8) !void {
@@ -1210,6 +2245,23 @@ fn makeRampF32(allocator: std.mem.Allocator, len: usize, scale: f32) ![]f32 {
 pub fn buildPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
     const kind = try parseKind(recipe.recipe orelse recipe.kind orelse return error.MissingRecipeKind);
     const family = recipe.model.family orelse try inferFamily(recipe);
+    if (kind != .dpo and kind != .grpo and recipe.execution.mode != null) {
+        return error.ExecutionModeOnlySupportedForPreference;
+    }
+
+    if (recipe.optimizer.seed != null and
+        (!(kind == .dpo or kind == .grpo) or !eqlAny(family, &.{ "gemma4", "gemma" })))
+    {
+        return error.UnsupportedOptimizerSeed;
+    }
+
+    if (eqlAny(family, &.{ "gemma4", "gemma" })) {
+        switch (kind) {
+            .sft => return error.Gemma4FullSftNotYetSupported,
+            .qlora_sft => return error.Gemma4QLoRANotYetSupported,
+            else => {},
+        }
+    }
 
     return switch (kind) {
         .sft, .lora_sft, .qlora_sft => try buildLoraSftPlan(allocator, recipe, family),
@@ -1238,6 +2290,7 @@ fn buildLoraSftPlan(allocator: std.mem.Allocator, recipe: Recipe, family: []cons
 }
 
 fn buildQwen35TextSftPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
+    try validateNativePreferenceOptions(recipe);
     _ = trainDatasetPath(recipe) orelse return error.MissingDatasetPath;
     return .{ .steps = try allocator.dupe(Step, &.{
         .{
@@ -1248,13 +2301,906 @@ fn buildQwen35TextSftPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
     }) };
 }
 
+fn validateGemma4LoraRecipeContract(recipe: Recipe, adapter: AdapterConfig) !void {
+    if (recipe.model.reference_path != null) return error.UnsupportedGemma4ModelOption;
+    if (recipe.model.projector_path != null) return error.Gemma4MultimodalFinetuningNotSupported;
+    if (recipe.model.allow_direct_gguf_training != null) return error.UnsupportedGemma4ModelOption;
+
+    if (recipe.dataset.cache_path != null or
+        recipe.dataset.train_cache_path != null or
+        recipe.dataset.format != null or
+        recipe.dataset.labels != null)
+    {
+        return error.UnsupportedGemma4DatasetOption;
+    }
+    if (evalDatasetPath(recipe) == null) return error.MissingEvaluationDataset;
+    _ = try gemma4.validateTrainingSequenceLength(recipe.dataset.max_seq_len orelse 512, std.math.maxInt(u32));
+
+    const rank = adapterRank(adapter, .lora_sft);
+    if (rank == 0 or rank > std.math.maxInt(u32)) return error.InvalidLoRARank;
+    const alpha = adapterAlpha(adapter);
+    if (!std.math.isFinite(alpha) or alpha <= 0) return error.InvalidLoRAAlpha;
+    if (adapter.dropout != null or adapter.layer_name != null or adapter.quantization != null) {
+        return error.UnsupportedGemma4AdapterOption;
+    }
+    if (adapter.use_dora orelse false) return error.DoRAAutodiffNotYetSupported;
+    try gemma4.validateLoRAInitializerBaseCompatibility(adapter.init_lora_weights);
+    if (adapter.init_lora_weights) |initializer| {
+        if (eqlName(initializer, "eva") or
+            eqlName(initializer, "lora-ga") or
+            eqlName(initializer, "loraga") or
+            eqlName(initializer, "lora_ga"))
+        {
+            return error.Gemma4RecipeInitializerStatsNotYetSupported;
+        }
+    }
+
+    if (recipe.optimizer.weight_decay) |decay| {
+        if (!std.math.isFinite(decay) or decay < 0) return error.InvalidWeightDecay;
+    }
+    if (recipe.optimizer.lr_scheduler != null or
+        recipe.optimizer.warmup_ratio != null or
+        recipe.optimizer.warmup_steps != null or
+        recipe.optimizer.num_cycles != null or
+        recipe.optimizer.max_steps != null or
+        recipe.optimizer.micro_batch_size != null or
+        recipe.optimizer.llrd_decay != null or
+        (recipe.optimizer.schedule_free orelse false))
+    {
+        return error.UnsupportedGemma4OptimizerOption;
+    }
+
+    if (recipe.eval) |eval| {
+        if (eval.every_epochs != null or
+            eval.batch_size != null or
+            eval.early_stopping_patience != null or
+            eval.improvement_threshold != null or
+            eval.backend != null or
+            eval.entity_minimums != null or
+            eval.full_task_minimums != null or
+            eval.dpo_minimums != null or
+            eval.grpo_minimums != null)
+        {
+            return error.UnsupportedGemma4EvalOption;
+        }
+    }
+
+    if (recipe.checkpoint) |checkpoint| {
+        // Gemma4 production v1 publishes one atomic mutable trainer-state
+        // checkpoint. Retention/generation policies require a future indexed
+        // checkpoint store rather than silently pretending `keep_last` works.
+        if (checkpoint.keep_last != null) return error.UnsupportedGemma4CheckpointOption;
+        // Mid-epoch cadence is a preference-training contract; the SFT text
+        // loop only owns epoch-boundary durability.
+        if (checkpoint.every_examples != null) return error.UnsupportedGemma4CheckpointOption;
+        if (checkpoint.every_epochs) |every| {
+            if (every == 0 or @as(usize, every) > (recipe.optimizer.epochs orelse 1)) {
+                return error.InvalidGemma4CheckpointInterval;
+            }
+        }
+        if (checkpoint.resume_path) |path| {
+            if (std.mem.trim(u8, path, " \t\r\n").len == 0) return error.InvalidGemma4CheckpointPath;
+        }
+    }
+    if (recipe.runtime) |runtime| {
+        if (runtime.compiled_required != null or
+            runtime.grpo_incremental_kv != null or
+            runtime.grpo_incremental_kv_batch_active != null or
+            runtime.grpo_incremental_kv_clone_prompt_tail != null or
+            runtime.grpo_incremental_kv_shadow_exact != null)
+        {
+            return error.UnsupportedGemma4RuntimeOption;
+        }
+        if (runtime.sequence_length_bucket_quantum) |quantum| {
+            if (quantum == 0) return error.InvalidGemma4SequenceLengthBucket;
+            if (runtime.sequence_length_bucket_min) |minimum| {
+                if (minimum == 0) return error.InvalidGemma4SequenceLengthBucket;
+            }
+            if (runtime.graph_cache_capacity) |capacity| {
+                if (capacity == 0 or capacity > 8) return error.InvalidGemma4GraphCacheCapacity;
+            }
+        } else if (runtime.sequence_length_bucket_min != null or runtime.graph_cache_capacity != null) {
+            return error.Gemma4SequenceLengthBucketQuantumRequired;
+        }
+    }
+    if (recipe.trainer) |trainer| {
+        if (!std.mem.eql(u8, trainer, "autodiff") and !std.mem.eql(u8, trainer, "auto")) {
+            return error.UnsupportedGemma4Trainer;
+        }
+    }
+
+    if (recipe.preference.loss_type != null or
+        recipe.preference.beta != null or
+        recipe.preference.label_smoothing != null or
+        recipe.preference.simpo_gamma != null or
+        recipe.preference.sft_lambda != null or
+        recipe.preference.ipo_tau != null or
+        recipe.grpo.group_size != null or
+        recipe.grpo.clip_epsilon != null or
+        recipe.grpo.epsilon_high != null or
+        recipe.grpo.kl_coef != null or
+        recipe.grpo.train_max_kl != null or
+        recipe.grpo.train_max_kl_policy != null or
+        recipe.grpo.adaptive_kl != null or
+        recipe.grpo.target_kl != null or
+        recipe.grpo.kl_horizon != null or
+        recipe.grpo.min_kl_coef != null or
+        recipe.grpo.max_kl_coef != null or
+        recipe.grpo.advantage_eps != null or
+        recipe.grpo.normalize_advantage != null or
+        recipe.grpo.scale_rewards != null or
+        recipe.grpo.loss_type != null or
+        recipe.grpo.max_completion_tokens != null or
+        recipe.grpo.mask_truncated_completions != null or
+        recipe.grpo.sampling != null or
+        recipe.grpo.reward_mode != null or
+        recipe.reward != null)
+    {
+        return error.UnsupportedGemma4AlgorithmOption;
+    }
+
+    if (recipe.artifacts.materialized_dir != null or
+        recipe.artifacts.validation_report_path != null or
+        recipe.artifacts.evaluation_report_path != null or
+        recipe.artifacts.reload_report_path != null or
+        recipe.artifacts.report_path != null)
+    {
+        return error.UnsupportedGemma4ArtifactOption;
+    }
+}
+
+fn validateGemma4ArtifactDirectories(
+    allocator: std.mem.Allocator,
+    recipe: Recipe,
+    prepared_path: []const u8,
+    eval_prepared_path: []const u8,
+    bootstrap_dir: []const u8,
+    trained_dir: []const u8,
+) !void {
+    const planned_files = [_]?[]const u8{
+        prepared_path,
+        eval_prepared_path,
+        recipe.artifacts.manifest_path,
+    };
+    try validateGemma4AdapterOutputDirectories(
+        allocator,
+        recipe,
+        bootstrap_dir,
+        trained_dir,
+        &planned_files,
+    );
+}
+
+fn validateGemma4AdapterOutputDirectories(
+    allocator: std.mem.Allocator,
+    recipe: Recipe,
+    bootstrap_dir: []const u8,
+    trained_dir: []const u8,
+    planned_files: []const ?[]const u8,
+) !void {
+    const resolved_bootstrap = try path_isolation.resolveRequestedPath(allocator, compat.io(), bootstrap_dir);
+    defer allocator.free(resolved_bootstrap);
+    const resolved_trained = try path_isolation.resolveRequestedPath(allocator, compat.io(), trained_dir);
+    defer allocator.free(resolved_trained);
+    if (path_isolation.pathsOverlap(resolved_bootstrap, resolved_trained)) {
+        return error.Gemma4BootstrapAndTrainingOutputConflict;
+    }
+
+    const artifact_root = recipe.artifacts.root orelse "antfly-inference-finetune-out";
+    const resolved_root = try path_isolation.resolveRequestedPath(allocator, compat.io(), artifact_root);
+    defer allocator.free(resolved_root);
+    if (path_isolation.sameOrWithin(resolved_bootstrap, resolved_root) or
+        path_isolation.sameOrWithin(resolved_trained, resolved_root))
+    {
+        return error.Gemma4OutputConflictsWithArtifactRoot;
+    }
+
+    for (planned_files) |maybe_path| {
+        const path = maybe_path orelse continue;
+        const resolved = try path_isolation.resolveRequestedPath(allocator, compat.io(), path);
+        defer allocator.free(resolved);
+        if (path_isolation.pathsOverlap(resolved_bootstrap, resolved) or
+            path_isolation.pathsOverlap(resolved_trained, resolved))
+        {
+            return error.Gemma4OutputContainsPlannedArtifact;
+        }
+    }
+}
+
+fn validateGemma4PreferenceTrainingRecipeContract(
+    allocator: std.mem.Allocator,
+    recipe: Recipe,
+    task: PreferenceTask,
+) !void {
+    if (isGemmaCudaPreferenceTrainingRoute(recipe, task, recipe.dataset.format orelse "")) {
+        return validateGemma4CudaPreferenceRecipeContract(recipe, task);
+    }
+    const base_model_dir = recipe.model.path orelse return error.MissingModelPath;
+    if (recipe.model.reference_path) |reference_path| {
+        if (!std.mem.eql(u8, reference_path, base_model_dir)) return error.UnsupportedReferencePath;
+    }
+    if (task == .dpo and recipe.model.projector_path != null) {
+        return error.Gemma4DpoMultimodalFinetuningNotSupported;
+    }
+    if (task == .grpo and recipe.model.projector_path != null and recipe.checkpoint != null) {
+        return error.Gemma4MultimodalPreferenceCheckpointResumeNotSupported;
+    }
+    if ((recipe.model.allow_direct_gguf_training orelse false) and
+        !eqlName(recipe.backend orelse "", "metal"))
+    {
+        return error.GgufAutodiffRequiresMetal;
+    }
+    // Direct Q4_0 GGUF preference training is qualified through the canonical
+    // full-prefix scorer. Its paged one-token decode graph can select a
+    // different lower-ranked continuation than that canonical graph, even
+    // with prompt-tail cloning disabled. Keep this composition fail-closed
+    // until quantized paged decode has its own exact trajectory proof.
+    if (task == .grpo and
+        (recipe.model.allow_direct_gguf_training orelse false) and
+        gemmaGrpoIncrementalKvEnabled(recipe))
+    {
+        return error.DirectGgufGrpoIncrementalKvNotQualified;
+    }
+
+    if (recipe.dataset.cache_path != null or
+        recipe.dataset.train_cache_path != null or
+        recipe.dataset.eval_cache_path != null or
+        recipe.dataset.prepared_path != null or
+        recipe.dataset.labels != null)
+    {
+        return error.UnsupportedGemma4DatasetOption;
+    }
+    try validateGemma4PreferenceEvaluationContract(allocator, recipe, task);
+    if (recipe.dataset.max_examples) |max_examples| {
+        if (max_examples == 0) return error.InvalidMaxExamples;
+    }
+    _ = try gemma4.validateTrainingSequenceLength(
+        recipe.dataset.max_seq_len orelse if (task == .dpo) 512 else 128,
+        std.math.maxInt(u32),
+    );
+
+    const adapter = recipe.adapter orelse AdapterConfig{};
+    const rank = adapterRank(adapter, if (task == .dpo) .dpo else .grpo);
+    if (rank == 0 or rank > std.math.maxInt(u32)) return error.InvalidLoRARank;
+    const alpha = adapterAlpha(adapter);
+    if (!std.math.isFinite(alpha) or alpha <= 0) return error.InvalidLoRAAlpha;
+    if (adapter.dropout != null or adapter.layer_name != null or adapter.quantization != null) {
+        return error.UnsupportedGemma4AdapterOption;
+    }
+    if (adapter.use_dora orelse false) return error.DoRAAutodiffNotYetSupported;
+    try gemma4.validateLoRAInitializerBaseCompatibility(adapter.init_lora_weights);
+    if (adapter.init_lora_weights) |initializer| {
+        if (eqlName(initializer, "eva") or
+            eqlName(initializer, "lora-ga") or
+            eqlName(initializer, "loraga") or
+            eqlName(initializer, "lora_ga"))
+        {
+            return error.Gemma4RecipeInitializerStatsNotYetSupported;
+        }
+    }
+    try validateGemmaAdapterOptions(adapter);
+
+    if (recipe.optimizer.weight_decay) |decay| {
+        if (!std.math.isFinite(decay) or decay < 0) return error.InvalidWeightDecay;
+    }
+    if (recipe.optimizer.lr_scheduler != null or
+        recipe.optimizer.warmup_ratio != null or
+        recipe.optimizer.warmup_steps != null or
+        recipe.optimizer.num_cycles != null or
+        recipe.optimizer.max_steps != null or
+        recipe.optimizer.micro_batch_size != null or
+        recipe.optimizer.llrd_decay != null or
+        recipe.optimizer.schedule_free != null)
+    {
+        return error.UnsupportedGemma4OptimizerOption;
+    }
+    const learning_rate = recipe.optimizer.learning_rate orelse 0.0001;
+    if (!std.math.isFinite(learning_rate) or learning_rate <= 0) return error.InvalidLearningRate;
+    if ((recipe.optimizer.epochs orelse 1) == 0) return error.InvalidEpochCount;
+    if ((recipe.optimizer.gradient_accumulation_steps orelse 1) == 0) {
+        return error.InvalidGradientAccumulationSteps;
+    }
+    const max_grad_norm = recipe.optimizer.max_grad_norm orelse 1.0;
+    if (!std.math.isFinite(max_grad_norm) or max_grad_norm <= 0) return error.InvalidMaxGradNorm;
+
+    if (recipe.checkpoint) |checkpoint| {
+        // Preference training publishes one mutable, atomically replaced
+        // trainer checkpoint plus a content-addressed aggregate-state sidecar.
+        // Retention is deliberately not emulated by leaving ambiguous files.
+        if (checkpoint.keep_last != null) return error.UnsupportedGemma4CheckpointOption;
+        if (checkpoint.every_epochs) |every| {
+            if (every == 0 or @as(usize, every) > (recipe.optimizer.epochs orelse 1)) {
+                return error.InvalidGemma4CheckpointInterval;
+            }
+        }
+        if (checkpoint.every_examples) |every| {
+            if (every == 0) return error.InvalidGemma4CheckpointInterval;
+            // Epoch-boundary saves remain the durable baseline; a cadence
+            // that never reaches a boundary would leave the final publication
+            // recovery path unreachable.
+            if (checkpoint.every_epochs == null) return error.CheckpointIntervalRequired;
+            // The qualified mid-epoch surface is eager sampling only. The
+            // incremental-KV sampler rebuilds transient pages from
+            // epoch-boundary telemetry and has no mid-epoch recovery
+            // evidence, so keep the combination fail-closed.
+            if (task == .grpo and gemmaGrpoIncrementalKvEnabled(recipe)) {
+                return error.Gemma4MidEpochCheckpointIncrementalKvNotSupported;
+            }
+        }
+        if (checkpoint.resume_path) |path| {
+            if (std.mem.trim(u8, path, " \t\r\n").len == 0) return error.InvalidGemma4CheckpointPath;
+        } else if (checkpoint.every_epochs == null) {
+            return error.CheckpointIntervalRequired;
+        }
+        if (task == .grpo) {
+            if (recipe.reward) |reward| {
+                // Resume publishes into a fresh artifact root. Custom trace or
+                // exchange paths would otherwise alias the interrupted run's
+                // mutable outputs, so keep that combination fail-closed until
+                // the recipe owns a relocatable artifact-path contract.
+                if (reward.trace_path != null or
+                    reward.evaluation_trace_path != null or
+                    reward.exchange_dir != null)
+                {
+                    return error.Gemma4GrpoCheckpointCustomRewardArtifactsNotSupported;
+                }
+            }
+        }
+    }
+    if (recipe.runtime) |runtime| {
+        if (runtime.compiled_required != null) return error.UnsupportedGemma4RuntimeOption;
+        switch (task) {
+            .dpo => {
+                if (runtime.grpo_incremental_kv != null or
+                    runtime.grpo_incremental_kv_batch_active != null or
+                    runtime.grpo_incremental_kv_clone_prompt_tail != null or
+                    runtime.grpo_incremental_kv_shadow_exact != null)
+                {
+                    return error.UnsupportedGemma4RuntimeOption;
+                }
+                if (runtime.sequence_length_bucket_quantum) |quantum| {
+                    if (quantum == 0) return error.InvalidGemma4SequenceLengthBucket;
+                    if (runtime.sequence_length_bucket_min) |minimum| {
+                        if (minimum == 0) return error.InvalidGemma4SequenceLengthBucket;
+                    }
+                    if (runtime.graph_cache_capacity) |capacity| {
+                        if (capacity == 0 or capacity > 8) return error.InvalidGemma4GraphCacheCapacity;
+                    }
+                } else if (runtime.sequence_length_bucket_min != null or runtime.graph_cache_capacity != null) {
+                    return error.Gemma4SequenceLengthBucketQuantumRequired;
+                }
+            },
+            .grpo => {
+                if (runtime.sequence_length_bucket_quantum != null or
+                    runtime.sequence_length_bucket_min != null or
+                    runtime.graph_cache_capacity != null)
+                {
+                    return error.UnsupportedGemma4RuntimeOption;
+                }
+                const incremental_enabled = runtime.grpo_incremental_kv orelse false;
+                if (!incremental_enabled and
+                    (runtime.grpo_incremental_kv_batch_active != null or
+                        runtime.grpo_incremental_kv_clone_prompt_tail != null or
+                        runtime.grpo_incremental_kv_shadow_exact != null))
+                {
+                    return error.Gemma4GrpoIncrementalKvRequired;
+                }
+                if (incremental_enabled and !eqlName(recipe.backend orelse "", "metal")) {
+                    return error.Gemma4GrpoIncrementalKvRequiresMetal;
+                }
+            },
+        }
+    }
+    if (recipe.trainer) |trainer| {
+        if (!eqlName(trainer, "autodiff") and !eqlName(trainer, "auto")) {
+            return error.UnsupportedGemma4Trainer;
+        }
+    }
+
+    switch (task) {
+        .dpo => {
+            _ = try resolveDpoObjectiveConfig(recipe.preference);
+            if (recipe.grpo.group_size != null or
+                recipe.grpo.clip_epsilon != null or
+                recipe.grpo.epsilon_high != null or
+                recipe.grpo.kl_coef != null or
+                recipe.grpo.train_max_kl != null or
+                recipe.grpo.train_max_kl_policy != null or
+                recipe.grpo.adaptive_kl != null or
+                recipe.grpo.target_kl != null or
+                recipe.grpo.kl_horizon != null or
+                recipe.grpo.min_kl_coef != null or
+                recipe.grpo.max_kl_coef != null or
+                recipe.grpo.advantage_eps != null or
+                recipe.grpo.normalize_advantage != null or
+                recipe.grpo.scale_rewards != null or
+                recipe.grpo.loss_type != null or
+                recipe.grpo.max_completion_tokens != null or
+                recipe.grpo.mask_truncated_completions != null or
+                recipe.grpo.sampling != null or
+                recipe.grpo.reward_mode != null or
+                recipe.reward != null)
+            {
+                return error.UnsupportedGemma4AlgorithmOption;
+            }
+        },
+        .grpo => {
+            if (recipe.preference.loss_type != null or
+                recipe.preference.beta != null or
+                recipe.preference.label_smoothing != null or
+                recipe.preference.simpo_gamma != null or
+                recipe.preference.sft_lambda != null or
+                recipe.preference.ipo_tau != null)
+            {
+                return error.UnsupportedGemma4AlgorithmOption;
+            }
+            const group_size = recipe.grpo.group_size orelse 2;
+            if (group_size < 2) return error.InvalidGrpoGroupSize;
+            const max_completion_tokens = recipe.grpo.max_completion_tokens orelse default_grpo_max_completion_tokens;
+            if (max_completion_tokens == 1 and
+                group_size > gemma4_real_autodiff.max_single_token_completion_group_size)
+            {
+                return error.InvalidGrpoGroupSize;
+            }
+            _ = try resolveGrpoObjectiveConfig(
+                recipe.grpo,
+                recipe.optimizer.gradient_accumulation_steps orelse 1,
+            );
+            const kl_coef = recipe.grpo.kl_coef orelse 0.04;
+            if (!std.math.isFinite(kl_coef) or kl_coef < 0) return error.InvalidGrpoKlCoefficient;
+            _ = try resolveGrpoKlControl(recipe.grpo);
+            const advantage_eps = recipe.grpo.advantage_eps orelse 1e-4;
+            if (!std.math.isFinite(advantage_eps) or advantage_eps <= 0) return error.InvalidGrpoAdvantageEpsilon;
+            _ = try resolveGrpoSamplingConfig(recipe.grpo);
+            try validateRewardPipelineConfig(recipe);
+        },
+    }
+
+    if (recipe.artifacts.prepared_path != null or
+        recipe.artifacts.materialized_dir != null or
+        recipe.artifacts.validation_report_path != null or
+        recipe.artifacts.reload_report_path != null)
+    {
+        return error.UnsupportedGemma4ArtifactOption;
+    }
+
+    const execution = try resolveGemmaPreferenceExecution(recipe.backend);
+    // Validate the process environment during planning so the public `run`
+    // command fails before runPlan publishes a manifest or status report.
+    // The execution path validates it again immediately before model loading.
+    try validateGemmaPreferenceEnvironmentContract(execution.backend_kind);
+
+    const bootstrap_configured = adapter.path != null;
+    const bootstrap_dir = adapter.path orelse try defaultArtifactPath(allocator, recipe, "adapter-bootstrap");
+    defer if (!bootstrap_configured) allocator.free(bootstrap_dir);
+    const trained_configured = recipe.artifacts.trained_adapter_dir != null or recipe.artifacts.adapter_dir != null;
+    const trained_dir = recipe.artifacts.trained_adapter_dir orelse recipe.artifacts.adapter_dir orelse try defaultArtifactPath(allocator, recipe, "adapter-trained");
+    defer if (!trained_configured) allocator.free(trained_dir);
+    const manifest_path = try manifestPath(allocator, recipe);
+    defer allocator.free(manifest_path);
+    const training_config_path = try defaultArtifactPath(allocator, recipe, "training_config.json");
+    defer allocator.free(training_config_path);
+    const training_report_path = try defaultArtifactPath(allocator, recipe, "training_report.json");
+    defer allocator.free(training_report_path);
+    const algorithm_report_path = switch (task) {
+        .dpo => try dpoReportPath(allocator, recipe),
+        .grpo => try grpoReportPath(allocator, recipe),
+    };
+    defer allocator.free(algorithm_report_path);
+    const evaluation_report_path = try preferenceEvaluationReportPath(allocator, recipe, task);
+    defer allocator.free(evaluation_report_path);
+    const checkpoint_path = try preferenceCheckpointPath(allocator, recipe, task);
+    defer if (checkpoint_path) |path| allocator.free(path);
+    var reward_trace_path: ?[]const u8 = null;
+    defer if (reward_trace_path) |path| allocator.free(path);
+    var evaluation_reward_trace_path: ?[]const u8 = null;
+    defer if (evaluation_reward_trace_path) |path| allocator.free(path);
+    var reward_exchange_dir: ?[]const u8 = null;
+    defer if (reward_exchange_dir) |path| allocator.free(path);
+    if (task == .grpo) {
+        reward_trace_path = try grpoRewardTracePath(allocator, recipe, false);
+        evaluation_reward_trace_path = try grpoRewardTracePath(allocator, recipe, true);
+        if (rewardPipelineHasExternalProvider(recipe)) {
+            reward_exchange_dir = try grpoRewardExchangeDir(allocator, recipe);
+        }
+    }
+    const planned_files = [_]?[]const u8{
+        manifest_path,
+        training_config_path,
+        training_report_path,
+        algorithm_report_path,
+        evaluation_report_path,
+        reward_trace_path,
+        evaluation_reward_trace_path,
+        reward_exchange_dir,
+        checkpoint_path,
+    };
+    try validateDistinctPreferenceOutputPaths(allocator, &planned_files);
+    try validateGemma4AdapterOutputDirectories(
+        allocator,
+        recipe,
+        bootstrap_dir,
+        trained_dir,
+        &planned_files,
+    );
+    try validatePreferenceOutputInputConflicts(
+        allocator,
+        recipe,
+        bootstrap_dir,
+        trained_dir,
+        &planned_files,
+    );
+}
+
+fn validateDistinctPreferenceOutputPaths(
+    allocator: std.mem.Allocator,
+    paths: []const ?[]const u8,
+) !void {
+    for (paths, 0..) |maybe_lhs, lhs_idx| {
+        const lhs = maybe_lhs orelse continue;
+        const resolved_lhs = try path_isolation.resolveRequestedPath(allocator, compat.io(), lhs);
+        defer allocator.free(resolved_lhs);
+        for (paths[lhs_idx + 1 ..]) |maybe_rhs| {
+            const rhs = maybe_rhs orelse continue;
+            const resolved_rhs = try path_isolation.resolveRequestedPath(allocator, compat.io(), rhs);
+            defer allocator.free(resolved_rhs);
+            if (path_isolation.pathsOverlap(resolved_lhs, resolved_rhs)) {
+                return error.PreferenceArtifactPathConflict;
+            }
+        }
+    }
+}
+
+fn validatePreferenceOutputInputConflicts(
+    allocator: std.mem.Allocator,
+    recipe: Recipe,
+    bootstrap_dir: []const u8,
+    trained_dir: []const u8,
+    planned_files: []const ?[]const u8,
+) !void {
+    const inputs = [_]?[]const u8{
+        recipe.model.path,
+        recipe.model.reference_path,
+        recipe.model.projector_path,
+        trainDatasetPath(recipe),
+        evalDatasetPath(recipe),
+    };
+    var outputs: [16]?[]const u8 = @splat(null);
+    outputs[0] = bootstrap_dir;
+    outputs[1] = trained_dir;
+    for (planned_files, 0..) |path, idx| outputs[idx + 2] = path;
+    for (inputs) |maybe_input| {
+        const input = maybe_input orelse continue;
+        const resolved_input = try path_isolation.resolveRequestedPath(allocator, compat.io(), input);
+        defer allocator.free(resolved_input);
+        for (outputs) |maybe_output| {
+            const output = maybe_output orelse continue;
+            const resolved_output = try path_isolation.resolveRequestedPath(allocator, compat.io(), output);
+            defer allocator.free(resolved_output);
+            if (path_isolation.pathsOverlap(resolved_input, resolved_output)) {
+                return error.PreferenceArtifactInputConflict;
+            }
+        }
+    }
+    if (recipe.reward) |reward| if (reward.providers) |providers| {
+        for (providers) |provider| {
+            const provider_inputs = [_]?[]const u8{
+                provider.executable_path,
+                provider.model_path,
+                provider.tokenizer_path,
+                provider.chat_template_path,
+                provider.calibration_dataset_path,
+            };
+            for (provider_inputs) |maybe_provider_input| {
+                const provider_input = maybe_provider_input orelse continue;
+                const resolved_input = try path_isolation.resolveRequestedPath(allocator, compat.io(), provider_input);
+                defer allocator.free(resolved_input);
+                for (outputs) |maybe_output| {
+                    const output = maybe_output orelse continue;
+                    const resolved_output = try path_isolation.resolveRequestedPath(allocator, compat.io(), output);
+                    defer allocator.free(resolved_output);
+                    if (path_isolation.pathsOverlap(resolved_input, resolved_output)) {
+                        return error.PreferenceArtifactInputConflict;
+                    }
+                }
+            }
+        }
+    };
+}
+
+fn validateGemma4PreferenceEvaluationContract(
+    allocator: std.mem.Allocator,
+    recipe: Recipe,
+    task: PreferenceTask,
+) !void {
+    const train_path = trainDatasetPath(recipe) orelse return error.MissingDatasetPath;
+    const eval_path = evalDatasetPath(recipe) orelse return error.MissingPreferenceEvaluationDataset;
+    if (std.mem.trim(u8, eval_path, " \t\r\n").len == 0) return error.MissingPreferenceEvaluationDataset;
+    if (recipe.eval == null) return error.MissingPreferenceEvaluationConfig;
+
+    if (recipe.dataset.path != null and recipe.dataset.train_path != null and
+        !try resolvedPathsEqual(allocator, recipe.dataset.path.?, recipe.dataset.train_path.?))
+    {
+        return error.ConflictingPreferenceTrainingDataset;
+    }
+    if (recipe.dataset.eval_path != null and recipe.eval.?.path != null and
+        !try resolvedPathsEqual(allocator, recipe.dataset.eval_path.?, recipe.eval.?.path.?))
+    {
+        return error.ConflictingPreferenceEvaluationDataset;
+    }
+    if (recipe.dataset.eval_max_examples != null and recipe.eval.?.max_examples != null and
+        recipe.dataset.eval_max_examples.? != recipe.eval.?.max_examples.?)
+    {
+        return error.ConflictingPreferenceEvaluationLimit;
+    }
+    if (recipe.dataset.train_split) |split| {
+        if (!std.mem.eql(u8, split, "train")) return error.UnsupportedPreferenceTrainingSplit;
+    }
+    if (recipe.dataset.eval_split != null or recipe.eval.?.split != null) {
+        return error.UnsupportedPreferenceEvaluationSplit;
+    }
+    if (recipe.eval.?.every_epochs != null or
+        recipe.eval.?.batch_size != null or
+        recipe.eval.?.early_stopping_patience != null or
+        recipe.eval.?.improvement_threshold != null or
+        recipe.eval.?.backend != null or
+        recipe.eval.?.entity_minimums != null or
+        recipe.eval.?.full_task_minimums != null)
+    {
+        return error.UnsupportedGemma4PreferenceEvalOption;
+    }
+    if (evalMaxExamples(recipe)) |max_examples| {
+        if (max_examples == 0) return error.InvalidEvaluationMaxExamples;
+    }
+
+    const resolved_train = try path_isolation.resolveRequestedPath(allocator, compat.io(), train_path);
+    defer allocator.free(resolved_train);
+    const resolved_eval = try path_isolation.resolveRequestedPath(allocator, compat.io(), eval_path);
+    defer allocator.free(resolved_eval);
+    if (std.mem.eql(u8, resolved_train, resolved_eval)) return error.PreferenceTrainEvalDatasetConflict;
+
+    switch (task) {
+        .dpo => {
+            if (recipe.eval.?.grpo_minimums != null) return error.UnsupportedGemma4PreferenceEvalOption;
+            const minimums = recipe.eval.?.dpo_minimums orelse return error.MissingDpoEvaluationMinimums;
+            if (!std.math.isFinite(minimums.accuracy) or minimums.accuracy < 0.0 or minimums.accuracy > 1.0) {
+                return error.InvalidDpoEvaluationMinimums;
+            }
+            if (!std.math.isFinite(minimums.max_loss) or minimums.max_loss < 0.0) {
+                return error.InvalidDpoEvaluationMinimums;
+            }
+            const has_accuracy_improvement = minimums.min_accuracy_improvement != null;
+            const has_reward_margin_improvement = minimums.min_reward_margin_improvement != null;
+            const has_loss_improvement = minimums.min_loss_improvement != null;
+            if ((has_accuracy_improvement or has_reward_margin_improvement or has_loss_improvement) and
+                !(has_accuracy_improvement and has_reward_margin_improvement and has_loss_improvement))
+            {
+                return error.IncompleteDpoBaselineRelativeMinimums;
+            }
+            if (minimums.min_accuracy_improvement) |value| {
+                if (!std.math.isFinite(value) or value < 0.0 or
+                    !std.math.isFinite(minimums.min_reward_margin_improvement.?) or minimums.min_reward_margin_improvement.? < 0.0 or
+                    !std.math.isFinite(minimums.min_loss_improvement.?) or minimums.min_loss_improvement.? < 0.0)
+                {
+                    return error.InvalidDpoEvaluationMinimums;
+                }
+            }
+        },
+        .grpo => {
+            if (recipe.model.projector_path != null) return error.Gemma4MultimodalPreferenceEvaluationNotYetSupported;
+            if (recipe.eval.?.dpo_minimums != null) return error.UnsupportedGemma4PreferenceEvalOption;
+            const minimums = recipe.eval.?.grpo_minimums orelse return error.MissingGrpoEvaluationMinimums;
+            if (!std.math.isFinite(minimums.mean_reward) or
+                !std.math.isFinite(minimums.top_rank_mean_reward) or
+                !std.math.isFinite(minimums.positive_reward_group_rate) or
+                minimums.positive_reward_group_rate < 0.0 or minimums.positive_reward_group_rate > 1.0 or
+                !std.math.isFinite(minimums.max_kl_loss) or minimums.max_kl_loss < 0.0)
+            {
+                return error.InvalidGrpoEvaluationMinimums;
+            }
+            const has_mean_reward_improvement = minimums.min_mean_reward_improvement != null;
+            const has_top_rank_mean_reward_improvement = minimums.min_top_rank_mean_reward_improvement != null;
+            const has_positive_group_improvement = minimums.min_positive_reward_group_rate_improvement != null;
+            if ((has_mean_reward_improvement or has_top_rank_mean_reward_improvement or has_positive_group_improvement) and
+                !(has_mean_reward_improvement and has_top_rank_mean_reward_improvement and has_positive_group_improvement))
+            {
+                return error.IncompleteGrpoBaselineRelativeMinimums;
+            }
+            if (minimums.min_mean_reward_improvement) |value| {
+                const positive_group_improvement = minimums.min_positive_reward_group_rate_improvement.?;
+                if (!std.math.isFinite(value) or value < 0.0 or
+                    !std.math.isFinite(minimums.min_top_rank_mean_reward_improvement.?) or minimums.min_top_rank_mean_reward_improvement.? < 0.0 or
+                    !std.math.isFinite(positive_group_improvement))
+                {
+                    return error.InvalidGrpoEvaluationMinimums;
+                }
+                if (positive_group_improvement < 0.0) {
+                    const evaluation_groups = evalMaxExamples(recipe) orelse
+                        return error.InvalidGrpoEvaluationMinimums;
+                    const one_group_regression = 1.0 / @as(f64, @floatFromInt(evaluation_groups));
+                    if (positive_group_improvement < -one_group_regression) {
+                        return error.InvalidGrpoEvaluationMinimums;
+                    }
+                }
+            }
+        },
+    }
+}
+
+fn resolvedPathsEqual(allocator: std.mem.Allocator, lhs: []const u8, rhs: []const u8) !bool {
+    const resolved_lhs = try path_isolation.resolveRequestedPath(allocator, compat.io(), lhs);
+    defer allocator.free(resolved_lhs);
+    const resolved_rhs = try path_isolation.resolveRequestedPath(allocator, compat.io(), rhs);
+    defer allocator.free(resolved_rhs);
+    return std.mem.eql(u8, resolved_lhs, resolved_rhs);
+}
+
+fn validateRewardPipelineConfig(recipe: Recipe) !void {
+    const reward = recipe.reward orelse {
+        _ = try parseTextRewardMode(recipe.grpo.reward_mode orelse "exact-match");
+        return;
+    };
+    if (recipe.grpo.reward_mode != null) return error.ConflictingRewardConfiguration;
+    const aggregation = reward.aggregation orelse "weighted-mean";
+    if (!std.mem.eql(u8, aggregation, "weighted-mean") and
+        !std.mem.eql(u8, aggregation, "weighted-sum"))
+    {
+        return error.UnsupportedRewardAggregation;
+    }
+    if (!std.mem.eql(u8, reward.failure_policy orelse "fail", "fail")) {
+        return error.UnsupportedRewardFailurePolicy;
+    }
+    const providers = reward.providers orelse return error.MissingRewardProviders;
+    if (providers.len == 0) return error.MissingRewardProviders;
+    if (providers.len > 32) return error.TooManyRewardProviders;
+    const max_trace_bytes = reward.max_trace_bytes orelse 64 * 1024 * 1024;
+    if (max_trace_bytes < 1024 or max_trace_bytes > 1024 * 1024 * 1024) return error.InvalidRewardTraceLimit;
+
+    var positive_weight = false;
+    for (providers, 0..) |provider, idx| {
+        if (!validRewardProviderName(provider.name)) return error.InvalidRewardProviderName;
+        for (providers[0..idx]) |prior| {
+            if (std.mem.eql(u8, prior.name, provider.name)) return error.DuplicateRewardProviderName;
+        }
+        if (!std.math.isFinite(provider.weight) or provider.weight < 0.0) return error.InvalidRewardProviderWeight;
+        positive_weight = positive_weight or provider.weight > 0.0;
+        if (provider.min_reward) |minimum| {
+            if (!std.math.isFinite(minimum)) return error.InvalidRewardBounds;
+        }
+        if (provider.max_reward) |maximum| {
+            if (!std.math.isFinite(maximum)) return error.InvalidRewardBounds;
+        }
+        if (provider.min_reward != null and provider.max_reward != null and
+            provider.min_reward.? > provider.max_reward.?)
+        {
+            return error.InvalidRewardBounds;
+        }
+
+        if (std.mem.eql(u8, provider.kind, "builtin")) {
+            _ = try parseTextRewardMode(provider.mode orelse return error.MissingBuiltinRewardMode);
+            if (provider.executable_path != null or provider.executable_sha256 != null or
+                provider.args != null or provider.timeout_ms != null or providerHasModelConfiguration(provider))
+            {
+                return error.InvalidBuiltinRewardProvider;
+            }
+        } else if (std.mem.eql(u8, provider.kind, "external-command")) {
+            if (providerHasModelConfiguration(provider)) return error.InvalidExternalRewardProvider;
+            try validateCommandRewardProvider(provider);
+        } else if (std.mem.eql(u8, provider.kind, "model-command")) {
+            try validateCommandRewardProvider(provider);
+            if (provider.min_reward == null or provider.max_reward == null) return error.MissingModelRewardBounds;
+            try validatePinnedRewardArtifact(
+                provider.model_path,
+                provider.model_sha256,
+                error.MissingRewardModel,
+                error.MissingRewardModelDigest,
+                error.InvalidRewardModelDigest,
+            );
+            try validatePinnedRewardArtifact(
+                provider.tokenizer_path,
+                provider.tokenizer_sha256,
+                error.MissingRewardTokenizer,
+                error.MissingRewardTokenizerDigest,
+                error.InvalidRewardTokenizerDigest,
+            );
+            try validatePinnedRewardArtifact(
+                provider.chat_template_path,
+                provider.chat_template_sha256,
+                error.MissingRewardChatTemplate,
+                error.MissingRewardChatTemplateDigest,
+                error.InvalidRewardChatTemplateDigest,
+            );
+            try validatePinnedRewardArtifact(
+                provider.calibration_dataset_path,
+                provider.calibration_dataset_sha256,
+                error.MissingRewardCalibrationDataset,
+                error.MissingRewardCalibrationDatasetDigest,
+                error.InvalidRewardCalibrationDatasetDigest,
+            );
+            const max_input_tokens = provider.max_input_tokens orelse return error.MissingModelRewardTokenLimit;
+            if (max_input_tokens == 0 or max_input_tokens > 1024 * 1024) return error.InvalidModelRewardTokenLimit;
+            // The current exchange protocol invokes one completion at a time.
+            // Refuse aspirational batching settings until batching is real.
+            if ((provider.max_batch_size orelse return error.MissingModelRewardBatchLimit) != 1) {
+                return error.UnsupportedModelRewardBatchSize;
+            }
+        } else return error.UnsupportedRewardProviderKind;
+    }
+    if (!positive_weight) return error.InvalidRewardProviderWeight;
+}
+
+fn providerHasModelConfiguration(provider: RewardProviderConfig) bool {
+    return provider.model_path != null or provider.model_sha256 != null or
+        provider.tokenizer_path != null or provider.tokenizer_sha256 != null or
+        provider.chat_template_path != null or provider.chat_template_sha256 != null or
+        provider.calibration_dataset_path != null or provider.calibration_dataset_sha256 != null or
+        provider.max_input_tokens != null or provider.max_batch_size != null;
+}
+
+fn validateCommandRewardProvider(provider: RewardProviderConfig) !void {
+    if (provider.mode != null) return error.InvalidExternalRewardProvider;
+    const executable_path = provider.executable_path orelse return error.MissingRewardExecutable;
+    if (!std.fs.path.isAbsolute(executable_path)) return error.RewardExecutableMustBeAbsolute;
+    const expected_digest = provider.executable_sha256 orelse return error.MissingRewardExecutableDigest;
+    if (!validSha256DigestString(expected_digest)) return error.InvalidRewardExecutableDigest;
+    const timeout_ms = provider.timeout_ms orelse 10_000;
+    if (timeout_ms < 10 or timeout_ms > 60_000) return error.InvalidRewardTimeout;
+    if (provider.args) |args| {
+        if (args.len > 16) return error.TooManyRewardArguments;
+        for (args) |arg| {
+            if (arg.len > 4096 or std.mem.indexOfScalar(u8, arg, 0) != null) return error.InvalidRewardArgument;
+        }
+    }
+}
+
+fn validatePinnedRewardArtifact(
+    maybe_path: ?[]const u8,
+    maybe_digest: ?[]const u8,
+    missing_path_error: anyerror,
+    missing_digest_error: anyerror,
+    invalid_digest_error: anyerror,
+) !void {
+    const path = maybe_path orelse return missing_path_error;
+    if (!std.fs.path.isAbsolute(path)) return error.RewardModelArtifactMustBeAbsolute;
+    const digest = maybe_digest orelse return missing_digest_error;
+    if (!validSha256DigestString(digest)) return invalid_digest_error;
+}
+
+fn validSha256DigestString(value: []const u8) bool {
+    const prefix = "sha256:";
+    if (!std.mem.startsWith(u8, value, prefix) or value.len != prefix.len + 64) return false;
+    for (value[prefix.len..]) |byte| {
+        if (!std.ascii.isHex(byte)) return false;
+    }
+    return true;
+}
+
+fn validRewardProviderName(value: []const u8) bool {
+    if (value.len == 0 or value.len > 64) return false;
+    for (value) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_' and byte != '.') return false;
+    }
+    return true;
+}
+
 fn buildGemma4LoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
     const model_path = recipe.model.path orelse return error.MissingModelPath;
     const dataset_path = trainDatasetPath(recipe) orelse return error.MissingDatasetPath;
-    const prepared_path = recipe.artifacts.prepared_path orelse recipe.dataset.prepared_path orelse try defaultArtifactPath(allocator, recipe, "prepared_inputs.json");
-    const bootstrap_dir = adapterBootstrapDir(recipe) orelse try defaultArtifactPath(allocator, recipe, "adapter-bootstrap");
-    const trained_dir = recipe.artifacts.trained_adapter_dir orelse recipe.artifacts.adapter_dir orelse try defaultArtifactPath(allocator, recipe, "adapter-trained");
     const adapter = recipe.adapter orelse AdapterConfig{};
+    const prepared_path = recipe.artifacts.prepared_path orelse recipe.dataset.prepared_path orelse try defaultArtifactPath(allocator, recipe, "prepared_inputs.json");
+    const eval_prepared_path = recipe.dataset.eval_cache_path orelse try defaultArtifactPath(allocator, recipe, "prepared_eval_inputs.json");
+    const bootstrap_dir = adapter.path orelse try defaultArtifactPath(allocator, recipe, "adapter-bootstrap");
+    const trained_dir = recipe.artifacts.trained_adapter_dir orelse recipe.artifacts.adapter_dir orelse try defaultArtifactPath(allocator, recipe, "adapter-trained");
+    const checkpoint = recipe.checkpoint orelse CheckpointConfig{};
+    const runtime = recipe.runtime orelse RuntimeConfig{};
+    const checkpoint_path: ?[]const u8 = if (checkpoint.resume_path) |path|
+        path
+    else if (checkpoint.every_epochs != null)
+        try defaultArtifactPath(allocator, recipe, "gemma4_trainer_state.safetensors")
+    else
+        null;
+    try validateGemma4LoraRecipeContract(recipe, adapter);
+    try validateGemma4ArtifactDirectories(allocator, recipe, prepared_path, eval_prepared_path, bootstrap_dir, trained_dir);
 
     var steps: std.ArrayList(Step) = .empty;
     errdefer freeSteps(allocator, steps.items);
@@ -1276,6 +3222,23 @@ fn buildGemma4LoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
     }
     try steps.append(allocator, .{ .name = "prepare", .argv = try prepare_argv.toOwnedSlice(allocator) });
 
+    var prepare_eval_argv: std.ArrayList([]const u8) = .empty;
+    try appendMany(allocator, &prepare_eval_argv, &.{
+        "prepare-gemma4-lora-inputs",
+        model_path,
+        evalDatasetPath(recipe).?,
+        if (recipe.eval) |eval| eval.split orelse recipe.dataset.eval_split orelse "-" else recipe.dataset.eval_split orelse "-",
+        eval_prepared_path,
+        "--max-examples",
+        try fmtInt(allocator, evalMaxExamples(recipe) orelse 0),
+        "--max-seq-len",
+        try fmtInt(allocator, recipe.dataset.max_seq_len orelse 512),
+    });
+    if (recipe.model.projector_path) |path| {
+        try appendMany(allocator, &prepare_eval_argv, &.{ "--gguf-projector", path });
+    }
+    try steps.append(allocator, .{ .name = "prepare-eval", .argv = try prepare_eval_argv.toOwnedSlice(allocator) });
+
     var bootstrap_argv: std.ArrayList([]const u8) = .empty;
     try appendMany(allocator, &bootstrap_argv, &.{
         "bootstrap-gemma4-lora",
@@ -1285,6 +3248,10 @@ fn buildGemma4LoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
     try appendGemmaBootstrapAdapterArgs(allocator, &bootstrap_argv, adapter, .lora_sft);
     try steps.append(allocator, .{ .name = "bootstrap-adapter", .argv = try bootstrap_argv.toOwnedSlice(allocator) });
 
+    const backend = recipe.backend orelse return error.MissingBackend;
+    if (!std.mem.eql(u8, backend, "native") and !std.mem.eql(u8, backend, "metal")) {
+        return error.UnsupportedBackend;
+    }
     var train_argv: std.ArrayList([]const u8) = .empty;
     try appendMany(allocator, &train_argv, &.{
         "train-eval-gemma4-lora-bundle",
@@ -1296,16 +3263,28 @@ fn buildGemma4LoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
         try fmtFloat(allocator, recipe.optimizer.learning_rate orelse 0.001),
         "--max-examples",
         try fmtInt(allocator, recipe.dataset.max_examples orelse 32),
+        "--eval-prepared",
+        eval_prepared_path,
         "--epochs",
         try fmtInt(allocator, recipe.optimizer.epochs orelse 1),
     });
-    if (recipe.eval) |eval| if (eval.max_examples) |max| try appendMany(allocator, &train_argv, &.{ "--eval-max-examples", try fmtInt(allocator, max) });
-    if (adapter.layer_name) |layer| try appendMany(allocator, &train_argv, &.{ "--layer-name", layer });
+    if (recipe.optimizer.weight_decay) |decay| try appendMany(allocator, &train_argv, &.{ "--weight-decay", try fmtFloat(allocator, decay) });
+    if (evalMaxExamples(recipe)) |max| try appendMany(allocator, &train_argv, &.{ "--eval-max-examples", try fmtInt(allocator, max) });
     if (recipe.optimizer.gradient_accumulation_steps) |steps_count| try appendMany(allocator, &train_argv, &.{ "--grad-accum", try fmtInt(allocator, steps_count) });
     if (recipe.optimizer.max_grad_norm) |norm| try appendMany(allocator, &train_argv, &.{ "--max-grad-norm", try fmtFloat(allocator, norm) });
-    if (recipe.optimizer.llrd_decay) |decay| try appendMany(allocator, &train_argv, &.{ "--llrd-decay", try fmtFloat(allocator, decay) });
-    if (recipe.optimizer.schedule_free orelse false) try train_argv.append(allocator, "--schedule-free");
-    if (recipe.backend) |backend| try appendMany(allocator, &train_argv, &.{ "--backend", backend });
+    if (runtime.sequence_length_bucket_quantum) |quantum| {
+        try appendMany(allocator, &train_argv, &.{ "--sequence-length-bucket-quantum", try fmtInt(allocator, quantum) });
+    }
+    if (runtime.sequence_length_bucket_min) |minimum| {
+        try appendMany(allocator, &train_argv, &.{ "--sequence-length-bucket-min", try fmtInt(allocator, minimum) });
+    }
+    if (runtime.graph_cache_capacity) |capacity| {
+        try appendMany(allocator, &train_argv, &.{ "--graph-cache-capacity", try fmtInt(allocator, capacity) });
+    }
+    if (checkpoint_path) |path| try appendMany(allocator, &train_argv, &.{ "--checkpoint-path", path });
+    if (checkpoint.every_epochs) |every| try appendMany(allocator, &train_argv, &.{ "--checkpoint-every-epochs", try fmtInt(allocator, every) });
+    if (checkpoint.resume_path != null) try train_argv.append(allocator, "--resume");
+    try appendMany(allocator, &train_argv, &.{ "--backend", backend });
     if (recipe.trainer) |trainer| try appendMany(allocator, &train_argv, &.{ "--trainer", trainer });
     if (recipe.model.projector_path) |path| try appendMany(allocator, &train_argv, &.{ "--gguf-projector", path });
     try steps.append(allocator, .{ .name = "train-eval", .argv = try train_argv.toOwnedSlice(allocator) });
@@ -1427,12 +3406,14 @@ fn buildGliner2LoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
 }
 
 fn buildLayoutLmv3LoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
+    try validateLegacyRecipeOptions(recipe, .layout);
     const model_path = recipe.model.path orelse return error.MissingModelPath;
     const train_path = trainDatasetPath(recipe) orelse return error.MissingDatasetPath;
     const eval_path = evalDatasetPath(recipe) orelse train_path;
     const bootstrap_dir = adapterBootstrapDir(recipe) orelse try defaultArtifactPath(allocator, recipe, "adapter-bootstrap");
     const trained_dir = recipe.artifacts.trained_adapter_dir orelse recipe.artifacts.adapter_dir orelse try defaultArtifactPath(allocator, recipe, "adapter-trained");
     const task = recipe.dataset.format orelse "sequence";
+    if (!eqlAny(task, &.{ "token", "sequence" })) return error.UnsupportedLayoutLmTask;
     const train_cmd = if (std.mem.eql(u8, task, "token")) "train-eval-layoutlmv3-lora-token" else "train-eval-layoutlmv3-lora-sequence";
     const adapter = recipe.adapter orelse AdapterConfig{};
 
@@ -1455,6 +3436,7 @@ fn buildLayoutLmv3LoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
 }
 
 fn buildRerankerPlan(allocator: std.mem.Allocator, recipe: Recipe, family: []const u8) !Plan {
+    try validateLegacyRecipeOptions(recipe, .reranker);
     if (eqlAny(family, &.{ "reranker", "text-reranker", "deberta", "modernbert" })) {
         const model_path = recipe.model.path orelse return error.MissingModelPath;
         const train_path = trainDatasetPath(recipe) orelse return error.MissingDatasetPath;
@@ -1488,6 +3470,7 @@ fn buildRerankerPlan(allocator: std.mem.Allocator, recipe: Recipe, family: []con
 }
 
 fn buildRerankerLoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
+    try validateLegacyRecipeOptions(recipe, .reranker);
     const model_path = recipe.model.path orelse return error.MissingModelPath;
     const train_path = trainDatasetPath(recipe) orelse return error.MissingDatasetPath;
     const eval_path = evalDatasetPath(recipe);
@@ -1525,6 +3508,7 @@ fn buildRerankerLoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
 }
 
 fn buildVlmRetrievalPlan(allocator: std.mem.Allocator, recipe: Recipe, family: []const u8) !Plan {
+    try validateLegacyRecipeOptions(recipe, .retrieval);
     if (!eqlAny(family, &.{ "colqwen2", "colqwen", "qwen2vl" })) return error.UnsupportedRecipeFamily;
     const model_path = recipe.model.path orelse return error.MissingModelPath;
     const dataset_path = recipe.dataset.path orelse return error.MissingDatasetRoot;
@@ -1551,12 +3535,183 @@ fn buildVlmRetrievalPlan(allocator: std.mem.Allocator, recipe: Recipe, family: [
     return .{ .steps = try steps.toOwnedSlice(allocator) };
 }
 
+/// Main's Gemma 4 CUDA preference lane (`runOptimizerBackedGemma{Dpo,Grpo}Cuda`)
+/// selects CUDA through `backend` and treats a Gemma text preference dataset
+/// as a policy-training request. It predates the explicit `execution.mode`
+/// and held-out evaluation contract of the Metal/native lane, so CUDA recipes
+/// keep main's semantics.
+fn isGemmaCudaPreferenceTrainingRoute(recipe: Recipe, task: PreferenceTask, format: []const u8) bool {
+    const choice = parseRecipeBackendChoice(recipe.backend) catch return false;
+    if (choice != .cuda) return false;
+    const model_format = switch (task) {
+        .dpo => isDpoModelFormat(format),
+        .grpo => isGrpoModelFormat(format),
+    };
+    if (!model_format) return false;
+    const family = recipe.model.family orelse (inferFamily(recipe) catch return false);
+    return eqlAny(family, &.{ "gemma4", "gemma" });
+}
+
+fn resolvePreferenceExecutionMode(recipe: Recipe, task: PreferenceTask, format: []const u8) !PreferenceExecutionMode {
+    if (recipe.execution.mode == null and isGemmaCudaPreferenceTrainingRoute(recipe, task, format)) return .train;
+    return parsePreferenceExecutionMode(recipe);
+}
+
+fn parsePreferenceExecutionMode(recipe: Recipe) !PreferenceExecutionMode {
+    const raw = recipe.execution.mode orelse return error.MissingPreferenceExecutionMode;
+    if (eqlName(raw, "train")) return .train;
+    if (eqlName(raw, "score") or eqlName(raw, "metrics") or eqlName(raw, "analyze")) return .score;
+    return error.UnsupportedPreferenceExecutionMode;
+}
+
+fn isDpoModelFormat(format: []const u8) bool {
+    return std.mem.eql(u8, format, "text-preference") or
+        std.mem.eql(u8, format, "rendered-text-preference");
+}
+
+fn isGrpoModelFormat(format: []const u8) bool {
+    return std.mem.eql(u8, format, "text-grpo") or
+        std.mem.eql(u8, format, "rendered-text-grpo");
+}
+
+fn optimizerConfigHasAnyValue(config: OptimizerConfig) bool {
+    return config.seed != null or
+        config.learning_rate != null or
+        config.weight_decay != null or
+        config.lr_scheduler != null or
+        config.warmup_ratio != null or
+        config.warmup_steps != null or
+        config.num_cycles != null or
+        config.max_steps != null or
+        config.epochs != null or
+        config.micro_batch_size != null or
+        config.gradient_accumulation_steps != null or
+        config.max_grad_norm != null or
+        config.schedule_free != null or
+        config.llrd_decay != null;
+}
+
+fn preferenceTrainingFamilySupported(family: []const u8) bool {
+    return eqlAny(family, &.{ "gemma4", "gemma", "qwen2", "qwen", "colqwen2", "colqwen", "qwen2vl" }) or
+        isQwen35Family(family);
+}
+
+// Admission mirrors the arguments actually forwarded by the legacy shims.
+// A configured option must affect execution or fail before any artifacts exist.
+fn validateLegacyRecipeOptions(recipe: Recipe, lane: enum { layout, reranker, retrieval }) !void {
+    if (recipe.checkpoint != null or recipe.runtime != null or recipe.trainer != null)
+        return error.UnsupportedRecipeOption;
+    if (lane != .reranker and recipe.backend != null) return error.UnsupportedRecipeBackend;
+    inline for (std.meta.fields(OptimizerConfig)) |field| {
+        if (comptime !eqlAny(field.name, &.{ "learning_rate", "epochs" })) {
+            if (@field(recipe.optimizer, field.name) != null) return error.UnsupportedRecipeOptimizerOption;
+        }
+    }
+    if (recipe.eval) |evaluation| {
+        if (lane == .retrieval) return error.UnsupportedRecipeEvaluationOption;
+        inline for (std.meta.fields(EvalConfig)) |field| {
+            if (comptime !eqlAny(field.name, &.{ "path", "max_examples" })) {
+                if (@field(evaluation, field.name) != null) return error.UnsupportedRecipeEvaluationOption;
+            }
+        }
+    }
+    if (lane == .retrieval and (recipe.dataset.eval_path != null or recipe.dataset.eval_max_examples != null))
+        return error.UnsupportedRecipeEvaluationOption;
+}
+
+// These legacy lanes train on native and do not implement evaluation or
+// durable recovery. Reject requests before creating an output or loading a model.
+fn validateNativePreferenceOptions(recipe: Recipe) !void {
+    if (recipe.backend) |backend| {
+        if (!eqlName(backend, "native")) return error.UnsupportedPreferenceTrainingBackend;
+    }
+    if (recipe.checkpoint != null or recipe.eval != null or recipe.runtime != null or recipe.trainer != null or
+        recipe.dataset.eval_path != null or recipe.dataset.eval_max_examples != null or recipe.dataset.eval_split != null)
+    {
+        return error.UnsupportedPreferenceTrainingOption;
+    }
+    inline for (std.meta.fields(OptimizerConfig)) |field| {
+        if (comptime !eqlAny(field.name, &.{ "learning_rate", "epochs", "gradient_accumulation_steps", "max_grad_norm" })) {
+            if (@field(recipe.optimizer, field.name) != null) return error.UnsupportedPreferenceOptimizerOption;
+        }
+    }
+    if (recipe.adapter) |adapter| {
+        if (adapter.initialization_seed != null) return error.UnsupportedPreferenceTrainingOption;
+    }
+}
+
+fn validatePreferenceExecutionContract(recipe: Recipe, task: PreferenceTask, mode: PreferenceExecutionMode, format: []const u8) !void {
+    const fixture_format = switch (task) {
+        .dpo => std.mem.eql(u8, format, "scalar-logprobs"),
+        .grpo => std.mem.eql(u8, format, "token-logprobs"),
+    };
+    const model_format = switch (task) {
+        .dpo => isDpoModelFormat(format),
+        .grpo => isGrpoModelFormat(format),
+    };
+    if (!fixture_format and !model_format) {
+        return switch (task) {
+            .dpo => error.UnsupportedDpoFormat,
+            .grpo => error.UnsupportedGrpoFormat,
+        };
+    }
+
+    switch (mode) {
+        .train => {
+            if (!model_format) return error.PreferenceTrainingRequiresModelDataset;
+            if (!requestsAdapterTraining(recipe) and !isGemmaCudaPreferenceTrainingRoute(recipe, task, format)) {
+                return error.MissingAdapterTrainingIntent;
+            }
+            _ = recipe.model.path orelse return error.MissingModelPath;
+            const family = recipe.model.family orelse try inferFamily(recipe);
+            if (!preferenceTrainingFamilySupported(family)) return error.UnsupportedPreferenceTrainingFamily;
+            if (!eqlAny(family, &.{ "gemma4", "gemma" })) try validateNativePreferenceOptions(recipe);
+        },
+        .score => {
+            if (requestsAdapterTraining(recipe)) return error.AdapterTrainingRequiresTrainMode;
+            if (optimizerConfigHasAnyValue(recipe.optimizer)) return error.OptimizerRequiresTrainMode;
+            if (recipe.checkpoint != null or recipe.runtime != null or recipe.trainer != null) {
+                return error.TrainingOptionRequiresTrainMode;
+            }
+            if (recipe.grpo.train_max_kl != null or recipe.grpo.train_max_kl_policy != null or
+                recipe.grpo.adaptive_kl != null or
+                recipe.grpo.target_kl != null or recipe.grpo.kl_horizon != null or
+                recipe.grpo.min_kl_coef != null or recipe.grpo.max_kl_coef != null)
+            {
+                return error.TrainingOptionRequiresTrainMode;
+            }
+            if (model_format) {
+                _ = recipe.model.path orelse return error.MissingModelPath;
+            } else if (recipe.model.path != null or
+                recipe.model.reference_path != null or
+                recipe.model.projector_path != null or
+                recipe.backend != null)
+            {
+                return error.ModelOptionNotUsedByFixtureScoring;
+            }
+        },
+    }
+}
+
 fn buildDpoPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
     _ = trainDatasetPath(recipe) orelse return error.MissingDatasetPath;
+    const format = recipe.dataset.format orelse return error.MissingDatasetFormat;
+    const mode = try resolvePreferenceExecutionMode(recipe, .dpo, format);
+    try validatePreferenceExecutionContract(recipe, .dpo, mode, format);
+    const objective = try resolveDpoObjectiveConfig(recipe.preference);
+    if (recipe.reward != null) return error.RewardConfigurationOnlySupportedForGrpo;
+    if (mode == .train) {
+        const family = recipe.model.family orelse try inferFamily(recipe);
+        if (eqlAny(family, &.{ "gemma4", "gemma" })) {
+            try validateGemma4PreferenceTrainingRecipeContract(allocator, recipe, .dpo);
+        } else if (objective.loss_type != .sigmoid or objective.preference.label_smoothing != 0.0) {
+            return error.DpoLossTypeNotSupportedForFamily;
+        }
+    }
     return .{ .steps = try allocator.dupe(Step, &.{
         .{
             .kind = .direct_dpo,
-            .name = "train-eval",
+            .name = if (mode == .train) "train" else "score",
             .argv = try argv(allocator, &.{"antfly-inference-internal-dpo"}),
         },
     }) };
@@ -1564,10 +3719,48 @@ fn buildDpoPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
 
 fn buildGrpoPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
     _ = trainDatasetPath(recipe) orelse return error.MissingDatasetPath;
+    const format = recipe.dataset.format orelse return error.MissingDatasetFormat;
+    const mode = try resolvePreferenceExecutionMode(recipe, .grpo, format);
+    try validatePreferenceExecutionContract(recipe, .grpo, mode, format);
+    const objective = try resolveGrpoObjectiveConfig(
+        recipe.grpo,
+        recipe.optimizer.gradient_accumulation_steps orelse 1,
+    );
+    if (mode == .train and objective.scale_rewards == .batch) {
+        // Every current model-backed path samples and scores one prompt group
+        // at a time. Claiming batch reward scaling here would silently reduce
+        // to group scaling. Keep the multi-group core implementation available
+        // to score fixtures, but fail closed for training until prompt groups
+        // share one explicit rollout batch.
+        return error.GrpoBatchRewardScalingRequiresBatchedGroups;
+    }
+    if (recipe.reward != null) {
+        if (mode != .train) return error.TypedRewardPipelineRequiresGemma4Training;
+        const family = recipe.model.family orelse try inferFamily(recipe);
+        if (!eqlAny(family, &.{ "gemma4", "gemma" })) {
+            return error.TypedRewardPipelineRequiresGemma4Training;
+        }
+        try validateRewardPipelineConfig(recipe);
+    }
+    if (mode == .train) {
+        const family = recipe.model.family orelse try inferFamily(recipe);
+        if (eqlAny(family, &.{ "gemma4", "gemma" })) {
+            try validateGemma4PreferenceTrainingRecipeContract(allocator, recipe, .grpo);
+        }
+    }
+    // `grpo.validateConfig` is the core objective's admission rule; enforce it
+    // at plan time (after the recipe-specific diagnostics above) so an invalid
+    // objective fails before any manifest, report, or adapter is written.
+    var core_cfg = if (isGemmaCudaPreferenceTrainingRoute(recipe, .grpo, format))
+        gemmaCudaGrpoConfig(recipe)
+    else
+        try resolveGrpoCoreConfig(recipe);
+    if (std.mem.eql(u8, format, "token-logprobs")) core_cfg.group_size = recipe.grpo.group_size orelse 8;
+    try grpo.validateConfig(core_cfg);
     return .{ .steps = try allocator.dupe(Step, &.{
         .{
             .kind = .direct_grpo,
-            .name = "train-eval",
+            .name = if (mode == .train) "train" else "score",
             .argv = try argv(allocator, &.{"antfly-inference-internal-grpo"}),
         },
     }) };
@@ -1633,47 +3826,22 @@ fn runPlan(
 
         print("finetune[{d}/{d}] {s}: ", .{ idx + 1, plan.steps.len, step.name });
         switch (step.kind) {
-            .direct_sft => {
+            .direct_sft, .direct_dpo, .direct_grpo => {
                 print("{s}\n", .{step.argv[0]});
-                const report_path = try sftReportPath(allocator, recipe);
-                defer allocator.free(report_path);
-                runDirectSft(allocator, io, recipe, report_path) catch |err| {
-                    step_manifests[idx].status = .failed;
-                    try writeFailedRunStatus(allocator, io, recipe, plan, step_manifests, manifest_path, training_config_path, training_report_path, static_metadata);
-                    return err;
+                const report_path = try switch (step.kind) {
+                    .direct_sft => sftReportPath(allocator, recipe),
+                    .direct_dpo => dpoReportPath(allocator, recipe),
+                    .direct_grpo => grpoReportPath(allocator, recipe),
+                    .command => unreachable,
                 };
-                step_manifests[idx].stdout_bytes = 0;
-                step_manifests[idx].stderr_bytes = 0;
-                step_manifests[idx].exit_code = 0;
-                step_manifests[idx].status = .succeeded;
-                if (idx + 1 == plan.steps.len) {
-                    try writeSucceededRunStatus(allocator, io, recipe, step_manifests, manifest_path, training_report_path, static_metadata);
-                }
-                continue;
-            },
-            .direct_dpo => {
-                print("{s}\n", .{step.argv[0]});
-                const report_path = try dpoReportPath(allocator, recipe);
                 defer allocator.free(report_path);
-                runDirectDpo(allocator, io, recipe, report_path) catch |err| {
-                    step_manifests[idx].status = .failed;
-                    try writeFailedRunStatus(allocator, io, recipe, plan, step_manifests, manifest_path, training_config_path, training_report_path, static_metadata);
-                    return err;
+                const execution = switch (step.kind) {
+                    .direct_sft => runDirectSft(allocator, io, recipe, report_path),
+                    .direct_dpo => runDirectDpo(allocator, io, recipe, report_path),
+                    .direct_grpo => runDirectGrpo(allocator, io, recipe, report_path),
+                    .command => unreachable,
                 };
-                step_manifests[idx].stdout_bytes = 0;
-                step_manifests[idx].stderr_bytes = 0;
-                step_manifests[idx].exit_code = 0;
-                step_manifests[idx].status = .succeeded;
-                if (idx + 1 == plan.steps.len) {
-                    try writeSucceededRunStatus(allocator, io, recipe, step_manifests, manifest_path, training_report_path, static_metadata);
-                }
-                continue;
-            },
-            .direct_grpo => {
-                print("{s}\n", .{step.argv[0]});
-                const report_path = try grpoReportPath(allocator, recipe);
-                defer allocator.free(report_path);
-                runDirectGrpo(allocator, io, recipe, report_path) catch |err| {
+                execution catch |err| {
                     step_manifests[idx].status = .failed;
                     try writeFailedRunStatus(allocator, io, recipe, plan, step_manifests, manifest_path, training_config_path, training_report_path, static_metadata);
                     return err;
@@ -2012,7 +4180,10 @@ fn validateAdapterTargetSelection(adapter: AdapterConfig) !void {
 fn validateGemmaAdapterOptions(adapter: AdapterConfig) !void {
     try validateAdapterScaling(adapter);
     try validateAdapterTargetSelection(adapter);
-    if (adapter.target_modules == null) _ = try parseAdapterTargetPreset(adapter.target_preset orelse default_lora_target_preset);
+    if (adapter.target_modules == null) {
+        const name = adapter.target_preset orelse default_gemma4_lora_target_preset;
+        if (gemma4.parseGemma4LoRATargetPreset(name) == null) return error.UnsupportedLoRATargetPreset;
+    }
 }
 
 /// The current optimizer graph owns standard LoRA A/B tensors only. Gemma's
@@ -2102,6 +4273,85 @@ fn validateGemmaGrpoObjectiveOptions(recipe: Recipe) !void {
     }
 }
 
+/// Main's CUDA lane implements the sigmoid DPO objective only. The loss-type
+/// and label-smoothing knobs belong to the Metal/native lane; reject them
+/// rather than accept a recipe whose objective the CUDA lane does not honor.
+fn validateGemmaCudaDpoLossOptions(objective: ResolvedDpoObjectiveConfig) !void {
+    if (objective.loss_type != .sigmoid or objective.preference.label_smoothing != 0.0) {
+        return error.UnsupportedGemmaDpoLossOption;
+    }
+}
+
+/// GRPO knobs implemented only by the Metal/native Gemma lane (asymmetric
+/// clipping, KL budgets/adaptive KL, reward scaling/loss variants, truncation
+/// masking, temperature/top-p/top-k sampling, typed reward pipelines). The
+/// CUDA lane keeps main's fixed per-completion-token-mean objective and
+/// full-vocabulary seeded sampling, so fail closed on these.
+fn validateGemmaCudaGrpoLaneOptions(recipe: Recipe) !void {
+    const config = recipe.grpo;
+    if (config.epsilon_high != null or
+        config.train_max_kl != null or
+        config.train_max_kl_policy != null or
+        config.adaptive_kl != null or
+        config.target_kl != null or
+        config.kl_horizon != null or
+        config.min_kl_coef != null or
+        config.max_kl_coef != null or
+        config.scale_rewards != null or
+        config.loss_type != null or
+        config.mask_truncated_completions != null or
+        config.sampling != null or
+        recipe.reward != null)
+    {
+        return error.UnsupportedGemmaCudaGrpoOption;
+    }
+}
+
+/// Main's CUDA GRPO objective. `loss_type` keeps the `GRPOConfig` default
+/// (per-completion token mean), which the CUDA smoke/benchmark protocol pins.
+fn gemmaCudaGrpoConfig(recipe: Recipe) grpo.GRPOConfig {
+    return .{
+        .group_size = recipe.grpo.group_size orelse 2,
+        .clip_epsilon = recipe.grpo.clip_epsilon orelse 0.2,
+        .kl_coef = recipe.grpo.kl_coef orelse 0.04,
+        .advantage_eps = recipe.grpo.advantage_eps orelse 1e-4,
+        .normalize_advantage = recipe.grpo.normalize_advantage orelse true,
+    };
+}
+
+/// Plan-time contract for the Gemma 4 CUDA preference lane. It replaces
+/// `validateGemma4PreferenceTrainingRecipeContract` (whose held-out
+/// evaluation, checkpoint and Metal environment requirements belong to the
+/// Metal/native lane) with main's CUDA admission rules.
+fn validateGemma4CudaPreferenceRecipeContract(recipe: Recipe, task: PreferenceTask) !void {
+    _ = recipe.model.path orelse return error.MissingModelPath;
+    const execution = try resolveGemmaPreferenceExecution(recipe.backend);
+    if (execution.backend_kind != .cuda) return error.UnsupportedBackend;
+    if (recipe.model.allow_direct_gguf_training orelse false) return error.GgufAutodiffRequiresMetal;
+    if (recipe.trainer) |trainer| {
+        if (!eqlName(trainer, "autodiff") and !eqlName(trainer, "auto")) {
+            return error.UnsupportedGemma4Trainer;
+        }
+    }
+    try validateGemmaPreferenceAdapterOptions(recipe.adapter orelse AdapterConfig{});
+    try validateGemmaPreferenceLifecycleOptions(recipe);
+    switch (task) {
+        .dpo => {
+            if (recipe.model.projector_path != null) return error.UnsupportedGemmaMultimodalDpo;
+            try validateGemmaDpoObjectiveOptions(recipe);
+            try validateGemmaCudaDpoLossOptions(try resolveDpoObjectiveConfig(recipe.preference));
+        },
+        .grpo => {
+            if (recipe.model.projector_path != null) return error.UnsupportedGemmaCudaMultimodalTraining;
+            try validateGemmaGrpoObjectiveOptions(recipe);
+            try validateGemmaCudaGrpoLaneOptions(recipe);
+            if ((recipe.grpo.max_completion_tokens orelse 4) == 0) return error.InvalidGRPOConfig;
+            try grpo.validateConfig(gemmaCudaGrpoConfig(recipe));
+            _ = try parseTextRewardMode(recipe.grpo.reward_mode orelse "exact-match");
+        },
+    }
+}
+
 fn validateNonGemmaAdapterOptions(adapter: AdapterConfig) !void {
     try validateAdapterScaling(adapter);
     try validateAdapterTargetSelection(adapter);
@@ -2118,9 +4368,14 @@ fn parseAdapterTargetPreset(name: []const u8) !peft.TargetPreset {
     return peft.parseTargetPreset(name) orelse error.UnsupportedLoRATargetPreset;
 }
 
-fn gemmaTargetPreset(adapter: AdapterConfig) !?peft.TargetPreset {
+fn gemma4TargetPreset(adapter: AdapterConfig) ?gemma4.Gemma4LoRATargetPreset {
     if (adapter.target_modules != null) return null;
-    return try parseAdapterTargetPreset(adapter.target_preset orelse default_lora_target_preset);
+    return gemma4.parseGemma4LoRATargetPreset(adapter.target_preset orelse default_gemma4_lora_target_preset);
+}
+
+fn gemmaLegacyTargetPreset(adapter: AdapterConfig) !?peft.TargetPreset {
+    if (adapter.target_modules != null or gemma4TargetPreset(adapter) != null) return null;
+    return try parseAdapterTargetPreset(adapter.target_preset orelse default_gemma4_lora_target_preset);
 }
 
 fn adapterTargetModulesForQwen(adapter: AdapterConfig, default_target_modules: []const []const u8) ![]const []const u8 {
@@ -2155,11 +4410,13 @@ fn appendGemmaBootstrapAdapterArgs(
     if (adapter.target_modules) |modules| {
         try appendTargetModulesCsv(allocator, list, modules);
     } else {
-        _ = try parseAdapterTargetPreset(adapter.target_preset orelse default_lora_target_preset);
-        try appendMany(allocator, list, &.{ "--target-preset", adapter.target_preset orelse default_lora_target_preset });
+        const preset = adapter.target_preset orelse default_gemma4_lora_target_preset;
+        if (gemma4.parseGemma4LoRATargetPreset(preset) == null) return error.UnsupportedLoRATargetPreset;
+        try appendMany(allocator, list, &.{ "--target-preset", preset });
     }
     if (adapter.layer_name) |layer| try appendMany(allocator, list, &.{ "--layer-name", layer });
     if (adapter.use_dora orelse false) try list.append(allocator, "--use-dora");
+    if (adapter.initialization_seed) |seed| try appendMany(allocator, list, &.{ "--initialization-seed", try fmtInt(allocator, seed) });
     if (adapter.init_lora_weights) |init| try appendMany(allocator, list, &.{ "--init-lora-weights", init });
 }
 
@@ -2254,8 +4511,9 @@ fn collectStaticMetadata(allocator: std.mem.Allocator, io: std.Io, recipe: Recip
             },
         },
         .optimizer = .{
+            .seed = recipe.optimizer.seed,
             .learning_rate = recipe.optimizer.learning_rate,
-            .weight_decay = recipe.optimizer.weight_decay,
+            .weight_decay = recipe.optimizer.weight_decay orelse if (eqlAny(recipe.model.family orelse "", &.{ "gemma", "gemma4" })) @as(f32, 0.01) else null,
             .lr_scheduler = recipe.optimizer.lr_scheduler,
             .warmup_ratio = recipe.optimizer.warmup_ratio,
             .warmup_steps = recipe.optimizer.warmup_steps,
@@ -2333,11 +4591,51 @@ fn appendArtifactPathsFromPlan(allocator: std.mem.Allocator, planned: *std.Array
                 const report_path = try dpoReportPath(allocator, recipe);
                 defer allocator.free(report_path);
                 try appendUniquePlannedPathOwned(allocator, planned, "dpo_report", report_path);
+                const dpo_format = recipe.dataset.format orelse "";
+                if ((try resolvePreferenceExecutionMode(recipe, .dpo, dpo_format)) == .train) {
+                    try appendDirectPreferenceTrainingArtifacts(allocator, planned, recipe);
+                    // The CUDA lane publishes only the trained adapter and report.
+                    if (isGemmaCudaPreferenceTrainingRoute(recipe, .dpo, dpo_format)) continue;
+                    if (try preferenceCheckpointPath(allocator, recipe, .dpo)) |checkpoint_path| {
+                        defer allocator.free(checkpoint_path);
+                        try appendUniquePlannedPathOwned(allocator, planned, "dpo_training_checkpoint", checkpoint_path);
+                    }
+                    const evaluation_path = try preferenceEvaluationReportPath(allocator, recipe, .dpo);
+                    defer allocator.free(evaluation_path);
+                    try appendUniquePlannedPathOwned(allocator, planned, "dpo_evaluation", evaluation_path);
+                }
             },
             .direct_grpo => {
                 const report_path = try grpoReportPath(allocator, recipe);
                 defer allocator.free(report_path);
                 try appendUniquePlannedPathOwned(allocator, planned, "grpo_report", report_path);
+                const grpo_format = recipe.dataset.format orelse "";
+                if ((try resolvePreferenceExecutionMode(recipe, .grpo, grpo_format)) == .train) {
+                    try appendDirectPreferenceTrainingArtifacts(allocator, planned, recipe);
+                    // The CUDA lane publishes only the trained adapter and report.
+                    if (isGemmaCudaPreferenceTrainingRoute(recipe, .grpo, grpo_format)) continue;
+                    if (try preferenceCheckpointPath(allocator, recipe, .grpo)) |checkpoint_path| {
+                        defer allocator.free(checkpoint_path);
+                        try appendUniquePlannedPathOwned(allocator, planned, "grpo_training_checkpoint", checkpoint_path);
+                    }
+                    const evaluation_path = try preferenceEvaluationReportPath(allocator, recipe, .grpo);
+                    defer allocator.free(evaluation_path);
+                    try appendUniquePlannedPathOwned(allocator, planned, "grpo_evaluation", evaluation_path);
+                    const reward_trace_path = try grpoRewardTracePath(allocator, recipe, false);
+                    defer allocator.free(reward_trace_path);
+                    try appendUniquePlannedPathOwned(allocator, planned, "grpo_reward_trace", reward_trace_path);
+                    const eval_reward_trace_path = try grpoRewardTracePath(allocator, recipe, true);
+                    defer allocator.free(eval_reward_trace_path);
+                    try appendUniquePlannedPathOwned(allocator, planned, "grpo_evaluation_reward_trace", eval_reward_trace_path);
+                    const kl_trace_path = try grpoKlTracePath(allocator, recipe);
+                    defer allocator.free(kl_trace_path);
+                    try appendUniquePlannedPathOwned(allocator, planned, "grpo_kl_control_trace", kl_trace_path);
+                    if (rewardPipelineHasExternalProvider(recipe)) {
+                        const exchange_dir = try grpoRewardExchangeDir(allocator, recipe);
+                        defer allocator.free(exchange_dir);
+                        try appendUniquePlannedPathOwned(allocator, planned, "reward_verifier_exchanges", exchange_dir);
+                    }
+                }
             },
             .command => {
                 const command = step.argv[0];
@@ -2388,6 +4686,29 @@ fn appendArtifactPathsFromPlan(allocator: std.mem.Allocator, planned: *std.Array
                 }
             },
         }
+    }
+}
+
+fn appendDirectPreferenceTrainingArtifacts(
+    allocator: std.mem.Allocator,
+    planned: *std.ArrayListUnmanaged(PlannedPath),
+    recipe: Recipe,
+) !void {
+    const adapter = recipe.adapter orelse AdapterConfig{};
+    if (adapter.path) |bootstrap_dir| {
+        try appendUniquePlannedPath(allocator, planned, "adapter_bootstrap", bootstrap_dir);
+    } else {
+        const bootstrap_dir = try defaultArtifactPath(allocator, recipe, "adapter-bootstrap");
+        defer allocator.free(bootstrap_dir);
+        try appendUniquePlannedPathOwned(allocator, planned, "adapter_bootstrap", bootstrap_dir);
+    }
+
+    if (recipe.artifacts.trained_adapter_dir orelse recipe.artifacts.adapter_dir) |trained_dir| {
+        try appendUniquePlannedPath(allocator, planned, "trained_adapter", trained_dir);
+    } else {
+        const trained_dir = try defaultArtifactPath(allocator, recipe, "adapter-trained");
+        defer allocator.free(trained_dir);
+        try appendUniquePlannedPathOwned(allocator, planned, "trained_adapter", trained_dir);
     }
 }
 
@@ -2495,9 +4816,478 @@ fn sha256FileAlloc(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !
     return std.fmt.allocPrint(allocator, "sha256:{s}", .{std.fmt.bytesToHex(digest, .lower)});
 }
 
+const PreferenceFingerprintPolicy = struct {
+    seed: u64 = 42,
+    max_examples: usize,
+    max_seq_len: usize,
+    epochs: usize,
+    learning_rate: f32,
+    max_grad_norm: f32,
+    requested_gradient_accumulation_steps: u32,
+    physical_micro_batches_per_unit: usize,
+    graph_cache_capacity: u8,
+    sequence_length_bucket_quantum: ?u32 = null,
+    sequence_length_bucket_min: ?u32 = null,
+    direct_gguf_base: bool,
+    fused_linear_cross_entropy: bool,
+    execution_flags: u64,
+    metal_numerical_policy_flags: u64 = 0,
+    metal_sparse_loss_chunk_rows: ?u32 = null,
+    metal_linear_cce_tile_vocab: ?usize = null,
+    dpo_beta: ?f32 = null,
+    dpo_loss_type: ?[]const u8 = null,
+    dpo_label_smoothing: ?f32 = null,
+    dpo_simpo_gamma: ?f32 = null,
+    dpo_ipo_tau: ?f32 = null,
+    dpo_initial_adapter_reference: ?bool = null,
+    dpo_activation_checkpoint_layer_interval: ?u32 = null,
+    dpo_activation_checkpoint_recursive: ?bool = null,
+    grpo_group_size: ?usize = null,
+    grpo_backward_batch_size: ?usize = null,
+    grpo_max_completion_tokens: ?usize = null,
+    grpo_sampling_temperature: ?f32 = null,
+    grpo_sampling_top_p: ?f32 = null,
+    grpo_sampling_top_k: ?usize = null,
+    grpo_stop_token_fingerprint: ?[32]u8 = null,
+    grpo_loss_type: ?[]const u8 = null,
+    grpo_scale_rewards: ?[]const u8 = null,
+    grpo_mask_truncated_completions: ?bool = null,
+    grpo_clip_epsilon: ?f32 = null,
+    grpo_epsilon_high: ?f32 = null,
+    grpo_kl_coef: ?f32 = null,
+    grpo_train_max_kl: ?f32 = null,
+    grpo_train_max_kl_policy: ?[]const u8 = null,
+    grpo_adaptive_kl: ?bool = null,
+    grpo_target_kl: ?f32 = null,
+    grpo_kl_horizon: ?f32 = null,
+    grpo_min_kl_coef: ?f32 = null,
+    grpo_max_kl_coef: ?f32 = null,
+    grpo_advantage_eps: ?f32 = null,
+    grpo_normalize_advantage: ?bool = null,
+    reward_configuration_digest: ?[]const u8 = null,
+};
+
+fn preferenceHashField(hasher: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
+    preferenceHashU64(hasher, value.len);
+    hasher.update(value);
+}
+
+fn preferenceHashOptionalField(hasher: *std.crypto.hash.sha2.Sha256, value: ?[]const u8) void {
+    preferenceHashU64(hasher, @intFromBool(value != null));
+    if (value) |present| preferenceHashField(hasher, present);
+}
+
+fn preferenceHashU64(hasher: *std.crypto.hash.sha2.Sha256, value: anytype) void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, @intCast(value), .little);
+    hasher.update(&bytes);
+}
+
+fn preferenceHashOptionalU64(hasher: *std.crypto.hash.sha2.Sha256, value: anytype) void {
+    preferenceHashU64(hasher, @intFromBool(value != null));
+    if (value) |present| preferenceHashU64(hasher, present);
+}
+
+fn preferenceHashF32(hasher: *std.crypto.hash.sha2.Sha256, value: f32) void {
+    preferenceHashU64(hasher, @as(u32, @bitCast(value)));
+}
+
+fn preferenceHashF64(hasher: *std.crypto.hash.sha2.Sha256, value: f64) void {
+    preferenceHashU64(hasher, @as(u64, @bitCast(value)));
+}
+
+fn preferenceHashOptionalF32(hasher: *std.crypto.hash.sha2.Sha256, value: ?f32) void {
+    preferenceHashU64(hasher, @intFromBool(value != null));
+    if (value) |present| preferenceHashF32(hasher, present);
+}
+
+fn preferenceHashOptionalBool(hasher: *std.crypto.hash.sha2.Sha256, value: ?bool) void {
+    preferenceHashU64(hasher, @intFromBool(value != null));
+    if (value) |present| preferenceHashU64(hasher, @intFromBool(present));
+}
+
+fn gemmaPreferenceRunFingerprint(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    recipe: Recipe,
+    task: PreferenceTask,
+    base_model_dir: []const u8,
+    bootstrap_dir: []const u8,
+    target_modules: []const []const u8,
+    lora_rank: u32,
+    lora_alpha: f32,
+    recursive_lora: bool,
+    backend_kind: gemma4_real_autodiff.BackendKind,
+    policy: PreferenceFingerprintPolicy,
+) ![std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var provenance = try gemma4.fingerprintGemma4Model(allocator, base_model_dir);
+    defer provenance.deinit(allocator);
+    const train_path = trainDatasetPath(recipe) orelse return error.MissingDatasetPath;
+    const eval_path = evalDatasetPath(recipe) orelse return error.MissingPreferenceEvaluationDataset;
+    const train_digest = try sha256FileAlloc(allocator, io, train_path);
+    defer allocator.free(train_digest);
+    const eval_digest = try sha256FileAlloc(allocator, io, eval_path);
+    defer allocator.free(eval_digest);
+    const adapter_payload_path = try std.fs.path.join(allocator, &.{ bootstrap_dir, gemma4.adapter_checkpoint_file_name });
+    defer allocator.free(adapter_payload_path);
+    const adapter_digest = try sha256FileAlloc(allocator, io, adapter_payload_path);
+    defer allocator.free(adapter_digest);
+    const projector_digest = if (recipe.model.projector_path) |path|
+        try sha256FileAlloc(allocator, io, path)
+    else
+        null;
+    defer if (projector_digest) |digest| allocator.free(digest);
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    preferenceHashField(&hasher, "antfly.gemma4.preference.run/v6");
+    preferenceHashField(&hasher, @tagName(task));
+    preferenceHashField(&hasher, provenance.base_model_sha256);
+    preferenceHashField(&hasher, provenance.tokenizer_sha256);
+    preferenceHashField(&hasher, provenance.chat_template_sha256);
+    preferenceHashField(&hasher, adapter_digest);
+    preferenceHashField(&hasher, train_digest);
+    preferenceHashField(&hasher, eval_digest);
+    preferenceHashField(&hasher, recipe.dataset.format orelse "");
+    preferenceHashOptionalU64(&hasher, evalMaxExamples(recipe));
+    switch (task) {
+        .dpo => {
+            const minimums = recipe.eval.?.dpo_minimums.?;
+            preferenceHashF64(&hasher, minimums.accuracy);
+            preferenceHashF64(&hasher, minimums.max_loss);
+        },
+        .grpo => {
+            const minimums = recipe.eval.?.grpo_minimums.?;
+            preferenceHashF64(&hasher, minimums.mean_reward);
+            preferenceHashF64(&hasher, minimums.top_rank_mean_reward);
+            preferenceHashF64(&hasher, minimums.positive_reward_group_rate);
+            preferenceHashF64(&hasher, minimums.max_kl_loss);
+        },
+    }
+    preferenceHashOptionalField(&hasher, projector_digest);
+    preferenceHashU64(&hasher, target_modules.len);
+    for (target_modules) |module| preferenceHashField(&hasher, module);
+    preferenceHashU64(&hasher, lora_rank);
+    preferenceHashF32(&hasher, lora_alpha);
+    preferenceHashU64(&hasher, @intFromBool(recursive_lora));
+    preferenceHashField(&hasher, @tagName(backend_kind));
+    preferenceHashU64(&hasher, policy.max_examples);
+    preferenceHashU64(&hasher, policy.max_seq_len);
+    preferenceHashU64(&hasher, policy.epochs);
+    preferenceHashF32(&hasher, policy.learning_rate);
+    preferenceHashF32(&hasher, recipe.optimizer.weight_decay orelse 0.01);
+    preferenceHashF32(&hasher, policy.max_grad_norm);
+    preferenceHashU64(&hasher, policy.requested_gradient_accumulation_steps);
+    preferenceHashU64(&hasher, policy.physical_micro_batches_per_unit);
+    preferenceHashU64(&hasher, policy.graph_cache_capacity);
+    preferenceHashOptionalU64(&hasher, policy.sequence_length_bucket_quantum);
+    preferenceHashOptionalU64(&hasher, policy.sequence_length_bucket_min);
+    preferenceHashU64(&hasher, @intFromBool(policy.direct_gguf_base));
+    preferenceHashU64(&hasher, @intFromBool(policy.fused_linear_cross_entropy));
+    preferenceHashU64(&hasher, policy.execution_flags);
+    var environment = try @import("training_environment.zig").capture(allocator);
+    defer environment.deinit();
+    preferenceHashField(&hasher, "training-environment/v1");
+    preferenceHashField(&hasher, &environment.sha256);
+    preferenceHashU64(&hasher, policy.metal_numerical_policy_flags);
+    preferenceHashOptionalU64(&hasher, policy.metal_sparse_loss_chunk_rows);
+    preferenceHashOptionalU64(&hasher, policy.metal_linear_cce_tile_vocab);
+    preferenceHashOptionalF32(&hasher, policy.dpo_beta);
+    if (task == .dpo and
+        (policy.dpo_loss_type != null or
+            policy.dpo_label_smoothing != null or
+            policy.dpo_simpo_gamma != null or
+            policy.dpo_ipo_tau != null or
+            policy.dpo_initial_adapter_reference != null))
+    {
+        // Bind the explicit objective and non-base initial reference within
+        // fingerprint v6. Pre-v6 checkpoints lack the environment contract.
+        preferenceHashField(&hasher, "dpo-objective-and-reference/v1");
+        preferenceHashOptionalField(&hasher, policy.dpo_loss_type);
+        preferenceHashOptionalF32(&hasher, policy.dpo_label_smoothing);
+        preferenceHashOptionalF32(&hasher, policy.dpo_simpo_gamma);
+        preferenceHashOptionalF32(&hasher, policy.dpo_ipo_tau);
+        preferenceHashOptionalBool(&hasher, policy.dpo_initial_adapter_reference);
+    }
+    preferenceHashOptionalU64(&hasher, policy.dpo_activation_checkpoint_layer_interval);
+    preferenceHashOptionalBool(&hasher, policy.dpo_activation_checkpoint_recursive);
+    preferenceHashOptionalU64(&hasher, policy.grpo_group_size);
+    preferenceHashOptionalU64(&hasher, policy.grpo_backward_batch_size);
+    preferenceHashOptionalU64(&hasher, policy.grpo_max_completion_tokens);
+    if (task == .grpo) {
+        // These extensions intentionally invalidate checkpoints produced by
+        // the former rank-enumeration sampler or fixed per-epoch prompt order
+        // within the v6 fingerprint domain.
+        preferenceHashField(&hasher, "stochastic-grpo-sampling/v1");
+        if (policy.grpo_stop_token_fingerprint) |digest| {
+            // Older checkpoints sampled past configured end-of-turn tokens.
+            // They cannot resume under the corrected rollout/truncation policy.
+            preferenceHashField(&hasher, "model-configured-grpo-stops/v1");
+            preferenceHashField(&hasher, &digest);
+        }
+        preferenceHashField(&hasher, "deterministic-grpo-epoch-prompt-order/v1");
+        preferenceHashOptionalF32(&hasher, policy.grpo_sampling_temperature);
+        preferenceHashOptionalF32(&hasher, policy.grpo_sampling_top_p);
+        preferenceHashOptionalU64(&hasher, policy.grpo_sampling_top_k);
+        preferenceHashField(&hasher, "grpo-objective/temperature-scaled-v2");
+        preferenceHashOptionalField(&hasher, policy.grpo_loss_type);
+        preferenceHashOptionalField(&hasher, policy.grpo_scale_rewards);
+        preferenceHashOptionalF32(&hasher, policy.grpo_epsilon_high);
+        preferenceHashOptionalBool(&hasher, policy.grpo_mask_truncated_completions);
+        preferenceHashOptionalField(&hasher, policy.grpo_train_max_kl_policy);
+        if (policy.grpo_adaptive_kl orelse false) {
+            // The controller horizon is denominated in sampled completion
+            // episodes. This domain tag prevents a checkpoint created by the
+            // former one-unit-per-group controller from resuming under the
+            // corrected update rate.
+            preferenceHashField(&hasher, "grpo-adaptive-kl-objective-sync/v2");
+        }
+    }
+    preferenceHashOptionalF32(&hasher, policy.grpo_clip_epsilon);
+    preferenceHashOptionalF32(&hasher, policy.grpo_kl_coef);
+    preferenceHashOptionalF32(&hasher, policy.grpo_train_max_kl);
+    preferenceHashU64(&hasher, @intFromBool(policy.grpo_adaptive_kl orelse false));
+    preferenceHashOptionalF32(&hasher, policy.grpo_target_kl);
+    preferenceHashOptionalF32(&hasher, policy.grpo_kl_horizon);
+    preferenceHashOptionalF32(&hasher, policy.grpo_min_kl_coef);
+    preferenceHashOptionalF32(&hasher, policy.grpo_max_kl_coef);
+    preferenceHashOptionalF32(&hasher, policy.grpo_advantage_eps);
+    preferenceHashU64(&hasher, @intFromBool(policy.grpo_normalize_advantage orelse false));
+    preferenceHashOptionalField(&hasher, policy.reward_configuration_digest);
+    // Seed 42 is the v6 default; non-default seeds extend the domain.
+    if (policy.seed != 42) {
+        preferenceHashField(&hasher, "typed-training-seed/v1");
+        preferenceHashU64(&hasher, policy.seed);
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn preferenceCheckpointMagic(task: PreferenceTask) u64 {
+    return switch (task) {
+        .dpo => 0x44504f2d43504b31,
+        .grpo => 0x4752504f43504b31,
+    };
+}
+
+fn preferenceDigestWords(digest: [std.crypto.hash.sha2.Sha256.digest_length]u8) [4]u64 {
+    var words: [4]u64 = undefined;
+    for (&words, 0..) |*word, idx| {
+        word.* = std.mem.readInt(u64, digest[idx * 8 ..][0..8], .little);
+    }
+    return words;
+}
+
+fn preferenceDigestFromProgress(progress: real_autodiff.TrainingProgress) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    for (progress.rng_state, 0..) |word, idx| {
+        std.mem.writeInt(u64, digest[idx * 8 ..][0..8], word, .little);
+    }
+    return digest;
+}
+
+fn preferenceCheckpointStatePath(
+    allocator: std.mem.Allocator,
+    checkpoint_path: []const u8,
+    digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}.preference-state-{s}.json",
+        .{ checkpoint_path, std.fmt.bytesToHex(digest, .lower) },
+    );
+}
+
+fn savePreferenceCheckpoint(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    checkpoint_path: []const u8,
+    task: PreferenceTask,
+    epoch_index: usize,
+    examples_into_epoch: usize,
+    examples_seen: usize,
+    run_fingerprint: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    state: PreferenceCheckpointState,
+) !void {
+    if (!std.mem.eql(u8, state.schema_version, preference_checkpoint_state_schema_v2) or
+        state.epoch_index != epoch_index or
+        state.examples_into_epoch != examples_into_epoch or
+        state.micro_batch_steps != trainer.microBatchSteps() or
+        state.optimizer_steps != trainer.optimizerSteps() or
+        state.accumulation_micro_batches != trainer.accumulatedMicroBatches())
+    {
+        return error.InvalidPreferenceCheckpointState;
+    }
+    const previous_progress = trainer.trainingProgress();
+    const previous_state_path = if (previous_progress.order_seed == preferenceCheckpointMagic(task))
+        try preferenceCheckpointStatePath(
+            allocator,
+            checkpoint_path,
+            preferenceDigestFromProgress(previous_progress),
+        )
+    else
+        null;
+    defer if (previous_state_path) |path| allocator.free(path);
+    const rendered = try std.json.Stringify.valueAlloc(allocator, state, .{});
+    defer allocator.free(rendered);
+    var state_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(rendered, &state_digest, .{});
+    const state_path = try preferenceCheckpointStatePath(allocator, checkpoint_path, state_digest);
+    defer allocator.free(state_path);
+    try artifact_publication.writeFileAtomicReplace(allocator, io, state_path, rendered);
+    const persisted_digest = try sha256FileAlloc(allocator, io, state_path);
+    defer allocator.free(persisted_digest);
+    const expected_digest = try formatSha256DigestAlloc(allocator, state_digest);
+    defer allocator.free(expected_digest);
+    if (!std.ascii.eqlIgnoreCase(persisted_digest, expected_digest)) {
+        return error.PreferenceCheckpointStateDigestMismatch;
+    }
+    trainer.setTrainingProgress(.{
+        .epoch_index = @intCast(epoch_index),
+        .examples_seen = @intCast(examples_seen),
+        .order_seed = preferenceCheckpointMagic(task),
+        .rng_state = preferenceDigestWords(state_digest),
+    });
+    try trainer.saveTrainingCheckpoint(checkpoint_path, run_fingerprint, null);
+    // The newly synced trainer checkpoint is now the sole authority for the
+    // sidecar generation. Remove the previously referenced sidecar only after
+    // that atomic publication; a crash before this point leaves the old pair
+    // valid, while a cleanup failure merely leaves a harmless orphan.
+    if (previous_state_path) |previous_path| {
+        if (!std.mem.eql(u8, previous_path, state_path)) {
+            std.Io.Dir.cwd().deleteFile(io, previous_path) catch {};
+        }
+    }
+}
+
+fn loadPreferenceCheckpointState(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    checkpoint_path: []const u8,
+    task: PreferenceTask,
+    run_fingerprint: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    restored: real_autodiff.RestoredTrainingCheckpoint,
+) !LoadedPreferenceCheckpointState {
+    if (restored.progress.next_example_index != 0 or
+        restored.progress.order_cursor != 0 or
+        restored.progress.order_seed != preferenceCheckpointMagic(task))
+    {
+        return error.InvalidPreferenceCheckpointProgress;
+    }
+    const state_digest = preferenceDigestFromProgress(restored.progress);
+    const state_path = try preferenceCheckpointStatePath(allocator, checkpoint_path, state_digest);
+    errdefer allocator.free(state_path);
+    const bytes = try readFileMax(allocator, io, state_path, 192 * 1024 * 1024);
+    defer allocator.free(bytes);
+    var actual_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &actual_digest, .{});
+    if (!std.mem.eql(u8, &actual_digest, &state_digest)) {
+        return error.PreferenceCheckpointStateDigestMismatch;
+    }
+    var parsed = try std.json.parseFromSlice(
+        PreferenceCheckpointState,
+        allocator,
+        bytes,
+        .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
+    );
+    errdefer parsed.deinit();
+    const expected_fingerprint = try formatSha256DigestAlloc(allocator, run_fingerprint.*);
+    defer allocator.free(expected_fingerprint);
+    const state = parsed.value;
+    const schema_v1 = std.mem.eql(u8, state.schema_version, preference_checkpoint_state_schema_v1);
+    const schema_v2 = std.mem.eql(u8, state.schema_version, preference_checkpoint_state_schema_v2);
+    if (!std.ascii.eqlIgnoreCase(state.run_fingerprint_sha256, expected_fingerprint)) {
+        std.debug.print("preference resume identity mismatch (expected fingerprint v6): model, data, renderer, optimizer, evaluation acceptance, and numerical environment must match; pre-v6 checkpoints require a new run\n", .{});
+        return error.PreferenceCheckpointFingerprintMismatch;
+    }
+    if ((!schema_v1 and !schema_v2) or
+        (schema_v1 and state.examples_into_epoch != 0) or
+        !std.mem.eql(u8, state.task, @tagName(task)) or
+        !std.ascii.eqlIgnoreCase(state.run_fingerprint_sha256, expected_fingerprint) or
+        state.epoch_index != restored.progress.epoch_index or
+        state.micro_batch_steps != restored.micro_batch_steps or
+        state.optimizer_steps != restored.optimizer_steps or
+        state.accumulation_micro_batches != restored.accumulation_micro_batches or
+        state.epoch_index > std.math.maxInt(usize) or
+        restored.progress.examples_seen > std.math.maxInt(usize))
+    {
+        return error.InvalidPreferenceCheckpointState;
+    }
+    if ((task == .dpo) != (state.dpo != null) or (task == .grpo) != (state.grpo != null)) {
+        return error.InvalidPreferenceCheckpointState;
+    }
+    const aggregate_examples = switch (task) {
+        .dpo => state.dpo.?.examples_seen,
+        .grpo => state.grpo.?.total_groups,
+    };
+    if (aggregate_examples != restored.progress.examples_seen) {
+        return error.InvalidPreferenceCheckpointState;
+    }
+    if (state.grpo) |aggregate| {
+        if (aggregate.diagnostic_first_token_count > aggregate.diagnostic_first_tokens.len or
+            aggregate.optimizer_groups > aggregate.total_groups or
+            aggregate.zero_reward_std_groups > aggregate.total_groups - aggregate.optimizer_groups or
+            aggregate.all_truncated_groups > aggregate.total_groups - aggregate.optimizer_groups - aggregate.zero_reward_std_groups or
+            aggregate.kl_rejected_groups != aggregate.total_groups - aggregate.optimizer_groups - aggregate.zero_reward_std_groups - aggregate.all_truncated_groups or
+            aggregate.truncated_completions > aggregate.total_completions or
+            aggregate.kl_admitted_groups != aggregate.optimizer_groups or
+            aggregate.policy_rescore_completions > aggregate.total_completions or
+            aggregate.reward_call_index != aggregate.total_completions or
+            aggregate.reward_external_calls > aggregate.reward_call_index or
+            aggregate.reward_external_failures > aggregate.reward_external_calls or
+            aggregate.total_tokens < aggregate.total_completions)
+        {
+            return error.InvalidPreferenceCheckpointState;
+        }
+        if (aggregate.incremental_kv) |telemetry| {
+            if (telemetry.groups != aggregate.total_groups or
+                telemetry.prompt_prefill_forwards != aggregate.total_groups or
+                telemetry.cache_page_tokens == 0 or
+                !std.mem.eql(u8, telemetry.cache_dtype, "f32"))
+            {
+                return error.InvalidPreferenceCheckpointState;
+            }
+        }
+    }
+    return .{ .parsed = parsed, .path = state_path };
+}
+
+fn preferenceCheckpointArtifactSummary(
+    allocator: std.mem.Allocator,
+    checkpoint_path: ?[]const u8,
+    task: PreferenceTask,
+    progress: real_autodiff.TrainingProgress,
+) !?PreferenceCheckpointArtifactSummary {
+    const path = checkpoint_path orelse return null;
+    if (progress.order_seed != preferenceCheckpointMagic(task) or
+        progress.next_example_index != 0 or
+        progress.order_cursor != 0)
+    {
+        return error.InvalidPreferenceCheckpointProgress;
+    }
+    const epoch = std.math.cast(usize, progress.epoch_index) orelse
+        return error.InvalidPreferenceCheckpointProgress;
+    const digest = preferenceDigestFromProgress(progress);
+    const state_path = try preferenceCheckpointStatePath(allocator, path, digest);
+    errdefer allocator.free(state_path);
+    const state_sha256 = try formatSha256DigestAlloc(allocator, digest);
+    return .{
+        .state_path = state_path,
+        .state_sha256 = state_sha256,
+        .epoch = epoch,
+    };
+}
+
 fn digestDirectoryAlloc(allocator: std.mem.Allocator, io: std.Io, dir_path: []const u8) !DirectoryDigest {
     var entries: std.ArrayListUnmanaged(DirectoryDigestEntry) = .empty;
-    errdefer entries.deinit(allocator);
+    defer {
+        for (entries.items) |entry| {
+            allocator.free(entry.relative_path);
+            allocator.free(entry.digest);
+        }
+        entries.deinit(allocator);
+    }
     try appendDirectoryDigestEntries(allocator, io, dir_path, "", &entries);
     std.sort.heap(DirectoryDigestEntry, entries.items, {}, lessThanDirectoryDigestEntry);
 
@@ -2547,11 +5337,13 @@ fn appendDirectoryDigestEntries(
 
         if (entry.kind == .directory) {
             try appendDirectoryDigestEntries(allocator, io, child_path, rel_path, entries);
+            allocator.free(rel_path);
             continue;
         }
 
         const stat = try std.Io.Dir.cwd().statFile(io, child_path, .{});
         const digest = try sha256FileAlloc(allocator, io, child_path);
+        errdefer allocator.free(digest);
         try entries.append(allocator, .{
             .relative_path = rel_path,
             .size_bytes = stat.size,
@@ -2560,17 +5352,117 @@ fn appendDirectoryDigestEntries(
     }
 }
 
+fn validatePublishedAdapterChanged(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    bootstrap_dir: []const u8,
+    trained_dir: []const u8,
+) !void {
+    const trained = try digestDirectoryAlloc(allocator, io, trained_dir);
+    defer allocator.free(trained.digest);
+    if (trained.entries == 0) return error.EmptyTrainedAdapter;
+
+    // Header formatting and tensor order can change even if serialization
+    // republishes the original weights. Use the existing canonical tensor
+    // identity, complementing the pre-publication host digest.
+    const bootstrap_payload_path = try std.fs.path.join(allocator, &.{ bootstrap_dir, "adapter_model.safetensors" });
+    defer allocator.free(bootstrap_payload_path);
+    const trained_payload_path = try std.fs.path.join(allocator, &.{ trained_dir, "adapter_model.safetensors" });
+    defer allocator.free(trained_payload_path);
+    if (try train_eval_gemma4_lora_bundle.adapterPayloadsEqual(
+        allocator,
+        io,
+        bootstrap_payload_path,
+        trained_payload_path,
+    )) return error.UnchangedTrainedAdapter;
+}
+
+test "gemma4 published adapter change gate ignores headers order and PEFT aliases" {
+    const allocator = std.testing.allocator;
+    const io = compat.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const bootstrap = try std.fs.path.join(allocator, &.{ root, "bootstrap" });
+    defer allocator.free(bootstrap);
+    const trained = try std.fs.path.join(allocator, &.{ root, "trained" });
+    defer allocator.free(trained);
+    try compat.cwd().createDirPath(io, bootstrap);
+    try compat.cwd().createDirPath(io, trained);
+    const bootstrap_path = try std.fs.path.join(allocator, &.{ bootstrap, "adapter_model.safetensors" });
+    defer allocator.free(bootstrap_path);
+    const trained_path = try std.fs.path.join(allocator, &.{ trained, "adapter_model.safetensors" });
+    defer allocator.free(trained_path);
+    const a = [_]f32{ 1.0, -2.0 };
+    var b = [_]f32{ 0.0, 0.0 };
+    const checkpoint = @import("safetensors_checkpoint.zig");
+    try checkpoint.save(allocator, bootstrap_path, &.{
+        .{ .name = "model.layers.0.self_attn.q_proj.weight.lora_A.weight", .shape = &.{ 1, 2 }, .data = &a },
+        .{ .name = "model.layers.0.self_attn.q_proj.weight.lora_B.weight", .shape = &.{ 2, 1 }, .data = &b },
+    });
+    const reordered = [_]checkpoint.NamedTensor{
+        .{ .name = "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_B.default.weight", .shape = &.{ 2, 1 }, .data = &b },
+        .{ .name = "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_A.default.weight", .shape = &.{ 1, 2 }, .data = &a },
+    };
+    try checkpoint.save(allocator, trained_path, &reordered);
+    try std.testing.expectError(error.UnchangedTrainedAdapter, validatePublishedAdapterChanged(allocator, io, bootstrap, trained));
+    b[1] = 0.125;
+    try checkpoint.save(allocator, trained_path, &reordered);
+    try validatePublishedAdapterChanged(allocator, io, bootstrap, trained);
+}
+
+fn trainerLoRAParameterDigest(trainer: *const real_autodiff.RealAutodiffTrainer) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    for (trainer.lora_params.items) |slot| {
+        hasher.update(slot.name);
+        hasher.update(&.{0});
+        hasher.update(std.mem.sliceAsBytes(slot.weights));
+        hasher.update(&.{0});
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn formatSha256DigestAlloc(
+    allocator: std.mem.Allocator,
+    digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "sha256:{s}", .{std.fmt.bytesToHex(digest, .lower)});
+}
+
+fn validateTrainerAdapterChanged(
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    initial_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+) !void {
+    try trainer.syncDeviceTrainablesToHost();
+    if (trainer.lora_params.items.len == 0) return error.MissingAdapterParameters;
+    for (trainer.lora_params.items) |slot| {
+        for (slot.weights) |value| {
+            if (!std.math.isFinite(value)) return error.NonFiniteTrainedAdapter;
+        }
+    }
+    const final_digest = trainerLoRAParameterDigest(trainer);
+    if (std.mem.eql(u8, &initial_digest, &final_digest)) return error.UnchangedTrainedAdapter;
+}
+
+fn requireMissingPreferencePublicationTarget(io: std.Io, path: []const u8) !void {
+    std.Io.Dir.cwd().access(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    return error.PreferenceTrainedAdapterAlreadyExists;
+}
+
 fn lessThanDirectoryDigestEntry(_: void, lhs: DirectoryDigestEntry, rhs: DirectoryDigestEntry) bool {
     return std.mem.order(u8, lhs.relative_path, rhs.relative_path) == .lt;
 }
 
 fn writeJsonFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, value: anytype) !void {
-    if (std.fs.path.dirname(path)) |parent| {
-        if (parent.len > 0) try std.Io.Dir.cwd().createDirPath(io, parent);
-    }
     const rendered = try std.json.Stringify.valueAlloc(allocator, value, .{ .whitespace = .indent_2 });
     defer allocator.free(rendered);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = rendered });
+    try artifact_publication.writeFileAtomicReplace(allocator, io, path, rendered);
 }
 
 fn sftReportPath(allocator: std.mem.Allocator, recipe: Recipe) ![]const u8 {
@@ -2586,6 +5478,69 @@ fn dpoReportPath(allocator: std.mem.Allocator, recipe: Recipe) ![]const u8 {
 fn grpoReportPath(allocator: std.mem.Allocator, recipe: Recipe) ![]const u8 {
     if (recipe.artifacts.report_path) |path| return allocator.dupe(u8, path);
     return defaultArtifactPath(allocator, recipe, "grpo_report.json");
+}
+
+fn preferenceCheckpointPath(
+    allocator: std.mem.Allocator,
+    recipe: Recipe,
+    task: PreferenceTask,
+) !?[]const u8 {
+    const checkpoint = recipe.checkpoint orelse return null;
+    if (checkpoint.resume_path) |path| return try allocator.dupe(u8, path);
+    if (checkpoint.every_epochs == null) return error.CheckpointIntervalRequired;
+    return try defaultArtifactPath(
+        allocator,
+        recipe,
+        switch (task) {
+            .dpo => "gemma4_dpo_trainer_state.safetensors",
+            .grpo => "gemma4_grpo_trainer_state.safetensors",
+        },
+    );
+}
+
+fn preferenceEvaluationReportPath(
+    allocator: std.mem.Allocator,
+    recipe: Recipe,
+    task: PreferenceTask,
+) ![]const u8 {
+    if (recipe.artifacts.evaluation_report_path) |path| return allocator.dupe(u8, path);
+    return defaultArtifactPath(allocator, recipe, switch (task) {
+        .dpo => "dpo_evaluation_report.json",
+        .grpo => "grpo_evaluation_report.json",
+    });
+}
+
+fn preferenceBaselineEvaluationReportPath(
+    allocator: std.mem.Allocator,
+    recipe: Recipe,
+    task: PreferenceTask,
+) ![]const u8 {
+    return defaultArtifactPath(allocator, recipe, switch (task) {
+        .dpo => "dpo_baseline_evaluation_report.json",
+        .grpo => "grpo_baseline_evaluation_report.json",
+    });
+}
+
+fn grpoRewardTracePath(allocator: std.mem.Allocator, recipe: Recipe, evaluation: bool) ![]const u8 {
+    if (recipe.reward) |reward| {
+        if (evaluation) {
+            if (reward.evaluation_trace_path) |path| return allocator.dupe(u8, path);
+        } else if (reward.trace_path) |path| return allocator.dupe(u8, path);
+    }
+    return defaultArtifactPath(
+        allocator,
+        recipe,
+        if (evaluation) "grpo_evaluation_reward_trace.jsonl" else "grpo_reward_trace.jsonl",
+    );
+}
+
+fn grpoKlTracePath(allocator: std.mem.Allocator, recipe: Recipe) ![]const u8 {
+    return defaultArtifactPath(allocator, recipe, "grpo_kl_control_trace.jsonl");
+}
+
+fn grpoRewardExchangeDir(allocator: std.mem.Allocator, recipe: Recipe) ![]const u8 {
+    if (recipe.reward) |reward| if (reward.exchange_dir) |path| return allocator.dupe(u8, path);
+    return defaultArtifactPath(allocator, recipe, "reward-verifier-exchanges");
 }
 
 fn expectRunStatusFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, expected_status: []const u8) !void {
@@ -2642,23 +5597,15 @@ fn runDirectPrepareGemma4LoraInputs(allocator: std.mem.Allocator, io: std.Io, ar
     defer loaded.deinit();
     const has_multimodal = gemmaMessagesHaveMedia(loaded.examples);
     if (has_multimodal and gguf_projector_path == null) return error.MissingGgufProjector;
-    var summary = if (has_multimodal)
-        try gemma4.prepareMultimodalInputsFromChatData(
-            allocator,
-            model_dir,
-            gguf_projector_path.?,
-            loaded.examples,
-            max_examples,
-            max_seq_len,
-        )
-    else
-        try gemma4.prepareInputsFromChatData(
-            allocator,
-            model_dir,
-            loaded.examples,
-            max_examples,
-            max_seq_len,
-        );
+    if (has_multimodal) return error.Gemma4MultimodalFinetuningNotSupported;
+    var summary = try gemma4.prepareInputsFromChatDataWithSource(
+        allocator,
+        model_dir,
+        loaded.examples,
+        max_examples,
+        max_seq_len,
+        .{ .dataset_path = dataset_path, .split = split },
+    );
     defer gemma4.freePreparedInputsSummary(allocator, &summary);
     try gemma4.savePreparedInputsSummary(allocator, out_path, summary);
     print("direct adapter: {s}\n", .{argv_in[0]});
@@ -2678,6 +5625,7 @@ fn runDirectBootstrapGemma4Lora(allocator: std.mem.Allocator, io: std.Io, argv_i
     var base_model_name_or_path: ?[]const u8 = null;
     var layer_name: ?[]const u8 = null;
     var target_preset: ?peft.TargetPreset = null;
+    var gemma4_target_preset: ?gemma4.Gemma4LoRATargetPreset = null;
     var target_modules: ?[]const []const u8 = null;
     defer if (target_modules) |modules| allocator.free(modules);
     var use_dora = false;
@@ -2706,7 +5654,11 @@ fn runDirectBootstrapGemma4Lora(allocator: std.mem.Allocator, io: std.Io, argv_i
         } else if (std.mem.eql(u8, arg, "--target-preset")) {
             i += 1;
             if (i >= argv_in.len) return error.InvalidArguments;
-            target_preset = peft.parseTargetPreset(argv_in[i]) orelse return error.InvalidArguments;
+            if (gemma4.parseGemma4LoRATargetPreset(argv_in[i])) |preset| {
+                gemma4_target_preset = preset;
+            } else {
+                target_preset = peft.parseTargetPreset(argv_in[i]) orelse return error.InvalidArguments;
+            }
         } else if (std.mem.eql(u8, arg, "--target-modules")) {
             if (target_modules != null) return error.InvalidArguments;
             i += 1;
@@ -2730,8 +5682,10 @@ fn runDirectBootstrapGemma4Lora(allocator: std.mem.Allocator, io: std.Io, argv_i
             return error.InvalidArguments;
         }
     }
-    if (target_modules != null and target_preset != null) return error.InvalidArguments;
-    const effective_target_preset = if (target_modules == null) target_preset orelse .all_linear else null;
+    const selection_count = @intFromBool(target_modules != null) +
+        @intFromBool(target_preset != null) +
+        @intFromBool(gemma4_target_preset != null);
+    if (selection_count > 1) return error.InvalidArguments;
 
     var summary = try gemma4.bootstrapLoRABundle(allocator, model_dir, out_dir, .{
         .rank = rank,
@@ -2739,7 +5693,8 @@ fn runDirectBootstrapGemma4Lora(allocator: std.mem.Allocator, io: std.Io, argv_i
         .base_model_name_or_path = base_model_name_or_path,
         .layer_name = layer_name,
         .target_modules = target_modules,
-        .target_preset = effective_target_preset,
+        .target_preset = target_preset,
+        .gemma4_target_preset = gemma4_target_preset,
         .use_dora = use_dora,
         .init_lora_weights = init_lora_weights,
     });
@@ -3225,6 +6180,7 @@ const GrpoTextRow = struct {
 const GrpoPromptBatchOwned = struct {
     arena: std.heap.ArenaAllocator,
     prompts: []const []const i32,
+    prompt_texts: []const []const u8,
     targets: []const []const u8,
 
     fn deinit(self: *GrpoPromptBatchOwned) void {
@@ -3341,7 +6297,9 @@ const DecoderGrpoSampler = struct {
     model: *model_manager_mod.LoadedModel,
     max_seq_len: usize,
     max_completion_tokens: usize,
-    rollout_nonce: u64 = 0,
+    sampling: ResolvedGrpoSamplingConfig,
+    run_seed: u64,
+    groups_sampled: usize = 0,
 
     fn sample(
         ctx: *anyopaque,
@@ -3360,10 +6318,18 @@ const DecoderGrpoSampler = struct {
         defer cb.deinit();
 
         const eos_id = self.model.getTokenizer().specialTokens().sep_id;
+        const group_seed = gemma4_real_autodiff.deriveGrpoSamplingGroupSeed(
+            self.run_seed,
+            gemma_grpo_evaluation_sampling_domain,
+            0,
+            self.groups_sampled,
+        );
+        self.groups_sampled += 1;
 
         for (0..num_samples) |sample_idx| {
-            var prng = std.Random.DefaultPrng.init(grpoRolloutSeed(self.rollout_nonce, 0, sample_idx));
-            const random = prng.random();
+            var rng = std.Random.DefaultPrng.init(
+                gemma4_real_autodiff.deriveGrpoCompletionSamplingSeed(group_seed, sample_idx),
+            );
             var seq = std.ArrayListUnmanaged(i64).empty;
             defer seq.deinit(allocator);
             try seq.ensureTotalCapacity(allocator, prompt.len + self.max_completion_tokens);
@@ -3380,7 +6346,18 @@ const DecoderGrpoSampler = struct {
                 defer self.allocator.free(logits);
                 const vocab_size: usize = @intCast(gpt_config.vocab_size);
                 const row = logits[(seq.items.len - 1) * vocab_size ..][0..vocab_size];
-                const token_id = try sampleTokenFromLogits(row, random);
+                const token_id: i32 = @intCast(try gemma4_real_autodiff.sampleGrpoTokenFromLogits(
+                    allocator,
+                    row,
+                    .{
+                        .seed = group_seed,
+                        .temperature = self.sampling.temperature,
+                        .top_p = if (sample_idx == 0) 1.0 else self.sampling.top_p,
+                        .top_k = if (sample_idx == 0) 1 else self.sampling.top_k,
+                        .first_completion_greedy = sample_idx == 0,
+                    },
+                    rng.random().float(f64),
+                ));
                 const token_logp = logProbAtToken(row, token_id);
                 try completion.append(allocator, token_id);
                 try old_logps.append(allocator, token_logp);
@@ -3392,7 +6369,6 @@ const DecoderGrpoSampler = struct {
             try out_tokens.append(allocator, try completion.toOwnedSlice(allocator));
             try out_old_logps.append(allocator, try old_logps.toOwnedSlice(allocator));
         }
-        self.rollout_nonce +%= 1;
     }
 };
 
@@ -3400,6 +6376,8 @@ const TextRewardMode = enum {
     exact_match,
     exact_match_ci,
     prefix_match,
+    token_exact_match,
+    token_prefix_match,
     sequence_hash,
 };
 
@@ -3417,24 +6395,689 @@ const TextRewardCtx = struct {
         const self: *TextRewardCtx = @ptrCast(@alignCast(ctx));
         if (prompt_idx >= self.targets.len) return error.InvalidPromptIndex;
         if (self.mode == .sequence_hash) return tokenSequenceHashReward(completion_tokens);
+        const target_trimmed = std.mem.trim(u8, self.targets[prompt_idx], " \t\r\n");
+        if (target_trimmed.len == 0) return error.EmptyRewardTarget;
+
+        if (self.mode == .token_exact_match or self.mode == .token_prefix_match) {
+            const target_tokens = try self.tokenizer.encode(self.allocator, target_trimmed);
+            defer self.allocator.free(target_tokens);
+            if (target_tokens.len == 0) return error.EmptyRewardTarget;
+            return scoreTokenReward(self.mode, completion_tokens, target_tokens);
+        }
+
         const decoded = try self.tokenizer.decode(self.allocator, completion_tokens);
         defer self.allocator.free(decoded);
         const completion_trimmed = std.mem.trim(u8, decoded, " \t\r\n");
-        const target_trimmed = std.mem.trim(u8, self.targets[prompt_idx], " \t\r\n");
         return scoreTextReward(self.mode, completion_trimmed, target_trimmed);
     }
 };
 
+const RewardPhase = enum { train, evaluation };
+
+const RewardProviderTrace = struct {
+    name: []const u8,
+    kind: []const u8,
+    weight: f32,
+    reward: f32,
+    mode: ?[]const u8 = null,
+    executable_path: ?[]const u8 = null,
+    executable_digest: ?[]const u8 = null,
+    evidence: ?[]const u8 = null,
+    request_path: ?[]const u8 = null,
+    request_digest: ?[]const u8 = null,
+    response_path: ?[]const u8 = null,
+    response_digest: ?[]const u8 = null,
+    model_path: ?[]const u8 = null,
+    model_digest: ?[]const u8 = null,
+    tokenizer_path: ?[]const u8 = null,
+    tokenizer_digest: ?[]const u8 = null,
+    chat_template_path: ?[]const u8 = null,
+    chat_template_digest: ?[]const u8 = null,
+    calibration_dataset_path: ?[]const u8 = null,
+    calibration_dataset_digest: ?[]const u8 = null,
+    max_input_tokens: ?usize = null,
+    max_batch_size: ?usize = null,
+    input_tokens: ?usize = null,
+};
+
+const RewardTraceRecord = struct {
+    schema_version: []const u8 = "antfly_inference_grpo_reward_trace/v1",
+    phase: []const u8,
+    call_index: usize,
+    prompt_index: usize,
+    completion_tokens: []const i32,
+    aggregate_reward: f32,
+    aggregation: []const u8,
+    failure_policy: []const u8,
+    pipeline_configuration_digest: []const u8,
+    providers: []const RewardProviderTrace,
+};
+
+const ExternalRewardFailureTraceRecord = struct {
+    schema_version: []const u8 = "antfly_inference_grpo_reward_failure/v1",
+    status: []const u8 = "failed",
+    phase: []const u8,
+    call_index: usize,
+    prompt_index: usize,
+    completion_tokens: []const i32,
+    provider_name: []const u8,
+    provider_kind: []const u8,
+    executable_path: []const u8,
+    executable_digest: []const u8,
+    model_path: ?[]const u8 = null,
+    model_digest: ?[]const u8 = null,
+    tokenizer_path: ?[]const u8 = null,
+    tokenizer_digest: ?[]const u8 = null,
+    chat_template_path: ?[]const u8 = null,
+    chat_template_digest: ?[]const u8 = null,
+    calibration_dataset_path: ?[]const u8 = null,
+    calibration_dataset_digest: ?[]const u8 = null,
+    error_name: []const u8,
+    failure_policy: []const u8,
+    pipeline_configuration_digest: []const u8,
+    request_path: []const u8,
+    request_digest: ?[]const u8 = null,
+    response_path: []const u8,
+    response_digest: ?[]const u8 = null,
+    stderr_path: []const u8,
+    stderr_digest: ?[]const u8 = null,
+};
+
+const ExternalRewardRequest = struct {
+    schema_version: []const u8,
+    phase: []const u8,
+    call_index: usize,
+    prompt_index: usize,
+    prompt: []const u8,
+    target: []const u8,
+    completion: []const u8,
+    completion_tokens: []const i32,
+    model: ?ModelRewardRequestIdentity = null,
+};
+
+fn rewardRequestSchemaVersion(provider_kind: []const u8) []const u8 {
+    return if (std.mem.eql(u8, provider_kind, "model-command"))
+        "antfly_inference_grpo_reward_request/v2"
+    else
+        "antfly_inference_grpo_reward_request/v1";
+}
+
+const ModelRewardRequestIdentity = struct {
+    model_path: []const u8,
+    model_sha256: []const u8,
+    tokenizer_path: []const u8,
+    tokenizer_sha256: []const u8,
+    chat_template_path: []const u8,
+    chat_template_sha256: []const u8,
+    calibration_dataset_path: []const u8,
+    calibration_dataset_sha256: []const u8,
+    max_input_tokens: usize,
+    max_batch_size: usize,
+};
+
+const ExternalRewardResponse = struct {
+    reward: f32,
+    evidence: ?[]const u8 = null,
+    input_tokens: ?usize = null,
+    model_sha256: ?[]const u8 = null,
+    tokenizer_sha256: ?[]const u8 = null,
+    chat_template_sha256: ?[]const u8 = null,
+    calibration_dataset_sha256: ?[]const u8 = null,
+};
+
+const ExternalRewardResult = struct {
+    reward: f32,
+    evidence: ?[]const u8,
+    request_path: []const u8,
+    request_digest: []const u8,
+    response_path: []const u8,
+    response_digest: []const u8,
+    input_tokens: ?usize,
+};
+
+const RewardPipeline = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    tokenizer: tokenizer_mod.Tokenizer,
+    prompt_texts: []const []const u8,
+    targets: []const []const u8,
+    providers: ?[]const RewardProviderConfig,
+    legacy_mode: ?TextRewardMode,
+    aggregation: []const u8,
+    failure_policy: []const u8,
+    phase: RewardPhase,
+    trace_path: []const u8,
+    exchange_dir: []const u8,
+    configuration_digest: []const u8,
+    max_trace_bytes: usize,
+    trace: std.ArrayList(u8) = .empty,
+    trace_digest: ?[]const u8 = null,
+    call_index: usize = 0,
+    external_calls: usize = 0,
+    external_failures: usize = 0,
+    finished: bool = false,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        recipe: Recipe,
+        tokenizer: tokenizer_mod.Tokenizer,
+        prompt_texts: []const []const u8,
+        targets: []const []const u8,
+        phase: RewardPhase,
+    ) !RewardPipeline {
+        if (prompt_texts.len != targets.len) return error.RewardPromptTargetAlignmentMismatch;
+        try validateRewardPipelineConfig(recipe);
+        const trace_path = try grpoRewardTracePath(allocator, recipe, phase == .evaluation);
+        errdefer allocator.free(trace_path);
+        const exchange_dir = try grpoRewardExchangeDir(allocator, recipe);
+        errdefer allocator.free(exchange_dir);
+        const configuration_digest = try rewardPipelineConfigurationDigestAlloc(allocator, recipe);
+        errdefer allocator.free(configuration_digest);
+        const reward = recipe.reward;
+        const providers = if (reward) |config| config.providers else null;
+        const legacy_mode = if (reward == null)
+            try parseTextRewardMode(recipe.grpo.reward_mode orelse "exact-match")
+        else
+            null;
+
+        if (rewardPipelineHasExternalProvider(recipe)) {
+            try preflightRewardExecutables(allocator, io, recipe);
+            try std.Io.Dir.cwd().createDirPath(io, exchange_dir);
+        }
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .tokenizer = tokenizer,
+            .prompt_texts = prompt_texts,
+            .targets = targets,
+            .providers = providers,
+            .legacy_mode = legacy_mode,
+            .aggregation = if (reward) |config| config.aggregation orelse "weighted-mean" else "weighted-mean",
+            .failure_policy = if (reward) |config| config.failure_policy orelse "fail" else "fail",
+            .phase = phase,
+            .trace_path = trace_path,
+            .exchange_dir = exchange_dir,
+            .configuration_digest = configuration_digest,
+            .max_trace_bytes = if (reward) |config| config.max_trace_bytes orelse 64 * 1024 * 1024 else 64 * 1024 * 1024,
+        };
+    }
+
+    fn deinit(self: *RewardPipeline) void {
+        self.trace.deinit(self.allocator);
+        self.allocator.free(self.trace_path);
+        self.allocator.free(self.exchange_dir);
+        self.allocator.free(self.configuration_digest);
+        if (self.trace_digest) |digest| self.allocator.free(digest);
+        self.* = undefined;
+    }
+
+    fn restoreCheckpoint(
+        self: *RewardPipeline,
+        call_index: usize,
+        external_calls: usize,
+        external_failures: usize,
+        trace: []const u8,
+    ) !void {
+        if (self.finished or self.trace.items.len != 0 or self.call_index != 0 or
+            self.external_calls != 0 or self.external_failures != 0 or
+            trace.len > self.max_trace_bytes or external_calls > call_index)
+        {
+            return error.InvalidPreferenceCheckpointState;
+        }
+        try self.trace.appendSlice(self.allocator, trace);
+        self.call_index = call_index;
+        self.external_calls = external_calls;
+        self.external_failures = external_failures;
+    }
+
+    fn score(ctx: *anyopaque, prompt_idx: usize, completion_tokens: []const i32) !f32 {
+        const self: *RewardPipeline = @ptrCast(@alignCast(ctx));
+        if (prompt_idx >= self.targets.len or prompt_idx >= self.prompt_texts.len) return error.InvalidPromptIndex;
+        const target = std.mem.trim(u8, self.targets[prompt_idx], " \t\r\n");
+        if (target.len == 0) return error.EmptyRewardTarget;
+        const decoded_owned = try self.tokenizer.decode(self.allocator, completion_tokens);
+        defer self.allocator.free(decoded_owned);
+        const completion = std.mem.trim(u8, decoded_owned, " \t\r\n");
+
+        var temp = std.heap.ArenaAllocator.init(self.allocator);
+        defer temp.deinit();
+        const aa = temp.allocator();
+        const provider_count = if (self.providers) |providers| providers.len else 1;
+        const traces = try aa.alloc(RewardProviderTrace, provider_count);
+        var weighted_sum: f64 = 0.0;
+        var weight_sum: f64 = 0.0;
+
+        if (self.providers) |providers| {
+            for (providers, 0..) |provider, idx| {
+                var trace = RewardProviderTrace{
+                    .name = provider.name,
+                    .kind = provider.kind,
+                    .weight = provider.weight,
+                    .reward = 0.0,
+                    .mode = provider.mode,
+                    .executable_path = provider.executable_path,
+                    .executable_digest = provider.executable_sha256,
+                    .model_path = provider.model_path,
+                    .model_digest = provider.model_sha256,
+                    .tokenizer_path = provider.tokenizer_path,
+                    .tokenizer_digest = provider.tokenizer_sha256,
+                    .chat_template_path = provider.chat_template_path,
+                    .chat_template_digest = provider.chat_template_sha256,
+                    .calibration_dataset_path = provider.calibration_dataset_path,
+                    .calibration_dataset_digest = provider.calibration_dataset_sha256,
+                    .max_input_tokens = provider.max_input_tokens,
+                    .max_batch_size = provider.max_batch_size,
+                };
+                if (std.mem.eql(u8, provider.kind, "builtin")) {
+                    const mode = try parseTextRewardMode(provider.mode.?);
+                    trace.reward = try scoreBuiltinReward(
+                        self.allocator,
+                        self.tokenizer,
+                        mode,
+                        completion_tokens,
+                        completion,
+                        target,
+                    );
+                } else {
+                    const external = try self.scoreExternalProvider(
+                        aa,
+                        provider,
+                        prompt_idx,
+                        completion_tokens,
+                        completion,
+                        target,
+                    );
+                    trace.reward = external.reward;
+                    trace.evidence = external.evidence;
+                    trace.request_path = external.request_path;
+                    trace.request_digest = external.request_digest;
+                    trace.response_path = external.response_path;
+                    trace.response_digest = external.response_digest;
+                    trace.input_tokens = external.input_tokens;
+                }
+                try validateProviderReward(provider, trace.reward);
+                weighted_sum += @as(f64, trace.reward) * @as(f64, provider.weight);
+                weight_sum += provider.weight;
+                traces[idx] = trace;
+            }
+        } else {
+            const reward = try scoreBuiltinReward(
+                self.allocator,
+                self.tokenizer,
+                self.legacy_mode.?,
+                completion_tokens,
+                completion,
+                target,
+            );
+            traces[0] = .{
+                .name = "legacy-builtin",
+                .kind = "builtin",
+                .weight = 1.0,
+                .reward = reward,
+                .mode = @tagName(self.legacy_mode.?),
+            };
+            weighted_sum = reward;
+            weight_sum = 1.0;
+        }
+        if (!(weight_sum > 0.0) or !std.math.isFinite(weighted_sum)) return error.InvalidAggregateReward;
+        const aggregate: f32 = @floatCast(if (std.mem.eql(u8, self.aggregation, "weighted-sum"))
+            weighted_sum
+        else
+            weighted_sum / weight_sum);
+        if (!std.math.isFinite(aggregate)) return error.InvalidAggregateReward;
+
+        try self.appendTraceRecord(aa, RewardTraceRecord{
+            .phase = @tagName(self.phase),
+            .call_index = self.call_index,
+            .prompt_index = prompt_idx,
+            .completion_tokens = completion_tokens,
+            .aggregate_reward = aggregate,
+            .aggregation = self.aggregation,
+            .failure_policy = self.failure_policy,
+            .pipeline_configuration_digest = self.configuration_digest,
+            .providers = traces,
+        });
+        self.call_index += 1;
+        return aggregate;
+    }
+
+    fn appendTraceRecord(self: *RewardPipeline, allocator: std.mem.Allocator, record: anytype) !void {
+        const rendered = try std.json.Stringify.valueAlloc(allocator, record, .{});
+        const record_size = std.math.add(usize, rendered.len, 1) catch return error.RewardTraceLimitExceeded;
+        const next_trace_size = std.math.add(usize, self.trace.items.len, record_size) catch
+            return error.RewardTraceLimitExceeded;
+        if (next_trace_size > self.max_trace_bytes) return error.RewardTraceLimitExceeded;
+        try self.trace.ensureTotalCapacity(self.allocator, next_trace_size);
+        try self.trace.appendSlice(self.allocator, rendered);
+        try self.trace.append(self.allocator, '\n');
+    }
+
+    fn appendExternalFailureTrace(
+        self: *RewardPipeline,
+        allocator: std.mem.Allocator,
+        provider: RewardProviderConfig,
+        prompt_idx: usize,
+        completion_tokens: []const i32,
+        request_path: []const u8,
+        response_path: []const u8,
+        stderr_path: []const u8,
+        failure: anyerror,
+    ) !void {
+        const request_digest = sha256FileAlloc(self.allocator, self.io, request_path) catch null;
+        defer if (request_digest) |digest| self.allocator.free(digest);
+        const response_digest = sha256FileAlloc(self.allocator, self.io, response_path) catch null;
+        defer if (response_digest) |digest| self.allocator.free(digest);
+        const stderr_digest = sha256FileAlloc(self.allocator, self.io, stderr_path) catch null;
+        defer if (stderr_digest) |digest| self.allocator.free(digest);
+        self.external_failures +|= 1;
+        try self.appendTraceRecord(allocator, ExternalRewardFailureTraceRecord{
+            .phase = @tagName(self.phase),
+            .call_index = self.call_index,
+            .prompt_index = prompt_idx,
+            .completion_tokens = completion_tokens,
+            .provider_name = provider.name,
+            .provider_kind = provider.kind,
+            .executable_path = provider.executable_path.?,
+            .executable_digest = provider.executable_sha256.?,
+            .model_path = provider.model_path,
+            .model_digest = provider.model_sha256,
+            .tokenizer_path = provider.tokenizer_path,
+            .tokenizer_digest = provider.tokenizer_sha256,
+            .chat_template_path = provider.chat_template_path,
+            .chat_template_digest = provider.chat_template_sha256,
+            .calibration_dataset_path = provider.calibration_dataset_path,
+            .calibration_dataset_digest = provider.calibration_dataset_sha256,
+            .error_name = @errorName(failure),
+            .failure_policy = self.failure_policy,
+            .pipeline_configuration_digest = self.configuration_digest,
+            .request_path = request_path,
+            .request_digest = request_digest,
+            .response_path = response_path,
+            .response_digest = response_digest,
+            .stderr_path = stderr_path,
+            .stderr_digest = stderr_digest,
+        });
+    }
+
+    fn scoreExternalProvider(
+        self: *RewardPipeline,
+        allocator: std.mem.Allocator,
+        provider: RewardProviderConfig,
+        prompt_idx: usize,
+        completion_tokens: []const i32,
+        completion: []const u8,
+        target: []const u8,
+    ) !ExternalRewardResult {
+        const stem = try std.fmt.allocPrint(
+            allocator,
+            "{s}-{d:0>8}-{s}",
+            .{ @tagName(self.phase), self.call_index, provider.name },
+        );
+        const request_name = try std.fmt.allocPrint(allocator, "{s}.request.json", .{stem});
+        const response_name = try std.fmt.allocPrint(allocator, "{s}.response.json", .{stem});
+        const stderr_name = try std.fmt.allocPrint(allocator, "{s}.stderr.txt", .{stem});
+        const request_path = try std.fs.path.join(allocator, &.{ self.exchange_dir, request_name });
+        const response_path = try std.fs.path.join(allocator, &.{ self.exchange_dir, response_name });
+        const stderr_path = try std.fs.path.join(allocator, &.{ self.exchange_dir, stderr_name });
+        errdefer |failure| self.appendExternalFailureTrace(
+            allocator,
+            provider,
+            prompt_idx,
+            completion_tokens,
+            request_path,
+            response_path,
+            stderr_path,
+            failure,
+        ) catch {};
+
+        try verifyRewardProviderArtifacts(self.allocator, self.io, provider);
+        if (self.prompt_texts[prompt_idx].len > 1024 * 1024 or
+            target.len > 64 * 1024 or completion.len > 1024 * 1024)
+        {
+            return error.RewardProviderRequestTooLarge;
+        }
+        const request_argument = try std.fs.path.resolve(allocator, &.{request_path});
+        try writeJsonFile(self.allocator, self.io, request_path, ExternalRewardRequest{
+            .schema_version = rewardRequestSchemaVersion(provider.kind),
+            .phase = @tagName(self.phase),
+            .call_index = self.call_index,
+            .prompt_index = prompt_idx,
+            .prompt = self.prompt_texts[prompt_idx],
+            .target = target,
+            .completion = completion,
+            .completion_tokens = completion_tokens,
+            .model = if (std.mem.eql(u8, provider.kind, "model-command")) .{
+                .model_path = provider.model_path.?,
+                .model_sha256 = provider.model_sha256.?,
+                .tokenizer_path = provider.tokenizer_path.?,
+                .tokenizer_sha256 = provider.tokenizer_sha256.?,
+                .chat_template_path = provider.chat_template_path.?,
+                .chat_template_sha256 = provider.chat_template_sha256.?,
+                .calibration_dataset_path = provider.calibration_dataset_path.?,
+                .calibration_dataset_sha256 = provider.calibration_dataset_sha256.?,
+                .max_input_tokens = provider.max_input_tokens.?,
+                .max_batch_size = provider.max_batch_size.?,
+            } else null,
+        });
+
+        var argv_list: std.ArrayList([]const u8) = .empty;
+        defer argv_list.deinit(self.allocator);
+        try argv_list.append(self.allocator, provider.executable_path.?);
+        if (provider.args) |args| try argv_list.appendSlice(self.allocator, args);
+        try argv_list.append(self.allocator, request_argument);
+        var empty_environment = std.process.Environ.Map.init(self.allocator);
+        defer empty_environment.deinit();
+        const result = std.process.run(self.allocator, self.io, .{
+            .argv = argv_list.items,
+            .cwd = .{ .path = "/" },
+            .environ_map = &empty_environment,
+            .stdout_limit = .limited(64 * 1024),
+            .stderr_limit = .limited(64 * 1024),
+            .timeout = .{ .duration = .{ .raw = .fromMilliseconds(provider.timeout_ms orelse 10_000), .clock = .awake } },
+        }) catch |err| {
+            const marker = std.fmt.allocPrint(allocator, "provider invocation failed: {s}\n", .{@errorName(err)}) catch "provider invocation failed\n";
+            artifact_publication.writeFileAtomicReplace(self.allocator, self.io, stderr_path, marker) catch {};
+            if (err == error.Timeout) return error.RewardProviderTimeout;
+            return error.RewardProviderInvocationFailed;
+        };
+        defer self.allocator.free(result.stdout);
+        defer self.allocator.free(result.stderr);
+        try artifact_publication.writeFileAtomicReplace(self.allocator, self.io, response_path, result.stdout);
+        try artifact_publication.writeFileAtomicReplace(self.allocator, self.io, stderr_path, result.stderr);
+        try verifyRewardProviderArtifacts(self.allocator, self.io, provider);
+        switch (result.term) {
+            .exited => |code| if (code != 0) return error.RewardProviderFailed,
+            else => return error.RewardProviderFailed,
+        }
+        const response = std.json.parseFromSliceLeaky(
+            ExternalRewardResponse,
+            allocator,
+            std.mem.trim(u8, result.stdout, " \t\r\n"),
+            .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
+        ) catch return error.InvalidRewardProviderResponse;
+        if (!std.math.isFinite(response.reward)) return error.NonFiniteRewardProviderResponse;
+        if (std.mem.eql(u8, provider.kind, "model-command")) {
+            try validateModelRewardResponse(provider, response);
+        } else if (response.input_tokens != null or response.model_sha256 != null or
+            response.tokenizer_sha256 != null or response.chat_template_sha256 != null or
+            response.calibration_dataset_sha256 != null)
+        {
+            return error.UnexpectedModelRewardAttestation;
+        }
+        // Validate external bounds while the invocation-scoped errdefer still
+        // owns the exchange paths, so an out-of-contract score is represented
+        // by a structured failure trace rather than by orphaned files alone.
+        try validateProviderReward(provider, response.reward);
+        const request_digest_owned = try sha256FileAlloc(self.allocator, self.io, request_path);
+        defer self.allocator.free(request_digest_owned);
+        const response_digest_owned = try sha256FileAlloc(self.allocator, self.io, response_path);
+        defer self.allocator.free(response_digest_owned);
+        self.external_calls += 1;
+        return .{
+            .reward = response.reward,
+            .evidence = if (response.evidence) |evidence| try allocator.dupe(u8, evidence) else null,
+            .request_path = request_path,
+            .request_digest = try allocator.dupe(u8, request_digest_owned),
+            .response_path = response_path,
+            .response_digest = try allocator.dupe(u8, response_digest_owned),
+            .input_tokens = response.input_tokens,
+        };
+    }
+
+    fn finish(self: *RewardPipeline) !void {
+        if (self.finished) return;
+        try artifact_publication.writeFileAtomicReplace(self.allocator, self.io, self.trace_path, self.trace.items);
+        self.trace_digest = try sha256FileAlloc(self.allocator, self.io, self.trace_path);
+        self.finished = true;
+    }
+
+    fn telemetry(self: *const RewardPipeline) RewardPipelineTelemetry {
+        return .{
+            .aggregation = self.aggregation,
+            .failure_policy = self.failure_policy,
+            .providers = if (self.providers) |providers| providers.len else 1,
+            .external_calls = self.external_calls,
+            .external_failures = self.external_failures,
+            .configuration_digest = self.configuration_digest,
+            .trace_path = self.trace_path,
+            .trace_digest = self.trace_digest,
+        };
+    }
+};
+
+fn rewardPipelineHasExternalProvider(recipe: Recipe) bool {
+    const reward = recipe.reward orelse return false;
+    const providers = reward.providers orelse return false;
+    for (providers) |provider| {
+        if (std.mem.eql(u8, provider.kind, "external-command") or
+            std.mem.eql(u8, provider.kind, "model-command")) return true;
+    }
+    return false;
+}
+
+fn preflightRewardExecutables(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    recipe: Recipe,
+) !void {
+    const reward = recipe.reward orelse return;
+    const providers = reward.providers orelse return;
+    for (providers) |provider| {
+        if (!std.mem.eql(u8, provider.kind, "external-command") and
+            !std.mem.eql(u8, provider.kind, "model-command")) continue;
+        try verifyRewardProviderArtifacts(allocator, io, provider);
+    }
+}
+
+fn rewardPipelineConfigurationDigestAlloc(
+    allocator: std.mem.Allocator,
+    recipe: Recipe,
+) ![]const u8 {
+    const rendered = try std.json.Stringify.valueAlloc(allocator, .{
+        .legacy_reward_mode = recipe.grpo.reward_mode,
+        .reward = recipe.reward,
+    }, .{});
+    defer allocator.free(rendered);
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(rendered);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return std.fmt.allocPrint(allocator, "sha256:{s}", .{std.fmt.bytesToHex(digest, .lower)});
+}
+
+fn verifyRewardExecutableDigest(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    provider: RewardProviderConfig,
+) !void {
+    const stat = try std.Io.Dir.cwd().statFile(io, provider.executable_path.?, .{});
+    if (stat.kind != .file) return error.InvalidRewardExecutable;
+    const actual = try sha256FileAlloc(allocator, io, provider.executable_path.?);
+    defer allocator.free(actual);
+    if (!std.ascii.eqlIgnoreCase(actual, provider.executable_sha256.?)) {
+        return error.RewardExecutableDigestMismatch;
+    }
+}
+
+fn verifyRewardProviderArtifacts(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    provider: RewardProviderConfig,
+) !void {
+    try verifyRewardExecutableDigest(allocator, io, provider);
+    if (!std.mem.eql(u8, provider.kind, "model-command")) return;
+    try verifyRewardArtifactDigest(allocator, io, provider.model_path.?, provider.model_sha256.?);
+    try verifyRewardArtifactDigest(allocator, io, provider.tokenizer_path.?, provider.tokenizer_sha256.?);
+    try verifyRewardArtifactDigest(allocator, io, provider.chat_template_path.?, provider.chat_template_sha256.?);
+    try verifyRewardArtifactDigest(allocator, io, provider.calibration_dataset_path.?, provider.calibration_dataset_sha256.?);
+}
+
+fn verifyRewardArtifactDigest(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    expected_digest: []const u8,
+) !void {
+    const fingerprint = try fingerprintPath(allocator, io, "reward_model_artifact", path);
+    defer if (fingerprint.digest) |digest| allocator.free(digest);
+    if (!fingerprint.exists or fingerprint.digest == null or
+        !std.ascii.eqlIgnoreCase(fingerprint.digest.?, expected_digest))
+    {
+        return error.RewardModelArtifactDigestMismatch;
+    }
+}
+
+fn validateModelRewardResponse(provider: RewardProviderConfig, response: ExternalRewardResponse) !void {
+    const input_tokens = response.input_tokens orelse return error.MissingModelRewardAttestation;
+    if (input_tokens == 0 or input_tokens > provider.max_input_tokens.?) return error.ModelRewardTokenLimitExceeded;
+    if (!std.ascii.eqlIgnoreCase(response.model_sha256 orelse return error.MissingModelRewardAttestation, provider.model_sha256.?) or
+        !std.ascii.eqlIgnoreCase(response.tokenizer_sha256 orelse return error.MissingModelRewardAttestation, provider.tokenizer_sha256.?) or
+        !std.ascii.eqlIgnoreCase(response.chat_template_sha256 orelse return error.MissingModelRewardAttestation, provider.chat_template_sha256.?) or
+        !std.ascii.eqlIgnoreCase(response.calibration_dataset_sha256 orelse return error.MissingModelRewardAttestation, provider.calibration_dataset_sha256.?))
+    {
+        return error.ModelRewardIdentityMismatch;
+    }
+}
+
+fn validateProviderReward(provider: RewardProviderConfig, reward: f32) !void {
+    if (!std.math.isFinite(reward)) return error.NonFiniteRewardProviderResponse;
+    if (provider.min_reward) |minimum| if (reward < minimum) return error.RewardProviderOutOfBounds;
+    if (provider.max_reward) |maximum| if (reward > maximum) return error.RewardProviderOutOfBounds;
+}
+
+fn scoreBuiltinReward(
+    allocator: std.mem.Allocator,
+    tokenizer: tokenizer_mod.Tokenizer,
+    mode: TextRewardMode,
+    completion_tokens: []const i32,
+    completion_trimmed: []const u8,
+    target_trimmed: []const u8,
+) !f32 {
+    if (mode == .sequence_hash) return tokenSequenceHashReward(completion_tokens);
+    if (mode == .token_exact_match or mode == .token_prefix_match) {
+        const target_tokens = try tokenizer.encode(allocator, target_trimmed);
+        defer allocator.free(target_tokens);
+        if (target_tokens.len == 0) return error.EmptyRewardTarget;
+        return scoreTokenReward(mode, completion_tokens, target_tokens);
+    }
+    return scoreTextReward(mode, completion_trimmed, target_trimmed);
+}
+
 fn scoreTextReward(mode: TextRewardMode, completion_trimmed: []const u8, target_trimmed: []const u8) f32 {
     return switch (mode) {
-        .exact_match => blk: {
-            if (std.mem.eql(u8, completion_trimmed, target_trimmed)) break :blk 1.0;
-            if (std.mem.indexOf(u8, completion_trimmed, target_trimmed) != null) break :blk 0.5;
-            break :blk 0.0;
-        },
+        .exact_match => if (std.mem.eql(u8, completion_trimmed, target_trimmed)) 1.0 else 0.0,
         .exact_match_ci => if (std.ascii.eqlIgnoreCase(completion_trimmed, target_trimmed)) 1.0 else 0.0,
         .prefix_match => if (std.mem.startsWith(u8, completion_trimmed, target_trimmed)) 1.0 else 0.0,
-        .sequence_hash => unreachable,
+        .token_exact_match, .token_prefix_match, .sequence_hash => unreachable,
+    };
+}
+
+fn scoreTokenReward(mode: TextRewardMode, completion_tokens: []const i32, target_tokens: []const i32) f32 {
+    return switch (mode) {
+        .token_exact_match => if (std.mem.eql(i32, completion_tokens, target_tokens)) 1.0 else 0.0,
+        .token_prefix_match => if (std.mem.startsWith(i32, completion_tokens, target_tokens)) 1.0 else 0.0,
+        .exact_match, .exact_match_ci, .prefix_match, .sequence_hash => unreachable,
     };
 }
 
@@ -3471,7 +7114,10 @@ fn shouldRunOptimizerBackedQwen35Sft(recipe: Recipe, format: []const u8) !bool {
 
 fn runDirectDpo(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, report_path: []const u8) !void {
     const path = trainDatasetPath(recipe) orelse return error.MissingDatasetPath;
-    const format = recipe.dataset.format orelse "scalar-logprobs";
+    const format = recipe.dataset.format orelse return error.MissingDatasetFormat;
+    const mode = try resolvePreferenceExecutionMode(recipe, .dpo, format);
+    try validatePreferenceExecutionContract(recipe, .dpo, mode, format);
+    const objective = try resolveDpoObjectiveConfig(recipe.preference);
     if (recipe.model.projector_path != null) {
         const family = recipe.model.family orelse try inferFamily(recipe);
         if (eqlAny(family, &.{ "gemma4", "gemma" })) return error.UnsupportedGemmaMultimodalDpo;
@@ -3479,34 +7125,33 @@ fn runDirectDpo(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, report
     if (std.mem.eql(u8, format, "scalar-logprobs")) {
         const batch = try loadDpoScalarJsonl(allocator, io, path);
         defer batch.deinit(allocator);
-        var result = try preference_loss.pairedPreferenceLoss(allocator, batch.batch(), .{
-            .kind = .dpo,
-            .beta = recipe.preference.beta orelse 0.1,
-            .simpo_gamma = recipe.preference.simpo_gamma orelse 0.5,
-            .sft_lambda = recipe.preference.sft_lambda orelse 1.0,
-            .ipo_tau = recipe.preference.ipo_tau orelse 0.1,
-        });
+        var result = try preference_loss.pairedPreferenceLoss(allocator, batch.batch(), objective.preference);
         defer result.deinit();
         try writeJsonFile(allocator, io, report_path, DpoReport{
+            .execution_mode = "score",
+            .dataset_format = format,
             .examples = batch.policy_chosen_logps.len,
             .loss = result.loss,
             .mean_reward_margin = result.mean_reward_margin,
             .accuracy = result.accuracy,
-            .beta = recipe.preference.beta orelse 0.1,
+            .beta = objective.preference.beta,
+            .loss_type = @tagName(objective.loss_type),
+            .logprob_aggregation = objective.logprobAggregation(),
+            .label_smoothing = objective.preference.label_smoothing,
         });
         print("dpo report: {s}\n", .{report_path});
         return;
     }
-    if (!std.mem.eql(u8, format, "text-preference") and !std.mem.eql(u8, format, "rendered-text-preference")) {
-        return error.UnsupportedDpoFormat;
-    }
-    if (try shouldRunOptimizerBackedQwen2Dpo(recipe, format)) {
-        try runOptimizerBackedQwen2Dpo(allocator, io, recipe, path, report_path);
-        return;
-    }
-    if (try shouldRunOptimizerBackedGemmaDpo(recipe, format)) {
-        try runOptimizerBackedGemmaDpo(allocator, io, recipe, path, report_path);
-        return;
+    if (mode == .train) {
+        if (try shouldRunOptimizerBackedQwen2Dpo(recipe, format)) {
+            try runOptimizerBackedQwen2Dpo(allocator, io, recipe, path, report_path);
+            return;
+        }
+        if (try shouldRunOptimizerBackedGemmaDpo(recipe, format)) {
+            try runOptimizerBackedGemmaDpo(allocator, io, recipe, path, report_path);
+            return;
+        }
+        return error.UnsupportedPreferenceTrainingFamily;
     }
 
     const policy_path = recipe.model.path orelse return error.MissingModelPath;
@@ -3524,7 +7169,13 @@ fn runDirectDpo(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, report
     else
         try model_manager.loadFromDir(reference_path);
 
-    var samples = try loadDpoTextPreferenceSamples(allocator, io, path, recipe, policy_model);
+    var samples = try loadDpoTextPreferenceSamples(
+        allocator,
+        io,
+        path,
+        recipe,
+        PreferenceTokenizerView.fromLoadedModel(policy_model),
+    );
     defer samples.deinit();
 
     var policy_scorer = DecoderLogprobScorer{
@@ -3545,21 +7196,26 @@ fn runDirectDpo(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, report
         .call = DecoderLogprobScorer.modelForward,
     }, samples.samples, .{
         .pref = .{
-            .kind = .dpo,
-            .beta = recipe.preference.beta orelse 0.1,
-            .simpo_gamma = recipe.preference.simpo_gamma orelse 0.5,
-            .sft_lambda = recipe.preference.sft_lambda orelse 1.0,
-            .ipo_tau = recipe.preference.ipo_tau orelse 0.1,
+            .kind = objective.preference.kind,
+            .beta = objective.preference.beta,
+            .label_smoothing = objective.preference.label_smoothing,
+            .simpo_gamma = objective.preference.simpo_gamma,
+            .ipo_tau = objective.preference.ipo_tau,
         },
         .reference_from_disabled_adapter = false,
     });
     defer result.deinit();
     try writeJsonFile(allocator, io, report_path, DpoReport{
+        .execution_mode = "score",
+        .dataset_format = format,
         .examples = samples.samples.len,
         .loss = result.loss,
         .mean_reward_margin = result.mean_reward_margin,
         .accuracy = result.accuracy,
-        .beta = recipe.preference.beta orelse 0.1,
+        .beta = objective.preference.beta,
+        .loss_type = @tagName(objective.loss_type),
+        .logprob_aggregation = objective.logprobAggregation(),
+        .label_smoothing = objective.preference.label_smoothing,
     });
     print("dpo report: {s}\n", .{report_path});
 }
@@ -3769,10 +7425,11 @@ fn tokenizeSftTextRow(
     completion: []const u8,
     max_seq_len: usize,
 ) !gemma4.PreparedExampleInput {
-    const tokenizer = model.getTokenizer();
+    const tokenizer_view = PreferenceTokenizerView.fromLoadedModel(model);
+    const tokenizer = tokenizer_view.tokenizer;
     const render_prompt = !std.mem.eql(u8, recipe.dataset.format orelse "text-sft", "rendered-text-sft");
     const prompt_text = if (render_prompt)
-        try renderDpoPrompt(allocator, model, prompt)
+        try tokenizer_view.renderPrompt(allocator, prompt)
     else
         try allocator.dupe(u8, prompt);
     defer allocator.free(prompt_text);
@@ -3782,8 +7439,8 @@ fn tokenizeSftTextRow(
         allocator,
         prompt_text,
         max_seq_len,
-        model.manifest.add_bos_token,
-        model.manifest.bos_token,
+        tokenizer_view.add_bos_token,
+        tokenizer_view.bos_token,
     );
     defer prompt_encoded.deinit();
 
@@ -3802,6 +7459,1263 @@ fn tokenizeSftTextRow(
     return buildGemmaPreparedExampleFromTokens(allocator, prompt_tokens, completion_tokens, max_seq_len);
 }
 
+const GemmaDpoReferenceCache = struct {
+    allocator: std.mem.Allocator,
+    chosen_logps: []f32,
+    rejected_logps: []f32,
+    precompute_seconds: f64,
+    base_equivalent_policy: bool,
+
+    fn deinit(self: *GemmaDpoReferenceCache) void {
+        self.allocator.free(self.chosen_logps);
+        self.allocator.free(self.rejected_logps);
+        self.* = undefined;
+    }
+};
+
+fn initUnusedGemmaDpoReferenceCache(
+    allocator: std.mem.Allocator,
+    examples: usize,
+    base_equivalent_policy: bool,
+) !GemmaDpoReferenceCache {
+    const chosen_logps = try allocator.alloc(f32, examples);
+    errdefer allocator.free(chosen_logps);
+    const rejected_logps = try allocator.alloc(f32, examples);
+    @memset(chosen_logps, 0.0);
+    @memset(rejected_logps, 0.0);
+    return .{
+        .allocator = allocator,
+        .chosen_logps = chosen_logps,
+        .rejected_logps = rejected_logps,
+        .precompute_seconds = 0.0,
+        .base_equivalent_policy = base_equivalent_policy,
+    };
+}
+
+fn gemmaDpoReferenceMode(base_equivalent: bool, coalesced: bool) []const u8 {
+    if (base_equivalent) {
+        return if (coalesced)
+            "frozen-base-equivalent-initial-adapter-shared-prompt-single-row"
+        else
+            "frozen-base-equivalent-initial-adapter";
+    }
+    return if (coalesced)
+        "frozen-initial-adapter-snapshot-shared-prompt-single-row"
+    else
+        "frozen-initial-adapter-snapshot";
+}
+
+fn gemmaDpoObjectiveReferenceMode(
+    objective: ResolvedDpoObjectiveConfig,
+    base_equivalent: bool,
+    coalesced: bool,
+) []const u8 {
+    if (!objective.needsReference()) return "not-used-reference-free-simpo";
+    return gemmaDpoReferenceMode(base_equivalent, coalesced);
+}
+
+const GemmaGrpoReferenceCache = struct {
+    const Entry = GrpoReferenceCacheCheckpointEntry;
+
+    allocator: std.mem.Allocator,
+    capacity: usize,
+    entries: std.ArrayList(Entry) = .empty,
+    next_evict: usize = 0,
+    hits: usize = 0,
+    misses: usize = 0,
+
+    fn init(allocator: std.mem.Allocator, capacity: usize) GemmaGrpoReferenceCache {
+        return .{
+            .allocator = allocator,
+            .capacity = capacity,
+        };
+    }
+
+    fn deinit(self: *GemmaGrpoReferenceCache) void {
+        self.clear();
+        self.entries.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn clear(self: *GemmaGrpoReferenceCache) void {
+        for (self.entries.items) |entry| {
+            self.allocator.free(entry.completion_tokens);
+            self.allocator.free(entry.reference_logps);
+        }
+        self.entries.clearRetainingCapacity();
+        self.next_evict = 0;
+        self.hits = 0;
+        self.misses = 0;
+    }
+
+    fn checkpoint(self: *const GemmaGrpoReferenceCache) GrpoReferenceCacheCheckpoint {
+        return .{
+            .capacity = self.capacity,
+            .next_evict = self.next_evict,
+            .hits = self.hits,
+            .misses = self.misses,
+            .entries = self.entries.items,
+        };
+    }
+
+    fn restoreCheckpoint(
+        self: *GemmaGrpoReferenceCache,
+        snapshot: GrpoReferenceCacheCheckpoint,
+        prompt_count: usize,
+    ) !void {
+        if (self.entries.items.len != 0 or self.hits != 0 or self.misses != 0 or self.next_evict != 0) {
+            return error.GrpoReferenceCacheAlreadyStarted;
+        }
+        if (snapshot.capacity != self.capacity or snapshot.entries.len > snapshot.capacity) {
+            return error.InvalidPreferenceCheckpointState;
+        }
+        if ((snapshot.capacity == 0 and snapshot.next_evict != 0) or
+            (snapshot.entries.len < snapshot.capacity and snapshot.next_evict != 0) or
+            (snapshot.entries.len == snapshot.capacity and snapshot.capacity != 0 and snapshot.next_evict >= snapshot.capacity))
+        {
+            return error.InvalidPreferenceCheckpointState;
+        }
+
+        for (snapshot.entries, 0..) |entry, entry_idx| {
+            if (entry.prompt_idx >= prompt_count or
+                entry.completion_tokens.len == 0 or
+                entry.completion_tokens.len != entry.reference_logps.len)
+            {
+                return error.InvalidPreferenceCheckpointState;
+            }
+            for (entry.reference_logps) |logp| {
+                if (!std.math.isFinite(logp)) return error.InvalidPreferenceCheckpointState;
+            }
+            for (snapshot.entries[0..entry_idx]) |previous| {
+                if (entry.prompt_idx == previous.prompt_idx and
+                    std.mem.eql(i32, entry.completion_tokens, previous.completion_tokens))
+                {
+                    return error.InvalidPreferenceCheckpointState;
+                }
+            }
+        }
+
+        errdefer self.clear();
+        for (snapshot.entries) |entry| {
+            try self.insert(entry.prompt_idx, entry.completion_tokens, entry.reference_logps);
+        }
+        self.next_evict = snapshot.next_evict;
+        self.hits = snapshot.hits;
+        self.misses = snapshot.misses;
+    }
+
+    fn lookup(
+        self: *GemmaGrpoReferenceCache,
+        prompt_idx: usize,
+        completion_tokens: []const i32,
+        out_reference_logps: []f32,
+    ) !bool {
+        if (completion_tokens.len != out_reference_logps.len) return error.LogpLenMismatch;
+        for (self.entries.items) |entry| {
+            if (entry.prompt_idx != prompt_idx) continue;
+            if (!std.mem.eql(i32, entry.completion_tokens, completion_tokens)) continue;
+            if (entry.reference_logps.len != out_reference_logps.len) return error.CorruptGrpoReferenceCache;
+            @memcpy(out_reference_logps, entry.reference_logps);
+            self.hits += 1;
+            return true;
+        }
+        self.misses += 1;
+        return false;
+    }
+
+    fn contains(
+        self: *const GemmaGrpoReferenceCache,
+        prompt_idx: usize,
+        completion_tokens: []const i32,
+    ) bool {
+        for (self.entries.items) |entry| {
+            if (entry.prompt_idx != prompt_idx) continue;
+            if (std.mem.eql(i32, entry.completion_tokens, completion_tokens)) return true;
+        }
+        return false;
+    }
+
+    fn insert(
+        self: *GemmaGrpoReferenceCache,
+        prompt_idx: usize,
+        completion_tokens: []const i32,
+        reference_logps: []const f32,
+    ) !void {
+        if (completion_tokens.len != reference_logps.len) return error.LogpLenMismatch;
+        if (self.capacity == 0) return;
+        const owned_tokens = try self.allocator.dupe(i32, completion_tokens);
+        errdefer self.allocator.free(owned_tokens);
+        const owned_logps = try self.allocator.dupe(f32, reference_logps);
+        errdefer self.allocator.free(owned_logps);
+        const entry = Entry{
+            .prompt_idx = prompt_idx,
+            .completion_tokens = owned_tokens,
+            .reference_logps = owned_logps,
+        };
+        if (self.entries.items.len < self.capacity) {
+            try self.entries.append(self.allocator, entry);
+            return;
+        }
+
+        const victim = &self.entries.items[self.next_evict];
+        self.allocator.free(victim.completion_tokens);
+        self.allocator.free(victim.reference_logps);
+        victim.* = entry;
+        self.next_evict = (self.next_evict + 1) % self.capacity;
+    }
+
+    fn telemetry(self: *const GemmaGrpoReferenceCache) GrpoReferenceCacheTelemetry {
+        return .{
+            .capacity = self.capacity,
+            .entries = self.entries.items.len,
+            .hits = self.hits,
+            .misses = self.misses,
+        };
+    }
+};
+
+/// Scores every one-token completion for a shared prompt with one frozen-base
+/// sparse projection. Cache accounting remains completion-granular: existing
+/// entries are hits, the first uncached occurrence is a miss and insertion,
+/// and a duplicate later in the same group observes that insertion as a hit.
+fn cachedSingleTokenGroupReferenceLogps(
+    allocator: std.mem.Allocator,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    ctx: *gemma4_real_autodiff.GemmaAutodiffCtx,
+    prompt: []const i32,
+    prompt_idx: usize,
+    sampled_tokens: []const std.ArrayList(i32),
+    seq_len: u32,
+    frozen_lora: *const gemma4_real_autodiff.FrozenBaseLoraBindings,
+    reference_cache: *GemmaGrpoReferenceCache,
+    out_logps: []f32,
+) !void {
+    if (sampled_tokens.len == 0 or sampled_tokens.len != out_logps.len) {
+        return error.InvalidCompletionGroup;
+    }
+    const candidate_token_ids = try allocator.alloc(i32, sampled_tokens.len);
+    defer allocator.free(candidate_token_ids);
+
+    var any_miss = false;
+    for (sampled_tokens, candidate_token_ids) |tokens, *token_id| {
+        if (tokens.items.len != 1) return error.ExpectedSingleTokenCompletion;
+        token_id.* = tokens.items[0];
+        any_miss = any_miss or !reference_cache.contains(prompt_idx, tokens.items);
+    }
+
+    if (any_miss) {
+        try gemma4_real_autodiff.singleTokenCandidateLogprobsForPromptFrozenBase(
+            allocator,
+            trainer,
+            ctx,
+            prompt,
+            candidate_token_ids,
+            seq_len,
+            out_logps,
+            frozen_lora,
+        );
+    }
+
+    for (sampled_tokens, 0..) |tokens, completion_idx| {
+        var cached = [_]f32{0.0};
+        if (try reference_cache.lookup(prompt_idx, tokens.items, &cached)) {
+            out_logps[completion_idx] = cached[0];
+        } else {
+            if (!any_miss) return error.CorruptGrpoReferenceCache;
+            try reference_cache.insert(
+                prompt_idx,
+                tokens.items,
+                out_logps[completion_idx .. completion_idx + 1],
+            );
+        }
+    }
+}
+
+const CompletionGroupLogps = struct {
+    allocator: std.mem.Allocator,
+    flat: []f32,
+    rows: [][]f32,
+
+    fn init(allocator: std.mem.Allocator, sampled_tokens: []const std.ArrayList(i32)) !CompletionGroupLogps {
+        var total_tokens: usize = 0;
+        for (sampled_tokens) |tokens| {
+            if (tokens.items.len == 0) return error.EmptyCompletion;
+            total_tokens = std.math.add(usize, total_tokens, tokens.items.len) catch
+                return error.InvalidCompletionGroup;
+        }
+        const flat = try allocator.alloc(f32, total_tokens);
+        errdefer allocator.free(flat);
+        const rows = try allocator.alloc([]f32, sampled_tokens.len);
+        errdefer allocator.free(rows);
+        var offset: usize = 0;
+        for (sampled_tokens, rows) |tokens, *row| {
+            row.* = flat[offset .. offset + tokens.items.len];
+            offset += tokens.items.len;
+        }
+        return .{ .allocator = allocator, .flat = flat, .rows = rows };
+    }
+
+    fn deinit(self: *CompletionGroupLogps) void {
+        self.allocator.free(self.rows);
+        self.allocator.free(self.flat);
+        self.* = undefined;
+    }
+};
+
+fn completionTokenSlices(
+    allocator: std.mem.Allocator,
+    sampled_tokens: []const std.ArrayList(i32),
+) ![][]const i32 {
+    const completions = try allocator.alloc([]const i32, sampled_tokens.len);
+    for (sampled_tokens, completions) |tokens, *completion| completion.* = tokens.items;
+    return completions;
+}
+
+fn gemmaGrpoMultiTokenBatchEnabled(group_size: usize) bool {
+    if (!platform.env.getenvBoolDefault("ANTFLY_GEMMA4_GRPO_BATCH_MULTI_TOKEN_SCORING", false)) return false;
+    const max_batch = platform.env.getenvUsize("ANTFLY_GEMMA4_GRPO_MULTI_TOKEN_MAX_BATCH") orelse 4;
+    return max_batch != 0 and group_size <= max_batch;
+}
+
+/// Research lane for one contamination-free multi-token GRPO backward per
+/// completion group. Independent batch rows preserve causal/RoPE isolation,
+/// while one sparse weighted objective sums every completion contribution
+/// before the optimizer boundary. Keep default-off until E2B and E4B pass the
+/// exact trajectory and peak-memory gates against the serial rollback.
+fn gemmaGrpoMultiTokenBackwardBatchSize(group_size: usize) usize {
+    if (!platform.env.getenvBoolDefault("ANTFLY_GEMMA4_GRPO_BATCH_MULTI_TOKEN_BACKWARD", false)) return 1;
+    const max_batch = platform.env.getenvUsize("ANTFLY_GEMMA4_GRPO_MULTI_TOKEN_BACKWARD_MAX_BATCH") orelse 4;
+    if (max_batch < 2) return 1;
+    return @min(group_size, max_batch);
+}
+
+/// Qualified on real E2B and E4B Metal GRPO with two- and four-token
+/// completions. Sampling and both policy/reference rescoring must select the
+/// same projection geometry or the on-policy sampling/rescore contract is not
+/// numerically stable. Keep this as one switch rather than independently
+/// configurable phases; setting it to false is the production rollback.
+fn gemmaGrpoSparseMultiTokenEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_GRPO_SPARSE_MULTI_TOKEN", true);
+}
+
+/// The exact E2B/E4B replay campaign passes, but the first serial paged-decode
+/// implementation is slower than the qualified full-prefix sampler. Keep it
+/// default-off until prompt/prefix-aware active-candidate batching beats the
+/// rollback on both model sizes. The shadow gate runs the legacy full-prefix
+/// sampler and the incremental sampler against the same live adapter, then
+/// rejects any token or f32-logprob bit drift.
+fn gemmaGrpoIncrementalKvEnabled(recipe: Recipe) bool {
+    if (recipe.runtime) |runtime| if (runtime.grpo_incremental_kv) |enabled| return enabled;
+    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_GRPO_INCREMENTAL_KV", false);
+}
+
+fn gemmaGrpoIncrementalKvShadowExactEnabled(recipe: Recipe) bool {
+    if (recipe.runtime) |runtime| if (runtime.grpo_incremental_kv_shadow_exact) |enabled| return enabled;
+    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_GRPO_INCREMENTAL_KV_SHADOW_EXACT", false);
+}
+
+/// Incremental KV is itself default-off. Within that research lane, batch
+/// active candidates that have the same decode position so Q/V LoRA and the
+/// vocabulary head execute once for the group. Set false for the serial
+/// incremental rollback used by the performance gate.
+fn gemmaGrpoIncrementalKvBatchActiveEnabled(recipe: Recipe) bool {
+    if (recipe.runtime) |runtime| if (runtime.grpo_incremental_kv_batch_active) |enabled| return enabled;
+    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_GRPO_INCREMENTAL_KV_BATCH_ACTIVE", true);
+}
+
+/// Research-only device fan-out of a single qualified segmented prompt-tail
+/// replay. This avoids replaying the same prompt tail for every GRPO candidate
+/// while keeping each subsequent decode page independently writable.
+fn gemmaGrpoIncrementalKvClonePromptTailEnabled(recipe: Recipe) bool {
+    if (recipe.runtime) |runtime| if (runtime.grpo_incremental_kv_clone_prompt_tail) |enabled| return enabled;
+    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_GRPO_INCREMENTAL_KV_CLONE_PROMPT_TAIL", false);
+}
+
+fn sampleGemmaGrpoCompletionGroup(
+    allocator: std.mem.Allocator,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    ctx: *gemma4_real_autodiff.GemmaAutodiffCtx,
+    incremental_sampler: ?*gemma4_real_autodiff.GrpoIncrementalKvSampler,
+    incremental_shadow_exact: bool,
+    prompt: []const i32,
+    seq_len: u32,
+    max_completion_tokens: usize,
+    sampling: gemma4_real_autodiff.GrpoSamplingOptions,
+    eos_token_id: ?i32,
+    sparse_multi_token_projection: bool,
+    out_tokens: []std.ArrayList(i32),
+    out_logps: []std.ArrayList(f32),
+) !void {
+    const sampler = incremental_sampler orelse return gemma4_real_autodiff.sampleCompletionGroup(
+        allocator,
+        trainer,
+        ctx,
+        prompt,
+        seq_len,
+        max_completion_tokens,
+        sampling,
+        eos_token_id,
+        sparse_multi_token_projection,
+        out_tokens,
+        out_logps,
+    );
+
+    const run_shadow = incremental_shadow_exact and sampler.telemetry.groups == 0;
+    var shadow_tokens: ?[]std.ArrayList(i32) = null;
+    defer if (shadow_tokens) |lists| {
+        for (lists) |*tokens| tokens.deinit(allocator);
+        allocator.free(lists);
+    };
+    var shadow_logps: ?[]std.ArrayList(f32) = null;
+    defer if (shadow_logps) |lists| {
+        for (lists) |*logps| logps.deinit(allocator);
+        allocator.free(lists);
+    };
+    if (run_shadow) {
+        const baseline_tokens = try allocator.alloc(std.ArrayList(i32), out_tokens.len);
+        @memset(baseline_tokens, .empty);
+        shadow_tokens = baseline_tokens;
+        const baseline_logps = try allocator.alloc(std.ArrayList(f32), out_logps.len);
+        @memset(baseline_logps, .empty);
+        shadow_logps = baseline_logps;
+        try gemma4_real_autodiff.sampleCompletionGroup(
+            allocator,
+            trainer,
+            ctx,
+            prompt,
+            seq_len,
+            max_completion_tokens,
+            sampling,
+            eos_token_id,
+            sparse_multi_token_projection,
+            baseline_tokens,
+            baseline_logps,
+        );
+    }
+
+    try sampler.sampleCompletionGroup(
+        prompt,
+        seq_len,
+        max_completion_tokens,
+        sampling,
+        eos_token_id,
+        out_tokens,
+        out_logps,
+    );
+
+    // Paged one-token decode and the qualified fixed-shape graph can select
+    // identical tokens while differing by a few f32 bits in their reduction
+    // order. Canonicalize the sampled-policy log-probabilities with the same
+    // sparse, sequence-wide graph used by the legacy sampler. This retains
+    // incremental KV for token selection and replaces N per-token full-prefix
+    // forwards with one exact full-sequence rescore per completion.
+    try canonicalizeGemmaGrpoCompletionGroupLogps(
+        allocator,
+        trainer,
+        ctx,
+        prompt,
+        seq_len,
+        out_tokens,
+        out_logps,
+    );
+    sampler.telemetry.exact_logprob_rescore_forwards += out_tokens.len;
+
+    if (shadow_tokens) |baseline_tokens| {
+        const baseline_logps = shadow_logps.?;
+        for (baseline_tokens, out_tokens, 0..) |want_tokens, got_tokens, candidate_index| {
+            if (!std.mem.eql(i32, want_tokens.items, got_tokens.items)) {
+                std.log.err(
+                    "GRPO incremental-KV shadow token mismatch candidate={d} expected={any} actual={any}",
+                    .{ candidate_index, want_tokens.items, got_tokens.items },
+                );
+                return error.GrpoIncrementalKvTokenParityFailed;
+            }
+        }
+        // The legacy sampler records log-softmax values from its selection
+        // forward, while the product incremental path deliberately replaces
+        // placeholder decode logprobs with the canonical sparse sequence-wide
+        // rescore above. Those two qualified graphs can differ by a few F32
+        // ULPs, especially for direct Q4_0 GGUF weights. Canonicalize the
+        // shadow through the same authoritative scorer before demanding bit
+        // equality. Token selection remains an independent exact comparison,
+        // so this cannot mask a paged-decode decision change.
+        for (baseline_tokens, baseline_logps) |tokens, *logps| {
+            if (tokens.items.len != logps.items.len) return error.GrpoIncrementalKvLogprobParityFailed;
+            try gemma4_real_autodiff.tokenLogprobsForPromptCompletionSparseRows(
+                allocator,
+                trainer,
+                ctx,
+                prompt,
+                tokens.items,
+                seq_len,
+                logps.items,
+            );
+        }
+        for (baseline_logps, out_logps, 0..) |want_logps, got_logps, candidate_index| {
+            if (want_logps.items.len != got_logps.items.len) return error.GrpoIncrementalKvLogprobParityFailed;
+            for (want_logps.items, got_logps.items, 0..) |want, got, token_index| {
+                if (@as(u32, @bitCast(want)) != @as(u32, @bitCast(got))) {
+                    std.log.err(
+                        "GRPO incremental-KV shadow logprob mismatch candidate={d} token={d} expected_bits=0x{x} actual_bits=0x{x}",
+                        .{ candidate_index, token_index, @as(u32, @bitCast(want)), @as(u32, @bitCast(got)) },
+                    );
+                    return error.GrpoIncrementalKvLogprobParityFailed;
+                }
+            }
+        }
+    }
+}
+
+const gemma_grpo_training_sampling_domain: u64 = 0x4752504f54524149;
+const gemma_grpo_evaluation_sampling_domain: u64 = 0x4752504f4556414c;
+const gemma_grpo_training_order_domain: u64 = 0x4752504f4f524452;
+
+fn fillGemmaGrpoEpochPromptOrder(
+    order: []usize,
+    training_seed: u64,
+    epoch_index: usize,
+) void {
+    for (order, 0..) |*prompt_index, index| prompt_index.* = index;
+    if (order.len < 2) return;
+
+    var rng = std.Random.DefaultPrng.init(
+        gemma4_real_autodiff.deriveGrpoEpochPromptOrderSeed(
+            training_seed,
+            gemma_grpo_training_order_domain,
+            epoch_index,
+            order.len,
+        ),
+    );
+    var random = rng.random();
+    random.shuffle(usize, order);
+}
+
+/// Replace sampler-local log-probabilities with the authoritative sparse
+/// sequence-wide policy scorer for the same already-selected tokens.  The
+/// incremental-KV route uses this for every group because paged decode has a
+/// different reduction order. The scorer is explicitly eager so enabling the
+/// compiled sampler cannot make this canonicalization reuse the drifting
+/// output session.
+fn canonicalizeGemmaGrpoCompletionGroupLogps(
+    allocator: std.mem.Allocator,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    ctx: *gemma4_real_autodiff.GemmaAutodiffCtx,
+    prompt: []const i32,
+    seq_len: u32,
+    out_tokens: []const std.ArrayList(i32),
+    out_logps: []std.ArrayList(f32),
+) !void {
+    if (out_tokens.len != out_logps.len) return error.GrpoLogprobCanonicalizationShapeMismatch;
+    for (out_tokens, out_logps) |tokens, *logps| {
+        if (tokens.items.len != logps.items.len) return error.GrpoLogprobCanonicalizationShapeMismatch;
+        try gemma4_real_autodiff.tokenLogprobsForPromptCompletionSparseRowsCanonical(
+            allocator,
+            trainer,
+            ctx,
+            prompt,
+            tokens.items,
+            seq_len,
+            logps.items,
+        );
+    }
+}
+
+/// Scores an entire multi-token frozen-reference group in one sparse batch.
+/// Cache lookup/insertion remains completion-granular and ordered, including
+/// duplicate candidates. A false return leaves the cache telemetry untouched
+/// and asks the caller to execute the legacy per-completion scorer.
+fn cachedMultiTokenGroupReferenceLogps(
+    allocator: std.mem.Allocator,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    ctx: *gemma4_real_autodiff.GemmaAutodiffCtx,
+    prompt: []const i32,
+    prompt_idx: usize,
+    sampled_tokens: []const std.ArrayList(i32),
+    seq_len: u32,
+    frozen_lora: *const gemma4_real_autodiff.FrozenBaseLoraBindings,
+    reference_cache: *GemmaGrpoReferenceCache,
+    out_logps: *CompletionGroupLogps,
+) !bool {
+    if (sampled_tokens.len == 0 or sampled_tokens.len != out_logps.rows.len) {
+        return error.InvalidCompletionGroup;
+    }
+    var any_miss = false;
+    for (sampled_tokens) |tokens| {
+        if (tokens.items.len == 0) return error.EmptyCompletion;
+        any_miss = any_miss or !reference_cache.contains(prompt_idx, tokens.items);
+    }
+
+    if (any_miss) {
+        const completions = try completionTokenSlices(allocator, sampled_tokens);
+        defer allocator.free(completions);
+        if (!try gemma4_real_autodiff.tokenLogprobsForPromptCompletionGroupSparseRowsFrozenBase(
+            allocator,
+            trainer,
+            ctx,
+            prompt,
+            completions,
+            seq_len,
+            out_logps.rows,
+            frozen_lora,
+        )) return false;
+    }
+
+    for (sampled_tokens, out_logps.rows) |tokens, output| {
+        if (try reference_cache.lookup(prompt_idx, tokens.items, output)) continue;
+        if (!any_miss) return error.CorruptGrpoReferenceCache;
+        try reference_cache.insert(prompt_idx, tokens.items, output);
+    }
+    return true;
+}
+
+fn batchedMultiTokenGroupReferenceLogps(
+    allocator: std.mem.Allocator,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    ctx: *gemma4_real_autodiff.GemmaAutodiffCtx,
+    prompt: []const i32,
+    prompt_idx: usize,
+    sampled_tokens: []const std.ArrayList(i32),
+    seq_len: u32,
+    frozen_lora: *const gemma4_real_autodiff.FrozenBaseLoraBindings,
+    reference_cache: *GemmaGrpoReferenceCache,
+) !?CompletionGroupLogps {
+    var logps = try CompletionGroupLogps.init(allocator, sampled_tokens);
+    errdefer logps.deinit();
+    if (!try cachedMultiTokenGroupReferenceLogps(
+        allocator,
+        trainer,
+        ctx,
+        prompt,
+        prompt_idx,
+        sampled_tokens,
+        seq_len,
+        frozen_lora,
+        reference_cache,
+        &logps,
+    )) {
+        logps.deinit();
+        return null;
+    }
+    return logps;
+}
+
+fn batchedMultiTokenGroupPolicyLogps(
+    allocator: std.mem.Allocator,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    ctx: *gemma4_real_autodiff.GemmaAutodiffCtx,
+    prompt: []const i32,
+    sampled_tokens: []const std.ArrayList(i32),
+    seq_len: u32,
+) !?CompletionGroupLogps {
+    var logps = try CompletionGroupLogps.init(allocator, sampled_tokens);
+    errdefer logps.deinit();
+    const completions = try completionTokenSlices(allocator, sampled_tokens);
+    defer allocator.free(completions);
+    if (!try gemma4_real_autodiff.tokenLogprobsForPromptCompletionGroupSparseRows(
+        allocator,
+        trainer,
+        ctx,
+        prompt,
+        completions,
+        seq_len,
+        logps.rows,
+    )) {
+        logps.deinit();
+        return null;
+    }
+    return logps;
+}
+
+/// Score every already-selected completion through the explicitly eager,
+/// restart-stable sparse policy graph. Keep batch=1 here: the matched control
+/// and compiled campaigns are bit-exact at that geometry, while a batch-wide
+/// rescore changes tied-head reduction order enough to move log-probs by 2e-2.
+/// Compiled sampling remains responsible for the many per-token selection
+/// forwards, so this adds one sequence-wide rescore per completion.
+fn canonicalCompiledSamplingGroupPolicyLogps(
+    allocator: std.mem.Allocator,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    ctx: *gemma4_real_autodiff.GemmaAutodiffCtx,
+    prompt: []const i32,
+    sampled_tokens: []const std.ArrayList(i32),
+    seq_len: u32,
+) !CompletionGroupLogps {
+    var logps = try CompletionGroupLogps.init(allocator, sampled_tokens);
+    errdefer logps.deinit();
+    for (sampled_tokens, logps.rows) |tokens, row| {
+        try gemma4_real_autodiff.tokenLogprobsForPromptCompletionSparseRowsCanonical(
+            allocator,
+            trainer,
+            ctx,
+            prompt,
+            tokens.items,
+            seq_len,
+            row,
+        );
+    }
+    return logps;
+}
+
+const DpoBenchmarkRecorder = struct {
+    const warmup_updates = 3;
+    const measured_updates = 20;
+    const total_updates = 2 + warmup_updates + measured_updates;
+
+    allocator: std.mem.Allocator,
+    updates_seen: usize = 0,
+    cold_seconds: f64 = 0.0,
+    cold_loss: f32 = 0.0,
+    first_seconds: f64 = 0.0,
+    first_loss: f32 = 0.0,
+    warmup_seconds: []f64,
+    warmup_losses: []f32,
+    measured_seconds: []f64,
+    measured_losses: []f32,
+
+    fn init(allocator: std.mem.Allocator) !DpoBenchmarkRecorder {
+        const warmup_seconds = try allocator.alloc(f64, warmup_updates);
+        errdefer allocator.free(warmup_seconds);
+        const warmup_losses = try allocator.alloc(f32, warmup_updates);
+        errdefer allocator.free(warmup_losses);
+        const measured_seconds = try allocator.alloc(f64, measured_updates);
+        errdefer allocator.free(measured_seconds);
+        const measured_losses = try allocator.alloc(f32, measured_updates);
+        return .{
+            .allocator = allocator,
+            .warmup_seconds = warmup_seconds,
+            .warmup_losses = warmup_losses,
+            .measured_seconds = measured_seconds,
+            .measured_losses = measured_losses,
+        };
+    }
+
+    fn deinit(self: *DpoBenchmarkRecorder) void {
+        self.allocator.free(self.warmup_seconds);
+        self.allocator.free(self.warmup_losses);
+        self.allocator.free(self.measured_seconds);
+        self.allocator.free(self.measured_losses);
+        self.* = undefined;
+    }
+
+    fn record(self: *DpoBenchmarkRecorder, elapsed_seconds: f64, loss: f32) !void {
+        const idx = self.updates_seen;
+        if (idx >= total_updates) return error.DpoBenchmarkUpdateCountMismatch;
+        if (idx == 0) {
+            self.cold_seconds = elapsed_seconds;
+            self.cold_loss = loss;
+        } else if (idx == 1) {
+            self.first_seconds = elapsed_seconds;
+            self.first_loss = loss;
+        } else if (idx < 2 + warmup_updates) {
+            const warmup_idx = idx - 2;
+            self.warmup_seconds[warmup_idx] = elapsed_seconds;
+            self.warmup_losses[warmup_idx] = loss;
+        } else {
+            const measured_idx = idx - 2 - warmup_updates;
+            self.measured_seconds[measured_idx] = elapsed_seconds;
+            self.measured_losses[measured_idx] = loss;
+        }
+        self.updates_seen += 1;
+    }
+
+    fn finish(self: *DpoBenchmarkRecorder) !DpoBenchmarkTelemetry {
+        if (self.updates_seen != total_updates) return error.DpoBenchmarkUpdateCountMismatch;
+        var saw_policy_movement = @abs(self.first_loss - self.cold_loss) > 1e-6;
+        for (self.warmup_losses) |loss| saw_policy_movement = saw_policy_movement or @abs(loss - self.cold_loss) > 1e-6;
+        for (self.measured_losses) |loss| saw_policy_movement = saw_policy_movement or @abs(loss - self.cold_loss) > 1e-6;
+        if (!saw_policy_movement) return error.DpoBenchmarkNoPolicyMovement;
+        const sorted = try self.allocator.dupe(f64, self.measured_seconds);
+        defer self.allocator.free(sorted);
+        std.mem.sort(f64, sorted, {}, std.sort.asc(f64));
+        const median = (sorted[measured_updates / 2 - 1] + sorted[measured_updates / 2]) / 2.0;
+        var total: f64 = 0.0;
+        for (self.measured_seconds) |seconds| total += seconds;
+        return .{
+            .protocol = .{
+                .cold = 1,
+                .first = 1,
+                .warmup = warmup_updates,
+                .measured = measured_updates,
+            },
+            .cold_seconds = self.cold_seconds,
+            .cold_loss = self.cold_loss,
+            .first_seconds = self.first_seconds,
+            .first_loss = self.first_loss,
+            .warmup_seconds = self.warmup_seconds,
+            .warmup_losses = self.warmup_losses,
+            .measured_seconds = self.measured_seconds,
+            .measured_losses = self.measured_losses,
+            .median_seconds = median,
+            .mean_seconds = total / measured_updates,
+        };
+    }
+};
+
+const GrpoBenchmarkRecorder = struct {
+    const warmup_updates = 3;
+    const measured_updates = 20;
+    const total_updates = 2 + warmup_updates + measured_updates;
+
+    allocator: std.mem.Allocator,
+    updates_seen: usize = 0,
+    cold: GrpoBenchmarkUpdate = undefined,
+    first: GrpoBenchmarkUpdate = undefined,
+    warmup: []GrpoBenchmarkUpdate,
+    measured: []GrpoBenchmarkUpdate,
+
+    fn init(allocator: std.mem.Allocator) !GrpoBenchmarkRecorder {
+        const warmup = try allocator.alloc(GrpoBenchmarkUpdate, warmup_updates);
+        errdefer allocator.free(warmup);
+        const measured = try allocator.alloc(GrpoBenchmarkUpdate, measured_updates);
+        return .{
+            .allocator = allocator,
+            .warmup = warmup,
+            .measured = measured,
+        };
+    }
+
+    fn deinit(self: *GrpoBenchmarkRecorder) void {
+        self.allocator.free(self.warmup);
+        self.allocator.free(self.measured);
+        self.* = undefined;
+    }
+
+    fn record(self: *GrpoBenchmarkRecorder, update: GrpoBenchmarkUpdate) !void {
+        const idx = self.updates_seen;
+        if (idx >= total_updates) return error.GrpoBenchmarkUpdateCountMismatch;
+        if (idx == 0) {
+            self.cold = update;
+        } else if (idx == 1) {
+            self.first = update;
+        } else if (idx < 2 + warmup_updates) {
+            self.warmup[idx - 2] = update;
+        } else {
+            self.measured[idx - 2 - warmup_updates] = update;
+        }
+        self.updates_seen += 1;
+    }
+
+    fn finish(self: *GrpoBenchmarkRecorder) !GrpoBenchmarkTelemetry {
+        if (self.updates_seen != total_updates) return error.GrpoBenchmarkUpdateCountMismatch;
+        var saw_policy_movement = self.first.policy_reference_max_abs_error > 1e-5;
+        for (self.warmup) |update| saw_policy_movement = saw_policy_movement or update.policy_reference_max_abs_error > 1e-5;
+        for (self.measured) |update| saw_policy_movement = saw_policy_movement or update.policy_reference_max_abs_error > 1e-5;
+        if (!saw_policy_movement) return error.GrpoBenchmarkNoPolicyMovement;
+
+        const sorted = try self.allocator.alloc(f64, measured_updates);
+        defer self.allocator.free(sorted);
+        var total: f64 = 0.0;
+        for (self.measured, 0..) |update, idx| {
+            sorted[idx] = update.seconds;
+            total += update.seconds;
+        }
+        std.mem.sort(f64, sorted, {}, std.sort.asc(f64));
+        const median = (sorted[measured_updates / 2 - 1] + sorted[measured_updates / 2]) / 2.0;
+        return .{
+            .protocol = .{
+                .cold = 1,
+                .first = 1,
+                .warmup = warmup_updates,
+                .measured = measured_updates,
+            },
+            .cold = self.cold,
+            .first = self.first,
+            .warmup = self.warmup,
+            .measured = self.measured,
+            .median_seconds = median,
+            .mean_seconds = total / measured_updates,
+        };
+    }
+};
+
+fn gemmaLoraAdapterIsBaseEquivalent(trainer: *const real_autodiff.RealAutodiffTrainer) bool {
+    var saw_lora_b = false;
+    for (trainer.lora_params.items) |slot| {
+        if (!std.mem.endsWith(u8, slot.name, ".lora_B")) continue;
+        saw_lora_b = true;
+        for (slot.weights) |weight| {
+            if (weight != 0.0) return false;
+        }
+    }
+    return saw_lora_b;
+}
+
+const GemmaDpoSingleTokenPair = struct {
+    prompt: []const i32,
+    chosen_token: i32,
+    rejected_token: i32,
+};
+
+/// Returns a shared-prompt view only when the prepared pair proves the exact
+/// causal layout required by the one-row scorer and weighted backward path.
+/// Any richer or structurally ambiguous preference pair keeps the general
+/// two-sequence implementation.
+fn gemmaDpoSingleTokenPair(
+    chosen: *const gemma4.PreparedExampleInput,
+    rejected: *const gemma4.PreparedExampleInput,
+) ?GemmaDpoSingleTokenPair {
+    const prompt_len = chosen.prompt_input_ids.len;
+    if (prompt_len == 0 or !std.mem.eql(i32, chosen.prompt_input_ids, rejected.prompt_input_ids)) return null;
+    if (chosen.num_prompt_tokens != prompt_len or rejected.num_prompt_tokens != prompt_len) return null;
+    if (chosen.response_input_ids.len != 1 or rejected.response_input_ids.len != 1) return null;
+    if (chosen.num_response_tokens != 1 or rejected.num_response_tokens != 1) return null;
+    if (chosen.num_supervised_tokens != 1 or rejected.num_supervised_tokens != 1) return null;
+    if (chosen.input_ids.len != prompt_len + 1 or rejected.input_ids.len != prompt_len + 1) return null;
+    if (chosen.labels.len != chosen.input_ids.len or rejected.labels.len != rejected.input_ids.len) return null;
+    if (chosen.num_input_tokens != chosen.input_ids.len or rejected.num_input_tokens != rejected.input_ids.len) return null;
+    if (!std.mem.eql(i32, chosen.input_ids[0..prompt_len], chosen.prompt_input_ids) or
+        !std.mem.eql(i32, rejected.input_ids[0..prompt_len], rejected.prompt_input_ids)) return null;
+    if (chosen.input_ids[prompt_len] != chosen.response_input_ids[0] or
+        rejected.input_ids[prompt_len] != rejected.response_input_ids[0]) return null;
+    for (chosen.labels[0..prompt_len]) |label| if (label != -100) return null;
+    for (rejected.labels[0..prompt_len]) |label| if (label != -100) return null;
+    if (chosen.labels[prompt_len] != chosen.response_input_ids[0] or
+        rejected.labels[prompt_len] != rejected.response_input_ids[0]) return null;
+    if (chosen.image_paths.len != 0 or chosen.audio_paths.len != 0 or
+        rejected.image_paths.len != 0 or rejected.audio_paths.len != 0) return null;
+    if (chosen.teacher_top_k != 0 or rejected.teacher_top_k != 0 or
+        chosen.teacher_top_k_token_ids.len != 0 or rejected.teacher_top_k_token_ids.len != 0 or
+        chosen.teacher_top_k_probs.len != 0 or rejected.teacher_top_k_probs.len != 0) return null;
+
+    return .{
+        .prompt = chosen.prompt_input_ids,
+        .chosen_token = chosen.response_input_ids[0],
+        .rejected_token = rejected.response_input_ids[0],
+    };
+}
+
+fn allGemmaDpoPairsAreSingleTokenSharedPrompt(
+    chosen_examples: []const gemma4.PreparedExampleInput,
+    rejected_examples: []const gemma4.PreparedExampleInput,
+) bool {
+    if (chosen_examples.len == 0 or chosen_examples.len != rejected_examples.len) return false;
+    for (chosen_examples, rejected_examples) |*chosen, *rejected| {
+        if (gemmaDpoSingleTokenPair(chosen, rejected) == null) return false;
+    }
+    return true;
+}
+
+/// Invert `loss = -log(sigmoid(reward_margin))` without another policy
+/// scoring pass. `-expm1(-loss)` is stable when loss is close to zero.
+fn rewardMarginFromDpoLoss(loss: f32) !f32 {
+    if (!std.math.isFinite(loss) or loss <= 0.0) return error.InvalidDpoCompiledLoss;
+    const one_minus_sigmoid = -std.math.expm1(-loss);
+    if (!(one_minus_sigmoid > 0.0) or !std.math.isFinite(one_minus_sigmoid)) {
+        return error.InvalidDpoCompiledLoss;
+    }
+    const margin = -loss - @log(one_minus_sigmoid);
+    if (!std.math.isFinite(margin)) return error.InvalidDpoCompiledLoss;
+    return margin;
+}
+
+const GemmaDpoPairSchedule = struct {
+    sequence_length: u32,
+    weighted_target_rows: usize,
+};
+
+fn gemmaDpoLengthBuckets(recipe: Recipe) ?gemma4_real_autodiff.SequenceLengthBuckets {
+    const runtime = recipe.runtime orelse return null;
+    const quantum = runtime.sequence_length_bucket_quantum orelse return null;
+    return .{
+        .quantum = quantum,
+        .minimum = runtime.sequence_length_bucket_min orelse 0,
+    };
+}
+
+fn gemmaDpoGraphCacheCapacity(recipe: Recipe, coalesce_single_token_pairs: bool) u8 {
+    if (recipe.runtime) |runtime| {
+        if (runtime.graph_cache_capacity) |capacity| return capacity;
+        if (runtime.sequence_length_bucket_quantum != null) return 4;
+    }
+    return if (coalesce_single_token_pairs) 1 else 4;
+}
+
+fn gemmaDpoPairGraphSignature(schedule: GemmaDpoPairSchedule) u128 {
+    return (@as(u128, schedule.sequence_length) << 64) |
+        @as(u128, schedule.weighted_target_rows);
+}
+
+/// One DPO unit always schedules its chosen and rejected branches together.
+/// Sequence length is the rounded maximum logical row; sparse weighted-target
+/// rows use the maximum completion bucket. Therefore neither attention nor
+/// loss metadata can acquire a branch-specific compiled signature.
+fn gemmaDpoPairSchedule(
+    chosen: *const gemma4.PreparedExampleInput,
+    rejected: *const gemma4.PreparedExampleInput,
+    max_seq_len: u32,
+    buckets: ?gemma4_real_autodiff.SequenceLengthBuckets,
+) !GemmaDpoPairSchedule {
+    return .{
+        .sequence_length = try gemma4_real_autodiff.sequenceLengthForExample(
+            @max(chosen.num_input_tokens, rejected.num_input_tokens),
+            max_seq_len,
+            buckets,
+        ),
+        .weighted_target_rows = @max(
+            try gemma4_real_autodiff.preferenceTargetRows(chosen.num_supervised_tokens),
+            try gemma4_real_autodiff.preferenceTargetRows(rejected.num_supervised_tokens),
+        ),
+    };
+}
+
+fn summarizeGemmaDpoPairLengthPolicy(
+    allocator: std.mem.Allocator,
+    chosen_examples: []const gemma4.PreparedExampleInput,
+    rejected_examples: []const gemma4.PreparedExampleInput,
+    max_seq_len: u32,
+    buckets: ?gemma4_real_autodiff.SequenceLengthBuckets,
+    graph_cache_capacity: u8,
+    scope: []const u8,
+) !DpoPairLengthPolicyTelemetry {
+    if (chosen_examples.len == 0 or chosen_examples.len != rejected_examples.len) {
+        return error.DpoBatchAlignmentMismatch;
+    }
+
+    var logical_branch_rows: usize = 0;
+    var scheduled_branch_rows: usize = 0;
+    var minimum_pair_sequence_length: u32 = 0;
+    var maximum_pair_sequence_length: u32 = 0;
+    var unique_sequence_lengths = std.AutoHashMap(u32, void).init(allocator);
+    defer unique_sequence_lengths.deinit();
+    var unique_graph_signatures = std.AutoHashMap(u128, void).init(allocator);
+    defer unique_graph_signatures.deinit();
+
+    for (chosen_examples, rejected_examples) |*chosen, *rejected| {
+        const schedule = try gemmaDpoPairSchedule(chosen, rejected, max_seq_len, buckets);
+        logical_branch_rows = std.math.add(usize, logical_branch_rows, chosen.num_input_tokens) catch
+            return error.SequenceTooLong;
+        logical_branch_rows = std.math.add(usize, logical_branch_rows, rejected.num_input_tokens) catch
+            return error.SequenceTooLong;
+        scheduled_branch_rows = std.math.add(
+            usize,
+            scheduled_branch_rows,
+            try std.math.mul(usize, @as(usize, schedule.sequence_length), 2),
+        ) catch return error.SequenceTooLong;
+        if (minimum_pair_sequence_length == 0) {
+            minimum_pair_sequence_length = schedule.sequence_length;
+        } else {
+            minimum_pair_sequence_length = @min(minimum_pair_sequence_length, schedule.sequence_length);
+        }
+        maximum_pair_sequence_length = @max(maximum_pair_sequence_length, schedule.sequence_length);
+
+        try unique_sequence_lengths.put(schedule.sequence_length, {});
+        try unique_graph_signatures.put(gemmaDpoPairGraphSignature(schedule), {});
+    }
+
+    const fixed_shape_branch_rows = try std.math.mul(
+        usize,
+        try std.math.mul(usize, chosen_examples.len, @as(usize, max_seq_len)),
+        2,
+    );
+    const padding_rows_avoided = fixed_shape_branch_rows - scheduled_branch_rows;
+    return .{
+        .mode = if (buckets == null) "fixed-pair-padding" else "pair-safe-length-buckets",
+        .scope = scope,
+        .maximum_sequence_length = max_seq_len,
+        .bucket_quantum = if (buckets) |policy| policy.quantum else null,
+        .bucket_minimum = if (buckets) |policy| if (policy.minimum == 0) policy.quantum else policy.minimum else null,
+        .graph_cache_capacity = graph_cache_capacity,
+        .pairs = chosen_examples.len,
+        .logical_branch_rows = logical_branch_rows,
+        .scheduled_branch_rows = scheduled_branch_rows,
+        .fixed_shape_branch_rows = fixed_shape_branch_rows,
+        .padding_rows_avoided = padding_rows_avoided,
+        .padding_reduction_fraction = @as(f64, @floatFromInt(padding_rows_avoided)) /
+            @as(f64, @floatFromInt(fixed_shape_branch_rows)),
+        .minimum_pair_sequence_length = minimum_pair_sequence_length,
+        .maximum_pair_sequence_length = maximum_pair_sequence_length,
+        .unique_pair_sequence_lengths = unique_sequence_lengths.count(),
+        .unique_pair_graph_signatures = if (buckets == null) null else unique_graph_signatures.count(),
+        .weighted_target_row_policy = if (buckets == null) "branch-local" else "pair-shared-maximum-bucket",
+    };
+}
+
+fn validateGemmaDpoInitialBucketSignatureParity(
+    allocator: std.mem.Allocator,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    ctx: *gemma4_real_autodiff.GemmaAutodiffCtx,
+    chosen_examples: []const gemma4.PreparedExampleInput,
+    rejected_examples: []const gemma4.PreparedExampleInput,
+    reference_cache: *const GemmaDpoReferenceCache,
+    seq_len: u32,
+    coalesce_single_token_pairs: bool,
+    buckets: ?gemma4_real_autodiff.SequenceLengthBuckets,
+    enforce_policy_reference_parity: bool,
+) !?DpoInitialBucketSignatureParity {
+    if (buckets == null) return null;
+    if (chosen_examples.len == 0 or
+        chosen_examples.len != rejected_examples.len or
+        chosen_examples.len != reference_cache.chosen_logps.len or
+        chosen_examples.len != reference_cache.rejected_logps.len)
+    {
+        return error.DpoBatchAlignmentMismatch;
+    }
+
+    var seen = std.AutoHashMap(u128, void).init(allocator);
+    defer seen.deinit();
+    var result: ?DpoInitialBucketSignatureParity = null;
+
+    for (chosen_examples, rejected_examples, 0..) |*chosen, *rejected, pair_idx| {
+        const schedule = try gemmaDpoPairSchedule(chosen, rejected, seq_len, buckets);
+        const signature = gemmaDpoPairGraphSignature(schedule);
+        if (seen.contains(signature)) continue;
+        try seen.put(signature, {});
+
+        var policy_logps: [2]f32 = undefined;
+        if (coalesce_single_token_pairs) {
+            const pair = gemmaDpoSingleTokenPair(chosen, rejected) orelse
+                return error.DpoSingleTokenPairContractMismatch;
+            const candidate_tokens = [_]i32{ pair.chosen_token, pair.rejected_token };
+            try gemma4_real_autodiff.singleTokenCandidateLogprobsForPrompt(
+                allocator,
+                trainer,
+                ctx,
+                pair.prompt,
+                &candidate_tokens,
+                schedule.sequence_length,
+                &policy_logps,
+            );
+        } else {
+            policy_logps[0] = try gemma4_real_autodiff.sequenceLogprobForExampleScheduled(
+                allocator,
+                trainer,
+                ctx,
+                chosen,
+                schedule.sequence_length,
+                schedule.weighted_target_rows,
+            );
+            policy_logps[1] = try gemma4_real_autodiff.sequenceLogprobForExampleScheduled(
+                allocator,
+                trainer,
+                ctx,
+                rejected,
+                schedule.sequence_length,
+                schedule.weighted_target_rows,
+            );
+        }
+
+        const error_for_pair = @max(
+            @abs(policy_logps[0] - reference_cache.chosen_logps[pair_idx]),
+            @abs(policy_logps[1] - reference_cache.rejected_logps[pair_idx]),
+        );
+        if (result == null or error_for_pair > result.?.max_abs_error) {
+            result = .{
+                .graph_signatures_checked = 0,
+                .representative_pair_index = pair_idx,
+                .policy_chosen_logp = policy_logps[0],
+                .policy_rejected_logp = policy_logps[1],
+                .reference_chosen_logp = reference_cache.chosen_logps[pair_idx],
+                .reference_rejected_logp = reference_cache.rejected_logps[pair_idx],
+                .max_abs_error = error_for_pair,
+                .base_equivalent_policy = reference_cache.base_equivalent_policy,
+            };
+        }
+    }
+
+    var parity = result orelse return error.DpoBatchAlignmentMismatch;
+    parity.graph_signatures_checked = seen.count();
+    if (enforce_policy_reference_parity and parity.max_abs_error > 1e-4) {
+        return error.GemmaDpoInitialReferenceParityMismatch;
+    }
+    return parity;
+}
+
+fn precomputeGemmaDpoReferenceCache(
+    allocator: std.mem.Allocator,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    ctx: *gemma4_real_autodiff.GemmaAutodiffCtx,
+    chosen_examples: []const gemma4.PreparedExampleInput,
+    rejected_examples: []const gemma4.PreparedExampleInput,
+    seq_len: u32,
+    coalesce_single_token_pairs: bool,
+    buckets: ?gemma4_real_autodiff.SequenceLengthBuckets,
+    reference_lora: *const gemma4_real_autodiff.FrozenBaseLoraBindings,
+    reference_base_equivalent: bool,
+) !GemmaDpoReferenceCache {
+    if (chosen_examples.len != rejected_examples.len) return error.DpoBatchAlignmentMismatch;
+
+    const chosen_logps = try allocator.alloc(f32, chosen_examples.len);
+    errdefer allocator.free(chosen_logps);
+    const rejected_logps = try allocator.alloc(f32, rejected_examples.len);
+    errdefer allocator.free(rejected_logps);
+
+    const started_ns = platform.time.monotonicNs();
+    for (chosen_examples, rejected_examples, 0..) |*chosen, *rejected, idx| {
+        const schedule = try gemmaDpoPairSchedule(chosen, rejected, seq_len, buckets);
+        if (coalesce_single_token_pairs) {
+            const pair = gemmaDpoSingleTokenPair(chosen, rejected) orelse return error.DpoSingleTokenPairContractMismatch;
+            const candidate_tokens = [_]i32{ pair.chosen_token, pair.rejected_token };
+            var pair_logps: [2]f32 = undefined;
+            try gemma4_real_autodiff.singleTokenCandidateLogprobsForPromptFrozenBase(
+                allocator,
+                trainer,
+                ctx,
+                pair.prompt,
+                &candidate_tokens,
+                schedule.sequence_length,
+                &pair_logps,
+                reference_lora,
+            );
+            chosen_logps[idx] = pair_logps[0];
+            rejected_logps[idx] = pair_logps[1];
+        } else {
+            chosen_logps[idx] = if (buckets == null)
+                try gemma4_real_autodiff.sequenceLogprobForExampleFrozenBase(
+                    allocator,
+                    trainer,
+                    ctx,
+                    chosen,
+                    seq_len,
+                    reference_lora,
+                )
+            else
+                try gemma4_real_autodiff.sequenceLogprobForExampleFrozenBaseScheduled(
+                    allocator,
+                    trainer,
+                    ctx,
+                    chosen,
+                    schedule.sequence_length,
+                    schedule.weighted_target_rows,
+                    reference_lora,
+                );
+            if (platform.env.getenvBoolDefault("ANTFLY_GEMMA4_PREFERENCE_TRACE", false)) {
+                print("gemma4 dpo reference lora after chosen: max_abs_prefix={d:.9}\n", .{try reference_lora.debugMaxAbsPrefix(8)});
+            }
+            rejected_logps[idx] = if (buckets == null)
+                try gemma4_real_autodiff.sequenceLogprobForExampleFrozenBase(
+                    allocator,
+                    trainer,
+                    ctx,
+                    rejected,
+                    seq_len,
+                    reference_lora,
+                )
+            else
+                try gemma4_real_autodiff.sequenceLogprobForExampleFrozenBaseScheduled(
+                    allocator,
+                    trainer,
+                    ctx,
+                    rejected,
+                    schedule.sequence_length,
+                    schedule.weighted_target_rows,
+                    reference_lora,
+                );
+            if (platform.env.getenvBoolDefault("ANTFLY_GEMMA4_PREFERENCE_TRACE", false)) {
+                print("gemma4 dpo reference lora after rejected: max_abs_prefix={d:.9}\n", .{try reference_lora.debugMaxAbsPrefix(8)});
+            }
+        }
+    }
+    const elapsed_ns = platform.time.monotonicNs() - started_ns;
+
+    return .{
+        .allocator = allocator,
+        .chosen_logps = chosen_logps,
+        .rejected_logps = rejected_logps,
+        .precompute_seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s,
+        .base_equivalent_policy = reference_base_equivalent,
+    };
+}
+
 /// Preference recipes alternate between a batch-one scoring graph
 /// (`sequenceLogprobForExample`, `sampleCompletion`) and the batched update
 /// graph every unit. Retaining both keeps each preference pair or group from
@@ -3809,6 +8723,1106 @@ fn tokenizeSftTextRow(
 const preference_graph_cache_capacity: u8 = 2;
 
 fn runOptimizerBackedGemmaDpo(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    recipe: Recipe,
+    dataset_path: []const u8,
+    report_path: []const u8,
+) !void {
+    // CUDA recipes run main's strict CUDA optimizer lane; Metal/native keep
+    // this lane's evaluation/checkpoint contract.
+    if ((try resolveGemmaPreferenceExecution(recipe.backend)).backend_kind == .cuda) {
+        return runOptimizerBackedGemmaDpoCuda(allocator, io, recipe, dataset_path, report_path);
+    }
+    const base_model_dir = recipe.model.path orelse return error.MissingModelPath;
+    const dpo_objective = try resolveDpoObjectiveConfig(recipe.preference);
+    const adapter = recipe.adapter orelse AdapterConfig{};
+    const bootstrap_dir_config = adapter.path;
+    const bootstrap_dir = bootstrap_dir_config orelse try defaultArtifactPath(allocator, recipe, "adapter-bootstrap");
+    defer if (bootstrap_dir_config == null) allocator.free(bootstrap_dir);
+    const trained_dir_config = recipe.artifacts.trained_adapter_dir orelse recipe.artifacts.adapter_dir;
+    const trained_dir = trained_dir_config orelse try defaultArtifactPath(allocator, recipe, "adapter-trained");
+    defer if (trained_dir_config == null) allocator.free(trained_dir);
+    try requireMissingPreferencePublicationTarget(io, trained_dir);
+    const reference_path = recipe.model.reference_path orelse base_model_dir;
+    if (!std.mem.eql(u8, reference_path, base_model_dir)) return error.UnsupportedReferencePath;
+    const execution = try resolveGemmaPreferenceExecution(recipe.backend);
+    const backend_kind = execution.backend_kind;
+    try validateGemmaPreferenceEnvironmentContract(backend_kind);
+    const execution_policy = train_eval_gemma4_lora_bundle.autodiffExecutionPolicy(backend_kind);
+    const max_examples = recipe.dataset.max_examples orelse 32;
+    const max_seq_len = recipe.dataset.max_seq_len orelse 512;
+    try validateGemmaAdapterOptions(adapter);
+    var graph_executor_scope = try train_eval_gemma4_lora_bundle.acquireMetalGraphExecutorScope(backend_kind);
+    defer if (graph_executor_scope) |*scope| scope.deinit();
+    try train_eval_gemma4_lora_bundle.validateAutodiffBaseArtifactForRecipe(
+        allocator,
+        base_model_dir,
+        backend_kind,
+        recipe.model.allow_direct_gguf_training orelse false,
+    );
+    const direct_gguf_base = try train_eval_gemma4_lora_bundle.autodiffBaseUsesGguf(allocator, base_model_dir);
+    if ((recipe.model.allow_direct_gguf_training orelse false) != direct_gguf_base) {
+        return error.DirectGgufTrainingAdmissionMismatch;
+    }
+
+    compat.cwd().access(compat.io(), bootstrap_dir, .{}) catch {
+        var bootstrap = try gemma4.bootstrapLoRABundle(allocator, base_model_dir, bootstrap_dir, .{
+            .rank = adapterRank(adapter, .dpo),
+            .alpha = adapterAlpha(adapter),
+            .base_model_name_or_path = adapter.base_model_name_or_path,
+            .target_modules = adapter.target_modules,
+            .gemma4_target_preset = gemma4TargetPreset(adapter),
+            .target_preset = try gemmaLegacyTargetPreset(adapter),
+            .use_dora = adapter.use_dora orelse false,
+            .init_lora_weights = adapter.init_lora_weights,
+            .initialization_seed = adapter.initialization_seed orelse 0,
+        });
+        defer gemma4.freeBootstrapSummary(allocator, &bootstrap);
+    };
+
+    var tokenizer_assets = try OwnedPreferenceTokenizer.init(allocator, base_model_dir);
+    defer tokenizer_assets.deinit();
+    const tokenizer_view = tokenizer_assets.view();
+
+    var samples = try loadDpoTextPreferenceSamples(allocator, io, dataset_path, recipe, tokenizer_view);
+    defer samples.deinit();
+
+    var chosen_prepared = try prepareGemmaDpoPreparedExamplesFromSamples(allocator, base_model_dir, samples.samples, max_examples, max_seq_len, .chosen);
+    defer gemma4.freePreparedInputsSummary(allocator, &chosen_prepared);
+    var rejected_prepared = try prepareGemmaDpoPreparedExamplesFromSamples(allocator, base_model_dir, samples.samples, max_examples, max_seq_len, .rejected);
+    defer gemma4.freePreparedInputsSummary(allocator, &rejected_prepared);
+    if (chosen_prepared.examples.len != rejected_prepared.examples.len or chosen_prepared.examples.len != samples.samples.len) {
+        return error.DpoBatchAlignmentMismatch;
+    }
+    // The weighted sparse-row backward is currently qualified only through
+    // the strict Metal executor. Native retains the general two-sequence path;
+    // its rank-2 dot implementation does not yet support this sparse target
+    // graph and must not receive it through a structural fast-path match.
+    const coalesce_single_token_pairs = backend_kind == .metal and
+        allGemmaDpoPairsAreSingleTokenSharedPrompt(
+            chosen_prepared.examples,
+            rejected_prepared.examples,
+        );
+    const length_buckets = gemmaDpoLengthBuckets(recipe);
+    const graph_cache_capacity = gemmaDpoGraphCacheCapacity(recipe, coalesce_single_token_pairs);
+    const sequence_length_policy = try summarizeGemmaDpoPairLengthPolicy(
+        allocator,
+        chosen_prepared.examples,
+        rejected_prepared.examples,
+        @intCast(max_seq_len),
+        length_buckets,
+        graph_cache_capacity,
+        "train-dataset-one-pass",
+    );
+    // The simultaneous whole-objective graph remains an explicit research
+    // lane until its activation lifetime is below the MLX memory gate. The
+    // production fast path instead detaches adapter-sized branch gradients.
+    const pair_objective_requested = backend_kind == .metal and
+        !coalesce_single_token_pairs and
+        platform.env.getenvBoolDefault("ANTFLY_GEMMA4_DPO_PAIR_GRAPH", false);
+    if (pair_objective_requested and
+        (dpo_objective.loss_type != .sigmoid or dpo_objective.preference.label_smoothing != 0.0))
+    {
+        return error.DpoCompiledPairObjectiveRequiresUnsmoothSigmoid;
+    }
+    const batch2_pair_forward_requested = pair_objective_requested and
+        platform.env.getenvBoolDefault("ANTFLY_GEMMA4_DPO_BATCH2_FORWARD_GRAPH", false);
+    const detached_pair_gradients_requested = backend_kind == .metal and
+        !coalesce_single_token_pairs and
+        platform.env.getenvBoolDefault("ANTFLY_GEMMA4_DPO_DETACHED_GRADIENTS", true);
+    const coalesced_snapshot_frame_requested = backend_kind == .metal and
+        platform.env.getenvBoolDefault("ANTFLY_GEMMA4_DPO_COALESCED_SNAPSHOT_FRAME", false);
+    const ping_pong_gradients_requested = backend_kind == .metal and
+        platform.env.getenvBoolDefault("ANTFLY_GEMMA4_DPO_PING_PONG_GRADIENTS", false);
+    const slot_bound_outputs = backend_kind == .metal and
+        platform.env.getenvBoolDefault("ANTFLY_GEMMA4_DPO_SLOT_BOUND_OUTPUTS", false);
+    const completion_cache_enabled = backend_kind == .metal and
+        platform.env.getenvBoolDefault("ANTFLY_GEMMA4_DPO_COMPLETION_FENCED_CACHE", true);
+    const checkpoint_interval_raw = platform.env.getenvUsize("ANTFLY_GEMMA4_DPO_CHECKPOINT_LAYER_INTERVAL") orelse 1;
+    const checkpoint_interval: u32 = @intCast(@min(
+        @max(checkpoint_interval_raw, 1),
+        @as(usize, std.math.maxInt(u32)),
+    ));
+    const dpo_checkpoint_config: ?ml.graph.checkpoint.CheckpointConfig = if (backend_kind == .metal and
+        platform.env.getenvBoolDefault("ANTFLY_GEMMA4_DPO_ACTIVATION_CHECKPOINTING", false))
+        .{
+            .strategy = .every_n_layers,
+            .layer_interval = checkpoint_interval,
+            .recursive_recompute_dependencies = platform.env.getenvBoolDefault("ANTFLY_GEMMA4_DPO_RECURSIVE_CHECKPOINTING", false),
+        }
+    else
+        null;
+
+    const graph_config = try gemma4_real_autodiff.loadGraphConfig(allocator, base_model_dir);
+    // The allocator fences aliases recycled inside a planned encoder and
+    // quarantines releases made outside one. The exact E2B topology is
+    // production-qualified; other shapes remain fail-closed unless explicitly
+    // enabled for research. Setting the variable to 0 is the E2B kill switch.
+    const in_frame_buffer_reuse_enabled = backend_kind == .metal and
+        platform.env.getenvBoolDefault(
+            "ANTFLY_GEMMA4_DPO_IN_FRAME_BUFFER_REUSE",
+            gemma4_real_autodiff.qualifiedE2BTrainingTopology(graph_config),
+        );
+    var backend = try gemma4_real_autodiff.loadBackendForModelDir(allocator, base_model_dir, backend_kind);
+    defer backend.deinit();
+
+    var adapter_inspect = try gemma4.inspectCheckpoint(allocator, bootstrap_dir);
+    defer gemma4.freeInspectionSummary(allocator, &adapter_inspect);
+    const lora_rank = adapter_inspect.lora_rank orelse return error.MissingAdapterConfig;
+    const lora_alpha = @as(f32, @floatCast(adapter_inspect.lora_alpha orelse return error.MissingAdapterConfig));
+    const target_modules = adapter_inspect.target_modules orelse (adapter.target_modules orelse gemma4.default_lora_target_modules[0..]);
+    // Recursive adapters intentionally train distinct use-site parameters.
+    // A dual branch would double those sites rather than share one policy, so
+    // keep the proven two-microbatch path until a recursive-aware pair graph
+    // has an explicit parameter-sharing contract.
+    const requested_grad_accum_steps = recipe.optimizer.gradient_accumulation_steps orelse 1;
+    const compile_pair_objective = pair_objective_requested and !adapter_inspect.recursive_lora_enabled;
+    const dpo_pair_graph_mode: gemma4_real_autodiff.DpoPairGraphMode = if (batch2_pair_forward_requested)
+        .batched_forward
+    else
+        .split_batch1;
+    const detach_pair_gradients = detached_pair_gradients_requested and
+        !compile_pair_objective and
+        requested_grad_accum_steps == 1 and
+        !adapter_inspect.recursive_lora_enabled;
+    const physical_micro_batches_per_pair: usize = if (coalesce_single_token_pairs or compile_pair_objective) 1 else 2;
+    const grad_accum_steps = try preferenceGradAccumSteps(
+        requested_grad_accum_steps,
+        physical_micro_batches_per_pair,
+    );
+    const lora_config = ml.graph.lora.LoRAConfig{
+        .rank = @intCast(lora_rank),
+        .alpha = lora_alpha,
+        .target_patterns = target_modules,
+        .strict_target_patterns = true,
+        .sharing = if (adapter_inspect.recursive_lora_enabled) .by_use else .by_weight,
+    };
+
+    var trainer = try @import("real_autodiff_trainer.zig").RealAutodiffTrainer.init(allocator, backend.backendPtr(), .{
+        .lora = lora_config,
+        .optimizer = .{ .weight_decay = recipe.optimizer.weight_decay orelse 0.01 },
+        .lr_schedule = .{ .constant = recipe.optimizer.learning_rate orelse 0.0001 },
+        .max_grad_norm = recipe.optimizer.max_grad_norm orelse 1.0,
+        .grad_accum_steps = grad_accum_steps,
+        .seed = recipe.optimizer.seed orelse 42,
+        .hidden_size_hint = graph_config.hidden_size,
+        .num_layers_hint = graph_config.num_hidden_layers,
+        .execution_engine = execution_policy.engine,
+        .compiled_required = execution_policy.compiled_required,
+        .strict_metal_execution = execution_policy.strict_metal_execution,
+        .checkpoint_config = dpo_checkpoint_config,
+        .metal_slot_bound_outputs = slot_bound_outputs,
+        // Fixed preference examples and the qualified bucketed policy retain
+        // four graphs by default. Recipes may explicitly admit up to eight;
+        // every run reports actual build/eviction behavior.
+        .graph_cache_capacity = graph_cache_capacity,
+    });
+    defer trainer.deinit();
+
+    var ctx = gemma4_real_autodiff.GemmaAutodiffCtx.init(graph_config);
+    ctx.enable_fused_rms_norm_backward = backend_kind == .metal;
+    ctx.enable_fused_gqa_attention_backward = backend_kind == .metal and gemma4_real_autodiff.fusedGqaAttentionExperimentEnabled(graph_config);
+    ctx.enable_fused_linear_cross_entropy = backend_kind == .metal and
+        !direct_gguf_base and
+        !platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_LINEAR_CCE", false);
+    const bootstrap_example = gemma4_real_autodiff.findFirstSupervisedExample(chosen_prepared.examples) orelse return error.NoTrainingData;
+    try gemma4_real_autodiff.initializeTrainerFromAdapterDir(allocator, &trainer, &ctx, bootstrap_dir, bootstrap_example, @intCast(max_seq_len));
+    const dpo_reference_base_equivalent = gemmaLoraAdapterIsBaseEquivalent(&trainer);
+    var dpo_reference_lora = if (dpo_reference_base_equivalent)
+        try gemma4_real_autodiff.FrozenBaseLoraBindings.init(allocator, &trainer)
+    else
+        try gemma4_real_autodiff.FrozenBaseLoraBindings.initSnapshot(allocator, &trainer);
+    defer dpo_reference_lora.deinit();
+
+    const dpo_minimums = recipe.eval.?.dpo_minimums.?;
+    const dpo_baseline_report_path = if (dpo_minimums.min_accuracy_improvement != null)
+        try preferenceBaselineEvaluationReportPath(allocator, recipe, .dpo)
+    else
+        null;
+    defer if (dpo_baseline_report_path) |path| allocator.free(path);
+    const baseline_evaluation: ?DpoEvaluationSummary = if (dpo_baseline_report_path) |path|
+        try evaluateGemmaDpoHeldout(
+            allocator,
+            io,
+            recipe,
+            tokenizer_view,
+            samples.samples,
+            &trainer,
+            &ctx,
+            base_model_dir,
+            backend_kind,
+            path,
+            false,
+            &dpo_reference_lora,
+            dpo_reference_base_equivalent,
+        )
+    else
+        null;
+
+    var dpo_execution_flags: u64 = 0;
+    if (coalesce_single_token_pairs) dpo_execution_flags |= @as(u64, 1) << 0;
+    if (compile_pair_objective) dpo_execution_flags |= @as(u64, 1) << 1;
+    if (batch2_pair_forward_requested) dpo_execution_flags |= @as(u64, 1) << 2;
+    if (detach_pair_gradients) dpo_execution_flags |= @as(u64, 1) << 3;
+    if (coalesced_snapshot_frame_requested) dpo_execution_flags |= @as(u64, 1) << 4;
+    if (ping_pong_gradients_requested) dpo_execution_flags |= @as(u64, 1) << 5;
+    if (slot_bound_outputs) dpo_execution_flags |= @as(u64, 1) << 6;
+    if (completion_cache_enabled) dpo_execution_flags |= @as(u64, 1) << 7;
+    if (in_frame_buffer_reuse_enabled) dpo_execution_flags |= @as(u64, 1) << 8;
+    if (dpo_checkpoint_config != null) dpo_execution_flags |= @as(u64, 1) << 9;
+    if (ctx.enable_fused_gqa_attention_backward) dpo_execution_flags |= @as(u64, 1) << 10;
+    var numerical_environment = try @import("training_environment.zig").capture(allocator);
+    defer numerical_environment.deinit();
+    const metal_numerical_policy = resolveGemmaMetalNumericalPolicy(backend_kind, &ctx);
+    const dpo_run_fingerprint = try gemmaPreferenceRunFingerprint(
+        allocator,
+        io,
+        recipe,
+        .dpo,
+        base_model_dir,
+        bootstrap_dir,
+        target_modules,
+        @intCast(lora_rank),
+        lora_alpha,
+        adapter_inspect.recursive_lora_enabled,
+        backend_kind,
+        .{
+            .seed = recipe.optimizer.seed orelse 42,
+            .max_examples = max_examples,
+            .max_seq_len = max_seq_len,
+            .epochs = recipe.optimizer.epochs orelse 1,
+            .learning_rate = recipe.optimizer.learning_rate orelse 0.0001,
+            .max_grad_norm = recipe.optimizer.max_grad_norm orelse 1.0,
+            .requested_gradient_accumulation_steps = requested_grad_accum_steps,
+            .physical_micro_batches_per_unit = physical_micro_batches_per_pair,
+            .graph_cache_capacity = graph_cache_capacity,
+            .sequence_length_bucket_quantum = if (length_buckets) |policy| policy.quantum else null,
+            .sequence_length_bucket_min = if (length_buckets) |policy| policy.minimum else null,
+            .direct_gguf_base = direct_gguf_base,
+            .fused_linear_cross_entropy = ctx.enable_fused_linear_cross_entropy orelse false,
+            .execution_flags = dpo_execution_flags,
+            .metal_numerical_policy_flags = if (metal_numerical_policy) |policy| policy.fingerprint_flags else 0,
+            .metal_sparse_loss_chunk_rows = if (metal_numerical_policy) |policy| policy.sparse_loss_chunk_rows else null,
+            .metal_linear_cce_tile_vocab = if (metal_numerical_policy) |policy| policy.linear_cce_tile_vocab else null,
+            .dpo_beta = dpo_objective.preference.beta,
+            .dpo_loss_type = if (dpo_objective.loss_type == .sigmoid) null else @tagName(dpo_objective.loss_type),
+            .dpo_label_smoothing = if (dpo_objective.preference.label_smoothing == 0.0)
+                null
+            else
+                dpo_objective.preference.label_smoothing,
+            .dpo_simpo_gamma = if (dpo_objective.loss_type == .simpo)
+                dpo_objective.preference.simpo_gamma
+            else
+                null,
+            .dpo_ipo_tau = if (dpo_objective.loss_type == .ipo)
+                dpo_objective.preference.ipo_tau
+            else
+                null,
+            .dpo_initial_adapter_reference = if (dpo_reference_base_equivalent) null else true,
+            .dpo_activation_checkpoint_layer_interval = if (dpo_checkpoint_config) |cfg| cfg.layer_interval else null,
+            .dpo_activation_checkpoint_recursive = if (dpo_checkpoint_config) |cfg| cfg.recursive_recompute_dependencies else null,
+        },
+    );
+    const dpo_run_fingerprint_text = try formatSha256DigestAlloc(allocator, dpo_run_fingerprint);
+    defer allocator.free(dpo_run_fingerprint_text);
+    const dpo_checkpoint_path = try preferenceCheckpointPath(allocator, recipe, .dpo);
+    defer if (dpo_checkpoint_path) |path| allocator.free(path);
+    const dpo_resume_enabled = if (recipe.checkpoint) |checkpoint| checkpoint.resume_path != null else false;
+    var dpo_restored = real_autodiff.RestoredTrainingCheckpoint{
+        .micro_batch_steps = 0,
+        .optimizer_steps = 0,
+        .accumulation_micro_batches = 0,
+        .configured_accumulation_steps = grad_accum_steps,
+        .stochastic_steps = 0,
+        .progress = .{},
+    };
+    var loaded_dpo_state: ?LoadedPreferenceCheckpointState = null;
+    defer if (loaded_dpo_state) |*state| state.deinit(allocator);
+    var start_epoch: usize = 0;
+    var initial_adapter_digest = trainerLoRAParameterDigest(&trainer);
+    if (dpo_resume_enabled) {
+        const path = dpo_checkpoint_path orelse return error.CheckpointPathRequired;
+        dpo_restored = try trainer.loadTrainingCheckpoint(path, &dpo_run_fingerprint);
+        loaded_dpo_state = try loadPreferenceCheckpointState(
+            allocator,
+            io,
+            path,
+            .dpo,
+            &dpo_run_fingerprint,
+            dpo_restored,
+        );
+        start_epoch = std.math.cast(usize, dpo_restored.progress.epoch_index) orelse
+            return error.InvalidPreferenceCheckpointState;
+        if (start_epoch > (recipe.optimizer.epochs orelse 1)) {
+            return error.CheckpointBeyondRequestedEpochCount;
+        }
+        initial_adapter_digest = loaded_dpo_state.?.parsed.value.dpo.?.initial_adapter_digest;
+    }
+    const resume_examples_into_epoch: usize = if (loaded_dpo_state) |*state|
+        state.parsed.value.examples_into_epoch
+    else
+        0;
+    const graph_cache_after_initialization = trainer.graphCacheStats();
+
+    // Scope both reuse tiers across the complete DPO workload. The default
+    // remains fail-closed while the planned-encoder path is requalified; the
+    // research admission is explicit and recorded in the DPO report.
+    var dpo_buffer_reuse_scope = try gemma4_real_autodiff.configureMetalBufferReuseForPreferenceRun(
+        &trainer,
+        in_frame_buffer_reuse_enabled,
+        completion_cache_enabled,
+    );
+    defer dpo_buffer_reuse_scope.deinit();
+
+    const epochs = recipe.optimizer.epochs orelse 1;
+    const benchmark_enabled = platform.env.getenvBoolDefault("ANTFLY_GEMMA4_DPO_BENCHMARK", false);
+    if (benchmark_enabled and recipe.checkpoint != null) return error.PreferenceBenchmarkCheckpointingNotSupported;
+    const planned_updates = std.math.mul(usize, chosen_prepared.examples.len, epochs) catch return error.DpoBenchmarkUpdateCountMismatch;
+    if (benchmark_enabled and planned_updates != DpoBenchmarkRecorder.total_updates) {
+        return error.DpoBenchmarkUpdateCountMismatch;
+    }
+    var benchmark: ?DpoBenchmarkRecorder = if (benchmark_enabled) try DpoBenchmarkRecorder.init(allocator) else null;
+    defer if (benchmark) |*recorder| recorder.deinit();
+
+    var reference_cache = if (dpo_objective.needsReference())
+        try precomputeGemmaDpoReferenceCache(
+            allocator,
+            &trainer,
+            &ctx,
+            chosen_prepared.examples,
+            rejected_prepared.examples,
+            @intCast(max_seq_len),
+            coalesce_single_token_pairs,
+            length_buckets,
+            &dpo_reference_lora,
+            dpo_reference_base_equivalent,
+        )
+    else
+        try initUnusedGemmaDpoReferenceCache(
+            allocator,
+            chosen_prepared.examples.len,
+            dpo_reference_base_equivalent,
+        );
+    defer reference_cache.deinit();
+    const graph_cache_after_reference_precompute = trainer.graphCacheStats();
+    const observed_bucket_signature_parity: ?DpoInitialBucketSignatureParity = if (dpo_objective.needsReference())
+        try validateGemmaDpoInitialBucketSignatureParity(
+            allocator,
+            &trainer,
+            &ctx,
+            chosen_prepared.examples,
+            rejected_prepared.examples,
+            &reference_cache,
+            @intCast(max_seq_len),
+            coalesce_single_token_pairs,
+            length_buckets,
+            start_epoch == 0 and resume_examples_into_epoch == 0,
+        )
+    else
+        null;
+    const graph_cache_after_initial_bucket_signature_parity = trainer.graphCacheStats();
+
+    const restored_dpo_aggregates = if (loaded_dpo_state) |*state| state.parsed.value.dpo else null;
+    if (restored_dpo_aggregates) |state| {
+        if (resume_examples_into_epoch >= chosen_prepared.examples.len and
+            resume_examples_into_epoch != 0)
+        {
+            return error.InvalidPreferenceCheckpointState;
+        }
+        const boundary_examples = std.math.mul(usize, start_epoch, chosen_prepared.examples.len) catch
+            return error.InvalidPreferenceCheckpointState;
+        const expected_examples = std.math.add(usize, boundary_examples, resume_examples_into_epoch) catch
+            return error.InvalidPreferenceCheckpointState;
+        if (state.examples_seen != expected_examples) return error.InvalidPreferenceCheckpointState;
+        // A cursor inside the final epoch is resumable, but a cursor at or
+        // beyond the requested epoch count has no examples left to replay.
+        if (resume_examples_into_epoch != 0 and start_epoch >= (recipe.optimizer.epochs orelse 1)) {
+            return error.CheckpointBeyondRequestedEpochCount;
+        }
+    }
+    var total_loss: f64 = if (restored_dpo_aggregates) |state| state.total_loss else 0.0;
+    var total_margin: f64 = if (restored_dpo_aggregates) |state| state.total_margin else 0.0;
+    var total_accuracy: f64 = if (restored_dpo_aggregates) |state| state.total_accuracy else 0.0;
+    var examples_seen: usize = if (restored_dpo_aggregates) |state| state.examples_seen else 0;
+    var initial_logprob_parity: ?DpoInitialLogprobParity = if (restored_dpo_aggregates) |state|
+        state.initial_logprob_parity
+    else
+        null;
+    const initial_bucket_signature_parity: ?DpoInitialBucketSignatureParity = if (restored_dpo_aggregates) |state|
+        state.initial_bucket_signature_parity
+    else
+        observed_bucket_signature_parity;
+    var single_pc = [_]f32{0};
+    var single_pr = [_]f32{0};
+    var single_rc = [_]f32{0};
+    var single_rr = [_]f32{0};
+    var single_cl = [_]u32{0};
+    var single_rl = [_]u32{0};
+    var single_sft = [_]f32{0};
+
+    const checkpoint_every_examples: ?u32 = if (recipe.checkpoint) |checkpoint| checkpoint.every_examples else null;
+    var resume_skip_examples: usize = resume_examples_into_epoch;
+    var epoch_idx: usize = start_epoch;
+    while (epoch_idx < epochs) : (epoch_idx += 1) {
+        // The prepared pair order is the on-disk order every epoch, so a
+        // mid-epoch resume only needs to skip the already-consumed prefix of
+        // the first restored epoch.
+        const epoch_start_example = resume_skip_examples;
+        resume_skip_examples = 0;
+        for (
+            chosen_prepared.examples[epoch_start_example..],
+            rejected_prepared.examples[epoch_start_example..],
+            samples.samples[epoch_start_example..],
+            epoch_start_example..,
+        ) |*chosen_ex, *rejected_ex, sample, sample_idx| {
+            // Mid-epoch cadence saves before the pair at `sample_idx` so the
+            // durable state always describes exactly `sample_idx` completed
+            // pairs, independent of any skip path inside the pair body. The
+            // resume position itself is not re-saved.
+            if (checkpoint_every_examples) |every| {
+                if (sample_idx != 0 and
+                    sample_idx != epoch_start_example and
+                    sample_idx % @as(usize, every) == 0)
+                {
+                    const path = dpo_checkpoint_path orelse return error.CheckpointPathRequired;
+                    try savePreferenceCheckpoint(
+                        allocator,
+                        io,
+                        &trainer,
+                        path,
+                        .dpo,
+                        epoch_idx,
+                        sample_idx,
+                        examples_seen,
+                        &dpo_run_fingerprint,
+                        .{
+                            .task = @tagName(PreferenceTask.dpo),
+                            .run_fingerprint_sha256 = dpo_run_fingerprint_text,
+                            .epoch_index = epoch_idx,
+                            .examples_into_epoch = sample_idx,
+                            .micro_batch_steps = trainer.microBatchSteps(),
+                            .optimizer_steps = trainer.optimizerSteps(),
+                            .accumulation_micro_batches = trainer.accumulatedMicroBatches(),
+                            .dpo = .{
+                                .initial_adapter_digest = initial_adapter_digest,
+                                .examples_seen = examples_seen,
+                                .total_loss = total_loss,
+                                .total_margin = total_margin,
+                                .total_accuracy = total_accuracy,
+                                .initial_logprob_parity = initial_logprob_parity,
+                                .initial_bucket_signature_parity = initial_bucket_signature_parity,
+                            },
+                        },
+                    );
+                }
+            }
+            const update_started_ns = if (benchmark_enabled) platform.time.monotonicNs() else 0;
+            const pair_schedule = try gemmaDpoPairSchedule(
+                chosen_ex,
+                rejected_ex,
+                @intCast(max_seq_len),
+                length_buckets,
+            );
+            var policy_chosen: f32 = 0.0;
+            var policy_rejected: f32 = 0.0;
+            var detached_device_gradients: ?real_autodiff.DetachedDeviceGradients = null;
+            defer if (detached_device_gradients) |*gradients| gradients.deinit();
+            // The pair graph owns policy scoring after the initial oracle
+            // check. Keeping exactly one live-policy comparison preserves the
+            // base-equivalence gate without putting two score-only forwards
+            // back into every measured update.
+            if (detach_pair_gradients) {
+                // Execute each exact batch-1 branch once. A coefficient of one
+                // makes the graph's scalar loss equal the raw summed sequence
+                // log-probability and its gradient equal d(logp)/d(theta).
+                // The chosen gradient is detached before rejected executes, so
+                // neither branch updates weights or retains model activations.
+                var chosen_raw_input = if (length_buckets == null)
+                    try gemma4_real_autodiff.makeTrainerInputForLogprobCoeff(
+                        allocator,
+                        &ctx,
+                        chosen_ex,
+                        @intCast(max_seq_len),
+                        1.0,
+                    )
+                else
+                    try gemma4_real_autodiff.makeTrainerInputForLogprobCoeffScheduled(
+                        allocator,
+                        &ctx,
+                        chosen_ex,
+                        pair_schedule.sequence_length,
+                        pair_schedule.weighted_target_rows,
+                        1.0,
+                    );
+                defer chosen_raw_input.deinit(allocator);
+                const chosen_raw_step = try trainer.step(chosen_raw_input.trainer_input);
+                if (chosen_raw_step.optimizer_stepped) return error.DpoDetachedGradientSteppedEarly;
+                policy_chosen = chosen_raw_step.loss;
+                detached_device_gradients = try trainer.detachAccumulatedDeviceGradients();
+
+                var rejected_raw_input = if (length_buckets == null)
+                    try gemma4_real_autodiff.makeTrainerInputForLogprobCoeff(
+                        allocator,
+                        &ctx,
+                        rejected_ex,
+                        @intCast(max_seq_len),
+                        1.0,
+                    )
+                else
+                    try gemma4_real_autodiff.makeTrainerInputForLogprobCoeffScheduled(
+                        allocator,
+                        &ctx,
+                        rejected_ex,
+                        pair_schedule.sequence_length,
+                        pair_schedule.weighted_target_rows,
+                        1.0,
+                    );
+                defer rejected_raw_input.deinit(allocator);
+                const rejected_raw_step = try trainer.step(rejected_raw_input.trainer_input);
+                if (rejected_raw_step.optimizer_stepped) return error.DpoDetachedGradientSteppedEarly;
+                policy_rejected = rejected_raw_step.loss;
+            } else if (!compile_pair_objective or examples_seen == 0) {
+                if (coalesce_single_token_pairs) {
+                    const pair = gemmaDpoSingleTokenPair(chosen_ex, rejected_ex) orelse return error.DpoSingleTokenPairContractMismatch;
+                    const candidate_tokens = [_]i32{ pair.chosen_token, pair.rejected_token };
+                    var pair_logps: [2]f32 = undefined;
+                    try gemma4_real_autodiff.singleTokenCandidateLogprobsForPrompt(
+                        allocator,
+                        &trainer,
+                        &ctx,
+                        pair.prompt,
+                        &candidate_tokens,
+                        pair_schedule.sequence_length,
+                        &pair_logps,
+                    );
+                    policy_chosen = pair_logps[0];
+                    policy_rejected = pair_logps[1];
+                } else {
+                    policy_chosen = if (length_buckets == null)
+                        try gemma4_real_autodiff.sequenceLogprobForExample(
+                            allocator,
+                            &trainer,
+                            &ctx,
+                            chosen_ex,
+                            @intCast(max_seq_len),
+                        )
+                    else
+                        try gemma4_real_autodiff.sequenceLogprobForExampleScheduled(
+                            allocator,
+                            &trainer,
+                            &ctx,
+                            chosen_ex,
+                            pair_schedule.sequence_length,
+                            pair_schedule.weighted_target_rows,
+                        );
+                    policy_rejected = if (length_buckets == null)
+                        try gemma4_real_autodiff.sequenceLogprobForExample(
+                            allocator,
+                            &trainer,
+                            &ctx,
+                            rejected_ex,
+                            @intCast(max_seq_len),
+                        )
+                    else
+                        try gemma4_real_autodiff.sequenceLogprobForExampleScheduled(
+                            allocator,
+                            &trainer,
+                            &ctx,
+                            rejected_ex,
+                            pair_schedule.sequence_length,
+                            pair_schedule.weighted_target_rows,
+                        );
+                }
+            }
+
+            single_rc[0] = reference_cache.chosen_logps[sample_idx];
+            single_rr[0] = reference_cache.rejected_logps[sample_idx];
+
+            if (examples_seen == 0 and dpo_objective.needsReference()) {
+                const max_abs_error = @max(
+                    @abs(policy_chosen - single_rc[0]),
+                    @abs(policy_rejected - single_rr[0]),
+                );
+                initial_logprob_parity = .{
+                    .policy_chosen_logp = policy_chosen,
+                    .policy_rejected_logp = policy_rejected,
+                    .reference_chosen_logp = single_rc[0],
+                    .reference_rejected_logp = single_rr[0],
+                    .max_abs_error = max_abs_error,
+                    .base_equivalent_policy = reference_cache.base_equivalent_policy,
+                };
+                if (platform.env.getenvBoolDefault("ANTFLY_GEMMA4_PREFERENCE_TRACE", false)) {
+                    print(
+                        "gemma4 dpo initial logps: policy_chosen={d:.9} policy_rejected={d:.9} ref_chosen={d:.9} ref_rejected={d:.9} prompt_tokens={} chosen_tokens={} rejected_tokens={}\n",
+                        .{
+                            policy_chosen,
+                            policy_rejected,
+                            single_rc[0],
+                            single_rr[0],
+                            sample.prompt_tokens.len,
+                            sample.chosen_tokens.len,
+                            sample.rejected_tokens.len,
+                        },
+                    );
+                }
+                if (max_abs_error > 1e-4) {
+                    return error.GemmaDpoInitialReferenceParityMismatch;
+                }
+            }
+
+            var update_loss: f32 = undefined;
+            var update_margin: f32 = undefined;
+            var update_accuracy: f32 = undefined;
+            if (compile_pair_objective) {
+                var pair_input = try gemma4_real_autodiff.makeTrainerInputForDpoPair(
+                    allocator,
+                    &ctx,
+                    chosen_ex,
+                    rejected_ex,
+                    pair_schedule.sequence_length,
+                    dpo_pair_graph_mode,
+                    single_rc[0],
+                    single_rr[0],
+                    dpo_objective.preference.beta,
+                );
+                defer pair_input.deinit(allocator);
+                const pair_step = try trainer.step(pair_input.trainer_input);
+                update_loss = pair_step.loss;
+                update_margin = try rewardMarginFromDpoLoss(pair_step.loss);
+                update_accuracy = if (update_margin > 0.0) 1.0 else 0.0;
+            } else {
+                single_pc[0] = policy_chosen;
+                single_pr[0] = policy_rejected;
+                single_cl[0] = @intCast(sample.chosen_tokens.len);
+                single_rl[0] = @intCast(sample.rejected_tokens.len);
+                single_sft[0] = sample.sft_chosen_loss orelse 0;
+
+                var step_result = try preference_loss.pairedPreferenceLoss(allocator, .{
+                    .policy_chosen_logps = single_pc[0..1],
+                    .policy_rejected_logps = single_pr[0..1],
+                    .ref_chosen_logps = single_rc[0..1],
+                    .ref_rejected_logps = single_rr[0..1],
+                    .chosen_lengths = single_cl[0..1],
+                    .rejected_lengths = single_rl[0..1],
+                    .sft_chosen_loss = single_sft[0..1],
+                }, dpo_objective.preference);
+                defer step_result.deinit();
+                if (!coalesce_single_token_pairs) {
+                    try scalePreferenceUnitGradients(step_result.grad_chosen, 2);
+                    try scalePreferenceUnitGradients(step_result.grad_rejected, 2);
+                }
+                update_loss = step_result.loss;
+                update_margin = step_result.mean_reward_margin;
+                update_accuracy = step_result.accuracy;
+
+                if (detach_pair_gradients) {
+                    if (detached_device_gradients) |*detached| {
+                        try trainer.combineDetachedDeviceGradients(
+                            detached,
+                            step_result.grad_chosen[0],
+                            step_result.grad_rejected[0],
+                        );
+                    } else return error.MissingDpoDetachedGradient;
+                    detached_device_gradients = null;
+
+                    const flush = (try trainer.flushAccumulatedGradients()) orelse
+                        return error.MissingDpoDetachedGradientUpdate;
+                    if (flush.micro_batches != 2 or
+                        trainer.accumulatedMicroBatches() != 0 or
+                        trainer.optimizerSteps() != @as(u64, @intCast(examples_seen + 1)))
+                    {
+                        return error.InvalidDpoDetachedGradientUpdate;
+                    }
+                } else if (coalesce_single_token_pairs) {
+                    const pair = gemmaDpoSingleTokenPair(chosen_ex, rejected_ex) orelse return error.DpoSingleTokenPairContractMismatch;
+                    const candidate_tokens = [_]i32{ pair.chosen_token, pair.rejected_token };
+                    const logprob_grads = [_]f32{ step_result.grad_chosen[0], step_result.grad_rejected[0] };
+                    var pair_input = try gemma4_real_autodiff.makeTrainerInputForSingleTokenCandidatesLogprobGrads(
+                        allocator,
+                        &ctx,
+                        chosen_ex,
+                        pair_schedule.sequence_length,
+                        &candidate_tokens,
+                        &logprob_grads,
+                    );
+                    defer pair_input.deinit(allocator);
+                    _ = try trainer.step(pair_input.trainer_input);
+                } else {
+                    var chosen_input = if (length_buckets == null)
+                        try gemma4_real_autodiff.makeTrainerInputForLogprobCoeff(
+                            allocator,
+                            &ctx,
+                            chosen_ex,
+                            @intCast(max_seq_len),
+                            step_result.grad_chosen[0],
+                        )
+                    else
+                        try gemma4_real_autodiff.makeTrainerInputForLogprobCoeffScheduled(
+                            allocator,
+                            &ctx,
+                            chosen_ex,
+                            pair_schedule.sequence_length,
+                            pair_schedule.weighted_target_rows,
+                            step_result.grad_chosen[0],
+                        );
+                    defer chosen_input.deinit(allocator);
+                    _ = try trainer.step(chosen_input.trainer_input);
+
+                    var rejected_input = if (length_buckets == null)
+                        try gemma4_real_autodiff.makeTrainerInputForLogprobCoeff(
+                            allocator,
+                            &ctx,
+                            rejected_ex,
+                            @intCast(max_seq_len),
+                            step_result.grad_rejected[0],
+                        )
+                    else
+                        try gemma4_real_autodiff.makeTrainerInputForLogprobCoeffScheduled(
+                            allocator,
+                            &ctx,
+                            rejected_ex,
+                            pair_schedule.sequence_length,
+                            pair_schedule.weighted_target_rows,
+                            step_result.grad_rejected[0],
+                        );
+                    defer rejected_input.deinit(allocator);
+                    _ = try trainer.step(rejected_input.trainer_input);
+                }
+            }
+
+            total_loss += update_loss;
+            total_margin += update_margin;
+            total_accuracy += update_accuracy;
+            examples_seen += 1;
+
+            if (benchmark) |*recorder| {
+                const elapsed_ns = platform.time.monotonicNs() - update_started_ns;
+                try recorder.record(
+                    @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s,
+                    update_loss,
+                );
+            }
+        }
+        const completed_epochs = epoch_idx + 1;
+        const checkpoint_every = if (recipe.checkpoint) |checkpoint| checkpoint.every_epochs else null;
+        if (checkpoint_every) |every| {
+            if (completed_epochs % @as(usize, every) == 0 or completed_epochs == epochs) {
+                const path = dpo_checkpoint_path orelse return error.CheckpointPathRequired;
+                try savePreferenceCheckpoint(
+                    allocator,
+                    io,
+                    &trainer,
+                    path,
+                    .dpo,
+                    completed_epochs,
+                    0,
+                    examples_seen,
+                    &dpo_run_fingerprint,
+                    .{
+                        .task = @tagName(PreferenceTask.dpo),
+                        .run_fingerprint_sha256 = dpo_run_fingerprint_text,
+                        .epoch_index = completed_epochs,
+                        .micro_batch_steps = trainer.microBatchSteps(),
+                        .optimizer_steps = trainer.optimizerSteps(),
+                        .accumulation_micro_batches = trainer.accumulatedMicroBatches(),
+                        .dpo = .{
+                            .initial_adapter_digest = initial_adapter_digest,
+                            .examples_seen = examples_seen,
+                            .total_loss = total_loss,
+                            .total_margin = total_margin,
+                            .total_accuracy = total_accuracy,
+                            .initial_logprob_parity = initial_logprob_parity,
+                            .initial_bucket_signature_parity = initial_bucket_signature_parity,
+                        },
+                    },
+                );
+            }
+        }
+    }
+
+    const benchmark_telemetry = if (benchmark) |*recorder| try recorder.finish() else null;
+
+    _ = try trainer.flushAccumulatedGradients();
+    if (recipe.checkpoint) |checkpoint| if (checkpoint.every_epochs != null) {
+        const path = dpo_checkpoint_path orelse return error.CheckpointPathRequired;
+        try savePreferenceCheckpoint(
+            allocator,
+            io,
+            &trainer,
+            path,
+            .dpo,
+            epochs,
+            0,
+            examples_seen,
+            &dpo_run_fingerprint,
+            .{
+                .task = @tagName(PreferenceTask.dpo),
+                .run_fingerprint_sha256 = dpo_run_fingerprint_text,
+                .epoch_index = epochs,
+                .micro_batch_steps = trainer.microBatchSteps(),
+                .optimizer_steps = trainer.optimizerSteps(),
+                .accumulation_micro_batches = trainer.accumulatedMicroBatches(),
+                .dpo = .{
+                    .initial_adapter_digest = initial_adapter_digest,
+                    .examples_seen = examples_seen,
+                    .total_loss = total_loss,
+                    .total_margin = total_margin,
+                    .total_accuracy = total_accuracy,
+                    .initial_logprob_parity = initial_logprob_parity,
+                    .initial_bucket_signature_parity = initial_bucket_signature_parity,
+                },
+            },
+        );
+    };
+    if (trainer.optimizerSteps() == 0) return error.NoOptimizerSteps;
+    try validateTrainerAdapterChanged(&trainer, initial_adapter_digest);
+    const graph_cache_after_training = trainer.graphCacheStats();
+
+    const evaluation_report_path = try preferenceEvaluationReportPath(allocator, recipe, .dpo);
+    defer allocator.free(evaluation_report_path);
+    // Quality admission must be a function of the published policy and held-
+    // out data, not of how many allocator generations the training process
+    // happened to retire before evaluation. In particular, uninterrupted and
+    // resumed E4B runs can reach byte-identical adapter weights while the live
+    // Metal runtime retains different allocation history. Snapshot the exact
+    // final values to host, retire the training device state, and evaluate on
+    // a separately initialized backend/trainer with both private-buffer reuse
+    // tiers disabled.
+    var graph_cache_after_evaluation = graph_cache_after_training;
+    const evaluation = evaluation: {
+        try trainer.prepareTerminalEvaluationFromHostSnapshot();
+
+        var evaluation_backend = try gemma4_real_autodiff.loadBackendForModelDir(
+            allocator,
+            base_model_dir,
+            backend_kind,
+        );
+        defer evaluation_backend.deinit();
+        var evaluation_trainer = try real_autodiff.RealAutodiffTrainer.init(
+            allocator,
+            evaluation_backend.backendPtr(),
+            .{
+                .lora = lora_config,
+                .optimizer = .{ .weight_decay = recipe.optimizer.weight_decay orelse 0.01 },
+                .lr_schedule = .{ .constant = recipe.optimizer.learning_rate orelse 0.0001 },
+                .max_grad_norm = recipe.optimizer.max_grad_norm orelse 1.0,
+                .grad_accum_steps = grad_accum_steps,
+                .seed = recipe.optimizer.seed orelse 42,
+                .hidden_size_hint = graph_config.hidden_size,
+                .num_layers_hint = graph_config.num_hidden_layers,
+                .execution_engine = execution_policy.engine,
+                .compiled_required = execution_policy.compiled_required,
+                .strict_metal_execution = execution_policy.strict_metal_execution,
+                .checkpoint_config = dpo_checkpoint_config,
+                .metal_slot_bound_outputs = slot_bound_outputs,
+                .graph_cache_capacity = graph_cache_capacity,
+            },
+        );
+        defer evaluation_trainer.deinit();
+        var evaluation_ctx = gemma4_real_autodiff.GemmaAutodiffCtx.init(graph_config);
+        evaluation_ctx.enable_fused_rms_norm_backward = ctx.enable_fused_rms_norm_backward;
+        evaluation_ctx.enable_fused_gqa_attention_backward = ctx.enable_fused_gqa_attention_backward;
+        evaluation_ctx.enable_fused_linear_cross_entropy = ctx.enable_fused_linear_cross_entropy;
+        var canonical_eval_reuse_scope = try gemma4_real_autodiff.configureMetalBufferReuseForPreferenceRun(
+            &evaluation_trainer,
+            false,
+            false,
+        );
+        defer canonical_eval_reuse_scope.deinit();
+        try gemma4_real_autodiff.initializeTrainerFromAdapterDir(
+            allocator,
+            &evaluation_trainer,
+            &evaluation_ctx,
+            bootstrap_dir,
+            bootstrap_example,
+            @intCast(max_seq_len),
+        );
+        const evaluation_reference_base_equivalent = gemmaLoraAdapterIsBaseEquivalent(&evaluation_trainer);
+        var evaluation_reference_lora = if (evaluation_reference_base_equivalent)
+            try gemma4_real_autodiff.FrozenBaseLoraBindings.init(allocator, &evaluation_trainer)
+        else
+            try gemma4_real_autodiff.FrozenBaseLoraBindings.initSnapshot(allocator, &evaluation_trainer);
+        defer evaluation_reference_lora.deinit();
+        try evaluation_trainer.initializeTerminalEvaluationFromHostSnapshot(&trainer);
+        const summary = try evaluateGemmaDpoHeldout(
+            allocator,
+            io,
+            recipe,
+            tokenizer_view,
+            samples.samples,
+            &evaluation_trainer,
+            &evaluation_ctx,
+            base_model_dir,
+            backend_kind,
+            evaluation_report_path,
+            true,
+            &evaluation_reference_lora,
+            evaluation_reference_base_equivalent,
+        );
+        graph_cache_after_evaluation = evaluation_trainer.graphCacheStats();
+        break :evaluation summary;
+    };
+
+    const baseline_relative: ?DpoBaselineRelativeSummary = if (baseline_evaluation) |baseline| relative: {
+        const summary = compareDpoToBaseline(baseline, evaluation, dpo_minimums);
+        break :relative summary;
+    } else null;
+    const baseline_relative_passed = if (baseline_relative) |summary| summary.passed else true;
+
+    if (baseline_relative_passed) {
+        try gemma4_real_autodiff.saveTrainerAsGemmaBundle(allocator, &trainer, base_model_dir, bootstrap_dir, trained_dir);
+        try validatePublishedAdapterChanged(allocator, io, bootstrap_dir, trained_dir);
+    }
+    // Report only completion-published storage. This also guarantees the
+    // override can drain/restore the cache at its defer boundary.
+    try trainer.compute_backend.decoderRuntimeSubmitAndWaitFrame();
+    const completion_cache_stats = gemma4_real_autodiff.metalCompletionCacheStats(&trainer);
+    const completion_cache_telemetry: ?DpoMetalCompletionCacheTelemetry = if (backend_kind == .metal)
+        .{
+            .enabled = completion_cache_stats.enabled,
+            .max_bytes = completion_cache_stats.max_bytes,
+            .available_bytes = completion_cache_stats.available_bytes,
+            .available_slots = completion_cache_stats.available_slots,
+            .peak_bytes = completion_cache_stats.peak_bytes,
+            .peak_slots = completion_cache_stats.peak_slots,
+            .requests = completion_cache_stats.requests,
+            .hits = completion_cache_stats.hits,
+            .misses = completion_cache_stats.misses,
+            .retired = completion_cache_stats.retired,
+            .evictions = completion_cache_stats.evictions,
+            .completed_generation = completion_cache_stats.completed_generation,
+        }
+    else
+        null;
+
+    var dpo_checkpoint_artifact = try preferenceCheckpointArtifactSummary(
+        allocator,
+        dpo_checkpoint_path,
+        .dpo,
+        trainer.trainingProgress(),
+    );
+    defer if (dpo_checkpoint_artifact) |*artifact| artifact.deinit(allocator);
+
+    const denom = @as(f64, @floatFromInt(@max(examples_seen, 1)));
+    try writeJsonFile(allocator, io, report_path, DpoReport{
+        .execution_mode = "train",
+        .dataset_format = recipe.dataset.format.?,
+        .examples = examples_seen,
+        .loss = @floatCast(total_loss / denom),
+        .mean_reward_margin = @floatCast(total_margin / denom),
+        .accuracy = @floatCast(total_accuracy / denom),
+        .beta = dpo_objective.preference.beta,
+        .loss_type = @tagName(dpo_objective.loss_type),
+        .logprob_aggregation = dpo_objective.logprobAggregation(),
+        .label_smoothing = dpo_objective.preference.label_smoothing,
+        .training_seed = recipe.optimizer.seed orelse 42,
+        .policy_backend = @tagName(backend_kind),
+        .optimizer_steps = trainer.optimizerSteps(),
+        .micro_batch_steps = trainer.microBatchSteps(),
+        .policy_scoring_mode = if (coalesce_single_token_pairs)
+            "shared-prompt-single-row"
+        else if (compile_pair_objective)
+            "initial-parity-only-then-in-graph"
+        else if (detach_pair_gradients)
+            "backward-loss-reuse-device-detached"
+        else
+            "compiled-loss-only-device-reduced",
+        .training_microbatch_mode = if (coalesce_single_token_pairs)
+            "coalesced-single-token-pair-sparse-weighted-row"
+        else if (compile_pair_objective)
+            if (dpo_pair_graph_mode == .batched_forward)
+                "compiled-single-forward-batch2-pair-in-graph-dpo"
+            else
+                "compiled-split-batch1-pair-in-graph-dpo"
+        else if (detach_pair_gradients)
+            "chosen-rejected-raw-gradients-device-combined"
+        else
+            "chosen-rejected-pair-fused-uniform-cce",
+        .device_gradient_snapshot_mode = if (!detach_pair_gradients)
+            "not-applicable"
+        else if (ping_pong_gradients_requested)
+            "persistent-ping-pong-accumulator-swap"
+        else if (coalesced_snapshot_frame_requested)
+            "single-frame-copy-then-clear"
+        else
+            "per-copy-wait-then-single-frame-clear",
+        .activation_checkpointing_mode = if (dpo_checkpoint_config) |cfg|
+            if (cfg.recursive_recompute_dependencies)
+                "every-n-layers-recursive-recompute"
+            else
+                "every-n-layers-direct-recompute"
+        else
+            "disabled",
+        .activation_checkpointing_layer_interval = if (dpo_checkpoint_config) |cfg| cfg.layer_interval else null,
+        .metal_buffer_reuse_mode = if (backend_kind != .metal)
+            "not-applicable"
+        else if (in_frame_buffer_reuse_enabled and completion_cache_enabled)
+            "planned-encoder-fenced-in-frame-reuse;completion-fenced-cross-frame-cache"
+        else if (in_frame_buffer_reuse_enabled)
+            "planned-encoder-fenced-in-frame-reuse;cross-frame-cache-disabled"
+        else if (completion_cache_enabled)
+            "completion-fenced-cross-frame-cache;in-frame-reuse-disabled"
+        else if (slot_bound_outputs)
+            "compiler-slot-workspace;in-frame-reuse-disabled"
+        else
+            "disabled-for-dpo-run",
+        .metal_completion_cache = completion_cache_telemetry,
+        .reference_mode = gemmaDpoObjectiveReferenceMode(
+            dpo_objective,
+            reference_cache.base_equivalent_policy,
+            coalesce_single_token_pairs,
+        ),
+        .reference_precompute_seconds = reference_cache.precompute_seconds,
+        .initial_logprob_parity = initial_logprob_parity,
+        .initial_bucket_signature_parity = initial_bucket_signature_parity,
+        .sequence_length_policy = sequence_length_policy,
+        .graph_cache = .{
+            .after_initialization = graph_cache_after_initialization,
+            .after_reference_precompute = graph_cache_after_reference_precompute,
+            .after_initial_bucket_signature_parity = graph_cache_after_initial_bucket_signature_parity,
+            .after_training = graph_cache_after_training,
+            .after_evaluation = graph_cache_after_evaluation,
+        },
+        .benchmark = benchmark_telemetry,
+        .checkpoint_resume = .{
+            .enabled = dpo_resume_enabled,
+            .start_epoch = start_epoch,
+            .start_examples_into_epoch = resume_examples_into_epoch,
+            .checkpoint_path = dpo_checkpoint_path,
+            .checkpoint_state_path = if (dpo_checkpoint_artifact) |artifact| artifact.state_path else null,
+            .checkpoint_state_sha256 = if (dpo_checkpoint_artifact) |artifact| artifact.state_sha256 else null,
+            .checkpoint_epoch = if (dpo_checkpoint_artifact) |artifact| artifact.epoch else null,
+            .checkpoint_every_epochs = if (recipe.checkpoint) |checkpoint| checkpoint.every_epochs else null,
+            .checkpoint_every_examples = if (recipe.checkpoint) |checkpoint| checkpoint.every_examples else null,
+            .run_fingerprint_sha256 = dpo_run_fingerprint_text,
+            .restored_micro_batch_steps = dpo_restored.micro_batch_steps,
+            .restored_optimizer_steps = dpo_restored.optimizer_steps,
+            .restored_accumulation_micro_batches = dpo_restored.accumulation_micro_batches,
+        },
+        .metal_numerical_policy = metal_numerical_policy,
+        .numerical_environment_overrides = numerical_environment.assignments,
+        .optimizer_weight_decay = recipe.optimizer.weight_decay orelse 0.01,
+        .evaluation_execution_policy = canonical_preference_evaluation_policy,
+        .baseline_evaluation = baseline_evaluation,
+        .baseline_relative = baseline_relative,
+        .evaluation = evaluation,
+        .trained_adapter_dir = if (baseline_relative_passed) trained_dir else null,
+    });
+    if (!baseline_relative_passed) return error.DpoBaselineRelativeEvaluationGateFailed;
+    print("dpo report: {s}\ntrained adapter: {s}\n", .{ report_path, trained_dir });
+}
+
+/// Gemma 4 DPO on the strict CUDA optimizer lane (from main, PR #626).
+///
+/// The Metal/native lane (`runOptimizerBackedGemmaDpo`) carries the held-out
+/// evaluation, checkpoint/resume and Metal numerical-policy contract. This
+/// lane keeps main's CUDA contract instead: it rejects those lifecycle knobs
+/// (see `validateGemma4CudaPreferenceRecipeContract`), implies `train` mode,
+/// keeps tokenizer/reward/external-reference models on host sessions, reuses
+/// the resident policy checkpoint as a frozen same-base reference, and proves
+/// device optimizer movement through `TrainableParameterSnapshot`.
+fn runOptimizerBackedGemmaDpoCuda(
     allocator: std.mem.Allocator,
     io: std.Io,
     recipe: Recipe,
@@ -3825,12 +9839,15 @@ fn runOptimizerBackedGemmaDpo(
     const trained_dir = trained_dir_config orelse try defaultArtifactPath(allocator, recipe, "adapter-trained");
     defer if (trained_dir_config == null) allocator.free(trained_dir);
     const reference_path = recipe.model.reference_path orelse base_model_dir;
-    const backend_kind = try gemmaAutodiffBackendKind(recipe.backend);
+    const backend_kind = (try resolveGemmaPreferenceExecution(recipe.backend)).backend_kind;
+    if (backend_kind != .cuda) return error.UnsupportedBackend;
+    const dpo_objective = try resolveDpoObjectiveConfig(recipe.preference);
     const max_examples = recipe.dataset.max_examples orelse 32;
     const max_seq_len = recipe.dataset.max_seq_len orelse 512;
     try validateGemmaPreferenceAdapterOptions(adapter);
     try validateGemmaPreferenceLifecycleOptions(recipe);
     try validateGemmaDpoObjectiveOptions(recipe);
+    try validateGemmaCudaDpoLossOptions(dpo_objective);
 
     compat.cwd().access(compat.io(), bootstrap_dir, .{}) catch {
         var bootstrap = try gemma4.bootstrapLoRABundle(allocator, base_model_dir, bootstrap_dir, .{
@@ -3838,9 +9855,11 @@ fn runOptimizerBackedGemmaDpo(
             .alpha = adapterAlpha(adapter),
             .base_model_name_or_path = adapter.base_model_name_or_path,
             .target_modules = adapter.target_modules,
-            .target_preset = try gemmaTargetPreset(adapter),
+            .gemma4_target_preset = gemma4TargetPreset(adapter),
+            .target_preset = try gemmaLegacyTargetPreset(adapter),
             .use_dora = adapter.use_dora orelse false,
             .init_lora_weights = adapter.init_lora_weights,
+            .initialization_seed = adapter.initialization_seed orelse 0,
         });
         defer gemma4.freeBootstrapSummary(allocator, &bootstrap);
     };
@@ -3860,7 +9879,13 @@ fn runOptimizerBackedGemmaDpo(
 
     // Preference tokens always belong to the trainable policy vocabulary.
     // An external reference checkpoint only supplies reference log-probs.
-    var samples = try loadDpoTextPreferenceSamples(allocator, io, dataset_path, recipe, tokenizer_model);
+    var samples = try loadDpoTextPreferenceSamples(
+        allocator,
+        io,
+        dataset_path,
+        recipe,
+        PreferenceTokenizerView.fromLoadedModel(tokenizer_model),
+    );
     defer samples.deinit();
 
     var chosen_prepared = try prepareGemmaDpoPreparedExamplesFromSamples(allocator, base_model_dir, samples.samples, max_examples, max_seq_len, .chosen);
@@ -4005,13 +10030,7 @@ fn runOptimizerBackedGemmaDpo(
             .chosen_lengths = single_cl[0..1],
             .rejected_lengths = single_rl[0..1],
             .sft_chosen_loss = single_sft[0..1],
-        }, .{
-            .kind = .dpo,
-            .beta = recipe.preference.beta orelse 0.1,
-            .simpo_gamma = recipe.preference.simpo_gamma orelse 0.5,
-            .sft_lambda = recipe.preference.sft_lambda orelse 1.0,
-            .ipo_tau = recipe.preference.ipo_tau orelse 0.1,
-        });
+        }, dpo_objective.preference);
         defer step_result.deinit();
 
         total_loss += step_result.loss;
@@ -4060,11 +10079,19 @@ fn runOptimizerBackedGemmaDpo(
 
     const denom = @as(f64, @floatFromInt(@max(examples_seen, 1)));
     try writeJsonFile(allocator, io, report_path, DpoReport{
+        .execution_mode = "train",
+        .dataset_format = recipe.dataset.format orelse "text-preference",
         .examples = examples_seen,
         .loss = @floatCast(total_loss / denom),
         .mean_reward_margin = @floatCast(total_margin / denom),
         .accuracy = @floatCast(total_accuracy / denom),
-        .beta = recipe.preference.beta orelse 0.1,
+        .beta = dpo_objective.preference.beta,
+        .loss_type = @tagName(dpo_objective.loss_type),
+        .logprob_aggregation = dpo_objective.logprobAggregation(),
+        .label_smoothing = dpo_objective.preference.label_smoothing,
+        .optimizer_weight_decay = recipe.optimizer.weight_decay orelse 0.01,
+        .reference_mode = if (shared_base_reference != null) "shared-base-frozen-scorer" else "external-decoder-model",
+        .trained_adapter_dir = trained_dir,
         .policy_backend = @tagName(backend_kind),
         .optimizer_backend = if (backend_kind == .cuda) "cuda" else "host",
         .optimizer_steps = trainer.optimizerSteps(),
@@ -4078,6 +10105,259 @@ fn runOptimizerBackedGemmaDpo(
     print("dpo report: {s}\ntrained adapter: {s}\n", .{ report_path, trained_dir });
 }
 
+fn evaluateGemmaDpoHeldout(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    recipe: Recipe,
+    tokenizer_view: PreferenceTokenizerView,
+    train_samples: []const preference_harness.PreferenceSample,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    ctx: *gemma4_real_autodiff.GemmaAutodiffCtx,
+    base_model_dir: []const u8,
+    backend_kind: gemma4_real_autodiff.BackendKind,
+    report_path: []const u8,
+    enforce_minimums: bool,
+    reference_lora: *const gemma4_real_autodiff.FrozenBaseLoraBindings,
+    reference_base_equivalent: bool,
+) !DpoEvaluationSummary {
+    const dpo_objective = try resolveDpoObjectiveConfig(recipe.preference);
+    const eval_path = evalDatasetPath(recipe) orelse return error.MissingPreferenceEvaluationDataset;
+    const minimums = recipe.eval.?.dpo_minimums orelse return error.MissingDpoEvaluationMinimums;
+    var eval_recipe = recipe;
+    eval_recipe.dataset.max_examples = evalMaxExamples(recipe);
+    var samples = try loadDpoTextPreferenceSamples(allocator, io, eval_path, eval_recipe, tokenizer_view);
+    defer samples.deinit();
+    const dataset_fingerprint = try fingerprintPath(allocator, io, "eval_dataset", eval_path);
+    defer if (dataset_fingerprint.digest) |digest| allocator.free(digest);
+    const policy_adapter_digest = try formatSha256DigestAlloc(allocator, trainerLoRAParameterDigest(trainer));
+    defer allocator.free(policy_adapter_digest);
+
+    const overlap_count = try countPreferencePromptOverlaps(allocator, train_samples, samples.samples);
+    if (overlap_count != 0) {
+        try writeJsonFile(allocator, io, report_path, DpoEvaluationReport{
+            .status = "failed-prompt-overlap",
+            .dataset_path = eval_path,
+            .dataset_fingerprint = dataset_fingerprint,
+            .policy_adapter_digest = policy_adapter_digest,
+            .policy_backend = @tagName(backend_kind),
+            .metal_numerical_policy = resolveGemmaMetalNumericalPolicy(backend_kind, ctx),
+            .optimizer_weight_decay = recipe.optimizer.weight_decay orelse 0.01,
+            .examples = samples.samples.len,
+            .prompt_overlap_count = overlap_count,
+            .loss = 0.0,
+            .mean_reward_margin = 0.0,
+            .accuracy = 0.0,
+            .loss_type = @tagName(dpo_objective.loss_type),
+            .logprob_aggregation = dpo_objective.logprobAggregation(),
+            .label_smoothing = dpo_objective.preference.label_smoothing,
+            .minimums = minimums,
+            .reference_mode = gemmaDpoObjectiveReferenceMode(
+                dpo_objective,
+                reference_base_equivalent,
+                false,
+            ),
+        });
+        return error.PreferenceTrainEvalPromptOverlap;
+    }
+
+    const max_examples = evalMaxExamples(recipe) orelse samples.samples.len;
+    const max_seq_len = recipe.dataset.max_seq_len orelse 512;
+    var chosen = try prepareGemmaDpoPreparedExamplesFromSamples(
+        allocator,
+        base_model_dir,
+        samples.samples,
+        max_examples,
+        max_seq_len,
+        .chosen,
+    );
+    defer gemma4.freePreparedInputsSummary(allocator, &chosen);
+    var rejected = try prepareGemmaDpoPreparedExamplesFromSamples(
+        allocator,
+        base_model_dir,
+        samples.samples,
+        max_examples,
+        max_seq_len,
+        .rejected,
+    );
+    defer gemma4.freePreparedInputsSummary(allocator, &rejected);
+    if (chosen.examples.len != rejected.examples.len or chosen.examples.len != samples.samples.len) {
+        return error.DpoBatchAlignmentMismatch;
+    }
+
+    const coalesce = backend_kind == .metal and
+        allGemmaDpoPairsAreSingleTokenSharedPrompt(chosen.examples, rejected.examples);
+    const length_buckets = gemmaDpoLengthBuckets(recipe);
+    const sequence_length_policy = try summarizeGemmaDpoPairLengthPolicy(
+        allocator,
+        chosen.examples,
+        rejected.examples,
+        @intCast(max_seq_len),
+        length_buckets,
+        @intCast(trainer.graphCacheStats().capacity),
+        "heldout-dataset-one-pass",
+    );
+    var reference = if (dpo_objective.needsReference())
+        try precomputeGemmaDpoReferenceCache(
+            allocator,
+            trainer,
+            ctx,
+            chosen.examples,
+            rejected.examples,
+            @intCast(max_seq_len),
+            coalesce,
+            length_buckets,
+            reference_lora,
+            reference_base_equivalent,
+        )
+    else
+        try initUnusedGemmaDpoReferenceCache(
+            allocator,
+            chosen.examples.len,
+            reference_base_equivalent,
+        );
+    defer reference.deinit();
+
+    const policy_chosen = try allocator.alloc(f32, samples.samples.len);
+    defer allocator.free(policy_chosen);
+    const policy_rejected = try allocator.alloc(f32, samples.samples.len);
+    defer allocator.free(policy_rejected);
+    const chosen_lengths = try allocator.alloc(u32, samples.samples.len);
+    defer allocator.free(chosen_lengths);
+    const rejected_lengths = try allocator.alloc(u32, samples.samples.len);
+    defer allocator.free(rejected_lengths);
+    const sft_loss = try allocator.alloc(f32, samples.samples.len);
+    defer allocator.free(sft_loss);
+
+    for (chosen.examples, rejected.examples, samples.samples, 0..) |*chosen_example, *rejected_example, sample, idx| {
+        const pair_schedule = try gemmaDpoPairSchedule(
+            chosen_example,
+            rejected_example,
+            @intCast(max_seq_len),
+            length_buckets,
+        );
+        if (coalesce) {
+            const pair = gemmaDpoSingleTokenPair(chosen_example, rejected_example) orelse
+                return error.DpoSingleTokenPairContractMismatch;
+            const candidates = [_]i32{ pair.chosen_token, pair.rejected_token };
+            var pair_logps: [2]f32 = undefined;
+            try gemma4_real_autodiff.singleTokenCandidateLogprobsForPrompt(
+                allocator,
+                trainer,
+                ctx,
+                pair.prompt,
+                &candidates,
+                pair_schedule.sequence_length,
+                &pair_logps,
+            );
+            policy_chosen[idx] = pair_logps[0];
+            policy_rejected[idx] = pair_logps[1];
+        } else {
+            policy_chosen[idx] = if (length_buckets == null)
+                try gemma4_real_autodiff.sequenceLogprobForExample(
+                    allocator,
+                    trainer,
+                    ctx,
+                    chosen_example,
+                    @intCast(max_seq_len),
+                )
+            else
+                try gemma4_real_autodiff.sequenceLogprobForExampleScheduled(
+                    allocator,
+                    trainer,
+                    ctx,
+                    chosen_example,
+                    pair_schedule.sequence_length,
+                    pair_schedule.weighted_target_rows,
+                );
+            policy_rejected[idx] = if (length_buckets == null)
+                try gemma4_real_autodiff.sequenceLogprobForExample(
+                    allocator,
+                    trainer,
+                    ctx,
+                    rejected_example,
+                    @intCast(max_seq_len),
+                )
+            else
+                try gemma4_real_autodiff.sequenceLogprobForExampleScheduled(
+                    allocator,
+                    trainer,
+                    ctx,
+                    rejected_example,
+                    pair_schedule.sequence_length,
+                    pair_schedule.weighted_target_rows,
+                );
+        }
+        chosen_lengths[idx] = @intCast(sample.chosen_tokens.len);
+        rejected_lengths[idx] = @intCast(sample.rejected_tokens.len);
+        sft_loss[idx] = sample.sft_chosen_loss orelse 0.0;
+    }
+
+    var result = try preference_loss.pairedPreferenceLoss(allocator, .{
+        .policy_chosen_logps = policy_chosen,
+        .policy_rejected_logps = policy_rejected,
+        .ref_chosen_logps = reference.chosen_logps,
+        .ref_rejected_logps = reference.rejected_logps,
+        .chosen_lengths = chosen_lengths,
+        .rejected_lengths = rejected_lengths,
+        .sft_chosen_loss = sft_loss,
+    }, dpo_objective.preference);
+    defer result.deinit();
+
+    const passed = @as(f64, result.accuracy) >= minimums.accuracy and
+        @as(f64, result.loss) <= minimums.max_loss;
+    try writeJsonFile(allocator, io, report_path, DpoEvaluationReport{
+        .status = if (passed) "passed" else "failed-quality-gate",
+        .dataset_path = eval_path,
+        .dataset_fingerprint = dataset_fingerprint,
+        .policy_adapter_digest = policy_adapter_digest,
+        .policy_backend = @tagName(backend_kind),
+        .metal_numerical_policy = resolveGemmaMetalNumericalPolicy(backend_kind, ctx),
+        .optimizer_weight_decay = recipe.optimizer.weight_decay orelse 0.01,
+        .examples = samples.samples.len,
+        .prompt_overlap_count = 0,
+        .loss = result.loss,
+        .mean_reward_margin = result.mean_reward_margin,
+        .accuracy = result.accuracy,
+        .loss_type = @tagName(dpo_objective.loss_type),
+        .logprob_aggregation = dpo_objective.logprobAggregation(),
+        .label_smoothing = dpo_objective.preference.label_smoothing,
+        .minimums = minimums,
+        .reference_mode = gemmaDpoObjectiveReferenceMode(
+            dpo_objective,
+            reference_base_equivalent,
+            coalesce,
+        ),
+        .sequence_length_policy = sequence_length_policy,
+    });
+    if (!passed and enforce_minimums) return error.DpoEvaluationGateFailed;
+    return .{
+        .report_path = report_path,
+        .examples = samples.samples.len,
+        .loss = result.loss,
+        .mean_reward_margin = result.mean_reward_margin,
+        .accuracy = result.accuracy,
+        .passed = passed,
+    };
+}
+
+fn countPreferencePromptOverlaps(
+    allocator: std.mem.Allocator,
+    train_samples: []const preference_harness.PreferenceSample,
+    eval_samples: []const preference_harness.PreferenceSample,
+) !usize {
+    var train_prompts = std.StringHashMap(void).init(allocator);
+    defer train_prompts.deinit();
+    for (train_samples) |sample| {
+        try train_prompts.put(std.mem.sliceAsBytes(sample.prompt_tokens), {});
+    }
+
+    var count: usize = 0;
+    for (eval_samples) |eval_sample| {
+        count += @intFromBool(train_prompts.contains(std.mem.sliceAsBytes(eval_sample.prompt_tokens)));
+    }
+    return count;
+}
+
 fn runOptimizerBackedQwen2Dpo(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -4087,7 +10367,7 @@ fn runOptimizerBackedQwen2Dpo(
 ) !void {
     const base_model_dir = recipe.model.path orelse return error.MissingModelPath;
     const adapter = recipe.adapter orelse AdapterConfig{};
-    const bootstrap_dir_config = adapter.path orelse adapterBootstrapDir(recipe);
+    const bootstrap_dir_config = adapter.path;
     const bootstrap_dir = bootstrap_dir_config orelse try defaultArtifactPath(allocator, recipe, "adapter-bootstrap");
     defer if (bootstrap_dir_config == null) allocator.free(bootstrap_dir);
     const trained_dir_config = recipe.artifacts.trained_adapter_dir orelse recipe.artifacts.adapter_dir;
@@ -4118,7 +10398,13 @@ fn runOptimizerBackedQwen2Dpo(
     defer model_manager.deinit();
     const reference_model = try model_manager.loadFromDir(reference_path);
 
-    var samples = try loadDpoTextPreferenceSamples(allocator, io, dataset_path, recipe, reference_model);
+    var samples = try loadDpoTextPreferenceSamples(
+        allocator,
+        io,
+        dataset_path,
+        recipe,
+        PreferenceTokenizerView.fromLoadedModel(reference_model),
+    );
     defer samples.deinit();
 
     var chosen_prepared = try prepareGemmaDpoPreparedExamplesFromSamples(allocator, base_model_dir, samples.samples, max_examples, max_seq_len, .chosen);
@@ -4209,6 +10495,8 @@ fn runOptimizerBackedQwen2Dpo(
                 .ipo_tau = recipe.preference.ipo_tau orelse 0.1,
             });
             defer step_result.deinit();
+            try scalePreferenceUnitGradients(step_result.grad_chosen, 2);
+            try scalePreferenceUnitGradients(step_result.grad_rejected, 2);
 
             total_loss += step_result.loss;
             total_margin += step_result.mean_reward_margin;
@@ -4234,11 +10522,14 @@ fn runOptimizerBackedQwen2Dpo(
 
     const denom = @as(f64, @floatFromInt(@max(examples_seen, 1)));
     try writeJsonFile(allocator, io, report_path, DpoReport{
+        .execution_mode = "train",
+        .dataset_format = recipe.dataset.format.?,
         .examples = examples_seen,
         .loss = @floatCast(total_loss / denom),
         .mean_reward_margin = @floatCast(total_margin / denom),
         .accuracy = @floatCast(total_accuracy / denom),
         .beta = recipe.preference.beta orelse 0.1,
+        .trained_adapter_dir = trained_dir,
     });
     print("dpo report: {s}\ntrained adapter: {s}\n", .{ report_path, trained_dir });
 }
@@ -4314,8 +10605,21 @@ fn parseTextRewardMode(value: []const u8) !TextRewardMode {
     if (std.mem.eql(u8, value, "exact-match")) return .exact_match;
     if (std.mem.eql(u8, value, "exact-match-ci")) return .exact_match_ci;
     if (std.mem.eql(u8, value, "prefix-match")) return .prefix_match;
+    if (std.mem.eql(u8, value, "token-exact-match")) return .token_exact_match;
+    if (std.mem.eql(u8, value, "token-prefix-match")) return .token_prefix_match;
     if (std.mem.eql(u8, value, "sequence-hash")) return .sequence_hash;
     return error.UnsupportedRewardMode;
+}
+
+fn isGrpoCompletionTruncated(completion_tokens: []const i32, eos_token_id: ?i32) bool {
+    if (completion_tokens.len == 0) return false;
+    const eos_id = eos_token_id orelse return true;
+    return completion_tokens[completion_tokens.len - 1] != eos_id;
+}
+
+fn isGemmaGrpoCompletionTruncated(config: *const gemma_graph.Config, completion_tokens: []const i32, eos_token_id: ?i32) bool {
+    if (completion_tokens.len == 0) return false;
+    return !gemma4_real_autodiff.isCompletionStopToken(config, completion_tokens[completion_tokens.len - 1], eos_token_id);
 }
 
 fn runOptimizerBackedGemmaGrpo(
@@ -4325,33 +10629,84 @@ fn runOptimizerBackedGemmaGrpo(
     dataset_path: []const u8,
     report_path: []const u8,
 ) !void {
+    // CUDA recipes run main's strict CUDA optimizer lane; Metal/native keep
+    // this lane's evaluation/checkpoint contract.
+    if ((try resolveGemmaPreferenceExecution(recipe.backend)).backend_kind == .cuda) {
+        return runOptimizerBackedGemmaGrpoCuda(allocator, io, recipe, dataset_path, report_path);
+    }
     const base_model_dir = recipe.model.path orelse return error.MissingModelPath;
     const adapter = recipe.adapter orelse AdapterConfig{};
-    const bootstrap_dir_config = adapter.path orelse adapterBootstrapDir(recipe);
+    const bootstrap_dir_config = adapter.path;
     const bootstrap_dir = bootstrap_dir_config orelse try defaultArtifactPath(allocator, recipe, "adapter-bootstrap");
     defer if (bootstrap_dir_config == null) allocator.free(bootstrap_dir);
     const trained_dir_config = recipe.artifacts.trained_adapter_dir orelse recipe.artifacts.adapter_dir;
     const trained_dir = trained_dir_config orelse try defaultArtifactPath(allocator, recipe, "adapter-trained");
     defer if (trained_dir_config == null) allocator.free(trained_dir);
+    try requireMissingPreferencePublicationTarget(io, trained_dir);
+    try preflightRewardExecutables(allocator, io, recipe);
     const reference_path = recipe.model.reference_path orelse base_model_dir;
-    const backend_kind = try gemmaAutodiffBackendKind(recipe.backend);
-    if (backend_kind == .cuda and recipe.model.projector_path != null) return error.UnsupportedGemmaCudaMultimodalTraining;
+    if (!std.mem.eql(u8, reference_path, base_model_dir)) return error.UnsupportedReferencePath;
+    const execution = try resolveGemmaPreferenceExecution(recipe.backend);
+    const backend_kind = execution.backend_kind;
+    try validateGemmaPreferenceEnvironmentContract(backend_kind);
+    const execution_policy = train_eval_gemma4_lora_bundle.autodiffExecutionPolicy(backend_kind);
     const max_seq_len = recipe.dataset.max_seq_len orelse 128;
     const group_size = recipe.grpo.group_size orelse 2;
-    const max_completion_tokens = recipe.grpo.max_completion_tokens orelse 4;
-    if (max_completion_tokens == 0) return error.InvalidGRPOConfig;
+    const max_completion_tokens = recipe.grpo.max_completion_tokens orelse default_grpo_max_completion_tokens;
+    const resolved_sampling = try resolveGrpoSamplingConfig(recipe.grpo);
+    const resolved_objective = try resolveGrpoObjectiveConfig(
+        recipe.grpo,
+        recipe.optimizer.gradient_accumulation_steps orelse 1,
+    );
+    const training_seed = recipe.optimizer.seed orelse 42;
+    if (group_size < 2) return error.InvalidGrpoGroupSize;
+    if (max_completion_tokens == 1 and
+        group_size > gemma4_real_autodiff.max_single_token_completion_group_size)
+    {
+        return error.InvalidGrpoGroupSize;
+    }
+    if (max_completion_tokens == 0) return error.InvalidMaxCompletionTokens;
+    const coalesce_single_token_groups = max_completion_tokens == 1;
+    const batch_single_token_group_scoring = coalesce_single_token_groups and
+        platform.env.getenvBoolDefault("ANTFLY_GEMMA4_GRPO_BATCH_SINGLE_TOKEN_SCORING", true);
+    const batch_multi_token_group_scoring = !coalesce_single_token_groups and
+        gemmaGrpoMultiTokenBatchEnabled(group_size);
+    const multi_token_backward_batch_size = if (!coalesce_single_token_groups and backend_kind == .metal)
+        gemmaGrpoMultiTokenBackwardBatchSize(group_size)
+    else
+        1;
+    const batch_multi_token_group_backward = multi_token_backward_batch_size > 1;
+    const sparse_multi_token = !coalesce_single_token_groups and
+        backend_kind == .metal and
+        !batch_multi_token_group_scoring and
+        gemmaGrpoSparseMultiTokenEnabled();
+    const compiled_sampling_requested = !coalesce_single_token_groups and
+        backend_kind == .metal and
+        platform.env.getenvBoolDefault("ANTFLY_GEMMA4_GRPO_COMPILED_SAMPLING", false);
+    const physical_micro_batches_per_group: usize = if (coalesce_single_token_groups)
+        1
+    else if (batch_multi_token_group_backward)
+        try std.math.divCeil(usize, group_size, multi_token_backward_batch_size)
+    else
+        group_size;
+    const grad_accum_steps = try preferenceGradAccumSteps(
+        recipe.optimizer.gradient_accumulation_steps orelse 1,
+        physical_micro_batches_per_group,
+    );
     const reward_mode = try parseTextRewardMode(recipe.grpo.reward_mode orelse "exact-match");
-    const cfg = grpo.GRPOConfig{
-        .group_size = group_size,
-        .clip_epsilon = recipe.grpo.clip_epsilon orelse 0.2,
-        .kl_coef = recipe.grpo.kl_coef orelse 0.04,
-        .advantage_eps = recipe.grpo.advantage_eps orelse 1e-4,
-        .normalize_advantage = recipe.grpo.normalize_advantage orelse true,
-    };
-    try grpo.validateConfig(cfg);
-    try validateGemmaPreferenceAdapterOptions(adapter);
-    try validateGemmaPreferenceLifecycleOptions(recipe);
-    try validateGemmaGrpoObjectiveOptions(recipe);
+    try validateGemmaAdapterOptions(adapter);
+    var graph_executor_scope = try train_eval_gemma4_lora_bundle.acquireMetalGraphExecutorScope(backend_kind);
+    defer if (graph_executor_scope) |*scope| scope.deinit();
+    try train_eval_gemma4_lora_bundle.validateAutodiffBaseArtifactForRecipe(
+        allocator,
+        base_model_dir,
+        backend_kind,
+        recipe.model.allow_direct_gguf_training orelse false,
+    );
+    const direct_gguf_base = try train_eval_gemma4_lora_bundle.autodiffBaseUsesGguf(allocator, base_model_dir);
+    if ((recipe.model.allow_direct_gguf_training orelse false) != direct_gguf_base) {
+        return error.DirectGgufTrainingAdmissionMismatch;
+    }
 
     compat.cwd().access(compat.io(), bootstrap_dir, .{}) catch {
         var bootstrap = try gemma4.bootstrapLoRABundle(allocator, base_model_dir, bootstrap_dir, .{
@@ -4359,9 +10714,11 @@ fn runOptimizerBackedGemmaGrpo(
             .alpha = adapterAlpha(adapter),
             .base_model_name_or_path = adapter.base_model_name_or_path,
             .target_modules = adapter.target_modules,
-            .target_preset = try gemmaTargetPreset(adapter),
+            .gemma4_target_preset = gemma4TargetPreset(adapter),
+            .target_preset = try gemmaLegacyTargetPreset(adapter),
             .use_dora = adapter.use_dora orelse false,
             .init_lora_weights = adapter.init_lora_weights,
+            .initialization_seed = adapter.initialization_seed orelse 0,
         });
         defer gemma4.freeBootstrapSummary(allocator, &bootstrap);
     };
@@ -4386,6 +10743,1481 @@ fn runOptimizerBackedGemmaGrpo(
         return;
     }
 
+    var tokenizer_assets = try OwnedPreferenceTokenizer.init(allocator, base_model_dir);
+    defer tokenizer_assets.deinit();
+    const tokenizer_view = tokenizer_assets.view();
+
+    var prompt_batch = try loadGrpoTextPrompts(allocator, io, dataset_path, recipe, tokenizer_view);
+    defer prompt_batch.deinit();
+    const epochs = recipe.optimizer.epochs orelse 1;
+    const benchmark_enabled = platform.env.getenvBoolDefault("ANTFLY_GEMMA4_GRPO_BENCHMARK", false);
+    if (benchmark_enabled and recipe.checkpoint != null) return error.PreferenceBenchmarkCheckpointingNotSupported;
+    const planned_updates = std.math.mul(usize, prompt_batch.prompts.len, epochs) catch return error.GrpoBenchmarkUpdateCountMismatch;
+    if (benchmark_enabled and planned_updates != GrpoBenchmarkRecorder.total_updates) {
+        return error.GrpoBenchmarkUpdateCountMismatch;
+    }
+    var benchmark: ?GrpoBenchmarkRecorder = if (benchmark_enabled) try GrpoBenchmarkRecorder.init(allocator) else null;
+    defer if (benchmark) |*recorder| recorder.deinit();
+
+    const graph_config = try gemma4_real_autodiff.loadGraphConfig(allocator, base_model_dir);
+    var backend = try gemma4_real_autodiff.loadBackendForModelDir(allocator, base_model_dir, backend_kind);
+    defer backend.deinit();
+
+    var adapter_inspect = try gemma4.inspectCheckpoint(allocator, bootstrap_dir);
+    defer gemma4.freeInspectionSummary(allocator, &adapter_inspect);
+    const lora_rank = adapter_inspect.lora_rank orelse return error.MissingAdapterConfig;
+    const lora_alpha = @as(f32, @floatCast(adapter_inspect.lora_alpha orelse return error.MissingAdapterConfig));
+    const target_modules = adapter_inspect.target_modules orelse (adapter.target_modules orelse gemma4.default_lora_target_modules[0..]);
+    const lora_config = ml.graph.lora.LoRAConfig{
+        .rank = @intCast(lora_rank),
+        .alpha = lora_alpha,
+        .target_patterns = target_modules,
+        .strict_target_patterns = true,
+        .sharing = if (adapter_inspect.recursive_lora_enabled) .by_use else .by_weight,
+    };
+
+    const grpo_graph_cache_capacity: u8 = if (batch_multi_token_group_backward or compiled_sampling_requested) 2 else 1;
+    var trainer = try real_autodiff.RealAutodiffTrainer.init(allocator, backend.backendPtr(), .{
+        .lora = lora_config,
+        .optimizer = .{ .weight_decay = recipe.optimizer.weight_decay orelse 0.01 },
+        .lr_schedule = .{ .constant = recipe.optimizer.learning_rate orelse 0.0001 },
+        .max_grad_norm = recipe.optimizer.max_grad_norm orelse 1.0,
+        .grad_accum_steps = grad_accum_steps,
+        .seed = recipe.optimizer.seed orelse 42,
+        .hidden_size_hint = graph_config.hidden_size,
+        .num_layers_hint = graph_config.num_hidden_layers,
+        .execution_engine = execution_policy.engine,
+        .compiled_required = execution_policy.compiled_required,
+        .strict_metal_execution = execution_policy.strict_metal_execution,
+        // Batched backward and exact batch-1 rescoring deliberately use two
+        // graph signatures. Retain both so an opt-in campaign measures the
+        // batching strategy rather than rebuilding on every GRPO group.
+        .graph_cache_capacity = grpo_graph_cache_capacity,
+    });
+    defer trainer.deinit();
+
+    // The optimizer-backed GRPO loop interleaves eager policy/reference
+    // scoring with compiled backward/update frames on one Metal runtime.
+    // Coalesced encoders make that mixed ownership timing-dependent: the same
+    // inputs can yield a different adapter digest even when the reward trace
+    // is identical. Keep ordered encoders for this trainer's complete
+    // lifetime; serving and unrelated training routes retain coalescing.
+    var grpo_metal_ordering_suspended = false;
+    var grpo_metal_row_staging_suspended = false;
+    if (backend_kind == .metal) {
+        try trainer.compute_backend.decoderRuntimeSubmitAndWaitFrame();
+        grpo_metal_ordering_suspended = try trainer.compute_backend.decoderRuntimePushPlannedEncoderCoalescingSuppression();
+        if (!grpo_metal_ordering_suspended) return error.PlannedEncoderCoalescingSuppressionUnavailable;
+        errdefer trainer.compute_backend.decoderRuntimePopPlannedEncoderCoalescingSuppression() catch {};
+        grpo_metal_row_staging_suspended = try trainer.compute_backend.decoderRuntimePushBf16EmbeddingRowStagingSuppression();
+        if (!grpo_metal_row_staging_suspended) return error.Bf16EmbeddingRowStagingSuppressionUnavailable;
+    }
+    defer if (grpo_metal_ordering_suspended or grpo_metal_row_staging_suspended) {
+        trainer.compute_backend.decoderRuntimeSubmitAndWaitFrame() catch {
+            if (trainer.compute_backend.decoderRuntimeHasActiveFrame()) {
+                trainer.compute_backend.decoderRuntimeCancelFrame() catch {};
+            }
+        };
+        if (grpo_metal_row_staging_suspended) {
+            trainer.compute_backend.decoderRuntimePopBf16EmbeddingRowStagingSuppression() catch {};
+        }
+        trainer.compute_backend.decoderRuntimePopPlannedEncoderCoalescingSuppression() catch {};
+    };
+
+    var ctx = gemma4_real_autodiff.GemmaAutodiffCtx.init(graph_config);
+    ctx.policy_temperature = resolved_sampling.temperature;
+    ctx.enable_fused_rms_norm_backward = backend_kind == .metal;
+    ctx.enable_fused_gqa_attention_backward = backend_kind == .metal and gemma4_real_autodiff.fusedGqaAttentionExperimentEnabled(graph_config);
+    ctx.enable_fused_linear_cross_entropy = backend_kind == .metal and
+        !direct_gguf_base and
+        !platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_LINEAR_CCE", false);
+    const bootstrap_prompt = prompt_batch.prompts[0];
+    if (bootstrap_prompt.len == 0 or bootstrap_prompt.len >= max_seq_len) return error.NoCompletionBudget;
+    const bootstrap_completion = [_]i32{bootstrap_prompt[bootstrap_prompt.len - 1]};
+    const bootstrap_example = try buildGemmaPreparedExampleFromTokens(allocator, bootstrap_prompt, &bootstrap_completion, max_seq_len);
+    defer freeGemmaPreparedExample(allocator, &bootstrap_example);
+    try gemma4_real_autodiff.initializeTrainerFromAdapterDir(allocator, &trainer, &ctx, bootstrap_dir, &bootstrap_example, @intCast(max_seq_len));
+    // Freeze the starting adapter before checkpoint restore mutates the live policy.
+    const reference_base_equivalent = gemmaLoraAdapterIsBaseEquivalent(&trainer);
+    var frozen_lora = if (reference_base_equivalent)
+        try gemma4_real_autodiff.FrozenBaseLoraBindings.init(allocator, &trainer)
+    else
+        try gemma4_real_autodiff.FrozenBaseLoraBindings.initSnapshot(allocator, &trainer);
+    defer frozen_lora.deinit();
+
+    const incremental_kv_enabled = gemmaGrpoIncrementalKvEnabled(recipe);
+    if (incremental_kv_enabled and compiled_sampling_requested) {
+        return error.Gemma4GrpoCompiledSamplingConflictsWithIncrementalKv;
+    }
+    if (incremental_kv_enabled and !sparse_multi_token) {
+        return error.Gemma4GrpoIncrementalKvRequiresSparseMultiToken;
+    }
+    // The qualified mid-epoch checkpoint surface is eager sampling only.
+    // Compiled sampling owns execution-cache retirement semantics at durable
+    // boundaries and the incremental-KV sampler rebuilds transient pages from
+    // epoch-boundary telemetry; neither has mid-epoch recovery evidence.
+    const checkpoint_every_examples: ?u32 = if (recipe.checkpoint) |checkpoint| checkpoint.every_examples else null;
+    if (checkpoint_every_examples != null and compiled_sampling_requested) {
+        return error.Gemma4MidEpochCheckpointCompiledSamplingNotSupported;
+    }
+    if (checkpoint_every_examples != null and incremental_kv_enabled) {
+        return error.Gemma4MidEpochCheckpointIncrementalKvNotSupported;
+    }
+    const incremental_kv_requested = incremental_kv_enabled;
+    const incremental_kv_batch_active = gemmaGrpoIncrementalKvBatchActiveEnabled(recipe);
+    const incremental_kv_clone_prompt_tail = gemmaGrpoIncrementalKvClonePromptTailEnabled(recipe);
+    const incremental_kv_shadow_exact = gemmaGrpoIncrementalKvShadowExactEnabled(recipe);
+    const reward_configuration_digest = try rewardPipelineConfigurationDigestAlloc(allocator, recipe);
+    defer allocator.free(reward_configuration_digest);
+    const resolved_kl_control = try resolveGrpoKlControl(recipe.grpo);
+    var grpo_execution_flags: u64 = 0;
+    if (coalesce_single_token_groups) grpo_execution_flags |= @as(u64, 1) << 0;
+    if (batch_single_token_group_scoring) grpo_execution_flags |= @as(u64, 1) << 1;
+    if (batch_multi_token_group_scoring) grpo_execution_flags |= @as(u64, 1) << 2;
+    if (batch_multi_token_group_backward) grpo_execution_flags |= @as(u64, 1) << 3;
+    if (sparse_multi_token) grpo_execution_flags |= @as(u64, 1) << 4;
+    if (incremental_kv_requested) grpo_execution_flags |= @as(u64, 1) << 5;
+    if (incremental_kv_batch_active) grpo_execution_flags |= @as(u64, 1) << 6;
+    if (incremental_kv_clone_prompt_tail) grpo_execution_flags |= @as(u64, 1) << 7;
+    if (incremental_kv_shadow_exact) grpo_execution_flags |= @as(u64, 1) << 8;
+    if (ctx.enable_fused_gqa_attention_backward) grpo_execution_flags |= @as(u64, 1) << 9;
+    if (compiled_sampling_requested) grpo_execution_flags |= @as(u64, 1) << 10;
+    if (!reference_base_equivalent) grpo_execution_flags |= @as(u64, 1) << 11;
+    var numerical_environment = try @import("training_environment.zig").capture(allocator);
+    defer numerical_environment.deinit();
+    const metal_numerical_policy = resolveGemmaMetalNumericalPolicy(backend_kind, &ctx);
+    const grpo_run_fingerprint = try gemmaPreferenceRunFingerprint(
+        allocator,
+        io,
+        recipe,
+        .grpo,
+        base_model_dir,
+        bootstrap_dir,
+        target_modules,
+        @intCast(lora_rank),
+        lora_alpha,
+        adapter_inspect.recursive_lora_enabled,
+        backend_kind,
+        .{
+            .seed = training_seed,
+            .max_examples = recipe.dataset.max_examples orelse 32,
+            .max_seq_len = max_seq_len,
+            .epochs = epochs,
+            .learning_rate = recipe.optimizer.learning_rate orelse 0.0001,
+            .max_grad_norm = recipe.optimizer.max_grad_norm orelse 1.0,
+            .requested_gradient_accumulation_steps = recipe.optimizer.gradient_accumulation_steps orelse 1,
+            .physical_micro_batches_per_unit = physical_micro_batches_per_group,
+            .graph_cache_capacity = grpo_graph_cache_capacity,
+            .direct_gguf_base = direct_gguf_base,
+            .fused_linear_cross_entropy = ctx.enable_fused_linear_cross_entropy orelse false,
+            .execution_flags = grpo_execution_flags,
+            .metal_numerical_policy_flags = if (metal_numerical_policy) |policy| policy.fingerprint_flags else 0,
+            .metal_sparse_loss_chunk_rows = if (metal_numerical_policy) |policy| policy.sparse_loss_chunk_rows else null,
+            .metal_linear_cce_tile_vocab = if (metal_numerical_policy) |policy| policy.linear_cce_tile_vocab else null,
+            .grpo_group_size = group_size,
+            .grpo_backward_batch_size = multi_token_backward_batch_size,
+            .grpo_max_completion_tokens = max_completion_tokens,
+            .grpo_sampling_temperature = resolved_sampling.temperature,
+            .grpo_sampling_top_p = resolved_sampling.top_p,
+            .grpo_sampling_top_k = resolved_sampling.top_k,
+            .grpo_stop_token_fingerprint = gemma4_real_autodiff.completionStopTokenFingerprint(
+                &ctx.graph_config,
+                if (tokenizer_view.tokenizer.specialTokens().sep_id >= 0)
+                    tokenizer_view.tokenizer.specialTokens().sep_id
+                else
+                    null,
+            ),
+            .grpo_loss_type = @tagName(resolved_objective.loss_type),
+            .grpo_scale_rewards = @tagName(resolved_objective.scale_rewards),
+            .grpo_mask_truncated_completions = resolved_objective.mask_truncated_completions,
+            .grpo_clip_epsilon = resolved_objective.epsilon_low,
+            .grpo_epsilon_high = resolved_objective.epsilon_high,
+            .grpo_kl_coef = recipe.grpo.kl_coef orelse 0.04,
+            .grpo_train_max_kl = resolved_kl_control.train_max_kl,
+            .grpo_train_max_kl_policy = @tagName(resolved_kl_control.budget_policy),
+            .grpo_adaptive_kl = resolved_kl_control.adaptive,
+            .grpo_target_kl = resolved_kl_control.target_kl,
+            .grpo_kl_horizon = resolved_kl_control.kl_horizon,
+            .grpo_min_kl_coef = resolved_kl_control.min_kl_coef,
+            .grpo_max_kl_coef = resolved_kl_control.max_kl_coef,
+            .grpo_advantage_eps = recipe.grpo.advantage_eps orelse 1e-4,
+            .grpo_normalize_advantage = recipe.grpo.normalize_advantage orelse true,
+            .reward_configuration_digest = reward_configuration_digest,
+        },
+    );
+    const grpo_run_fingerprint_text = try formatSha256DigestAlloc(allocator, grpo_run_fingerprint);
+    defer allocator.free(grpo_run_fingerprint_text);
+    // Baseline acceptance compares against the immutable initial adapter, including on resume.
+    const grpo_minimums = recipe.eval.?.grpo_minimums.?;
+    const grpo_baseline_report_path = if (grpo_minimums.min_mean_reward_improvement != null)
+        try preferenceBaselineEvaluationReportPath(allocator, recipe, .grpo)
+    else
+        null;
+    defer if (grpo_baseline_report_path) |path| allocator.free(path);
+    const grpo_baseline_reward_trace_path = if (grpo_baseline_report_path != null)
+        try defaultArtifactPath(allocator, recipe, "grpo_baseline_evaluation_reward_trace.jsonl")
+    else
+        null;
+    defer if (grpo_baseline_reward_trace_path) |path| allocator.free(path);
+    const grpo_baseline_exchange_dir = if (grpo_baseline_report_path != null)
+        try defaultArtifactPath(allocator, recipe, "grpo-baseline-reward-verifier-exchanges")
+    else
+        null;
+    defer if (grpo_baseline_exchange_dir) |path| allocator.free(path);
+    var baseline_recipe = recipe;
+    var baseline_reward = recipe.reward orelse RewardConfig{};
+    if (grpo_baseline_reward_trace_path) |path| baseline_reward.evaluation_trace_path = path;
+    if (grpo_baseline_exchange_dir) |path| baseline_reward.exchange_dir = path;
+    if (grpo_baseline_report_path != null) baseline_recipe.reward = baseline_reward;
+    const baseline_evaluation: ?GrpoEvaluationSummary = if (grpo_baseline_report_path) |path|
+        try evaluateGemmaGrpoHeldout(
+            allocator,
+            io,
+            baseline_recipe,
+            tokenizer_view,
+            prompt_batch.prompts,
+            &trainer,
+            &ctx,
+            null,
+            &frozen_lora,
+            max_seq_len,
+            group_size,
+            max_completion_tokens,
+            backend_kind,
+            path,
+            false,
+        )
+    else
+        null;
+
+    const grpo_checkpoint_path = try preferenceCheckpointPath(allocator, recipe, .grpo);
+    defer if (grpo_checkpoint_path) |path| allocator.free(path);
+    const grpo_resume_enabled = if (recipe.checkpoint) |checkpoint| checkpoint.resume_path != null else false;
+    var grpo_restored = real_autodiff.RestoredTrainingCheckpoint{
+        .micro_batch_steps = 0,
+        .optimizer_steps = 0,
+        .accumulation_micro_batches = 0,
+        .configured_accumulation_steps = grad_accum_steps,
+        .stochastic_steps = 0,
+        .progress = .{},
+    };
+    var loaded_grpo_state: ?LoadedPreferenceCheckpointState = null;
+    defer if (loaded_grpo_state) |*state| state.deinit(allocator);
+    var start_epoch: usize = 0;
+    var initial_adapter_digest = trainerLoRAParameterDigest(&trainer);
+    var compiled_sampling_execution_cache_retired = false;
+    if (grpo_resume_enabled) {
+        const path = grpo_checkpoint_path orelse return error.CheckpointPathRequired;
+        grpo_restored = try trainer.loadTrainingCheckpoint(path, &grpo_run_fingerprint);
+        loaded_grpo_state = try loadPreferenceCheckpointState(
+            allocator,
+            io,
+            path,
+            .grpo,
+            &grpo_run_fingerprint,
+            grpo_restored,
+        );
+        start_epoch = std.math.cast(usize, grpo_restored.progress.epoch_index) orelse
+            return error.InvalidPreferenceCheckpointState;
+        if (start_epoch > epochs) return error.CheckpointBeyondRequestedEpochCount;
+        initial_adapter_digest = loaded_grpo_state.?.parsed.value.grpo.?.initial_adapter_digest;
+        if (loaded_grpo_state.?.parsed.value.examples_into_epoch != 0) {
+            // Mid-epoch checkpoints are only admitted back into the eager
+            // path; both restricted samplers were already unable to write one.
+            if (compiled_sampling_requested) {
+                return error.Gemma4MidEpochCheckpointCompiledSamplingNotSupported;
+            }
+            if (incremental_kv_requested) {
+                return error.Gemma4MidEpochCheckpointIncrementalKvNotSupported;
+            }
+        }
+        if (compiled_sampling_requested) {
+            try trainer.retireExecutionCachesAtCheckpointBoundary();
+            compiled_sampling_execution_cache_retired = true;
+        }
+    }
+    const resume_examples_into_epoch: usize = if (loaded_grpo_state) |*state|
+        state.parsed.value.examples_into_epoch
+    else
+        0;
+
+    var incremental_kv_sampler: ?gemma4_real_autodiff.GrpoIncrementalKvSampler = if (incremental_kv_requested)
+        try gemma4_real_autodiff.GrpoIncrementalKvSampler.init(
+            allocator,
+            &trainer,
+            &ctx,
+            incremental_kv_batch_active,
+            incremental_kv_clone_prompt_tail,
+        )
+    else
+        null;
+    defer if (incremental_kv_sampler) |*sampler| sampler.deinit();
+
+    const current_base_equivalent_policy = gemmaLoraAdapterIsBaseEquivalent(&trainer);
+    const restored_grpo_aggregates = if (loaded_grpo_state) |*state| state.parsed.value.grpo else null;
+    if (restored_grpo_aggregates) |state| {
+        if (resume_examples_into_epoch != 0 and
+            resume_examples_into_epoch >= prompt_batch.prompts.len)
+        {
+            return error.InvalidPreferenceCheckpointState;
+        }
+        // A cursor inside the final epoch is resumable, but a cursor at or
+        // beyond the requested epoch count has no groups left to replay.
+        if (resume_examples_into_epoch != 0 and start_epoch >= epochs) {
+            return error.CheckpointBeyondRequestedEpochCount;
+        }
+        const boundary_groups = std.math.mul(usize, start_epoch, prompt_batch.prompts.len) catch
+            return error.InvalidPreferenceCheckpointState;
+        const expected_groups = std.math.add(usize, boundary_groups, resume_examples_into_epoch) catch
+            return error.InvalidPreferenceCheckpointState;
+        const expected_completions = std.math.mul(usize, expected_groups, group_size) catch
+            return error.InvalidPreferenceCheckpointState;
+        if (state.total_groups != expected_groups or state.total_completions != expected_completions) {
+            return error.InvalidPreferenceCheckpointState;
+        }
+        if (incremental_kv_sampler) |*sampler| {
+            const telemetry = state.incremental_kv orelse return error.InvalidPreferenceCheckpointState;
+            try sampler.restoreCheckpointTelemetry(telemetry, expected_groups);
+        } else if (state.incremental_kv != null) {
+            return error.InvalidPreferenceCheckpointState;
+        }
+    }
+    const initial_base_equivalent_policy = if (restored_grpo_aggregates) |state|
+        state.initial_base_equivalent_policy
+    else
+        current_base_equivalent_policy;
+    var reference_cache = GemmaGrpoReferenceCache.init(allocator, 1024);
+    defer reference_cache.deinit();
+    if (restored_grpo_aggregates) |state| {
+        if (state.reference_cache) |checkpoint| {
+            try reference_cache.restoreCheckpoint(checkpoint, prompt_batch.prompts.len);
+        } else if (compiled_sampling_requested) {
+            // Compiled Metal reference values are stable while cached, but a
+            // fresh process is not admitted to recompute an omitted cache and
+            // silently change the optimizer trajectory.
+            return error.CompiledGrpoReferenceCacheCheckpointRequired;
+        }
+    }
+
+    var reward_pipeline = try RewardPipeline.init(
+        allocator,
+        io,
+        recipe,
+        tokenizer_view.tokenizer,
+        prompt_batch.prompt_texts,
+        prompt_batch.targets,
+        .train,
+    );
+    defer reward_pipeline.deinit();
+    errdefer reward_pipeline.finish() catch {};
+
+    const rewarder = grpo.Rewarder{
+        .ctx = &reward_pipeline,
+        .call = RewardPipeline.score,
+    };
+    var cfg = try resolveGrpoCoreConfig(recipe);
+    var kl_control = try GrpoKlControl.init(allocator, io, recipe);
+    defer kl_control.deinit();
+    errdefer kl_control.finish() catch {};
+
+    if (restored_grpo_aggregates) |state| {
+        try reward_pipeline.restoreCheckpoint(
+            state.reward_call_index,
+            state.reward_external_calls,
+            state.reward_external_failures,
+            state.reward_trace,
+        );
+        try kl_control.restoreCheckpoint(
+            state.kl_current_coef,
+            state.kl_admitted_groups,
+            state.kl_rejected_groups,
+            state.kl_max_observed_mean,
+            state.kl_trace,
+        );
+        cfg.kl_coef = state.kl_current_coef;
+    }
+
+    var total_loss: f64 = if (restored_grpo_aggregates) |state| state.total_loss else 0.0;
+    var total_pg_loss: f64 = if (restored_grpo_aggregates) |state| state.total_pg_loss else 0.0;
+    var total_kl_loss: f64 = if (restored_grpo_aggregates) |state| state.total_kl_loss else 0.0;
+    var total_mean_kl: f64 = if (restored_grpo_aggregates) |state| state.total_mean_kl else 0.0;
+    var total_clip_fraction: f64 = if (restored_grpo_aggregates) |state| state.total_clip_fraction else 0.0;
+    var total_groups: usize = if (restored_grpo_aggregates) |state| state.total_groups else 0;
+    var optimizer_groups: usize = if (restored_grpo_aggregates) |state| state.optimizer_groups else 0;
+    var zero_reward_std_groups: usize = if (restored_grpo_aggregates) |state| state.zero_reward_std_groups else 0;
+    var all_truncated_groups: usize = if (restored_grpo_aggregates) |state| state.all_truncated_groups else 0;
+    var kl_rejected_groups: usize = if (restored_grpo_aggregates) |state| state.kl_rejected_groups else 0;
+    var total_completions: usize = if (restored_grpo_aggregates) |state| state.total_completions else 0;
+    var truncated_completions: usize = if (restored_grpo_aggregates) |state| state.truncated_completions else 0;
+    var total_tokens: usize = if (restored_grpo_aggregates) |state| state.total_tokens else 0;
+    var total_reward: f64 = if (restored_grpo_aggregates) |state| state.total_reward else 0.0;
+    var total_reward_squared: f64 = if (restored_grpo_aggregates) |state| state.total_reward_squared else 0.0;
+    var total_sampling_seconds: f64 = 0.0;
+    var total_policy_rescore_seconds: f64 = 0.0;
+    var total_backward_update_seconds: f64 = 0.0;
+    var total_reference_scoring_seconds: f64 = 0.0;
+    var saw_nonzero_reward_advantage = if (restored_grpo_aggregates) |state| state.saw_nonzero_reward_advantage else false;
+    var saw_nonzero_policy_gradient = if (restored_grpo_aggregates) |state| state.saw_nonzero_policy_gradient else false;
+    var initial_sampling_rescore_max_abs_error: f32 = if (restored_grpo_aggregates) |state| state.initial_sampling_rescore_max_abs_error else 0.0;
+    var initial_policy_reference_max_abs_error: f32 = if (restored_grpo_aggregates) |state| state.initial_policy_reference_max_abs_error else 0.0;
+    var captured_initial_logprob_parity = if (restored_grpo_aggregates) |state| state.captured_initial_logprob_parity else false;
+    var policy_rescore_completions: usize = if (restored_grpo_aggregates) |state| state.policy_rescore_completions else 0;
+    var diagnostic_first_tokens: [8]i32 = if (restored_grpo_aggregates) |state| state.diagnostic_first_tokens else @splat(-1);
+    var diagnostic_policy_first_token_logps: [8]f32 = if (restored_grpo_aggregates) |state| state.diagnostic_policy_first_token_logps else @splat(0.0);
+    var diagnostic_reference_first_token_logps: [8]f32 = if (restored_grpo_aggregates) |state| state.diagnostic_reference_first_token_logps else @splat(0.0);
+    var diagnostic_first_token_count: usize = if (restored_grpo_aggregates) |state| state.diagnostic_first_token_count else 0;
+
+    const eos_id = tokenizer_view.tokenizer.specialTokens().sep_id;
+    const epoch_prompt_order = try allocator.alloc(usize, prompt_batch.prompts.len);
+    defer allocator.free(epoch_prompt_order);
+    var resume_skip_groups: usize = resume_examples_into_epoch;
+    var epoch_idx: usize = start_epoch;
+    while (epoch_idx < epochs) : (epoch_idx += 1) {
+        // The epoch prompt order is a pure function of the training seed and
+        // epoch index and each group's sampling seed is derived from
+        // (seed, epoch, prompt), so a mid-epoch resume replays the identical
+        // trajectory by recomputing the order and skipping the consumed
+        // prefix of the first restored epoch.
+        fillGemmaGrpoEpochPromptOrder(epoch_prompt_order, training_seed, epoch_idx);
+        const epoch_start_group = resume_skip_groups;
+        resume_skip_groups = 0;
+        for (epoch_prompt_order[epoch_start_group..], epoch_start_group..) |prompt_idx, order_pos| {
+            // Mid-epoch cadence saves before the group at `order_pos` so the
+            // durable state always describes exactly `order_pos` completed
+            // groups, independent of the zero-variance/truncation/KL skip
+            // paths inside the group body. The resume position itself is not
+            // re-saved.
+            if (checkpoint_every_examples) |every| {
+                if (order_pos != 0 and
+                    order_pos != epoch_start_group and
+                    order_pos % @as(usize, every) == 0)
+                {
+                    const path = grpo_checkpoint_path orelse return error.CheckpointPathRequired;
+                    try savePreferenceCheckpoint(
+                        allocator,
+                        io,
+                        &trainer,
+                        path,
+                        .grpo,
+                        epoch_idx,
+                        order_pos,
+                        total_groups,
+                        &grpo_run_fingerprint,
+                        .{
+                            .task = @tagName(PreferenceTask.grpo),
+                            .run_fingerprint_sha256 = grpo_run_fingerprint_text,
+                            .epoch_index = epoch_idx,
+                            .examples_into_epoch = order_pos,
+                            .micro_batch_steps = trainer.microBatchSteps(),
+                            .optimizer_steps = trainer.optimizerSteps(),
+                            .accumulation_micro_batches = trainer.accumulatedMicroBatches(),
+                            .grpo = .{
+                                .initial_adapter_digest = initial_adapter_digest,
+                                .total_loss = total_loss,
+                                .total_pg_loss = total_pg_loss,
+                                .total_kl_loss = total_kl_loss,
+                                .total_mean_kl = total_mean_kl,
+                                .total_clip_fraction = total_clip_fraction,
+                                .total_groups = total_groups,
+                                .optimizer_groups = optimizer_groups,
+                                .zero_reward_std_groups = zero_reward_std_groups,
+                                .all_truncated_groups = all_truncated_groups,
+                                .kl_rejected_groups = kl_rejected_groups,
+                                .total_completions = total_completions,
+                                .truncated_completions = truncated_completions,
+                                .total_tokens = total_tokens,
+                                .total_reward = total_reward,
+                                .total_reward_squared = total_reward_squared,
+                                .saw_nonzero_reward_advantage = saw_nonzero_reward_advantage,
+                                .saw_nonzero_policy_gradient = saw_nonzero_policy_gradient,
+                                .initial_sampling_rescore_max_abs_error = initial_sampling_rescore_max_abs_error,
+                                .initial_policy_reference_max_abs_error = initial_policy_reference_max_abs_error,
+                                .initial_base_equivalent_policy = initial_base_equivalent_policy,
+                                .captured_initial_logprob_parity = captured_initial_logprob_parity,
+                                .policy_rescore_completions = policy_rescore_completions,
+                                .diagnostic_first_tokens = diagnostic_first_tokens,
+                                .diagnostic_policy_first_token_logps = diagnostic_policy_first_token_logps,
+                                .diagnostic_reference_first_token_logps = diagnostic_reference_first_token_logps,
+                                .diagnostic_first_token_count = diagnostic_first_token_count,
+                                .kl_current_coef = kl_control.current_kl_coef,
+                                .kl_admitted_groups = kl_control.admitted_groups,
+                                .kl_max_observed_mean = kl_control.max_observed_mean_kl,
+                                .kl_trace = kl_control.trace.items,
+                                .reward_call_index = reward_pipeline.call_index,
+                                .reward_external_calls = reward_pipeline.external_calls,
+                                .reward_external_failures = reward_pipeline.external_failures,
+                                .reward_trace = reward_pipeline.trace.items,
+                                .reference_cache = reference_cache.checkpoint(),
+                                // Mid-epoch cadence is rejected for the
+                                // incremental-KV sampler, so no telemetry can
+                                // exist here.
+                                .incremental_kv = null,
+                            },
+                        },
+                    );
+                }
+            }
+            const prompt = prompt_batch.prompts[prompt_idx];
+            const group_started_ns = if (benchmark_enabled) platform.time.monotonicNs() else 0;
+            var group_sampling_rescore_max_abs_error: f32 = 0.0;
+            var group_policy_reference_max_abs_error: f32 = 0.0;
+            var group_token_count: usize = 0;
+            var completions = std.ArrayList(grpo.Completion).empty;
+            defer {
+                for (completions.items) |completion| {
+                    allocator.free(completion.tokens);
+                    allocator.free(completion.old_logps);
+                    allocator.free(completion.ref_logps);
+                }
+                completions.deinit(allocator);
+            }
+            var flat_new_logps = std.ArrayList(f32).empty;
+            defer flat_new_logps.deinit(allocator);
+
+            const sampled_token_lists = try allocator.alloc(std.ArrayList(i32), group_size);
+            defer allocator.free(sampled_token_lists);
+            const sampled_logp_lists = try allocator.alloc(std.ArrayList(f32), group_size);
+            defer allocator.free(sampled_logp_lists);
+            for (sampled_token_lists, sampled_logp_lists) |*tokens, *logps| {
+                tokens.* = .empty;
+                logps.* = .empty;
+            }
+            defer for (sampled_token_lists, sampled_logp_lists) |*tokens, *logps| {
+                tokens.deinit(allocator);
+                logps.deinit(allocator);
+            };
+            const sampling_started_ns = platform.time.monotonicNs();
+            try sampleGemmaGrpoCompletionGroup(
+                allocator,
+                &trainer,
+                &ctx,
+                if (incremental_kv_sampler) |*sampler| sampler else null,
+                incremental_kv_shadow_exact,
+                prompt,
+                @intCast(max_seq_len),
+                max_completion_tokens,
+                .{
+                    .seed = gemma4_real_autodiff.deriveGrpoSamplingGroupSeed(
+                        training_seed,
+                        gemma_grpo_training_sampling_domain,
+                        epoch_idx,
+                        prompt_idx,
+                    ),
+                    .temperature = resolved_sampling.temperature,
+                    .top_p = resolved_sampling.top_p,
+                    .top_k = resolved_sampling.top_k,
+                },
+                if (eos_id >= 0) eos_id else null,
+                sparse_multi_token,
+                sampled_token_lists,
+                sampled_logp_lists,
+            );
+            total_sampling_seconds += @as(f64, @floatFromInt(platform.time.monotonicNs() - sampling_started_ns)) / std.time.ns_per_s;
+
+            var single_token_policy_rescore_logps: ?[]f32 = null;
+            defer if (single_token_policy_rescore_logps) |values| allocator.free(values);
+            var single_token_reference_logps: ?[]f32 = null;
+            defer if (single_token_reference_logps) |values| allocator.free(values);
+            if (batch_single_token_group_scoring) {
+                const reference_logps = try allocator.alloc(f32, group_size);
+                single_token_reference_logps = reference_logps;
+                const reference_started_ns = platform.time.monotonicNs();
+                try cachedSingleTokenGroupReferenceLogps(
+                    allocator,
+                    &trainer,
+                    &ctx,
+                    prompt,
+                    prompt_idx,
+                    sampled_token_lists,
+                    @intCast(max_seq_len),
+                    &frozen_lora,
+                    &reference_cache,
+                    reference_logps,
+                );
+                total_reference_scoring_seconds += @as(f64, @floatFromInt(platform.time.monotonicNs() - reference_started_ns)) / std.time.ns_per_s;
+
+                if (!captured_initial_logprob_parity and !compiled_sampling_requested) {
+                    const candidate_token_ids = try allocator.alloc(i32, group_size);
+                    defer allocator.free(candidate_token_ids);
+                    for (sampled_token_lists, candidate_token_ids) |tokens, *token_id| {
+                        if (tokens.items.len != 1) return error.ExpectedSingleTokenCompletion;
+                        token_id.* = tokens.items[0];
+                    }
+                    const policy_logps = try allocator.alloc(f32, group_size);
+                    single_token_policy_rescore_logps = policy_logps;
+                    const rescore_started_ns = platform.time.monotonicNs();
+                    try gemma4_real_autodiff.singleTokenCandidateLogprobsForPrompt(
+                        allocator,
+                        &trainer,
+                        &ctx,
+                        prompt,
+                        candidate_token_ids,
+                        @intCast(max_seq_len),
+                        policy_logps,
+                    );
+                    total_policy_rescore_seconds += @as(f64, @floatFromInt(platform.time.monotonicNs() - rescore_started_ns)) / std.time.ns_per_s;
+                    policy_rescore_completions += group_size;
+                }
+            }
+
+            var multi_token_policy_rescore_logps: ?CompletionGroupLogps = null;
+            defer if (multi_token_policy_rescore_logps) |*values| values.deinit();
+            if (compiled_sampling_requested) {
+                const rescore_started_ns = platform.time.monotonicNs();
+                multi_token_policy_rescore_logps = try canonicalCompiledSamplingGroupPolicyLogps(
+                    allocator,
+                    &trainer,
+                    &ctx,
+                    prompt,
+                    sampled_token_lists,
+                    @intCast(max_seq_len),
+                );
+                total_policy_rescore_seconds += @as(f64, @floatFromInt(platform.time.monotonicNs() - rescore_started_ns)) / std.time.ns_per_s;
+                policy_rescore_completions += group_size;
+            }
+            var multi_token_reference_logps: ?CompletionGroupLogps = null;
+            defer if (multi_token_reference_logps) |*values| values.deinit();
+            if (batch_multi_token_group_scoring) {
+                const reference_started_ns = platform.time.monotonicNs();
+                multi_token_reference_logps = try batchedMultiTokenGroupReferenceLogps(
+                    allocator,
+                    &trainer,
+                    &ctx,
+                    prompt,
+                    prompt_idx,
+                    sampled_token_lists,
+                    @intCast(max_seq_len),
+                    &frozen_lora,
+                    &reference_cache,
+                );
+                total_reference_scoring_seconds += @as(f64, @floatFromInt(platform.time.monotonicNs() - reference_started_ns)) / std.time.ns_per_s;
+
+                if (!captured_initial_logprob_parity and !compiled_sampling_requested) {
+                    const rescore_started_ns = platform.time.monotonicNs();
+                    multi_token_policy_rescore_logps = try batchedMultiTokenGroupPolicyLogps(
+                        allocator,
+                        &trainer,
+                        &ctx,
+                        prompt,
+                        sampled_token_lists,
+                        @intCast(max_seq_len),
+                    );
+                    total_policy_rescore_seconds += @as(f64, @floatFromInt(platform.time.monotonicNs() - rescore_started_ns)) / std.time.ns_per_s;
+                    if (multi_token_policy_rescore_logps != null) {
+                        policy_rescore_completions += group_size;
+                    }
+                }
+            }
+
+            var completion_idx: usize = 0;
+            while (completion_idx < group_size) : (completion_idx += 1) {
+                const tokens_owned = try sampled_token_lists[completion_idx].toOwnedSlice(allocator);
+                errdefer allocator.free(tokens_owned);
+                var diagnostic_slot: ?usize = null;
+                if (total_groups == 0 and tokens_owned.len > 0 and diagnostic_first_token_count < diagnostic_first_tokens.len) {
+                    diagnostic_slot = diagnostic_first_token_count;
+                    diagnostic_first_tokens[diagnostic_slot.?] = tokens_owned[0];
+                    diagnostic_first_token_count += 1;
+                }
+                const old_logps_owned = try sampled_logp_lists[completion_idx].toOwnedSlice(allocator);
+                errdefer allocator.free(old_logps_owned);
+                const new_logps_owned = try allocator.alloc(f32, tokens_owned.len);
+                defer allocator.free(new_logps_owned);
+                if (compiled_sampling_requested) {
+                    const canonical_logps = multi_token_policy_rescore_logps orelse
+                        return error.CompiledGrpoCanonicalLogprobsMissing;
+                    @memcpy(new_logps_owned, canonical_logps.rows[completion_idx]);
+                } else if (!captured_initial_logprob_parity) {
+                    if (single_token_policy_rescore_logps) |batched_logps| {
+                        if (new_logps_owned.len != 1) return error.ExpectedSingleTokenCompletion;
+                        new_logps_owned[0] = batched_logps[completion_idx];
+                    } else if (multi_token_policy_rescore_logps) |batched_logps| {
+                        @memcpy(new_logps_owned, batched_logps.rows[completion_idx]);
+                    } else if (coalesce_single_token_groups) {
+                        const rescore_started_ns = platform.time.monotonicNs();
+                        try gemma4_real_autodiff.tokenLogprobsForPromptCompletionSparseRows(
+                            allocator,
+                            &trainer,
+                            &ctx,
+                            prompt,
+                            tokens_owned,
+                            @intCast(max_seq_len),
+                            new_logps_owned,
+                        );
+                        total_policy_rescore_seconds += @as(f64, @floatFromInt(platform.time.monotonicNs() - rescore_started_ns)) / std.time.ns_per_s;
+                        policy_rescore_completions += 1;
+                    } else {
+                        const rescore_started_ns = platform.time.monotonicNs();
+                        if (sparse_multi_token) {
+                            try gemma4_real_autodiff.tokenLogprobsForPromptCompletionSparseRows(
+                                allocator,
+                                &trainer,
+                                &ctx,
+                                prompt,
+                                tokens_owned,
+                                @intCast(max_seq_len),
+                                new_logps_owned,
+                            );
+                        } else {
+                            try gemma4_real_autodiff.tokenLogprobsForPromptCompletion(
+                                allocator,
+                                &trainer,
+                                &ctx,
+                                prompt,
+                                tokens_owned,
+                                @intCast(max_seq_len),
+                                new_logps_owned,
+                            );
+                        }
+                        total_policy_rescore_seconds += @as(f64, @floatFromInt(platform.time.monotonicNs() - rescore_started_ns)) / std.time.ns_per_s;
+                        policy_rescore_completions += 1;
+                    }
+                } else {
+                    @memcpy(new_logps_owned, old_logps_owned);
+                }
+                const ref_logps_owned = try allocator.alloc(f32, tokens_owned.len);
+                errdefer allocator.free(ref_logps_owned);
+                if (single_token_reference_logps) |batched_logps| {
+                    if (ref_logps_owned.len != 1) return error.ExpectedSingleTokenCompletion;
+                    ref_logps_owned[0] = batched_logps[completion_idx];
+                } else if (multi_token_reference_logps) |batched_logps| {
+                    @memcpy(ref_logps_owned, batched_logps.rows[completion_idx]);
+                } else if (!try reference_cache.lookup(prompt_idx, tokens_owned, ref_logps_owned)) {
+                    const reference_started_ns = platform.time.monotonicNs();
+                    if (coalesce_single_token_groups) {
+                        try gemma4_real_autodiff.tokenLogprobsForPromptCompletionSparseRowsFrozenBase(
+                            allocator,
+                            &trainer,
+                            &ctx,
+                            prompt,
+                            tokens_owned,
+                            @intCast(max_seq_len),
+                            ref_logps_owned,
+                            &frozen_lora,
+                        );
+                    } else {
+                        if (sparse_multi_token) {
+                            try gemma4_real_autodiff.tokenLogprobsForPromptCompletionSparseRowsFrozenBase(
+                                allocator,
+                                &trainer,
+                                &ctx,
+                                prompt,
+                                tokens_owned,
+                                @intCast(max_seq_len),
+                                ref_logps_owned,
+                                &frozen_lora,
+                            );
+                        } else {
+                            try gemma4_real_autodiff.tokenLogprobsForPromptCompletionFrozenBase(
+                                allocator,
+                                &trainer,
+                                &ctx,
+                                prompt,
+                                tokens_owned,
+                                @intCast(max_seq_len),
+                                ref_logps_owned,
+                                &frozen_lora,
+                            );
+                        }
+                    }
+                    total_reference_scoring_seconds += @as(f64, @floatFromInt(platform.time.monotonicNs() - reference_started_ns)) / std.time.ns_per_s;
+                    try reference_cache.insert(prompt_idx, tokens_owned, ref_logps_owned);
+                }
+                for (old_logps_owned, new_logps_owned, ref_logps_owned) |old_logp, new_logp, ref_logp| {
+                    if (!std.math.isFinite(old_logp) or !std.math.isFinite(new_logp) or !std.math.isFinite(ref_logp)) {
+                        return error.NonFiniteGrpoLogprob;
+                    }
+                    group_sampling_rescore_max_abs_error = @max(group_sampling_rescore_max_abs_error, @abs(old_logp - new_logp));
+                    group_policy_reference_max_abs_error = @max(group_policy_reference_max_abs_error, @abs(new_logp - ref_logp));
+                }
+                if (compiled_sampling_requested) @memcpy(old_logps_owned, new_logps_owned);
+                if (diagnostic_slot) |slot| {
+                    diagnostic_policy_first_token_logps[slot] = new_logps_owned[0];
+                    diagnostic_reference_first_token_logps[slot] = ref_logps_owned[0];
+                }
+                try flat_new_logps.appendSlice(allocator, new_logps_owned);
+                try completions.append(allocator, .{
+                    .prompt_idx = prompt_idx,
+                    .tokens = tokens_owned,
+                    .old_logps = old_logps_owned,
+                    .ref_logps = ref_logps_owned,
+                    .truncated = isGemmaGrpoCompletionTruncated(
+                        &ctx.graph_config,
+                        tokens_owned,
+                        if (eos_id >= 0) eos_id else null,
+                    ),
+                });
+                total_tokens += tokens_owned.len;
+                group_token_count += tokens_owned.len;
+            }
+
+            if (!captured_initial_logprob_parity and !compiled_sampling_requested) {
+                if (group_sampling_rescore_max_abs_error > 1e-4) {
+                    print("grpo sampling-rescore parity mismatch: max_abs_error={d:.9} tolerance=0.000100000 batched_multi={} sparse_multi={}\n", .{
+                        group_sampling_rescore_max_abs_error,
+                        batch_multi_token_group_scoring,
+                        sparse_multi_token,
+                    });
+                    return error.GrpoSamplingRescoreParityMismatch;
+                }
+            }
+            if (!captured_initial_logprob_parity) {
+                if (current_base_equivalent_policy and group_policy_reference_max_abs_error > 1e-4) {
+                    print("grpo initial policy-reference parity mismatch: max_abs_error={d:.9} tolerance=0.000100000 compiled_sampling={}\n", .{
+                        group_policy_reference_max_abs_error,
+                        compiled_sampling_requested,
+                    });
+                    return error.GrpoInitialReferenceParityMismatch;
+                }
+                initial_sampling_rescore_max_abs_error = group_sampling_rescore_max_abs_error;
+                initial_policy_reference_max_abs_error = group_policy_reference_max_abs_error;
+                captured_initial_logprob_parity = true;
+            }
+
+            var ga = try grpo.scoreGroup(allocator, rewarder, completions.items);
+            defer ga.deinit();
+            try grpo.computeAdvantages(&ga, completions.items, cfg);
+            for (ga.advantages) |advantage| {
+                if (advantage != 0.0) saw_nonzero_reward_advantage = true;
+            }
+            var group_reward: f64 = 0.0;
+            var group_reward_squared: f64 = 0.0;
+            for (ga.rewards) |reward| {
+                total_reward += reward;
+                total_reward_squared += @as(f64, reward) * @as(f64, reward);
+                group_reward += reward;
+                group_reward_squared += @as(f64, reward) * @as(f64, reward);
+            }
+            const group_reward_denom = @as(f64, @floatFromInt(@max(ga.rewards.len, 1)));
+            const group_mean_reward = group_reward / group_reward_denom;
+            const group_reward_variance = @max(group_reward_squared / group_reward_denom - group_mean_reward * group_mean_reward, 0.0);
+            const logical_group_index = total_groups;
+            total_groups += 1;
+            total_completions += completions.items.len;
+            truncated_completions += countTruncatedGrpoCompletions(completions.items);
+            if (!grpo.rewardsHaveVariation(ga.rewards)) {
+                zero_reward_std_groups += 1;
+                if (benchmark_enabled) return error.GrpoBenchmarkZeroRewardStdGroup;
+                continue;
+            }
+            if (!hasActiveGrpoCompletion(completions.items, cfg.mask_truncated_completions)) {
+                all_truncated_groups += 1;
+                if (benchmark_enabled) return error.GrpoBenchmarkAllCompletionsTruncated;
+                continue;
+            }
+
+            var loss_result = try grpo.grpoLoss(allocator, completions.items, flat_new_logps.items, ga.advantages, cfg);
+            defer loss_result.deinit();
+            for (loss_result.grad_new_logps) |gradient| {
+                if (gradient != 0.0) saw_nonzero_policy_gradient = true;
+            }
+
+            const kl_admitted = try kl_control.observeAndSyncObjective(
+                &cfg,
+                logical_group_index,
+                epoch_idx,
+                prompt_idx,
+                trainer.optimizerSteps(),
+                completions.items.len,
+                loss_result.mean_kl,
+                loss_result.kl_loss,
+            );
+            if (!kl_admitted) {
+                kl_rejected_groups += 1;
+                if (benchmark_enabled) return error.GrpoBenchmarkKlRejectedGroup;
+                continue;
+            }
+
+            total_loss += loss_result.loss;
+            total_pg_loss += loss_result.pg_loss;
+            total_kl_loss += loss_result.kl_loss;
+            total_mean_kl += loss_result.mean_kl;
+            total_clip_fraction += loss_result.clip_fraction;
+            optimizer_groups += 1;
+
+            const backward_started_ns = platform.time.monotonicNs();
+            if (coalesce_single_token_groups) {
+                var completion_token_ids = std.ArrayList(i32).empty;
+                defer completion_token_ids.deinit(allocator);
+                for (completions.items) |completion| {
+                    if (completion.tokens.len != 1) return error.ExpectedSingleTokenCompletion;
+                    try completion_token_ids.append(allocator, completion.tokens[0]);
+                }
+                var prepared = try buildGemmaPreparedExampleFromTokens(allocator, prompt, completions.items[0].tokens, max_seq_len);
+                defer freeGemmaPreparedExample(allocator, &prepared);
+                var input = try gemma4_real_autodiff.makeTrainerInputForSingleTokenCompletionGroupLogprobGrads(
+                    allocator,
+                    &ctx,
+                    &prepared,
+                    @intCast(max_seq_len),
+                    completion_token_ids.items,
+                    loss_result.grad_new_logps,
+                );
+                defer input.deinit(allocator);
+                _ = try trainer.step(input.trainer_input);
+            } else if (batch_multi_token_group_backward) {
+                try scalePreferenceUnitGradients(loss_result.grad_new_logps, physical_micro_batches_per_group);
+                var token_offset: usize = 0;
+                var completion_start: usize = 0;
+                while (completion_start < completions.items.len) {
+                    const completion_end = @min(
+                        completion_start + multi_token_backward_batch_size,
+                        completions.items.len,
+                    );
+                    const completion_chunk = completions.items[completion_start..completion_end];
+                    const prepared = try allocator.alloc(gemma4.PreparedExampleInput, completion_chunk.len);
+                    var prepared_count: usize = 0;
+                    defer {
+                        for (prepared[0..prepared_count]) |*example| freeGemmaPreparedExample(allocator, example);
+                        allocator.free(prepared);
+                    }
+                    const gradient_rows = try allocator.alloc([]const f32, completion_chunk.len);
+                    defer allocator.free(gradient_rows);
+
+                    for (completion_chunk, 0..) |completion, chunk_completion_idx| {
+                        prepared[chunk_completion_idx] = try buildGemmaPreparedExampleFromTokens(
+                            allocator,
+                            prompt,
+                            completion.tokens,
+                            max_seq_len,
+                        );
+                        prepared_count += 1;
+                        gradient_rows[chunk_completion_idx] = loss_result.grad_new_logps[token_offset .. token_offset + completion.tokens.len];
+                        token_offset += completion.tokens.len;
+                    }
+
+                    var input = try gemma4_real_autodiff.makeTrainerInputForTokenLogprobGradBatch(
+                        allocator,
+                        &ctx,
+                        prepared,
+                        @intCast(max_seq_len),
+                        gradient_rows,
+                    );
+                    defer input.deinit(allocator);
+                    _ = try trainer.step(input.trainer_input);
+                    completion_start = completion_end;
+                }
+                if (token_offset != loss_result.grad_new_logps.len) return error.GradientShapeMismatch;
+            } else {
+                try scalePreferenceUnitGradients(loss_result.grad_new_logps, group_size);
+                var token_offset: usize = 0;
+                for (completions.items) |completion| {
+                    var prepared = try buildGemmaPreparedExampleFromTokens(allocator, prompt, completion.tokens, max_seq_len);
+                    defer freeGemmaPreparedExample(allocator, &prepared);
+                    const grads = loss_result.grad_new_logps[token_offset .. token_offset + completion.tokens.len];
+                    var input = try gemma4_real_autodiff.makeTrainerInputForTokenLogprobGrads(
+                        allocator,
+                        &ctx,
+                        &prepared,
+                        @intCast(max_seq_len),
+                        grads,
+                    );
+                    defer input.deinit(allocator);
+                    _ = try trainer.step(input.trainer_input);
+                    token_offset += completion.tokens.len;
+                }
+            }
+            total_backward_update_seconds += @as(f64, @floatFromInt(platform.time.monotonicNs() - backward_started_ns)) / std.time.ns_per_s;
+            if (benchmark) |*recorder| {
+                try recorder.record(.{
+                    .seconds = @as(f64, @floatFromInt(platform.time.monotonicNs() - group_started_ns)) / std.time.ns_per_s,
+                    .loss = loss_result.loss,
+                    .pg_loss = loss_result.pg_loss,
+                    .kl_loss = loss_result.kl_loss,
+                    .mean_reward = @floatCast(group_mean_reward),
+                    .reward_stddev = @floatCast(@sqrt(group_reward_variance)),
+                    .completion_tokens = group_token_count,
+                    .policy_reference_max_abs_error = group_policy_reference_max_abs_error,
+                });
+            }
+        }
+        const completed_epochs = epoch_idx + 1;
+        const checkpoint_every = if (recipe.checkpoint) |checkpoint| checkpoint.every_epochs else null;
+        if (checkpoint_every) |every| {
+            if (completed_epochs % @as(usize, every) == 0 or completed_epochs == epochs) {
+                const path = grpo_checkpoint_path orelse return error.CheckpointPathRequired;
+                const checkpoint_incremental_kv = if (incremental_kv_sampler) |*sampler|
+                    try sampler.checkpointTelemetry()
+                else
+                    null;
+                try savePreferenceCheckpoint(
+                    allocator,
+                    io,
+                    &trainer,
+                    path,
+                    .grpo,
+                    completed_epochs,
+                    0,
+                    total_groups,
+                    &grpo_run_fingerprint,
+                    .{
+                        .task = @tagName(PreferenceTask.grpo),
+                        .run_fingerprint_sha256 = grpo_run_fingerprint_text,
+                        .epoch_index = completed_epochs,
+                        .micro_batch_steps = trainer.microBatchSteps(),
+                        .optimizer_steps = trainer.optimizerSteps(),
+                        .accumulation_micro_batches = trainer.accumulatedMicroBatches(),
+                        .grpo = .{
+                            .initial_adapter_digest = initial_adapter_digest,
+                            .total_loss = total_loss,
+                            .total_pg_loss = total_pg_loss,
+                            .total_kl_loss = total_kl_loss,
+                            .total_mean_kl = total_mean_kl,
+                            .total_clip_fraction = total_clip_fraction,
+                            .total_groups = total_groups,
+                            .optimizer_groups = optimizer_groups,
+                            .zero_reward_std_groups = zero_reward_std_groups,
+                            .all_truncated_groups = all_truncated_groups,
+                            .kl_rejected_groups = kl_rejected_groups,
+                            .total_completions = total_completions,
+                            .truncated_completions = truncated_completions,
+                            .total_tokens = total_tokens,
+                            .total_reward = total_reward,
+                            .total_reward_squared = total_reward_squared,
+                            .saw_nonzero_reward_advantage = saw_nonzero_reward_advantage,
+                            .saw_nonzero_policy_gradient = saw_nonzero_policy_gradient,
+                            .initial_sampling_rescore_max_abs_error = initial_sampling_rescore_max_abs_error,
+                            .initial_policy_reference_max_abs_error = initial_policy_reference_max_abs_error,
+                            .initial_base_equivalent_policy = initial_base_equivalent_policy,
+                            .captured_initial_logprob_parity = captured_initial_logprob_parity,
+                            .policy_rescore_completions = policy_rescore_completions,
+                            .diagnostic_first_tokens = diagnostic_first_tokens,
+                            .diagnostic_policy_first_token_logps = diagnostic_policy_first_token_logps,
+                            .diagnostic_reference_first_token_logps = diagnostic_reference_first_token_logps,
+                            .diagnostic_first_token_count = diagnostic_first_token_count,
+                            .kl_current_coef = kl_control.current_kl_coef,
+                            .kl_admitted_groups = kl_control.admitted_groups,
+                            .kl_max_observed_mean = kl_control.max_observed_mean_kl,
+                            .kl_trace = kl_control.trace.items,
+                            .reward_call_index = reward_pipeline.call_index,
+                            .reward_external_calls = reward_pipeline.external_calls,
+                            .reward_external_failures = reward_pipeline.external_failures,
+                            .reward_trace = reward_pipeline.trace.items,
+                            .reference_cache = reference_cache.checkpoint(),
+                            .incremental_kv = checkpoint_incremental_kv,
+                        },
+                    },
+                );
+                if (compiled_sampling_requested and completed_epochs < epochs) {
+                    try trainer.retireExecutionCachesAtCheckpointBoundary();
+                    compiled_sampling_execution_cache_retired = true;
+                }
+            }
+        }
+    }
+
+    const benchmark_telemetry = if (benchmark) |*recorder| try recorder.finish() else null;
+
+    try reward_pipeline.finish();
+    try kl_control.finish();
+
+    if (!saw_nonzero_reward_advantage or !saw_nonzero_policy_gradient) {
+        print("grpo zero-signal first completion token ids: {any}\n", .{diagnostic_first_tokens[0..diagnostic_first_token_count]});
+    }
+    try validateGrpoLearningSignal(saw_nonzero_reward_advantage, saw_nonzero_policy_gradient, total_reward, total_reward_squared, total_completions, total_loss);
+    _ = try trainer.flushAccumulatedGradients();
+    if (recipe.checkpoint) |checkpoint| if (checkpoint.every_epochs != null) {
+        const path = grpo_checkpoint_path orelse return error.CheckpointPathRequired;
+        const checkpoint_incremental_kv = if (incremental_kv_sampler) |*sampler|
+            try sampler.checkpointTelemetry()
+        else
+            null;
+        try savePreferenceCheckpoint(
+            allocator,
+            io,
+            &trainer,
+            path,
+            .grpo,
+            epochs,
+            0,
+            total_groups,
+            &grpo_run_fingerprint,
+            .{
+                .task = @tagName(PreferenceTask.grpo),
+                .run_fingerprint_sha256 = grpo_run_fingerprint_text,
+                .epoch_index = epochs,
+                .micro_batch_steps = trainer.microBatchSteps(),
+                .optimizer_steps = trainer.optimizerSteps(),
+                .accumulation_micro_batches = trainer.accumulatedMicroBatches(),
+                .grpo = .{
+                    .initial_adapter_digest = initial_adapter_digest,
+                    .total_loss = total_loss,
+                    .total_pg_loss = total_pg_loss,
+                    .total_kl_loss = total_kl_loss,
+                    .total_mean_kl = total_mean_kl,
+                    .total_clip_fraction = total_clip_fraction,
+                    .total_groups = total_groups,
+                    .optimizer_groups = optimizer_groups,
+                    .zero_reward_std_groups = zero_reward_std_groups,
+                    .all_truncated_groups = all_truncated_groups,
+                    .kl_rejected_groups = kl_rejected_groups,
+                    .total_completions = total_completions,
+                    .truncated_completions = truncated_completions,
+                    .total_tokens = total_tokens,
+                    .total_reward = total_reward,
+                    .total_reward_squared = total_reward_squared,
+                    .saw_nonzero_reward_advantage = saw_nonzero_reward_advantage,
+                    .saw_nonzero_policy_gradient = saw_nonzero_policy_gradient,
+                    .initial_sampling_rescore_max_abs_error = initial_sampling_rescore_max_abs_error,
+                    .initial_policy_reference_max_abs_error = initial_policy_reference_max_abs_error,
+                    .initial_base_equivalent_policy = initial_base_equivalent_policy,
+                    .captured_initial_logprob_parity = captured_initial_logprob_parity,
+                    .policy_rescore_completions = policy_rescore_completions,
+                    .diagnostic_first_tokens = diagnostic_first_tokens,
+                    .diagnostic_policy_first_token_logps = diagnostic_policy_first_token_logps,
+                    .diagnostic_reference_first_token_logps = diagnostic_reference_first_token_logps,
+                    .diagnostic_first_token_count = diagnostic_first_token_count,
+                    .kl_current_coef = kl_control.current_kl_coef,
+                    .kl_admitted_groups = kl_control.admitted_groups,
+                    .kl_max_observed_mean = kl_control.max_observed_mean_kl,
+                    .kl_trace = kl_control.trace.items,
+                    .reward_call_index = reward_pipeline.call_index,
+                    .reward_external_calls = reward_pipeline.external_calls,
+                    .reward_external_failures = reward_pipeline.external_failures,
+                    .reward_trace = reward_pipeline.trace.items,
+                    .reference_cache = reference_cache.checkpoint(),
+                    .incremental_kv = checkpoint_incremental_kv,
+                },
+            },
+        );
+    };
+    if (trainer.optimizerSteps() == 0) return error.NoOptimizerSteps;
+    try validateTrainerAdapterChanged(&trainer, initial_adapter_digest);
+
+    const evaluation_report_path = try preferenceEvaluationReportPath(allocator, recipe, .grpo);
+    defer allocator.free(evaluation_report_path);
+    const training_incremental_kv = if (incremental_kv_sampler) |*sampler| sampler.telemetry else null;
+    if (incremental_kv_sampler) |*sampler| sampler.resetTelemetry();
+    // As with DPO, terminal quality admission must not inherit graph, device-
+    // allocation, or private-buffer history from the training trajectory.
+    // Snapshot the exact final values to host and rebuild the evaluator,
+    // frozen-base bindings, and optional incremental sampler on a separately
+    // initialized backend with private-buffer reuse disabled.
+    const evaluation = evaluation: {
+        try trainer.prepareTerminalEvaluationFromHostSnapshot();
+
+        var evaluation_backend = try gemma4_real_autodiff.loadBackendForModelDir(
+            allocator,
+            base_model_dir,
+            backend_kind,
+        );
+        defer evaluation_backend.deinit();
+        var evaluation_trainer = try real_autodiff.RealAutodiffTrainer.init(
+            allocator,
+            evaluation_backend.backendPtr(),
+            .{
+                .lora = lora_config,
+                .optimizer = .{ .weight_decay = recipe.optimizer.weight_decay orelse 0.01 },
+                .lr_schedule = .{ .constant = recipe.optimizer.learning_rate orelse 0.0001 },
+                .max_grad_norm = recipe.optimizer.max_grad_norm orelse 1.0,
+                .grad_accum_steps = grad_accum_steps,
+                .seed = recipe.optimizer.seed orelse 42,
+                .hidden_size_hint = graph_config.hidden_size,
+                .num_layers_hint = graph_config.num_hidden_layers,
+                .execution_engine = execution_policy.engine,
+                .compiled_required = execution_policy.compiled_required,
+                .strict_metal_execution = execution_policy.strict_metal_execution,
+                .graph_cache_capacity = grpo_graph_cache_capacity,
+            },
+        );
+        defer evaluation_trainer.deinit();
+
+        var evaluation_metal_ordering_suspended = false;
+        var evaluation_metal_row_staging_suspended = false;
+        if (backend_kind == .metal) {
+            try evaluation_trainer.compute_backend.decoderRuntimeSubmitAndWaitFrame();
+            evaluation_metal_ordering_suspended = try evaluation_trainer.compute_backend.decoderRuntimePushPlannedEncoderCoalescingSuppression();
+            if (!evaluation_metal_ordering_suspended) return error.PlannedEncoderCoalescingSuppressionUnavailable;
+            errdefer evaluation_trainer.compute_backend.decoderRuntimePopPlannedEncoderCoalescingSuppression() catch {};
+            evaluation_metal_row_staging_suspended = try evaluation_trainer.compute_backend.decoderRuntimePushBf16EmbeddingRowStagingSuppression();
+            if (!evaluation_metal_row_staging_suspended) return error.Bf16EmbeddingRowStagingSuppressionUnavailable;
+        }
+        defer if (evaluation_metal_ordering_suspended or evaluation_metal_row_staging_suspended) {
+            evaluation_trainer.compute_backend.decoderRuntimeSubmitAndWaitFrame() catch {
+                if (evaluation_trainer.compute_backend.decoderRuntimeHasActiveFrame()) {
+                    evaluation_trainer.compute_backend.decoderRuntimeCancelFrame() catch {};
+                }
+            };
+            if (evaluation_metal_row_staging_suspended) {
+                evaluation_trainer.compute_backend.decoderRuntimePopBf16EmbeddingRowStagingSuppression() catch {};
+            }
+            evaluation_trainer.compute_backend.decoderRuntimePopPlannedEncoderCoalescingSuppression() catch {};
+        };
+
+        var evaluation_ctx = gemma4_real_autodiff.GemmaAutodiffCtx.init(graph_config);
+        evaluation_ctx.policy_temperature = ctx.policy_temperature;
+        evaluation_ctx.enable_fused_rms_norm_backward = ctx.enable_fused_rms_norm_backward;
+        evaluation_ctx.enable_fused_gqa_attention_backward = ctx.enable_fused_gqa_attention_backward;
+        evaluation_ctx.enable_fused_linear_cross_entropy = ctx.enable_fused_linear_cross_entropy;
+        var canonical_eval_reuse_scope = try gemma4_real_autodiff.configureMetalBufferReuseForPreferenceRun(
+            &evaluation_trainer,
+            false,
+            false,
+        );
+        defer canonical_eval_reuse_scope.deinit();
+        try gemma4_real_autodiff.initializeTrainerFromAdapterDir(
+            allocator,
+            &evaluation_trainer,
+            &evaluation_ctx,
+            bootstrap_dir,
+            &bootstrap_example,
+            @intCast(max_seq_len),
+        );
+        // Snapshot the original adapter before installing terminal policy weights.
+        var evaluation_frozen_lora = if (reference_base_equivalent)
+            try gemma4_real_autodiff.FrozenBaseLoraBindings.init(allocator, &evaluation_trainer)
+        else
+            try gemma4_real_autodiff.FrozenBaseLoraBindings.initSnapshot(allocator, &evaluation_trainer);
+        defer evaluation_frozen_lora.deinit();
+        try evaluation_trainer.initializeTerminalEvaluationFromHostSnapshot(&trainer);
+        var evaluation_incremental_kv_sampler: ?gemma4_real_autodiff.GrpoIncrementalKvSampler = if (incremental_kv_requested)
+            try gemma4_real_autodiff.GrpoIncrementalKvSampler.init(
+                allocator,
+                &evaluation_trainer,
+                &evaluation_ctx,
+                incremental_kv_batch_active,
+                incremental_kv_clone_prompt_tail,
+            )
+        else
+            null;
+        defer if (evaluation_incremental_kv_sampler) |*sampler| sampler.deinit();
+        break :evaluation try evaluateGemmaGrpoHeldout(
+            allocator,
+            io,
+            recipe,
+            tokenizer_view,
+            prompt_batch.prompts,
+            &evaluation_trainer,
+            &evaluation_ctx,
+            if (evaluation_incremental_kv_sampler) |*sampler| sampler else null,
+            &evaluation_frozen_lora,
+            max_seq_len,
+            group_size,
+            max_completion_tokens,
+            backend_kind,
+            evaluation_report_path,
+            // Retain the full training summary before returning the gate error.
+            // Adapter publication below still requires both quality gates.
+            false,
+        );
+    };
+
+    const baseline_relative: ?GrpoBaselineRelativeSummary = if (baseline_evaluation) |baseline| relative: {
+        const summary = compareGrpoToBaseline(baseline, evaluation, grpo_minimums);
+        break :relative summary;
+    } else null;
+    const baseline_relative_passed = if (baseline_relative) |summary| summary.passed else true;
+
+    const quality_passed = evaluation.passed and baseline_relative_passed;
+    if (quality_passed) {
+        try gemma4_real_autodiff.saveTrainerAsGemmaBundle(allocator, &trainer, base_model_dir, bootstrap_dir, trained_dir);
+        try validatePublishedAdapterChanged(allocator, io, bootstrap_dir, trained_dir);
+    }
+
+    var grpo_checkpoint_artifact = try preferenceCheckpointArtifactSummary(
+        allocator,
+        grpo_checkpoint_path,
+        .grpo,
+        trainer.trainingProgress(),
+    );
+    defer if (grpo_checkpoint_artifact) |*artifact| artifact.deinit(allocator);
+
+    const denom = @as(f64, @floatFromInt(@max(optimizer_groups, 1)));
+    const reward_denom = @as(f64, @floatFromInt(@max(total_completions, 1)));
+    const mean_reward = total_reward / reward_denom;
+    const reward_variance = @max(total_reward_squared / reward_denom - mean_reward * mean_reward, 0.0);
+    try writeJsonFile(allocator, io, report_path, GrpoReport{
+        .execution_mode = "train",
+        .dataset_format = recipe.dataset.format.?,
+        .completions = total_completions,
+        .tokens = total_tokens,
+        .groups = total_groups,
+        .optimizer_groups = optimizer_groups,
+        .zero_reward_std_groups = zero_reward_std_groups,
+        .all_truncated_groups = all_truncated_groups,
+        .kl_rejected_groups = kl_rejected_groups,
+        .frac_reward_zero_std = @floatCast(
+            @as(f64, @floatFromInt(zero_reward_std_groups)) /
+                @as(f64, @floatFromInt(@max(total_groups, 1))),
+        ),
+        .truncated_completions = truncated_completions,
+        .frac_completions_truncated = @floatCast(
+            @as(f64, @floatFromInt(truncated_completions)) / reward_denom,
+        ),
+        .mask_truncated_completions = resolved_objective.mask_truncated_completions,
+        .frac_kl_rejected = @floatCast(
+            @as(f64, @floatFromInt(kl_rejected_groups)) /
+                @as(f64, @floatFromInt(@max(total_groups, 1))),
+        ),
+        .loss_type = @tagName(resolved_objective.loss_type),
+        .scale_rewards = @tagName(resolved_objective.scale_rewards),
+        .epsilon_low = resolved_objective.epsilon_low,
+        .epsilon_high = resolved_objective.epsilon_high,
+        .max_completion_tokens = resolved_objective.max_completion_tokens,
+        .loss = @floatCast(total_loss / denom),
+        .pg_loss = @floatCast(total_pg_loss / denom),
+        .kl_loss = @floatCast(total_kl_loss / denom),
+        .mean_kl = @floatCast(total_mean_kl / denom),
+        .clip_fraction = @floatCast(total_clip_fraction / denom),
+        .mean_reward = @floatCast(mean_reward),
+        .reward_stddev = @floatCast(@sqrt(reward_variance)),
+        .training_seed = training_seed,
+        .policy_backend = @tagName(backend_kind),
+        .optimizer_steps = trainer.optimizerSteps(),
+        .micro_batch_steps = trainer.microBatchSteps(),
+        .training_order = .{},
+        .sampling_mode = if (coalesce_single_token_groups)
+            "shared-prompt-seeded-categorical-sparse-row"
+        else if (incremental_kv_sampler != null)
+            "shared-page-prompt-seeded-categorical-incremental-kv"
+        else if (compiled_sampling_requested)
+            "compiled-shared-prompt-seeded-categorical-sparse-row-each-step"
+        else if (sparse_multi_token)
+            "shared-prompt-seeded-categorical-sparse-row-each-step"
+        else
+            "shared-prompt-seeded-categorical",
+        .sampling = .{
+            .temperature = resolved_sampling.temperature,
+            .top_p = resolved_sampling.top_p,
+            .top_k = resolved_sampling.top_k,
+            .first_completion_greedy = false,
+        },
+        .policy_logprob_mode = if (compiled_sampling_requested)
+            "compiled-token-selection-with-eager-per-completion-canonical-logprob-rescore"
+        else if (batch_single_token_group_scoring)
+            "sampling-logprob-reuse-with-batched-initial-rescore"
+        else if (batch_multi_token_group_scoring)
+            "sampling-logprob-reuse-with-batched-completion-row-initial-rescore"
+        else if (sparse_multi_token)
+            "sampling-logprob-reuse-with-sparse-completion-row-initial-rescore"
+        else
+            "sampling-logprob-reuse-with-initial-rescore",
+        .policy_rescore_completions = policy_rescore_completions,
+        .training_microbatch_mode = if (coalesce_single_token_groups)
+            "coalesced-single-token-sparse-weighted-row"
+        else if (batch_multi_token_group_backward)
+            "batched-independent-row-sparse-weighted-group"
+        else
+            "per-completion",
+        .training_microbatch_batch_size = if (batch_multi_token_group_backward)
+            multi_token_backward_batch_size
+        else
+            1,
+        .training_physical_micro_batches_per_group = physical_micro_batches_per_group,
+        .sampling_seconds = total_sampling_seconds,
+        .incremental_kv = training_incremental_kv,
+        .policy_rescore_seconds = total_policy_rescore_seconds,
+        .backward_update_seconds = total_backward_update_seconds,
+        .reference_mode = if (!reference_base_equivalent)
+            "compiled-initial-adapter-snapshot"
+        else if (batch_single_token_group_scoring)
+            "compiled-zero-lora-shared-prompt-candidate-row"
+        else if (batch_multi_token_group_scoring)
+            "compiled-zero-lora-batched-completion-rows"
+        else if (sparse_multi_token)
+            "compiled-zero-lora-sparse-completion-rows"
+        else
+            "compiled-zero-lora",
+        .reference_scoring_seconds = total_reference_scoring_seconds,
+        .reference_cache = reference_cache.telemetry(),
+        .initial_logprob_parity = .{
+            .sampling_rescore_max_abs_error = initial_sampling_rescore_max_abs_error,
+            .policy_reference_max_abs_error = initial_policy_reference_max_abs_error,
+            .base_equivalent_policy = initial_base_equivalent_policy,
+            .completion_first_token_ids = diagnostic_first_tokens[0..diagnostic_first_token_count],
+            .policy_first_token_logps = diagnostic_policy_first_token_logps[0..diagnostic_first_token_count],
+            .reference_first_token_logps = diagnostic_reference_first_token_logps[0..diagnostic_first_token_count],
+        },
+        .kl_control = kl_control.telemetry(),
+        .benchmark = benchmark_telemetry,
+        .checkpoint_resume = .{
+            .enabled = grpo_resume_enabled,
+            .start_epoch = start_epoch,
+            .start_examples_into_epoch = resume_examples_into_epoch,
+            .checkpoint_path = grpo_checkpoint_path,
+            .checkpoint_state_path = if (grpo_checkpoint_artifact) |artifact| artifact.state_path else null,
+            .checkpoint_state_sha256 = if (grpo_checkpoint_artifact) |artifact| artifact.state_sha256 else null,
+            .checkpoint_epoch = if (grpo_checkpoint_artifact) |artifact| artifact.epoch else null,
+            .checkpoint_every_epochs = if (recipe.checkpoint) |checkpoint| checkpoint.every_epochs else null,
+            .checkpoint_every_examples = if (recipe.checkpoint) |checkpoint| checkpoint.every_examples else null,
+            .run_fingerprint_sha256 = grpo_run_fingerprint_text,
+            .restored_micro_batch_steps = grpo_restored.micro_batch_steps,
+            .restored_optimizer_steps = grpo_restored.optimizer_steps,
+            .restored_accumulation_micro_batches = grpo_restored.accumulation_micro_batches,
+            .compiled_sampling_execution_cache_retired = compiled_sampling_execution_cache_retired,
+        },
+        .reward_pipeline = reward_pipeline.telemetry(),
+        .metal_numerical_policy = metal_numerical_policy,
+        .numerical_environment_overrides = numerical_environment.assignments,
+        .optimizer_weight_decay = recipe.optimizer.weight_decay orelse 0.01,
+        .evaluation_execution_policy = canonical_preference_evaluation_policy,
+        .baseline_evaluation = baseline_evaluation,
+        .baseline_relative = baseline_relative,
+        .evaluation = evaluation,
+        .trained_adapter_dir = if (quality_passed) trained_dir else null,
+    });
+    if (!evaluation.passed) return error.GrpoEvaluationGateFailed;
+    if (!baseline_relative_passed) return error.GrpoBaselineRelativeEvaluationGateFailed;
+    print("grpo report: {s}\ntrained adapter: {s}\n", .{ report_path, trained_dir });
+}
+
+/// Gemma 4 GRPO on the strict CUDA optimizer lane (from main, PR #626).
+///
+/// The Metal/native lane (`runOptimizerBackedGemmaGrpo`) carries the held-out
+/// evaluation, checkpoint/resume and Metal numerical-policy contract. This
+/// lane keeps main's CUDA contract instead: it rejects those lifecycle knobs
+/// (see `validateGemma4CudaPreferenceRecipeContract`), implies `train` mode,
+/// keeps tokenizer/reward/external-reference models on host sessions, reuses
+/// the resident policy checkpoint as a frozen same-base reference, and proves
+/// device optimizer movement through `TrainableParameterSnapshot`.
+fn runOptimizerBackedGemmaGrpoCuda(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    recipe: Recipe,
+    dataset_path: []const u8,
+    report_path: []const u8,
+) !void {
+    const base_model_dir = recipe.model.path orelse return error.MissingModelPath;
+    const adapter = recipe.adapter orelse AdapterConfig{};
+    const bootstrap_dir_config = adapter.path orelse adapterBootstrapDir(recipe);
+    const bootstrap_dir = bootstrap_dir_config orelse try defaultArtifactPath(allocator, recipe, "adapter-bootstrap");
+    defer if (bootstrap_dir_config == null) allocator.free(bootstrap_dir);
+    const trained_dir_config = recipe.artifacts.trained_adapter_dir orelse recipe.artifacts.adapter_dir;
+    const trained_dir = trained_dir_config orelse try defaultArtifactPath(allocator, recipe, "adapter-trained");
+    defer if (trained_dir_config == null) allocator.free(trained_dir);
+    const reference_path = recipe.model.reference_path orelse base_model_dir;
+    const backend_kind = (try resolveGemmaPreferenceExecution(recipe.backend)).backend_kind;
+    if (backend_kind != .cuda) return error.UnsupportedBackend;
+    if (recipe.model.projector_path != null) return error.UnsupportedGemmaCudaMultimodalTraining;
+    const max_seq_len = recipe.dataset.max_seq_len orelse 128;
+    const group_size = recipe.grpo.group_size orelse 2;
+    // Main's CUDA lane default; the Metal/native lane uses
+    // `default_grpo_max_completion_tokens`.
+    const max_completion_tokens = recipe.grpo.max_completion_tokens orelse 4;
+    if (max_completion_tokens == 0) return error.InvalidGRPOConfig;
+    const reward_mode = try parseTextRewardMode(recipe.grpo.reward_mode orelse "exact-match");
+    const cfg = gemmaCudaGrpoConfig(recipe);
+    try grpo.validateConfig(cfg);
+    try validateGemmaPreferenceAdapterOptions(adapter);
+    try validateGemmaPreferenceLifecycleOptions(recipe);
+    try validateGemmaGrpoObjectiveOptions(recipe);
+    try validateGemmaCudaGrpoLaneOptions(recipe);
+
+    compat.cwd().access(compat.io(), bootstrap_dir, .{}) catch {
+        var bootstrap = try gemma4.bootstrapLoRABundle(allocator, base_model_dir, bootstrap_dir, .{
+            .rank = adapterRank(adapter, .grpo),
+            .alpha = adapterAlpha(adapter),
+            .base_model_name_or_path = adapter.base_model_name_or_path,
+            .target_modules = adapter.target_modules,
+            .gemma4_target_preset = gemma4TargetPreset(adapter),
+            .target_preset = try gemmaLegacyTargetPreset(adapter),
+            .use_dora = adapter.use_dora orelse false,
+            .init_lora_weights = adapter.init_lora_weights,
+            .initialization_seed = adapter.initialization_seed orelse 0,
+        });
+        defer gemma4.freeBootstrapSummary(allocator, &bootstrap);
+    };
+
     var session_manager = backends.SessionManager.init(allocator);
     // Keep tokenizer, reward, and any external reference off the training
     // device. A same-base reference reuses the policy's resident checkpoint
@@ -4400,7 +12232,13 @@ fn runOptimizerBackedGemmaGrpo(
     else
         try model_manager.loadFromDir(reference_path);
 
-    var prompt_batch = try loadGrpoTextPrompts(allocator, io, dataset_path, recipe, tokenizer_model);
+    var prompt_batch = try loadGrpoTextPrompts(
+        allocator,
+        io,
+        dataset_path,
+        recipe,
+        PreferenceTokenizerView.fromLoadedModel(tokenizer_model),
+    );
     defer prompt_batch.deinit();
     const preference_seq_len = try gemmaGrpoBatchSequenceLength(
         prompt_batch.prompts,
@@ -4647,12 +12485,23 @@ fn runOptimizerBackedGemmaGrpo(
     const mean_reward = reward_sum / reward_denom;
     const reward_variance = @max(0.0, reward_square_sum / reward_denom - mean_reward * mean_reward);
     try writeJsonFile(allocator, io, report_path, GrpoReport{
+        .execution_mode = "train",
+        .dataset_format = recipe.dataset.format orelse "text-grpo",
         .completions = total_completions,
         .tokens = total_tokens,
         .groups = total_groups,
         .informative_groups = informative_groups,
         .mean_reward = @floatCast(mean_reward),
         .reward_std = @floatCast(@sqrt(reward_variance)),
+        .reward_stddev = @floatCast(@sqrt(reward_variance)),
+        .loss_type = @tagName(cfg.loss_type),
+        .scale_rewards = if (cfg.normalize_advantage) "group" else "none",
+        .epsilon_low = cfg.clip_epsilon,
+        .epsilon_high = cfg.clip_epsilon,
+        .max_completion_tokens = max_completion_tokens,
+        .optimizer_weight_decay = recipe.optimizer.weight_decay orelse 0.01,
+        .reference_mode = if (shared_base_reference != null) "shared-base-frozen-scorer" else "external-decoder-model",
+        .trained_adapter_dir = trained_dir,
         .loss = @floatCast(total_loss / denom),
         .pg_loss = @floatCast(total_pg_loss / denom),
         .kl_loss = @floatCast(total_kl_loss / denom),
@@ -4677,6 +12526,519 @@ fn runOptimizerBackedGemmaGrpo(
     print("grpo report: {s}\ntrained adapter: {s}\n", .{ report_path, trained_dir });
 }
 
+fn evaluateGemmaGrpoHeldout(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    recipe: Recipe,
+    tokenizer_view: PreferenceTokenizerView,
+    train_prompts: []const []const i32,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    ctx: *gemma4_real_autodiff.GemmaAutodiffCtx,
+    incremental_kv_sampler: ?*gemma4_real_autodiff.GrpoIncrementalKvSampler,
+    frozen_lora: *gemma4_real_autodiff.FrozenBaseLoraBindings,
+    max_seq_len: usize,
+    group_size: usize,
+    max_completion_tokens: usize,
+    backend_kind: gemma4_real_autodiff.BackendKind,
+    report_path: []const u8,
+    enforce_minimums: bool,
+) !GrpoEvaluationSummary {
+    const eval_path = evalDatasetPath(recipe) orelse return error.MissingPreferenceEvaluationDataset;
+    const minimums = recipe.eval.?.grpo_minimums orelse return error.MissingGrpoEvaluationMinimums;
+    var eval_recipe = recipe;
+    eval_recipe.dataset.max_examples = evalMaxExamples(recipe);
+    var prompt_batch = try loadGrpoTextPrompts(allocator, io, eval_path, eval_recipe, tokenizer_view);
+    defer prompt_batch.deinit();
+    const dataset_fingerprint = try fingerprintPath(allocator, io, "eval_dataset", eval_path);
+    defer if (dataset_fingerprint.digest) |digest| allocator.free(digest);
+    const policy_adapter_digest = try formatSha256DigestAlloc(allocator, trainerLoRAParameterDigest(trainer));
+    defer allocator.free(policy_adapter_digest);
+    var reward_pipeline = try RewardPipeline.init(
+        allocator,
+        io,
+        recipe,
+        tokenizer_view.tokenizer,
+        prompt_batch.prompt_texts,
+        prompt_batch.targets,
+        .evaluation,
+    );
+    defer reward_pipeline.deinit();
+    errdefer reward_pipeline.finish() catch {};
+
+    const overlap_count = try countTokenPromptOverlaps(allocator, train_prompts, prompt_batch.prompts);
+    if (overlap_count != 0) {
+        try reward_pipeline.finish();
+        try writeJsonFile(allocator, io, report_path, GrpoEvaluationReport{
+            .status = "failed-prompt-overlap",
+            .dataset_path = eval_path,
+            .dataset_fingerprint = dataset_fingerprint,
+            .policy_adapter_digest = policy_adapter_digest,
+            .policy_backend = @tagName(backend_kind),
+            .metal_numerical_policy = resolveGemmaMetalNumericalPolicy(backend_kind, ctx),
+            .optimizer_weight_decay = recipe.optimizer.weight_decay orelse 0.01,
+            .groups = 0,
+            .completions = 0,
+            .tokens = 0,
+            .prompt_overlap_count = overlap_count,
+            .mean_reward = 0.0,
+            .top_rank_mean_reward = 0.0,
+            .positive_reward_group_rate = 0.0,
+            .reward_stddev = 0.0,
+            .loss = 0.0,
+            .pg_loss = 0.0,
+            .kl_loss = 0.0,
+            .mean_kl = 0.0,
+            .clip_fraction = 0.0,
+            .minimums = minimums,
+            .reference_mode = if (frozen_lora.is_snapshot) "compiled-initial-adapter-snapshot" else "compiled-zero-lora",
+            .reward_pipeline = reward_pipeline.telemetry(),
+        });
+        return error.PreferenceTrainEvalPromptOverlap;
+    }
+
+    const rewarder = grpo.Rewarder{ .ctx = &reward_pipeline, .call = RewardPipeline.score };
+    const cfg = try resolveGrpoCoreConfig(recipe);
+    const resolved_sampling = try resolveGrpoSamplingConfig(recipe.grpo);
+    const evaluation_seed = recipe.optimizer.seed orelse 42;
+    const coalesce = max_completion_tokens == 1;
+    const batch_single_token_group_scoring = coalesce and
+        platform.env.getenvBoolDefault("ANTFLY_GEMMA4_GRPO_BATCH_SINGLE_TOKEN_SCORING", true);
+    const batch_multi_token_group_scoring = !coalesce and gemmaGrpoMultiTokenBatchEnabled(group_size);
+    const sparse_multi_token = !coalesce and
+        backend_kind == .metal and
+        !batch_multi_token_group_scoring and
+        gemmaGrpoSparseMultiTokenEnabled();
+    const eos_id = tokenizer_view.tokenizer.specialTokens().sep_id;
+    var reference_cache = GemmaGrpoReferenceCache.init(allocator, 1024);
+    defer reference_cache.deinit();
+    var total_loss: f64 = 0.0;
+    var total_pg_loss: f64 = 0.0;
+    var total_kl_loss: f64 = 0.0;
+    var total_mean_kl: f64 = 0.0;
+    var total_clip_fraction: f64 = 0.0;
+    var total_reward: f64 = 0.0;
+    var total_reward_squared: f64 = 0.0;
+    var total_top_rank_reward: f64 = 0.0;
+    var groups_with_positive_reward: usize = 0;
+    var zero_reward_std_groups: usize = 0;
+    var truncated_completions: usize = 0;
+    var total_groups: usize = 0;
+    var total_completions: usize = 0;
+    var total_tokens: usize = 0;
+    var total_sampling_seconds: f64 = 0.0;
+    var total_reference_scoring_seconds: f64 = 0.0;
+    var total_reward_loss_seconds: f64 = 0.0;
+    const loop_started_ns = platform.time.monotonicNs();
+
+    // Keep live-policy and frozen-reference eager executions in separate
+    // phases for the one-token production lane. Besides avoiding repeated
+    // model-state switches, this makes the evaluation schedule explicit and
+    // deterministic: every sampled token is fixed before a zero-LoRA binding
+    // is installed. The storage is only two scalars per completion.
+    var sampled_single_token_ids: ?[]i32 = null;
+    defer if (sampled_single_token_ids) |values| allocator.free(values);
+    var sampled_single_token_logps: ?[]f32 = null;
+    defer if (sampled_single_token_logps) |values| allocator.free(values);
+    if (batch_single_token_group_scoring) {
+        const sampled_count = std.math.mul(usize, prompt_batch.prompts.len, group_size) catch
+            return error.InvalidCompletionGroup;
+        const token_ids = try allocator.alloc(i32, sampled_count);
+        sampled_single_token_ids = token_ids;
+        const token_logps = try allocator.alloc(f32, sampled_count);
+        sampled_single_token_logps = token_logps;
+
+        for (prompt_batch.prompts, 0..) |prompt, prompt_idx| {
+            const sampled_tokens = try allocator.alloc(std.ArrayList(i32), group_size);
+            defer allocator.free(sampled_tokens);
+            const sampled_logps = try allocator.alloc(std.ArrayList(f32), group_size);
+            defer allocator.free(sampled_logps);
+            for (sampled_tokens, sampled_logps) |*tokens, *logps| {
+                tokens.* = .empty;
+                logps.* = .empty;
+            }
+            defer for (sampled_tokens, sampled_logps) |*tokens, *logps| {
+                tokens.deinit(allocator);
+                logps.deinit(allocator);
+            };
+
+            const sampling_started_ns = platform.time.monotonicNs();
+            try sampleGemmaGrpoCompletionGroup(
+                allocator,
+                trainer,
+                ctx,
+                incremental_kv_sampler,
+                gemmaGrpoIncrementalKvShadowExactEnabled(recipe),
+                prompt,
+                @intCast(max_seq_len),
+                max_completion_tokens,
+                .{
+                    .seed = gemma4_real_autodiff.deriveGrpoSamplingGroupSeed(
+                        evaluation_seed,
+                        gemma_grpo_evaluation_sampling_domain,
+                        0,
+                        prompt_idx,
+                    ),
+                    .temperature = resolved_sampling.temperature,
+                    .top_p = resolved_sampling.top_p,
+                    .top_k = resolved_sampling.top_k,
+                    .first_completion_greedy = true,
+                },
+                if (eos_id >= 0) eos_id else null,
+                sparse_multi_token,
+                sampled_tokens,
+                sampled_logps,
+            );
+            total_sampling_seconds += @as(f64, @floatFromInt(platform.time.monotonicNs() - sampling_started_ns)) / std.time.ns_per_s;
+
+            const group_offset = prompt_idx * group_size;
+            for (sampled_tokens, sampled_logps, 0..) |tokens, logps, completion_idx| {
+                if (tokens.items.len != 1 or logps.items.len != 1) {
+                    return error.ExpectedSingleTokenCompletion;
+                }
+                token_ids[group_offset + completion_idx] = tokens.items[0];
+                token_logps[group_offset + completion_idx] = logps.items[0];
+            }
+        }
+    }
+
+    for (prompt_batch.prompts, 0..) |prompt, prompt_idx| {
+        var sampled_tokens = try allocator.alloc(std.ArrayList(i32), group_size);
+        defer allocator.free(sampled_tokens);
+        var sampled_logps = try allocator.alloc(std.ArrayList(f32), group_size);
+        defer allocator.free(sampled_logps);
+        for (sampled_tokens, sampled_logps) |*tokens, *logps| {
+            tokens.* = .empty;
+            logps.* = .empty;
+        }
+        defer for (sampled_tokens, sampled_logps) |*tokens, *logps| {
+            tokens.deinit(allocator);
+            logps.deinit(allocator);
+        };
+        if (sampled_single_token_ids) |token_ids| {
+            const token_logps = sampled_single_token_logps orelse return error.InvalidCompletionGroup;
+            const group_offset = prompt_idx * group_size;
+            for (sampled_tokens, sampled_logps, 0..) |*tokens, *logps, completion_idx| {
+                try tokens.append(allocator, token_ids[group_offset + completion_idx]);
+                try logps.append(allocator, token_logps[group_offset + completion_idx]);
+            }
+        } else {
+            const sampling_started_ns = platform.time.monotonicNs();
+            try sampleGemmaGrpoCompletionGroup(
+                allocator,
+                trainer,
+                ctx,
+                incremental_kv_sampler,
+                gemmaGrpoIncrementalKvShadowExactEnabled(recipe),
+                prompt,
+                @intCast(max_seq_len),
+                max_completion_tokens,
+                .{
+                    .seed = gemma4_real_autodiff.deriveGrpoSamplingGroupSeed(
+                        evaluation_seed,
+                        gemma_grpo_evaluation_sampling_domain,
+                        0,
+                        prompt_idx,
+                    ),
+                    .temperature = resolved_sampling.temperature,
+                    .top_p = resolved_sampling.top_p,
+                    .top_k = resolved_sampling.top_k,
+                    .first_completion_greedy = true,
+                },
+                if (eos_id >= 0) eos_id else null,
+                sparse_multi_token,
+                sampled_tokens,
+                sampled_logps,
+            );
+            total_sampling_seconds += @as(f64, @floatFromInt(platform.time.monotonicNs() - sampling_started_ns)) / std.time.ns_per_s;
+        }
+
+        var single_token_reference_logps: ?[]f32 = null;
+        defer if (single_token_reference_logps) |values| allocator.free(values);
+        if (batch_single_token_group_scoring) {
+            const reference_logps = try allocator.alloc(f32, group_size);
+            single_token_reference_logps = reference_logps;
+            const reference_started_ns = platform.time.monotonicNs();
+            try cachedSingleTokenGroupReferenceLogps(
+                allocator,
+                trainer,
+                ctx,
+                prompt,
+                prompt_idx,
+                sampled_tokens,
+                @intCast(max_seq_len),
+                frozen_lora,
+                &reference_cache,
+                reference_logps,
+            );
+            total_reference_scoring_seconds += @as(f64, @floatFromInt(platform.time.monotonicNs() - reference_started_ns)) / std.time.ns_per_s;
+        }
+        var multi_token_reference_logps: ?CompletionGroupLogps = null;
+        defer if (multi_token_reference_logps) |*values| values.deinit();
+        if (batch_multi_token_group_scoring) {
+            const reference_started_ns = platform.time.monotonicNs();
+            multi_token_reference_logps = try batchedMultiTokenGroupReferenceLogps(
+                allocator,
+                trainer,
+                ctx,
+                prompt,
+                prompt_idx,
+                sampled_tokens,
+                @intCast(max_seq_len),
+                frozen_lora,
+                &reference_cache,
+            );
+            total_reference_scoring_seconds += @as(f64, @floatFromInt(platform.time.monotonicNs() - reference_started_ns)) / std.time.ns_per_s;
+        }
+
+        var completions: std.ArrayList(grpo.Completion) = .empty;
+        defer {
+            for (completions.items) |completion| {
+                allocator.free(completion.tokens);
+                allocator.free(completion.old_logps);
+                allocator.free(completion.ref_logps);
+            }
+            completions.deinit(allocator);
+        }
+        var flat_new_logps: std.ArrayList(f32) = .empty;
+        defer flat_new_logps.deinit(allocator);
+        for (0..group_size) |completion_idx| {
+            const tokens_owned = try sampled_tokens[completion_idx].toOwnedSlice(allocator);
+            errdefer allocator.free(tokens_owned);
+            const policy_logps_owned = try sampled_logps[completion_idx].toOwnedSlice(allocator);
+            errdefer allocator.free(policy_logps_owned);
+            const reference_logps_owned = try allocator.alloc(f32, tokens_owned.len);
+            errdefer allocator.free(reference_logps_owned);
+            if (single_token_reference_logps) |batched_logps| {
+                if (reference_logps_owned.len != 1) return error.ExpectedSingleTokenCompletion;
+                reference_logps_owned[0] = batched_logps[completion_idx];
+            } else if (multi_token_reference_logps) |batched_logps| {
+                @memcpy(reference_logps_owned, batched_logps.rows[completion_idx]);
+            } else if (!try reference_cache.lookup(prompt_idx, tokens_owned, reference_logps_owned)) {
+                const reference_started_ns = platform.time.monotonicNs();
+                if (coalesce) {
+                    try gemma4_real_autodiff.tokenLogprobsForPromptCompletionSparseRowsFrozenBase(
+                        allocator,
+                        trainer,
+                        ctx,
+                        prompt,
+                        tokens_owned,
+                        @intCast(max_seq_len),
+                        reference_logps_owned,
+                        frozen_lora,
+                    );
+                } else {
+                    if (sparse_multi_token) {
+                        try gemma4_real_autodiff.tokenLogprobsForPromptCompletionSparseRowsFrozenBase(
+                            allocator,
+                            trainer,
+                            ctx,
+                            prompt,
+                            tokens_owned,
+                            @intCast(max_seq_len),
+                            reference_logps_owned,
+                            frozen_lora,
+                        );
+                    } else {
+                        try gemma4_real_autodiff.tokenLogprobsForPromptCompletionFrozenBase(
+                            allocator,
+                            trainer,
+                            ctx,
+                            prompt,
+                            tokens_owned,
+                            @intCast(max_seq_len),
+                            reference_logps_owned,
+                            frozen_lora,
+                        );
+                    }
+                }
+                total_reference_scoring_seconds += @as(f64, @floatFromInt(platform.time.monotonicNs() - reference_started_ns)) / std.time.ns_per_s;
+                try reference_cache.insert(prompt_idx, tokens_owned, reference_logps_owned);
+            }
+            for (policy_logps_owned, reference_logps_owned) |policy_logp, reference_logp| {
+                if (!std.math.isFinite(policy_logp) or !std.math.isFinite(reference_logp)) {
+                    return error.NonFiniteGrpoLogprob;
+                }
+            }
+            try flat_new_logps.appendSlice(allocator, policy_logps_owned);
+            try completions.append(allocator, .{
+                .prompt_idx = prompt_idx,
+                .tokens = tokens_owned,
+                .old_logps = policy_logps_owned,
+                .ref_logps = reference_logps_owned,
+                .truncated = isGemmaGrpoCompletionTruncated(
+                    &ctx.graph_config,
+                    tokens_owned,
+                    if (eos_id >= 0) eos_id else null,
+                ),
+            });
+            total_tokens += tokens_owned.len;
+        }
+
+        const reward_loss_started_ns = platform.time.monotonicNs();
+        var advantages = try grpo.scoreGroup(allocator, rewarder, completions.items);
+        defer advantages.deinit();
+        truncated_completions += countTruncatedGrpoCompletions(completions.items);
+        if (!grpo.rewardsHaveVariation(advantages.rewards)) zero_reward_std_groups += 1;
+        try grpo.computeAdvantages(&advantages, completions.items, cfg);
+        if (advantages.rewards.len == 0) return error.EmptyCompletionGroup;
+        total_top_rank_reward += advantages.rewards[0];
+        var group_has_positive_reward = false;
+        for (advantages.rewards) |reward| {
+            total_reward += reward;
+            total_reward_squared += @as(f64, reward) * @as(f64, reward);
+            group_has_positive_reward = group_has_positive_reward or reward > 0.0;
+        }
+        if (group_has_positive_reward) groups_with_positive_reward += 1;
+        var loss = try grpo.grpoLoss(allocator, completions.items, flat_new_logps.items, advantages.advantages, cfg);
+        defer loss.deinit();
+        total_loss += loss.loss;
+        total_pg_loss += loss.pg_loss;
+        total_kl_loss += loss.kl_loss;
+        total_mean_kl += loss.mean_kl;
+        total_clip_fraction += loss.clip_fraction;
+        total_groups += 1;
+        total_completions += completions.items.len;
+        total_reward_loss_seconds += @as(f64, @floatFromInt(platform.time.monotonicNs() - reward_loss_started_ns)) / std.time.ns_per_s;
+    }
+
+    const loop_seconds = @as(f64, @floatFromInt(platform.time.monotonicNs() - loop_started_ns)) / std.time.ns_per_s;
+    try reward_pipeline.finish();
+    const group_denom = @as(f64, @floatFromInt(@max(total_groups, 1)));
+    const completion_denom = @as(f64, @floatFromInt(@max(total_completions, 1)));
+    const mean_reward = total_reward / completion_denom;
+    const top_rank_mean_reward = total_top_rank_reward / group_denom;
+    const positive_reward_group_rate = @as(f64, @floatFromInt(groups_with_positive_reward)) / group_denom;
+    const reward_variance = @max(total_reward_squared / completion_denom - mean_reward * mean_reward, 0.0);
+    const mean_kl = total_kl_loss / group_denom;
+    const mean_unweighted_kl = total_mean_kl / group_denom;
+    const passed = passesGrpoEvaluationMinimums(
+        mean_reward,
+        top_rank_mean_reward,
+        positive_reward_group_rate,
+        mean_kl,
+        minimums,
+    );
+    try writeJsonFile(allocator, io, report_path, GrpoEvaluationReport{
+        .status = if (passed) "passed" else "failed-quality-gate",
+        .dataset_path = eval_path,
+        .dataset_fingerprint = dataset_fingerprint,
+        .policy_adapter_digest = policy_adapter_digest,
+        .policy_backend = @tagName(backend_kind),
+        .metal_numerical_policy = resolveGemmaMetalNumericalPolicy(backend_kind, ctx),
+        .optimizer_weight_decay = recipe.optimizer.weight_decay orelse 0.01,
+        .groups = total_groups,
+        .completions = total_completions,
+        .tokens = total_tokens,
+        .zero_reward_std_groups = zero_reward_std_groups,
+        .frac_reward_zero_std = @floatCast(
+            @as(f64, @floatFromInt(zero_reward_std_groups)) / group_denom,
+        ),
+        .truncated_completions = truncated_completions,
+        .frac_completions_truncated = @floatCast(
+            @as(f64, @floatFromInt(truncated_completions)) / completion_denom,
+        ),
+        .mask_truncated_completions = cfg.mask_truncated_completions,
+        .prompt_overlap_count = 0,
+        .mean_reward = @floatCast(mean_reward),
+        .top_rank_mean_reward = @floatCast(top_rank_mean_reward),
+        .positive_reward_group_rate = @floatCast(positive_reward_group_rate),
+        .reward_stddev = @floatCast(@sqrt(reward_variance)),
+        .loss = @floatCast(total_loss / group_denom),
+        .pg_loss = @floatCast(total_pg_loss / group_denom),
+        .kl_loss = @floatCast(mean_kl),
+        .mean_kl = @floatCast(mean_unweighted_kl),
+        .clip_fraction = @floatCast(total_clip_fraction / group_denom),
+        .minimums = minimums,
+        .reference_mode = if (frozen_lora.is_snapshot)
+            "compiled-initial-adapter-snapshot"
+        else if (batch_single_token_group_scoring)
+            "compiled-zero-lora-shared-prompt-candidate-row"
+        else if (batch_multi_token_group_scoring)
+            "compiled-zero-lora-batched-completion-rows"
+        else if (sparse_multi_token)
+            "compiled-zero-lora-sparse-completion-rows"
+        else
+            "compiled-zero-lora",
+        .sampling = .{
+            .temperature = resolved_sampling.temperature,
+            .top_p = resolved_sampling.top_p,
+            .top_k = resolved_sampling.top_k,
+            .first_completion_greedy = true,
+        },
+        .execution_order = if (batch_single_token_group_scoring)
+            "policy-sampling-pass-then-frozen-reference-pass"
+        else if (batch_multi_token_group_scoring)
+            "interleaved-policy-batched-reference"
+        else if (sparse_multi_token)
+            "interleaved-policy-sparse-reference"
+        else
+            "interleaved-policy-reference",
+        .sampling_seconds = total_sampling_seconds,
+        .incremental_kv = if (incremental_kv_sampler) |sampler| sampler.telemetry else null,
+        .reference_scoring_seconds = total_reference_scoring_seconds,
+        .reward_loss_seconds = total_reward_loss_seconds,
+        .loop_seconds = loop_seconds,
+        .reward_pipeline = reward_pipeline.telemetry(),
+    });
+    if (!passed and enforce_minimums) return error.GrpoEvaluationGateFailed;
+    return .{
+        .report_path = report_path,
+        .groups = total_groups,
+        .completions = total_completions,
+        .zero_reward_std_groups = zero_reward_std_groups,
+        .frac_reward_zero_std = @floatCast(
+            @as(f64, @floatFromInt(zero_reward_std_groups)) / group_denom,
+        ),
+        .truncated_completions = truncated_completions,
+        .frac_completions_truncated = @floatCast(
+            @as(f64, @floatFromInt(truncated_completions)) / completion_denom,
+        ),
+        .mask_truncated_completions = cfg.mask_truncated_completions,
+        .mean_reward = @floatCast(mean_reward),
+        .top_rank_mean_reward = @floatCast(top_rank_mean_reward),
+        .positive_reward_group_rate = @floatCast(positive_reward_group_rate),
+        .reward_stddev = @floatCast(@sqrt(reward_variance)),
+        .kl_loss = @floatCast(mean_kl),
+        .mean_kl = @floatCast(mean_unweighted_kl),
+        .sampling_seconds = total_sampling_seconds,
+        .reference_scoring_seconds = total_reference_scoring_seconds,
+        .reward_loss_seconds = total_reward_loss_seconds,
+        .loop_seconds = loop_seconds,
+        .passed = passed,
+    };
+}
+
+fn passesGrpoEvaluationMinimums(
+    mean_reward: f64,
+    top_rank_mean_reward: f64,
+    positive_reward_group_rate: f64,
+    mean_kl: f64,
+    minimums: GrpoEvalMinimums,
+) bool {
+    return mean_reward >= minimums.mean_reward and
+        top_rank_mean_reward >= minimums.top_rank_mean_reward and
+        positive_reward_group_rate >= minimums.positive_reward_group_rate and
+        mean_kl <= minimums.max_kl_loss;
+}
+
+fn countTokenPromptOverlaps(
+    allocator: std.mem.Allocator,
+    train_prompts: []const []const i32,
+    eval_prompts: []const []const i32,
+) !usize {
+    var train_prompt_set = std.StringHashMap(void).init(allocator);
+    defer train_prompt_set.deinit();
+    for (train_prompts) |prompt| {
+        try train_prompt_set.put(std.mem.sliceAsBytes(prompt), {});
+    }
+
+    var count: usize = 0;
+    for (eval_prompts) |eval_prompt| {
+        count += @intFromBool(train_prompt_set.contains(std.mem.sliceAsBytes(eval_prompt)));
+    }
+    return count;
+}
+
 fn runOptimizerBackedQwen2Grpo(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -4684,9 +13046,12 @@ fn runOptimizerBackedQwen2Grpo(
     dataset_path: []const u8,
     report_path: []const u8,
 ) !void {
+    if (recipe.grpo.mask_truncated_completions orelse false) {
+        return error.GrpoTruncationMaskRequiresGemma4TextTrainer;
+    }
     const base_model_dir = recipe.model.path orelse return error.MissingModelPath;
     const adapter = recipe.adapter orelse AdapterConfig{};
-    const bootstrap_dir_config = adapter.path orelse adapterBootstrapDir(recipe);
+    const bootstrap_dir_config = adapter.path;
     const bootstrap_dir = bootstrap_dir_config orelse try defaultArtifactPath(allocator, recipe, "adapter-bootstrap");
     defer if (bootstrap_dir_config == null) allocator.free(bootstrap_dir);
     const trained_dir_config = recipe.artifacts.trained_adapter_dir orelse recipe.artifacts.adapter_dir;
@@ -4696,18 +13061,12 @@ fn runOptimizerBackedQwen2Grpo(
     const backend_kind: qwen2_real_autodiff.BackendKind = .native;
     const max_seq_len = recipe.dataset.max_seq_len orelse 128;
     const group_size = recipe.grpo.group_size orelse 2;
-    const max_completion_tokens = recipe.grpo.max_completion_tokens orelse 4;
+    const max_completion_tokens = recipe.grpo.max_completion_tokens orelse default_grpo_max_completion_tokens;
     if (max_completion_tokens == 0) return error.InvalidGRPOConfig;
     const reward_mode = try parseTextRewardMode(recipe.grpo.reward_mode orelse "exact-match");
     const family = recipe.model.family orelse try inferFamily(recipe);
     const default_target_modules = qwenLoraTargetModulesForFamily(family);
-    const cfg = grpo.GRPOConfig{
-        .group_size = group_size,
-        .clip_epsilon = recipe.grpo.clip_epsilon orelse 0.2,
-        .kl_coef = recipe.grpo.kl_coef orelse 0.04,
-        .advantage_eps = recipe.grpo.advantage_eps orelse 1e-4,
-        .normalize_advantage = recipe.grpo.normalize_advantage orelse true,
-    };
+    const cfg = try resolveGrpoCoreConfig(recipe);
     try grpo.validateConfig(cfg);
     try validateNonGemmaAdapterOptions(adapter);
     const bootstrap_target_modules = try adapterTargetModulesForQwen(adapter, default_target_modules);
@@ -4733,7 +13092,13 @@ fn runOptimizerBackedQwen2Grpo(
     else
         try model_manager.loadFromDir(reference_path);
 
-    var prompt_batch = try loadGrpoTextPrompts(allocator, io, dataset_path, recipe, tokenizer_model);
+    var prompt_batch = try loadGrpoTextPrompts(
+        allocator,
+        io,
+        dataset_path,
+        recipe,
+        PreferenceTokenizerView.fromLoadedModel(tokenizer_model),
+    );
     defer prompt_batch.deinit();
 
     const graph_config = try qwen2_real_autodiff.loadGraphConfig(allocator, base_model_dir);
@@ -4763,7 +13128,10 @@ fn runOptimizerBackedQwen2Grpo(
     defer trainer.deinit();
 
     var ctx = qwen2_real_autodiff.Qwen2AutodiffCtx.init(graph_config);
-    const bootstrap_example = try buildGemmaPreparedExampleFromTokens(allocator, prompt_batch.prompts[0], &.{}, max_seq_len);
+    const bootstrap_prompt = prompt_batch.prompts[0];
+    if (bootstrap_prompt.len == 0 or bootstrap_prompt.len >= max_seq_len) return error.NoCompletionBudget;
+    const bootstrap_completion = [_]i32{bootstrap_prompt[bootstrap_prompt.len - 1]};
+    const bootstrap_example = try buildGemmaPreparedExampleFromTokens(allocator, bootstrap_prompt, &bootstrap_completion, max_seq_len);
     defer freeGemmaPreparedExample(allocator, &bootstrap_example);
     try qwen2_real_autodiff.initializeTrainerFromAdapterDir(allocator, &trainer, &ctx, bootstrap_dir, &bootstrap_example, @intCast(max_seq_len));
 
@@ -4789,6 +13157,7 @@ fn runOptimizerBackedQwen2Grpo(
     var total_clip_fraction: f64 = 0.0;
     var total_groups: usize = 0;
     var total_completions: usize = 0;
+    var truncated_completions: usize = 0;
     var total_tokens: usize = 0;
 
     const eos_id = tokenizer_model.getTokenizer().specialTokens().sep_id;
@@ -4850,6 +13219,10 @@ fn runOptimizerBackedQwen2Grpo(
                     .tokens = tokens_owned,
                     .old_logps = old_logps_owned,
                     .ref_logps = ref_logps_owned,
+                    .truncated = isGrpoCompletionTruncated(
+                        tokens_owned,
+                        if (eos_id >= 0) eos_id else null,
+                    ),
                 });
                 total_tokens += tokens_owned.len;
             }
@@ -4860,6 +13233,7 @@ fn runOptimizerBackedQwen2Grpo(
 
             var loss_result = try grpo.grpoLoss(allocator, completions.items, flat_new_logps.items, ga.advantages, cfg);
             defer loss_result.deinit();
+            try scalePreferenceUnitGradients(loss_result.grad_new_logps, group_size);
 
             total_loss += loss_result.loss;
             total_pg_loss += loss_result.pg_loss;
@@ -4867,16 +13241,17 @@ fn runOptimizerBackedQwen2Grpo(
             total_clip_fraction += loss_result.clip_fraction;
             total_groups += 1;
             total_completions += completions.items.len;
+            truncated_completions += countTruncatedGrpoCompletions(completions.items);
 
             var token_offset: usize = 0;
             for (completions.items) |completion| {
                 var prepared = try buildGemmaPreparedExampleFromTokens(allocator, prompt, completion.tokens, max_seq_len);
                 defer freeGemmaPreparedExample(allocator, &prepared);
+                // `scalePreferenceUnitGradients` above already compensates the
+                // trainer's per-physical-micro-batch averaging (group_size
+                // micro-batches per group); do not scale a second time.
                 const grads = loss_result.grad_new_logps[token_offset .. token_offset + completion.tokens.len];
-                const scaled_grads = try allocator.alloc(f32, grads.len);
-                defer allocator.free(scaled_grads);
-                for (scaled_grads, grads) |*scaled, grad| scaled.* = grad * @as(f32, @floatFromInt(group_size));
-                var input = try qwen2_real_autodiff.makeTrainerInputForTokenLogprobGrads(allocator, &ctx, &prepared, @intCast(max_seq_len), scaled_grads);
+                var input = try qwen2_real_autodiff.makeTrainerInputForTokenLogprobGrads(allocator, &ctx, &prepared, @intCast(max_seq_len), grads);
                 defer input.deinit(allocator);
                 _ = try trainer.step(input.trainer_input);
                 token_offset += completion.tokens.len;
@@ -4889,13 +13264,25 @@ fn runOptimizerBackedQwen2Grpo(
 
     const denom = @as(f64, @floatFromInt(@max(total_groups, 1)));
     try writeJsonFile(allocator, io, report_path, GrpoReport{
+        .execution_mode = "train",
+        .dataset_format = recipe.dataset.format.?,
         .completions = total_completions,
         .tokens = total_tokens,
         .groups = total_groups,
+        .truncated_completions = truncated_completions,
+        .frac_completions_truncated = @as(f32, @floatFromInt(truncated_completions)) /
+            @as(f32, @floatFromInt(@max(total_completions, 1))),
+        .loss_type = @tagName(cfg.loss_type),
+        .scale_rewards = @tagName(cfg.scale_rewards),
+        .epsilon_low = cfg.clip_epsilon,
+        .epsilon_high = cfg.epsilon_high orelse cfg.clip_epsilon,
+        .max_completion_tokens = cfg.max_completion_tokens,
+        .mask_truncated_completions = cfg.mask_truncated_completions,
         .loss = @floatCast(total_loss / denom),
         .pg_loss = @floatCast(total_pg_loss / denom),
         .kl_loss = @floatCast(total_kl_loss / denom),
         .clip_fraction = @floatCast(total_clip_fraction / denom),
+        .trained_adapter_dir = trained_dir,
     });
     print("grpo report: {s}\ntrained adapter: {s}\n", .{ report_path, trained_dir });
 }
@@ -4916,23 +13303,20 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
     max_completion_tokens: usize,
     reward_mode: TextRewardMode,
 ) !void {
+    const sampling = try resolveGrpoSamplingConfig(recipe.grpo);
+    if (sampling.temperature != 1.0) return error.Gemma4MultimodalGrpoTemperatureNotSupported;
+    if (recipe.grpo.mask_truncated_completions orelse false) {
+        return error.Gemma4MultimodalGrpoTruncationMaskNotSupported;
+    }
     const projector_path = recipe.model.projector_path orelse return error.MissingGgufProjector;
     if (!std.mem.eql(u8, reference_path, base_model_dir)) return error.UnsupportedReferencePath;
+    const execution_policy = train_eval_gemma4_lora_bundle.autodiffExecutionPolicy(backend_kind);
+    const grad_accum_steps = try preferenceGradAccumSteps(recipe.optimizer.gradient_accumulation_steps orelse 1, group_size);
     if (max_completion_tokens == 0) return error.InvalidGRPOConfig;
-    const cfg = grpo.GRPOConfig{
-        .group_size = group_size,
-        .clip_epsilon = recipe.grpo.clip_epsilon orelse 0.2,
-        .kl_coef = recipe.grpo.kl_coef orelse 0.04,
-        .advantage_eps = recipe.grpo.advantage_eps orelse 1e-4,
-        .normalize_advantage = recipe.grpo.normalize_advantage orelse true,
-    };
-    try grpo.validateConfig(cfg);
 
-    var session_manager = backends.SessionManager.init(allocator);
-    native_backend_choice.configureSessionPreference(&session_manager, try parseRecipeBackendChoice(recipe.backend));
-    var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
-    defer model_manager.deinit();
-    const tokenizer_model = try model_manager.loadFromDir(base_model_dir);
+    var tokenizer_assets = try OwnedPreferenceTokenizer.init(allocator, base_model_dir);
+    defer tokenizer_assets.deinit();
+    const tokenizer_view = tokenizer_assets.view();
 
     var prompt_batch = try loadGemmaGrpoPreparedPrompts(allocator, io, dataset_path, recipe, base_model_dir, projector_path);
     defer prompt_batch.deinit();
@@ -4950,6 +13334,8 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
         .rank = @intCast(lora_rank),
         .alpha = lora_alpha,
         .target_patterns = target_modules,
+        .strict_target_patterns = true,
+        .sharing = if (adapter_inspect.recursive_lora_enabled) .by_use else .by_weight,
     };
 
     var trainer = try real_autodiff.RealAutodiffTrainer.init(allocator, backend.backendPtr(), .{
@@ -4957,17 +13343,26 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
         .optimizer = .{},
         .lr_schedule = .{ .constant = recipe.optimizer.learning_rate orelse 0.0001 },
         .max_grad_norm = recipe.optimizer.max_grad_norm orelse 1.0,
-        .grad_accum_steps = try preferenceAccumulationSteps(recipe.optimizer.gradient_accumulation_steps orelse 1, group_size),
+        .grad_accum_steps = grad_accum_steps,
         .hidden_size_hint = graph_config.hidden_size,
         .num_layers_hint = graph_config.num_hidden_layers,
-        .execution_engine = if (backend_kind == .cuda) .compiled_device else .interpreter,
-        .compiled_required = backend_kind == .cuda,
+        // CUDA (main) uses the compiled device executor; Metal/native use
+        // the Gemma 4 autodiff execution policy.
+        .execution_engine = if (backend_kind == .cuda) .compiled_device else execution_policy.engine,
+        .compiled_required = backend_kind == .cuda or execution_policy.compiled_required,
+        .strict_metal_execution = execution_policy.strict_metal_execution,
     });
     defer trainer.deinit();
     const tokenizer = try gemma4_mm_real_autodiff.loadTokenizerForModelDir(allocator, base_model_dir);
     var ctx = gemma4_mm_real_autodiff.MultimodalCtx.init(allocator, backend.backendPtr(), graph_config, projector_path, prompt_batch.summaries[0].gguf_projector_sha256.?, tokenizer);
     defer ctx.deinit();
-    try gemma4_mm_real_autodiff.initializeTrainerFromAdapterDir(allocator, &trainer, &ctx, bootstrap_dir, prompt_batch.prompts[0], @intCast(max_seq_len));
+    const bootstrap_prompt = prompt_batch.prompts[0];
+    if (bootstrap_prompt.prompt_input_ids.len == 0 or bootstrap_prompt.prompt_input_ids.len >= max_seq_len) return error.NoCompletionBudget;
+    const bootstrap_completion = [_]i32{bootstrap_prompt.prompt_input_ids[bootstrap_prompt.prompt_input_ids.len - 1]};
+    const bootstrap_example = try buildGemmaPreparedExampleFromPromptExample(allocator, bootstrap_prompt, &bootstrap_completion, max_seq_len);
+    defer freeGemmaPreparedExample(allocator, &bootstrap_example);
+    try gemma4_mm_real_autodiff.initializeTrainerFromAdapterDir(allocator, &trainer, &ctx, bootstrap_dir, &bootstrap_example, @intCast(max_seq_len));
+    const initial_adapter_digest = trainerLoRAParameterDigest(&trainer);
 
     var ref_trainer = try real_autodiff.RealAutodiffTrainer.init(allocator, backend.backendPtr(), .{
         .lora = lora_config,
@@ -4977,27 +13372,21 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
         .grad_accum_steps = 1,
         .hidden_size_hint = graph_config.hidden_size,
         .num_layers_hint = graph_config.num_hidden_layers,
-        .execution_engine = if (backend_kind == .cuda) .compiled_device else .interpreter,
-        .compiled_required = backend_kind == .cuda,
+        // CUDA (main) uses the compiled device executor; Metal/native use
+        // the Gemma 4 autodiff execution policy.
+        .execution_engine = if (backend_kind == .cuda) .compiled_device else execution_policy.engine,
+        .compiled_required = backend_kind == .cuda or execution_policy.compiled_required,
+        .strict_metal_execution = execution_policy.strict_metal_execution,
     });
     defer ref_trainer.deinit();
     const ref_tokenizer = try gemma4_mm_real_autodiff.loadTokenizerForModelDir(allocator, base_model_dir);
     var ref_ctx = gemma4_mm_real_autodiff.MultimodalCtx.init(allocator, backend.backendPtr(), graph_config, projector_path, prompt_batch.summaries[0].gguf_projector_sha256.?, ref_tokenizer);
     defer ref_ctx.deinit();
-    // The reference is the frozen base policy. Building the graph initializes
-    // zero-effect LoRA slots; loading the policy adapter here would silently
-    // change the KL anchor to the trainable policy's bootstrap checkpoint.
-    var ref_bootstrap = try gemma4_mm_real_autodiff.makeTrainerInputForExample(allocator, &ref_ctx, prompt_batch.prompts[0], @intCast(max_seq_len));
-    defer ref_bootstrap.deinit(allocator);
-    try ref_trainer.ensureGraphBuilt(ref_bootstrap.trainer_input);
-    for (ref_trainer.lora_params.items) |*slot| {
-        @memset(slot.weights, 0.0);
-        @memset(slot.grad_accum, 0.0);
-    }
+    try gemma4_mm_real_autodiff.initializeTrainerFromAdapterDir(allocator, &ref_trainer, &ref_ctx, bootstrap_dir, &bootstrap_example, @intCast(max_seq_len));
 
     var rewarder_ctx = TextRewardCtx{
         .allocator = allocator,
-        .tokenizer = tokenizer_model.getTokenizer(),
+        .tokenizer = tokenizer_view.tokenizer,
         .targets = prompt_batch.targets,
         .mode = reward_mode,
     };
@@ -5005,15 +13394,26 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
         .ctx = &rewarder_ctx,
         .call = TextRewardCtx.score,
     };
+    var cfg = try resolveGrpoCoreConfig(recipe);
+    var kl_control = try GrpoKlControl.init(allocator, io, recipe);
+    defer kl_control.deinit();
+    errdefer kl_control.finish() catch {};
+
     var total_loss: f64 = 0.0;
     var total_pg_loss: f64 = 0.0;
     var total_kl_loss: f64 = 0.0;
+    var total_mean_kl: f64 = 0.0;
     var total_clip_fraction: f64 = 0.0;
     var total_groups: usize = 0;
     var total_completions: usize = 0;
+    var truncated_completions: usize = 0;
     var total_tokens: usize = 0;
+    var total_reward: f64 = 0.0;
+    var total_reward_squared: f64 = 0.0;
+    var saw_nonzero_reward_advantage = false;
+    var saw_nonzero_policy_gradient = false;
 
-    const eos_id = tokenizer_model.getTokenizer().specialTokens().sep_id;
+    const eos_id = tokenizer_view.tokenizer.specialTokens().sep_id;
     const epochs = recipe.optimizer.epochs orelse 1;
     var epoch_idx: usize = 0;
     while (epoch_idx < epochs) : (epoch_idx += 1) {
@@ -5064,6 +13464,10 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
                     .tokens = tokens_owned,
                     .old_logps = old_logps_owned,
                     .ref_logps = ref_logps_owned,
+                    .truncated = isGrpoCompletionTruncated(
+                        tokens_owned,
+                        if (eos_id >= 0) eos_id else null,
+                    ),
                 });
                 total_tokens += tokens_owned.len;
             }
@@ -5071,31 +13475,53 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
             var ga = try grpo.scoreGroup(allocator, rewarder, completions.items);
             defer ga.deinit();
             try grpo.computeAdvantages(&ga, completions.items, cfg);
+            for (ga.advantages) |advantage| {
+                if (advantage != 0.0) saw_nonzero_reward_advantage = true;
+            }
+            for (ga.rewards) |reward| {
+                total_reward += reward;
+                total_reward_squared += @as(f64, reward) * @as(f64, reward);
+            }
 
             var loss_result = try grpo.grpoLoss(allocator, completions.items, flat_new_logps.items, ga.advantages, cfg);
             defer loss_result.deinit();
+            for (loss_result.grad_new_logps) |gradient| {
+                if (gradient != 0.0) saw_nonzero_policy_gradient = true;
+            }
+            const kl_admitted = try kl_control.observeAndSyncObjective(
+                &cfg,
+                total_groups,
+                epoch_idx,
+                prompt_idx,
+                trainer.optimizerSteps(),
+                completions.items.len,
+                loss_result.mean_kl,
+                loss_result.kl_loss,
+            );
+            if (!kl_admitted) return error.Gemma4MultimodalGrpoKlSkipNotSupported;
+            try scalePreferenceUnitGradients(loss_result.grad_new_logps, group_size);
 
             total_loss += loss_result.loss;
             total_pg_loss += loss_result.pg_loss;
             total_kl_loss += loss_result.kl_loss;
+            total_mean_kl += loss_result.mean_kl;
             total_clip_fraction += loss_result.clip_fraction;
             total_groups += 1;
             total_completions += completions.items.len;
+            truncated_completions += countTruncatedGrpoCompletions(completions.items);
 
             var token_offset: usize = 0;
             for (completions.items) |completion| {
                 var prepared = try buildGemmaPreparedExampleFromPromptExample(allocator, prompt, completion.tokens, max_seq_len);
                 defer freeGemmaPreparedExample(allocator, &prepared);
+                // Already compensated by `scalePreferenceUnitGradients` above.
                 const grads = loss_result.grad_new_logps[token_offset .. token_offset + completion.tokens.len];
-                const scaled_grads = try allocator.alloc(f32, grads.len);
-                defer allocator.free(scaled_grads);
-                for (scaled_grads, grads) |*scaled, grad| scaled.* = grad * @as(f32, @floatFromInt(group_size));
                 var input = try gemma4_mm_real_autodiff.makeTrainerInputForTokenLogprobGrads(
                     allocator,
                     &ctx,
                     &prepared,
                     @intCast(max_seq_len),
-                    scaled_grads,
+                    grads,
                 );
                 defer input.deinit(allocator);
                 _ = try trainer.step(input.trainer_input);
@@ -5104,18 +13530,46 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
         }
     }
 
+    try kl_control.finish();
+    try validateGrpoLearningSignal(saw_nonzero_reward_advantage, saw_nonzero_policy_gradient, total_reward, total_reward_squared, total_completions, total_loss);
     _ = try trainer.flushAccumulatedGradients();
+    if (trainer.optimizerSteps() == 0) return error.NoOptimizerSteps;
+    try validateTrainerAdapterChanged(&trainer, initial_adapter_digest);
+
     try gemma4_real_autodiff.saveTrainerAsGemmaBundle(allocator, &trainer, base_model_dir, bootstrap_dir, trained_dir);
+    try validatePublishedAdapterChanged(allocator, io, bootstrap_dir, trained_dir);
 
     const denom = @as(f64, @floatFromInt(@max(total_groups, 1)));
+    const reward_denom = @as(f64, @floatFromInt(@max(total_completions, 1)));
+    const mean_reward = total_reward / reward_denom;
+    const reward_variance = @max(total_reward_squared / reward_denom - mean_reward * mean_reward, 0.0);
     try writeJsonFile(allocator, io, report_path, GrpoReport{
+        .execution_mode = "train",
+        .dataset_format = recipe.dataset.format.?,
         .completions = total_completions,
         .tokens = total_tokens,
         .groups = total_groups,
+        .truncated_completions = truncated_completions,
+        .frac_completions_truncated = @as(f32, @floatFromInt(truncated_completions)) /
+            @as(f32, @floatFromInt(@max(total_completions, 1))),
+        .loss_type = @tagName(cfg.loss_type),
+        .scale_rewards = @tagName(cfg.scale_rewards),
+        .epsilon_low = cfg.clip_epsilon,
+        .epsilon_high = cfg.epsilon_high orelse cfg.clip_epsilon,
+        .max_completion_tokens = cfg.max_completion_tokens,
+        .mask_truncated_completions = cfg.mask_truncated_completions,
         .loss = @floatCast(total_loss / denom),
         .pg_loss = @floatCast(total_pg_loss / denom),
         .kl_loss = @floatCast(total_kl_loss / denom),
+        .mean_kl = @floatCast(total_mean_kl / denom),
         .clip_fraction = @floatCast(total_clip_fraction / denom),
+        .mean_reward = @floatCast(mean_reward),
+        .reward_stddev = @floatCast(@sqrt(reward_variance)),
+        .policy_backend = @tagName(backend_kind),
+        .optimizer_steps = trainer.optimizerSteps(),
+        .micro_batch_steps = trainer.microBatchSteps(),
+        .kl_control = kl_control.telemetry(),
+        .trained_adapter_dir = trained_dir,
     });
     print("grpo report: {s}\ntrained adapter: {s}\n", .{ report_path, trained_dir });
 }
@@ -5366,7 +13820,7 @@ fn loadDpoTextPreferenceSamples(
     io: std.Io,
     path: []const u8,
     recipe: Recipe,
-    policy_model: *model_manager_mod.LoadedModel,
+    tokenizer_view: PreferenceTokenizerView,
 ) !DpoPreferenceSamplesOwned {
     const raw = try readFileMax(allocator, io, path, 256 * 1024 * 1024);
     defer allocator.free(raw);
@@ -5390,7 +13844,7 @@ fn loadDpoTextPreferenceSamples(
 
     const samples = try arena_alloc.alloc(preference_harness.PreferenceSample, rows.items.len);
     for (rows.items, 0..) |row, idx| {
-        const tokenized = try tokenizeDpoTextRow(arena_alloc, policy_model, recipe, row);
+        const tokenized = try tokenizeDpoTextRow(arena_alloc, tokenizer_view, recipe, row);
         samples[idx] = .{
             .prompt_tokens = tokenized.prompt_tokens,
             .chosen_tokens = tokenized.chosen_tokens,
@@ -5412,19 +13866,19 @@ const TokenizedPreferenceRow = struct {
 
 fn tokenizeDpoTextRow(
     allocator: std.mem.Allocator,
-    model: *model_manager_mod.LoadedModel,
+    tokenizer_view: PreferenceTokenizerView,
     recipe: Recipe,
     row: DpoTextRow,
 ) !TokenizedPreferenceRow {
-    const tokenizer = model.getTokenizer();
+    const tokenizer = tokenizer_view.tokenizer;
     const max_seq_len = recipe.dataset.max_seq_len orelse 2048;
-    const joint_max_seq_len = if (model.manifest.add_eos_token) blk: {
+    const joint_max_seq_len = if (tokenizer_view.add_eos_token) blk: {
         if (max_seq_len <= 1) return error.NoCompletionBudget;
         break :blk max_seq_len - 1;
     } else max_seq_len;
     const render_prompt = !std.mem.eql(u8, recipe.dataset.format orelse "text-preference", "rendered-text-preference");
     const prompt_text = if (render_prompt)
-        try renderDpoPrompt(allocator, model, row.prompt)
+        try tokenizer_view.renderPrompt(allocator, row.prompt)
     else
         try allocator.dupe(u8, row.prompt);
     defer allocator.free(prompt_text);
@@ -5439,8 +13893,8 @@ fn tokenizeDpoTextRow(
         allocator,
         prompt_text,
         max_seq_len,
-        model.manifest.add_bos_token,
-        model.manifest.bos_token,
+        tokenizer_view.add_bos_token,
+        tokenizer_view.bos_token,
     );
     defer prompt_encoded.deinit();
     var chosen_encoded = try generation.encodePromptForGeneration(
@@ -5448,8 +13902,8 @@ fn tokenizeDpoTextRow(
         allocator,
         chosen_text,
         joint_max_seq_len,
-        model.manifest.add_bos_token,
-        model.manifest.bos_token,
+        tokenizer_view.add_bos_token,
+        tokenizer_view.bos_token,
     );
     defer chosen_encoded.deinit();
     var rejected_encoded = try generation.encodePromptForGeneration(
@@ -5457,8 +13911,8 @@ fn tokenizeDpoTextRow(
         allocator,
         rejected_text,
         joint_max_seq_len,
-        model.manifest.add_bos_token,
-        model.manifest.bos_token,
+        tokenizer_view.add_bos_token,
+        tokenizer_view.bos_token,
     );
     defer rejected_encoded.deinit();
 
@@ -5482,13 +13936,13 @@ fn tokenizeDpoTextRow(
     const chosen_tokens = try copyCompletionWithManifestEos(
         allocator,
         chosen_encoded.ids[common_prompt_len..chosen_len],
-        model.manifest.add_eos_token,
+        tokenizer_view.add_eos_token,
         eos_token_id,
     );
     const rejected_tokens = try copyCompletionWithManifestEos(
         allocator,
         rejected_encoded.ids[common_prompt_len..rejected_len],
-        model.manifest.add_eos_token,
+        tokenizer_view.add_eos_token,
         eos_token_id,
     );
     return .{
@@ -5511,14 +13965,6 @@ fn copyCompletionWithManifestEos(
     @memcpy(out[0..tokens.len], tokens);
     out[tokens.len] = eos_token_id;
     return out;
-}
-
-fn renderDpoPrompt(allocator: std.mem.Allocator, model: *model_manager_mod.LoadedModel, prompt: []const u8) ![]u8 {
-    const messages = [_]generation.Message{
-        .{ .role = "user", .content = prompt },
-    };
-    if (model.chat_tmpl) |tmpl| return tmpl.apply(allocator, &messages, true);
-    return generation.formatMessages(allocator, &messages);
 }
 
 fn tokenizeCompletion(
@@ -5564,20 +14010,757 @@ fn parseRecipeBackendChoice(value: ?[]const u8) !native_backend_choice.Choice {
     return native_backend_choice.parse(raw) orelse error.InvalidBackend;
 }
 
-fn gemmaAutodiffBackendKind(value: ?[]const u8) !gemma4_real_autodiff.BackendKind {
-    const choice = try parseRecipeBackendChoice(value);
-    return switch (choice) {
-        .auto => .native,
-        .native => blk: {
-            try native_backend_choice.validate(choice);
-            break :blk .native;
-        },
-        .cuda => blk: {
-            try native_backend_choice.validate(choice);
-            break :blk .cuda;
-        },
-        else => error.UnsupportedGemmaTrainingBackend,
+const GemmaPreferenceExecution = struct {
+    backend_kind: gemma4_real_autodiff.BackendKind,
+    session_choice: native_backend_choice.Choice,
+};
+
+/// Keep Gemma policy training and reference scoring on one explicit backend.
+/// `auto` retains the historical CPU-safe recipe behavior; callers requesting
+/// Metal get the strict compiled-device training lane and no fallback.
+/// Callers requesting CUDA get the strict compiled-device CUDA optimizer lane
+/// (`runOptimizerBackedGemma{Dpo,Grpo}Cuda`); tokenizer, reward and any
+/// external reference model stay on host sessions so the training device holds
+/// a single resident checkpoint.
+fn resolveGemmaPreferenceExecution(value: ?[]const u8) !GemmaPreferenceExecution {
+    const requested = try parseRecipeBackendChoice(value);
+    const exact_choice: native_backend_choice.Choice = switch (requested) {
+        .auto, .native => .native,
+        .metal => .metal,
+        .cuda => .cuda,
+        .onnx, .xla, .webgpu => return error.UnsupportedBackend,
     };
+    try native_backend_choice.validate(exact_choice);
+    return .{
+        .backend_kind = switch (exact_choice) {
+            .native => .native,
+            .metal => .metal,
+            .cuda => .cuda,
+            else => unreachable,
+        },
+        .session_choice = if (exact_choice == .cuda) .native else exact_choice,
+    };
+}
+
+fn metalKernelEnabledUnlessDisabled(name: [*:0]const u8) bool {
+    // The bundled BF16 kernels treat an unset, empty, or exact "0" rollback
+    // as enabled and every other present value as disabled. Mirror that ABI
+    // exactly rather than applying the platform's broader false/no/off parser.
+    const raw = platform.env.getenv(name) orelse return true;
+    return raw.len == 0 or std.mem.eql(u8, raw, "0");
+}
+
+fn metalKernelExplicitlyEnabledUnlessDisabled(enable_name: [*:0]const u8, disable_name: [*:0]const u8) bool {
+    return !platform.env.getenvBoolDefault(disable_name, false) and
+        platform.env.getenvBoolDefault(enable_name, false);
+}
+
+fn gemmaPreferenceEnvironmentNameInScope(name: []const u8) bool {
+    return gemma_preference_environment.nameInScope(name);
+}
+
+fn gemmaPreferenceEnvironmentNameAttested(name: []const u8) bool {
+    return gemma_preference_environment.nameAllowed(name);
+}
+
+fn gemmaPreferenceEnvironmentValueIsCanonical(name: []const u8, value: []const u8) bool {
+    return gemma_preference_environment.valueIsCanonical(name, value);
+}
+
+/// Product preference runs admit only environment controls represented in the
+/// report and checkpoint fingerprint. This makes newly added debug/serving
+/// switches fail closed until their training semantics are reviewed.
+fn validateGemmaPreferenceEnvironmentAssignment(name: []const u8, value: []const u8) !void {
+    if (!gemmaPreferenceEnvironmentNameInScope(name)) return;
+    if (!gemmaPreferenceEnvironmentNameAttested(name)) {
+        return error.UnattestedGemma4PreferenceEnvironmentOverride;
+    }
+    if (!gemmaPreferenceEnvironmentValueIsCanonical(name, value)) {
+        return error.InvalidGemma4PreferenceEnvironmentValue;
+    }
+}
+
+fn validateGemmaPreferenceEnvironmentContract(backend_kind: gemma4_real_autodiff.BackendKind) !void {
+    _ = backend_kind;
+    const builtin = @import("builtin");
+    if (comptime builtin.os.tag == .windows or !builtin.link_libc) return error.UnsupportedBackend;
+
+    var index: usize = 0;
+    while (std.c.environ[index]) |entry| : (index += 1) {
+        const assignment = std.mem.span(entry);
+        const separator = std.mem.indexOfScalar(u8, assignment, '=') orelse continue;
+        const name = assignment[0..separator];
+        validateGemmaPreferenceEnvironmentAssignment(name, assignment[separator + 1 ..]) catch |err| {
+            if (err == error.UnattestedGemma4PreferenceEnvironmentOverride) {
+                std.log.err("unattested Gemma 4 preference-training environment override: {s}", .{name});
+            } else if (err == error.InvalidGemma4PreferenceEnvironmentValue) {
+                std.log.err("non-canonical Gemma 4 preference-training environment value: {s}", .{name});
+            }
+            return err;
+        };
+    }
+}
+
+fn resolveGemmaMetalNumericalPolicy(
+    backend_kind: gemma4_real_autodiff.BackendKind,
+    ctx: *const gemma4_real_autodiff.GemmaAutodiffCtx,
+) ?GemmaMetalNumericalPolicy {
+    if (backend_kind != .metal) return null;
+    const eager_policy = metal_compute_mod.resolvedGemmaTrainingNumericalPolicy(ctx.graph_config.vocab_size);
+    const executor_policy = metal_partition_executor.resolvedGemmaTrainingNumericalPolicy();
+    const residual_add_enabled = if (platform.env.getenvBoolDefault(
+        "TERMITE_METAL_DISABLE_RMS_NORM_BACKWARD_RESIDUAL_ADD_FUSION",
+        false,
+    ))
+        false
+    else if (platform.env.getenv("TERMITE_METAL_ENABLE_RMS_NORM_BACKWARD_RESIDUAL_ADD_FUSION") != null)
+        platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_RMS_NORM_BACKWARD_RESIDUAL_ADD_FUSION", false)
+    else
+        ctx.graph_config.hidden_size == 1536;
+    const gate_up_backward_enabled = if (platform.env.getenvBoolDefault(
+        "TERMITE_METAL_DISABLE_GEMMA4_BF16_GATE_UP_BACKWARD_INPUT_SUM",
+        false,
+    ))
+        false
+    else
+        // Preference Metal training always acquires the strict training graph
+        // executor scope, whose product policy enables the qualified shape
+        // set when no explicit override is present.
+        true;
+
+    var policy = GemmaMetalNumericalPolicy{
+        .fingerprint_flags = 0,
+        .sparse_loss_chunk_rows = gemma4_real_autodiff.resolvedSparseLossChunkRows(),
+        .linear_cce_tile_vocab = eager_policy.linear_cce_tile_vocab,
+        .fused_rms_norm_backward = ctx.enable_fused_rms_norm_backward,
+        .fused_gqa_attention_backward = ctx.enable_fused_gqa_attention_backward,
+        .fused_linear_cross_entropy = ctx.enable_fused_linear_cross_entropy orelse false,
+        .sparse_logits_cross_entropy = gemma4_real_autodiff.resolvedSparseLogitsCrossEntropyEnabled(),
+        .bf16_tiled32_m16 = metalKernelEnabledUnlessDisabled("TERMITE_METAL_DISABLE_BF16_TILED32_M16"),
+        .bf16_simdgroup_mm = metalKernelEnabledUnlessDisabled("TERMITE_METAL_DISABLE_BF16_SIMDGROUP_MM"),
+        .bf16_simdgroup_m64 = metalKernelEnabledUnlessDisabled("TERMITE_METAL_DISABLE_BF16_SIMDGROUP_M64"),
+        .bf16_forward_simdgroup_m64_packed = metalKernelEnabledUnlessDisabled("TERMITE_METAL_DISABLE_BF16_FORWARD_SIMDGROUP_M64_PACKED"),
+        .bf16_simdgroup_m64_prefix_tail = metalKernelEnabledUnlessDisabled("TERMITE_METAL_DISABLE_BF16_SIMDGROUP_M64_PREFIX_TAIL"),
+        .bf16_backward_tiled32_m16 = metalKernelEnabledUnlessDisabled("TERMITE_METAL_DISABLE_BF16_BACKWARD_TILED32_M16"),
+        .bf16_backward_small_rows = metalKernelEnabledUnlessDisabled("TERMITE_METAL_DISABLE_BF16_BACKWARD_SMALL_ROWS"),
+        .bf16_backward_simdgroup_mm = metalKernelEnabledUnlessDisabled("TERMITE_METAL_DISABLE_BF16_BACKWARD_SIMDGROUP_MM"),
+        .bf16_backward_simdgroup_m64 = metalKernelEnabledUnlessDisabled("TERMITE_METAL_DISABLE_BF16_BACKWARD_SIMDGROUP_M64"),
+        .bf16_backward_simdgroup_m64_coalesced = metalKernelEnabledUnlessDisabled("TERMITE_METAL_DISABLE_BF16_BACKWARD_SIMDGROUP_M64_COALESCED"),
+        .bf16_backward_simdgroup_m64_packed = metalKernelEnabledUnlessDisabled("TERMITE_METAL_DISABLE_BF16_BACKWARD_SIMDGROUP_M64_PACKED"),
+        .rms_norm_backward_simdgroup = metalKernelEnabledUnlessDisabled("TERMITE_METAL_DISABLE_RMS_NORM_BACKWARD_SIMDGROUP"),
+        .rms_norm_backward_residual_add = residual_add_enabled,
+        .rms_norm_generated = platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_RMS_NORM_GENERATED", false),
+        .linear_cce_f16_grad = metalKernelEnabledUnlessDisabled("TERMITE_METAL_DISABLE_LINEAR_CCE_F16_GRAD"),
+        .linear_cce_logit_cache = metalKernelEnabledUnlessDisabled("TERMITE_METAL_DISABLE_LINEAR_CCE_LOGIT_CACHE"),
+        .linear_cce_f16_mps_backward = metalKernelEnabledUnlessDisabled("TERMITE_METAL_DISABLE_LINEAR_CCE_F16_MPS_BACKWARD"),
+        .dense_mps_linear = platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_DENSE_MPS_LINEAR", false),
+        .gemma4_bf16_mlp_fusion = metalKernelExplicitlyEnabledUnlessDisabled(
+            "TERMITE_METAL_ENABLE_GEMMA4_BF16_MLP_FUSION",
+            "TERMITE_METAL_DISABLE_GEMMA4_BF16_MLP_FUSION",
+        ),
+        .gemma4_gate_up_backward_input_sum = gate_up_backward_enabled,
+        .q4_0_linear_rms_add_sumsq = metalKernelExplicitlyEnabledUnlessDisabled(
+            "TERMITE_METAL_ENABLE_Q4_0_LINEAR_RMS_ADD_SUMSQ",
+            "TERMITE_METAL_DISABLE_Q4_0_LINEAR_RMS_ADD_SUMSQ",
+        ),
+        .eager_rank1_dot_specialization = eager_policy.rank1_dot_specialization,
+        .dense_device_dot_general = eager_policy.dense_device_dot_general,
+        .lora_forward_fused_branch = eager_policy.lora_forward_fused_branch,
+        .lora_forward_generic_rank16 = eager_policy.lora_forward_generic_rank16,
+        .lora_forward_rank1_fused = eager_policy.lora_forward_rank1_fused,
+        .reference_quant_linear = eager_policy.reference_quant_linear,
+        .quant_backward_force_barriers = eager_policy.quant_backward_force_barriers,
+        .contiguous_slice_device_view = eager_policy.contiguous_slice_device_view,
+        .partition_fused_patterns = executor_policy.partition_fused_patterns,
+        .partition_runtime_commands = executor_policy.partition_runtime_commands,
+        .runtime_region_plan = executor_policy.runtime_region_plan,
+        .grouped_mps_dot = executor_policy.grouped_mps_dot,
+        .gather_promote_input = executor_policy.gather_promote_input,
+        .reduce_promote_input = executor_policy.reduce_promote_input,
+        .lora_backward_runtime_region = executor_policy.lora_backward_runtime_region,
+        .low_rank_lora_backward_runtime_region = executor_policy.low_rank_lora_backward_runtime_region,
+        .rank_adapter_backward_runtime_region = executor_policy.rank_adapter_backward_runtime_region,
+        .ffn_gelu_backward_runtime_region = executor_policy.ffn_gelu_backward_runtime_region,
+        .gated_gelu_backward_runtime_region = executor_policy.gated_gelu_backward_runtime_region,
+        .gated_gelu_forward_fusion = executor_policy.gated_gelu_forward_fusion,
+        .masked_softmax_runtime_region = executor_policy.masked_softmax_runtime_region,
+        .softmax_backward_runtime_region = executor_policy.softmax_backward_runtime_region,
+        .graph_rank1_dot_specialization = executor_policy.rank1_dot_specialization,
+        .raw_linear_bias_pair_runtime_region = executor_policy.raw_linear_bias_pair_runtime_region,
+        .raw_linear_runtime_regions_suppressed = executor_policy.raw_linear_runtime_regions_suppressed,
+        .gated_ffn_graph_fusion = executor_policy.gated_ffn_graph_fusion,
+        .gemma_gated_mlp_training_graph_fusion = executor_policy.gemma_gated_mlp_training_graph_fusion,
+        .attention_output_residual_graph_fusion = executor_policy.attention_output_residual_graph_fusion,
+        .grouped_lora_a_r16 = executor_policy.grouped_lora_a_r16,
+        .add3_fusion = executor_policy.add3_fusion,
+    };
+    comptime std.debug.assert(std.meta.fields(GemmaMetalNumericalPolicy).len <= @bitSizeOf(u64));
+    inline for (std.meta.fields(GemmaMetalNumericalPolicy), 0..) |field, field_index| {
+        if (field.type == bool and @field(policy, field.name)) {
+            // The schema string and fingerprint field are non-bools, leaving
+            // a stable compact bit for every resolved arithmetic choice.
+            policy.fingerprint_flags |= @as(u64, 1) << @intCast(field_index);
+        }
+    }
+    return policy;
+}
+
+/// A preference unit is only allowed to cross an optimizer boundary after all
+/// of its coupled micro-batches have contributed gradients: chosen+rejected
+/// for DPO, or every sampled completion for one GRPO group.
+fn preferenceGradAccumSteps(requested_units: u32, micro_batches_per_unit: usize) !u32 {
+    if (requested_units == 0 or micro_batches_per_unit == 0) {
+        return error.InvalidGradientAccumulationSteps;
+    }
+    const total = std.math.mul(usize, @as(usize, requested_units), micro_batches_per_unit) catch {
+        return error.InvalidGradientAccumulationSteps;
+    };
+    if (total > std.math.maxInt(u32)) return error.InvalidGradientAccumulationSteps;
+    return @intCast(total);
+}
+
+/// RealAutodiffTrainer averages every physical micro-batch in an accumulation
+/// window. Preference losses are coupled logical units whose gradient is the
+/// sum of their chosen/rejected or completion contributions, averaged only
+/// across requested logical units. Compensate each physical contribution so
+/// the trainer's final mean preserves that objective exactly.
+fn scalePreferenceUnitGradients(gradients: []f32, micro_batches_per_unit: usize) !void {
+    if (micro_batches_per_unit == 0) return error.InvalidGradientAccumulationSteps;
+    const scale: f32 = @floatFromInt(micro_batches_per_unit);
+    if (!std.math.isFinite(scale)) return error.InvalidGradientAccumulationSteps;
+    for (gradients) |*gradient| gradient.* *= scale;
+}
+
+fn validateGrpoLearningSignal(
+    saw_nonzero_reward_advantage: bool,
+    saw_nonzero_policy_gradient: bool,
+    total_reward: f64,
+    total_reward_squared: f64,
+    total_completions: usize,
+    total_loss: f64,
+) !void {
+    if (saw_nonzero_reward_advantage and saw_nonzero_policy_gradient) return;
+    const denom = @as(f64, @floatFromInt(@max(total_completions, 1)));
+    const mean = total_reward / denom;
+    const variance = @max(total_reward_squared / denom - mean * mean, 0.0);
+    print(
+        "grpo rejected zero learning signal: completions={d} reward_advantage={} policy_gradient={} mean_reward={d:.6} reward_stddev={d:.6} accumulated_loss={d:.6}\n",
+        .{ total_completions, saw_nonzero_reward_advantage, saw_nonzero_policy_gradient, mean, @sqrt(variance), total_loss },
+    );
+    return error.NoGrpoLearningSignal;
+}
+
+test "gemma4 preference execution resolves policy and scoring to one backend" {
+    const automatic = try resolveGemmaPreferenceExecution(null);
+    try std.testing.expectEqual(gemma4_real_autodiff.BackendKind.native, automatic.backend_kind);
+    try std.testing.expectEqual(native_backend_choice.Choice.native, automatic.session_choice);
+
+    const native = try resolveGemmaPreferenceExecution("native");
+    try std.testing.expectEqual(gemma4_real_autodiff.BackendKind.native, native.backend_kind);
+    try std.testing.expectEqual(native_backend_choice.Choice.native, native.session_choice);
+
+    if (build_options.enable_metal) {
+        const metal = try resolveGemmaPreferenceExecution("metal");
+        try std.testing.expectEqual(gemma4_real_autodiff.BackendKind.metal, metal.backend_kind);
+        try std.testing.expectEqual(native_backend_choice.Choice.metal, metal.session_choice);
+    } else {
+        try std.testing.expectError(error.BackendUnavailable, resolveGemmaPreferenceExecution("metal"));
+    }
+
+    if (build_options.enable_cuda) {
+        const cuda = try resolveGemmaPreferenceExecution("cuda");
+        try std.testing.expectEqual(gemma4_real_autodiff.BackendKind.cuda, cuda.backend_kind);
+        // Tokenizer/reward/external-reference sessions stay on the host.
+        try std.testing.expectEqual(native_backend_choice.Choice.native, cuda.session_choice);
+    } else {
+        try std.testing.expectError(error.BackendUnavailable, resolveGemmaPreferenceExecution("cuda"));
+    }
+    try std.testing.expectError(error.UnsupportedBackend, resolveGemmaPreferenceExecution("onnx"));
+    try std.testing.expectError(error.InvalidBackend, resolveGemmaPreferenceExecution("bogus"));
+}
+
+test "gemma4 preference gradient accumulation preserves complete DPO pairs and GRPO groups" {
+    try std.testing.expectEqual(@as(u32, 2), try preferenceGradAccumSteps(1, 2));
+    try std.testing.expectEqual(@as(u32, 12), try preferenceGradAccumSteps(3, 4));
+    try std.testing.expectError(error.InvalidGradientAccumulationSteps, preferenceGradAccumSteps(0, 2));
+    try std.testing.expectError(error.InvalidGradientAccumulationSteps, preferenceGradAccumSteps(1, 0));
+    try std.testing.expectError(error.InvalidGradientAccumulationSteps, preferenceGradAccumSteps(std.math.maxInt(u32), 2));
+
+    var dpo_gradients = [_]f32{ -0.05, 0.05 };
+    try scalePreferenceUnitGradients(&dpo_gradients, 2);
+    try std.testing.expectEqualSlices(f32, &.{ -0.1, 0.1 }, &dpo_gradients);
+    var grpo_gradients = [_]f32{ -0.25, 0.0, 0.25 };
+    try scalePreferenceUnitGradients(&grpo_gradients, 4);
+    try std.testing.expectEqualSlices(f32, &.{ -1.0, 0.0, 1.0 }, &grpo_gradients);
+    try std.testing.expectError(error.InvalidGradientAccumulationSteps, scalePreferenceUnitGradients(&dpo_gradients, 0));
+}
+
+test "gemma4 preference baseline-relative gates require strict heldout improvement" {
+    const dpo_baseline = DpoEvaluationSummary{
+        .report_path = "baseline",
+        .examples = 40,
+        .loss = 0.7,
+        .mean_reward_margin = 0.0,
+        .accuracy = 0.5,
+        .passed = false,
+    };
+    var dpo_final = dpo_baseline;
+    dpo_final.report_path = "final";
+    dpo_final.loss = 0.6;
+    dpo_final.mean_reward_margin = 0.1;
+    dpo_final.accuracy = 0.6;
+    const dpo_minimums = DpoEvalMinimums{
+        .accuracy = 0.4,
+        .max_loss = 1.0,
+        .min_accuracy_improvement = 0.05,
+        .min_reward_margin_improvement = 0.05,
+        .min_loss_improvement = 0.05,
+    };
+    try std.testing.expect(compareDpoToBaseline(dpo_baseline, dpo_final, dpo_minimums).passed);
+    dpo_final.accuracy = 0.5;
+    try std.testing.expect(!compareDpoToBaseline(dpo_baseline, dpo_final, dpo_minimums).passed);
+
+    var saturated_dpo_baseline = dpo_baseline;
+    saturated_dpo_baseline.accuracy = 1.0;
+    saturated_dpo_baseline.loss = 0.0;
+    var saturated_dpo_final = saturated_dpo_baseline;
+    saturated_dpo_final.report_path = "saturated-final";
+    saturated_dpo_final.mean_reward_margin = 0.1;
+    const saturated_dpo = compareDpoToBaseline(saturated_dpo_baseline, saturated_dpo_final, dpo_minimums);
+    try std.testing.expect(saturated_dpo.passed);
+    try std.testing.expect(saturated_dpo.accuracy_requirement_saturated);
+    try std.testing.expectEqual(@as(f32, 0.0), saturated_dpo.accuracy_required_improvement);
+    try std.testing.expect(saturated_dpo.loss_requirement_saturated);
+    try std.testing.expectEqual(@as(f32, 0.0), saturated_dpo.loss_required_improvement);
+    saturated_dpo_final.accuracy = 0.99;
+    try std.testing.expect(!compareDpoToBaseline(saturated_dpo_baseline, saturated_dpo_final, dpo_minimums).passed);
+
+    const grpo_baseline = GrpoEvaluationSummary{
+        .report_path = "baseline",
+        .groups = 64,
+        .completions = 256,
+        .mean_reward = 0.1,
+        .top_rank_mean_reward = 0.1,
+        .positive_reward_group_rate = 0.5,
+        .reward_stddev = 0.3,
+        .kl_loss = 0.0,
+        .mean_kl = 0.0,
+        .passed = false,
+    };
+    var grpo_final = grpo_baseline;
+    grpo_final.report_path = "final";
+    grpo_final.mean_reward = 0.2;
+    grpo_final.top_rank_mean_reward = 0.25;
+    grpo_final.positive_reward_group_rate = 0.75;
+    const grpo_minimums = GrpoEvalMinimums{
+        .mean_reward = 0.125,
+        .top_rank_mean_reward = 0.125,
+        .positive_reward_group_rate = 0.75,
+        .max_kl_loss = 0.004,
+        .min_mean_reward_improvement = 0.05,
+        .min_top_rank_mean_reward_improvement = 0.05,
+        .min_positive_reward_group_rate_improvement = 0.05,
+    };
+    try std.testing.expect(compareGrpoToBaseline(grpo_baseline, grpo_final, grpo_minimums).passed);
+    grpo_final.top_rank_mean_reward = 0.1;
+    try std.testing.expect(!compareGrpoToBaseline(grpo_baseline, grpo_final, grpo_minimums).passed);
+
+    var saturated_grpo_baseline = grpo_baseline;
+    saturated_grpo_baseline.positive_reward_group_rate = 1.0;
+    var saturated_grpo_final = grpo_final;
+    saturated_grpo_final.top_rank_mean_reward = 0.25;
+    saturated_grpo_final.positive_reward_group_rate = 1.0;
+    const saturated_grpo = compareGrpoToBaseline(saturated_grpo_baseline, saturated_grpo_final, grpo_minimums);
+    try std.testing.expect(saturated_grpo.passed);
+    try std.testing.expect(saturated_grpo.positive_reward_group_rate_requirement_saturated);
+    try std.testing.expectEqual(@as(f32, 0.0), saturated_grpo.positive_reward_group_rate_required_improvement);
+    saturated_grpo_final.positive_reward_group_rate = 0.99;
+    try std.testing.expect(!compareGrpoToBaseline(saturated_grpo_baseline, saturated_grpo_final, grpo_minimums).passed);
+
+    var noninferiority_minimums = grpo_minimums;
+    noninferiority_minimums.min_positive_reward_group_rate_improvement = -1.0 / 256.0;
+    var noninferiority_baseline = grpo_baseline;
+    noninferiority_baseline.groups = 256;
+    noninferiority_baseline.completions = 4096;
+    noninferiority_baseline.positive_reward_group_rate = 216.0 / 256.0;
+    var noninferiority_final = grpo_final;
+    noninferiority_final.groups = 256;
+    noninferiority_final.completions = 4096;
+    noninferiority_final.top_rank_mean_reward = 0.25;
+    noninferiority_final.positive_reward_group_rate = 215.0 / 256.0;
+    const one_group_regression = compareGrpoToBaseline(
+        noninferiority_baseline,
+        noninferiority_final,
+        noninferiority_minimums,
+    );
+    try std.testing.expect(one_group_regression.passed);
+    try std.testing.expectEqual(
+        @as(f32, -1.0 / 256.0),
+        one_group_regression.positive_reward_group_rate_required_improvement,
+    );
+    noninferiority_final.positive_reward_group_rate = 214.0 / 256.0;
+    try std.testing.expect(!compareGrpoToBaseline(
+        noninferiority_baseline,
+        noninferiority_final,
+        noninferiority_minimums,
+    ).passed);
+
+    noninferiority_baseline.groups = 254;
+    noninferiority_baseline.completions = 4064;
+    noninferiority_baseline.positive_reward_group_rate = 214.0 / 254.0;
+    noninferiority_final.groups = 254;
+    noninferiority_final.completions = 4064;
+    noninferiority_final.positive_reward_group_rate = 213.0 / 254.0;
+    noninferiority_minimums.min_positive_reward_group_rate_improvement = -1.0 / 254.0;
+    try std.testing.expect(compareGrpoToBaseline(
+        noninferiority_baseline,
+        noninferiority_final,
+        noninferiority_minimums,
+    ).passed);
+    noninferiority_minimums.min_positive_reward_group_rate_improvement = -0.5 / 254.0;
+    try std.testing.expect(!compareGrpoToBaseline(
+        noninferiority_baseline,
+        noninferiority_final,
+        noninferiority_minimums,
+    ).passed);
+}
+
+test "compiled DPO loss inversion recovers reward margin" {
+    for ([_]f32{ -8.0, -1.25, 0.0, 2.5, 8.0 }) |expected_margin| {
+        const loss = -@log(1.0 / (1.0 + @exp(-expected_margin)));
+        const actual_margin = try rewardMarginFromDpoLoss(loss);
+        try std.testing.expectApproxEqAbs(expected_margin, actual_margin, 2e-3);
+    }
+    try std.testing.expectError(error.InvalidDpoCompiledLoss, rewardMarginFromDpoLoss(0.0));
+    try std.testing.expectError(error.InvalidDpoCompiledLoss, rewardMarginFromDpoLoss(std.math.nan(f32)));
+}
+
+test "gemma4 DPO single-token coalescing requires an identical causal prompt" {
+    var chosen_prompt = [_]i32{ 1, 2, 3 };
+    var rejected_prompt = [_]i32{ 1, 2, 3 };
+    var chosen_response = [_]i32{5};
+    var rejected_response = [_]i32{7};
+    var chosen_input = [_]i32{ 1, 2, 3, 5 };
+    var rejected_input = [_]i32{ 1, 2, 3, 7 };
+    var chosen_labels = [_]i32{ -100, -100, -100, 5 };
+    var rejected_labels = [_]i32{ -100, -100, -100, 7 };
+    const chosen = gemma4.PreparedExampleInput{
+        .mode = .instruction,
+        .prompt_input_ids = &chosen_prompt,
+        .response_input_ids = &chosen_response,
+        .num_prompt_tokens = 3,
+        .num_response_tokens = 1,
+        .input_ids = &chosen_input,
+        .labels = &chosen_labels,
+        .num_input_tokens = 4,
+        .num_supervised_tokens = 1,
+    };
+    var rejected = gemma4.PreparedExampleInput{
+        .mode = .instruction,
+        .prompt_input_ids = &rejected_prompt,
+        .response_input_ids = &rejected_response,
+        .num_prompt_tokens = 3,
+        .num_response_tokens = 1,
+        .input_ids = &rejected_input,
+        .labels = &rejected_labels,
+        .num_input_tokens = 4,
+        .num_supervised_tokens = 1,
+    };
+
+    const pair = gemmaDpoSingleTokenPair(&chosen, &rejected) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualSlices(i32, &.{ 1, 2, 3 }, pair.prompt);
+    try std.testing.expectEqual(@as(i32, 5), pair.chosen_token);
+    try std.testing.expectEqual(@as(i32, 7), pair.rejected_token);
+    try std.testing.expect(allGemmaDpoPairsAreSingleTokenSharedPrompt(&.{chosen}, &.{rejected}));
+
+    rejected.labels[0] = 7;
+    try std.testing.expect(gemmaDpoSingleTokenPair(&chosen, &rejected) == null);
+    try std.testing.expect(!allGemmaDpoPairsAreSingleTokenSharedPrompt(&.{chosen}, &.{rejected}));
+}
+
+test "gemma4 DPO length buckets preserve pair alignment and bound graph signatures" {
+    const chosen = [_]gemma4.PreparedExampleInput{
+        .{
+            .mode = .instruction,
+            .prompt_input_ids = &.{},
+            .response_input_ids = &.{},
+            .num_prompt_tokens = 98,
+            .num_response_tokens = 46,
+            .num_input_tokens = 144,
+            .num_supervised_tokens = 46,
+        },
+        .{
+            .mode = .instruction,
+            .prompt_input_ids = &.{},
+            .response_input_ids = &.{},
+            .num_prompt_tokens = 164,
+            .num_response_tokens = 136,
+            .num_input_tokens = 300,
+            .num_supervised_tokens = 136,
+        },
+    };
+    const rejected = [_]gemma4.PreparedExampleInput{
+        .{
+            .mode = .instruction,
+            .prompt_input_ids = &.{},
+            .response_input_ids = &.{},
+            .num_prompt_tokens = 98,
+            .num_response_tokens = 161,
+            .num_input_tokens = 259,
+            .num_supervised_tokens = 161,
+        },
+        .{
+            .mode = .instruction,
+            .prompt_input_ids = &.{},
+            .response_input_ids = &.{},
+            .num_prompt_tokens = 164,
+            .num_response_tokens = 187,
+            .num_input_tokens = 351,
+            .num_supervised_tokens = 187,
+        },
+    };
+    const buckets = gemma4_real_autodiff.SequenceLengthBuckets{ .quantum = 16, .minimum = 16 };
+    const first = try gemmaDpoPairSchedule(&chosen[0], &rejected[0], 512, buckets);
+    try std.testing.expectEqual(@as(u32, 272), first.sequence_length);
+    try std.testing.expectEqual(@as(usize, 256), first.weighted_target_rows);
+    const second = try gemmaDpoPairSchedule(&chosen[1], &rejected[1], 512, buckets);
+    try std.testing.expectEqual(@as(u32, 352), second.sequence_length);
+    try std.testing.expectEqual(@as(usize, 256), second.weighted_target_rows);
+
+    const telemetry = try summarizeGemmaDpoPairLengthPolicy(
+        std.testing.allocator,
+        &chosen,
+        &rejected,
+        512,
+        buckets,
+        8,
+        "test",
+    );
+    try std.testing.expectEqualStrings("pair-safe-length-buckets", telemetry.mode);
+    try std.testing.expectEqual(@as(usize, 1248), telemetry.scheduled_branch_rows);
+    try std.testing.expectEqual(@as(usize, 2048), telemetry.fixed_shape_branch_rows);
+    try std.testing.expectEqual(@as(usize, 800), telemetry.padding_rows_avoided);
+    try std.testing.expectEqual(@as(usize, 2), telemetry.unique_pair_sequence_lengths);
+    try std.testing.expectEqual(@as(?usize, 2), telemetry.unique_pair_graph_signatures);
+
+    const fixed = try summarizeGemmaDpoPairLengthPolicy(
+        std.testing.allocator,
+        &chosen,
+        &rejected,
+        512,
+        null,
+        4,
+        "test",
+    );
+    try std.testing.expectEqualStrings("fixed-pair-padding", fixed.mode);
+    try std.testing.expectEqual(@as(usize, 2048), fixed.scheduled_branch_rows);
+    try std.testing.expectEqual(@as(usize, 0), fixed.padding_rows_avoided);
+    try std.testing.expectEqual(@as(?usize, null), fixed.unique_pair_graph_signatures);
+
+    try std.testing.expectEqual(@as(u8, 1), gemmaDpoGraphCacheCapacity(.{}, true));
+    try std.testing.expectEqual(@as(u8, 4), gemmaDpoGraphCacheCapacity(.{}, false));
+    try std.testing.expectEqual(
+        @as(u8, 4),
+        gemmaDpoGraphCacheCapacity(.{
+            .runtime = .{ .sequence_length_bucket_quantum = 128 },
+        }, false),
+    );
+    try std.testing.expectEqual(
+        @as(u8, 8),
+        gemmaDpoGraphCacheCapacity(.{
+            .runtime = .{
+                .sequence_length_bucket_quantum = 128,
+                .graph_cache_capacity = 8,
+            },
+        }, false),
+    );
+}
+
+test "gemma4 GRPO learning-signal gate requires reward variation and a policy gradient" {
+    try std.testing.expectError(error.NoGrpoLearningSignal, validateGrpoLearningSignal(true, false, 1.0, 1.0, 2, 0.0));
+    try std.testing.expectError(error.NoGrpoLearningSignal, validateGrpoLearningSignal(false, true, 0.0, 0.0, 2, 0.5));
+    try validateGrpoLearningSignal(true, true, 1.0, 1.0, 2, 0.5);
+}
+
+test "gemma4 GRPO heldout gate rejects reward concentrated outside the top rank or in one group" {
+    const minimums = GrpoEvalMinimums{
+        .mean_reward = 0.1,
+        .top_rank_mean_reward = 0.5,
+        .positive_reward_group_rate = 0.5,
+        .max_kl_loss = 1.0,
+    };
+    try std.testing.expect(passesGrpoEvaluationMinimums(0.2, 0.5, 0.5, 0.1, minimums));
+    try std.testing.expect(!passesGrpoEvaluationMinimums(0.2, 0.25, 0.5, 0.1, minimums));
+    try std.testing.expect(!passesGrpoEvaluationMinimums(0.2, 0.5, 0.25, 0.1, minimums));
+    try std.testing.expect(!passesGrpoEvaluationMinimums(0.2, 0.5, 0.5, 1.1, minimums));
+}
+
+test "gemma4 GRPO KL control persists admitted and rejected pre-update decisions" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(root);
+    const control_recipe = Recipe{
+        .grpo = .{
+            .kl_coef = 0.04,
+            .train_max_kl = 0.1,
+            .adaptive_kl = true,
+            .target_kl = 0.01,
+            .kl_horizon = 100,
+            .min_kl_coef = 0.001,
+            .max_kl_coef = 1.0,
+        },
+        .artifacts = .{ .root = root },
+    };
+
+    var admitted = try GrpoKlControl.init(allocator, std.testing.io, control_recipe);
+    const coefficient_after = (try admitted.observe(0, 0, 0, 0, 16, 0.0, 0.0, 0.04)).?;
+    try std.testing.expect(coefficient_after < 0.04);
+    try admitted.finish();
+    try std.testing.expectEqual(@as(usize, 1), admitted.telemetry().admitted_groups);
+    try std.testing.expect(admitted.telemetry().trace_digest != null);
+    const admitted_trace_path = try allocator.dupe(u8, admitted.trace_path);
+    admitted.deinit();
+    defer allocator.free(admitted_trace_path);
+
+    const admitted_trace = try readFileMax(allocator, std.testing.io, admitted_trace_path, 64 * 1024);
+    defer allocator.free(admitted_trace);
+    try std.testing.expect(std.mem.indexOf(u8, admitted_trace, "\"status\":\"admitted\"") != null);
+
+    var rejected = try GrpoKlControl.init(allocator, std.testing.io, control_recipe);
+    defer rejected.deinit();
+    try std.testing.expectEqual(@as(?f32, null), try rejected.observe(0, 0, 0, 0, 16, 0.1001, 0.004004, 0.04));
+    try rejected.finish();
+    try std.testing.expectEqual(@as(usize, 0), rejected.telemetry().admitted_groups);
+    try std.testing.expectEqual(@as(usize, 1), rejected.telemetry().rejected_groups);
+    try std.testing.expect(rejected.telemetry().final_kl_coef > 0.04);
+    try std.testing.expectEqual(@as(f32, 0.1001), rejected.telemetry().max_observed_mean_kl);
+    try std.testing.expect(rejected.telemetry().trace_digest != null);
+    const rejected_trace = try readFileMax(allocator, std.testing.io, rejected.trace_path, 64 * 1024);
+    defer allocator.free(rejected_trace);
+    try std.testing.expect(std.mem.indexOf(u8, rejected_trace, "\"status\":\"budget-exceeded-skipped\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rejected_trace, "\"schema_version\":\"antfly_inference_grpo_kl_control_trace/v5\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rejected_trace, "\"observed_completions\":16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rejected_trace, "\"objective_kl_coef\":") != null);
+    try std.testing.expectError(
+        error.GrpoKlControllerObjectiveMismatch,
+        rejected.observe(1, 0, 1, 0, 16, 0.05, 0.002, 0.04),
+    );
+
+    var synchronized = try GrpoKlControl.init(allocator, std.testing.io, control_recipe);
+    defer synchronized.deinit();
+    var synchronized_config = grpo.GRPOConfig{ .kl_coef = 0.04 };
+    try std.testing.expect(!try synchronized.observeAndSyncObjective(
+        &synchronized_config,
+        0,
+        0,
+        0,
+        0,
+        16,
+        0.1001,
+        0.004004,
+    ));
+    try std.testing.expectEqual(synchronized.current_kl_coef, synchronized_config.kl_coef);
+    try std.testing.expect(synchronized_config.kl_coef > 0.04);
+    try std.testing.expect(try synchronized.observeAndSyncObjective(
+        &synchronized_config,
+        1,
+        0,
+        1,
+        0,
+        16,
+        0.05,
+        synchronized_config.kl_coef * 0.05,
+    ));
+
+    var abort_recipe = control_recipe;
+    abort_recipe.grpo.train_max_kl_policy = "abort";
+    var aborted = try GrpoKlControl.init(allocator, std.testing.io, abort_recipe);
+    defer aborted.deinit();
+    try std.testing.expectError(
+        error.GrpoTrainKlBudgetExceeded,
+        aborted.observe(0, 0, 0, 0, 16, 0.1001, 0.004004, 0.04),
+    );
+}
+
+test "gemma4 GRPO KL checkpoint restores an exact adaptive continuation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(root);
+    const control_recipe = Recipe{
+        .grpo = .{
+            .kl_coef = 0.04,
+            .train_max_kl = 0.1,
+            .adaptive_kl = true,
+            .target_kl = 0.01,
+            .kl_horizon = 100,
+            .min_kl_coef = 0.001,
+            .max_kl_coef = 1.0,
+        },
+        .artifacts = .{ .root = root },
+    };
+
+    var uninterrupted = try GrpoKlControl.init(allocator, std.testing.io, control_recipe);
+    defer uninterrupted.deinit();
+    _ = try uninterrupted.observe(0, 0, 0, 0, 16, 0.005, 0.0002, 0.04);
+
+    var resumed = try GrpoKlControl.init(allocator, std.testing.io, control_recipe);
+    defer resumed.deinit();
+    try resumed.restoreCheckpoint(
+        uninterrupted.current_kl_coef,
+        uninterrupted.admitted_groups,
+        uninterrupted.rejected_groups,
+        uninterrupted.max_observed_mean_kl,
+        uninterrupted.trace.items,
+    );
+
+    const uninterrupted_next = try uninterrupted.observe(1, 1, 0, 1, 16, 0.02, 0.0008, uninterrupted.current_kl_coef);
+    const resumed_next = try resumed.observe(1, 1, 0, 1, 16, 0.02, 0.0008, resumed.current_kl_coef);
+    try std.testing.expectEqual(uninterrupted_next, resumed_next);
+    try std.testing.expectEqual(uninterrupted.current_kl_coef, resumed.current_kl_coef);
+    try std.testing.expectEqual(uninterrupted.admitted_groups, resumed.admitted_groups);
+    try std.testing.expectEqual(uninterrupted.max_observed_mean_kl, resumed.max_observed_mean_kl);
+    try std.testing.expectEqualSlices(u8, uninterrupted.trace.items, resumed.trace.items);
+}
+
+test "gemma4 preference checkpoint embeds its content-addressed sidecar identity" {
+    const allocator = std.testing.allocator;
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("checkpoint aggregate state", &digest, .{});
+    const progress = real_autodiff.TrainingProgress{
+        .epoch_index = 1,
+        .examples_seen = 7,
+        .order_seed = preferenceCheckpointMagic(.dpo),
+        .rng_state = preferenceDigestWords(digest),
+    };
+    const restored_digest = preferenceDigestFromProgress(progress);
+    try std.testing.expectEqualSlices(u8, &digest, &restored_digest);
+    try std.testing.expect(preferenceCheckpointMagic(.dpo) != preferenceCheckpointMagic(.grpo));
+
+    const state_path = try preferenceCheckpointStatePath(
+        allocator,
+        "/tmp/gemma4-dpo-state.safetensors",
+        digest,
+    );
+    defer allocator.free(state_path);
+    const digest_hex = std.fmt.bytesToHex(digest, .lower);
+    const expected_suffix = try std.fmt.allocPrint(allocator, "{s}.json", .{digest_hex});
+    defer allocator.free(expected_suffix);
+    try std.testing.expect(std.mem.endsWith(u8, state_path, expected_suffix));
+
+    var artifact = (try preferenceCheckpointArtifactSummary(
+        allocator,
+        "/tmp/gemma4-dpo-state.safetensors",
+        .dpo,
+        progress,
+    )).?;
+    defer artifact.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), artifact.epoch);
+    try std.testing.expectEqualStrings(state_path, artifact.state_path);
+    try std.testing.expect(std.mem.endsWith(u8, artifact.state_sha256, &digest_hex));
 }
 
 fn preferenceAccumulationSteps(configured: u32, objective_components: usize) !u32 {
@@ -5624,6 +14807,7 @@ const GrpoScalarRow = struct {
     ref_logps: []const f32,
     new_logps: []const f32,
     reward: f32,
+    truncated: bool = false,
 };
 
 const GrpoBatchOwned = struct {
@@ -5643,17 +14827,14 @@ const GrpoBatchOwned = struct {
 
 fn runDirectGrpo(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, report_path: []const u8) !void {
     const path = trainDatasetPath(recipe) orelse return error.MissingDatasetPath;
-    const format = recipe.dataset.format orelse "token-logprobs";
+    const format = recipe.dataset.format orelse return error.MissingDatasetFormat;
+    const mode = try resolvePreferenceExecutionMode(recipe, .grpo, format);
+    try validatePreferenceExecutionContract(recipe, .grpo, mode, format);
     if (std.mem.eql(u8, format, "token-logprobs")) {
         var batch = try loadGrpoScalarJsonl(allocator, io, path);
         defer batch.deinit();
-        const cfg = grpo.GRPOConfig{
-            .group_size = recipe.grpo.group_size orelse 8,
-            .clip_epsilon = recipe.grpo.clip_epsilon orelse 0.2,
-            .kl_coef = recipe.grpo.kl_coef orelse 0.04,
-            .advantage_eps = recipe.grpo.advantage_eps orelse 1e-4,
-            .normalize_advantage = recipe.grpo.normalize_advantage orelse true,
-        };
+        var cfg = try resolveGrpoCoreConfig(recipe);
+        cfg.group_size = recipe.grpo.group_size orelse 8;
         try grpo.validateConfig(cfg);
         var ga = grpo.GroupAdvantages{
             .allocator = allocator,
@@ -5667,9 +14848,20 @@ fn runDirectGrpo(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, repor
         var result = try grpo.grpoLoss(allocator, batch.completions, batch.new_logps, ga.advantages, cfg);
         defer result.deinit();
         try writeJsonFile(allocator, io, report_path, GrpoReport{
+            .execution_mode = "score",
+            .dataset_format = format,
             .completions = batch.completions.len,
             .tokens = batch.new_logps.len,
             .groups = ga.num_groups,
+            .loss_type = @tagName(cfg.loss_type),
+            .scale_rewards = @tagName(cfg.scale_rewards),
+            .epsilon_low = cfg.clip_epsilon,
+            .epsilon_high = cfg.epsilon_high orelse cfg.clip_epsilon,
+            .max_completion_tokens = cfg.max_completion_tokens,
+            .truncated_completions = countTruncatedGrpoCompletions(batch.completions),
+            .frac_completions_truncated = @as(f32, @floatFromInt(countTruncatedGrpoCompletions(batch.completions))) /
+                @as(f32, @floatFromInt(@max(batch.completions.len, 1))),
+            .mask_truncated_completions = cfg.mask_truncated_completions,
             .loss = result.loss,
             .pg_loss = result.pg_loss,
             .kl_loss = result.kl_loss,
@@ -5678,16 +14870,16 @@ fn runDirectGrpo(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, repor
         print("grpo report: {s}\n", .{report_path});
         return;
     }
-    if (!std.mem.eql(u8, format, "text-grpo") and !std.mem.eql(u8, format, "rendered-text-grpo")) {
-        return error.UnsupportedGrpoFormat;
-    }
-    if (try shouldRunOptimizerBackedQwen2Grpo(recipe, format)) {
-        try runOptimizerBackedQwen2Grpo(allocator, io, recipe, path, report_path);
-        return;
-    }
-    if (try shouldRunOptimizerBackedGemmaGrpo(recipe, format)) {
-        try runOptimizerBackedGemmaGrpo(allocator, io, recipe, path, report_path);
-        return;
+    if (mode == .train) {
+        if (try shouldRunOptimizerBackedQwen2Grpo(recipe, format)) {
+            try runOptimizerBackedQwen2Grpo(allocator, io, recipe, path, report_path);
+            return;
+        }
+        if (try shouldRunOptimizerBackedGemmaGrpo(recipe, format)) {
+            try runOptimizerBackedGemmaGrpo(allocator, io, recipe, path, report_path);
+            return;
+        }
+        return error.UnsupportedPreferenceTrainingFamily;
     }
 
     const policy_path = recipe.model.path orelse return error.MissingModelPath;
@@ -5705,11 +14897,17 @@ fn runDirectGrpo(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, repor
     else
         try model_manager.loadFromDir(reference_path);
 
-    var prompt_batch = try loadGrpoTextPrompts(allocator, io, path, recipe, policy_model);
+    var prompt_batch = try loadGrpoTextPrompts(
+        allocator,
+        io,
+        path,
+        recipe,
+        PreferenceTokenizerView.fromLoadedModel(policy_model),
+    );
     defer prompt_batch.deinit();
 
     const reward_mode = try parseTextRewardMode(recipe.grpo.reward_mode orelse "exact-match");
-    const max_completion_tokens = recipe.grpo.max_completion_tokens orelse 4;
+    const max_completion_tokens = recipe.grpo.max_completion_tokens orelse default_grpo_max_completion_tokens;
     if (max_completion_tokens == 0) return error.InvalidGRPOConfig;
 
     var sampler = DecoderGrpoSampler{
@@ -5717,6 +14915,8 @@ fn runDirectGrpo(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, repor
         .model = policy_model,
         .max_seq_len = recipe.dataset.max_seq_len orelse 128,
         .max_completion_tokens = max_completion_tokens,
+        .sampling = try resolveGrpoSamplingConfig(recipe.grpo),
+        .run_seed = recipe.optimizer.seed orelse 42,
     };
     var policy_scorer = DecoderLogprobScorer{
         .allocator = allocator,
@@ -5735,6 +14935,10 @@ fn runDirectGrpo(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, repor
         .mode = reward_mode,
     };
 
+    const core_cfg = try resolveGrpoCoreConfig(recipe);
+    if (core_cfg.mask_truncated_completions) {
+        return error.GrpoTruncationMaskNotSupportedForModelScore;
+    }
     var result = try preference_harness.grpoStep(allocator, prompt_batch.prompts, .{
         .ctx = &sampler,
         .call = DecoderGrpoSampler.sample,
@@ -5748,20 +14952,22 @@ fn runDirectGrpo(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, repor
         .ctx = &rewarder_ctx,
         .call = TextRewardCtx.score,
     }, .{
-        .grpo = .{
-            .group_size = recipe.grpo.group_size orelse 2,
-            .clip_epsilon = recipe.grpo.clip_epsilon orelse 0.2,
-            .kl_coef = recipe.grpo.kl_coef orelse 0.04,
-            .advantage_eps = recipe.grpo.advantage_eps orelse 1e-4,
-            .normalize_advantage = recipe.grpo.normalize_advantage orelse true,
-        },
+        .grpo = core_cfg,
         .num_prompts = prompt_batch.prompts.len,
     });
     defer result.deinit();
     try writeJsonFile(allocator, io, report_path, GrpoReport{
+        .execution_mode = "score",
+        .dataset_format = format,
         .completions = prompt_batch.prompts.len * (recipe.grpo.group_size orelse 2),
         .tokens = result.grad_new_logps.len,
         .groups = prompt_batch.prompts.len,
+        .loss_type = @tagName(core_cfg.loss_type),
+        .scale_rewards = @tagName(core_cfg.scale_rewards),
+        .epsilon_low = core_cfg.clip_epsilon,
+        .epsilon_high = core_cfg.epsilon_high orelse core_cfg.clip_epsilon,
+        .max_completion_tokens = core_cfg.max_completion_tokens,
+        .mask_truncated_completions = core_cfg.mask_truncated_completions,
         .loss = result.loss,
         .pg_loss = result.pg_loss,
         .kl_loss = result.kl_loss,
@@ -5796,6 +15002,7 @@ fn loadGrpoScalarJsonl(allocator: std.mem.Allocator, io: std.Io, path: []const u
             .tokens = row.tokens,
             .old_logps = row.old_logps,
             .ref_logps = row.ref_logps,
+            .truncated = row.truncated,
         });
         try new_logps.appendSlice(allocator, row.new_logps);
         try rewards.append(allocator, row.reward);
@@ -5815,7 +15022,7 @@ fn loadGrpoTextPrompts(
     io: std.Io,
     path: []const u8,
     recipe: Recipe,
-    policy_model: *model_manager_mod.LoadedModel,
+    tokenizer_view: PreferenceTokenizerView,
 ) !GrpoPromptBatchOwned {
     const raw = try readFileMax(allocator, io, path, 256 * 1024 * 1024);
     defer allocator.free(raw);
@@ -5838,16 +15045,22 @@ fn loadGrpoTextPrompts(
     if (rows.items.len == 0) return error.EmptyBatch;
 
     const prompts = try aa.alloc([]const i32, rows.items.len);
+    const prompt_texts = try aa.alloc([]const u8, rows.items.len);
     const targets = try aa.alloc([]const u8, rows.items.len);
     for (rows.items, 0..) |row, idx| {
-        const tokenized_prompt = try tokenizeGrpoPrompt(aa, policy_model, recipe, row.prompt);
+        const tokenized_prompt = try tokenizeGrpoPrompt(aa, tokenizer_view, recipe, row.prompt);
         prompts[idx] = tokenized_prompt;
-        targets[idx] = row.target;
+        prompt_texts[idx] = try aa.dupe(u8, row.prompt);
+        // parseFromSliceLeaky may borrow string storage from `raw`, which is
+        // released when this loader returns. Keep reward targets in the arena
+        // alongside the tokenized prompts so GRPO never scores dangling data.
+        targets[idx] = try aa.dupe(u8, row.target);
     }
 
     return .{
         .arena = arena,
         .prompts = prompts,
+        .prompt_texts = prompt_texts,
         .targets = targets,
     };
 }
@@ -5897,9 +15110,12 @@ fn loadGemmaGrpoPreparedPrompts(
     }
 
     const max_seq_len = recipe.dataset.max_seq_len orelse 128;
+    const max_completion_tokens = recipe.grpo.max_completion_tokens orelse default_grpo_max_completion_tokens;
+    if (max_completion_tokens == 0 or max_completion_tokens >= max_seq_len) return error.NoCompletionBudget;
+    const prompt_max_seq_len = max_seq_len - max_completion_tokens;
     for (rows.items, 0..) |row, idx| {
         const messages = try allocator.alloc(gemma_chat_data.Message, 1);
-        errdefer allocator.free(messages);
+        defer allocator.free(messages);
         messages[0] = .{ .role = .user, .content = row.prompt };
         const example = gemma_chat_data.Example{
             .messages = messages,
@@ -5907,8 +15123,8 @@ fn loadGemmaGrpoPreparedPrompts(
             .audio_paths = row.audio_paths orelse &.{},
         };
         const source = [_]gemma_chat_data.Example{example};
-        summaries[idx] = try gemma4.prepareMultimodalInputsFromChatData(allocator, base_model_dir, projector_path, source[0..], 1, max_seq_len);
-        allocator.free(messages);
+        summaries[idx] = try gemma4.prepareMultimodalInputsFromChatData(allocator, base_model_dir, projector_path, source[0..], 1, prompt_max_seq_len);
+        errdefer gemma4.freePreparedInputsSummary(allocator, &summaries[idx]);
         if (summaries[idx].examples.len == 0) return error.EmptyPrompt;
         prompts[idx] = &summaries[idx].examples[0];
         targets[idx] = try allocator.dupe(u8, row.target);
@@ -5926,15 +15142,18 @@ fn loadGemmaGrpoPreparedPrompts(
 
 fn tokenizeGrpoPrompt(
     allocator: std.mem.Allocator,
-    model: *model_manager_mod.LoadedModel,
+    tokenizer_view: PreferenceTokenizerView,
     recipe: Recipe,
     prompt: []const u8,
 ) ![]const i32 {
-    const tokenizer = model.getTokenizer();
+    const tokenizer = tokenizer_view.tokenizer;
     const max_seq_len = recipe.dataset.max_seq_len orelse 128;
+    const max_completion_tokens = recipe.grpo.max_completion_tokens orelse default_grpo_max_completion_tokens;
+    if (max_completion_tokens == 0 or max_completion_tokens >= max_seq_len) return error.NoCompletionBudget;
+    const prompt_max_seq_len = max_seq_len - max_completion_tokens;
     const render_prompt = !std.mem.eql(u8, recipe.dataset.format orelse "text-grpo", "rendered-text-grpo");
     const prompt_text = if (render_prompt)
-        try renderDpoPrompt(allocator, model, prompt)
+        try tokenizer_view.renderPrompt(allocator, prompt)
     else
         try allocator.dupe(u8, prompt);
     defer allocator.free(prompt_text);
@@ -5943,9 +15162,9 @@ fn tokenizeGrpoPrompt(
         tokenizer,
         allocator,
         prompt_text,
-        max_seq_len,
-        model.manifest.add_bos_token,
-        model.manifest.bos_token,
+        prompt_max_seq_len,
+        tokenizer_view.add_bos_token,
+        tokenizer_view.bos_token,
     );
     defer encoded.deinit();
     const prompt_len = countAttentionMask(encoded.attention_mask);
@@ -5963,6 +15182,22 @@ fn countGrpoGroups(completions: []const grpo.Completion) usize {
         any = true;
     }
     return if (any) max_prompt + 1 else 0;
+}
+
+fn countTruncatedGrpoCompletions(completions: []const grpo.Completion) usize {
+    var count: usize = 0;
+    for (completions) |completion| {
+        if (completion.truncated) count += 1;
+    }
+    return count;
+}
+
+fn hasActiveGrpoCompletion(completions: []const grpo.Completion, mask_truncated: bool) bool {
+    if (!mask_truncated) return completions.len != 0;
+    for (completions) |completion| {
+        if (!completion.truncated) return true;
+    }
+    return false;
 }
 
 fn selectRankedTokenFromLogits(allocator: std.mem.Allocator, logits: []const f32, rank: usize) !i32 {
@@ -6108,10 +15343,10 @@ fn readFileMax(allocator: std.mem.Allocator, io: std.Io, path: []const u8, max_b
     return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_bytes));
 }
 
-fn usage() void {
+pub fn usage() void {
     print(
         \\usage: antfly inference finetune run <recipe.json> [--dry-run]
-        \\       antfly inference finetune smoke-fast [--out-root <path>]
+        \\       antfly inference finetune smoke-fast [--out-root <path>] [--case <name>]
         \\
         \\recipe kinds: sft, lora-sft, qlora-sft, dpo, grpo, reranker, vlm-retrieval
         \\common fields: model, dataset, adapter, optimizer, eval, artifacts
@@ -6128,6 +15363,166 @@ test "recipe kind accepts taxonomy spellings" {
     try std.testing.expectEqual(RecipeKind.lora_sft, try parseKind("lora-sft"));
     try std.testing.expectEqual(RecipeKind.qlora_sft, try parseKind("qlora_sft"));
     try std.testing.expectEqual(RecipeKind.vlm_retrieval, try parseKind("vlm-retrieval"));
+}
+
+test "gemma4 recipe loading rejects unknown fields" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "recipe.json",
+        .data =
+        \\{"recipe":"lora-sft","model":{"path":"mystery","familly":"gemma4"}}
+        ,
+    });
+    const path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "recipe.json" });
+    defer allocator.free(path);
+    try std.testing.expectError(error.UnknownField, loadRecipe(allocator, std.testing.io, path));
+}
+
+test "gemma4 preference tokenizer loads without constructing decoder weights" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+    try writeOwnedTextFile(allocator, std.testing.io, try std.fs.path.join(allocator, &.{ model_dir, "config.json" }),
+        \\{"model_type":"gemma4_text","hidden_size":32,"num_hidden_layers":1,"num_attention_heads":4,"num_key_value_heads":2,"attention_head_dim":8,"intermediate_size":64,"vocab_size":13}
+    );
+    try writeOwnedSyntheticPreferenceTokenizerArtifact(allocator, std.testing.io, model_dir, "tokenizer.json");
+    try writeOwnedSyntheticPreferenceTokenizerArtifact(allocator, std.testing.io, model_dir, "tokenizer_config.json");
+    try writeOwnedTextFile(allocator, std.testing.io, try std.fs.path.join(allocator, &.{ model_dir, "special_tokens_map.json" }),
+        \\{"bos_token":"<bos>","eos_token":"<eos>","pad_token":"<pad>"}
+    );
+
+    // Deliberately omit model.safetensors: this loader is the preference
+    // trainer's tokenizer-only path and must not instantiate a decoder.
+    var tokenizer_assets = try OwnedPreferenceTokenizer.init(allocator, model_dir);
+    defer tokenizer_assets.deinit();
+    const view = tokenizer_assets.view();
+    try std.testing.expectEqual(@as(usize, 13), view.tokenizer.vocabSize());
+    const rendered = try view.renderPrompt(allocator, "answer yes");
+    defer allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "answer yes") != null);
+}
+
+test "gemma4 DPO benchmark recorder enforces and summarizes the fixed protocol" {
+    var recorder = try DpoBenchmarkRecorder.init(std.testing.allocator);
+    defer recorder.deinit();
+
+    for (0..DpoBenchmarkRecorder.total_updates) |idx| {
+        try recorder.record(
+            @floatFromInt(idx + 1),
+            @as(f32, @floatFromInt(idx)) / 10.0,
+        );
+    }
+    const telemetry = try recorder.finish();
+    try std.testing.expectEqual(@as(usize, 1), telemetry.protocol.cold);
+    try std.testing.expectEqual(@as(usize, 1), telemetry.protocol.first);
+    try std.testing.expectEqual(@as(usize, 3), telemetry.protocol.warmup);
+    try std.testing.expectEqual(@as(usize, 20), telemetry.protocol.measured);
+    try std.testing.expectEqual(@as(f64, 1.0), telemetry.cold_seconds);
+    try std.testing.expectEqual(@as(f64, 2.0), telemetry.first_seconds);
+    try std.testing.expectEqual(@as(f64, 15.5), telemetry.median_seconds);
+    try std.testing.expectEqual(@as(f64, 15.5), telemetry.mean_seconds);
+    try std.testing.expectError(error.DpoBenchmarkUpdateCountMismatch, recorder.record(26.0, 2.5));
+
+    var incomplete = try DpoBenchmarkRecorder.init(std.testing.allocator);
+    defer incomplete.deinit();
+    try incomplete.record(1.0, 0.6931472);
+    try std.testing.expectError(error.DpoBenchmarkUpdateCountMismatch, incomplete.finish());
+
+    var stagnant = try DpoBenchmarkRecorder.init(std.testing.allocator);
+    defer stagnant.deinit();
+    for (0..DpoBenchmarkRecorder.total_updates) |idx| {
+        try stagnant.record(@floatFromInt(idx + 1), 0.6931472);
+    }
+    try std.testing.expectError(error.DpoBenchmarkNoPolicyMovement, stagnant.finish());
+}
+
+test "gemma4 GRPO benchmark recorder enforces protocol and policy movement" {
+    var recorder = try GrpoBenchmarkRecorder.init(std.testing.allocator);
+    defer recorder.deinit();
+
+    for (0..GrpoBenchmarkRecorder.total_updates) |idx| {
+        try recorder.record(.{
+            .seconds = @floatFromInt(idx + 1),
+            .loss = @as(f32, @floatFromInt(idx)) / 100.0,
+            .pg_loss = 0.0,
+            .kl_loss = @as(f32, @floatFromInt(idx)) / 100.0,
+            .mean_reward = 0.5,
+            .reward_stddev = 0.5,
+            .completion_tokens = 2,
+            .policy_reference_max_abs_error = if (idx == 0) 0.0 else 0.01,
+        });
+    }
+    const telemetry = try recorder.finish();
+    try std.testing.expectEqual(@as(usize, 1), telemetry.protocol.cold);
+    try std.testing.expectEqual(@as(usize, 1), telemetry.protocol.first);
+    try std.testing.expectEqual(@as(usize, 3), telemetry.protocol.warmup);
+    try std.testing.expectEqual(@as(usize, 20), telemetry.protocol.measured);
+    try std.testing.expectEqual(@as(f64, 1.0), telemetry.cold.seconds);
+    try std.testing.expectEqual(@as(f64, 2.0), telemetry.first.seconds);
+    try std.testing.expectEqual(@as(f64, 15.5), telemetry.median_seconds);
+    try std.testing.expectEqual(@as(f64, 15.5), telemetry.mean_seconds);
+
+    var stagnant = try GrpoBenchmarkRecorder.init(std.testing.allocator);
+    defer stagnant.deinit();
+    for (0..GrpoBenchmarkRecorder.total_updates) |idx| {
+        try stagnant.record(.{
+            .seconds = @floatFromInt(idx + 1),
+            .loss = 0.0,
+            .pg_loss = 0.0,
+            .kl_loss = 0.0,
+            .mean_reward = 0.5,
+            .reward_stddev = 0.5,
+            .completion_tokens = 2,
+            .policy_reference_max_abs_error = 0.0,
+        });
+    }
+    try std.testing.expectError(error.GrpoBenchmarkNoPolicyMovement, stagnant.finish());
+}
+
+test "gemma4 GRPO reference cache uses exact keys and bounded eviction" {
+    var cache = GemmaGrpoReferenceCache.init(std.testing.allocator, 2);
+    defer cache.deinit();
+
+    var output: [2]f32 = undefined;
+    try std.testing.expect(!cache.contains(0, &.{ 10, 11 }));
+    try std.testing.expectEqual(@as(usize, 0), cache.telemetry().hits);
+    try std.testing.expectEqual(@as(usize, 0), cache.telemetry().misses);
+    try std.testing.expect(!try cache.lookup(0, &.{ 10, 11 }, &output));
+    try cache.insert(0, &.{ 10, 11 }, &.{ -0.1, -0.2 });
+    try std.testing.expect(cache.contains(0, &.{ 10, 11 }));
+    try std.testing.expectEqual(@as(usize, 0), cache.telemetry().hits);
+    try std.testing.expectEqual(@as(usize, 1), cache.telemetry().misses);
+    try std.testing.expect(try cache.lookup(0, &.{ 10, 11 }, &output));
+    try std.testing.expectEqualSlices(f32, &.{ -0.1, -0.2 }, &output);
+
+    try cache.insert(0, &.{12}, &.{-0.3});
+    try cache.insert(1, &.{13}, &.{-0.4});
+    try std.testing.expect(!try cache.lookup(0, &.{ 10, 11 }, &output));
+    const telemetry = cache.telemetry();
+    try std.testing.expectEqual(@as(usize, 2), telemetry.capacity);
+    try std.testing.expectEqual(@as(usize, 2), telemetry.entries);
+    try std.testing.expectEqual(@as(usize, 1), telemetry.hits);
+    try std.testing.expectEqual(@as(usize, 2), telemetry.misses);
+
+    var restored = GemmaGrpoReferenceCache.init(std.testing.allocator, 2);
+    defer restored.deinit();
+    try restored.restoreCheckpoint(cache.checkpoint(), 2);
+    try std.testing.expectEqualDeep(telemetry, restored.telemetry());
+    var restored_output: [1]f32 = undefined;
+    try std.testing.expect(try restored.lookup(1, &.{13}, &restored_output));
+    try std.testing.expectEqualSlices(f32, &.{-0.4}, &restored_output);
+
+    var wrong_capacity = GemmaGrpoReferenceCache.init(std.testing.allocator, 1);
+    defer wrong_capacity.deinit();
+    try std.testing.expectError(
+        error.InvalidPreferenceCheckpointState,
+        wrong_capacity.restoreCheckpoint(cache.checkpoint(), 2),
+    );
 }
 
 test "family inference keeps qwen3_5 and colqwen distinct from qwen2" {
@@ -6152,6 +15547,7 @@ test "qwen3_5 text preference recipes route to qwen autodiff planner" {
 
     const dpo = Recipe{
         .recipe = "dpo",
+        .execution = .{ .mode = "train" },
         .model = .{ .path = "/models/Qwen3.5-VL" },
         .dataset = .{ .path = "/data/prefs.jsonl", .format = "text-preference" },
         .adapter = .{ .rank = 8, .alpha = 16 },
@@ -6164,6 +15560,7 @@ test "qwen3_5 text preference recipes route to qwen autodiff planner" {
 
     var report_only = dpo;
     report_only.adapter = null;
+    report_only.execution.mode = "score";
     report_only.artifacts = .{ .root = "/tmp/qwen35-report" };
     const plan = try buildPlan(std.heap.page_allocator, report_only);
     defer freePlan(std.heap.page_allocator, plan);
@@ -6172,6 +15569,7 @@ test "qwen3_5 text preference recipes route to qwen autodiff planner" {
 
     const grpo_recipe = Recipe{
         .recipe = "grpo",
+        .execution = .{ .mode = "train" },
         .model = .{ .path = "/models/Qwen3.5-VL" },
         .dataset = .{ .path = "/data/prompts.jsonl", .format = "text-grpo" },
         .adapter = .{ .rank = 8, .alpha = 16 },
@@ -6183,64 +15581,508 @@ test "qwen3_5 text preference recipes route to qwen autodiff planner" {
     try std.testing.expect(try shouldRunOptimizerBackedQwen2Grpo(grpo_recipe, "text-grpo"));
 }
 
-test "gemma4 lora recipe builds prepare bootstrap train plan" {
+test "gemma4 lora recipe builds disjoint prepare bootstrap train plan" {
     const recipe = Recipe{
         .recipe = "lora-sft",
         .model = .{ .path = "/models/gemma4", .family = "gemma4" },
-        .dataset = .{ .path = "/data/train.jsonl", .max_examples = 4 },
+        .dataset = .{ .path = "/data/train.jsonl", .eval_path = "/data/eval.jsonl", .max_examples = 4 },
         .adapter = .{ .rank = 4, .alpha = 8 },
         .optimizer = .{ .learning_rate = 0.0002, .epochs = 2 },
         .artifacts = .{ .root = "/tmp/out" },
+        .backend = "native",
     };
     const plan = try buildPlan(std.heap.page_allocator, recipe);
     defer freePlan(std.heap.page_allocator, plan);
-    try std.testing.expectEqual(@as(usize, 3), plan.steps.len);
+    try std.testing.expectEqual(@as(usize, 4), plan.steps.len);
     try std.testing.expectEqualStrings("prepare-gemma4-lora-inputs", plan.steps[0].argv[0]);
-    try std.testing.expectEqualStrings("bootstrap-gemma4-lora", plan.steps[1].argv[0]);
-    try std.testing.expectEqualStrings("train-eval-gemma4-lora-bundle", plan.steps[2].argv[0]);
+    try std.testing.expectEqualStrings("prepare-gemma4-lora-inputs", plan.steps[1].argv[0]);
+    try std.testing.expectEqualStrings("/data/eval.jsonl", plan.steps[1].argv[2]);
+    try std.testing.expectEqualStrings("bootstrap-gemma4-lora", plan.steps[2].argv[0]);
+    try std.testing.expectEqualStrings("train-eval-gemma4-lora-bundle", plan.steps[3].argv[0]);
+    try expectArgValue(plan.steps[3].argv, "--eval-prepared", plan.steps[1].argv[4]);
 }
 
-test "gemma4 lora recipe defaults to all-linear rank16 alpha32" {
+test "gemma4 lora recipe requires a held-out evaluation dataset" {
     const recipe = Recipe{
         .recipe = "lora-sft",
         .model = .{ .path = "/models/gemma4", .family = "gemma4" },
         .dataset = .{ .path = "/data/train.jsonl" },
         .artifacts = .{ .root = "/tmp/out" },
+        .backend = "native",
     };
-    const plan = try buildPlan(std.heap.page_allocator, recipe);
-    defer freePlan(std.heap.page_allocator, plan);
-    try std.testing.expectEqualStrings("16", plan.steps[1].argv[3]);
-    try std.testing.expectEqualStrings("32", plan.steps[1].argv[4]);
-    try std.testing.expectEqualStrings("--target-preset", plan.steps[1].argv[5]);
-    try std.testing.expectEqualStrings("all-linear", plan.steps[1].argv[6]);
+    try std.testing.expectError(error.MissingEvaluationDataset, buildPlan(std.heap.page_allocator, recipe));
 }
 
-test "gemma4 lora recipe passes explicit adapter knobs" {
+test "gemma4 lora recipe defaults to text-all-linear rank16 alpha32" {
     const recipe = Recipe{
         .recipe = "lora-sft",
         .model = .{ .path = "/models/gemma4", .family = "gemma4" },
-        .dataset = .{ .path = "/data/train.jsonl" },
+        .dataset = .{ .path = "/data/train.jsonl", .eval_path = "/data/eval.jsonl" },
+        .artifacts = .{ .root = "/tmp/out" },
+        .backend = "native",
+    };
+    const plan = try buildPlan(std.heap.page_allocator, recipe);
+    defer freePlan(std.heap.page_allocator, plan);
+    try std.testing.expectEqualStrings("16", plan.steps[2].argv[3]);
+    try std.testing.expectEqualStrings("32", plan.steps[2].argv[4]);
+    try std.testing.expectEqualStrings("--target-preset", plan.steps[2].argv[5]);
+    try std.testing.expectEqualStrings("text-all-linear", plan.steps[2].argv[6]);
+}
+
+test "gemma4 lora recipe wires the supported heldout example limit" {
+    const recipe = Recipe{
+        .recipe = "lora-sft",
+        .model = .{ .path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/train.jsonl", .eval_path = "/data/eval.jsonl", .eval_max_examples = 3 },
+        .artifacts = .{ .root = "/tmp/out" },
+        .backend = "native",
+    };
+    const plan = try buildPlan(std.heap.page_allocator, recipe);
+    defer freePlan(std.heap.page_allocator, plan);
+    try expectArgValue(plan.steps[3].argv, "--eval-max-examples", "3");
+}
+
+test "gemma4 lora recipe wires opt-in independent row length buckets" {
+    const recipe = Recipe{
+        .recipe = "lora-sft",
+        .model = .{ .path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/train.jsonl", .eval_path = "/data/eval.jsonl", .max_seq_len = 512 },
+        .runtime = .{
+            .sequence_length_bucket_quantum = 16,
+            .sequence_length_bucket_min = 32,
+            .graph_cache_capacity = 4,
+        },
+        .artifacts = .{ .root = "/tmp/out" },
+        .backend = "metal",
+    };
+    const plan = try buildPlan(std.heap.page_allocator, recipe);
+    defer freePlan(std.heap.page_allocator, plan);
+    try expectArgValue(plan.steps[3].argv, "--sequence-length-bucket-quantum", "16");
+    try expectArgValue(plan.steps[3].argv, "--sequence-length-bucket-min", "32");
+    try expectArgValue(plan.steps[3].argv, "--graph-cache-capacity", "4");
+}
+
+test "gemma4 bootstrap presets execute through runPlan" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(root);
+    const model_dir = try std.fs.path.join(allocator, &.{ root, "model" });
+    defer allocator.free(model_dir);
+    try std.Io.Dir.cwd().createDirPath(io, model_dir);
+
+    const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
+    defer allocator.free(config_path);
+    try writeTextFile(io, config_path,
+        \\{"model_type":"gemma4","text_config":{"hidden_size":3,"num_hidden_layers":1,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":3,"intermediate_size":4,"vocab_size":4}}
+    );
+
+    const checkpoint_path = try std.fs.path.join(allocator, &.{ model_dir, "model.safetensors" });
+    defer allocator.free(checkpoint_path);
+    try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{
+        .{ .name = "model.layers.0.self_attn.q_proj.weight", .shape = &.{ 2, 3 }, .data = try makeFilledF32(allocator, 6, 0.1) },
+        .{ .name = "model.layers.0.self_attn.k_proj.weight", .shape = &.{ 2, 3 }, .data = try makeFilledF32(allocator, 6, 0.2) },
+        .{ .name = "model.layers.0.self_attn.v_proj.weight", .shape = &.{ 2, 3 }, .data = try makeFilledF32(allocator, 6, 0.3) },
+        .{ .name = "model.layers.0.self_attn.o_proj.weight", .shape = &.{ 2, 3 }, .data = try makeFilledF32(allocator, 6, 0.4) },
+        .{ .name = "model.layers.0.mlp.gate_proj.weight", .shape = &.{ 2, 3 }, .data = try makeFilledF32(allocator, 6, 0.5) },
+        .{ .name = "model.layers.0.mlp.up_proj.weight", .shape = &.{ 2, 3 }, .data = try makeFilledF32(allocator, 6, 0.6) },
+        .{ .name = "model.layers.0.mlp.down_proj.weight", .shape = &.{ 2, 3 }, .data = try makeFilledF32(allocator, 6, 0.7) },
+    });
+
+    const dataset_path = try std.fs.path.join(allocator, &.{ root, "train.jsonl" });
+    defer allocator.free(dataset_path);
+    try writeTextFile(io, dataset_path, "{}\n");
+
+    const cases = [_]struct {
+        name: []const u8,
+        requested_preset: ?[]const u8,
+        expected_preset: []const u8,
+        expected_target_count: usize,
+    }{
+        .{ .name = "default", .requested_preset = null, .expected_preset = "text-all-linear", .expected_target_count = 7 },
+        .{ .name = "peft-qv", .requested_preset = "peft-qv", .expected_preset = "peft-qv", .expected_target_count = 2 },
+    };
+
+    for (cases) |case| {
+        const case_root = try std.fs.path.join(allocator, &.{ root, case.name });
+        defer allocator.free(case_root);
+        const recipe = Recipe{
+            .recipe = "lora-sft",
+            .model = .{ .path = model_dir, .family = "gemma4" },
+            .dataset = .{ .path = dataset_path, .eval_path = dataset_path },
+            .adapter = .{ .rank = 1, .alpha = 2, .target_preset = case.requested_preset },
+            .artifacts = .{ .root = case_root },
+            .backend = "native",
+        };
+
+        var plan_arena = std.heap.ArenaAllocator.init(allocator);
+        defer plan_arena.deinit();
+        const generated_plan = try buildPlan(plan_arena.allocator(), recipe);
+        const bootstrap_plan = Plan{ .steps = generated_plan.steps[2..3] };
+        try std.testing.expectEqualStrings("--target-preset", bootstrap_plan.steps[0].argv[5]);
+        try std.testing.expectEqualStrings(case.expected_preset, bootstrap_plan.steps[0].argv[6]);
+
+        const manifest_path = try manifestPath(allocator, recipe);
+        defer allocator.free(manifest_path);
+        const training_config_path = try defaultArtifactPath(allocator, recipe, "training_config.json");
+        defer allocator.free(training_config_path);
+        const training_report_path = try defaultArtifactPath(allocator, recipe, "training_report.json");
+        defer allocator.free(training_report_path);
+        try runPlan(allocator, io, ".", recipe, bootstrap_plan, manifest_path, training_config_path, training_report_path);
+        try expectRunStatusFile(allocator, io, manifest_path, "succeeded");
+
+        const adapter_manifest_path = try std.fs.path.join(allocator, &.{ bootstrap_plan.steps[0].argv[2], gemma4.adapter_manifest_file_name });
+        defer allocator.free(adapter_manifest_path);
+        const raw = try readFileMax(allocator, io, adapter_manifest_path, 1024 * 1024);
+        defer allocator.free(raw);
+        const parsed = try std.json.parseFromSlice(struct {
+            target_preset: []const u8,
+            target_modules: []const []const u8,
+        }, allocator, raw, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(case.expected_preset, parsed.value.target_preset);
+        try std.testing.expectEqual(case.expected_target_count, parsed.value.target_modules.len);
+    }
+}
+
+test "gemma4 lora recipe passes supported explicit adapter knobs" {
+    const recipe = Recipe{
+        .recipe = "lora-sft",
+        .model = .{ .path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/train.jsonl", .eval_path = "/data/eval.jsonl" },
         .adapter = .{
             .target_modules = &.{ "q_proj", "v_proj" },
             .init_lora_weights = "default",
-            .use_dora = true,
         },
         .artifacts = .{ .root = "/tmp/out" },
+        .backend = "metal",
     };
     const plan = try buildPlan(std.heap.page_allocator, recipe);
     defer freePlan(std.heap.page_allocator, plan);
-    try std.testing.expectEqualStrings("--target-modules", plan.steps[1].argv[5]);
-    try std.testing.expectEqualStrings("q_proj,v_proj", plan.steps[1].argv[6]);
-    try std.testing.expectEqualStrings("--use-dora", plan.steps[1].argv[7]);
-    try std.testing.expectEqualStrings("--init-lora-weights", plan.steps[1].argv[8]);
-    try std.testing.expectEqualStrings("default", plan.steps[1].argv[9]);
+    try std.testing.expectEqualStrings("--target-modules", plan.steps[2].argv[5]);
+    try std.testing.expectEqualStrings("q_proj,v_proj", plan.steps[2].argv[6]);
+    try std.testing.expectEqualStrings("--init-lora-weights", plan.steps[2].argv[7]);
+    try std.testing.expectEqualStrings("default", plan.steps[2].argv[8]);
+}
+
+test "gemma4 recipe kinds fail closed when the requested training semantics are unavailable" {
+    const base = Recipe{
+        .model = .{ .path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/train.jsonl" },
+        .artifacts = .{ .root = "/tmp/out" },
+        .backend = "native",
+    };
+    var full_sft = base;
+    full_sft.recipe = "sft";
+    try std.testing.expectError(error.Gemma4FullSftNotYetSupported, buildPlan(std.heap.page_allocator, full_sft));
+
+    var qlora = base;
+    qlora.recipe = "qlora-sft";
+    try std.testing.expectError(error.Gemma4QLoRANotYetSupported, buildPlan(std.heap.page_allocator, qlora));
+}
+
+test "gemma4 lora recipe rejects options the trainer cannot honor" {
+    const base = Recipe{
+        .recipe = "lora-sft",
+        .model = .{ .path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/train.jsonl", .eval_path = "/data/eval.jsonl" },
+        .artifacts = .{ .root = "/tmp/out" },
+        .backend = "native",
+    };
+
+    var recipe = base;
+    recipe.model.reference_path = "/models/reference";
+    try std.testing.expectError(error.UnsupportedGemma4ModelOption, buildPlan(std.heap.page_allocator, recipe));
+
+    recipe = base;
+    recipe.model.projector_path = "/models/projector.gguf";
+    try std.testing.expectError(error.Gemma4MultimodalFinetuningNotSupported, buildPlan(std.heap.page_allocator, recipe));
+
+    recipe = base;
+    recipe.dataset.format = "messages";
+    try std.testing.expectError(error.UnsupportedGemma4DatasetOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.dataset.cache_path = "/tmp/cache";
+    try std.testing.expectError(error.UnsupportedGemma4DatasetOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.dataset.train_cache_path = "/tmp/train-cache";
+    try std.testing.expectError(error.UnsupportedGemma4DatasetOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.dataset.labels = "labels";
+    try std.testing.expectError(error.UnsupportedGemma4DatasetOption, buildPlan(std.heap.page_allocator, recipe));
+
+    recipe = base;
+    recipe.adapter = .{ .dropout = 0.05 };
+    try std.testing.expectError(error.UnsupportedGemma4AdapterOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.adapter = .{ .layer_name = "model.layers.0" };
+    try std.testing.expectError(error.UnsupportedGemma4AdapterOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.adapter = .{ .quantization = "nf4" };
+    try std.testing.expectError(error.UnsupportedGemma4AdapterOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.adapter = .{ .use_dora = true };
+    try std.testing.expectError(error.DoRAAutodiffNotYetSupported, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.adapter = .{ .init_lora_weights = "pissa" };
+    try std.testing.expectError(error.LoRAInitializerRequiresAdjustedBase, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.adapter = .{ .init_lora_weights = "eva" };
+    try std.testing.expectError(error.Gemma4RecipeInitializerStatsNotYetSupported, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.adapter = .{ .init_lora_weights = "lora-ga" };
+    try std.testing.expectError(error.Gemma4RecipeInitializerStatsNotYetSupported, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.adapter = .{ .rank = 0 };
+    try std.testing.expectError(error.InvalidLoRARank, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.adapter = .{ .alpha = 0 };
+    try std.testing.expectError(error.InvalidLoRAAlpha, buildPlan(std.heap.page_allocator, recipe));
+
+    recipe = base;
+    recipe.optimizer.weight_decay = 0;
+    const no_decay_plan = try buildPlan(std.heap.page_allocator, recipe);
+    defer freePlan(std.heap.page_allocator, no_decay_plan);
+    try expectArgValue(no_decay_plan.steps[no_decay_plan.steps.len - 1].argv, "--weight-decay", "0");
+    recipe.optimizer.weight_decay = -1;
+    try std.testing.expectError(error.InvalidWeightDecay, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.optimizer.lr_scheduler = "cosine";
+    try std.testing.expectError(error.UnsupportedGemma4OptimizerOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.optimizer.warmup_steps = 10;
+    try std.testing.expectError(error.UnsupportedGemma4OptimizerOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.optimizer.warmup_ratio = 0.1;
+    try std.testing.expectError(error.UnsupportedGemma4OptimizerOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.optimizer.num_cycles = 1;
+    try std.testing.expectError(error.UnsupportedGemma4OptimizerOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.optimizer.max_steps = 100;
+    try std.testing.expectError(error.UnsupportedGemma4OptimizerOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.optimizer.micro_batch_size = 2;
+    try std.testing.expectError(error.UnsupportedGemma4OptimizerOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.optimizer.llrd_decay = 0.9;
+    try std.testing.expectError(error.UnsupportedGemma4OptimizerOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.optimizer.schedule_free = true;
+    try std.testing.expectError(error.UnsupportedGemma4OptimizerOption, buildPlan(std.heap.page_allocator, recipe));
+
+    recipe = base;
+    recipe.eval = .{ .every_epochs = 1 };
+    try std.testing.expectError(error.UnsupportedGemma4EvalOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.eval = .{ .batch_size = 2 };
+    try std.testing.expectError(error.UnsupportedGemma4EvalOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.eval = .{ .early_stopping_patience = 2 };
+    try std.testing.expectError(error.UnsupportedGemma4EvalOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.eval = .{ .improvement_threshold = 0.01 };
+    try std.testing.expectError(error.UnsupportedGemma4EvalOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.eval = .{ .backend = "metal" };
+    try std.testing.expectError(error.UnsupportedGemma4EvalOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.checkpoint = .{ .resume_path = " \t" };
+    try std.testing.expectError(error.InvalidGemma4CheckpointPath, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.checkpoint = .{ .every_epochs = 0 };
+    try std.testing.expectError(error.InvalidGemma4CheckpointInterval, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.checkpoint = .{ .every_epochs = 2 };
+    try std.testing.expectError(error.InvalidGemma4CheckpointInterval, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.checkpoint = .{ .keep_last = 2 };
+    try std.testing.expectError(error.UnsupportedGemma4CheckpointOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.runtime = .{ .compiled_required = true };
+    try std.testing.expectError(error.UnsupportedGemma4RuntimeOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.runtime = .{ .graph_cache_capacity = 4 };
+    try std.testing.expectError(error.Gemma4SequenceLengthBucketQuantumRequired, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.runtime = .{ .sequence_length_bucket_quantum = 16, .graph_cache_capacity = 9 };
+    try std.testing.expectError(error.InvalidGemma4GraphCacheCapacity, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.trainer = "surrogate";
+    try std.testing.expectError(error.UnsupportedGemma4Trainer, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.preference.beta = 0.1;
+    try std.testing.expectError(error.UnsupportedGemma4AlgorithmOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.grpo.group_size = 4;
+    try std.testing.expectError(error.UnsupportedGemma4AlgorithmOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.artifacts.materialized_dir = "/tmp/merged";
+    try std.testing.expectError(error.UnsupportedGemma4ArtifactOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.artifacts.report_path = "/tmp/report.json";
+    try std.testing.expectError(error.UnsupportedGemma4ArtifactOption, buildPlan(std.heap.page_allocator, recipe));
+}
+
+test "gemma4 lora recipe wires bounded atomic checkpoint and resume controls" {
+    const base = Recipe{
+        .recipe = "lora-sft",
+        .model = .{ .path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/train.jsonl", .eval_path = "/data/eval.jsonl" },
+        .optimizer = .{ .epochs = 3 },
+        .artifacts = .{ .root = "/tmp/out" },
+        .backend = "native",
+    };
+
+    var fresh = base;
+    fresh.checkpoint = .{ .every_epochs = 2 };
+    const fresh_plan = try buildPlan(std.heap.page_allocator, fresh);
+    defer freePlan(std.heap.page_allocator, fresh_plan);
+    const fresh_train = fresh_plan.steps[3].argv;
+    try expectArgValue(fresh_train, "--checkpoint-path", "/tmp/out/gemma4_trainer_state.safetensors");
+    try expectArgValue(fresh_train, "--checkpoint-every-epochs", "2");
+
+    var resumed = base;
+    resumed.checkpoint = .{ .every_epochs = 1, .resume_path = "/runs/interrupted/gemma4-state.safetensors" };
+    const resumed_plan = try buildPlan(std.heap.page_allocator, resumed);
+    defer freePlan(std.heap.page_allocator, resumed_plan);
+    const resumed_train = resumed_plan.steps[3].argv;
+    try expectArgValue(resumed_train, "--checkpoint-path", "/runs/interrupted/gemma4-state.safetensors");
+    try expectArgValue(resumed_train, "--checkpoint-every-epochs", "1");
+    try expectArgPresent(resumed_train, "--resume");
+}
+
+test "gemma4 recipe keeps bootstrap and immutable training outputs distinct" {
+    const base = Recipe{
+        .recipe = "lora-sft",
+        .model = .{ .path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/train.jsonl", .eval_path = "/data/eval.jsonl" },
+        .backend = "native",
+    };
+
+    var artifact_only = base;
+    artifact_only.artifacts = .{ .root = "/tmp/out", .adapter_dir = "/tmp/out/final-adapter" };
+    const plan = try buildPlan(std.heap.page_allocator, artifact_only);
+    defer freePlan(std.heap.page_allocator, plan);
+    try std.testing.expectEqualStrings("/tmp/out/adapter-bootstrap", plan.steps[2].argv[2]);
+    try std.testing.expectEqualStrings("/tmp/out/final-adapter", plan.steps[3].argv[4]);
+
+    var conflict = base;
+    conflict.adapter = .{ .path = "/tmp/out/same" };
+    conflict.artifacts = .{ .trained_adapter_dir = "/tmp/out/same" };
+    try std.testing.expectError(
+        error.Gemma4BootstrapAndTrainingOutputConflict,
+        buildPlan(std.heap.page_allocator, conflict),
+    );
+
+    var normalized_conflict = base;
+    // Parent traversal is only meaningful after resolving an existing parent;
+    // a missing seed directory is now rejected as an invalid requested path.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "seed", .default_dir);
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const bootstrap = try std.fs.path.join(std.testing.allocator, &.{ root, "seed", "..", "same" });
+    defer std.testing.allocator.free(bootstrap);
+    const trained = try std.fs.path.join(std.testing.allocator, &.{ root, "same" });
+    defer std.testing.allocator.free(trained);
+    normalized_conflict.adapter = .{ .path = bootstrap };
+    normalized_conflict.artifacts = .{ .trained_adapter_dir = trained };
+    try std.testing.expectError(
+        error.Gemma4BootstrapAndTrainingOutputConflict,
+        buildPlan(std.heap.page_allocator, normalized_conflict),
+    );
+
+    var ancestor_conflict = base;
+    ancestor_conflict.adapter = .{ .path = "/tmp/out/seed" };
+    ancestor_conflict.artifacts = .{ .root = "/tmp/out", .trained_adapter_dir = "/tmp/out" };
+    try std.testing.expectError(
+        error.Gemma4BootstrapAndTrainingOutputConflict,
+        buildPlan(std.heap.page_allocator, ancestor_conflict),
+    );
+
+    var root_conflict = base;
+    root_conflict.adapter = .{ .path = "/tmp/seed-outside" };
+    root_conflict.artifacts = .{ .root = "/tmp/out", .trained_adapter_dir = "/tmp/out" };
+    try std.testing.expectError(
+        error.Gemma4OutputConflictsWithArtifactRoot,
+        buildPlan(std.heap.page_allocator, root_conflict),
+    );
+
+    var prepared_conflict = base;
+    prepared_conflict.adapter = .{ .path = "/tmp/seed-outside" };
+    prepared_conflict.artifacts = .{
+        .prepared_path = "/tmp/final/prepared.json",
+        .trained_adapter_dir = "/tmp/final",
+    };
+    try std.testing.expectError(
+        error.Gemma4OutputContainsPlannedArtifact,
+        buildPlan(std.heap.page_allocator, prepared_conflict),
+    );
+
+    var manifest_conflict = base;
+    manifest_conflict.adapter = .{ .path = "/tmp/seed-outside" };
+    manifest_conflict.artifacts = .{
+        .manifest_path = "/tmp/final/manifest.json",
+        .trained_adapter_dir = "/tmp/final",
+    };
+    try std.testing.expectError(
+        error.Gemma4OutputContainsPlannedArtifact,
+        buildPlan(std.heap.page_allocator, manifest_conflict),
+    );
+}
+
+test "gemma4 preference preflight rejects output through symlinked input ancestor" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDir(io, "immutable-model", .default_dir);
+    try tmp.dir.symLink(io, "immutable-model", "output-alias", .{});
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const model_path = try std.fs.path.join(allocator, &.{ root, "immutable-model" });
+    defer allocator.free(model_path);
+    const train_path = try std.fs.path.join(allocator, &.{ root, "train.jsonl" });
+    defer allocator.free(train_path);
+    const eval_path = try std.fs.path.join(allocator, &.{ root, "eval.jsonl" });
+    defer allocator.free(eval_path);
+    const output_root = try std.fs.path.join(allocator, &.{ root, "output-alias", "subroot" });
+    defer allocator.free(output_root);
+
+    const recipe = Recipe{
+        .recipe = "dpo",
+        .execution = .{ .mode = "train" },
+        .model = .{ .path = model_path, .reference_path = model_path, .family = "gemma4" },
+        .dataset = .{ .path = train_path, .eval_path = eval_path, .format = "text-preference", .max_seq_len = 128 },
+        .adapter = .{ .rank = 8, .alpha = 16 },
+        .optimizer = .{ .learning_rate = 0.0001, .epochs = 1 },
+        .eval = .{ .dpo_minimums = .{ .accuracy = 0.5, .max_loss = 2.0 } },
+        .artifacts = .{ .root = output_root },
+        .backend = "native",
+    };
+    try std.testing.expectError(
+        error.PreferenceArtifactInputConflict,
+        buildPlan(allocator, recipe),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.statFile(io, "immutable-model/subroot", .{}),
+    );
 }
 
 test "gemma4 lora recipe rejects conflicting target selectors" {
     const recipe = Recipe{
         .recipe = "lora-sft",
         .model = .{ .path = "/models/gemma4", .family = "gemma4" },
-        .dataset = .{ .path = "/data/train.jsonl" },
+        .dataset = .{ .path = "/data/train.jsonl", .eval_path = "/data/eval.jsonl" },
         .adapter = .{
             .target_preset = "all-linear",
             .target_modules = &.{"q_proj"},
@@ -6248,6 +16090,16 @@ test "gemma4 lora recipe rejects conflicting target selectors" {
         .artifacts = .{ .root = "/tmp/out" },
     };
     try std.testing.expectError(error.ConflictingLoRATargetSelection, buildPlan(std.heap.page_allocator, recipe));
+}
+
+test "gemma4 lora recipe requires an explicit execution backend" {
+    const recipe = Recipe{
+        .recipe = "lora-sft",
+        .model = .{ .path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/train.jsonl", .eval_path = "/data/eval.jsonl" },
+        .artifacts = .{ .root = "/tmp/out" },
+    };
+    try std.testing.expectError(error.MissingBackend, buildPlan(std.heap.page_allocator, recipe));
 }
 
 test "gemma4 preference adapter rejects semantically mismatched scoring options" {
@@ -6348,6 +16200,56 @@ test "gemma4 preference recipes reject unimplemented lifecycle and cross-objecti
         error.UnsupportedGemmaGrpoOption,
         validateGemmaGrpoObjectiveOptions(.{ .preference = .{ .beta = 0.1 } }),
     );
+}
+
+test "gemma4 cuda preference recipes keep the CUDA lane contract" {
+    const dpo_recipe = Recipe{
+        .recipe = "dpo",
+        .model = .{ .path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/dpo.jsonl", .format = "text-preference" },
+        .adapter = .{ .target_modules = &.{ "q_proj", "v_proj" } },
+        .backend = "cuda",
+        .artifacts = .{ .root = "/tmp/out" },
+    };
+    // No explicit execution mode: CUDA text-preference recipes imply training.
+    try std.testing.expect(isGemmaCudaPreferenceTrainingRoute(dpo_recipe, .dpo, "text-preference"));
+    try std.testing.expectEqual(
+        PreferenceExecutionMode.train,
+        try resolvePreferenceExecutionMode(dpo_recipe, .dpo, "text-preference"),
+    );
+    var metal_recipe = dpo_recipe;
+    metal_recipe.backend = "metal";
+    try std.testing.expect(!isGemmaCudaPreferenceTrainingRoute(metal_recipe, .dpo, "text-preference"));
+    try std.testing.expectError(
+        error.MissingPreferenceExecutionMode,
+        resolvePreferenceExecutionMode(metal_recipe, .dpo, "text-preference"),
+    );
+    try std.testing.expect(!isGemmaCudaPreferenceTrainingRoute(dpo_recipe, .dpo, "scalar-logprobs"));
+
+    var smoothed = dpo_recipe;
+    smoothed.preference = .{ .label_smoothing = 0.1 };
+    try std.testing.expectError(
+        error.UnsupportedGemmaDpoLossOption,
+        validateGemmaCudaDpoLossOptions(try resolveDpoObjectiveConfig(smoothed.preference)),
+    );
+    const grpo_recipe = Recipe{
+        .recipe = "grpo",
+        .model = .{ .path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/grpo.jsonl", .format = "text-grpo" },
+        .backend = "cuda",
+        .grpo = .{ .loss_type = "dr_grpo" },
+    };
+    try std.testing.expectError(error.UnsupportedGemmaCudaGrpoOption, validateGemmaCudaGrpoLaneOptions(grpo_recipe));
+    const default_grpo_config: grpo.GRPOConfig = .{};
+    try std.testing.expectEqual(default_grpo_config.loss_type, gemmaCudaGrpoConfig(grpo_recipe).loss_type);
+
+    if (!build_options.enable_cuda) return;
+    const plan = try buildPlan(std.heap.page_allocator, dpo_recipe);
+    defer freePlan(std.heap.page_allocator, plan);
+    try std.testing.expectEqualStrings("train", plan.steps[0].name);
+    var with_eval = dpo_recipe;
+    with_eval.dataset.eval_path = "/data/eval.jsonl";
+    try std.testing.expectError(error.UnsupportedPreferenceEvaluation, buildPlan(std.heap.page_allocator, with_eval));
 }
 
 test "recipe JSON rejects unknown fields" {
@@ -6678,28 +16580,1072 @@ test "vlm retrieval routes colqwen2 prepared inputs" {
     try std.testing.expectEqualStrings("/data/colqwen-examples.jsonl", plan.steps[0].argv[3]);
 }
 
-test "sft dpo grpo recipes build runnable plans" {
+test "gemma4 full sft fails closed while dpo and grpo build runnable plans" {
     const base = Recipe{
         .model = .{ .path = "/models/gemma4", .family = "gemma4" },
         .dataset = .{ .path = "/data/train.jsonl" },
+        .backend = "native",
     };
     var sft = base;
     sft.recipe = "sft";
-    const sft_plan = try buildPlan(std.heap.page_allocator, sft);
-    defer freePlan(std.heap.page_allocator, sft_plan);
-    try std.testing.expectEqualStrings("prepare-gemma4-lora-inputs", sft_plan.steps[0].argv[0]);
+    try std.testing.expectError(error.Gemma4FullSftNotYetSupported, buildPlan(std.heap.page_allocator, sft));
 
     var dpo = base;
     dpo.recipe = "dpo";
+    dpo.execution.mode = "train";
+    dpo.dataset.format = "text-preference";
+    dpo.dataset.eval_path = "/data/eval-preferences.jsonl";
+    dpo.eval = .{ .dpo_minimums = .{
+        .accuracy = 0.5,
+        .max_loss = 2.0,
+        .min_accuracy_improvement = 0.01,
+        .min_reward_margin_improvement = 0.01,
+        .min_loss_improvement = 0.01,
+    } };
+    dpo.adapter = .{ .rank = 8, .alpha = 16 };
     const dpo_plan = try buildPlan(std.heap.page_allocator, dpo);
     defer freePlan(std.heap.page_allocator, dpo_plan);
     try std.testing.expectEqual(StepKind.direct_dpo, dpo_plan.steps[0].kind);
+    var incomplete_dpo = dpo;
+    incomplete_dpo.eval.?.dpo_minimums.?.min_loss_improvement = null;
+    try std.testing.expectError(
+        error.IncompleteDpoBaselineRelativeMinimums,
+        buildPlan(std.heap.page_allocator, incomplete_dpo),
+    );
 
     var grpo_recipe = base;
     grpo_recipe.recipe = "grpo";
+    grpo_recipe.execution.mode = "train";
+    grpo_recipe.dataset.format = "text-grpo";
+    grpo_recipe.dataset.eval_path = "/data/eval-prompts.jsonl";
+    grpo_recipe.eval = .{ .grpo_minimums = .{
+        .mean_reward = 0.25,
+        .top_rank_mean_reward = 0.25,
+        .positive_reward_group_rate = 0.25,
+        .max_kl_loss = 1.0,
+        .min_mean_reward_improvement = 0.01,
+        .min_top_rank_mean_reward_improvement = 0.01,
+        .min_positive_reward_group_rate_improvement = 0.01,
+    } };
+    grpo_recipe.adapter = .{ .rank = 8, .alpha = 16 };
     const grpo_plan = try buildPlan(std.heap.page_allocator, grpo_recipe);
     defer freePlan(std.heap.page_allocator, grpo_plan);
     try std.testing.expectEqual(StepKind.direct_grpo, grpo_plan.steps[0].kind);
+    var missing_noninferiority_resolution = grpo_recipe;
+    missing_noninferiority_resolution.eval.?.grpo_minimums.?.min_positive_reward_group_rate_improvement = -1.0 / 256.0;
+    try std.testing.expectError(
+        error.InvalidGrpoEvaluationMinimums,
+        buildPlan(std.heap.page_allocator, missing_noninferiority_resolution),
+    );
+    var noninferiority_grpo = grpo_recipe;
+    noninferiority_grpo.eval.?.max_examples = 256;
+    noninferiority_grpo.eval.?.grpo_minimums.?.min_positive_reward_group_rate_improvement = -1.0 / 256.0;
+    const noninferiority_plan = try buildPlan(std.heap.page_allocator, noninferiority_grpo);
+    defer freePlan(std.heap.page_allocator, noninferiority_plan);
+    var non_power_of_two_noninferiority_grpo = grpo_recipe;
+    non_power_of_two_noninferiority_grpo.eval.?.max_examples = 254;
+    non_power_of_two_noninferiority_grpo.eval.?.grpo_minimums.?.min_positive_reward_group_rate_improvement = -1.0 / 254.0;
+    const non_power_of_two_noninferiority_plan = try buildPlan(
+        std.heap.page_allocator,
+        non_power_of_two_noninferiority_grpo,
+    );
+    defer freePlan(std.heap.page_allocator, non_power_of_two_noninferiority_plan);
+    var invalid_non_power_of_two_noninferiority_grpo = non_power_of_two_noninferiority_grpo;
+    invalid_non_power_of_two_noninferiority_grpo.eval.?.grpo_minimums.?.min_positive_reward_group_rate_improvement = -2.0 / 254.0;
+    try std.testing.expectError(
+        error.InvalidGrpoEvaluationMinimums,
+        buildPlan(std.heap.page_allocator, invalid_non_power_of_two_noninferiority_grpo),
+    );
+    var invalid_noninferiority_grpo = noninferiority_grpo;
+    invalid_noninferiority_grpo.eval.?.grpo_minimums.?.min_positive_reward_group_rate_improvement = -2.0 / 256.0;
+    try std.testing.expectError(
+        error.InvalidGrpoEvaluationMinimums,
+        buildPlan(std.heap.page_allocator, invalid_noninferiority_grpo),
+    );
+    var incomplete_grpo = grpo_recipe;
+    incomplete_grpo.eval.?.grpo_minimums.?.min_top_rank_mean_reward_improvement = null;
+    try std.testing.expectError(
+        error.IncompleteGrpoBaselineRelativeMinimums,
+        buildPlan(std.heap.page_allocator, incomplete_grpo),
+    );
+}
+
+test "gemma4 preference recipes require explicit execution intent and dataset format" {
+    const base = Recipe{
+        .recipe = "dpo",
+        .model = .{ .path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/preferences.jsonl" },
+        .backend = "native",
+    };
+    try std.testing.expectError(error.MissingDatasetFormat, buildPlan(std.heap.page_allocator, base));
+
+    var missing_mode = base;
+    missing_mode.dataset.format = "text-preference";
+    try std.testing.expectError(error.MissingPreferenceExecutionMode, buildPlan(std.heap.page_allocator, missing_mode));
+
+    var missing_adapter = missing_mode;
+    missing_adapter.execution.mode = "train";
+    try std.testing.expectError(error.MissingAdapterTrainingIntent, buildPlan(std.heap.page_allocator, missing_adapter));
+
+    var score_with_adapter = missing_mode;
+    score_with_adapter.execution.mode = "score";
+    score_with_adapter.adapter = .{ .rank = 8, .alpha = 16 };
+    try std.testing.expectError(error.AdapterTrainingRequiresTrainMode, buildPlan(std.heap.page_allocator, score_with_adapter));
+
+    var fixture_train = base;
+    fixture_train.dataset.format = "scalar-logprobs";
+    fixture_train.execution.mode = "train";
+    fixture_train.adapter = .{ .rank = 8, .alpha = 16 };
+    try std.testing.expectError(error.PreferenceTrainingRequiresModelDataset, buildPlan(std.heap.page_allocator, fixture_train));
+}
+
+test "gemma4 preference training preflight rejects ignored and conflicting options" {
+    const valid = Recipe{
+        .recipe = "dpo",
+        .execution = .{ .mode = "train" },
+        .model = .{ .path = "/models/gemma4", .reference_path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/preferences.jsonl", .eval_path = "/data/eval-preferences.jsonl", .format = "text-preference", .max_seq_len = 128 },
+        .adapter = .{ .rank = 8, .alpha = 16 },
+        .optimizer = .{ .learning_rate = 0.0001, .epochs = 1 },
+        .eval = .{ .dpo_minimums = .{ .accuracy = 0.5, .max_loss = 2.0 } },
+        .artifacts = .{ .root = "/tmp/gemma4-dpo-contract" },
+        .backend = "native",
+    };
+
+    const plan = try buildPlan(std.heap.page_allocator, valid);
+    defer freePlan(std.heap.page_allocator, plan);
+    try std.testing.expectEqualStrings("train", plan.steps[0].name);
+
+    var seeded = valid;
+    seeded.optimizer.seed = 991;
+    const seeded_plan = try buildPlan(std.heap.page_allocator, seeded);
+    defer freePlan(std.heap.page_allocator, seeded_plan);
+
+    var unsupported_seed = valid;
+    unsupported_seed.recipe = "reranker";
+    unsupported_seed.execution.mode = null;
+    unsupported_seed.optimizer.seed = 991;
+    try std.testing.expectError(
+        error.UnsupportedOptimizerSeed,
+        buildPlan(std.heap.page_allocator, unsupported_seed),
+    );
+
+    var checkpointed = valid;
+    checkpointed.optimizer.epochs = 2;
+    checkpointed.checkpoint = .{ .every_epochs = 1 };
+    const checkpointed_plan = try buildPlan(std.heap.page_allocator, checkpointed);
+    defer freePlan(std.heap.page_allocator, checkpointed_plan);
+    const checkpointed_path = try preferenceCheckpointPath(std.testing.allocator, checkpointed, .dpo);
+    defer std.testing.allocator.free(checkpointed_path.?);
+    try std.testing.expectEqualStrings(
+        "/tmp/gemma4-dpo-contract/gemma4_dpo_trainer_state.safetensors",
+        checkpointed_path.?,
+    );
+
+    var resumed = checkpointed;
+    resumed.checkpoint = .{
+        .every_epochs = 1,
+        .resume_path = "/tmp/gemma4-dpo-resume/state.safetensors",
+    };
+    const resumed_plan = try buildPlan(std.heap.page_allocator, resumed);
+    defer freePlan(std.heap.page_allocator, resumed_plan);
+
+    var empty_checkpoint = valid;
+    empty_checkpoint.checkpoint = .{};
+    try std.testing.expectError(error.CheckpointIntervalRequired, buildPlan(std.heap.page_allocator, empty_checkpoint));
+
+    var zero_checkpoint = valid;
+    zero_checkpoint.checkpoint = .{ .every_epochs = 0 };
+    try std.testing.expectError(error.InvalidGemma4CheckpointInterval, buildPlan(std.heap.page_allocator, zero_checkpoint));
+
+    var retained_checkpoint = valid;
+    retained_checkpoint.checkpoint = .{ .every_epochs = 1, .keep_last = 2 };
+    try std.testing.expectError(error.UnsupportedGemma4CheckpointOption, buildPlan(std.heap.page_allocator, retained_checkpoint));
+
+    var checkpoint_overwrites_dataset = valid;
+    checkpoint_overwrites_dataset.checkpoint = .{
+        .every_epochs = 1,
+        .resume_path = "/data/preferences.jsonl",
+    };
+    try std.testing.expectError(
+        error.PreferenceArtifactInputConflict,
+        buildPlan(std.heap.page_allocator, checkpoint_overwrites_dataset),
+    );
+
+    var bucketed = valid;
+    bucketed.runtime = .{
+        .sequence_length_bucket_quantum = 16,
+        .sequence_length_bucket_min = 32,
+        .graph_cache_capacity = 8,
+    };
+    const bucketed_plan = try buildPlan(std.heap.page_allocator, bucketed);
+    defer freePlan(std.heap.page_allocator, bucketed_plan);
+    try std.testing.expectEqualStrings("train", bucketed_plan.steps[0].name);
+
+    var missing_bucket_quantum = valid;
+    missing_bucket_quantum.runtime = .{ .graph_cache_capacity = 8 };
+    try std.testing.expectError(
+        error.Gemma4SequenceLengthBucketQuantumRequired,
+        buildPlan(std.heap.page_allocator, missing_bucket_quantum),
+    );
+
+    var oversized_graph_cache = valid;
+    oversized_graph_cache.runtime = .{ .sequence_length_bucket_quantum = 16, .graph_cache_capacity = 9 };
+    try std.testing.expectError(
+        error.InvalidGemma4GraphCacheCapacity,
+        buildPlan(std.heap.page_allocator, oversized_graph_cache),
+    );
+
+    var bad_backend = valid;
+    bad_backend.backend = "onnx";
+    try std.testing.expectError(error.UnsupportedBackend, buildPlan(std.heap.page_allocator, bad_backend));
+
+    // CUDA routes to the CUDA preference lane, which does not implement this
+    // lane's held-out evaluation/checkpoint lifecycle and must fail closed.
+    var cuda_backend = valid;
+    cuda_backend.backend = "cuda";
+    if (buildPlan(std.heap.page_allocator, cuda_backend)) |unexpected_plan| {
+        freePlan(std.heap.page_allocator, unexpected_plan);
+        return error.TestUnexpectedResult;
+    } else |_| {}
+
+    var bad_reference = valid;
+    bad_reference.model.reference_path = "/models/other-gemma4";
+    try std.testing.expectError(error.UnsupportedReferencePath, buildPlan(std.heap.page_allocator, bad_reference));
+
+    var same_eval = valid;
+    same_eval.dataset.eval_path = "/data/preferences.jsonl";
+    try std.testing.expectError(error.PreferenceTrainEvalDatasetConflict, buildPlan(std.heap.page_allocator, same_eval));
+
+    var missing_eval_gate = valid;
+    missing_eval_gate.eval = null;
+    try std.testing.expectError(error.MissingPreferenceEvaluationConfig, buildPlan(std.heap.page_allocator, missing_eval_gate));
+
+    var ignored_optimizer = valid;
+    ignored_optimizer.optimizer.max_steps = 10;
+    try std.testing.expectError(error.UnsupportedGemma4OptimizerOption, buildPlan(std.heap.page_allocator, ignored_optimizer));
+
+    var unsupported_adapter = valid;
+    unsupported_adapter.adapter.?.dropout = 0.1;
+    try std.testing.expectError(error.UnsupportedGemma4AdapterOption, buildPlan(std.heap.page_allocator, unsupported_adapter));
+
+    var conflicting_outputs = valid;
+    conflicting_outputs.adapter.?.path = "/tmp/gemma4-dpo-same";
+    conflicting_outputs.artifacts.trained_adapter_dir = "/tmp/gemma4-dpo-same";
+    try std.testing.expectError(error.Gemma4BootstrapAndTrainingOutputConflict, buildPlan(std.heap.page_allocator, conflicting_outputs));
+}
+
+test "gemma4 preference mid-epoch checkpoint cadence validates fail-closed" {
+    const valid = Recipe{
+        .recipe = "dpo",
+        .execution = .{ .mode = "train" },
+        .model = .{ .path = "/models/gemma4", .reference_path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/preferences.jsonl", .eval_path = "/data/eval-preferences.jsonl", .format = "text-preference", .max_seq_len = 128 },
+        .adapter = .{ .rank = 8, .alpha = 16 },
+        .optimizer = .{ .learning_rate = 0.0001, .epochs = 2 },
+        .eval = .{ .dpo_minimums = .{ .accuracy = 0.5, .max_loss = 2.0 } },
+        .artifacts = .{ .root = "/tmp/gemma4-dpo-mid-epoch" },
+        .backend = "native",
+    };
+
+    var cadenced = valid;
+    cadenced.checkpoint = .{ .every_epochs = 1, .every_examples = 4 };
+    const cadenced_plan = try buildPlan(std.heap.page_allocator, cadenced);
+    defer freePlan(std.heap.page_allocator, cadenced_plan);
+    try std.testing.expectEqual(StepKind.direct_dpo, cadenced_plan.steps[0].kind);
+
+    var zero_cadence = valid;
+    zero_cadence.checkpoint = .{ .every_epochs = 1, .every_examples = 0 };
+    try std.testing.expectError(
+        error.InvalidGemma4CheckpointInterval,
+        buildPlan(std.heap.page_allocator, zero_cadence),
+    );
+
+    var cadence_without_boundary = valid;
+    cadence_without_boundary.checkpoint = .{ .every_examples = 4 };
+    try std.testing.expectError(
+        error.CheckpointIntervalRequired,
+        buildPlan(std.heap.page_allocator, cadence_without_boundary),
+    );
+
+    var grpo_incremental = Recipe{
+        .recipe = "grpo",
+        .execution = .{ .mode = "train" },
+        .model = .{ .path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/prompts.jsonl", .eval_path = "/data/eval-prompts.jsonl", .format = "text-grpo" },
+        .adapter = .{ .rank = 8, .alpha = 16 },
+        .optimizer = .{ .learning_rate = 0.0001, .epochs = 2 },
+        .eval = .{ .grpo_minimums = .{
+            .mean_reward = 0.25,
+            .top_rank_mean_reward = 0.25,
+            .positive_reward_group_rate = 0.25,
+            .max_kl_loss = 1.0,
+        } },
+        .artifacts = .{ .root = "/tmp/gemma4-grpo-mid-epoch" },
+        .backend = "native",
+    };
+    grpo_incremental.runtime = .{ .grpo_incremental_kv = true };
+    grpo_incremental.checkpoint = .{ .every_epochs = 1, .every_examples = 4 };
+    try std.testing.expectError(
+        error.Gemma4MidEpochCheckpointIncrementalKvNotSupported,
+        buildPlan(std.heap.page_allocator, grpo_incremental),
+    );
+
+    var sft_cadence = Recipe{
+        .recipe = "lora-sft",
+        .model = .{ .path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/train.jsonl", .eval_path = "/data/eval.jsonl" },
+        .optimizer = .{ .epochs = 3 },
+        .artifacts = .{ .root = "/tmp/gemma4-sft-mid-epoch" },
+        .backend = "native",
+    };
+    sft_cadence.checkpoint = .{ .every_epochs = 1, .every_examples = 4 };
+    try std.testing.expectError(
+        error.UnsupportedGemma4CheckpointOption,
+        buildPlan(std.heap.page_allocator, sft_cadence),
+    );
+}
+
+test "gemma4 preference checkpoint sidecar schema carries the mid-epoch cursor" {
+    const allocator = std.testing.allocator;
+
+    const mid_epoch = PreferenceCheckpointState{
+        .task = "grpo",
+        .run_fingerprint_sha256 = "sha256:0000",
+        .epoch_index = 0,
+        .examples_into_epoch = 3,
+        .micro_batch_steps = 3,
+        .optimizer_steps = 3,
+        .accumulation_micro_batches = 0,
+    };
+    const rendered = try std.json.Stringify.valueAlloc(allocator, mid_epoch, .{});
+    defer allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, preference_checkpoint_state_schema_v2) != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"examples_into_epoch\":3") != null);
+
+    // A v1 sidecar has no cursor field; it must parse with an implied
+    // epoch-boundary cursor of zero under the strict unknown-field policy.
+    const v1_sidecar =
+        \\{"schema_version":"antfly_gemma4_preference_checkpoint_state/v1","task":"dpo","run_fingerprint_sha256":"sha256:0000","epoch_index":2,"micro_batch_steps":4,"optimizer_steps":4,"accumulation_micro_batches":0,"dpo":null,"grpo":null}
+    ;
+    var parsed = try std.json.parseFromSlice(
+        PreferenceCheckpointState,
+        allocator,
+        v1_sidecar,
+        .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.examples_into_epoch);
+    try std.testing.expectEqualStrings(preference_checkpoint_state_schema_v1, parsed.value.schema_version);
+}
+
+test "gemma4 DPO objective resolver admits only gradient-complete paired modes" {
+    const sigmoid = try resolveDpoObjectiveConfig(.{});
+    try std.testing.expectEqual(DpoLossType.sigmoid, sigmoid.loss_type);
+    try std.testing.expectEqual(preference_loss.PreferenceLoss.dpo, sigmoid.preference.kind);
+    try std.testing.expectEqualStrings("sum", sigmoid.logprobAggregation());
+
+    const smoothed = try resolveDpoObjectiveConfig(.{ .label_smoothing = 0.1 });
+    try std.testing.expectEqual(@as(f32, 0.1), smoothed.preference.label_smoothing);
+
+    const ipo = try resolveDpoObjectiveConfig(.{ .loss_type = "ipo", .ipo_tau = 0.2 });
+    try std.testing.expectEqual(DpoLossType.ipo, ipo.loss_type);
+    try std.testing.expectEqual(preference_loss.PreferenceLoss.ipo, ipo.preference.kind);
+    try std.testing.expectEqualStrings("completion-token-mean", ipo.logprobAggregation());
+    try std.testing.expectEqual(@as(f32, 0.2), ipo.preference.ipo_tau);
+
+    const ipo_beta_default = try resolveDpoObjectiveConfig(.{ .loss_type = "ipo", .beta = 0.3 });
+    try std.testing.expectEqual(@as(f32, 0.3), ipo_beta_default.preference.ipo_tau);
+
+    const simpo = try resolveDpoObjectiveConfig(.{ .loss_type = "simpo", .simpo_gamma = 0.3 });
+    try std.testing.expectEqual(DpoLossType.simpo, simpo.loss_type);
+    try std.testing.expect(!simpo.needsReference());
+
+    try std.testing.expectError(
+        error.InvalidDpoLabelSmoothing,
+        resolveDpoObjectiveConfig(.{ .label_smoothing = 0.5 }),
+    );
+    try std.testing.expectError(
+        error.DpoLabelSmoothingRequiresSigmoid,
+        resolveDpoObjectiveConfig(.{ .loss_type = "ipo", .label_smoothing = 0.1 }),
+    );
+    try std.testing.expectError(
+        error.DpoLossTypeNotYetSupported,
+        resolveDpoObjectiveConfig(.{ .loss_type = "orpo" }),
+    );
+    try std.testing.expectError(
+        error.DpoLossTypeNotYetSupported,
+        resolveDpoObjectiveConfig(.{ .loss_type = "kto" }),
+    );
+}
+
+test "gemma4 GRPO reward and group contracts fail during planning" {
+    const valid = Recipe{
+        .recipe = "grpo",
+        .execution = .{ .mode = "train" },
+        .model = .{ .path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/prompts.jsonl", .eval_path = "/data/eval-prompts.jsonl", .format = "text-grpo", .max_seq_len = 64 },
+        .adapter = .{ .rank = 8, .alpha = 16 },
+        .grpo = .{ .group_size = 2, .max_completion_tokens = 2, .reward_mode = "prefix-match" },
+        .eval = .{ .grpo_minimums = .{
+            .mean_reward = 0.25,
+            .top_rank_mean_reward = 0.25,
+            .positive_reward_group_rate = 0.25,
+            .max_kl_loss = 1.0,
+        } },
+        .artifacts = .{ .root = "/tmp/gemma4-grpo-contract" },
+        .backend = "native",
+    };
+    const plan = try buildPlan(std.heap.page_allocator, valid);
+    defer freePlan(std.heap.page_allocator, plan);
+
+    var unsupported_runtime = valid;
+    unsupported_runtime.runtime = .{ .sequence_length_bucket_quantum = 16 };
+    try std.testing.expectError(
+        error.UnsupportedGemma4RuntimeOption,
+        buildPlan(std.heap.page_allocator, unsupported_runtime),
+    );
+
+    var incremental_native = valid;
+    incremental_native.runtime = .{ .grpo_incremental_kv = true };
+    try std.testing.expectError(
+        error.Gemma4GrpoIncrementalKvRequiresMetal,
+        buildPlan(std.heap.page_allocator, incremental_native),
+    );
+
+    var incremental_without_admission = valid;
+    incremental_without_admission.runtime = .{ .grpo_incremental_kv_batch_active = true };
+    try std.testing.expectError(
+        error.Gemma4GrpoIncrementalKvRequired,
+        buildPlan(std.heap.page_allocator, incremental_without_admission),
+    );
+
+    var incremental_checkpointed = valid;
+    incremental_checkpointed.backend = "metal";
+    incremental_checkpointed.optimizer.epochs = 2;
+    incremental_checkpointed.checkpoint = .{ .every_epochs = 1 };
+    incremental_checkpointed.runtime = .{
+        .grpo_incremental_kv = true,
+        .grpo_incremental_kv_batch_active = true,
+        .grpo_incremental_kv_clone_prompt_tail = true,
+        .grpo_incremental_kv_shadow_exact = true,
+    };
+    if (build_options.enable_metal) {
+        const incremental_checkpointed_plan = try buildPlan(
+            std.heap.page_allocator,
+            incremental_checkpointed,
+        );
+        defer freePlan(std.heap.page_allocator, incremental_checkpointed_plan);
+
+        var direct_gguf_incremental = incremental_checkpointed;
+        direct_gguf_incremental.model.path = "/models/gemma4.gguf";
+        direct_gguf_incremental.model.allow_direct_gguf_training = true;
+        try std.testing.expectError(
+            error.DirectGgufGrpoIncrementalKvNotQualified,
+            buildPlan(std.heap.page_allocator, direct_gguf_incremental),
+        );
+    } else {
+        try std.testing.expectError(
+            error.BackendUnavailable,
+            buildPlan(std.heap.page_allocator, incremental_checkpointed),
+        );
+    }
+
+    var bad_reward = valid;
+    bad_reward.grpo.reward_mode = "webhook";
+    try std.testing.expectError(error.UnsupportedRewardMode, buildPlan(std.heap.page_allocator, bad_reward));
+
+    var bad_group = valid;
+    bad_group.grpo.group_size = 1;
+    try std.testing.expectError(error.InvalidGrpoGroupSize, buildPlan(std.heap.page_allocator, bad_group));
+
+    var oversized_single_token_group = valid;
+    oversized_single_token_group.grpo.group_size =
+        gemma4_real_autodiff.max_single_token_completion_group_size + 1;
+    oversized_single_token_group.grpo.max_completion_tokens = 1;
+    try std.testing.expectError(
+        error.InvalidGrpoGroupSize,
+        buildPlan(std.heap.page_allocator, oversized_single_token_group),
+    );
+
+    var stochastic = valid;
+    stochastic.grpo.sampling = .{ .temperature = 0.8, .top_p = 0.95, .top_k = 64 };
+    const stochastic_plan = try buildPlan(std.heap.page_allocator, stochastic);
+    defer freePlan(std.heap.page_allocator, stochastic_plan);
+    const resolved_sampling = try resolveGrpoSamplingConfig(stochastic.grpo);
+    try std.testing.expectEqual(@as(f32, 0.8), resolved_sampling.temperature);
+    try std.testing.expectEqual(@as(f32, 0.95), resolved_sampling.top_p);
+    try std.testing.expectEqual(@as(usize, 64), resolved_sampling.top_k);
+
+    var objective = valid;
+    objective.grpo.loss_type = "dr_grpo";
+    objective.grpo.scale_rewards = "none";
+    objective.grpo.epsilon_high = 0.28;
+    objective.grpo.mask_truncated_completions = true;
+    const objective_plan = try buildPlan(std.heap.page_allocator, objective);
+    defer freePlan(std.heap.page_allocator, objective_plan);
+    const resolved_objective = try resolveGrpoObjectiveConfig(objective.grpo, 1);
+    try std.testing.expectEqual(grpo.LossType.dr_grpo, resolved_objective.loss_type);
+    try std.testing.expectEqual(grpo.RewardScale.none, resolved_objective.scale_rewards);
+    try std.testing.expectEqual(@as(f32, 0.28), resolved_objective.epsilon_high);
+    try std.testing.expect(resolved_objective.mask_truncated_completions);
+
+    var batch_scaled_training = valid;
+    batch_scaled_training.grpo.scale_rewards = "batch";
+    try std.testing.expectError(
+        error.GrpoBatchRewardScalingRequiresBatchedGroups,
+        buildPlan(std.heap.page_allocator, batch_scaled_training),
+    );
+
+    var invalid_loss_type = valid;
+    invalid_loss_type.grpo.loss_type = "made-up";
+    try std.testing.expectError(
+        error.InvalidGrpoLossType,
+        buildPlan(std.heap.page_allocator, invalid_loss_type),
+    );
+
+    var invalid_scale = valid;
+    invalid_scale.grpo.scale_rewards = "local";
+    try std.testing.expectError(
+        error.InvalidGrpoRewardScale,
+        buildPlan(std.heap.page_allocator, invalid_scale),
+    );
+
+    var accumulated_dapo = valid;
+    accumulated_dapo.grpo.loss_type = "dapo";
+    accumulated_dapo.optimizer.gradient_accumulation_steps = 2;
+    try std.testing.expectError(
+        error.GrpoDapoRequiresUnitGradientAccumulation,
+        buildPlan(std.heap.page_allocator, accumulated_dapo),
+    );
+
+    var bad_temperature = valid;
+    bad_temperature.grpo.sampling = .{ .temperature = 0.0 };
+    try std.testing.expectError(
+        error.InvalidGrpoSamplingTemperature,
+        buildPlan(std.heap.page_allocator, bad_temperature),
+    );
+
+    var bad_top_p = valid;
+    bad_top_p.grpo.sampling = .{ .top_p = 1.01 };
+    try std.testing.expectError(
+        error.InvalidGrpoSamplingTopP,
+        buildPlan(std.heap.page_allocator, bad_top_p),
+    );
+
+    const default_kl = try resolveGrpoKlControl(valid.grpo);
+    try std.testing.expectEqual(@as(f32, 0.1), default_kl.train_max_kl);
+    try std.testing.expectEqual(
+        ResolvedGrpoKlControl.BudgetPolicy.skip_group,
+        default_kl.budget_policy,
+    );
+    try std.testing.expect(!default_kl.adaptive);
+
+    var bad_kl_policy = valid;
+    bad_kl_policy.grpo.train_max_kl_policy = "halve_lr";
+    try std.testing.expectError(
+        error.InvalidGrpoTrainKlPolicy,
+        buildPlan(std.heap.page_allocator, bad_kl_policy),
+    );
+
+    var incomplete_adaptive_kl = valid;
+    incomplete_adaptive_kl.grpo.adaptive_kl = true;
+    incomplete_adaptive_kl.grpo.target_kl = 0.01;
+    try std.testing.expectError(
+        error.IncompleteGrpoAdaptiveKlConfig,
+        buildPlan(std.heap.page_allocator, incomplete_adaptive_kl),
+    );
+
+    var invalid_adaptive_kl = valid;
+    invalid_adaptive_kl.grpo = .{
+        .group_size = 2,
+        .max_completion_tokens = 2,
+        .reward_mode = "prefix-match",
+        .kl_coef = 0.04,
+        .train_max_kl = 0.01,
+        .adaptive_kl = true,
+        .target_kl = 0.01,
+        .kl_horizon = 100,
+    };
+    try std.testing.expectError(
+        error.InvalidGrpoAdaptiveKlConfig,
+        buildPlan(std.heap.page_allocator, invalid_adaptive_kl),
+    );
+
+    var adaptive_kl = valid;
+    adaptive_kl.grpo = .{
+        .group_size = 2,
+        .max_completion_tokens = 2,
+        .reward_mode = "prefix-match",
+        .kl_coef = 0.04,
+        .train_max_kl = 0.1,
+        .adaptive_kl = true,
+        .target_kl = 0.01,
+        .kl_horizon = 100,
+        .min_kl_coef = 0.001,
+        .max_kl_coef = 1.0,
+    };
+    const adaptive_plan = try buildPlan(std.heap.page_allocator, adaptive_kl);
+    defer freePlan(std.heap.page_allocator, adaptive_plan);
+    const resolved_adaptive_kl = try resolveGrpoKlControl(adaptive_kl.grpo);
+    try std.testing.expect(resolved_adaptive_kl.adaptive);
+    try std.testing.expectEqual(@as(f32, 0.01), resolved_adaptive_kl.target_kl.?);
+    try std.testing.expectEqual(@as(f32, 100), resolved_adaptive_kl.kl_horizon.?);
+
+    adaptive_kl.optimizer.epochs = 2;
+    adaptive_kl.checkpoint = .{ .every_epochs = 1 };
+    const adaptive_checkpoint_plan = try buildPlan(std.heap.page_allocator, adaptive_kl);
+    defer freePlan(std.heap.page_allocator, adaptive_checkpoint_plan);
+    const adaptive_checkpoint_path = try preferenceCheckpointPath(std.testing.allocator, adaptive_kl, .grpo);
+    defer std.testing.allocator.free(adaptive_checkpoint_path.?);
+    try std.testing.expectEqualStrings(
+        "/tmp/gemma4-grpo-contract/gemma4_grpo_trainer_state.safetensors",
+        adaptive_checkpoint_path.?,
+    );
+
+    var checkpoint_with_custom_reward_artifacts = adaptive_kl;
+    checkpoint_with_custom_reward_artifacts.grpo.reward_mode = null;
+    checkpoint_with_custom_reward_artifacts.reward = .{
+        .trace_path = "/tmp/shared-grpo-reward-trace.jsonl",
+        .providers = &.{.{
+            .name = "exact",
+            .kind = "builtin",
+            .mode = "exact-match",
+        }},
+    };
+    try std.testing.expectError(
+        error.Gemma4GrpoCheckpointCustomRewardArtifactsNotSupported,
+        buildPlan(std.heap.page_allocator, checkpoint_with_custom_reward_artifacts),
+    );
+
+    var typed = valid;
+    typed.grpo.reward_mode = null;
+    typed.reward = .{
+        .aggregation = "weighted-mean",
+        .providers = &.{
+            .{ .name = "exact", .kind = "builtin", .mode = "exact-match", .weight = 0.25 },
+            .{ .name = "prefix", .kind = "builtin", .mode = "prefix-match", .weight = 0.75 },
+        },
+    };
+    const typed_plan = try buildPlan(std.heap.page_allocator, typed);
+    defer freePlan(std.heap.page_allocator, typed_plan);
+
+    var conflicting_reward = typed;
+    conflicting_reward.grpo.reward_mode = "exact-match";
+    try std.testing.expectError(error.ConflictingRewardConfiguration, buildPlan(std.heap.page_allocator, conflicting_reward));
+
+    var fallback_reward = typed;
+    fallback_reward.reward.?.failure_policy = "zero";
+    try std.testing.expectError(error.UnsupportedRewardFailurePolicy, buildPlan(std.heap.page_allocator, fallback_reward));
+
+    var duplicate_provider = typed;
+    duplicate_provider.reward.?.providers = &.{
+        .{ .name = "same", .kind = "builtin", .mode = "exact-match" },
+        .{ .name = "same", .kind = "builtin", .mode = "prefix-match" },
+    };
+    try std.testing.expectError(error.DuplicateRewardProviderName, buildPlan(std.heap.page_allocator, duplicate_provider));
+
+    var unpinned_external = typed;
+    unpinned_external.reward.?.providers = &.{
+        .{ .name = "judge", .kind = "external-command", .executable_path = "/usr/bin/true" },
+    };
+    try std.testing.expectError(error.MissingRewardExecutableDigest, buildPlan(std.heap.page_allocator, unpinned_external));
+
+    const zero_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    var incomplete_model = typed;
+    incomplete_model.reward.?.providers = &.{.{
+        .name = "judge-model",
+        .kind = "model-command",
+        .executable_path = "/usr/bin/true",
+        .executable_sha256 = zero_digest,
+        .min_reward = 0,
+        .max_reward = 1,
+    }};
+    try std.testing.expectError(error.MissingRewardModel, buildPlan(std.heap.page_allocator, incomplete_model));
+
+    var pinned_model = typed;
+    pinned_model.reward.?.providers = &.{.{
+        .name = "judge-model",
+        .kind = "model-command",
+        .executable_path = "/usr/bin/true",
+        .executable_sha256 = zero_digest,
+        .model_path = "/models/reward/model.safetensors",
+        .model_sha256 = zero_digest,
+        .tokenizer_path = "/models/reward/tokenizer.json",
+        .tokenizer_sha256 = zero_digest,
+        .chat_template_path = "/models/reward/chat-template.txt",
+        .chat_template_sha256 = zero_digest,
+        .calibration_dataset_path = "/data/reward-calibration.jsonl",
+        .calibration_dataset_sha256 = zero_digest,
+        .max_input_tokens = 4096,
+        .max_batch_size = 1,
+        .min_reward = 0,
+        .max_reward = 1,
+    }};
+    const pinned_model_plan = try buildPlan(std.heap.page_allocator, pinned_model);
+    defer freePlan(std.heap.page_allocator, pinned_model_plan);
+
+    var bad_batch_provider = pinned_model.reward.?.providers.?[0];
+    bad_batch_provider.max_batch_size = 8;
+    var aspirational_batching = pinned_model;
+    aspirational_batching.reward.?.providers = &.{bad_batch_provider};
+    try std.testing.expectError(error.UnsupportedModelRewardBatchSize, buildPlan(std.heap.page_allocator, aspirational_batching));
+
+    var bad_multimodal = valid;
+    bad_multimodal.model.projector_path = "/models/gemma4/mmproj.gguf";
+    try std.testing.expectError(
+        error.Gemma4MultimodalPreferenceEvaluationNotYetSupported,
+        buildPlan(std.heap.page_allocator, bad_multimodal),
+    );
+}
+
+test "gemma4 GRPO epoch prompt order is deterministic and complete" {
+    var epoch_three: [32]usize = undefined;
+    var resumed_epoch_three: [32]usize = undefined;
+    var epoch_four: [32]usize = undefined;
+    fillGemmaGrpoEpochPromptOrder(&epoch_three, 17, 3);
+    fillGemmaGrpoEpochPromptOrder(&resumed_epoch_three, 17, 3);
+    fillGemmaGrpoEpochPromptOrder(&epoch_four, 17, 4);
+
+    try std.testing.expectEqualSlices(usize, &epoch_three, &resumed_epoch_three);
+    try std.testing.expect(!std.mem.eql(usize, &epoch_three, &epoch_four));
+
+    var seen: [32]bool = @splat(false);
+    for (epoch_three) |prompt_index| {
+        try std.testing.expect(prompt_index < seen.len);
+        try std.testing.expect(!seen[prompt_index]);
+        seen[prompt_index] = true;
+    }
+    for (seen) |present| try std.testing.expect(present);
+
+    var singleton = [_]usize{99};
+    fillGemmaGrpoEpochPromptOrder(&singleton, 17, 0);
+    try std.testing.expectEqual(@as(usize, 0), singleton[0]);
+    var empty: [0]usize = .{};
+    fillGemmaGrpoEpochPromptOrder(&empty, 17, 0);
+}
+
+test "gemma4 GRPO external reward executable preflight rejects digest drift" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(root);
+    const executable_path = try std.fs.path.join(allocator, &.{ root, "reward-verifier" });
+    defer allocator.free(executable_path);
+    try artifact_publication.writeFileAtomicReplace(allocator, std.testing.io, executable_path, "verifier-v1\n");
+    const executable_digest = try sha256FileAlloc(allocator, std.testing.io, executable_path);
+    defer allocator.free(executable_digest);
+
+    var providers = [_]RewardProviderConfig{.{
+        .name = "judge",
+        .kind = "external-command",
+        .executable_path = executable_path,
+        .executable_sha256 = executable_digest,
+    }};
+    const recipe = Recipe{ .reward = .{ .providers = &providers } };
+    try preflightRewardExecutables(allocator, std.testing.io, recipe);
+
+    providers[0].executable_sha256 = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    try std.testing.expectError(
+        error.RewardExecutableDigestMismatch,
+        preflightRewardExecutables(allocator, std.testing.io, recipe),
+    );
+}
+
+test "gemma4 GRPO model reward preflight and response attestation fail closed" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(root);
+    const artifact_path = try std.fs.path.join(allocator, &.{ root, "pinned-artifact" });
+    defer allocator.free(artifact_path);
+    try artifact_publication.writeFileAtomicReplace(allocator, std.testing.io, artifact_path, "pinned-v1\n");
+    const digest = try sha256FileAlloc(allocator, std.testing.io, artifact_path);
+    defer allocator.free(digest);
+
+    var providers = [_]RewardProviderConfig{.{
+        .name = "judge-model",
+        .kind = "model-command",
+        .executable_path = artifact_path,
+        .executable_sha256 = digest,
+        .model_path = artifact_path,
+        .model_sha256 = digest,
+        .tokenizer_path = artifact_path,
+        .tokenizer_sha256 = digest,
+        .chat_template_path = artifact_path,
+        .chat_template_sha256 = digest,
+        .calibration_dataset_path = artifact_path,
+        .calibration_dataset_sha256 = digest,
+        .max_input_tokens = 16,
+        .max_batch_size = 1,
+        .min_reward = 0,
+        .max_reward = 1,
+    }};
+    const recipe = Recipe{ .reward = .{ .providers = &providers } };
+    try preflightRewardExecutables(allocator, std.testing.io, recipe);
+    try validateModelRewardResponse(providers[0], .{
+        .reward = 0.75,
+        .input_tokens = 12,
+        .model_sha256 = digest,
+        .tokenizer_sha256 = digest,
+        .chat_template_sha256 = digest,
+        .calibration_dataset_sha256 = digest,
+    });
+    try std.testing.expectError(error.ModelRewardTokenLimitExceeded, validateModelRewardResponse(providers[0], .{
+        .reward = 0.75,
+        .input_tokens = 17,
+        .model_sha256 = digest,
+        .tokenizer_sha256 = digest,
+        .chat_template_sha256 = digest,
+        .calibration_dataset_sha256 = digest,
+    }));
+    try std.testing.expectError(error.ModelRewardIdentityMismatch, validateModelRewardResponse(providers[0], .{
+        .reward = 0.75,
+        .input_tokens = 12,
+        .model_sha256 = "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        .tokenizer_sha256 = digest,
+        .chat_template_sha256 = digest,
+        .calibration_dataset_sha256 = digest,
+    }));
+
+    try artifact_publication.writeFileAtomicReplace(allocator, std.testing.io, artifact_path, "pinned-v2\n");
+    try std.testing.expectError(
+        error.RewardExecutableDigestMismatch,
+        preflightRewardExecutables(allocator, std.testing.io, recipe),
+    );
+}
+
+test "gemma4 GRPO model reward subprocess is attested and failures are traced" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const relative_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(relative_root);
+    const root = try std.fs.path.resolve(allocator, &.{relative_root});
+    defer allocator.free(root);
+    const artifact_path = try std.fs.path.join(allocator, &.{ root, "pinned-model-artifact" });
+    defer allocator.free(artifact_path);
+    try artifact_publication.writeFileAtomicReplace(allocator, std.testing.io, artifact_path, "pinned-v1\n");
+    const artifact_digest = try sha256FileAlloc(allocator, std.testing.io, artifact_path);
+    defer allocator.free(artifact_digest);
+    const executable_digest = try sha256FileAlloc(allocator, std.testing.io, "/bin/sh");
+    defer allocator.free(executable_digest);
+
+    const success_response = try std.json.Stringify.valueAlloc(allocator, ExternalRewardResponse{
+        .reward = 0.75,
+        .evidence = "fixture-score",
+        .input_tokens = 4,
+        .model_sha256 = artifact_digest,
+        .tokenizer_sha256 = artifact_digest,
+        .chat_template_sha256 = artifact_digest,
+        .calibration_dataset_sha256 = artifact_digest,
+    }, .{});
+    defer allocator.free(success_response);
+    const script = try std.fmt.allocPrint(allocator, "printf '%s\\n' '{s}'\n", .{success_response});
+    defer allocator.free(script);
+
+    const exchange_dir = try std.fs.path.join(allocator, &.{ root, "exchange" });
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, exchange_dir);
+    const trace_path = try std.fs.path.join(allocator, &.{ root, "reward-trace.jsonl" });
+    const configuration_digest = try allocator.dupe(u8, artifact_digest);
+    const prompts = [_][]const u8{"Question?"};
+    const targets = [_][]const u8{"yes"};
+    var pipeline = RewardPipeline{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .tokenizer = undefined,
+        .prompt_texts = &prompts,
+        .targets = &targets,
+        .providers = null,
+        .legacy_mode = null,
+        .aggregation = "weighted-mean",
+        .failure_policy = "fail",
+        .phase = .train,
+        .trace_path = trace_path,
+        .exchange_dir = exchange_dir,
+        .configuration_digest = configuration_digest,
+        .max_trace_bytes = 1024 * 1024,
+    };
+    defer pipeline.deinit();
+
+    // The request path appended by the provider protocol becomes sh's $0;
+    // the pinned command emits one response and intentionally ignores it.
+    const success_args = [_][]const u8{ "-c", script };
+    const provider = RewardProviderConfig{
+        .name = "judge-model",
+        .kind = "model-command",
+        .executable_path = "/bin/sh",
+        .executable_sha256 = executable_digest,
+        .args = &success_args,
+        .model_path = artifact_path,
+        .model_sha256 = artifact_digest,
+        .tokenizer_path = artifact_path,
+        .tokenizer_sha256 = artifact_digest,
+        .chat_template_path = artifact_path,
+        .chat_template_sha256 = artifact_digest,
+        .calibration_dataset_path = artifact_path,
+        .calibration_dataset_sha256 = artifact_digest,
+        .max_input_tokens = 16,
+        .max_batch_size = 1,
+        .min_reward = 0,
+        .max_reward = 1,
+    };
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const completion_tokens = [_]i32{ 1, 2 };
+    const result = try pipeline.scoreExternalProvider(
+        arena.allocator(),
+        provider,
+        0,
+        &completion_tokens,
+        "yes",
+        "yes",
+    );
+    try std.testing.expectEqual(@as(f32, 0.75), result.reward);
+    try std.testing.expectEqual(@as(?usize, 4), result.input_tokens);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.external_calls);
+    const request = try readFileMax(allocator, std.testing.io, result.request_path, 64 * 1024);
+    defer allocator.free(request);
+    try std.testing.expect(std.mem.indexOf(u8, request, "antfly_inference_grpo_reward_request/v2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, artifact_digest) != null);
+
+    pipeline.call_index = 1;
+    const failure_args = [_][]const u8{ "-c", "exit 7" };
+    var failing_provider = provider;
+    failing_provider.args = &failure_args;
+    try std.testing.expectError(error.RewardProviderFailed, pipeline.scoreExternalProvider(
+        arena.allocator(),
+        failing_provider,
+        0,
+        &completion_tokens,
+        "no",
+        "yes",
+    ));
+    try std.testing.expectEqual(@as(usize, 1), pipeline.external_failures);
+
+    const out_of_bounds_response = try std.json.Stringify.valueAlloc(allocator, ExternalRewardResponse{
+        .reward = 2.0,
+        .input_tokens = 4,
+        .model_sha256 = artifact_digest,
+        .tokenizer_sha256 = artifact_digest,
+        .chat_template_sha256 = artifact_digest,
+        .calibration_dataset_sha256 = artifact_digest,
+    }, .{});
+    defer allocator.free(out_of_bounds_response);
+    const out_of_bounds_script = try std.fmt.allocPrint(allocator, "printf '%s\\n' '{s}'\n", .{out_of_bounds_response});
+    defer allocator.free(out_of_bounds_script);
+    const out_of_bounds_args = [_][]const u8{ "-c", out_of_bounds_script };
+    var out_of_bounds_provider = provider;
+    out_of_bounds_provider.args = &out_of_bounds_args;
+    pipeline.call_index = 2;
+    try std.testing.expectError(error.RewardProviderOutOfBounds, pipeline.scoreExternalProvider(
+        arena.allocator(),
+        out_of_bounds_provider,
+        0,
+        &completion_tokens,
+        "yes",
+        "yes",
+    ));
+    try std.testing.expectEqual(@as(usize, 2), pipeline.external_failures);
+    try pipeline.finish();
+    const trace = try readFileMax(allocator, std.testing.io, pipeline.trace_path, 64 * 1024);
+    defer allocator.free(trace);
+    try std.testing.expect(std.mem.indexOf(u8, trace, "antfly_inference_grpo_reward_failure/v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, trace, "RewardProviderFailed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, trace, "RewardProviderOutOfBounds") != null);
+    try std.testing.expect(std.mem.indexOf(u8, trace, artifact_digest) != null);
+}
+
+test "gemma4 GRPO reward request schema preserves generic provider compatibility" {
+    try std.testing.expectEqualStrings(
+        "antfly_inference_grpo_reward_request/v1",
+        rewardRequestSchemaVersion("external-command"),
+    );
+    try std.testing.expectEqualStrings(
+        "antfly_inference_grpo_reward_request/v2",
+        rewardRequestSchemaVersion("model-command"),
+    );
+}
+
+test "preference evaluators reject token-identical train and heldout prompts" {
+    const train_prompt_a = [_]i32{ 1, 2, 3 };
+    const train_prompt_b = [_]i32{ 4, 5 };
+    const eval_prompt_same = [_]i32{ 1, 2, 3 };
+    const eval_prompt_new = [_]i32{ 6, 7 };
+    const chosen = [_]i32{8};
+    const rejected = [_]i32{9};
+    const train_samples = [_]preference_harness.PreferenceSample{
+        .{ .prompt_tokens = &train_prompt_a, .chosen_tokens = &chosen, .rejected_tokens = &rejected },
+        .{ .prompt_tokens = &train_prompt_b, .chosen_tokens = &chosen, .rejected_tokens = &rejected },
+    };
+    const eval_samples = [_]preference_harness.PreferenceSample{
+        .{ .prompt_tokens = &eval_prompt_same, .chosen_tokens = &chosen, .rejected_tokens = &rejected },
+        .{ .prompt_tokens = &eval_prompt_new, .chosen_tokens = &chosen, .rejected_tokens = &rejected },
+    };
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try countPreferencePromptOverlaps(std.testing.allocator, &train_samples, &eval_samples),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try countTokenPromptOverlaps(
+            std.testing.allocator,
+            &.{ &train_prompt_a, &train_prompt_b },
+            &.{ &eval_prompt_same, &eval_prompt_new },
+        ),
+    );
+}
+
+test "preference training refuses a stale trained adapter publication target" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(root);
+    const target = try std.fs.path.join(allocator, &.{ root, "adapter-trained" });
+    defer allocator.free(target);
+    try requireMissingPreferencePublicationTarget(std.testing.io, target);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, target);
+    try std.testing.expectError(
+        error.PreferenceTrainedAdapterAlreadyExists,
+        requireMissingPreferencePublicationTarget(std.testing.io, target),
+    );
+}
+
+test "gemma4 preference training reports fingerprint bootstrap and trained adapters" {
+    const recipe = Recipe{
+        .recipe = "dpo",
+        .execution = .{ .mode = "train" },
+        .model = .{ .path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/preferences.jsonl", .eval_path = "/data/eval-preferences.jsonl", .format = "text-preference" },
+        .adapter = .{ .rank = 8, .alpha = 16 },
+        .eval = .{ .dpo_minimums = .{ .accuracy = 0.5, .max_loss = 2.0 } },
+        .artifacts = .{ .root = "/tmp/gemma4-preference-artifacts" },
+        .backend = "native",
+    };
+    const plan = try buildPlan(std.testing.allocator, recipe);
+    defer freePlan(std.testing.allocator, plan);
+
+    var planned: std.ArrayListUnmanaged(PlannedPath) = .empty;
+    defer {
+        for (planned.items) |item| std.testing.allocator.free(item.path);
+        planned.deinit(std.testing.allocator);
+    }
+    try appendArtifactPathsFromPlan(std.testing.allocator, &planned, recipe, plan);
+
+    var found_bootstrap = false;
+    var found_trained = false;
+    var found_evaluation = false;
+    for (planned.items) |item| {
+        if (std.mem.eql(u8, item.label, "adapter_bootstrap")) found_bootstrap = true;
+        if (std.mem.eql(u8, item.label, "trained_adapter")) found_trained = true;
+        if (std.mem.eql(u8, item.label, "dpo_evaluation")) found_evaluation = true;
+    }
+    try std.testing.expect(found_bootstrap);
+    try std.testing.expect(found_trained);
+    try std.testing.expect(found_evaluation);
 }
 
 test "run manifest captures recipe plan status" {
@@ -6733,6 +17679,62 @@ test "fast smoke resolves checked-in testdata from current package cwd" {
     try std.testing.expect(cwdPathExists(std.testing.io, path));
 }
 
+test "fast smoke result cleanup handles an error after an initialized prefix" {
+    const Harness = struct {
+        fn makeResult(allocator: std.mem.Allocator, index: usize) !FastSmokeCaseResult {
+            const manifest_path = try std.fmt.allocPrint(allocator, "/tmp/manifest-{d}.json", .{index});
+            errdefer allocator.free(manifest_path);
+            const training_report_path = try std.fmt.allocPrint(allocator, "/tmp/report-{d}.json", .{index});
+            return .{
+                .name = "case",
+                .recipe_path = "recipe.json",
+                .mode = .execute,
+                .status = .succeeded,
+                .manifest_path = manifest_path,
+                .training_report_path = training_report_path,
+            };
+        }
+
+        fn failAfter(allocator: std.mem.Allocator, initialized_before_error: usize) !void {
+            var results = try allocator.alloc(FastSmokeCaseResult, initialized_before_error + 1);
+            var initialized_results: usize = 0;
+            defer freeFastSmokeResults(allocator, results, initialized_results);
+            while (initialized_results < initialized_before_error) : (initialized_results += 1) {
+                results[initialized_results] = try makeResult(allocator, initialized_results);
+            }
+            return error.InjectedFastSmokeFailure;
+        }
+    };
+
+    try std.testing.expectError(error.InjectedFastSmokeFailure, Harness.failAfter(std.testing.allocator, 2));
+}
+
+test "fast smoke fixture resolution supports repo root and inference directory" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "zig/pkg/inference/testdata");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "zig/pkg/inference/testdata/recipe.json",
+        .data = "{}",
+    });
+
+    const requested = "pkg/inference/testdata/recipe.json";
+    const from_repo_root = try resolvePathFromDir(allocator, io, tmp.dir, requested);
+    defer allocator.free(from_repo_root);
+    try std.testing.expectEqualStrings("zig/pkg/inference/testdata/recipe.json", from_repo_root);
+    try std.testing.expect(dirPathExists(tmp.dir, io, from_repo_root));
+
+    var inference_dir = try tmp.dir.openDir(io, "zig/pkg/inference", .{});
+    defer inference_dir.close(io);
+    const from_inference_dir = try resolvePathFromDir(allocator, io, inference_dir, requested);
+    defer allocator.free(from_inference_dir);
+    try std.testing.expectEqualStrings("testdata/recipe.json", from_inference_dir);
+    try std.testing.expect(dirPathExists(inference_dir, io, from_inference_dir));
+}
+
 test "direct command adapter registry covers reranker family steps" {
     try std.testing.expect(isDirectCommandAdapter("prepare-gemma4-lora-inputs"));
     try std.testing.expect(isDirectCommandAdapter("bootstrap-gemma4-lora"));
@@ -6753,9 +17755,21 @@ test "direct command adapter registry covers reranker family steps" {
     try std.testing.expect(isDirectCommandAdapter("materialize-reranker-head"));
 }
 
+test "gemma4 GRPO configured end of turn is complete rather than truncated" {
+    var config = gemma_graph.Config{ .eos_token_id = 1 };
+    config.extra_eos_token_ids[0] = 106;
+    config.extra_eos_token_ids_len = 1;
+    try std.testing.expect(!isGemmaGrpoCompletionTruncated(&config, &.{}, 1));
+    try std.testing.expect(!isGemmaGrpoCompletionTruncated(&config, &.{ 42, 1 }, 1));
+    try std.testing.expect(!isGemmaGrpoCompletionTruncated(&config, &.{ 42, 106 }, 1));
+    try std.testing.expect(!isGemmaGrpoCompletionTruncated(&config, &.{ 42, 106 }, null));
+    try std.testing.expect(isGemmaGrpoCompletionTruncated(&config, &.{ 42, 43 }, 1));
+    try std.testing.expect(isGemmaGrpoCompletionTruncated(&config, &.{ 42, -1 }, null));
+}
+
 test "text reward modes score as expected" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), scoreTextReward(.exact_match, "yes", "yes"), 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), scoreTextReward(.exact_match, "yes indeed", "yes"), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), scoreTextReward(.exact_match, "yes indeed", "yes"), 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), scoreTextReward(.exact_match_ci, "Yes", "yes"), 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), scoreTextReward(.exact_match_ci, "yes indeed", "yes"), 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), scoreTextReward(.prefix_match, "yes indeed", "yes"), 1e-6);
@@ -6783,6 +17797,52 @@ test "DPO completion EOS follows manifest without duplication" {
     const unchanged = try copyCompletionWithManifestEos(allocator, &tokens, false, -1);
     defer allocator.free(unchanged);
     try std.testing.expectEqualSlices(i32, &tokens, unchanged);
+}
+
+test "gemma4 token reward modes score control-token completions without decoding" {
+    const completion = [_]i32{ 1, 42 };
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), scoreTokenReward(.token_exact_match, &completion, &completion), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), scoreTokenReward(.token_exact_match, &completion, &.{1}), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), scoreTokenReward(.token_prefix_match, &completion, &.{1}), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), scoreTokenReward(.token_prefix_match, &completion, &.{42}), 1e-6);
+}
+
+test "gemma4 preference environment contract fails closed for unknown policy knobs" {
+    try std.testing.expect(gemmaPreferenceEnvironmentNameInScope("TERMITE_METAL_DISABLE_FUTURE_TRAINING_FUSION"));
+    try std.testing.expect(!gemmaPreferenceEnvironmentNameAttested("TERMITE_METAL_DISABLE_FUTURE_TRAINING_FUSION"));
+    try std.testing.expect(gemmaPreferenceEnvironmentNameInScope("ANTFLY_GEMMA4_GRPO_FUTURE_BATCH_ROUTE"));
+    try std.testing.expect(!gemmaPreferenceEnvironmentNameAttested("ANTFLY_GEMMA4_GRPO_FUTURE_BATCH_ROUTE"));
+    try std.testing.expect(gemmaPreferenceEnvironmentNameInScope("ANTFLY_GEMMA4_PREFERENCE_TRACE"));
+    try std.testing.expect(!gemmaPreferenceEnvironmentNameAttested("ANTFLY_GEMMA4_PREFERENCE_TRACE"));
+    try std.testing.expect(!gemmaPreferenceEnvironmentNameInScope("HF_HOME"));
+
+    for ([_][]const u8{
+        "TERMITE_DISABLE_GRAPH_OUTPUT_OWNED_COPY",
+        "TERMITE_DISABLE_GRAPH_OUTPUT_ELISION_OVERRIDE",
+        "TERMITE_DISABLE_OUTPUT_HOST_MIRROR_RESYNC",
+        "TERMITE_DISABLE_PAGED_KV",
+    }) |name| {
+        try std.testing.expect(gemmaPreferenceEnvironmentNameInScope(name));
+        try std.testing.expect(!gemmaPreferenceEnvironmentNameAttested(name));
+        try std.testing.expectError(
+            error.UnattestedGemma4PreferenceEnvironmentOverride,
+            validateGemmaPreferenceEnvironmentAssignment(name, "1"),
+        );
+    }
+    try std.testing.expect(gemmaPreferenceEnvironmentValueIsCanonical("TERMITE_METAL_DISABLE_BF16_SIMDGROUP_M64", "0"));
+    try std.testing.expect(!gemmaPreferenceEnvironmentValueIsCanonical("TERMITE_METAL_DISABLE_BF16_SIMDGROUP_M64", "false"));
+    try std.testing.expect(gemmaPreferenceEnvironmentValueIsCanonical("TERMITE_METAL_DISABLE_GEMMA_GQA_ATTENTION_FUSION", "1"));
+    try std.testing.expect(!gemmaPreferenceEnvironmentValueIsCanonical("TERMITE_METAL_DISABLE_GEMMA_GQA_ATTENTION_FUSION", "0"));
+    try std.testing.expect(gemmaPreferenceEnvironmentValueIsCanonical("TERMITE_GEMMA4_SPARSE_LOSS_CHUNK_ROWS", "512"));
+    try std.testing.expect(!gemmaPreferenceEnvironmentValueIsCanonical("TERMITE_GEMMA4_SPARSE_LOSS_CHUNK_ROWS", "513"));
+    try std.testing.expect(gemmaPreferenceEnvironmentValueIsCanonical("TERMITE_DEBUG_DEVICE_GRAD_NORM", "0"));
+    try std.testing.expect(!gemmaPreferenceEnvironmentValueIsCanonical("TERMITE_DEBUG_DEVICE_GRAD_NORM", "1"));
+    try validateGemmaPreferenceEnvironmentAssignment("TERMITE_DEBUG_DEVICE_GRAD_NORM", "0");
+    try std.testing.expectError(
+        error.InvalidGemma4PreferenceEnvironmentValue,
+        validateGemmaPreferenceEnvironmentAssignment("TERMITE_DEBUG_DEVICE_GRAD_NORM", "1"),
+    );
+    try validateGemmaPreferenceEnvironmentAssignment("HF_HOME", "/tmp/hf-cache");
 }
 
 fn expectStepCommands(plan: Plan, expected: []const []const u8) !void {
@@ -6821,4 +17881,47 @@ fn containsArg(args: []const []const u8, expected: []const u8) bool {
         if (std.mem.eql(u8, arg, expected)) return true;
     }
     return false;
+}
+
+test "gemma4 recipe rejects ignored execution and legacy native preference options" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.ExecutionModeOnlySupportedForPreference, buildPlan(allocator, .{
+        .kind = "lora-sft",
+        .model = .{ .family = "gemma4" },
+        .execution = .{ .mode = "score" },
+    }));
+    try std.testing.expectError(error.UnsupportedPreferenceTrainingBackend, validateNativePreferenceOptions(.{ .backend = "metal" }));
+    try std.testing.expectError(error.UnsupportedPreferenceTrainingOption, validateNativePreferenceOptions(.{ .checkpoint = .{} }));
+    try std.testing.expectError(error.UnsupportedPreferenceTrainingOption, validateNativePreferenceOptions(.{ .eval = .{} }));
+    try std.testing.expectError(error.UnsupportedPreferenceTrainingOption, validateNativePreferenceOptions(.{ .runtime = .{} }));
+    try std.testing.expectError(error.UnsupportedPreferenceOptimizerOption, validateNativePreferenceOptions(.{ .optimizer = .{ .weight_decay = 0.0 } }));
+    try validateNativePreferenceOptions(.{ .backend = "native", .optimizer = .{ .learning_rate = 0.001 } });
+}
+
+test "gemma4 recipe passes adapter initialization seed to bootstrap" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var args: std.ArrayList([]const u8) = .empty;
+    defer args.deinit(allocator);
+    try appendGemmaBootstrapAdapterArgs(allocator, &args, .{ .initialization_seed = 991 }, .lora_sft);
+    try expectArgValue(args.items, "--initialization-seed", "991");
+}
+
+test "gemma4 recipe legacy lanes fail closed on ignored optimizer and evaluation fields" {
+    var recipe = Recipe{};
+    recipe.optimizer.weight_decay = 0;
+    try std.testing.expectError(error.UnsupportedRecipeOptimizerOption, validateLegacyRecipeOptions(recipe, .layout));
+    try std.testing.expectError(error.UnsupportedPreferenceOptimizerOption, validateNativePreferenceOptions(recipe));
+    recipe.optimizer = .{};
+    recipe.eval = .{ .every_epochs = 1 };
+    try std.testing.expectError(error.UnsupportedRecipeEvaluationOption, validateLegacyRecipeOptions(recipe, .reranker));
+    recipe.eval = null;
+    recipe.dataset.eval_path = "heldout.jsonl";
+    try std.testing.expectError(error.UnsupportedRecipeEvaluationOption, validateLegacyRecipeOptions(recipe, .retrieval));
+    try std.testing.expectError(error.UnsupportedPreferenceTrainingOption, validateNativePreferenceOptions(recipe));
+    recipe.dataset.eval_path = null;
+    recipe.backend = "metal";
+    try std.testing.expectError(error.UnsupportedRecipeBackend, validateLegacyRecipeOptions(recipe, .layout));
+    try std.testing.expectError(error.UnsupportedPreferenceTrainingBackend, validateNativePreferenceOptions(recipe));
 }

@@ -7452,6 +7452,10 @@ fn generateWithOptionalStreaming(
 
 fn serverGenerateRequest(opts: Options, messages: []const api.ChatMessage) api.GenerateRequest {
     const draft_requested = opts.draft_model != null;
+    var chat_template_kwargs: ?api.GenerateChatTemplateKwargs = null;
+    if (opts.enable_thinking) |enabled| {
+        chat_template_kwargs = .{ .enable_thinking = enabled };
+    }
     return .{
         .model = opts.model_dir,
         .messages = messages,
@@ -7463,6 +7467,7 @@ fn serverGenerateRequest(opts: Options, messages: []const api.ChatMessage) api.G
         .repetition_penalty = opts.repetition_penalty,
         .stream = if (opts.stream) true else null,
         .stream_options = if (opts.stream) .{ .include_usage = true } else null,
+        .chat_template_kwargs = chat_template_kwargs,
         .draft_model = opts.draft_model,
         .speculative_k = if (draft_requested) opts.speculative_k else null,
         .speculation_policy = if (draft_requested) opts.speculation_policy.name() else null,
@@ -9440,6 +9445,41 @@ test "server generate forwards only explicit ignore eos" {
     const controlled_body = try serializeServerGenerateRequest(std.testing.allocator, controlled);
     defer std.testing.allocator.free(controlled_body);
     try std.testing.expect(std.mem.indexOf(u8, controlled_body, "\"ignore_eos\":true") != null);
+}
+
+test "server generate forwards only explicit thinking mode" {
+    const messages = [_]api.ChatMessage{.{
+        .role = .user,
+        .content = .{ .string = "hello" },
+    }};
+    const defaults = serverGenerateRequest(.{
+        .model_dir = "gemma-e2b",
+        .prompt = "hello",
+        .backend = .cuda,
+    }, &messages);
+    const default_body = try serializeServerGenerateRequest(std.testing.allocator, defaults);
+    defer std.testing.allocator.free(default_body);
+    try std.testing.expect(std.mem.indexOf(u8, default_body, "\"chat_template_kwargs\"") == null);
+
+    const disabled = serverGenerateRequest(.{
+        .model_dir = "gemma-e2b",
+        .prompt = "hello",
+        .backend = .cuda,
+        .enable_thinking = false,
+    }, &messages);
+    const disabled_body = try serializeServerGenerateRequest(std.testing.allocator, disabled);
+    defer std.testing.allocator.free(disabled_body);
+    try std.testing.expect(std.mem.indexOf(u8, disabled_body, "\"chat_template_kwargs\":{\"enable_thinking\":false}") != null);
+
+    const enabled = serverGenerateRequest(.{
+        .model_dir = "gemma-e2b",
+        .prompt = "hello",
+        .backend = .cuda,
+        .enable_thinking = true,
+    }, &messages);
+    const enabled_body = try serializeServerGenerateRequest(std.testing.allocator, enabled);
+    defer std.testing.allocator.free(enabled_body);
+    try std.testing.expect(std.mem.indexOf(u8, enabled_body, "\"chat_template_kwargs\":{\"enable_thinking\":true}") != null);
 }
 
 test "server generate stream requests terminal usage accounting" {

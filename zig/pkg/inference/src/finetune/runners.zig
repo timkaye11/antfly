@@ -13,7 +13,10 @@
 // limitations under the License.
 
 // Shared implementations used by recipe dispatch and standalone CLI entrypoints.
-pub const train_eval_gemma4_lora_bundle = @import("train/train_eval_gemma4_lora_bundle.zig");
+// Recipe dispatch already lives inside the inference module, so call the
+// command implementation directly. The standalone wrapper imports
+// `inference_internal` to keep CLI build ownership separate.
+pub const train_eval_gemma4_lora_bundle = @import("gemma4_train_command.zig");
 pub const train_eval_layoutlmv3_lora_sequence = @import("train/train_eval_layoutlmv3_lora_sequence.zig");
 pub const train_eval_layoutlmv3_lora_token = @import("train/train_eval_layoutlmv3_lora_token.zig");
 pub const train_eval_colqwen2_lora_bundle = @import("train/train_eval_colqwen2_lora_bundle.zig");

@@ -1,5 +1,6 @@
 {
   "recipe": "grpo",
+  "execution": { "mode": "score" },
   "model": {
     "name": "scalar-grpo-smoke",
     "family": "preference"
@@ -13,10 +14,6 @@
     "clip_epsilon": 0.2,
     "kl_coef": 0.04,
     "normalize_advantage": true
-  },
-  "optimizer": {
-    "epochs": 1,
-    "learning_rate": 0.0
   },
   "artifacts": {
     "root": "/tmp/termite-grpo-recipe-smoke"

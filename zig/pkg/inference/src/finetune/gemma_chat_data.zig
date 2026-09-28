@@ -35,6 +35,9 @@ pub const ToolSpec = struct {
 pub const Metadata = struct {
     policy_version: ?[]const u8 = null,
     source: ?[]const u8 = null,
+    /// Stable group identity used to keep related records in one dataset
+    /// partition and to reject train/eval leakage.
+    group_id: ?[]const u8 = null,
 };
 
 pub const Message = struct {
@@ -280,6 +283,7 @@ fn coerceMetadata(value: std.json.Value) !Metadata {
     return .{
         .policy_version = optionalString(obj.get("policy_version")),
         .source = optionalString(obj.get("source")),
+        .group_id = firstNonEmptyString(obj, &.{ "group_id", "group" }),
     };
 }
 

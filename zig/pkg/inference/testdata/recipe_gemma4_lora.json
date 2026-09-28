@@ -6,6 +6,7 @@
   },
   "dataset": {
     "path": "/tmp/termite-data/chat.jsonl",
+    "eval_path": "/tmp/termite-data/chat-eval.jsonl",
     "train_split": "train",
     "max_examples": 4,
     "max_seq_len": 128
@@ -13,7 +14,7 @@
   "adapter": {
     "rank": 16,
     "alpha": 32,
-    "target_preset": "all-linear",
+    "target_preset": "text-all-linear",
     "scaling": "standard",
     "init_lora_weights": "default"
   },
@@ -28,5 +29,5 @@
     "root": "/tmp/termite-recipe-gemma4",
     "manifest_path": "/tmp/termite-recipe-gemma4/recipe_run_manifest.json"
   },
-  "backend": "auto"
+  "backend": "native"
 }

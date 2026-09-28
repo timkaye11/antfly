@@ -198,6 +198,11 @@ pub fn build(b: *std.Build) void {
     else
         blas_root_opt;
     const antfly_version = b.option([]const u8, "antfly-version", "Antfly version string") orelse "dev";
+    const benchmark_source_revision = b.option(
+        []const u8,
+        "benchmark-source-revision",
+        "Clean 40-hex source commit embedded for fail-closed benchmark attestation",
+    ) orelse "dev";
     const enable_native_quant_dispatch_stats = b.option(bool, "enable-native-quant-dispatch-stats", "Enable native quant dispatch counters for benchmark diagnostics") orelse false;
     const configured_platform_mod = b.dependency("antfly_platform", .{
         .target = target,
@@ -275,6 +280,8 @@ pub fn build(b: *std.Build) void {
             .link_libc = link_libc,
             .skip_openapi = skip_openapi,
             .enable_native_quant_dispatch_stats = enable_native_quant_dispatch_stats,
+            .inference_version = antfly_version,
+            .benchmark_source_revision = benchmark_source_revision,
         },
     };
     const runtime_graph = runtime_build.create(runtime_config);

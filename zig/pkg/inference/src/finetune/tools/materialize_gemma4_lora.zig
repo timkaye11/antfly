@@ -19,12 +19,11 @@ pub fn main(init: std.process.Init) !void {
 }
 
 // Reuse the parser and implementation in the combined CLI without creating a
-// second instance of model/tensor types inside its inference module.
+// second instance of model and tensor types inside its inference module.
 pub fn Command(comptime assets: type) type {
     return struct {
         const inference = assets;
         const finetune = inference.finetune.gemma4;
-        const peft = inference.finetune.peft;
 
         pub fn main(init: std.process.Init) !void {
             const allocator = init.gpa;
@@ -47,60 +46,16 @@ pub fn Command(comptime assets: type) type {
             }
 
             if (positional.items.len != 3) return usageError();
+            try validateEvalAdmission(eval_program);
             const base_model_dir = positional.items[0];
             const adapter_model_dir = positional.items[1];
             const out_dir = positional.items[2];
-
-            if (eval_program) |program| {
-                var eval_before = try peft.runEvalCapture(allocator, init.io, program, "before");
-                defer eval_before.deinit(allocator);
-                if (!eval_before.success) {
-                    const report = MaterializeEvalFailureReport{
-                        .eval_program = program,
-                        .eval_before = eval_before,
-                        .blocked_export = true,
-                    };
-                    try printJson(init, report);
-                    return error.EvalBeforeFailed;
-                }
-
-                var summary = try finetune.materializeMergedModel(allocator, base_model_dir, adapter_model_dir, out_dir);
-                defer finetune.freeMaterializeSummary(allocator, &summary);
-
-                var eval_after = try peft.runEvalCapture(allocator, init.io, program, "after");
-                defer eval_after.deinit(allocator);
-
-                const report = MaterializeEvalReport{
-                    .eval_program = program,
-                    .eval_before = eval_before,
-                    .materialize = summary,
-                    .eval_after = eval_after,
-                    .export_succeeded = true,
-                };
-                try printJson(init, report);
-                if (!eval_after.success) return error.EvalAfterFailed;
-                return;
-            }
 
             var summary = try finetune.materializeMergedModel(allocator, base_model_dir, adapter_model_dir, out_dir);
             defer finetune.freeMaterializeSummary(allocator, &summary);
 
             try printJson(init, summary);
         }
-
-        const MaterializeEvalReport = struct {
-            eval_program: []const u8,
-            eval_before: peft.EvalRun,
-            materialize: finetune.MaterializeSummary,
-            eval_after: peft.EvalRun,
-            export_succeeded: bool,
-        };
-
-        const MaterializeEvalFailureReport = struct {
-            eval_program: []const u8,
-            eval_before: peft.EvalRun,
-            blocked_export: bool,
-        };
 
         fn printJson(init: std.process.Init, value: anytype) !void {
             const stdout = std.Io.File.stdout();
@@ -117,11 +72,23 @@ pub fn Command(comptime assets: type) type {
                 \\       materialize-gemma4-lora [--eval <program>] <base_model_dir> <adapter_model_dir> <out_dir>
                 \\example: materialize-gemma4-lora /tmp/gemma4-base /tmp/gemma4-lora /tmp/gemma4-merged
                 \\
-                \\When --eval is provided, the program is run before and after export.
-                \\A non-zero before eval blocks export; a non-zero after eval reports failure after export.
+                \\--eval is currently rejected: evaluation must target the staged artifact
+                \\and succeed before immutable publication.
                 \\
             , .{});
             return error.InvalidArguments;
         }
     };
+}
+
+fn validateEvalAdmission(eval_program: ?[]const u8) !void {
+    if (eval_program != null) return error.MaterializeEvalRequiresStagedEvaluator;
+}
+
+test "gemma4 materialize eval fails closed before publication" {
+    try validateEvalAdmission(null);
+    try std.testing.expectError(
+        error.MaterializeEvalRequiresStagedEvaluator,
+        validateEvalAdmission("eval-program"),
+    );
 }

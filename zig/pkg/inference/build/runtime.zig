@@ -34,6 +34,10 @@ pub const BackendOptions = struct {
     link_libc: bool = true,
     skip_openapi: bool = false,
     enable_native_quant_dispatch_stats: bool = false,
+    inference_version: []const u8 = "dev",
+    /// Independent clean source commit embedded only for benchmark evidence.
+    /// `dev` means unattested and is rejected by benchmark admission.
+    benchmark_source_revision: []const u8 = "dev",
 };
 
 pub const Paths = struct {
@@ -437,7 +441,7 @@ pub fn create(config: Config) Graph {
 pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, inference_root: []const u8, link_libc: bool) *std.Build.Step.Compile {
     const exe = b.addExecutable(.{
         .name = "antfly-inference",
-        .max_rss = 7 * 1024 * 1024 * 1024,
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 15 else 7) * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = b.path(pathJoin(b, inference_root, "src/main.zig")),
             .target = target,
@@ -549,6 +553,8 @@ fn addCommonOptions(options: *std.Build.Step.Options, backend: BackendOptions) v
     options.addOption(bool, "link_libc", backend.link_libc);
     options.addOption([]const u8, "wasm_memory_model", backend.wasm_memory_model);
     options.addOption(bool, "skip_openapi", backend.skip_openapi);
+    options.addOption([]const u8, "inference_version", backend.inference_version);
+    options.addOption([]const u8, "benchmark_source_revision", backend.benchmark_source_revision);
 }
 
 /// Entrypoints resolve the scripts owner and share a host compiler when available.

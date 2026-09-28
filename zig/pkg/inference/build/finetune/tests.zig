@@ -14,6 +14,92 @@
 
 const common = @import("common.zig");
 
+// Shared numerical, cache, and artifact regressions are part of this gate
+// even when their names do not contain the model family. Keep these explicit
+// to avoid compiling every unrelated backend test into the focused binary.
+const gemma4_regression_filters = [_][]const u8{
+    "gemma4",
+    "finetune.chat_template",
+    "finetune.grpo",
+    "gemma graph",
+    "buildForwardGraph",
+    "preference environment",
+    "artifact publication",
+    "file publication",
+    "metadata-only GPT config loader refines GGUF-only config from tensor headers",
+    "metadata-only GPT config loader rejects non-GPT architectures",
+    "direct gemma runtime preserves per-layer sliding attention policy",
+    "Metal paged KV clones private prompt tails for every destination in one frame",
+    "Metal paged KV clone uses materialized Gemma4 E2B layer geometry",
+    "metal native decoder runtime bf16 embedding refreshes reused host address",
+    "metal native BF16 gather releases output after dispatch failure",
+    "metal native decoder runtime bf16 multi-row linear planned qkv and single-row pair match identity projection",
+    "metal native decoder runtime bf16 linear backward input crosses every tile boundary",
+    "metal native planned encoder coalescing suppression is idle scoped and nestable",
+    "metal native forced planned compute barrier fails closed under suppression",
+    "computeAdvantages uses unbiased reward standard deviation",
+    "uniform reward groups are explicitly zero variance without NaN",
+    "computeAdvantages supports batch and none reward scaling",
+    "grpoLoss rejects completion logprob length mismatches",
+    "grpoLoss rejects invalid coefficients and non-finite inputs",
+    "grpoLoss exposes unweighted stable mean K3 when beta is zero",
+    "grpoLoss implements documented normalization modes",
+    "grpoLoss masks every token from truncated completions",
+    "grpoLoss uses asymmetric high clipping",
+    "adaptive KL controller is bounded and updates the next-group coefficient",
+    "requested paths canonicalize symlinked ancestors with missing suffixes",
+    "path overlap observes component boundaries",
+    "requested relative paths become canonical absolute paths",
+    "DPO label smoothing mixes positive and negative preference labels",
+    "paired preference loss rejects invalid scaling and non-finite inputs",
+    "IPO finite-difference gradient check uses per-completion means",
+    "compiled DPO loss inversion recovers reward margin",
+    "preference evaluators reject token-identical train and heldout prompts",
+    "preference training refuses a stale trained adapter publication target",
+    "fast smoke result cleanup handles an error after an initialized prefix",
+    "fast smoke fixture resolution supports repo root and inference directory",
+    "metal partition executor matches Gemma gated MLP training contract",
+    "metal partition executor Gemma gated MLP matcher rejects mixed layers",
+    "metal partition executor matches Gemma gate up backward input sum",
+    "metal partition executor rejects unsafe Gemma gate up backward input sums",
+    "metal partition executor matches seq128 Gemma gate up backward input sum",
+    "metal partition executor defaults Gemma gate up backward input sum only on qualified rows",
+    "metal partition executor qualifies E2B and E4B BF16 MLP projections",
+    "metal partition executor keeps a satisfied fused interior elided",
+    "metal fusion cleanup preserves a pre-materialized input before its graph position",
+    "metal partition executor softmax backward declines protected elision",
+    "metal partition executor executes Gemma gated MLP contract and preserves saved values",
+    "metal partition executor lora linear replaces an existing internal value without leaking",
+    "metal partition executor matches low-rank LoRA backward with direct B rhs",
+    "metal partition executor fuses sibling no-bias linears into one pair command",
+    "metal linear pair fusion preserves shared input for intervening consumer",
+    "metal partition executor qualifies only same-layer Gemma raw gate up pair",
+    "metal partition executor defers one same-shape add into add3",
+    "metal partition executor does not defer multi-use add into add3",
+    "metal partition executor does not defer add3 with broadcast outer operand",
+    "metal partition executor defers only lhs when both add3 inputs qualify",
+    "metal partition executor limits add3 deferral to one chain level",
+    "metal partition executor recognizes qualified grouped rank-16 LoRA-A dot candidate",
+    "metal partition executor declines grouped rank-16 dot for non-LoRA parameter",
+    "metal partition executor keeps deferred weight source live across forced chunk boundary",
+    "metal partition executor routes lazy native BF16 backward input without fallback",
+    "CompiledTrainSession loss-only evaluation redirects fused GQA forward alternate",
+    "product training executor enablement is scoped and nestable",
+    "metal_compute: ring-backed paged decode accepts existing device prefix",
+    "metal_compute: paged decode attention matches native on metal device f32 cache across pages",
+    "metal_compute: paged decode attention matches native on Gemma qLen1 f32 cache shape",
+    "metal_compute: multiplyScalar keeps active-frame Gemma query resident",
+    "metal_compute: preserve-last rank4 transpose uses packed device route exactly",
+    "metal_compute: rms norm backward matches native across hidden widths",
+    "metal_compute: exact-order add3 fusion is bit exact",
+    "metal_compute: rank-4 LoRA backward stays on device inside frame",
+    "metal_compute: native BF16 frozen linear backward input stays on device",
+    "metal_compute: tensor embedding lookup keeps recycled dense device activations current",
+    "metal_compute: native BF16 gather axis0 with device indices stays on device",
+    "metal_compute: training accumulate invalidates the owning tensor host mirror",
+    "metal_compute: batched training AdamW invalidates mutated owning tensor host mirrors",
+};
+
 // These CLI test bodies are also reachable from inference.zig. The shared
 // finetuning executable owns them; inference's default run excludes them.
 pub const inference_overlap_filters: []const []const u8 = &.{
@@ -36,6 +122,32 @@ pub const specs = [_]common.TestSpec{
         .description = "Run isolated ColQwen2 finetune tests",
         .imports = &.{ .build_options, .ml, .inference_tokenizer, .inference_hf_tokenizer, .antfly_image, .inference_internal },
         .native_link = .default,
+    },
+    .{
+        .step_name = "test-gemma4-finetune",
+        // ReleaseSafe reaches 8.6 GB with the embedded recipe/Metal regressions.
+        .compile_max_rss = 10 * 1024 * 1024 * 1024,
+        .root_source_file = "src/gemma4_finetune_test_root.zig",
+        .description = "Run focused Gemma4 finetune data, adapter, recipe, and autodiff regressions",
+        .imports = &.{ .antfly_image, .antfly_platform, .build_info, .build_options, .jinja, .ml, .onnx_graph, .pjrt, .protobuf, .inference_audio, .inference_hf_tokenizer, .inference_linalg, .inference_tokenizer },
+        .native_link = .default,
+        .filters = &gemma4_regression_filters,
+    },
+    .{
+        .step_name = "test-gemma4-serving",
+        .root_source_file = "src/gemma4_serving_test_root.zig",
+        .description = "Run isolated Gemma4 whole-decoder serving parity regressions",
+        .imports = &.{ .antfly_image, .antfly_platform, .build_info, .build_options, .jinja, .ml, .onnx_graph, .pjrt, .protobuf, .inference_audio, .inference_hf_tokenizer, .inference_linalg, .inference_tokenizer },
+        .native_link = .default,
+        .filters = &.{"gemma4 serving"},
+    },
+    .{
+        .step_name = "test-gemma-graph",
+        .root_source_file = "src/gemma_graph_test_root.zig",
+        .description = "Run Gemma graph regressions",
+        .imports = &.{ .antfly_image, .antfly_platform, .build_info, .build_options, .jinja, .ml, .onnx_graph, .pjrt, .protobuf, .inference_audio, .inference_hf_tokenizer, .inference_linalg, .inference_tokenizer },
+        .native_link = .default,
+        .filters = &.{ "gemma4", "gemma graph", "buildForwardGraph" },
     },
     .{
         .step_name = "test-gliner2-data",
@@ -226,6 +338,11 @@ pub fn addTests(ctx: common.Context, name: []const u8) *@import("std").Build.Ste
         if (spec.covered_by_inference) {
             // Compatibility targets only: inference-test owns these tests in
             // both root and standalone gates. Do not execute them twice.
+            if (ctx.publish_targets) _ = common.addTest(ctx, spec);
+        } else if (spec.filters.len != 0) {
+            // Compile-filtered gates select tests that inference-test already
+            // owns; the unit ownership audit rejects running them twice. They
+            // stay published for the dedicated Gemma4 Metal CI job.
             if (ctx.publish_targets) _ = common.addTest(ctx, spec);
         } else if (ctx.publish_targets) {
             const focused = ctx.b.addRunArtifact(shared);

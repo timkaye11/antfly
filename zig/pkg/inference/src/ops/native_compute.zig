@@ -43,6 +43,7 @@ const tier_shared_mod = runtime.tier.shared;
 const gguf_tensor_types = @import("../gguf/tensor_types.zig");
 const quant_codec = @import("../gguf/quant_codec.zig");
 const tensor_mod = @import("../backends/tensor.zig");
+const native_f64_dot = @import("native_f64_dot.zig");
 const large_tensor_log_threshold: usize = 5_000_000;
 const native_aarch64_dotprod = builtin.cpu.arch == .aarch64 and std.Target.aarch64.featureSetHas(builtin.cpu.features, .dotprod);
 
@@ -3874,13 +3875,17 @@ fn convertTensorRowsToF32(
 
 fn shouldBorrowEmbeddingTensor(name: []const u8) bool {
     return std.mem.eql(u8, name, "model.embed_tokens.weight") or
+        std.mem.eql(u8, name, "model.language_model.embed_tokens.weight") or
+        std.mem.eql(u8, name, "model.per_layer_input.per_layer_token_embd.weight") or
+        std.mem.eql(u8, name, "model.language_model.per_layer_input.per_layer_token_embd.weight") or
         std.mem.eql(u8, name, "wte.weight");
 }
 
-fn shouldBorrowTypedWeightTensor(self: *const NativeCompute, name: []const u8, tensor: *const tensor_mod.Tensor) bool {
+fn shouldBorrowWeightTensor(self: *const NativeCompute, name: []const u8, tensor: *const tensor_mod.Tensor) bool {
     if (shouldBorrowEmbeddingTensor(name)) return true;
-    if (!self.borrow_bf16_linear_weights) return false;
-    if (tensor.dtype != .bf16 or tensor.shape.len != 2) return false;
+    if (self.borrow_frozen_linear_weights and tensor.shape.len == 2 and
+        (tensor.dtype == .bf16 or tensor.dtype == .f16)) return true;
+    if (!self.borrow_bf16_linear_weights or tensor.dtype != .bf16 or tensor.shape.len != 2) return false;
     if (std.mem.eql(u8, name, "lm_head.weight") or std.mem.eql(u8, name, "cls.output.weight")) return true;
     if (!std.mem.startsWith(u8, name, "model.layers.")) return false;
     return std.mem.endsWith(u8, name, ".self_attn.q_proj.weight") or
@@ -3950,6 +3955,15 @@ fn linearNoBiasSourceTensorChunked(
     const input_elements = std.math.mul(usize, rows, in_dim) catch return error.ShapeMismatch;
     const output_elements = std.math.mul(usize, rows, out_dim) catch return error.ShapeMismatch;
     if (tensor.data.len != weight_bytes or input.len != input_elements or output.len != output_elements) return error.ShapeMismatch;
+
+    if (self.borrow_frozen_linear_weights and !shouldBorrowEmbeddingTensor(tensor.name)) {
+        // Preserve the previous eager F32 GEMM's shape and accumulation.
+        // Only this temporary view's lifetime changes, not its arithmetic.
+        const view = try tensorF32View(self, tensor);
+        defer if (view.owned) |owned| self.allocator.free(owned);
+        try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, input, view.data, 0.0, output);
+        return;
+    }
 
     // Fast path: f16 weights, naturally aligned, can be consumed directly by
     // sgemmTransBF16Weights without materializing an f32 copy.  This halves
@@ -4142,6 +4156,10 @@ pub const NativeCompute = struct {
     /// accept typed weights. Other native/PJRT callers keep their load policy.
     borrow_bf16_linear_weights: bool = false,
     weight_handles: std.StringHashMapUnmanaged(CT) = .empty,
+    /// Gemma4 autodiff retains all parameter handles across the training graph.
+    /// Keep frozen rank-2 BF16/F16 weights in source storage; operations own
+    /// temporary F32 views. Ordinary native inference retains its policy.
+    borrow_frozen_linear_weights: bool = false,
     /// Optional Io for parallel GEMM dispatch.  When non-null, sgemm calls
     /// route through linalg's Io-aware variants and parallel work is
     /// scheduled on the runtime's thread pool.  When null, sgemm uses the
@@ -4691,6 +4709,7 @@ pub const vtable_impl = ComputeBackend.VTable{
     .layerNormConsumeInput = &layerNormConsumeInputOp,
     .layerNormBackward = &layerNormBackwardOp,
     .rmsNorm = &rmsNormOp,
+    .rmsNormBackward = &rmsNormBackwardOp,
     .rmsNormConsumeInput = &rmsNormConsumeInputOp,
     .gelu = &geluOp,
     .geluExact = &geluExactOp,
@@ -4735,6 +4754,8 @@ pub const vtable_impl = ComputeBackend.VTable{
     .visionRope = &visionRopeOp,
     .ropePerItem = &ropePerItemOp,
     .gqaCausalAttention = &gqaCausalAttentionOp,
+    .gqaCausalAttentionTraining = &gqaCausalAttentionTrainingOp,
+    .gqaCausalAttentionBackward = &gqaCausalAttentionBackwardOp,
     .gqaPagedAttention = &gqaPagedAttentionOp,
     .fromFloat32 = &fromFloat32Op,
     .fromFloat32Shape = &fromFloat32ShapeOp,
@@ -4784,6 +4805,8 @@ pub const vtable_impl = ComputeBackend.VTable{
     .logSoftmaxConsume = &logSoftmaxConsumeOp,
     .softmaxOp = &primSoftmaxOp,
     .logSoftmaxOp = &primLogSoftmaxOp,
+    .linearCrossEntropyLoss = &linearCrossEntropyLossOp,
+    .linearCrossEntropyBackward = &linearCrossEntropyBackwardOp,
     .maskedBceWithLogitsLoss = &maskedBceWithLogitsLossOp,
     .maskedBceWithLogitsBackward = &maskedBceWithLogitsBackwardOp,
 };
@@ -4890,8 +4913,19 @@ fn maybeDiscardLazyEntryFileCacheAfterUse(
 }
 
 fn maybeDiscardMappedWeightAfterUse(self: *NativeCompute, weight: CT) void {
-    const entry = toBuf(weight).lazy_entry orelse return;
-    _ = maybeDiscardLazyEntryFileCacheAfterUse(self.data, entry);
+    const buf = toBuf(weight);
+    if (buf.lazy_entry) |entry| {
+        _ = maybeDiscardLazyEntryFileCacheAfterUse(self.data, entry);
+        return;
+    }
+    if (!self.borrow_frozen_linear_weights) return;
+    const source = buf.source_tensor orelse return;
+    if (source.mmap_source_bytes == null) return;
+    const tensor_store = self.data.tensor_store orelse return;
+    // The operation has completed, even if its immutable parameter handle is
+    // retained by a graph. Reclaim only the consumed clean mapping range;
+    // later readers fault the same bytes back through the live tensor store.
+    tensor_store.discardTensorFileCache(source.name);
 }
 
 fn acquireWeightReservation(self: *NativeCompute, name: []const u8, bytes: usize) !?run_memory.Reservation {
@@ -4975,7 +5009,7 @@ fn checkedF32Bytes(len: usize) usize {
 fn loadedWeightHandleBytes(self: *const NativeCompute, loaded: *const LoadedWeight, name: []const u8, cached_bytes: usize) usize {
     if (loaded.quantized_storage != null or
         loaded.tensor.dtype == .f32 or
-        shouldBorrowTypedWeightTensor(self, name, &loaded.tensor))
+        shouldBorrowWeightTensor(self, name, &loaded.tensor))
     {
         return cached_bytes;
     }
@@ -5090,7 +5124,7 @@ fn loadWeight(self: *NativeCompute, name: []const u8, prepare_matrix: bool) !CT 
             const tensor = try makeBufFromWeightView(self, view, name, null, null);
             return finishWeight(self, tensor, name, checkedF32Bytes(view.data.len), w.tensor.shape);
         }
-        if (shouldBorrowTypedWeightTensor(self, name, &w.tensor)) {
+        if (shouldBorrowWeightTensor(self, name, &w.tensor)) {
             const tensor = try self.makeBufWithEntry(empty_f32[0..], false, name, null, null, &w.tensor);
             return finishWeight(self, tensor, name, w.tensor.data.len, w.tensor.shape);
         }
@@ -5147,7 +5181,7 @@ fn loadWeight(self: *NativeCompute, name: []const u8, prepare_matrix: bool) !CT 
             const tensor = try makeBufFromWeightView(self, view, name, entry, null);
             return finishLazyWeightLocked(self, tensor, reservation, loaded.tensor.shape);
         }
-        if (shouldBorrowTypedWeightTensor(self, name, &loaded.tensor)) {
+        if (shouldBorrowWeightTensor(self, name, &loaded.tensor)) {
             const tensor = try self.makeBufWithEntry(empty_f32[0..], false, name, entry, null, &loaded.tensor);
             return finishLazyWeightLocked(self, tensor, reservation, loaded.tensor.shape);
         }
@@ -6562,6 +6596,52 @@ fn layerNormBackwardOp(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dy: CT, 
     @memcpy(packed_grads[0 .. rows * dim], grads.dx[0 .. rows * dim]);
     @memcpy(packed_grads[rows * dim .. (rows + 1) * dim], grads.dgamma[0..dim]);
     @memcpy(packed_grads[(rows + 1) * dim .. (rows + 2) * dim], grads.dbeta[0..dim]);
+    return self.makeBuf(packed_grads, true);
+}
+
+/// `fused_rms_norm_backward` reference implementation. Returns d_input and,
+/// when requested, one reduced d_weight row.
+fn rmsNormBackwardOp(ctx: *anyopaque, input: CT, weight: CT, dy: CT, dim: usize, eps: f32, compute_weight_grad: bool) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const in_data = getData(input);
+    const weight_data = getData(weight);
+    const dy_data = getData(dy);
+    if (dim == 0 or in_data.len % dim != 0) return error.InvalidTensorShape;
+    if (weight_data.len < dim or dy_data.len != in_data.len) return error.InvalidTensorShape;
+    const rows = in_data.len / dim;
+
+    const output_rows = rows + @intFromBool(compute_weight_grad);
+    const packed_grads = try self.allocator.alloc(f32, output_rows * dim);
+    errdefer self.allocator.free(packed_grads);
+    const dx = packed_grads[0 .. rows * dim];
+    const dweight = if (compute_weight_grad) packed_grads[rows * dim .. (rows + 1) * dim] else null;
+    if (dweight) |gradient| @memset(gradient, 0.0);
+
+    const inv_dim = 1.0 / @as(f32, @floatFromInt(dim));
+    for (0..rows) |row| {
+        const row_base = row * dim;
+        var sum_sq: f32 = 0.0;
+        for (0..dim) |col| {
+            const x = in_data[row_base + col];
+            sum_sq += x * x;
+        }
+        const inv_rms = 1.0 / @sqrt(sum_sq * inv_dim + eps);
+
+        var mean_gx: f32 = 0.0;
+        for (0..dim) |col| {
+            const idx = row_base + col;
+            mean_gx += dy_data[idx] * weight_data[col] * in_data[idx];
+            if (dweight) |gradient| gradient[col] += dy_data[idx] * in_data[idx] * inv_rms;
+        }
+        mean_gx *= inv_dim;
+        const inv_rms_cubed = inv_rms * inv_rms * inv_rms;
+        for (0..dim) |col| {
+            const idx = row_base + col;
+            const g = dy_data[idx] * weight_data[col];
+            dx[idx] = inv_rms * g - in_data[idx] * inv_rms_cubed * mean_gx;
+        }
+    }
+
     return self.makeBuf(packed_grads, true);
 }
 
@@ -36022,6 +36102,78 @@ test "fused_layer_norm backward matches finite differences (multi-row)" {
     try layerNormBackwardFiniteDiffCase(5, 6, 1e-5, 0xBADF00D);
 }
 
+fn rmsNormBackwardFiniteDiffCase(rows: usize, dim: usize, eps: f32, seed: u64) !void {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rnd = prng.random();
+
+    const x = try allocator.alloc(f32, rows * dim);
+    defer allocator.free(x);
+    const weight = try allocator.alloc(f32, dim);
+    defer allocator.free(weight);
+    const dy = try allocator.alloc(f32, rows * dim);
+    defer allocator.free(dy);
+    for (x) |*v| v.* = rnd.floatNorm(f32);
+    for (weight) |*v| v.* = 1.0 + rnd.floatNorm(f32) * 0.3;
+    for (dy) |*v| v.* = rnd.floatNorm(f32);
+
+    var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weight_store, null);
+    const x_ct = try compute.makeBuf(x, false);
+    defer freeTensor(&compute, x_ct);
+    const weight_ct = try compute.makeBuf(weight, false);
+    defer freeTensor(&compute, weight_ct);
+    const dy_ct = try compute.makeBuf(dy, false);
+    defer freeTensor(&compute, dy_ct);
+    const out_ct = try rmsNormBackwardOp(&compute, x_ct, weight_ct, dy_ct, dim, eps, true);
+    defer freeTensor(&compute, out_ct);
+    const packed_data = getData(out_ct);
+
+    const lossFn = struct {
+        fn f(a: std.mem.Allocator, xx: []const f32, ww: []const f32, dd: []const f32, d: usize, e: f32) !f32 {
+            const tmp = try a.dupe(f32, xx);
+            defer a.free(tmp);
+            activations_mod.rmsNorm(tmp, ww, d, e);
+            var loss: f32 = 0.0;
+            for (tmp, dd) |out, grad| loss += out * grad;
+            return loss;
+        }
+    }.f;
+
+    const h: f32 = 1e-3;
+    const Param = struct { buf: []f32, grad: []const f32, name: []const u8 };
+    const params = [_]Param{
+        .{ .buf = x, .grad = packed_data[0 .. rows * dim], .name = "dx" },
+        .{ .buf = weight, .grad = packed_data[rows * dim .. (rows + 1) * dim], .name = "dweight" },
+    };
+    for (params) |param| {
+        for (param.buf, 0..) |*elem, idx| {
+            const original = elem.*;
+            elem.* = original + h;
+            const loss_plus = try lossFn(allocator, x, weight, dy, dim, eps);
+            elem.* = original - h;
+            const loss_minus = try lossFn(allocator, x, weight, dy, dim, eps);
+            elem.* = original;
+            const numerical = (loss_plus - loss_minus) / (2.0 * h);
+            const analytical = param.grad[idx];
+            const denom = @max(@as(f32, 1.0), @max(@abs(numerical), @abs(analytical)));
+            const relative_error = @abs(numerical - analytical) / denom;
+            if (relative_error > 2e-2) {
+                std.debug.print("rms_norm backward mismatch {s}[{d}] num={d} ana={d} rel={d}\n", .{ param.name, idx, numerical, analytical, relative_error });
+                return error.RmsNormBackwardFiniteDiffMismatch;
+            }
+        }
+    }
+}
+
+test "gemma4 fused_rms_norm backward matches finite differences (single row)" {
+    try rmsNormBackwardFiniteDiffCase(1, 8, 1e-5, 0xA4B);
+}
+
+test "gemma4 fused_rms_norm backward matches finite differences (multi-row)" {
+    try rmsNormBackwardFiniteDiffCase(5, 6, 1e-5, 0xC0FFEE);
+}
+
 test "DeBERTa backward matches finite differences (all keys valid)" {
     const allocator = std.testing.allocator;
     const batch = 1;
@@ -37020,6 +37172,169 @@ fn gqaCausalAttentionOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, attn_bias
     const bias: ?[]f32 = if (attn_bias_ct) |b| getData(b) else null;
 
     return gqaAttentionSlices(self, Q, K, V, bias, null, 0, null, seq_len, batch, seq_len, seq_len, 0, 0, num_heads, num_kv_heads, head_dim);
+}
+
+fn effectiveGqaTrainingScale(head_dim: usize, score_scale: f32) f32 {
+    return if (score_scale != 0.0)
+        score_scale
+    else
+        1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+}
+
+fn gqaCausalAttentionTrainingOp(
+    ctx: *anyopaque,
+    q_ct: CT,
+    k_ct: CT,
+    v_ct: CT,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    sliding_window: usize,
+    score_scale: f32,
+) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (batch == 0 or seq_len == 0 or num_heads == 0 or num_kv_heads == 0 or head_dim == 0 or num_heads % num_kv_heads != 0) {
+        return error.InvalidAttentionShape;
+    }
+    const q = getData(q_ct);
+    const k = getData(k_ct);
+    const v = getData(v_ct);
+    const q_width = num_heads * head_dim;
+    const kv_width = num_kv_heads * head_dim;
+    if (q.len != batch * seq_len * q_width or k.len != batch * seq_len * kv_width or v.len != k.len) {
+        return error.InvalidAttentionShape;
+    }
+
+    const output = try self.allocator.alloc(f32, q.len);
+    errdefer self.allocator.free(output);
+    const probs = try self.allocator.alloc(f32, seq_len);
+    defer self.allocator.free(probs);
+    const heads_per_group = num_heads / num_kv_heads;
+    const scale = effectiveGqaTrainingScale(head_dim, score_scale);
+    for (0..batch) |b| {
+        for (0..num_heads) |h| {
+            const kv_h = h / heads_per_group;
+            for (0..seq_len) |qi| {
+                const first_k = if (sliding_window != 0 and qi + 1 > sliding_window) qi + 1 - sliding_window else 0;
+                const q_base = (b * seq_len + qi) * q_width + h * head_dim;
+                var best = -std.math.inf(f32);
+                for (first_k..qi + 1) |ki| {
+                    const k_base = (b * seq_len + ki) * kv_width + kv_h * head_dim;
+                    var dot: f32 = 0.0;
+                    for (0..head_dim) |d| dot += q[q_base + d] * k[k_base + d];
+                    best = @max(best, dot * scale);
+                }
+                var denom: f32 = 0.0;
+                for (first_k..qi + 1) |ki| {
+                    const k_base = (b * seq_len + ki) * kv_width + kv_h * head_dim;
+                    var dot: f32 = 0.0;
+                    for (0..head_dim) |d| dot += q[q_base + d] * k[k_base + d];
+                    const p = @exp(dot * scale - best);
+                    probs[ki] = p;
+                    denom += p;
+                }
+                const inv_denom = if (denom > 0.0) 1.0 / denom else 0.0;
+                const out_base = q_base;
+                @memset(output[out_base .. out_base + head_dim], 0.0);
+                for (first_k..qi + 1) |ki| {
+                    const v_base = (b * seq_len + ki) * kv_width + kv_h * head_dim;
+                    const p = probs[ki] * inv_denom;
+                    for (0..head_dim) |d| output[out_base + d] += p * v[v_base + d];
+                }
+            }
+        }
+    }
+    return self.makeBuf(output, true);
+}
+
+fn gqaCausalAttentionBackwardOp(
+    ctx: *anyopaque,
+    q_ct: CT,
+    k_ct: CT,
+    v_ct: CT,
+    d_out_ct: CT,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    sliding_window: usize,
+    score_scale: f32,
+) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (batch == 0 or seq_len == 0 or num_heads == 0 or num_kv_heads == 0 or head_dim == 0 or num_heads % num_kv_heads != 0) {
+        return error.InvalidAttentionShape;
+    }
+    const q = getData(q_ct);
+    const k = getData(k_ct);
+    const v = getData(v_ct);
+    const d_out = getData(d_out_ct);
+    const q_width = num_heads * head_dim;
+    const kv_width = num_kv_heads * head_dim;
+    const q_count = batch * seq_len * q_width;
+    const kv_count = batch * seq_len * kv_width;
+    if (q.len != q_count or d_out.len != q_count or k.len != kv_count or v.len != kv_count) {
+        return error.InvalidAttentionShape;
+    }
+
+    const packed_grads = try self.allocator.alloc(f32, q_count + 2 * kv_count);
+    errdefer self.allocator.free(packed_grads);
+    @memset(packed_grads, 0.0);
+    const probs = try self.allocator.alloc(f32, seq_len);
+    defer self.allocator.free(probs);
+    const d_probs = try self.allocator.alloc(f32, seq_len);
+    defer self.allocator.free(d_probs);
+    const heads_per_group = num_heads / num_kv_heads;
+    const scale = effectiveGqaTrainingScale(head_dim, score_scale);
+    const dk_offset = q_count;
+    const dv_offset = q_count + kv_count;
+
+    for (0..batch) |b| {
+        for (0..num_heads) |h| {
+            const kv_h = h / heads_per_group;
+            for (0..seq_len) |qi| {
+                const first_k = if (sliding_window != 0 and qi + 1 > sliding_window) qi + 1 - sliding_window else 0;
+                const q_base = (b * seq_len + qi) * q_width + h * head_dim;
+                var best = -std.math.inf(f32);
+                for (first_k..qi + 1) |ki| {
+                    const k_base = (b * seq_len + ki) * kv_width + kv_h * head_dim;
+                    var dot: f32 = 0.0;
+                    for (0..head_dim) |d| dot += q[q_base + d] * k[k_base + d];
+                    best = @max(best, dot * scale);
+                }
+                var denom: f32 = 0.0;
+                for (first_k..qi + 1) |ki| {
+                    const k_base = (b * seq_len + ki) * kv_width + kv_h * head_dim;
+                    var dot: f32 = 0.0;
+                    for (0..head_dim) |d| dot += q[q_base + d] * k[k_base + d];
+                    probs[ki] = @exp(dot * scale - best);
+                    denom += probs[ki];
+                }
+                const inv_denom = if (denom > 0.0) 1.0 / denom else 0.0;
+                var row_dot: f32 = 0.0;
+                for (first_k..qi + 1) |ki| {
+                    const v_base = (b * seq_len + ki) * kv_width + kv_h * head_dim;
+                    probs[ki] *= inv_denom;
+                    var dp: f32 = 0.0;
+                    for (0..head_dim) |d| dp += d_out[q_base + d] * v[v_base + d];
+                    d_probs[ki] = dp;
+                    row_dot += probs[ki] * dp;
+                }
+                for (first_k..qi + 1) |ki| {
+                    const kv_base = (b * seq_len + ki) * kv_width + kv_h * head_dim;
+                    const ds = probs[ki] * (d_probs[ki] - row_dot);
+                    for (0..head_dim) |d| {
+                        packed_grads[q_base + d] += scale * ds * k[kv_base + d];
+                        packed_grads[dk_offset + kv_base + d] += scale * ds * q[q_base + d];
+                        packed_grads[dv_offset + kv_base + d] += probs[ki] * d_out[q_base + d];
+                    }
+                }
+            }
+        }
+    }
+    return self.makeBuf(packed_grads, true);
 }
 
 fn attentionSinkScores(sink: AttentionSinkMetadata, num_heads: usize) !?[]const f32 {
@@ -38269,6 +38584,7 @@ fn primReshapeOp(ctx: *anyopaque, input: CT, new_shape: []const i64) anyerror!CT
 
 fn primTransposeOp(ctx: *anyopaque, input: CT, perm: []const u8, input_shape: []const i64) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, input);
     const input_buf = toBuf(input);
     const effective_input_shape = storedOrDeclaredShape(input, input_shape);
     var resolved_shape_buf: [8]i64 = undefined;
@@ -38518,6 +38834,8 @@ fn primBroadcastInDimOp(ctx: *anyopaque, input: CT, target_shape: []const i64, b
 
 fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, rhs_shape: []const i64, lhs_contracting: []const u8, rhs_contracting: []const u8, lhs_batch: []const u8, rhs_batch: []const u8) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, lhs);
+    defer maybeDiscardMappedWeightAfterUse(self, rhs);
     const lhs_buf = toBuf(lhs);
     const lhs_len = tensorLogicalElementCount(lhs, lhs_shape) orelse lhs_buf.data.len;
     var rhs_resolved_shape_buf: [8]i64 = undefined;
@@ -38604,7 +38922,9 @@ fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, r
             errdefer if (raw_output) |raw| self.allocator.free(raw);
             @memset(output, 0.0);
 
-            if (lc == 1 and rc == 0) {
+            // Newly borrowed linear weights must retain the dense path's
+            // F64 reduction, not enter the older embedding BLAS/F32 path.
+            if (lc == 1 and rc == 0 and (!self.borrow_frozen_linear_weights or shouldBorrowEmbeddingTensor(rhs_buf.name))) {
                 if (lhs_buf.view_strides == null and rhs_buf.view_strides == null) {
                     const lhs_data = getData(lhs);
                     if (toBuf(rhs).source_tensor) |rhs_tensor| {
@@ -38620,8 +38940,11 @@ fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, r
             if (lhs_buf.view_strides == null and rhs_buf.view_strides == null and rhs_buf.source_tensor == null) {
                 const lhs_data = getData(lhs);
                 const rhs_dense = getData(rhs);
-                // General 2D dot: C[i,j] = sum_k A[..] * B[..]
-                for (0..m) |i| {
+                // SIMD lanes preserve independent F64 accumulations. Keep
+                // the existing BLAS/F32 source path above unchanged.
+                if (m >= 2 and n >= 8 and k >= 16) {
+                    try native_f64_dot.rank2(self.allocator, lhs_data, if (lc == 1) k else 1, if (lc == 1) 1 else m, rhs_dense, if (rc == 1) k else 1, if (rc == 1) 1 else n, output, m, k, n);
+                } else for (0..m) |i| {
                     for (0..n) |j| {
                         var acc: f64 = 0.0;
                         for (0..k) |ki| {
@@ -38649,7 +38972,9 @@ fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, r
             if (rhs_buf.source_tensor) |rhs_tensor| {
                 const rhs_view = try tensorF32View(self, rhs_tensor);
                 defer if (rhs_view.owned) |owned| self.allocator.free(owned);
-                for (0..m) |i| {
+                if (m >= 2 and n >= 8 and k >= 16) {
+                    try native_f64_dot.rank2(self.allocator, lhs_base, lhs_strides[1 - lc], lhs_strides[lc], rhs_view.data, if (rc == 1) k else 1, if (rc == 1) 1 else n, output, m, k, n);
+                } else for (0..m) |i| {
                     for (0..n) |j| {
                         var acc: f64 = 0.0;
                         for (0..k) |ki| {
@@ -38660,6 +38985,8 @@ fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, r
                         output[i * n + j] = @floatCast(acc);
                     }
                 }
+            } else if (m >= 2 and n >= 8 and k >= 16) {
+                try native_f64_dot.rank2(self.allocator, lhs_base, lhs_strides[1 - lc], lhs_strides[lc], rhs_base, rhs_strides[1 - rc], rhs_strides[rc], output, m, k, n);
             } else {
                 for (0..m) |i| {
                     for (0..n) |j| {
@@ -39681,6 +40008,7 @@ fn primScatterAddOp(ctx: *anyopaque, input: CT, indices: CT, input_shape: []cons
 
 fn primGatherOp(ctx: *anyopaque, input: CT, indices: CT, axis: u8, input_shape: []const i64) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, input);
     if (integerSource(indices) != null or integerSource(input) != null) return typedGather(self, input, indices, axis, input_shape);
     const idx_data = getData(indices);
     const effective_input_shape = storedOrDeclaredShape(input, input_shape);
@@ -40459,6 +40787,120 @@ fn bceSigmoid(x: f32) f32 {
         const e = @exp(x);
         break :blk e / (1.0 + e);
     };
+}
+
+fn linearCrossEntropyLabel(raw: f32, vocab_size: usize, ignore_index: i32) !?usize {
+    if (!std.math.isFinite(raw)) return error.InvalidLabel;
+    const rounded = @round(raw);
+    if (@abs(raw - rounded) > 1e-3) return error.InvalidLabel;
+    const label: i64 = @intFromFloat(rounded);
+    if (label == ignore_index) return null;
+    if (label < 0 or label >= vocab_size) return error.InvalidLabel;
+    return @intCast(label);
+}
+
+fn linearCrossEntropyLogit(raw: f32, softcap: f32) f32 {
+    return if (softcap > 0.0) softcap * std.math.tanh(raw / softcap) else raw;
+}
+
+fn validateLinearCrossEntropy(
+    hidden: []const f32,
+    weight: []const f32,
+    labels: []const f32,
+    rows: usize,
+    in_dim: usize,
+    vocab_size: usize,
+    logit_softcap: f32,
+    frozen_weight: bool,
+) !void {
+    if (!frozen_weight) return error.LinearCrossEntropyRequiresFrozenWeight;
+    if (rows == 0 or in_dim == 0 or vocab_size == 0) return error.ShapeMismatch;
+    if (hidden.len != rows * in_dim or weight.len != vocab_size * in_dim or labels.len != rows) return error.ShapeMismatch;
+    if (logit_softcap < 0.0 or !std.math.isFinite(logit_softcap)) return error.InvalidLogitSoftcap;
+}
+
+fn linearCrossEntropyLossOp(ctx: *anyopaque, request: *const ops.LinearCrossEntropyRequest) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const hidden = getData(request.hidden);
+    const weight = getData(request.weight);
+    const labels = getData(request.labels);
+    try validateLinearCrossEntropy(hidden, weight, labels, request.rows, request.in_dim, request.vocab_size, request.logit_softcap, request.frozen_weight);
+
+    const logits = try self.allocator.alloc(f32, request.vocab_size);
+    defer self.allocator.free(logits);
+    var loss: f32 = 0.0;
+    var valid_rows: usize = 0;
+    for (0..request.rows) |row| {
+        const label = (try linearCrossEntropyLabel(labels[row], request.vocab_size, request.ignore_index)) orelse continue;
+        valid_rows += 1;
+        var max_logit = -std.math.inf(f32);
+        for (0..request.vocab_size) |vocab| {
+            var raw: f32 = 0.0;
+            for (0..request.in_dim) |d| raw += hidden[row * request.in_dim + d] * weight[vocab * request.in_dim + d];
+            logits[vocab] = linearCrossEntropyLogit(raw, request.logit_softcap);
+            max_logit = @max(max_logit, logits[vocab]);
+        }
+        var sum_exp: f32 = 0.0;
+        for (logits) |logit| sum_exp += @exp(logit - max_logit);
+        loss += max_logit + @log(sum_exp) - logits[label];
+    }
+
+    const output = try self.allocator.alloc(f32, 1);
+    output[0] = if (valid_rows == 0) 0.0 else loss / @as(f32, @floatFromInt(valid_rows));
+    const result = try self.makeOwnedBuf(output);
+    errdefer freeTensor(self, result);
+    return self.withLogicalShape(result, request.output_shape);
+}
+
+fn linearCrossEntropyBackwardOp(ctx: *anyopaque, request: *const ops.LinearCrossEntropyBackwardRequest) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const hidden = getData(request.hidden);
+    const weight = getData(request.weight);
+    const labels = getData(request.labels);
+    const upstream = getData(request.upstream);
+    try validateLinearCrossEntropy(hidden, weight, labels, request.rows, request.in_dim, request.vocab_size, request.logit_softcap, request.frozen_weight);
+    if (upstream.len != 1) return error.ShapeMismatch;
+
+    var valid_rows: usize = 0;
+    for (labels) |raw| if ((try linearCrossEntropyLabel(raw, request.vocab_size, request.ignore_index)) != null) {
+        valid_rows += 1;
+    };
+    const output = try self.allocator.alloc(f32, hidden.len);
+    @memset(output, 0.0);
+    if (valid_rows != 0) {
+        const logits = try self.allocator.alloc(f32, request.vocab_size);
+        defer self.allocator.free(logits);
+        const raw_logits = try self.allocator.alloc(f32, request.vocab_size);
+        defer self.allocator.free(raw_logits);
+        const loss_scale = upstream[0] / @as(f32, @floatFromInt(valid_rows));
+        for (0..request.rows) |row| {
+            const label = (try linearCrossEntropyLabel(labels[row], request.vocab_size, request.ignore_index)) orelse continue;
+            var max_logit = -std.math.inf(f32);
+            for (0..request.vocab_size) |vocab| {
+                var raw: f32 = 0.0;
+                for (0..request.in_dim) |d| raw += hidden[row * request.in_dim + d] * weight[vocab * request.in_dim + d];
+                raw_logits[vocab] = raw;
+                logits[vocab] = linearCrossEntropyLogit(raw, request.logit_softcap);
+                max_logit = @max(max_logit, logits[vocab]);
+            }
+            var sum_exp: f32 = 0.0;
+            for (logits) |logit| sum_exp += @exp(logit - max_logit);
+            for (0..request.vocab_size) |vocab| {
+                var d_logit = @exp(logits[vocab] - max_logit) / sum_exp;
+                if (vocab == label) d_logit -= 1.0;
+                if (request.logit_softcap > 0.0) {
+                    const t = std.math.tanh(raw_logits[vocab] / request.logit_softcap);
+                    d_logit *= 1.0 - t * t;
+                }
+                for (0..request.in_dim) |d| {
+                    output[row * request.in_dim + d] += loss_scale * d_logit * weight[vocab * request.in_dim + d];
+                }
+            }
+        }
+    }
+    const result = try self.makeBuf(output, true);
+    errdefer freeTensor(self, result);
+    return self.withLogicalShape(result, request.hidden_shape);
 }
 
 fn maskedBceWithLogitsLossOp(ctx: *anyopaque, request: *const ops.MaskedBceWithLogitsRequest) anyerror!CT {
@@ -47458,7 +47900,7 @@ test "native typed BF16 weights borrow source reserve bytes and preserve linear 
     try std.testing.expect(toBuf(weight).source_tensor == &store.resident_weights.getPtr(name).?.tensor);
     try std.testing.expectEqual(@as(usize, 12), budget.host_weight_bytes);
     try std.testing.expectEqual(@as(usize, 12), loadedWeightHandleBytes(&compute, store.resident_weights.getPtr(name).?, name, 12));
-    try std.testing.expect(!shouldBorrowTypedWeightTensor(&compute, "model.layers.0.input_layernorm.weight", toBuf(weight).source_tensor.?));
+    try std.testing.expect(!shouldBorrowWeightTensor(&compute, "model.layers.0.input_layernorm.weight", toBuf(weight).source_tensor.?));
     var input_values = [_]f32{ 0x1p-20, 2, 3, -0x1p-20, -2, 0.5 };
     var bias_values = [_]f32{ 0.25, -0.75 };
     const input = try compute.makeBuf(&input_values, false);
@@ -47528,7 +47970,7 @@ test "native typed BF16 weights borrow source reserve bytes and preserve linear 
     try std.testing.expectEqualSlices(f32, getData(result), getData(triple.second));
     try std.testing.expectEqualSlices(f32, getData(result), getData(triple.third));
     compute.borrow_bf16_linear_weights = false;
-    try std.testing.expect(!shouldBorrowTypedWeightTensor(&compute, name, toBuf(weight).source_tensor.?));
+    try std.testing.expect(!shouldBorrowWeightTensor(&compute, name, toBuf(weight).source_tensor.?));
 }
 
 test "native Qwen3 quantized-only weight handle preserves shape and lookup without dense storage" {
@@ -47808,7 +48250,7 @@ test "native gather lazy handles retain pins and allow later matrix preparation"
     try std.testing.expectEqual(@as(usize, 0), budget.host_weight_bytes);
 }
 
-test "native typed BF16 lazy weight stays pinned until all handles are freed" {
+test "gemma4 native typed BF16 lazy weight stays pinned until all handles are freed" {
     const allocator = std.testing.allocator;
     const name = "model.layers.0.mlp.up_proj.weight";
     var bits = [_]u16{ 0x3f80, 0x4000, 0x4040, 0x4080 };
@@ -50349,6 +50791,63 @@ test "ComputeBackend crossAttention call site matches masked reference" {
     try expectApproxEqSlice(ref, getData(out_ct), 1e-4);
 }
 
+test "gemma4 native transposed-weight dot retains F64 results for dense and native storage" {
+    const allocator = std.testing.allocator;
+    var store = WeightStore{ .allocator = allocator, .resident_weights = .empty, .lazy_weights = .empty };
+    var compute = NativeCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    const m = 3;
+    const k = 17;
+    const n = 13;
+    var lhs_data: [m * k]f32 = undefined;
+    var lhs_transposed: [m * k]f32 = undefined;
+    var rhs_data: [n * k]f32 = undefined;
+    var rhs_words: [n * k]u16 = undefined;
+    var rhs_shape = [_]i64{ n, k };
+    for (&lhs_data, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 31)) - 15)) / 7.0;
+    for (&rhs_data, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 47)) - 23)) / 4.0;
+    for (0..m) |row| for (0..k) |ki| {
+        lhs_transposed[ki * m + row] = lhs_data[row * k + ki];
+    };
+    for ([_]tensor_mod.DType{ .f32, .bf16, .f16 }) |dtype| {
+        for (rhs_data, &rhs_words) |value, *word| word.* = if (dtype == .f16) @bitCast(@as(f16, @floatCast(value))) else @truncate(@as(u32, @bitCast(value)) >> 16);
+        const rhs = if (dtype == .f32)
+            try compute.makeBuf(&rhs_data, false)
+        else
+            try compute.makeBufWithOwnedSourceTensor(.{
+                .data = std.mem.sliceAsBytes(&rhs_words),
+                .dtype = dtype,
+                .shape = &rhs_shape,
+                .name = "rhs",
+                .allocator = allocator,
+                .owns_data = false,
+                .owns_shape = false,
+            });
+        defer freeTensor(&compute, rhs);
+        for ([_]u8{ 0, 1 }) |lc| {
+            const lhs = try compute.makeBuf(if (lc == 1) &lhs_data else &lhs_transposed, false);
+            defer freeTensor(&compute, lhs);
+            const actual = try primDotGeneralOp(&compute, lhs, rhs, if (lc == 1) &.{ m, k } else &.{ k, m }, &rhs_shape, &.{lc}, &.{1}, &.{}, &.{});
+            defer freeTensor(&compute, actual);
+            try std.testing.expectEqualSlices(i64, &.{ m, n }, tensorStoredShape(actual).?);
+            if (dtype == .f32) {
+                const shaped_rhs = try compute.withLogicalShape(rhs, &rhs_shape);
+                const rhs_view = try primTransposeOp(&compute, shaped_rhs, &.{ 1, 0 }, &rhs_shape);
+                defer freeTensor(&compute, rhs_view);
+                try std.testing.expect(toBuf(rhs_view).view_strides != null);
+                const view_result = try primDotGeneralOp(&compute, lhs, rhs_view, if (lc == 1) &.{ m, k } else &.{ k, m }, &.{ k, n }, &.{lc}, &.{0}, &.{}, &.{});
+                defer freeTensor(&compute, view_result);
+                try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(getData(actual)), std.mem.sliceAsBytes(getData(view_result)));
+            }
+            for (0..m) |row| for (0..n) |column| {
+                var expected: f64 = 0.0;
+                for (0..k) |ki| expected += @as(f64, lhs_data[row * k + ki]) * @as(f64, rhs_data[column * k + ki]);
+                try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, @floatCast(expected)))), @as(u32, @bitCast(getData(actual)[row * n + column])));
+            };
+        }
+    }
+}
+
 test "dot_general flattens lhs suffix for shared rhs source tensor" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
@@ -51419,6 +51918,281 @@ test "gather source-backed 2d table with unshaped vector indices" {
         1, 2,
         7, 8,
     }, getData(out_ct));
+}
+
+test "gemma4 native embedding handles preserve BF16 storage for fused and lowered lookup" {
+    const allocator = std.testing.allocator;
+    const names = [_][]const u8{
+        "model.embed_tokens.weight",
+        "model.language_model.embed_tokens.weight",
+        "model.per_layer_input.per_layer_token_embd.weight",
+        "model.language_model.per_layer_input.per_layer_token_embd.weight",
+    };
+    for (names) |name| {
+        for ([_]bool{ false, true }) |lazy| {
+            var bytes = [_]u8{ 0x80, 0x3f, 0x20, 0xc0, 0x00, 0x3f, 0x40, 0x40 };
+            var shape = [_]i64{ 2, 2 };
+            const weight = LoadedWeight{ .tensor = .{
+                .data = &bytes,
+                .shape = &shape,
+                .dtype = .bf16,
+                .name = name,
+                .allocator = allocator,
+                .owns_data = false,
+                .owns_shape = false,
+            } };
+            var store = WeightStore{ .allocator = allocator, .resident_weights = .empty, .lazy_weights = .empty };
+            defer store.resident_weights.deinit(allocator);
+            defer store.lazy_weights.deinit(allocator);
+            if (lazy) {
+                try store.lazy_weights.put(allocator, name, .{
+                    .tensor_ref = .{ .name = name },
+                    .loaded = weight,
+                    .loaded_bytes = bytes.len,
+                });
+            } else {
+                try store.resident_weights.put(allocator, name, weight);
+            }
+            var compute = NativeCompute.init(allocator, &store, null);
+            defer store.prefetch.deinit();
+            defer compute.deinit();
+            const table = try getWeight(&compute, name);
+            defer freeTensor(&compute, table);
+            // Loading an embedding must not allocate a full F32 table.
+            try std.testing.expectEqual(@as(usize, 0), toBuf(table).data.len);
+            try std.testing.expect(toBuf(table).source_tensor != null);
+            const selected = try embeddingLookup(&compute, table, &.{ 1, 0, 1 }, 3, 2);
+            defer freeTensor(&compute, selected);
+            const expected = [_]f32{ 0.5, 3.0, 1.0, -2.5, 0.5, 3.0 };
+            try std.testing.expectEqualSlices(f32, &expected, getData(selected));
+            const ids = try fromFloat32ShapeOp(&compute, &.{ 1, 0, 1 }, &.{3});
+            defer freeTensor(&compute, ids);
+            const gathered = try primGatherOp(&compute, table, ids, 0, &shape);
+            defer freeTensor(&compute, gathered);
+            try std.testing.expectEqualSlices(f32, &expected, getData(gathered));
+            // The same borrowed embedding is also the tied output head. Check
+            // CPU logits against an explicitly materialized F32 table.
+            const f32_table = try fromFloat32ShapeOp(&compute, &.{ 1.0, -2.5, 0.5, 3.0 }, &.{ 2, 2 });
+            defer freeTensor(&compute, f32_table);
+            const logits = try linearNoBiasOp(&compute, selected, table, 3, 2, 2);
+            defer freeTensor(&compute, logits);
+            const dense_logits = try linearNoBiasOp(&compute, gathered, f32_table, 3, 2, 2);
+            defer freeTensor(&compute, dense_logits);
+            try std.testing.expectEqualSlices(f32, getData(dense_logits), getData(logits));
+            try std.testing.expectEqualSlices(f32, &.{ -7.0, 9.25, 7.25, -7.0, -7.0, 9.25 }, getData(logits));
+            try std.testing.expectEqual(@as(usize, 0), toBuf(table).data.len);
+        }
+    }
+}
+
+test "gemma4 native frozen linear handles borrow storage and preserve dense numerics" {
+    const allocator = std.testing.allocator;
+    const name = "model.language_model.layers.0.self_attn.q_proj.weight";
+    const m = 3;
+    const k = 17;
+    const n = 13;
+    var inputs: [m * k]f32 = undefined;
+    var words: [k * n]u16 = undefined;
+    for (&inputs, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 31)) - 15)) / 7.0;
+    for ([_]tensor_mod.DType{ .bf16, .f16 }) |dtype| {
+        for (&words, 0..) |*word, i| {
+            const value = @as(f32, @floatFromInt(@as(i32, @intCast(i % 47)) - 23)) / 4.0;
+            word.* = if (dtype == .f16) @bitCast(@as(f16, @floatCast(value))) else @truncate(@as(u32, @bitCast(value)) >> 16);
+        }
+        for ([_]u8{ 0, 1 }) |rc| {
+            var shape = if (rc == 0) [_]i64{ k, n } else [_]i64{ n, k };
+            const weight = LoadedWeight{ .tensor = .{
+                .data = std.mem.sliceAsBytes(&words),
+                .shape = &shape,
+                .dtype = dtype,
+                .name = name,
+                .allocator = allocator,
+                .owns_data = false,
+                .owns_shape = false,
+            } };
+            for ([_]bool{ false, true }) |lazy| {
+                var store = WeightStore{ .allocator = allocator, .resident_weights = .empty, .lazy_weights = .empty };
+                defer store.resident_weights.deinit(allocator);
+                defer store.lazy_weights.deinit(allocator);
+                if (lazy) {
+                    try store.lazy_weights.put(allocator, name, .{ .tensor_ref = .{ .name = name }, .loaded = weight, .loaded_bytes = words.len * 2 });
+                } else {
+                    try store.resident_weights.put(allocator, name, weight);
+                }
+                var compute = NativeCompute.init(allocator, &store, null);
+                defer store.prefetch.deinit();
+                defer compute.deinit();
+                const dense = try acquireWeight(&compute, name);
+                defer freeTensor(&compute, dense);
+                try std.testing.expectEqual(@as(usize, words.len * 4), loadedWeightHandleBytes(&compute, &weight, name, words.len * 2));
+                compute.borrow_frozen_linear_weights = true;
+                const borrowed = try getWeight(&compute, name);
+                defer freeTensor(&compute, borrowed);
+                try std.testing.expectEqual(@as(usize, 0), toBuf(borrowed).data.len);
+                try std.testing.expect(toBuf(borrowed).source_tensor != null);
+                try std.testing.expectEqual(@as(usize, words.len * 2), loadedWeightHandleBytes(&compute, &weight, name, words.len * 2));
+                const input = try fromFloat32ShapeOp(&compute, &inputs, &.{ m, k });
+                defer freeTensor(&compute, input);
+                const expected = try primDotGeneralOp(&compute, input, dense, &.{ m, k }, &shape, &.{1}, &.{rc}, &.{}, &.{});
+                defer freeTensor(&compute, expected);
+                const actual = try primDotGeneralOp(&compute, input, borrowed, &.{ m, k }, &shape, &.{1}, &.{rc}, &.{}, &.{});
+                defer freeTensor(&compute, actual);
+                try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(getData(expected)), std.mem.sliceAsBytes(getData(actual)));
+                if (rc == 1) {
+                    const eager_dense = try linearNoBiasOp(&compute, input, dense, m, k, n);
+                    defer freeTensor(&compute, eager_dense);
+                    const eager_borrowed = try linearNoBiasOp(&compute, input, borrowed, m, k, n);
+                    defer freeTensor(&compute, eager_borrowed);
+                    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(getData(eager_dense)), std.mem.sliceAsBytes(getData(eager_borrowed)));
+                    const bias_values = [_]f32{0.25} ** n;
+                    const bias = try fromFloat32ShapeOp(&compute, &bias_values, &.{n});
+                    defer freeTensor(&compute, bias);
+                    const biased_dense = try linearOp(&compute, input, dense, bias, m, k, n);
+                    defer freeTensor(&compute, biased_dense);
+                    const biased_borrowed = try linearOp(&compute, input, borrowed, bias, m, k, n);
+                    defer freeTensor(&compute, biased_borrowed);
+                    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(getData(biased_dense)), std.mem.sliceAsBytes(getData(biased_borrowed)));
+                }
+                try std.testing.expectEqual(@as(usize, 0), toBuf(borrowed).data.len);
+            }
+        }
+    }
+}
+
+test "gemma4 frozen resident mmap weights reclaim after use and remain readable" {
+    const allocator = std.testing.allocator;
+    const Trace = struct {
+        calls: usize = 0,
+        name: []const u8 = "",
+        fn discard(ctx: *anyopaque, name: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            self.name = name;
+        }
+    };
+    var trace = Trace{};
+    // Only the discard hook is used: this fixture supplies an already loaded
+    // source handle, and never asks the store to load or destroy a tensor.
+    const callbacks = tensor_store_mod.TensorStore.VTable{
+        .kind = undefined,
+        .weightSource = undefined,
+        .describeTensor = undefined,
+        .describeTensorRange = undefined,
+        .loadTensorRef = undefined,
+        .loadQuantizedStorageRef = undefined,
+        .discardTensorFileCache = Trace.discard,
+        .preserveFileCacheOnDeinit = undefined,
+        .ggufFile = undefined,
+        .deinit = undefined,
+    };
+    var store = WeightStore{ .allocator = allocator, .resident_weights = .empty, .lazy_weights = .empty, .tensor_store = .{ .ptr = &trace, .vtable = &callbacks } };
+    var compute = NativeCompute.init(allocator, &store, null);
+    defer store.prefetch.deinit();
+    defer compute.deinit();
+    var words = [_]u16{ 0x3f80, 0x4000, 0x4040, 0x4080 };
+    var shape = [_]i64{ 2, 2 };
+    var source = tensor_mod.Tensor{
+        .data = std.mem.sliceAsBytes(&words),
+        .dtype = .bf16,
+        .shape = &shape,
+        .name = "original.source.weight",
+        .allocator = allocator,
+        .owns_data = false,
+        .owns_shape = false,
+        .mmap_source_bytes = std.mem.sliceAsBytes(&words),
+    };
+    const weight = try compute.makeBufWithEntry(empty_f32[0..], false, "canonical.weight", null, null, &source);
+    defer freeTensor(&compute, weight);
+    const input = try fromFloat32ShapeOp(&compute, &.{ 1, 1 }, &.{ 1, 2 });
+    defer freeTensor(&compute, input);
+    maybeDiscardMappedWeightAfterUse(&compute, weight);
+    try std.testing.expectEqual(@as(usize, 0), trace.calls);
+    compute.borrow_frozen_linear_weights = true;
+    for (0..2) |iteration| {
+        const out = try linearNoBiasOp(&compute, input, weight, 1, 2, 2);
+        defer freeTensor(&compute, out);
+        try std.testing.expectEqualSlices(f32, &.{ 3, 7 }, getData(out));
+        try std.testing.expectEqual(iteration + 1, trace.calls);
+        try std.testing.expectEqualStrings(source.name, trace.name);
+    }
+    const dot = try primDotGeneralOp(&compute, input, weight, &.{ 1, 2 }, &shape, &.{1}, &.{1}, &.{}, &.{});
+    defer freeTensor(&compute, dot);
+    try std.testing.expectEqualSlices(f32, &.{ 3, 7 }, getData(dot));
+    try std.testing.expectEqual(@as(usize, 3), trace.calls);
+    source.mmap_source_bytes = null;
+    maybeDiscardMappedWeightAfterUse(&compute, weight);
+    try std.testing.expectEqual(@as(usize, 3), trace.calls);
+}
+
+test "gemma4 fused GQA backward matches independent finite differences across batches and sliding windows" {
+    const allocator = std.testing.allocator;
+    var weights = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weights, null);
+    defer compute.deinit();
+    const batch = 2;
+    const seq = 3;
+    const heads = 2;
+    const dim = 2;
+    var q: [batch * seq * heads * dim]f32 = undefined;
+    var k: [batch * seq * dim]f32 = undefined;
+    var v: [batch * seq * dim]f32 = undefined;
+    var dy: [q.len]f32 = undefined;
+    for (&q, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 7)) * 0.13 - 0.4;
+    for (&k, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 5)) * 0.17 - 0.3;
+    for (&v, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 9)) * 0.11 - 0.5;
+    for (&dy, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 11)) * 0.07 - 0.35;
+    const qt = try compute.makeBuf(&q, false);
+    defer freeTensor(&compute, qt);
+    const kt = try compute.makeBuf(&k, false);
+    defer freeTensor(&compute, kt);
+    const vt = try compute.makeBuf(&v, false);
+    defer freeTensor(&compute, vt);
+    const dyt = try compute.makeBuf(&dy, false);
+    defer freeTensor(&compute, dyt);
+    const loss = struct {
+        fn evaluate(qq: []const f32, kk: []const f32, vv: []const f32, dd: []const f32, window: usize, scale: f32) f64 {
+            var result: f64 = 0;
+            for (0..batch) |b| for (0..seq) |row| for (0..heads) |head| {
+                const first = if (window != 0 and row + 1 > window) row + 1 - window else 0;
+                var probabilities: [seq]f64 = @splat(0);
+                var denominator: f64 = 0;
+                for (first..row + 1) |key| {
+                    var score: f64 = 0;
+                    for (0..dim) |d| score += @as(f64, qq[((b * seq + row) * heads + head) * dim + d]) * kk[(b * seq + key) * dim + d];
+                    probabilities[key] = @exp(score * scale);
+                    denominator += probabilities[key];
+                }
+                for (0..dim) |d| {
+                    var out: f64 = 0;
+                    for (first..row + 1) |key| out += probabilities[key] / denominator * vv[(b * seq + key) * dim + d];
+                    result += out * dd[((b * seq + row) * heads + head) * dim + d];
+                }
+            };
+            return result;
+        }
+    }.evaluate;
+    for ([_]usize{ 0, 1, 2 }) |window| {
+        const scale: f32 = 0.75;
+        const gradient = (try gqaCausalAttentionBackwardOp(&compute, qt, kt, vt, dyt, batch, seq, heads, 1, dim, window, scale)) orelse return error.UnsupportedOperation;
+        defer freeTensor(&compute, gradient);
+        const analytical = getData(gradient);
+        var offset: usize = 0;
+        for ([_][]f32{ &q, &k, &v }) |parameter| {
+            for (parameter, 0..) |*x, i| {
+                const original = x.*;
+                x.* = original + 0.001;
+                const plus_x = x.*;
+                const plus = loss(&q, &k, &v, &dy, window, scale);
+                x.* = original - 0.001;
+                const minus_x = x.*;
+                const minus = loss(&q, &k, &v, &dy, window, scale);
+                x.* = original;
+                const numerical: f32 = @floatCast((plus - minus) / (@as(f64, plus_x) - minus_x));
+                try std.testing.expectApproxEqAbs(numerical, analytical[offset + i], 0.00002);
+            }
+            offset += parameter.len;
+        }
+    }
 }
 
 test "native CumSum preserves batched strided i32 and i64 scans" {

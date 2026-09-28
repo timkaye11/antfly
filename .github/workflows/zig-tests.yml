@@ -80,6 +80,7 @@ jobs:
     runs-on: arc-antfly-standard-runtime
     outputs:
       zig_tests: ${{ steps.detect.outputs.zig_tests }}
+      gemma4_training: ${{ steps.detect.outputs.gemma4_training }}
       e2e: ${{ steps.detect.outputs.e2e }}
       model_check: ${{ steps.detect.outputs.model_check }}
       trace_validate: ${{ steps.detect.outputs.trace_validate }}
@@ -167,6 +168,7 @@ jobs:
             fi
             {
               echo "zig_tests=true"
+              echo "gemma4_training=true"
               echo "e2e=true"
               echo "model_check=true"
               echo "trace_validate=true"
@@ -179,6 +181,7 @@ jobs:
             echo "zig_tests=false" >> "$GITHUB_OUTPUT"
             if [[ "${{ github.event.schedule }}" == "0 3 * * 0" ]]; then
               {
+                echo "gemma4_training=true"
                 echo "e2e=false"
                 echo "model_check=true"
                 echo "trace_validate=true"
@@ -186,6 +189,7 @@ jobs:
               } >> "$GITHUB_OUTPUT"
             else
               {
+                echo "gemma4_training=false"
                 echo "e2e=true"
                 echo "model_check=false"
                 echo "trace_validate=false"
@@ -197,11 +201,14 @@ jobs:
 
           if [[ "${{ inputs.pr_number != '' && 'pull_request' || github.event_name }}" == "pull_request" ]]; then
             base="${{ inputs.base_sha }}"
+          elif [[ "${{ github.event_name }}" == "merge_group" && -n "${{ github.event.merge_group.base_sha }}" ]]; then
+            base="${{ github.event.merge_group.base_sha }}"
           elif [[ "${{ inputs.pr_number != '' && 'pull_request' || github.event_name }}" == "push" && -n "${{ github.event.before }}" && "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
             base="${{ github.event.before }}"
           else
             {
               echo "zig_tests=true"
+              echo "gemma4_training=true"
               echo "e2e=true"
               echo "model_check=true"
               echo "trace_validate=true"
@@ -248,6 +255,61 @@ jobs:
             echo "zig_tests=false" >> "$GITHUB_OUTPUT"
           else
             echo "zig_tests=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          if git diff --quiet "$base" "${{ inputs.head_sha || github.sha }}" -- \
+            ':(glob)zig/lib/**' \
+            zig/build.zig \
+            zig/build.zig.zon \
+            ':(glob)zig/build/**' \
+            ':(glob)zig/pkg/antfly/build/**' \
+            ':(glob)zig/pkg/antfly/src/inference_runtime/**' \
+            zig/pkg/inference/build.zig \
+            zig/pkg/inference/build.zig.zon \
+            ':(glob)zig/pkg/inference/build/**' \
+            zig/pkg/inference/src/architectures/gemma_graph.zig \
+            zig/pkg/inference/src/architectures/session_factory.zig \
+            ':(glob)zig/pkg/inference/src/backends/metal_*' \
+            ':(glob)zig/pkg/inference/src/backends/decoder_*' \
+            ':(glob)zig/pkg/inference/src/runtime/**' \
+            ':(glob)zig/pkg/inference/src/ops/metal/**' \
+            zig/pkg/inference/src/finetune/artifact_publication.zig \
+            zig/pkg/inference/src/finetune/chat_template.zig \
+            ':(glob)zig/pkg/inference/src/finetune/cli/**' \
+            ':(glob)zig/pkg/inference/src/finetune/gemma4*' \
+            zig/pkg/inference/src/finetune/grpo.zig \
+            ':(glob)zig/pkg/inference/src/finetune/lora*' \
+            zig/pkg/inference/src/finetune/path_isolation.zig \
+            ':(glob)zig/pkg/inference/src/finetune/preference*' \
+            ':(glob)zig/pkg/inference/src/finetune/run_gemma4*' \
+            ':(glob)zig/pkg/inference/src/finetune/test/test_gemma4*' \
+            ':(glob)zig/pkg/inference/src/finetune/tools/*gemma4*' \
+            ':(glob)zig/pkg/inference/src/finetune/train/*gemma4*' \
+            zig/pkg/inference/src/finetune/real_autodiff_trainer.zig \
+            ':(glob)zig/pkg/inference/src/finetune/recipe*.zig' \
+            zig/pkg/inference/src/finetune/training_environment.zig \
+            ':(glob)zig/pkg/inference/src/graph/**' \
+            ':(glob)zig/pkg/inference/src/gemma*_test_root.zig' \
+            ':(glob)zig/pkg/inference/scripts/*gemma4*' \
+            ':(glob)zig/pkg/inference/scripts/gemma4/**' \
+            ':(glob)zig/pkg/inference/testdata/*dpo*' \
+            ':(glob)zig/pkg/inference/testdata/*grpo*' \
+            ':(glob)zig/pkg/inference/testdata/*gemma4*' \
+            ':(glob)zig/pkg/inference/testdata/gemma4_oracle/**' \
+            zig/pkg/inference/src/inference_internal.zig \
+            zig/pkg/inference/src/ops/metal_compute.zig \
+            zig/pkg/inference/src/ops/native_compute.zig \
+            scripts/ci/audit_gemma4_test_selection.py \
+            scripts/ci/test_audit_gemma4_test_selection.py \
+            scripts/ci/test_zig_validation_scope.py \
+            scripts/ci/toolchain-policy.json \
+            .github/actions/load-toolchain-policy/action.yml \
+            .github/workflows/zig-tests.yml \
+            ':(exclude,glob)**/*.md'
+          then
+            echo "gemma4_training=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "gemma4_training=true" >> "$GITHUB_OUTPUT"
           fi
 
           if ! "$helper" "$base" "${{ inputs.head_sha || github.sha }}" -- \
@@ -872,6 +934,117 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  gemma4-metal-training-tests:
+    name: gemma4-metal-training / macos-arm64-gpu
+    needs: [admission, changes]
+    if: >-
+      ${{ !cancelled() && needs.admission.result == 'success' &&
+      (inputs.pr_number == '' || github.run_attempt == 1) &&
+      needs.changes.outputs.gemma4_training == 'true' }}
+    runs-on: macos-15-xlarge
+    timeout-minutes: 120
+    env:
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache-gemma4-metal
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache-gemma4-metal
+      TERMITE_REQUIRE_METAL_TESTS: "1"
+      ANTFLY_BENCHMARK_SOURCE_REVISION: ${{ inputs.head_sha || github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
+          submodules: true
+          fetch-depth: 0
+
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
+      - name: Set up pinned Gemma4 benchmark Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
+
+      - name: Install Gemma4 Zig-oracle packaging dependencies
+        run: python3 -m pip install --disable-pip-version-check -r zig/pkg/inference/scripts/gemma4/requirements-gemma4-zig-oracle.txt
+
+      - name: Verify Metal device
+        run: system_profiler SPDisplaysDataType
+
+      - name: Validate Gemma4 Python contracts
+        working-directory: zig/pkg/inference
+        run: |
+          set -euo pipefail
+          python3 ../../../scripts/ci/test_zig_validation_scope.py
+          python3 ../../../scripts/ci/test_audit_gemma4_test_selection.py
+          python3 scripts/gemma4/compare_gemma4_lora_hf_zig.py validate-lock
+          python3 -m unittest discover -v -s scripts/gemma4 -p 'test_*.py'
+          fixture_dir="$(mktemp -d "${RUNNER_TEMP}/gemma4-oracle-contract.XXXXXX")"
+          trap 'rm -rf "$fixture_dir"' EXIT
+          python3 scripts/gemma4/generate_gemma4_oracle_fixture.py \
+            --output "$fixture_dir/fixture.jsonl" \
+            --manifest "$fixture_dir/fixture.manifest.json" \
+            --train-count 8 --eval-count 4 --test-count 4
+          python3 scripts/gemma4/generate_gemma4_oracle_fixture.py \
+            --output "$fixture_dir/fixture.jsonl" \
+            --manifest "$fixture_dir/fixture.manifest.json" \
+            --train-count 8 --eval-count 4 --test-count 4 --check
+
+      - name: Run Gemma4 Metal Debug gates
+        working-directory: zig/pkg/inference
+        run: |
+          set -euo pipefail
+          zig build test-gemma4-finetune -j1 --maxrss 10737418240 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=Debug -Dbenchmark-source-revision="$ANTFLY_BENCHMARK_SOURCE_REVISION" --summary all 2>&1 | tee "$RUNNER_TEMP/gemma4-focused.log"
+          zig build test-gemma4-serving -j1 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=Debug --summary all
+          zig build test-gemma-graph -j1 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=Debug --summary all
+          zig build test -j1 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=Debug -- \
+            --test-filter "owned backend factory controls wrapper lifecycle" \
+            --test-filter "lora linear replaces an existing internal value without leaking" \
+            --test-filter "owning tensor host mirror" \
+            --test-filter "Gemma4 PEFT export parser requires the named production contract" \
+            --test-filter "finetune contextual help covers the production Gemma4 path" \
+            --test-filter "gemma4 prepare canonical flags normalize to the legacy adapter boundary" \
+            --test-filter "gemma4 public prepare rejects media projection before command dispatch" \
+            --test-filter "server generate forwards only explicit thinking mode" 2>&1 | tee "$RUNNER_TEMP/gemma4-cli.log"
+          python3 ../../../scripts/ci/audit_gemma4_test_selection.py \
+            --base "${{ inputs.base_sha || github.event.merge_group.base_sha || github.event.before }}" \
+            "$RUNNER_TEMP/gemma4-focused.log" "$RUNNER_TEMP/gemma4-cli.log"
+
+      - name: Run ML graph unit tests
+        working-directory: zig/lib/ml
+        run: zig build test -Doptimize=Debug --summary all
+
+      - name: Run Gemma4 Metal ReleaseSafe gates
+        working-directory: zig/pkg/inference
+        run: |
+          zig build test-gemma4-finetune -j1 --maxrss 10737418240 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=ReleaseSafe -Dbenchmark-source-revision="$ANTFLY_BENCHMARK_SOURCE_REVISION" --summary all
+          zig build test-gemma-graph -j1 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=ReleaseSafe --summary all
+
+      - name: Run packaged-optimization Metal lifecycle smoke
+        working-directory: zig/pkg/inference
+        run: |
+          zig build test-gemma4-finetune -j1 --maxrss 10737418240 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=ReleaseFast -Dbenchmark-source-revision="$ANTFLY_BENCHMARK_SOURCE_REVISION" --summary all
+
+      - name: Build public CLI for PEFT interchange check
+        working-directory: zig
+        run: zig build antfly -j1 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=ReleaseFast -Dbenchmark-source-revision="$ANTFLY_BENCHMARK_SOURCE_REVISION" --summary all
+
+      - name: Load exported adapter with stock PEFT on CPU
+        working-directory: zig/pkg/inference
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/gemma4-peft-venv"
+          "$RUNNER_TEMP/gemma4-peft-venv/bin/python" -m pip install --disable-pip-version-check -r scripts/gemma4/requirements-gemma4-oracle.txt
+          "$RUNNER_TEMP/gemma4-peft-venv/bin/python" scripts/gemma4/verify_gemma4_peft_export_roundtrip.py \
+            --antfly ../../zig-out/bin/antfly \
+            --work-dir "$RUNNER_TEMP/gemma4-peft-roundtrip"
+
   zig-full-tests:
     if: >-
       ${{ !cancelled() &&
@@ -1264,11 +1437,13 @@ jobs:
       needs.changes.outputs.model_check == 'true' ||
       needs.changes.outputs.trace_validate == 'true' )) }}
     name: zig-base
-    needs: [admission, changes, zig-base-tests, arm64-codec]
+    needs: [admission, changes, zig-base-tests, arm64-codec, gemma4-metal-training-tests]
     runs-on: arc-antfly-standard-runtime
     steps:
       - name: Verify zig-base shards
         env:
+          GEMMA4_REQUIRED: ${{ needs.changes.outputs.gemma4_training }}
+          GEMMA4_RESULT: ${{ needs.gemma4-metal-training-tests.result }}
           CHANGES_RESULT: ${{ needs.changes.result }}
           X86_64_RESULT: ${{ needs.zig-base-tests.result }}
           ARM64_CODEC_RESULT: ${{ needs.arm64-codec.result }}
@@ -1277,6 +1452,10 @@ jobs:
           test "$CHANGES_RESULT" = "success"
           test "$X86_64_RESULT" = "success"
           test "$ARM64_CODEC_RESULT" = "success"
+
+          if [ "$GEMMA4_REQUIRED" = "true" ]; then
+            test "$GEMMA4_RESULT" = "success"
+          fi
 
   zig-full:
     if: >-
@@ -1294,11 +1473,13 @@ jobs:
       inputs.validation_scope == 'all') ||
       github.event.schedule == '0 8 * * *' )) }}
     name: zig-full
-    needs: [admission, changes, zig-full-tests, zig-build-cache-tests, arm64-codec]
+    needs: [admission, changes, zig-full-tests, zig-build-cache-tests, arm64-codec, gemma4-metal-training-tests]
     runs-on: arc-antfly-standard-runtime
     steps:
       - name: Verify zig-full shards
         env:
+          GEMMA4_REQUIRED: ${{ needs.changes.outputs.gemma4_training }}
+          GEMMA4_RESULT: ${{ needs.gemma4-metal-training-tests.result }}
           CHANGES_RESULT: ${{ needs.changes.result }}
           X86_64_RESULT: ${{ needs.zig-full-tests.result }}
           BUILD_CACHE_RESULT: ${{ needs.zig-build-cache-tests.result }}
@@ -1309,6 +1490,10 @@ jobs:
           test "$X86_64_RESULT" = "success"
           test "$BUILD_CACHE_RESULT" = "success"
           test "$ARM64_CODEC_RESULT" = "success"
+
+          if [ "$GEMMA4_REQUIRED" = "true" ]; then
+            test "$GEMMA4_RESULT" = "success"
+          fi
 
   e2e-base-build:
     if: >-

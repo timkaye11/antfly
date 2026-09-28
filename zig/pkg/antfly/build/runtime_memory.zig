@@ -97,9 +97,10 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         // scheduler can overlap whichever roots fit without forcing
         // callers to serialize the whole build.
         .inference => 16 * 1024 * 1024 * 1024,
-        // Clean aarch64-macOS ReleaseFast codegen currently peaks
-        // around 2.23 GB, just above the former 2 GiB reservation.
-        .cli => 3 * 1024 * 1024 * 1024,
+        // Clean aarch64-macOS ReleaseFast CLI codegen reached 3.26 GB,
+        // exceeding the former 3 GiB reservation. Keep headroom for
+        // that measured profile without changing the Linux envelope.
+        .cli => @as(usize, if (target.os.tag == .macos) 4 else 3) * 1024 * 1024 * 1024,
     };
 }
 

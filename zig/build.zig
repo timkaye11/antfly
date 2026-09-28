@@ -166,6 +166,11 @@ pub fn create(b: *std.Build) ?Artifacts {
     else
         null;
     const antfly_version = b.option([]const u8, "antfly-version", "Antfly version string") orelse "dev";
+    const benchmark_source_revision = b.option(
+        []const u8,
+        "benchmark-source-revision",
+        "Clean 40-hex source commit embedded for fail-closed benchmark attestation",
+    ) orelse "dev";
     const build_info = @import("lib/build_info/build_support.zig").create(b, .{
         .root = b.path("lib/build_info"),
         .target = target,
@@ -580,6 +585,8 @@ pub fn create(b: *std.Build) ?Artifacts {
             .blas_root = inference_blas_root,
             .link_libc = link_libc,
             .skip_openapi = false,
+            .inference_version = antfly_version,
+            .benchmark_source_revision = benchmark_source_revision,
         },
         .shared = .{
             .build_info_mod = build_info.module,

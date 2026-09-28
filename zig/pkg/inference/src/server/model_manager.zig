@@ -5549,6 +5549,13 @@ pub const ModelManager = struct {
         return limits;
     }
 
+    fn applyModelAdmissionOverrides(
+        widened_limits: runtime.tier.memory.Limits,
+        operator_overrides: runtime.tier.memory.Limits,
+    ) runtime.tier.memory.Limits {
+        return runtime.tier.memory.applyLimitOverrides(widened_limits, operator_overrides);
+    }
+
     /// Apply architecture/artifact residency floors before attaching the hard
     /// serving envelope. Explicit per-bucket operator overrides remain the
     /// final authority; the model floor only widens automatically derived
@@ -5585,7 +5592,7 @@ pub const ModelManager = struct {
             self.process_memory_limit_bytes,
         );
         limits = session_factory.widenBudgetLimitsForSession(session, limits);
-        return runtime.tier.memory.applyLimitOverrides(limits, self.admission_limit_overrides);
+        return applyModelAdmissionOverrides(limits, self.admission_limit_overrides);
     }
 
     /// Lazily loaded composite-model components participate in the same
@@ -10026,6 +10033,30 @@ test "serving admission applies the node-wide host-memory override" {
         @as(usize, 100),
         manager.resource_domain.?.admission_limits.combined_limit_bytes,
     );
+}
+
+test "gemma4 model admission preserves explicit operator limits after automatic widening" {
+    const widened = runtime.tier.memory.Limits{
+        .host_limit_bytes = 21 * 1024 * 1024 * 1024 / 4,
+        .backend_limit_bytes = 12 * 1024 * 1024 * 1024,
+        .combined_limit_bytes = 18 * 1024 * 1024 * 1024,
+        .kv_limit_bytes = 1024,
+        .scratch_limit_bytes = 2048,
+    };
+    try std.testing.expectEqual(
+        widened,
+        ModelManager.applyModelAdmissionOverrides(widened, .{}),
+    );
+
+    const explicit = ModelManager.applyModelAdmissionOverrides(widened, .{
+        .host_limit_bytes = 4 * 1024 * 1024 * 1024,
+        .combined_limit_bytes = 16 * 1024 * 1024 * 1024,
+    });
+    try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024 * 1024), explicit.host_limit_bytes);
+    try std.testing.expectEqual(widened.backend_limit_bytes, explicit.backend_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 16 * 1024 * 1024 * 1024), explicit.combined_limit_bytes);
+    try std.testing.expectEqual(widened.kv_limit_bytes, explicit.kv_limit_bytes);
+    try std.testing.expectEqual(widened.scratch_limit_bytes, explicit.scratch_limit_bytes);
 }
 
 test "shouldPreferNativeSession prefers native GLiNER weights" {

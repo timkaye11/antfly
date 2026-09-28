@@ -1,5 +1,6 @@
 {
   "recipe": "dpo",
+  "execution": { "mode": "train" },
   "model": {
     "path": "/tmp/termite-models/Qwen/Qwen2.5-0.5B-Instruct",
     "reference_path": "/tmp/termite-models/Qwen/Qwen2.5-0.5B-Instruct",

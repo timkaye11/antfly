@@ -27,6 +27,7 @@ pub const Import = enum {
     termite_c_file,
     inference_finetune_data,
     inference_finetune_tokenizer_batch,
+    inference_audio,
     inference_hf_tokenizer,
     inference_internal,
     termite_io_compat,
@@ -59,6 +60,7 @@ pub const Context = struct {
     ml_mod: *std.Build.Module,
     onnx: @import("../runtime.zig").OnnxModules,
     inference_internal_mod: *std.Build.Module,
+    inference_audio_mod: *std.Build.Module,
     inference_tokenizer_mod: *std.Build.Module,
     inference_hf_tokenizer_mod: *std.Build.Module,
     antfly_image_mod: *std.Build.Module,
@@ -108,6 +110,7 @@ pub const Context = struct {
                 mod.addImport("inference_hf_tokenizer", ctx.inference_hf_tokenizer_mod);
                 break :blk mod;
             },
+            .inference_audio => ctx.inference_audio_mod,
             .inference_hf_tokenizer => ctx.inference_hf_tokenizer_mod,
             .inference_internal => ctx.inference_internal_mod,
             .termite_io_compat => ctx.b.createModule(.{
@@ -137,6 +140,7 @@ pub const CommandSpec = struct {
 };
 
 pub const TestSpec = struct {
+    compile_max_rss: ?usize = null,
     /// This import-only root is completely covered by the full inference unit gate.
     covered_by_inference: bool = false,
     step_name: []const u8,
@@ -243,7 +247,13 @@ pub fn addCommandChecks(ctx: Context, specs: []const CommandSpec) *std.Build.Ste
         source.writer.writeAll("    return error.CompileCheckOnly;\n}\n") catch @panic("OOM");
         const check = b.addExecutable(.{
             .name = b.fmt("finetune-command-check-{d}", .{group_index}),
-            .max_rss = ctx.test_compile_max_rss,
+            // The shared Metal CLI group reached 8.09 GB in ReleaseFast on
+            // macOS. Keep the measured command-check allowance distinct from
+            // the smaller unit-test roots.
+            .max_rss = if (ctx.enable_metal and ctx.target.result.os.tag == .macos)
+                10 * 1024 * 1024 * 1024
+            else
+                ctx.test_compile_max_rss,
             .root_module = b.createModule(.{
                 .root_source_file = generated.add("check.zig", source.written()),
                 .target = ctx.target,
@@ -301,7 +311,8 @@ pub fn sharedTests(ctx: Context, specs: []const TestSpec) *std.Build.Step.Compil
     });
     root.addImport("antfly_platform", ctx.antfly_platform_mod);
     for (specs) |spec| {
-        if (spec.covered_by_inference) continue;
+        // Compile-filtered gates own a separate root and executable.
+        if (spec.covered_by_inference or spec.filters.len != 0) continue;
         std.debug.assert(spec.filters.len == 0);
         std.debug.assert(spec.native_link != .no_accel);
         for (spec.imports) |dependency| {
@@ -316,7 +327,7 @@ pub fn sharedTests(ctx: Context, specs: []const TestSpec) *std.Build.Step.Compil
 pub fn addTest(ctx: Context, spec: TestSpec) *std.Build.Step {
     const b = ctx.b;
     const test_exe = b.addTest(.{
-        .max_rss = ctx.test_compile_max_rss,
+        .max_rss = spec.compile_max_rss orelse ctx.test_compile_max_rss,
         .root_module = b.createModule(.{
             .root_source_file = ctx.path(spec.root_source_file),
             .target = ctx.target,
@@ -449,6 +460,7 @@ pub fn fromWorkflow(ctx: @import("../context.zig").Context) Context {
         .ml_mod = ctx.graph.ml_mod,
         .onnx = ctx.graph.onnx,
         .inference_internal_mod = ctx.graph.inference_internal_mod,
+        .inference_audio_mod = ctx.graph.inference_audio_mod,
         .inference_tokenizer_mod = ctx.graph.inference_tokenizer_mod,
         .inference_hf_tokenizer_mod = ctx.graph.inference_hf_tokenizer_mod,
         .antfly_image_mod = ctx.graph.image_mod,

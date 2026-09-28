@@ -109,6 +109,10 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     raw_linear_slot_kinds: [decoder_runtime_linear_slot_capacity]RawLinearSlotKind = [_]RawLinearSlotKind{.none} ** decoder_runtime_linear_slot_capacity,
     raw_linear_slot_in_dims: [decoder_runtime_linear_slot_capacity]usize = [_]usize{0} ** decoder_runtime_linear_slot_capacity,
     raw_linear_slot_out_dims: [decoder_runtime_linear_slot_capacity]usize = [_]usize{0} ** decoder_runtime_linear_slot_capacity,
+    /// True only when the runtime slot directly borrows the caller's dense
+    /// BF16 mapping. Private-copy slots may release clean source mmap pages
+    /// after their synchronous upload completes.
+    raw_linear_slot_borrows_dense_weight: [decoder_runtime_linear_slot_capacity]bool = [_]bool{false} ** decoder_runtime_linear_slot_capacity,
     raw_linear_slot_quantized_storage: [decoder_runtime_linear_slot_capacity]?*QuantizedStorage = [_]?*QuantizedStorage{null} ** decoder_runtime_linear_slot_capacity,
     raw_linear_slot_dense_weights: [decoder_runtime_linear_slot_capacity]?MetalTensor = [_]?MetalTensor{null} ** decoder_runtime_linear_slot_capacity,
     raw_linear_slot_dense_biases: [decoder_runtime_linear_slot_capacity]?MetalTensor = [_]?MetalTensor{null} ** decoder_runtime_linear_slot_capacity,

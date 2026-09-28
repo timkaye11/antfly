@@ -171,6 +171,11 @@ pub const ExecuteOptions = struct {
     /// backends reuse them without allocating.
     donate: ?[]const bool = null,
 
+    /// Permit internal ops to consume their last-use input buffers in place.
+    /// Explicit parameter-override callers can disable this when zero-copy
+    /// views may alias caller-owned runtime inputs across executions.
+    allow_buffer_donation: bool = true,
+
     /// Attention context for GQA paged/causal attention nodes.
     /// The interpreter auto-increments layer_index for each
     /// successive attention node encountered during execution.
@@ -211,6 +216,12 @@ pub const ExecuteOptions = struct {
     /// aligned with the direct interpreter, where labels, masks, and borrowed
     /// weights stay in the representation supplied by the caller.
     preserve_runtime_input_residency: bool = false,
+
+    /// Bind eligible Metal command outputs to the compiler's reusable
+    /// allocation IDs. This is scoped to the compiled session rather than a
+    /// process-global environment mutation, so concurrent trainers can choose
+    /// their own workspace policy safely.
+    metal_slot_bound_outputs: bool = false,
 };
 
 /// Result of graph execution. Caller owns the output tensors and must
@@ -319,6 +330,18 @@ fn nullCtAliases(values: []?CT, needle: CT) void {
     for (values) |*value| {
         if (value.* == needle) value.* = null;
     }
+}
+
+fn isBorrowedRuntimeCt(
+    rt_values: []const ?CT,
+    donated_values: []const bool,
+    needle: CT,
+) bool {
+    for (rt_values, 0..) |maybe_value, index| {
+        const value = maybe_value orelse continue;
+        if (value == needle and !donated_values[index]) return true;
+    }
+    return false;
 }
 
 /// Return true when another graph value aliases `needle` and is still needed
@@ -867,6 +890,14 @@ pub fn execute(
                 const input_idx: usize = @intCast(input_id);
                 if (rt_values[input_idx] != null and !donated_values[input_idx]) continue;
                 if (values[input_id]) |ct| {
+                    // A pass-through/view node can carry the exact handle of
+                    // a caller-owned runtime tensor even though that alias
+                    // node is not itself present in rt_values. Protect by CT
+                    // identity across every runtime slot, not only by node ID.
+                    if (isBorrowedRuntimeCt(rt_values, donated_values, ct)) {
+                        values[input_idx] = null;
+                        continue;
+                    }
                     if (values[i]) |out_ct| {
                         if (ct == out_ct and canKeepAliasedOutput(n.op)) {
                             values[input_id] = null;
@@ -966,6 +997,7 @@ pub fn execute(
         // Free any remaining handles (parameters, donated inputs, or
         // intermediates that weren't caught by liveness-based freeing)
         const ct = values[i].?;
+        if (isBorrowedRuntimeCt(rt_values, donated_values, ct)) continue;
         nullCtAliases(values, ct);
         cb.free(ct);
     }
@@ -1394,6 +1426,7 @@ pub const ExecState = struct {
     moe_grouped: ?MoeGroupedState = null,
 
     pub fn isLastUseBy(self: *const ExecState, input_id: NodeId, node_id: NodeId) bool {
+        if (!self.options.allow_buffer_donation) return false;
         const idx: usize = @intCast(input_id);
         return idx < self.last_use.len and self.last_use[idx] == node_id;
     }
@@ -2574,10 +2607,7 @@ pub fn executeNode(
                 if (graph.node(ins[1]).op == .fused_from_float32) {
                     break :blk state.options.embedding_ids orelse return error.MissingRuntimeInput;
                 }
-                const raw = try cb.toFloat32(V.get(ins[1]), std.heap.page_allocator);
-                defer std.heap.page_allocator.free(raw);
-                const converted = try std.heap.page_allocator.alloc(i64, raw.len);
-                for (converted, raw) |*dst, value| dst.* = @intFromFloat(@round(value));
+                const converted = try readEmbeddingIds(cb, V.get(ins[1]), std.heap.page_allocator);
                 owned_ids = converted;
                 break :blk converted;
             };
@@ -2600,6 +2630,10 @@ pub fn executeNode(
                 if (try cb.rmsNormConsumeInput(V.get(ins[0]), V.get(ins[1]), attrs.dim, attrs.eps)) |consumed| return consumed;
             }
             return cb.rmsNorm(V.get(ins[0]), V.get(ins[1]), attrs.dim, attrs.eps);
+        },
+
+        .fused_rms_norm_backward => |attrs| {
+            return (try cb.rmsNormBackward(V.get(ins[0]), V.get(ins[1]), V.get(ins[2]), attrs.dim, attrs.eps, attrs.backward_weight_grad)) orelse error.UnsupportedPrimitiveOp;
         },
 
         .fused_gelu => {
@@ -2688,6 +2722,24 @@ pub fn executeNode(
             return cb.multiply(V.get(ins[0]), V.get(ins[1]));
         },
 
+        .fused_linear_cross_entropy_loss => |attrs| {
+            if (!attrs.frozen_weight) return error.UnsupportedPrimitiveOp;
+            var output_shape_buf: [8]i64 = undefined;
+            const output_shape = fillShapeDims(graph, node_id, &output_shape_buf);
+            return cb.linearCrossEntropyLoss(&.{
+                .hidden = V.get(ins[0]),
+                .weight = V.get(ins[1]),
+                .labels = V.get(ins[2]),
+                .rows = attrs.rows,
+                .in_dim = attrs.in_dim,
+                .vocab_size = attrs.vocab_size,
+                .logit_softcap = attrs.logit_softcap,
+                .ignore_index = attrs.ignore_index,
+                .frozen_weight = attrs.frozen_weight,
+                .output_shape = output_shape,
+            });
+        },
+
         .fused_selected_tied_head_logits => |attrs| {
             if (!attrs.frozen_weight) return error.UnsupportedPrimitiveOp;
             var output_shape_buf: [8]i64 = undefined;
@@ -2700,6 +2752,25 @@ pub fn executeNode(
                 .vocab_size = attrs.vocab_size,
                 .frozen_weight = attrs.frozen_weight,
                 .output_shape = output_shape,
+            });
+        },
+
+        .fused_linear_cross_entropy_backward => |attrs| {
+            if (!attrs.frozen_weight) return error.UnsupportedPrimitiveOp;
+            var hidden_shape_buf: [8]i64 = undefined;
+            const hidden_shape = fillShapeDims(graph, ins[0], &hidden_shape_buf);
+            return cb.linearCrossEntropyBackward(&.{
+                .hidden = V.get(ins[0]),
+                .weight = V.get(ins[1]),
+                .labels = V.get(ins[2]),
+                .upstream = V.get(ins[3]),
+                .rows = attrs.rows,
+                .in_dim = attrs.in_dim,
+                .vocab_size = attrs.vocab_size,
+                .logit_softcap = attrs.logit_softcap,
+                .ignore_index = attrs.ignore_index,
+                .frozen_weight = attrs.frozen_weight,
+                .hidden_shape = hidden_shape,
             });
         },
 
@@ -2863,6 +2934,21 @@ pub fn executeNode(
         },
 
         .fused_gqa_causal_attention => |attrs| {
+            if (attrs.training) {
+                if (try cb.gqaCausalAttentionTraining(
+                    V.get(ins[0]),
+                    V.get(ins[1]),
+                    V.get(ins[2]),
+                    attrs.batch,
+                    attrs.seq_len,
+                    attrs.num_heads,
+                    attrs.num_kv_heads,
+                    attrs.head_dim,
+                    attrs.sliding_window,
+                    attrs.score_scale,
+                )) |training_result| return training_result;
+                return error.UnsupportedOperation;
+            }
             // If an attention context is provided, route through
             // gqaPagedAttention with auto-incremented layer_index.
             if (state.options.attention) |base_attn| {
@@ -2896,6 +2982,23 @@ pub fn executeNode(
                 attrs.num_kv_heads,
                 attrs.head_dim,
             );
+        },
+
+        .fused_gqa_causal_attention_backward => |attrs| {
+            if (try cb.gqaCausalAttentionBackward(
+                V.get(ins[0]),
+                V.get(ins[1]),
+                V.get(ins[2]),
+                V.get(ins[3]),
+                attrs.batch,
+                attrs.seq_len,
+                attrs.num_heads,
+                attrs.num_kv_heads,
+                attrs.head_dim,
+                attrs.sliding_window,
+                attrs.score_scale,
+            )) |packed_result| return packed_result;
+            return error.UnsupportedOperation;
         },
 
         .fused_deberta_training_attention_v1 => |attrs| {
@@ -4457,6 +4560,45 @@ pub fn executeNode(
             return error.UnsupportedPrimitiveOp;
         },
     };
+}
+
+/// Read embedding-lookup ids to host i64. Float-backed ids go through
+/// `toFloat32`; typed integer device tensors (which `toFloat32` rejects)
+/// are decoded exactly from `exportTensorData`. Caller owns the result.
+pub fn readEmbeddingIds(cb: *const ComputeBackend, ids: CT, allocator: std.mem.Allocator) ![]i64 {
+    const raw = cb.toFloat32(ids, allocator) catch |err| switch (err) {
+        error.UnsupportedTensorType => return readIntegerIds(cb, ids, allocator, err),
+        else => return err,
+    };
+    defer allocator.free(raw);
+    const converted = try allocator.alloc(i64, raw.len);
+    for (converted, raw) |*dst, value| dst.* = @intFromFloat(@round(value));
+    return converted;
+}
+
+fn readIntegerIds(cb: *const ComputeBackend, ids: CT, allocator: std.mem.Allocator, original: anyerror) ![]i64 {
+    const exported = (try cb.exportTensorData(ids, allocator)) orelse return original;
+    const bytes = switch (exported.payload) {
+        .bytes => |bytes| bytes,
+        .quantized_f32 => |quantized| {
+            allocator.free(quantized.raw_bytes);
+            allocator.free(quantized.shape);
+            return original;
+        },
+    };
+    defer allocator.free(bytes);
+    const width: usize = switch (exported.dtype) {
+        .i64 => 8,
+        .i32 => 4,
+        else => return original,
+    };
+    if (bytes.len % width != 0) return error.InvalidTensorShape;
+    const out = try allocator.alloc(i64, bytes.len / width);
+    for (out, 0..) |*dst, i| dst.* = switch (width) {
+        8 => std.mem.readInt(i64, bytes[i * 8 ..][0..8], .little),
+        else => std.mem.readInt(i32, bytes[i * 4 ..][0..4], .little),
+    };
+    return out;
 }
 
 fn isIntegerDType(dtype: ml.graph.DType) bool {

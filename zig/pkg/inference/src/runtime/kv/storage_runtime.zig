@@ -201,6 +201,22 @@ pub const DeviceKvLayerWriteCommit = struct {
     position_offset: usize,
 };
 
+/// Exact device-side clone of the final, partially-filled page of a sequence.
+/// Complete prefix pages remain reference-counted and shared; the destination
+/// owns a distinct tail block so subsequent candidate tokens cannot alias.
+pub const DeviceKvSequenceTailClone = struct {
+    source_sequence_id: SequenceId,
+    destination_sequence_id: SequenceId,
+    total_token_count: usize,
+    tail_token_count: usize,
+    num_layers_packed: u16,
+    num_kv_heads: u32,
+    head_dim: u32,
+    page_size_tokens: u16,
+    source_logical_blocks: []const block.KvBlockId,
+    destination_logical_blocks: []const block.KvBlockId,
+};
+
 pub const DeviceKvLayerReserve = struct {
     sequence_id: SequenceId,
     layer_index: usize,
@@ -296,6 +312,13 @@ pub const DeviceWriteHook = struct {
             ctx: *anyopaque,
             commit: DeviceKvLayerWriteCommit,
         ) anyerror!void = null,
+        /// Optional exact device-to-device clone of one private partial tail
+        /// page. Backends must copy every packed layer and publish readable
+        /// coverage for the destination sequence before returning.
+        cloneSequenceTail: ?*const fn (
+            ctx: *anyopaque,
+            clone: DeviceKvSequenceTailClone,
+        ) anyerror!void = null,
         /// Optional notification that a sequence tail was truncated. Device
         /// coverage metadata must shrink with the logical block table so a
         /// subsequent correction/retry can rewrite the rolled-back positions.
@@ -349,6 +372,11 @@ pub const DeviceWriteHook = struct {
     pub fn commitLayerKvDeviceWrite(self: DeviceWriteHook, commit: DeviceKvLayerWriteCommit) !void {
         const commit_fn = self.vtable.commitLayerKvDeviceWrite orelse return error.DeviceWriteUnsupported;
         return commit_fn(self.ctx, commit);
+    }
+
+    pub fn cloneSequenceTail(self: DeviceWriteHook, clone: DeviceKvSequenceTailClone) !void {
+        const clone_fn = self.vtable.cloneSequenceTail orelse return error.DeviceWriteUnsupported;
+        return clone_fn(self.ctx, clone);
     }
 
     pub fn truncateSequence(self: DeviceWriteHook, sequence_id: SequenceId, retained_token_count: usize) void {
@@ -487,6 +515,53 @@ pub const KvStorageRuntime = struct {
         });
     }
 
+    /// Clone the canonical sequence's private partial page into a destination
+    /// sequence whose logical metadata has already been advanced to the same
+    /// token count. This deliberately rejects page-aligned or multi-page
+    /// suffixes: those use retained complete pages instead.
+    pub fn cloneSequenceTailDevice(
+        self: *KvStorageRuntime,
+        source_sequence_id: SequenceId,
+        destination_sequence_id: SequenceId,
+        tail_token_count: usize,
+    ) !void {
+        const hook = self.device_write_hook orelse return error.DeviceWriteUnsupported;
+        if (source_sequence_id == destination_sequence_id) return error.InvalidSequenceId;
+        const page_size: usize = self.storage.config.page_size_tokens;
+        if (page_size == 0 or tail_token_count == 0 or tail_token_count >= page_size) return error.InvalidKvShape;
+
+        const source_state = try self.sequenceMut(source_sequence_id);
+        const destination_state = try self.sequenceMut(destination_sequence_id);
+        const source_token_count = source_state.block_table.tokenCount(self.storage.config.page_size_tokens);
+        const destination_token_count = destination_state.block_table.tokenCount(self.storage.config.page_size_tokens);
+        if (source_token_count != destination_token_count or tail_token_count > source_token_count) return error.InvalidKvShape;
+        const aligned_prefix_tokens = source_token_count - tail_token_count;
+        if (aligned_prefix_tokens % page_size != 0) return error.InvalidKvShape;
+
+        const source_blocks = source_state.block_table.blocks.items;
+        const destination_blocks = destination_state.block_table.blocks.items;
+        const expected_blocks = std.math.divCeil(usize, source_token_count, page_size) catch return error.InvalidKvShape;
+        if (source_blocks.len != expected_blocks or destination_blocks.len != expected_blocks) return error.InvalidKvShape;
+        const tail_block_index = expected_blocks - 1;
+        if (!std.mem.eql(block.KvBlockId, source_blocks[0..tail_block_index], destination_blocks[0..tail_block_index])) {
+            return error.InvalidPagedKvState;
+        }
+        if (source_blocks[tail_block_index] == destination_blocks[tail_block_index]) return error.InvalidPagedKvState;
+
+        try hook.cloneSequenceTail(.{
+            .source_sequence_id = source_sequence_id,
+            .destination_sequence_id = destination_sequence_id,
+            .total_token_count = source_token_count,
+            .tail_token_count = tail_token_count,
+            .num_layers_packed = self.storage.config.num_layers_packed,
+            .num_kv_heads = self.storage.config.num_kv_heads,
+            .head_dim = self.storage.config.head_dim,
+            .page_size_tokens = self.storage.config.page_size_tokens,
+            .source_logical_blocks = source_blocks,
+            .destination_logical_blocks = destination_blocks,
+        });
+    }
+
     pub fn poolId(self: *const KvStorageRuntime) block.KvPoolId {
         return self.storage.pool_id;
     }
@@ -550,6 +625,17 @@ pub const KvStorageRuntime = struct {
         if (idx >= self.sequences.items.len) return null;
         if (!self.sequences.items[idx].active) return null;
         return self.sequences.items[idx].block_table.tokenCount(self.storage.config.page_size_tokens);
+    }
+
+    /// Returns the number of device-storage sequence lifetimes that still own
+    /// KV references. A drained checkpoint boundary is portable only when this
+    /// and the logical manager both report zero.
+    pub fn activeSequenceCount(self: *const KvStorageRuntime) usize {
+        var count: usize = 0;
+        for (self.sequences.items) |sequence| {
+            if (sequence.active) count += 1;
+        }
+        return count;
     }
 
     pub fn retainSequencePrefixBlocks(self: *KvStorageRuntime, sequence_id: SequenceId, token_count: usize, out: *std.ArrayListUnmanaged(block.KvBlockId)) !void {
@@ -1038,9 +1124,12 @@ test "storage runtime reuses released sequence slots" {
 
     const first = try runtime.attachSequence(runtime.poolId());
     try runtime.appendTokens(first, 2);
+    try std.testing.expectEqual(@as(usize, 1), runtime.activeSequenceCount());
     try runtime.releaseSequence(first);
+    try std.testing.expectEqual(@as(usize, 0), runtime.activeSequenceCount());
 
     const second = try runtime.attachSequence(runtime.poolId());
+    try std.testing.expectEqual(@as(usize, 1), runtime.activeSequenceCount());
     try std.testing.expectEqual(first, second);
     try std.testing.expectEqual(@as(usize, 1), runtime.sequences.items.len);
     try std.testing.expectEqual(@as(?usize, 0), runtime.tokenCount(second));

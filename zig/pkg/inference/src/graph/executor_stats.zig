@@ -60,6 +60,8 @@ var aggregate_graph_output_owned_copies: AtomicU64 = .init(0);
 var aggregate_metal_frame_chunk_boundaries: AtomicU64 = .init(0);
 var aggregate_metal_frame_chunk_promoted_values: AtomicU64 = .init(0);
 var aggregate_metal_frame_chunk_swept_values: AtomicU64 = .init(0);
+var aggregate_metal_final_frame_swept_values: AtomicU64 = .init(0);
+var aggregate_metal_final_frame_swept_bytes: AtomicU64 = .init(0);
 var aggregate_graph_plan_slots_reserved: AtomicU64 = .init(0);
 var aggregate_graph_plan_bytes_reserved: AtomicU64 = .init(0);
 
@@ -98,6 +100,8 @@ pub fn record(stats: ExecutionStats) void {
     _ = aggregate_metal_frame_chunk_boundaries.fetchAdd(stats.metal_frame_chunk_boundaries, .monotonic);
     _ = aggregate_metal_frame_chunk_promoted_values.fetchAdd(stats.metal_frame_chunk_promoted_values, .monotonic);
     _ = aggregate_metal_frame_chunk_swept_values.fetchAdd(stats.metal_frame_chunk_swept_values, .monotonic);
+    _ = aggregate_metal_final_frame_swept_values.fetchAdd(stats.metal_final_frame_swept_values, .monotonic);
+    _ = aggregate_metal_final_frame_swept_bytes.fetchAdd(stats.metal_final_frame_swept_bytes, .monotonic);
     _ = aggregate_graph_plan_slots_reserved.fetchAdd(stats.graph_plan_slots_reserved, .monotonic);
     _ = aggregate_graph_plan_bytes_reserved.fetchAdd(stats.graph_plan_bytes_reserved, .monotonic);
 }
@@ -138,6 +142,8 @@ pub fn snapshot() ExecutionStats {
         .metal_frame_chunk_boundaries = aggregate_metal_frame_chunk_boundaries.load(.monotonic),
         .metal_frame_chunk_promoted_values = aggregate_metal_frame_chunk_promoted_values.load(.monotonic),
         .metal_frame_chunk_swept_values = aggregate_metal_frame_chunk_swept_values.load(.monotonic),
+        .metal_final_frame_swept_values = aggregate_metal_final_frame_swept_values.load(.monotonic),
+        .metal_final_frame_swept_bytes = aggregate_metal_final_frame_swept_bytes.load(.monotonic),
         .graph_plan_slots_reserved = aggregate_graph_plan_slots_reserved.load(.monotonic),
         .graph_plan_bytes_reserved = aggregate_graph_plan_bytes_reserved.load(.monotonic),
     };
@@ -189,6 +195,8 @@ pub fn reset() void {
     aggregate_metal_frame_chunk_boundaries.store(0, .monotonic);
     aggregate_metal_frame_chunk_promoted_values.store(0, .monotonic);
     aggregate_metal_frame_chunk_swept_values.store(0, .monotonic);
+    aggregate_metal_final_frame_swept_values.store(0, .monotonic);
+    aggregate_metal_final_frame_swept_bytes.store(0, .monotonic);
     aggregate_graph_plan_slots_reserved.store(0, .monotonic);
     aggregate_graph_plan_bytes_reserved.store(0, .monotonic);
 }
@@ -239,11 +247,13 @@ pub fn print(stats: ExecutionStats) void {
         },
     );
     std.debug.print(
-        " metal_frame_chunk_boundaries={d} metal_frame_chunk_promoted_values={d} metal_frame_chunk_swept_values={d} metal_chunk_local_output_peak_bytes={d} metal_chunk_local_output_live_bytes={d} metal_chunk_local_output_allocations={d} metal_chunk_local_output_reuse_hits={d} metal_chunk_local_output_consumed_hints={d} metal_chunk_local_output_unconsumed_hints={d} metal_chunk_local_output_spill_bytes={d} metal_chunk_local_output_alias_conflicts={d} metal_chunk_local_output_resets={d} metal_chunk_local_output_reset_freed_bytes={d} metal_chunk_local_output_discard_freed_bytes={d} metal_chunk_local_output_reset_live_carry_values={d}",
+        " metal_frame_chunk_boundaries={d} metal_frame_chunk_promoted_values={d} metal_frame_chunk_swept_values={d} metal_final_frame_swept_values={d} metal_final_frame_swept_bytes={d} metal_chunk_local_output_peak_bytes={d} metal_chunk_local_output_live_bytes={d} metal_chunk_local_output_allocations={d} metal_chunk_local_output_reuse_hits={d} metal_chunk_local_output_consumed_hints={d} metal_chunk_local_output_unconsumed_hints={d} metal_chunk_local_output_spill_bytes={d} metal_chunk_local_output_alias_conflicts={d} metal_chunk_local_output_resets={d} metal_chunk_local_output_reset_freed_bytes={d} metal_chunk_local_output_discard_freed_bytes={d} metal_chunk_local_output_reset_live_carry_values={d}",
         .{
             stats.metal_frame_chunk_boundaries,
             stats.metal_frame_chunk_promoted_values,
             stats.metal_frame_chunk_swept_values,
+            stats.metal_final_frame_swept_values,
+            stats.metal_final_frame_swept_bytes,
             stats.metal_chunk_local_output_peak_bytes,
             stats.metal_chunk_local_output_live_bytes,
             stats.metal_chunk_local_output_allocations,

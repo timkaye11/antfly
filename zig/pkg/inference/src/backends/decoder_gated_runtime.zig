@@ -969,6 +969,11 @@ fn layerHasOwnKvWeights(gpt_config: gpt_mod.Config, layer: usize) bool {
     return !gpt_config.layerSharesKv(layer);
 }
 
+fn configuredLayerSlidingWindow(gpt_config: gpt_mod.Config, layer: usize, disabled: bool) usize {
+    if (disabled or !gpt_config.layerUsesSlidingAttention(layer)) return 0;
+    return gpt_config.sliding_window;
+}
+
 pub fn fillDenseQwen3LayerSpecs(
     gpt_config: gpt_mod.Config,
     configured_layer_count: usize,
@@ -2143,7 +2148,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
             decode_context.query_sequence_len,
             gpt_config.hidden_size,
         );
-    errdefer if (reserved_hidden) |*carrier| carrier.deinit(cb, false);
+    defer if (reserved_hidden) |*carrier| carrier.deinit(cb, false);
 
     var hidden = if (reserved_hidden) |*carrier| carrier.active() else hidden_input;
     var owns_hidden = false;
@@ -2154,6 +2159,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
         compare_hidden = try cloneTensorForCompare(cb, allocator, hidden_input);
     }
 
+    const sliding_attention_disabled = getenvBool("TERMITE_DISABLE_SLIDING_ATTENTION");
     const layer_count: usize = gpt_config.num_hidden_layers;
     for (0..layer_count) |layer| {
         if (phase == .prefill) timing_stats.prefill_layers += 1;
@@ -2235,6 +2241,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
             var attention = gpt_arch.attentionContextFromDecode(decode_context);
             attention.layer_index = kv_layer_index;
             attention.skip_kv_write = shares_kv;
+            attention.sliding_window = configuredLayerSlidingWindow(gpt_config, layer, sliding_attention_disabled);
             const rope_dim: usize = gpt_config.layerRopeActiveDim(layer);
             const rope_theta = gpt_config.layerRopeEffectiveTheta(layer);
 
@@ -2754,6 +2761,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
             var attention_seed = gpt_arch.attentionContextFromDecode(decode_context);
             attention_seed.layer_index = kv_layer_index;
             attention_seed.skip_kv_write = shares_kv;
+            attention_seed.sliding_window = configuredLayerSlidingWindow(gpt_config, layer, sliding_attention_disabled);
             const seed_k = try prepareKeyForPagedPrefillSeed(
                 cb,
                 gpt_config,
@@ -2845,6 +2853,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
             var attention = gpt_arch.attentionContextFromDecode(decode_context);
             attention.layer_index = kv_layer_index;
             attention.skip_kv_write = true;
+            attention.sliding_window = configuredLayerSlidingWindow(gpt_config, layer, sliding_attention_disabled);
 
             const q_block = blk: {
                 if (gpt_config.global_head_dim != 0 and gpt_config.position_encoding == .rope) {
@@ -3040,6 +3049,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
             var attention = gpt_arch.attentionContextFromDecode(decode_context);
             attention.layer_index = kv_layer_index;
             attention.skip_kv_write = shares_kv;
+            attention.sliding_window = configuredLayerSlidingWindow(gpt_config, layer, sliding_attention_disabled);
             const block_started_at = monotonicNowNs();
             if (try cb.runGatedDecoderBlock(&.{
                 .q = q_for_attn,
@@ -3178,6 +3188,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
             var attention = gpt_arch.attentionContextFromDecode(decode_context);
             attention.layer_index = kv_layer_index;
             attention.skip_kv_write = shares_kv;
+            attention.sliding_window = configuredLayerSlidingWindow(gpt_config, layer, sliding_attention_disabled);
             const q_block = blk: {
                 if (gpt_config.global_head_dim != 0 and gpt_config.position_encoding == .rope) {
                     const scale: f32 = @sqrt(@as(f32, @floatFromInt(head_dim)));
@@ -4668,7 +4679,9 @@ fn forwardFinalHiddenTensorGemmaDirect(
     }
 
     if (reserved_hidden) |*carrier| {
-        carrier.deinit(cb, true);
+        // Some fused paths return a new tensor instead of the carrier's
+        // active slot. Retain a carrier slot only when it is the result.
+        carrier.deinit(cb, hidden == carrier.active());
         reserved_hidden = null;
     }
     return_decoder_frame = decoder_frame_active and phase == .prefill and decode_context.query_sequence_len > 1;
@@ -4719,7 +4732,7 @@ fn forwardFinalHiddenTensorDirect(
         )
     else
         null;
-    errdefer if (reserved_hidden) |*carrier| carrier.deinit(cb, false);
+    defer if (reserved_hidden) |*carrier| carrier.deinit(cb, false);
 
     var hidden = if (reserved_hidden) |*carrier| carrier.active() else hidden_input;
     var owns_hidden = false;
@@ -4782,7 +4795,9 @@ fn forwardFinalHiddenTensorDirect(
     }
 
     if (reserved_hidden) |*carrier| {
-        carrier.deinit(cb, true);
+        // Some fused paths return a new tensor instead of the carrier's
+        // active slot. Retain a carrier slot only when it is the result.
+        carrier.deinit(cb, hidden == carrier.active());
         reserved_hidden = null;
     }
     return .{
@@ -4813,6 +4828,12 @@ fn forwardFinalHiddenLastRowDirect(
         phase,
         ple_vectors,
     )) orelse return null;
+    // The direct implementation borrows its input; the canonical fallback
+    // consumes it. Complete that ownership transfer only on direct success,
+    // after any returned frame drains, so callers have one consistent contract.
+    defer if (hidden_result.hidden != hidden_input) cb.free(hidden_input);
+    var frame_active = hidden_result.decoder_frame_active;
+    defer finishDecoderRuntimeFrame(cb, &frame_active);
     errdefer cb.free(hidden_result.hidden);
     if (hidden_result.total_rows == 1) return hidden_result.hidden;
     const last_hidden = try cb.sliceRows2D(allocator, hidden_result.hidden, hidden_result.total_rows - 1, 1, gpt_config.hidden_size);
@@ -6174,6 +6195,9 @@ pub fn forwardPrefillLastPreparedTail(
         cb.free(hidden);
         return null;
     }
+    defer if (direct_hidden_result) |result| {
+        if (result.hidden != hidden) cb.free(hidden);
+    };
     var decoder_frame_active = if (direct_hidden_result) |direct_hidden|
         direct_hidden.decoder_frame_active
     else
@@ -6199,9 +6223,6 @@ pub fn forwardPrefillLastPreparedTail(
     };
     finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.prefill_block_nanos += finished_at - started_at;
-    // The embedded rows were borrowed by the block stack (the direct paths
-    // copy them into their own hidden buffers); release them here.
-    if (final_hidden != hidden) cb.free(hidden);
     var owns_final_hidden = true;
     errdefer if (owns_final_hidden) cb.free(final_hidden);
     if (direct_hidden_result != null and compare_hidden_input != null) {
@@ -6426,9 +6447,7 @@ fn forwardFinalHiddenRowsFromHidden(
         return null;
     }
     const hidden_result = direct_hidden_result.?;
-    // The direct paths copy the input rows into their own hidden buffers, so
-    // an owned input is done once they return.
-    if (owns_hidden and hidden_result.hidden != hidden) cb.free(hidden);
+    defer if (owns_hidden and hidden_result.hidden != hidden) cb.free(hidden);
     var decoder_frame_active = hidden_result.decoder_frame_active;
     defer finishDecoderRuntimeFrame(cb, &decoder_frame_active);
     finished_at = monotonicNowNs();
@@ -6949,6 +6968,20 @@ test "direct gemma runtime allows gemma4-style global head configs without share
     shared_kv.num_kv_shared_layers = 2;
     try std.testing.expect(supportsDirectGemmaRuntime(shared_kv, shared_kv.num_hidden_layers, &decode_context));
     try std.testing.expect(supportsDirectGemmaRuntime(shared_kv, shared_kv.num_hidden_layers, &prefill_context));
+}
+
+test "direct gemma runtime preserves per-layer sliding attention policy" {
+    const config: gpt_mod.Config = .{
+        .family = .gemma,
+        .num_hidden_layers = 6,
+        .sliding_window = 512,
+        .sliding_window_pattern = 6,
+    };
+
+    try std.testing.expectEqual(@as(usize, 512), configuredLayerSlidingWindow(config, 0, false));
+    try std.testing.expectEqual(@as(usize, 512), configuredLayerSlidingWindow(config, 4, false));
+    try std.testing.expectEqual(@as(usize, 0), configuredLayerSlidingWindow(config, 5, false));
+    try std.testing.expectEqual(@as(usize, 0), configuredLayerSlidingWindow(config, 0, true));
 }
 
 test "gemma4 shared kv layers do not own decode runtime kv weights" {

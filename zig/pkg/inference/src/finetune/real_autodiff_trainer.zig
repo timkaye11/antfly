@@ -55,6 +55,7 @@ const ops_mod = @import("../ops/ops.zig");
 const CT = ops_mod.CT;
 const ComputeBackend = ops_mod.ComputeBackend;
 const training = @import("../graph/training.zig");
+const metal_partition_executor = @import("../graph/metal_partition_executor.zig");
 
 const coord_mod = @import("training_memory_coordinator.zig");
 const TrainingMemoryCoordinator = coord_mod.TrainingMemoryCoordinator;
@@ -96,6 +97,27 @@ pub const BuildLossFn = *const fn (
     targets: NodeId,
 ) anyerror!NodeId;
 
+/// Optional whole-objective builder for coupled objectives whose execution
+/// order matters. Unlike the ordinary forward/loss callback pair, this hook
+/// receives every standard placeholder at once and may interleave multiple
+/// forward branches with their reductions. DPO uses it to reduce the chosen
+/// branch before constructing the rejected branch while retaining one scalar
+/// autodiff objective and one optimizer boundary.
+pub const ObjectiveGraph = struct {
+    forward_output: NodeId,
+    loss: NodeId,
+};
+
+pub const BuildObjectiveFn = *const fn (
+    ctx: *anyopaque,
+    bld: *Builder,
+    input_ids: NodeId,
+    attention_mask: NodeId,
+    targets: NodeId,
+    batch: u32,
+    seq_len: u32,
+) anyerror!ObjectiveGraph;
+
 // ── Distributed gradient reduction hook ─────────────────────────────────────
 
 /// A single LoRA parameter's gradient block, handed to the distributed
@@ -132,6 +154,17 @@ pub const ReduceGradsFn = *const fn (
 /// compiled Metal path because it avoids materializing full accumulated
 /// gradients on the host for distributed/custom reductions.
 pub const ReduceDeviceGradsFn = *const fn (
+    ctx: *anyopaque,
+    cb: *const ComputeBackend,
+    grads: []const DeviceGradBlock,
+) anyerror!void;
+
+/// Read-only observer for the raw device gradients consumed by the direct
+/// single-microbatch optimizer path. Unlike a reduction hook, installing an
+/// observer does not select the accumulation path or change optimizer input.
+/// The callback may synchronize or download tensors for diagnostics, but it
+/// must not mutate the supplied device storage.
+pub const ObserveDirectDeviceGradsFn = *const fn (
     ctx: *anyopaque,
     cb: *const ComputeBackend,
     grads: []const DeviceGradBlock,
@@ -185,6 +218,12 @@ pub const TrainerConfig = struct {
     reduce_device_grads: ?ReduceDeviceGradsFn = null,
     /// Opaque context pointer forwarded to `reduce_device_grads`.
     reduce_device_grads_ctx: ?*anyopaque = null,
+    /// Optional read-only observer for the direct device optimizer input.
+    /// It is called immediately before norm/clipping and AdamW, and is only
+    /// valid when `grad_accum_steps == 1` and no reduction hook is installed.
+    observe_direct_device_grads: ?ObserveDirectDeviceGradsFn = null,
+    /// Opaque context pointer forwarded to `observe_direct_device_grads`.
+    observe_direct_device_grads_ctx: ?*anyopaque = null,
     /// Execution engine for the gradient graph. The interpreter preserves
     /// historical behavior. `compiled_device` caches the autodiff graph and
     /// keeps trainable optimizer state on any backend exposing device-training
@@ -193,6 +232,9 @@ pub const TrainerConfig = struct {
     /// When true, fail instead of silently falling back to interpreter if the
     /// requested compiled engine cannot be prepared.
     compiled_required: bool = false,
+    /// Require a fully device-resident Metal graph step. This is intentionally
+    /// opt-in so existing trainers retain their current fallback behavior.
+    strict_metal_execution: bool = false,
     /// Require a fully device-resident CUDA graph step. Runtime inputs may be
     /// uploaded only by declared trainer binders, graph execution may read
     /// back only the scalar loss, and gradients plus optimizer state must
@@ -213,6 +255,10 @@ pub const TrainerConfig = struct {
     /// inactive graph while another shape is built. Zero disables the guard.
     /// Callers should pass their conservative active-step peak estimate.
     graph_cache_build_reserve_bytes: u64 = 0,
+    /// Keep compiler-planned Metal intermediates in executor-owned allocation
+    /// slots across repeated steps. Intended for fixed-shape compiled training
+    /// graphs; false preserves the historical allocation policy.
+    metal_slot_bound_outputs: bool = false,
 };
 
 pub const TrainingExecutionEngine = enum {
@@ -277,6 +323,10 @@ pub const TrainerInput = struct {
     ctx: *anyopaque,
     build_forward: BuildForwardFn,
     build_loss: BuildLossFn,
+    /// When present, bypasses build_forward/build_loss and constructs the
+    /// complete scalar objective directly. The legacy callbacks remain
+    /// required so existing call sites and graph signatures stay explicit.
+    build_objective: ?BuildObjectiveFn = null,
     /// Actual [batch, seq] input IDs for this step.
     input_ids: []const i64,
     /// Actual [batch, seq] attention mask for this step.
@@ -323,6 +373,29 @@ pub const FlushResult = struct {
     micro_batches: u32,
 };
 
+/// Dataset/shuffle progress that must travel with optimizer state for an
+/// exact resume. The trainer does not choose a dataset ordering policy; the
+/// caller advances these fields after a micro-batch is committed, and the
+/// checkpoint keeps the values atomically paired with weights and moments.
+pub const TrainingProgress = struct {
+    epoch_index: u64 = 0,
+    next_example_index: u64 = 0,
+    examples_seen: u64 = 0,
+    order_seed: u64 = 0,
+    order_cursor: u64 = 0,
+    /// Opaque state for the caller's deterministic shuffle/sampling PRNG.
+    rng_state: [4]u64 = .{0} ** 4,
+};
+
+pub const RestoredTrainingCheckpoint = struct {
+    micro_batch_steps: u64,
+    optimizer_steps: u64,
+    accumulation_micro_batches: u32,
+    configured_accumulation_steps: u32,
+    stochastic_steps: u64,
+    progress: TrainingProgress,
+};
+
 pub const StepProfile = struct {
     graph_build_ns: u64 = 0,
     runtime_input_ns: u64 = 0,
@@ -344,6 +417,8 @@ pub const StepProfile = struct {
     /// but the step fell back to the regular compiled path.
     graph_executor_fallback_reason: ?[]const u8 = null,
     graph_executor_partitions: u64 = 0,
+    graph_executor_runtime_input_transfers: u64 = 0,
+    graph_executor_device_resident_transfers: u64 = 0,
     graph_executor_native_partitions: u64 = 0,
     graph_executor_unsupported_ops: u64 = 0,
     graph_executor_command_dispatches: u64 = 0,
@@ -362,6 +437,8 @@ pub const StepProfile = struct {
     graph_executor_metal_frame_chunk_boundaries: u64 = 0,
     graph_executor_metal_frame_chunk_promoted_values: u64 = 0,
     graph_executor_metal_frame_chunk_swept_values: u64 = 0,
+    graph_executor_metal_final_frame_swept_values: u64 = 0,
+    graph_executor_metal_final_frame_swept_bytes: u64 = 0,
     graph_executor_metal_chunk_local_output_peak_bytes: u64 = 0,
     graph_executor_metal_chunk_local_output_live_bytes: u64 = 0,
     graph_executor_metal_chunk_local_output_allocations: u64 = 0,
@@ -469,6 +546,8 @@ pub const StepProfile = struct {
     metal_runtime_reuse_pool_peak_slots: u64 = 0,
     metal_runtime_reuse_alloc_delta: u64 = 0,
     metal_runtime_reuse_hit_delta: u64 = 0,
+    metal_gemma4_bf16_gate_up_fused_calls: u64 = 0,
+    metal_gemma4_bf16_gate_up_backward_input_sum_fused_calls: u64 = 0,
     metal_last_frame_compute_encoders: u64 = 0,
     metal_last_frame_blit_encoders: u64 = 0,
     metal_last_frame_planned_scopes: u64 = 0,
@@ -508,6 +587,21 @@ pub const StepProfile = struct {
     cuda_exact_gelu_backward_calls: u64 = 0,
     cuda_training_input_uploads: u64 = 0,
     cuda_training_input_upload_bytes: u64 = 0,
+    training_runtime_h2d_bytes: u64 = 0,
+    training_runtime_d2h_bytes: u64 = 0,
+    training_runtime_input_uploads: u64 = 0,
+    training_runtime_input_upload_bytes: u64 = 0,
+    metal_linear_cross_entropy_forward_calls: u64 = 0,
+    metal_linear_cross_entropy_backward_calls: u64 = 0,
+    metal_linear_cce_forward_calls: u64 = 0,
+    metal_linear_cce_backward_calls: u64 = 0,
+    metal_linear_cce_forward_state_hits: u64 = 0,
+    metal_linear_cce_forward_state_misses: u64 = 0,
+    metal_linear_cce_peak_scratch_bytes: u64 = 0,
+    /// Runtime-input uploads performed while constructing this step's input
+    /// map. `declared` counts only uploads owned by the trainer's typed input
+    /// binders; a larger observed count is an undeclared binder/host staging
+    /// path and is rejected by strict Metal execution.
     runtime_input_uploads: u64 = 0,
     runtime_input_upload_bytes: u64 = 0,
     runtime_input_h2d_bytes: u64 = 0,
@@ -523,8 +617,10 @@ pub const StepProfile = struct {
     graph_execution_input_upload_bytes: u64 = 0,
     graph_execution_h2d_bytes: u64 = 0,
     graph_execution_d2h_bytes: u64 = 0,
-    training_runtime_h2d_bytes: u64 = 0,
-    training_runtime_d2h_bytes: u64 = 0,
+    /// Host-materialized gradients observed before strict-device validation.
+    /// Strict Metal steps require this to remain zero; retaining the count in
+    /// the immutable step profile lets benchmark evidence prove that property
+    /// without reaching into the already-released gradient maps.
     host_gradient_tensors: u64 = 0,
 };
 
@@ -608,6 +704,67 @@ const ExecutionMode = enum {
     eval,
 };
 
+pub const StrictMetalStepMode = enum { train, eval };
+
+pub fn validateStrictMetalStepEvidence(
+    profile: StepProfile,
+    host_gradient_count: usize,
+    device_gradient_count: usize,
+    expected_gradient_count: usize,
+    mode: StrictMetalStepMode,
+) !void {
+    if (profile.graph_executor_fallback_reason != null) return error.StrictMetalGraphExecutorFallback;
+    if (profile.graph_executor_partitions == 0) return error.StrictMetalGraphExecutorDidNotRun;
+    if (profile.graph_executor_command_dispatches == 0) return error.StrictMetalGraphExecutorDidNotDispatch;
+    if (profile.graph_executor_runtime_input_transfers != 0 or
+        profile.graph_executor_device_resident_transfers != 0)
+    {
+        return error.StrictMetalRuntimeInputTransfer;
+    }
+    if (profile.graph_executor_metal_gather_input_promotions != 0 or
+        profile.graph_executor_metal_gather_output_promotions != 0 or
+        profile.graph_executor_metal_reduce_input_promotions != 0 or
+        profile.graph_executor_metal_resident_input_cache_misses != 0 or
+        profile.graph_executor_metal_resident_input_cache_unique_promotions != 0)
+    {
+        return error.StrictMetalRuntimePromotion;
+    }
+    if (profile.runtime_input_uploads != profile.declared_runtime_input_uploads or
+        profile.runtime_input_upload_bytes != profile.declared_runtime_input_upload_bytes or
+        profile.runtime_input_h2d_bytes != profile.declared_runtime_input_h2d_bytes or
+        profile.runtime_input_d2h_bytes != 0)
+    {
+        return error.StrictMetalUndeclaredRuntimeInputUpload;
+    }
+    if (profile.graph_execution_input_uploads != 0 or
+        profile.graph_execution_input_upload_bytes != 0 or
+        profile.graph_execution_h2d_bytes != 0)
+    {
+        return error.StrictMetalGraphExecutionUpload;
+    }
+    // Compiled-session construction/preparation is measured separately from
+    // graph execution. Strict Metal permits no transfer in either interval.
+    if (profile.compiled_session_setup_input_uploads != 0 or
+        profile.compiled_session_setup_input_upload_bytes != 0 or
+        profile.compiled_session_setup_h2d_bytes != 0)
+    {
+        return error.StrictMetalGraphExecutionUpload;
+    }
+    if (profile.graph_executor_native_partitions != 0) return error.StrictMetalNativePartition;
+    if (profile.graph_executor_unsupported_ops != 0) return error.StrictMetalUnsupportedOperation;
+    if (profile.graph_executor_interpreter_fallbacks != 0) return error.StrictMetalInterpreterFallback;
+    if (profile.graph_executor_runtime_region_fallbacks != 0 or
+        profile.graph_executor_host_output_runtime_region != 0)
+    {
+        return error.StrictMetalRuntimeRegion;
+    }
+    if (profile.graph_executor_true_host_outputs != 0) return error.StrictMetalHostOutput;
+    if (host_gradient_count != 0 or device_gradient_count != expected_gradient_count) {
+        return error.StrictMetalGradientNotDeviceResident;
+    }
+    if (mode == .train and profile.optimizer_backend != .metal) return error.StrictMetalOptimizerRequired;
+}
+
 pub const StrictCudaStepMode = enum { train, eval };
 
 pub fn validateStrictCudaStepEvidence(
@@ -668,6 +825,28 @@ pub const ConditionalOptimizerFamily = struct {
     window_present: bool = false,
 };
 
+/// Device-owned snapshot of one incomplete gradient-accumulation window.
+/// Preference training detaches the chosen branch, computes the rejected
+/// branch with unchanged weights, then combines both snapshots using the DPO
+/// coefficients before a single optimizer step. Only adapter-sized gradients
+/// are duplicated; transformer activations remain batch-1 and step-local.
+pub const DetachedDeviceGradients = struct {
+    allocator: std.mem.Allocator,
+    compute_backend: *const ComputeBackend,
+    tensors: []CT,
+    /// True when `tensors` are the trainer's former active accumulators rather
+    /// than deep copies. On a successful combine they return to the trainer as
+    /// the spare half of a persistent ping-pong pair.
+    ping_pong: bool = false,
+
+    pub fn deinit(self: *DetachedDeviceGradients) void {
+        for (self.tensors) |tensor| self.compute_backend.free(tensor);
+        if (self.tensors.len != 0) self.allocator.free(self.tensors);
+        self.tensors = &.{};
+        self.ping_pong = false;
+    }
+};
+
 pub const RealAutodiffTrainer = struct {
     allocator: std.mem.Allocator,
     compute_backend: *const ComputeBackend,
@@ -684,12 +863,16 @@ pub const RealAutodiffTrainer = struct {
     /// Number of micro-batches already accumulated into `grad_accum` in the
     /// current accumulation window.
     accum_count: u32 = 0,
+    training_progress: TrainingProgress = .{},
     device_optimizer_transfers: u64 = 0,
     device_trainable_bytes: usize = 0,
     runtime_input_cache: RuntimeInputCache = .{},
     /// Optional Hypura coordinator.
     coord: ?*TrainingMemoryCoordinator = null,
     compiled_session: ?training.CompiledTrainSession = null,
+    compiled_eval_session: ?training.CompiledTrainSession = null,
+    compiled_output_session: ?training.CompiledTrainSession = null,
+    compiled_output_source_node: ?NodeId = null,
     graph_signature: ?GraphSignature = null,
     graph_context_state: ?*anyopaque = null,
     inactive_graphs: std.ArrayListUnmanaged(CachedGraphState) = .empty,
@@ -699,9 +882,17 @@ pub const RealAutodiffTrainer = struct {
     graph_cache_active_reuses: u64 = 0,
     graph_cache_evictions: u64 = 0,
     graph_cache_peak_entries: usize = 0,
+    /// Set after the final trainable values have been canonicalized through a
+    /// host snapshot for held-out evaluation. Device optimizer slots and their
+    /// moments no longer exist after that transition, so allowing another
+    /// training step would silently restart Adam from zero state.
+    terminal_evaluation_only: bool = false,
+    /// Unlike graph-owned adapter metadata, this inventory survives graph
+    /// cache eviction and the one-way terminal-evaluation transition. Eager
+    /// runtimes such as incremental-KV GRPO can therefore resolve the exact
+    /// live A/B slots without retaining a compiled training graph.
+    runtime_lora_adapters: std.ArrayListUnmanaged(RuntimeLoraAdapterInfo) = .empty,
     training_execution_evidence: TrainingExecutionEvidence = .{},
-    /// Per-LoRA-parameter state. Indices match `graph_state.lora_adapter.adapters`:
-    /// `lora_params[i*2]` = A matrix, `lora_params[i*2+1]` = B matrix.
     /// Optimizer families whose parameters only receive gradients when the
     /// current accumulation window contained a matching task (PyTorch leaves
     /// `grad=None` for modules absent from the loss graph, so their Adam
@@ -709,6 +900,8 @@ pub const RealAutodiffTrainer = struct {
     /// Registered prefixes must outlive the trainer (string literals).
     conditional_optimizer_families: [max_conditional_optimizer_families]ConditionalOptimizerFamily = undefined,
     conditional_optimizer_family_count: usize = 0,
+    /// Per-LoRA-parameter state. Indices match `runtime_lora_adapters`:
+    /// `lora_params[i*2]` = A matrix, `lora_params[i*2+1]` = B matrix.
     lora_params: std.ArrayListUnmanaged(ParamSlot) = .empty,
     /// Per-regular-parameter state for non-LoRA trainables such as task heads.
     regular_params: std.ArrayListUnmanaged(ParamSlot) = .empty,
@@ -734,14 +927,41 @@ pub const RealAutodiffTrainer = struct {
         /// leaves behind the global optimizer step, and drives the device
         /// AdamW bias correction.
         adam_step_count: u32 = 0,
+        /// Device-resident parameter used by forward-only evaluation. This is
+        /// deliberately separate from `device`, so eval does not allocate
+        /// gradient accumulators or Adam moments.
+        eval_device_weight: ?CT = null,
         device: ?DeviceOptimizerSlot = null,
     };
 
     pub const DeviceOptimizerSlot = struct {
         weight: CT,
         grad_accum: CT,
+        /// Optional second accumulator used by preference training. Detaching
+        /// swaps buffers instead of copying adapter gradients device-to-device.
+        grad_spare: ?CT = null,
+        grad_spare_allocated: bool = false,
         m: CT,
         v: CT,
+    };
+
+    /// Borrowed device-resident LoRA weights for an eager forward that must
+    /// observe the exact live optimizer state. The trainer retains ownership
+    /// of both tensors; callers may use them only while the trainer is alive.
+    pub const ResidentLoraBinding = struct {
+        base_name: []const u8,
+        lora_a: CT,
+        lora_b: CT,
+        rank: usize,
+        in_dim: usize,
+        out_dim: usize,
+        scale: f32,
+    };
+
+    pub const RuntimeLoraAdapterInfo = struct {
+        /// Trainer-owned frozen projection name. Position `i` maps to
+        /// `lora_params[i*2]` and `lora_params[i*2+1]`.
+        base_name: []const u8,
     };
 
     pub const RuntimeInputCache = struct {
@@ -761,6 +981,7 @@ pub const RealAutodiffTrainer = struct {
         ctx: *anyopaque,
         build_forward: BuildForwardFn,
         build_loss: BuildLossFn,
+        build_objective: ?BuildObjectiveFn,
         capture_graph_context: ?CaptureGraphContextFn,
         restore_graph_context: ?RestoreGraphContextFn,
         deinit_graph_context: ?DeinitGraphContextFn,
@@ -774,6 +995,7 @@ pub const RealAutodiffTrainer = struct {
                 .ctx = input.ctx,
                 .build_forward = input.build_forward,
                 .build_loss = input.build_loss,
+                .build_objective = input.build_objective,
                 .capture_graph_context = input.capture_graph_context,
                 .restore_graph_context = input.restore_graph_context,
                 .deinit_graph_context = input.deinit_graph_context,
@@ -788,6 +1010,7 @@ pub const RealAutodiffTrainer = struct {
             return a.ctx == b.ctx and
                 a.build_forward == b.build_forward and
                 a.build_loss == b.build_loss and
+                a.build_objective == b.build_objective and
                 a.capture_graph_context == b.capture_graph_context and
                 a.restore_graph_context == b.restore_graph_context and
                 a.deinit_graph_context == b.deinit_graph_context and
@@ -802,11 +1025,16 @@ pub const RealAutodiffTrainer = struct {
         signature: GraphSignature,
         graph_state: GraphState,
         compiled_session: ?training.CompiledTrainSession,
+        compiled_eval_session: ?training.CompiledTrainSession,
+        compiled_output_session: ?training.CompiledTrainSession,
+        compiled_output_source_node: ?NodeId,
         graph_context_state: ?*anyopaque,
         last_used: u64,
 
         fn deinit(self: *CachedGraphState, trainer: *RealAutodiffTrainer) void {
             if (self.compiled_session) |*session| session.deinit();
+            if (self.compiled_eval_session) |*session| session.deinit();
+            if (self.compiled_output_session) |*session| session.deinit();
             if (self.signature.deinit_graph_context) |deinit_context| {
                 deinit_context(self.graph_context_state, trainer.allocator);
             }
@@ -847,6 +1075,13 @@ pub const RealAutodiffTrainer = struct {
         compute_backend: *const ComputeBackend,
         config: TrainerConfig,
     ) !RealAutodiffTrainer {
+        if (config.observe_direct_device_grads != null and
+            (@max(config.grad_accum_steps, 1) != 1 or
+                config.reduce_device_grads != null or
+                config.reduce_grads != null))
+        {
+            return error.InvalidDirectDeviceGradientObserverConfiguration;
+        }
         return .{
             .allocator = allocator,
             .compute_backend = compute_backend,
@@ -867,6 +1102,8 @@ pub const RealAutodiffTrainer = struct {
             self.allocator.free(slot.dims);
         }
         self.lora_params.deinit(self.allocator);
+        for (self.runtime_lora_adapters.items) |adapter| self.allocator.free(adapter.base_name);
+        self.runtime_lora_adapters.deinit(self.allocator);
         for (self.regular_params.items) |*slot| {
             self.deinitDeviceOptimizerSlot(slot);
             self.allocator.free(slot.name);
@@ -908,6 +1145,9 @@ pub const RealAutodiffTrainer = struct {
             try self.stashOrDropActiveGraph();
             self.graph_state = cached.graph_state;
             self.compiled_session = cached.compiled_session;
+            self.compiled_eval_session = cached.compiled_eval_session;
+            self.compiled_output_session = cached.compiled_output_session;
+            self.compiled_output_source_node = cached.compiled_output_source_node;
             self.runtime_input_cache = .{};
             self.graph_signature = cached.signature;
             self.graph_context_state = cached.graph_context_state;
@@ -992,11 +1232,17 @@ pub const RealAutodiffTrainer = struct {
             .signature = signature,
             .graph_state = self.graph_state.?,
             .compiled_session = self.compiled_session,
+            .compiled_eval_session = self.compiled_eval_session,
+            .compiled_output_session = self.compiled_output_session,
+            .compiled_output_source_node = self.compiled_output_source_node,
             .graph_context_state = self.graph_context_state,
             .last_used = self.graph_cache_clock,
         });
         self.graph_state = null;
         self.compiled_session = null;
+        self.compiled_eval_session = null;
+        self.compiled_output_session = null;
+        self.compiled_output_source_node = null;
         self.runtime_input_cache = .{};
         self.graph_context_state = null;
         self.graph_signature = null;
@@ -1024,6 +1270,146 @@ pub const RealAutodiffTrainer = struct {
         };
     }
 
+    /// Retire graph, compiled-session, and runtime-input caches at a durable
+    /// optimizer checkpoint without touching trainable weights, accumulated
+    /// gradients, Adam moments, or counters. A tensor checkpoint cannot carry
+    /// backend execution plans into a fresh process, so uninterrupted
+    /// continuation must cross the same cache-empty boundary for exact resume.
+    pub fn retireExecutionCachesAtCheckpointBoundary(self: *RealAutodiffTrainer) !void {
+        if (self.terminal_evaluation_only) return error.TrainerIsTerminalEvaluationOnly;
+        if (self.accum_count != 0) return error.CheckpointDuringGradientAccumulation;
+        if (self.compute_backend.kind() == .metal) {
+            try self.compute_backend.decoderRuntimeSubmitAndWaitFrame();
+            if (self.compute_backend.decoderRuntimeHasActiveFrame()) {
+                return error.CheckpointExecutionCacheSynchronizationFailed;
+            }
+        }
+
+        self.retireExecutionCaches();
+    }
+
+    fn retireExecutionCaches(self: *RealAutodiffTrainer) void {
+        const resident_entries = self.inactive_graphs.items.len + @intFromBool(self.graph_state != null);
+        self.deinitActiveGraph();
+        for (self.inactive_graphs.items) |*entry| entry.deinit(self);
+        self.inactive_graphs.clearRetainingCapacity();
+        self.graph_cache_evictions +%= resident_entries;
+    }
+
+    /// Make terminal held-out evaluation a function of the final host-visible
+    /// trainable values, not of the Metal allocation and optimizer residency
+    /// history that produced them. This is intentionally a one-way boundary:
+    /// after draining and copying weights to host, all compiled graphs and
+    /// device optimizer/eval slots are destroyed. Evaluation then lazily
+    /// uploads fresh, weight-only tensors. A subsequent training step is
+    /// rejected because the device Adam moments were deliberately retired.
+    pub fn prepareTerminalEvaluationFromHostSnapshot(self: *RealAutodiffTrainer) !void {
+        if (self.terminal_evaluation_only) return error.TrainerIsTerminalEvaluationOnly;
+        if (self.accum_count != 0) return error.PendingGradientAccumulation;
+        if (self.compute_backend.kind() == .metal) {
+            try self.compute_backend.decoderRuntimeSubmitAndWaitFrame();
+            if (self.compute_backend.decoderRuntimeHasActiveFrame()) {
+                return error.CanonicalEvaluationDeviceSynchronizationFailed;
+            }
+        }
+
+        try self.syncDeviceTrainablesToHost();
+
+        const resident_entries = self.inactive_graphs.items.len + @intFromBool(self.graph_state != null);
+        self.deinitActiveGraph();
+        for (self.inactive_graphs.items) |*entry| entry.deinit(self);
+        self.inactive_graphs.clearRetainingCapacity();
+        self.graph_cache_evictions +%= resident_entries;
+
+        for (self.lora_params.items) |*slot| self.deinitDeviceOptimizerSlot(slot);
+        for (self.regular_params.items) |*slot| self.deinitDeviceOptimizerSlot(slot);
+        self.terminal_evaluation_only = true;
+    }
+
+    /// Install an already-drained trainer's exact host trainables into a
+    /// separately initialized evaluator. The evaluator's bootstrap graph is
+    /// retired before the copy, so subsequent evaluation starts with a fresh
+    /// backend, fresh graph cache, and freshly uploaded weight-only tensors.
+    /// Inventories are compared positionally because both trainers must have
+    /// been built from the same strict LoRA configuration and model graph.
+    pub fn initializeTerminalEvaluationFromHostSnapshot(
+        self: *RealAutodiffTrainer,
+        source: *const RealAutodiffTrainer,
+    ) !void {
+        if (self == source) return error.TerminalEvaluationTrainerMustBeDistinct;
+        if (self.terminal_evaluation_only) return error.TrainerIsTerminalEvaluationOnly;
+        if (!source.terminal_evaluation_only) return error.SourceTrainerNotPreparedForTerminalEvaluation;
+        if (self.compute_backend.kind() != source.compute_backend.kind()) {
+            return error.TerminalEvaluationBackendMismatch;
+        }
+        if (self.step_count != 0 or self.optimizer_step_count != 0 or
+            self.optimizer_state.param_states.count() != 0)
+        {
+            return error.TerminalEvaluationTrainerMustBeFresh;
+        }
+        if (self.accum_count != 0) return error.PendingGradientAccumulation;
+        if (self.compute_backend.kind() == .metal) {
+            try self.compute_backend.decoderRuntimeSubmitAndWaitFrame();
+            if (self.compute_backend.decoderRuntimeHasActiveFrame()) {
+                return error.CanonicalEvaluationDeviceSynchronizationFailed;
+            }
+        }
+
+        try validateTerminalEvaluationSlots(self.lora_params.items, source.lora_params.items);
+        try validateTerminalEvaluationSlots(self.regular_params.items, source.regular_params.items);
+        try validateRuntimeLoraAdapterInventory(
+            self.runtime_lora_adapters.items,
+            source.runtime_lora_adapters.items,
+        );
+
+        const resident_entries = self.inactive_graphs.items.len + @intFromBool(self.graph_state != null);
+        self.deinitActiveGraph();
+        for (self.inactive_graphs.items) |*entry| entry.deinit(self);
+        self.inactive_graphs.clearRetainingCapacity();
+        self.graph_cache_evictions +%= resident_entries;
+
+        try self.copyTerminalEvaluationSlots(self.lora_params.items, source.lora_params.items);
+        try self.copyTerminalEvaluationSlots(self.regular_params.items, source.regular_params.items);
+        self.terminal_evaluation_only = true;
+    }
+
+    fn copyTerminalEvaluationSlots(
+        self: *RealAutodiffTrainer,
+        destination: []ParamSlot,
+        source: []const ParamSlot,
+    ) !void {
+        for (destination, source) |*dst, src| {
+            self.deinitDeviceOptimizerSlot(dst);
+            @memcpy(dst.weights, src.weights);
+            @memset(dst.grad_accum, 0.0);
+            dst.adam_step_count = src.adam_step_count;
+        }
+    }
+
+    fn validateTerminalEvaluationSlots(destination: []const ParamSlot, source: []const ParamSlot) !void {
+        if (destination.len != source.len) return error.TerminalEvaluationTrainableInventoryMismatch;
+        for (destination, source) |dst, src| {
+            if (!std.mem.eql(u8, dst.name, src.name) or
+                !std.mem.eql(i32, dst.dims, src.dims) or
+                dst.weights.len != src.weights.len)
+            {
+                return error.TerminalEvaluationTrainableInventoryMismatch;
+            }
+        }
+    }
+
+    fn validateRuntimeLoraAdapterInventory(
+        destination: []const RuntimeLoraAdapterInfo,
+        source: []const RuntimeLoraAdapterInfo,
+    ) !void {
+        if (destination.len != source.len) return error.TerminalEvaluationTrainableInventoryMismatch;
+        for (destination, source) |dst, src| {
+            if (!std.mem.eql(u8, dst.base_name, src.base_name)) {
+                return error.TerminalEvaluationTrainableInventoryMismatch;
+            }
+        }
+    }
+
     fn updateGraphCachePeak(self: *RealAutodiffTrainer) void {
         self.graph_cache_peak_entries = @max(
             self.graph_cache_peak_entries,
@@ -1034,6 +1420,11 @@ pub const RealAutodiffTrainer = struct {
     fn deinitActiveGraph(self: *RealAutodiffTrainer) void {
         if (self.compiled_session) |*session| session.deinit();
         self.compiled_session = null;
+        if (self.compiled_eval_session) |*session| session.deinit();
+        self.compiled_eval_session = null;
+        if (self.compiled_output_session) |*session| session.deinit();
+        self.compiled_output_session = null;
+        self.compiled_output_source_node = null;
         self.deinitRuntimeInputCache();
         if (self.graph_signature) |signature| {
             if (signature.deinit_graph_context) |deinit_context| {
@@ -1072,7 +1463,11 @@ pub const RealAutodiffTrainer = struct {
                 self.allocator,
                 &gs.graph,
                 gs.loss_node,
-                .{ .trainable_params = trainable, .checkpoint_config = self.config.checkpoint_config },
+                .{
+                    .trainable_params = trainable,
+                    .checkpoint_config = self.config.checkpoint_config,
+                    .metal_slot_bound_outputs = self.config.metal_slot_bound_outputs,
+                },
             );
             compiledDiag(
                 "compiled session build done compiled_nodes={} outputs={} compile_ms={d:.3} peak_rss={}",
@@ -1087,13 +1482,115 @@ pub const RealAutodiffTrainer = struct {
         return true;
     }
 
+    pub fn ensureCompiledEvalSessionBuilt(self: *RealAutodiffTrainer) !bool {
+        // `CompiledTrainSession` is also the reusable execution container for
+        // the pruned loss-only graph. It does not require a device compiler,
+        // so interpreter/native evaluation must use it too; falling back to
+        // `training.trainStep` would construct and retain an autodiff graph.
+        switch (self.config.execution_engine) {
+            .interpreter => {},
+            .compiled_device => if (!self.compute_backend.supportsDeviceTraining()) {
+                if (self.config.compiled_required) return error.DeviceTrainingUnavailable;
+            },
+            .compiled_metal => if (self.compute_backend.kind() != .metal or !self.compute_backend.supportsDeviceTraining()) {
+                if (self.config.compiled_required) return error.CompiledMetalRequiresMetalBackend;
+            },
+        }
+        if (self.compiled_eval_session == null) {
+            const initial_gs = &(self.graph_state orelse return error.GraphNotBuilt);
+            const match_training_forward = training.graphHasFusedGqaForwardAlternate(&initial_gs.graph);
+            if (match_training_forward and self.compiled_session == null) {
+                const trainable = try self.allocator.alloc([]const u8, self.lora_params.items.len + self.regular_params.items.len);
+                defer self.allocator.free(trainable);
+                var trainable_index: usize = 0;
+                for (self.lora_params.items) |slot| {
+                    trainable[trainable_index] = slot.name;
+                    trainable_index += 1;
+                }
+                for (self.regular_params.items) |slot| {
+                    trainable[trainable_index] = slot.name;
+                    trainable_index += 1;
+                }
+                _ = try self.ensureCompiledSessionBuilt(trainable);
+            }
+            const gs = &(self.graph_state orelse return error.GraphNotBuilt);
+            compiledDiag(
+                "compiled loss-only eval session build begin graph_nodes={} rss={}",
+                .{ gs.graph.nodeCount(), currentResidentBytes() },
+            );
+            self.compiled_eval_session = if (match_training_forward)
+                try training.CompiledTrainSession.initLossOnlyFromCompiled(
+                    self.allocator,
+                    &(self.compiled_session orelse return error.CompiledTrainingSessionUnavailable),
+                )
+            else
+                try training.CompiledTrainSession.initLossOnly(
+                    self.allocator,
+                    &gs.graph,
+                    gs.loss_node,
+                );
+            compiledDiag(
+                "compiled loss-only eval session build done compiled_nodes={} outputs={} compile_ms={d:.3} peak_rss={}",
+                .{
+                    self.compiled_eval_session.?.graph.nodeCount(),
+                    self.compiled_eval_session.?.graph.outputs.items.len,
+                    nsToMs(self.compiled_eval_session.?.build_profile.total_ns),
+                    self.compiled_eval_session.?.build_profile.peak_resident_bytes,
+                },
+            );
+        }
+        return true;
+    }
+
+    /// Build and cache a forward-only compiled session for one source-graph
+    /// output. GRPO sampling uses this for its sparse logits row so repeated
+    /// candidate forwards share the graph executor's cached plan instead of
+    /// rebuilding and draining an eager interpreter traversal every time.
+    pub fn ensureCompiledOutputSessionBuilt(
+        self: *RealAutodiffTrainer,
+        output_node: NodeId,
+    ) !bool {
+        const gs = &(self.graph_state orelse return error.GraphNotBuilt);
+        if (output_node == null_node or output_node >= gs.graph.nodeCount()) {
+            return error.InvalidCompiledOutputNode;
+        }
+        if (self.compiled_output_session != null and self.compiled_output_source_node == output_node) {
+            return true;
+        }
+        if (self.compiled_output_session) |*session| session.deinit();
+        self.compiled_output_session = null;
+        self.compiled_output_source_node = null;
+        self.compiled_output_session = try training.CompiledTrainSession.initForwardOutputOnly(
+            self.allocator,
+            &gs.graph,
+            output_node,
+        );
+        self.compiled_output_source_node = output_node;
+        return true;
+    }
+
     /// Run one training step.
     pub fn step(self: *RealAutodiffTrainer, input: TrainerInput) !StepResult {
+        if (self.terminal_evaluation_only) return error.TrainerIsTerminalEvaluationOnly;
         return self.runStep(input, .train);
     }
 
     pub fn evaluate(self: *RealAutodiffTrainer, input: TrainerInput) !StepResult {
         return self.runStep(input, .eval);
+    }
+
+    /// Close and wait for any backend-owned Metal frame at a benchmark
+    /// optimizer boundary. Normal training never calls this method; the
+    /// benchmark observer uses it to make the recorded wall interval end at a
+    /// defensible device-complete synchronization point.
+    pub fn synchronizeMetalForBenchmark(self: *RealAutodiffTrainer) !void {
+        if (self.compute_backend.kind() != .metal or !self.config.strict_metal_execution) {
+            return error.StrictMetalBackendRequired;
+        }
+        try self.compute_backend.decoderRuntimeSubmitAndWaitFrame();
+        if (self.compute_backend.decoderRuntimeHasActiveFrame()) {
+            return error.BenchmarkDeviceSynchronizationFailed;
+        }
     }
 
     pub fn optimizerSteps(self: *const RealAutodiffTrainer) u64 {
@@ -1102,6 +1599,243 @@ pub const RealAutodiffTrainer = struct {
 
     pub fn microBatchSteps(self: *const RealAutodiffTrainer) u64 {
         return self.step_count;
+    }
+
+    pub fn accumulatedMicroBatches(self: *const RealAutodiffTrainer) u32 {
+        return self.accum_count;
+    }
+
+    /// Detach the current device gradient window without touching weights or
+    /// optimizer moments. The active accumulators are zeroed for the next
+    /// branch and the logical accumulation count returns to zero.
+    pub fn detachAccumulatedDeviceGradients(self: *RealAutodiffTrainer) !DetachedDeviceGradients {
+        if (!self.deviceOptimizerRequested()) return error.DeviceOptimizerRequired;
+        if (self.compute_backend.kind() != .metal and self.compute_backend.kind() != .cuda) {
+            return error.DeviceOptimizerRequired;
+        }
+        if (self.accum_count == 0) return error.NoAccumulatedGradients;
+
+        const tensor_count = self.lora_params.items.len + self.regular_params.items.len;
+        if (platform.env.getenvBoolDefault("ANTFLY_GEMMA4_DPO_PING_PONG_GRADIENTS", false)) {
+            return self.detachAccumulatedDeviceGradientsPingPong(tensor_count);
+        }
+        const tensors = try self.allocator.alloc(CT, tensor_count);
+        var initialized: usize = 0;
+        // A Metal device-to-device copy made outside a runtime frame owns its
+        // command buffer and waits before returning.  Detaching a Gemma LoRA
+        // window used to pay that submit/wait once per trainable tensor, then
+        // pay another frame for clearing the source accumulators.  Put every
+        // blit and the ordered clears in one frame instead: command-buffer
+        // ordering guarantees each snapshot copy observes the old accumulator
+        // before that accumulator is zeroed for the rejected branch.
+        const coalesce_snapshot_frame = self.compute_backend.kind() == .metal and
+            platform.env.getenvBoolDefault("ANTFLY_GEMMA4_DPO_COALESCED_SNAPSHOT_FRAME", false);
+        var snapshot_frame_active = if (coalesce_snapshot_frame)
+            try self.compute_backend.decoderRuntimeBeginFrame()
+        else
+            false;
+        if (coalesce_snapshot_frame and !snapshot_frame_active) {
+            return error.DeviceGradientSnapshotFrameUnavailable;
+        }
+        errdefer if (snapshot_frame_active) self.compute_backend.decoderRuntimeCancelFrame() catch {};
+        errdefer {
+            for (tensors[0..initialized]) |tensor| self.compute_backend.free(tensor);
+            self.allocator.free(tensors);
+        }
+
+        for (self.lora_params.items) |slot| {
+            const device = slot.device orelse return error.DeviceOptimizerNotInitialized;
+            tensors[initialized] = (try self.compute_backend.copyTensorFromBackend(self.compute_backend, device.grad_accum)) orelse
+                return error.DeviceGradientSnapshotUnavailable;
+            initialized += 1;
+        }
+        for (self.regular_params.items) |slot| {
+            const device = slot.device orelse return error.DeviceOptimizerNotInitialized;
+            tensors[initialized] = (try self.compute_backend.copyTensorFromBackend(self.compute_backend, device.grad_accum)) orelse
+                return error.DeviceGradientSnapshotUnavailable;
+            initialized += 1;
+        }
+        // CUDA and the default Metal rollback lane preserve the prior
+        // synchronization before clearing in place. Coalesced Metal gets the
+        // same dependency from command ordering inside snapshot_frame_active.
+        if (!snapshot_frame_active) try self.compute_backend.trainingSynchronize();
+        if (self.compute_backend.kind() == .metal and !snapshot_frame_active) {
+            snapshot_frame_active = try self.compute_backend.decoderRuntimeBeginFrame();
+        }
+        for (self.lora_params.items) |*slot| try self.zeroDeviceGradAccum(slot);
+        for (self.regular_params.items) |*slot| try self.zeroDeviceGradAccum(slot);
+        if (snapshot_frame_active) {
+            try self.compute_backend.decoderRuntimeSubmitAndWaitFrame();
+            snapshot_frame_active = false;
+        }
+        self.accum_count = 0;
+        return .{
+            .allocator = self.allocator,
+            .compute_backend = self.compute_backend,
+            .tensors = tensors,
+        };
+    }
+
+    fn detachAccumulatedDeviceGradientsPingPong(
+        self: *RealAutodiffTrainer,
+        tensor_count: usize,
+    ) !DetachedDeviceGradients {
+        const tensors = try self.allocator.alloc(CT, tensor_count);
+        var initialized: usize = 0;
+        errdefer {
+            for (tensors[0..initialized]) |tensor| self.compute_backend.free(tensor);
+            self.allocator.free(tensors);
+        }
+
+        for (self.lora_params.items) |*slot| {
+            try self.swapDeviceGradientAccumulator(slot, tensors, &initialized);
+        }
+        for (self.regular_params.items) |*slot| {
+            try self.swapDeviceGradientAccumulator(slot, tensors, &initialized);
+        }
+        self.accum_count = 0;
+        return .{
+            .allocator = self.allocator,
+            .compute_backend = self.compute_backend,
+            .tensors = tensors,
+            .ping_pong = true,
+        };
+    }
+
+    fn swapDeviceGradientAccumulator(
+        self: *RealAutodiffTrainer,
+        slot: *ParamSlot,
+        detached_tensors: []CT,
+        initialized: *usize,
+    ) !void {
+        const device = if (slot.device) |*value| value else return error.DeviceOptimizerNotInitialized;
+        const replacement = if (device.grad_spare) |spare| blk: {
+            device.grad_spare = null;
+            break :blk spare;
+        } else blk: {
+            if (device.grad_spare_allocated) return error.DeviceGradientPingPongStateInvalid;
+            const spare = try self.compute_backend.trainingZeroF32(slot.weights.len, slot.dims);
+            device.grad_spare_allocated = true;
+            self.device_trainable_bytes += slot.weights.len * @sizeOf(f32);
+            break :blk spare;
+        };
+        detached_tensors[initialized.*] = device.grad_accum;
+        device.grad_accum = replacement;
+        initialized.* += 1;
+    }
+
+    /// Combine a detached branch with the currently accumulated branch. The
+    /// scales apply to the already accumulation-normalized buffers. On
+    /// success this marks a complete configured window; the caller must invoke
+    /// flushAccumulatedGradients() to clip and update exactly once.
+    pub fn combineDetachedDeviceGradients(
+        self: *RealAutodiffTrainer,
+        detached: *DetachedDeviceGradients,
+        detached_scale: f32,
+        current_scale: f32,
+    ) !void {
+        if (detached.compute_backend != self.compute_backend) return error.DeviceGradientSnapshotBackendMismatch;
+        if (!std.math.isFinite(detached_scale) or !std.math.isFinite(current_scale)) {
+            return error.NonFiniteLogprobGradient;
+        }
+        if (self.accum_count == 0) return error.NoAccumulatedGradients;
+        const configured_steps = @max(self.config.grad_accum_steps, 1);
+        if (configured_steps != 2 or self.accum_count != 1) return error.InvalidDetachedGradientWindow;
+        const tensor_count = self.lora_params.items.len + self.regular_params.items.len;
+        if (detached.tensors.len != tensor_count) return error.DeviceGradientSnapshotShapeMismatch;
+
+        var frame_active = if (self.compute_backend.kind() == .metal)
+            try self.compute_backend.decoderRuntimeBeginFrame()
+        else
+            false;
+        errdefer if (frame_active) self.compute_backend.decoderRuntimeCancelFrame() catch {};
+        var tensor_idx: usize = 0;
+        for (self.lora_params.items) |*slot| {
+            const device = if (slot.device) |*value| value else return error.DeviceOptimizerNotInitialized;
+            try self.compute_backend.trainingAccumulateF32(
+                device.grad_accum,
+                device.grad_accum,
+                slot.weights.len,
+                current_scale,
+                true,
+            );
+            try self.compute_backend.trainingAccumulateF32(
+                device.grad_accum,
+                detached.tensors[tensor_idx],
+                slot.weights.len,
+                detached_scale,
+                false,
+            );
+            tensor_idx += 1;
+        }
+        for (self.regular_params.items) |*slot| {
+            const device = if (slot.device) |*value| value else return error.DeviceOptimizerNotInitialized;
+            try self.compute_backend.trainingAccumulateF32(
+                device.grad_accum,
+                device.grad_accum,
+                slot.weights.len,
+                current_scale,
+                true,
+            );
+            try self.compute_backend.trainingAccumulateF32(
+                device.grad_accum,
+                detached.tensors[tensor_idx],
+                slot.weights.len,
+                detached_scale,
+                false,
+            );
+            tensor_idx += 1;
+        }
+        if (frame_active) {
+            try self.compute_backend.decoderRuntimeSubmitAndWaitFrame();
+            frame_active = false;
+        }
+        self.accum_count = configured_steps;
+        if (detached.ping_pong) {
+            for (self.lora_params.items) |slot| {
+                const device = slot.device orelse return error.DeviceOptimizerNotInitialized;
+                if (device.grad_spare != null or !device.grad_spare_allocated) return error.DeviceGradientPingPongStateInvalid;
+            }
+            for (self.regular_params.items) |slot| {
+                const device = slot.device orelse return error.DeviceOptimizerNotInitialized;
+                if (device.grad_spare != null or !device.grad_spare_allocated) return error.DeviceGradientPingPongStateInvalid;
+            }
+            tensor_idx = 0;
+            for (self.lora_params.items) |*slot| {
+                const device = &slot.device.?;
+                device.grad_spare = detached.tensors[tensor_idx];
+                tensor_idx += 1;
+            }
+            for (self.regular_params.items) |*slot| {
+                const device = &slot.device.?;
+                device.grad_spare = detached.tensors[tensor_idx];
+                tensor_idx += 1;
+            }
+            detached.allocator.free(detached.tensors);
+            detached.tensors = &.{};
+            detached.ping_pong = false;
+        } else {
+            detached.deinit();
+        }
+    }
+
+    /// Benchmark admission check used immediately before the cold optimizer
+    /// window. Graph construction and adapter loading are allowed, but no
+    /// compiled train/eval session or prior training step may exist.
+    pub fn benchmarkHasExecutedGraph(self: *const RealAutodiffTrainer) bool {
+        return self.compiled_session != null or
+            self.compiled_eval_session != null or
+            self.compiled_output_session != null or
+            self.step_count != 0 or
+            self.optimizer_step_count != 0;
+    }
+
+    pub fn setTrainingProgress(self: *RealAutodiffTrainer, progress: TrainingProgress) void {
+        self.training_progress = progress;
+    }
+
+    pub fn trainingProgress(self: *const RealAutodiffTrainer) TrainingProgress {
+        return self.training_progress;
     }
 
     pub fn trainingExecutionEvidence(self: *const RealAutodiffTrainer) TrainingExecutionEvidence {
@@ -1118,6 +1852,16 @@ pub const RealAutodiffTrainer = struct {
         metrics_prefix_sha256: ?*const [32]u8,
     ) !void {
         return self.saveTrainingStateWithExtensions(path, run_fingerprint, metrics_prefix_sha256, .{});
+    }
+
+    /// Save an incomplete accumulation window with dataset and RNG progress.
+    pub fn saveTrainingCheckpoint(
+        self: *RealAutodiffTrainer,
+        path: []const u8,
+        run_fingerprint: ?*const [32]u8,
+        metrics_prefix_sha256: ?*const [32]u8,
+    ) !void {
+        return self.saveTrainingCheckpointInternal(path, run_fingerprint, metrics_prefix_sha256, .{});
     }
 
     pub const CheckpointExtensions = struct {
@@ -1143,6 +1887,17 @@ pub const RealAutodiffTrainer = struct {
         if (extensions.accumulation_count) |count| {
             if (count != self.accum_count or count >= self.config.grad_accum_steps or extensions.tensors.len == 0) return error.InvalidTrainingStateCounters;
         } else if (self.accum_count != 0) return error.CheckpointDuringGradientAccumulation;
+        return self.saveTrainingCheckpointInternal(path, run_fingerprint, metrics_prefix_sha256, extensions);
+    }
+
+    fn saveTrainingCheckpointInternal(
+        self: *RealAutodiffTrainer,
+        path: []const u8,
+        run_fingerprint: ?*const [32]u8,
+        metrics_prefix_sha256: ?*const [32]u8,
+        extensions: CheckpointExtensions,
+    ) !void {
+        if (extensions.execution_control) |control| try control.check();
         for (extensions.tensors, 0..) |tensor, i| {
             if (!std.mem.startsWith(u8, tensor.name, "__extension.")) return error.InvalidTrainingStateExtension;
             for (extensions.tensors[0..i]) |previous| if (std.mem.eql(u8, previous.name, tensor.name)) return error.InvalidTrainingStateExtension;
@@ -1152,6 +1907,9 @@ pub const RealAutodiffTrainer = struct {
         }
         if (self.optimizer_step_count > self.step_count) return error.InvalidTrainingStateCounters;
         if (self.optimizer_step_count > std.math.maxInt(u32)) return error.CheckpointStepOverflow;
+        const accumulation_steps = @max(self.config.grad_accum_steps, 1);
+        if (self.accum_count >= accumulation_steps) return error.InvalidTrainingStateCounters;
+        try self.ensureHostGradientAccumulators();
 
         var tensors = std.ArrayListUnmanaged(safetensors_checkpoint.NamedTensor).empty;
         defer tensors.deinit(self.allocator);
@@ -1177,6 +1935,22 @@ pub const RealAutodiffTrainer = struct {
             .data = &counters,
             .shape = &.{counters.len},
         });
+        const checkpoint_state = encodeTrainingCheckpointState(.{
+            .micro_batch_steps = self.step_count,
+            .optimizer_steps = self.optimizer_step_count,
+            .accumulation_micro_batches = self.accum_count,
+            .configured_accumulation_steps = accumulation_steps,
+            .stochastic_steps = self.step_count,
+            .trainer_seed = self.config.seed,
+            .progress = self.training_progress,
+            .conditional_family_count = @intCast(self.conditional_optimizer_family_count),
+            .conditional_family_present_mask = self.conditionalOptimizerFamilyPresentMask(),
+        });
+        try tensors.append(self.allocator, .{
+            .name = training_checkpoint_state_tensor_name,
+            .data = &checkpoint_state,
+            .shape = &.{checkpoint_state.len},
+        });
         var fingerprint_values: [32]f32 = undefined;
         if (run_fingerprint) |fingerprint| {
             for (fingerprint, 0..) |byte, idx| fingerprint_values[idx] = @floatFromInt(byte);
@@ -1195,8 +1969,8 @@ pub const RealAutodiffTrainer = struct {
                 .shape = &.{metrics_fingerprint_values.len},
             });
         }
-        try self.appendTrainingStateSlots(&tensors, &names, &shapes, &owned_data, self.lora_params.items, extensions.use_synchronized_host_state);
-        try self.appendTrainingStateSlots(&tensors, &names, &shapes, &owned_data, self.regular_params.items, extensions.use_synchronized_host_state);
+        try self.appendTrainingStateSlots(&tensors, &names, &shapes, &owned_data, self.lora_params.items, true, extensions.use_synchronized_host_state);
+        try self.appendTrainingStateSlots(&tensors, &names, &shapes, &owned_data, self.regular_params.items, true, extensions.use_synchronized_host_state);
         try tensors.appendSlice(self.allocator, extensions.tensors);
 
         var random: [16]u8 = undefined;
@@ -1227,17 +2001,41 @@ pub const RealAutodiffTrainer = struct {
     /// Restore a state written by `saveTrainingState`. The graph must already
     /// be built so checkpoint names and shapes are checked against live slots.
     pub fn loadTrainingState(self: *RealAutodiffTrainer, path: []const u8, expected_run_fingerprint: ?*const [32]u8) !void {
+        _ = try self.loadTrainingCheckpointInternal(path, expected_run_fingerprint);
+    }
+
+    pub fn loadTrainingCheckpoint(
+        self: *RealAutodiffTrainer,
+        path: []const u8,
+        expected_run_fingerprint: ?*const [32]u8,
+    ) !RestoredTrainingCheckpoint {
+        return self.loadTrainingCheckpointInternal(path, expected_run_fingerprint);
+    }
+
+    fn loadTrainingCheckpointInternal(
+        self: *RealAutodiffTrainer,
+        path: []const u8,
+        expected_run_fingerprint: ?*const [32]u8,
+    ) !RestoredTrainingCheckpoint {
+        if (self.lora_params.items.len == 0 and self.regular_params.items.len == 0) return error.GraphNotBuilt;
+        if (self.step_count != 0 or self.optimizer_step_count != 0 or self.accum_count != 0 or self.optimizer_state.param_states.count() != 0) {
+            return error.TrainerAlreadyStarted;
+        }
         const absolute_path = try compat.cwd().realPathFileAlloc(compat.io(), path, self.allocator);
         defer self.allocator.free(absolute_path);
         var reader = try safetensors.MMapReader.openFileAbsolute(self.allocator, absolute_path);
         defer reader.deinit();
-        return self.loadTrainingStateFromReader(&reader, expected_run_fingerprint);
+        return self.loadTrainingCheckpointFromReader(&reader, expected_run_fingerprint);
     }
 
     /// Reuse one opened checkpoint for core and extension state. Higher-level
     /// owners can validate and publish an atomic staged restore without
     /// reopening a path that a concurrent checkpoint writer may replace.
     pub fn loadTrainingStateFromReader(self: *RealAutodiffTrainer, reader: *safetensors.MMapReader, expected_run_fingerprint: ?*const [32]u8) !void {
+        _ = try self.loadTrainingCheckpointFromReader(reader, expected_run_fingerprint);
+    }
+
+    fn loadTrainingCheckpointFromReader(self: *RealAutodiffTrainer, reader: *safetensors.MMapReader, expected_run_fingerprint: ?*const [32]u8) !RestoredTrainingCheckpoint {
         if (self.lora_params.items.len == 0 and self.regular_params.items.len == 0) return error.GraphNotBuilt;
         if (self.step_count != 0 or self.optimizer_step_count != 0 or self.accum_count != 0 or self.optimizer_state.param_states.count() != 0) return error.TrainerAlreadyStarted;
 
@@ -1250,12 +2048,62 @@ pub const RealAutodiffTrainer = struct {
         if (restored.optimizer_steps > std.math.maxInt(u32)) return error.CheckpointStepOverflow;
         if (expected_run_fingerprint) |expected| try validateTrainingStateFingerprint(reader, expected);
 
-        try self.loadTrainingStateSlots(reader, self.lora_params.items, restored.optimizer_steps);
-        try self.loadTrainingStateSlots(reader, self.regular_params.items, restored.optimizer_steps);
+        const checkpoint_state_optional = try readTrainingCheckpointState(reader);
+        const checkpoint_state = checkpoint_state_optional orelse TrainingCheckpointState{
+            .micro_batch_steps = restored.micro_batch_steps,
+            .optimizer_steps = restored.optimizer_steps,
+            .accumulation_micro_batches = 0,
+            .configured_accumulation_steps = @max(self.config.grad_accum_steps, 1),
+            .stochastic_steps = restored.micro_batch_steps,
+            .trainer_seed = self.config.seed,
+            .progress = .{},
+            .conditional_family_count = @intCast(self.conditional_optimizer_family_count),
+            .conditional_family_present_mask = 0,
+        };
+        if (checkpoint_state.micro_batch_steps != restored.micro_batch_steps or
+            checkpoint_state.optimizer_steps != restored.optimizer_steps or
+            checkpoint_state.stochastic_steps != restored.micro_batch_steps)
+        {
+            return error.InvalidTrainingCheckpointState;
+        }
+        const configured_accumulation_steps = @max(self.config.grad_accum_steps, 1);
+        if (checkpoint_state.configured_accumulation_steps != configured_accumulation_steps) {
+            return error.TrainingStateAccumulationConfigMismatch;
+        }
+        if (checkpoint_state.trainer_seed != self.config.seed) return error.TrainingStateSeedMismatch;
+        if (checkpoint_state.accumulation_micro_batches >= configured_accumulation_steps or
+            checkpoint_state.accumulation_micro_batches > checkpoint_state.micro_batch_steps)
+        {
+            return error.InvalidTrainingCheckpointState;
+        }
+        try self.validateConditionalOptimizerFamilyPresentMask(
+            checkpoint_state.conditional_family_count,
+            checkpoint_state.conditional_family_present_mask,
+        );
+        try self.validateTrainingStateSlots(reader, self.lora_params.items, restored.optimizer_steps, checkpoint_state_optional != null);
+        try self.validateTrainingStateSlots(reader, self.regular_params.items, restored.optimizer_steps, checkpoint_state_optional != null);
+
+        try self.ensureHostGradientAccumulators();
+        try self.loadTrainingStateSlots(reader, self.lora_params.items, restored.optimizer_steps, checkpoint_state_optional != null);
+        try self.loadTrainingStateSlots(reader, self.regular_params.items, restored.optimizer_steps, checkpoint_state_optional != null);
+        try self.restoreConditionalOptimizerFamilyPresentMask(
+            checkpoint_state.conditional_family_count,
+            checkpoint_state.conditional_family_present_mask,
+        );
         self.step_count = restored.micro_batch_steps;
         self.optimizer_step_count = restored.optimizer_steps;
+        self.accum_count = checkpoint_state.accumulation_micro_batches;
+        self.training_progress = checkpoint_state.progress;
         self.optimizer_state.step_count = @intCast(restored.optimizer_steps);
         if (self.deviceOptimizerRequested()) try self.uploadRestoredOptimizerState();
+        return .{
+            .micro_batch_steps = restored.micro_batch_steps,
+            .optimizer_steps = restored.optimizer_steps,
+            .accumulation_micro_batches = checkpoint_state.accumulation_micro_batches,
+            .configured_accumulation_steps = checkpoint_state.configured_accumulation_steps,
+            .stochastic_steps = checkpoint_state.stochastic_steps,
+            .progress = checkpoint_state.progress,
+        };
     }
 
     /// Validate a recoverable checkpoint without mutating trainer state.
@@ -1275,6 +2123,49 @@ pub const RealAutodiffTrainer = struct {
         if (counters.optimizer_steps > counters.micro_batch_steps) return error.InvalidTrainingStateCounters;
         if (expected_run_fingerprint) |expected| try validateTrainingStateFingerprint(&reader, expected);
         return counters;
+    }
+
+    pub fn inspectTrainingCheckpoint(
+        self: *RealAutodiffTrainer,
+        path: []const u8,
+        expected_run_fingerprint: ?*const [32]u8,
+    ) !RestoredTrainingCheckpoint {
+        const absolute_path = try compat.cwd().realPathFileAlloc(compat.io(), path, self.allocator);
+        defer self.allocator.free(absolute_path);
+        var reader = try safetensors.MMapReader.openFileAbsolute(self.allocator, absolute_path);
+        defer reader.deinit();
+        var counter_tensor = try reader.readTensor("__trainer_counters");
+        defer counter_tensor.deinit();
+        if (counter_tensor.dtype != .f32) return error.InvalidTrainingStateDType;
+        const counters = try decodeTrainingStateCounters(counter_tensor.asFloat32());
+        if (counters.optimizer_steps > counters.micro_batch_steps) return error.InvalidTrainingStateCounters;
+        if (expected_run_fingerprint) |expected| try validateTrainingStateFingerprint(&reader, expected);
+        const state = (try readTrainingCheckpointState(&reader)) orelse return error.LegacyTrainingStateHasNoResumeProgress;
+        if (state.micro_batch_steps != counters.micro_batch_steps or
+            state.optimizer_steps != counters.optimizer_steps or
+            state.stochastic_steps != counters.micro_batch_steps)
+        {
+            return error.InvalidTrainingCheckpointState;
+        }
+        const configured_accumulation_steps = @max(self.config.grad_accum_steps, 1);
+        if (state.configured_accumulation_steps != configured_accumulation_steps) return error.TrainingStateAccumulationConfigMismatch;
+        if (state.trainer_seed != self.config.seed) return error.TrainingStateSeedMismatch;
+        if (state.accumulation_micro_batches >= configured_accumulation_steps or
+            state.accumulation_micro_batches > state.micro_batch_steps)
+        {
+            return error.InvalidTrainingCheckpointState;
+        }
+        try self.validateConditionalOptimizerFamilyPresentMask(state.conditional_family_count, state.conditional_family_present_mask);
+        try self.validateTrainingStateSlots(&reader, self.lora_params.items, counters.optimizer_steps, true);
+        try self.validateTrainingStateSlots(&reader, self.regular_params.items, counters.optimizer_steps, true);
+        return .{
+            .micro_batch_steps = state.micro_batch_steps,
+            .optimizer_steps = state.optimizer_steps,
+            .accumulation_micro_batches = state.accumulation_micro_batches,
+            .configured_accumulation_steps = state.configured_accumulation_steps,
+            .stochastic_steps = state.stochastic_steps,
+            .progress = state.progress,
+        };
     }
 
     /// Select checkpoint weights for final export without rewinding optimizer
@@ -1300,7 +2191,6 @@ pub const RealAutodiffTrainer = struct {
         }
     }
 
-    /// Apply a final, incomplete accumulation window. Match the pinned
     /// Register a parameter-name prefix whose optimizer step is gated on
     /// per-window task presence (see `conditional_optimizer_families`).
     /// Families start absent each accumulation window; callers mark presence
@@ -1331,6 +2221,29 @@ pub const RealAutodiffTrainer = struct {
         }
     }
 
+    fn conditionalOptimizerFamilyPresentMask(self: *const RealAutodiffTrainer) u64 {
+        var mask: u64 = 0;
+        for (self.conditional_optimizer_families[0..self.conditional_optimizer_family_count], 0..) |family, idx| {
+            if (family.window_present) mask |= @as(u64, 1) << @intCast(idx);
+        }
+        return mask;
+    }
+
+    fn restoreConditionalOptimizerFamilyPresentMask(self: *RealAutodiffTrainer, count: u64, mask: u64) !void {
+        try self.validateConditionalOptimizerFamilyPresentMask(count, mask);
+        for (self.conditional_optimizer_families[0..self.conditional_optimizer_family_count], 0..) |*family, idx| {
+            family.window_present = (mask & (@as(u64, 1) << @intCast(idx))) != 0;
+        }
+    }
+
+    fn validateConditionalOptimizerFamilyPresentMask(self: *const RealAutodiffTrainer, count: u64, mask: u64) !void {
+        if (count != @as(u64, @intCast(self.conditional_optimizer_family_count))) return error.TrainingStateConditionalFamiliesMismatch;
+        if (count < 64) {
+            const shift: u6 = @intCast(count);
+            if ((mask >> shift) != 0) return error.InvalidTrainingStateCounters;
+        }
+    }
+
     /// Step one enrolled trainable on the host optimizer. Parameters whose
     /// module produced gradients this window step even when those gradients are
     /// exactly zero (e.g. LoRA-A at step 0, where grad_A ∝ B=0): PyTorch
@@ -1351,48 +2264,55 @@ pub const RealAutodiffTrainer = struct {
         @memset(slot.grad_accum, 0);
     }
 
-    /// upstream trainer: every micro-batch was divided by the configured
-    /// accumulation count, and a partial flush keeps that divisor.
+    fn partialAccumulationRenormalization(configured_steps: u32, micro_batches: u32) !f32 {
+        const configured = @max(configured_steps, 1);
+        if (micro_batches == 0 or micro_batches > configured) return error.InvalidGradientAccumulationState;
+        return @as(f32, @floatFromInt(configured)) /
+            @as(f32, @floatFromInt(micro_batches));
+    }
+
+    fn renormalizePartialHostAccumulation(self: *RealAutodiffTrainer, scale: f32) void {
+        if (scale == 1.0) return;
+        for (self.lora_params.items) |*slot| {
+            for (slot.grad_accum) |*value| value.* *= scale;
+        }
+        for (self.regular_params.items) |*slot| {
+            for (slot.grad_accum) |*value| value.* *= scale;
+        }
+    }
+
+    /// Apply a final, incomplete accumulation window. Every micro-batch is
+    /// accumulated with the configured 1/N scale. A final M<N window is
+    /// renormalized by N/M so the optimizer sees its actual mean.
     pub fn flushAccumulatedGradients(self: *RealAutodiffTrainer) !?FlushResult {
         if (self.accum_count == 0) return null;
 
         const micro_batches = self.accum_count;
         const use_device_optimizer = self.deviceOptimizerRequested();
         try self.reduceAccumulatedGradients(use_device_optimizer);
-
-        // Each micro-batch gradient was accumulated at 1/grad_accum_steps.
-        // A partial window (fewer micro-batches than configured) must be
-        // rescaled to the mean over the micro-batches that actually ran, or
-        // the final optimizer step of an epoch is silently under-weighted.
-        const accum_steps: u32 = @max(self.config.grad_accum_steps, 1);
-        const window_rescale: f32 = if (micro_batches < accum_steps)
-            @as(f32, @floatFromInt(accum_steps)) / @as(f32, @floatFromInt(micro_batches))
-        else
-            1.0;
+        const accumulation_scale = try partialAccumulationRenormalization(
+            self.config.grad_accum_steps,
+            micro_batches,
+        );
+        if (!use_device_optimizer) self.renormalizePartialHostAccumulation(accumulation_scale);
 
         self.optimizer_state.step_count = @intCast(self.optimizer_step_count + 1);
         const learning_rate = self.config.lr_schedule.lr(@intCast(self.optimizer_step_count));
         var grad_norm: f32 = undefined;
         if (use_device_optimizer) {
             const accumulated_norm = try self.deviceGlobalGradNorm();
-            grad_norm = accumulated_norm * window_rescale;
+            grad_norm = accumulated_norm * accumulation_scale;
+            if (!std.math.isFinite(grad_norm)) return error.NonFiniteGradientNorm;
             const clip_scale = if (self.config.max_grad_norm > 0.0 and grad_norm > self.config.max_grad_norm)
-                self.config.max_grad_norm / (grad_norm + 1e-6)
+                accumulation_scale * self.config.max_grad_norm / (grad_norm + 1e-6)
             else
-                1.0;
-            try self.stepDeviceAdamW(learning_rate, clip_scale * window_rescale);
+                accumulation_scale;
+            try self.stepDeviceAdamW(learning_rate, clip_scale);
             for (self.lora_params.items) |*slot| @memset(slot.grad_accum, 0);
             for (self.regular_params.items) |*slot| @memset(slot.grad_accum, 0);
         } else {
-            if (window_rescale != 1.0) {
-                for (self.lora_params.items) |*slot| {
-                    for (slot.grad_accum) |*value| value.* *= window_rescale;
-                }
-                for (self.regular_params.items) |*slot| {
-                    for (slot.grad_accum) |*value| value.* *= window_rescale;
-                }
-            }
             grad_norm = self.globalGradNorm();
+            if (!std.math.isFinite(grad_norm)) return error.NonFiniteGradientNorm;
             if (self.config.max_grad_norm > 0.0 and grad_norm > self.config.max_grad_norm) {
                 const clip_scale = self.config.max_grad_norm / (grad_norm + 1e-6);
                 for (self.lora_params.items) |*slot| {
@@ -1421,7 +2341,10 @@ pub const RealAutodiffTrainer = struct {
 
     fn runStep(self: *RealAutodiffTrainer, input: TrainerInput, mode: ExecutionMode) !StepResult {
         const total_start_ns = monotonicNowNs();
+        const strict_metal = self.config.strict_metal_execution;
         const strict_cuda = self.config.strict_cuda_execution;
+        if (strict_metal and strict_cuda) return error.ConflictingStrictDeviceExecution;
+        if (strict_metal and self.compute_backend.kind() != .metal) return error.StrictMetalBackendRequired;
         if (strict_cuda) {
             if (self.compute_backend.kind() != .cuda) return error.StrictCudaBackendRequired;
             if (self.config.execution_engine != .compiled_device or !self.config.compiled_required) {
@@ -1447,10 +2370,12 @@ pub const RealAutodiffTrainer = struct {
         // 1. Lazy graph construction.
         const graph_build_start_ns = monotonicNowNs();
         try self.ensureGraphBuilt(input);
+        if (mode == .train) try self.ensureHostGradientAccumulators();
         profile.graph_build_ns = elapsedNs(graph_build_start_ns, monotonicNowNs());
         const gs = &self.graph_state.?;
         const use_device_optimizer = mode == .train and self.deviceOptimizerRequested();
-        const use_cached_runtime_inputs = (use_device_optimizer or strict_cuda) and
+        const retain_device_gradients = mode == .train and (use_device_optimizer or strict_metal);
+        const use_cached_runtime_inputs = (use_device_optimizer or strict_metal or strict_cuda) and
             (self.compute_backend.kind() == .metal or self.compute_backend.kind() == .cuda);
         if (strict_cuda and !use_device_optimizer) return error.StrictCudaDeviceOptimizerRequired;
         if (use_device_optimizer) {
@@ -1463,6 +2388,13 @@ pub const RealAutodiffTrainer = struct {
                 "device optimizer slots done trainable_bytes={} transfers={} rss={}",
                 .{ self.device_trainable_bytes, self.device_optimizer_transfers, currentResidentBytes() },
             );
+        } else if (strict_metal) {
+            // Strict evaluation only needs resident trainable weights. Do not
+            // allocate gradient accumulators or Adam moments for a loss-only
+            // forward pass.
+            try self.ensureDeviceEvalWeights();
+        }
+        if (use_device_optimizer) {
             profile.optimizer_backend = self.deviceOptimizerBackend();
             profile.device_resident_transfer_count = self.device_optimizer_transfers - device_optimizer_transfers_start;
             profile.device_trainable_bytes = self.device_trainable_bytes;
@@ -1558,16 +2490,16 @@ pub const RealAutodiffTrainer = struct {
 
         // LoRA parameter slices.
         for (self.lora_params.items) |*slot| {
-            if (slot.device) |device| {
-                try rt.put(self.allocator, slot.node_id, device.weight);
+            if (self.residentSlotWeight(slot)) |weight| {
+                try rt.put(self.allocator, slot.node_id, weight);
                 try borrowed_rt.put(self.allocator, slot.node_id, {});
             } else {
                 try putRuntimeInput(self.allocator, self.compute_backend, &rt, slot.node_id, slot.weights, slot.dims);
             }
         }
         for (self.regular_params.items) |*slot| {
-            if (slot.device) |device| {
-                try rt.put(self.allocator, slot.node_id, device.weight);
+            if (self.residentSlotWeight(slot)) |weight| {
+                try rt.put(self.allocator, slot.node_id, weight);
                 try borrowed_rt.put(self.allocator, slot.node_id, {});
             } else {
                 try putRuntimeInput(self.allocator, self.compute_backend, &rt, slot.node_id, slot.weights, slot.dims);
@@ -1587,6 +2519,7 @@ pub const RealAutodiffTrainer = struct {
                 try bind_fn(input.ctx, self.compute_backend, self.allocator, &gs.graph, &rt, input.batch, input.seq_len, input.attention_mask);
             }
         }
+        if (strict_metal) try self.validateStrictMetalRuntimeInputs(&rt);
         const runtime_transfer_after = self.compute_backend.trainingRuntimeStats();
         profile.runtime_input_uploads = runtime_transfer_after.training_input_uploads -| runtime_transfer_before.training_input_uploads;
         profile.runtime_input_upload_bytes = runtime_transfer_after.training_input_upload_bytes -| runtime_transfer_before.training_input_upload_bytes;
@@ -1625,13 +2558,23 @@ pub const RealAutodiffTrainer = struct {
         }
 
         const train_step_start_ns = monotonicNowNs();
-        const had_compiled_session = self.compiled_session != null;
-        const use_compiled = try self.ensureCompiledSessionBuilt(trainable);
+        const had_compiled_session = switch (mode) {
+            .train => self.compiled_session != null,
+            .eval => self.compiled_eval_session != null,
+        };
+        const use_compiled = switch (mode) {
+            .train => try self.ensureCompiledSessionBuilt(trainable),
+            .eval => try self.ensureCompiledEvalSessionBuilt(),
+        };
         profile.compiled_session_built = use_compiled and !had_compiled_session;
         var compiled_session_backend_prepared = false;
         if (use_compiled) {
-            compiled_session_backend_prepared = !self.compiled_session.?.backendPrepared(self.compute_backend);
-            try self.compiled_session.?.prepareBackend(self.compute_backend);
+            const prepared_session = switch (mode) {
+                .train => &self.compiled_session.?,
+                .eval => &self.compiled_eval_session.?,
+            };
+            compiled_session_backend_prepared = !prepared_session.backendPrepared(self.compute_backend);
+            try prepared_session.prepareBackend(self.compute_backend);
         }
         profile.compiled_session_backend_prepared = compiled_session_backend_prepared;
         const graph_execution_transfer_before = self.compute_backend.trainingRuntimeStats();
@@ -1645,24 +2588,28 @@ pub const RealAutodiffTrainer = struct {
                 .{ use_device_optimizer, trainable.len, rt.count(), currentResidentBytes() },
             );
         }
-        var step_result = if (use_compiled and strict_cuda)
-            try self.compiled_session.?.executeDeviceGradientsStrictCuda(self.compute_backend, rt)
-        else if (use_compiled and use_device_optimizer)
-            try self.compiled_session.?.executeDeviceGradients(self.compute_backend, rt)
-        else if (use_compiled)
-            try self.compiled_session.?.execute(self.compute_backend, rt)
-        else
-            try training.trainStep(
-                self.allocator,
-                &gs.graph,
-                gs.loss_node,
-                self.compute_backend,
-                rt,
-                .{
-                    .trainable_params = trainable,
-                    .checkpoint_config = self.config.checkpoint_config,
-                },
-            );
+        var step_result = if (use_compiled) compiled: {
+            const session = switch (mode) {
+                .train => &self.compiled_session.?,
+                .eval => &self.compiled_eval_session.?,
+            };
+            break :compiled if (strict_cuda)
+                try session.executeDeviceGradientsStrictCuda(self.compute_backend, rt)
+            else if (retain_device_gradients)
+                try session.executeDeviceGradients(self.compute_backend, rt)
+            else
+                try session.execute(self.compute_backend, rt);
+        } else try training.trainStep(
+            self.allocator,
+            &gs.graph,
+            gs.loss_node,
+            self.compute_backend,
+            rt,
+            .{
+                .trainable_params = trainable,
+                .checkpoint_config = self.config.checkpoint_config,
+            },
+        );
         profile.train_step_ns = elapsedNs(train_step_start_ns, monotonicNowNs());
         if (use_compiled) {
             compiledDiag(
@@ -1671,12 +2618,17 @@ pub const RealAutodiffTrainer = struct {
             );
         }
         profile.autodiff_ns = if (use_compiled) 0 else step_result.profile.autodiff_ns;
-        profile.compile_ns = if (use_compiled and !had_compiled_session) self.compiled_session.?.build_profile.total_ns else 0;
+        profile.compile_ns = if (use_compiled and !had_compiled_session) switch (mode) {
+            .train => self.compiled_session.?.build_profile.total_ns,
+            .eval => self.compiled_eval_session.?.build_profile.total_ns,
+        } else 0;
         profile.execute_ns = step_result.profile.execute_ns;
         profile.extract_ns = step_result.profile.extract_ns;
         profile.peak_resident_bytes = step_result.profile.peak_resident_bytes;
         profile.graph_executor_fallback_reason = step_result.profile.graph_executor_fallback_reason;
         profile.graph_executor_partitions = step_result.profile.graph_executor_partitions;
+        profile.graph_executor_runtime_input_transfers = step_result.profile.graph_executor_runtime_input_transfers;
+        profile.graph_executor_device_resident_transfers = step_result.profile.graph_executor_device_resident_transfers;
         profile.graph_executor_native_partitions = step_result.profile.graph_executor_native_partitions;
         profile.graph_executor_unsupported_ops = step_result.profile.graph_executor_unsupported_ops;
         profile.graph_executor_command_dispatches = step_result.profile.graph_executor_command_dispatches;
@@ -1695,6 +2647,8 @@ pub const RealAutodiffTrainer = struct {
         profile.graph_executor_metal_frame_chunk_boundaries = step_result.profile.graph_executor_metal_frame_chunk_boundaries;
         profile.graph_executor_metal_frame_chunk_promoted_values = step_result.profile.graph_executor_metal_frame_chunk_promoted_values;
         profile.graph_executor_metal_frame_chunk_swept_values = step_result.profile.graph_executor_metal_frame_chunk_swept_values;
+        profile.graph_executor_metal_final_frame_swept_values = step_result.profile.graph_executor_metal_final_frame_swept_values;
+        profile.graph_executor_metal_final_frame_swept_bytes = step_result.profile.graph_executor_metal_final_frame_swept_bytes;
         profile.graph_executor_metal_chunk_local_output_peak_bytes = step_result.profile.graph_executor_metal_chunk_local_output_peak_bytes;
         profile.graph_executor_metal_chunk_local_output_live_bytes = step_result.profile.graph_executor_metal_chunk_local_output_live_bytes;
         profile.graph_executor_metal_chunk_local_output_allocations = step_result.profile.graph_executor_metal_chunk_local_output_allocations;
@@ -1802,6 +2756,8 @@ pub const RealAutodiffTrainer = struct {
         profile.metal_runtime_reuse_pool_peak_slots = step_result.profile.metal_runtime_reuse_pool_peak_slots;
         profile.metal_runtime_reuse_alloc_delta = step_result.profile.metal_runtime_reuse_alloc_delta;
         profile.metal_runtime_reuse_hit_delta = step_result.profile.metal_runtime_reuse_hit_delta;
+        profile.metal_gemma4_bf16_gate_up_fused_calls = step_result.profile.metal_gemma4_bf16_gate_up_fused_calls;
+        profile.metal_gemma4_bf16_gate_up_backward_input_sum_fused_calls = step_result.profile.metal_gemma4_bf16_gate_up_backward_input_sum_fused_calls;
         profile.metal_last_frame_compute_encoders = step_result.profile.metal_last_frame_compute_encoders;
         profile.metal_last_frame_blit_encoders = step_result.profile.metal_last_frame_blit_encoders;
         profile.metal_last_frame_planned_scopes = step_result.profile.metal_last_frame_planned_scopes;
@@ -1841,6 +2797,17 @@ pub const RealAutodiffTrainer = struct {
         profile.cuda_exact_gelu_backward_calls = step_result.profile.cuda_exact_gelu_backward_calls;
         profile.cuda_training_input_uploads = step_result.profile.cuda_training_input_uploads;
         profile.cuda_training_input_upload_bytes = step_result.profile.cuda_training_input_upload_bytes;
+        profile.training_runtime_h2d_bytes = step_result.profile.training_runtime_h2d_bytes;
+        profile.training_runtime_d2h_bytes = step_result.profile.training_runtime_d2h_bytes;
+        profile.training_runtime_input_uploads = step_result.profile.training_runtime_input_uploads;
+        profile.training_runtime_input_upload_bytes = step_result.profile.training_runtime_input_upload_bytes;
+        profile.metal_linear_cross_entropy_forward_calls = step_result.profile.metal_linear_cross_entropy_forward_calls;
+        profile.metal_linear_cross_entropy_backward_calls = step_result.profile.metal_linear_cross_entropy_backward_calls;
+        profile.metal_linear_cce_forward_calls = step_result.profile.metal_linear_cce_forward_calls;
+        profile.metal_linear_cce_backward_calls = step_result.profile.metal_linear_cce_backward_calls;
+        profile.metal_linear_cce_forward_state_hits = step_result.profile.metal_linear_cce_forward_state_hits;
+        profile.metal_linear_cce_forward_state_misses = step_result.profile.metal_linear_cce_forward_state_misses;
+        profile.metal_linear_cce_peak_scratch_bytes = step_result.profile.metal_linear_cce_peak_scratch_bytes;
         const graph_execution_transfer_after = self.compute_backend.trainingRuntimeStats();
         profile.graph_execution_input_uploads = graph_execution_transfer_after.training_input_uploads -| graph_execution_transfer_before.training_input_uploads;
         profile.graph_execution_input_upload_bytes = graph_execution_transfer_after.training_input_upload_bytes -| graph_execution_transfer_before.training_input_upload_bytes;
@@ -1849,6 +2816,21 @@ pub const RealAutodiffTrainer = struct {
         var step_result_live = true;
         defer if (step_result_live) step_result.deinit();
         profile.host_gradient_tensors = @intCast(step_result.gradients.count());
+        if (strict_metal) {
+            try validateStrictMetalStepEvidence(
+                profile,
+                step_result.gradients.count(),
+                step_result.device_gradients.count(),
+                if (mode == .train) trainable.len else 0,
+                if (mode == .train) .train else .eval,
+            );
+            var device_gradient_it = step_result.device_gradients.iterator();
+            while (device_gradient_it.next()) |entry| {
+                if (!metal_partition_executor.isMetalDeviceResident(self.compute_backend, entry.value_ptr.*)) {
+                    return error.StrictMetalGradientNotDeviceResident;
+                }
+            }
+        }
         if (strict_cuda) {
             if (step_result.gradients.count() != 0 or step_result.device_gradients.count() != trainable.len) {
                 std.log.err(
@@ -1871,6 +2853,7 @@ pub const RealAutodiffTrainer = struct {
         }
         const loss_value = step_result.loss;
         if (!std.math.isFinite(loss_value)) return error.NonFiniteTrainingLoss;
+        self.debugTraceDeviceGradientFingerprints(&step_result);
 
         var grad_norm: f32 = 0.0;
         var stepped = false;
@@ -1887,6 +2870,11 @@ pub const RealAutodiffTrainer = struct {
                     self.config.reduce_device_grads == null and
                     self.config.reduce_grads == null;
                 if (!direct_device_step) {
+                    var accumulation_frame_active = if (use_device_optimizer and self.compute_backend.kind() == .metal)
+                        try self.compute_backend.decoderRuntimeBeginFrame()
+                    else
+                        false;
+                    errdefer if (accumulation_frame_active) self.compute_backend.decoderRuntimeCancelFrame() catch {};
                     for (self.lora_params.items) |*slot| {
                         if (use_device_optimizer) {
                             const g_ct = step_result.device_gradients.get(slot.name) orelse return error.MissingTrainableGradient;
@@ -1915,6 +2903,10 @@ pub const RealAutodiffTrainer = struct {
                             for (slot.grad_accum, g) |*a, v| a.* += v * scale;
                         }
                     }
+                    if (accumulation_frame_active) {
+                        try self.compute_backend.decoderRuntimeSubmitAndWaitFrame();
+                        accumulation_frame_active = false;
+                    }
                     self.accum_count += 1;
                 } else {
                     self.accum_count = accum_steps;
@@ -1923,6 +2915,10 @@ pub const RealAutodiffTrainer = struct {
                 // 6. If the accumulation window is full, clip + step the optimizer.
                 if (self.accum_count >= accum_steps) {
                     if (!direct_device_step) try self.reduceAccumulatedGradients(use_device_optimizer);
+                    if (self.config.observe_direct_device_grads != null) {
+                        if (!direct_device_step) return error.DirectDeviceGradientObserverUnavailable;
+                        try self.observeDirectDeviceGradients(&step_result);
+                    }
 
                     learning_rate = self.config.lr_schedule.lr(@intCast(self.optimizer_step_count));
                     grad_norm = if (direct_device_step)
@@ -1972,7 +2968,10 @@ pub const RealAutodiffTrainer = struct {
                 }
             },
             .eval => {
-                grad_norm = try self.gradientNormFromResult(&step_result);
+                grad_norm = if (retain_device_gradients)
+                    try self.deviceGlobalGradNormFromResult(&step_result)
+                else
+                    try self.gradientNormFromResult(&step_result);
             },
         }
         profile.optimizer_update_ns = elapsedNs(optimizer_update_start_ns, monotonicNowNs());
@@ -2095,17 +3094,22 @@ pub const RealAutodiffTrainer = struct {
         shapes: *std.ArrayListUnmanaged([]usize),
         owned_data: *std.ArrayListUnmanaged([]f32),
         slots: []const ParamSlot,
+        include_grad_accum: bool,
         use_synchronized_host_state: bool,
     ) !void {
         for (slots) |slot| {
             var weights: []const f32 = slot.weights;
             var moments: struct { m: []const f32, v: []const f32 } = undefined;
+            var accumulated_gradient: []const f32 = slot.grad_accum;
             if (if (use_synchronized_host_state) null else slot.device) |device| {
                 weights = try self.downloadTrainingStateTensor(owned_data, device.weight);
                 moments = .{
                     .m = try self.downloadTrainingStateTensor(owned_data, device.m),
                     .v = try self.downloadTrainingStateTensor(owned_data, device.v),
                 };
+                if (include_grad_accum) {
+                    accumulated_gradient = try self.downloadTrainingStateTensor(owned_data, device.grad_accum);
+                }
             } else {
                 if (self.optimizer_state.param_states.get(slot.name)) |state| {
                     moments = .{ .m = state.m, .v = state.v };
@@ -2137,6 +3141,10 @@ pub const RealAutodiffTrainer = struct {
             try appendTrainingStateTensor(self.allocator, tensors, names, shapes, "adam_m", slot.name, moments.m);
             try appendTrainingStateTensor(self.allocator, tensors, names, shapes, "adam_v", slot.name, moments.v);
             try appendTrainingStateTensor(self.allocator, tensors, names, shapes, "adam_step", slot.name, adam_step);
+            if (include_grad_accum) {
+                if (accumulated_gradient.len != slot.weights.len) return error.CheckpointSizeMismatch;
+                try appendTrainingStateTensor(self.allocator, tensors, names, shapes, "grad_accum", slot.name, accumulated_gradient);
+            }
             try appendTrainingStateTensor(self.allocator, tensors, names, shapes, "adam_step_u32", slot.name, step_bytes);
         }
     }
@@ -2182,6 +3190,7 @@ pub const RealAutodiffTrainer = struct {
         reader: *safetensors.MMapReader,
         slots: []ParamSlot,
         optimizer_steps: u64,
+        restore_grad_accum: bool,
     ) !void {
         for (slots) |*slot| {
             try readTrainingStateTensor(self.allocator, reader, "weight", slot.name, slot.weights);
@@ -2194,6 +3203,33 @@ pub const RealAutodiffTrainer = struct {
             const adam_step = try readTrainingStateStep(self.allocator, reader, slot.name) orelse @as(u32, @intCast(optimizer_steps));
             state.step_count = adam_step;
             slot.adam_step_count = adam_step;
+            if (restore_grad_accum) {
+                try readTrainingStateTensor(self.allocator, reader, "grad_accum", slot.name, slot.grad_accum);
+            } else {
+                @memset(slot.grad_accum, 0.0);
+            }
+        }
+    }
+
+    /// Validate every expected tensor before mutating the trainer. This makes
+    /// malformed/truncated checkpoints fail before any weight or Adam moment
+    /// is partially installed.
+    fn validateTrainingStateSlots(
+        self: *RealAutodiffTrainer,
+        reader: *safetensors.MMapReader,
+        slots: []const ParamSlot,
+        optimizer_steps: u64,
+        require_grad_accum: bool,
+    ) !void {
+        for (slots) |slot| {
+            try validateTrainingStateTensor(self.allocator, reader, "weight", slot.name, slot.weights.len);
+            try validateTrainingStateTensor(self.allocator, reader, "adam_m", slot.name, slot.weights.len);
+            try validateTrainingStateTensor(self.allocator, reader, "adam_v", slot.name, slot.weights.len);
+            const adam_step = try readTrainingStateStep(self.allocator, reader, slot.name) orelse @as(u32, @intCast(optimizer_steps));
+            if (@as(u64, adam_step) > optimizer_steps) return error.InvalidTrainingStateCounters;
+            if (require_grad_accum) {
+                try validateTrainingStateTensor(self.allocator, reader, "grad_accum", slot.name, slot.weights.len);
+            }
         }
     }
 
@@ -2201,6 +3237,48 @@ pub const RealAutodiffTrainer = struct {
         try self.ensureDeviceOptimizerSlots();
         for (self.lora_params.items) |*slot| try self.uploadRestoredOptimizerSlot(slot);
         for (self.regular_params.items) |*slot| try self.uploadRestoredOptimizerSlot(slot);
+        // A restored weight is consumed by the next forward pass, while Adam
+        // moments are first consumed only by the next optimizer dispatch. Do
+        // not let an apparently correct forward mask an outstanding private-
+        // buffer upload for m/v/grad_accum. Loading a checkpoint is a durable
+        // device-state boundary: every restored slot must be visible before
+        // the caller can build or execute another graph.
+        try self.compute_backend.trainingSynchronize();
+        try self.validateRestoredDeviceOptimizerState();
+    }
+
+    fn validateRestoredDeviceOptimizerState(self: *RealAutodiffTrainer) !void {
+        for (self.lora_params.items) |*slot| try self.validateRestoredDeviceOptimizerSlot(slot);
+        for (self.regular_params.items) |*slot| try self.validateRestoredDeviceOptimizerSlot(slot);
+    }
+
+    fn validateRestoredDeviceOptimizerSlot(self: *RealAutodiffTrainer, slot: *ParamSlot) !void {
+        const state = self.optimizer_state.param_states.get(slot.name) orelse return error.MissingOptimizerState;
+        const device = slot.device orelse return error.DeviceOptimizerNotInitialized;
+        if (!try self.restoredDeviceTensorMatches(device.weight, slot.weights)) {
+            return error.RestoredDeviceWeightMismatch;
+        }
+        if (!try self.restoredDeviceTensorMatches(device.m, state.m)) {
+            return error.RestoredDeviceFirstMomentMismatch;
+        }
+        if (!try self.restoredDeviceTensorMatches(device.v, state.v)) {
+            return error.RestoredDeviceSecondMomentMismatch;
+        }
+        if (!try self.restoredDeviceTensorMatches(device.grad_accum, slot.grad_accum)) {
+            return error.RestoredDeviceGradientAccumMismatch;
+        }
+    }
+
+    fn restoredDeviceTensorMatches(
+        self: *RealAutodiffTrainer,
+        tensor: CT,
+        expected: []const f32,
+    ) !bool {
+        const actual = try self.compute_backend.toFloat32(tensor, self.allocator);
+        defer self.allocator.free(actual);
+        self.device_optimizer_transfers += 1;
+        return actual.len == expected.len and
+            std.mem.eql(u8, std.mem.sliceAsBytes(actual), std.mem.sliceAsBytes(expected));
     }
 
     fn uploadRestoredOptimizerSlot(self: *RealAutodiffTrainer, slot: *ParamSlot) !void {
@@ -2212,15 +3290,15 @@ pub const RealAutodiffTrainer = struct {
         // otherwise resumed CUDA training silently continues from the stale
         // pre-load weight while using the restored Adam moments.
         try self.compute_backend.trainingOverwriteF32(device.weight, slot.weights, slot.dims);
-        const restored_m = try self.compute_backend.fromFloat32Shape(state.m, slot.dims);
-        errdefer self.compute_backend.free(restored_m);
-        const restored_v = try self.compute_backend.fromFloat32Shape(state.v, slot.dims);
-        errdefer self.compute_backend.free(restored_v);
-        self.compute_backend.free(device.m);
-        self.compute_backend.free(device.v);
-        device.m = restored_m;
-        device.v = restored_v;
-        self.device_optimizer_transfers += 3;
+        // Keep optimizer buffers allocated by the device-training API. Metal's
+        // generic fromFloat32Shape deliberately leaves small tensors host
+        // backed; replacing resident moments with those handles makes the next
+        // AdamW dispatch fail (or silently promote). Overwrite the stable
+        // device slots in place on every backend instead.
+        try self.compute_backend.trainingOverwriteF32(device.m, state.m, slot.dims);
+        try self.compute_backend.trainingOverwriteF32(device.v, state.v, slot.dims);
+        try self.compute_backend.trainingOverwriteF32(device.grad_accum, slot.grad_accum, slot.dims);
+        self.device_optimizer_transfers += 4;
     }
 
     // ── Internals ────────────────────────────────────────────────────────
@@ -2250,12 +3328,22 @@ pub const RealAutodiffTrainer = struct {
         data: []const f32,
         dims: []const i32,
     ) !RuntimeInputUploadDeclaration {
+        const reused = cache.tensor != null and
+            cache.elem_count == data.len and
+            std.mem.eql(i32, cache.dims, dims);
         const ct = try self.ensureCachedRuntimeTensor(cache, data, dims);
         try rt.put(self.allocator, node_id, ct);
         errdefer _ = rt.remove(node_id);
         try borrowed_rt.put(self.allocator, node_id, {});
         const bytes: u64 = @intCast(data.len * @sizeOf(f32));
-        return .{ .uploads = 1, .bytes = bytes, .h2d_bytes = bytes };
+        return .{
+            .uploads = 1,
+            .bytes = bytes,
+            // Metal initializes a new training buffer from host zeros before
+            // overwriting it. Record that first-use transfer explicitly;
+            // cache reuse performs only the overwrite.
+            .h2d_bytes = bytes * (if (self.compute_backend.kind() == .metal and !reused) @as(u64, 2) else 1),
+        };
     }
 
     fn putDeviceRuntimeInput(
@@ -2270,7 +3358,78 @@ pub const RealAutodiffTrainer = struct {
         try self.compute_backend.trainingOverwriteF32(tensor, data, dims);
         try rt.put(self.allocator, node_id, tensor);
         const bytes: u64 = @intCast(data.len * @sizeOf(f32));
-        return .{ .uploads = 1, .bytes = bytes, .h2d_bytes = bytes };
+        return .{
+            .uploads = 1,
+            .bytes = bytes,
+            .h2d_bytes = bytes * (if (self.compute_backend.kind() == .metal) @as(u64, 2) else 1),
+        };
+    }
+
+    fn residentSlotWeight(self: *const RealAutodiffTrainer, slot: *const ParamSlot) ?CT {
+        _ = self;
+        if (slot.device) |device| return device.weight;
+        return slot.eval_device_weight;
+    }
+
+    /// Ensure every LoRA parameter has a device-resident forward copy. A
+    /// subsequent optimizer-slot promotion adopts the same weight handle, so
+    /// eager inference keeps observing in-place updates without a host copy.
+    pub fn ensureResidentLoraWeightsForRuntime(self: *RealAutodiffTrainer) !void {
+        try self.ensureDeviceEvalWeights();
+    }
+
+    pub fn loraAdapterBaseNames(self: *const RealAutodiffTrainer) ![]const RuntimeLoraAdapterInfo {
+        if (self.runtime_lora_adapters.items.len * 2 != self.lora_params.items.len) {
+            return error.InvalidLoRAParameterInventory;
+        }
+        return self.runtime_lora_adapters.items;
+    }
+
+    /// Resolve the adapter associated with one frozen base projection. The
+    /// lora_params order is contractually paired with the adapter inventory.
+    pub fn residentLoraBinding(
+        self: *const RealAutodiffTrainer,
+        base_name: []const u8,
+    ) !?ResidentLoraBinding {
+        const infos = try self.loraAdapterBaseNames();
+        if (self.lora_params.items.len != infos.len * 2) return error.InvalidLoRAParameterInventory;
+        for (infos, 0..) |info, index| {
+            if (!std.mem.eql(u8, info.base_name, base_name)) continue;
+            const a_slot = &self.lora_params.items[index * 2];
+            const b_slot = &self.lora_params.items[index * 2 + 1];
+            if (a_slot.dims.len != 2 or b_slot.dims.len != 2) return error.InvalidLoRAAdapterShape;
+            if (a_slot.dims[0] <= 0 or a_slot.dims[1] <= 0 or b_slot.dims[0] <= 0 or b_slot.dims[1] <= 0) {
+                return error.InvalidLoRAAdapterShape;
+            }
+            const rank: usize = @intCast(a_slot.dims[0]);
+            const in_dim: usize = @intCast(a_slot.dims[1]);
+            const out_dim: usize = @intCast(b_slot.dims[0]);
+            if (@as(usize, @intCast(b_slot.dims[1])) != rank) return error.InvalidLoRAAdapterShape;
+            const lora_a = self.residentSlotWeight(a_slot) orelse return error.LoRAWeightNotResident;
+            const lora_b = self.residentSlotWeight(b_slot) orelse return error.LoRAWeightNotResident;
+            return .{
+                .base_name = info.base_name,
+                .lora_a = lora_a,
+                .lora_b = lora_b,
+                .rank = rank,
+                .in_dim = in_dim,
+                .out_dim = out_dim,
+                .scale = self.config.lora.alpha / @as(f32, @floatFromInt(rank)),
+            };
+        }
+        return null;
+    }
+
+    fn validateStrictMetalRuntimeInputs(
+        self: *const RealAutodiffTrainer,
+        rt: *const std.AutoHashMapUnmanaged(NodeId, CT),
+    ) !void {
+        var it = rt.iterator();
+        while (it.next()) |entry| {
+            if (!metal_partition_executor.isMetalDeviceResident(self.compute_backend, entry.value_ptr.*)) {
+                return error.StrictMetalRuntimeInputNotDeviceResident;
+            }
+        }
     }
 
     fn ensureCachedRuntimeTensor(
@@ -2290,10 +3449,11 @@ pub const RealAutodiffTrainer = struct {
             cache.dims = &.{};
             cache.elem_count = 0;
         }
-        const ct = if (self.compute_backend.kind() == .cuda) blk: {
-            // Allocate cached CUDA inputs without an unclassified H2D copy so
-            // both initial population and subsequent overwrites contribute to
-            // the dedicated runtime-input upload counters.
+        const device_backend = self.compute_backend.kind() == .metal or self.compute_backend.kind() == .cuda;
+        const ct = if (device_backend) blk: {
+            // Allocate cached device inputs explicitly. Small Metal tensors
+            // otherwise remain host-backed, which makes strict compiled
+            // execution fall through on metadata and indexing tails.
             const device_ct = try self.compute_backend.trainingZeroF32(data.len, dims);
             errdefer self.compute_backend.free(device_ct);
             try self.compute_backend.trainingOverwriteF32(device_ct, data, dims);
@@ -2399,38 +3559,64 @@ pub const RealAutodiffTrainer = struct {
         for (self.regular_params.items) |*slot| try self.ensureDeviceOptimizerSlot(slot);
     }
 
+    fn ensureDeviceEvalWeights(self: *RealAutodiffTrainer) !void {
+        if (!self.compute_backend.supportsDeviceTraining()) return error.DeviceOptimizerBackendUnavailable;
+        for (self.lora_params.items) |*slot| try self.ensureDeviceEvalWeight(slot);
+        for (self.regular_params.items) |*slot| try self.ensureDeviceEvalWeight(slot);
+    }
+
+    fn ensureDeviceEvalWeight(self: *RealAutodiffTrainer, slot: *ParamSlot) !void {
+        if (slot.device != null or slot.eval_device_weight != null) return;
+        const weight = try self.compute_backend.trainingZeroF32(slot.weights.len, slot.dims);
+        errdefer self.compute_backend.free(weight);
+        try self.compute_backend.trainingOverwriteF32(weight, slot.weights, slot.dims);
+        slot.eval_device_weight = weight;
+        self.device_trainable_bytes += slot.weights.len * @sizeOf(f32);
+    }
+
     fn ensureDeviceOptimizerSlot(self: *RealAutodiffTrainer, slot: *ParamSlot) !void {
         if (slot.device != null) return;
-        const weight = try self.compute_backend.fromFloat32Shape(slot.weights, slot.dims);
-        errdefer self.compute_backend.free(weight);
+        const existing_eval_weight = slot.eval_device_weight;
+        const weight = existing_eval_weight orelse try self.compute_backend.trainingZeroF32(slot.weights.len, slot.dims);
+        errdefer if (existing_eval_weight == null) self.compute_backend.free(weight);
+        if (existing_eval_weight == null) try self.compute_backend.trainingOverwriteF32(weight, slot.weights, slot.dims);
         const grad_accum = try self.compute_backend.trainingZeroF32(slot.weights.len, slot.dims);
         errdefer self.compute_backend.free(grad_accum);
         const m = try self.compute_backend.trainingZeroF32(slot.weights.len, slot.dims);
         errdefer self.compute_backend.free(m);
         const v = try self.compute_backend.trainingZeroF32(slot.weights.len, slot.dims);
         errdefer self.compute_backend.free(v);
+        slot.eval_device_weight = null;
         slot.device = .{
             .weight = weight,
             .grad_accum = grad_accum,
             .m = m,
             .v = v,
         };
-        self.device_trainable_bytes += slot.weights.len * @sizeOf(f32) * 4;
+        self.device_trainable_bytes += slot.weights.len * @sizeOf(f32) * (if (existing_eval_weight == null) @as(usize, 4) else 3);
     }
 
     fn deinitDeviceOptimizerSlot(self: *RealAutodiffTrainer, slot: *ParamSlot) void {
         if (slot.device) |device| {
             self.compute_backend.free(device.weight);
             self.compute_backend.free(device.grad_accum);
+            if (device.grad_spare) |spare| self.compute_backend.free(spare);
             self.compute_backend.free(device.m);
             self.compute_backend.free(device.v);
             slot.device = null;
+            self.device_trainable_bytes -|= slot.weights.len * @sizeOf(f32) *
+                (4 + @as(usize, @intFromBool(device.grad_spare_allocated)));
+        }
+        if (slot.eval_device_weight) |weight| {
+            self.compute_backend.free(weight);
+            slot.eval_device_weight = null;
+            self.device_trainable_bytes -|= slot.weights.len * @sizeOf(f32);
         }
     }
 
     fn syncDeviceSlotToHost(self: *RealAutodiffTrainer, slot: *ParamSlot) !void {
-        const device = slot.device orelse return;
-        const weights = try self.compute_backend.toFloat32(device.weight, self.allocator);
+        const device_weight = if (slot.device) |device| device.weight else slot.eval_device_weight orelse return;
+        const weights = try self.compute_backend.toFloat32(device_weight, self.allocator);
         defer self.allocator.free(weights);
         if (weights.len != slot.weights.len) return error.TrainableParameterShapeMismatch;
         @memcpy(slot.weights, weights);
@@ -2527,6 +3713,37 @@ pub const RealAutodiffTrainer = struct {
         try reduce_fn(ctx, self.compute_backend, blocks);
     }
 
+    fn observeDirectDeviceGradients(
+        self: *RealAutodiffTrainer,
+        result: *const training.TrainStepResult,
+    ) !void {
+        const observe_fn = self.config.observe_direct_device_grads orelse return;
+        var blocks = try self.allocator.alloc(DeviceGradBlock, self.lora_params.items.len + self.regular_params.items.len);
+        defer self.allocator.free(blocks);
+        var block_idx: usize = 0;
+        for (self.lora_params.items) |*slot| {
+            blocks[block_idx] = .{
+                .name = slot.name,
+                .data = result.device_gradients.get(slot.name) orelse return error.MissingTrainableGradient,
+                .elem_count = slot.weights.len,
+                .dims = slot.dims,
+            };
+            block_idx += 1;
+        }
+        for (self.regular_params.items) |*slot| {
+            blocks[block_idx] = .{
+                .name = slot.name,
+                .data = result.device_gradients.get(slot.name) orelse return error.MissingTrainableGradient,
+                .elem_count = slot.weights.len,
+                .dims = slot.dims,
+            };
+            block_idx += 1;
+        }
+        const ctx = self.config.observe_direct_device_grads_ctx orelse
+            @as(*anyopaque, @ptrFromInt(@alignOf(usize)));
+        try observe_fn(ctx, self.compute_backend, blocks);
+    }
+
     fn deviceGlobalGradNorm(self: *RealAutodiffTrainer) !f32 {
         var inputs = try std.ArrayList(ops_mod.TrainingSumSquaresInput).initCapacity(self.allocator, self.lora_params.items.len + self.regular_params.items.len);
         defer inputs.deinit(self.allocator);
@@ -2542,6 +3759,15 @@ pub const RealAutodiffTrainer = struct {
     }
 
     fn deviceGlobalGradNormFromResult(self: *RealAutodiffTrainer, result: *const training.TrainStepResult) !f32 {
+        // Compiled Metal execution may return device-resident gradient views
+        // while their owning frame is still active or merely submitted. The
+        // sum-of-squares and AdamW helpers open a separate runtime frame, so
+        // establish an explicit device-only producer/consumer boundary first.
+        // Diagnostic host readback used to do this accidentally, which made
+        // preference updates depend on timing and allocation history.
+        if (self.compute_backend.kind() == .metal) {
+            try self.compute_backend.trainingSynchronize();
+        }
         var inputs = try std.ArrayList(ops_mod.TrainingSumSquaresInput).initCapacity(self.allocator, self.lora_params.items.len + self.regular_params.items.len);
         defer inputs.deinit(self.allocator);
         for (self.lora_params.items) |*slot| {
@@ -2606,6 +3832,58 @@ pub const RealAutodiffTrainer = struct {
         std.debug.print(
             "[grad-norm-debug] kernel_norm={d:.9} host_norm={d:.9} tensors={} host_nonzero_tensors={} (kernel 0 + host >0 => sum-squares kernel/offset broken; both 0 => zeros reached the trainer)\n",
             .{ kernel_norm, @sqrt(total), tensors, nonzero_tensors },
+        );
+    }
+
+    /// Diagnostic-only, pre-optimizer fingerprint of every device gradient in
+    /// stable trainer-slot order. This deliberately performs host readback and
+    /// is never enabled by a production recipe; it distinguishes graph-output
+    /// divergence from sum-of-squares or optimizer corruption without writing
+    /// model artifacts or changing the update inputs.
+    fn debugTraceDeviceGradientFingerprints(
+        self: *RealAutodiffTrainer,
+        result: *const training.TrainStepResult,
+    ) void {
+        if (!platform.env.getenvBoolDefault("TERMITE_TRACE_DEVICE_GRADIENT_FINGERPRINTS", false)) return;
+        for (self.lora_params.items) |*slot| {
+            self.debugTraceOneDeviceGradient(result, slot.name);
+        }
+        for (self.regular_params.items) |*slot| {
+            self.debugTraceOneDeviceGradient(result, slot.name);
+        }
+    }
+
+    fn debugTraceOneDeviceGradient(
+        self: *RealAutodiffTrainer,
+        result: *const training.TrainStepResult,
+        name: []const u8,
+    ) void {
+        const gradient = result.device_gradients.get(name) orelse {
+            std.debug.print("device_gradient_fingerprint: name={s} missing=true\n", .{name});
+            return;
+        };
+        const data = self.compute_backend.toFloat32(gradient, self.allocator) catch |err| {
+            std.debug.print(
+                "device_gradient_fingerprint: name={s} read_error={s}\n",
+                .{ name, @errorName(err) },
+            );
+            return;
+        };
+        defer self.allocator.free(data);
+        var sum: f64 = 0;
+        var abs_sum: f64 = 0;
+        var nonzero: usize = 0;
+        var finite = true;
+        for (data) |value| {
+            sum += value;
+            abs_sum += @abs(value);
+            if (value != 0) nonzero += 1;
+            finite = finite and std.math.isFinite(value);
+        }
+        const hash = std.hash.Wyhash.hash(0x6765_6d6d_6134_6772, std.mem.sliceAsBytes(data));
+        std.debug.print(
+            "device_gradient_fingerprint: name={s} len={} nonzero={} finite={} sum={d:.9} abs_sum={d:.9} hash={x}\n",
+            .{ name, data.len, nonzero, finite, sum, abs_sum, hash },
         );
     }
 
@@ -2814,21 +4092,43 @@ pub const RealAutodiffTrainer = struct {
         const mask_shape = Shape.init(.f32, &.{ @intCast(input.batch), @intCast(input.seq_len) });
         var attention_mask_node = try bld.parameter("__attention_mask", mask_shape);
 
-        // Forward pass via callback.
-        var forward_output = try input.build_forward(
-            input.ctx,
-            &bld,
-            input_ids_node,
-            attention_mask_node,
-            input.batch,
-            input.seq_len,
-        );
+        var targets_node: NodeId = undefined;
+        var forward_output: NodeId = undefined;
+        var loss_node: NodeId = undefined;
+        if (input.build_objective) |build_objective| {
+            // Coupled objectives need the target placeholder while arranging
+            // their forward branches. Keep the legacy node order unchanged
+            // for every ordinary trainer input so existing graph fingerprints
+            // and deterministic trajectories do not move.
+            targets_node = try bld.parameter("__targets", input.targets_shape);
+            const objective = try build_objective(
+                input.ctx,
+                &bld,
+                input_ids_node,
+                attention_mask_node,
+                targets_node,
+                input.batch,
+                input.seq_len,
+            );
+            forward_output = objective.forward_output;
+            loss_node = objective.loss;
+        } else {
+            // Forward pass via callback.
+            forward_output = try input.build_forward(
+                input.ctx,
+                &bld,
+                input_ids_node,
+                attention_mask_node,
+                input.batch,
+                input.seq_len,
+            );
 
-        // Targets placeholder.
-        var targets_node = try bld.parameter("__targets", input.targets_shape);
+            // Targets placeholder.
+            targets_node = try bld.parameter("__targets", input.targets_shape);
 
-        // Loss.
-        var loss_node = try input.build_loss(input.ctx, &bld, forward_output, targets_node);
+            // Loss.
+            loss_node = try input.build_loss(input.ctx, &bld, forward_output, targets_node);
+        }
         try base_graph.markOutput(loss_node);
 
         // 2. Inject LoRA. This clones the graph.
@@ -2922,6 +4222,39 @@ pub const RealAutodiffTrainer = struct {
                 slot.block_registered = true;
             }
         }
+        try self.captureOrValidateRuntimeLoraAdapterInventory(
+            self.graph_state.?.lora_adapter.adapters.items,
+        );
+    }
+
+    fn captureOrValidateRuntimeLoraAdapterInventory(
+        self: *RealAutodiffTrainer,
+        adapters: []const lora_mod.AdapterInfo,
+    ) !void {
+        if (self.runtime_lora_adapters.items.len != 0) {
+            if (self.runtime_lora_adapters.items.len != adapters.len) {
+                return error.GraphTrainableSetMismatch;
+            }
+            for (self.runtime_lora_adapters.items, adapters) |runtime, graph| {
+                if (!std.mem.eql(u8, runtime.base_name, graph.base_name)) {
+                    return error.GraphTrainableSetMismatch;
+                }
+            }
+            return;
+        }
+        if (adapters.len == 0) return;
+
+        var captured: std.ArrayListUnmanaged(RuntimeLoraAdapterInfo) = .empty;
+        errdefer {
+            for (captured.items) |adapter| self.allocator.free(adapter.base_name);
+            captured.deinit(self.allocator);
+        }
+        try captured.ensureTotalCapacity(self.allocator, adapters.len);
+        for (adapters) |adapter| {
+            const base_name = try self.allocator.dupe(u8, adapter.base_name);
+            captured.appendAssumeCapacity(.{ .base_name = base_name });
+        }
+        self.runtime_lora_adapters = captured;
     }
 
     fn bindParamSlotsToActiveGraph(self: *RealAutodiffTrainer) !void {
@@ -2966,10 +4299,6 @@ pub const RealAutodiffTrainer = struct {
             @memset(weights, 0.0);
         }
 
-        const grad_accum = try self.allocator.alloc(f32, n_elems);
-        errdefer self.allocator.free(grad_accum);
-        @memset(grad_accum, 0.0);
-
         const rank = shape.rank();
         const dims = try self.allocator.alloc(i32, rank);
         errdefer self.allocator.free(dims);
@@ -2981,7 +4310,11 @@ pub const RealAutodiffTrainer = struct {
         try self.lora_params.append(self.allocator, .{
             .name = owned_name,
             .weights = weights,
-            .grad_accum = grad_accum,
+            // Evaluation never consumes gradients. Allocate the host
+            // accumulation buffer lazily on the first training/resume path so
+            // a loss-only session does not retain one adapter-sized scratch
+            // copy for every trainable parameter.
+            .grad_accum = &.{},
             .node_id = node_id,
             .dims = dims,
         });
@@ -3008,10 +4341,6 @@ pub const RealAutodiffTrainer = struct {
         errdefer self.allocator.free(weights);
         if (weights.len != n_elems) return error.TrainableParameterShapeMismatch;
 
-        const grad_accum = try self.allocator.alloc(f32, n_elems);
-        errdefer self.allocator.free(grad_accum);
-        @memset(grad_accum, 0.0);
-
         const rank = shape.rank();
         const dims = try self.allocator.alloc(i32, rank);
         errdefer self.allocator.free(dims);
@@ -3023,10 +4352,23 @@ pub const RealAutodiffTrainer = struct {
         try self.regular_params.append(self.allocator, .{
             .name = owned_name,
             .weights = weights,
-            .grad_accum = grad_accum,
+            .grad_accum = &.{},
             .node_id = node_id,
             .dims = dims,
         });
+    }
+
+    fn ensureHostGradientAccumulators(self: *RealAutodiffTrainer) !void {
+        for (self.lora_params.items) |*slot| try self.ensureHostGradientAccumulator(slot);
+        for (self.regular_params.items) |*slot| try self.ensureHostGradientAccumulator(slot);
+    }
+
+    fn ensureHostGradientAccumulator(self: *RealAutodiffTrainer, slot: *ParamSlot) !void {
+        if (slot.grad_accum.len == slot.weights.len) return;
+        if (slot.grad_accum.len != 0) return error.GradientShapeMismatch;
+        const gradient = try self.allocator.alloc(f32, slot.weights.len);
+        @memset(gradient, 0.0);
+        slot.grad_accum = gradient;
     }
 
     fn reserveActivationBudget(self: *RealAutodiffTrainer, input: TrainerInput) !void {
@@ -3091,6 +4433,97 @@ pub const RestoredTrainingStateCounters = struct {
     micro_batch_steps: u64,
     optimizer_steps: u64,
 };
+
+const training_checkpoint_schema_version: u64 = 2;
+const training_checkpoint_state_tensor_name = "__trainer_state_v2";
+const training_checkpoint_field_count = 18;
+const training_checkpoint_encoded_len = training_checkpoint_field_count * 4;
+
+const TrainingCheckpointState = struct {
+    micro_batch_steps: u64,
+    optimizer_steps: u64,
+    accumulation_micro_batches: u32,
+    configured_accumulation_steps: u32,
+    stochastic_steps: u64,
+    trainer_seed: u64,
+    progress: TrainingProgress,
+    conditional_family_count: u64,
+    conditional_family_present_mask: u64,
+};
+
+fn encodeTrainingCheckpointState(state: TrainingCheckpointState) [training_checkpoint_encoded_len]f32 {
+    const fields = [_]u64{
+        training_checkpoint_schema_version,
+        state.micro_batch_steps,
+        state.optimizer_steps,
+        state.stochastic_steps,
+        state.accumulation_micro_batches,
+        state.configured_accumulation_steps,
+        state.trainer_seed,
+        state.progress.epoch_index,
+        state.progress.next_example_index,
+        state.progress.examples_seen,
+        state.progress.order_seed,
+        state.progress.order_cursor,
+        state.progress.rng_state[0],
+        state.progress.rng_state[1],
+        state.progress.rng_state[2],
+        state.progress.rng_state[3],
+        state.conditional_family_count,
+        state.conditional_family_present_mask,
+    };
+    var encoded: [training_checkpoint_encoded_len]f32 = undefined;
+    for (fields, 0..) |field, field_index| {
+        for (0..4) |chunk_index| {
+            const shift: u6 = @intCast(chunk_index * 16);
+            encoded[field_index * 4 + chunk_index] = @floatFromInt((field >> shift) & 0xffff);
+        }
+    }
+    return encoded;
+}
+
+fn decodeTrainingCheckpointState(values: []const f32) !TrainingCheckpointState {
+    if (values.len != training_checkpoint_encoded_len) return error.InvalidTrainingCheckpointState;
+    var fields: [training_checkpoint_field_count]u64 = .{0} ** training_checkpoint_field_count;
+    for (values, 0..) |value, value_index| {
+        if (!std.math.isFinite(value) or value < 0 or value > 65535 or value != @floor(value)) {
+            return error.InvalidTrainingCheckpointState;
+        }
+        const shift: u6 = @intCast((value_index % 4) * 16);
+        fields[value_index / 4] |= @as(u64, @intFromFloat(value)) << shift;
+    }
+    if (fields[0] != training_checkpoint_schema_version) return error.UnsupportedTrainingCheckpointVersion;
+    const accumulation_micro_batches = std.math.cast(u32, fields[4]) orelse return error.InvalidTrainingCheckpointState;
+    const configured_accumulation_steps = std.math.cast(u32, fields[5]) orelse return error.InvalidTrainingCheckpointState;
+    return .{
+        .micro_batch_steps = fields[1],
+        .optimizer_steps = fields[2],
+        .stochastic_steps = fields[3],
+        .accumulation_micro_batches = accumulation_micro_batches,
+        .configured_accumulation_steps = configured_accumulation_steps,
+        .trainer_seed = fields[6],
+        .progress = .{
+            .epoch_index = fields[7],
+            .next_example_index = fields[8],
+            .examples_seen = fields[9],
+            .order_seed = fields[10],
+            .order_cursor = fields[11],
+            .rng_state = .{ fields[12], fields[13], fields[14], fields[15] },
+        },
+        .conditional_family_count = fields[16],
+        .conditional_family_present_mask = fields[17],
+    };
+}
+
+fn readTrainingCheckpointState(reader: *safetensors.MMapReader) !?TrainingCheckpointState {
+    var tensor = reader.readTensor(training_checkpoint_state_tensor_name) catch |err| switch (err) {
+        error.TensorNotFound => return null,
+        else => return err,
+    };
+    defer tensor.deinit();
+    if (tensor.dtype != .f32) return error.InvalidTrainingStateDType;
+    return try decodeTrainingCheckpointState(tensor.asFloat32());
+}
 
 fn encodeTrainingStateCounters(micro_batch_steps: u64, optimizer_steps: u64) [8]f32 {
     var values: [8]f32 = undefined;
@@ -3199,8 +4632,35 @@ fn readTrainingStateTensor(
     if (tensor.dtype != .f32) return error.InvalidTrainingStateDType;
     const source = tensor.asFloat32();
     if (source.len != destination.len) return error.CheckpointSizeMismatch;
-    for (source) |value| if (!std.math.isFinite(value)) return error.NonFiniteCheckpointState;
+    try validateTrainingStateValues(prefix, source);
     @memcpy(destination, source);
+}
+
+fn validateTrainingStateTensor(
+    allocator: std.mem.Allocator,
+    reader: *safetensors.MMapReader,
+    prefix: []const u8,
+    parameter_name: []const u8,
+    expected_len: usize,
+) !void {
+    const name = try std.fmt.allocPrint(allocator, "{s}::{s}", .{ prefix, parameter_name });
+    defer allocator.free(name);
+    var tensor = try reader.readTensor(name);
+    defer tensor.deinit();
+    if (tensor.dtype != .f32) return error.InvalidTrainingStateDType;
+    const source = tensor.asFloat32();
+    if (source.len != expected_len) return error.CheckpointSizeMismatch;
+    try validateTrainingStateValues(prefix, source);
+}
+
+fn validateTrainingStateValues(prefix: []const u8, values: []const f32) !void {
+    for (values) |value| {
+        if (!std.math.isFinite(value)) return error.NonFiniteCheckpointState;
+        // Adam's second moment is an average of squared gradients. A finite
+        // negative value would pass a finiteness check but poison the next
+        // optimizer update when its square root is taken.
+        if (std.mem.eql(u8, prefix, "adam_v") and value < 0) return error.InvalidCheckpointSecondMoment;
+    }
 }
 
 /// Read a parameter's persisted Adam step count, or null when the checkpoint
@@ -3561,6 +5021,12 @@ test "RealAutodiffTrainer: bounded shape cache shares trainables and isolates co
         gs_a.loss_node,
         .{ .trainable_params = &trainable },
     );
+    trainer.compiled_output_session = try training.CompiledTrainSession.initOutputOnly(
+        allocator,
+        &gs_a.graph,
+        gs_a.loss_node,
+    );
+    trainer.compiled_output_source_node = gs_a.loss_node;
     trainer.runtime_input_cache.input_ids.dims = try allocator.dupe(i32, &.{ 1, 2 });
     trainer.runtime_input_cache.input_ids.elem_count = 2;
 
@@ -3582,6 +5048,8 @@ test "RealAutodiffTrainer: bounded shape cache shares trainables and isolates co
     try trainer.ensureGraphBuilt(input_b);
     try testing.expectEqual(@as(usize, 1), trainer.inactive_graphs.items.len);
     try testing.expect(trainer.compiled_session == null);
+    try testing.expect(trainer.compiled_output_session == null);
+    try testing.expect(trainer.compiled_output_source_node == null);
     try testing.expectEqual(@as(usize, 0), trainer.runtime_input_cache.input_ids.dims.len);
     try testing.expectEqual(@as(f32, 3.25), trainer.lora_params.items[0].weights[0]);
     try testing.expectEqual(@as(u64, 7), trainer.step_count);
@@ -3592,6 +5060,8 @@ test "RealAutodiffTrainer: bounded shape cache shares trainables and isolates co
     trainer.runtime_input_cache.input_ids.elem_count = 4;
     try trainer.ensureGraphBuilt(input_a);
     try testing.expect(trainer.compiled_session != null);
+    try testing.expect(trainer.compiled_output_session != null);
+    try testing.expectEqual(trainer.graph_state.?.loss_node, trainer.compiled_output_source_node.?);
     try testing.expectEqual(@as(usize, 0), trainer.runtime_input_cache.input_ids.dims.len);
     try testing.expectEqual(@as(u32, 2), ctx.active_seq_len);
     try testing.expectEqual(@as(f32, 3.25), trainer.lora_params.items[0].weights[0]);
@@ -3618,6 +5088,105 @@ test "RealAutodiffTrainer: bounded shape cache shares trainables and isolates co
     try testing.expectEqual(@as(u32, 4), trainer.inactive_graphs.items[0].signature.seq_len);
     try testing.expectEqual(@as(u32, 6), trainer.graph_signature.?.seq_len);
     try testing.expectEqualStrings("test.linear.weight.lora_A", trainer.lora_params.items[0].name);
+
+    const evictions_before = trainer.graph_cache_evictions;
+    trainer.retireExecutionCaches();
+    try testing.expect(trainer.graph_state == null);
+    try testing.expect(trainer.graph_signature == null);
+    try testing.expect(trainer.compiled_session == null);
+    try testing.expect(trainer.compiled_eval_session == null);
+    try testing.expect(trainer.compiled_output_session == null);
+    try testing.expectEqual(@as(usize, 0), trainer.inactive_graphs.items.len);
+    try testing.expectEqual(evictions_before + 2, trainer.graph_cache_evictions);
+    try testing.expectEqual(@as(f32, 3.25), trainer.lora_params.items[0].weights[0]);
+    try testing.expectEqual(@as(u64, 7), trainer.step_count);
+    try testing.expectEqual(@as(u64, 3), trainer.optimizer_step_count);
+}
+
+test "gemma4 RealAutodiffTrainer: runtime LoRA inventory survives active graph retirement" {
+    const allocator = testing.allocator;
+    const dummy_cb: *const ComputeBackend = @ptrFromInt(@alignOf(ComputeBackend));
+    var ctx = TestCtx{ .hidden = 8 };
+    var trainer = try RealAutodiffTrainer.init(allocator, dummy_cb, .{
+        .lora = .{ .rank = 2, .alpha = 4.0, .target_patterns = &.{"linear.weight"} },
+    });
+    defer {
+        for (trainer.lora_params.items) |*slot| slot.eval_device_weight = null;
+        trainer.deinit();
+    }
+
+    const ids = [_]i64{ 0, 1 };
+    const mask = [_]f32{ 1.0, 1.0 };
+    const targets = [_]f32{0.0} ** 16;
+    try trainer.ensureGraphBuilt(.{
+        .ctx = @ptrCast(&ctx),
+        .build_forward = &TestCtx.buildForward,
+        .build_loss = &TestCtx.buildLoss,
+        .input_ids = &ids,
+        .attention_mask = &mask,
+        .targets = &targets,
+        .targets_shape = Shape.init(.f32, &.{ 2, 8 }),
+        .batch = 1,
+        .seq_len = 2,
+    });
+
+    const adapters_before = try trainer.loraAdapterBaseNames();
+    try testing.expectEqual(@as(usize, 1), adapters_before.len);
+    try testing.expectEqualStrings("test.linear.weight", adapters_before[0].base_name);
+
+    const a_marker: CT = @ptrFromInt(@alignOf(usize));
+    const b_marker: CT = @ptrFromInt(@alignOf(usize) * 2);
+    trainer.lora_params.items[0].eval_device_weight = a_marker;
+    trainer.lora_params.items[1].eval_device_weight = b_marker;
+    trainer.deinitActiveGraph();
+    try testing.expect(trainer.graph_state == null);
+
+    const adapters_after = try trainer.loraAdapterBaseNames();
+    try testing.expectEqual(@as(usize, 1), adapters_after.len);
+    try testing.expectEqualStrings("test.linear.weight", adapters_after[0].base_name);
+    const binding = (try trainer.residentLoraBinding("test.linear.weight")).?;
+    try testing.expectEqual(a_marker, binding.lora_a);
+    try testing.expectEqual(b_marker, binding.lora_b);
+    try testing.expectEqual(@as(usize, 2), binding.rank);
+    try testing.expectEqual(@as(f32, 2.0), binding.scale);
+}
+
+test "gemma4 RealAutodiffTrainer: interpreter evaluation builds a loss-only session without optimizer state" {
+    const allocator = testing.allocator;
+    const dummy_cb: *const ComputeBackend = @ptrFromInt(@alignOf(ComputeBackend));
+    var ctx = TestCtx{ .hidden = 4 };
+    var trainer = try RealAutodiffTrainer.init(allocator, dummy_cb, .{
+        .lora = .{ .rank = 1, .alpha = 1.0, .target_patterns = &.{"linear.weight"} },
+        .execution_engine = .interpreter,
+    });
+    defer trainer.deinit();
+
+    const ids = [_]i64{ 1, 2 };
+    const mask = [_]f32{ 1.0, 1.0 };
+    const targets = [_]f32{0.0} ** 8;
+    const input = TrainerInput{
+        .ctx = @ptrCast(&ctx),
+        .build_forward = &TestCtx.buildForward,
+        .build_loss = &TestCtx.buildLoss,
+        .input_ids = &ids,
+        .attention_mask = &mask,
+        .targets = &targets,
+        .targets_shape = Shape.init(.f32, &.{ 2, 4 }),
+        .batch = 1,
+        .seq_len = 2,
+    };
+    try trainer.ensureGraphBuilt(input);
+    try testing.expect(try trainer.ensureCompiledEvalSessionBuilt());
+    const session = &trainer.compiled_eval_session.?;
+    try testing.expectEqual(@as(usize, 1), session.graph.outputs.items.len);
+    try testing.expectEqual(@as(usize, 0), session.wrt_names.len);
+    try testing.expectEqual(@as(usize, 0), session.param_grads.len);
+    try testing.expectEqual(@as(usize, 0), trainer.optimizer_state.param_states.count());
+    for (trainer.lora_params.items) |slot| {
+        try testing.expectEqual(@as(usize, 0), slot.grad_accum.len);
+        try testing.expect(slot.device == null);
+        try testing.expect(slot.eval_device_weight == null);
+    }
 }
 
 // Mock reduce hook for the DDP hook test. Writes a sentinel value into
@@ -3645,6 +5214,13 @@ fn mockReduceDeviceGrads(ctx_opaque: *anyopaque, cb: *const ComputeBackend, grad
     ctx.last_block_count = grads.len;
 }
 
+fn mockObserveDirectDeviceGrads(ctx_opaque: *anyopaque, cb: *const ComputeBackend, grads: []const DeviceGradBlock) anyerror!void {
+    _ = cb;
+    const ctx: *MockReduceCtx = @ptrCast(@alignCast(ctx_opaque));
+    ctx.call_count += 1;
+    ctx.last_block_count = grads.len;
+}
+
 test "RealAutodiffTrainer: reduce_grads hook type wiring" {
     // Compile-time verification that the hook type + config fields line up,
     // plus a runtime check that a caller-provided hook can be invoked
@@ -3665,6 +5241,8 @@ test "RealAutodiffTrainer: reduce_grads hook type wiring" {
         _ = @TypeOf(C.reduce_grads_ctx);
         _ = @TypeOf(C.reduce_device_grads);
         _ = @TypeOf(C.reduce_device_grads_ctx);
+        _ = @TypeOf(C.observe_direct_device_grads);
+        _ = @TypeOf(C.observe_direct_device_grads_ctx);
     }
 
     var ctx = MockReduceCtx{};
@@ -3734,7 +5312,67 @@ test "RealAutodiffTrainer: reduce_device_grads hook type wiring" {
     try testing.expect(trainer.config.reduce_device_grads != null);
 }
 
-test "RealAutodiffTrainer: partial accumulation flush rescales to the executed micro-batch mean" {
+test "gemma4 RealAutodiffTrainer: direct device gradient observer type wiring" {
+    const allocator = testing.allocator;
+
+    comptime {
+        const F: ?ObserveDirectDeviceGradsFn = mockObserveDirectDeviceGrads;
+        _ = F;
+    }
+
+    var ctx = MockReduceCtx{};
+    const fake_ct: CT = @ptrFromInt(0x1000);
+    const dims = [_]i32{3};
+    const blocks = [_]DeviceGradBlock{
+        .{ .name = "a", .data = fake_ct, .elem_count = 3, .dims = &dims },
+    };
+    const dummy_cb: *const ComputeBackend = @ptrFromInt(@alignOf(ComputeBackend));
+    const observe: ObserveDirectDeviceGradsFn = mockObserveDirectDeviceGrads;
+    try observe(@ptrCast(&ctx), dummy_cb, &blocks);
+    try testing.expectEqual(@as(u32, 1), ctx.call_count);
+    try testing.expectEqual(@as(usize, 1), ctx.last_block_count);
+
+    const cfg = TrainerConfig{
+        .lora = .{ .rank = 2, .alpha = 2.0, .target_patterns = &.{"q_proj"} },
+        .observe_direct_device_grads = mockObserveDirectDeviceGrads,
+        .observe_direct_device_grads_ctx = @ptrCast(&ctx),
+    };
+    try testing.expect(cfg.observe_direct_device_grads != null);
+    try testing.expect(cfg.observe_direct_device_grads_ctx != null);
+
+    var trainer = try RealAutodiffTrainer.init(allocator, dummy_cb, cfg);
+    defer trainer.deinit();
+    try testing.expect(trainer.config.observe_direct_device_grads != null);
+
+    var accumulated = cfg;
+    accumulated.grad_accum_steps = 2;
+    try testing.expectError(
+        error.InvalidDirectDeviceGradientObserverConfiguration,
+        RealAutodiffTrainer.init(allocator, dummy_cb, accumulated),
+    );
+    var reduced = cfg;
+    reduced.reduce_device_grads = mockReduceDeviceGrads;
+    try testing.expectError(
+        error.InvalidDirectDeviceGradientObserverConfiguration,
+        RealAutodiffTrainer.init(allocator, dummy_cb, reduced),
+    );
+}
+
+test "gemma4 partial accumulation renormalization uses the actual micro-batch count" {
+    try testing.expectEqual(@as(f32, 1.0), try RealAutodiffTrainer.partialAccumulationRenormalization(4, 4));
+    try testing.expectEqual(@as(f32, 2.0), try RealAutodiffTrainer.partialAccumulationRenormalization(4, 2));
+    try testing.expectEqual(@as(f32, 1.0), try RealAutodiffTrainer.partialAccumulationRenormalization(0, 1));
+    try testing.expectError(
+        error.InvalidGradientAccumulationState,
+        RealAutodiffTrainer.partialAccumulationRenormalization(4, 0),
+    );
+    try testing.expectError(
+        error.InvalidGradientAccumulationState,
+        RealAutodiffTrainer.partialAccumulationRenormalization(4, 5),
+    );
+}
+
+test "gemma4 RealAutodiffTrainer: partial accumulation flush renormalizes and rejects non-finite norm" {
     const allocator = testing.allocator;
     const dummy_cb: *const ComputeBackend = @ptrFromInt(@alignOf(ComputeBackend));
 
@@ -3751,8 +5389,8 @@ test "RealAutodiffTrainer: partial accumulation flush rescales to the executed m
     weights[0] = 0.0;
     const grad_accum = try allocator.alloc(f32, 1);
     // Two micro-batch gradients summing to 8 were accumulated with the
-    // configured 1/4 scale. Flushing the partial window rescales the stored
-    // value to the mean over the two micro-batches that ran: 8 / 2 = 4.
+    // configured 1/4 scale. The partial flush rescales by 4/2, recovering the
+    // actual two-example mean of 4.
     grad_accum[0] = 2.0;
     const dims = try allocator.dupe(i32, &.{1});
     const name = try allocator.dupe(u8, "x.lora_A");
@@ -3779,6 +5417,12 @@ test "RealAutodiffTrainer: partial accumulation flush rescales to the executed m
     try testing.expectApproxEqAbs(@as(f32, -4.0 / 5.0), weights[0], 1e-6);
     try testing.expectEqual(@as(f32, 0.0), grad_accum[0]);
     try testing.expect((try trainer.flushAccumulatedGradients()) == null);
+
+    const weight_before_nonfinite = weights[0];
+    grad_accum[0] = std.math.nan(f32);
+    trainer.accum_count = 1;
+    try testing.expectError(error.NonFiniteGradientNorm, trainer.flushAccumulatedGradients());
+    try testing.expectEqual(weight_before_nonfinite, weights[0]);
 }
 
 test "RealAutodiffTrainer: training state round-trips weights moments and counters" {
@@ -3853,6 +5497,132 @@ test "RealAutodiffTrainer: training state round-trips weights moments and counte
     try testing.expectEqual(@as(u64, 3), trainer.optimizerSteps());
     try testing.expectEqual(@as(u32, 3), restored.step_count);
     try testing.expectEqual(@as(u32, 3), trainer.lora_params.items[0].adam_step_count);
+}
+
+test "gemma4 RealAutodiffTrainer: pending accumulation checkpoint resumes exact host AdamW trajectory" {
+    const allocator = testing.allocator;
+    const dummy_cb: *const ComputeBackend = @ptrFromInt(@alignOf(ComputeBackend));
+    const config = TrainerConfig{
+        .lora = .{ .rank = 1, .alpha = 1.0, .target_patterns = &.{"x"} },
+        .optimizer = .{ .beta1 = 0.5, .beta2 = 0.75, .eps = 1.0e-5, .weight_decay = 0.01 },
+        .lr_schedule = .{ .constant = 0.05 },
+        .max_grad_norm = 0.0,
+        .grad_accum_steps = 3,
+        .seed = 991,
+    };
+    const progress = TrainingProgress{
+        .epoch_index = 4,
+        .next_example_index = 17,
+        .examples_seen = 91,
+        .order_seed = 12345,
+        .order_cursor = 17,
+        .rng_state = .{ 3, 5, 8, 13 },
+    };
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const resume_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/pending.safetensors", .{tmp.sub_path});
+    defer allocator.free(resume_path);
+    const expected_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/expected.safetensors", .{tmp.sub_path});
+    defer allocator.free(expected_path);
+    const actual_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/actual.safetensors", .{tmp.sub_path});
+    defer allocator.free(actual_path);
+    const fingerprint = [_]u8{0x42} ** 32;
+
+    var uninterrupted = try RealAutodiffTrainer.init(allocator, dummy_cb, config);
+    defer uninterrupted.deinit();
+    try appendTestHostParamSlot(&uninterrupted, "x.lora_A", &.{ 1.25, -0.75 }, &.{ 0.2, -0.4 });
+    const uninterrupted_state = try uninterrupted.optimizer_state.getOrCreate("x.lora_A", 2, true);
+    @memcpy(uninterrupted_state.m, &[_]f32{ 0.1, -0.2 });
+    @memcpy(uninterrupted_state.v, &[_]f32{ 0.3, 0.4 });
+    uninterrupted_state.step_count = 2;
+    uninterrupted.lora_params.items[0].adam_step_count = 2;
+    uninterrupted.optimizer_state.step_count = 2;
+    uninterrupted.step_count = 8;
+    uninterrupted.optimizer_step_count = 2;
+    uninterrupted.accum_count = 2;
+    uninterrupted.setTrainingProgress(progress);
+
+    try testing.expectError(
+        error.CheckpointDuringGradientAccumulation,
+        uninterrupted.saveTrainingState(resume_path, &fingerprint, null),
+    );
+    try uninterrupted.saveTrainingCheckpoint(resume_path, &fingerprint, null);
+    const inspected = try uninterrupted.inspectTrainingCheckpoint(resume_path, &fingerprint);
+    try testing.expectEqual(@as(u32, 2), inspected.accumulation_micro_batches);
+    try testing.expectEqualDeep(progress, inspected.progress);
+
+    _ = (try uninterrupted.flushAccumulatedGradients()).?;
+    try uninterrupted.saveTrainingCheckpoint(expected_path, &fingerprint, null);
+
+    var resumed = try RealAutodiffTrainer.init(allocator, dummy_cb, config);
+    defer resumed.deinit();
+    try appendTestHostParamSlot(&resumed, "x.lora_A", &.{ 0.0, 0.0 }, &.{ 0.0, 0.0 });
+    const restored = try resumed.loadTrainingCheckpoint(resume_path, &fingerprint);
+    try testing.expectEqual(@as(u64, 8), restored.micro_batch_steps);
+    try testing.expectEqual(@as(u64, 2), restored.optimizer_steps);
+    try testing.expectEqual(@as(u32, 2), restored.accumulation_micro_batches);
+    try testing.expectEqualDeep(progress, restored.progress);
+    try testing.expectEqualSlices(f32, &.{ 0.2, -0.4 }, resumed.lora_params.items[0].grad_accum);
+
+    _ = (try resumed.flushAccumulatedGradients()).?;
+    try resumed.saveTrainingCheckpoint(actual_path, &fingerprint, null);
+
+    const expected = try compat.cwd().readFileAlloc(compat.io(), expected_path, allocator, .unlimited);
+    defer allocator.free(expected);
+    const actual = try compat.cwd().readFileAlloc(compat.io(), actual_path, allocator, .unlimited);
+    defer allocator.free(actual);
+    try testing.expectEqualSlices(u8, expected, actual);
+}
+
+test "gemma4 RealAutodiffTrainer: invalid second moment rejects restore before mutating any slot" {
+    const allocator = testing.allocator;
+    const dummy_cb: *const ComputeBackend = @ptrFromInt(@alignOf(ComputeBackend));
+    const config = TrainerConfig{
+        .lora = .{ .rank = 1, .alpha = 1.0, .target_patterns = &.{"x"} },
+        .lr_schedule = .{ .constant = 0.05 },
+    };
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/state.safetensors", .{tmp.sub_path});
+    defer allocator.free(path);
+    const fingerprint = [_]u8{0x42} ** 32;
+
+    var source = try RealAutodiffTrainer.init(allocator, dummy_cb, config);
+    defer source.deinit();
+    try appendTestHostParamSlot(&source, "x.lora_A", &.{-2.0}, &.{0.0});
+    try appendTestHostParamSlot(&source, "x.lora_B", &.{-3.0}, &.{0.0});
+    source.step_count = 1;
+    source.optimizer_step_count = 1;
+    for (source.lora_params.items) |*slot| slot.adam_step_count = 1;
+    _ = try source.optimizer_state.getOrCreate("x.lora_A", 1, true);
+    const state = try source.optimizer_state.getOrCreate("x.lora_B", 1, true);
+    state.m[0] = -0.25;
+    state.v[0] = -0.5;
+    try source.saveTrainingCheckpoint(path, &fingerprint, null);
+
+    var resumed = try RealAutodiffTrainer.init(allocator, dummy_cb, config);
+    defer resumed.deinit();
+    try appendTestHostParamSlot(&resumed, "x.lora_A", &.{10.0}, &.{0.0});
+    try appendTestHostParamSlot(&resumed, "x.lora_B", &.{20.0}, &.{0.0});
+    try testing.expectError(error.InvalidCheckpointSecondMoment, resumed.inspectTrainingCheckpoint(path, &fingerprint));
+    try testing.expectError(error.InvalidCheckpointSecondMoment, resumed.loadTrainingCheckpoint(path, &fingerprint));
+    try testing.expectEqual(@as(f32, 10.0), resumed.lora_params.items[0].weights[0]);
+    try testing.expectEqual(@as(f32, 20.0), resumed.lora_params.items[1].weights[0]);
+    try testing.expectEqual(@as(u64, 0), resumed.step_count);
+    try testing.expectEqual(@as(u64, 0), resumed.optimizer_step_count);
+    try testing.expectEqual(@as(usize, 0), resumed.optimizer_state.param_states.count());
+
+    // Negative weights and first moments are valid; a zero second moment is
+    // also valid for parameters that have only received zero gradients.
+    state.v[0] = 0.0;
+    try source.saveTrainingCheckpoint(path, &fingerprint, null);
+    _ = try resumed.loadTrainingCheckpoint(path, &fingerprint);
+    try testing.expectEqual(@as(f32, -2.0), resumed.lora_params.items[0].weights[0]);
+    try testing.expectEqual(@as(f32, -3.0), resumed.lora_params.items[1].weights[0]);
+    const restored = resumed.optimizer_state.param_states.get("x.lora_B").?;
+    try testing.expectEqual(@as(f32, -0.25), restored.m[0]);
+    try testing.expectEqual(@as(f32, 0.0), restored.v[0]);
 }
 
 test "RealAutodiffTrainer: checkpoint persists zero Adam state for a never-stepped conditional family" {
@@ -3994,6 +5764,58 @@ test "RealAutodiffTrainer: conditional optimizer families gate absent-task steps
     );
 }
 
+test "gemma4 strict Metal evidence rejects undeclared uploads and runtime promotions" {
+    var profile = StepProfile{
+        .graph_executor_partitions = 1,
+        .graph_executor_command_dispatches = 1,
+        .optimizer_backend = .metal,
+        .runtime_input_uploads = 3,
+        .runtime_input_upload_bytes = 48,
+        .runtime_input_h2d_bytes = 48,
+        .declared_runtime_input_uploads = 3,
+        .declared_runtime_input_upload_bytes = 48,
+        .declared_runtime_input_h2d_bytes = 48,
+    };
+    try validateStrictMetalStepEvidence(profile, 0, 2, 2, .train);
+
+    profile.runtime_input_uploads += 1;
+    try testing.expectError(
+        error.StrictMetalUndeclaredRuntimeInputUpload,
+        validateStrictMetalStepEvidence(profile, 0, 2, 2, .train),
+    );
+    profile.runtime_input_uploads -= 1;
+
+    profile.runtime_input_h2d_bytes += 4;
+    try testing.expectError(
+        error.StrictMetalUndeclaredRuntimeInputUpload,
+        validateStrictMetalStepEvidence(profile, 0, 2, 2, .train),
+    );
+    profile.runtime_input_h2d_bytes -= 4;
+
+    profile.graph_execution_input_upload_bytes = 4;
+    try testing.expectError(
+        error.StrictMetalGraphExecutionUpload,
+        validateStrictMetalStepEvidence(profile, 0, 2, 2, .train),
+    );
+    profile.graph_execution_input_upload_bytes = 0;
+
+    profile.graph_executor_metal_gather_input_promotions = 1;
+    try testing.expectError(
+        error.StrictMetalRuntimePromotion,
+        validateStrictMetalStepEvidence(profile, 0, 2, 2, .train),
+    );
+    profile.graph_executor_metal_gather_input_promotions = 0;
+    profile.graph_executor_metal_resident_input_cache_unique_promotions = 1;
+    try testing.expectError(
+        error.StrictMetalRuntimePromotion,
+        validateStrictMetalStepEvidence(profile, 0, 2, 2, .train),
+    );
+
+    profile.graph_executor_metal_resident_input_cache_unique_promotions = 0;
+    profile.optimizer_backend = .host;
+    try validateStrictMetalStepEvidence(profile, 0, 0, 0, .eval);
+}
+
 test "strict CUDA evidence permits only declared uploads and scalar loss readback" {
     var profile = StepProfile{
         .graph_executor_partitions = 1,
@@ -4061,6 +5883,31 @@ test "training execution evidence records only validated successful profiles" {
 
 /// Enroll a one-element trainable whose device handles are unique opaque
 /// markers, so batch membership can be checked without a Metal device.
+fn appendTestHostParamSlot(
+    trainer: *RealAutodiffTrainer,
+    name: []const u8,
+    initial_weights: []const f32,
+    initial_grad_accum: []const f32,
+) !void {
+    if (initial_weights.len != initial_grad_accum.len) return error.InvalidTensorShape;
+    const allocator = trainer.allocator;
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_name);
+    const weights = try allocator.dupe(f32, initial_weights);
+    errdefer allocator.free(weights);
+    const grad_accum = try allocator.dupe(f32, initial_grad_accum);
+    errdefer allocator.free(grad_accum);
+    const dims = try allocator.dupe(i32, &.{@as(i32, @intCast(initial_weights.len))});
+    errdefer allocator.free(dims);
+    try trainer.lora_params.append(allocator, .{
+        .name = owned_name,
+        .weights = weights,
+        .grad_accum = grad_accum,
+        .node_id = null_node,
+        .dims = dims,
+    });
+}
+
 fn appendTestDeviceParamSlot(
     trainer: *RealAutodiffTrainer,
     slots: *std.ArrayListUnmanaged(RealAutodiffTrainer.ParamSlot),

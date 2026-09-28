@@ -1,5 +1,6 @@
 {
   "recipe": "dpo",
+  "execution": { "mode": "train" },
   "model": {
     "path": "/tmp/termite-models/gemma/gemma4-local",
     "reference_path": "/tmp/termite-models/gemma/gemma4-local",
@@ -18,6 +19,14 @@
   },
   "preference": {
     "beta": 0.1
+  },
+  "eval": {
+    "path": "pkg/inference/testdata/dpo_text_preference_eval.jsonl",
+    "max_examples": 1,
+    "dpo_minimums": {
+      "accuracy": 0.0,
+      "max_loss": 100.0
+    }
   },
   "artifacts": {
     "root": "/tmp/termite-dpo-text-gemma-fast"

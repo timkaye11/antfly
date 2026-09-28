@@ -1,0 +1,394 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://antfly.io/schemas/gemma4_oracle_lock.schema.json",
+  "title": "Antfly Gemma4 oracle lock",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "lock_policy",
+    "models",
+    "python_oracle",
+    "mlx_reference",
+    "target_presets",
+    "target_inventory",
+    "training_contract",
+    "benchmark_contract",
+    "tolerance_profiles",
+    "performance_gate",
+    "references"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "antfly_gemma4_oracle_lock/v3"
+    },
+    "lock_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "network_access",
+        "model_loading",
+        "unknown_fields",
+        "comparison_input",
+        "prepared_schema",
+        "label_ignore_index",
+        "causal_label_shift",
+        "loss_reduction"
+      ],
+      "properties": {
+        "network_access": { "const": "forbidden-during-run" },
+        "model_loading": { "const": "local-files-only" },
+        "unknown_fields": { "const": "reject" },
+        "comparison_input": { "const": "exact-antfly-input-ids-and-labels" },
+        "prepared_schema": { "const": "gemma4_prepared/v6" },
+        "label_ignore_index": { "const": -100 },
+        "causal_label_shift": { "const": 1 },
+        "loss_reduction": { "type": "string", "minLength": 1 }
+      }
+    },
+    "models": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gemma-4-E2B-it", "gemma-4-E4B-it"],
+      "properties": {
+        "gemma-4-E2B-it": { "$ref": "#/$defs/model" },
+        "gemma-4-E4B-it": { "$ref": "#/$defs/model" }
+      }
+    },
+    "python_oracle": { "$ref": "#/$defs/pythonEnvironment" },
+    "mlx_reference": { "$ref": "#/$defs/mlxEnvironment" },
+    "target_presets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["peft-qv", "text-all-linear"],
+      "properties": {
+        "peft-qv": { "$ref": "#/$defs/nonEmptyUniqueStrings" },
+        "text-all-linear": { "$ref": "#/$defs/nonEmptyUniqueStrings" }
+      }
+    },
+    "target_inventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gemma-4-E2B-it", "gemma-4-E4B-it"],
+      "properties": {
+        "gemma-4-E2B-it": { "$ref": "#/$defs/modelTargetInventory" },
+        "gemma-4-E4B-it": { "$ref": "#/$defs/modelTargetInventory" }
+      }
+    },
+    "training_contract": { "$ref": "#/$defs/trainingContract" },
+    "benchmark_contract": { "$ref": "#/$defs/benchmarkContract" },
+    "tolerance_profiles": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tiny-f32", "native-metal-bf16", "hf-zig-bf16", "resume"],
+      "properties": {
+        "tiny-f32": { "$ref": "#/$defs/tolerance" },
+        "native-metal-bf16": { "$ref": "#/$defs/tolerance" },
+        "hf-zig-bf16": { "$ref": "#/$defs/tolerance" },
+        "resume": { "$ref": "#/$defs/tolerance" }
+      }
+    },
+    "performance_gate": { "$ref": "#/$defs/performanceGate" },
+    "references": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "type": "string", "pattern": "^https://" }
+    }
+  },
+  "$defs": {
+    "hex40": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "hex64": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "nonEmptyUniqueStrings": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["size"],
+      "properties": {
+        "size": { "type": "integer", "minimum": 1 },
+        "sha256": { "$ref": "#/$defs/hex64" },
+        "git_blob_sha1": { "$ref": "#/$defs/hex40" }
+      },
+      "oneOf": [
+        { "required": ["sha256"] },
+        { "required": ["git_blob_sha1"] }
+      ]
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repo_id", "revision", "architecture", "files"],
+      "properties": {
+        "repo_id": { "type": "string", "pattern": "^[^/]+/[^/]+$" },
+        "revision": { "$ref": "#/$defs/hex40" },
+        "architecture": { "const": "Gemma4ForConditionalGeneration" },
+        "files": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": { "$ref": "#/$defs/file" }
+        }
+      }
+    },
+    "packages": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "type": "string", "pattern": "^[0-9]+(?:\\.[0-9]+)+(?:[-+][A-Za-z0-9.]+)?$" }
+    },
+    "sourceRevisions": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "$ref": "#/$defs/hex40" }
+    },
+    "pythonEnvironment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["python", "packages", "source_revisions", "execution"],
+      "properties": {
+        "python": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+$" },
+        "packages": { "$ref": "#/$defs/packages" },
+        "source_revisions": { "$ref": "#/$defs/sourceRevisions" },
+        "execution": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["attention_implementation", "device", "dropout", "dtype", "gradient_dtype", "optimizer_state_dtype", "use_cache", "deterministic_algorithms"],
+          "properties": {
+            "attention_implementation": { "const": "eager" },
+            "device": { "const": "cuda" },
+            "dropout": { "const": 0.0 },
+            "dtype": { "const": "bfloat16" },
+            "gradient_dtype": { "const": "float32" },
+            "optimizer_state_dtype": { "const": "float32" },
+            "use_cache": { "const": false },
+            "deterministic_algorithms": { "const": true }
+          }
+        }
+      }
+    },
+    "mlxEnvironment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["python", "packages", "source_revisions", "native_runtime", "role", "minimum_fresh_processes", "warmup_steps", "measured_steps", "required_platform", "required_machine"],
+      "properties": {
+        "python": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+$" },
+        "packages": { "$ref": "#/$defs/packages" },
+        "source_revisions": { "$ref": "#/$defs/sourceRevisions" },
+        "native_runtime": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["extension_module", "artifact_roles", "minimum_macos_sdk_version", "build_attestation_schema_version", "precision_policy_sha256"],
+          "properties": {
+            "extension_module": { "const": "mlx.core" },
+            "artifact_roles": {
+              "type": "array",
+              "prefixItems": [
+                { "const": "jaccl-runtime-dylib" },
+                { "const": "metal-library" },
+                { "const": "python-extension" },
+                { "const": "runtime-dylib" }
+              ],
+              "minItems": 4,
+              "maxItems": 4
+            },
+            "minimum_macos_sdk_version": { "const": "26.2" },
+            "build_attestation_schema_version": { "const": "antfly_mlx_native_build_attestation/v1" },
+            "precision_policy_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+          }
+        },
+        "role": { "const": "same-mac-performance-reference-only" },
+        "minimum_fresh_processes": { "type": "integer", "minimum": 5 },
+        "warmup_steps": { "type": "integer", "minimum": 1 },
+        "measured_steps": { "type": "integer", "minimum": 5 },
+        "required_platform": { "const": "Darwin" },
+        "required_machine": { "const": "arm64" }
+      }
+    },
+    "performanceGate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["minimum_geomean_throughput_ratio", "minimum_cell_throughput_ratio", "maximum_peak_memory_ratio", "maximum_regression_fraction", "primary_sequence_lengths", "gradient_accumulation", "microbatch", "rank", "alpha"],
+      "properties": {
+        "minimum_geomean_throughput_ratio": { "type": "number", "exclusiveMinimum": 0 },
+        "minimum_cell_throughput_ratio": { "type": "number", "exclusiveMinimum": 0 },
+        "maximum_peak_memory_ratio": { "type": "number", "exclusiveMinimum": 0 },
+        "maximum_regression_fraction": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+        "primary_sequence_lengths": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "integer", "minimum": 1 } },
+        "gradient_accumulation": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "integer", "minimum": 1 } },
+        "microbatch": { "type": "integer", "minimum": 1 },
+        "rank": { "type": "integer", "minimum": 1 },
+        "alpha": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "modelTargetInventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["peft-qv", "text-all-linear"],
+      "properties": {
+        "peft-qv": { "$ref": "#/$defs/targetCounts" },
+        "text-all-linear": { "$ref": "#/$defs/targetCounts" }
+      }
+    },
+    "targetCounts": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "type": "integer", "minimum": 1 }
+    },
+    "trainingContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["optimizer", "seed", "steps", "learning_rate", "betas", "eps", "weight_decay", "max_grad_norm", "grad_accum_steps", "supervised_token_normalization"],
+      "properties": {
+        "optimizer": { "const": "adamw" },
+        "seed": { "type": "integer", "minimum": 0 },
+        "steps": { "type": "array", "prefixItems": [{"const": 1}, {"const": 2}, {"const": 8}], "minItems": 3, "maxItems": 3 },
+        "learning_rate": { "type": "number", "exclusiveMinimum": 0 },
+        "betas": { "type": "array", "prefixItems": [{"type": "number", "minimum": 0, "exclusiveMaximum": 1}, {"type": "number", "minimum": 0, "exclusiveMaximum": 1}], "minItems": 2, "maxItems": 2 },
+        "eps": { "type": "number", "exclusiveMinimum": 0 },
+        "weight_decay": { "type": "number", "minimum": 0 },
+        "max_grad_norm": { "type": "number", "minimum": 0 },
+        "grad_accum_steps": { "const": 1 },
+        "supervised_token_normalization": { "const": "mean" }
+      }
+    },
+    "benchmarkContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "precision", "optimizer", "determinism", "runtime", "memory"],
+      "properties": {
+        "schema_version": { "const": "antfly_gemma4_lora_benchmark_semantics/v3" },
+        "precision": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["verified", "not_asserted", "comparison_policy"],
+          "properties": {
+            "verified": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["base_model_storage_dtype", "lora_parameter_storage_dtype", "gradient_storage_dtype", "optimizer_moment_storage_dtype", "loss_tensor_dtype", "loss_reduction_input_dtype"],
+              "properties": {
+                "base_model_storage_dtype": { "const": "bfloat16" },
+                "lora_parameter_storage_dtype": { "const": "float32" },
+                "gradient_storage_dtype": { "const": "float32" },
+                "optimizer_moment_storage_dtype": { "const": "float32" },
+                "loss_tensor_dtype": { "const": "float32" },
+                "loss_reduction_input_dtype": { "const": "float32" }
+              }
+            },
+            "not_asserted": {
+              "type": "array",
+              "prefixItems": [
+                { "const": "activation_dtype" },
+                { "const": "matmul_accumulator_dtype" }
+              ],
+              "minItems": 2,
+              "maxItems": 2
+            },
+            "comparison_policy": { "const": "diagnostic-only-until-all-comparison-critical-dtypes-are-runtime-proven" }
+          }
+        },
+        "optimizer": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "learning_rate", "schedule", "betas", "eps", "bias_correction", "weight_decay", "weight_decay_scope", "gradient_clip_kind", "gradient_clip_max_norm", "gradient_clip_epsilon", "gradient_clip_order", "gradient_accumulation_reduction", "partial_accumulation_windows"],
+          "properties": {
+            "name": { "const": "adamw" },
+            "learning_rate": { "const": 0.001 },
+            "schedule": { "const": "constant-no-warmup" },
+            "betas": { "type": "array", "prefixItems": [{"const": 0.9}, {"const": 0.999}], "minItems": 2, "maxItems": 2 },
+            "eps": { "const": 1e-8 },
+            "bias_correction": { "const": true },
+            "weight_decay": { "const": 0.01 },
+            "weight_decay_scope": { "const": "all-and-only-lora-a-and-lora-b-parameters" },
+            "gradient_clip_kind": { "const": "global-l2-norm" },
+            "gradient_clip_max_norm": { "const": 1.0 },
+            "gradient_clip_epsilon": { "const": 1e-6 },
+            "gradient_clip_order": { "const": "after-accumulation-before-adamw-update" },
+            "gradient_accumulation_reduction": { "const": "arithmetic-mean-of-per-microbatch-mean-supervised-token-gradients" },
+            "partial_accumulation_windows": { "const": "forbidden" }
+          }
+        },
+        "determinism": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["seed", "sample_order", "dropout", "lora_a_initializer", "lora_b_initializer", "initial_adapter_policy"],
+          "properties": {
+            "seed": { "const": 42 },
+            "sample_order": { "const": "fixed-prepared-workload-order-without-shuffle" },
+            "dropout": { "const": 0.0 },
+            "lora_a_initializer": { "const": "kaiming-uniform-a-sqrt5-fan-in" },
+            "lora_b_initializer": { "const": "zeros" },
+            "initial_adapter_policy": { "const": "load-byte-equivalent-canonical-f32-semantics" }
+          }
+        },
+        "runtime": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["attention_kv_cache", "activation_checkpointing", "training_checkpoint_io", "compiled_graph_cache", "compile_policy", "filesystem_cache_policy", "per_step_device_sync"],
+          "properties": {
+            "attention_kv_cache": { "const": false },
+            "activation_checkpointing": { "const": false },
+            "training_checkpoint_io": { "const": "disabled" },
+            "compiled_graph_cache": { "const": "enabled-process-local-shape-keyed" },
+            "compile_policy": { "const": "lazy-first-full-optimizer-window-included-in-cold-metric" },
+            "filesystem_cache_policy": { "const": "not-flushed-between-alternating-fresh-processes" },
+            "per_step_device_sync": { "const": "after-optimizer-update-before-timer-stop-every-window" }
+          }
+        },
+        "memory": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["process_peak_definition", "sampler_interval_ms", "framework_allocator_peak", "system_delta_source", "system_delta_window", "maximum_swapins_bytes", "maximum_swapouts_bytes", "maximum_pageins_bytes", "maximum_pageouts_bytes", "minimum_pressure_available_percent_delta"],
+          "properties": {
+            "process_peak_definition": { "const": "maximum-darwin-proc-pid-rusage-v4-ri-phys-footprint-sample" },
+            "sampler_interval_ms": { "const": 10 },
+            "framework_allocator_peak": { "const": "separate-diagnostic-not-cross-framework-gate" },
+            "system_delta_source": { "const": "darwin-vm-stat-pages-and-memory-pressure-before-after" },
+            "system_delta_window": { "const": "measured-optimizer-steps-only" },
+            "maximum_swapins_bytes": { "const": 0 },
+            "maximum_swapouts_bytes": { "const": 0 },
+            "maximum_pageins_bytes": { "const": 0 },
+            "maximum_pageouts_bytes": { "const": 0 },
+            "minimum_pressure_available_percent_delta": { "const": -5.0 }
+          }
+        }
+      }
+    },
+    "tolerance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "loss_abs",
+        "loss_rel",
+        "grad_norm_abs",
+        "grad_norm_rel",
+        "logits_max_abs",
+        "logits_rel_l2",
+        "logits_cosine_min",
+        "gradient_max_abs",
+        "gradient_rel_l2",
+        "gradient_cosine_min",
+        "state_max_abs",
+        "state_rel_l2",
+        "state_cosine_min"
+      ],
+      "properties": {
+        "loss_abs": { "type": "number", "minimum": 0 },
+        "loss_rel": { "type": "number", "minimum": 0 },
+        "grad_norm_abs": { "type": "number", "minimum": 0 },
+        "grad_norm_rel": { "type": "number", "minimum": 0 },
+        "logits_max_abs": { "type": "number", "minimum": 0 },
+        "logits_rel_l2": { "type": "number", "minimum": 0 },
+        "logits_cosine_min": { "type": "number", "minimum": -1, "maximum": 1 },
+        "gradient_max_abs": { "type": "number", "minimum": 0 },
+        "gradient_rel_l2": { "type": "number", "minimum": 0 },
+        "gradient_cosine_min": { "type": "number", "minimum": -1, "maximum": 1 },
+        "state_max_abs": { "type": "number", "minimum": 0 },
+        "state_rel_l2": { "type": "number", "minimum": 0 },
+        "state_cosine_min": { "type": "number", "minimum": -1, "maximum": 1 }
+      }
+    }
+  }
+}

@@ -1,0 +1,5 @@
+# Exact dependencies used to validate and package the Zig numerical-oracle
+# capture. Keep this minimal subset synchronized with gemma4_oracle.lock.json;
+# the macOS Metal contract job must not install the CUDA-only HF oracle stack.
+numpy==2.4.2
+safetensors==0.7.0

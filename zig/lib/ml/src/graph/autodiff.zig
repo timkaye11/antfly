@@ -50,6 +50,9 @@ pub const GradientError = error{
     NoVjpRule,
     /// The loss node must produce a scalar.
     LossNotScalar,
+    /// Fused linear cross-entropy deliberately omits the frozen vocabulary
+    /// projection gradient. Callers needing d_weight must use the dense path.
+    LinearCrossEntropyWeightGradientUnsupported,
     /// None of the requested differentiation targets can reach the loss.
     NoGradientPath,
 };
@@ -111,6 +114,13 @@ pub fn gradient(
     const forward_count = lowered.graph.nodeCount();
     const param_grads = try appendBackwardPass(allocator, &lowered.graph, lowered_loss, lowered_wrt);
 
+    // The fused GQA node owns the VJP boundary, but its saved primitive
+    // alternate is the faster proven training forward. Rewire every forward
+    // value use only after the custom backward nodes exist. The fused node then
+    // becomes dead while its compact backward remains reachable from parameter
+    // gradients.
+    redirectFusedGqaForwardAlternates(&lowered.graph, lowered.id_map);
+
     return .{
         .graph = lowered.graph,
         .param_grads = param_grads,
@@ -118,6 +128,33 @@ pub fn gradient(
         .forward_node_count = forward_count,
         .allocator = allocator,
     };
+}
+
+fn redirectFusedGqaForwardAlternates(g: *Graph, id_map: []NodeId) void {
+    const count = g.nodeCount();
+    for (0..count) |raw_fused_id| {
+        const fused_id: NodeId = @intCast(raw_fused_id);
+        const fused = g.node(fused_id).*;
+        if (fused.op != .fused_gqa_causal_attention or fused.vjp_alternate == null_node) continue;
+        const alternate = fused.vjp_alternate;
+        if (alternate >= fused_id) continue;
+
+        for (0..count) |raw_node_id| {
+            const node_id: NodeId = @intCast(raw_node_id);
+            if (node_id == fused_id) continue;
+            const node = g.nodeMut(node_id);
+            for (0..node.num_inputs) |input_index| {
+                if (node.inputs[input_index] == fused_id) node.inputs[input_index] = alternate;
+            }
+        }
+        for (g.outputs.items) |*output| {
+            if (output.* == fused_id) output.* = alternate;
+        }
+        for (id_map) |*mapped| {
+            if (mapped.* == fused_id) mapped.* = alternate;
+        }
+        g.nodeMut(fused_id).vjp_alternate = null_node;
+    }
 }
 
 /// Append the reverse-mode graph for an already-lowered forward graph.
@@ -957,98 +994,152 @@ fn applyVjp(
                 if (lhs_ax == 1 and rhs_ax == 0 and !attrs.retain_backward_storage) {
                     vjp_geometry_supported = true;
                     // Y = A @ B → dA = dY @ B^T, dB = A^T @ dY
-                    const bt = try b.transpose(ins[1], &.{ 1, 0 });
-                    const grad_a = try b.matmul(adj_for_dot, bt);
-                    try accumulate(b, adjoints, ins[0], grad_a);
-
-                    const at = try b.transpose(ins[0], &.{ 1, 0 });
-                    const grad_b = try b.matmul(at, adj_for_dot);
-                    try accumulate(b, adjoints, ins[1], grad_b);
-                } else if (lhs_ax == 1 and rhs_ax == 1) {
-                    vjp_geometry_supported = true;
-                    // Y = A @ B^T with B stored physically as [out, in].
-                    // Preserve that layout in both VJPs so large frozen
-                    // weights never need a materialized transpose.
                     if (depends_on_wrt[ins[0]]) {
-                        const grad_a = try dotGeneral2DDirect(b, adj_for_dot, ins[1], 1, 0);
+                        const grad_a = if (transpose2dSource(g, ins[1])) |source|
+                            try b.matmul(adj_for_dot, source)
+                        else blk: {
+                            const bt = try b.transpose(ins[1], &.{ 1, 0 });
+                            break :blk try b.matmul(adj_for_dot, bt);
+                        };
+                        try accumulate(b, adjoints, ins[0], grad_a);
+                    }
+
+                    if (depends_on_wrt[ins[1]]) {
+                        // Linear weights are represented as W[out, in] and
+                        // consumed through transpose(W). Emit dW directly as
+                        // dY^T @ A whenever the RHS is such a transpose. This
+                        // avoids both materialized transposes in
+                        // A^T @ dY -> transpose(...) for LoRA A and B.
+                        if (transpose2dSource(g, ins[1])) |source| {
+                            const grad_source = try dotGeneral2DDirect(b, adj_for_dot, ins[0], 0, 0);
+                            try accumulate(b, adjoints, source, grad_source);
+                        } else {
+                            const at = try b.transpose(ins[0], &.{ 1, 0 });
+                            const grad_b = try b.matmul(at, adj_for_dot);
+                            try accumulate(b, adjoints, ins[1], grad_b);
+                        }
+                    }
+                } else if (attrs.retain_backward_storage and lhs_ax <= 1 and rhs_ax <= 1) {
+                    vjp_geometry_supported = true;
+                    // Retained forward storage must stay in its physical
+                    // layout. Form each derivative directly in that layout
+                    // rather than materializing a transpose, and prune
+                    // derivatives that cannot reach a requested parameter.
+                    if (depends_on_wrt[ins[0]]) {
+                        const grad_a = if (lhs_ax == 1)
+                            try b.matmul2DLayout(adj_for_dot, ins[1], false, rhs_ax == 0)
+                        else
+                            try b.matmul2DLayout(ins[1], adj_for_dot, rhs_ax == 1, true);
                         try accumulate(b, adjoints, ins[0], grad_a);
                     }
                     if (depends_on_wrt[ins[1]]) {
-                        const grad_b = try dotGeneral2DDirect(b, adj_for_dot, ins[0], 0, 0);
+                        const grad_b = if (rhs_ax == 0)
+                            try b.matmul2DLayout(ins[0], adj_for_dot, lhs_ax == 1, false)
+                        else
+                            try b.matmul2DLayout(adj_for_dot, ins[0], true, lhs_ax == 0);
                         try accumulate(b, adjoints, ins[1], grad_b);
                     }
                 } else if (lhs_ax <= 1 and rhs_ax <= 1) {
                     vjp_geometry_supported = true;
-                    // Retained forward storage must stay in its physical
-                    // layout. Form each derivative directly in that layout
-                    // rather than materializing a transpose.
-                    const grad_a = if (lhs_ax == 1)
-                        try b.matmul2DLayout(adj_for_dot, ins[1], false, rhs_ax == 0)
-                    else
-                        try b.matmul2DLayout(ins[1], adj_for_dot, rhs_ax == 1, true);
-                    const grad_b = if (rhs_ax == 0)
-                        try b.matmul2DLayout(ins[0], adj_for_dot, lhs_ax == 1, false)
-                    else
-                        try b.matmul2DLayout(adj_for_dot, ins[0], true, lhs_ax == 0);
-                    try accumulate(b, adjoints, ins[0], grad_a);
-                    try accumulate(b, adjoints, ins[1], grad_b);
-                } else if (strict) return error.NoVjpRule;
-            } else if (attrs.num_contracting == 1 and attrs.num_batch == 1 and a_shape.rank() == 3 and b_shape.rank() == 3) {
+                    // Remaining rank-2 layouts, including Y = A @ B^T with B
+                    // stored physically as [out, in]. Choose operand order
+                    // and contracting axes so each dot emits its operand's
+                    // physical layout; large frozen weights never need a
+                    // materialized transpose.
+                    if (depends_on_wrt[ins[0]]) {
+                        const grad_a = if (lhs_ax == 1)
+                            try dotGeneral2DDirect(b, adj_for_dot, ins[1], 1, 1 - rhs_ax)
+                        else
+                            try dotGeneral2DDirect(b, ins[1], adj_for_dot, 1 - rhs_ax, 1);
+                        try accumulate(b, adjoints, ins[0], grad_a);
+                    }
+                    if (depends_on_wrt[ins[1]]) {
+                        const grad_b = if (rhs_ax == 1)
+                            try dotGeneral2DDirect(b, adj_for_dot, ins[0], 0, 1 - lhs_ax)
+                        else
+                            try dotGeneral2DDirect(b, ins[0], adj_for_dot, 1 - lhs_ax, 0);
+                        try accumulate(b, adjoints, ins[1], grad_b);
+                    }
+                }
+            } else if (attrs.num_contracting == 1 and attrs.num_batch == 1 and a_shape.rank() == 3 and b_shape.rank() == 3 and
+                attrs.lhs_batch[0] == 0 and attrs.rhs_batch[0] == 0)
+            {
                 vjp_geometry_supported = true;
                 // 3D batched matmul with batch dim 0.
                 // Y[b] = A[b] @ B[b] → dA[b] = dY[b] @ B[b]^T, dB[b] = A[b]^T @ dY[b]
-                // Implemented via transpose([0,2,1]) + batched dot_general(lc=2, rc=1).
+                // Emit the contractions in the operand order that directly
+                // produces each input's physical layout.  This avoids the
+                // four materialized matrix transposes that otherwise surround
+                // an attention-style batched-dot VJP.
                 const lc = attrs.lhs_contracting[0];
                 const rc = attrs.rhs_contracting[0];
+                if ((lc != 1 and lc != 2) or (rc != 1 and rc != 2)) return error.NoVjpRule;
                 const lb = attrs.lhs_batch[0];
                 const rb = attrs.rhs_batch[0];
                 if (lb != 0 or rb != 0 or (lc != 1 and lc != 2) or (rc != 1 and rc != 2)) return error.NoVjpRule;
 
                 if (attrs.retain_backward_storage) {
-                    // Retain both contraction operands. Match the reference's
-                    // dA product before restoring a transposed A layout:
-                    // reversing the product to avoid that output copy changes
-                    // FP32 reduction order even with the same BLAS library.
-                    const grad_a_raw = try b.matmul3DLayout(adj_for_dot, ins[1], false, rc == 1);
-                    const grad_a = if (lc == 1) try b.transpose(grad_a_raw, &.{ 0, 2, 1 }) else grad_a_raw;
-                    const grad_b = if (rc == 1)
-                        try b.matmul3DLayout(ins[0], adj_for_dot, lc == 2, false)
-                    else
-                        try b.matmul3DLayout(adj_for_dot, ins[0], true, lc == 1);
-                    try accumulate(b, adjoints, ins[0], grad_a);
-                    try accumulate(b, adjoints, ins[1], grad_b);
+                    // Retain the reference dA product order before restoring
+                    // a transposed A layout; swapping operands changes FP32
+                    // reduction order even with the same BLAS library.
+                    if (depends_on_wrt[ins[0]]) {
+                        const grad_a_raw = try b.matmul3DLayout(adj_for_dot, ins[1], false, rc == 1);
+                        const grad_a = if (lc == 1) try b.transpose(grad_a_raw, &.{ 0, 2, 1 }) else grad_a_raw;
+                        try accumulate(b, adjoints, ins[0], grad_a);
+                    }
+                    if (depends_on_wrt[ins[1]]) {
+                        const grad_b = if (rc == 1)
+                            try b.matmul3DLayout(ins[0], adj_for_dot, lc == 2, false)
+                        else
+                            try b.matmul3DLayout(adj_for_dot, ins[0], true, lc == 1);
+                        try accumulate(b, adjoints, ins[1], grad_b);
+                    }
                     return;
                 }
 
-                // dA = adj @ B^T (contract adj's last dim with B's free dim)
-                const bt = if (rc == 1) try b.transpose(ins[1], &.{ 0, 2, 1 }) else ins[1];
-                const grad_a_raw = try batchedDotGeneral3D(b, adj_for_dot, bt);
-                // If A's layout isn't [batch, free, contract], transpose back.
-                const grad_a = if (lc == 1) try b.transpose(grad_a_raw, &.{ 0, 2, 1 }) else grad_a_raw;
-                try accumulate(b, adjoints, ins[0], grad_a);
+                // Find free dims (the one that's not batch and not contracting).
+                const a_free: u8 = for ([_]u8{ 0, 1, 2 }) |d| {
+                    if (d != lb and d != lc) break d;
+                } else 1;
+                const b_free: u8 = for ([_]u8{ 0, 1, 2 }) |d| {
+                    if (d != rb and d != rc) break d;
+                } else 1;
+                // dA.  When A is [free,contract], adj @ B contracts the
+                // adjoint's B-free axis with B's free axis.  When A is
+                // [contract,free], swapping the operands directly emits that
+                // transposed physical layout.
+                if (depends_on_wrt[ins[0]]) {
+                    const grad_a = if (lc == 2)
+                        try batchedDotGeneralDirect(b, adj_for_dot, ins[1], 1, 2, b_free)
+                    else
+                        try batchedDotGeneralDirect(b, ins[1], adj_for_dot, 1, b_free, 2);
+                    try accumulate(b, adjoints, ins[0], grad_a);
+                }
 
-                // dB = A^T @ adj (contract A's free dim with adj's first non-batch dim)
-                // For a retained transposed RHS, form dB = adj^T @ A
-                // directly in its storage layout.
-                const grad_b = if (rc == 1) blk: {
-                    const at = if (lc == 2) try b.transpose(ins[0], &.{ 0, 2, 1 }) else ins[0];
-                    break :blk try batchedDotGeneral3D(b, at, adj_for_dot);
-                } else blk: {
-                    const a = if (lc == 2) ins[0] else try b.transpose(ins[0], &.{ 0, 2, 1 });
-                    const adj_t = try b.transpose(adj_for_dot, &.{ 0, 2, 1 });
-                    break :blk try batchedDotGeneral3D(b, adj_t, a);
-                };
-                try accumulate(b, adjoints, ins[1], grad_b);
+                // dB follows the same rule: choose operand order so the dot's
+                // [lhs-free,rhs-free] output axes already match B.
+                if (depends_on_wrt[ins[1]]) {
+                    const grad_b = if (rc == 1)
+                        try batchedDotGeneralDirect(b, ins[0], adj_for_dot, 1, a_free, 1)
+                    else
+                        try batchedDotGeneralDirect(b, adj_for_dot, ins[0], 1, 1, a_free);
+                    try accumulate(b, adjoints, ins[1], grad_b);
+                }
             } else if (attrs.num_contracting == 1 and attrs.num_batch == 2 and a_shape.rank() == 4 and b_shape.rank() == 4 and
                 attrs.lhs_batch[0] == 0 and attrs.lhs_batch[1] == 1 and
                 attrs.rhs_batch[0] == 0 and attrs.rhs_batch[1] == 1)
             {
-                // Gemma attention keeps batch and head as separate leading
-                // batch axes. Choose operand order and contracting axes so
-                // both VJPs directly match the physical input layouts:
+                // Transformer (e.g. Gemma) attention keeps batch and head as
+                // separate batch axes. The remaining two axes form a matrix,
+                // with the contracting axis in either position:
                 //
                 //   scores: [B,H,Q,D] @ [B,H,K,D] -> [B,H,Q,K]
                 //   values: [B,H,Q,K] @ [B,H,K,D] -> [B,H,Q,D]
+                //
+                // Select operand order and contracting axes so every VJP dot
+                // directly emits the requested input layout.  The batched-dot
+                // kernels accept either matrix axis as the contraction, so no
+                // input or output transpose is needed.
                 const lc = attrs.lhs_contracting[0];
                 const rc = attrs.rhs_contracting[0];
                 if ((lc == 2 or lc == 3) and (rc == 2 or rc == 3)) {
@@ -1062,6 +1153,7 @@ fn applyVjp(
                             try batchedDotGeneralDirect(b, ins[1], adj_for_dot, 2, b_free, 3);
                         try accumulate(b, adjoints, ins[0], grad_a);
                     }
+
                     if (depends_on_wrt[ins[1]]) {
                         const grad_b = if (rc == 2)
                             try batchedDotGeneralDirect(b, ins[0], adj_for_dot, 2, a_free, 2)
@@ -1071,6 +1163,8 @@ fn applyVjp(
                     }
                 }
             }
+            // An unsupported contraction must never look like a zero
+            // gradient for a requested trainable parameter.
             if (!vjp_geometry_supported and (strict or depends_on_wrt[ins[0]] or depends_on_wrt[ins[1]])) {
                 return error.NoVjpRule;
             }
@@ -1078,8 +1172,9 @@ fn applyVjp(
 
         // ── Data movement ────────────────────────────────────────────
 
-        .gather => |attrs| {
-            if (strict and n.op.gather.axis != 0) return error.NoVjpRule;
+        .gather, .fused_embedding_lookup => {
+            if (strict and n.op == .gather and n.op.gather.axis != 0) return error.NoVjpRule;
+            const attrs = if (n.op == .gather) n.op.gather else node_mod.GatherAttrs{};
             // d/d(table)(gather(table, indices)) = scatter_add(adj, indices)
             const table_shape = g.node(ins[0]).output_shape;
             const grad = try b.graph.addNode(.{
@@ -1144,9 +1239,14 @@ fn applyVjp(
             const sin_id = ins[2];
 
             const neg_sin = try b.neg(sin_id);
+            // Runtime backends may reconstruct the angle from attributes
+            // instead of consuming the tables. Encode the inverse rotation
+            // in both representations so their VJP agrees.
+            var inverse_attrs = attrs;
+            inverse_attrs.freq_scale = -attrs.freq_scale;
             const input_shape = g.node(input_id).output_shape;
             const grad_input = try b.graph.addNode(.{
-                .op = .{ .fused_rope = attrs },
+                .op = .{ .fused_rope = inverse_attrs },
                 .output_shape = input_shape,
                 .inputs = .{ adj, cos_id, neg_sin, null_node },
                 .num_inputs = 3,
@@ -1158,6 +1258,46 @@ fn applyVjp(
             try accumulate(b, adjoints, input_id, grad_input);
             // cos/sin are treated as frozen position embeddings; no grad.
         },
+
+        // ── Fused causal GQA (hand-written VJP) ─────────────────────
+        // Q is [B*S, H*D], K/V are [B*S, KV*D]. The backward op returns
+        // [dQ rows; dK rows; dV rows] with every row width D, which lets the
+        // accelerator compute shared-KV gradients without materializing the
+        // H/KV fan-out used by the primitive graph.
+        .fused_gqa_causal_attention => |attrs| {
+            if (n.num_inputs != 3 or attrs.batch == 0 or attrs.seq_len == 0 or
+                attrs.num_heads == 0 or attrs.num_kv_heads == 0 or attrs.head_dim == 0)
+            {
+                return error.NoVjpRule;
+            }
+            const dtype = g.node(ins[0]).output_shape.dtype;
+            const bs: i64 = @intCast(@as(u64, attrs.batch) * @as(u64, attrs.seq_len));
+            const q_rows: i64 = bs * @as(i64, @intCast(attrs.num_heads));
+            const kv_rows: i64 = bs * @as(i64, @intCast(attrs.num_kv_heads));
+            const d: i64 = @intCast(attrs.head_dim);
+            const packed_grads = try b.graph.addNode(.{
+                .op = .{ .fused_gqa_causal_attention_backward = attrs },
+                .output_shape = Shape.init(dtype, &.{ q_rows + 2 * kv_rows, d }),
+                .inputs = .{ ins[0], ins[1], ins[2], adj },
+                .num_inputs = 4,
+                .vjp_alternate = null_node,
+            });
+
+            if (depends_on_wrt[ins[0]]) {
+                const rows = try sliceRows(b, packed_grads, 0, q_rows, d, dtype);
+                try accumulate(b, adjoints, ins[0], try b.reshape(rows, g.node(ins[0]).output_shape));
+            }
+            if (depends_on_wrt[ins[1]]) {
+                const rows = try sliceRows(b, packed_grads, q_rows, q_rows + kv_rows, d, dtype);
+                try accumulate(b, adjoints, ins[1], try b.reshape(rows, g.node(ins[1]).output_shape));
+            }
+            if (depends_on_wrt[ins[2]]) {
+                const rows = try sliceRows(b, packed_grads, q_rows + kv_rows, q_rows + 2 * kv_rows, d, dtype);
+                try accumulate(b, adjoints, ins[2], try b.reshape(rows, g.node(ins[2]).output_shape));
+            }
+        },
+
+        .fused_gqa_causal_attention_backward => {},
 
         // ── Fused disentangled attention (hand-written VJP) ──────────
         // Forward inputs: ins[0]=qkv_packed [3*B*S, H], ins[1]=qr_kr_packed
@@ -1281,6 +1421,59 @@ fn applyVjp(
             try accumulate(b, adjoints, ins[0], d_input);
             try accumulate(b, adjoints, ins[1], d_gamma);
             try accumulate(b, adjoints, ins[2], d_beta);
+        },
+
+        .fused_rms_norm => |attrs| {
+            // Only reached when `fuse_rms_norm_backward` kept the forward op
+            // fused. Frozen norm weights do not need the reduced d_weight row.
+            const in_shape = g.node(ins[0]).output_shape;
+            const dtype = in_shape.dtype;
+            const dim: i64 = @intCast(attrs.dim);
+            const rank = in_shape.rank();
+            var rows: i64 = 1;
+            for (0..rank - 1) |ax| rows *= in_shape.dim(@intCast(ax));
+            const compute_weight_grad = depends_on_wrt[ins[1]];
+            var backward_attrs = attrs;
+            backward_attrs.backward_weight_grad = compute_weight_grad;
+
+            const grad_packed = try b.graph.addNode(.{
+                .op = .{ .fused_rms_norm_backward = backward_attrs },
+                .output_shape = Shape.init(dtype, &.{ rows + @intFromBool(compute_weight_grad), dim }),
+                .inputs = .{ ins[0], ins[1], adj, null_node },
+                .num_inputs = 3,
+                .vjp_alternate = null_node,
+            });
+
+            if (depends_on_wrt[ins[0]]) {
+                const d_input_2d = if (compute_weight_grad)
+                    try sliceRows(b, grad_packed, 0, rows, dim, dtype)
+                else
+                    grad_packed;
+                const d_input = if (rank == 2) d_input_2d else try b.reshape(d_input_2d, in_shape);
+                try accumulate(b, adjoints, ins[0], d_input);
+            }
+            if (compute_weight_grad) {
+                const d_weight_row = try sliceRows(b, grad_packed, rows, rows + 1, dim, dtype);
+                const d_weight = try b.reshape(d_weight_row, g.node(ins[1]).output_shape);
+                try accumulate(b, adjoints, ins[1], d_weight);
+            }
+        },
+
+        .fused_linear_cross_entropy_loss => |attrs| {
+            if (!attrs.frozen_weight or depends_on_wrt[ins[1]]) {
+                return error.LinearCrossEntropyWeightGradientUnsupported;
+            }
+            if (depends_on_wrt[ins[0]]) {
+                const grad_hidden = try b.graph.addNode(.{
+                    .op = .{ .fused_linear_cross_entropy_backward = attrs },
+                    .output_shape = g.node(ins[0]).output_shape,
+                    .inputs = .{ ins[0], ins[1], ins[2], adj },
+                    .num_inputs = 4,
+                    .vjp_alternate = null_node,
+                });
+                try accumulate(b, adjoints, ins[0], grad_hidden);
+            }
+            // Sparse labels are discrete and the projection is frozen.
         },
 
         .fused_selected_tied_head_logits => |attrs| {
@@ -1422,12 +1615,6 @@ fn sliceRows(b: *Builder, input: NodeId, start: i64, end: i64, cols: i64, dtype:
     });
 }
 
-/// Emit a 3D batched matmul: C[b] = A[b] @ B[b] with batch dim 0,
-/// contracting A's dim 2 with B's dim 1 (standard layout).
-fn batchedDotGeneral3D(b: *Builder, lhs: NodeId, rhs: NodeId) !NodeId {
-    return b.matmul3D(lhs, rhs);
-}
-
 /// Reduce a gradient to match a smaller (broadcast source) shape.
 /// When z = op(x, y) and y was broadcast from a smaller shape,
 /// d_y must sum along the broadcast dimensions.
@@ -1540,6 +1727,23 @@ fn sliceConcatAdjoint(
         .inputs = .{ adj, null_node, null_node, null_node },
         .num_inputs = 1,
     });
+}
+
+/// Return X when node is exactly transpose(X, [1, 0]) over rank-2 tensors.
+/// This lets matmul VJPs emit dY @ X instead of dY @ transpose(transpose(X)).
+fn transpose2dSource(g: *const Graph, node_id: NodeId) ?NodeId {
+    const n = g.node(node_id);
+    if (n.output_shape.rank() != 2 or n.num_inputs != 1) return null;
+
+    const attrs = switch (n.op) {
+        .transpose => |attrs| attrs,
+        else => return null,
+    };
+    if (attrs.num_axes != 2 or attrs.perm[0] != 1 or attrs.perm[1] != 0) return null;
+
+    const source = n.inputs[0];
+    if (source == null_node or g.node(source).output_shape.rank() != 2) return null;
+    return source;
 }
 
 fn zeroConstLike(b: *Builder, shape: Shape) !NodeId {
@@ -1848,7 +2052,7 @@ test "gradient of matmul (linear)" {
     try std.testing.expect(result.param_grads[1] != null_node);
 }
 
-test "rank4 two-batch dot VJP emits Gemma attention gradients" {
+test "rank4 two-batch dot VJP emits attention gradients and prunes frozen rhs" {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
     defer g.deinit();
@@ -1874,14 +2078,227 @@ test "rank4 two-batch dot VJP emits Gemma attention gradients" {
     const loss = try b.reduceSum(scores, &.{ 0, 1, 2, 3 });
     try g.markOutput(loss);
 
-    var result = try gradient(allocator, &g, loss, &.{ q, k });
+    var both = try gradient(allocator, &g, loss, &.{ q, k });
+    defer both.deinit();
+    try std.testing.expect(both.param_grads[0] != null_node);
+    try std.testing.expect(both.param_grads[1] != null_node);
+    try std.testing.expect(both.graph.node(both.param_grads[0]).output_shape.eq(q_shape));
+    try std.testing.expect(both.graph.node(both.param_grads[1]).output_shape.eq(k_shape));
+
+    const dq_attrs = switch (both.graph.node(both.param_grads[0]).op) {
+        .dot_general => |attrs| attrs,
+        else => return error.TestExpectedEqual,
+    };
+    try std.testing.expectEqual(@as(u8, 2), dq_attrs.num_batch);
+    try std.testing.expectEqual(@as(u8, 3), dq_attrs.lhs_contracting[0]);
+    try std.testing.expectEqual(@as(u8, 2), dq_attrs.rhs_contracting[0]);
+
+    const dk_attrs = switch (both.graph.node(both.param_grads[1]).op) {
+        .dot_general => |attrs| attrs,
+        else => return error.TestExpectedEqual,
+    };
+    try std.testing.expectEqual(@as(u8, 2), dk_attrs.num_batch);
+    try std.testing.expectEqual(@as(u8, 2), dk_attrs.lhs_contracting[0]);
+    try std.testing.expectEqual(@as(u8, 2), dk_attrs.rhs_contracting[0]);
+    var transpose_count: usize = 0;
+    for (0..both.graph.nodeCount()) |node_index| {
+        if (std.meta.activeTag(both.graph.node(@intCast(node_index)).op) == .transpose) transpose_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), transpose_count);
+
+    // Rebuild with K frozen. The depends_on_wrt mask must avoid emitting
+    // the otherwise-required dK transpose/dot branch.
+    var q_only = try gradient(allocator, &g, loss, &.{q});
+    defer q_only.deinit();
+    try std.testing.expect(q_only.param_grads[0] != null_node);
+    for (0..q_only.graph.nodeCount()) |node_index| {
+        const node = q_only.graph.node(@intCast(node_index));
+        if (node.op != .parameter) {
+            try std.testing.expect(!node.output_shape.eq(k_shape));
+        }
+    }
+}
+
+test "linear input gradient cancels double transpose" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = Builder.init(&g);
+
+    const x = try bld.parameter("x", Shape.init(.bf16, &.{ 2, 4 }));
+    const w = try bld.parameter("w", Shape.init(.bf16, &.{ 3, 4 }));
+    const y = try bld.linearNoBias(x, w, 2, 4, 3);
+    const loss = try bld.reduceSum(y, &.{ 0, 1 });
+    try g.markOutput(loss);
+
+    var result = try gradient(allocator, &g, loss, &.{x});
     defer result.deinit();
+
+    const dx = result.graph.node(result.param_grads[0]);
+    const dot_attrs = switch (dx.op) {
+        .dot_general => |attrs| attrs,
+        else => return error.TestExpectedEqual,
+    };
+    try std.testing.expectEqual(@as(u8, 1), dot_attrs.num_contracting);
+    try std.testing.expectEqual(@as(u8, 1), dot_attrs.lhs_contracting[0]);
+    try std.testing.expectEqual(@as(u8, 0), dot_attrs.rhs_contracting[0]);
+    try std.testing.expectEqual(DType.bf16, dx.output_shape.dtype);
+    try std.testing.expectEqual(result.id_map[w], dx.inputs[1]);
+    try std.testing.expectEqual(.parameter, std.meta.activeTag(result.graph.node(dx.inputs[1]).op));
+}
+
+test "LoRA linear backward prunes frozen base weight gradient" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = Builder.init(&g);
+
+    const x_shape = Shape.init(.f32, &.{ 2, 4 });
+    const base_weight_shape = Shape.init(.f32, &.{ 5, 4 });
+    const lora_a_shape = Shape.init(.f32, &.{ 2, 4 });
+    const lora_b_shape = Shape.init(.f32, &.{ 5, 2 });
+    const input_seed = try bld.parameter("input_seed", x_shape);
+    const input_scale = try bld.scalarConst(.f32, 1.0);
+    const x = try bld.mul(input_seed, input_scale);
+    const base_weight = try bld.parameter("base_weight", base_weight_shape);
+    const lora_a = try bld.parameter("lora_a", lora_a_shape);
+    const lora_b = try bld.parameter("lora_b", lora_b_shape);
+
+    const base = try bld.linearNoBias(x, base_weight, 2, 4, 5);
+    const lora_down = try bld.linearNoBias(x, lora_a, 2, 4, 2);
+    const lora_up = try bld.linearNoBias(lora_down, lora_b, 2, 2, 5);
+    const combined = try bld.add(base, lora_up);
+    const loss = try bld.reduceSum(combined, &.{ 0, 1 });
+    try g.markOutput(loss);
+
+    // Request the upstream seed rather than x itself. This proves the
+    // dependency mask preserves dX transitively for earlier LoRA layers.
+    var result = try gradient(allocator, &g, loss, &.{ input_seed, lora_a, lora_b });
+    defer result.deinit();
+
     try std.testing.expect(result.param_grads[0] != null_node);
     try std.testing.expect(result.param_grads[1] != null_node);
-    try std.testing.expect(result.graph.node(result.param_grads[0]).output_shape.eq(q_shape));
-    try std.testing.expect(result.graph.node(result.param_grads[1]).output_shape.eq(k_shape));
-    try std.testing.expectEqual(@as(u8, 2), result.graph.node(result.param_grads[0]).op.dot_general.num_batch);
-    try std.testing.expectEqual(@as(u8, 2), result.graph.node(result.param_grads[1]).op.dot_general.num_batch);
+    try std.testing.expect(result.param_grads[2] != null_node);
+    try std.testing.expect(result.graph.node(result.param_grads[0]).output_shape.eq(x_shape));
+    try std.testing.expect(result.graph.node(result.param_grads[1]).output_shape.eq(lora_a_shape));
+    try std.testing.expect(result.graph.node(result.param_grads[2]).output_shape.eq(lora_b_shape));
+
+    const lora_a_grad = result.graph.node(result.param_grads[1]);
+    const lora_a_grad_attrs = switch (lora_a_grad.op) {
+        .dot_general => |attrs| attrs,
+        else => return error.TestExpectedEqual,
+    };
+    try std.testing.expectEqual(@as(u8, 0), lora_a_grad_attrs.lhs_contracting[0]);
+    try std.testing.expectEqual(@as(u8, 0), lora_a_grad_attrs.rhs_contracting[0]);
+
+    const lora_b_grad = result.graph.node(result.param_grads[2]);
+    const lora_b_grad_attrs = switch (lora_b_grad.op) {
+        .dot_general => |attrs| attrs,
+        else => return error.TestExpectedEqual,
+    };
+    try std.testing.expectEqual(@as(u8, 0), lora_b_grad_attrs.lhs_contracting[0]);
+    try std.testing.expectEqual(@as(u8, 0), lora_b_grad_attrs.rhs_contracting[0]);
+
+    const lowered_base_weight = result.id_map[base_weight];
+    var saw_base_input_gradient = false;
+    var saw_frozen_base_weight_gradient = false;
+    for (0..result.graph.nodeCount()) |node_index| {
+        const node = result.graph.node(@intCast(node_index));
+        switch (node.op) {
+            .dot_general => {
+                if (node.output_shape.eq(x_shape) and node.inputs[1] == lowered_base_weight) {
+                    saw_base_input_gradient = true;
+                }
+            },
+            .transpose => {
+                if (!node.output_shape.eq(base_weight_shape)) continue;
+                const source = result.graph.node(node.inputs[0]);
+                if (source.output_shape.eq(Shape.init(.f32, &.{ 4, 5 })) and source.op == .dot_general) {
+                    saw_frozen_base_weight_gradient = true;
+                }
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_base_input_gradient);
+    try std.testing.expect(!saw_frozen_base_weight_gradient);
+}
+
+test "gradient returns null for a disconnected requested parameter" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = Builder.init(&g);
+
+    const used = try bld.parameter("used", Shape.init(.f32, &.{2}));
+    const disconnected = try bld.parameter("disconnected", Shape.init(.f32, &.{2}));
+    const loss = try bld.reduceSum(used, &.{0});
+    try g.markOutput(loss);
+
+    // A disconnected target alongside a connected one yields a null gradient.
+    var result = try gradient(allocator, &g, loss, &.{ used, disconnected });
+    defer result.deinit();
+    try std.testing.expect(result.param_grads[0] != null_node);
+    try std.testing.expectEqual(null_node, result.param_grads[1]);
+
+    // When no requested target reaches the loss, fail closed instead of
+    // returning a forward-only "training" graph.
+    try std.testing.expectError(error.NoGradientPath, gradient(allocator, &g, loss, &.{disconnected}));
+}
+
+test "linear input gradient double-transpose cancellation is numerical" {
+    const allocator = std.testing.allocator;
+    const weights = [_]f32{
+        1.0,  2.0,  3.0,  4.0,
+        5.0,  6.0,  7.0,  8.0,
+        -1.0, -2.0, -3.0, -4.0,
+    };
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = Builder.init(&g);
+
+    const x = try bld.parameter("x", Shape.init(.f32, &.{ 2, 4 }));
+    const w = try bld.tensorConst(&weights, Shape.init(.f32, &.{ 3, 4 }));
+    const y = try bld.linearNoBias(x, w, 2, 4, 3);
+    const loss = try bld.reduceSum(y, &.{ 0, 1 });
+    try g.markOutput(loss);
+
+    var result = try gradient(allocator, &g, loss, &.{x});
+    defer result.deinit();
+
+    const dx = result.graph.node(result.param_grads[0]);
+    const rhs = result.graph.node(dx.inputs[1]);
+    const constant = switch (rhs.op) {
+        .constant => |attrs| attrs,
+        else => return error.TestExpectedEqual,
+    };
+    const direct_weights = result.graph.constantData(constant.data_offset, constant.data_len);
+
+    const x_values = [_]f32{ 0.2, -0.4, 0.6, -0.8, 1.0, -1.2, 1.4, -1.6 };
+    const epsilon: f32 = 1e-3;
+    for (x_values, 0..) |_, x_index| {
+        var x_plus = x_values;
+        var x_minus = x_values;
+        x_plus[x_index] += epsilon;
+        x_minus[x_index] -= epsilon;
+
+        var plus_loss: f32 = 0;
+        var minus_loss: f32 = 0;
+        for (0..2) |row| {
+            for (0..3) |out_col| {
+                for (0..4) |in_col| {
+                    plus_loss += x_plus[row * 4 + in_col] * weights[out_col * 4 + in_col];
+                    minus_loss += x_minus[row * 4 + in_col] * weights[out_col * 4 + in_col];
+                }
+            }
+        }
+        const numerical = (plus_loss - minus_loss) / (2.0 * epsilon);
+
+        const in_col = x_index % 4;
+        var direct: f32 = 0;
+        for (0..3) |out_col| direct += direct_weights[out_col * 4 + in_col];
+        try std.testing.expectApproxEqAbs(numerical, direct, 1e-2);
+    }
 }
 
 test "gradient through fused rmsNorm (lowered)" {
@@ -1904,6 +2321,155 @@ test "gradient through fused rmsNorm (lowered)" {
     // All have VJP rules, so gradients should reach both params.
     try std.testing.expect(result.param_grads[0] != null_node);
     try std.testing.expect(result.param_grads[1] != null_node);
+}
+
+test "gradient through fused rmsNorm uses custom backward" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = Builder.init(&g);
+    bld.fuse_rms_norm_backward = true;
+
+    const x = try bld.parameter("x", Shape.init(.f32, &.{ 2, 4 }));
+    const w = try bld.parameter("w", Shape.init(.f32, &.{4}));
+    const normed = try bld.rmsNorm(x, w, 4, 1e-5);
+    try std.testing.expectEqual(null_node, g.node(normed).vjp_alternate);
+    const loss = try bld.reduceSum(normed, &.{ 0, 1 });
+    try g.markOutput(loss);
+
+    var result = try gradient(allocator, &g, loss, &.{ x, w });
+    defer result.deinit();
+    try std.testing.expect(result.param_grads[0] != null_node);
+    try std.testing.expect(result.param_grads[1] != null_node);
+
+    var backward_count: usize = 0;
+    for (0..result.graph.nodeCount()) |node_index| {
+        if (std.meta.activeTag(result.graph.node(@intCast(node_index)).op) == .fused_rms_norm_backward) backward_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), backward_count);
+}
+
+test "gradient through fused GQA uses one packed backward" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = Builder.init(&g);
+
+    const q_shape = Shape.init(.f32, &.{ 3, 8 });
+    const kv_shape = Shape.init(.f32, &.{ 3, 4 });
+    const q = try bld.parameter("q", q_shape);
+    const k = try bld.parameter("k", kv_shape);
+    const v = try bld.parameter("v", kv_shape);
+    const forward_alternate = try bld.add(q, q);
+    const attention = try g.addNode(.{
+        .op = .{ .fused_gqa_causal_attention = .{
+            .batch = 1,
+            .seq_len = 3,
+            .kv_seq_len = 3,
+            .num_heads = 4,
+            .num_kv_heads = 2,
+            .head_dim = 2,
+            .score_scale = 1.0,
+            .sliding_window = 2,
+        } },
+        .output_shape = q_shape,
+        .inputs = .{ q, k, v, null_node },
+        .num_inputs = 3,
+        .vjp_alternate = forward_alternate,
+    });
+    const loss = try bld.reduceSum(attention, &.{ 0, 1 });
+    try g.markOutput(loss);
+
+    var result = try gradient(allocator, &g, loss, &.{ q, k, v });
+    defer result.deinit();
+    try std.testing.expect(result.graph.node(result.param_grads[0]).output_shape.eq(q_shape));
+    try std.testing.expect(result.graph.node(result.param_grads[1]).output_shape.eq(kv_shape));
+    try std.testing.expect(result.graph.node(result.param_grads[2]).output_shape.eq(kv_shape));
+    var backward_count: usize = 0;
+    var fused_forward_id: NodeId = null_node;
+    for (0..result.graph.nodeCount()) |index| {
+        switch (std.meta.activeTag(result.graph.node(@intCast(index)).op)) {
+            .fused_gqa_causal_attention => fused_forward_id = @intCast(index),
+            .fused_gqa_causal_attention_backward => backward_count += 1,
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), backward_count);
+    try std.testing.expect(fused_forward_id != null_node);
+    try std.testing.expect(result.id_map[attention] != fused_forward_id);
+    for (0..result.graph.nodeCount()) |index| {
+        for (result.graph.node(@intCast(index)).getInputs()) |input| {
+            try std.testing.expect(input != fused_forward_id);
+        }
+    }
+}
+
+test "gradient through fused rmsNorm skips frozen weight gradient" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = Builder.init(&g);
+    bld.fuse_rms_norm_backward = true;
+
+    const x = try bld.parameter("x", Shape.init(.f32, &.{ 2, 4 }));
+    const w = try bld.parameter("w", Shape.init(.f32, &.{4}));
+    const normed = try bld.rmsNorm(x, w, 4, 1e-5);
+    const loss = try bld.reduceSum(normed, &.{ 0, 1 });
+    try g.markOutput(loss);
+
+    var result = try gradient(allocator, &g, loss, &.{x});
+    defer result.deinit();
+    try std.testing.expect(result.param_grads[0] != null_node);
+
+    var saw_backward = false;
+    var saw_slice = false;
+    for (0..result.graph.nodeCount()) |node_index| {
+        const node = result.graph.node(@intCast(node_index));
+        switch (node.op) {
+            .fused_rms_norm_backward => |backward_attrs| {
+                saw_backward = true;
+                try std.testing.expect(!backward_attrs.backward_weight_grad);
+                try std.testing.expectEqual(@as(i64, 2), node.output_shape.dim(0));
+                try std.testing.expectEqual(@as(i64, 4), node.output_shape.dim(1));
+            },
+            .slice => saw_slice = true,
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_backward);
+    try std.testing.expect(!saw_slice);
+}
+
+test "gradient through fused linear cross entropy emits d_hidden only" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = Builder.init(&g);
+
+    const hidden = try bld.parameter("hidden", Shape.init(.f32, &.{ 3, 4 }));
+    const weight = try bld.parameter("weight", Shape.init(.f32, &.{ 5, 4 }));
+    const labels = try bld.parameter("labels", Shape.init(.f32, &.{ 3, 1 }));
+    const loss = try bld.linearCrossEntropyLoss(hidden, weight, labels, .{
+        .rows = 3,
+        .in_dim = 4,
+        .vocab_size = 5,
+        .logit_softcap = 30.0,
+        .ignore_index = -100,
+        .frozen_weight = true,
+    });
+    try g.markOutput(loss);
+
+    var result = try gradient(allocator, &g, loss, &.{hidden});
+    defer result.deinit();
+    const grad_node = result.graph.node(result.param_grads[0]);
+    try std.testing.expectEqual(.fused_linear_cross_entropy_backward, std.meta.activeTag(grad_node.op));
+    try std.testing.expect(grad_node.output_shape.eq(Shape.init(.f32, &.{ 3, 4 })));
+    try std.testing.expectEqual(@as(u8, 4), grad_node.num_inputs);
+
+    try std.testing.expectError(
+        error.LinearCrossEntropyWeightGradientUnsupported,
+        gradient(allocator, &g, loss, &.{weight}),
+    );
 }
 
 test "gradient through fused gelu (lowered)" {

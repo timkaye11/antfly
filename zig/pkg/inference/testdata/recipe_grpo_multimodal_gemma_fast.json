@@ -1,5 +1,6 @@
 {
   "recipe": "grpo",
+  "execution": { "mode": "train" },
   "model": {
     "path": "/tmp/termite-models/gemma/gemma4-local",
     "reference_path": "/tmp/termite-models/gemma/gemma4-local",
@@ -24,6 +25,16 @@
     "normalize_advantage": true,
     "max_completion_tokens": 2,
     "reward_mode": "prefix-match"
+  },
+  "eval": {
+    "path": "pkg/inference/testdata/grpo_text_prompts_eval.jsonl",
+    "max_examples": 1,
+    "grpo_minimums": {
+      "mean_reward": 0.0,
+      "top_rank_mean_reward": 0.0,
+      "positive_reward_group_rate": 0.0,
+      "max_kl_loss": 100.0
+    }
   },
   "artifacts": {
     "root": "/tmp/termite-grpo-multimodal-gemma-fast"

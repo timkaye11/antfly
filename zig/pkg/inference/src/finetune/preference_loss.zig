@@ -13,7 +13,8 @@
 // limitations under the License.
 
 // Preference tuning losses for LoRA finetuning: DPO, IPO, KTO, SimPO, ORPO, CPO.
-// All losses take summed logprobs per sample and return scalar loss + per-sample gradients.
+// Scorers provide summed logprobs per sample. IPO and SimPO normalize them by
+// completion length inside this module; the remaining objectives consume sums.
 
 const std = @import("std");
 
@@ -45,10 +46,15 @@ pub const UnpairedBatch = struct {
 pub const PreferenceConfig = struct {
     kind: PreferenceLoss,
     beta: f32 = 0.1,
+    /// Conservative DPO (cDPO) label-noise probability. This is admitted only
+    /// by the sigmoid DPO objective and must remain in [0, 0.5).
+    label_smoothing: f32 = 0.0,
     simpo_gamma: f32 = 0.5,
     sft_lambda: f32 = 1.0,
     kto_desirable_weight: f32 = 1.0,
     kto_undesirable_weight: f32 = 1.0,
+    /// IPO regularization parameter. The objective target is `1 / (2 * tau)`
+    /// over the policy/reference completion-token mean log-ratio margin.
     ipo_tau: f32 = 0.1,
 };
 
@@ -76,6 +82,13 @@ pub const PreferenceError = error{
     BatchSizeMismatch,
     EmptyBatch,
     WrongLossKind,
+    InvalidLabelSmoothing,
+    InvalidBeta,
+    InvalidIpoTau,
+    InvalidLengths,
+    NonFiniteLogprob,
+    NonFiniteSFTLoss,
+    NonFinitePreferenceComputation,
     OutOfMemory,
 };
 
@@ -167,12 +180,9 @@ inline fn log1mExp(a: f32) f32 {
 }
 
 fn validatePaired(batch: PairedBatch, config: PreferenceConfig) PreferenceError!usize {
-    try validateConfig(config);
     const n = batch.policy_chosen_logps.len;
     if (n == 0) return error.EmptyBatch;
     if (batch.policy_rejected_logps.len != n) return error.BatchSizeMismatch;
-    try requireFinite(batch.policy_chosen_logps);
-    try requireFinite(batch.policy_rejected_logps);
 
     switch (config.kind) {
         .dpo, .ipo => {
@@ -180,8 +190,12 @@ fn validatePaired(batch: PairedBatch, config: PreferenceConfig) PreferenceError!
                 return error.MissingReferenceLogps;
             if (batch.ref_chosen_logps.len != n or batch.ref_rejected_logps.len != n)
                 return error.BatchSizeMismatch;
-            try requireFinite(batch.ref_chosen_logps);
-            try requireFinite(batch.ref_rejected_logps);
+            if (config.kind == .ipo) {
+                if (batch.chosen_lengths.len == 0 or batch.rejected_lengths.len == 0)
+                    return error.MissingLengths;
+                if (batch.chosen_lengths.len != n or batch.rejected_lengths.len != n)
+                    return error.BatchSizeMismatch;
+            }
         },
         .simpo => {
             if (batch.chosen_lengths.len == 0 or batch.rejected_lengths.len == 0)
@@ -192,9 +206,47 @@ fn validatePaired(batch: PairedBatch, config: PreferenceConfig) PreferenceError!
         .orpo, .cpo => {
             if (batch.sft_chosen_loss.len != 0 and batch.sft_chosen_loss.len != n)
                 return error.BatchSizeMismatch;
-            try requireFinite(batch.sft_chosen_loss);
         },
         .kto => return error.WrongLossKind,
+    }
+    if ((config.kind == .dpo or config.kind == .simpo) and
+        (!std.math.isFinite(config.beta) or config.beta <= 0.0))
+    {
+        return error.InvalidBeta;
+    }
+    if (config.kind == .ipo and
+        (!std.math.isFinite(config.ipo_tau) or config.ipo_tau <= 0.0))
+    {
+        return error.InvalidIpoTau;
+    }
+    // The specific scale errors above are reported first; the full objective
+    // admission rule (KTO weights, SimPO/CPO gamma, ORPO lambda) still applies.
+    try validateConfig(config);
+    if (!std.math.isFinite(config.label_smoothing) or
+        config.label_smoothing < 0.0 or
+        config.label_smoothing >= 0.5 or
+        (config.kind != .dpo and config.label_smoothing != 0.0))
+    {
+        return error.InvalidLabelSmoothing;
+    }
+    if (config.kind == .ipo or config.kind == .simpo) {
+        for (batch.chosen_lengths, batch.rejected_lengths) |chosen_len, rejected_len| {
+            if (chosen_len == 0 or rejected_len == 0) return error.InvalidLengths;
+        }
+    }
+    for (batch.policy_chosen_logps, batch.policy_rejected_logps) |chosen, rejected| {
+        if (!std.math.isFinite(chosen) or !std.math.isFinite(rejected)) {
+            return error.NonFiniteLogprob;
+        }
+    }
+    for (batch.ref_chosen_logps) |logprob| {
+        if (!std.math.isFinite(logprob)) return error.NonFiniteLogprob;
+    }
+    for (batch.ref_rejected_logps) |logprob| {
+        if (!std.math.isFinite(logprob)) return error.NonFiniteLogprob;
+    }
+    for (batch.sft_chosen_loss) |loss| {
+        if (!std.math.isFinite(loss)) return error.NonFiniteSFTLoss;
     }
     return n;
 }
@@ -219,29 +271,36 @@ pub fn pairedPreferenceLoss(
     switch (config.kind) {
         .dpo => {
             const beta = config.beta;
+            const label_smoothing = config.label_smoothing;
             var i: usize = 0;
             while (i < n) : (i += 1) {
                 const r_c = beta * (batch.policy_chosen_logps[i] - batch.ref_chosen_logps[i]);
                 const r_r = beta * (batch.policy_rejected_logps[i] - batch.ref_rejected_logps[i]);
                 const diff = r_c - r_r;
-                total_loss += -logSigmoid(diff);
+                total_loss += -(1.0 - label_smoothing) * logSigmoid(diff) -
+                    label_smoothing * logSigmoid(-diff);
                 total_margin += diff;
                 if (diff > 0.0) correct += 1;
 
                 // d/d(diff) [-lsig(diff)] = -sigma(-diff) = sigma(diff) - 1
-                const s_neg = sigmoid(-diff);
-                // grad w.r.t. policy_chosen = -beta * sigma(-diff) / n
-                grad_chosen[i] = -beta * s_neg / n_f;
-                grad_rejected[i] = beta * s_neg / n_f;
+                // d/d(diff) = sigmoid(diff) - (1 - label_smoothing).
+                const d_loss_d_diff = sigmoid(diff) - (1.0 - label_smoothing);
+                grad_chosen[i] = beta * d_loss_d_diff / n_f;
+                grad_rejected[i] = -beta * d_loss_d_diff / n_f;
             }
         },
         .ipo => {
-            const beta = config.beta;
             const target = 1.0 / (2.0 * config.ipo_tau);
             var i: usize = 0;
             while (i < n) : (i += 1) {
-                const r_c = beta * (batch.policy_chosen_logps[i] - batch.ref_chosen_logps[i]);
-                const r_r = beta * (batch.policy_rejected_logps[i] - batch.ref_rejected_logps[i]);
+                // IPO is defined over per-token average log-probabilities.
+                // The scorer supplies exact sequence sums; divide policy and
+                // reference by the same completion length here so every call
+                // site shares one auditable aggregation rule.
+                const chosen_len: f32 = @floatFromInt(batch.chosen_lengths[i]);
+                const rejected_len: f32 = @floatFromInt(batch.rejected_lengths[i]);
+                const r_c = (batch.policy_chosen_logps[i] - batch.ref_chosen_logps[i]) / chosen_len;
+                const r_r = (batch.policy_rejected_logps[i] - batch.ref_rejected_logps[i]) / rejected_len;
                 const diff = r_c - r_r;
                 const resid = diff - target;
                 total_loss += resid * resid;
@@ -249,8 +308,8 @@ pub fn pairedPreferenceLoss(
                 if (diff > 0.0) correct += 1;
 
                 const d_loss_d_diff = 2.0 * resid;
-                grad_chosen[i] = beta * d_loss_d_diff / n_f;
-                grad_rejected[i] = -beta * d_loss_d_diff / n_f;
+                grad_chosen[i] = d_loss_d_diff / (chosen_len * n_f);
+                grad_rejected[i] = -d_loss_d_diff / (rejected_len * n_f);
             }
         },
         .simpo => {
@@ -350,6 +409,15 @@ pub fn pairedPreferenceLoss(
             }
         },
         .kto => unreachable,
+    }
+
+    if (!std.math.isFinite(total_loss) or !std.math.isFinite(total_margin)) {
+        return error.NonFinitePreferenceComputation;
+    }
+    for (grad_chosen, grad_rejected) |chosen, rejected| {
+        if (!std.math.isFinite(chosen) or !std.math.isFinite(rejected)) {
+            return error.NonFinitePreferenceComputation;
+        }
     }
 
     return PreferenceResult{
@@ -455,8 +523,15 @@ test "DPO rejects non-finite policy and reference log-probs" {
         .sft_chosen_loss = &.{},
     };
     try std.testing.expectError(
-        error.InvalidPreferenceInput,
+        error.NonFiniteLogprob,
         pairedPreferenceLoss(std.testing.allocator, batch, .{ .kind = .dpo }),
+    );
+    var invalid_reference = batch;
+    invalid_reference.policy_chosen_logps = &valid;
+    invalid_reference.ref_rejected_logps = &invalid;
+    try std.testing.expectError(
+        error.NonFiniteLogprob,
+        pairedPreferenceLoss(std.testing.allocator, invalid_reference, .{ .kind = .dpo }),
     );
 }
 
@@ -535,17 +610,15 @@ test "DPO hand-computed numeric check on batch of 2" {
     try testing.expect(approxEq(res.accuracy, 0.5, 1e-6));
 }
 
-test "IPO loss zero at diff = 1/(2*tau)" {
+test "DPO label smoothing mixes positive and negative preference labels" {
     const allocator = testing.allocator;
-    const tau: f32 = 0.25;
-    const beta: f32 = 0.5;
-    // Need diff = beta*(pc-rc) - beta*(pr-rr) = 1/(2*tau) = 2.
-    // Pick pc-rc = 4, pr-rr = 0 => diff = 0.5*4 - 0 = 2.
-    var pc = [_]f32{3.0};
+    var pc = [_]f32{-0.5};
+    var pr = [_]f32{-1.5};
     var rc = [_]f32{-1.0};
-    var pr = [_]f32{-1.0};
     var rr = [_]f32{-1.0};
-
+    const beta: f32 = 0.5;
+    const smoothing: f32 = 0.2;
+    const diff: f32 = 0.5;
     const batch = PairedBatch{
         .policy_chosen_logps = &pc,
         .policy_rejected_logps = &pr,
@@ -555,7 +628,43 @@ test "IPO loss zero at diff = 1/(2*tau)" {
         .rejected_lengths = &.{},
         .sft_chosen_loss = &.{},
     };
-    const config = PreferenceConfig{ .kind = .ipo, .beta = beta, .ipo_tau = tau };
+    var res = try pairedPreferenceLoss(allocator, batch, .{
+        .kind = .dpo,
+        .beta = beta,
+        .label_smoothing = smoothing,
+    });
+    defer res.deinit();
+
+    const expected_loss = -(1.0 - smoothing) * logSigmoid(diff) - smoothing * logSigmoid(-diff);
+    const expected_grad = beta * (sigmoid(diff) - (1.0 - smoothing));
+    try testing.expect(approxEq(res.loss, expected_loss, 1e-6));
+    try testing.expect(approxEq(res.grad_chosen[0], expected_grad, 1e-6));
+    try testing.expect(approxEq(res.grad_rejected[0], -expected_grad, 1e-6));
+}
+
+test "IPO loss zero at diff = 1/(2*tau)" {
+    const allocator = testing.allocator;
+    const tau: f32 = 0.25;
+    // Need diff = (pc-rc) - (pr-rr) = 1/(2*tau) = 2.
+    // Pick pc-rc = 2, pr-rr = 0.
+    var pc = [_]f32{1.0};
+    var rc = [_]f32{-1.0};
+    var pr = [_]f32{-1.0};
+    var rr = [_]f32{-1.0};
+    var lengths = [_]u32{1};
+
+    const batch = PairedBatch{
+        .policy_chosen_logps = &pc,
+        .policy_rejected_logps = &pr,
+        .ref_chosen_logps = &rc,
+        .ref_rejected_logps = &rr,
+        .chosen_lengths = &lengths,
+        .rejected_lengths = &lengths,
+        .sft_chosen_loss = &.{},
+    };
+    // An independently supplied DPO beta must not scale the IPO margin a
+    // second time; tau alone defines the IPO target.
+    const config = PreferenceConfig{ .kind = .ipo, .beta = 0.5, .ipo_tau = tau };
     var res = try pairedPreferenceLoss(allocator, batch, config);
     defer res.deinit();
     try testing.expect(approxEq(res.loss, 0.0, 1e-5));
@@ -672,6 +781,64 @@ test "Error: missing lengths on SimPO" {
     try testing.expectError(error.MissingLengths, pairedPreferenceLoss(allocator, batch, config));
 }
 
+test "paired preference loss rejects invalid scaling and non-finite inputs" {
+    const finite = [_]f32{-1.0};
+    const non_finite = [_]f32{std.math.nan(f32)};
+    const lengths = [_]u32{1};
+    const batch = PairedBatch{
+        .policy_chosen_logps = &finite,
+        .policy_rejected_logps = &finite,
+        .ref_chosen_logps = &finite,
+        .ref_rejected_logps = &finite,
+        .chosen_lengths = &lengths,
+        .rejected_lengths = &lengths,
+        .sft_chosen_loss = &.{},
+    };
+
+    try testing.expectError(error.InvalidBeta, pairedPreferenceLoss(testing.allocator, batch, .{
+        .kind = .dpo,
+        .beta = std.math.nan(f32),
+    }));
+    try testing.expectError(error.InvalidIpoTau, pairedPreferenceLoss(testing.allocator, batch, .{
+        .kind = .ipo,
+        .ipo_tau = 0.0,
+    }));
+
+    var non_finite_batch = batch;
+    non_finite_batch.policy_chosen_logps = &non_finite;
+    try testing.expectError(
+        error.NonFiniteLogprob,
+        pairedPreferenceLoss(testing.allocator, non_finite_batch, .{ .kind = .dpo }),
+    );
+
+    const positive_extreme = [_]f32{std.math.floatMax(f32)};
+    const negative_extreme = [_]f32{-std.math.floatMax(f32)};
+    const zero = [_]f32{0.0};
+    const overflowing_batch = PairedBatch{
+        .policy_chosen_logps = &positive_extreme,
+        .policy_rejected_logps = &negative_extreme,
+        .ref_chosen_logps = &zero,
+        .ref_rejected_logps = &zero,
+        .chosen_lengths = &lengths,
+        .rejected_lengths = &lengths,
+        .sft_chosen_loss = &.{},
+    };
+    try testing.expectError(
+        error.NonFinitePreferenceComputation,
+        pairedPreferenceLoss(testing.allocator, overflowing_batch, .{
+            .kind = .dpo,
+            .beta = 1.0,
+        }),
+    );
+    try testing.expectError(
+        error.NonFinitePreferenceComputation,
+        pairedPreferenceLoss(testing.allocator, overflowing_batch, .{
+            .kind = .ipo,
+            .ipo_tau = 0.1,
+        }),
+    );
+}
+
 // ---- Finite-difference gradient checks ------------------------------------
 
 fn dpoLossOnly(
@@ -681,6 +848,7 @@ fn dpoLossOnly(
     rc: []const f32,
     rr: []const f32,
     beta: f32,
+    label_smoothing: f32,
 ) !f32 {
     const batch = PairedBatch{
         .policy_chosen_logps = pc,
@@ -691,7 +859,11 @@ fn dpoLossOnly(
         .rejected_lengths = &.{},
         .sft_chosen_loss = &.{},
     };
-    var res = try pairedPreferenceLoss(allocator, batch, .{ .kind = .dpo, .beta = beta });
+    var res = try pairedPreferenceLoss(allocator, batch, .{
+        .kind = .dpo,
+        .beta = beta,
+        .label_smoothing = label_smoothing,
+    });
     defer res.deinit();
     return res.loss;
 }
@@ -703,6 +875,7 @@ test "DPO finite-difference gradient check" {
     var rc = [_]f32{ -0.5, -1.0 };
     var rr = [_]f32{ -1.1, -0.8 };
     const beta: f32 = 0.3;
+    const label_smoothing: f32 = 0.2;
 
     const batch = PairedBatch{
         .policy_chosen_logps = &pc,
@@ -713,28 +886,108 @@ test "DPO finite-difference gradient check" {
         .rejected_lengths = &.{},
         .sft_chosen_loss = &.{},
     };
-    var res = try pairedPreferenceLoss(allocator, batch, .{ .kind = .dpo, .beta = beta });
+    var res = try pairedPreferenceLoss(allocator, batch, .{
+        .kind = .dpo,
+        .beta = beta,
+        .label_smoothing = label_smoothing,
+    });
     defer res.deinit();
 
     const h: f32 = 1e-3;
     for (0..pc.len) |i| {
         const save = pc[i];
         pc[i] = save + h;
-        const lp = try dpoLossOnly(allocator, &pc, &pr, &rc, &rr, beta);
+        const lp = try dpoLossOnly(allocator, &pc, &pr, &rc, &rr, beta, label_smoothing);
         pc[i] = save - h;
-        const lm = try dpoLossOnly(allocator, &pc, &pr, &rc, &rr, beta);
+        const lm = try dpoLossOnly(allocator, &pc, &pr, &rc, &rr, beta, label_smoothing);
         pc[i] = save;
         const num = (lp - lm) / (2.0 * h);
         try testing.expect(approxEq(num, res.grad_chosen[i], 1e-3));
 
         const save_r = pr[i];
         pr[i] = save_r + h;
-        const lp2 = try dpoLossOnly(allocator, &pc, &pr, &rc, &rr, beta);
+        const lp2 = try dpoLossOnly(allocator, &pc, &pr, &rc, &rr, beta, label_smoothing);
         pr[i] = save_r - h;
-        const lm2 = try dpoLossOnly(allocator, &pc, &pr, &rc, &rr, beta);
+        const lm2 = try dpoLossOnly(allocator, &pc, &pr, &rc, &rr, beta, label_smoothing);
         pr[i] = save_r;
         const num2 = (lp2 - lm2) / (2.0 * h);
         try testing.expect(approxEq(num2, res.grad_rejected[i], 1e-3));
+    }
+}
+
+fn ipoLossOnly(
+    allocator: std.mem.Allocator,
+    pc: []const f32,
+    pr: []const f32,
+    rc: []const f32,
+    rr: []const f32,
+    lc: []const u32,
+    lr: []const u32,
+    beta: f32,
+    tau: f32,
+) !f32 {
+    const batch = PairedBatch{
+        .policy_chosen_logps = pc,
+        .policy_rejected_logps = pr,
+        .ref_chosen_logps = rc,
+        .ref_rejected_logps = rr,
+        .chosen_lengths = lc,
+        .rejected_lengths = lr,
+        .sft_chosen_loss = &.{},
+    };
+    var res = try pairedPreferenceLoss(allocator, batch, .{
+        .kind = .ipo,
+        .beta = beta,
+        .ipo_tau = tau,
+    });
+    defer res.deinit();
+    return res.loss;
+}
+
+test "IPO finite-difference gradient check uses per-completion means" {
+    const allocator = testing.allocator;
+    var pc = [_]f32{ -2.0, -3.5 };
+    var pr = [_]f32{ -3.0, -2.5 };
+    var rc = [_]f32{ -2.2, -3.0 };
+    var rr = [_]f32{ -2.8, -2.7 };
+    var lc = [_]u32{ 5, 7 };
+    var lr = [_]u32{ 6, 4 };
+    const beta: f32 = 0.7;
+    const tau: f32 = 0.2;
+
+    const batch = PairedBatch{
+        .policy_chosen_logps = &pc,
+        .policy_rejected_logps = &pr,
+        .ref_chosen_logps = &rc,
+        .ref_rejected_logps = &rr,
+        .chosen_lengths = &lc,
+        .rejected_lengths = &lr,
+        .sft_chosen_loss = &.{},
+    };
+    var res = try pairedPreferenceLoss(allocator, batch, .{
+        .kind = .ipo,
+        .beta = beta,
+        .ipo_tau = tau,
+    });
+    defer res.deinit();
+
+    const h: f32 = 1e-3;
+    for (0..pc.len) |i| {
+        const saved_chosen = pc[i];
+        pc[i] = saved_chosen + h;
+        const loss_plus = try ipoLossOnly(allocator, &pc, &pr, &rc, &rr, &lc, &lr, beta, tau);
+        pc[i] = saved_chosen - h;
+        const loss_minus = try ipoLossOnly(allocator, &pc, &pr, &rc, &rr, &lc, &lr, beta, tau);
+        pc[i] = saved_chosen;
+        try testing.expect(approxEq((loss_plus - loss_minus) / (2.0 * h), res.grad_chosen[i], 1e-3));
+
+        const saved_rejected = pr[i];
+        pr[i] = saved_rejected + h;
+        const rejected_plus = try ipoLossOnly(allocator, &pc, &pr, &rc, &rr, &lc, &lr, beta, tau);
+        pr[i] = saved_rejected - h;
+        const rejected_minus = try ipoLossOnly(allocator, &pc, &pr, &rc, &rr, &lc, &lr, beta, tau);
+        pr[i] = saved_rejected;
+        try testing.expect(approxEq((rejected_plus - rejected_minus) / (2.0 * h), res.grad_rejected[i], 1e-3));
     }
 }
 

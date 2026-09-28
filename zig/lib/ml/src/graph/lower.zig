@@ -30,7 +30,6 @@ const Graph = graph_mod.Graph;
 const Node = node_mod.Node;
 const NodeId = node_mod.NodeId;
 const null_node = node_mod.null_node;
-const OpCode = node_mod.OpCode;
 const Shape = shape_mod.Shape;
 
 pub const LowerResult = struct {
@@ -45,12 +44,28 @@ pub const LowerResult = struct {
     }
 };
 
+pub const LowerOptions = struct {
+    /// Replace fused grouped-query attention with its proven primitive
+    /// alternate when one is available. The default keeps the fused node so
+    /// autodiff can use its custom VJP and runtime backends can use their
+    /// specialized kernels.
+    lower_gqa: bool = false,
+};
+
 /// Lower a graph by replacing fused ops (that have vjp_alternate) with
 /// their decomposed primitive subgraphs. Returns a new graph where lowerable
 /// fused ops are replaced by their primitive equivalents.
 ///
 /// The returned id_map translates old node IDs to new node IDs.
 pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
+    return lowerWithOptions(allocator, graph, .{});
+}
+
+pub fn lowerWithOptions(
+    allocator: std.mem.Allocator,
+    graph: *const Graph,
+    options: LowerOptions,
+) !LowerResult {
     const count = graph.nodeCount();
 
     // Step 1: Build a "redirect" map. For each fused node with vjp_alternate,
@@ -65,10 +80,20 @@ pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
         if (n.num_inputs > n.inputs.len) return error.InvalidGraphDependency;
         for (n.getInputs()) |input| if (input != null_node and input >= count) return error.InvalidGraphDependency;
         if (n.vjp_alternate != null_node and n.vjp_alternate >= count) return error.InvalidGraphDependency;
-        if (n.op == .fused_gelu or n.op == .fused_gelu_exact or n.op == .fused_softmax) continue;
+        // Embedding lookup has the same scatter-add VJP as gather. Keep its
+        // sparse forward: a general device gather can make an entire frozen
+        // BF16 table resident when only a few token rows are needed.
+        if (n.op == .fused_gelu or n.op == .fused_gelu_exact or n.op == .fused_softmax or
+            n.op == .fused_embedding_lookup) continue;
         // Fused disentangled attention keeps its fused forward kernel and is
         // differentiated by a custom VJP rule (not vjp_alternate lowering).
-        if (n.op == .fused_disentangled_attention or n.op == .fused_disentangled_attention_backward) continue;
+        if (n.op == .fused_disentangled_attention or
+            n.op == .fused_disentangled_attention_backward or
+            n.op == .fused_gqa_causal_attention_backward or
+            (n.op == .fused_gqa_causal_attention and !options.lower_gqa))
+        {
+            continue;
+        }
         // A materialized alternate would discard replay/control semantics and
         // reintroduce quadratic owners. These versioned kernels have a VJP.
         if (n.op == .fused_deberta_training_attention_v1 or n.op == .fused_deberta_training_attention_backward_v1) continue;
@@ -120,13 +145,25 @@ pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
     }
     // Iterative reachability bounds call-stack use for long unrolled training
     // graphs. Each semantic node is pushed at most once, including shared uses.
-    while (stack.pop()) |id| for (graph.node(id).getInputs()) |input| {
-        if (input == null_node) continue;
-        const target = redirect[input];
-        if (reachable[target]) continue;
-        reachable[target] = true;
-        try stack.append(allocator, target);
-    };
+    while (stack.pop()) |id| {
+        const n = graph.node(id);
+        for (n.getInputs()) |input| {
+            if (input == null_node) continue;
+            const target = redirect[input];
+            if (reachable[target]) continue;
+            reachable[target] = true;
+            try stack.append(allocator, target);
+        }
+        // The custom GQA VJP retains its primitive forward alternate for
+        // execution. Traverse it with the same bounded iterative worklist.
+        if (!options.lower_gqa and n.op == .fused_gqa_causal_attention and n.vjp_alternate != null_node) {
+            const target = redirect[n.vjp_alternate];
+            if (!reachable[target]) {
+                reachable[target] = true;
+                try stack.append(allocator, target);
+            }
+        }
+    }
     for (graph.parameters.items) |id| if (id >= count) return error.InvalidGraphDependency;
 
     // Step 3: Collect reachable node IDs and compute their redirected
@@ -167,6 +204,12 @@ pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
             in_degree[pos] += 1;
             offsets[@as(usize, tmp_idx[redirected]) + 1] += 1;
         }
+        const n = graph.node(old_id);
+        if (!options.lower_gqa and n.op == .fused_gqa_causal_attention and n.vjp_alternate != null_node) {
+            const alternate = redirect[n.vjp_alternate];
+            in_degree[pos] += 1;
+            offsets[@as(usize, tmp_idx[alternate]) + 1] += 1;
+        }
     }
     for (1..offsets.len) |i| offsets[i] = try std.math.add(usize, offsets[i], offsets[i - 1]);
     const successors = try allocator.alloc(u32, offsets[num_reachable]);
@@ -177,6 +220,13 @@ pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
         for (graph.node(old_id).getInputs()) |input| {
             if (input == null_node) continue;
             const dep = tmp_idx[redirect[input]];
+            successors[next[dep]] = @intCast(pos);
+            next[dep] += 1;
+        }
+        const n = graph.node(old_id);
+        if (!options.lower_gqa and n.op == .fused_gqa_causal_attention and n.vjp_alternate != null_node) {
+            // The execution rewrite requires the alternate before consumers.
+            const dep = tmp_idx[redirect[n.vjp_alternate]];
             successors[next[dep]] = @intCast(pos);
             next[dep] += 1;
         }
@@ -228,7 +278,11 @@ pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
             }
         }
 
-        new_node.vjp_alternate = null_node;
+        new_node.vjp_alternate = if (!options.lower_gqa and old_node.op == .fused_gqa_causal_attention and
+            old_node.vjp_alternate != null_node)
+            id_map[redirect[old_node.vjp_alternate]]
+        else
+            null_node;
         _ = try new_graph.addNode(new_node);
     }
 
@@ -371,6 +425,45 @@ test "lower preserves parameter names" {
     }
     try std.testing.expect(found_input);
     try std.testing.expect(found_weight);
+}
+
+test "lower optionally replaces fused grouped-query attention" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const q = try b.parameter("q", Shape.init(.f32, &.{ 3, 8 }));
+    const k = try b.parameter("k", Shape.init(.f32, &.{ 3, 4 }));
+    const v = try b.parameter("v", Shape.init(.f32, &.{ 3, 4 }));
+    const alternate = try b.add(q, q);
+    const gqa = try g.addNode(.{
+        .op = .{ .fused_gqa_causal_attention = .{
+            .batch = 1,
+            .seq_len = 3,
+            .num_heads = 4,
+            .num_kv_heads = 2,
+            .head_dim = 2,
+        } },
+        .output_shape = Shape.init(.f32, &.{ 3, 8 }),
+        .inputs = .{ q, k, v, null_node },
+        .num_inputs = 3,
+        .vjp_alternate = alternate,
+    });
+    try g.markOutput(gqa);
+
+    var preserved = try lower(allocator, &g);
+    defer preserved.deinit();
+    try std.testing.expect(
+        preserved.graph.node(preserved.graph.outputs.items[0]).op == .fused_gqa_causal_attention,
+    );
+
+    var lowered = try lowerWithOptions(allocator, &g, .{ .lower_gqa = true });
+    defer lowered.deinit();
+    try std.testing.expect(lowered.graph.node(lowered.graph.outputs.items[0]).op == .add);
+    for (0..lowered.graph.nodeCount()) |i| {
+        try std.testing.expect(lowered.graph.node(@intCast(i)).op != .fused_gqa_causal_attention);
+    }
 }
 
 test "lower resolves transitive fused value identities and rejects cyclic or invalid dependencies" {

@@ -402,3 +402,61 @@ test "resident training Metal AdamW failed partial tensor preparation releases r
     const after = metal_tensor.memoryStatsSnapshot();
     try std.testing.expectEqual(before.device_owned_live_bytes, after.device_owned_live_bytes);
 }
+
+test "resident training Metal dots honor both retained operand layouts" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    var fixture = try Fixture.init(std.testing.allocator);
+    defer fixture.deinit();
+    const cb = fixture.backend.computeBackend();
+    const batch = 2;
+    const m = 3;
+    const k = 5;
+    const n = 4;
+    for ([_]u8{ 2, 3 }) |rank| {
+        const batches: usize = if (rank == 3) batch else 1;
+        for ([_]bool{ false, true }) |lt| {
+            for ([_]bool{ false, true }) |rt| {
+                // Small integers keep every product and sum exact in f32.
+                var lhs: [batch * m * k]f32 = undefined;
+                var rhs: [batch * k * n]f32 = undefined;
+                for (&lhs, 0..) |*value, i| value.* = @floatFromInt(@as(i32, @intCast(i % 7)) - 3);
+                for (&rhs, 0..) |*value, i| value.* = @floatFromInt(@as(i32, @intCast((i * 5) % 9)) - 4);
+                var expected: [batch * m * n]f32 = @splat(0);
+                for (0..batches) |b| for (0..m) |row| for (0..n) |col| for (0..k) |kk| {
+                    const l = lhs[b * m * k + if (lt) kk * m + row else row * k + kk];
+                    const r = rhs[b * k * n + if (rt) col * k + kk else kk * n + col];
+                    expected[(b * m + row) * n + col] += l * r;
+                };
+                const lhs_dims = [_]i64{ batch, if (lt) k else m, if (lt) m else k };
+                const rhs_dims = [_]i64{ batch, if (rt) n else k, if (rt) k else n };
+                const out_dims = [_]i64{ batch, m, n };
+                const instruction = ops.resident_program.Instruction{
+                    .op = .{ .dot_general = .{
+                        .lhs_contracting = .{ if (lt) rank - 2 else rank - 1, 0, 0, 0, 0, 0, 0, 0 },
+                        .rhs_contracting = .{ if (rt) rank - 1 else rank - 2, 0, 0, 0, 0, 0, 0, 0 },
+                        .num_contracting = 1,
+                        .num_batch = if (rank == 3) 1 else 0,
+                    } },
+                    .output = ml.Shape.init(.f32, out_dims[3 - rank ..]),
+                    .inputs = .{ ml.Shape.init(.f32, lhs_dims[3 - rank ..]), ml.Shape.init(.f32, rhs_dims[3 - rank ..]), .{}, .{} },
+                    .num_inputs = 2,
+                };
+                var lhs_shape: [3]i32 = undefined;
+                var rhs_shape: [3]i32 = undefined;
+                for (lhs_dims, rhs_dims, &lhs_shape, &rhs_shape) |ld, rd, *ls, *rs| {
+                    ls.* = @intCast(ld);
+                    rs.* = @intCast(rd);
+                }
+                const lhs_tensor = try upload(&cb, lhs[0 .. batches * m * k], lhs_shape[3 - rank ..]);
+                defer cb.free(lhs_tensor);
+                const rhs_tensor = try upload(&cb, rhs[0 .. batches * k * n], rhs_shape[3 - rank ..]);
+                defer cb.free(rhs_tensor);
+                const output = try cb.residentTrainingInstruction(&instruction, &.{ lhs_tensor, rhs_tensor }, .{});
+                defer cb.free(output);
+                errdefer std.debug.print("resident Metal dot rank={d} lhs_transposed={} rhs_transposed={}\n", .{ rank, lt, rt });
+                try expectFloats(&cb, output, expected[0 .. batches * m * n]);
+            }
+        }
+    }
+}
