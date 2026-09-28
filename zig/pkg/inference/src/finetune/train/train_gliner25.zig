@@ -20,6 +20,11 @@ pub fn mainWithOriginal(init: std.process.Init, original: std.process.Args) !voi
 /// handlers or unrelated IO teardown, so do not return into either after a
 /// supervised job. Help and pre-supervision setup errors retain normal return.
 fn commandWithOriginal(init: std.process.Init, original: std.process.Args) !?process.Outcome {
+    if (std.c.getenv("ANTFLY_JACCL_RANK") != null or
+        std.c.getenv("ANTFLY_JACCL_COORDINATOR") != null or
+        std.c.getenv("ANTFLY_JACCL_DEVICES_FILE") != null or
+        std.c.getenv("ANTFLY_JACCL_LIBRARY") != null)
+        return error.DistributedGliner25NotImplemented;
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
     defer args.deinit();
     _ = args.next();

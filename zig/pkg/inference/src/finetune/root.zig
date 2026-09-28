@@ -48,6 +48,7 @@ pub const reranker_train = @import("reranker_train.zig");
 pub const text_encoder_boundary = @import("text_encoder_boundary.zig");
 pub const gliner2_real_autodiff = @import("gliner2_real_autodiff.zig");
 pub const real_autodiff_trainer = @import("real_autodiff_trainer.zig");
+pub const distributed_runtime = @import("distributed/runtime.zig");
 pub const seeded_gradient_trainer = @import("seeded_gradient_trainer.zig");
 pub const seeded_device_snapshot = @import("seeded_device_snapshot.zig");
 pub const seeded_device_state = @import("seeded_device_state.zig");

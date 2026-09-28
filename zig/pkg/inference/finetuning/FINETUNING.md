@@ -1623,6 +1623,14 @@ Current non-goals: `run_actions.json`, deferred quantize/shard promotion, full `
 
 ---
 
+## Two-Mac Thunderbolt RDMA training
+
+The experimental two-rank JACCL path for GLiNER2 LoRA and text Gemma4 LoRA
+has a [preflight, transport smoke, and first-run guide](DISTRIBUTED_JACCL.md).
+GLiNER2.5 uses a separate optimizer and is not yet supported by that path.
+
+---
+
 ## Key Files
 
 | File | Purpose |
@@ -1635,7 +1643,8 @@ Current non-goals: `run_actions.json`, deferred quantize/shard promotion, full `
 | `lib/ml/src/graph/checkpoint.zig` | Activation checkpointing pass |
 | `src/graph/training.zig` | Training step orchestration |
 | `src/graph/training_loop.zig` | TrainingWeightStore + TrainingLoop + checkpoints |
-| `src/graph/distributed_training.zig` | Data-parallel distributed training |
+| `src/graph/distributed_training.zig` | Local-device graph data parallelism; not the two-Mac transport |
+| `src/finetune/distributed/` | Optional two-rank JACCL gradient transport |
 | `src/bench/training.zig` | Native optimizer / checkpoint benchmark |
 | `src/finetune/fused_chunker_train.zig` | Reference fused-chunker training implementation |
 | `src/ops/blas_compute.zig` | BLAS primitive op implementations |

@@ -19,6 +19,7 @@ const finetune = inference.finetune.gemma4;
 const gemma4_real = inference.finetune.gemma4_real_autodiff;
 const gemma4_mm_real = inference.finetune.gemma4_multimodal_real_autodiff;
 const real_autodiff = inference.finetune.real_autodiff_trainer;
+const distributed_runtime = inference.finetune.distributed_runtime;
 const graph_bridge = inference.finetune.graph_bridge;
 const gemma_graph = @import("../../architectures/gemma_graph.zig");
 const build_options = @import("build_options");
@@ -35,6 +36,8 @@ const pjrt_mod = if (build_options.enable_pjrt) @import("pjrt") else struct {
 const TrainerMode = enum { auto, surrogate, autodiff };
 
 const AutodiffEpochSummary = struct {
+    duration_ns: u64 = 0,
+    examples_per_second: f64 = 0,
     examples_seen: usize = 0,
     supervised_tokens_seen: usize = 0,
     teacher_examples_seen: usize = 0,
@@ -83,6 +86,12 @@ const ReportContext = struct {
     llrd_decay: f32,
     use_schedule_free: bool,
 };
+
+fn monotonicNowNs() u64 {
+    var ts: std.posix.timespec = undefined;
+    if (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return 0;
+    return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec);
+}
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -178,10 +187,13 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
     var prepared = try finetune.loadPreparedInputsSummary(allocator, prepared_inputs_path);
     defer finetune.freePreparedInputsSummary(allocator, &prepared);
 
+    var distributed = try distributed_runtime.openFromEnv(allocator);
+    defer if (distributed) |*context| context.deinit();
     const actual_mode = try resolveTrainerMode(allocator, base_model_dir, prepared, opts.trainer_mode, opts);
+    if (distributed != null and actual_mode != .autodiff) return error.DistributedGemma4RequiresAutodiff;
     switch (actual_mode) {
         .surrogate => try runSurrogate(io, allocator, base_model_dir, adapter_model_dir, prepared_inputs_path, out_dir, prepared, opts),
-        .autodiff => try runAutodiff(io, allocator, base_model_dir, adapter_model_dir, prepared_inputs_path, out_dir, prepared, opts),
+        .autodiff => try runAutodiff(io, allocator, base_model_dir, adapter_model_dir, prepared_inputs_path, out_dir, prepared, opts, if (distributed) |*context| context else null),
         .auto => unreachable,
     }
 }
@@ -234,6 +246,7 @@ fn runAutodiff(
     out_dir: []const u8,
     prepared: finetune.PreparedInputsSummary,
     opts: CliOptions,
+    distributed: ?*distributed_runtime.Context,
 ) !void {
     if (opts.layer_name != null) return error.LayerScopedAutodiffNotYetSupported;
     if (!std.math.approxEqAbs(f32, opts.llrd_decay, 1.0, 1e-6)) return error.LayerWiseDecayNotYetSupportedForAutodiff;
@@ -241,6 +254,19 @@ fn runAutodiff(
 
     const bootstrap = gemma4_real.findFirstSupervisedExample(prepared.examples) orelse return error.NoTrainingData;
     const is_multimodal = prepared.examples_with_images > 0 or prepared.examples_with_audio > 0;
+    if (distributed != null and (is_multimodal or opts.grad_accum_steps != 1))
+        return error.UnsupportedDistributedGemma4Options;
+    const train_limit = if (opts.max_examples > 0 and opts.max_examples < prepared.examples.len) opts.max_examples else prepared.examples.len;
+    if (distributed != null and (train_limit < 2 or train_limit % 2 != 0)) return error.DistributedRequiresEvenExamples;
+    if (distributed != null) for (prepared.examples[0..train_limit]) |example| {
+        if (example.num_supervised_tokens == 0) return error.DistributedRequiresSupervisedExamples;
+    };
+    const local_examples = if (distributed) |context| blk: {
+        const items = try allocator.alloc(finetune.PreparedExampleInput, train_limit / 2);
+        for (items, 0..) |*item, index| item.* = prepared.examples[2 * index + context.rank()];
+        break :blk items;
+    } else null;
+    defer if (local_examples) |items| allocator.free(items);
     if (is_multimodal and opts.gguf_projector_path == null) return error.MissingGgufProjector;
     var maybe_projector_fingerprint: ?finetune.ProjectorFingerprint = null;
     defer if (maybe_projector_fingerprint) |*fp| finetune.freeProjectorFingerprint(allocator, fp);
@@ -288,6 +314,8 @@ fn runAutodiff(
         .lr_schedule = .{ .constant = opts.learning_rate },
         .max_grad_norm = opts.max_grad_norm,
         .grad_accum_steps = opts.grad_accum_steps,
+        .reduce_grads = if (distributed != null) distributed_runtime.Context.reduce else null,
+        .reduce_grads_ctx = if (distributed) |context| @ptrCast(context) else null,
         .hidden_size_hint = graph_config.hidden_size,
         .num_layers_hint = graph_config.num_hidden_layers,
     });
@@ -323,17 +351,19 @@ fn runAutodiff(
         );
     }
     defer if (maybe_mm_ctx) |*ctx| ctx.deinit();
+    if (distributed) |context| try context.verifyWeightsAgree(&trainer);
 
     const epoch_history = try allocator.alloc(AutodiffEpochSummary, opts.epochs);
     defer allocator.free(epoch_history);
     for (0..opts.epochs) |epoch_idx| {
+        const epoch_started_ns = monotonicNowNs();
         const metrics = if (is_multimodal)
             try gemma4_mm_real.trainPreparedExamples(
                 allocator,
                 &trainer,
                 &maybe_mm_ctx.?,
-                prepared.examples,
-                opts.max_examples,
+                local_examples orelse prepared.examples,
+                if (distributed != null) 0 else opts.max_examples,
                 @intCast(prepared.max_seq_len),
             )
         else
@@ -341,11 +371,17 @@ fn runAutodiff(
                 allocator,
                 &trainer,
                 &maybe_text_ctx.?,
-                prepared.examples,
-                opts.max_examples,
+                local_examples orelse prepared.examples,
+                if (distributed != null) 0 else opts.max_examples,
                 @intCast(prepared.max_seq_len),
             );
+        const epoch_duration_ns = monotonicNowNs() -| epoch_started_ns;
         epoch_history[epoch_idx] = .{
+            .duration_ns = epoch_duration_ns,
+            .examples_per_second = if (epoch_duration_ns > 0)
+                @as(f64, @floatFromInt(metrics.examples_seen)) * @as(f64, std.time.ns_per_s) / @as(f64, @floatFromInt(epoch_duration_ns))
+            else
+                0,
             .examples_seen = metrics.examples_seen,
             .supervised_tokens_seen = metrics.supervised_tokens_seen,
             .teacher_examples_seen = metrics.teacher_examples_seen,
@@ -356,11 +392,12 @@ fn runAutodiff(
             .optimizer_steps = metrics.optimizer_steps,
         };
         std.log.info(
-            "gemma4 autodiff: epoch={d}/{d} loss={d:.4} examples={d} tokens={d} updates={d}",
-            .{ epoch_idx + 1, opts.epochs, metrics.average_loss, metrics.examples_seen, metrics.supervised_tokens_seen, metrics.optimizer_steps },
+            "gemma4 autodiff: epoch={d}/{d} loss={d:.4} examples={d} tokens={d} updates={d} duration_ns={d} examples_per_second={d:.3}",
+            .{ epoch_idx + 1, opts.epochs, metrics.average_loss, metrics.examples_seen, metrics.supervised_tokens_seen, metrics.optimizer_steps, epoch_duration_ns, epoch_history[epoch_idx].examples_per_second },
         );
     }
 
+    if (distributed) |context| try context.verifyWeightsAgree(&trainer);
     try gemma4_real.saveTrainerAsGemmaBundle(allocator, &trainer, base_model_dir, adapter_model_dir, out_dir);
     const after = try evaluateAutodiff(
         allocator,

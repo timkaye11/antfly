@@ -82,6 +82,7 @@ const gliner2_data = inference.finetune.gliner2_data;
 const gliner2_bundle = inference.finetune.gliner2;
 const gliner2_autodiff = inference.finetune.gliner2_real_autodiff;
 const real_autodiff = inference.finetune.real_autodiff_trainer;
+const distributed_runtime = inference.finetune.distributed_runtime;
 const optimizers = ml.graph.optimizers;
 const run_validation = inference.finetune.gliner2_run_validation;
 const deberta_arch = inference.architectures.deberta;
@@ -865,7 +866,21 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     if (opts.eval_data != null and eval_examples.len == 0) return error.NoEvalData;
     if (opts.objective == .gliner2_total_loss and eval_records.len != eval_examples.len) return error.InvalidGliner2Example;
     if (opts.eval_data != null) try ensureDisjointExampleTexts(allocator, examples, eval_examples);
-    const effective_batch_size = @min(examples.len, @as(usize, opts.batch_size));
+    var distributed = try distributed_runtime.openFromEnv(allocator);
+    defer if (distributed) |*context| context.deinit();
+    if (distributed != null) {
+        // Each rank processes one half of every shuffled global batch. An
+        // incomplete global batch would leave the optimizers at different
+        // steps, so reject it instead of dropping or duplicating examples.
+        if (examples.len < 2 or examples.len % 2 != 0 or
+            examples.len / 2 % @as(usize, opts.batch_size) != 0)
+            return error.DistributedRequiresCompleteGlobalBatches;
+        if (!opts.lora_only_trainables or opts.eval_data != null or opts.resume_checkpoint != null or
+            opts.checkpoint_every_epochs != 0 or opts.early_stopping_patience != 0)
+            return error.UnsupportedDistributedGliner2Options;
+    }
+    const local_example_count = if (distributed != null) examples.len / 2 else examples.len;
+    const effective_batch_size = @min(local_example_count, @as(usize, opts.batch_size));
     if (opts.objective == .gliner2_total_loss and training_records.len != examples.len) {
         print("error: gliner2-total-loss requires aligned upstream records ({d}) and flattened examples ({d})\n", .{ training_records.len, examples.len });
         return error.InvalidGliner2Example;
@@ -1267,7 +1282,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         regular_trainable_params.len,
     });
 
-    const total_examples = examples.len;
+    const total_examples = local_example_count;
     const plan = planOptimizerSchedule(total_examples, opts.batch_size, opts.grad_accum, opts.epochs, opts.max_steps);
     const examples_per_epoch = plan.examples_per_epoch;
     const steps_per_epoch: usize = @intCast(plan.steps_per_epoch);
@@ -1393,6 +1408,8 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
             .num_layers_hint = deberta_config.num_hidden_layers,
             .seed = opts.seed,
             .regular_trainable_params = regular_trainable_params,
+            .reduce_grads = if (distributed != null) distributed_runtime.Context.reduce else null,
+            .reduce_grads_ctx = if (distributed) |*context| @ptrCast(context) else null,
             .execution_engine = switch (selected_backend) {
                 .metal, .cuda => .compiled_device,
                 else => .interpreter,
@@ -1404,6 +1421,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         },
     );
     defer trainer.deinit();
+    if (distributed) |*context| context.trainer = &trainer;
 
     if (opts.objective == .gliner2_total_loss) {
         // Upstream only builds loss terms for tasks present in the batch, so
@@ -1473,7 +1491,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     defer allocator.free(batch_records);
 
     const prepare_accelerator_training = selected_backend == .metal or selected_backend == .cuda;
-    if (prepare_accelerator_training or opts.initial_adapter_checkpoint != null or opts.resume_checkpoint != null) {
+    if (prepare_accelerator_training or opts.initial_adapter_checkpoint != null or opts.resume_checkpoint != null or distributed != null) {
         try ensureTrainerGraphBuiltFromFirstBatch(
             allocator,
             opts,
@@ -1507,6 +1525,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         });
     }
     if (prepare_accelerator_training) try trainer.prepareDeviceTraining();
+    if (distributed) |*context| try context.verifyWeightsAgree(&trainer);
 
     const resumed_micro_batches = trainer.microBatchSteps();
     const resumed_optimizer_steps = trainer.optimizerSteps();
@@ -1624,7 +1643,10 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         while (batch_start < examples_per_epoch and trainer.optimizerSteps() < target_optimizer_steps) {
             const batch_end = batch_start + bs;
             for (0..bs) |slot| {
-                const src = batch_start + slot;
+                const src = if (distributed) |*context|
+                    2 * (batch_start + slot) + context.rank()
+                else
+                    batch_start + slot;
                 batch_examples[slot] = examples[src];
                 if (opts.objective == .gliner2_total_loss) batch_records[slot] = training_records[src];
             }
@@ -1961,7 +1983,10 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
 
         // -- End-of-epoch evaluation summary --------------------------------
         var gold_ent_count: u64 = 0;
-        for (examples[0..examples_per_epoch]) |ex| gold_ent_count += ex.entities.len;
+        for (0..examples_per_epoch) |index| {
+            const src = if (distributed) |*context| 2 * index + context.rank() else index;
+            gold_ent_count += examples[src].entities.len;
+        }
 
         print("  epoch {d}/{d} complete -- avg_loss={d:.6}  ({d} gold entities)\n", .{
             epoch_number,
@@ -2065,6 +2090,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         print("  selected best checkpoint from epoch {d} for export\n", .{eval_state.best_epoch});
     }
     try trainer.syncDeviceTrainablesToHost();
+    if (distributed) |*context| try context.verifyWeightsAgree(&trainer);
     try trainer.saveAdapters(opts.out_dir);
     const autodiff_params = try collectAutodiffAdapterParams(allocator, &trainer);
     defer allocator.free(autodiff_params);
