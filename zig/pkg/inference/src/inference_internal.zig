@@ -51,6 +51,7 @@ pub const pipelines = struct {
 };
 pub const finetune = struct {
     pub const distributed_runtime = @import("finetune/distributed/runtime.zig");
+    pub const gliner_boundary_run = @import("finetune/gliner/boundary_run.zig");
     pub const laya_job = @import("finetune/laya/job.zig");
     pub const gliner_boundary_training_source = @import("finetune/gliner/boundary_training_source.zig");
     pub const gliner_boundary_dataset = @import("finetune/gliner/boundary_dataset.zig");

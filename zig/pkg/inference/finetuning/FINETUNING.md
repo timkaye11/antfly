@@ -1625,7 +1625,7 @@ Current non-goals: `run_actions.json`, deferred quantize/shard promotion, full `
 
 ## Two-Mac RDMA or TCP/IP training
 
-The experimental two-rank JACCL or TCP/IP path for GLiNER2 LoRA and text Gemma4 LoRA
+The experimental two-rank JACCL or TCP/IP path for GLiNER2 LoRA, GLiNER2.5 LoRA/DoRA, and text Gemma4 LoRA
 has a [preflight, transport smoke, and first-run guide](DISTRIBUTED_JACCL.md).
 GLiNER2.5 uses a separate optimizer and is not yet supported by that path.
 

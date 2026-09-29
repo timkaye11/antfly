@@ -47,6 +47,7 @@ pub const Data = struct {
     examples: u32,
 };
 pub const Limits = struct { max_examples: u32 = 16 * 1024 * 1024, max_order_bytes: usize = 64 * 1024 * 1024, max_batch_size: u32 = 1024, max_parameters: usize = 4096 };
+pub const Distribution = struct { rank: u8, world_size: u8 = 2 };
 pub const Position = struct {
     epoch: u64,
     batch: u32,
@@ -103,8 +104,14 @@ pub const Plan = struct {
     total_optimizer_steps: u32,
     warmup_steps: u32,
     groups: [2]controller.Group,
+    distribution: ?Distribution = null,
 
     pub fn init(config: Config, source: bundle.Identity, data: Data, limits: Limits) !Plan {
+        return initDistributed(config, source, data, limits, null);
+    }
+
+    pub fn initDistributed(config: Config, source: bundle.Identity, data: Data, limits: Limits, distribution: ?Distribution) !Plan {
+        if (distribution) |value| if (value.world_size != 2 or value.rank >= 2) return error.InvalidBoundaryTrainingDistribution;
         if (source.precision != .fp32) return error.QuantizedBoundaryTrainingUnsupported;
         if (data.examples == 0 or data.examples > limits.max_examples or config.batch_size == 0 or config.batch_size > limits.max_batch_size or config.accumulation == 0 or config.accumulation > 65536 or config.epochs == 0) return error.InvalidBoundaryTrainingRun;
         const order_bytes = std.math.mul(usize, data.examples, @sizeOf(u32)) catch return error.BoundaryTrainingRunLimitExceeded;
@@ -127,7 +134,7 @@ pub const Plan = struct {
             group.* = .{ .optimizer = optimizer, .schedule = schedule(config, rate, warmup, total).cast(f32) };
             try @import("../seeded_device_transaction.zig").validateGroup(group.*);
         }
-        return .{ .config = config, .source = source, .data = data, .limits = limits, .batches_per_epoch = batches, .updates_per_epoch = updates, .total_optimizer_steps = total, .warmup_steps = warmup, .groups = groups };
+        return .{ .config = config, .source = source, .data = data, .limits = limits, .batches_per_epoch = batches, .updates_per_epoch = updates, .total_optimizer_steps = total, .warmup_steps = warmup, .groups = groups, .distribution = distribution };
     }
 
     /// Explicit backend profile: preserve source scalar bits for CUDA fused
@@ -199,7 +206,20 @@ pub const Plan = struct {
     /// controller checkpoint fingerprint. Paths and output directories do not
     /// participate, so a verified immutable run can move between machines.
     pub fn fingerprint(self: *const Plan, a: Allocator) ![32]u8 {
-        const settings = try std.json.Stringify.valueAlloc(a, .{ .family = "boundary_training_run/v1", .source = self.source, .data = self.data, .config = self.config, .order = "sha256_splitmix64_fisher_yates_v1", .dropout = "boundary_counter_replay_v1", .dtype = "f32", .partial_window = "flush_each_epoch_actual_count", .total_optimizer_steps = self.total_optimizer_steps, .warmup_steps = self.warmup_steps }, .{});
+        const common = try self.sharedFingerprint(a);
+        if (self.distribution == null) return common;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("boundary_training_rank/v1\x00");
+        hash.update(&common);
+        hash.update(&.{ self.distribution.?.rank, self.distribution.?.world_size });
+        return hash.finalResult();
+    }
+
+    pub fn sharedFingerprint(self: *const Plan, a: Allocator) ![32]u8 {
+        const settings = if (self.distribution != null)
+            try std.json.Stringify.valueAlloc(a, .{ .family = "boundary_training_run/v2", .source = self.source, .data = self.data, .config = self.config, .order = "sha256_splitmix64_fisher_yates_v1", .dropout = "boundary_counter_replay_v1", .dtype = "f32", .partial_window = "flush_each_epoch_actual_count", .total_optimizer_steps = self.total_optimizer_steps, .warmup_steps = self.warmup_steps, .distribution = "interleaved_two_rank_v1" }, .{})
+        else
+            try std.json.Stringify.valueAlloc(a, .{ .family = "boundary_training_run/v1", .source = self.source, .data = self.data, .config = self.config, .order = "sha256_splitmix64_fisher_yates_v1", .dropout = "boundary_counter_replay_v1", .dtype = "f32", .partial_window = "flush_each_epoch_actual_count", .total_optimizer_steps = self.total_optimizer_steps, .warmup_steps = self.warmup_steps }, .{});
         defer a.free(settings);
         var result: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(settings, &result, .{});

@@ -1,20 +1,19 @@
 # Two-Mac LoRA training over Thunderbolt RDMA or TCP/IP
 
-This is an opt-in, synchronous, two-rank data-parallel path for the GLiNER2
-real-autodiff trainer and the text-only Gemma4 real-autodiff trainer. Both ranks
+This is an opt-in, synchronous, two-rank data-parallel path for GLiNER2 LoRA,
+GLiNER2.5 LoRA/DoRA, and text-only Gemma4 LoRA. Both ranks
 load the same base model and adapter, train on disjoint examples, average LoRA
 gradients through either standalone JACCL or TCP/IP before clipping and AdamW, and check that
 their trainable weights match before and after the run. Antfly loads the C++
 bridge at runtime; ordinary builds do not link MLX or JACCL. Select the
 transport with `--transport jaccl` (the default) or `--transport tcp`.
 
-GLiNER2.5 has a separate seeded optimizer and replay/checkpoint contract. Its
-distributed training path is **not implemented** by this bridge. Do not launch
-`train-gliner25` with distributed environment variables expecting data parallelism.
-To add it, shard `gliner/boundary_run.zig`'s replay order by rank, reduce the
-staged native and resident gradients inside `seeded_gradient_trainer.zig`
-before clipping, and bind rank/world size to its durable job fingerprint and
-resume validation. Its atomic optimizer transaction must stay intact.
+GLiNER2.5 uses its seeded optimizer and durable replay protocol. Its two-rank
+path supports native CPU and resident Metal LoRA/DoRA training. Each rank reads
+one interleaved half of the same immutable dataset, synchronizes the union of
+present adapter gradients before clipping and AdamW, and writes its own
+rank-bound checkpoint and portable model. Full and heads training, resident
+CUDA, and odd-sized datasets are rejected in distributed mode.
 
 ## Prepare both Macs for RDMA
 
@@ -193,6 +192,38 @@ surrogate training are rejected. The example above trains one example per
 rank. Increase to `--max-examples 32` for 16 examples per rank per epoch.
 `--eval-max-examples` still evaluates the same
 held-out prefix on each rank; it does not affect training sharding.
+
+## Launch GLiNER2.5 LoRA or DoRA
+
+Stage the same validated `job.json`, source directory, and even-sized training
+JSONL on both Macs at the same absolute paths. The job must select `run.mode`
+`lora` or `dora`, include the matching `peft` configuration, and select
+`execution: resident_metal` (or `native` for CPU). Use a fresh `output_dir` on
+each host. The same absolute output path is safe because each Mac has its own
+filesystem. The launcher checks the job, source, and training bytes before
+starting either rank.
+
+```sh
+python3 zig/pkg/inference/scripts/launch_jaccl_finetune.py \
+  --transport tcp --remote mac2 --coordinator 192.168.1.1:32132 \
+  --library /repo/antfly/zig/pkg/inference/zig-out/lib/libantfly_tcp.dylib \
+  --check /jobs/gliner25.json --check /models/gliner25 \
+  --check /data/gliner25-train.jsonl \
+  --report /runs/gliner25-tcp-launch.json --timeout-seconds 7200 \
+  --compare-adapter /runs/gliner25/model/adapter_model.safetensors -- \
+  /repo/antfly/zig/pkg/inference/zig-out/bin/antfly-inference \
+  finetune train gliner25 /jobs/gliner25.json
+```
+
+For RDMA, use `--transport jaccl`, the JACCL library, and `--devices-file` as
+in the GLiNER2 command. Run the transport smoke first. Check both rank logs,
+the launcher report's `[0, 0]` exit codes, and the exported model hash before
+longer training. Each rank's checkpoint fingerprint includes its rank and the
+two-rank replay policy. Resume each rank from its own checkpoint; a mismatched
+identity or optimizer state fails before training continues. A resume config
+with a rank-specific expected checkpoint hash will differ between hosts, so
+omit the job config from `--check` in that case and keep the shared source and
+training data checks.
 
 ## Validation and comparison
 

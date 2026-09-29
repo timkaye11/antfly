@@ -96,8 +96,6 @@ def parse_args():
         parser.error('--devices-file is required for JACCL')
     if args.transport == 'tcp' and args.devices_file:
         parser.error('--devices-file is only used with JACCL')
-    if args.command and (Path(args.command[0]).name == 'train-gliner25' or args.command[1:5] == ['finetune', 'train', 'run', 'gliner25']):
-        parser.error('GLiNER2.5 distributed optimizer and replay are not implemented')
     if args.timeout_seconds < 0:
         parser.error('--timeout-seconds must be nonnegative')
     if args.compare_adapter and args.preflight_only:

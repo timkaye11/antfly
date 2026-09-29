@@ -22,6 +22,7 @@ const Budget = @import("../../runtime/bounded_allocator.zig").BoundedAllocator;
 const publication = @import("../../gliner_boundary_export.zig");
 const Control = @import("../../execution_control.zig").InferenceExecutionControl;
 const Identity = @import("../seeded_gradient_trainer.zig").Identity;
+const distributed_runtime = @import("../distributed/runtime.zig");
 const export_mod = @import("boundary_training_export.zig");
 const Allocator = std.mem.Allocator;
 const mib = 1024 * 1024;
@@ -228,6 +229,11 @@ pub fn execute(a: Allocator, io: std.Io, config: Config, admission: *memory.Admi
 
 fn executeOwned(a: Allocator, io: std.Io, config: Config, admission: *memory.AdmissionController, execution: Execution, outer_control: ?Control, budget: *Budget) !Result {
     try validate(config);
+    var distributed = try distributed_runtime.openFromEnv(a);
+    defer if (distributed) |*context| context.deinit();
+    if (distributed != null and (config.execution == .resident_cuda or
+        (config.run.mode != .lora and config.run.mode != .dora)))
+        return error.UnsupportedDistributedGliner25Options;
     if (comptime !@import("build_options").enable_metal) if (config.execution == .resident_metal) return error.UnsupportedBoundaryTrainingBackend;
     if (comptime !@import("build_options").enable_cuda) if (config.execution == .resident_cuda) return error.UnsupportedBoundaryTrainingBackend;
     var bounded_control = outer_control orelse Control{};
@@ -248,6 +254,7 @@ fn executeOwned(a: Allocator, io: std.Io, config: Config, admission: *memory.Adm
     const scratch = budget.allocator();
     var train = try openDataset(a, config.train_file, config.dataset_limits, .train, control);
     defer train.deinit();
+    if (distributed != null and (train.index.len < 2 or train.index.len % 2 != 0)) return error.DistributedRequiresEvenExamples;
     var calibration: ?dataset_mod.Dataset = if (config.calibration_file) |path| try openDataset(a, path, config.dataset_limits, .calibration, control) else null;
     defer if (calibration) |*value| value.deinit();
     var heldout: ?dataset_mod.Dataset = if (config.test_file) |path| try openDataset(a, path, config.dataset_limits, .test_holdout, control) else null;
@@ -279,6 +286,7 @@ fn executeOwned(a: Allocator, io: std.Io, config: Config, admission: *memory.Adm
     if (heldout) |*value| value.deinit();
     heldout = null;
     const trainer = try native.Trainer.init(a, &source.store, source.tokenizer(), source.identity, source.config, &train, source.parameters, .{
+        .distributed = if (distributed) |*context| context else null,
         .run = config.run,
         .execution = config.execution,
         .attention_profile = config.attention_profile,
@@ -298,6 +306,10 @@ fn executeOwned(a: Allocator, io: std.Io, config: Config, admission: *memory.Adm
     }, control);
     defer trainer.deinit();
     const restore_receipt = if (config.resume_from) |path| try trainer.restorePinned(path, config.expected_restore_state_sha256, control) else null;
+    if (distributed) |*context| {
+        try context.verifyDigest(trainer.shared_fingerprint);
+        try context.verifyDigest(try trainer.optimizer.stateFingerprint(trainer.shared_fingerprint, control));
+    }
     const executable_path = try std.process.executablePathAlloc(io, scratch);
     defer scratch.free(executable_path);
     const executable_digest = try snapshots.digest(io, std.Io.Dir.cwd(), executable_path, 1024 * mib, control);
@@ -336,6 +348,7 @@ fn executeOwned(a: Allocator, io: std.Io, config: Config, admission: *memory.Adm
         .calibration_sha256 = trainer.run_plan.data.calibration_sha256,
         .test_sha256 = trainer.run_plan.data.test_sha256,
         .run_fingerprint = trainer.fingerprint,
+        .distributed = if (distributed) |*context| .{ .rank = context.rank(), .world_size = @as(u8, 2), .transport = if (std.c.getenv("ANTFLY_DISTRIBUTED_TRANSPORT")) |value| std.mem.span(value) else "jaccl" } else null,
         .initial_identity = trainer.optimizer.identity(),
         .restore_receipt = restore_receipt,
         .admitted_bytes = combined,
@@ -377,6 +390,7 @@ fn executeOwned(a: Allocator, io: std.Io, config: Config, admission: *memory.Adm
         if (execution.report_fn) |callback| try callback(execution.report_context, report);
     }
     const final_identity = trainer.optimizer.identity();
+    if (distributed) |*context| try context.verifyDigest(try trainer.optimizer.stateFingerprint(trainer.shared_fingerprint, control));
     if (last_checkpoint == null or !std.meta.eql(last_checkpoint.?, final_identity)) try save(trainer, checkpoint_path, checkpoint_bytes, config.disk_headroom_bytes, control);
     try progress.sync(io);
     const model_path = try std.fs.path.join(scratch, &.{ config.output_dir, "model" });

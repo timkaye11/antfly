@@ -15,6 +15,8 @@ pub const Context = struct {
     local_weight: u64 = 1,
     total_sync_ns: u64 = 0,
 
+    pub const OptionalBlock = struct { name: []const u8, data: ?[]f32, elements: usize };
+
     pub fn rank(self: *const Context) u8 {
         return self.group.rank();
     }
@@ -74,7 +76,67 @@ pub const Context = struct {
         try self.group.allGatherBytes(&digest, &gathered);
         if (!std.mem.eql(u8, gathered[0..32], gathered[32..64])) return error.DistributedWeightsMismatch;
     }
+
+    pub fn verifyDigest(self: *Context, digest: [32]u8) !void {
+        var gathered: [64]u8 = undefined;
+        try self.group.allGatherBytes(&digest, &gathered);
+        if (!std.mem.eql(u8, gathered[0..32], gathered[32..64])) return error.DistributedStateMismatch;
+    }
+
+    /// Make the union of trainable paths identical before either rank stages
+    /// its optimizer transaction. Missing local paths contribute zero; paths
+    /// missing on both ranks remain absent and retain grad=None semantics.
+    pub fn reduceOptional(self: *Context, scratch: std.mem.Allocator, step: u64, local_weight: u64, blocks: []OptionalBlock) !void {
+        const started_ns = monotonicNowNs();
+        try reduceOptionalCollective(scratch, &self.group, step, local_weight, blocks);
+        const duration_ns = monotonicNowNs() -| started_ns;
+        self.total_sync_ns +|= duration_ns;
+        std.debug.print("distributed_sync rank={d} step={d} duration_ns={d} total_sync_ns={d}\n", .{ self.rank(), step, duration_ns, self.total_sync_ns });
+    }
 };
+
+pub fn reduceOptionalCollective(scratch: std.mem.Allocator, collective: anytype, step: u64, local_weight: u64, blocks: []Context.OptionalBlock) !void {
+    if (blocks.len == 0 or blocks.len > 4096 or local_weight == 0) return error.InvalidGradientInventory;
+    var header: [40]u8 = undefined;
+    std.mem.writeInt(u64, header[0..8], step, .little);
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    for (blocks) |block| {
+        if (block.name.len == 0 or block.elements == 0 or (block.data != null and block.data.?.len != block.elements)) return error.InvalidGradientInventory;
+        hash.update(block.name);
+        hash.update(&.{0});
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, block.elements, .little);
+        hash.update(&length);
+    }
+    hash.final(header[8..40]);
+    var peer_header: [80]u8 = undefined;
+    try collective.allGatherBytes(&header, &peer_header);
+    if (!std.mem.eql(u8, peer_header[0..40], peer_header[40..80])) return error.GradientInventoryMismatch;
+    const local = try scratch.alloc(u8, blocks.len);
+    const gathered = try scratch.alloc(u8, blocks.len * 2);
+    for (blocks, local) |block, *flag| flag.* = @intFromBool(block.data != null);
+    try collective.allGatherBytes(local, gathered);
+    const active = try scratch.alloc(sync.Block, blocks.len);
+    var count: usize = 0;
+    for (blocks, 0..) |*block, index| {
+        if (gathered[index] > 1 or gathered[blocks.len + index] > 1) return error.InvalidGradientInventory;
+        if (gathered[index] == 0 and gathered[blocks.len + index] == 0) continue;
+        if (block.data == null) {
+            const zeros = try scratch.alloc(f32, block.elements);
+            @memset(zeros, 0);
+            block.data = zeros;
+        }
+        active[count] = .{ .name = block.name, .data = block.data.? };
+        count += 1;
+    }
+    if (count == 0) return;
+    std.mem.sort(sync.Block, active[0..count], {}, struct {
+        fn less(_: void, a: sync.Block, b: sync.Block) bool {
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.less);
+    try sync.reduce(scratch, collective, step, local_weight, active[0..count]);
+}
 
 fn monotonicNowNs() u64 {
     var ts: std.posix.timespec = undefined;

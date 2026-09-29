@@ -14,6 +14,7 @@ const ops = @import("../../ops/ops.zig");
 const Budget = @import("../../runtime/bounded_allocator.zig").BoundedAllocator;
 const Control = @import("../../execution_control.zig").InferenceExecutionControl;
 const controller = @import("../seeded_gradient_trainer.zig");
+const distributed_runtime = @import("../distributed/runtime.zig");
 const run = @import("boundary_run.zig");
 const data = @import("boundary_dataset.zig");
 const step = @import("boundary_train_step.zig");
@@ -52,6 +53,7 @@ pub const Limits = struct {
 };
 pub const DecisionEvents = @import("boundary_training_decisions.zig");
 pub const Options = struct {
+    distributed: ?*distributed_runtime.Context = null,
     /// Borrowed diagnostics over decisions already produced by the step.
     decision_observer: ?DecisionEvents.Observer = null,
     run: run.Config,
@@ -206,6 +208,7 @@ pub const Trainer = struct {
     order: []u32 = &.{},
     order_epoch: ?u64 = null,
     fingerprint: [32]u8,
+    shared_fingerprint: [32]u8 = undefined,
     resident_device_upper_bound_bytes: usize = 0,
     busy: std.atomic.Value(bool) = .init(false),
     synthetic_fixture: SyntheticFixture = if (@import("builtin").is_test) null else {},
@@ -263,7 +266,10 @@ pub const Trainer = struct {
             run_config.adapter_config_sha256 = self.adapter_layout.?.fingerprint;
         }
         errdefer if (self.adapter_layout) |*layout| layout.deinit();
-        self.run_plan = try run.Plan.init(run_config, source, .{ .train_sha256 = dataset.sha256, .schema_sha256 = dataset.schemas_sha256, .calibration_sha256 = options.calibration_sha256, .test_sha256 = options.test_sha256, .examples = std.math.cast(u32, dataset.index.len) orelse return error.BoundaryTrainingRunLimitExceeded }, options.limits.run);
+        const distribution: ?run.Distribution = if (options.distributed) |context| .{ .rank = context.rank() } else null;
+        const global_examples = std.math.cast(u32, dataset.index.len) orelse return error.BoundaryTrainingRunLimitExceeded;
+        if (distribution != null and (global_examples < 2 or global_examples % 2 != 0)) return error.DistributedRequiresEvenExamples;
+        self.run_plan = try run.Plan.initDistributed(run_config, source, .{ .train_sha256 = dataset.sha256, .schema_sha256 = dataset.schemas_sha256, .calibration_sha256 = options.calibration_sha256, .test_sha256 = options.test_sha256, .examples = if (distribution != null) global_examples / 2 else global_examples }, options.limits.run, distribution);
         // Validate the actual schedule before reading or updating any batch.
         _ = try objectives.scales(config.head, .{ .optimizer_step = 0, .total_optimizer_steps = self.run_plan.total_optimizer_steps, .gold_start = options.gold_start, .gold_end = options.gold_end, .gold_hold_fraction = options.gold_hold_fraction });
         inline for (std.meta.fields(objectives.Weights)) |field| {
@@ -355,15 +361,22 @@ pub const Trainer = struct {
             hash.update(@tagName(options.attention_profile));
             hash.update("\x00");
         }
+        var shared_hash = hash;
         hash.update(&try self.run_plan.fingerprint(scratch));
+        shared_hash.update(&try self.run_plan.sharedFingerprint(scratch));
         if (options.activation_profile != .retained_v1) {
             hash.update("activation_profile\x00");
             hash.update(@tagName(options.activation_profile));
             hash.update("\x00");
+            shared_hash.update("activation_profile\x00");
+            shared_hash.update(@tagName(options.activation_profile));
+            shared_hash.update("\x00");
         }
         const settings = try std.json.Stringify.valueAlloc(scratch, .{ .model = config, .capacities = options.capacities, .weights = options.weights, .gold_start = options.gold_start, .gold_end = options.gold_end, .gold_hold_fraction = options.gold_hold_fraction, .require_gold_relation_coverage = options.require_gold_relation_coverage, .word_splitter = options.processor.word_splitter, .validators = "native_python312_unicode15_v1" }, .{});
         hash.update(settings);
+        shared_hash.update(settings);
         self.fingerprint = hash.finalResult();
+        self.shared_fingerprint = shared_hash.finalResult();
         var processor_options = options.processor;
         processor_options.control = control;
         var target_options = options.limits.step.targets;
@@ -515,6 +528,7 @@ pub const Trainer = struct {
                 try self.admitResident(update.device_upper_bound_bytes);
             }
             const updated = try self.optimizer.flush(self.optimizer.identity(), control);
+            if (self.options.distributed) |distributed| try distributed.verifyDigest(try self.optimizer.stateFingerprint(self.shared_fingerprint, control));
             return .{ .epoch = pos.epoch - 1, .batch = self.run_plan.batches_per_epoch, .examples = 0, .terms = null, .optimizer = updated, .host_peak_bytes = self.host_budget.peak, .backend_peak_bytes = self.backend_budget.peak, .resident_device_upper_bound_bytes = self.resident_device_upper_bound_bytes };
         }
         self.cb.execution_control = control;
@@ -552,7 +566,11 @@ pub const Trainer = struct {
         const annotations = try scratch.alloc(targets.Annotations, pos.count);
         const inputs = try scratch.alloc(processor.Item, pos.count);
         for (samples, schemas, annotations, inputs, self.order[pos.offset..][0..pos.count]) |*sample, *s, *annotation, *input, index| {
-            sample.* = try self.dataset.sample(index, control, null);
+            const global_index = if (self.run_plan.distribution) |distribution|
+                2 * index + distribution.rank
+            else
+                index;
+            sample.* = try self.dataset.sample(global_index, control, null);
             initialized += 1;
             s.* = &sample.schema;
             annotation.* = sample.annotations;
@@ -627,8 +645,12 @@ pub const Trainer = struct {
         var gradient_control_bytes: usize = 0;
         const updated = if (self.options.execution == .native) cpu: {
             var gradients = std.ArrayListUnmanaged(controller.Gradient).empty;
-            for (slots, routes) |slot, route| {
-                if (route.kind == .absent) continue;
+            const optional = try scratch.alloc(distributed_runtime.Context.OptionalBlock, if (self.options.distributed != null) slots.len else 0);
+            for (slots, routes, 0..) |slot, route, slot_index| {
+                if (route.kind == .absent) {
+                    if (self.options.distributed != null) optional[slot_index] = .{ .name = slot.name, .data = null, .elements = slot.weights.len };
+                    continue;
+                }
                 const values = if (route.gradient_index) |index|
                     try self.cb.toFloat32(result.backward.gradients.outputs[index], scratch)
                 else if (route.kind == .computed_zero) zero: {
@@ -639,15 +661,23 @@ pub const Trainer = struct {
                 if (values.len != slot.weights.len) return error.TrainingBindingShapeMismatch;
                 if (route.kind == .computed_zero) for (values) |value| if (value != 0) return error.InvalidBoundaryTrainingGradientPresence;
                 try gradients.append(scratch, .{ .name = slot.name, .values = values });
+                if (self.options.distributed != null) optional[slot_index] = .{ .name = slot.name, .data = values, .elements = slot.weights.len };
             }
             result.deinit(&self.cb);
             result_live = false;
             try plan.advanceParameterEpoch();
+            if (self.options.distributed) |distributed| {
+                try distributed.reduceOptional(scratch, identity.microbatch_step, pos.count, optional);
+                gradients.items.len = 0;
+                for (optional) |block| if (block.data) |values| try gradients.append(scratch, .{ .name = block.name, .values = values });
+            }
             self.memory_failures.begin(.optimizer);
             break :cpu try self.optimizer.submit(identity, optimizer_loss, gradients.items, control);
         } else gpu: {
             var gradients = std.ArrayListUnmanaged(controller.ResidentGradient).empty;
-            for (slots, routes) |slot, route| {
+            const optional = try scratch.alloc(distributed_runtime.Context.OptionalBlock, if (self.options.distributed != null) slots.len else 0);
+            for (slots, routes, 0..) |slot, route, slot_index| {
+                if (self.options.distributed != null) optional[slot_index] = .{ .name = slot.name, .data = null, .elements = slot.weights.len };
                 if (route.kind == .absent) continue;
                 if (route.kind == .computed_zero) {
                     if (route.gradient_index) |found| {
@@ -655,18 +685,43 @@ pub const Trainer = struct {
                         if (!norm.finite or norm.norm != 0) return error.InvalidBoundaryTrainingGradientPresence;
                         gradient_control_bytes = try std.math.add(usize, gradient_control_bytes, norm.download_bytes);
                     }
-                    try gradients.append(scratch, .{ .name = slot.name, .value = .zero });
+                    if (self.options.distributed) |_| {
+                        const zeros = try scratch.alloc(f32, slot.weights.len);
+                        @memset(zeros, 0);
+                        optional[slot_index].data = zeros;
+                    } else try gradients.append(scratch, .{ .name = slot.name, .value = .zero });
                 } else {
                     const found = route.gradient_index orelse return error.MissingBoundaryTrainingGradient;
-                    try gradients.append(scratch, .{ .name = slot.name, .value = .{ .tensor = result.backward.gradients.outputs[found] } });
+                    if (self.options.distributed) |_| {
+                        const values = try self.cb.toFloat32(result.backward.gradients.outputs[found], scratch);
+                        if (values.len != slot.weights.len) return error.TrainingBindingShapeMismatch;
+                        optional[slot_index].data = values;
+                    } else try gradients.append(scratch, .{ .name = slot.name, .value = .{ .tensor = result.backward.gradients.outputs[found] } });
                 }
             }
             // Forward/backward and parameter leases have ended. The result
             // still owns its gradient CTs throughout atomic optimizer staging.
             try plan.advanceParameterEpoch();
+            var uploads = std.ArrayListUnmanaged(ops.CT).empty;
+            defer {
+                for (uploads.items) |tensor| self.cb.free(tensor);
+                uploads.deinit(scratch);
+            }
+            if (self.options.distributed) |distributed| {
+                try distributed.reduceOptional(scratch, identity.microbatch_step, pos.count, optional);
+                for (slots, optional) |slot, block| if (block.data) |values| {
+                    const tensor = try self.cb.residentTrainingPrimitive(&.{ .upload_f32 = .{ .values = values, .shape = slot.dims } }, .{});
+                    uploads.append(scratch, tensor) catch |err| {
+                        self.cb.free(tensor);
+                        return err;
+                    };
+                    try gradients.append(scratch, .{ .name = slot.name, .value = .{ .tensor = tensor } });
+                };
+            }
             self.memory_failures.begin(.optimizer);
             break :gpu try self.optimizer.submitResident(identity, optimizer_loss, gradients.items, control);
         };
+        if (self.options.distributed) |distributed| try distributed.verifyDigest(try self.optimizer.stateFingerprint(self.shared_fingerprint, control));
         return .{ .epoch = pos.epoch, .batch = pos.batch, .examples = pos.count, .terms = terms, .coverage = coverage, .optimizer = updated, .decision_fingerprint = decisions, .host_peak_bytes = self.host_budget.peak, .backend_peak_bytes = self.backend_budget.peak, .resident_device_upper_bound_bytes = self.resident_device_upper_bound_bytes, .transfers = transfers, .resident_gradient_control_bytes = gradient_control_bytes, .resident_instruction_control_readback_upper_bound_bytes = instruction_control_readback_upper_bound, .zero_loss_fallback = zero_loss_fallback };
     }
 
@@ -738,7 +793,8 @@ pub const Trainer = struct {
             const transaction = try self.optimizer.residentUpdateAdmission(a);
             // Conservatively retain the complete Step bound while staging an
             // all-slot optimizer flush. Actual lifetimes are often disjoint.
-            try self.admitResident(try std.math.add(usize, execution.device_upper_bound_bytes, transaction.device_upper_bound_bytes));
+            const staged = try std.math.add(usize, transaction.device_upper_bound_bytes, try self.distributedGradientUploadBytes());
+            try self.admitResident(try std.math.add(usize, execution.device_upper_bound_bytes, staged));
         }
         try check(control);
         self.plan = plan;
@@ -763,7 +819,7 @@ pub const Trainer = struct {
         if (self.options.execution != .native) {
             const update = try self.optimizer.residentUpdateAdmission(self.host_budget.allocator());
             owner.fixed_backend_bytes = try std.math.add(usize, self.options.limits.max_backend_host_bytes, try std.math.add(usize, self.backend.admission.frozen_device_bytes, self.optimizer.owner.device_trainable_bytes));
-            owner.optimizer_transaction_backend_bytes = update.device_upper_bound_bytes;
+            owner.optimizer_transaction_backend_bytes = try std.math.add(usize, update.device_upper_bound_bytes, try self.distributedGradientUploadBytes());
             owner.optimizer_transaction_host_bytes = update.host_metadata_upper_bound_bytes;
             owner.optimizer_transaction_work = update.total_work;
         } else {
@@ -815,6 +871,15 @@ pub const Trainer = struct {
         const bound = try std.math.add(usize, fixed, try std.math.add(usize, self.options.limits.max_backend_host_bytes, additional_bytes));
         if (bound > self.options.limits.max_backend_bytes) return error.BoundaryTrainingRunLimitExceeded;
         self.resident_device_upper_bound_bytes = @max(self.resident_device_upper_bound_bytes, bound);
+    }
+
+    fn distributedGradientUploadBytes(self: *const Trainer) !usize {
+        if (self.options.distributed == null or self.options.execution == .native) return 0;
+        var total: usize = 0;
+        for (self.optimizer.owner.regular_params.items) |slot| {
+            total = try std.math.add(usize, total, try std.math.mul(usize, slot.weights.len, @sizeOf(f32)));
+        }
+        return total;
     }
 
     fn enter(self: *Trainer) !void {
