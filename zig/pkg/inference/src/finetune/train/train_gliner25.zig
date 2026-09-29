@@ -23,7 +23,12 @@ fn commandWithOriginal(init: std.process.Init, original: std.process.Args) !?pro
     if (std.c.getenv("ANTFLY_JACCL_RANK") != null or
         std.c.getenv("ANTFLY_JACCL_COORDINATOR") != null or
         std.c.getenv("ANTFLY_JACCL_DEVICES_FILE") != null or
-        std.c.getenv("ANTFLY_JACCL_LIBRARY") != null)
+        std.c.getenv("ANTFLY_JACCL_LIBRARY") != null or
+        std.c.getenv("ANTFLY_DISTRIBUTED_TRANSPORT") != null or
+        std.c.getenv("ANTFLY_DISTRIBUTED_RANK") != null or
+        std.c.getenv("ANTFLY_DISTRIBUTED_COORDINATOR") != null or
+        std.c.getenv("ANTFLY_DISTRIBUTED_DEVICES_FILE") != null or
+        std.c.getenv("ANTFLY_DISTRIBUTED_LIBRARY") != null)
         return error.DistributedGliner25NotImplemented;
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
     defer args.deinit();

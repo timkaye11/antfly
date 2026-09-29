@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch the same pre-staged Antfly LoRA training command on two TB5 Macs.
+"""Launch the same pre-staged Antfly LoRA training command on two Macs.
 
 The caller supplies identical absolute paths on both machines. The launcher
 checks bytes at those paths before starting either rank and never copies data.
@@ -20,28 +20,31 @@ PREFLIGHT = r'''
 import hashlib, json, pathlib, platform, subprocess, sys
 paths = json.loads(sys.argv[1])
 rank = int(sys.argv[2])
-topology_path = pathlib.Path(sys.argv[3])
-version = tuple(int(p) for p in platform.mac_ver()[0].split('.')[:2])
-if version < (26, 2): raise SystemExit('macOS 26.2 or newer is required for TB5 RDMA')
-devices = subprocess.run(['ibv_devices'], capture_output=True, text=True, check=True).stdout
-rows = [line.strip() for line in devices.splitlines()
-        if len(line.split()) == 2 and line.split()[1] and
-        all(char in '0123456789abcdefABCDEF' for char in line.split()[1])]
-if not rows: raise SystemExit('no RDMA device found by ibv_devices')
-found_devices = {line.split()[0] for line in rows}
-with topology_path.open() as source: topology = json.load(source)
-if (not isinstance(topology, list) or len(topology) != 2 or
-        any(not isinstance(row, list) or len(row) != 2 for row in topology) or
-        topology[0][0] is not None or topology[1][1] is not None):
-    raise SystemExit('JACCL topology must be a 2x2 matrix with null diagonal')
-link = topology[rank][1 - rank]
-link_names = [link] if isinstance(link, str) else link
-if (not isinstance(link_names, list) or not link_names or
-        any(not isinstance(name, str) or not name for name in link_names)):
-    raise SystemExit('JACCL topology needs an RDMA device for the peer')
-if not set(link_names).issubset(found_devices):
-    raise SystemExit('JACCL topology names not present in local ibv_devices: ' +
-                     repr(sorted(set(link_names) - found_devices)))
+transport = sys.argv[3]
+rows, link_names = [], []
+if transport == 'jaccl':
+    topology_path = pathlib.Path(sys.argv[4])
+    version = tuple(int(p) for p in platform.mac_ver()[0].split('.')[:2])
+    if version < (26, 2): raise SystemExit('macOS 26.2 or newer is required for TB5 RDMA')
+    devices = subprocess.run(['ibv_devices'], capture_output=True, text=True, check=True).stdout
+    rows = [line.strip() for line in devices.splitlines()
+            if len(line.split()) == 2 and line.split()[1] and
+            all(char in '0123456789abcdefABCDEF' for char in line.split()[1])]
+    if not rows: raise SystemExit('no RDMA device found by ibv_devices')
+    found_devices = {line.split()[0] for line in rows}
+    with topology_path.open() as source: topology = json.load(source)
+    if (not isinstance(topology, list) or len(topology) != 2 or
+            any(not isinstance(row, list) or len(row) != 2 for row in topology) or
+            topology[0][0] is not None or topology[1][1] is not None):
+        raise SystemExit('JACCL topology must be a 2x2 matrix with null diagonal')
+    link = topology[rank][1 - rank]
+    link_names = [link] if isinstance(link, str) else link
+    if (not isinstance(link_names, list) or not link_names or
+            any(not isinstance(name, str) or not name for name in link_names)):
+        raise SystemExit('JACCL topology needs an RDMA device for the peer')
+    if not set(link_names).issubset(found_devices):
+        raise SystemExit('JACCL topology names not present in local ibv_devices: ' +
+                         repr(sorted(set(link_names) - found_devices)))
 def digest(path):
     path = pathlib.Path(path)
     if not path.exists(): raise SystemExit('missing pre-staged path: ' + str(path))
@@ -53,7 +56,7 @@ def digest(path):
         with f.open('rb') as source:
             for chunk in iter(lambda: source.read(1024 * 1024), b''): h.update(chunk)
     return h.hexdigest()
-print(json.dumps({'macos': platform.mac_ver()[0], 'devices': rows,
+print(json.dumps({'macos': platform.mac_ver()[0], 'transport': transport, 'devices': rows,
                   'topology_devices': link_names,
                   'digests': {p: digest(p) for p in paths}}, sort_keys=True))
 '''
@@ -72,9 +75,10 @@ print(hash.hexdigest())
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--remote', required=True, help='SSH destination of rank 1')
-    parser.add_argument('--coordinator', required=True, help='rank 0 JACCL host:port reachable over Thunderbolt')
-    parser.add_argument('--devices-file', required=True, help='JACCL topology JSON at the same path on both Macs')
-    parser.add_argument('--library', required=True, help='libantfly_jaccl.dylib at the same path on both Macs')
+    parser.add_argument('--transport', choices=('jaccl', 'tcp'), default='jaccl')
+    parser.add_argument('--coordinator', required=True, help='rank 0 host:port reachable by rank 1')
+    parser.add_argument('--devices-file', help='JACCL topology JSON at the same path on both Macs')
+    parser.add_argument('--library', required=True, help='selected transport bridge at the same path on both Macs')
     parser.add_argument('--check', action='append', default=[], help='model or dataset path to hash on both Macs; repeat as needed')
     parser.add_argument('--report', required=True, help='local JSON run report path')
     parser.add_argument('--compare-adapter', help='same absolute adapter safetensors path on both Macs, hashed after successful training')
@@ -88,13 +92,17 @@ def parse_args():
         parser.error('supply a command after -- or use --preflight-only')
     if not args.preflight_only and not args.check and Path(args.command[0]).name != 'jaccl_smoke.py':
         parser.error('supply at least one --check model or dataset path')
+    if args.transport == 'jaccl' and not args.devices_file:
+        parser.error('--devices-file is required for JACCL')
+    if args.transport == 'tcp' and args.devices_file:
+        parser.error('--devices-file is only used with JACCL')
     if args.command and (Path(args.command[0]).name == 'train-gliner25' or args.command[1:5] == ['finetune', 'train', 'run', 'gliner25']):
         parser.error('GLiNER2.5 distributed optimizer and replay are not implemented')
     if args.timeout_seconds < 0:
         parser.error('--timeout-seconds must be nonnegative')
     if args.compare_adapter and args.preflight_only:
         parser.error('--compare-adapter requires a training command')
-    for path in (args.devices_file, args.library, *args.check, *args.command[:1], *([args.compare_adapter] if args.compare_adapter else [])):
+    for path in (*([args.devices_file] if args.devices_file else []), args.library, *args.check, *args.command[:1], *([args.compare_adapter] if args.compare_adapter else [])):
         if not Path(path).is_absolute(): parser.error('all executable, library, topology and checked paths must be absolute')
     return args
 
@@ -106,19 +114,20 @@ def remote_command(host, command, env=None):
 
 def main():
     args = parse_args()
-    paths = sorted(set([args.devices_file, args.library, *args.command[:1], *args.check]))
-    rank_env = {'ANTFLY_JACCL_COORDINATOR': args.coordinator,
-                'ANTFLY_JACCL_DEVICES_FILE': args.devices_file,
-                'ANTFLY_JACCL_LIBRARY': args.library}
-    remote = remote_command(args.remote, args.command, {**rank_env, 'ANTFLY_JACCL_RANK': '1'}) if args.command else None
-    local_env = {**os.environ, **rank_env, 'ANTFLY_JACCL_RANK': '0'}
+    paths = sorted(set([*([args.devices_file] if args.devices_file else []), args.library, *args.command[:1], *args.check]))
+    rank_env = {'ANTFLY_DISTRIBUTED_TRANSPORT': args.transport,
+                'ANTFLY_DISTRIBUTED_COORDINATOR': args.coordinator,
+                'ANTFLY_DISTRIBUTED_LIBRARY': args.library}
+    if args.devices_file: rank_env['ANTFLY_DISTRIBUTED_DEVICES_FILE'] = args.devices_file
+    remote = remote_command(args.remote, args.command, {**rank_env, 'ANTFLY_DISTRIBUTED_RANK': '1'}) if args.command else None
+    local_env = {**os.environ, **rank_env, 'ANTFLY_DISTRIBUTED_RANK': '0'}
     if args.dry_run:
         print(json.dumps({'local': args.command, 'remote': remote, 'checked_paths': paths,
                           'preflight_only': args.preflight_only,
                           'compare_adapter': args.compare_adapter}, indent=2))
         return 0
     report = {'started_unix': time.time(), 'command': args.command, 'remote': args.remote,
-              'coordinator': args.coordinator, 'checked_paths': paths, 'status': 'preflight_running'}
+              'coordinator': args.coordinator, 'transport': args.transport, 'checked_paths': paths, 'status': 'preflight_running'}
     report_path = Path(args.report)
     if report_path.exists():
         raise SystemExit(f'report already exists: {report_path}')
@@ -133,9 +142,9 @@ def main():
     write_report()
     preflight_stage = 'rank0'
     try:
-        local_check = subprocess.run([sys.executable, '-c', PREFLIGHT, json.dumps(paths), '0', args.devices_file], capture_output=True, text=True, check=True)
+        local_check = subprocess.run([sys.executable, '-c', PREFLIGHT, json.dumps(paths), '0', args.transport, args.devices_file or ''], capture_output=True, text=True, check=True)
         preflight_stage = 'rank1'
-        remote_check = subprocess.run(remote_command(args.remote, ['python3', '-c', PREFLIGHT, json.dumps(paths), '1', args.devices_file]), capture_output=True, text=True, check=True)
+        remote_check = subprocess.run(remote_command(args.remote, ['python3', '-c', PREFLIGHT, json.dumps(paths), '1', args.transport, args.devices_file or '']), capture_output=True, text=True, check=True)
         local_info, remote_info = json.loads(local_check.stdout), json.loads(remote_check.stdout)
         report.update(local_preflight=local_info, remote_preflight=remote_info)
         preflight_stage = 'hash_compare'

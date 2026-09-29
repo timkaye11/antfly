@@ -1,21 +1,22 @@
-# Two-Mac LoRA training over Thunderbolt RDMA
+# Two-Mac LoRA training over Thunderbolt RDMA or TCP/IP
 
 This is an opt-in, synchronous, two-rank data-parallel path for the GLiNER2
 real-autodiff trainer and the text-only Gemma4 real-autodiff trainer. Both ranks
 load the same base model and adapter, train on disjoint examples, average LoRA
-gradients through standalone JACCL before clipping and AdamW, and check that
+gradients through either standalone JACCL or TCP/IP before clipping and AdamW, and check that
 their trainable weights match before and after the run. Antfly loads the C++
-bridge at runtime; ordinary builds do not link MLX or JACCL.
+bridge at runtime; ordinary builds do not link MLX or JACCL. Select the
+transport with `--transport jaccl` (the default) or `--transport tcp`.
 
 GLiNER2.5 has a separate seeded optimizer and replay/checkpoint contract. Its
 distributed training path is **not implemented** by this bridge. Do not launch
-`train-gliner25` with JACCL environment variables expecting data parallelism.
+`train-gliner25` with distributed environment variables expecting data parallelism.
 To add it, shard `gliner/boundary_run.zig`'s replay order by rank, reduce the
 staged native and resident gradients inside `seeded_gradient_trainer.zig`
 before clipping, and bind rank/world size to its durable job fingerprint and
 resume validation. Its atomic optimizer transaction must stay intact.
 
-## Prepare both Macs
+## Prepare both Macs for RDMA
 
 Use macOS 26.2 or newer, Thunderbolt 5 connectivity, and enable RDMA in
 Recovery (`rdma_ctl enable`). After reboot, `ibv_devices` must list an RDMA
@@ -40,7 +41,25 @@ binary and dylib bytes on both Macs, since the launcher verifies their hashes.
 The launcher also needs Python 3 on both Macs and noninteractive SSH access
 from rank 0 to rank 1.
 
-Create the same JSON topology path on both hosts. For two ranks with one
+For **TCP/IP**, the Macs only need a routable IP connection. Thunderbolt 5,
+RDMA setup, `ibv_devices`, a JACCL topology file, and macOS 26.2 are not
+required by the transport. On both Macs, build the TCP bridge instead:
+
+```sh
+zig/pkg/inference/scripts/build_tcp_bridge.sh
+cd zig/pkg/inference
+zig build -Dmetal=true install
+```
+
+The TCP bridge is `zig/pkg/inference/zig-out/lib/libantfly_tcp.dylib` and has
+no MLX dependency. Use an address of rank 0 reachable by rank 1 for
+`--coordinator`; allow inbound TCP on that port through the host firewall.
+Use it on a trusted network: this first TCP transport does not encrypt or
+authenticate the training traffic. The trainer and launcher requirements for
+matching staged files, Python 3, SSH, and separate host-local output paths
+apply to both transports.
+
+For RDMA, create the same JSON topology path on both hosts. For two ranks with one
 Thunderbolt RDMA interface each:
 
 ```json
@@ -82,11 +101,31 @@ python3 zig/pkg/inference/scripts/launch_jaccl_finetune.py \
 ```
 
 Both rank logs (`/runs/jaccl-smoke-logs/rank0.log` and `rank1.log`) must contain
-a `jaccl_smoke` JSON line with `status: pass`, and the launcher report must
+a `collective_smoke` JSON line with `status: pass`, and the launcher report must
 show exit codes `[0, 0]`. The smoke script is hashed as
 the executable, so it must have the same bytes and executable bit on both
 hosts. A passing preflight alone does not establish RDMA connectivity; the
 smoke does.
+
+For a TCP/IP preflight and smoke, use the same launcher with `--transport tcp`,
+omit `--devices-file`, and select `libantfly_tcp.dylib`:
+
+```sh
+python3 zig/pkg/inference/scripts/launch_jaccl_finetune.py \
+  --transport tcp --remote mac2 --coordinator 192.168.1.1:32132 \
+  --library /repo/antfly/zig/pkg/inference/zig-out/lib/libantfly_tcp.dylib \
+  --report /runs/tcp-preflight.json --preflight-only
+
+python3 zig/pkg/inference/scripts/launch_jaccl_finetune.py \
+  --transport tcp --remote mac2 --coordinator 192.168.1.1:32132 \
+  --library /repo/antfly/zig/pkg/inference/zig-out/lib/libantfly_tcp.dylib \
+  --report /runs/tcp-smoke.json --timeout-seconds 60 -- \
+  /repo/antfly/zig/pkg/inference/scripts/jaccl_smoke.py
+```
+
+For a TCP/IP training run, take either GLiNER2 or Gemma4 command below and
+replace its bridge options with `--transport tcp` and the TCP library path.
+Remove `--devices-file`. Keep the same `--check` and `--compare-adapter` paths.
 
 ## Launch GLiNER2
 
@@ -168,6 +207,8 @@ is no performance threshold in this first milestone.
 
 For the later MLX/JACCL comparison, use the same two hosts, topology, LoRA
 rank, model, token lengths, global batch, and number of optimizer steps. Record
-MLX's own implementation and JACCL version with the measurements. exo is a
+MLX's own implementation and JACCL version with the measurements. For a
+transport comparison, use the same two Macs and optimizer settings over TCP/IP
+and RDMA, and record synchronization time and examples/s. exo is a
 reference for inference routing and topology discovery only; this training
 path does not depend on exo.

@@ -1,8 +1,7 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Opt-in two-rank JACCL context for RealAutodiffTrainer. The launcher sets
-//! all four variables; partial configuration fails before a training step.
+//! Opt-in two-rank collective context for RealAutodiffTrainer.
 const std = @import("std");
 const jaccl = @import("jaccl.zig");
 const sync = @import("gradient_sync.zig");
@@ -46,7 +45,7 @@ pub const Context = struct {
             }
         }.less);
         sync.reduce(self.allocator, &self.group, self.step, self.local_weight, blocks) catch |err| {
-            std.log.err("JACCL gradient reduction at step {d}: {s}: {s}", .{ self.step, @errorName(err), self.group.lastError() });
+            std.log.err("distributed gradient reduction at step {d}: {s}: {s}", .{ self.step, @errorName(err), self.group.lastError() });
             return err;
         };
         const ended_ns = monotonicNowNs();
@@ -84,15 +83,30 @@ fn monotonicNowNs() u64 {
 }
 
 pub fn openFromEnv(allocator: std.mem.Allocator) !?Context {
-    const rank_raw = std.c.getenv("ANTFLY_JACCL_RANK");
-    const coordinator_raw = std.c.getenv("ANTFLY_JACCL_COORDINATOR");
-    const devices_raw = std.c.getenv("ANTFLY_JACCL_DEVICES_FILE");
-    const library_raw = std.c.getenv("ANTFLY_JACCL_LIBRARY");
-    if (rank_raw == null and coordinator_raw == null and devices_raw == null and library_raw == null) return null;
-    if (rank_raw == null or coordinator_raw == null or devices_raw == null or library_raw == null) return error.IncompleteJacclConfiguration;
+    const transport_raw = std.c.getenv("ANTFLY_DISTRIBUTED_TRANSPORT");
+    const generic_rank = std.c.getenv("ANTFLY_DISTRIBUTED_RANK");
+    const generic_coordinator = std.c.getenv("ANTFLY_DISTRIBUTED_COORDINATOR");
+    const generic_library = std.c.getenv("ANTFLY_DISTRIBUTED_LIBRARY");
+    const generic_devices = std.c.getenv("ANTFLY_DISTRIBUTED_DEVICES_FILE");
+    const legacy_rank = std.c.getenv("ANTFLY_JACCL_RANK");
+    const legacy_coordinator = std.c.getenv("ANTFLY_JACCL_COORDINATOR");
+    const legacy_library = std.c.getenv("ANTFLY_JACCL_LIBRARY");
+    const legacy_devices = std.c.getenv("ANTFLY_JACCL_DEVICES_FILE");
+    const generic = transport_raw != null or generic_rank != null or generic_coordinator != null or generic_library != null or generic_devices != null;
+    const legacy = legacy_rank != null or legacy_coordinator != null or legacy_library != null or legacy_devices != null;
+    if (!generic and !legacy) return null;
+    if (generic and legacy) return error.MixedDistributedConfiguration;
+    const rank_raw = if (generic) generic_rank else legacy_rank;
+    const coordinator_raw = if (generic) generic_coordinator else legacy_coordinator;
+    const library_raw = if (generic) generic_library else legacy_library;
+    const devices_raw = if (generic) generic_devices else legacy_devices;
+    const transport = if (transport_raw) |value| std.mem.span(value) else "jaccl";
+    if (!std.mem.eql(u8, transport, "jaccl") and !std.mem.eql(u8, transport, "tcp")) return error.InvalidDistributedTransport;
+    if (rank_raw == null or coordinator_raw == null or library_raw == null or
+        (std.mem.eql(u8, transport, "jaccl") and devices_raw == null)) return error.IncompleteDistributedConfiguration;
     const rank = try std.fmt.parseInt(u8, std.mem.span(rank_raw.?), 10);
     return .{
         .allocator = allocator,
-        .group = try jaccl.Group.open(std.mem.span(library_raw.?), rank, std.mem.span(coordinator_raw.?), std.mem.span(devices_raw.?)),
+        .group = try jaccl.Group.open(std.mem.span(library_raw.?), rank, std.mem.span(coordinator_raw.?), if (devices_raw) |value| std.mem.span(value) else ""),
     };
 }
