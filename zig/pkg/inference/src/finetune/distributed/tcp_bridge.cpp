@@ -12,6 +12,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -49,8 +50,20 @@ struct Socket {
   Socket(Socket&& other) noexcept : fd(other.fd) { other.fd = -1; }
 };
 
+unsigned timeout_seconds(const char* name) {
+  const char* raw = std::getenv(name);
+  if (!raw) return 1800;
+  std::string value(raw);
+  if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos)
+    throw std::invalid_argument(std::string(name) + " must be between 1 and 604800");
+  auto seconds = std::stoul(value);
+  if (seconds == 0 || seconds > 604800)
+    throw std::invalid_argument(std::string(name) + " must be between 1 and 604800");
+  return static_cast<unsigned>(seconds);
+}
+
 void configure_socket(int fd) {
-  timeval timeout{300, 0};
+  timeval timeout{static_cast<time_t>(timeout_seconds("ANTFLY_TCP_IO_TIMEOUT_SECONDS")), 0};
   if (::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
       ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0)
     throw std::runtime_error("cannot configure TCP socket timeout");
@@ -123,6 +136,9 @@ AddressList resolve(const char* endpoint) {
 }
 
 Socket connect_peer(int rank, const char* coordinator) {
+  const auto startup_timeout = std::chrono::seconds(timeout_seconds("ANTFLY_TCP_STARTUP_TIMEOUT_SECONDS"));
+  // Validate both options before opening a socket, even if no peer arrives.
+  (void)timeout_seconds("ANTFLY_TCP_IO_TIMEOUT_SECONDS");
   auto addresses = resolve(coordinator);
   if (rank == 0) {
     Socket listener;
@@ -139,7 +155,7 @@ Socket connect_peer(int rank, const char* coordinator) {
       }
     }
     if (listener.fd < 0) throw std::runtime_error("cannot bind TCP coordinator");
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    auto deadline = std::chrono::steady_clock::now() + startup_timeout;
     while (std::chrono::steady_clock::now() < deadline) {
       fd_set ready;
       FD_ZERO(&ready);
@@ -156,7 +172,7 @@ Socket connect_peer(int rank, const char* coordinator) {
     }
     throw std::runtime_error("timed out waiting for TCP rank 1");
   }
-  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  auto deadline = std::chrono::steady_clock::now() + startup_timeout;
   while (std::chrono::steady_clock::now() < deadline) {
     for (auto* address = addresses.first; address; address = address->ai_next) {
       Socket candidate(::socket(address->ai_family, address->ai_socktype, address->ai_protocol));

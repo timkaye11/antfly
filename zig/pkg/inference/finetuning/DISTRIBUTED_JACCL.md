@@ -58,6 +58,23 @@ authenticate the training traffic. The trainer and launcher requirements for
 matching staged files, Python 3, SSH, and separate host-local output paths
 apply to both transports.
 
+TCP rendezvous and socket I/O waits default to 1800 seconds, allowing time for
+different model loading and compute speeds. Override them with
+`--tcp-startup-timeout-seconds` and `--tcp-io-timeout-seconds`. Direct bridge
+callers can set `ANTFLY_TCP_STARTUP_TIMEOUT_SECONDS` and
+`ANTFLY_TCP_IO_TIMEOUT_SECONDS`; values must be between 1 and 604800 seconds.
+These transport deadlines are independent of the overall `--timeout-seconds`.
+
+Both ranks run under a Python supervisor sent by the launcher. The launcher
+sends heartbeats, and each supervisor owns its training process group. On a
+stop request, lost launcher connection, or expired heartbeat lease, it sends
+SIGTERM, allows `--shutdown-grace-seconds` (default 30), then sends SIGKILL if
+needed. `--heartbeat-timeout-seconds` defaults to 30. A live launcher continues
+heartbeats during long model preparation and collective calls. The report's
+`rank_cleanup` entries acknowledge process-group cleanup; a missing receipt
+means shutdown could not be confirmed, even though the remote lease still
+expires. Training commands must not daemonize out of supervision.
+
 For RDMA, create the same JSON topology path on both hosts. For two ranks with one
 Thunderbolt RDMA interface each:
 
@@ -225,7 +242,44 @@ with a rank-specific expected checkpoint hash will differ between hosts, so
 omit the job config from `--check` in that case and keep the shared source and
 training data checks.
 
+Distributed jobs save an initial checkpoint before training and then write
+immutable `checkpoint-<microbatch>-<optimizer>.safetensors` generations.
+Each generation has a `.safetensors.json` receipt, published only after both
+ranks confirm their snapshots are durable. All generations are retained, so
+a disk error, peer failure, or incomplete receipt publication cannot erase the
+previous common recovery point. Reserve disk space for the accumulated
+checkpoints; remove old generations only after verifying a newer pair on both
+hosts. Single-rank jobs continue to use `latest.safetensors`.
+
+After an interrupted distributed run, find the newest matching pair:
+
+```sh
+python3 zig/pkg/inference/scripts/find_distributed_checkpoint.py \
+  --remote mac2 --directory /runs/gliner25
+```
+
+Set each host's `resume_from` to its returned path and choose fresh output
+directories. The helper ignores incomplete generations and mismatched run or
+state receipts. It never modifies checkpoint files; the trainer validates the
+actual checkpoint again during restore. `--remote-directory` supports a
+different recovery directory on rank 1. Legacy distributed runs without
+generation receipts still require manually selecting matching checkpoints.
+
+Pause requests and checkpoint requests are exchanged at every shared training
+boundary. A cooperative pause on either rank pauses both at the same identity
+and preserves unfinished accumulation. Forced termination can still interrupt
+publication; recover from the last common generation in that case.
+
 ## Validation and comparison
+
+Local lifecycle regression tests (including loopback TCP, requiring permission
+to bind local sockets) can run without model artifacts or RDMA hardware:
+
+```sh
+python3 zig/pkg/inference/scripts/test_distributed_training.py -v
+cd zig/pkg/inference
+zig build -Dmetal=true test-finetune-unit -- --test-filter 'distributed GLiNER2.5'
+```
 
 First run one optimizer step on each Mac and compare the resulting rank-local
 adapter files. Then run the same effective global batch on one Mac and two Macs

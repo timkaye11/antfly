@@ -60,3 +60,100 @@ test "distributed GLiNER2.5 gradients reduce the union of present paths" {
     try std.testing.expectEqualSlices(f32, &.{5}, blocks[1].data.?);
     try std.testing.expect(blocks[2].data == null);
 }
+
+const lifecycle = distributed.lifecycle;
+
+test "distributed GLiNER2.5 peer pause and checkpoint requests reach both ranks" {
+    const Collective = struct {
+        own_rank: usize,
+        pub fn allGatherBytes(self: *@This(), input: []const u8, output: []u8) !void {
+            @memcpy(output[0..19], input);
+            @memcpy(output[19..38], input);
+            output[17] = 0;
+            output[18] = 0;
+            output[36] = 1;
+            output[37] = 1;
+            try std.testing.expectEqual(input[17], output[self.own_rank * 19 + 17]);
+        }
+    };
+    for (0..2) |rank| {
+        var collective = Collective{ .own_rank = rank };
+        const agreed = try lifecycle.agreeBoundary(&collective, .{
+            .microbatch = 7,
+            .optimizer = 2,
+            .complete = false,
+            .pause = rank == 1,
+            .checkpoint = rank == 1,
+        });
+        try std.testing.expect(agreed.pause and agreed.checkpoint);
+        try std.testing.expectEqual(@as(u64, 7), agreed.microbatch);
+    }
+}
+
+test "distributed GLiNER2.5 pause refuses divergent training boundaries" {
+    const Collective = struct {
+        pub fn allGatherBytes(_: *@This(), input: []const u8, output: []u8) !void {
+            @memcpy(output[0..19], input);
+            @memcpy(output[19..38], input);
+            output[19] ^= 1;
+        }
+    };
+    var collective = Collective{};
+    try std.testing.expectError(error.DistributedBoundaryMismatch, lifecycle.agreeBoundary(&collective, .{
+        .microbatch = 7,
+        .optimizer = 2,
+        .complete = false,
+        .pause = true,
+        .checkpoint = false,
+    }));
+}
+
+const CheckpointFixture = struct {
+    fail_snapshot: bool = false,
+    fail_receipt: bool = false,
+    peer_fail_phase: u8 = 0,
+    disconnect_phase: u8 = 0,
+    snapshots: usize = 0,
+    receipts: usize = 0,
+    acknowledged_phase: u8 = 0,
+    pub fn writeSnapshot(self: *@This()) !void {
+        if (self.fail_snapshot) return error.DiskFull;
+        self.snapshots += 1;
+    }
+    pub fn writeReceipt(self: *@This()) !void {
+        try std.testing.expectEqual(@as(u8, 1), self.acknowledged_phase);
+        if (self.fail_receipt) return error.ReceiptWriteFailed;
+        self.receipts += 1;
+    }
+    pub fn allGatherBytes(self: *@This(), input: []const u8, output: []u8) !void {
+        if (input[0] == self.disconnect_phase) return error.PeerDisconnected;
+        @memcpy(output[0..2], input);
+        @memcpy(output[2..4], input);
+        output[3] = @intFromBool(input[0] != self.peer_fail_phase);
+        self.acknowledged_phase = input[0];
+    }
+};
+
+test "distributed GLiNER2.5 checkpoint never acknowledges a one-sided snapshot" {
+    var own_failure = CheckpointFixture{ .fail_snapshot = true };
+    try std.testing.expectError(error.DiskFull, lifecycle.publishCheckpoint(&own_failure, &own_failure));
+    try std.testing.expectEqual(@as(usize, 0), own_failure.receipts);
+    var peer_failure = CheckpointFixture{ .peer_fail_phase = 1 };
+    try std.testing.expectError(error.DistributedPeerCheckpointFailed, lifecycle.publishCheckpoint(&peer_failure, &peer_failure));
+    try std.testing.expectEqual(@as(usize, 1), peer_failure.snapshots);
+    try std.testing.expectEqual(@as(usize, 0), peer_failure.receipts);
+    var lost_peer = CheckpointFixture{ .disconnect_phase = 1 };
+    try std.testing.expectError(error.PeerDisconnected, lifecycle.publishCheckpoint(&lost_peer, &lost_peer));
+    try std.testing.expectEqual(@as(usize, 0), lost_peer.receipts);
+}
+
+test "distributed GLiNER2.5 checkpoint requires receipts from both ranks" {
+    var own_failure = CheckpointFixture{ .fail_receipt = true };
+    try std.testing.expectError(error.ReceiptWriteFailed, lifecycle.publishCheckpoint(&own_failure, &own_failure));
+    var peer_failure = CheckpointFixture{ .peer_fail_phase = 2 };
+    try std.testing.expectError(error.DistributedPeerCheckpointFailed, lifecycle.publishCheckpoint(&peer_failure, &peer_failure));
+    var success = CheckpointFixture{};
+    try lifecycle.publishCheckpoint(&success, &success);
+    try std.testing.expectEqual(@as(u8, 2), success.acknowledged_phase);
+    try std.testing.expectEqual(@as(usize, 1), success.receipts);
+}

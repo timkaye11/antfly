@@ -6,11 +6,11 @@ checks bytes at those paths before starting either rank and never copies data.
 """
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -83,6 +83,14 @@ def parse_args():
     parser.add_argument('--report', required=True, help='local JSON run report path')
     parser.add_argument('--compare-adapter', help='same absolute adapter safetensors path on both Macs, hashed after successful training')
     parser.add_argument('--timeout-seconds', type=int, default=0, help='stop a stalled two-rank command after this many seconds; 0 disables the limit')
+    parser.add_argument('--tcp-startup-timeout-seconds', type=int, default=1800,
+                        help='TCP rendezvous deadline, including rank preparation skew (default: 1800)')
+    parser.add_argument('--tcp-io-timeout-seconds', type=int, default=1800,
+                        help='TCP socket wait deadline, including peer computation (default: 1800)')
+    parser.add_argument('--heartbeat-timeout-seconds', type=int, default=30,
+                        help='supervisor lease; stops training if launcher heartbeats disappear')
+    parser.add_argument('--shutdown-grace-seconds', type=int, default=30,
+                        help='grace before supervisors kill their training process groups')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--preflight-only', action='store_true', help='verify both hosts and write a report without starting ranks')
     parser.add_argument('command', nargs=argparse.REMAINDER, help='-- <training executable> <arguments>')
@@ -98,6 +106,10 @@ def parse_args():
         parser.error('--devices-file is only used with JACCL')
     if args.timeout_seconds < 0:
         parser.error('--timeout-seconds must be nonnegative')
+    for name in ('tcp_startup_timeout_seconds', 'tcp_io_timeout_seconds',
+                 'heartbeat_timeout_seconds', 'shutdown_grace_seconds'):
+        if not 1 <= getattr(args, name) <= 604800:
+            parser.error(name.replace('_', '-') + ' must be between 1 and 604800')
     if args.compare_adapter and args.preflight_only:
         parser.error('--compare-adapter requires a training command')
     for path in (*([args.devices_file] if args.devices_file else []), args.library, *args.check, *args.command[:1], *([args.compare_adapter] if args.compare_adapter else [])):
@@ -107,25 +119,85 @@ def parse_args():
 
 def remote_command(host, command, env=None):
     words = ['env'] + [f'{key}={value}' for key, value in (env or {}).items()] + command
-    return ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', host, shlex.join(words)]
+    return ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+            '-o', 'ServerAliveInterval=5', '-o', 'ServerAliveCountMax=3', host, shlex.join(words)]
+
+
+def supervisor_command(args, rank, source):
+    env = {'ANTFLY_DISTRIBUTED_TRANSPORT': args.transport,
+           'ANTFLY_DISTRIBUTED_COORDINATOR': args.coordinator,
+           'ANTFLY_DISTRIBUTED_LIBRARY': args.library,
+           'ANTFLY_DISTRIBUTED_RANK': str(rank),
+           'ANTFLY_TCP_STARTUP_TIMEOUT_SECONDS': str(args.tcp_startup_timeout_seconds),
+           'ANTFLY_TCP_IO_TIMEOUT_SECONDS': str(args.tcp_io_timeout_seconds)}
+    if args.devices_file:
+        env['ANTFLY_DISTRIBUTED_DEVICES_FILE'] = args.devices_file
+    config = {'command': args.command, 'env': env, 'timeout': args.timeout_seconds,
+              'heartbeat_timeout': args.heartbeat_timeout_seconds,
+              'shutdown_grace': args.shutdown_grace_seconds}
+    command = [sys.executable if rank == 0 else 'python3', '-c', source, json.dumps(config)]
+    return command if rank == 0 else remote_command(args.remote, command)
+
+
+def send_control(process, message):
+    if process.poll() is not None:
+        return
+    try:
+        os.write(process.stdin.fileno(), message)
+    except (BrokenPipeError, BlockingIOError):
+        # A blocked SSH connection cannot block the launcher. The remote
+        # supervisor will expire its independent heartbeat lease.
+        pass
+
+
+def stop_ranks(processes, timeout):
+    for process in processes:
+        send_control(process, b'S')
+    deadline = time.monotonic() + timeout
+    for process in processes:
+        try:
+            process.wait(timeout=max(0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+
+def cleanup_receipt(path):
+    with path.open('rb') as source:
+        source.seek(0, os.SEEK_END)
+        source.seek(max(0, source.tell() - 65536))
+        lines = source.read().splitlines()
+    for line in reversed(lines):
+        try:
+            value = json.loads(line)
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if isinstance(value, dict) and value.get('event') == 'distributed_rank_exit':
+            return value
+    return None
 
 
 def main():
     args = parse_args()
     paths = sorted(set([*([args.devices_file] if args.devices_file else []), args.library, *args.command[:1], *args.check]))
-    rank_env = {'ANTFLY_DISTRIBUTED_TRANSPORT': args.transport,
-                'ANTFLY_DISTRIBUTED_COORDINATOR': args.coordinator,
-                'ANTFLY_DISTRIBUTED_LIBRARY': args.library}
-    if args.devices_file: rank_env['ANTFLY_DISTRIBUTED_DEVICES_FILE'] = args.devices_file
-    remote = remote_command(args.remote, args.command, {**rank_env, 'ANTFLY_DISTRIBUTED_RANK': '1'}) if args.command else None
-    local_env = {**os.environ, **rank_env, 'ANTFLY_DISTRIBUTED_RANK': '0'}
+    supervisor_source = Path(__file__).with_name('distributed_rank_supervisor.py').read_text()
+    local = supervisor_command(args, 0, supervisor_source) if args.command else None
+    remote = supervisor_command(args, 1, supervisor_source) if args.command else None
     if args.dry_run:
-        print(json.dumps({'local': args.command, 'remote': remote, 'checked_paths': paths,
+        print(json.dumps({'local': local, 'remote': remote, 'checked_paths': paths,
                           'preflight_only': args.preflight_only,
                           'compare_adapter': args.compare_adapter}, indent=2))
         return 0
     report = {'started_unix': time.time(), 'command': args.command, 'remote': args.remote,
-              'coordinator': args.coordinator, 'transport': args.transport, 'checked_paths': paths, 'status': 'preflight_running'}
+              'coordinator': args.coordinator, 'transport': args.transport, 'checked_paths': paths, 'status': 'preflight_running',
+              'tcp_startup_timeout_seconds': args.tcp_startup_timeout_seconds,
+              'tcp_io_timeout_seconds': args.tcp_io_timeout_seconds,
+              'heartbeat_timeout_seconds': args.heartbeat_timeout_seconds,
+              'shutdown_grace_seconds': args.shutdown_grace_seconds}
     report_path = Path(args.report)
     if report_path.exists():
         raise SystemExit(f'report already exists: {report_path}')
@@ -165,46 +237,61 @@ def main():
     processes = []
     logs = []
     timed_out = False
+    cleanup_timeout = args.heartbeat_timeout_seconds + args.shutdown_grace_seconds + 5
+    def interrupted(_signum, _frame):
+        raise KeyboardInterrupt
+    previous_sigterm = signal.signal(signal.SIGTERM, interrupted)
+    previous_sigint = signal.getsignal(signal.SIGINT)
     try:
         logs = [path.open('wb') for path in log_paths]
-        processes.append(subprocess.Popen(args.command, env=local_env, stdout=logs[0], stderr=subprocess.STDOUT))
-        processes.append(subprocess.Popen(remote, stdout=logs[1], stderr=subprocess.STDOUT))
+        for command, log in zip((local, remote), logs):
+            process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=log,
+                                       stderr=subprocess.STDOUT, start_new_session=True)
+            processes.append(process)
+            os.set_blocking(process.stdin.fileno(), False)
+            send_control(process, b'H')
         deadline = time.monotonic() + args.timeout_seconds if args.timeout_seconds else None
+        heartbeat = time.monotonic()
         while True:
+            if time.monotonic() >= heartbeat:
+                for process in processes:
+                    send_control(process, b'H')
+                heartbeat = time.monotonic() + min(1, args.heartbeat_timeout_seconds / 3)
             codes = [process.poll() for process in processes]
             if all(code is not None for code in codes): break
             if deadline is not None and time.monotonic() >= deadline:
                 timed_out = True
-                for process in processes:
-                    if process.poll() is None: process.terminate()
+                stop_ranks(processes, cleanup_timeout)
                 break
             if any(code is not None and code != 0 for code in codes):
-                for process in processes:
-                    if process.poll() is None: process.terminate()
+                stop_ranks(processes, cleanup_timeout)
                 break
             time.sleep(0.2)
-        codes = []
-        for process in processes:
-            try:
-                codes.append(process.wait(timeout=5))
-            except subprocess.TimeoutExpired:
-                process.kill()
-                codes.append(process.wait())
+        codes = [process.wait() for process in processes]
     except BaseException:
-        for process in processes:
-            if process.poll() is None: process.terminate()
-        for process in processes:
-            try: process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-        report.update(finished_unix=time.time(), status='failed')
+        # Ignore additional interrupts while the supervisors finish cleanup.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        stop_ranks(processes, cleanup_timeout)
+        report.update(finished_unix=time.time(), status='failed',
+                      rank_cleanup=[cleanup_receipt(path) for path in log_paths if path.exists()])
         write_report()
         raise
     finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
+        signal.signal(signal.SIGINT, previous_sigint)
+        for process in processes:
+            if process.stdin: process.stdin.close()
         for log in logs: log.close()
+    report['rank_cleanup'] = [cleanup_receipt(path) for path in log_paths]
+    timed_out = timed_out or any(receipt and receipt.get('reason') == 'timeout'
+                                for receipt in report['rank_cleanup'])
     report.update(finished_unix=time.time(), rank_exit_codes=codes,
                   status='timeout' if timed_out else 'complete' if codes == [0, 0] else 'failed')
+    if report['status'] == 'complete' and not all(
+            receipt and receipt.get('cleanup_complete') and receipt.get('exit_code') == 0
+            for receipt in report['rank_cleanup']):
+        report['status'] = 'cleanup_unconfirmed'
     if report['status'] == 'complete' and args.compare_adapter:
         try:
             local_hash = subprocess.run([sys.executable, '-c', HASH_FILE, args.compare_adapter], capture_output=True, text=True, check=True).stdout.strip()

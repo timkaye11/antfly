@@ -365,9 +365,28 @@ fn executeOwned(a: Allocator, io: std.Io, config: Config, admission: *memory.Adm
     while (true) {
         try check(control);
         const identity = trainer.optimizer.identity();
-        if ((try trainer.position()).complete) break;
-        if (pauseRequested(execution, identity.microbatch_step - initial_microbatch)) {
-            try save(trainer, checkpoint_path, checkpoint_bytes, config.disk_headroom_bytes, control);
+        const complete = (try trainer.position()).complete;
+        const already_saved = if (last_checkpoint) |saved| std.meta.eql(saved, identity) else false;
+        var boundary = distributed_runtime.lifecycle.Boundary{
+            .microbatch = identity.microbatch_step,
+            .optimizer = identity.optimizer_step,
+            .complete = complete,
+            .pause = !complete and pauseRequested(execution, identity.microbatch_step - initial_microbatch),
+            .checkpoint = !already_saved and (complete or
+                (identity.microbatch_step != initial_microbatch and identity.microbatch_step % config.checkpoint_every_microbatches == 0) or
+                (distributed != null and last_checkpoint == null)),
+        };
+        if (distributed) |*context| boundary = try distributed_runtime.lifecycle.agreeBoundary(&context.group, boundary);
+        if (!already_saved and (boundary.checkpoint or boundary.pause)) {
+            if (distributed) |*context|
+                try saveDistributed(scratch, io, trainer, context, config.output_dir, checkpoint_bytes, config.disk_headroom_bytes, control)
+            else
+                try save(trainer, checkpoint_path, checkpoint_bytes, config.disk_headroom_bytes, control);
+            last_checkpoint = identity;
+            try progress.sync(io);
+        }
+        if (boundary.complete) break;
+        if (boundary.pause) {
             try progress.sync(io);
             const result = Result{ .status = .paused, .identity = identity, .accumulated_microbatches = trainer.optimizer.owner.accum_count, .run_fingerprint = trainer.fingerprint, .state_sha256 = try trainer.optimizer.stateFingerprint(trainer.fingerprint, control) };
             try writeJson(scratch, io, result_path, result, control);
@@ -381,17 +400,20 @@ fn executeOwned(a: Allocator, io: std.Io, config: Config, admission: *memory.Adm
         try progress.writeStreamingAll(io, bytes);
         try progress.writeStreamingAll(io, "\n");
         log_bytes += bytes.len + 1;
-        const current = trainer.optimizer.identity();
-        if (current.microbatch_step % config.checkpoint_every_microbatches == 0) {
-            try save(trainer, checkpoint_path, checkpoint_bytes, config.disk_headroom_bytes, control);
-            last_checkpoint = current;
-            try progress.sync(io);
+        // Preserve the single-rank publication-before-callback contract.
+        // Distributed jobs publish together at the next shared boundary.
+        if (distributed == null) {
+            const current = trainer.optimizer.identity();
+            if (current.microbatch_step % config.checkpoint_every_microbatches == 0) {
+                try save(trainer, checkpoint_path, checkpoint_bytes, config.disk_headroom_bytes, control);
+                last_checkpoint = current;
+                try progress.sync(io);
+            }
         }
         if (execution.report_fn) |callback| try callback(execution.report_context, report);
     }
     const final_identity = trainer.optimizer.identity();
     if (distributed) |*context| try context.verifyDigest(try trainer.optimizer.stateFingerprint(trainer.shared_fingerprint, control));
-    if (last_checkpoint == null or !std.meta.eql(last_checkpoint.?, final_identity)) try save(trainer, checkpoint_path, checkpoint_bytes, config.disk_headroom_bytes, control);
     try progress.sync(io);
     const model_path = try std.fs.path.join(scratch, &.{ config.output_dir, "model" });
     defer scratch.free(model_path);
@@ -432,6 +454,54 @@ fn disk(output: []const u8, additional: u64, reserve: u64) !void {
     const available = try platform.filesystem.capacity(parent);
     if (try std.math.add(u64, additional, reserve) > available.available_bytes) return error.BoundaryTrainingDiskLimitExceeded;
 }
+// Generations are immutable and intentionally retained. Recovery selects the
+// newest receipt present on both hosts, never a host-local "latest" pointer.
+fn saveDistributed(a: Allocator, io: std.Io, trainer: *native.Trainer, context: *distributed_runtime.Context, directory: []const u8, required: u64, reserve: u64, control: ?Control) !void {
+    const identity = trainer.optimizer.identity();
+    const state = try trainer.optimizer.stateFingerprint(trainer.shared_fingerprint, control);
+    try context.verifyDigest(state);
+    const name = try std.fmt.allocPrint(a, "checkpoint-{d}-{d}.safetensors", .{ identity.microbatch_step, identity.optimizer_step });
+    defer a.free(name);
+    const path = try std.fs.path.join(a, &.{ directory, name });
+    defer a.free(path);
+    const receipt_path = try std.fmt.allocPrint(a, "{s}.json", .{path});
+    defer a.free(receipt_path);
+    const Writer = struct {
+        allocator: Allocator,
+        io: std.Io,
+        trainer: *native.Trainer,
+        rank: u8,
+        name: []const u8,
+        path: []const u8,
+        receipt_path: []const u8,
+        required: u64,
+        reserve: u64,
+        state: [32]u8,
+        control: ?Control,
+        pub fn writeSnapshot(self: *@This()) !void {
+            // A fresh output directory plus monotonic identities normally
+            // guarantees uniqueness; fail closed if a generation exists.
+            if (std.Io.Dir.cwd().access(self.io, self.path, .{})) |_| {
+                return error.PathAlreadyExists;
+            } else |err| if (err != error.FileNotFound) return err;
+            try save(self.trainer, self.path, self.required, self.reserve, self.control);
+        }
+        pub fn writeReceipt(self: *@This()) !void {
+            try writeJson(self.allocator, self.io, self.receipt_path, .{
+                .format = "antfly.distributed-checkpoint/v1",
+                .rank = self.rank,
+                .checkpoint = self.name,
+                .identity = self.trainer.optimizer.identity(),
+                .shared_run_fingerprint = std.fmt.bytesToHex(self.trainer.shared_fingerprint, .lower),
+                .shared_state_sha256 = std.fmt.bytesToHex(self.state, .lower),
+            }, self.control);
+        }
+    };
+    var writer = Writer{ .allocator = a, .io = io, .trainer = trainer, .rank = context.rank(), .name = name, .path = path, .receipt_path = receipt_path, .required = required, .reserve = reserve, .state = state, .control = control };
+    try distributed_runtime.lifecycle.publishCheckpoint(&context.group, &writer);
+    std.debug.print("distributed_checkpoint rank={d} path={s}\n", .{ context.rank(), path });
+}
+
 fn save(trainer: *native.Trainer, path: []const u8, required: u64, reserve: u64, control: ?Control) !void {
     try check(control);
     try disk(path, required, reserve);

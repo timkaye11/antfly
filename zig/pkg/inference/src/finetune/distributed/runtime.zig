@@ -6,6 +6,7 @@ const std = @import("std");
 const jaccl = @import("jaccl.zig");
 const sync = @import("gradient_sync.zig");
 const trainer_mod = @import("../real_autodiff_trainer.zig");
+pub const lifecycle = @import("lifecycle.zig");
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
