@@ -303,6 +303,7 @@ pub const Config = struct {
     inference: ?antfly_inference_config_openapi.RuntimeConfig = null,
     tls: ?TLSInfo = null,
     remote_content: ?antfly_scraping_openapi.RemoteContentConfig = null,
+    training: ?TrainingConfig = null,
     /// Public connection resources keyed by stable connection ID. These are the external systems Antfly can use for inference, external IO, CDC, backups, indexing, agents, and related workflows.
     connections: ?std.json.ArrayHashMap(ConnectionConfig) = null,
     /// Named speech-to-text provider configurations. Define named STT providers that can be referenced by templates and API calls. The first provider defined becomes the default when no provider name is specified. **Example:** ```json { "speech_to_text": { "antfly-whisper": { "provider": "antfly", "api_url": "http://localhost:8080", "model": "openai/whisper-base" }, "openai-whisper": { "provider": "openai", "model": "whisper-1" } } } ``` Then in templates: `{{transcribeAudio url="..." provider="whisper-local"}}`
@@ -362,6 +363,7 @@ pub const Config = struct {
         .{ "inference", "inference", false },
         .{ "tls", "tls", true },
         .{ "remote_content", "remote_content", false },
+        .{ "training", "training", true },
         .{ "connections", "connections", true },
         .{ "speech_to_text", "speech_to_text", true },
         .{ "cors", "cors", false },
@@ -470,6 +472,10 @@ pub const Config = struct {
         } else if (jw.options.emit_null_optional_fields) {
             try jw.objectField("remote_content");
             try jw.write(@as(?u8, null));
+        }
+        if (self.training) |value| {
+            try jw.objectField("training");
+            try jw.write(value);
         }
         if (self.connections) |value| {
             try jw.objectField("connections");
@@ -2201,6 +2207,70 @@ pub const TLSInfo = struct {
         }
         if (self.key) |value| {
             try jw.objectField("key");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const TrainingConfig = struct {
+    enabled: ?bool = null,
+    state_dir: []const u8,
+    toolchain_dir: []const u8,
+    models_dir: []const u8,
+    input_roots: []const []const u8,
+    output_root: []const u8,
+    python: ?[]const u8 = null,
+    discovery: ?bool = null,
+    ssh_port: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "enabled", "enabled", true },
+        .{ "state_dir", "state_dir", false },
+        .{ "toolchain_dir", "toolchain_dir", false },
+        .{ "models_dir", "models_dir", false },
+        .{ "input_roots", "input_roots", false },
+        .{ "output_root", "output_root", false },
+        .{ "python", "python", true },
+        .{ "discovery", "discovery", true },
+        .{ "ssh_port", "ssh_port", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.enabled) |value| {
+            try jw.objectField("enabled");
+            try jw.write(value);
+        }
+        try jw.objectField("state_dir");
+        try jw.write(self.state_dir);
+        try jw.objectField("toolchain_dir");
+        try jw.write(self.toolchain_dir);
+        try jw.objectField("models_dir");
+        try jw.write(self.models_dir);
+        try jw.objectField("input_roots");
+        try jw.write(self.input_roots);
+        try jw.objectField("output_root");
+        try jw.write(self.output_root);
+        if (self.python) |value| {
+            try jw.objectField("python");
+            try jw.write(value);
+        }
+        if (self.discovery) |value| {
+            try jw.objectField("discovery");
+            try jw.write(value);
+        }
+        if (self.ssh_port) |value| {
+            try jw.objectField("ssh_port");
             try jw.write(value);
         }
         try jw.endObject();

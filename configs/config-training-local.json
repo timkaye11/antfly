@@ -1,0 +1,21 @@
+{
+  "deployment_mode": "standalone",
+  "storage": {
+    "engine": "local",
+    "local": { "base_dir": "/Users/Shared/antfly-training/server-data" }
+  },
+  "training": {
+    "enabled": true,
+    "state_dir": "/Users/Shared/antfly-training/state",
+    "toolchain_dir": "/Users/Shared/antfly-training/toolchain",
+    "models_dir": "/Users/Shared/antfly-training/models",
+    "input_roots": [
+      "/Users/Shared/antfly-training/models",
+      "/Users/Shared/antfly-training/data"
+    ],
+    "output_root": "/Users/Shared/antfly-training/runs",
+    "python": "/usr/bin/python3",
+    "discovery": true,
+    "ssh_port": 22
+  }
+}

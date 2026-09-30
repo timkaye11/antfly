@@ -36,6 +36,7 @@ import RerankingPlaygroundPage from "./pages/RerankingPlaygroundPage";
 import { SecretsPage } from "./pages/SecretsPage";
 import TableDetailsPage from "./pages/TableDetailsPage";
 import TablesListPage from "./pages/TablesListPage";
+import TrainingPage from "./pages/TrainingPage";
 import TranscribePlaygroundPage from "./pages/TranscribePlaygroundPage";
 import { UsersPage } from "./pages/UsersPage";
 
@@ -221,6 +222,7 @@ function AppContent() {
                     {isProductEnabled("inference") && (
                       <>
                         <Route path="/inference/models" element={<ModelsPage />} />
+                        <Route path="/inference/training" element={<TrainingPage />} />
                         <Route
                           path="/inference/playground/chunk"
                           element={<ChunkingPlaygroundPage />}

@@ -491,7 +491,20 @@ import { Client } from "./sdk.js";
 export default Client;
 
 export * from "./models.js";
-
+export type {
+  TrainingDataset,
+  TrainingDatasetSpec,
+  TrainingDatasetsResponse,
+  TrainingHuggingFaceRequest,
+  TrainingHuggingFaceResponse,
+  TrainingJob,
+  TrainingJobSpec,
+  TrainingJobsResponse,
+  TrainingLogsResponse,
+  TrainingPeer,
+  TrainingPeerRegistration,
+  TrainingPeersResponse,
+} from "./training.js";
 export type {
   CatalogTablespaceBindingRequest,
   CreateTablespaceRequest,

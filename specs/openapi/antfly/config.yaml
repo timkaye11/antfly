@@ -6,6 +6,35 @@ info:
 
 components:
   schemas:
+    TrainingConfig:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+          default: false
+        state_dir: &id001
+          type: string
+        toolchain_dir: *id001
+        models_dir: *id001
+        input_roots:
+          type: array
+          items: *id001
+        output_root: *id001
+        python:
+          type: string
+          default: /usr/bin/python3
+        discovery:
+          type: boolean
+          default: false
+        ssh_port:
+          type: integer
+          default: 22
+      required:
+      - state_dir
+      - toolchain_dir
+      - models_dir
+      - input_roots
+      - output_root
     SecretsConfig:
       type: object
       additionalProperties: false
@@ -148,6 +177,8 @@ components:
           $ref: "#/components/schemas/TLSInfo"
         remote_content:
           $ref: "../shared/scraping.yaml#/components/schemas/RemoteContentConfig"
+        training:
+          $ref: "#/components/schemas/TrainingConfig"
         connections:
           type: object
           additionalProperties:

@@ -45,6 +45,7 @@ pub const SecretsConfig = types.SecretsConfig;
 pub const StorageConfig = types.StorageConfig;
 pub const StorageEngine = types.StorageEngine;
 pub const TLSInfo = types.TLSInfo;
+pub const TrainingConfig = types.TrainingConfig;
 pub const TransactionSessionConfig = types.TransactionSessionConfig;
 pub const WebSearchConnectionConfig = types.WebSearchConnectionConfig;
 pub const WebSearchConnectionVariant = types.WebSearchConnectionVariant;

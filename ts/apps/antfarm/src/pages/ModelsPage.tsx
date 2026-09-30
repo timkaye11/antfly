@@ -52,6 +52,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { ErrorState, NoResultsState } from "@/components/branded-empty-state";
 import { ConnectedProvidersSummary } from "@/components/ConnectedProvidersSummary";
+import { TrainingPeers } from "@/components/training-peers";
 import { isProductEnabled } from "@/config/products";
 import {
   type Backend,
@@ -1085,6 +1086,7 @@ const ModelsPage: React.FC = () => {
           </div>
         </DashboardPageActions>
       </DashboardPageHeader>
+      <TrainingPeers inventoryOnly />
 
       <ConnectedProvidersSummary />
 

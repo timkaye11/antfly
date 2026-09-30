@@ -19,6 +19,28 @@ pub const PublicOperationPolicy = struct {
 /// that deliberately bypass foreground admission. A newly generated route
 /// therefore fails its contract test until its resource class is reviewed.
 pub const public_operation_policies = [_]PublicOperationPolicy{
+    .{ .operation_id = "listTrainingDatasets", .class = .none },
+    .{ .operation_id = "createTrainingDataset", .class = .none },
+    .{ .operation_id = "previewTrainingHuggingFace", .class = .none },
+    .{ .operation_id = "getTrainingDataset", .class = .none },
+    .{ .operation_id = "removeTrainingDataset", .class = .none },
+    .{ .operation_id = "uploadTrainingDatasetChunk", .class = .none },
+    .{ .operation_id = "prepareTrainingDataset", .class = .none },
+    .{ .operation_id = "cancelTrainingDataset", .class = .none },
+    .{ .operation_id = "listTrainingPeers", .class = .none },
+    .{ .operation_id = "registerTrainingPeer", .class = .none },
+    .{ .operation_id = "removeTrainingPeer", .class = .none },
+    .{ .operation_id = "refreshTrainingPeer", .class = .none },
+    .{ .operation_id = "startTrainingPreflight", .class = .none },
+    .{ .operation_id = "getTrainingPreflight", .class = .none },
+    .{ .operation_id = "startTrainingJob", .class = .none },
+    .{ .operation_id = "listTrainingJobs", .class = .none },
+    .{ .operation_id = "getTrainingJob", .class = .none },
+    .{ .operation_id = "getTrainingLogs", .class = .none },
+    .{ .operation_id = "cancelTrainingJob", .class = .none },
+    .{ .operation_id = "pauseTrainingJob", .class = .none },
+    .{ .operation_id = "resumeTrainingJob", .class = .none },
+
     .{ .operation_id = "listDatabases", .class = .none },
     .{ .operation_id = "getDatabase", .class = .none },
     .{ .operation_id = "createDatabase", .class = .none },

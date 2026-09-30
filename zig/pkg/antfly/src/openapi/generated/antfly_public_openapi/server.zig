@@ -1368,6 +1368,111 @@ pub fn parseRenameTablespaceBody(allocator: std.mem.Allocator, body: []const u8)
     return std.json.parseFromSlice(types.RenameCatalogResourceRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Parse the JSON request body for createTrainingDataset.
+pub fn parseCreateTrainingDatasetBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TrainingDatasetSpec) {
+    return std.json.parseFromSlice(types.TrainingDatasetSpec, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for previewTrainingHuggingFace.
+pub fn parsePreviewTrainingHuggingFaceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TrainingHuggingFaceRequest) {
+    return std.json.parseFromSlice(types.TrainingHuggingFaceRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// getTrainingDataset
+pub const GetTrainingDatasetPathParams = struct {
+    dataset_id: []const u8,
+};
+
+/// removeTrainingDataset
+pub const RemoveTrainingDatasetPathParams = struct {
+    dataset_id: []const u8,
+};
+
+/// cancelTrainingDataset
+pub const CancelTrainingDatasetPathParams = struct {
+    dataset_id: []const u8,
+};
+
+/// uploadTrainingDatasetChunk
+pub const UploadTrainingDatasetChunkPathParams = struct {
+    dataset_id: []const u8,
+};
+
+/// Parse the JSON request body for uploadTrainingDatasetChunk.
+pub fn parseUploadTrainingDatasetChunkBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TrainingDatasetChunk) {
+    return std.json.parseFromSlice(types.TrainingDatasetChunk, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// prepareTrainingDataset
+pub const PrepareTrainingDatasetPathParams = struct {
+    dataset_id: []const u8,
+};
+
+/// Parse the JSON request body for startTrainingJob.
+pub fn parseStartTrainingJobBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TrainingJobSpec) {
+    return std.json.parseFromSlice(types.TrainingJobSpec, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// getTrainingJob
+pub const GetTrainingJobPathParams = struct {
+    job_id: []const u8,
+};
+
+/// cancelTrainingJob
+pub const CancelTrainingJobPathParams = struct {
+    job_id: []const u8,
+};
+
+/// getTrainingLogs
+pub const GetTrainingLogsPathParams = struct {
+    job_id: []const u8,
+};
+
+pub const GetTrainingLogsParams = struct {
+    rank: ?[]const u8 = null,
+    cursor: ?[]const u8 = null,
+};
+
+/// pauseTrainingJob
+pub const PauseTrainingJobPathParams = struct {
+    job_id: []const u8,
+};
+
+/// resumeTrainingJob
+pub const ResumeTrainingJobPathParams = struct {
+    job_id: []const u8,
+};
+
+/// Parse the JSON request body for resumeTrainingJob.
+pub fn parseResumeTrainingJobBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TrainingResumeRequest) {
+    return std.json.parseFromSlice(types.TrainingResumeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for registerTrainingPeer.
+pub fn parseRegisterTrainingPeerBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TrainingPeerRegistration) {
+    return std.json.parseFromSlice(types.TrainingPeerRegistration, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// removeTrainingPeer
+pub const RemoveTrainingPeerPathParams = struct {
+    peer_id: []const u8,
+};
+
+/// refreshTrainingPeer
+pub const RefreshTrainingPeerPathParams = struct {
+    peer_id: []const u8,
+};
+
+/// Parse the JSON request body for startTrainingPreflight.
+pub fn parseStartTrainingPreflightBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TrainingJobSpec) {
+    return std.json.parseFromSlice(types.TrainingJobSpec, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// getTrainingPreflight
+pub const GetTrainingPreflightPathParams = struct {
+    job_id: []const u8,
+};
+
 /// Parse the JSON request body for beginTransaction.
 pub fn parseBeginTransactionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionBeginRequest) {
     return std.json.parseFromSlice(types.TransactionBeginRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -1605,6 +1710,27 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tablespaces/{tablespaceName}", .operation_id = "createTablespace", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/tablespaces/{tablespaceName}", .operation_id = "dropTablespace", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tablespaces/{tablespaceName}/rename", .operation_id = "renameTablespace", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/training/datasets", .operation_id = "listTrainingDatasets", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/training/datasets", .operation_id = "createTrainingDataset", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/training/datasets/huggingface", .operation_id = "previewTrainingHuggingFace", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/training/datasets/{dataset_id}", .operation_id = "getTrainingDataset", .request_body = .none, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/training/datasets/{dataset_id}", .operation_id = "removeTrainingDataset", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/training/datasets/{dataset_id}/cancel", .operation_id = "cancelTrainingDataset", .request_body = .none, .streaming_response = false },
+    .{ .method = "PUT", .path = "/training/datasets/{dataset_id}/chunks", .operation_id = "uploadTrainingDatasetChunk", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/training/datasets/{dataset_id}/prepare", .operation_id = "prepareTrainingDataset", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/training/jobs", .operation_id = "listTrainingJobs", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/training/jobs", .operation_id = "startTrainingJob", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/training/jobs/{job_id}", .operation_id = "getTrainingJob", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/training/jobs/{job_id}/cancel", .operation_id = "cancelTrainingJob", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/training/jobs/{job_id}/logs", .operation_id = "getTrainingLogs", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/training/jobs/{job_id}/pause", .operation_id = "pauseTrainingJob", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/training/jobs/{job_id}/resume", .operation_id = "resumeTrainingJob", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/training/peers", .operation_id = "listTrainingPeers", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/training/peers", .operation_id = "registerTrainingPeer", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/training/peers/{peer_id}", .operation_id = "removeTrainingPeer", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/training/peers/{peer_id}/refresh", .operation_id = "refreshTrainingPeer", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/training/preflights", .operation_id = "startTrainingPreflight", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/training/preflights/{job_id}", .operation_id = "getTrainingPreflight", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/transactions", .operation_id = "listTransactionSessions", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/transactions/begin", .operation_id = "beginTransaction", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/transactions/cleanup", .operation_id = "cleanupTransactionSessions", .request_body = .none, .streaming_response = false },
@@ -1762,6 +1888,27 @@ pub const routes = [_]Route{
 //   fn createTablespace(self: *Impl, ctx: *httpx.Context, tablespace_name: []const u8) !httpx.Response
 //   fn dropTablespace(self: *Impl, ctx: *httpx.Context, tablespace_name: []const u8) !httpx.Response
 //   fn renameTablespace(self: *Impl, ctx: *httpx.Context, tablespace_name: []const u8) !httpx.Response
+//   fn listTrainingDatasets(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn createTrainingDataset(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn previewTrainingHuggingFace(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getTrainingDataset(self: *Impl, ctx: *httpx.Context, dataset_id: []const u8) !httpx.Response
+//   fn removeTrainingDataset(self: *Impl, ctx: *httpx.Context, dataset_id: []const u8) !httpx.Response
+//   fn cancelTrainingDataset(self: *Impl, ctx: *httpx.Context, dataset_id: []const u8) !httpx.Response
+//   fn uploadTrainingDatasetChunk(self: *Impl, ctx: *httpx.Context, dataset_id: []const u8) !httpx.Response
+//   fn prepareTrainingDataset(self: *Impl, ctx: *httpx.Context, dataset_id: []const u8) !httpx.Response
+//   fn listTrainingJobs(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn startTrainingJob(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getTrainingJob(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
+//   fn cancelTrainingJob(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
+//   fn getTrainingLogs(self: *Impl, ctx: *httpx.Context, job_id: []const u8, params: GetTrainingLogsParams) !httpx.Response
+//   fn pauseTrainingJob(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
+//   fn resumeTrainingJob(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
+//   fn listTrainingPeers(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn registerTrainingPeer(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn removeTrainingPeer(self: *Impl, ctx: *httpx.Context, peer_id: []const u8) !httpx.Response
+//   fn refreshTrainingPeer(self: *Impl, ctx: *httpx.Context, peer_id: []const u8) !httpx.Response
+//   fn startTrainingPreflight(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getTrainingPreflight(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
 //   fn listTransactionSessions(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn beginTransaction(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn cleanupTransactionSessions(self: *Impl, ctx: *httpx.Context, params: CleanupTransactionSessionsParams) !httpx.Response

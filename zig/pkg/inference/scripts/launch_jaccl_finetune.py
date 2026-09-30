@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Launch the same pre-staged Antfly LoRA training command on two Macs.
+"""Launch Antfly LoRA training locally or on two Macs.
 
-The caller supplies identical absolute paths on both machines. The launcher
-checks bytes at those paths before starting either rank and never copies data.
+The caller supplies absolute paths, identical on both machines when distributed.
+The launcher checks bytes at those paths before starting and never copies data.
 """
 
 import argparse
@@ -11,6 +11,8 @@ import os
 from pathlib import Path
 import shlex
 import signal
+import select
+import selectors
 import subprocess
 import sys
 import time
@@ -72,17 +74,79 @@ print(hash.hexdigest())
 '''
 
 
+class OwnerControl:
+    """Keep the owner lease and operation deadline active during every phase."""
+    def __init__(self, args):
+        self.args = args
+        now = time.monotonic()
+        self.deadline = now + args.timeout_seconds if args.timeout_seconds else None
+        self.lease = now + args.heartbeat_timeout_seconds
+        self.pause = False
+
+    def poll(self):
+        if self.args.managed:
+            if select.select([sys.stdin], [], [], 0)[0]:
+                message = os.read(sys.stdin.fileno(), 4096)
+                if not message or b'S' in message:
+                    raise KeyboardInterrupt
+                if any(byte not in b'HP' for byte in message):
+                    raise ValueError('invalid manager control')
+                if b'H' in message:
+                    self.lease = time.monotonic() + self.args.heartbeat_timeout_seconds
+                if b'P' in message:
+                    if 'gliner25' not in self.args.command:
+                        raise ValueError('pause is only supported by GLiNER2.5')
+                    self.pause = True
+            if time.monotonic() >= self.lease:
+                raise TimeoutError('training manager lease expired')
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            raise TimeoutError('training operation timed out')
+
+    def capture(self, command):
+        # Read bounded chunks rather than communicate(), which can accumulate
+        # an unlimited response from a broken remote helper.
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        output = {process.stdout: bytearray(), process.stderr: bytearray()}
+        try:
+            with selectors.DefaultSelector() as selector:
+                for stream in output:
+                    selector.register(stream, selectors.EVENT_READ)
+                while selector.get_map():
+                    self.poll()
+                    for key, _ in selector.select(0.2):
+                        data = os.read(key.fd, 65536)
+                        if not data:
+                            selector.unregister(key.fileobj)
+                            continue
+                        output[key.fileobj].extend(data)
+                        if sum(map(len, output.values())) > 4 * 1024 * 1024:
+                            raise ValueError('helper response exceeds size limit')
+                while process.poll() is None:
+                    self.poll()
+                    time.sleep(0.05)
+            stdout, stderr = (bytes(output[stream]).decode(errors='replace') for stream in (process.stdout, process.stderr))
+            if process.returncode:
+                raise subprocess.CalledProcessError(process.returncode, command, stdout, stderr)
+            return stdout
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            process.stdout.close()
+            process.stderr.close()
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--remote', required=True, help='SSH destination of rank 1')
-    parser.add_argument('--transport', choices=('jaccl', 'tcp'), default='jaccl')
-    parser.add_argument('--coordinator', required=True, help='rank 0 host:port reachable by rank 1')
+    parser.add_argument('--remote', help='SSH destination of rank 1')
+    parser.add_argument('--transport', choices=('local', 'jaccl', 'tcp'), default='jaccl')
+    parser.add_argument('--coordinator', help='rank 0 host:port reachable by rank 1')
     parser.add_argument('--devices-file', help='JACCL topology JSON at the same path on both Macs')
-    parser.add_argument('--library', required=True, help='selected transport bridge at the same path on both Macs')
+    parser.add_argument('--library', help='selected transport bridge at the same path on both Macs')
     parser.add_argument('--check', action='append', default=[], help='model or dataset path to hash on both Macs; repeat as needed')
     parser.add_argument('--report', required=True, help='local JSON run report path')
     parser.add_argument('--compare-adapter', help='same absolute adapter safetensors path on both Macs, hashed after successful training')
-    parser.add_argument('--timeout-seconds', type=int, default=0, help='stop a stalled two-rank command after this many seconds; 0 disables the limit')
+    parser.add_argument('--timeout-seconds', type=int, default=0, help='stop a stalled command after this many seconds; 0 disables the limit')
     parser.add_argument('--tcp-startup-timeout-seconds', type=int, default=1800,
                         help='TCP rendezvous deadline, including rank preparation skew (default: 1800)')
     parser.add_argument('--tcp-io-timeout-seconds', type=int, default=1800,
@@ -92,7 +156,9 @@ def parse_args():
     parser.add_argument('--shutdown-grace-seconds', type=int, default=30,
                         help='grace before supervisors kill their training process groups')
     parser.add_argument('--dry-run', action='store_true')
-    parser.add_argument('--preflight-only', action='store_true', help='verify both hosts and write a report without starting ranks')
+    parser.add_argument('--managed', action='store_true', help='receive H heartbeat, P pause, S stop on stdin')
+    parser.add_argument('--lock-file', help='same absolute host-local exclusive training lock on both ranks')
+    parser.add_argument('--preflight-only', action='store_true', help='verify participating hosts and write a report without starting training')
     parser.add_argument('command', nargs=argparse.REMAINDER, help='-- <training executable> <arguments>')
     args = parser.parse_args()
     if args.command and args.command[0] == '--': args.command.pop(0)
@@ -100,6 +166,11 @@ def parse_args():
         parser.error('supply a command after -- or use --preflight-only')
     if not args.preflight_only and not args.check and Path(args.command[0]).name != 'jaccl_smoke.py':
         parser.error('supply at least one --check model or dataset path')
+    if args.transport == 'local':
+        if args.remote or args.coordinator or args.library or args.devices_file:
+            parser.error('local execution does not use remote, coordinator, library or devices-file')
+    elif not all((args.remote, args.coordinator, args.library)):
+        parser.error('--remote, --coordinator and --library are required for two-Mac training')
     if args.transport == 'jaccl' and not args.devices_file:
         parser.error('--devices-file is required for JACCL')
     if args.transport == 'tcp' and args.devices_file:
@@ -112,19 +183,19 @@ def parse_args():
             parser.error(name.replace('_', '-') + ' must be between 1 and 604800')
     if args.compare_adapter and args.preflight_only:
         parser.error('--compare-adapter requires a training command')
-    for path in (*([args.devices_file] if args.devices_file else []), args.library, *args.check, *args.command[:1], *([args.compare_adapter] if args.compare_adapter else [])):
+    for path in (*([args.lock_file] if args.lock_file else []), *([args.devices_file] if args.devices_file else []), *([args.library] if args.library else []), *args.check, *args.command[:1], *([args.compare_adapter] if args.compare_adapter else [])):
         if not Path(path).is_absolute(): parser.error('all executable, library, topology and checked paths must be absolute')
     return args
 
 
 def remote_command(host, command, env=None):
     words = ['env'] + [f'{key}={value}' for key, value in (env or {}).items()] + command
-    return ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+    return ['ssh', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=10',
             '-o', 'ServerAliveInterval=5', '-o', 'ServerAliveCountMax=3', host, shlex.join(words)]
 
 
 def supervisor_command(args, rank, source):
-    env = {'ANTFLY_DISTRIBUTED_TRANSPORT': args.transport,
+    env = {} if args.transport == 'local' else {'ANTFLY_DISTRIBUTED_TRANSPORT': args.transport,
            'ANTFLY_DISTRIBUTED_COORDINATOR': args.coordinator,
            'ANTFLY_DISTRIBUTED_LIBRARY': args.library,
            'ANTFLY_DISTRIBUTED_RANK': str(rank),
@@ -132,9 +203,11 @@ def supervisor_command(args, rank, source):
            'ANTFLY_TCP_IO_TIMEOUT_SECONDS': str(args.tcp_io_timeout_seconds)}
     if args.devices_file:
         env['ANTFLY_DISTRIBUTED_DEVICES_FILE'] = args.devices_file
-    config = {'command': args.command, 'env': env, 'timeout': args.timeout_seconds,
+    config = {'command': args.command, 'env': env, 'rank': str(rank), 'timeout': args.timeout_seconds,
               'heartbeat_timeout': args.heartbeat_timeout_seconds,
-              'shutdown_grace': args.shutdown_grace_seconds}
+              'shutdown_grace': args.shutdown_grace_seconds,
+              'lock_file': args.lock_file,
+              'pause_supported': 'gliner25' in args.command}
     command = [sys.executable if rank == 0 else 'python3', '-c', source, json.dumps(config)]
     return command if rank == 0 else remote_command(args.remote, command)
 
@@ -183,10 +256,10 @@ def cleanup_receipt(path):
 
 def main():
     args = parse_args()
-    paths = sorted(set([*([args.devices_file] if args.devices_file else []), args.library, *args.command[:1], *args.check]))
+    paths = sorted(set([*([args.devices_file] if args.devices_file else []), *([args.library] if args.library else []), *args.command[:1], *args.check]))
     supervisor_source = Path(__file__).with_name('distributed_rank_supervisor.py').read_text()
     local = supervisor_command(args, 0, supervisor_source) if args.command else None
-    remote = supervisor_command(args, 1, supervisor_source) if args.command else None
+    remote = supervisor_command(args, 1, supervisor_source) if args.command and args.transport != 'local' else None
     if args.dry_run:
         print(json.dumps({'local': local, 'remote': remote, 'checked_paths': paths,
                           'preflight_only': args.preflight_only,
@@ -210,17 +283,26 @@ def main():
         temporary.write_text(json.dumps(report, indent=2) + '\n')
         temporary.replace(report_path)
     write_report()
+    control = OwnerControl(args)
+    def interrupted(_signum, _frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, interrupted)
     preflight_stage = 'rank0'
     try:
-        local_check = subprocess.run([sys.executable, '-c', PREFLIGHT, json.dumps(paths), '0', args.transport, args.devices_file or ''], capture_output=True, text=True, check=True)
-        preflight_stage = 'rank1'
-        remote_check = subprocess.run(remote_command(args.remote, ['python3', '-c', PREFLIGHT, json.dumps(paths), '1', args.transport, args.devices_file or '']), capture_output=True, text=True, check=True)
-        local_info, remote_info = json.loads(local_check.stdout), json.loads(remote_check.stdout)
-        report.update(local_preflight=local_info, remote_preflight=remote_info)
-        preflight_stage = 'hash_compare'
-        if local_info['digests'] != remote_info['digests']:
-            raise ValueError('pre-staged file hash mismatch between ranks')
-    except (subprocess.CalledProcessError, ValueError, OSError) as error:
+        # The alarm also bounds a remote preflight after SSH disconnects.
+        preflight_source = 'import signal; signal.alarm(1800)\n' + PREFLIGHT
+        local_check = control.capture([sys.executable, '-c', preflight_source, json.dumps(paths), '0', args.transport, args.devices_file or ''])
+        local_info = json.loads(local_check)
+        report['local_preflight'] = local_info
+        if args.transport != 'local':
+            preflight_stage = 'rank1'
+            remote_check = control.capture(remote_command(args.remote, ['python3', '-c', preflight_source, json.dumps(paths), '1', args.transport, args.devices_file or '']))
+            remote_info = json.loads(remote_check)
+            report['remote_preflight'] = remote_info
+            preflight_stage = 'hash_compare'
+            if local_info['digests'] != remote_info['digests']:
+                raise ValueError('pre-staged file hash mismatch between ranks')
+    except BaseException as error:
         report.update(finished_unix=time.time(), status='preflight_failed', preflight_stage=preflight_stage,
                       error=(error.stderr or str(error)) if isinstance(error, subprocess.CalledProcessError) else str(error))
         write_report()
@@ -231,12 +313,14 @@ def main():
         print(json.dumps({'status': 'preflight_complete', 'report': str(report_path)}))
         return 0
     log_dir.mkdir(parents=True, exist_ok=False)
-    log_paths = [log_dir / 'rank0.log', log_dir / 'rank1.log']
+    commands = [local] if args.transport == 'local' else [local, remote]
+    log_paths = [log_dir / f'rank{rank}.log' for rank in range(len(commands))]
     report.update(status='running', rank_logs=[str(path) for path in log_paths])
     write_report()
     processes = []
     logs = []
     timed_out = False
+    pause_requested = False
     cleanup_timeout = args.heartbeat_timeout_seconds + args.shutdown_grace_seconds + 5
     def interrupted(_signum, _frame):
         raise KeyboardInterrupt
@@ -244,26 +328,37 @@ def main():
     previous_sigint = signal.getsignal(signal.SIGINT)
     try:
         logs = [path.open('wb') for path in log_paths]
-        for command, log in zip((local, remote), logs):
+        for command, log in zip(commands, logs):
             process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=log,
                                        stderr=subprocess.STDOUT, start_new_session=True)
             processes.append(process)
             os.set_blocking(process.stdin.fileno(), False)
             send_control(process, b'H')
-        deadline = time.monotonic() + args.timeout_seconds if args.timeout_seconds else None
         heartbeat = time.monotonic()
+        pause_deadline = None
         while True:
+            try:
+                control.poll()
+            except TimeoutError:
+                timed_out = True
+                stop_ranks(processes, cleanup_timeout)
+                break
+            if control.pause and not pause_requested:
+                pause_requested = True
+                pause_deadline = time.monotonic() + 300
+                for process in processes:
+                    send_control(process, b'P')
             if time.monotonic() >= heartbeat:
                 for process in processes:
                     send_control(process, b'H')
                 heartbeat = time.monotonic() + min(1, args.heartbeat_timeout_seconds / 3)
             codes = [process.poll() for process in processes]
             if all(code is not None for code in codes): break
-            if deadline is not None and time.monotonic() >= deadline:
+            if pause_deadline is not None and time.monotonic() >= pause_deadline:
                 timed_out = True
                 stop_ranks(processes, cleanup_timeout)
                 break
-            if any(code is not None and code != 0 for code in codes):
+            if any(code is not None and code != 0 for code in codes) and not pause_requested:
                 stop_ranks(processes, cleanup_timeout)
                 break
             time.sleep(0.2)
@@ -287,24 +382,42 @@ def main():
     timed_out = timed_out or any(receipt and receipt.get('reason') == 'timeout'
                                 for receipt in report['rank_cleanup'])
     report.update(finished_unix=time.time(), rank_exit_codes=codes,
-                  status='timeout' if timed_out else 'complete' if codes == [0, 0] else 'failed')
+                  status='timeout' if timed_out else 'complete' if codes == [0] * len(commands) else 'failed')
     if report['status'] == 'complete' and not all(
             receipt and receipt.get('cleanup_complete') and receipt.get('exit_code') == 0
             for receipt in report['rank_cleanup']):
         report['status'] = 'cleanup_unconfirmed'
+    if pause_requested and all(receipt and receipt.get('cleanup_complete') for receipt in report['rank_cleanup']):
+        def paused_result(path):
+            with path.open('rb') as source:
+                source.seek(0, os.SEEK_END)
+                source.seek(max(0, source.tell() - 65536))
+                for line in reversed(source.read().splitlines()):
+                    try:
+                        event = json.loads(line)
+                        if event.get('event') == 'result':
+                            return event.get('result', {}).get('status') == 'paused'
+                    except (ValueError, AttributeError):
+                        pass
+            return False
+        if all(paused_result(path) for path in log_paths):
+            report['status'] = 'paused'
     if report['status'] == 'complete' and args.compare_adapter:
         try:
-            local_hash = subprocess.run([sys.executable, '-c', HASH_FILE, args.compare_adapter], capture_output=True, text=True, check=True).stdout.strip()
-            remote_hash = subprocess.run(remote_command(args.remote, ['python3', '-c', HASH_FILE, args.compare_adapter]), capture_output=True, text=True, check=True).stdout.strip()
-            report['adapter_sha256'] = {'rank0': local_hash, 'rank1': remote_hash}
-            if local_hash != remote_hash:
-                report['status'] = 'artifact_mismatch'
-        except (subprocess.CalledProcessError, OSError) as error:
+            hash_source = 'import signal; signal.alarm(1800)\n' + HASH_FILE
+            local_hash = control.capture([sys.executable, '-c', hash_source, args.compare_adapter]).strip()
+            report['adapter_sha256'] = {'rank0': local_hash}
+            if args.transport != 'local':
+                remote_hash = control.capture(remote_command(args.remote, ['python3', '-c', hash_source, args.compare_adapter])).strip()
+                report['adapter_sha256']['rank1'] = remote_hash
+                if local_hash != remote_hash:
+                    report['status'] = 'artifact_mismatch'
+        except (subprocess.CalledProcessError, OSError, ValueError, KeyboardInterrupt, TimeoutError) as error:
             report.update(status='artifact_check_failed', error=(error.stderr or str(error)) if isinstance(error, subprocess.CalledProcessError) else str(error))
     write_report()
     print(json.dumps({'status': report['status'], 'rank_exit_codes': codes,
                       'rank_logs': report['rank_logs'], 'report': str(report_path)}))
-    return 0 if report['status'] == 'complete' else 1
+    return 0 if report['status'] in ('complete', 'paused') else 1
 
 
 if __name__ == '__main__':

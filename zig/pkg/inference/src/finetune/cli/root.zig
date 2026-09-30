@@ -36,6 +36,7 @@ const inspect_colqwen2_lora_bundle = @import("../tools/inspect_colqwen2_lora_bun
 const inspect_gemma4_lora_bundle = @import("../tools/inspect_gemma4_lora_bundle.zig").Command(@import("inference_internal"));
 const inspect_gliner2_checkpoint = @import("../tools/inspect_gliner2_checkpoint.zig").Command(@import("inference_internal"));
 const inspect_gliner2_dataset = dataCommand(@import("../tools/inspect_gliner2_dataset.zig"));
+const inspect_gliner25_dataset = @import("../tools/inspect_gliner25_dataset.zig");
 const inspect_gliner2_lora_bundle = @import("../tools/inspect_gliner2_lora_bundle.zig").Command(@import("inference_internal"));
 const inspect_layoutlmv3_bundle = @import("../tools/inspect_layoutlmv3_bundle.zig");
 const inspect_layoutlmv3_lora_bundle = @import("../tools/inspect_layoutlmv3_lora_bundle.zig").Command(@import("inference_internal"));
@@ -106,6 +107,7 @@ const commands = [_]Command{
     .{ .domain = "dataset", .action = "generate", .subject = "gemma4-pilot", .adapter_argv0 = "generate-gemma4-pilot-dataset", .main_fn = generate_gemma4_pilot_dataset.main },
     .{ .domain = "dataset", .action = "generate", .subject = "gemma4-multimodal-pilot", .adapter_argv0 = "generate-gemma4-multimodal-pilot-dataset", .main_fn = generate_gemma4_multimodal_pilot_dataset.main },
     .{ .domain = "dataset", .action = "inspect", .subject = "gliner2", .adapter_argv0 = "inspect-gliner2-dataset", .main_fn = inspect_gliner2_dataset.main },
+    .{ .domain = "dataset", .action = "inspect", .subject = "gliner25", .adapter_argv0 = "inspect-gliner25-dataset", .main_fn = inspect_gliner25_dataset.main },
     .{ .domain = "dataset", .action = "inspect", .subject = "reranker", .adapter_argv0 = "inspect-reranker-dataset", .main_fn = inspect_reranker_dataset.main },
     .{ .domain = "dataset", .action = "prepare", .subject = "gemma4-text", .adapter_argv0 = "prepare-gemma4-text-dataset", .main_fn = prepare_gemma4_text_dataset.main },
     .{ .domain = "dataset", .action = "prepare", .subject = "gemma4-multimodal", .adapter_argv0 = "prepare-gemma4-multimodal-dataset", .main_fn = prepare_gemma4_multimodal_dataset.main },

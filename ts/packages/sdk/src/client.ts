@@ -14,6 +14,7 @@ import {
 import { InferenceCapacityError, isTransientCapacityError } from "./inference-client.js";
 import type { paths } from "./public-api.js";
 import { parseSSEFrames } from "./sse.js";
+import { createTrainingClient } from "./training.js";
 import type {
   AntflyAuth,
   AntflyConfig,
@@ -689,6 +690,24 @@ export class AntflyClient {
     if (error) throw new Error(`Failed to get cluster: ${errorMessage(error)}`);
     return data;
   }
+
+  training = createTrainingClient(
+    async <T>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> => {
+      const response = await fetch(this.url(path), {
+        method,
+        headers: this.requestHeaders(),
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal,
+      });
+      if (!response.ok) {
+        const { text } = await readLimitedResponseText(response, MAX_ERROR_RESPONSE_BYTES);
+        throw new Error(`Training API ${response.status}: ${apiErrorMessage(text)}`);
+      }
+      const { text, truncated } = await readLimitedResponseText(response, 4 * 1024 * 1024);
+      if (truncated) throw new Error("Training API response exceeded 4 MiB");
+      return JSON.parse(text) as T;
+    }
+  );
 
   connections = {
     /**

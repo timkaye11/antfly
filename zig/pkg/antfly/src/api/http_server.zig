@@ -3487,6 +3487,7 @@ pub const ApiHttpServer = struct {
     backup_cohort_recovery_cursor_len: usize = 0,
     mcp_sessions: mcp.InMemorySessionStore = .{},
     a2a_tasks: a2a.InMemoryTaskStore = .{},
+    training_manager: @import("training.zig").Manager = .{},
     connections_cache: connections_api.Cache = .{ .alloc = undefined },
     local_resource_manager: resource_manager_mod.ResourceManager,
     shared_resource_manager: ?*resource_manager_mod.ResourceManager,
@@ -3691,6 +3692,15 @@ pub const ApiHttpServer = struct {
             .session_maintenance_owner_id = owner_ids.session_maintenance,
             .backup_maintenance_owner_id = owner_ids.backup_maintenance,
             .index_installation_owner_id = owner_ids.index_installation,
+            .training_manager = blk: {
+                var manager: @import("training.zig").Manager = .{};
+                if (cfg.node_config) |node| if (node.training) |training| {
+                    if (training.value.enabled) manager.ensure(owner_alloc, api_io, training.value) catch |err| {
+                        std.log.err("training manager startup failed: {s}", .{@errorName(err)});
+                    };
+                };
+                break :blk manager;
+            },
             .connections_cache = connections_api.Cache.init(owner_alloc),
             .local_resource_manager = resource_manager_mod.ResourceManager.init(.{}),
             .shared_resource_manager = cfg.resource_manager,
@@ -3775,6 +3785,12 @@ pub const ApiHttpServer = struct {
     pub fn inferenceIo(self: *const ApiHttpServer) std.Io {
         const fallback = std.Io.Threaded.global_single_threaded.io();
         return configuredApiNetworkIo(self.cfg) orelse fallback;
+    }
+
+    pub fn trainingIo(self: *const ApiHttpServer) std.Io {
+        // Process and lifetime-pipe operations use the native API authority,
+        // not the network-only connector view used by HTTP inference clients.
+        return queryEmbeddingCacheIo(self.cfg);
     }
 
     pub fn requestStats(self: *ApiHttpServer) RequestStats {
@@ -4145,6 +4161,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn deinit(self: *ApiHttpServer) void {
+        self.training_manager.deinit(self.trainingIo());
         self.restore_jobs_closing.store(true, .release);
         self.signalRestoreRetryWakeup();
         self.signalRestoreBackoffWaiters();
@@ -23466,6 +23483,7 @@ fn extensionDependencyExists(dependencies: []const extension_domain.ExtensionDep
 }
 
 pub fn requiresAdminPermission(path: []const u8) bool {
+    if (std.mem.startsWith(u8, path, "/training/")) return true;
     if (isHaAdminPath(path)) return true;
     if (isStorageMaintenancePath(path)) return true;
     if (std.mem.eql(u8, path, admin_routes.raft) or std.mem.startsWith(u8, path, admin_routes.raft ++ "/")) return true;

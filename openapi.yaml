@@ -2049,6 +2049,465 @@ security:
   - ApiKeyAuth: []
   - BearerAuth: []
 paths:
+  /db/v1/training/peers:
+    get:
+      summary: listTrainingPeers
+      description: Opt-in node-local two-Mac TCP training. Requires administrator permission; unauthenticated
+        access is loopback-only.
+      tags:
+        - training
+      operationId: listTrainingPeers
+      responses:
+        '200':
+          description: Training operation response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrainingPeersResponse'
+        '400':
+          description: Invalid training request
+        '403':
+          description: Administrator access required
+        '404':
+          description: Training is disabled or resource is missing
+        '409':
+          description: Operation conflicts with an active job or idempotency key
+        '503':
+          description: Training manager unavailable
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    post:
+      summary: registerTrainingPeer
+      description: Opt-in node-local two-Mac TCP training. Requires administrator permission; unauthenticated
+        access is loopback-only.
+      tags:
+        - training
+      operationId: registerTrainingPeer
+      responses:
+        '202':
+          description: Training operation response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrainingPeer'
+        '400':
+          description: Invalid training request
+        '403':
+          description: Administrator access required
+        '404':
+          description: Training is disabled or resource is missing
+        '409':
+          description: Operation conflicts with an active job or idempotency key
+        '503':
+          description: Training manager unavailable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TrainingPeerRegistration'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/training/peers/{peer_id}:
+    delete:
+      summary: removeTrainingPeer
+      description: Opt-in node-local two-Mac TCP training. Requires administrator permission; unauthenticated
+        access is loopback-only.
+      tags:
+        - training
+      operationId: removeTrainingPeer
+      responses:
+        '200':
+          description: Training operation response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrainingRemovedResponse'
+        '400':
+          description: Invalid training request
+        '403':
+          description: Administrator access required
+        '404':
+          description: Training is disabled or resource is missing
+        '409':
+          description: Operation conflicts with an active job or idempotency key
+        '503':
+          description: Training manager unavailable
+      parameters:
+        - name: peer_id
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/training/peers/{peer_id}/refresh:
+    post:
+      summary: refreshTrainingPeer
+      description: Opt-in node-local two-Mac TCP training. Requires administrator permission; unauthenticated
+        access is loopback-only.
+      tags:
+        - training
+      operationId: refreshTrainingPeer
+      responses:
+        '202':
+          description: Training operation response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrainingPeer'
+        '400':
+          description: Invalid training request
+        '403':
+          description: Administrator access required
+        '404':
+          description: Training is disabled or resource is missing
+        '409':
+          description: Operation conflicts with an active job or idempotency key
+        '503':
+          description: Training manager unavailable
+      parameters:
+        - name: peer_id
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/training/preflights:
+    post:
+      summary: startTrainingPreflight
+      description: Opt-in node-local two-Mac TCP training. Requires administrator permission; unauthenticated
+        access is loopback-only.
+      tags:
+        - training
+      operationId: startTrainingPreflight
+      responses:
+        '202':
+          description: Training operation response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrainingJob'
+        '400':
+          description: Invalid training request
+        '403':
+          description: Administrator access required
+        '404':
+          description: Training is disabled or resource is missing
+        '409':
+          description: Operation conflicts with an active job or idempotency key
+        '503':
+          description: Training manager unavailable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TrainingJobSpec'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/training/preflights/{job_id}:
+    get:
+      summary: getTrainingPreflight
+      description: Opt-in node-local two-Mac TCP training. Requires administrator permission; unauthenticated
+        access is loopback-only.
+      tags:
+        - training
+      operationId: getTrainingPreflight
+      responses:
+        '200':
+          description: Training operation response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrainingJob'
+        '400':
+          description: Invalid training request
+        '403':
+          description: Administrator access required
+        '404':
+          description: Training is disabled or resource is missing
+        '409':
+          description: Operation conflicts with an active job or idempotency key
+        '503':
+          description: Training manager unavailable
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/training/jobs:
+    post:
+      summary: startTrainingJob
+      description: Opt-in node-local two-Mac TCP training. Requires administrator permission; unauthenticated
+        access is loopback-only.
+      tags:
+        - training
+      operationId: startTrainingJob
+      responses:
+        '202':
+          description: Training operation response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrainingJob'
+        '400':
+          description: Invalid training request
+        '403':
+          description: Administrator access required
+        '404':
+          description: Training is disabled or resource is missing
+        '409':
+          description: Operation conflicts with an active job or idempotency key
+        '503':
+          description: Training manager unavailable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TrainingJobSpec'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    get:
+      summary: listTrainingJobs
+      description: Opt-in node-local two-Mac TCP training. Requires administrator permission; unauthenticated
+        access is loopback-only.
+      tags:
+        - training
+      operationId: listTrainingJobs
+      responses:
+        '200':
+          description: Training operation response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrainingJobsResponse'
+        '400':
+          description: Invalid training request
+        '403':
+          description: Administrator access required
+        '404':
+          description: Training is disabled or resource is missing
+        '409':
+          description: Operation conflicts with an active job or idempotency key
+        '503':
+          description: Training manager unavailable
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/training/jobs/{job_id}:
+    get:
+      summary: getTrainingJob
+      description: Opt-in node-local two-Mac TCP training. Requires administrator permission; unauthenticated
+        access is loopback-only.
+      tags:
+        - training
+      operationId: getTrainingJob
+      responses:
+        '200':
+          description: Training operation response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrainingJob'
+        '400':
+          description: Invalid training request
+        '403':
+          description: Administrator access required
+        '404':
+          description: Training is disabled or resource is missing
+        '409':
+          description: Operation conflicts with an active job or idempotency key
+        '503':
+          description: Training manager unavailable
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/training/jobs/{job_id}/logs:
+    get:
+      summary: getTrainingLogs
+      description: Opt-in node-local two-Mac TCP training. Requires administrator permission; unauthenticated
+        access is loopback-only.
+      tags:
+        - training
+      operationId: getTrainingLogs
+      responses:
+        '200':
+          description: Training operation response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrainingLogsResponse'
+        '400':
+          description: Invalid training request
+        '403':
+          description: Administrator access required
+        '404':
+          description: Training is disabled or resource is missing
+        '409':
+          description: Operation conflicts with an active job or idempotency key
+        '503':
+          description: Training manager unavailable
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: rank
+          in: query
+          schema:
+            type: string
+            enum:
+              - launcher
+              - '0'
+              - '1'
+        - name: cursor
+          in: query
+          schema:
+            type: integer
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/training/jobs/{job_id}/cancel:
+    post:
+      summary: cancelTrainingJob
+      description: Opt-in node-local two-Mac TCP training. Requires administrator permission; unauthenticated
+        access is loopback-only.
+      tags:
+        - training
+      operationId: cancelTrainingJob
+      responses:
+        '202':
+          description: Training operation response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrainingJob'
+        '400':
+          description: Invalid training request
+        '403':
+          description: Administrator access required
+        '404':
+          description: Training is disabled or resource is missing
+        '409':
+          description: Operation conflicts with an active job or idempotency key
+        '503':
+          description: Training manager unavailable
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/training/jobs/{job_id}/pause:
+    post:
+      summary: pauseTrainingJob
+      description: Opt-in node-local two-Mac TCP training. Requires administrator permission; unauthenticated
+        access is loopback-only.
+      tags:
+        - training
+      operationId: pauseTrainingJob
+      responses:
+        '202':
+          description: Training operation response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrainingJob'
+        '400':
+          description: Invalid training request
+        '403':
+          description: Administrator access required
+        '404':
+          description: Training is disabled or resource is missing
+        '409':
+          description: Operation conflicts with an active job or idempotency key
+        '503':
+          description: Training manager unavailable
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/training/jobs/{job_id}/resume:
+    post:
+      summary: resumeTrainingJob
+      description: Opt-in node-local two-Mac TCP training. Requires administrator permission; unauthenticated
+        access is loopback-only.
+      tags:
+        - training
+      operationId: resumeTrainingJob
+      responses:
+        '202':
+          description: Training operation response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrainingJob'
+        '400':
+          description: Invalid training request
+        '403':
+          description: Administrator access required
+        '404':
+          description: Training is disabled or resource is missing
+        '409':
+          description: Operation conflicts with an active job or idempotency key
+        '503':
+          description: Training manager unavailable
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TrainingResumeRequest'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/status:
     get:
       summary: Get cluster status
@@ -8558,6 +9017,284 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/training/datasets:
+    get:
+      summary: listTrainingDatasets
+      operationId: listTrainingDatasets
+      tags:
+        - training
+      description: Administrator-only dataset import for the local training coordinator. Without authentication,
+        access is loopback-only.
+      responses:
+        '200':
+          description: Dataset operation response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrainingDatasetsResponse'
+        '400':
+          description: Invalid dataset request
+        '403':
+          description: Administrator access required
+        '404':
+          description: Dataset not found or training disabled
+        '409':
+          description: Dataset operation conflict
+        '503':
+          description: Training manager unavailable
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    post:
+      summary: createTrainingDataset
+      operationId: createTrainingDataset
+      tags:
+        - training
+      description: Administrator-only dataset import for the local training coordinator. Without authentication,
+        access is loopback-only.
+      responses:
+        '201':
+          description: Dataset operation response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrainingDataset'
+        '400':
+          description: Invalid dataset request
+        '403':
+          description: Administrator access required
+        '404':
+          description: Dataset not found or training disabled
+        '409':
+          description: Dataset operation conflict
+        '503':
+          description: Training manager unavailable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TrainingDatasetSpec'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/training/datasets/huggingface:
+    post:
+      summary: previewTrainingHuggingFace
+      operationId: previewTrainingHuggingFace
+      tags:
+        - training
+      description: Administrator-only dataset import for the local training coordinator. Without authentication,
+        access is loopback-only.
+      responses:
+        '200':
+          description: Dataset operation response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrainingHuggingFaceResponse'
+        '400':
+          description: Invalid dataset request
+        '403':
+          description: Administrator access required
+        '404':
+          description: Dataset not found or training disabled
+        '409':
+          description: Dataset operation conflict
+        '503':
+          description: Training manager unavailable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TrainingHuggingFaceRequest'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/training/datasets/{dataset_id}:
+    get:
+      summary: getTrainingDataset
+      operationId: getTrainingDataset
+      tags:
+        - training
+      description: Administrator-only dataset import for the local training coordinator. Without authentication,
+        access is loopback-only.
+      responses:
+        '200':
+          description: Dataset operation response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrainingDataset'
+        '400':
+          description: Invalid dataset request
+        '403':
+          description: Administrator access required
+        '404':
+          description: Dataset not found or training disabled
+        '409':
+          description: Dataset operation conflict
+        '503':
+          description: Training manager unavailable
+      parameters:
+        - name: dataset_id
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    delete:
+      summary: removeTrainingDataset
+      operationId: removeTrainingDataset
+      tags:
+        - training
+      description: Administrator-only dataset import for the local training coordinator. Without authentication,
+        access is loopback-only.
+      responses:
+        '200':
+          description: Dataset operation response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrainingRemovedResponse'
+        '400':
+          description: Invalid dataset request
+        '403':
+          description: Administrator access required
+        '404':
+          description: Dataset not found or training disabled
+        '409':
+          description: Dataset operation conflict
+        '503':
+          description: Training manager unavailable
+      parameters:
+        - name: dataset_id
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/training/datasets/{dataset_id}/chunks:
+    put:
+      summary: uploadTrainingDatasetChunk
+      operationId: uploadTrainingDatasetChunk
+      tags:
+        - training
+      description: Administrator-only dataset import for the local training coordinator. Without authentication,
+        access is loopback-only.
+      responses:
+        '200':
+          description: Dataset operation response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrainingDataset'
+        '400':
+          description: Invalid dataset request
+        '403':
+          description: Administrator access required
+        '404':
+          description: Dataset not found or training disabled
+        '409':
+          description: Dataset operation conflict
+        '503':
+          description: Training manager unavailable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TrainingDatasetChunk'
+      parameters:
+        - name: dataset_id
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/training/datasets/{dataset_id}/prepare:
+    post:
+      summary: prepareTrainingDataset
+      operationId: prepareTrainingDataset
+      tags:
+        - training
+      description: Administrator-only dataset import for the local training coordinator. Without authentication,
+        access is loopback-only.
+      responses:
+        '202':
+          description: Dataset operation response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrainingDataset'
+        '400':
+          description: Invalid dataset request
+        '403':
+          description: Administrator access required
+        '404':
+          description: Dataset not found or training disabled
+        '409':
+          description: Dataset operation conflict
+        '503':
+          description: Training manager unavailable
+      parameters:
+        - name: dataset_id
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/training/datasets/{dataset_id}/cancel:
+    post:
+      summary: cancelTrainingDataset
+      operationId: cancelTrainingDataset
+      tags:
+        - training
+      description: Administrator-only dataset import for the local training coordinator. Without authentication,
+        access is loopback-only.
+      responses:
+        '200':
+          description: Dataset operation response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrainingDataset'
+        '400':
+          description: Invalid dataset request
+        '403':
+          description: Administrator access required
+        '404':
+          description: Dataset not found or training disabled
+        '409':
+          description: Dataset operation conflict
+        '503':
+          description: Training manager unavailable
+      parameters:
+        - name: dataset_id
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /auth/v1/me:
     get:
       tags:
@@ -11618,6 +12355,564 @@ components:
         type: string
         example: role:tenant_reader
   schemas:
+    TrainingPeerRegistration:
+      type: object
+      properties:
+        name:
+          type: string
+        ssh_destination:
+          type: string
+      required:
+        - ssh_destination
+    TrainingPeer:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        ssh_destination:
+          type: string
+        status:
+          type: string
+        error:
+          type: string
+          nullable: true
+        checked_at:
+          type: number
+        inventory:
+          type: object
+          additionalProperties: true
+      required:
+        - id
+        - name
+        - status
+    TrainingDiscoveredPeer:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        hostname:
+          type: string
+        ssh_port:
+          type: integer
+        status:
+          type: string
+        seen_at:
+          type: number
+      required:
+        - id
+        - name
+        - hostname
+        - ssh_port
+        - status
+    TrainingPeersResponse:
+      type: object
+      properties:
+        peers:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrainingPeer'
+        nearby:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrainingDiscoveredPeer'
+        discovery_error:
+          type: string
+          nullable: true
+        config:
+          type: object
+          additionalProperties: true
+        capabilities:
+          type: object
+          additionalProperties: true
+      required:
+        - peers
+        - nearby
+    TrainingDatasetSpec:
+      type: object
+      additionalProperties: false
+      required:
+        - request_id
+        - name
+        - family
+        - source
+        - format
+      properties:
+        request_id:
+          type: string
+          description: Stable idempotency key for this import.
+        name:
+          type: string
+          maxLength: 128
+        family:
+          type: string
+          enum:
+            - gliner25
+            - gemma4
+        source:
+          type: string
+          enum:
+            - upload
+            - huggingface
+        format:
+          type: string
+          enum:
+            - gliner25
+            - gliner_bio
+            - gemma_chat
+            - gemma_instruction
+            - gemma_completion
+        filename:
+          type: string
+          description: Original CSV or JSONL filename for uploads.
+        size_bytes:
+          type: integer
+          minimum: 1
+          maximum: 67108864
+        hf_dataset:
+          type: string
+        hf_config:
+          type: string
+        hf_split:
+          type: string
+        hf_offset:
+          type: integer
+          minimum: 0
+          maximum: 1000000000
+          default: 0
+        max_rows:
+          type: integer
+          minimum: 1
+          maximum: 10000
+          default: 1000
+        max_seq_len:
+          type: integer
+          minimum: 8
+          maximum: 8192
+          default: 512
+        model_dir:
+          type: string
+          description: Staged Gemma model whose tokenizer prepares these examples.
+        columns:
+          type: object
+          additionalProperties: false
+          properties:
+            messages:
+              type: string
+            prompt:
+              type: string
+            input:
+              type: string
+            response:
+              type: string
+            text:
+              type: string
+            tokens:
+              type: string
+            tags:
+              type: string
+        label_names:
+          type: array
+          maxItems: 1024
+          items:
+            type: string
+          description: Ordered BIO label names; HF ClassLabel metadata is used when omitted.
+    TrainingDataset:
+      type: object
+      required:
+        - id
+        - name
+        - family
+        - spec
+        - status
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        family:
+          type: string
+          enum:
+            - gliner25
+            - gemma4
+        spec:
+          $ref: '#/components/schemas/TrainingDatasetSpec'
+        status:
+          type: string
+          enum:
+            - pending
+            - uploading
+            - importing
+            - preparing
+            - ready
+            - failed
+            - cancelled
+        created_at:
+          type: number
+        updated_at:
+          type: number
+        error:
+          type: string
+          nullable: true
+        path:
+          type: string
+        row_count:
+          type: integer
+        size_bytes:
+          type: integer
+        sha256:
+          type: string
+        uploaded_bytes:
+          type: integer
+        preview:
+          type: array
+          items:
+            type: string
+        tokenizer_sha256:
+          type: string
+    TrainingDatasetsResponse:
+      type: object
+      required:
+        - datasets
+      properties:
+        datasets:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrainingDataset'
+    TrainingDatasetChunk:
+      type: object
+      additionalProperties: false
+      required:
+        - offset
+        - data
+      properties:
+        offset:
+          type: integer
+          minimum: 0
+        data:
+          type: string
+          description: Base64 encoding of at most 32768 bytes. Retrying an identical offset is idempotent.
+    TrainingHuggingFaceRequest:
+      type: object
+      required:
+        - dataset
+      properties:
+        dataset:
+          type: string
+        config:
+          type: string
+        split:
+          type: string
+    TrainingHuggingFaceResponse:
+      type: object
+      required:
+        - splits
+        - features
+        - rows
+      properties:
+        splits:
+          type: array
+          items:
+            type: object
+            required:
+              - config
+              - split
+            properties:
+              config:
+                type: string
+              split:
+                type: string
+        features:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        rows:
+          type: array
+          items:
+            type: string
+            description: Display-only JSON preview, truncated to 4000 characters.
+        total_rows:
+          type: integer
+          nullable: true
+    TrainingJobSpec:
+      type: object
+      properties:
+        request_id:
+          type: string
+          description: Stable idempotency key; retries with the same body return the existing operation.
+        execution_mode:
+          type: string
+          enum:
+            - local
+            - two_mac
+          description: Defaults to local when no peer is supplied. Legacy requests with a peer use two_mac.
+        peer_id:
+          type: string
+          description: Registered SSH peer; required only for two_mac execution.
+        coordinator:
+          type: string
+          description: This Mac's reachable host:port; required only for two_mac execution.
+        family:
+          type: string
+          enum:
+            - gliner25
+            - gemma4
+        kind:
+          type: string
+          enum:
+            - transport
+            - training
+        gliner25_config:
+          type: string
+          description: Optional existing GLiNER2.5 job JSON path. Otherwise configure the run with base_model,
+            a dataset_id or train_file, and gliner25_options. Mutually exclusive with base_model and train_file.
+        train_file:
+          type: string
+          description: Existing GLiNER2.5 training JSONL path for a form-configured run when no prepared
+            dataset_id is selected.
+        dataset_id:
+          type: string
+          description: Prepared training dataset; also staged on the peer during two_mac readiness.
+        calibration_dataset_id:
+          type: string
+          nullable: true
+          description: GLiNER calibration dataset override; null disables the template file.
+        test_dataset_id:
+          type: string
+          nullable: true
+          description: GLiNER held-out dataset override; null disables the template file.
+        gliner25_options:
+          type: object
+          additionalProperties: false
+          description: GLiNER2.5 form settings, or optional overrides of an existing job JSON. The coordinator
+            generates a native job snapshot and owns its output and recovery paths. Form defaults use
+            Metal, LoRA rank 8, alpha 16, and one epoch; other settings use native defaults.
+          properties:
+            execution:
+              type: string
+              enum:
+                - native
+                - resident_metal
+            mode:
+              type: string
+              enum:
+                - lora
+                - dora
+            rank:
+              type: integer
+              minimum: 1
+              maximum: 1024
+            alpha:
+              type: number
+              minimum: 0
+              exclusiveMinimum: true
+              maximum: 65536
+            epochs:
+              type: integer
+              minimum: 1
+              maximum: 10000
+            encoder_lr:
+              type: number
+              minimum: 0
+              exclusiveMinimum: true
+              maximum: 1
+            task_lr:
+              type: number
+              minimum: 0
+              exclusiveMinimum: true
+              maximum: 1
+            batch_size:
+              type: integer
+              minimum: 1
+              maximum: 8
+              description: Examples per microbatch on each participating machine.
+            accumulation:
+              type: integer
+              minimum: 1
+              maximum: 65536
+            scheduler:
+              type: string
+              enum:
+                - linear
+                - cosine
+                - constant
+            warmup_ratio:
+              type: number
+              minimum: 0
+              maximum: 1
+            weight_decay:
+              type: number
+              minimum: 0
+              maximum: 1
+            max_grad_norm:
+              type: number
+              minimum: 0
+              maximum: 1000
+            seed:
+              type: integer
+              minimum: 0
+              maximum: 4294967295
+            shuffle:
+              type: boolean
+            dropout:
+              type: number
+              minimum: 0
+              maximum: 1
+              exclusiveMaximum: true
+            targets:
+              type: array
+              minItems: 1
+              maxItems: 64
+              uniqueItems: true
+              items:
+                type: string
+                minLength: 1
+                maxLength: 256
+              description: Adapter target aliases or exact module names, resolved by the native trainer.
+                Defaults to encoder.
+            max_text_words:
+              type: integer
+              minimum: 1
+              maximum: 8192
+            max_sequence_tokens:
+              type: integer
+              minimum: 1
+              maximum: 16384
+            max_queries:
+              type: integer
+              minimum: 1
+              maximum: 256
+            checkpoint_every_microbatches:
+              type: integer
+              minimum: 1
+              maximum: 1000000
+            memory_total_gib:
+              type: number
+              minimum: 0.25
+              maximum: 1024
+              description: Combined native job memory ceiling, in GiB. Does not bypass admission or physical-memory
+                checks.
+            memory_host_gib:
+              type: number
+              minimum: 0.25
+              maximum: 1024
+              description: Native trainer host-memory ceiling, in GiB.
+            memory_backend_gib:
+              type: number
+              minimum: 0.25
+              maximum: 1024
+              description: Native compute-backend memory ceiling, in GiB.
+            dataset_memory_mib:
+              type: integer
+              minimum: 4
+              maximum: 4096
+              description: Memory ceiling for each decoded dataset, in MiB. Native default is 512.
+            source_auxiliary_mib:
+              type: integer
+              minimum: 4
+              maximum: 1024
+              description: Model-loading memory allowance beyond source file bytes, in MiB. Native default
+                is 384.
+        base_model:
+          type: string
+          description: Base model directory. Required for Gemma4 and for GLiNER2.5 form configuration
+            without gliner25_config. GLiNER2.5 requires a compatible FP32 package.
+        adapter:
+          type: string
+        prepared_inputs:
+          type: string
+        max_examples:
+          type: integer
+        epochs:
+          type: integer
+        learning_rate:
+          type: number
+        timeout_seconds:
+          type: integer
+      required:
+        - request_id
+    TrainingJob:
+      type: object
+      properties:
+        id:
+          type: string
+        request_id:
+          type: string
+        kind:
+          type: string
+          enum:
+            - preflight
+            - training
+        status:
+          type: string
+        spec:
+          $ref: '#/components/schemas/TrainingJobSpec'
+        created_at:
+          type: number
+        updated_at:
+          type: number
+        output_dir:
+          type: string
+        error:
+          type: string
+        configuration:
+          type: object
+          additionalProperties: true
+        transport_report:
+          type: object
+          additionalProperties: true
+        report:
+          type: object
+          additionalProperties: true
+        checkpoint:
+          type: object
+          additionalProperties: true
+      required:
+        - id
+        - request_id
+        - kind
+        - status
+        - spec
+        - created_at
+    TrainingJobsResponse:
+      type: object
+      properties:
+        jobs:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrainingJob'
+      required:
+        - jobs
+    TrainingLogsResponse:
+      type: object
+      properties:
+        text:
+          type: string
+        cursor:
+          type: integer
+      required:
+        - text
+        - cursor
+    TrainingResumeRequest:
+      type: object
+      properties:
+        request_id:
+          type: string
+      required:
+        - request_id
+    TrainingRemovedResponse:
+      type: object
+      properties:
+        removed:
+          type: boolean
+      required:
+        - removed
     DatabaseCatalogRecord:
       type: object
       required:

@@ -33,7 +33,12 @@ fn commandWithOriginal(init: std.process.Init, original: std.process.Args) !?pro
     try tail.append(init.gpa, config_path);
     var stop: ?u64 = null;
     var grace: ?u32 = null;
+    var validate_only = false;
     while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--validate-only")) {
+            validate_only = true;
+            continue;
+        }
         const value = args.next() orelse return usage();
         if (std.mem.eql(u8, arg, "--stop-after-microbatches") and stop == null) {
             stop = try std.fmt.parseUnsigned(u64, value, 10);
@@ -44,7 +49,7 @@ fn commandWithOriginal(init: std.process.Init, original: std.process.Args) !?pro
         try tail.appendSlice(init.gpa, &.{ arg, value });
     }
     const grace_seconds = grace orelse 30;
-    if (try process.workerRequested(init.environ_map)) {
+    if (!validate_only and try process.workerRequested(init.environ_map)) {
         // Start the executor-independent monitor before rereading the config
         // or initializing any model/provider. It survives Job's full teardown.
         const worker = try process.Worker.create(init.gpa, init.io, init.environ_map);
@@ -54,10 +59,15 @@ fn commandWithOriginal(init: std.process.Init, original: std.process.Args) !?pro
         };
         worker.finish(0);
     }
-    var invocation = try process.originalArguments(init.gpa, original, init.environ_map, tail.items);
-    defer invocation.deinit();
     var config = try job.loadConfigSnapshot(init.gpa, init.io, config_path);
     defer config.deinit();
+    try job.validate(config.parsed.value);
+    if (validate_only) {
+        try writeEvent(init.io, std.Io.File.stdout(), .{ .event = "validated", .config_sha256 = config.sha256 });
+        return null;
+    }
+    var invocation = try process.originalArguments(init.gpa, original, init.environ_map, tail.items);
+    defer invocation.deinit();
     return process.runParent(init, invocation.values, .{
         .timeout_ns = try std.math.mul(u64, config.parsed.value.timeout_seconds, std.time.ns_per_s),
         .shutdown_grace_ns = @as(u64, grace_seconds) * std.time.ns_per_s,
@@ -132,6 +142,7 @@ const Progress = struct {
 fn help() void {
     std.debug.print(
         \\usage: antfly-inference finetune train gliner25 <job.json> [--stop-after-microbatches N] [--shutdown-grace-seconds N]
+        \\--validate-only checks the job contract without loading a model or starting training.
         \\The version-1 job specifies absolute source/data/output paths and FP32 training settings.
         \\execution defaults to native; resident_metal and resident_cuda require the respective GPU build and admitted device budgets.
         \\The output directory must be new. To resume, set resume_from to latest.safetensors and choose a new output directory.

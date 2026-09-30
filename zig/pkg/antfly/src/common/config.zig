@@ -83,6 +83,7 @@ pub const Config = struct {
     inference: InferenceConfig = .{},
     remote_content: ?RemoteContentConfig = null,
     connections: ConnectionsConfig = .{},
+    training: ?std.json.Parsed(@import("training_config.zig").Config) = null,
     shard_allocation: ShardAllocationConfig = .{},
 
     pub const RequestAdmissionConfig = struct {
@@ -807,6 +808,15 @@ pub const Config = struct {
         var connections = try parseConnectionsConfig(alloc, root.get("connections"));
         errdefer deinitConnectionsConfig(alloc, &connections);
         try validateStorageConnections(&storage_config, &connections);
+        var training = if (root.get("training")) |value|
+            try std.json.parseFromValue(@import("training_config.zig").Config, alloc, value, .{ .allocate = .alloc_always })
+        else
+            null;
+        errdefer if (training) |*value| value.deinit();
+        if (training) |value| {
+            try value.value.validate();
+            if (value.value.enabled and deployment_mode != .standalone) return error.InvalidConfig;
+        }
 
         var registry = try provider_registry.Registry.parseFromValue(alloc, raw_tree.value);
         errdefer registry.deinit();
@@ -910,6 +920,7 @@ pub const Config = struct {
             else
                 null,
             .connections = connections,
+            .training = training,
             .shard_allocation = .{
                 .default_shards_per_table = try optionalU32Field(root, "default_shards_per_table") orelse if (deployment_mode.supportsLite()) default_standalone_shards_per_table else default_config_shards_per_table,
                 .max_shard_size_bytes = try optionalU64Field(root, "max_shard_size_bytes") orelse default_max_shard_size_bytes,
@@ -1117,6 +1128,7 @@ pub const Config = struct {
     }
 
     pub fn deinit(self: *Config) void {
+        if (self.training) |*value| value.deinit();
         if (self.tls) |*tls| tls.deinit(self.registry.allocator);
         if (self.cors) |*cors| cors.deinit(self.registry.allocator);
         self.metadata.deinit(self.registry.allocator);

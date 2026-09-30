@@ -22,6 +22,14 @@ const gemma_lora_imports = &.{ .build_options, .ml, .inference_internal };
 
 pub const specs = [_]common.CommandSpec{
     .{
+        .name = "inspect-gliner25-dataset",
+        .root_source_file = "src/finetune/tools/inspect_gliner25_dataset.zig",
+        .description = "Validate native GLiNER2.5 JSONL schemas and annotations without loading model weights",
+        .imports = &.{ .build_options, .inference_internal },
+        .native_link = .default,
+        .link_libc = true,
+    },
+    .{
         .name = "train-laya",
         .root_source_file = "src/finetune/train/train_laya.zig",
         .description = "Finetune native Laya typed decisions with resumable optimizer state and serving export",

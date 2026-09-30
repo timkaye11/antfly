@@ -456,6 +456,11 @@ pub const CreateTablespaceResponse = union(enum) {
     }
 };
 
+pub const GetTrainingLogsParams = struct {
+    rank: ?[]const u8 = null,
+    cursor: ?[]const u8 = null,
+};
+
 pub const CleanupTransactionSessionsParams = struct {
     cutoff_ns: ?[]const u8 = null,
 };
@@ -3192,6 +3197,259 @@ pub const Client = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+    }
+
+    /// listTrainingDatasets
+    /// GET /db/v1/training/datasets
+    pub fn listTrainingDatasets(self: *@This()) !ApiResponse(types.TrainingDatasetsResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/training/datasets", .{self.base_url});
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.TrainingDatasetsResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// createTrainingDataset
+    /// POST /db/v1/training/datasets
+    pub fn createTrainingDataset(self: *@This(), body: types.TrainingDatasetSpec) !ApiResponse(types.TrainingDataset) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/training/datasets", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.TrainingDataset).fromResponse(self.allocator, &resp);
+    }
+
+    /// previewTrainingHuggingFace
+    /// POST /db/v1/training/datasets/huggingface
+    pub fn previewTrainingHuggingFace(self: *@This(), body: types.TrainingHuggingFaceRequest) !ApiResponse(types.TrainingHuggingFaceResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/training/datasets/huggingface", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.TrainingHuggingFaceResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// getTrainingDataset
+    /// GET /db/v1/training/datasets/{dataset_id}
+    pub fn getTrainingDataset(self: *@This(), dataset_id: []const u8) !ApiResponse(types.TrainingDataset) {
+        const encoded_dataset_id = try httpx.PercentEncoding.encode(self.allocator, dataset_id);
+        defer self.allocator.free(encoded_dataset_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/training/datasets/{s}", .{ self.base_url, encoded_dataset_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.TrainingDataset).fromResponse(self.allocator, &resp);
+    }
+
+    /// removeTrainingDataset
+    /// DELETE /db/v1/training/datasets/{dataset_id}
+    pub fn removeTrainingDataset(self: *@This(), dataset_id: []const u8) !ApiResponse(types.TrainingRemovedResponse) {
+        const encoded_dataset_id = try httpx.PercentEncoding.encode(self.allocator, dataset_id);
+        defer self.allocator.free(encoded_dataset_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/training/datasets/{s}", .{ self.base_url, encoded_dataset_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.TrainingRemovedResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// cancelTrainingDataset
+    /// POST /db/v1/training/datasets/{dataset_id}/cancel
+    pub fn cancelTrainingDataset(self: *@This(), dataset_id: []const u8) !ApiResponse(types.TrainingDataset) {
+        const encoded_dataset_id = try httpx.PercentEncoding.encode(self.allocator, dataset_id);
+        defer self.allocator.free(encoded_dataset_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/training/datasets/{s}/cancel", .{ self.base_url, encoded_dataset_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.TrainingDataset).fromResponse(self.allocator, &resp);
+    }
+
+    /// uploadTrainingDatasetChunk
+    /// PUT /db/v1/training/datasets/{dataset_id}/chunks
+    pub fn uploadTrainingDatasetChunk(self: *@This(), dataset_id: []const u8, body: types.TrainingDatasetChunk) !ApiResponse(types.TrainingDataset) {
+        const encoded_dataset_id = try httpx.PercentEncoding.encode(self.allocator, dataset_id);
+        defer self.allocator.free(encoded_dataset_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/training/datasets/{s}/chunks", .{ self.base_url, encoded_dataset_id });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.put(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.TrainingDataset).fromResponse(self.allocator, &resp);
+    }
+
+    /// prepareTrainingDataset
+    /// POST /db/v1/training/datasets/{dataset_id}/prepare
+    pub fn prepareTrainingDataset(self: *@This(), dataset_id: []const u8) !ApiResponse(types.TrainingDataset) {
+        const encoded_dataset_id = try httpx.PercentEncoding.encode(self.allocator, dataset_id);
+        defer self.allocator.free(encoded_dataset_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/training/datasets/{s}/prepare", .{ self.base_url, encoded_dataset_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.TrainingDataset).fromResponse(self.allocator, &resp);
+    }
+
+    /// listTrainingJobs
+    /// GET /db/v1/training/jobs
+    pub fn listTrainingJobs(self: *@This()) !ApiResponse(types.TrainingJobsResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/training/jobs", .{self.base_url});
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.TrainingJobsResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// startTrainingJob
+    /// POST /db/v1/training/jobs
+    pub fn startTrainingJob(self: *@This(), body: types.TrainingJobSpec) !ApiResponse(types.TrainingJob) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/training/jobs", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.TrainingJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// getTrainingJob
+    /// GET /db/v1/training/jobs/{job_id}
+    pub fn getTrainingJob(self: *@This(), job_id: []const u8) !ApiResponse(types.TrainingJob) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/training/jobs/{s}", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.TrainingJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// cancelTrainingJob
+    /// POST /db/v1/training/jobs/{job_id}/cancel
+    pub fn cancelTrainingJob(self: *@This(), job_id: []const u8) !ApiResponse(types.TrainingJob) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/training/jobs/{s}/cancel", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.TrainingJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// getTrainingLogs
+    /// GET /db/v1/training/jobs/{job_id}/logs
+    pub fn getTrainingLogs(self: *@This(), job_id: []const u8, params: GetTrainingLogsParams) !ApiResponse(types.TrainingLogsResponse) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/training/jobs/{s}/logs", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.rank) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "rank=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.cursor) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "cursor=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.TrainingLogsResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// pauseTrainingJob
+    /// POST /db/v1/training/jobs/{job_id}/pause
+    pub fn pauseTrainingJob(self: *@This(), job_id: []const u8) !ApiResponse(types.TrainingJob) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/training/jobs/{s}/pause", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.TrainingJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// resumeTrainingJob
+    /// POST /db/v1/training/jobs/{job_id}/resume
+    pub fn resumeTrainingJob(self: *@This(), job_id: []const u8, body: types.TrainingResumeRequest) !ApiResponse(types.TrainingJob) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/training/jobs/{s}/resume", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.TrainingJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// listTrainingPeers
+    /// GET /db/v1/training/peers
+    pub fn listTrainingPeers(self: *@This()) !ApiResponse(types.TrainingPeersResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/training/peers", .{self.base_url});
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.TrainingPeersResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// registerTrainingPeer
+    /// POST /db/v1/training/peers
+    pub fn registerTrainingPeer(self: *@This(), body: types.TrainingPeerRegistration) !ApiResponse(types.TrainingPeer) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/training/peers", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.TrainingPeer).fromResponse(self.allocator, &resp);
+    }
+
+    /// removeTrainingPeer
+    /// DELETE /db/v1/training/peers/{peer_id}
+    pub fn removeTrainingPeer(self: *@This(), peer_id: []const u8) !ApiResponse(types.TrainingRemovedResponse) {
+        const encoded_peer_id = try httpx.PercentEncoding.encode(self.allocator, peer_id);
+        defer self.allocator.free(encoded_peer_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/training/peers/{s}", .{ self.base_url, encoded_peer_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.TrainingRemovedResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// refreshTrainingPeer
+    /// POST /db/v1/training/peers/{peer_id}/refresh
+    pub fn refreshTrainingPeer(self: *@This(), peer_id: []const u8) !ApiResponse(types.TrainingPeer) {
+        const encoded_peer_id = try httpx.PercentEncoding.encode(self.allocator, peer_id);
+        defer self.allocator.free(encoded_peer_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/training/peers/{s}/refresh", .{ self.base_url, encoded_peer_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.TrainingPeer).fromResponse(self.allocator, &resp);
+    }
+
+    /// startTrainingPreflight
+    /// POST /db/v1/training/preflights
+    pub fn startTrainingPreflight(self: *@This(), body: types.TrainingJobSpec) !ApiResponse(types.TrainingJob) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/training/preflights", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.TrainingJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// getTrainingPreflight
+    /// GET /db/v1/training/preflights/{job_id}
+    pub fn getTrainingPreflight(self: *@This(), job_id: []const u8) !ApiResponse(types.TrainingJob) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/training/preflights/{s}", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.TrainingJob).fromResponse(self.allocator, &resp);
     }
 
     /// List transaction sessions

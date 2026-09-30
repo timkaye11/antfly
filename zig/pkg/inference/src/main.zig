@@ -369,6 +369,17 @@ pub fn runFromArgs(
         try inference.cuda_microbench.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "smoke")) {
         try inference.native_smoke.main(allocator, init.io, command_args);
+    } else if (std.mem.eql(u8, command, "peer-info")) {
+        var registry = inference.registry.ModelRegistry.init(allocator, if (command_args.len > 0) command_args[0] else defaultModelsDir(allocator));
+        defer registry.deinit();
+        const models = try registry.discover(init.io);
+        defer allocator.free(models);
+        var buffer: [8192]u8 = undefined;
+        var writer = std.Io.File.stdout().writerStreaming(init.io, &buffer);
+        const metal_available = build_options.enable_metal and inference.metal_runtime.metalDeviceAvailable();
+        try std.json.Stringify.value(.{ .protocol_version = 1, .version = build_info.version(), .metal = metal_available, .models = models, .training = .{ .gliner25 = .{ .native = true, .metal = metal_available, .pause = true }, .gemma4 = .{ .native = true, .metal = false, .pause = false } } }, .{}, &writer.interface);
+        try writer.interface.writeByte('\n');
+        try writer.interface.flush();
     } else if (std.mem.eql(u8, command, "list")) {
         try listModels(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "pull")) {
@@ -387,6 +398,7 @@ const run_usage_options =
     \\options:
     \\  --host <address>                    Listen address (default: 127.0.0.1)
     \\  --port <port>                       Listen port (default: 8090)
+    \\  --advertise-training <dir>          Advertise SSH training discovery using an installed toolchain
     \\  --models-dir <path>                 AI model directory
     \\  --ml-dir <path>                     Predictor model directory
     \\  --config <path>                     JSON run configuration
@@ -470,6 +482,7 @@ fn consumeParsedMaxLoadedModelsOption(args: []const []const u8, index: *usize) b
 pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     structlog.init(.{ .formatter = .json, .level = .info });
 
+    var advertise_toolchain: ?[]const u8 = null;
     var host: []const u8 = "127.0.0.1";
     var port: u16 = 8090;
     var models_dir: []const u8 = defaultModelsDir(allocator);
@@ -491,6 +504,9 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--host") and i + 1 < args.len) {
             host = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--advertise-training") and i + 1 < args.len) {
+            advertise_toolchain = args[i + 1];
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--port") and i + 1 < args.len) {
             port = std.fmt.parseInt(u16, args[i + 1], 10) catch 8090;
@@ -545,6 +561,9 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
             return error.InvalidArguments;
         }
     }
+
+    var advertisement = if (advertise_toolchain) |path| try platform.training_advertisement.start(allocator, io, path) else null;
+    defer if (advertisement) |*child| child.kill(io);
 
     var loaded_cfg: ?std.json.Parsed(RunConfig) = if (config_path) |path| try loadRunConfig(allocator, path) else null;
     defer if (loaded_cfg) |*parsed| parsed.deinit();
@@ -816,6 +835,7 @@ fn printUsage(usage_name: []const u8) void {
         \\  finetune  Run fine-tuning recipes, datasets, adapters, train/eval, and workflows
         \\  smoke     Run a native GGUF/SafeTensors smoke test
         \\  cuda-info Inspect CUDA Driver API availability and optionally run CUDA smoke checks
+        \\  peer-info  Print bounded metadata for the training peer inventory
         \\  metal-info Inspect Metal device availability
         \\  bench-cuda Benchmark CUDA Q4_K, GLiNER2, and CLIP/CLAP kernel shapes
         \\  list      List available models
@@ -824,6 +844,7 @@ fn printUsage(usage_name: []const u8) void {
         \\  version   Print version information
         \\
         \\Run options:
+        \\  --advertise-training <dir>          Advertise SSH training discovery using an installed toolchain
         \\  --host <addr>     Listen address (default: 127.0.0.1)
         \\  --allow-insecure-public-bind Allow a non-loopback listener without built-in auth or TLS
         \\  --port <port>     Listen port (default: 8090)

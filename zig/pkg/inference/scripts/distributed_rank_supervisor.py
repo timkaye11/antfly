@@ -5,6 +5,7 @@ This source is sent to Python on each host, so no remote installation is needed.
 The training command receives /dev/null on stdin and never consumes the lease.
 """
 import json
+import fcntl
 import os
 import select
 import signal
@@ -25,8 +26,16 @@ def supervise(config):
     child = None
     reason = "command_exit"
     code = 1
+    lock = None
+    paused = False
     try:
-        child = subprocess.Popen(config['command'], env={**os.environ, **config['env']},
+        if config.get('lock_file'):
+            lock = open(config['lock_file'], 'a')
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Only explicit launcher configuration can enable distributed execution.
+        environment = {key: value for key, value in os.environ.items()
+                       if not key.startswith(('ANTFLY_DISTRIBUTED_', 'ANTFLY_TCP_', 'ANTFLY_JACCL_'))}
+        child = subprocess.Popen(config['command'], env={**environment, **config['env']},
                                  stdin=subprocess.DEVNULL, start_new_session=True)
         lease = time.monotonic() + config['heartbeat_timeout']
         deadline = (time.monotonic() + config['timeout']) if config['timeout'] else None
@@ -43,7 +52,12 @@ def supervise(config):
                     reason = 'launcher_disconnected' if not data else 'stop_requested'
                     code = 125
                     break
-                if any(byte != ord('H') for byte in data):
+                if b'P' in data and config.get('pause_supported') and not paused:
+                    # Signal only the CLI parent. It owns the disposable worker
+                    # and forwards the cooperative request at a safe boundary.
+                    child.send_signal(signal.SIGINT)
+                    paused = True
+                if any(byte not in b'HP' for byte in data) or (b'P' in data and not config.get('pause_supported')):
                     reason = 'invalid_lease'
                     code = 125
                     break
@@ -82,8 +96,10 @@ def supervise(config):
                     if code == 0: code = 125
                     break
                 time.sleep(0.02)
-        print('\n' + json.dumps({'event': 'distributed_rank_exit', 'rank': config['env']['ANTFLY_DISTRIBUTED_RANK'],
+        print('\n' + json.dumps({'event': 'distributed_rank_exit', 'rank': config.get('rank', config['env'].get('ANTFLY_DISTRIBUTED_RANK', '0')),
                                  'reason': reason, 'exit_code': code, 'cleanup_complete': cleaned}), flush=True)
+        if lock is not None:
+            lock.close()
     return code if code >= 0 else 128 - code
 
 

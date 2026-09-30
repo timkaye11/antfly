@@ -3734,6 +3734,146 @@ pub const AntflyApiHandler = struct {
         return ctx.openApiJson(topology);
     }
 
+    fn trainingRoute(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const node = self.api_server.cfg.node_config orelse return jsonErrorResponse(ctx, 404, "training is disabled");
+        const parsed_config = node.training orelse return jsonErrorResponse(ctx, 404, "training is disabled");
+        if (!parsed_config.value.enabled) return jsonErrorResponse(ctx, 404, "training is disabled");
+        if (node.deployment_mode != .standalone) return jsonErrorResponse(ctx, 403, "training requires a standalone coordinator");
+        if (identity == null and !trainingLoopback(ctx)) return jsonErrorResponse(ctx, 403, "remote training management requires administrator authentication");
+        if (identity == null and !@import("training.zig").localBrowserAllowed(ctx.header("host"), ctx.header("origin")))
+            return jsonErrorResponse(ctx, 403, "local training management requires a loopback host and matching origin");
+        const body = (try ctx.body()) orelse "";
+        const path = http_server_mod.stripApiPrefix(ctx.request.uri.path);
+        const response = self.api_server.training_manager.request(ctx.allocator, self.api_server.trainingIo(), parsed_config.value, @tagName(ctx.request.method), path["/training/".len..], ctx.request.uri.query orelse "", body) catch |err| return switch (err) {
+            error.TrainingBusy => jsonErrorResponse(ctx, 503, "training manager busy"),
+            error.TrainingRequestTooLarge => jsonErrorResponse(ctx, 413, "training request too large"),
+            error.InvalidTrainingRequest, error.SyntaxError, error.UnexpectedEndOfInput => jsonErrorResponse(ctx, 400, "invalid training request"),
+            else => jsonErrorResponse(ctx, 503, "training manager unavailable; check the configured toolchain and server logs"),
+        };
+        defer ctx.allocator.free(response);
+        var envelope = try std.json.parseFromSlice(struct { status: u16, body: std.json.Value }, ctx.allocator, response, .{});
+        defer envelope.deinit();
+        return ctx.status(envelope.value.status).json(envelope.value.body);
+    }
+
+    fn trainingLoopback(ctx: *httpx.Context) bool {
+        if (comptime @import("builtin").os.tag == .windows or @import("builtin").os.tag == .wasi) return false;
+        const socket = ctx.h1_sock orelse ctx.h2_sock orelse return false;
+        var address: std.posix.sockaddr.storage = undefined;
+        var length: std.posix.socklen_t = @sizeOf(@TypeOf(address));
+        if (std.c.getpeername(socket.handle, @ptrCast(&address), &length) != 0) return false;
+        if (address.family == std.posix.AF.INET) {
+            const ip: *const std.posix.sockaddr.in = @ptrCast(&address);
+            return std.mem.asBytes(&ip.addr)[0] == 127;
+        }
+        if (address.family == std.posix.AF.INET6) {
+            const ip: *const std.posix.sockaddr.in6 = @ptrCast(&address);
+            return std.mem.eql(u8, &ip.addr, &([_]u8{0} ** 15 ++ [_]u8{1}));
+        }
+        return false;
+    }
+
+    pub fn listTrainingDatasets(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.trainingRoute(ctx);
+    }
+
+    pub fn createTrainingDataset(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.trainingRoute(ctx);
+    }
+
+    pub fn previewTrainingHuggingFace(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.trainingRoute(ctx);
+    }
+
+    pub fn getTrainingDataset(self: *AntflyApiHandler, ctx: *httpx.Context, dataset_id: []const u8) !httpx.Response {
+        _ = dataset_id;
+        return self.trainingRoute(ctx);
+    }
+
+    pub fn removeTrainingDataset(self: *AntflyApiHandler, ctx: *httpx.Context, dataset_id: []const u8) !httpx.Response {
+        _ = dataset_id;
+        return self.trainingRoute(ctx);
+    }
+
+    pub fn uploadTrainingDatasetChunk(self: *AntflyApiHandler, ctx: *httpx.Context, dataset_id: []const u8) !httpx.Response {
+        _ = dataset_id;
+        return self.trainingRoute(ctx);
+    }
+
+    pub fn prepareTrainingDataset(self: *AntflyApiHandler, ctx: *httpx.Context, dataset_id: []const u8) !httpx.Response {
+        _ = dataset_id;
+        return self.trainingRoute(ctx);
+    }
+
+    pub fn cancelTrainingDataset(self: *AntflyApiHandler, ctx: *httpx.Context, dataset_id: []const u8) !httpx.Response {
+        _ = dataset_id;
+        return self.trainingRoute(ctx);
+    }
+
+    pub fn listTrainingPeers(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.trainingRoute(ctx);
+    }
+
+    pub fn registerTrainingPeer(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.trainingRoute(ctx);
+    }
+
+    pub fn removeTrainingPeer(self: *AntflyApiHandler, ctx: *httpx.Context, peer_id: []const u8) !httpx.Response {
+        _ = peer_id;
+        return self.trainingRoute(ctx);
+    }
+
+    pub fn refreshTrainingPeer(self: *AntflyApiHandler, ctx: *httpx.Context, peer_id: []const u8) !httpx.Response {
+        _ = peer_id;
+        return self.trainingRoute(ctx);
+    }
+
+    pub fn startTrainingPreflight(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.trainingRoute(ctx);
+    }
+
+    pub fn getTrainingPreflight(self: *AntflyApiHandler, ctx: *httpx.Context, job_id: []const u8) !httpx.Response {
+        _ = job_id;
+        return self.trainingRoute(ctx);
+    }
+
+    pub fn startTrainingJob(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.trainingRoute(ctx);
+    }
+
+    pub fn listTrainingJobs(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.trainingRoute(ctx);
+    }
+
+    pub fn getTrainingJob(self: *AntflyApiHandler, ctx: *httpx.Context, job_id: []const u8) !httpx.Response {
+        _ = job_id;
+        return self.trainingRoute(ctx);
+    }
+
+    pub fn getTrainingLogs(self: *AntflyApiHandler, ctx: *httpx.Context, job_id: []const u8, params: metadata_openapi.server.GetTrainingLogsParams) !httpx.Response {
+        _ = job_id;
+        _ = params;
+        return self.trainingRoute(ctx);
+    }
+
+    pub fn cancelTrainingJob(self: *AntflyApiHandler, ctx: *httpx.Context, job_id: []const u8) !httpx.Response {
+        _ = job_id;
+        return self.trainingRoute(ctx);
+    }
+
+    pub fn pauseTrainingJob(self: *AntflyApiHandler, ctx: *httpx.Context, job_id: []const u8) !httpx.Response {
+        _ = job_id;
+        return self.trainingRoute(ctx);
+    }
+
+    pub fn resumeTrainingJob(self: *AntflyApiHandler, ctx: *httpx.Context, job_id: []const u8) !httpx.Response {
+        _ = job_id;
+        return self.trainingRoute(ctx);
+    }
+
     pub fn listConnections(self: *AntflyApiHandler, ctx: *httpx.Context, params: metadata_openapi.server.ListConnectionsParams) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
@@ -10910,6 +11050,43 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
     try std.testing.expectEqual(@as(u16, 200), recovered.status.code);
 }
 
+test "httpx training loopback route fails closed when the manager is unavailable" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var node = try common_config.Config.parseFromSlice(alloc,
+        \\{"deployment_mode":"standalone","training":{"enabled":true,
+        \\"state_dir":"/tmp/antfly-test-training","toolchain_dir":"/tmp/tools",
+        \\"models_dir":"/tmp/models","input_roots":["/tmp/models"],
+        \\"output_root":"/tmp/runs","python":"/usr/bin/false"}}
+    );
+    defer node.deinit();
+    var io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io.deinit();
+    var api_server = ApiHttpServer.init(alloc, .{
+        .node_config = &node,
+        .deployment_mode = .standalone,
+        .imported_runtime_io = .{ .api = io.io(), .api_network = std.Io.failing },
+    }, source.iface(), null, null);
+    defer api_server.deinit();
+    var server: HttpxE2eServer = undefined;
+    try server.init(alloc, &api_server);
+    defer server.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try server.baseUrl(alloc);
+    defer alloc.free(base);
+    const url = try std.fmt.allocPrint(alloc, "{s}/db/v1/training/peers", .{base});
+    defer alloc.free(url);
+    var unavailable = try getWithRetry(&client, io.io(), url, null, 20);
+    defer unavailable.deinit();
+    try std.testing.expectEqual(@as(u16, 503), unavailable.status.code);
+    const headers = [_][2][]const u8{.{ "origin", "http://foreign.example" }};
+    var forbidden = try getWithRetry(&client, io.io(), url, &headers, 20);
+    defer forbidden.deinit();
+    try std.testing.expectEqual(@as(u16, 403), forbidden.status.code);
+}
+
 test "httpx antfly routes require auth and enforce admin middleware" {
     const alloc = std.testing.allocator;
 
@@ -11035,6 +11212,18 @@ test "httpx antfly routes require auth and enforce admin middleware" {
     var me_body = try std.json.parseFromSlice(struct { username: []const u8 }, alloc, me_resp.body.?, .{ .ignore_unknown_fields = true });
     defer me_body.deinit();
     try std.testing.expectEqualStrings("admin", me_body.value.username);
+
+    const training_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/training/peers", .{base_url});
+    defer alloc.free(training_url);
+    var training_unauthorized = try getWithRetry(&client, client_io.io(), training_url, null, 20);
+    defer training_unauthorized.deinit();
+    try std.testing.expectEqual(@as(u16, 401), training_unauthorized.status.code);
+    var training_forbidden = try getWithRetry(&client, client_io.io(), training_url, &reader_headers, 20);
+    defer training_forbidden.deinit();
+    try std.testing.expectEqual(@as(u16, 403), training_forbidden.status.code);
+    var training_disabled = try getWithRetry(&client, client_io.io(), training_url, &admin_headers, 20);
+    defer training_disabled.deinit();
+    try std.testing.expectEqual(@as(u16, 404), training_disabled.status.code);
 }
 
 test "httpx relational row query mutation endpoints enforce exact versions and schema epochs" {

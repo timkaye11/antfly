@@ -14828,6 +14828,746 @@ pub const TopologyChangedError = struct {
     retryable: bool,
 };
 
+pub const TrainingDataset = struct {
+    id: []const u8,
+    name: []const u8,
+    family: []const u8,
+    spec: TrainingDatasetSpec,
+    status: []const u8,
+    created_at: f64,
+    updated_at: f64,
+    @"error": OpenApiOptionalNullable([]const u8) = .absent,
+    path: ?[]const u8 = null,
+    row_count: ?i64 = null,
+    size_bytes: ?i64 = null,
+    sha256: ?[]const u8 = null,
+    uploaded_bytes: ?i64 = null,
+    preview: ?[]const []const u8 = null,
+    tokenizer_sha256: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "name", "name", false },
+        .{ "family", "family", false },
+        .{ "spec", "spec", false },
+        .{ "status", "status", false },
+        .{ "created_at", "created_at", false },
+        .{ "updated_at", "updated_at", false },
+        .{ "error", "error", false },
+        .{ "path", "path", true },
+        .{ "row_count", "row_count", true },
+        .{ "size_bytes", "size_bytes", true },
+        .{ "sha256", "sha256", true },
+        .{ "uploaded_bytes", "uploaded_bytes", true },
+        .{ "preview", "preview", true },
+        .{ "tokenizer_sha256", "tokenizer_sha256", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("family");
+        try jw.write(self.family);
+        try jw.objectField("spec");
+        try jw.write(self.spec);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        try jw.objectField("updated_at");
+        try jw.write(self.updated_at);
+        switch (self.@"error") {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("error");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("error");
+                try jw.write(value);
+            },
+        }
+        if (self.path) |value| {
+            try jw.objectField("path");
+            try jw.write(value);
+        }
+        if (self.row_count) |value| {
+            try jw.objectField("row_count");
+            try jw.write(value);
+        }
+        if (self.size_bytes) |value| {
+            try jw.objectField("size_bytes");
+            try jw.write(value);
+        }
+        if (self.sha256) |value| {
+            try jw.objectField("sha256");
+            try jw.write(value);
+        }
+        if (self.uploaded_bytes) |value| {
+            try jw.objectField("uploaded_bytes");
+            try jw.write(value);
+        }
+        if (self.preview) |value| {
+            try jw.objectField("preview");
+            try jw.write(value);
+        }
+        if (self.tokenizer_sha256) |value| {
+            try jw.objectField("tokenizer_sha256");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const TrainingDatasetChunk = struct {
+    offset: i64,
+    /// Base64 encoding of at most 32768 bytes. Retrying an identical offset is idempotent.
+    data: []const u8,
+};
+
+pub const TrainingDatasetSpec = struct {
+    /// Stable idempotency key for this import.
+    request_id: []const u8,
+    name: []const u8,
+    family: []const u8,
+    source: []const u8,
+    format: []const u8,
+    /// Original CSV or JSONL filename for uploads.
+    filename: ?[]const u8 = null,
+    size_bytes: ?i64 = null,
+    hf_dataset: ?[]const u8 = null,
+    hf_config: ?[]const u8 = null,
+    hf_split: ?[]const u8 = null,
+    hf_offset: ?i64 = null,
+    max_rows: ?i64 = null,
+    max_seq_len: ?i64 = null,
+    /// Staged Gemma model whose tokenizer prepares these examples.
+    model_dir: ?[]const u8 = null,
+    columns: ?std.json.Value = null,
+    /// Ordered BIO label names; HF ClassLabel metadata is used when omitted.
+    label_names: ?[]const []const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "request_id", "request_id", false },
+        .{ "name", "name", false },
+        .{ "family", "family", false },
+        .{ "source", "source", false },
+        .{ "format", "format", false },
+        .{ "filename", "filename", true },
+        .{ "size_bytes", "size_bytes", true },
+        .{ "hf_dataset", "hf_dataset", true },
+        .{ "hf_config", "hf_config", true },
+        .{ "hf_split", "hf_split", true },
+        .{ "hf_offset", "hf_offset", true },
+        .{ "max_rows", "max_rows", true },
+        .{ "max_seq_len", "max_seq_len", true },
+        .{ "model_dir", "model_dir", true },
+        .{ "columns", "columns", true },
+        .{ "label_names", "label_names", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("request_id");
+        try jw.write(self.request_id);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("family");
+        try jw.write(self.family);
+        try jw.objectField("source");
+        try jw.write(self.source);
+        try jw.objectField("format");
+        try jw.write(self.format);
+        if (self.filename) |value| {
+            try jw.objectField("filename");
+            try jw.write(value);
+        }
+        if (self.size_bytes) |value| {
+            try jw.objectField("size_bytes");
+            try jw.write(value);
+        }
+        if (self.hf_dataset) |value| {
+            try jw.objectField("hf_dataset");
+            try jw.write(value);
+        }
+        if (self.hf_config) |value| {
+            try jw.objectField("hf_config");
+            try jw.write(value);
+        }
+        if (self.hf_split) |value| {
+            try jw.objectField("hf_split");
+            try jw.write(value);
+        }
+        if (self.hf_offset) |value| {
+            try jw.objectField("hf_offset");
+            try jw.write(value);
+        }
+        if (self.max_rows) |value| {
+            try jw.objectField("max_rows");
+            try jw.write(value);
+        }
+        if (self.max_seq_len) |value| {
+            try jw.objectField("max_seq_len");
+            try jw.write(value);
+        }
+        if (self.model_dir) |value| {
+            try jw.objectField("model_dir");
+            try jw.write(value);
+        }
+        if (self.columns) |value| {
+            try jw.objectField("columns");
+            try jw.write(value);
+        }
+        if (self.label_names) |value| {
+            try jw.objectField("label_names");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const TrainingDatasetsResponse = struct {
+    datasets: []const TrainingDataset,
+};
+
+pub const TrainingDiscoveredPeer = struct {
+    id: []const u8,
+    name: []const u8,
+    hostname: []const u8,
+    ssh_port: i64,
+    status: []const u8,
+    seen_at: ?f64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "name", "name", false },
+        .{ "hostname", "hostname", false },
+        .{ "ssh_port", "ssh_port", false },
+        .{ "status", "status", false },
+        .{ "seen_at", "seen_at", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("hostname");
+        try jw.write(self.hostname);
+        try jw.objectField("ssh_port");
+        try jw.write(self.ssh_port);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        if (self.seen_at) |value| {
+            try jw.objectField("seen_at");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const TrainingHuggingFaceRequest = struct {
+    dataset: []const u8,
+    config: ?[]const u8 = null,
+    split: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "dataset", "dataset", false },
+        .{ "config", "config", true },
+        .{ "split", "split", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("dataset");
+        try jw.write(self.dataset);
+        if (self.config) |value| {
+            try jw.objectField("config");
+            try jw.write(value);
+        }
+        if (self.split) |value| {
+            try jw.objectField("split");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const TrainingHuggingFaceResponse = struct {
+    splits: []const std.json.Value,
+    features: []const std.json.ArrayHashMap(std.json.Value),
+    rows: []const []const u8,
+    total_rows: OpenApiOptionalNullable(i64) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("splits");
+        try jw.write(self.splits);
+        try jw.objectField("features");
+        try jw.write(self.features);
+        try jw.objectField("rows");
+        try jw.write(self.rows);
+        switch (self.total_rows) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("total_rows");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("total_rows");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+pub const TrainingJob = struct {
+    id: []const u8,
+    request_id: []const u8,
+    kind: []const u8,
+    status: []const u8,
+    spec: TrainingJobSpec,
+    created_at: f64,
+    updated_at: ?f64 = null,
+    output_dir: ?[]const u8 = null,
+    @"error": ?[]const u8 = null,
+    configuration: ?std.json.ArrayHashMap(std.json.Value) = null,
+    transport_report: ?std.json.ArrayHashMap(std.json.Value) = null,
+    report: ?std.json.ArrayHashMap(std.json.Value) = null,
+    checkpoint: ?std.json.ArrayHashMap(std.json.Value) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "request_id", "request_id", false },
+        .{ "kind", "kind", false },
+        .{ "status", "status", false },
+        .{ "spec", "spec", false },
+        .{ "created_at", "created_at", false },
+        .{ "updated_at", "updated_at", true },
+        .{ "output_dir", "output_dir", true },
+        .{ "error", "error", true },
+        .{ "configuration", "configuration", true },
+        .{ "transport_report", "transport_report", true },
+        .{ "report", "report", true },
+        .{ "checkpoint", "checkpoint", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("request_id");
+        try jw.write(self.request_id);
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        try jw.objectField("spec");
+        try jw.write(self.spec);
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        if (self.updated_at) |value| {
+            try jw.objectField("updated_at");
+            try jw.write(value);
+        }
+        if (self.output_dir) |value| {
+            try jw.objectField("output_dir");
+            try jw.write(value);
+        }
+        if (self.@"error") |value| {
+            try jw.objectField("error");
+            try jw.write(value);
+        }
+        if (self.configuration) |value| {
+            try jw.objectField("configuration");
+            try jw.write(value);
+        }
+        if (self.transport_report) |value| {
+            try jw.objectField("transport_report");
+            try jw.write(value);
+        }
+        if (self.report) |value| {
+            try jw.objectField("report");
+            try jw.write(value);
+        }
+        if (self.checkpoint) |value| {
+            try jw.objectField("checkpoint");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const TrainingJobSpec = struct {
+    /// Stable idempotency key; retries with the same body return the existing operation.
+    request_id: []const u8,
+    /// Defaults to local when no peer is supplied. Legacy requests with a peer use two_mac.
+    execution_mode: ?[]const u8 = null,
+    /// Registered SSH peer; required only for two_mac execution.
+    peer_id: ?[]const u8 = null,
+    /// This Mac's reachable host:port; required only for two_mac execution.
+    coordinator: ?[]const u8 = null,
+    family: ?[]const u8 = null,
+    kind: ?[]const u8 = null,
+    /// Optional existing GLiNER2.5 job JSON path. Otherwise configure the run with base_model, a dataset_id or train_file, and gliner25_options. Mutually exclusive with base_model and train_file.
+    gliner25_config: ?[]const u8 = null,
+    /// Existing GLiNER2.5 training JSONL path for a form-configured run when no prepared dataset_id is selected.
+    train_file: ?[]const u8 = null,
+    /// Prepared training dataset; also staged on the peer during two_mac readiness.
+    dataset_id: ?[]const u8 = null,
+    /// GLiNER calibration dataset override; null disables the template file.
+    calibration_dataset_id: OpenApiOptionalNullable([]const u8) = .absent,
+    /// GLiNER held-out dataset override; null disables the template file.
+    test_dataset_id: OpenApiOptionalNullable([]const u8) = .absent,
+    /// GLiNER2.5 form settings, or optional overrides of an existing job JSON. The coordinator generates a native job snapshot and owns its output and recovery paths. Form defaults use Metal, LoRA rank 8, alpha 16, and one epoch; other settings use native defaults.
+    gliner25_options: ?std.json.Value = null,
+    /// Base model directory. Required for Gemma4 and for GLiNER2.5 form configuration without gliner25_config. GLiNER2.5 requires a compatible FP32 package.
+    base_model: ?[]const u8 = null,
+    adapter: ?[]const u8 = null,
+    prepared_inputs: ?[]const u8 = null,
+    max_examples: ?i64 = null,
+    epochs: ?i64 = null,
+    learning_rate: ?f64 = null,
+    timeout_seconds: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "request_id", "request_id", false },
+        .{ "execution_mode", "execution_mode", true },
+        .{ "peer_id", "peer_id", true },
+        .{ "coordinator", "coordinator", true },
+        .{ "family", "family", true },
+        .{ "kind", "kind", true },
+        .{ "gliner25_config", "gliner25_config", true },
+        .{ "train_file", "train_file", true },
+        .{ "dataset_id", "dataset_id", true },
+        .{ "calibration_dataset_id", "calibration_dataset_id", false },
+        .{ "test_dataset_id", "test_dataset_id", false },
+        .{ "gliner25_options", "gliner25_options", true },
+        .{ "base_model", "base_model", true },
+        .{ "adapter", "adapter", true },
+        .{ "prepared_inputs", "prepared_inputs", true },
+        .{ "max_examples", "max_examples", true },
+        .{ "epochs", "epochs", true },
+        .{ "learning_rate", "learning_rate", true },
+        .{ "timeout_seconds", "timeout_seconds", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("request_id");
+        try jw.write(self.request_id);
+        if (self.execution_mode) |value| {
+            try jw.objectField("execution_mode");
+            try jw.write(value);
+        }
+        if (self.peer_id) |value| {
+            try jw.objectField("peer_id");
+            try jw.write(value);
+        }
+        if (self.coordinator) |value| {
+            try jw.objectField("coordinator");
+            try jw.write(value);
+        }
+        if (self.family) |value| {
+            try jw.objectField("family");
+            try jw.write(value);
+        }
+        if (self.kind) |value| {
+            try jw.objectField("kind");
+            try jw.write(value);
+        }
+        if (self.gliner25_config) |value| {
+            try jw.objectField("gliner25_config");
+            try jw.write(value);
+        }
+        if (self.train_file) |value| {
+            try jw.objectField("train_file");
+            try jw.write(value);
+        }
+        if (self.dataset_id) |value| {
+            try jw.objectField("dataset_id");
+            try jw.write(value);
+        }
+        switch (self.calibration_dataset_id) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("calibration_dataset_id");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("calibration_dataset_id");
+                try jw.write(value);
+            },
+        }
+        switch (self.test_dataset_id) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("test_dataset_id");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("test_dataset_id");
+                try jw.write(value);
+            },
+        }
+        if (self.gliner25_options) |value| {
+            try jw.objectField("gliner25_options");
+            try jw.write(value);
+        }
+        if (self.base_model) |value| {
+            try jw.objectField("base_model");
+            try jw.write(value);
+        }
+        if (self.adapter) |value| {
+            try jw.objectField("adapter");
+            try jw.write(value);
+        }
+        if (self.prepared_inputs) |value| {
+            try jw.objectField("prepared_inputs");
+            try jw.write(value);
+        }
+        if (self.max_examples) |value| {
+            try jw.objectField("max_examples");
+            try jw.write(value);
+        }
+        if (self.epochs) |value| {
+            try jw.objectField("epochs");
+            try jw.write(value);
+        }
+        if (self.learning_rate) |value| {
+            try jw.objectField("learning_rate");
+            try jw.write(value);
+        }
+        if (self.timeout_seconds) |value| {
+            try jw.objectField("timeout_seconds");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const TrainingJobsResponse = struct {
+    jobs: []const TrainingJob,
+};
+
+pub const TrainingLogsResponse = struct {
+    text: []const u8,
+    cursor: i64,
+};
+
+pub const TrainingPeer = struct {
+    id: []const u8,
+    name: []const u8,
+    ssh_destination: ?[]const u8 = null,
+    status: []const u8,
+    @"error": OpenApiOptionalNullable([]const u8) = .absent,
+    checked_at: ?f64 = null,
+    inventory: ?std.json.ArrayHashMap(std.json.Value) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "name", "name", false },
+        .{ "ssh_destination", "ssh_destination", true },
+        .{ "status", "status", false },
+        .{ "error", "error", false },
+        .{ "checked_at", "checked_at", true },
+        .{ "inventory", "inventory", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.ssh_destination) |value| {
+            try jw.objectField("ssh_destination");
+            try jw.write(value);
+        }
+        try jw.objectField("status");
+        try jw.write(self.status);
+        switch (self.@"error") {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("error");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("error");
+                try jw.write(value);
+            },
+        }
+        if (self.checked_at) |value| {
+            try jw.objectField("checked_at");
+            try jw.write(value);
+        }
+        if (self.inventory) |value| {
+            try jw.objectField("inventory");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const TrainingPeerRegistration = struct {
+    name: ?[]const u8 = null,
+    ssh_destination: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", true },
+        .{ "ssh_destination", "ssh_destination", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.name) |value| {
+            try jw.objectField("name");
+            try jw.write(value);
+        }
+        try jw.objectField("ssh_destination");
+        try jw.write(self.ssh_destination);
+        try jw.endObject();
+    }
+};
+
+pub const TrainingPeersResponse = struct {
+    peers: []const TrainingPeer,
+    nearby: []const TrainingDiscoveredPeer,
+    discovery_error: OpenApiOptionalNullable([]const u8) = .absent,
+    config: ?std.json.ArrayHashMap(std.json.Value) = null,
+    capabilities: ?std.json.ArrayHashMap(std.json.Value) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "peers", "peers", false },
+        .{ "nearby", "nearby", false },
+        .{ "discovery_error", "discovery_error", false },
+        .{ "config", "config", true },
+        .{ "capabilities", "capabilities", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("peers");
+        try jw.write(self.peers);
+        try jw.objectField("nearby");
+        try jw.write(self.nearby);
+        switch (self.discovery_error) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("discovery_error");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("discovery_error");
+                try jw.write(value);
+            },
+        }
+        if (self.config) |value| {
+            try jw.objectField("config");
+            try jw.write(value);
+        }
+        if (self.capabilities) |value| {
+            try jw.objectField("capabilities");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const TrainingRemovedResponse = struct {
+    removed: bool,
+};
+
+pub const TrainingResumeRequest = struct {
+    request_id: []const u8,
+};
+
 pub const TransactionBeginRequest = struct {
     sync_level: ?SyncLevel = null,
 

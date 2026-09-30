@@ -114,11 +114,18 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
     const out_dir = argv[3];
 
     var opts = CliOptions{};
+    var validate_only = false;
+    var validate_local = false;
     var positional_count: usize = 0;
     var i: usize = 4;
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
-        if (std.mem.eql(u8, arg, "--lr") or std.mem.eql(u8, arg, "--learning-rate")) {
+        if (std.mem.eql(u8, arg, "--validate-only")) {
+            validate_only = true;
+        } else if (std.mem.eql(u8, arg, "--validate-local-only")) {
+            validate_only = true;
+            validate_local = true;
+        } else if (std.mem.eql(u8, arg, "--lr") or std.mem.eql(u8, arg, "--learning-rate")) {
             i += 1;
             if (i >= argv.len) return usageError();
             opts.learning_rate = try std.fmt.parseFloat(f32, argv[i]);
@@ -187,6 +194,14 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
     var prepared = try finetune.loadPreparedInputsSummary(allocator, prepared_inputs_path);
     defer finetune.freePreparedInputsSummary(allocator, &prepared);
 
+    if (validate_only) {
+        const count = if (opts.max_examples == 0) prepared.examples.len else @min(opts.max_examples, prepared.examples.len);
+        if (prepared.examples_with_images > 0 or prepared.examples_with_audio > 0 or opts.grad_accum_steps != 1) return error.UnsupportedDistributedGemma4Options;
+        if (count == 0) return error.NoTrainingData;
+        if (!validate_local and (count < 2 or count % 2 != 0)) return error.DistributedRequiresEvenExamples;
+        for (prepared.examples[0..count]) |example| if (example.num_supervised_tokens == 0) return error.DistributedRequiresSupervisedExamples;
+        return;
+    }
     var distributed = try distributed_runtime.openFromEnv(allocator);
     defer if (distributed) |*context| context.deinit();
     const actual_mode = try resolveTrainerMode(allocator, base_model_dir, prepared, opts.trainer_mode, opts);
@@ -391,6 +406,19 @@ fn runAutodiff(
             .mean_grad_norm = metrics.mean_grad_norm,
             .optimizer_steps = metrics.optimizer_steps,
         };
+        var progress_buffer: [2048]u8 = undefined;
+        var progress_writer = std.Io.File.stdout().writerStreaming(io, &progress_buffer);
+        try std.json.Stringify.value(.{
+            .event = "progress",
+            .family = "gemma4",
+            .phase = "epoch",
+            .rank = if (distributed) |context| context.rank() else @as(u8, 0),
+            .epoch = epoch_idx + 1,
+            .epochs = opts.epochs,
+            .metrics = epoch_history[epoch_idx],
+        }, .{}, &progress_writer.interface);
+        try progress_writer.interface.writeByte('\n');
+        try progress_writer.interface.flush();
         std.log.info(
             "gemma4 autodiff: epoch={d}/{d} loss={d:.4} examples={d} tokens={d} updates={d} duration_ns={d} examples_per_second={d:.3}",
             .{ epoch_idx + 1, opts.epochs, metrics.average_loss, metrics.examples_seen, metrics.supervised_tokens_seen, metrics.optimizer_steps, epoch_duration_ns, epoch_history[epoch_idx].examples_per_second },
@@ -806,6 +834,8 @@ fn usageError() error{InvalidArguments} {
         \\
         \\Flags:
         \\  --trainer auto|surrogate|autodiff   Trainer implementation (default: auto)
+        \\  --validate-only                  Validate distributed text inputs without loading weights
+        \\  --validate-local-only            Validate local text inputs without loading weights
         \\  --lr, --learning-rate <f32>         Learning rate (default: 0.001)
         \\  --max-examples <usize>              Max examples per epoch (default: 32)
         \\  --eval-max-examples <usize>         Max examples for before/after eval (default: --max-examples)

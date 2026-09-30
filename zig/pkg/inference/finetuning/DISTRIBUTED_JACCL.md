@@ -8,6 +8,10 @@ their trainable weights match before and after the run. Antfly loads the C++
 bridge at runtime; ordinary builds do not link MLX or JACCL. Select the
 transport with `--transport jaccl` (the default) or `--transport tcp`.
 
+For Bonjour discovery, SSH peer inventory, and two-Mac TCP jobs managed through
+the dashboard, use the [Antfarm training setup](ANTFARM_TRAINING.md). Its backend
+owns jobs independently of the browser and supports GLiNER2.5 pause/resume.
+
 GLiNER2.5 uses its seeded optimizer and durable replay protocol. Its two-rank
 path supports native CPU and resident Metal LoRA/DoRA training. Each rank reads
 one interleaved half of the same immutable dataset, synchronizes the union of

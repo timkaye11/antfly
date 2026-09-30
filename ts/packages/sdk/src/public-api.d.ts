@@ -4,6 +4,234 @@
  */
 
 export interface paths {
+    "/db/v1/training/peers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * listTrainingPeers
+         * @description Opt-in node-local two-Mac TCP training. Requires administrator permission; unauthenticated access is loopback-only.
+         */
+        get: operations["listTrainingPeers"];
+        put?: never;
+        /**
+         * registerTrainingPeer
+         * @description Opt-in node-local two-Mac TCP training. Requires administrator permission; unauthenticated access is loopback-only.
+         */
+        post: operations["registerTrainingPeer"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/training/peers/{peer_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * removeTrainingPeer
+         * @description Opt-in node-local two-Mac TCP training. Requires administrator permission; unauthenticated access is loopback-only.
+         */
+        delete: operations["removeTrainingPeer"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/training/peers/{peer_id}/refresh": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * refreshTrainingPeer
+         * @description Opt-in node-local two-Mac TCP training. Requires administrator permission; unauthenticated access is loopback-only.
+         */
+        post: operations["refreshTrainingPeer"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/training/preflights": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * startTrainingPreflight
+         * @description Opt-in node-local two-Mac TCP training. Requires administrator permission; unauthenticated access is loopback-only.
+         */
+        post: operations["startTrainingPreflight"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/training/preflights/{job_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * getTrainingPreflight
+         * @description Opt-in node-local two-Mac TCP training. Requires administrator permission; unauthenticated access is loopback-only.
+         */
+        get: operations["getTrainingPreflight"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/training/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * listTrainingJobs
+         * @description Opt-in node-local two-Mac TCP training. Requires administrator permission; unauthenticated access is loopback-only.
+         */
+        get: operations["listTrainingJobs"];
+        put?: never;
+        /**
+         * startTrainingJob
+         * @description Opt-in node-local two-Mac TCP training. Requires administrator permission; unauthenticated access is loopback-only.
+         */
+        post: operations["startTrainingJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/training/jobs/{job_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * getTrainingJob
+         * @description Opt-in node-local two-Mac TCP training. Requires administrator permission; unauthenticated access is loopback-only.
+         */
+        get: operations["getTrainingJob"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/training/jobs/{job_id}/logs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * getTrainingLogs
+         * @description Opt-in node-local two-Mac TCP training. Requires administrator permission; unauthenticated access is loopback-only.
+         */
+        get: operations["getTrainingLogs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/training/jobs/{job_id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * cancelTrainingJob
+         * @description Opt-in node-local two-Mac TCP training. Requires administrator permission; unauthenticated access is loopback-only.
+         */
+        post: operations["cancelTrainingJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/training/jobs/{job_id}/pause": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * pauseTrainingJob
+         * @description Opt-in node-local two-Mac TCP training. Requires administrator permission; unauthenticated access is loopback-only.
+         */
+        post: operations["pauseTrainingJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/training/jobs/{job_id}/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * resumeTrainingJob
+         * @description Opt-in node-local two-Mac TCP training. Requires administrator permission; unauthenticated access is loopback-only.
+         */
+        post: operations["resumeTrainingJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/status": {
         parameters: {
             query?: never;
@@ -2888,6 +3116,134 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/training/datasets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * listTrainingDatasets
+         * @description Administrator-only dataset import for the local training coordinator. Without authentication, access is loopback-only.
+         */
+        get: operations["listTrainingDatasets"];
+        put?: never;
+        /**
+         * createTrainingDataset
+         * @description Administrator-only dataset import for the local training coordinator. Without authentication, access is loopback-only.
+         */
+        post: operations["createTrainingDataset"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/training/datasets/huggingface": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * previewTrainingHuggingFace
+         * @description Administrator-only dataset import for the local training coordinator. Without authentication, access is loopback-only.
+         */
+        post: operations["previewTrainingHuggingFace"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/training/datasets/{dataset_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * getTrainingDataset
+         * @description Administrator-only dataset import for the local training coordinator. Without authentication, access is loopback-only.
+         */
+        get: operations["getTrainingDataset"];
+        put?: never;
+        post?: never;
+        /**
+         * removeTrainingDataset
+         * @description Administrator-only dataset import for the local training coordinator. Without authentication, access is loopback-only.
+         */
+        delete: operations["removeTrainingDataset"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/training/datasets/{dataset_id}/chunks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * uploadTrainingDatasetChunk
+         * @description Administrator-only dataset import for the local training coordinator. Without authentication, access is loopback-only.
+         */
+        put: operations["uploadTrainingDatasetChunk"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/training/datasets/{dataset_id}/prepare": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * prepareTrainingDataset
+         * @description Administrator-only dataset import for the local training coordinator. Without authentication, access is loopback-only.
+         */
+        post: operations["prepareTrainingDataset"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/training/datasets/{dataset_id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * cancelTrainingDataset
+         * @description Administrator-only dataset import for the local training coordinator. Without authentication, access is loopback-only.
+         */
+        post: operations["cancelTrainingDataset"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/auth/v1/me": {
         parameters: {
             query?: never;
@@ -4165,6 +4521,230 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        TrainingPeerRegistration: {
+            name?: string;
+            ssh_destination: string;
+        };
+        TrainingPeer: {
+            id: string;
+            name: string;
+            ssh_destination?: string;
+            status: string;
+            error?: string | null;
+            checked_at?: number;
+            inventory?: {
+                [key: string]: unknown;
+            };
+        };
+        TrainingDiscoveredPeer: {
+            id: string;
+            name: string;
+            hostname: string;
+            ssh_port: number;
+            status: string;
+            seen_at?: number;
+        };
+        TrainingPeersResponse: {
+            peers: components["schemas"]["TrainingPeer"][];
+            nearby: components["schemas"]["TrainingDiscoveredPeer"][];
+            discovery_error?: string | null;
+            config?: {
+                [key: string]: unknown;
+            };
+            capabilities?: {
+                [key: string]: unknown;
+            };
+        };
+        TrainingDatasetSpec: {
+            /** @description Stable idempotency key for this import. */
+            request_id: string;
+            name: string;
+            /** @enum {string} */
+            family: "gliner25" | "gemma4";
+            /** @enum {string} */
+            source: "upload" | "huggingface";
+            /** @enum {string} */
+            format: "gliner25" | "gliner_bio" | "gemma_chat" | "gemma_instruction" | "gemma_completion";
+            /** @description Original CSV or JSONL filename for uploads. */
+            filename?: string;
+            size_bytes?: number;
+            hf_dataset?: string;
+            hf_config?: string;
+            hf_split?: string;
+            /** @default 0 */
+            hf_offset?: number;
+            /** @default 1000 */
+            max_rows?: number;
+            /** @default 512 */
+            max_seq_len?: number;
+            /** @description Staged Gemma model whose tokenizer prepares these examples. */
+            model_dir?: string;
+            columns?: {
+                messages?: string;
+                prompt?: string;
+                input?: string;
+                response?: string;
+                text?: string;
+                tokens?: string;
+                tags?: string;
+            };
+            /** @description Ordered BIO label names; HF ClassLabel metadata is used when omitted. */
+            label_names?: string[];
+        };
+        TrainingDataset: {
+            id: string;
+            name: string;
+            /** @enum {string} */
+            family: "gliner25" | "gemma4";
+            spec: components["schemas"]["TrainingDatasetSpec"];
+            /** @enum {string} */
+            status: "pending" | "uploading" | "importing" | "preparing" | "ready" | "failed" | "cancelled";
+            created_at: number;
+            updated_at: number;
+            error?: string | null;
+            path?: string;
+            row_count?: number;
+            size_bytes?: number;
+            sha256?: string;
+            uploaded_bytes?: number;
+            preview?: string[];
+            tokenizer_sha256?: string;
+        };
+        TrainingDatasetsResponse: {
+            datasets: components["schemas"]["TrainingDataset"][];
+        };
+        TrainingDatasetChunk: {
+            offset: number;
+            /** @description Base64 encoding of at most 32768 bytes. Retrying an identical offset is idempotent. */
+            data: string;
+        };
+        TrainingHuggingFaceRequest: {
+            dataset: string;
+            config?: string;
+            split?: string;
+        };
+        TrainingHuggingFaceResponse: {
+            splits: {
+                config: string;
+                split: string;
+            }[];
+            features: {
+                [key: string]: unknown;
+            }[];
+            rows: string[];
+            total_rows?: number | null;
+        };
+        TrainingJobSpec: {
+            /** @description Stable idempotency key; retries with the same body return the existing operation. */
+            request_id: string;
+            /**
+             * @description Defaults to local when no peer is supplied. Legacy requests with a peer use two_mac.
+             * @enum {string}
+             */
+            execution_mode?: "local" | "two_mac";
+            /** @description Registered SSH peer; required only for two_mac execution. */
+            peer_id?: string;
+            /** @description This Mac's reachable host:port; required only for two_mac execution. */
+            coordinator?: string;
+            /** @enum {string} */
+            family?: "gliner25" | "gemma4";
+            /** @enum {string} */
+            kind?: "transport" | "training";
+            /** @description Optional existing GLiNER2.5 job JSON path. Otherwise configure the run with base_model, a dataset_id or train_file, and gliner25_options. Mutually exclusive with base_model and train_file. */
+            gliner25_config?: string;
+            /** @description Existing GLiNER2.5 training JSONL path for a form-configured run when no prepared dataset_id is selected. */
+            train_file?: string;
+            /** @description Prepared training dataset; also staged on the peer during two_mac readiness. */
+            dataset_id?: string;
+            /** @description GLiNER calibration dataset override; null disables the template file. */
+            calibration_dataset_id?: string | null;
+            /** @description GLiNER held-out dataset override; null disables the template file. */
+            test_dataset_id?: string | null;
+            /** @description GLiNER2.5 form settings, or optional overrides of an existing job JSON. The coordinator generates a native job snapshot and owns its output and recovery paths. Form defaults use Metal, LoRA rank 8, alpha 16, and one epoch; other settings use native defaults. */
+            gliner25_options?: {
+                /** @enum {string} */
+                execution?: "native" | "resident_metal";
+                /** @enum {string} */
+                mode?: "lora" | "dora";
+                rank?: number;
+                alpha?: number;
+                epochs?: number;
+                encoder_lr?: number;
+                task_lr?: number;
+                /** @description Examples per microbatch on each participating machine. */
+                batch_size?: number;
+                accumulation?: number;
+                /** @enum {string} */
+                scheduler?: "linear" | "cosine" | "constant";
+                warmup_ratio?: number;
+                weight_decay?: number;
+                max_grad_norm?: number;
+                seed?: number;
+                shuffle?: boolean;
+                dropout?: number;
+                /** @description Adapter target aliases or exact module names, resolved by the native trainer. Defaults to encoder. */
+                targets?: string[];
+                max_text_words?: number;
+                max_sequence_tokens?: number;
+                max_queries?: number;
+                checkpoint_every_microbatches?: number;
+                /** @description Combined native job memory ceiling, in GiB. Does not bypass admission or physical-memory checks. */
+                memory_total_gib?: number;
+                /** @description Native trainer host-memory ceiling, in GiB. */
+                memory_host_gib?: number;
+                /** @description Native compute-backend memory ceiling, in GiB. */
+                memory_backend_gib?: number;
+                /** @description Memory ceiling for each decoded dataset, in MiB. Native default is 512. */
+                dataset_memory_mib?: number;
+                /** @description Model-loading memory allowance beyond source file bytes, in MiB. Native default is 384. */
+                source_auxiliary_mib?: number;
+            };
+            /** @description Base model directory. Required for Gemma4 and for GLiNER2.5 form configuration without gliner25_config. GLiNER2.5 requires a compatible FP32 package. */
+            base_model?: string;
+            adapter?: string;
+            prepared_inputs?: string;
+            max_examples?: number;
+            epochs?: number;
+            learning_rate?: number;
+            timeout_seconds?: number;
+        };
+        TrainingJob: {
+            id: string;
+            request_id: string;
+            /** @enum {string} */
+            kind: "preflight" | "training";
+            status: string;
+            spec: components["schemas"]["TrainingJobSpec"];
+            created_at: number;
+            updated_at?: number;
+            output_dir?: string;
+            error?: string;
+            configuration?: {
+                [key: string]: unknown;
+            };
+            transport_report?: {
+                [key: string]: unknown;
+            };
+            report?: {
+                [key: string]: unknown;
+            };
+            checkpoint?: {
+                [key: string]: unknown;
+            };
+        };
+        TrainingJobsResponse: {
+            jobs: components["schemas"]["TrainingJob"][];
+        };
+        TrainingLogsResponse: {
+            text: string;
+            cursor: number;
+        };
+        TrainingResumeRequest: {
+            request_id: string;
+        };
+        TrainingRemovedResponse: {
+            removed: boolean;
+        };
         /** @description Database catalog object. Tables and namespaces resolve under a database before authorization and routing. */
         DatabaseCatalogRecord: {
             /**
@@ -20009,6 +20589,756 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    listTrainingPeers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Training operation response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrainingPeersResponse"];
+                };
+            };
+            /** @description Invalid training request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Administrator access required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training is disabled or resource is missing */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Operation conflicts with an active job or idempotency key */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training manager unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    registerTrainingPeer: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TrainingPeerRegistration"];
+            };
+        };
+        responses: {
+            /** @description Training operation response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrainingPeer"];
+                };
+            };
+            /** @description Invalid training request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Administrator access required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training is disabled or resource is missing */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Operation conflicts with an active job or idempotency key */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training manager unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    removeTrainingPeer: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                peer_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Training operation response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrainingRemovedResponse"];
+                };
+            };
+            /** @description Invalid training request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Administrator access required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training is disabled or resource is missing */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Operation conflicts with an active job or idempotency key */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training manager unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    refreshTrainingPeer: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                peer_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Training operation response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrainingPeer"];
+                };
+            };
+            /** @description Invalid training request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Administrator access required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training is disabled or resource is missing */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Operation conflicts with an active job or idempotency key */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training manager unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    startTrainingPreflight: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TrainingJobSpec"];
+            };
+        };
+        responses: {
+            /** @description Training operation response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrainingJob"];
+                };
+            };
+            /** @description Invalid training request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Administrator access required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training is disabled or resource is missing */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Operation conflicts with an active job or idempotency key */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training manager unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getTrainingPreflight: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Training operation response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrainingJob"];
+                };
+            };
+            /** @description Invalid training request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Administrator access required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training is disabled or resource is missing */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Operation conflicts with an active job or idempotency key */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training manager unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    listTrainingJobs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Training operation response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrainingJobsResponse"];
+                };
+            };
+            /** @description Invalid training request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Administrator access required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training is disabled or resource is missing */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Operation conflicts with an active job or idempotency key */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training manager unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    startTrainingJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TrainingJobSpec"];
+            };
+        };
+        responses: {
+            /** @description Training operation response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrainingJob"];
+                };
+            };
+            /** @description Invalid training request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Administrator access required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training is disabled or resource is missing */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Operation conflicts with an active job or idempotency key */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training manager unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getTrainingJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Training operation response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrainingJob"];
+                };
+            };
+            /** @description Invalid training request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Administrator access required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training is disabled or resource is missing */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Operation conflicts with an active job or idempotency key */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training manager unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getTrainingLogs: {
+        parameters: {
+            query?: {
+                rank?: "launcher" | "0" | "1";
+                cursor?: number;
+            };
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Training operation response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrainingLogsResponse"];
+                };
+            };
+            /** @description Invalid training request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Administrator access required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training is disabled or resource is missing */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Operation conflicts with an active job or idempotency key */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training manager unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    cancelTrainingJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Training operation response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrainingJob"];
+                };
+            };
+            /** @description Invalid training request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Administrator access required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training is disabled or resource is missing */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Operation conflicts with an active job or idempotency key */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training manager unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    pauseTrainingJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Training operation response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrainingJob"];
+                };
+            };
+            /** @description Invalid training request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Administrator access required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training is disabled or resource is missing */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Operation conflicts with an active job or idempotency key */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training manager unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    resumeTrainingJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TrainingResumeRequest"];
+            };
+        };
+        responses: {
+            /** @description Training operation response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrainingJob"];
+                };
+            };
+            /** @description Invalid training request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Administrator access required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training is disabled or resource is missing */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Operation conflicts with an active job or idempotency key */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training manager unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     getStatus: {
         parameters: {
             query?: never;
@@ -25014,6 +26344,468 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             500: components["responses"]["InternalServerError"];
+        };
+    };
+    listTrainingDatasets: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Dataset operation response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrainingDatasetsResponse"];
+                };
+            };
+            /** @description Invalid dataset request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Administrator access required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset not found or training disabled */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset operation conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training manager unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    createTrainingDataset: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TrainingDatasetSpec"];
+            };
+        };
+        responses: {
+            /** @description Dataset operation response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrainingDataset"];
+                };
+            };
+            /** @description Invalid dataset request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Administrator access required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset not found or training disabled */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset operation conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training manager unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    previewTrainingHuggingFace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TrainingHuggingFaceRequest"];
+            };
+        };
+        responses: {
+            /** @description Dataset operation response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrainingHuggingFaceResponse"];
+                };
+            };
+            /** @description Invalid dataset request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Administrator access required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset not found or training disabled */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset operation conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training manager unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getTrainingDataset: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                dataset_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Dataset operation response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrainingDataset"];
+                };
+            };
+            /** @description Invalid dataset request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Administrator access required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset not found or training disabled */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset operation conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training manager unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    removeTrainingDataset: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                dataset_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Dataset operation response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrainingRemovedResponse"];
+                };
+            };
+            /** @description Invalid dataset request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Administrator access required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset not found or training disabled */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset operation conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training manager unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    uploadTrainingDatasetChunk: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                dataset_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TrainingDatasetChunk"];
+            };
+        };
+        responses: {
+            /** @description Dataset operation response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrainingDataset"];
+                };
+            };
+            /** @description Invalid dataset request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Administrator access required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset not found or training disabled */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset operation conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training manager unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    prepareTrainingDataset: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                dataset_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Dataset operation response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrainingDataset"];
+                };
+            };
+            /** @description Invalid dataset request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Administrator access required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset not found or training disabled */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset operation conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training manager unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    cancelTrainingDataset: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                dataset_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Dataset operation response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrainingDataset"];
+                };
+            };
+            /** @description Invalid dataset request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Administrator access required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset not found or training disabled */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset operation conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Training manager unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     getCurrentUser: {

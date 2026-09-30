@@ -81,6 +81,115 @@ class RecoveryTests(unittest.TestCase):
 
 
 class SupervisorTests(unittest.TestCase):
+    def test_local_launcher_hashes_artifact_without_ssh_or_distributed_environment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            script, adapter, report = (directory / name for name in ('train.py', 'adapter.safetensors', 'report.json'))
+            script.write_text('import os,pathlib,sys\n'
+                              'assert not any(k.startswith(("ANTFLY_DISTRIBUTED_", "ANTFLY_TCP_", "ANTFLY_JACCL_")) for k in os.environ)\n'
+                              'pathlib.Path(sys.argv[1]).write_bytes(b"local adapter fixture")\n')
+            ssh = directory / 'ssh'
+            ssh.write_text('#!/bin/sh\nexit 99\n')
+            ssh.chmod(0o755)
+            command = [sys.executable, str(SCRIPTS / 'launch_jaccl_finetune.py'), '--transport', 'local',
+                       '--report', str(report), '--check', str(script), '--compare-adapter', str(adapter),
+                       '--', sys.executable, str(script), str(adapter)]
+            result = subprocess.run(command, capture_output=True, text=True, timeout=15,
+                                    env={**os.environ, 'PATH': str(directory) + ':' + os.environ['PATH'],
+                                         'ANTFLY_DISTRIBUTED_RANK': '1', 'ANTFLY_DISTRIBUTED_TRANSPORT': 'tcp',
+                                         'ANTFLY_TCP_IO_TIMEOUT_SECONDS': '1', 'ANTFLY_JACCL_RANK': '1'})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            value = json.loads(report.read_text())
+            self.assertEqual(value['status'], 'complete')
+            self.assertEqual(value['rank_exit_codes'], [0])
+            self.assertEqual(len(value['rank_cleanup']), 1)
+            self.assertTrue(value['rank_cleanup'][0]['cleanup_complete'])
+            self.assertEqual(set(value['adapter_sha256']), {'rank0'})
+            self.assertNotIn('remote_preflight', value)
+
+    def test_local_owner_disconnect_stops_training_and_confirms_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            script, ready, report = (directory / name for name in ('train.py', 'ready.pid', 'report.json'))
+            script.write_text('import os,pathlib,sys,time\n'
+                              'pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n'
+                              'time.sleep(30)\n')
+            command = [sys.executable, str(SCRIPTS / 'launch_jaccl_finetune.py'), '--transport', 'local',
+                       '--report', str(report), '--check', str(script), '--managed',
+                       '--heartbeat-timeout-seconds', '3', '--shutdown-grace-seconds', '1',
+                       '--', sys.executable, str(script), str(ready)]
+            process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                wait_for(ready.exists)
+                process.stdin.close(); process.stdin = None
+                process.wait(timeout=10)
+                wait_for(lambda: not alive(int(ready.read_text())))
+                value = json.loads(report.read_text())
+                self.assertEqual(len(value['rank_cleanup']), 1)
+                self.assertTrue(value['rank_cleanup'][0]['cleanup_complete'])
+            finally:
+                if process.poll() is None: process.kill()
+                process.communicate()
+
+    def test_managed_launcher_disconnect_cancels_preflight(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            ready = directory / 'preflight.pid'
+            relay = directory / 'ssh'
+            relay.write_text('#!' + sys.executable + '\nimport os,pathlib,time\n'
+                             f'pathlib.Path({str(ready)!r}).write_text(str(os.getpid()))\n'
+                             'time.sleep(30)\n')
+            relay.chmod(0o755)
+            report = directory / 'report.json'
+            command = [sys.executable, str(SCRIPTS / 'launch_jaccl_finetune.py'), '--remote', 'fixture',
+                       '--transport', 'tcp', '--coordinator', '127.0.0.1:1', '--library', str(relay),
+                       '--report', str(report), '--preflight-only', '--managed']
+            process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       env={**os.environ, 'PATH': str(directory) + ':' + os.environ['PATH']})
+            try:
+                wait_for(ready.exists)
+                process.stdin.close(); process.stdin = None
+                process.wait(timeout=5)
+                wait_for(lambda: not alive(int(ready.read_text())))
+                self.assertEqual(json.loads(report.read_text())['status'], 'preflight_failed')
+                self.assertFalse((directory / 'report-logs').exists())
+            finally:
+                if process.poll() is None: process.kill()
+                process.communicate()
+
+    def test_managed_launcher_pauses_both_rank_parents(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            relay = directory / 'ssh'
+            relay.write_text('#!' + sys.executable + '\nimport os,sys,shlex\nargs=shlex.split(sys.argv[-1]); os.execvp(args[0],args)\n')
+            relay.chmod(0o755)
+            task = directory / 'trainer'
+            task.write_text('#!' + sys.executable + '\nimport os,time,pathlib,signal,json\n'
+                            'paused=False\ndef pause(*args):\n global paused; paused=True\n'
+                            'signal.signal(signal.SIGINT,pause)\n'
+                            f'pathlib.Path({str(directory)!r}, "rank"+os.environ["ANTFLY_DISTRIBUTED_RANK"]+".pid").write_text(str(os.getpid()))\n'
+                            'while not paused: time.sleep(.05)\n'
+                            'print(json.dumps({"event":"result","result":{"status":"paused"}}),flush=True)\n')
+            task.chmod(0o755)
+            report = directory / 'report.json'
+            process = subprocess.Popen([sys.executable, str(SCRIPTS / 'launch_jaccl_finetune.py'), '--remote', 'fixture',
+                '--transport', 'tcp', '--coordinator', '127.0.0.1:1', '--library', str(task), '--check', str(task),
+                '--report', str(report), '--managed', '--timeout-seconds', '10', '--', str(task), 'gliner25'],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env={**os.environ, 'PATH': str(directory) + ':' + os.environ['PATH']})
+            try:
+                wait_for(lambda: len(list(directory.glob('rank*.pid'))) == 2)
+                process.stdin.write(b'HP'); process.stdin.flush()
+                process.wait(timeout=5)
+                data = json.loads(report.read_text())
+                self.assertEqual(data['status'], 'paused', data)
+                self.assertTrue(all(row['cleanup_complete'] for row in data['rank_cleanup']))
+                for path in directory.glob('rank*.pid'):
+                    self.assertFalse(alive(int(path.read_text())))
+            finally:
+                if process.poll() is None: process.kill()
+                process.communicate()
+
     @unittest.skipUnless(sys.platform == 'darwin', 'Mac process-group reaping test; container PID 1 may retain orphan zombies')
     def test_supervisor_removes_descendants_when_the_command_exits(self):
         with tempfile.TemporaryDirectory() as temporary:

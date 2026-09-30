@@ -29,11 +29,14 @@ pub fn main(init: std.process.Init) !void {
     const out_path = args.next() orelse return usageError();
 
     var max_examples: usize = 0;
+    var quiet = false;
     var max_seq_len: usize = 512;
     var gguf_projector_path: ?[]const u8 = null;
 
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--max-examples")) {
+        if (std.mem.eql(u8, arg, "--quiet")) {
+            quiet = true;
+        } else if (std.mem.eql(u8, arg, "--max-examples")) {
             const val = args.next() orelse return usageError();
             max_examples = try std.fmt.parseUnsigned(usize, val, 10);
         } else if (std.mem.eql(u8, arg, "--max-seq-len")) {
@@ -76,7 +79,11 @@ pub fn main(init: std.process.Init) !void {
     const stdout = std.Io.File.stdout();
     var buf: [4096]u8 = undefined;
     var writer = stdout.writer(init.io, &buf);
-    try std.json.Stringify.value(summary, .{ .whitespace = .indent_2 }, &writer.interface);
+    if (quiet) {
+        try std.json.Stringify.value(.{ .examples = summary.examples_seen, .max_seq_len = summary.max_seq_len }, .{}, &writer.interface);
+    } else {
+        try std.json.Stringify.value(summary, .{ .whitespace = .indent_2 }, &writer.interface);
+    }
     try writer.interface.writeByte('\n');
     try writer.interface.flush();
 
@@ -96,6 +103,7 @@ fn usageError() error{InvalidArguments} {
         \\Options:
         \\  --max-examples N    Maximum number of examples to prepare (default: 0 = all)
         \\  --max-seq-len N     Maximum sequence length in tokens (default: 512)
+        \\  --quiet             Print counts instead of the full prepared dataset
         \\  --gguf-projector P  Required when the dataset contains image/audio parts; path to Gemma4 projector GGUF
         \\
         \\example: prepare-gemma4-lora-inputs /tmp/gemma4-base /tmp/data.jsonl train /tmp/gemma4_inputs.json --max-examples 256 --max-seq-len 512

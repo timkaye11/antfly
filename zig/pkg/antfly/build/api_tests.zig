@@ -238,6 +238,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "httpx shared registrar keeps root probes and rejects removed data aliases",
         "httpx storage maintenance routes call typed operations directly",
         "httpx antfly routes require auth and enforce admin middleware",
+        "httpx training",
         "httpx relational row query mutation endpoints enforce exact versions and schema epochs",
         "httpx antfly schema update returns full table status after projection",
         "httpx antfly schema update owns self partial support and rejects public index forgery",

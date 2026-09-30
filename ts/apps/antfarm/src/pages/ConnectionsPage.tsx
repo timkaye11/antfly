@@ -23,6 +23,7 @@ import {
 import type { ComponentType } from "react";
 import { useState } from "react";
 import { AntyEmptyState, ErrorState } from "@/components/branded-empty-state";
+import { TrainingPeers } from "@/components/training-peers";
 import {
   CONNECTED_MODEL_KINDS,
   OTHER_MODELS_GROUP,
@@ -508,6 +509,8 @@ export default function ConnectionsPage() {
           </div>
         </DashboardPageActions>
       </DashboardPageHeader>
+
+      <TrainingPeers />
 
       {connections.length === 0 ? (
         <AntyEmptyState

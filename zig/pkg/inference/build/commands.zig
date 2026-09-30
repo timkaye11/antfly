@@ -22,7 +22,14 @@ pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile 
     const install_exe = b.addInstallArtifact(exe, .{
         .dest_sub_path = "antfly-inference",
     });
-    if (install_default) b.getInstallStep().dependOn(&install_exe.step);
+    if (install_default) {
+        b.getInstallStep().dependOn(&install_exe.step);
+        for ([_][]const u8{ "launch_jaccl_finetune.py", "distributed_rank_supervisor.py", "jaccl_smoke.py", "find_distributed_checkpoint.py", "training_service.py", "training_peer.py", "training_discovery.py", "training_datasets.py" }) |name| {
+            const source = ctx.path(b.fmt("scripts/{s}", .{name}));
+            const install = b.addInstallFileWithDir(source, .prefix, b.fmt("share/antfly/training/{s}", .{name}));
+            b.getInstallStep().dependOn(&install.step);
+        }
+    }
 
     const run_exe = ctx.addRunArtifact(exe);
     run_exe.step.dependOn(&install_exe.step);

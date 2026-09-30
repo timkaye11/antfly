@@ -1125,6 +1125,111 @@ pub fn parseRenameTablespaceBody(allocator: std.mem.Allocator, body: []const u8)
     return std.json.parseFromSlice(types.RenameCatalogResourceRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Parse the JSON request body for createTrainingDataset.
+pub fn parseCreateTrainingDatasetBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TrainingDatasetSpec) {
+    return std.json.parseFromSlice(types.TrainingDatasetSpec, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for previewTrainingHuggingFace.
+pub fn parsePreviewTrainingHuggingFaceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TrainingHuggingFaceRequest) {
+    return std.json.parseFromSlice(types.TrainingHuggingFaceRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// getTrainingDataset
+pub const GetTrainingDatasetPathParams = struct {
+    dataset_id: []const u8,
+};
+
+/// removeTrainingDataset
+pub const RemoveTrainingDatasetPathParams = struct {
+    dataset_id: []const u8,
+};
+
+/// cancelTrainingDataset
+pub const CancelTrainingDatasetPathParams = struct {
+    dataset_id: []const u8,
+};
+
+/// uploadTrainingDatasetChunk
+pub const UploadTrainingDatasetChunkPathParams = struct {
+    dataset_id: []const u8,
+};
+
+/// Parse the JSON request body for uploadTrainingDatasetChunk.
+pub fn parseUploadTrainingDatasetChunkBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TrainingDatasetChunk) {
+    return std.json.parseFromSlice(types.TrainingDatasetChunk, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// prepareTrainingDataset
+pub const PrepareTrainingDatasetPathParams = struct {
+    dataset_id: []const u8,
+};
+
+/// Parse the JSON request body for startTrainingJob.
+pub fn parseStartTrainingJobBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TrainingJobSpec) {
+    return std.json.parseFromSlice(types.TrainingJobSpec, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// getTrainingJob
+pub const GetTrainingJobPathParams = struct {
+    job_id: []const u8,
+};
+
+/// cancelTrainingJob
+pub const CancelTrainingJobPathParams = struct {
+    job_id: []const u8,
+};
+
+/// getTrainingLogs
+pub const GetTrainingLogsPathParams = struct {
+    job_id: []const u8,
+};
+
+pub const GetTrainingLogsParams = struct {
+    rank: ?[]const u8 = null,
+    cursor: ?[]const u8 = null,
+};
+
+/// pauseTrainingJob
+pub const PauseTrainingJobPathParams = struct {
+    job_id: []const u8,
+};
+
+/// resumeTrainingJob
+pub const ResumeTrainingJobPathParams = struct {
+    job_id: []const u8,
+};
+
+/// Parse the JSON request body for resumeTrainingJob.
+pub fn parseResumeTrainingJobBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TrainingResumeRequest) {
+    return std.json.parseFromSlice(types.TrainingResumeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for registerTrainingPeer.
+pub fn parseRegisterTrainingPeerBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TrainingPeerRegistration) {
+    return std.json.parseFromSlice(types.TrainingPeerRegistration, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// removeTrainingPeer
+pub const RemoveTrainingPeerPathParams = struct {
+    peer_id: []const u8,
+};
+
+/// refreshTrainingPeer
+pub const RefreshTrainingPeerPathParams = struct {
+    peer_id: []const u8,
+};
+
+/// Parse the JSON request body for startTrainingPreflight.
+pub fn parseStartTrainingPreflightBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TrainingJobSpec) {
+    return std.json.parseFromSlice(types.TrainingJobSpec, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// getTrainingPreflight
+pub const GetTrainingPreflightPathParams = struct {
+    job_id: []const u8,
+};
+
 /// Parse the JSON request body for beginTransaction.
 pub fn parseBeginTransactionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionBeginRequest) {
     return std.json.parseFromSlice(types.TransactionBeginRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -1338,6 +1443,27 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tablespaces/{tablespaceName}", .operation_id = "createTablespace", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/tablespaces/{tablespaceName}", .operation_id = "dropTablespace", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tablespaces/{tablespaceName}/rename", .operation_id = "renameTablespace", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/training/datasets", .operation_id = "listTrainingDatasets", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/training/datasets", .operation_id = "createTrainingDataset", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/training/datasets/huggingface", .operation_id = "previewTrainingHuggingFace", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/training/datasets/{dataset_id}", .operation_id = "getTrainingDataset", .request_body = .none, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/training/datasets/{dataset_id}", .operation_id = "removeTrainingDataset", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/training/datasets/{dataset_id}/cancel", .operation_id = "cancelTrainingDataset", .request_body = .none, .streaming_response = false },
+    .{ .method = "PUT", .path = "/training/datasets/{dataset_id}/chunks", .operation_id = "uploadTrainingDatasetChunk", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/training/datasets/{dataset_id}/prepare", .operation_id = "prepareTrainingDataset", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/training/jobs", .operation_id = "listTrainingJobs", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/training/jobs", .operation_id = "startTrainingJob", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/training/jobs/{job_id}", .operation_id = "getTrainingJob", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/training/jobs/{job_id}/cancel", .operation_id = "cancelTrainingJob", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/training/jobs/{job_id}/logs", .operation_id = "getTrainingLogs", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/training/jobs/{job_id}/pause", .operation_id = "pauseTrainingJob", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/training/jobs/{job_id}/resume", .operation_id = "resumeTrainingJob", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/training/peers", .operation_id = "listTrainingPeers", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/training/peers", .operation_id = "registerTrainingPeer", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/training/peers/{peer_id}", .operation_id = "removeTrainingPeer", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/training/peers/{peer_id}/refresh", .operation_id = "refreshTrainingPeer", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/training/preflights", .operation_id = "startTrainingPreflight", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/training/preflights/{job_id}", .operation_id = "getTrainingPreflight", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/transactions", .operation_id = "listTransactionSessions", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/transactions/begin", .operation_id = "beginTransaction", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/transactions/cleanup", .operation_id = "cleanupTransactionSessions", .request_body = .none, .streaming_response = false },
@@ -1480,6 +1606,27 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "createTablespace")) @compileError("ServerRouter: Impl missing required method 'createTablespace'");
         if (!@hasDecl(Impl, "dropTablespace")) @compileError("ServerRouter: Impl missing required method 'dropTablespace'");
         if (!@hasDecl(Impl, "renameTablespace")) @compileError("ServerRouter: Impl missing required method 'renameTablespace'");
+        if (!@hasDecl(Impl, "listTrainingDatasets")) @compileError("ServerRouter: Impl missing required method 'listTrainingDatasets'");
+        if (!@hasDecl(Impl, "createTrainingDataset")) @compileError("ServerRouter: Impl missing required method 'createTrainingDataset'");
+        if (!@hasDecl(Impl, "previewTrainingHuggingFace")) @compileError("ServerRouter: Impl missing required method 'previewTrainingHuggingFace'");
+        if (!@hasDecl(Impl, "getTrainingDataset")) @compileError("ServerRouter: Impl missing required method 'getTrainingDataset'");
+        if (!@hasDecl(Impl, "removeTrainingDataset")) @compileError("ServerRouter: Impl missing required method 'removeTrainingDataset'");
+        if (!@hasDecl(Impl, "cancelTrainingDataset")) @compileError("ServerRouter: Impl missing required method 'cancelTrainingDataset'");
+        if (!@hasDecl(Impl, "uploadTrainingDatasetChunk")) @compileError("ServerRouter: Impl missing required method 'uploadTrainingDatasetChunk'");
+        if (!@hasDecl(Impl, "prepareTrainingDataset")) @compileError("ServerRouter: Impl missing required method 'prepareTrainingDataset'");
+        if (!@hasDecl(Impl, "listTrainingJobs")) @compileError("ServerRouter: Impl missing required method 'listTrainingJobs'");
+        if (!@hasDecl(Impl, "startTrainingJob")) @compileError("ServerRouter: Impl missing required method 'startTrainingJob'");
+        if (!@hasDecl(Impl, "getTrainingJob")) @compileError("ServerRouter: Impl missing required method 'getTrainingJob'");
+        if (!@hasDecl(Impl, "cancelTrainingJob")) @compileError("ServerRouter: Impl missing required method 'cancelTrainingJob'");
+        if (!@hasDecl(Impl, "getTrainingLogs")) @compileError("ServerRouter: Impl missing required method 'getTrainingLogs'");
+        if (!@hasDecl(Impl, "pauseTrainingJob")) @compileError("ServerRouter: Impl missing required method 'pauseTrainingJob'");
+        if (!@hasDecl(Impl, "resumeTrainingJob")) @compileError("ServerRouter: Impl missing required method 'resumeTrainingJob'");
+        if (!@hasDecl(Impl, "listTrainingPeers")) @compileError("ServerRouter: Impl missing required method 'listTrainingPeers'");
+        if (!@hasDecl(Impl, "registerTrainingPeer")) @compileError("ServerRouter: Impl missing required method 'registerTrainingPeer'");
+        if (!@hasDecl(Impl, "removeTrainingPeer")) @compileError("ServerRouter: Impl missing required method 'removeTrainingPeer'");
+        if (!@hasDecl(Impl, "refreshTrainingPeer")) @compileError("ServerRouter: Impl missing required method 'refreshTrainingPeer'");
+        if (!@hasDecl(Impl, "startTrainingPreflight")) @compileError("ServerRouter: Impl missing required method 'startTrainingPreflight'");
+        if (!@hasDecl(Impl, "getTrainingPreflight")) @compileError("ServerRouter: Impl missing required method 'getTrainingPreflight'");
         if (!@hasDecl(Impl, "listTransactionSessions")) @compileError("ServerRouter: Impl missing required method 'listTransactionSessions'");
         if (!@hasDecl(Impl, "beginTransaction")) @compileError("ServerRouter: Impl missing required method 'beginTransaction'");
         if (!@hasDecl(Impl, "cleanupTransactionSessions")) @compileError("ServerRouter: Impl missing required method 'cleanupTransactionSessions'");
@@ -1620,6 +1767,27 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/tablespaces/:tablespaceName", httpx.Handler.bind(self.impl, createTablespace));
             try server.delete("/tablespaces/:tablespaceName", httpx.Handler.bind(self.impl, dropTablespace));
             try server.post("/tablespaces/:tablespaceName/rename", httpx.Handler.bind(self.impl, renameTablespace));
+            try server.get("/training/datasets", httpx.Handler.bind(self.impl, listTrainingDatasets));
+            try server.post("/training/datasets", httpx.Handler.bind(self.impl, createTrainingDataset));
+            try server.post("/training/datasets/huggingface", httpx.Handler.bind(self.impl, previewTrainingHuggingFace));
+            try server.get("/training/datasets/:dataset_id", httpx.Handler.bind(self.impl, getTrainingDataset));
+            try server.delete("/training/datasets/:dataset_id", httpx.Handler.bind(self.impl, removeTrainingDataset));
+            try server.post("/training/datasets/:dataset_id/cancel", httpx.Handler.bind(self.impl, cancelTrainingDataset));
+            try server.put("/training/datasets/:dataset_id/chunks", httpx.Handler.bind(self.impl, uploadTrainingDatasetChunk));
+            try server.post("/training/datasets/:dataset_id/prepare", httpx.Handler.bind(self.impl, prepareTrainingDataset));
+            try server.get("/training/jobs", httpx.Handler.bind(self.impl, listTrainingJobs));
+            try server.post("/training/jobs", httpx.Handler.bind(self.impl, startTrainingJob));
+            try server.get("/training/jobs/:job_id", httpx.Handler.bind(self.impl, getTrainingJob));
+            try server.post("/training/jobs/:job_id/cancel", httpx.Handler.bind(self.impl, cancelTrainingJob));
+            try server.get("/training/jobs/:job_id/logs", httpx.Handler.bind(self.impl, getTrainingLogs));
+            try server.post("/training/jobs/:job_id/pause", httpx.Handler.bind(self.impl, pauseTrainingJob));
+            try server.post("/training/jobs/:job_id/resume", httpx.Handler.bind(self.impl, resumeTrainingJob));
+            try server.get("/training/peers", httpx.Handler.bind(self.impl, listTrainingPeers));
+            try server.post("/training/peers", httpx.Handler.bind(self.impl, registerTrainingPeer));
+            try server.delete("/training/peers/:peer_id", httpx.Handler.bind(self.impl, removeTrainingPeer));
+            try server.post("/training/peers/:peer_id/refresh", httpx.Handler.bind(self.impl, refreshTrainingPeer));
+            try server.post("/training/preflights", httpx.Handler.bind(self.impl, startTrainingPreflight));
+            try server.get("/training/preflights/:job_id", httpx.Handler.bind(self.impl, getTrainingPreflight));
             try server.get("/transactions", httpx.Handler.bind(self.impl, listTransactionSessions));
             try server.post("/transactions/begin", httpx.Handler.bind(self.impl, beginTransaction));
             try server.post("/transactions/cleanup", httpx.Handler.bind(self.impl, cleanupTransactionSessions));
@@ -2574,6 +2742,149 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.renameTablespace(ctx, tablespace_name);
         }
 
+        /// listTrainingDatasets
+        /// GET /training/datasets
+        fn listTrainingDatasets(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.listTrainingDatasets(ctx);
+        }
+
+        /// createTrainingDataset
+        /// POST /training/datasets
+        fn createTrainingDataset(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.createTrainingDataset(ctx);
+        }
+
+        /// previewTrainingHuggingFace
+        /// POST /training/datasets/huggingface
+        fn previewTrainingHuggingFace(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.previewTrainingHuggingFace(ctx);
+        }
+
+        /// getTrainingDataset
+        /// GET /training/datasets/{dataset_id}
+        fn getTrainingDataset(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const dataset_id = ctx.param("dataset_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: dataset_id" });
+            return impl.getTrainingDataset(ctx, dataset_id);
+        }
+
+        /// removeTrainingDataset
+        /// DELETE /training/datasets/{dataset_id}
+        fn removeTrainingDataset(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const dataset_id = ctx.param("dataset_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: dataset_id" });
+            return impl.removeTrainingDataset(ctx, dataset_id);
+        }
+
+        /// cancelTrainingDataset
+        /// POST /training/datasets/{dataset_id}/cancel
+        fn cancelTrainingDataset(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const dataset_id = ctx.param("dataset_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: dataset_id" });
+            return impl.cancelTrainingDataset(ctx, dataset_id);
+        }
+
+        /// uploadTrainingDatasetChunk
+        /// PUT /training/datasets/{dataset_id}/chunks
+        fn uploadTrainingDatasetChunk(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const dataset_id = ctx.param("dataset_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: dataset_id" });
+            return impl.uploadTrainingDatasetChunk(ctx, dataset_id);
+        }
+
+        /// prepareTrainingDataset
+        /// POST /training/datasets/{dataset_id}/prepare
+        fn prepareTrainingDataset(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const dataset_id = ctx.param("dataset_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: dataset_id" });
+            return impl.prepareTrainingDataset(ctx, dataset_id);
+        }
+
+        /// listTrainingJobs
+        /// GET /training/jobs
+        fn listTrainingJobs(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.listTrainingJobs(ctx);
+        }
+
+        /// startTrainingJob
+        /// POST /training/jobs
+        fn startTrainingJob(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.startTrainingJob(ctx);
+        }
+
+        /// getTrainingJob
+        /// GET /training/jobs/{job_id}
+        fn getTrainingJob(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const job_id = ctx.param("job_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: job_id" });
+            return impl.getTrainingJob(ctx, job_id);
+        }
+
+        /// cancelTrainingJob
+        /// POST /training/jobs/{job_id}/cancel
+        fn cancelTrainingJob(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const job_id = ctx.param("job_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: job_id" });
+            return impl.cancelTrainingJob(ctx, job_id);
+        }
+
+        /// getTrainingLogs
+        /// GET /training/jobs/{job_id}/logs
+        fn getTrainingLogs(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const job_id = ctx.param("job_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: job_id" });
+            const query_params = GetTrainingLogsParams{
+                .rank = try ctx.queryDecoded("rank"),
+                .cursor = try ctx.queryDecoded("cursor"),
+            };
+            return impl.getTrainingLogs(ctx, job_id, query_params);
+        }
+
+        /// pauseTrainingJob
+        /// POST /training/jobs/{job_id}/pause
+        fn pauseTrainingJob(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const job_id = ctx.param("job_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: job_id" });
+            return impl.pauseTrainingJob(ctx, job_id);
+        }
+
+        /// resumeTrainingJob
+        /// POST /training/jobs/{job_id}/resume
+        fn resumeTrainingJob(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const job_id = ctx.param("job_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: job_id" });
+            return impl.resumeTrainingJob(ctx, job_id);
+        }
+
+        /// listTrainingPeers
+        /// GET /training/peers
+        fn listTrainingPeers(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.listTrainingPeers(ctx);
+        }
+
+        /// registerTrainingPeer
+        /// POST /training/peers
+        fn registerTrainingPeer(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.registerTrainingPeer(ctx);
+        }
+
+        /// removeTrainingPeer
+        /// DELETE /training/peers/{peer_id}
+        fn removeTrainingPeer(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const peer_id = ctx.param("peer_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: peer_id" });
+            return impl.removeTrainingPeer(ctx, peer_id);
+        }
+
+        /// refreshTrainingPeer
+        /// POST /training/peers/{peer_id}/refresh
+        fn refreshTrainingPeer(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const peer_id = ctx.param("peer_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: peer_id" });
+            return impl.refreshTrainingPeer(ctx, peer_id);
+        }
+
+        /// startTrainingPreflight
+        /// POST /training/preflights
+        fn startTrainingPreflight(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.startTrainingPreflight(ctx);
+        }
+
+        /// getTrainingPreflight
+        /// GET /training/preflights/{job_id}
+        fn getTrainingPreflight(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const job_id = ctx.param("job_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: job_id" });
+            return impl.getTrainingPreflight(ctx, job_id);
+        }
+
         /// List transaction sessions
         /// GET /transactions
         fn listTransactionSessions(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -2785,6 +3096,27 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn createTablespace(self: *Impl, ctx: *httpx.Context, tablespace_name: []const u8) !httpx.Response
 //   fn dropTablespace(self: *Impl, ctx: *httpx.Context, tablespace_name: []const u8) !httpx.Response
 //   fn renameTablespace(self: *Impl, ctx: *httpx.Context, tablespace_name: []const u8) !httpx.Response
+//   fn listTrainingDatasets(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn createTrainingDataset(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn previewTrainingHuggingFace(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getTrainingDataset(self: *Impl, ctx: *httpx.Context, dataset_id: []const u8) !httpx.Response
+//   fn removeTrainingDataset(self: *Impl, ctx: *httpx.Context, dataset_id: []const u8) !httpx.Response
+//   fn cancelTrainingDataset(self: *Impl, ctx: *httpx.Context, dataset_id: []const u8) !httpx.Response
+//   fn uploadTrainingDatasetChunk(self: *Impl, ctx: *httpx.Context, dataset_id: []const u8) !httpx.Response
+//   fn prepareTrainingDataset(self: *Impl, ctx: *httpx.Context, dataset_id: []const u8) !httpx.Response
+//   fn listTrainingJobs(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn startTrainingJob(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getTrainingJob(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
+//   fn cancelTrainingJob(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
+//   fn getTrainingLogs(self: *Impl, ctx: *httpx.Context, job_id: []const u8, params: GetTrainingLogsParams) !httpx.Response
+//   fn pauseTrainingJob(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
+//   fn resumeTrainingJob(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
+//   fn listTrainingPeers(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn registerTrainingPeer(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn removeTrainingPeer(self: *Impl, ctx: *httpx.Context, peer_id: []const u8) !httpx.Response
+//   fn refreshTrainingPeer(self: *Impl, ctx: *httpx.Context, peer_id: []const u8) !httpx.Response
+//   fn startTrainingPreflight(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getTrainingPreflight(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
 //   fn listTransactionSessions(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn beginTransaction(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn cleanupTransactionSessions(self: *Impl, ctx: *httpx.Context, params: CleanupTransactionSessionsParams) !httpx.Response

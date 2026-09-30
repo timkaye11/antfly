@@ -570,6 +570,8 @@ jobs:
             scripts.gemma4.test_benchmark_metal_gemma4_long_output \
             scripts.test_content_security_contract \
             scripts.test_distributed_training \
+            scripts.test_training_service \
+            scripts.test_training_datasets \
             scripts.gemma4.test_gemma4_cuda_l4_release_gate \
             scripts.gemma4.test_gemma4_cuda_production_gate \
             scripts.gemma4.test_gemma4_qat_cuda_tuning \

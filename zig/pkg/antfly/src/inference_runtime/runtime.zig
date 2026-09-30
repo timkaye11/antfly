@@ -588,6 +588,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         first_arg = false;
     }
 
+    var advertise_toolchain: ?[]const u8 = null;
     var host: []const u8 = "127.0.0.1";
     var port: u16 = 8090;
     var model_overrides = RunModelOverrides{};
@@ -610,6 +611,8 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
             return;
         } else if (std.mem.eql(u8, arg, "--host")) {
             host = args.next() orelse host;
+        } else if (std.mem.eql(u8, arg, "--advertise-training")) {
+            advertise_toolchain = args.next() orelse return error.InvalidArguments;
         } else if (std.mem.eql(u8, arg, "--port")) {
             if (args.next()) |p| port = std.fmt.parseInt(u16, p, 10) catch 8090;
         } else if (std.mem.eql(u8, arg, "--models-dir")) {
@@ -765,6 +768,9 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
 
     var termination_signals = runtime_lifecycle.ProcessSignalScope.install();
     defer termination_signals.deinit();
+    var advertisement = if (advertise_toolchain) |path| try platform.training_advertisement.start(alloc, io, path) else null;
+    defer if (advertisement) |*child| child.kill(io);
+
     var supervisor = runtime_lifecycle.RuntimeSupervisor.init(30_000);
     defer supervisor.markStopped();
 
@@ -1150,6 +1156,7 @@ fn printUsage() void {
         \\
         \\Run options:
         \\  --host <addr>    Listen address (default: 127.0.0.1)
+        \\  --advertise-training <dir> Advertise SSH training discovery using an installed toolchain
         \\  --allow-insecure-public-bind Allow a non-loopback listener without built-in auth or TLS
         \\  --port <port>    Listen port (default: 8090)
         \\  --models-dir <dir> AI models directory (default: ~/.antfly/inference/models)
