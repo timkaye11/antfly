@@ -5556,6 +5556,14 @@ pub const Node = struct {
         };
         const debug_metal_timing = timing != null and use_metal_whole_model and platform.env.getenvBool("TERMITE_DEBUG_METAL_TIMING");
         if (debug_metal_timing) graph_mod.metal_executor.resetTimingStats();
+        // SSE returns through streamGenerate before the ordinary response
+        // path. Keep diagnostics at this common exit so streaming benchmarks
+        // observe the same completed-frame counters as non-streaming calls.
+        defer if (debug_metal_timing) {
+            if (model.native_generation_graph_cache.getSessionCompiledModelRuntime(.metal, .whole_model)) |runtime_model| {
+                runtime_model.printDebugTiming();
+            }
+        };
         const setup_at_ns = embedTimingNowNs();
         if (timing != null) {
             std.log.info("direct generator starting generation model={s} backend={s}", .{ model_name, @tagName(model.session.backend()) });
@@ -5599,11 +5607,6 @@ pub const Node = struct {
                     std.log.info("{s}", .{session_factory.formatCudaDecodeProfileLine(&cuda_profile_line_buf, profile_delta)});
                     std.log.info("{s}", .{session_factory.formatCudaPrefillProfileLine(&cuda_profile_line_buf, profile_delta)});
                 }
-            }
-        }
-        if (debug_metal_timing) {
-            if (model.native_generation_graph_cache.getSessionCompiledModelRuntime(.metal, .whole_model)) |runtime_model| {
-                runtime_model.printDebugTiming();
             }
         }
         if (timing) |t| {
@@ -12852,6 +12855,14 @@ pub const Node = struct {
             use_model_graph_cache and
             platform.env.getenvBool("TERMITE_DEBUG_METAL_TIMING");
         if (debug_metal_timing) graph_mod.metal_executor.resetTimingStats();
+        // Streaming returns through streamGenerate below, before the ordinary
+        // response path. Emit diagnostics from this common scope so both
+        // streaming and buffered OpenAI requests report completed counters.
+        defer if (debug_metal_timing) {
+            if (model.native_generation_graph_cache.getSessionCompiledModelRuntime(.metal, .whole_model)) |runtime_model| {
+                runtime_model.printDebugTiming();
+            }
+        };
 
         var pipeline = generation.NativeGenerationPipeline{
             .allocator = execution_allocator,
@@ -12915,12 +12926,6 @@ pub const Node = struct {
             return generationErrorResponse(ctx, err);
         };
         defer result.deinit();
-        if (debug_metal_timing) {
-            if (model.native_generation_graph_cache.getSessionCompiledModelRuntime(.metal, .whole_model)) |runtime_model| {
-                runtime_model.printDebugTiming();
-            }
-        }
-
         var response_text = result.text;
         var tool_response_text: ?[]u8 = null;
         defer if (tool_response_text) |text| ctx.allocator.free(text);

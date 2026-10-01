@@ -4882,9 +4882,13 @@ pub fn decoderRuntimeApplyLayerNormLinearSample(self: anytype, request: anytype)
     if (@as(usize, @intCast(request.input.dim(0))) != 1) return null;
     if (@as(usize, @intCast(request.input.dim(1))) != request.hidden_size) return null;
 
+    const exact_full_vocab_nucleus = request.temperature > 0.0 and
+        request.top_k == 0 and request.top_p > 0.0 and request.top_p < 1.0 and
+        request.min_p <= 0.0 and request.repetition_penalty == 1.0 and
+        request.frequency_penalty == 0.0 and request.presence_penalty == 0.0;
     const bounded_top_p = request.top_p <= 0.0 or request.top_p >= 1.0 or
         request.top_k > 0 or request.out_dim <= 256;
-    if (request.top_k <= 256 and bounded_top_p) {
+    if (request.top_k <= 256 and (bounded_top_p or exact_full_vocab_nucleus)) {
         if (decoderRuntimeReserveSampleTailScratch(self, request.out_dim, request.top_k)) {
             var penalty_entries = try buildSamplePenaltyEntries(std.heap.c_allocator, request.token_history);
             defer penalty_entries.deinit(std.heap.c_allocator);
@@ -5133,6 +5137,7 @@ pub fn decoderRuntimeEncodeRmsNormLinearArgmaxDevice(self: anytype, request: any
 
 pub fn decoderRuntimeEncodeRmsNormLinearLogitsDevice(self: anytype, request: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
+    const trace_decode = getenvBool("TERMITE_METAL_TRACE_DECODER_RUNTIME_DECODE");
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (request.hidden_size == 0 or request.out_dim == 0) return null;
     if (request.norm_slot >= decoder_runtime_rms_norm_slot_capacity or request.linear_slot >= decoder_runtime_linear_slot_capacity) return null;
@@ -5159,7 +5164,13 @@ pub fn decoderRuntimeEncodeRmsNormLinearLogitsDevice(self: anytype, request: any
     );
     const quant_kind = ensureQuantizedRuntimeLinearSlotPrepared(self, effective_slot, request.hidden_size, request.out_dim);
     const format = metalQuantFormatForKind(quant_kind);
-    if (format == .unsupported) return null;
+    if (format == .unsupported) {
+        if (trace_decode) std.debug.print(
+            "decoder-runtime-decode: planned-tail-logits failure=unsupported-format linear_slot={d} effective_slot={d} kind={s}\n",
+            .{ request.linear_slot, effective_slot, @tagName(quant_kind) },
+        );
+        return null;
+    }
     const planned_layer_contract: ops.PlannedLayerContract = if (@hasField(@TypeOf(request), "planned_layer_contract")) request.planned_layer_contract else .{};
     const raw_planned_layer_contract = RawPlannedLayerContract.fromContract(planned_layer_contract);
     var logits_handle: ?*anyopaque = null;
@@ -5176,7 +5187,13 @@ pub fn decoderRuntimeEncodeRmsNormLinearLogitsDevice(self: anytype, request: any
         raw_planned_layer_contract,
         &logits_handle,
     );
-    if (rc != 0) return null;
+    if (rc != 0) {
+        if (trace_decode) std.debug.print(
+            "decoder-runtime-decode: planned-tail-logits rc={d} linear_slot={d} effective_slot={d} format={s} hidden={d} out={d} ops={d}\n",
+            .{ rc, request.linear_slot, effective_slot, @tagName(format), request.hidden_size, request.out_dim, planned_layer_contract.command_ops.len },
+        );
+        return null;
+    }
     const shape = [_]i32{ 1, @intCast(request.out_dim) };
     return MetalTensor.deviceBorrowed(@ptrCast(runtime), logits_handle orelse return null, 0, request.out_dim * @sizeOf(f32), &shape);
 }
@@ -5604,9 +5621,13 @@ pub fn decoderRuntimeApplyRmsNormLinearSample(self: anytype, request: anytype) !
     if (@as(usize, @intCast(request.input.dim(0))) != 1) return null;
     if (@as(usize, @intCast(request.input.dim(1))) != request.hidden_size) return null;
 
+    const exact_full_vocab_nucleus = request.temperature > 0.0 and
+        request.top_k == 0 and request.top_p > 0.0 and request.top_p < 1.0 and
+        request.min_p <= 0.0 and request.repetition_penalty == 1.0 and
+        request.frequency_penalty == 0.0 and request.presence_penalty == 0.0;
     const bounded_top_p = request.top_p <= 0.0 or request.top_p >= 1.0 or
         request.top_k > 0 or request.out_dim <= 256;
-    if (request.top_k <= 256 and bounded_top_p) {
+    if (request.top_k <= 256 and (bounded_top_p or exact_full_vocab_nucleus)) {
         if (decoderRuntimeReserveSampleTailScratch(self, request.out_dim, request.top_k)) {
             var penalty_entries = try buildSamplePenaltyEntries(std.heap.c_allocator, request.token_history);
             defer penalty_entries.deinit(std.heap.c_allocator);
@@ -5657,17 +5678,58 @@ pub fn decoderRuntimeApplyRmsNormLinearSample(self: anytype, request: anytype) !
     return sampleLogits(logits_host, request);
 }
 
-var resident_sample_seed_state: u64 = 0;
+const resident_sample_seed_increment: u64 = 0x9e3779b97f4a7c15;
+var resident_sample_seed_sequence = std.atomic.Value(u64).init(0);
 
-/// True when the fused-sampling kernels can honor this sampling config
-/// on-device (mirrors the bounded-top-p gate in the fused sample tail).
-pub fn decoderRuntimeResidentLogitsSamplingSupported(self: anytype, out_dim: usize, top_k: usize, top_p: f32) bool {
+fn reserveResidentSampleSeedSequence(sequence: *std.atomic.Value(u64)) u64 {
+    return sequence.fetchAdd(resident_sample_seed_increment, .monotonic) +% resident_sample_seed_increment;
+}
+
+fn nextResidentSampleSeed(runtime: *RawMetalDecodeRuntime, token_history: []const i64) u32 {
+    // Keep the previous ASLR-derived entropy while making sequence allocation
+    // race-free across concurrently active model runtimes. Both resident
+    // sampling entry points use the same seed derivation.
+    const sequence = reserveResidentSampleSeedSequence(&resident_sample_seed_sequence);
+    const state = sequence ^
+        @as(u64, @truncate(@intFromPtr(runtime))) ^
+        @as(u64, @truncate(@intFromPtr(token_history.ptr))) ^
+        @as(u64, @truncate(@intFromPtr(&resident_sample_seed_sequence)));
+    var prng = std.Random.DefaultPrng.init(state | 1);
+    return prng.random().int(u32);
+}
+
+/// True only when the resident sampling tail can honor the complete request
+/// before a decode frame is submitted. Full-vocabulary nucleus sampling is
+/// exact: the weighted radix cutoff retains the crossing token and every tie.
+pub fn decoderRuntimeResidentLogitsSamplingSupported(self: anytype, request: anytype) bool {
     const runtime = self.raw_decode_runtime orelse return false;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
-    if (top_k > 256) return false;
-    const bounded_top_p = top_p <= 0.0 or top_p >= 1.0 or top_k > 0 or out_dim <= 256;
-    if (!bounded_top_p) return false;
-    return decoderRuntimeReserveSampleTailScratch(self, out_dim, top_k);
+    if (request.linear_slot >= decoder_runtime_linear_slot_capacity or
+        request.hidden_size == 0 or request.out_dim == 0 or request.top_k > 256) return false;
+    if (!std.math.isFinite(request.temperature) or !std.math.isFinite(request.top_p) or
+        !std.math.isFinite(request.min_p) or !std.math.isFinite(request.repetition_penalty) or
+        !std.math.isFinite(request.frequency_penalty) or !std.math.isFinite(request.presence_penalty) or
+        !std.math.isFinite(request.final_logit_softcap) or request.final_logit_softcap < 0.0) return false;
+    const exact_slot = exactLmHeadLinearSlot(self, request.linear_slot, request.hidden_size, request.out_dim);
+    const main_slot_supports_logits = residentLmHeadMainSlotSupportsLogits(
+        self,
+        request.linear_slot,
+        request.hidden_size,
+        request.out_dim,
+    );
+    if (!residentLmHeadLogitsAreCheckpointExact(exact_slot, main_slot_supports_logits)) return false;
+    const exact_full_vocab_nucleus = request.temperature > 0.0 and
+        request.top_k == 0 and request.top_p > 0.0 and request.top_p < 1.0 and
+        request.min_p <= 0.0 and request.repetition_penalty == 1.0 and
+        request.frequency_penalty == 0.0 and request.presence_penalty == 0.0;
+    const bounded_top_p = request.top_p <= 0.0 or request.top_p >= 1.0 or
+        request.top_k > 0 or request.out_dim <= 256;
+    if (!exact_full_vocab_nucleus and !bounded_top_p) return false;
+    // The existing bounded top-k tail cannot apply softcap. Pure temperature
+    // Gumbel and exact nucleus both apply it before sampling.
+    if (request.final_logit_softcap > 0.0 and request.top_k > 0) return false;
+    if (exact_full_vocab_nucleus and termite_metal_decode_runtime_prepare_nucleus_sampling(runtime) != 0) return false;
+    return decoderRuntimeReserveSampleTailScratch(self, request.out_dim, request.top_k);
 }
 
 pub fn decoderRuntimeSampleResidentLogits(self: anytype, request: anytype) !?usize {
@@ -5675,7 +5737,13 @@ pub fn decoderRuntimeSampleResidentLogits(self: anytype, request: anytype) !?usi
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (request.linear_slot >= decoder_runtime_linear_slot_capacity or request.hidden_size == 0) return null;
     const exact_slot = exactLmHeadLinearSlot(self, request.linear_slot, request.hidden_size, request.out_dim);
-    if (!residentLmHeadLogitsAreCheckpointExact(exact_slot)) {
+    const main_slot_supports_logits = residentLmHeadMainSlotSupportsLogits(
+        self,
+        request.linear_slot,
+        request.hidden_size,
+        request.out_dim,
+    );
+    if (!residentLmHeadLogitsAreCheckpointExact(exact_slot, main_slot_supports_logits)) {
         // This entry point is installed only for MetalNativeProvider; count
         // every refusal as part of the release telemetry contract.
         self.raw_lm_head_q4_resident_sampling_rejections += 1;
@@ -5686,7 +5754,7 @@ pub fn decoderRuntimeSampleResidentLogits(self: anytype, request: anytype) !?usi
         return null;
     }
     if (request.out_dim == 0) return null;
-    if (!decoderRuntimeResidentLogitsSamplingSupported(self, request.out_dim, request.top_k, request.top_p)) return null;
+    if (!decoderRuntimeResidentLogitsSamplingSupported(self, request)) return null;
     // Only materialize penalty entries when the config actually penalizes.
     const penalties_active = request.repetition_penalty != 1.0 or
         request.frequency_penalty != 0.0 or
@@ -5698,14 +5766,7 @@ pub fn decoderRuntimeSampleResidentLogits(self: anytype, request: anytype) !?usi
     defer penalty_entries.deinit(std.heap.c_allocator);
     if (penalty_entries.token_ids.len > 512 and request.top_k > 64) return null;
     const penalty_count = penalty_entries.token_ids.len;
-    if (resident_sample_seed_state == 0) {
-        // ASLR-derived per-process entropy, same trick as makeSampleSeed.
-        resident_sample_seed_state = (@as(u64, @truncate(@intFromPtr(request.token_history.ptr))) ^
-            @as(u64, @truncate(@intFromPtr(&resident_sample_seed_state)))) | 1;
-    }
-    resident_sample_seed_state +%= 0x9e3779b97f4a7c15;
-    var prng = std.Random.DefaultPrng.init(resident_sample_seed_state);
-    const seed = prng.random().int(u32);
+    const seed = nextResidentSampleSeed(runtime, request.token_history);
     var token_id: u32 = 0;
     const rc = termite_metal_decode_runtime_sample_from_resident_logits(
         runtime,
@@ -5726,6 +5787,50 @@ pub fn decoderRuntimeSampleResidentLogits(self: anytype, request: anytype) !?usi
     );
     if (rc != 0) return null;
     return token_id;
+}
+
+/// Append exact sampling to the currently active decode frame. The LM-head
+/// logits must already reside in the checkpoint-exact sample buffer.
+pub fn decoderRuntimeEncodeSampleResidentLogits(self: anytype, request: anytype) bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    const trace_decode = getenvBool("TERMITE_METAL_TRACE_DECODER_RUNTIME_DECODE");
+    if (!hasActiveFrame(runtime)) {
+        if (trace_decode) std.debug.print("decoder-runtime-decode: nucleus-tail failure=no-active-frame\n", .{});
+        return false;
+    }
+    if (!decoderRuntimeResidentLogitsSamplingSupported(self, request)) {
+        if (trace_decode) std.debug.print("decoder-runtime-decode: nucleus-tail failure=capability-changed\n", .{});
+        return false;
+    }
+    // The promoted full-vocabulary nucleus route currently accepts only the
+    // no-penalty contract. This keeps preflight and post-LM-head behavior
+    // identical and prevents a late allocation inside the active frame.
+    if (request.repetition_penalty != 1.0 or request.frequency_penalty != 0.0 or request.presence_penalty != 0.0) {
+        if (trace_decode) std.debug.print("decoder-runtime-decode: nucleus-tail failure=active-penalties\n", .{});
+        return false;
+    }
+    const seed = nextResidentSampleSeed(runtime, request.token_history);
+    const rc = termite_metal_decode_runtime_encode_sample_from_resident_logits(
+        runtime,
+        request.out_dim,
+        request.temperature,
+        request.top_k,
+        request.top_p,
+        request.min_p,
+        request.repetition_penalty,
+        request.frequency_penalty,
+        request.presence_penalty,
+        null,
+        null,
+        0,
+        seed,
+        request.final_logit_softcap,
+    );
+    if (trace_decode and rc != 0) std.debug.print(
+        "decoder-runtime-decode: nucleus-tail rc={d} out={d} temperature={d} top_p={d} softcap={d}\n",
+        .{ rc, request.out_dim, request.temperature, request.top_p, request.final_logit_softcap },
+    );
+    return rc == 0;
 }
 
 pub fn decoderRuntimeApplyActivation(self: anytype, request: anytype, stats: anytype) !?MetalTensor {
@@ -12432,6 +12537,127 @@ test "metal top-p sampling retains the crossing token and cutoff ties" {
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, source, "if (cumulative > threshold && i > 0u) probs[i] = 0.0f;"));
 }
 
+fn weightedRadixNucleusCutoffForTest(probabilities: []const f32, top_p: f32) u32 {
+    var total: f32 = 0;
+    for (probabilities) |probability| {
+        if (probability > 0) total += probability;
+    }
+    const target = top_p * total;
+    var prefix: u32 = 0;
+    var mass_above: f32 = 0;
+    for (0..8) |pass| {
+        var bins = [_]f32{0} ** 16;
+        const shift: u5 = @intCast(28 - pass * 4);
+        const prefix_mask: u32 = if (pass == 0) 0 else @as(u32, 0xffffffff) << @intCast(32 - pass * 4);
+        for (probabilities) |probability| {
+            if (!(probability > 0)) continue;
+            const key: u32 = @bitCast(probability);
+            if ((key & prefix_mask) == prefix) bins[@intCast((key >> shift) & 15)] += probability;
+        }
+        var selected: u32 = 0;
+        var bin: usize = 16;
+        while (bin > 0) {
+            bin -= 1;
+            if (mass_above + bins[bin] >= target) {
+                selected = @intCast(bin);
+                break;
+            }
+            mass_above += bins[bin];
+        }
+        prefix |= selected << shift;
+    }
+    return prefix;
+}
+
+test "metal full-vocabulary nucleus weighted radix matches sorted oracle and retains cutoff ties" {
+    // More than 256 candidates exercises the route that used to ignore top-p
+    // in the one-thread bounded shader. Two equal crossing probabilities prove
+    // that the complete cutoff tie is retained.
+    var probabilities = [_]f32{0.0001} ** 513;
+    probabilities[3] = 0.31;
+    probabilities[257] = 0.27;
+    probabilities[400] = 0.20;
+    probabilities[401] = 0.20;
+    const cutoff_key = weightedRadixNucleusCutoffForTest(&probabilities, 0.75);
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, 0.20))), cutoff_key);
+    try std.testing.expect(@as(u32, @bitCast(probabilities[400])) >= cutoff_key);
+    try std.testing.expect(@as(u32, @bitCast(probabilities[401])) >= cutoff_key);
+    try std.testing.expect(@as(u32, @bitCast(probabilities[0])) < cutoff_key);
+
+    const equal = [_]f32{0.25} ** 513;
+    try std.testing.expectEqual(
+        @as(u32, @bitCast(@as(f32, 0.25))),
+        weightedRadixNucleusCutoffForTest(&equal, 0.99999994),
+    );
+
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "termite_sample_nucleus_radix_histogram"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "as_type<uint>(prob) < state->cutoff_key"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "exact_full_vocab_nucleus"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "above -= bins[selected]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "simd_sum(bins[b])"));
+    try std.testing.expect(std.mem.containsAtLeast(
+        u8,
+        source,
+        1,
+        "threadgroup float *bins [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort tg_size [[threads_per_threadgroup]]",
+    ));
+    try std.testing.expect(std.mem.containsAtLeast(
+        u8,
+        source,
+        1,
+        "for (uint b = uint(tid); b < 16u; b += uint(tg_size)) { float mass = 0.0f; for (uint block = 0u; block < state->block_count; ++block) mass += histograms[block * 16u + b];",
+    ));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "[encoder setThreadgroupMemoryLength:16u * sizeof(float) atIndex:0]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "MTLSizeMake(parallel_radix ? 16u : 1u, 1, 1)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_NUCLEUS_MONOTONIC_MAX"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "p.defer_monotonic_max != 0u && isfinite(raw)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "partials[block_count + block] = shared[uint(tg_size)]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "reduced = max(reduced, shared[uint(tg_size)])"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "float transformed = p.final_logit_softcap * tanh(reduced / p.final_logit_softcap); reduced = transformed / p.temperature;"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "[encoder setBytes:&params length:sizeof(params) atIndex:3]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 2, "[encoder setThreadgroupMemoryLength:512u * sizeof(float) atIndex:0]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_PARALLEL_NUCLEUS_RADIX"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "threadExecutionWidth == 32u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "maxTotalThreadsPerThreadgroup >= 256u"));
+    const nucleus_begin = std.mem.indexOf(u8, source, "static int termite_metal_decode_runtime_encode_sample_nucleus_from_logits_buffer(") orelse return error.MissingNucleusEncoder;
+    const nucleus_tail = source[nucleus_begin..];
+    const nucleus_end = std.mem.indexOfPos(u8, nucleus_tail, 1, "static int termite_metal_decode_runtime_encode_sample_from_logits_buffer(") orelse return error.MissingNucleusEncoderEnd;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, nucleus_tail[0..nucleus_end], "termite_metal_tracked_compute_command_encoder(command_buffer)"),
+    );
+}
+
+test "resident sampling seed sequence is race-free" {
+    if (comptime @import("builtin").single_threaded) return error.SkipZigTest;
+    const thread_count = 8;
+    const sequences_per_thread = 128;
+    const Worker = struct {
+        fn run(sequence: *std.atomic.Value(u64), output: []u64) void {
+            for (output) |*value| value.* = reserveResidentSampleSeedSequence(sequence);
+        }
+    };
+
+    var sequence = std.atomic.Value(u64).init(0);
+    var values: [thread_count * sequences_per_thread]u64 = undefined;
+    var threads: [thread_count]std.Thread = undefined;
+    for (&threads, 0..) |*thread, index| {
+        const begin = index * sequences_per_thread;
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{
+            &sequence,
+            values[begin..][0..sequences_per_thread],
+        });
+    }
+    for (&threads) |*thread| thread.join();
+
+    for (values, 0..) |value, index| {
+        try std.testing.expect(value != 0);
+        for (values[index + 1 ..]) |other| try std.testing.expect(value != other);
+    }
+}
+
 test "metal prefill direct KV is selected-only, bounded, rollback-safe, and counted" {
     const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(source);
@@ -12624,17 +12850,50 @@ test "metal Q4_0 pair activation portfolios are exact gated and observable" {
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_MM"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_Q4_0_PAIR_ACTIVATION_MM"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_Q4_0_PAIR_ACTIVATION_MM_VARIANT"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_ENABLE_E2B_Q4_0_PAIR_ACTIVATION_MM"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_E2B_Q4_0_PAIR_ACTIVATION_MM"));
     inline for (.{ "nr4_nsg2", "nr8_nsg2", "nr4_nsg4", "nr8_nsg4" }) |variant| {
         try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "termite_q4_0_pair_activation_1x_reduce_" ++ variant));
     }
     inline for (.{ "m32_n64_aligned", "m32_n64_tail", "m32_n32_aligned", "m32_n32_tail" }) |variant| {
         try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "termite_q4_0_pair_activation_mm_" ++ variant));
     }
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "descriptor->in_dim == 2560u && descriptor->out_dim == 10240u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "in_dim == 2560u && out_dim == 10240u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "in_dim == 1536u && (out_dim == 6144u || out_dim == 12288u)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "selection.threadgroup_memory_bytes = 16u * 1024u"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "selection.threadgroup_memory_bytes = 8u * 1024u"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "snapshot->q4_0_pair_activation_mmv_variant_fallbacks = runtime->q4_0_pair_activation_mmv_variant_fallbacks"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "snapshot->q4_0_pair_activation_mm_variant_fallbacks = runtime->q4_0_pair_activation_mm_variant_fallbacks"));
+}
+
+test "E2B fused FFN flags preserve E4B route eligibility and rollbacks" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const shapes = [_]struct { in_dim: usize, out_dim: usize, e2b: bool }{
+        .{ .in_dim = 1536, .out_dim = 6144, .e2b = true },
+        .{ .in_dim = 1536, .out_dim = 12288, .e2b = true },
+        .{ .in_dim = 2560, .out_dim = 10240, .e2b = false },
+    };
+    for (shapes) |shape| {
+        for ([_]u32{ 0, 1 }) |broad_enable| {
+            for ([_]u32{ 0, 1 }) |e2b_enable| {
+                for ([_]u32{ 0, 1 }) |e2b_disable| {
+                    for ([_]u32{ 0, 1 }) |global_disable| {
+                        const expected: c_int = @intFromBool(global_disable == 0 and
+                            (if (shape.e2b) e2b_enable != 0 and e2b_disable == 0 else broad_enable != 0));
+                        try std.testing.expectEqual(expected, termite_metal_q4_0_pair_activation_mm_shape_policy_probe(
+                            shape.in_dim,
+                            shape.out_dim,
+                            broad_enable,
+                            e2b_enable,
+                            e2b_disable,
+                            global_disable,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_q4_0_pair_activation_mm_shape_policy_probe(1536, 10240, 1, 1, 0, 0));
 }
 
 test "concurrent planned dispatch policy is fail closed and hazards share production classifier" {
@@ -12884,6 +13143,29 @@ test "A4B local HD256 flash prefill has exact geometry admission and rollback" {
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_ENABLE_A4B_FLASH_PREFILL_HD256"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_A4B_FLASH_PREFILL_HD256"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "metal_a4b_flash_prefill_hd256: enabled=1 heads=16 kv_heads=8 window=1024"));
+}
+
+test "E2B local HD256 flash prefill has exact MQA geometry admission and rollback" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "num_heads == 8u && num_kv_heads == 1u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "head_dim == 256u && sliding_window == 512u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_ENABLE_E2B_FLASH_PREFILL_HD256"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_E2B_FLASH_PREFILL_HD256"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "metal_e2b_flash_prefill_hd256: enabled=1 heads=8 kv_heads=1 window=512"));
+}
+
+test "E2B Q4_0 aligned matrix prefill route is exact gated and reversible" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_ENABLE_E2B_Q4_0_MM_SG_ALIGNED"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_E2B_Q4_0_MM_SG_ALIGNED"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "q4_0_mm_sg_aligned_e2b_shape"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "descriptor->in_dim == 6144u || descriptor->in_dim == 12288u"));
 }
 
 test "Metal exact JIT pipeline lookup includes regime dispatch rows and both matrix dimensions" {
@@ -18138,6 +18420,15 @@ pub extern fn termite_metal_a4b_dag_scheduler_effective_policy_probe(force_enabl
 pub extern fn termite_metal_planned_range_hazard_probe(a_begin: usize, a_end: usize, a_write: u32, b_begin: usize, b_end: usize, b_write: u32, same_buffer: u32) c_int;
 pub extern fn termite_metal_decode_runtime_frame_cb_count(runtime: ?*RawMetalDecodeRuntime) u64;
 pub extern fn termite_metal_decode_runtime_decode_gqa_split_calls(runtime: ?*const RawMetalDecodeRuntime) u64;
+pub extern fn termite_metal_decode_runtime_full_vocab_nucleus_sample_calls(runtime: ?*const RawMetalDecodeRuntime) u64;
+pub extern fn termite_metal_q4_0_pair_activation_mm_shape_policy_probe(
+    in_dim: usize,
+    out_dim: usize,
+    broad_enable: u32,
+    e2b_enable: u32,
+    e2b_disable: u32,
+    global_disable: u32,
+) c_int;
 pub extern fn termite_metal_decode_gqa_split_policy_probe(
     requested_variant: c_uint,
     q_len: usize,
@@ -19001,6 +19292,9 @@ pub extern fn termite_metal_decode_runtime_reserve_sample_tail_scratch(
     runtime: ?*RawMetalDecodeRuntime,
     out_dim: usize,
     top_k: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_prepare_nucleus_sampling(
+    runtime: ?*RawMetalDecodeRuntime,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_reserve_attention_span_scratch(
     runtime: ?*RawMetalDecodeRuntime,
@@ -20804,6 +21098,22 @@ pub extern fn termite_metal_decode_runtime_sample_from_resident_logits(
     final_logit_softcap: f32,
     output_token_id: [*c]u32,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_encode_sample_from_resident_logits(
+    runtime: ?*RawMetalDecodeRuntime,
+    out_dim: usize,
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    min_p: f32,
+    repetition_penalty: f32,
+    frequency_penalty: f32,
+    presence_penalty: f32,
+    penalty_token_ids: ?*const u32,
+    penalty_counts: ?*const u32,
+    penalty_count: usize,
+    seed: u32,
+    final_logit_softcap: f32,
+) c_int;
 pub extern fn termite_metal_decode_runtime_sample_from_logits_device(
     runtime: ?*RawMetalDecodeRuntime,
     logits_handle: ?*anyopaque,
@@ -20820,6 +21130,17 @@ pub extern fn termite_metal_decode_runtime_sample_from_logits_device(
     penalty_counts: ?*const u32,
     penalty_count: usize,
     seed: u32,
+    output_token_id: [*c]u32,
+) c_int;
+pub extern fn termite_metal_decode_runtime_test_sample_from_logits_device_softcap(
+    runtime: ?*RawMetalDecodeRuntime,
+    logits_handle: ?*anyopaque,
+    logits_offset: usize,
+    out_dim: usize,
+    temperature: f32,
+    top_p: f32,
+    seed: u32,
+    final_logit_softcap: f32,
     output_token_id: [*c]u32,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_apply_activation(
@@ -23796,16 +24117,35 @@ fn chooseFullLogitLmHeadLinearSlot(
     return exact_slot orelse main_slot;
 }
 
-fn residentLmHeadLogitsAreCheckpointExact(exact_slot: ?usize) bool {
-    return exact_slot == null;
+fn residentLmHeadMainSlotSupportsLogits(
+    self: anytype,
+    main_slot: usize,
+    in_dim: usize,
+    out_dim: usize,
+) bool {
+    if (main_slot >= decoder_runtime_linear_slot_capacity) return false;
+    if (!self.raw_linear_slots_prepared[main_slot]) return false;
+    if (self.raw_linear_slot_kinds[main_slot] != .quantized) return false;
+    if (self.raw_linear_slot_in_dims[main_slot] != in_dim or
+        self.raw_linear_slot_out_dims[main_slot] != out_dim) return false;
+    const quant_kind = ensureQuantizedRuntimeLinearSlotPrepared(self, main_slot, in_dim, out_dim);
+    return metalQuantFormatForKind(quant_kind) != .unsupported;
+}
+
+fn residentLmHeadLogitsAreCheckpointExact(
+    exact_slot: ?usize,
+    main_slot_supports_logits: bool,
+) bool {
+    return exact_slot == null and main_slot_supports_logits;
 }
 
 test "LM-head full-logit and resident-sampling policy is fail closed" {
     try std.testing.expectEqual(@as(usize, 17), chooseFullLogitLmHeadLinearSlot(17, null, false));
     try std.testing.expectEqual(@as(usize, 19), chooseFullLogitLmHeadLinearSlot(17, 19, false));
     try std.testing.expectEqual(@as(usize, 17), chooseFullLogitLmHeadLinearSlot(17, 19, true));
-    try std.testing.expect(residentLmHeadLogitsAreCheckpointExact(null));
-    try std.testing.expect(!residentLmHeadLogitsAreCheckpointExact(19));
+    try std.testing.expect(residentLmHeadLogitsAreCheckpointExact(null, true));
+    try std.testing.expect(!residentLmHeadLogitsAreCheckpointExact(null, false));
+    try std.testing.expect(!residentLmHeadLogitsAreCheckpointExact(19, true));
 }
 
 fn setRuntimeQuantPrepareMode(self: anytype, slot: usize, mode: RawQuantizedRuntimeLinearStorageMode) void {
@@ -43319,6 +43659,300 @@ test "metal native top-p samplers can select the nucleus crossing token" {
         ));
         try std.testing.expectEqual(@as(u32, 1), sampled_token);
     }
+}
+
+test "metal native full-vocabulary nucleus retains cutoff ties beyond 256" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+
+    // Every token has the cutoff probability. Exact nucleus semantics retain
+    // the crossing token and every tie, including ids beyond the old 256 cap.
+    const out_dim: usize = 513;
+    // Lazy nucleus PSOs must not be created after a frame is armed. Idle
+    // preflight creates them once; the ready path remains valid while active.
+    try beginFrame(runtime);
+    try std.testing.expect(termite_metal_decode_runtime_prepare_nucleus_sampling(runtime) != 0);
+    try cancelFrame(runtime);
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_nucleus_sampling(runtime));
+    try beginFrame(runtime);
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_nucleus_sampling(runtime));
+    try cancelFrame(runtime);
+    try std.testing.expect(decoderRuntimeReserveSampleTailScratch(&provider, out_dim, 0));
+    try beginFrame(runtime);
+    errdefer cancelFrame(runtime) catch {};
+    try std.testing.expect(decoderRuntimeReserveSampleTailScratch(&provider, out_dim, 0));
+    try std.testing.expect(!decoderRuntimeReserveSampleTailScratch(&provider, out_dim + 1024, 0));
+    try cancelFrame(runtime);
+    const logits = try std.testing.allocator.alloc(f32, out_dim);
+    defer std.testing.allocator.free(logits);
+    @memset(logits, 0.0);
+    var logits_tensor = try testDeviceTensorFromSlice(runtime, logits, &[_]i32{ 1, @intCast(out_dim) });
+    defer logits_tensor.deinit();
+
+    const nucleus_calls_before = termite_metal_decode_runtime_full_vocab_nucleus_sample_calls(runtime);
+    for ([_]f32{ 0.01, 0.8 }) |temperature| {
+        for ([_]f32{ 0.95, 0.99999994 }) |top_p| {
+            var saw_high_id = false;
+            // The device sampler hashes `token_id ^ seed`. Consecutive seeds
+            // only permute the low token IDs for this equal-logit fixture, so
+            // stride across 257-wide ID pages to exercise the full vocabulary.
+            for (0..32) |draw_index| {
+                const seed: u32 = @intCast(draw_index * 257);
+                var sampled_token: u32 = std.math.maxInt(u32);
+                try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_sample_from_logits_device(
+                    runtime,
+                    logits_tensor.deviceHandle(),
+                    logits_tensor.deviceByteOffset(),
+                    out_dim,
+                    temperature,
+                    0,
+                    top_p,
+                    0.0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    null,
+                    null,
+                    0,
+                    seed,
+                    &sampled_token,
+                ));
+                try std.testing.expect(sampled_token < out_dim);
+                saw_high_id = saw_high_id or sampled_token > 256;
+            }
+            try std.testing.expect(saw_high_id);
+        }
+    }
+    try std.testing.expectEqual(
+        nucleus_calls_before + 128,
+        termite_metal_decode_runtime_full_vocab_nucleus_sample_calls(runtime),
+    );
+
+    @memset(logits, std.math.nan(f32));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_buffer_upload(
+        runtime,
+        logits_tensor.deviceHandle(),
+        logits_tensor.deviceByteOffset(),
+        @ptrCast(logits.ptr),
+        logits.len * @sizeOf(f32),
+    ));
+    var invalid_token: u32 = 0;
+    try std.testing.expectEqual(@as(c_int, -21), termite_metal_decode_runtime_sample_from_logits_device(
+        runtime,
+        logits_tensor.deviceHandle(),
+        logits_tensor.deviceByteOffset(),
+        out_dim,
+        0.8,
+        0,
+        0.95,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        null,
+        null,
+        0,
+        1,
+        &invalid_token,
+    ));
+}
+
+test "metal native full-vocabulary nucleus matches nonuniform softcap oracle" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+
+    const out_dim: usize = 513;
+    const temperature: f32 = 0.8;
+    const top_p: f32 = 0.8;
+    const softcap: f32 = 3.0;
+    const draw_count: usize = 1024;
+    const logits = try std.testing.allocator.alloc(f32, out_dim);
+    defer std.testing.allocator.free(logits);
+    @memset(logits, -100.0);
+    logits[3] = 8.0;
+    logits[300] = 4.0;
+    logits[400] = 2.0;
+    logits[401] = 1.0;
+
+    const WeightedToken = struct { id: usize, weight: f32 };
+    const weighted = try std.testing.allocator.alloc(WeightedToken, out_dim);
+    defer std.testing.allocator.free(weighted);
+    var max_scaled = -std.math.inf(f32);
+    for (logits) |raw| max_scaled = @max(max_scaled, (softcap * std.math.tanh(raw / softcap)) / temperature);
+    var total: f32 = 0;
+    for (logits, 0..) |raw, id| {
+        const adjusted = softcap * std.math.tanh(raw / softcap);
+        const weight = @exp(adjusted / temperature - max_scaled);
+        weighted[id] = .{ .id = id, .weight = weight };
+        total += weight;
+    }
+    std.mem.sort(WeightedToken, weighted, {}, struct {
+        fn lessThan(_: void, lhs: WeightedToken, rhs: WeightedToken) bool {
+            if (lhs.weight == rhs.weight) return lhs.id < rhs.id;
+            return lhs.weight > rhs.weight;
+        }
+    }.lessThan);
+    var retained_mass: f32 = 0;
+    var cutoff_id: usize = 0;
+    for (weighted) |entry| {
+        retained_mass += entry.weight;
+        cutoff_id = entry.id;
+        if (retained_mass >= top_p * total) break;
+    }
+    try std.testing.expectEqual(@as(usize, 400), cutoff_id);
+
+    var logits_tensor = try testDeviceTensorFromSlice(runtime, logits, &[_]i32{ 1, @intCast(out_dim) });
+    defer logits_tensor.deinit();
+    const retained_ids = [_]usize{ 3, 300, 400 };
+    var counts = [_]usize{0} ** retained_ids.len;
+    const calls_before = termite_metal_decode_runtime_full_vocab_nucleus_sample_calls(runtime);
+    for (0..draw_count) |seed| {
+        var token: u32 = std.math.maxInt(u32);
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_test_sample_from_logits_device_softcap(
+            runtime,
+            logits_tensor.deviceHandle(),
+            logits_tensor.deviceByteOffset(),
+            out_dim,
+            temperature,
+            top_p,
+            @intCast(seed),
+            softcap,
+            &token,
+        ));
+        const id: usize = @intCast(token);
+        const retained_index: usize = if (id == 3) 0 else if (id == 300) 1 else if (id == 400) 2 else return error.UnexpectedSampleOutsideNucleus;
+        counts[retained_index] += 1;
+    }
+    try std.testing.expect(counts[1] > 0 and counts[2] > 0);
+    try std.testing.expectEqual(calls_before + draw_count, termite_metal_decode_runtime_full_vocab_nucleus_sample_calls(runtime));
+
+    var expected_mass: f32 = 0;
+    for (retained_ids) |id| for (weighted) |entry| {
+        if (entry.id == id) {
+            expected_mass += entry.weight;
+            break;
+        }
+    };
+    for (retained_ids, 0..) |id, index| {
+        var weight: f32 = 0;
+        for (weighted) |entry| {
+            if (entry.id == id) {
+                weight = entry.weight;
+                break;
+            }
+        }
+        const expected: isize = @intFromFloat(@round(@as(f32, @floatFromInt(draw_count)) * weight / expected_mass));
+        const observed: isize = @intCast(counts[index]);
+        try std.testing.expect(@abs(observed - expected) <= 80);
+    }
+}
+
+test "metal native monotonic softcap max matches rollback across edge logits and full vocabulary" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const disable_env = "TERMITE_METAL_DISABLE_NUCLEUS_MONOTONIC_MAX";
+    const original = if (std.c.getenv(disable_env)) |value|
+        try std.testing.allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
+    defer {
+        if (original) |value| {
+            _ = setenv(disable_env, value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = unsetenv(disable_env);
+        }
+    }
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+
+    const Compare = struct {
+        fn run(
+            raw_runtime: *RawMetalDecodeRuntime,
+            label: []const u8,
+            logits: []const f32,
+            seeds: []const u32,
+            expected_rc: c_int,
+        ) !void {
+            const env_name = "TERMITE_METAL_DISABLE_NUCLEUS_MONOTONIC_MAX";
+            var tensor = try testDeviceTensorFromSlice(raw_runtime, logits, &[_]i32{ 1, @intCast(logits.len) });
+            defer tensor.deinit();
+            for (seeds) |seed| {
+                try std.testing.expectEqual(@as(c_int, 0), unsetenv(env_name));
+                var optimized_token: u32 = std.math.maxInt(u32);
+                const optimized_rc = termite_metal_decode_runtime_test_sample_from_logits_device_softcap(
+                    raw_runtime,
+                    tensor.deviceHandle(),
+                    tensor.deviceByteOffset(),
+                    logits.len,
+                    0.8,
+                    0.95,
+                    seed,
+                    30.0,
+                    &optimized_token,
+                );
+
+                try std.testing.expectEqual(@as(c_int, 0), setenv(env_name, "1", 1));
+                var rollback_token: u32 = std.math.maxInt(u32);
+                const rollback_rc = termite_metal_decode_runtime_test_sample_from_logits_device_softcap(
+                    raw_runtime,
+                    tensor.deviceHandle(),
+                    tensor.deviceByteOffset(),
+                    logits.len,
+                    0.8,
+                    0.95,
+                    seed,
+                    30.0,
+                    &rollback_token,
+                );
+                if (optimized_rc != expected_rc or rollback_rc != optimized_rc or
+                    (optimized_rc == 0 and optimized_token != rollback_token))
+                {
+                    std.debug.print(
+                        "monotonic-max-parity: fixture={s} seed={d} optimized_rc={d} rollback_rc={d} optimized_token={d} rollback_token={d}\n",
+                        .{ label, seed, optimized_rc, rollback_rc, optimized_token, rollback_token },
+                    );
+                }
+                try std.testing.expectEqual(expected_rc, optimized_rc);
+                try std.testing.expectEqual(optimized_rc, rollback_rc);
+                if (optimized_rc == 0) try std.testing.expectEqual(optimized_token, rollback_token);
+            }
+        }
+    };
+
+    const seeds = [_]u32{ 0, 1, 256, 0xdeadbeef };
+    const finite = [_]f32{ -40.0, -7.5, -0.0, 0.0, 1.25, 12.0, 29.0, 41.0 };
+    try Compare.run(runtime, "finite", &finite, &seeds, 0);
+    const infinities = [_]f32{ -std.math.inf(f32), -100.0, 0.0, 100.0, std.math.inf(f32) };
+    try Compare.run(runtime, "infinities", &infinities, &seeds, 0);
+    const saturation = [_]f32{ -1000.0, -30.000002, -30.0, -29.999998, 0.0, 29.999998, 30.0, 30.000002, 1000.0 };
+    try Compare.run(runtime, "saturation", &saturation, &seeds, 0);
+    const all_nan = [_]f32{ std.math.nan(f32), std.math.nan(f32), std.math.nan(f32) };
+    try Compare.run(runtime, "all-nan", &all_nan, &seeds, -21);
+
+    const full_vocab_size: usize = 262144;
+    const full_vocab = try std.testing.allocator.alloc(f32, full_vocab_size);
+    defer std.testing.allocator.free(full_vocab);
+    @memset(full_vocab, -12.0);
+    full_vocab[3] = 29.999998;
+    full_vocab[65537] = 30.0;
+    full_vocab[131071] = 30.000002;
+    full_vocab[262143] = 120.0;
+    try Compare.run(runtime, "full-vocab", full_vocab, &[_]u32{ 0, 257 }, 0);
 }
 
 test "metal native sampling preserves penalty histories larger than setBytes" {
