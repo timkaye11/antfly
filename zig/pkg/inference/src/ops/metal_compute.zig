@@ -20733,6 +20733,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const attention_input_size = request.num_heads * request.head_dim;
         const block_scope = self.beginActivePlannedComputeScopeIfPossible(.layer, .layer);
         defer self.endActivePlannedComputeScope(block_scope);
+        var attention_region = if (request.attention.mode == .dense_causal)
+            metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .attention)
+        else
+            metal_runtime.ComputeRegionScope{ .runtime = null, .previous = 0, .active = false };
+        defer attention_region.deinit();
+        var ffn_region = metal_runtime.ComputeRegionScope{ .runtime = null, .previous = 0, .active = false };
+        defer ffn_region.deinit();
         var attention_linear_input = attn_out;
         var attention_linear_input_owned: ?MetalTensor = null;
         defer if (attention_linear_input_owned) |*tensor| tensor.deinit();
@@ -20810,6 +20817,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             errdefer attn_res.deinit();
             try self.maybeDumpDecodeStageTensor("attn-residual", attention_layer_index, attn_res, request.hidden_size);
             self.activePlannedComputeBarrier(residual_scope or block_scope);
+            if (request.attention.mode == .dense_causal)
+                ffn_region = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .ffn);
             ffn_normed = (try metal_runtime.decoderRuntimeApplyFfnNormInternal(
                 self.provider_impl,
                 attn_res,
@@ -21973,6 +21982,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     ) anyerror!?CT {
         const trace = metalPrefillTraceRequested();
         const shape = self.denseCausalBatchShape(request) orelse return null;
+        var attention_region = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .attention);
+        defer attention_region.deinit();
         if (request.ple != null) {
             if (trace) std.debug.print("prefill-trace: dense-qwen3-block-null layer={d} reason=ple\n", .{request.attention.layer_index});
             return null;
@@ -28243,6 +28254,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (request.output_hidden.* != null) return self.declinePrefillFrameExecute(.output_hidden_set);
         const frame_plan = &(self.active_prefill_frame_plan orelse return self.declinePrefillFrameExecute(.missing_plan));
 
+        // Short rows are dominated by command/encoder overhead. Use the
+        // existing serial planned scope through attention and FFN, retaining
+        // the established barriers when concurrent dispatch is requested.
+        const short_scope = request.rows >= 9 and request.rows <= 64 and
+            getenvBool("TERMITE_METAL_ENABLE_Q8_0_SMALL_ROWS") and
+            !getenvBool("TERMITE_METAL_DISABLE_QWEN3_SMALL_ENCODER");
+        const owns_short_scope = if (short_scope) try decoderRuntimeBeginPlannedComputeScopeOp(ctx) else false;
+        defer if (owns_short_scope) decoderRuntimeEndPlannedComputeScopeOp(ctx);
+
         var hidden = request.hidden;
         var owns_hidden = false;
         defer if (owns_hidden) freeOp(ctx, hidden);
@@ -28253,6 +28273,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
         var frame_cursor = metal_command_planner.GatedFramePlanCursor.init(frame_plan.view());
         for (request.layers, 0..) |layer, layer_index| {
+            var attention_region = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .attention);
+            defer attention_region.deinit();
             if (request.execution_control) |control| try control.check();
             if (layer.shares_kv or layer.sliding_window != 0) return self.declinePrefillFrameExecute(.invalid_shape);
             const head_dim = layer.head_dim;
@@ -28351,6 +28373,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (metalPrefillTraceRequested()) std.debug.print("prefill-trace: qwen3-prefill-frame decline=incomplete next={d} ops={d}\n", .{ frame_cursor.next_index, frame_plan.view().ops.len });
             return self.declinePrefillFrameExecute(.plan_mismatch);
         }
+        var tail_region = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .tail);
+        defer tail_region.deinit();
         const final_hidden = (try decoderRuntimeApplyRmsNormOp(ctx, &.{
             .slot = request.final_norm_slot,
             .input = hidden,
@@ -34937,6 +34961,54 @@ test "metal_compute: non-last-axis reduce sum and mean stay resident" {
         5,  6,  7,  8,
         17, 18, 19, 20,
     }, mean_data);
+}
+
+test "metal_compute: short Qwen RMS rows match host across SIMD boundaries" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var store = testMetalWeightStoreInit(allocator);
+    defer {
+        deinitSharedNativeProvider(&store);
+        store.lazy_weights.deinit(allocator);
+    }
+    var compute = try MetalCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    const hidden: usize = 1024;
+    const eps: f32 = 1e-6;
+    var weights: [hidden]f32 = undefined;
+    for (&weights, 0..) |*value, i| value.* = 0.8 + @as(f32, @floatFromInt(i % 17)) * 0.025;
+    const weight = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&weights, &.{hidden}));
+    defer cb.free(weight);
+    for ([_]usize{ 1, 8, 9, 16, 20, 31, 32, 33, 64, 65 }) |rows| {
+        const data = try allocator.alloc(f32, rows * hidden);
+        defer allocator.free(data);
+        for (data, 0..) |*value, i| {
+            const row = i / hidden;
+            // Include zero rows and low-amplitude rows where epsilon matters.
+            const scale: f32 = if (row % 7 == 0) 0 else if (row % 7 == 1) 0.0001 else 0.015;
+            value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 127)) - 63)) * scale;
+        }
+        const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(data, &.{ @intCast(rows), hidden }));
+        defer cb.free(input);
+        var output: ?CT = null;
+        defer if (output) |value| cb.free(value);
+        try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        var active = true;
+        defer if (active) cb.decoderRuntimeCancelFrame() catch {};
+        output = try cb.rmsNorm(input, weight, hidden, eps);
+        try std.testing.expect(MetalCompute.debugHasDeviceTensor(&cb, output.?));
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        active = false;
+        const actual = try cb.toFloat32(output.?, allocator);
+        defer allocator.free(actual);
+        const expected = try allocator.dupe(f32, data);
+        defer allocator.free(expected);
+        activations_mod.rmsNorm(expected, &weights, hidden, eps);
+        try std.testing.expectEqual(expected.len, actual.len);
+        for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 3e-5);
+    }
 }
 
 test "metal_compute: lazy multiply reduce last dim stays resident" {

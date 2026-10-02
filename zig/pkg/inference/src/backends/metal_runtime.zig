@@ -18472,6 +18472,10 @@ pub extern fn termite_metal_decode_runtime_memory_snapshot(
     runtime: ?*RawMetalDecodeRuntime,
     snapshot: *RawRuntimeMemoryStats,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_begin_embedding_workspace(runtime: ?*RawMetalDecodeRuntime, bytes: usize) c_int;
+pub extern fn termite_metal_decode_runtime_end_embedding_workspace(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_trim_embedding_workspace(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_embedding_workspace_bytes(runtime: ?*RawMetalDecodeRuntime) usize;
 pub extern fn termite_metal_decode_runtime_expert_subbuffer_cache_snapshot(
     runtime: ?*const RawMetalDecodeRuntime,
     hits: *u64,
@@ -35318,11 +35322,51 @@ test "metal native decoderRuntimeApplyLinear q8_0 device rows match reference" {
     }
 }
 
-test "metal native q8_0 SG-v2 and M64 high-row routes match host reference" {
+test "metal native qwen embedding workspace quota and frame retirement" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_begin_embedding_workspace(runtime, 32 * 1024));
+    try beginFrame(runtime);
+    var tensor = try MetalTensor.deviceAllocate(runtime, 8192, .private, &.{2048});
+    var tensor_live = true;
+    defer if (tensor_live) tensor.deinit();
+    try std.testing.expectError(error.MetalBufferAllocFailed, MetalTensor.deviceAllocate(runtime, 24 * 1024, .private, &.{6144}));
+    // Neither the guard nor reclamation may cross an active GPU frame.
+    try std.testing.expectEqual(@as(c_int, -1), termite_metal_decode_runtime_end_embedding_workspace(runtime));
+    try std.testing.expectEqual(@as(c_int, -1), termite_metal_decode_runtime_trim_embedding_workspace(runtime));
+    tensor.deinit();
+    tensor_live = false;
+    try cancelFrame(runtime);
+    try std.testing.expectEqual(@as(c_int, 1), termite_metal_decode_runtime_end_embedding_workspace(runtime));
+    try provider.trimEmbeddingWorkspace();
+    try std.testing.expectEqual(@as(usize, 0), termite_metal_decode_runtime_embedding_workspace_bytes(runtime));
+}
+
+test "metal native q8_0 SG-v2 and M64 short tails and high rows match host reference" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
 
     const m64_disable_env = "TERMITE_METAL_DISABLE_Q8_0_SG_M64";
+    const small_m64_env = "TERMITE_METAL_ENABLE_Q8_0_SMALL_ROWS_M64";
+    const original_small_m64 = if (std.c.getenv(small_m64_env)) |value| try std.testing.allocator.dupeZ(u8, std.mem.span(value)) else null;
+    defer {
+        if (original_small_m64) |value| {
+            _ = setenv(small_m64_env, value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else _ = unsetenv(small_m64_env);
+    }
+    try std.testing.expectEqual(@as(c_int, 0), setenv(small_m64_env, "1", 1));
+    const small_env = "TERMITE_METAL_ENABLE_Q8_0_SMALL_ROWS";
+    const original_small = if (std.c.getenv(small_env)) |value| try std.testing.allocator.dupeZ(u8, std.mem.span(value)) else null;
+    defer {
+        if (original_small) |value| {
+            _ = setenv(small_env, value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else _ = unsetenv(small_env);
+    }
+    try std.testing.expectEqual(@as(c_int, 0), setenv(small_env, "1", 1));
     const original_m64_disable = if (std.c.getenv(m64_disable_env)) |value|
         try std.testing.allocator.dupeZ(u8, std.mem.span(value))
     else
@@ -35387,7 +35431,7 @@ test "metal native q8_0 SG-v2 and M64 high-row routes match host reference" {
 
     var weight_host: [out_dim * in_dim]f32 = undefined;
     try quant_codec.dequantizeToFloat32(.{ .known = .Q8_0 }, &weight_raw, &weight_host);
-    for ([_]usize{ 65, 96, 128 }) |rows| {
+    for ([_]usize{ 9, 16, 20, 31, 32, 33, 64, 65, 96, 128 }) |rows| {
         const input_data = try std.testing.allocator.alloc(f32, rows * in_dim);
         defer std.testing.allocator.free(input_data);
         for (input_data, 0..) |*value, i| {
@@ -35414,7 +35458,7 @@ test "metal native q8_0 SG-v2 and M64 high-row routes match host reference" {
         defer m64_output.deinit();
         const m64_after = runtimeMemorySnapshot(runtime);
         try std.testing.expect(m64_after.q8_0_linear_dispatch_mm > m64_before.q8_0_linear_dispatch_mm);
-        try std.testing.expect(m64_after.q8_0_linear_rows_65_plus > m64_before.q8_0_linear_rows_65_plus);
+        if (rows >= 65) try std.testing.expect(m64_after.q8_0_linear_rows_65_plus > m64_before.q8_0_linear_rows_65_plus);
 
         try std.testing.expectEqual(@as(c_int, 0), setenv(m64_disable_env, "1", 1));
         const sg_v2_before = runtimeMemorySnapshot(runtime);
@@ -35427,7 +35471,7 @@ test "metal native q8_0 SG-v2 and M64 high-row routes match host reference" {
         defer sg_v2_output.deinit();
         const sg_v2_after = runtimeMemorySnapshot(runtime);
         try std.testing.expect(sg_v2_after.q8_0_linear_dispatch_mm > sg_v2_before.q8_0_linear_dispatch_mm);
-        try std.testing.expect(sg_v2_after.q8_0_linear_rows_65_plus > sg_v2_before.q8_0_linear_rows_65_plus);
+        if (rows >= 65) try std.testing.expect(sg_v2_after.q8_0_linear_rows_65_plus > sg_v2_before.q8_0_linear_rows_65_plus);
 
         var m64_output_mut = m64_output;
         var sg_v2_output_mut = sg_v2_output;
@@ -35469,19 +35513,20 @@ fn expectHighRowTransformerLinear(comptime format: anytype, rows: usize, in_dim:
     var provider = try metal_native_provider.MetalNativeProvider.create();
     defer provider.deinitOwned();
     const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
-    const block_bytes: usize = if (format == .Q4_K) 144 else 210;
-    const row_bytes = in_dim / 256 * block_bytes;
+    const block_size: usize = if (format == .Q8_0) 32 else 256;
+    const block_bytes: usize = if (format == .Q8_0) 34 else if (format == .Q4_K) 144 else 210;
+    const row_bytes = in_dim / block_size * block_bytes;
     const raw = try allocator.alloc(u8, out_dim * row_bytes);
     defer allocator.free(raw);
     var seed: [256]f32 = undefined;
     for (0..out_dim) |row| {
-        for (0..in_dim / 256) |block| {
-            for (&seed, 0..) |*value, i| {
-                const signed = @as(i32, @intCast((row * 31 + (block * 256 + i) * 19) % 109)) - 54;
+        for (0..in_dim / block_size) |block| {
+            for (seed[0..block_size], 0..) |*value, i| {
+                const signed = @as(i32, @intCast((row * 31 + (block * block_size + i) * 19) % 109)) - 54;
                 value.* = @as(f32, @floatFromInt(signed)) / 211.0;
             }
             const destination = raw[row * row_bytes + block * block_bytes ..][0..block_bytes];
-            if (format == .Q4_K) quant_codec.quantizeQ4_KBlock(&seed, destination) else quant_codec.quantizeQ6_KBlock(&seed, destination);
+            if (format == .Q8_0) quant_codec.quantizeQ8_0Block(seed[0..32], destination) else if (format == .Q4_K) quant_codec.quantizeQ4_KBlock(&seed, destination) else quant_codec.quantizeQ6_KBlock(&seed, destination);
         }
     }
     const shape = [_]i64{ @intCast(out_dim), @intCast(in_dim) };
@@ -35527,7 +35572,9 @@ fn expectHighRowTransformerLinear(comptime format: anytype, rows: usize, in_dim:
     defer output.deinit();
     const after = runtimeMemorySnapshot(runtime);
     const expected_dispatches: u64 = if (rows > 64 and out_dim != 23) 1 else 0;
-    if (format == .Q4_K) {
+    if (format == .Q8_0) {
+        if (rows >= 9) try std.testing.expect(after.q8_0_linear_dispatch_mm > before.q8_0_linear_dispatch_mm);
+    } else if (format == .Q4_K) {
         try std.testing.expectEqual(before.florence_q4_k_mm_matrix_dispatches + expected_dispatches, after.florence_q4_k_mm_matrix_dispatches);
     } else {
         try std.testing.expectEqual(before.q6_k_high_row_mm_matrix_dispatches + expected_dispatches, after.q6_k_high_row_mm_matrix_dispatches);
@@ -35544,6 +35591,24 @@ fn expectHighRowTransformerLinear(comptime format: anytype, rows: usize, in_dim:
         if (!std.math.approxEqAbs(f32, wanted, got, 5e-3)) {
             std.debug.print("high-row {s} M={d} K={d} N={d} idx={d} expected={d} got={d}\n", .{ @tagName(format), rows, in_dim, out_dim, i, wanted, got });
             return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "metal native q8_0 short rows cover real Qwen projections and fallback tails" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    const name = "TERMITE_METAL_ENABLE_Q8_0_SMALL_ROWS";
+    const previous = if (std.c.getenv(name)) |value| try std.testing.allocator.dupeZ(u8, std.mem.span(value)) else null;
+    defer if (previous) |value| {
+        _ = setenv(name, value, 1);
+        std.testing.allocator.free(value);
+    } else {
+        _ = unsetenv(name);
+    };
+    try std.testing.expectEqual(@as(c_int, 0), setenv(name, "1", 1));
+    for ([_]usize{ 1, 8, 9, 16, 20, 31, 32, 33, 64, 65 }) |rows| {
+        for ([_][2]usize{ .{ 1024, 2048 }, .{ 1024, 1024 }, .{ 2048, 1024 }, .{ 1024, 3072 }, .{ 3072, 1024 }, .{ 64, 23 } }) |shape| {
+            try expectHighRowTransformerLinear(.Q8_0, rows, shape[0], shape[1]);
         }
     }
 }
@@ -41928,6 +41993,93 @@ test "metal native decoder runtime bf16 embedding lookup stages mmap rows" {
         9.0, 10.0, 11.0, 12.0,
         1.0, 2.0,  3.0,  4.0,
     }, out);
+}
+
+test "metal native short HD128 head norm rope matches host across row boundaries" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const hd: usize = 128;
+    var weights: [hd]f32 = undefined;
+    for (&weights, 0..) |*value, i| value.* = 0.8 + @as(f32, @floatFromInt(i % 13)) * 0.02;
+    var weight = try MetalTensor.ownedCloneFrom(&weights, &.{hd});
+    defer weight.deinit();
+    try std.testing.expect(try decoderRuntimePrepareRmsNorm(&provider, .{ .weight = weight, .slot = 0, .hidden_size = hd }));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_begin_embedding_workspace(runtime, 64 * 1024 * 1024));
+    defer _ = termite_metal_decode_runtime_end_embedding_workspace(runtime);
+    for ([_]usize{ 1, 8, 9, 16, 20, 31, 32, 33, 64, 65 }) |rows| {
+        for ([_]usize{ 8, 16 }) |heads| {
+            const data = try allocator.alloc(f32, rows * heads * hd);
+            defer allocator.free(data);
+            for (data, 0..) |*value, i| {
+                const head = i / hd;
+                const amplitude: f32 = if (head % 7 == 0) 0 else if (head % 7 == 1) 0.0001 else 0.015;
+                value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 127)) - 63)) * amplitude;
+            }
+            var input = try testDeviceTensorFromSlice(runtime, data, &.{ @intCast(rows * heads), hd });
+            defer input.deinit();
+            // Include the periodic batched route and the period-zero scratch
+            // route used by Qwen embeddings. Partial and consecutive RoPE
+            // exercise the established fallback for the same HD128 inputs.
+            for (0..4) |mode| {
+                const consecutive = mode == 3;
+                const rope_dim: usize = if (mode == 2) 64 else hd;
+                const period: usize = if (mode == 0) 3 else 0;
+                const scale: f32 = if (heads == 16) @sqrt(@as(f32, hd)) else 1;
+                const request = .{
+                    .input = input,
+                    .slot = @as(usize, 0),
+                    .total_heads = rows * heads,
+                    .head_dim = hd,
+                    .rope_dim = rope_dim,
+                    .position = @as(usize, 7),
+                    .theta = @as(f32, 1_000_000),
+                    .freq_scale = @as(f32, 0.75),
+                    .eps = @as(f32, 1e-6),
+                    .value_scale = scale,
+                    .consecutive_pairs = consecutive,
+                };
+                var output = (if (period != 0)
+                    try decoderRuntimeApplyHeadRmsNormRopeBatched(&provider, request, heads, period)
+                else
+                    try decoderRuntimeApplyHeadRmsNormRopeRowsScratch(&provider, request, 5, heads)) orelse return error.UnexpectedNull;
+                defer output.deinit();
+                const actual = try tensorHostSlice(&output);
+                try std.testing.expectEqual(data.len, actual.len);
+                for (0..rows * heads) |head| {
+                    const base = head * hd;
+                    var sum: f32 = 0;
+                    for (data[base..][0..hd]) |value| sum += value * value;
+                    const inv: f32 = 1 / @sqrt(sum / @as(f32, hd) + 1e-6);
+                    var expected: [hd]f32 = undefined;
+                    for (&expected, 0..) |*value, d| value.* = data[base + d] * inv * weights[d] * scale;
+                    const row = if (period != 0) (head / heads) % period else head / heads;
+                    for (0..rope_dim / 2) |j| {
+                        const d0 = if (consecutive) 2 * j else j;
+                        const d1 = if (consecutive) d0 + 1 else hd / 2 + j;
+                        // Compute the power accurately, then round to f32.
+                        // The f32 CPU approximation accumulates phase error
+                        // even against the established consecutive fallback.
+                        const powered: f32 = @floatCast(std.math.pow(f64, 1_000_000, @as(f64, @floatFromInt(2 * j)) / @as(f64, @floatFromInt(rope_dim))));
+                        const freq: f32 = 1 / powered;
+                        const angle: f32 = @as(f32, @floatFromInt(7 + row)) * 0.75 * freq;
+                        const x0 = expected[d0];
+                        const x1 = expected[d1];
+                        expected[d0] = x0 * @cos(angle) - x1 * @sin(angle);
+                        expected[d1] = x0 * @sin(angle) + x1 * @cos(angle);
+                    }
+                    for (expected, actual[base..][0..hd], 0..) |want, got, d| {
+                        if (@abs(want - got) > 6e-5) std.debug.print("head norm rope mismatch rows={d} heads={d} mode={d} head={d} d={d} delta={d}\n", .{ rows, heads, mode, head, d, @abs(want - got) });
+                        try std.testing.expectApproxEqAbs(want, got, 6e-5);
+                    }
+                }
+            }
+        }
+    }
 }
 
 test "metal native decoder runtime rope matches reference" {
