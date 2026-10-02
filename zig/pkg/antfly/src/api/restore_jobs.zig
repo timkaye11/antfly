@@ -7,7 +7,7 @@ const backend_erased = @import("../storage/backend_erased.zig");
 const mem_backend = @import("../storage/mem_backend.zig");
 const platform_sync = @import("antfly_platform").sync;
 const platform_time = @import("antfly_platform").time;
-const runtime_error_abi = @import("../runtime_error_abi.zig");
+const runtime_error_abi = @import("antfly_runtime_abi").error_abi;
 const runtime_memory_abi = @import("runtime_memory_abi");
 
 const key_prefix = "\x00\x00__api_restore_jobs__:";
@@ -1688,6 +1688,24 @@ pub const Store = struct {
             return pending.not_before_ms -| now_ms;
         }
         return null;
+    }
+
+    /// Owner/topology progress releases cooperative waits only. Durable failure
+    /// backoff and retained history are untouched; this is a queue operation,
+    /// not a new scheduling state or a persistence write.
+    pub fn wakeCooperativeContinuations(self: *Store) void {
+        self.lock();
+        defer self.mutex.unlock();
+        var changed = false;
+        for (self.pending.items[self.pending_head..]) |*pending| {
+            const continuation = self.continuations.getPtr(pending.job_id) orelse continue;
+            if (pending.dispatch_sequence != continuation.pending.dispatch_sequence) continue;
+            if (pending.not_before_ms == 0) continue;
+            pending.not_before_ms = 0;
+            continuation.pending.not_before_ms = 0;
+            changed = true;
+        }
+        if (changed) std.mem.sort(PendingJob, self.pending.items[self.pending_head..], {}, pendingJobLessThan);
     }
 
     pub fn requeuePending(self: *Store, job_id: u64) !void {
@@ -3899,6 +3917,15 @@ test "restore cooperative continuations preserve checkpoints without replicated 
     const pending = try store.takePendingIds(alloc, 1);
     defer alloc.free(pending);
     try std.testing.expectEqual(@as(usize, 0), pending.len);
+
+    const progress_writes = persistence.put_calls;
+    store.wakeCooperativeContinuations();
+    try std.testing.expectEqual(@as(?u64, 0), store.nextPendingDelayMs());
+    const notified = try store.takePendingIds(alloc, 1);
+    defer alloc.free(notified);
+    try std.testing.expectEqualSlices(u64, &.{job_id}, notified);
+    try std.testing.expectEqual(progress_writes, persistence.put_calls);
+    try store.requeuePending(job_id);
 
     // A lost process drops only the volatile timer. Leadership reconstruction
     // requeues the durable running job, retaining progress and fencing its token.

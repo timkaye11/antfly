@@ -1,5 +1,221 @@
 # Zig runtime flakes
 
+## 2026-10-01: full CI discovery drift and virtual HTTP teardown
+
+[Run 36903575966](https://github.com/antflydb/antfly/actions/runs/36903575966)
+failed physical storage compilation discovery after a fourth owner fixture was
+added. The bounded audit now names its three measured owner fixtures and four
+consumer fixtures explicitly. Missing and duplicate identities still fail;
+unrelated owner fixtures remain covered by their normal targets. Real build
+graph regressions prove that an unrelated, deliberately uncompilable owner
+fixture is excluded and that omitting either a required owner or consumer fails.
+The storage shard manifest also now imports `hot_standby/primary_effect.zig`
+and the Lite allocator/reclamation test sources added on main.
+
+The cancelled Zig job had already reported two deterministic API fixture
+failures. The authority fixture now exercises a partially configured dedicated
+authority, since absent dedicated fields intentionally inherit valid trusted
+principal credentials. The rewrite fixture supplies its mandatory generation
+handoff proof, including a nonzero owner retirement digest, while preserving
+the atomic admission, idempotency, and unchanged live-schema assertions.
+
+The same job timed out with a data-runtime test process still alive. Local
+Debug reproduction retained the active UNIQUE/FK three-owner history and a
+stack blocked in `Client.drainShutdown` during deferred `DataServer.deinit`.
+Admitted HTTP requests still needed virtual tasks to unwind, but teardown had
+stopped driving the scheduler. Composite shutdown now closes outbound read
+admission with the other owners. The history publishes every initialized
+node's stop, runs bounded scheduler cancellation/drain, checks that read-client
+leases are gone, and only then reclaims node state. This also runs on failure
+paths so a scenario failure can be reported instead of hidden by cleanup.
+
+Once teardown could report failures, local Debug execution also exposed a
+replicated merge stack overflow. A hardware watchpoint caught LSM open
+scratch writes overwriting a parked driver's context. The managed DB opener
+now selects `OpenOptions` before a single `DB.open`, instead of allocating a
+large DB-valued return slot for each policy branch. The original 8 MiB VOPR
+stack is retained, and the isolated merge regression passes.
+
+The embedded provisioned point-read path did not advertise authoritative
+read-index absence and still allowed a leader-loss stale fallback. The hosted
+UNIQUE/FK coordinator therefore exhausted placements on an uncertified 404
+following split cutover. Both physical and orchestration sources now expose
+the strict capability, admission preserves quorum failures, and direct
+`read_index` lookups cannot downgrade to stale. The history retains one physical
+ownership path and passes its merge/split/restart and constraint assertions.
+Apply-control shutdown also publishes its stop and wake separately from joining,
+so a borrowed scheduler can complete its uncancellable wait before reclamation.
+
+The store-report retry fixture now injects registration failures through the
+registration transport, rather than an unused snapshot-fetch seam. Its runner
+waits for the round's own completion and preserves unrelated runtime tasks
+between rounds. The focused retry regression passes.
+
+The full E2E binary build completed all 35 compilation steps at its 90-minute
+deadline and was cancelled before upload. Narrow ReleaseSafe CPU reservations
+now admit storage and inference concurrently under the existing 22 GiB budget,
+with margins above that run's rounded compiler MaxRSS. See
+[COMPILATION.md](COMPILATION.md#runtime-compilation-memory-reservations).
+These measurements identify admission serialization; they do not yet establish
+the fixed build's CI wall time.
+
+Validation: the full data-runtime target passed 53 implementation and 177
+consumer tests; the two reported API fixtures passed; all 461 hot-standby tests
+and the storage ownership audit passed; 19 build-discovery/shard tests and both
+memory-admission tests passed. The reproduced merge stack regression passed
+200/200 fresh-process repetitions using `scripts/ci/zig_vopr_soak.py`'s bounded
+process runner. The UNIQUE/FK merge/split/restart history also completed 200
+passing repetitions; one interrupted process-runner invocation was rerun before
+continuing the loop. Both soaks used the pre-merge revision; the full data-runtime
+target also passed after merging main. The mocked compilation rollover test now fixes its disk-free
+observation so a nearly full developer disk cannot alter its expected build
+sequence.
+
+## 2026-09-29: metadata WAL barriers and uncertain promotion outcomes (#919)
+
+[Issue #919](https://github.com/antflydb/antfly/issues/919) records an Autograph
+duplicate and two recovery failures in run 36609343247. Metadata logs include
+a 12,339 ms physical WAL commit for 41 encoded bytes. This is not evidence of
+a large batch or a second sync hidden inside that append. Local unchanged-main
+reproduction passed four invocations of each reported selector; it did not
+reproduce the CI disk latency.
+
+Metadata Ready persistence now owns a bounded immutable WAL record
+on an I/O worker. The Raft thread publishes its MemoryStorage delta and releases
+dependent messages only after the barrier completes. Same-term heartbeats may
+continue using the already durable term; votes, append acknowledgements and
+new-term messages remain fenced. Heartbeat extraction compacts its queue once
+in linear time, retaining skipped messages in order instead of repeatedly
+shifting the queue. Completion wakes the existing progress driver
+immediately. Failure is sticky, retirement joins the operation, and shutdown
+cannot checkpoint over an unreconciled durable tail. Incoming snapshots persist
+their payload before the WAL record on the same worker. Idle maintenance
+serializes checkpoints, log truncation, applied watermarks and superseded
+payload cleanup with Ready persistence. Local snapshot compaction retains its
+immutable builder payload until asynchronous publication completes; only then
+do storage and Raft expose the new compaction boundary. Application progress
+that advances during a checkpoint is retained in memory and carried by later
+maintenance. Deferred work is admitted before another Ready, with the same byte
+ceilings and fenced oversized-task recovery. Established durable-prefix reads
+and same-term heartbeats continue while maintenance I/O is outstanding.
+Completed appends waiting for downstream admission also retain heartbeat
+progress. Election ticks pause while the node's current term/vote is still
+behind its durability barrier; an election cannot repeatedly invalidate its
+unsent vote request during a slow write. Inbound traffic continues, and an
+established leader retains its heartbeat and quorum clocks. Snapshot completion
+rechecks both apply tasks and payload bytes before publication; another group's
+backlog cannot bypass admission. Snapshot worker startup failures retain the
+existing bounded publication retry backoff. Pending task/byte/oldest-age gauges expose
+queue pressure. A lock-free oldest-barrier timestamp preserves the existing
+progress-stall readiness deadline: short Raft rounds cannot hide a stalled
+asynchronous WAL write. Completion/retirement clears the age; elapsed time
+alone does not cancel the durable owner or mark its write failed.
+
+Commit-only HardState updates no longer append or sync when term/vote and the
+referenced entries are already durable. Later records fold in the cursor;
+recovery admits only the committed prefix proved by durable application
+completion or a snapshot. This removes redundant physical commits rather than
+weakening entry, term/vote, configuration or snapshot durability.
+
+The focused regressions hold a WAL operation for 123 virtual ticks, assert
+heartbeat progress without early append acknowledgement/application, exercise
+queue rejection and fenced recovery, and verify crash recovery after a skipped
+commit-only sync. The real WAL regression also joins an outstanding append
+before retirement and reopens the durable entries. Additional regressions hold
+an election's vote write across 123 ticks, keep durable-prefix reads live during
+checkpoint/snapshot publication, and reject a completed incoming snapshot when
+either apply-task or byte admission has become unavailable.
+
+Promotion keeps one immutable admitted batch in its existing companion state
+row until both remote success and the local receipt are known. A retry recovers
+that batch before diffing a newer resolution artifact, so a lost reply cannot
+forget an earlier provisional key. A review-band decision retains its prior
+accepted receipt while the mention exists. Deterministic tests cover both gaps;
+the CI logs do not prove which of them caused the reported duplicate.
+
+This change prevents ordinary WAL I/O from blocking Raft control progress and
+removes redundant syncs. It does not establish faster underlying filesystem
+sync latency. Graceful shutdown still joins outstanding I/O and performs its
+final durability flush; it is intentionally not a fire-and-forget operation.
+Stage timings distinguish snapshot publication, WAL append, truncation and
+applied-watermark persistence when a worker exceeds 500 ms.
+
+A preliminary soak reproduced a post-publication GET timeout after the schema
+rewrite job succeeded. This differs from the original issue’s job-progress
+timeout. The test retains the exact frontend, table/key, job result and metadata
+snapshots on a transport failure; the data ReadIndex gate reports whether it
+was still awaiting quorum or local application. Qualification remains pending
+until that failure is diagnosed and the final source passes its clean soak.
+
+Merged-main recovery smoke testing also exposed three deterministic integration
+failures. Initial FK publication now removes a changed table's legacy listing
+entry in the same transaction that installs its system-catalog binding, so the
+authoritative binding and derived listing cannot disagree. A hidden initial-FK
+placement with an absent private descriptor remains unadmitted and retries
+through the existing bounded control backoff; it no longer terminates an
+otherwise serving data process. Malformed generation authority remains fatal.
+Finally, authenticated live rewrite source-copy artifacts remain logical
+decoders: export excludes physical accepted-generation keys, and plan validation
+uses their fenced pin/certificate proof rather than repository-cohort admission
+proofs. Ordinary portable backups still require those admission proofs.
+
+Live rewrites also carry the namespace-bound accepted-generation and retirement
+summary for every source owner, including owners with empty summaries. Source
+fencing seals that immutable authority; hidden targets install only mappings for
+surviving FK declarations under fresh target IDs and generations. Removed or
+retargeted declarations retain their source proof without granting target
+acceptance. These live handoffs use the same validated descriptor projection for
+initial provisioning, cold job recovery and receipt reads. Regression coverage
+rejects missing handoffs, checks descriptor/install-receipt equality, and covers
+lost replies and native reopen. The distributed publication-reply-loss smoke
+previously stalled on an empty-only receipt guard and now completes successfully.
+
+Public restore-job views own their idempotency keys and nested result strings
+before parsed records are released. A regression overwrites the source buffers
+before inspecting the response, and the focused backup/restore target includes
+the job listing tests. Response ownership does not depend on allocator reuse.
+
+The retained-transfer fixtures use canonical artifact keys owned by their
+logical source document, including multi-fragment proofs across crash/reopen.
+The restore benchmark uses a checked allocator without per-allocation stack
+unwinding; its unchanged 30-second deadline now measures restore work rather
+than Mach-O debug-symbol lookup. These focused suites pass, but their results
+are separate from the pending final-binary recovery soak.
+
+## 2026-09-29: progressive native publication across process restart
+
+[Main e2e-full run 36526714836, job 109286926408](https://github.com/antflydb/antfly/actions/runs/36526714836/job/109286926408)
+failed `test_progressive_publication_remains_queryable_across_process_restart`:
+after restart the index had 128 native vectors and 64 covered sources, while its
+artifact target was 160 vectors. Queryability remained false throughout the
+eight-second restore wait. The original assertion did not include the
+pre-restart status, so the log alone does not establish the exact pre-restart
+native count.
+
+The native posting WAL's immutable generation is the query and restart
+authority. Status, certificate validation, and checkpoint count writers
+previously read mutable HBC cardinality that could describe the next source
+capture. A sidecar count that was absent or ahead of the recovered native
+generation could then leave the earlier durable prefix unadmitted after open.
+All three paths now read the native serving view. Both the progressive query
+gate and status use boundary certificates. An open-time proof retains a
+nonempty older native WAL prefix when its source sequence covers the projection
+checkpoint, without allowing later status reads to certify a coincidentally
+matching live count or an ahead-of-sidecar WAL generation. The restart
+regression compares the durable serving vector count and only the source
+coverage represented by its two-chunk-per-document fixture; it also prints
+its pre-restart status on a restore timeout.
+
+The unchanged main-based binary passed 40/40 focused E2E invocations on four
+workers, so that local baseline did not reproduce the CI timing failure. The
+deterministic storage regression covers both an ahead-of-WAL sidecar through
+an actual DB reopen and an absent sidecar, and verifies that uncommitted live
+cardinality cannot inflate reported serving count or mint a certificate.
+The fixed, merged-main server binary (SHA-256
+`4ef98bc7f3e9d7c82afe83e61a796b64488d1b0a8ad882628a399334e7c2311c`)
+passed 200/200 focused E2E invocations with
+`scripts/ci/zig-e2e-regression-loop.sh` (four workers, 50 repeats each).
+
 ## 2026-09-27: PR #885 CUDA build cancelled before qualification
 
 [PR #885 CUDA build job](https://github.com/antflydb/antfly/actions/runs/36345949010/job/108695038652)

@@ -12,6 +12,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const server_test_adapter = if (builtin.is_test) @import("../server_db_adapter.zig") else struct {};
+const builtin = @import("builtin");
+const replication_ingress = @import("replication_ingress.zig");
 const std = @import("std");
 const db_mod = @import("mod.zig");
 const pages = @import("merge_page_contract.zig");
@@ -35,7 +38,7 @@ test "relational index system merge tail streams REF5 oversized row with bounded
     try db.setSchemaJson(alloc, "{}");
     // A real first primary apply persists the physical namespace before the
     // separate retention admission. The bootstrap predates the retained cut.
-    try db.batchRaftReplicatedApply(.{ .timestamp_ns = 1, .writes = &.{.{ .key = "bootstrap", .value = "{}" }} }, .{ .term = 1, .index = 1 });
+    try server_test_adapter.applyOrdered(&db, .{ .timestamp_ns = 1, .writes = &.{.{ .key = "bootstrap", .value = "{}" }} }, .{ .term = 1, .index = 1 });
     const identity = try db.relationalTopologyIdentity();
     const scope: @import("online_source_contract.zig").Scope = .{
         .consumer_epoch = 1,
@@ -103,7 +106,7 @@ fn seal(input: types.BatchRequest) types.BatchRequest {
 }
 
 fn apply(db: *db_mod.DB, index: *u64, request: types.BatchRequest) !void {
-    try db.batchRaftReplicatedApply(request, .{ .term = 1, .index = index.* + 1 });
+    try server_test_adapter.applyOrdered(&db, request, .{ .term = 1, .index = index.* + 1 });
     index.* += 1;
 }
 
@@ -115,9 +118,9 @@ fn readCopyReceipt(db: *db_mod.DB) !std.json.Parsed(@import("merge_contract.zig"
 
 fn applyChunk(db: *db_mod.DB, index: *u64, lsn: *u64, standby: bool, request: types.BatchRequest) !void {
     if (!standby) return apply(db, index, request);
-    const encoded = try @import("../hot_standby/effects.zig").encodeBatchMutationRequestAlloc(alloc, request);
+    const encoded = try @import("replication_effects.zig").encodeBatchMutationRequestAlloc(alloc, request);
     defer alloc.free(encoded);
-    try db.applyHAReplicationRecord(.{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = lsn.* + 1, .previous_lsn = lsn.*, .payload = encoded });
+    try replication_ingress.applyRecord(db, .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = lsn.* + 1, .previous_lsn = lsn.*, .payload = encoded });
     lsn.* += 1;
 }
 
@@ -149,7 +152,9 @@ test "relational index system merge tail source proofs stage inertly with exact 
     var namespace: publication.Namespace = undefined;
     @import("doc_identity.zig").encodeNamespace(&namespace, source.namespace);
     const logical_source = publication.Source{ .document_key = "b", .content_digest = @splat(3), .timestamp = 1, .input_position = null };
-    const logical_effect = provenance.Effect{ .family = .document_artifact, .key = "effect", .source_index = 0, .value_digest = null, .value_bytes = 0 };
+    const effect_key = try @import("../internal_keys.zig").chunkArtifactKeyAlloc(alloc, "b", "asset", 0);
+    defer alloc.free(effect_key);
+    const logical_effect = provenance.Effect{ .family = .document_artifact, .key = effect_key, .source_index = 0, .value_digest = null, .value_bytes = 0 };
     var logical_proof: provenance.Proof = .{ .namespace = namespace, .authority_epoch = 1, .catalog_digest = @splat(2), .producer_kind = .index, .producer_name = "index", .producer_generation = 1, .producer_artifact_name = "asset", .publication_digest = @splat(4), .input_digest = undefined, .sources = (&logical_source)[0..1], .artifact_sources = &.{}, .effects = (&logical_effect)[0..1] };
     logical_proof.input_digest = logical_proof.inputCommand().inputDigest();
     const raw = try provenance.encodeAlloc(alloc, logical_proof);
@@ -182,6 +187,11 @@ test "relational index system merge tail source proofs stage inertly with exact 
     var large_proof = logical_proof;
     large_proof.publication_digest = @splat(6);
     large_proof.sources = (&large_source)[0..1];
+    const large_effect_key = try @import("../internal_keys.zig").chunkArtifactKeyAlloc(alloc, large_document, "asset", 0);
+    defer alloc.free(large_effect_key);
+    var large_effect = logical_effect;
+    large_effect.key = large_effect_key;
+    large_proof.effects = (&large_effect)[0..1];
     large_proof.input_digest = large_proof.inputCommand().inputDigest();
     const large_raw = try provenance.encodeAlloc(alloc, large_proof);
     defer alloc.free(large_raw);
@@ -196,7 +206,8 @@ test "relational index system merge tail source proofs stage inertly with exact 
     const transfer = try pages.RowChunks(types.BatchRequest).init(seal(.{ .merge_replication = context, .merge_page = page }));
     const first = try transfer.requestAt(0);
     const middle = try transfer.requestAt(pages.chunk_bytes);
-    const final = try transfer.requestAt(2 * pages.chunk_bytes);
+    const final_offset = ((large_value.len - 1) / pages.chunk_bytes) * pages.chunk_bytes;
+    const final = try transfer.requestAt(final_offset);
     try apply(&db, &index, first);
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, &large_key));
     db.close();
@@ -204,6 +215,11 @@ test "relational index system merge tail source proofs stage inertly with exact 
     try apply(&db, &index, first);
     try apply(&db, &index, middle);
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, &large_key));
+    var remaining_offset: usize = 2 * pages.chunk_bytes;
+    while (remaining_offset < final_offset) : (remaining_offset += pages.chunk_bytes) {
+        try apply(&db, &index, try transfer.requestAt(remaining_offset));
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, &large_key));
+    }
     try apply(&db, &index, final);
     const stored_large = try db.core.store.get(alloc, &large_key);
     defer alloc.free(stored_large);
@@ -421,11 +437,11 @@ test "relational index system retained merge tail fragments preserve deletes tim
         }
         // The native standby envelope is independently fail-closed and must
         // preserve the same tail fragment and its original row timestamp.
-        const standby_payload = try @import("../hot_standby/effects.zig").encodeBatchMutationRequestAlloc(alloc, second);
+        const standby_payload = try @import("replication_effects.zig").encodeBatchMutationRequestAlloc(alloc, second);
         defer alloc.free(standby_payload);
-        const standby_record: @import("../hot_standby/replication_record.zig").RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = standby_payload };
-        try db.applyHAReplicationRecord(standby_record);
-        try db.applyHAReplicationRecord(standby_record);
+        const standby_record: @import("replication_record.zig").RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = standby_payload };
+        try replication_ingress.applyRecord(&db, standby_record);
+        try replication_ingress.applyRecord(&db, standby_record);
         try std.testing.expectEqual(@as(u64, 555), try db.getTimestamp(alloc, "c"));
         var progress = (try db.mergeCopyPageStatus(alloc)).?;
         defer progress.deinit();
@@ -503,8 +519,8 @@ test "relational index system merge tail sessions decode bounded immutable fragm
         try std.testing.expect(!std.mem.eql(u8, &scope.pin(), &wrong_attempt.pin()));
         wrong_attempt.copy_attempt = .{ .donor_term = 1, .sequence = 0 };
         try std.testing.expectError(error.InvalidOnlineSourceCommand, wrong_attempt.validate());
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 });
-        try db.batchRaftReplicatedApply(.{ .timestamp_ns = 111, .writes = &.{ .{ .key = "a", .value = "{\"id\":1}" }, .{ .key = "b", .value = "{\"id\":2}" } }, .deletes = &.{"c"} }, .{ .term = 1, .index = 2 });
+        try server_test_adapter.applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 });
+        try server_test_adapter.applyOrdered(&db, .{ .timestamp_ns = 111, .writes = &.{ .{ .key = "a", .value = "{\"id\":1}" }, .{ .key = "b", .value = "{\"id\":2}" } }, .deletes = &.{"c"} }, .{ .term = 1, .index = 2 });
         var session = (try db.beginMergeTailRead(scope, 0)).?;
         defer session.deinit();
         const frame_digest = session.frameDigest();
@@ -522,7 +538,7 @@ test "relational index system merge tail sessions decode bounded immutable fragm
         try std.testing.expectEqual(@as(u64, 111), first.timestamps[0]);
         try std.testing.expect(!first.frame_complete);
         // Mutating the source after opening does not affect the pinned frame.
-        try db.batchRaftReplicatedApply(.{ .timestamp_ns = 222, .writes = &.{.{ .key = "b", .value = "{\"id\":3}" }} }, .{ .term = 1, .index = 3 });
+        try server_test_adapter.applyOrdered(&db, .{ .timestamp_ns = 222, .writes = &.{.{ .key = "b", .value = "{\"id\":3}" }} }, .{ .term = 1, .index = 3 });
         var second = (try session.next(alloc, 1, 1024, .none)).?;
         defer second.deinit();
         try std.testing.expectEqualStrings("b", second.writes[0].key);
@@ -714,13 +730,13 @@ test "relational index system merge pages commit effects and cursors with reopen
         try std.testing.expectError(error.MergePageSequenceGap, db.batch(skipped));
         command = .{ .source = source, .sequence = 3, .phase = .rows, .after = "b", .next = "c", .exhausted = true, .digest = @splat(0), .timestamps = &.{456} };
         const standby_request = seal(.{ .merge_replication = context, .merge_page = command, .writes = &.{.{ .key = "c", .value = "{\"id\":8,\"doubled\":16}" }} });
-        const standby_payload = try @import("../hot_standby/effects.zig").encodeBatchMutationRequestAlloc(alloc, standby_request);
+        const standby_payload = try @import("replication_effects.zig").encodeBatchMutationRequestAlloc(alloc, standby_request);
         defer alloc.free(standby_payload);
-        const standby_record: @import("../hot_standby/replication_record.zig").RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = standby_payload };
-        try db.applyHAReplicationRecord(standby_record);
+        const standby_record: @import("replication_record.zig").RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = standby_payload };
+        try replication_ingress.applyRecord(&db, standby_record);
         db.close();
         db = try db_mod.DB.open(alloc, directory.path(), options);
-        try db.applyHAReplicationRecord(standby_record);
+        try replication_ingress.applyRecord(&db, standby_record);
         if (relational) {
             const key = try @import("../internal_keys.zig").relationalRowKeyAlloc(alloc, "c");
             defer alloc.free(key);

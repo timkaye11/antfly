@@ -18,7 +18,7 @@ const store_report_baseline = @import("store_report_baseline.zig");
 const store_report_update = @import("store_report_update.zig");
 const storage_source_options = @import("storage_source_options");
 const control_only_storage_sources = storage_source_options.control_only;
-const fs_paths = @import("../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const common_group_ids = @import("../common/group_ids.zig");
 const common_secrets = @import("../common/secrets.zig");
 const metadata_mod = @import("domain.zig");
@@ -47,7 +47,7 @@ const process_memory_mod = @import("antfly_platform").process_memory;
 const platform_time = @import("antfly_platform").time;
 const raft_reconciler = @import("../raft/reconciler.zig");
 const transition_state = @import("transition_state.zig");
-const raft_catalog = @import("../raft/catalog.zig");
+const raft_catalog = @import("../raft/storage/catalog.zig");
 const raft_host = @import("../raft/host.zig");
 const raft_managed_host = @import("../raft/managed_host.zig");
 const raft_service = @import("../raft/service.zig");
@@ -7937,6 +7937,8 @@ pub const MetadataHttpService = struct {
     local_data_owner: bool,
     reallocation_protocol_peers: []const ReallocationProtocolPeer,
     store_status_ticks: usize,
+    restore_owner_progress_generation: std.atomic.Value(u64) = .init(1),
+    restore_owner_progress_event: std.Io.Event = .unset,
     projection_epoch: std.atomic.Value(u64) = .init(1),
     catalog_epoch: std.atomic.Value(u64) = .init(1),
     projected_core_epoch: std.atomic.Value(u64) = .init(1),
@@ -8296,6 +8298,10 @@ pub const MetadataHttpService = struct {
     fn metadataHttpServiceProjectionSignal(ptr: *anyopaque, signal: metadata_storage.raft_apply_store.ProjectionSignal) void {
         const self: *MetadataHttpService = @ptrCast(@alignCast(ptr));
         self.core_projection_changes.mark(signal);
+        if ((signal.kind == .store and signal.store_reports_changed) or signal.kind == .restore_job or signal.kind == .schema_progress or signal.kind == .restore_progress) {
+            _ = self.restore_owner_progress_generation.fetchAdd(1, .release);
+            self.restore_owner_progress_event.set(self.raft.host.http_host.host.deps.io);
+        }
         if (projectionSignalChangesCatalog(signal.kind)) {
             _ = self.catalog_epoch.fetchAdd(1, .release);
         }

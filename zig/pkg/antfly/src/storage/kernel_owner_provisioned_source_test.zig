@@ -30,6 +30,74 @@ const table_reads = @import("antfly_source_root").antfly_sources.table_reads;
 const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 const shard_state_store = @import("../data/storage/shard_state_store.zig");
 
+test "cold warmup reopens transient owners without disturbing resident siblings" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const Catalog = struct {
+        fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{
+                    .metadata_group_id = 1,
+                    .metadata_incarnation = "61616161616161616161616161616161".*,
+                    .metrics = .{},
+                },
+                .tables = @constCast(&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 71,
+                    .name = "warmup_probe",
+                    .placement_role = "data",
+                    .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"}}",
+                }}),
+                .ranges = @constCast(&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7501, .table_id = 71, .range_id = 7501, .start_key = "", .end_key = "m" },
+                    .{ .group_id = 7502, .table_id = 71, .range_id = 7502, .start_key = "m", .end_key = null },
+                }),
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn validate(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
+            var current = try snapshot(ptr);
+            return contract.matches(&current);
+        }
+        fn source(self: *@This()) table_catalog.CatalogSource {
+            return .{ .ptr = self, .vtable = &.{
+                .admin_snapshot = snapshot,
+                .free_admin_snapshot = free,
+                .routing_snapshot = table_catalog.TestAdminRoutingAdapter(snapshot, free).routingSnapshot,
+                .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(snapshot, free).linearizableSnapshot,
+                .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(snapshot, free).freeRoutingSnapshot,
+                .validate_publication = validate,
+            } };
+        }
+    };
+    var catalog = Catalog{};
+    var owners = kernel_owner_source.ProvisionedKernelOwnerSource.init(alloc, root, catalog.source(), read_gate.alreadyReadSafeBarrier());
+    defer owners.deinit();
+    _ = try owners.reconcileTableGroup(7501, "warmup_probe");
+    try std.testing.expectEqual(@as(usize, 1), owners.ownerCountForTest());
+    const resident = owners.entries.items[0];
+    const misses_before_resident_warmup = owners.cacheStats().miss_count;
+    try owners.warmTableGroup(7501, "warmup_probe");
+    try std.testing.expectEqual(misses_before_resident_warmup, owners.cacheStats().miss_count);
+
+    for (0..2) |_| {
+        const misses_before = owners.cacheStats().miss_count;
+        try std.testing.expect((try owners.writeSource().localRuntimeStatusGroupLocal(alloc, 7502, "warmup_probe")) == null);
+        try std.testing.expectEqual(misses_before, owners.cacheStats().miss_count);
+        try owners.warmTableGroup(7502, "warmup_probe");
+        try std.testing.expect(owners.cacheStats().miss_count > misses_before);
+        try std.testing.expectEqual(@as(usize, 1), owners.ownerCountForTest());
+        try std.testing.expectEqual(resident, owners.entries.items[0]);
+        try std.testing.expect((try owners.writeSource().localRuntimeStatusGroupLocal(alloc, 7502, "warmup_probe")) == null);
+    }
+}
+
 test "bulk callback ABI retains exact consumer error identity" {
     try kernel_owner_source.ProvisionedKernelOwnerSource.validateBulkCallbackIdentityForTest();
 }
@@ -179,7 +247,7 @@ test "empty hidden bootstrap read retries when the root generation advances" {
     });
     try std.testing.expectError(
         error.StorageKernelOwnerTransitionRequired,
-        owners.readHAHiddenOwnerBootstrap(alloc, 7196, 71),
+        owners.readHotStandbyHiddenOwnerBootstrap(alloc, 7196, 71),
     );
     try std.testing.expectEqual(@as(usize, 2), generation.reads);
 }
@@ -208,7 +276,7 @@ test "concurrent cold hidden bootstrap reads share one configured context" {
         fn run(self: *@This()) void {
             _ = self.ready.fetchAdd(1, .acq_rel);
             while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
-            const bootstrap = self.source.readHAHiddenOwnerBootstrap(std.heap.page_allocator, 7196, 71) catch |err| {
+            const bootstrap = self.source.readHotStandbyHiddenOwnerBootstrap(std.heap.page_allocator, 7196, 71) catch |err| {
                 self.failure = err;
                 return;
             };
@@ -554,10 +622,16 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
                     .free_admin_snapshot = freeAdminSnapshot,
                     .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
                     .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .table_routing_snapshot = descriptorSnapshot,
+                    .linearizable_table_routing_snapshot = descriptorSnapshot,
                     .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                     .validate_publication = validatePublication,
                 },
             };
+        }
+
+        fn descriptorSnapshot(ptr: *anyopaque, _: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            return table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot(ptr, deadline_ns);
         }
 
         fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
@@ -733,6 +807,10 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
             .execution_deadline_ns = started + 20 * std.time.ns_per_ms,
         }, .stale));
         try std.testing.expect(time.monotonicNs() - started < 4 * std.time.ns_per_s);
+        try std.testing.expect(entry.exclusive_active);
+        try std.testing.expectError(error.Timeout, owner_source.readSource().lookupGroupLocal(alloc, 7001, "articles", "doc:1", .{
+            .execution_deadline_ns = time.monotonicNs() + 20 * std.time.ns_per_ms,
+        }, .stale));
         try std.testing.expect(entry.exclusive_active);
         const CancelAfter = struct {
             at: u64,
@@ -1036,7 +1114,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         ));
     }
     try owner_source.waitForCurrentSyncGroupLocal(7001, "articles", .full_index);
-    try owner_source.applyHAReplicationRecordGroupLocal(7001, "articles", .{
+    try owner_source.applyHotStandbyReplicationRecordGroupLocal(7001, "articles", .{
         .kind = .checkpoint,
         .cluster_id = 1,
         .shard_id = 7001,
@@ -1273,6 +1351,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     defer edges_response.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), edges_response.edges.len);
     try std.testing.expectEqualStrings("doc:b", edges_response.edges[0].target);
+    try std.testing.expect(edges_response.scanned_rows >= edges_response.edges.len);
 
     var manifest = (try read_source.source().documentArtifactManifest(
         alloc,
