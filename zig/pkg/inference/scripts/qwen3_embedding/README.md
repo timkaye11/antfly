@@ -38,12 +38,18 @@ Matryoshka truncation to 32-1024 dims).
   benchmark expands it in memory and verifies the canonical expanded-case
   SHA-256 before making a request. Production serving does not read it.
 
-## Checked-in qualification reports
+## Qualification evidence
 
-The JSON files under `reports/` are intentionally versioned qualification
-evidence referenced by `BASELINE.md`; they are not runtime inputs or disposable
-test output. Replace them only when rerunning the documented protocol against
-the pinned model artifacts, and update `BASELINE.md` in the same change.
+`reports/` contains historical receipts and compact qualification summaries
+referenced by `BASELINE.md`. For new runs, version a summary of the protocol,
+artifact hashes, results, failures, and qualification limits. Preserve complete
+raw reports, source snapshots, and measurement samples outside Git, in an ignored
+output directory or separately hosted artifacts. Update `BASELINE.md` alongside
+the summary when rerunning the protocol against the pinned model artifacts.
+
+The [M4 Q8_0 gap summary](reports/qwen3_embedding_metal_gap_m4_q8_summary.md)
+records the 2026-10-01 qualification and 2026-10-02 review-fix checks, including
+the hashes and local archive location of both complete raw receipts.
 
 ## Produce the oracle
 
@@ -185,16 +191,15 @@ and no host swap growth. Host-wide swap growth invalidates the run without
 attributing the cause to Antfly. Competing builds or GPU work invalidate isolation.
 The [local M4 Q8_0 results](BASELINE.md#short-query-and-capacity-results--2026-10-01)
 include a fixed 600-second conditioning phase before an independent 1800-second
-soak on the same worker, with unchanged plateau and swap thresholds. The receipt
-embeds that repeat driver's source and preserves the initial soak's plateau
+soak on the same worker, with unchanged plateau and swap thresholds. The archived
+raw receipt embeds that repeat driver's source and preserves the initial soak's plateau
 failure and every conditioning/measurement sample. The default driver uses its
 normal geometry warmup; it does not add this extended conditioning implicitly.
-The [2026-10-02 PR review fix receipt](reports/qwen3_embedding_pr_review_fixes_m4_q8_20261002.json)
-records scoped workspace admission and owned warm-request metadata. It includes
-focused admission/ownership tests, HTTP correctness and eviction checks, and
-the repeated short matrix on the rebuilt binary. The 2026-10-01 receipt retains
-capacity, passage regression, and conditioned soak evidence for its original
-executable.
+The [compact qualification summary](reports/qwen3_embedding_metal_gap_m4_q8_summary.md)
+records scoped workspace admission and owned warm-request metadata, focused
+admission/ownership tests, HTTP correctness and eviction checks, and the repeated
+short matrix on the 2026-10-02 review-fix executable. Capacity, passage regression,
+and conditioned soak evidence cover the original 2026-10-01 executable.
 Longer singletons may need explicit `--scratch-budget-mb` and
 `--combined-budget-mb` operator caps in addition to the process budget;
 qualification records those caps and does not

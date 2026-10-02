@@ -28,9 +28,11 @@ Both endpoints used the identical 0.6B Q8_0 GGUF with SHA-256
 `06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439`.
 The reference was llama.cpp `b8990-660b1b4bd`, executable SHA-256
 `8eee1b1fa1c65d919c94116dd286134a4a9498059c21c1ee448c45fb87f2c590`.
-The complete [qualification receipt](reports/qwen3_embedding_metal_gap_m4_q8_20261001.json)
-retains all measured rounds, source/model/fixture hashes, live process arguments,
-tests and soak memory samples.
+The [compact qualification summary](reports/qwen3_embedding_metal_gap_m4_q8_summary.md)
+records results, provenance hashes, failures, and qualification limits. Complete
+raw receipts retain all measured rounds, source/model/fixture hashes, live process
+arguments, tests, and soak memory samples outside Git; their hashes and local
+archive location are recorded in the summary.
 
 Each cell ran three rounds of three warmups and twenty alternating AB/BA
 endpoint measurements. Exact-token fixtures include EOS. Query lengths include
@@ -78,7 +80,8 @@ The initial final-binary soak completed 1835.94 seconds with 243 requests,
 7776 vectors, zero failures, unchanged worker PIDs and no host swap growth.
 Downward RSS transitions in its final half produced a 110.03 MiB range against
 the 32 MiB allowance, so that run failed the plateau gate. The cause of those
-residency changes is unproven. Its failing result remains in the receipt.
+residency changes is unproven. Its failing result remains in the summary and
+archived raw receipt.
 
 A separate repeat used a fixed 600-second, eight-worker conditioning phase
 followed by an independent 1800-second measured phase on the same supervisor
@@ -86,8 +89,8 @@ and worker. Conditioning completed 113 requests with zero failures. The measured
 phase completed 1829.51 seconds, 310 requests and 9920 vectors with zero failures,
 no worker restart and no host swap growth. Its final-half RSS range was 2.203 MiB;
 the unchanged criterion is max-minus-min <= max(32 MiB, 5% mean). All returned
-rows retained same-binary order/vector parity at cosine >=0.99999. The receipt
-contains both full memory trajectories and the conditioning driver source.
+rows retained same-binary order/vector parity at cosine >=0.99999. The archived
+raw receipt contains both full memory trajectories and the conditioning driver source.
 This is qualification of the explicitly conditioned steady-state run; it does
 not reclassify the initial failing soak.
 
