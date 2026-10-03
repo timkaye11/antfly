@@ -1094,6 +1094,16 @@ fn getenvFlagEnabled(comptime name: [*:0]const u8) bool {
     return getenvFlagValue(name) orelse false;
 }
 
+/// Qualified serving defaults share one hardware policy. Explicit false values
+/// disable a feature; explicit true values still allow qualification elsewhere.
+/// Model and request eligibility remain the responsibility of each caller.
+pub fn qualifiedM4FeatureEnabled(comptime name: [*:0]const u8, default_eligible: bool) bool {
+    // HTTP admission can first read a flag from several concurrent callers.
+    // Use the stateless parser here; the hardware decision is initialized once
+    // in Metal. No mutable per-flag cache is needed on these serving paths.
+    return @import("antfly_platform").env.getenvBoolDefault(name, default_eligible and qualifiedM4DeviceDefault());
+}
+
 fn a4bHighMemoryFastPathEnabled() bool {
     return a4b_feature_flags.highMemoryFastPathEnabled();
 }
@@ -13803,7 +13813,55 @@ pub extern fn termite_metal_device_available() c_int;
 pub extern fn termite_metal_copy_device_name(buffer: [*c]u8, capacity: usize) usize;
 pub extern fn termite_metal_copy_compiler_identity(buffer: [*c]u8, capacity: usize) usize;
 pub extern fn termite_metal_device_info_get(info: *MetalDeviceInfo) c_int;
+pub extern fn termite_metal_qualified_m4_device_default() c_int;
 pub extern fn termite_metal_pipelined_decode_frame_device_default() c_int;
+
+/// Hardware qualification is independent of the prepared-frame rollback flags.
+pub fn qualifiedM4DeviceDefault() bool {
+    if (comptime !build_options.enable_metal) return false;
+    if (comptime @import("builtin").os.tag != .macos) return false;
+    return termite_metal_qualified_m4_device_default() != 0;
+}
+
+test "M4 qualified feature defaults honor explicit false and model isolation" {
+    const builtin = @import("builtin");
+    if (comptime !builtin.link_libc or (builtin.os.tag != .macos and builtin.os.tag != .linux)) return error.SkipZigTest;
+    // Exercise the serving parser with isolated environment names.
+    inline for (.{ "", "0", "false", "FALSE", "no", "off" }, 0..) |value, index| {
+        const name = std.fmt.comptimePrint("TERMITE_METAL_TEST_M4_FALSE_{d}", .{index});
+        const old = if (std.c.getenv(name)) |v| try std.testing.allocator.dupeZ(u8, std.mem.span(v)) else null;
+        defer if (old) |v| {
+            _ = setenv(name, v.ptr, 1);
+            std.testing.allocator.free(v);
+        } else {
+            _ = unsetenv(name);
+        };
+        try std.testing.expectEqual(@as(c_int, 0), setenv(name, value, 1));
+        try std.testing.expect(!qualifiedM4FeatureEnabled(name, true));
+    }
+    const enable = "TERMITE_METAL_TEST_M4_EXPLICIT_ENABLE";
+    const old_enable = if (std.c.getenv(enable)) |v| try std.testing.allocator.dupeZ(u8, std.mem.span(v)) else null;
+    defer if (old_enable) |v| {
+        _ = setenv(enable, v.ptr, 1);
+        std.testing.allocator.free(v);
+    } else {
+        _ = unsetenv(enable);
+    };
+    try std.testing.expectEqual(@as(c_int, 0), setenv(enable, "1", 1));
+    try std.testing.expect(qualifiedM4FeatureEnabled(enable, false));
+
+    const unset = "TERMITE_METAL_TEST_M4_UNSET";
+    const old_unset = if (std.c.getenv(unset)) |v| try std.testing.allocator.dupeZ(u8, std.mem.span(v)) else null;
+    defer if (old_unset) |v| {
+        _ = setenv(unset, v.ptr, 1);
+        std.testing.allocator.free(v);
+    } else {
+        _ = unsetenv(unset);
+    };
+    try std.testing.expectEqual(@as(c_int, 0), unsetenv(unset));
+    try std.testing.expect(!qualifiedM4FeatureEnabled(unset, false));
+    try std.testing.expectEqual(qualifiedM4DeviceDefault(), qualifiedM4FeatureEnabled(unset, true));
+}
 
 /// Device-qualified default for pipelined decode frames: true only where the
 /// fast prepared frame qualified (M4-family). Explicit enable/disable env

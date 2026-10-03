@@ -2025,8 +2025,53 @@ fn compiledSampleRequestEligible(
         !has_suppress_token_ids;
 }
 
-fn metalCompiledSampledDecodeEnabled() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_METAL_RESIDENT_NUCLEUS", false);
+fn metalCompiledSampledDecodeDefaultEligible(cfg: gpt_mod.Config) bool {
+    // Default promotion covers Gemma4 E2B. Other model geometries retain their
+    // explicit opt-in, and the exact sampling contract is checked separately.
+    return cfg.family == .gemma and cfg.gemma4_channel_protocol and
+        !cfg.gemma4_mtp_assistant and cfg.hidden_size == 1536 and
+        cfg.num_hidden_layers == 35 and cfg.num_attention_heads == 8 and
+        cfg.num_key_value_heads == 1 and cfg.attention_head_dim == 256 and
+        cfg.global_head_dim == 512 and cfg.sliding_window == 512 and
+        cfg.intermediate_size == 6144 and cfg.num_kv_shared_layers == 20;
+}
+
+fn metalCompiledSampledDecodeEnabled(cfg: gpt_mod.Config) bool {
+    return metal_runtime.qualifiedM4FeatureEnabled(
+        "ANTFLY_INFERENCE_METAL_RESIDENT_NUCLEUS",
+        metalCompiledSampledDecodeDefaultEligible(cfg),
+    );
+}
+
+test "compiled sampled decode defaults only to qualified Gemma4 E2B geometry" {
+    const e2b: gpt_mod.Config = .{
+        .family = .gemma,
+        .gemma4_channel_protocol = true,
+        .hidden_size = 1536,
+        .num_hidden_layers = 35,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .sliding_window = 512,
+        .intermediate_size = 6144,
+        .num_kv_shared_layers = 20,
+    };
+    try std.testing.expect(metalCompiledSampledDecodeDefaultEligible(e2b));
+    inline for (.{ "hidden_size", "num_hidden_layers", "num_attention_heads", "num_key_value_heads", "attention_head_dim", "global_head_dim", "sliding_window", "intermediate_size", "num_kv_shared_layers" }) |field| {
+        var other = e2b;
+        @field(other, field) += 1;
+        try std.testing.expect(!metalCompiledSampledDecodeDefaultEligible(other));
+    }
+    var other = e2b;
+    other.family = .qwen3;
+    try std.testing.expect(!metalCompiledSampledDecodeDefaultEligible(other));
+    other = e2b;
+    other.gemma4_channel_protocol = false;
+    try std.testing.expect(!metalCompiledSampledDecodeDefaultEligible(other));
+    other = e2b;
+    other.gemma4_mtp_assistant = true;
+    try std.testing.expect(!metalCompiledSampledDecodeDefaultEligible(other));
 }
 
 test "compiled sampled decode rejects grammar and static suppression before submission" {
@@ -7349,7 +7394,8 @@ pub const NativeGenerationPipeline = struct {
     ) !?usize {
         // Greedy requests do not need a sampling feature lookup per token.
         if (isPureGreedyConfig(config)) return null;
-        if (!metalCompiledSampledDecodeEnabled()) return null;
+        if (self.cb.kind() != .metal) return null;
+        if (!metalCompiledSampledDecodeEnabled(self.gpt_config)) return null;
         // Grammar and static model suppression are not represented by the
         // resident sampler contract. Decline before submission so the
         // canonical one-logits-frame host path applies them exactly.

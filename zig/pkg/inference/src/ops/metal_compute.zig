@@ -28258,7 +28258,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // existing serial planned scope through attention and FFN, retaining
         // the established barriers when concurrent dispatch is requested.
         const short_scope = request.rows >= 9 and request.rows <= 64 and
-            getenvBool("TERMITE_METAL_ENABLE_Q8_0_SMALL_ROWS") and
+            metal_runtime_mod.qualifiedM4FeatureEnabled("TERMITE_METAL_ENABLE_Q8_0_SMALL_ROWS", true) and
             !getenvBool("TERMITE_METAL_DISABLE_QWEN3_SMALL_ENCODER");
         const owns_short_scope = if (short_scope) try decoderRuntimeBeginPlannedComputeScopeOp(ctx) else false;
         defer if (owns_short_scope) decoderRuntimeEndPlannedComputeScopeOp(ctx);

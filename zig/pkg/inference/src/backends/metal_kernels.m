@@ -17,6 +17,7 @@
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #import <objc/runtime.h>
+#import <dispatch/dispatch.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -293,6 +294,7 @@ static void termite_metal_jit_exact_pipeline_entry_copy(
 #define TERMITE_METAL_OPERATOR_UNKNOWN 255u
 
 static bool termite_metal_env_flag_enabled(const char *value);
+int termite_metal_qualified_m4_device_default(void);
 
 // Mirrors zig/lib/platform/src/env.zig getenvBoolDefault: unset -> default,
 // empty/"0"/"false"/"no"/"off" -> false, any other value -> true (the same
@@ -301,6 +303,10 @@ static BOOL termite_metal_env_bool_default(const char *env_name, BOOL default_va
     const char *value = getenv(env_name);
     if (value == NULL) return default_value;
     return termite_metal_env_flag_enabled(value) ? YES : NO;
+}
+
+static BOOL termite_metal_qualified_m4_feature_enabled(const char *env_name) {
+    return termite_metal_env_bool_default(env_name, termite_metal_qualified_m4_device_default() != 0);
 }
 
 static BOOL termite_metal_generated_quant_disabled(void) {
@@ -16960,6 +16966,13 @@ typedef struct termite_metal_q4_0_pair_activation_mm_selection {
     BOOL fell_back;
 } termite_metal_q4_0_pair_activation_mm_selection;
 
+// Default short-row projection/norm changes are confined to the admitted
+// embedding workspace. An explicit opt-in retains the wider diagnostic scope.
+static BOOL termite_metal_qwen_short_rows_enabled(termite_metal_decode_runtime *runtime) {
+    return termite_metal_env_bool_default("TERMITE_METAL_ENABLE_Q8_0_SMALL_ROWS",
+        runtime != NULL && runtime->apple_m4_device && runtime->embedding_workspace_bounded);
+}
+
 static BOOL termite_metal_q4_0_pair_activation_mm_shape_enabled(
     size_t in_dim, size_t out_dim, BOOL e4b_enabled, BOOL e2b_enabled
 ) {
@@ -16973,7 +16986,7 @@ static BOOL termite_metal_q4_0_pair_activation_mm_enabled_for_shape(
 ) {
     if (runtime == NULL || !runtime->q4_0_pair_activation_mm_enabled) return NO;
     const BOOL e2b_enabled =
-        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_E2B_Q4_0_PAIR_ACTIVATION_MM")) &&
+        termite_metal_qualified_m4_feature_enabled("TERMITE_METAL_ENABLE_E2B_Q4_0_PAIR_ACTIVATION_MM") &&
         !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_E2B_Q4_0_PAIR_ACTIVATION_MM"));
     return termite_metal_q4_0_pair_activation_mm_shape_enabled(
         in_dim, out_dim, runtime->q4_0_pair_activation_mm_e4b_enabled, e2b_enabled);
@@ -18793,10 +18806,9 @@ static int termite_metal_encode_quant_matmul_none_on_encoder_family(
     const BOOL f32_activation_buffers =
         descriptor->input_dtype == TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32 &&
         descriptor->output_dtype == TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32;
-    // Short-row candidates stay opt-in until endpoint qualification. The tail
-    // kernels below also support a frame with no full M32/M64 tile.
-    const BOOL q8_0_small_rows = termite_metal_env_flag_enabled(
-        getenv("TERMITE_METAL_ENABLE_Q8_0_SMALL_ROWS"));
+    // Qualified M4 short rows use M32 by default. The tail kernels also
+    // support a frame with no full M32/M64 tile; explicit false rolls back.
+    const BOOL q8_0_small_rows = termite_metal_qwen_short_rows_enabled(runtime);
     const BOOL q8_0_sg_v2_shape = q8_0_format &&
         (descriptor->rows >= 65u || (q8_0_small_rows && descriptor->rows >= 9u)) &&
         descriptor->in_dim % 32u == 0u &&
@@ -19135,8 +19147,7 @@ static int termite_metal_encode_quant_matmul_pair_activation_mul_on_encoder(
         !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_Q8_PAIR_ACTIVATION_SG_V2"));
     const BOOL use_pair_sg_v2 = pair_sg_v2_enabled &&
         (descriptor->rows >= 65u ||
-            (descriptor->rows >= 9u && termite_metal_env_flag_enabled(
-                getenv("TERMITE_METAL_ENABLE_Q8_0_SMALL_ROWS")))) &&
+            (descriptor->rows >= 9u && termite_metal_qwen_short_rows_enabled(runtime))) &&
         descriptor->in_dim % 32u == 0u &&
         descriptor->out_dim % 64u == 0u &&
         dispatch_kind == TERMITE_METAL_Q8_0_LINEAR_DISPATCH_MM &&
@@ -20052,7 +20063,7 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
                         descriptor->out_dim == 1536u);
                 const BOOL q4_0_mm_sg_aligned_e2b =
                     q4_0_mm_sg_aligned_e2b_shape &&
-                    termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_E2B_Q4_0_MM_SG_ALIGNED")) &&
+                    termite_metal_qualified_m4_feature_enabled("TERMITE_METAL_ENABLE_E2B_Q4_0_MM_SG_ALIGNED") &&
                     !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_E2B_Q4_0_MM_SG_ALIGNED"));
                 const BOOL q4_0_mm_sg_aligned_override =
                     termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_Q4_0_MM_SG_ALIGNED"));
@@ -20067,7 +20078,7 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
                     descriptor->in_dim % 32u == 0u &&
                     descriptor->input_offset % 16u == 0u;
                 // An E2B-specific disable wins over broad/mapped-model enables,
-                // keeping this unqualified route independently reversible.
+                // keeping this route independently reversible.
                 const BOOL q4_0_mm_sg_aligned_shape_enabled =
                     q4_0_mm_sg_aligned_e2b_shape
                         ? q4_0_mm_sg_aligned_e2b
@@ -22398,6 +22409,21 @@ static bool termite_metal_fast_prepared_frame_enabled_for_device(id<MTLDevice> d
     return device != nil && apple_gpu_family == 9u && [device.name hasPrefix:@"Apple M4"];
 }
 
+// Serving qualification is a hardware property. Keep it independent of the
+// fast-prepared-frame kill switch so unrelated rollback flags stay isolated.
+int termite_metal_qualified_m4_device_default(void) {
+    static int qualified = 0;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        @autoreleasepool {
+            id<MTLDevice> device = termite_metal_shared_device();
+            qualified = device != nil && termite_metal_device_apple_gpu_family(device) == 9u &&
+                [device.name hasPrefix:@"Apple M4"];
+        }
+    });
+    return qualified;
+}
+
 // Pipelined decode frames default on only where the fast prepared frame is
 // qualified: the overlap win was validated on that command-buffer path, and
 // the shared qualification keeps one rollback story per device class.
@@ -22444,12 +22470,11 @@ static bool termite_metal_a4b_flash_prefill_hd256_shape(
         head_dim == 256u && sliding_window == 1024u;
 }
 
-// Gemma4 E2B uses the same generated HD256 body as the qualified E4B lane,
-// but with MQA (8Q/1KV). Keep this exact geometry independently opt-in until
-// whole-model TTFT and token-parity qualification promotes it.
+// Gemma4 E2B MQA (8Q/1KV) defaults on for qualified M4 devices. Its exact
+// geometry and independent rollback keep the E4B and A4B policies isolated.
 static bool termite_metal_e2b_flash_prefill_hd256_enabled(void) {
-    return termite_metal_env_flag_enabled(
-               getenv("TERMITE_METAL_ENABLE_E2B_FLASH_PREFILL_HD256")) &&
+    return termite_metal_qualified_m4_feature_enabled(
+               "TERMITE_METAL_ENABLE_E2B_FLASH_PREFILL_HD256") &&
         !termite_metal_env_flag_enabled(
                getenv("TERMITE_METAL_DISABLE_E2B_FLASH_PREFILL_HD256"));
 }
@@ -25498,7 +25523,7 @@ static int termite_metal_encode_rms_norm_add_rows_for(
 // the threadgroup-per-row reduce kernel: the thread-per-row kernel dispatches
 // only `rows` threads total, each serially scanning hidden_size twice, which
 // on the serial planned frame encoder is a near-idle GPU stall per norm. The
-// shape gate is deliberately narrow, and rollout remains explicit opt-in.
+// shape gate is deliberately narrow; bounded M4 embeddings default on.
 static bool termite_metal_rms_norm_rows_reduce_preferred(
     termite_metal_decode_runtime *runtime,
     size_t rows,
@@ -25520,7 +25545,7 @@ static bool termite_metal_rms_norm_rows_reduce_preferred(
     if (a4b_enabled == 1) {
         return rows >= 1u && rows <= 32u && hidden_size >= 128u;
     }
-    if (termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_Q8_0_SMALL_ROWS")) &&
+    if (termite_metal_qwen_short_rows_enabled(runtime) &&
         !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_SMALL_ROWS_NORM_REDUCE"))) {
         return rows >= 9u && rows <= 64u && hidden_size >= 1024u;
     }
@@ -26210,7 +26235,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
             !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_Q4_0_PAIR_ACTIVATION_FUSION")) &&
             !termite_metal_env_flag_truthy(getenv("TERMITE_METAL_DISABLE_A4B_SHARED_FFN_FUSION"));
         const bool e2b_pair_activation_mm_requested =
-            termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_E2B_Q4_0_PAIR_ACTIVATION_MM")) &&
+            termite_metal_qualified_m4_feature_enabled("TERMITE_METAL_ENABLE_E2B_Q4_0_PAIR_ACTIVATION_MM") &&
             !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_E2B_Q4_0_PAIR_ACTIVATION_MM"));
         runtime->q4_0_pair_activation_mm_e4b_enabled =
             termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_MM")) &&
@@ -26321,7 +26346,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->mrope_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_apply_mrope");
         runtime->rope_pair_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_apply_rope_pair");
         runtime->head_rms_rope_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_apply_head_rms_rope");
-        const bool enable_qwen_head_norm_sg = termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_QWEN3_HEAD_NORM_SG"));
+        const bool enable_qwen_head_norm_sg = termite_metal_qualified_m4_feature_enabled("TERMITE_METAL_ENABLE_QWEN3_HEAD_NORM_SG");
         runtime->head_rms_rope_hd128_sg_pipeline = enable_qwen_head_norm_sg ? termite_metal_make_pipeline(device, precise_library, @"termite_apply_head_rms_rope_hd128_sg") : nil;
         runtime->attention_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_attention_f32");
         runtime->attention_f32_decode_1x_hd64_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_attention_f32_decode_1x_hd64");
@@ -26893,7 +26918,8 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
             (termite_metal_a4b_flash_prefill_hd256_enabled() &&
                 !termite_metal_generated_flash_prefill_disabled() &&
                 runtime->attention_flash_generated_pipeline == nil) ||
-            (termite_metal_e2b_flash_prefill_hd256_enabled() &&
+            (termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_E2B_FLASH_PREFILL_HD256")) &&
+                termite_metal_e2b_flash_prefill_hd256_enabled() &&
                 !termite_metal_generated_flash_prefill_disabled() &&
                 runtime->attention_flash_generated_pipeline == nil) ||
             (termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_RMS_NORM_GENERATED")) && runtime->rms_norm_generated_pipeline == nil) ||
@@ -26937,7 +26963,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
                  runtime->attention_decode_gqa_split_scratch_buffer_alt == nil));
         // Default generated candidates remain optional. Explicit requests must
         // fail closed instead of silently benchmarking handwritten fallbacks.
-        if ((enable_qwen_head_norm_sg && runtime->head_rms_rope_hd128_sg_pipeline == nil) || missing_requested_generated_pipeline || missing_quant_reduce_pipeline || missing_dense_multi_row_reduce_pipeline || runtime->embed_absolute_position_pipeline == nil || runtime->embedding_lookup_pipeline == nil || runtime->q4_0_get_rows_pipeline == nil || runtime->q4_0_set_rows_pipeline == nil || runtime->q4_0_cpy_q_to_f32_pipeline == nil || runtime->q4_0_cpy_f32_to_q_pipeline == nil || runtime->q4_1_get_rows_pipeline == nil || runtime->q4_1_set_rows_pipeline == nil || runtime->q4_1_cpy_q_to_f32_pipeline == nil || runtime->q4_1_cpy_f32_to_q_pipeline == nil || runtime->q5_0_get_rows_pipeline == nil || runtime->q5_0_set_rows_pipeline == nil || runtime->q5_0_cpy_q_to_f32_pipeline == nil || runtime->q5_0_cpy_f32_to_q_pipeline == nil || runtime->q5_1_get_rows_pipeline == nil || runtime->q5_1_set_rows_pipeline == nil || runtime->q5_1_cpy_q_to_f32_pipeline == nil || runtime->q5_1_cpy_f32_to_q_pipeline == nil || runtime->q4_k_get_rows_pipeline == nil || runtime->q4_k_set_rows_pipeline == nil || runtime->q4_k_cpy_q_to_f32_pipeline == nil || runtime->q4_k_cpy_f32_to_q_pipeline == nil || runtime->q5_k_get_rows_pipeline == nil || runtime->q5_k_set_rows_pipeline == nil || runtime->q5_k_cpy_q_to_f32_pipeline == nil || runtime->q5_k_cpy_f32_to_q_pipeline == nil || runtime->q6_k_get_rows_pipeline == nil || runtime->q6_k_set_rows_pipeline == nil || runtime->q6_k_cpy_q_to_f32_pipeline == nil || runtime->q6_k_cpy_f32_to_q_pipeline == nil || runtime->q8_0_get_rows_pipeline == nil || runtime->q8_0_set_rows_pipeline == nil || runtime->q8_0_cpy_q_to_f32_pipeline == nil || runtime->q8_0_cpy_f32_to_q_pipeline == nil || runtime->q8_1_get_rows_pipeline == nil || runtime->q8_1_set_rows_pipeline == nil || runtime->q8_1_cpy_q_to_f32_pipeline == nil || runtime->q8_1_cpy_f32_to_q_pipeline == nil || runtime->rope_pipeline == nil || runtime->head_rms_rope_pipeline == nil || runtime->attention_f32_pipeline == nil || runtime->attention_f32_prefill_pipeline == nil || runtime->attention_paged_pipeline == nil || runtime->paged_f32_kv_seed_pipeline == nil || runtime->paged_f16_kv_seed_pipeline == nil || runtime->paged_f32_v_seed_pipeline == nil || runtime->slice_last_dim_f32_2d_pipeline == nil || runtime->gather_axis0_add_bias_f32_2d_pipeline == nil || runtime->transpose_f32_pipeline == nil || runtime->dot_general_2d_f32_pipeline == nil || runtime->dot_general_2d_f32_reduce_pipeline == nil || runtime->dot_general_batched_f32_pipeline == nil || runtime->lora_after_a_f32_pipeline == nil || runtime->lora_finish_f32_pipeline == nil || runtime->scatter_add_axis0_f32_pipeline == nil || runtime->conv1d_f32_pipeline == nil || runtime->conv2d_f32_pipeline == nil || runtime->layer_norm_pipeline == nil || runtime->rms_norm_pipeline == nil || runtime->rms_norm_reduce_pipeline == nil || runtime->rms_norm_rows_pipeline == nil || runtime->rms_norm_add_pipeline == nil || runtime->rms_norm_add_sumsq_pipeline == nil || runtime->rms_norm_add_f16_input_pipeline == nil || runtime->rms_norm_add_scale_pipeline == nil || runtime->rms_norm_add_scale_rows_pipeline == nil || runtime->linear_pipeline == nil || runtime->linear_reduce_pipeline == nil || runtime->linear_bf16_pipeline == nil || runtime->linear_bf16_reduce_pipeline == nil || runtime->linear_bf16_multi_row_pipeline == nil || runtime->linear_pair_reduce_pipeline == nil || runtime->linear_multi_row_pipeline == nil || runtime->linear_bias_pipeline == nil || runtime->argmax_logits_pipeline == nil || runtime->argmax_logits_partials_pipeline == nil || runtime->argmax_logits_suppress_partials_pipeline == nil || runtime->argmax_logits_reduce_pipeline == nil || runtime->sample_logits_pipeline == nil || runtime->sample_topk_partials_pipeline == nil || runtime->sample_topk_reduce_pipeline == nil || runtime->activation_pipeline == nil || runtime->gelu_backward_pipeline == nil || runtime->activation_multiply_pipeline == nil || runtime->softmax_pipeline == nil || runtime->reduce_last_dim_pipeline == nil || runtime->reduce_axis_f32_pipeline == nil || runtime->multiply_reduce_last_dim_pipeline == nil || runtime->broadcast_last_dim_pipeline == nil || runtime->broadcast_f32_pipeline == nil || runtime->multiply_pipeline == nil || runtime->scale_pipeline == nil || runtime->add_pipeline == nil || runtime->add_scale_pipeline == nil || runtime->subtract_pipeline == nil || runtime->divide_pipeline == nil || runtime->less_than_pipeline == nil || runtime->where_select_pipeline == nil || runtime->i2_s_quantize_pipeline == nil || runtime->q1_0_pipeline == nil || runtime->i8_s_pipeline == nil || runtime->q2_k_pipeline == nil || runtime->q3_k_pipeline == nil || runtime->q4_k_pipeline == nil || runtime->q4_k_reduce_pipeline == nil || runtime->q4_k_pair_pipeline == nil || runtime->q4_k_pair_activation_reduce_pipeline == nil || runtime->q4_k_pair_activation_reduce_f16_output_pipeline == nil || runtime->q4_k_activation_rhs_reduce_pipeline == nil || runtime->q4_0_activation_rhs_reduce_pipeline == nil || runtime->q4_0_activation_rhs_reduce_f16_output_pipeline == nil || runtime->q4_0_pipeline == nil || runtime->q4_0_pair_pipeline == nil || runtime->q4_0_pair_reduce_pipeline == nil || runtime->q4_0_pair_activation_reduce_pipeline == nil || runtime->q4_0_pair_activation_reduce_f16_output_pipeline == nil || runtime->q4_0_pair_activation_rms_scale_reduce_f16_output_pipeline == nil || runtime->q4_0_reduce_pipeline == nil || runtime->q4_0_reduce_sumsq_pipeline == nil || runtime->q4_0_reduce_f16_input_pipeline == nil || runtime->q4_0_reduce_f16_input_sumsq_pipeline == nil || runtime->q4_0_reduce_f16_output_pipeline == nil || runtime->q4_0_reduce_f16_input_f16_output_pipeline == nil || runtime->q4_1_pipeline == nil || runtime->q5_0_pipeline == nil || runtime->q5_0_reduce_pipeline == nil || runtime->q5_1_pipeline == nil || runtime->q8_0_pipeline == nil || runtime->q8_0_pair_pipeline == nil || runtime->q8_0_mmv_pipeline == nil || runtime->q8_0_rms_scale_mmv_pipeline == nil || runtime->q8_0_small_batch_pipeline == nil || (runtime->q8_0_mm_pipeline == nil && runtime->q8_0_mm_sg_pipeline == nil) || runtime->q8_0_pair_mmv_pipeline == nil || runtime->q8_0_pair_small_batch_pipeline == nil || runtime->q8_0_qkv_mmv_pipeline == nil || runtime->q8_0_pair_activation_reduce_pipeline == nil || runtime->q8_0_pair_activation_mmv_pipeline == nil || runtime->q8_0_pair_activation_small_batch_pipeline == nil || runtime->q8_0_activation_multiply_reduce_pipeline == nil || runtime->q8_0_activation_multiply_mmv_pipeline == nil || runtime->q8_1_pipeline == nil || runtime->q5_k_pipeline == nil || runtime->q5_k_reduce_pipeline == nil || runtime->q6_k_pipeline == nil || runtime->q6_k_reduce_pipeline == nil || runtime->q6_k_pair_pipeline == nil || runtime->q8_k_pipeline == nil || runtime->iq4_nl_pipeline == nil || runtime->iq4_xs_pipeline == nil || runtime->mxfp4_pipeline == nil || runtime->nvfp4_pipeline == nil || runtime->iq2_xs_pipeline == nil || runtime->i2_s_pipeline == nil || runtime->i2_s_pair_pipeline == nil || runtime->i2_s_linear_i8_pipeline == nil || runtime->i2_s_pair_i8_pipeline == nil || runtime->tl1_pipeline == nil || runtime->tl2_pipeline == nil || runtime->encode_polar4_key_pipeline == nil || runtime->encode_turbo3_key_pipeline == nil || runtime->polar4_attention_span_pipeline == nil || runtime->turbo3_attention_span_pipeline == nil) {
+        if ((termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_QWEN3_HEAD_NORM_SG")) && runtime->head_rms_rope_hd128_sg_pipeline == nil) || missing_requested_generated_pipeline || missing_quant_reduce_pipeline || missing_dense_multi_row_reduce_pipeline || runtime->embed_absolute_position_pipeline == nil || runtime->embedding_lookup_pipeline == nil || runtime->q4_0_get_rows_pipeline == nil || runtime->q4_0_set_rows_pipeline == nil || runtime->q4_0_cpy_q_to_f32_pipeline == nil || runtime->q4_0_cpy_f32_to_q_pipeline == nil || runtime->q4_1_get_rows_pipeline == nil || runtime->q4_1_set_rows_pipeline == nil || runtime->q4_1_cpy_q_to_f32_pipeline == nil || runtime->q4_1_cpy_f32_to_q_pipeline == nil || runtime->q5_0_get_rows_pipeline == nil || runtime->q5_0_set_rows_pipeline == nil || runtime->q5_0_cpy_q_to_f32_pipeline == nil || runtime->q5_0_cpy_f32_to_q_pipeline == nil || runtime->q5_1_get_rows_pipeline == nil || runtime->q5_1_set_rows_pipeline == nil || runtime->q5_1_cpy_q_to_f32_pipeline == nil || runtime->q5_1_cpy_f32_to_q_pipeline == nil || runtime->q4_k_get_rows_pipeline == nil || runtime->q4_k_set_rows_pipeline == nil || runtime->q4_k_cpy_q_to_f32_pipeline == nil || runtime->q4_k_cpy_f32_to_q_pipeline == nil || runtime->q5_k_get_rows_pipeline == nil || runtime->q5_k_set_rows_pipeline == nil || runtime->q5_k_cpy_q_to_f32_pipeline == nil || runtime->q5_k_cpy_f32_to_q_pipeline == nil || runtime->q6_k_get_rows_pipeline == nil || runtime->q6_k_set_rows_pipeline == nil || runtime->q6_k_cpy_q_to_f32_pipeline == nil || runtime->q6_k_cpy_f32_to_q_pipeline == nil || runtime->q8_0_get_rows_pipeline == nil || runtime->q8_0_set_rows_pipeline == nil || runtime->q8_0_cpy_q_to_f32_pipeline == nil || runtime->q8_0_cpy_f32_to_q_pipeline == nil || runtime->q8_1_get_rows_pipeline == nil || runtime->q8_1_set_rows_pipeline == nil || runtime->q8_1_cpy_q_to_f32_pipeline == nil || runtime->q8_1_cpy_f32_to_q_pipeline == nil || runtime->rope_pipeline == nil || runtime->head_rms_rope_pipeline == nil || runtime->attention_f32_pipeline == nil || runtime->attention_f32_prefill_pipeline == nil || runtime->attention_paged_pipeline == nil || runtime->paged_f32_kv_seed_pipeline == nil || runtime->paged_f16_kv_seed_pipeline == nil || runtime->paged_f32_v_seed_pipeline == nil || runtime->slice_last_dim_f32_2d_pipeline == nil || runtime->gather_axis0_add_bias_f32_2d_pipeline == nil || runtime->transpose_f32_pipeline == nil || runtime->dot_general_2d_f32_pipeline == nil || runtime->dot_general_2d_f32_reduce_pipeline == nil || runtime->dot_general_batched_f32_pipeline == nil || runtime->lora_after_a_f32_pipeline == nil || runtime->lora_finish_f32_pipeline == nil || runtime->scatter_add_axis0_f32_pipeline == nil || runtime->conv1d_f32_pipeline == nil || runtime->conv2d_f32_pipeline == nil || runtime->layer_norm_pipeline == nil || runtime->rms_norm_pipeline == nil || runtime->rms_norm_reduce_pipeline == nil || runtime->rms_norm_rows_pipeline == nil || runtime->rms_norm_add_pipeline == nil || runtime->rms_norm_add_sumsq_pipeline == nil || runtime->rms_norm_add_f16_input_pipeline == nil || runtime->rms_norm_add_scale_pipeline == nil || runtime->rms_norm_add_scale_rows_pipeline == nil || runtime->linear_pipeline == nil || runtime->linear_reduce_pipeline == nil || runtime->linear_bf16_pipeline == nil || runtime->linear_bf16_reduce_pipeline == nil || runtime->linear_bf16_multi_row_pipeline == nil || runtime->linear_pair_reduce_pipeline == nil || runtime->linear_multi_row_pipeline == nil || runtime->linear_bias_pipeline == nil || runtime->argmax_logits_pipeline == nil || runtime->argmax_logits_partials_pipeline == nil || runtime->argmax_logits_suppress_partials_pipeline == nil || runtime->argmax_logits_reduce_pipeline == nil || runtime->sample_logits_pipeline == nil || runtime->sample_topk_partials_pipeline == nil || runtime->sample_topk_reduce_pipeline == nil || runtime->activation_pipeline == nil || runtime->gelu_backward_pipeline == nil || runtime->activation_multiply_pipeline == nil || runtime->softmax_pipeline == nil || runtime->reduce_last_dim_pipeline == nil || runtime->reduce_axis_f32_pipeline == nil || runtime->multiply_reduce_last_dim_pipeline == nil || runtime->broadcast_last_dim_pipeline == nil || runtime->broadcast_f32_pipeline == nil || runtime->multiply_pipeline == nil || runtime->scale_pipeline == nil || runtime->add_pipeline == nil || runtime->add_scale_pipeline == nil || runtime->subtract_pipeline == nil || runtime->divide_pipeline == nil || runtime->less_than_pipeline == nil || runtime->where_select_pipeline == nil || runtime->i2_s_quantize_pipeline == nil || runtime->q1_0_pipeline == nil || runtime->i8_s_pipeline == nil || runtime->q2_k_pipeline == nil || runtime->q3_k_pipeline == nil || runtime->q4_k_pipeline == nil || runtime->q4_k_reduce_pipeline == nil || runtime->q4_k_pair_pipeline == nil || runtime->q4_k_pair_activation_reduce_pipeline == nil || runtime->q4_k_pair_activation_reduce_f16_output_pipeline == nil || runtime->q4_k_activation_rhs_reduce_pipeline == nil || runtime->q4_0_activation_rhs_reduce_pipeline == nil || runtime->q4_0_activation_rhs_reduce_f16_output_pipeline == nil || runtime->q4_0_pipeline == nil || runtime->q4_0_pair_pipeline == nil || runtime->q4_0_pair_reduce_pipeline == nil || runtime->q4_0_pair_activation_reduce_pipeline == nil || runtime->q4_0_pair_activation_reduce_f16_output_pipeline == nil || runtime->q4_0_pair_activation_rms_scale_reduce_f16_output_pipeline == nil || runtime->q4_0_reduce_pipeline == nil || runtime->q4_0_reduce_sumsq_pipeline == nil || runtime->q4_0_reduce_f16_input_pipeline == nil || runtime->q4_0_reduce_f16_input_sumsq_pipeline == nil || runtime->q4_0_reduce_f16_output_pipeline == nil || runtime->q4_0_reduce_f16_input_f16_output_pipeline == nil || runtime->q4_1_pipeline == nil || runtime->q5_0_pipeline == nil || runtime->q5_0_reduce_pipeline == nil || runtime->q5_1_pipeline == nil || runtime->q8_0_pipeline == nil || runtime->q8_0_pair_pipeline == nil || runtime->q8_0_mmv_pipeline == nil || runtime->q8_0_rms_scale_mmv_pipeline == nil || runtime->q8_0_small_batch_pipeline == nil || (runtime->q8_0_mm_pipeline == nil && runtime->q8_0_mm_sg_pipeline == nil) || runtime->q8_0_pair_mmv_pipeline == nil || runtime->q8_0_pair_small_batch_pipeline == nil || runtime->q8_0_qkv_mmv_pipeline == nil || runtime->q8_0_pair_activation_reduce_pipeline == nil || runtime->q8_0_pair_activation_mmv_pipeline == nil || runtime->q8_0_pair_activation_small_batch_pipeline == nil || runtime->q8_0_activation_multiply_reduce_pipeline == nil || runtime->q8_0_activation_multiply_mmv_pipeline == nil || runtime->q8_1_pipeline == nil || runtime->q5_k_pipeline == nil || runtime->q5_k_reduce_pipeline == nil || runtime->q6_k_pipeline == nil || runtime->q6_k_reduce_pipeline == nil || runtime->q6_k_pair_pipeline == nil || runtime->q8_k_pipeline == nil || runtime->iq4_nl_pipeline == nil || runtime->iq4_xs_pipeline == nil || runtime->mxfp4_pipeline == nil || runtime->nvfp4_pipeline == nil || runtime->iq2_xs_pipeline == nil || runtime->i2_s_pipeline == nil || runtime->i2_s_pair_pipeline == nil || runtime->i2_s_linear_i8_pipeline == nil || runtime->i2_s_pair_i8_pipeline == nil || runtime->tl1_pipeline == nil || runtime->tl2_pipeline == nil || runtime->encode_polar4_key_pipeline == nil || runtime->encode_turbo3_key_pipeline == nil || runtime->polar4_attention_span_pipeline == nil || runtime->turbo3_attention_span_pipeline == nil) {
             fprintf(stderr, "metal-runtime-create: pipeline=nil");
             if (termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_ATTENTION_1X_GENERATED")) && runtime->attention_1x_generated_pipeline == nil) fprintf(stderr, " generated_attention_1x");
             if (termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_FLASH_PREFILL_GENERATED")) &&
@@ -26946,7 +26972,8 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
             if (termite_metal_a4b_flash_prefill_hd256_enabled() &&
                 !termite_metal_generated_flash_prefill_disabled() &&
                 runtime->attention_flash_generated_pipeline == nil) fprintf(stderr, " a4b_flash_prefill_hd256");
-            if (termite_metal_e2b_flash_prefill_hd256_enabled() &&
+            if (termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_E2B_FLASH_PREFILL_HD256")) &&
+                termite_metal_e2b_flash_prefill_hd256_enabled() &&
                 !termite_metal_generated_flash_prefill_disabled() &&
                 runtime->attention_flash_generated_pipeline == nil) fprintf(stderr, " e2b_flash_prefill_hd256");
             if (termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_RMS_NORM_GENERATED")) && runtime->rms_norm_generated_pipeline == nil) fprintf(stderr, " generated_rms_norm");
@@ -30682,7 +30709,7 @@ int termite_metal_decode_runtime_apply_attention_f32_device(
         const BOOL short_embedding_encoder = runtime->embedding_workspace_bounded &&
             q_len >= 9u && q_len <= 64u &&
             !termite_metal_concurrent_planned_dispatch_enabled(runtime) &&
-            termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_Q8_0_SMALL_ROWS")) &&
+            termite_metal_qwen_short_rows_enabled(runtime) &&
             !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_QWEN3_SMALL_ENCODER"));
         id<MTLComputeCommandEncoder> encoder = short_embedding_encoder
             ? termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION, &encoder_owned)

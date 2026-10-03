@@ -381,7 +381,9 @@ def main():
         if args.baseline_antfly:
             baseline_env = dict(env)
             for flag in ("TERMITE_METAL_ENABLE_Q8_0_SMALL_ROWS", "TERMITE_METAL_ENABLE_Q8_0_SMALL_ROWS_M64", "TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING", "TERMITE_METAL_ENABLE_QWEN3_HEAD_NORM_SG"):
-                baseline_env.pop(flag, None)
+                # Unset flags now select qualified device defaults. The fixed
+                # comparison must explicitly disable these serving changes.
+                baseline_env[flag] = "0"
             paired_baseline = stack.enter_context(server(args.baseline_antfly.resolve(), baseline_args, baseline_env, reference + "/ai/v1/models", args.output_dir / "baseline.log"))
             (args.output_dir / "paired-baseline.json").write_text(json.dumps({"executable_sha256": benchmark.sha256_file(args.baseline_antfly), "argv": baseline_args, "controls": {k: v for k, v in baseline_env.items() if k.startswith(("TERMITE_", "ANTFLY_INFERENCE_"))}, "method": "same-host alternating AB/BA, fixed baseline and candidate; no simultaneous GPU requests", "threshold": 0.95}, indent=2) + "\n")
         cells = []

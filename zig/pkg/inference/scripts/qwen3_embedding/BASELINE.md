@@ -94,10 +94,12 @@ raw receipt contains both full memory trajectories and the conditioning driver s
 This is qualification of the explicitly conditioned steady-state run; it does
 not reclassify the initial failing soak.
 
-The three serving controls remain opt-in:
+Those historical runs explicitly enabled the three serving controls:
 `TERMITE_METAL_ENABLE_Q8_0_SMALL_ROWS=1`,
 `TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING=1`, and
-`TERMITE_METAL_ENABLE_QWEN3_HEAD_NORM_SG=1`. Qualification required Metal and
+`TERMITE_METAL_ENABLE_QWEN3_HEAD_NORM_SG=1`. The later
+[merged-branch default qualification](../metal_serving_defaults_m4_summary.md)
+records the current M4 default policy and fresh results. Qualification required Metal and
 resident execution. Other Apple devices, precision tiers, 4B/8B models, the full
 32K context and canonical CI remain separate qualification work.
 

@@ -116,7 +116,15 @@ bytes. A passing report alone is insufficient evidence of Metal execution or a
 particular precision tier. Strict throughput comparisons separately attest live
 process arguments and executable/model hashes.
 
-### Experimental short-row and bounded-batch controls
+### Qualified short-row and bounded-batch controls
+
+The three serving features below default on for Apple M4-family Metal devices.
+Short-row projection and normalization defaults require the admitted embedding
+workspace; batching still requires eligible dense Qwen3 text embeddings and a
+dynamic, unpadded tokenizer. Other devices retain explicit opt-in. Current
+qualification and its scope are recorded in the
+[default qualification receipt](../metal_serving_defaults_m4_summary.md).
+Explicit empty, `0`, `false`, `no`, or `off` values disable each feature.
 
 `TERMITE_METAL_ENABLE_Q8_0_SMALL_ROWS=1` enables SG-v2 projections and fused
 gate/up for 9–64 rows, selecting M32 for short rows and retaining the established
@@ -126,16 +134,15 @@ for comparison; `TERMITE_METAL_DISABLE_SMALL_ROWS_NORM_REDUCE=1` isolates the
 normalization change. With bounded batching enabled, short frames also reuse
 the serial planned encoder through attention and FFN; set
 `TERMITE_METAL_DISABLE_QWEN3_SMALL_ENCODER=1` to isolate that change. These
-controls remain opt-in; qualification applies to the hardware and artifacts
-documented in `BASELINE.md`.
+disable flags take precedence; the M64 short-row comparison remains opt-in.
 
 `TERMITE_METAL_ENABLE_QWEN3_HEAD_NORM_SG=1` additionally selects a SIMD
 reduction and paired rotary stores for bounded 9–64-row frames with full
 128-dimensional rotary heads and 8 or 16 heads per row. Four independent
 32-lane SIMD groups normalize four heads, without a threadgroup reduction.
 Other shapes, partial or consecutive rotary layouts, and incompatible SIMD
-widths use the existing head-normalization kernel. Remove this flag to isolate
-the change; it remains opt-in with the projection and bounded-batching controls.
+widths use the existing head-normalization kernel. Set this flag to `0` to
+isolate the change.
 
 Bounded last-token embeddings also encode the resident L2 normalization tail
 before submitting the decoder frame. Set
@@ -163,7 +170,8 @@ resident dense route. Other models and backend paths retain their existing route
 workspace, requested/current bytes and applicable limits. Pass-only GPU counters
 that would require splitting a bounded Qwen encoder report an incomplete sample
 instead of changing frame topology. CPU timing and dispatch census remain usable.
-Remove the enable flags to roll back the experimental serving paths.
+Set all three enable flags to `0` and restart the server to roll back these
+serving features. Removing them restores the device-qualified defaults.
 
 For the gap qualification lane, create a fixture and run the owned-server
 driver from this directory (install the pinned oracle tokenizer dependency
@@ -173,9 +181,6 @@ explicitly if it is unavailable):
 python3 build_qwen3_embedding_fixture.py \
   --tokenizer /absolute/models/model/tokenizer.json \
   --model-file /absolute/models/model/model.gguf --output /tmp/qwen-exact.json
-TERMITE_METAL_ENABLE_Q8_0_SMALL_ROWS=1 \
-TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING=1 \
-TERMITE_METAL_ENABLE_QWEN3_HEAD_NORM_SG=1 \
 python3 run_qwen3_embedding_gap_qualification.py \
   --antfly /absolute/antfly-inference-bench-server --llama /absolute/llama-server \
   --model-dir /absolute/models/model --fixture /tmp/qwen-exact.json \
@@ -204,7 +209,7 @@ Longer singletons may need explicit `--scratch-budget-mb` and
 `--combined-budget-mb` operator caps in addition to the process budget;
 qualification records those caps and does not
 silently weaken the default limits. Run the passage stage with the preserved
-baseline binary, the same budgets and the enable flags removed, then pass its
+baseline binary, the same budgets and all three enable flags set to `0`, then pass its
 report directory as `--baseline-dir` for the candidate run. This gates supported
 passage cells at a lower 95% throughput ratio of 0.95 against that fixed baseline,
 using an unpaired bootstrap across the independent runs. Provenance, model,
@@ -220,7 +225,7 @@ For a direct comparison under changing host conditions, supply
 instead of `--baseline-dir`. Both builds stay loaded across the six shapes,
 accept identical budgets and model bytes, and alternate measured requests.
 The reference endpoint is then the fixed Antfly build, with its injected EOS
-usage offset and experimental flags removed. Each paired round requires a
+usage offset and serving flags explicitly set to `0`. Each paired round requires a
 lower 95% candidate/baseline throughput ratio of 0.95 and cosine 0.995.
 It uses no llama.cpp server, and cannot be combined with `--baseline-dir`.
 Use `--stage capacity` with the default limits to isolate the three-round

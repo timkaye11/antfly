@@ -1269,10 +1269,9 @@ pub fn build(b: *std.Build) void {
         quant_kernel_metal_local_check_step.dependOn(q4_pair_route_tail);
     }
 
-    // Focused E2B prefill qualification suite. These candidates intentionally
-    // remain outside the default local check: they allocate production-sized
-    // Q4_0 weights and exist for explicit on-device A/B qualification before
-    // either selector is promoted.
+    // Focused E2B prefill qualification suite. It remains a separate local
+    // check because it allocates production-sized Q4_0 weights. Verify the
+    // qualified routes against their independently disabled baselines.
     const e2b_q4_mm_cases = [_]struct { rows: []const u8, in_dim: []const u8, out_dim: []const u8, route: []const u8 }{
         .{ .rows = "32", .in_dim = "1536", .out_dim = "6144", .route = "aligned" },
         .{ .rows = "31", .in_dim = "1536", .out_dim = "12288", .route = "aligned-tail" },

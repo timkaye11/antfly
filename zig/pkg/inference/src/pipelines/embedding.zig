@@ -37,6 +37,7 @@ const decoder_gated_runtime = @import("../backends/decoder_gated_runtime.zig");
 const resident_ops = @import("../graph/resident_ops.zig");
 const embedding_trace = @import("../embedding_trace.zig");
 const qwen_batch = @import("qwen_embedding_batch.zig");
+const metal_runtime = @import("../backends/metal_runtime.zig");
 const memory_admission = @import("../runtime/tier/memory.zig");
 const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
@@ -371,8 +372,8 @@ pub const EmbeddingPipeline = struct {
     }
 
     fn boundedQwenBatchingEnabled(self: *const EmbeddingPipeline) bool {
-        const enabled = platform.env.getenvSlice("TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING") orelse return false;
-        if (!envFlagEnabled(enabled) or self.text_projection != null) return false;
+        if (!metal_runtime.qualifiedM4FeatureEnabled("TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING", true) or
+            self.text_projection != null) return false;
         const cfg = session_factory.getGptConfig(self.textEncodingSession()) orelse return false;
         return residentQwen3EmbeddingEligible(self.textEncodingSession(), cfg, self.config) and
             self.tok.vtable.encodeForModelUnpadded != null and

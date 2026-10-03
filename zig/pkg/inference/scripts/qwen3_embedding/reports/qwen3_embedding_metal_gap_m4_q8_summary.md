@@ -2,7 +2,9 @@
 
 Historical local results for Apple M4, 16 GiB RAM, macOS 26.5, and
 Qwen3-Embedding-0.6B Q8_0. These measurements cover the recorded executables,
-not the current merged branch. All three experimental serving paths remain opt-in.
+not the current merged branch. See the later
+[default qualification receipt](../../metal_serving_defaults_m4_summary.md)
+for the current M4 serving policy and fresh qualification.
 
 ## Protocol and provenance
 

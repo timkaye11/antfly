@@ -49,6 +49,7 @@ const gpt_model_mod = @import("../models/gpt.zig");
 const model_compatibility = @import("../models/compatibility.zig");
 const chunking_mod = @import("../pipelines/chunking.zig");
 const embedding_mod = @import("../pipelines/embedding.zig");
+const metal_runtime = @import("../backends/metal_runtime.zig");
 const extraction_mod = @import("../pipelines/extraction.zig");
 const extraction_v2 = @import("../extractors/extraction_v2.zig");
 const boundary_executor = @import("../extractors/gliner_boundary_executor.zig");
@@ -10539,7 +10540,7 @@ pub const Node = struct {
         // Copy the warm publication's small metadata while briefly pinning it.
         // Request validation never scans its GGUF tokenizer arrays, and the
         // failed runtime can be reclaimed before a recovery replacement loads.
-        const cached_manifest = if (platform.env.getenvBool("TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING"))
+        const cached_manifest = if (metal_runtime.qualifiedM4FeatureEnabled("TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING", true))
             self.model_manager.copyCachedQwenEmbeddingManifest(ctx.allocator, model_path) catch |err|
                 return modelLoadFailureResponse(ctx, err)
         else

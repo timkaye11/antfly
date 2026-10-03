@@ -48,6 +48,7 @@ const whisper_prompt = @import("../pipelines/whisper_prompt.zig");
 const encoder_decoder = @import("../pipelines/encoder_decoder.zig");
 const vision_config = @import("../readers/vision_config.zig");
 const embedding_mod = @import("../pipelines/embedding.zig");
+const metal_runtime = @import("../backends/metal_runtime.zig");
 const EmbeddingPipeline = embedding_mod.EmbeddingPipeline;
 const EmbeddingConfig = embedding_mod.EmbeddingConfig;
 const PoolingStrategy = embedding_mod.PoolingStrategy;
@@ -3569,7 +3570,7 @@ fn attachSessionRunAdmission(
         resident.backend_weight_bytes,
     ) catch std.math.maxInt(usize);
     const qwen_cfg = if (backend_runtime.backend == .metal and
-        platform.env.getenvBool("TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING"))
+        metal_runtime.qualifiedM4FeatureEnabled("TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING", true))
         session_factory.getGptConfig(session.*)
     else
         null;
