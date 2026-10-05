@@ -1106,6 +1106,7 @@ fn applyVjp(
             // Convolution gradient is complex; skip for MVP.
             // Training with conv layers needs this implemented.
         },
+        .average_pool => return error.UnsupportedPoolGradient,
 
         // ── Type conversion ──────────────────────────────────────────
         .convert_dtype => {
@@ -1222,6 +1223,49 @@ fn applyVjp(
             try accumulate(b, adjoints, ins[0], d_qkv);
             try accumulate(b, adjoints, ins[1], d_relative);
             // Token validity, bucket indices and RNG counters have no VJP.
+        },
+
+        // ── Fused segment (tree/local/global) training attention ─────
+        // Forward inputs: ins[0]=qkv_packed [3*B*S, H] (a concat the
+        // upstream concat VJP later splits into dQ/dK/dV), ins[1]=physical
+        // i32 control (replay limbs, logical positions, ranges). The
+        // backward op recomputes scores per tile (no saved [tokens,tokens]
+        // tensor) and emits one qkv-shaped packed gradient.
+        .fused_segment_training_attention_v1 => |attrs| {
+            const layout = try attrs.layout();
+            if (ins.len != 2) return error.InvalidSegmentTrainingAttentionShape;
+            for (ins) |id|
+                if (id == null_node or id >= g.nodes.items.len) return error.InvalidGraphDependency;
+            if (!g.node(ins[0]).output_shape.eq(layout.qkvShape()) or
+                !g.node(ins[1]).output_shape.eq(layout.controlShape()) or
+                !n.output_shape.eq(layout.outputShape())) return error.InvalidSegmentTrainingAttentionShape;
+            const grad_qkv = try b.graph.addNode(.{
+                .op = .{ .fused_segment_training_attention_backward_v1 = attrs },
+                .output_shape = layout.gradientShape(),
+                .inputs = .{ ins[0], ins[1], adj, null_node },
+                .num_inputs = 3,
+                .vjp_alternate = null_node,
+            });
+            try accumulate(b, adjoints, ins[0], grad_qkv);
+            // Logical positions, ranges and RNG counters have no VJP.
+        },
+
+        .fused_modernbert_training_attention_v1 => |attrs| {
+            const layout = try attrs.layout();
+            if (ins.len != 2) return error.InvalidModernBertTrainingAttentionShape;
+            for (ins) |id|
+                if (id == null_node or id >= g.nodes.items.len) return error.InvalidGraphDependency;
+            if (!g.node(ins[0]).output_shape.eq(layout.qkvShape()) or !g.node(ins[1]).output_shape.eq(layout.controlShape()) or
+                !n.output_shape.eq(layout.outputShape())) return error.InvalidModernBertTrainingAttentionShape;
+            const grad_qkv = try b.graph.addNode(.{
+                .op = .{ .fused_modernbert_training_attention_backward_v1 = attrs },
+                .output_shape = layout.qkvShape(),
+                .inputs = .{ ins[0], ins[1], adj, null_node },
+                .num_inputs = 3,
+                .vjp_alternate = null_node,
+            });
+            try accumulate(b, adjoints, ins[0], grad_qkv);
+            // Ranges and positions have no VJP.
         },
 
         .fused_linear => |attrs| {
@@ -1377,8 +1421,8 @@ fn batchedDotGeneralDirect(
     if (lhs_shape.dim(lhs_contracting) != rhs_shape.dim(rhs_contracting)) return error.InvalidDotGeneralShape;
 
     var out_dims: [shape_mod.max_rank]i64 = undefined;
-    var lhs_batch = [_]u8{0} ** shape_mod.max_rank;
-    var rhs_batch = [_]u8{0} ** shape_mod.max_rank;
+    var lhs_batch = @as([shape_mod.max_rank]u8, @splat(0));
+    var rhs_batch = @as([shape_mod.max_rank]u8, @splat(0));
     for (0..num_batch) |axis| {
         const batch_axis: u8 = @intCast(axis);
         if (lhs_shape.dim(batch_axis) != rhs_shape.dim(batch_axis)) return error.InvalidDotGeneralShape;
@@ -1569,7 +1613,7 @@ fn broadcastToShape(
 
     // Use broadcast_in_dim for shape expansion, mapping adjoint axes onto
     // the unreduced target axes.
-    var reduced_mask: [shape_mod.max_rank]bool = .{false} ** shape_mod.max_rank;
+    var reduced_mask: [shape_mod.max_rank]bool = @splat(false);
     for (reduced_axes) |axis| reduced_mask[axis] = true;
 
     var broadcast_axes: [shape_mod.max_rank]u8 = undefined;

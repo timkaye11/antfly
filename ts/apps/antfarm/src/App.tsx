@@ -34,6 +34,7 @@ import RagPlaygroundPage from "./pages/RagPlaygroundPage";
 import ReaderPlaygroundPage from "./pages/ReaderPlaygroundPage";
 import RerankingPlaygroundPage from "./pages/RerankingPlaygroundPage";
 import { SecretsPage } from "./pages/SecretsPage";
+import SQLWorkbenchPage from "./pages/SQLWorkbenchPage";
 import TableDetailsPage from "./pages/TableDetailsPage";
 import TablesListPage from "./pages/TablesListPage";
 import TrainingPage from "./pages/TrainingPage";
@@ -125,6 +126,7 @@ function AppContent() {
                       <>
                         <Route path="/" element={<TablesListPage />} />
                         <Route path="/create" element={<CreateTablePage />} />
+                        <Route path="/sql" element={<SQLWorkbenchPage />} />
                         <Route
                           path="/tables/:tableName"
                           element={<TableDetailsPage currentSection={currentSection} />}

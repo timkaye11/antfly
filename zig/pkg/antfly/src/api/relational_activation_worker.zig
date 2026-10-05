@@ -16,15 +16,15 @@
 //! routed claims/references, and the owner-bound continuation share ONE durable
 //! transaction. Concurrent supervisors may race safely on the progress CAS.
 const std = @import("std");
-const reads = @import("table_reads.zig");
-const writes = @import("table_writes.zig");
+const reads = @import("table_read_source.zig");
+const writes = @import("table_write_source.zig");
 const planner = @import("relational_integrity_commit.zig");
 const activation = @import("../storage/db/relational_integrity_activation_contract.zig");
 const records = @import("../common/topology_records.zig");
 const contract = @import("distributed_txn_contract.zig");
 const Allocator = std.mem.Allocator;
 const RequestContext = @import("operation.zig").RequestContext;
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const time = @import("antfly_platform").time;
 
 const Attempt = enum { idle, progressed, shrink };
@@ -273,7 +273,7 @@ test "distributed txn activation failure publication atomically guards child and
 }
 
 test "distributed txn activation worker adapts pages and atomically publishes native claims and failure state" {
-    const db_mod = @import("../storage/db/db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const types = @import("../storage/db/types.zig");
     const integrity = @import("../storage/db/relational_integrity_contract.zig");
     const catalog = @import("../storage/db/relational_integrity_catalog.zig");
@@ -447,7 +447,7 @@ test "distributed txn activation admission reaches singleton in bounded reductio
 }
 
 test "distributed txn MATCH PARTIAL diagnostic admits guarded deletion and correction then resumes coverage" {
-    const db_mod = @import("../storage/db/db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const types = @import("../storage/db/types.zig");
     const gate = @import("../raft/read_gate.zig");
     const alloc = std.testing.allocator;
@@ -465,7 +465,8 @@ test "distributed txn MATCH PARTIAL diagnostic admits guarded deletion and corre
         defer db.close();
         try db.setSchemaJson(alloc, initial);
         try db.batch(.{ .writes = &.{.{ .key = "orphan", .value = "{\"a\":9,\"b\":9,\"x\":99,\"y\":null}" }} });
-        try db.setSchemaJson(alloc, declaration);
+        try std.testing.expectError(error.ForeignKeyGenerationPublicationRequired, db.setSchemaJson(alloc, declaration));
+        try @import("relational_fk_test_publication.zig").install(alloc, &db, initial, declaration, 1);
         inline for (.{ "by_a", "by_b" }) |index| {
             for (0..16) |_| {
                 if ((try db.relationalIndexBuildStatus(index)).state == .ready) break;
@@ -548,7 +549,7 @@ test "distributed txn MATCH PARTIAL diagnostic admits guarded deletion and corre
 }
 
 test "distributed txn CHECK activation shares durable repair retry and physical source guards" {
-    const db_mod = @import("../storage/db/db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const types = @import("../storage/db/types.zig");
     const read_gate = @import("../raft/read_gate.zig");
     const alloc = std.testing.allocator;

@@ -31,7 +31,7 @@ fn afterAdmission(err: anyerror) anyerror {
     return error.MetadataMutationOutcomeUnknown;
 }
 
-fn lockTableCatalogMutation(svc: anytype, table_name: []const u8) void {
+pub fn lockTableCatalogMutation(svc: anytype, table_name: []const u8) void {
     const Service = @TypeOf(svc.*);
     if (comptime @hasDecl(Service, "lockTableCatalogMutation")) {
         svc.lockTableCatalogMutation(table_name);
@@ -42,7 +42,7 @@ fn lockTableCatalogMutation(svc: anytype, table_name: []const u8) void {
     }
 }
 
-fn unlockTableCatalogMutation(svc: anytype, table_name: []const u8) void {
+pub fn unlockTableCatalogMutation(svc: anytype, table_name: []const u8) void {
     const Service = @TypeOf(svc.*);
     if (comptime @hasDecl(Service, "unlockTableCatalogMutation")) {
         svc.unlockTableCatalogMutation(table_name);
@@ -124,6 +124,8 @@ pub fn create(
     // boundary so embedded, HTTP-local, and forwarded callers cannot persist
     // different definitions for the same request.
     var normalized_req = req;
+    if (try @import("fk_generation_publication.zig").schemaHasForeignKeys(alloc, tables_api.effectiveSchemaJson(req.schema_json)))
+        return error.ForeignKeyGenerationPublicationRequired;
     if (req.storage) |storage| {
         if (storage.dense_embeddings == .vector_store)
             return error.VectorStoreRequiresLocalSingleShardTable;

@@ -15,7 +15,7 @@
 //! Local write request and configuration values shared with storage owners.
 
 const std = @import("std");
-const backups_api = @import("backups.zig");
+const backups_api = @import("local_backups.zig");
 const asset_producer_mod = @import("../storage/db/enrichment/asset_producer.zig");
 const document_extraction_mod = @import("../storage/db/enrichment/document_extraction.zig");
 const db_mod = @import("../storage/db/control_root.zig");
@@ -71,7 +71,7 @@ pub const ManagedDbOpenMode = enum {
     status_only,
 };
 
-pub const RestoreTerminalAdmission = enum { none, ha_replay, cancel_recovery };
+pub const RestoreTerminalAdmission = enum { none, hot_standby_replay, cancel_recovery };
 pub const StartupCatchUpMetadata = struct {
     pub const MetadataSource = enum { supplied, local_persisted };
     pub const IdentityValidation = enum {

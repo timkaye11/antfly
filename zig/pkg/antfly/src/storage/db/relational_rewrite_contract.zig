@@ -22,20 +22,22 @@ pub const max_source_schemas = 256;
 pub const max_schema_bytes = 4 * 1024 * 1024;
 
 pub const Intent = struct {
-    version: u8 = 1,
+    version: u8 = 2,
     /// Unchanged document tables in the dependency cohort retain their exact
     /// logical values. They still participate in the same tail/cutover proof.
     preserve_document: bool = false,
     source_schemas: []const []const u8,
     target_schema: []const u8,
     target_read_schema: []const u8 = "",
-    apply_defaults_to_absent: bool = false,
+    /// Only these target columns may receive defaults on historical rows.
+    /// An empty list preserves every absent historical value.
+    default_columns: []const []const u8 = &.{},
     allow_column_drops: bool = false,
     /// Digest of compiled semantic programs, NOT numeric schema versions.
     program_digest: Digest,
 
     pub fn validate(self: Intent) !void {
-        if (self.version != 1 or self.source_schemas.len == 0 or self.source_schemas.len > max_source_schemas or
+        if (self.version != 2 or self.source_schemas.len == 0 or self.source_schemas.len > max_source_schemas or
             self.target_schema.len == 0 or std.mem.allEqual(u8, &self.program_digest, 0)) return error.InvalidRestoreStagingCommand;
         var bytes = self.target_schema.len +| self.target_read_schema.len;
         for (self.source_schemas) |source| {
@@ -43,8 +45,15 @@ pub const Intent = struct {
             bytes = std.math.add(usize, bytes, source.len) catch return error.InvalidRestoreStagingCommand;
         }
         if (bytes > max_schema_bytes) return error.InvalidRestoreStagingCommand;
+        if (self.default_columns.len > 4096) return error.InvalidRestoreStagingCommand;
+        for (self.default_columns, 0..) |name, i| {
+            if (name.len == 0) return error.InvalidRestoreStagingCommand;
+            bytes = std.math.add(usize, bytes, name.len) catch return error.InvalidRestoreStagingCommand;
+            if (bytes > max_schema_bytes) return error.InvalidRestoreStagingCommand;
+            for (self.default_columns[0..i]) |previous| if (std.mem.eql(u8, name, previous)) return error.InvalidRestoreStagingCommand;
+        }
         if (self.preserve_document) {
-            if (self.apply_defaults_to_absent or self.allow_column_drops or self.source_schemas.len != @as(usize, if (self.target_read_schema.len == 0) 1 else 2)) return error.InvalidRestoreStagingCommand;
+            if (self.default_columns.len != 0 or self.allow_column_drops or self.source_schemas.len != @as(usize, if (self.target_read_schema.len == 0) 1 else 2)) return error.InvalidRestoreStagingCommand;
             var active = false;
             var previous = self.target_read_schema.len == 0;
             for (self.source_schemas) |definition| {
@@ -123,9 +132,17 @@ pub const TailChunk = struct {
     total: u32,
     offset: u32,
     data: []const u8,
+    frame_format: enum { contiguous, chunked } = .contiguous,
+    /// Authenticated ordinal/chunk directory, sent only with the first slice.
+    descriptor: ?[]const u8 = null,
 
     pub fn validate(self: TailChunk) !void {
-        if (self.sequence == 0 or self.total == 0 or self.total > 16 * 1024 * 1024 or self.offset >= self.total or
+        const limit: u32 = if (self.frame_format == .chunked) @import("../retained_frame.zig").max_logical_bytes else 16 * 1024 * 1024;
+        if ((self.frame_format == .contiguous and self.descriptor != null) or
+            (self.frame_format == .chunked and self.offset == 0 and self.descriptor == null) or
+            (self.offset != 0 and self.descriptor != null)) return error.InvalidRestoreStagingCommand;
+        if (self.descriptor) |bytes| if (bytes.len > 272 * 1024) return error.InvalidRestoreStagingCommand;
+        if (self.sequence == 0 or self.total == 0 or self.total > limit or self.offset >= self.total or
             self.data.len == 0 or self.data.len > 64 * 1024 or self.data.len > self.total - self.offset or
             std.mem.allEqual(u8, &self.pin, 0) or std.mem.allEqual(u8, &self.frame_digest, 0)) return error.InvalidRestoreStagingCommand;
     }
@@ -150,7 +167,7 @@ pub const Progress = struct {
         if (self.sequence < binding.retained_start or
             ((self.frame_offset == 0) != (self.frame_remaining == 0)) or
             ((self.frame_offset == 0) != std.mem.allEqual(u8, &self.frame_digest, 0)) or
-            self.frame_offset > 16 * 1024 * 1024 or self.frame_remaining > 65536 or
+            self.frame_offset > @import("../retained_frame.zig").max_logical_bytes or self.frame_remaining > 65536 or
             (!self.snapshot_complete and (self.sequence != binding.retained_start or self.frame_offset != 0 or self.final_cut != null))) return error.InvalidRestoreStagingCommand;
         if (self.final_cut) |cut| if (!self.snapshot_complete or self.frame_offset != 0 or cut.sequence != self.sequence or
             cut.applied_index < binding.source_applied_index or std.mem.allEqual(u8, &cut.digest, 0)) return error.InvalidRestoreStagingCommand;

@@ -30,8 +30,100 @@ const table_reads = @import("antfly_source_root").antfly_sources.table_reads;
 const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 const shard_state_store = @import("../data/storage/shard_state_store.zig");
 
+test "cold warmup reopens transient owners without disturbing resident siblings" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const Catalog = struct {
+        fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{
+                    .metadata_group_id = 1,
+                    .metadata_incarnation = "61616161616161616161616161616161".*,
+                    .metrics = .{},
+                },
+                .tables = @constCast(&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 71,
+                    .name = "warmup_probe",
+                    .placement_role = "data",
+                    .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"}}",
+                }}),
+                .ranges = @constCast(&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7501, .table_id = 71, .range_id = 7501, .start_key = "", .end_key = "m" },
+                    .{ .group_id = 7502, .table_id = 71, .range_id = 7502, .start_key = "m", .end_key = null },
+                }),
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        pub fn validate(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
+            var current = try snapshot(ptr);
+            return contract.matches(&current);
+        }
+        fn source(self: *@This()) table_catalog.CatalogSource {
+            return .{ .ptr = self, .vtable = &.{
+                .admin_snapshot = snapshot,
+                .free_admin_snapshot = free,
+                .routing_snapshot = table_catalog.TestAdminRoutingAdapter(snapshot, free).routingSnapshot,
+                .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(snapshot, free).linearizableSnapshot,
+                .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(snapshot, free).freeRoutingSnapshot,
+                .validate_publication = validate,
+            } };
+        }
+    };
+    var catalog = Catalog{};
+    var owners = kernel_owner_source.ProvisionedKernelOwnerSource.init(alloc, root, catalog.source(), read_gate.alreadyReadSafeBarrier());
+    defer owners.deinit();
+    _ = try owners.reconcileTableGroup(7501, "warmup_probe");
+    try std.testing.expectEqual(@as(usize, 1), owners.ownerCountForTest());
+    const resident = owners.entries.items[0];
+    const misses_before_resident_warmup = owners.cacheStats().miss_count;
+    try owners.warmTableGroup(7501, "warmup_probe");
+    try std.testing.expectEqual(misses_before_resident_warmup, owners.cacheStats().miss_count);
+
+    for (0..2) |_| {
+        const misses_before = owners.cacheStats().miss_count;
+        try std.testing.expect((try owners.writeSource().localRuntimeStatusGroupLocal(alloc, 7502, "warmup_probe")) == null);
+        try std.testing.expectEqual(misses_before, owners.cacheStats().miss_count);
+        try owners.warmTableGroup(7502, "warmup_probe");
+        try std.testing.expect(owners.cacheStats().miss_count > misses_before);
+        try std.testing.expectEqual(@as(usize, 1), owners.ownerCountForTest());
+        try std.testing.expectEqual(resident, owners.entries.items[0]);
+        try std.testing.expect((try owners.writeSource().localRuntimeStatusGroupLocal(alloc, 7502, "warmup_probe")) == null);
+    }
+}
+
 test "bulk callback ABI retains exact consumer error identity" {
     try kernel_owner_source.ProvisionedKernelOwnerSource.validateBulkCallbackIdentityForTest();
+}
+
+test "replica retirement cold readers configure a lazy compiled context" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io_impl.io(), ".", alloc);
+    defer alloc.free(root);
+    const group_path = try std.fs.path.join(alloc, &.{ root, "group-7198" });
+    defer alloc.free(group_path);
+    inline for (.{ false, true }) |by_path| {
+        var owners = kernel_owner_source.ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+        defer owners.deinit();
+        try std.testing.expect(owners.context.handle == null);
+        const record = if (by_path)
+            try owners.readColdInitialChildRetirementRecordAtPath(alloc, group_path)
+        else
+            try owners.readInitialChildRetirementRecord(alloc, 7198);
+        try std.testing.expect(record == null);
+        try std.testing.expect(owners.context.handle != null);
+        try std.testing.expectEqual(@as(usize, 0), owners.ownerCountForTest());
+    }
 }
 
 test "replica retirement drains active compiled owners before deleting physical roots" {
@@ -87,8 +179,16 @@ test "replica retirement drains active compiled owners before deleting physical 
                 if (group_id != 7198) return error.UnexpectedGroup;
                 return .retired;
             }
+            fn initialChild(ptr: *anyopaque, allocator: std.mem.Allocator, group_id: u64) !table_writes.InitialChildRetirementObservation {
+                const owner: *kernel_owner_source.ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+                // Match the linked runtime's native proof reader. An ordinary
+                // replica is removable only after observing no cold AICH;
+                // omitting this bridge must continue to fail closed.
+                return .{ .record = try owner.readInitialChildRetirementRecord(allocator, group_id) };
+            }
         };
         _ = source.withReplicaRetirementOwnership(.{ .ptr = &source, .classify = Ownership.classify });
+        _ = source.withInitialChildRetirementReader(.{ .ptr = &owners, .read = Ownership.initialChild });
         var prepared = try source.prepareReplicaRetirements(alloc, &.{.{ .group_id = 7198, .table_name = retirement_name }});
         defer prepared.deinit();
         const Release = struct {
@@ -147,7 +247,7 @@ test "empty hidden bootstrap read retries when the root generation advances" {
     });
     try std.testing.expectError(
         error.StorageKernelOwnerTransitionRequired,
-        owners.readHAHiddenOwnerBootstrap(alloc, 7196, 71),
+        owners.readHotStandbyHiddenOwnerBootstrap(alloc, 7196, 71),
     );
     try std.testing.expectEqual(@as(usize, 2), generation.reads);
 }
@@ -176,7 +276,7 @@ test "concurrent cold hidden bootstrap reads share one configured context" {
         fn run(self: *@This()) void {
             _ = self.ready.fetchAdd(1, .acq_rel);
             while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
-            const bootstrap = self.source.readHAHiddenOwnerBootstrap(std.heap.page_allocator, 7196, 71) catch |err| {
+            const bootstrap = self.source.readHotStandbyHiddenOwnerBootstrap(std.heap.page_allocator, 7196, 71) catch |err| {
                 self.failure = err;
                 return;
             };
@@ -284,9 +384,9 @@ test "hidden constrained lookup recovers cold compiled owner from exact plan aut
     try std.testing.expectError(error.StorageKernelOwnerTransitionRequired, owners.primeRestoreOwner(7196, "hidden", stale_descriptor));
     try std.testing.expectError(error.StorageKernelOwnerTransitionRequired, owners.restoreOwnerControl(alloc, 7196, "hidden", stale_descriptor, .{ .scope = scope, .action = .begin }, null, .{}, .{}));
     _ = try owners.restoreOwnerControl(alloc, 7196, "hidden", descriptor, .{ .scope = scope, .action = .begin }, null, .{}, .{});
-    const before = try (staging.Progress{ .scope = scope }).encode(alloc);
+    const before = try (staging.Progress{ .scope = scope, .phase = .importing, .source_generation_proofs_complete = true }).encode(alloc);
     defer alloc.free(before);
-    const imported = try (staging.Progress{ .scope = scope, .phase = .imported }).encode(alloc);
+    const imported = try (staging.Progress{ .scope = scope, .phase = .imported, .source_generation_proofs_complete = true }).encode(alloc);
     defer alloc.free(imported);
     try owners.applyPreparedReplicatedBatchGroupLocal(alloc, 7196, "hidden", descriptor, .{
         .restore_staging = .{ .import_page = .{ .expected = staging.digest(before), .next = imported, .scope = scope.digest(), .timestamps = &.{} } },
@@ -343,6 +443,132 @@ test "hidden constrained lookup recovers cold compiled owner from exact plan aut
     wrong_status = status_request;
     wrong_status.restore_staging_scope = @splat(0xbb);
     try std.testing.expectError(error.RestoreStagingScopeChanged, owners.writeSource().txnStatusGroupLocalWithRequest(alloc, 7196, "hidden", wrong_status, .{}));
+    // Restore validation uses scoped batch controls, not the direct native
+    // transaction callbacks above. Exercise both decisions through that route
+    // and lose their successful reply across a cold owner restart.
+    for ([_]db_mod.types.TxnStatus{ .aborted, .committed }, 0..) |decision, attempt| {
+        authority.expected_use = .mutate;
+        const batch_txn: db_mod.types.TxnId = @splat(@as(u8, @intCast(0x72 + attempt)));
+        const begin: db_mod.types.BatchRequest = .{
+            .restore_staging_scope = scope.digest(),
+            .restore_staging_plan_id = scope.plan_id,
+            .transaction = .{ .begin = .{ .txn_id = batch_txn, .begin_timestamp = 10, .created_at_ns = 10, .topology_epoch = 1, .retain_terminal = true, .participants = &.{participant} } },
+        };
+        var stale_begin = begin;
+        stale_begin.restore_staging_plan_id = @splat(0xaa);
+        try std.testing.expectError(error.RestoreStagingScopeChanged, owners.writeSource().batchGroupLocal(alloc, 7196, "hidden", stale_begin));
+        _ = (try owners.writeSource().batchGroupLocal(alloc, 7196, "hidden", begin)) orelse return error.TestUnexpectedResult;
+        _ = (try owners.writeSource().batchGroupLocal(alloc, 7196, "hidden", .{
+            .restore_staging_scope = scope.digest(),
+            .restore_staging_plan_id = scope.plan_id,
+            .transaction = .{ .prepare = .{ .txn_id = batch_txn, .topology_epoch = 1 } },
+        })) orelse return error.TestUnexpectedResult;
+        const resolve: db_mod.types.BatchRequest = .{
+            .restore_staging_scope = scope.digest(),
+            .restore_staging_plan_id = scope.plan_id,
+            .transaction = .{ .resolve = .{ .txn_id = batch_txn, .status = decision, .commit_version = 11 } },
+        };
+        authority.expected_use = .resolve;
+        _ = (try owners.writeSource().batchGroupLocal(alloc, 7196, "hidden", resolve)) orelse return error.TestUnexpectedResult;
+        owners.deinit();
+        owners = Source.init(alloc, root, table_catalog.emptyCatalogSource(), barrier);
+        _ = owners.withRestoreDescriptorRecovery(.{ .ptr = &authority, .recover_fn = Authority.recover });
+        authority.expected_use = .resolve;
+        _ = (try owners.writeSource().batchGroupLocal(alloc, 7196, "hidden", resolve)) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(decision, (try owners.writeSource().txnStatusGroupLocalWithRequest(alloc, 7196, "hidden", .{
+            .txn_id = batch_txn,
+            .restore_staging_scope = scope.digest(),
+            .restore_staging_plan_id = scope.plan_id,
+        }, .{})).?);
+        try std.testing.expectError(error.TableNotFound, owners.readSource().lookupGroupLocal(alloc, 7196, "hidden", "a", .{}, .read_index));
+    }
+}
+
+test "restore publication recovers a cold compiled owner between preparation and admission" {
+    const alloc = std.testing.allocator;
+    const Source = kernel_owner_source.ProvisionedKernelOwnerSource;
+    const staging = @import("db/restore_staging_contract.zig");
+    const schema_json = "{}";
+    const tables = @import("../api/tables.zig");
+    var parsed = try tables.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try tables.deriveRuntimeTableSchema(alloc, parsed);
+    defer @import("schema.zig").freeSchema(alloc, schema);
+    const encoded_schema = try @import("schema.zig").serializeSchema(alloc, schema);
+    defer alloc.free(encoded_schema);
+    const scope: staging.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = .{ .table_id = 70, .shard_id = 7001, .range_id = 7001 }, .target_namespace = .{ .table_id = 71, .shard_id = 7196, .range_id = 7196 }, .target_schema_digest = staging.digest(encoded_schema) };
+    const bootstrap: staging.OwnerBootstrap = .{ .scope = scope, .table_name = "hidden", .schema_json = schema_json, .indexes_json = "{}", .byte_range = .{ .start = "a", .end = "m" } };
+    const bootstrap_json = try std.json.Stringify.valueAlloc(alloc, bootstrap, .{});
+    defer alloc.free(bootstrap_json);
+    const descriptor: @import("kernel_owner_descriptor.zig").Descriptor = .{ .lsm_root_generation = table_reads.backend_current_root_generation, .identity = .{ .table_id = 71, .shard_id = 7196, .range_id = 7196 }, .schema_json = schema_json, .indexes_json = "{}", .restore_bootstrap_json = bootstrap_json };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const Authority = struct {
+        descriptor: @import("kernel_owner_descriptor.zig").Descriptor,
+        expected: staging.Scope,
+        expected_use: Source.RestoreDescriptorUse = .resolve,
+        reads: usize = 0,
+        fn recover(ptr: *anyopaque, allocator: std.mem.Allocator, group_id: u64, name: []const u8, digest: [32]u8, plan_id: [16]u8, use: Source.RestoreDescriptorUse, context: @import("../api/operation.zig").RequestContext) !Source.OwnedRestoreDescriptor {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.ensureActive();
+            try std.testing.expectEqual(@as(u64, 7196), group_id);
+            try std.testing.expectEqualStrings("hidden", name);
+            try std.testing.expectEqual(self.expected.digest(), digest);
+            try std.testing.expectEqual(self.expected.plan_id, plan_id);
+            try std.testing.expectEqual(self.expected_use, use);
+            self.reads += 1;
+            const schema_owned = try allocator.dupe(u8, self.descriptor.schema_json);
+            errdefer allocator.free(schema_owned);
+            const indexes_owned = try allocator.dupe(u8, self.descriptor.indexes_json);
+            errdefer allocator.free(indexes_owned);
+            const bootstrap_owned = try allocator.dupe(u8, self.descriptor.restore_bootstrap_json);
+            var result = self.descriptor;
+            result.schema_json = schema_owned;
+            result.indexes_json = indexes_owned;
+            result.restore_bootstrap_json = bootstrap_owned;
+            return .{ .descriptor = result };
+        }
+        fn barrier(_: *anyopaque, _: u64, _: []const u8) !void {}
+    };
+    var authority = Authority{ .descriptor = descriptor, .expected = scope };
+    const barrier: read_gate.ReadSafetyBarrier = .{ .ptr = &authority, .vtable = &.{ .wait_read_safe = Authority.barrier } };
+    var owners = Source.init(alloc, root, table_catalog.emptyCatalogSource(), barrier);
+    defer owners.deinit();
+    _ = try owners.restoreOwnerControl(alloc, 7196, "hidden", descriptor, .{ .scope = scope, .action = .begin }, null, .{}, .{});
+    const before = try (staging.Progress{ .scope = scope, .phase = .importing, .source_generation_proofs_complete = true }).encode(alloc);
+    defer alloc.free(before);
+    const imported = try (staging.Progress{ .scope = scope, .phase = .imported, .source_generation_proofs_complete = true }).encode(alloc);
+    defer alloc.free(imported);
+    try owners.applyPreparedReplicatedBatchGroupLocal(alloc, 7196, "hidden", descriptor, .{
+        .restore_staging = .{ .import_page = .{ .expected = staging.digest(before), .next = imported, .scope = scope.digest(), .timestamps = &.{} } },
+    });
+    // Lose the hidden descriptor between preparation and Raft admission.
+    // The captured finish must carry its plan identity and recover under
+    // resolution authority after metadata has already published the cohort.
+    _ = try owners.restoreOwnerControl(alloc, 7196, "hidden", descriptor, .{ .scope = scope, .action = .validate }, null, .{}, .{});
+    const Publication = struct {
+        owners: *Source,
+        authority: *Authority,
+        root: []const u8,
+        barrier: read_gate.ReadSafetyBarrier,
+        fn propose(ptr: *anyopaque, request: db_mod.types.BatchRequest, context: @import("../api/operation.zig").RequestContext) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.ensureActive();
+            try std.testing.expectEqual(self.authority.expected.plan_id, request.restore_staging_plan_id.?);
+            try std.testing.expectEqual(self.authority.expected.digest(), request.restore_staging_scope.?);
+            self.owners.deinit();
+            self.owners.* = Source.init(std.testing.allocator, self.root, table_catalog.emptyCatalogSource(), self.barrier);
+            _ = self.owners.withRestoreDescriptorRecovery(.{ .ptr = self.authority, .recover_fn = Authority.recover });
+            self.authority.expected_use = .resolve;
+            _ = (try self.owners.writeSource().batchGroupLocal(std.testing.allocator, 7196, "hidden", request)) orelse return error.TestUnexpectedResult;
+        }
+    };
+    var publication = Publication{ .owners = &owners, .authority = &authority, .root = root, .barrier = barrier };
+    const published = try owners.restoreOwnerControl(alloc, 7196, "hidden", descriptor, .{ .scope = scope, .action = .publish }, .{ .ptr = &publication, .propose = Publication.propose }, .{}, .{});
+    try std.testing.expectEqual(staging.Phase.published, published.phase);
+    try std.testing.expectEqual(@as(usize, 1), authority.reads);
 }
 
 test "transition lease reads unpublished owner metadata without admitting document reads" {
@@ -483,10 +709,16 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
                     .free_admin_snapshot = freeAdminSnapshot,
                     .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
                     .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .table_routing_snapshot = descriptorSnapshot,
+                    .linearizable_table_routing_snapshot = descriptorSnapshot,
                     .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                     .validate_publication = validatePublication,
                 },
             };
+        }
+
+        fn descriptorSnapshot(ptr: *anyopaque, _: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            return table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot(ptr, deadline_ns);
         }
 
         fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
@@ -662,6 +894,10 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
             .execution_deadline_ns = started + 20 * std.time.ns_per_ms,
         }, .stale));
         try std.testing.expect(time.monotonicNs() - started < 4 * std.time.ns_per_s);
+        try std.testing.expect(entry.exclusive_active);
+        try std.testing.expectError(error.Timeout, owner_source.readSource().lookupGroupLocal(alloc, 7001, "articles", "doc:1", .{
+            .execution_deadline_ns = time.monotonicNs() + 20 * std.time.ns_per_ms,
+        }, .stale));
         try std.testing.expect(entry.exclusive_active);
         const CancelAfter = struct {
             at: u64,
@@ -936,14 +1172,15 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         "articles",
         replicated_descriptor.view(),
         .{
-            .deletes = &.{"doc:missing"},
             .timestamp_ns = 4243,
             .sync_level = .full_index,
         },
     );
     {
         // Prepared replay must remain usable while the catalog is unavailable,
-        // and must fail closed if no resident generation was prepared.
+        // and must fail closed if no resident generation was prepared. Use an
+        // empty command: replicated deletes require separately ordered graph
+        // cleanup, which this owner-sharing fixture does not drive.
         const saved_catalog = owner_source.catalog;
         owner_source.catalog = table_catalog.emptyCatalogSource();
         defer owner_source.catalog = saved_catalog;
@@ -951,7 +1188,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
             alloc,
             7001,
             "articles",
-            .{ .deletes = &.{"doc:missing"} },
+            .{},
             true,
             null,
         )) != null);
@@ -965,7 +1202,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         ));
     }
     try owner_source.waitForCurrentSyncGroupLocal(7001, "articles", .full_index);
-    try owner_source.applyHAReplicationRecordGroupLocal(7001, "articles", .{
+    try owner_source.applyHotStandbyReplicationRecordGroupLocal(7001, "articles", .{
         .kind = .checkpoint,
         .cluster_id = 1,
         .shard_id = 7001,
@@ -1202,6 +1439,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     defer edges_response.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), edges_response.edges.len);
     try std.testing.expectEqualStrings("doc:b", edges_response.edges[0].target);
+    try std.testing.expect(edges_response.scanned_rows >= edges_response.edges.len);
 
     var manifest = (try read_source.source().documentArtifactManifest(
         alloc,

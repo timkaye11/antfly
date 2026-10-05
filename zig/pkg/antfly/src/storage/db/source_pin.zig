@@ -19,11 +19,11 @@ const std = @import("std");
 const ledger = @import("online_source.zig");
 const seal = @import("native_backup_seal.zig");
 const backup = @import("native_backup.zig");
-const fs = @import("../../common/fs_paths.zig");
+const fs = @import("antfly_runtime_fs").fs_paths;
 const state = @import("../source_pin_state.zig");
 const snapshot = @import("../source_snapshot.zig");
 const portable = @import("../portable_backup.zig");
-const DB = @import("db.zig").DB;
+const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
 const Allocator = std.mem.Allocator;
 const Cancellation = @import("types.zig").CancellationToken;
 const gc = @import("source_pin_gc.zig");
@@ -44,8 +44,8 @@ const CleanupCursor = struct {
         @memcpy(buffer[0..4], "SGC1");
         buffer[4..28].* = self.namespace;
         buffer[28..60].* = self.pin;
-        buffer[60] = @intFromEnum(self.mode);
-        buffer[61] = @intFromEnum(self.tree);
+        buffer[60] = @backingInt(self.mode);
+        buffer[61] = @backingInt(self.tree);
         std.mem.writeInt(u16, buffer[62..64], @intCast(self.directory.len), .little);
         @memcpy(buffer[64..][0..self.directory.len], self.directory.bytes());
         const body_len = 64 + self.directory.len;
@@ -152,6 +152,8 @@ fn verifyInventory(alloc: Allocator, io: std.Io, root: []const u8, handle: seal.
 /// Caller holds the DB apply lock. The normal path never exposes prepared
 /// admission to another writer. Restart retries complete this same frozen cut.
 pub fn ensureAssumeApply(db: *DB, scope: ledger.Scope) !void {
+    if (try db.core.store.hasGraphEndpointCleanup()) return error.IntegrityTopologyBusy;
+    if (comptime @import("builtin").os.tag == .freestanding) return error.UnsupportedPlatform;
     const alloc = db.alloc;
     const io = db.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
     const progress = try db.onlineSourceStatus(scope);
@@ -256,6 +258,7 @@ pub fn publicationCertificateIfPresent(db: *DB, scope: ledger.Scope, cancellatio
 }
 
 pub fn preparePublication(db: *DB, scope: ledger.Scope, cancellation: Cancellation) !snapshot.Certificate {
+    if (try db.core.store.hasGraphEndpointCleanup()) return error.IntegrityTopologyBusy;
     const alloc = db.alloc;
     const io = db.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
     try cancellation.check();
@@ -339,7 +342,7 @@ pub fn reclaimReleased(db: *DB, scope: ledger.Scope) !void {
     };
     if (found.progress.phase != .released) return error.OnlineSourceScopeChanged;
     if (found.progress.local_cleanup_complete) return;
-    _ = db.source_pin_gc_epoch.fetchAdd(1, .acq_rel);
+    _ = db.source_pin_cleanup.epoch.fetchAdd(1, .acq_rel);
     cleanupLocated(db, found) catch |err| {
         db.recordSourcePinCleanupFailure(err);
         return err;
@@ -355,14 +358,16 @@ pub fn reconcileReleased(db: *DB) !void {
 }
 
 pub fn reconcileReleasedWithBudget(db: *DB, budget: CleanupBudget) !CleanupWork {
+    // Replica-local source pins are native filesystem artifacts.
+    if (comptime @import("builtin").os.tag == .freestanding) return CleanupWork.init(.failing, budget);
     const io = db.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
     var work = CleanupWork.init(io, budget);
-    const epoch = db.source_pin_gc_epoch.load(.acquire);
+    const epoch = db.source_pin_cleanup.epoch.load(.acquire);
     if (epoch == 0) return work;
     // Preserve useful work even when a different slot reports an error: the
     // shared maintenance scheduler must not back off healthy cleanup pages.
     defer if (work.completed_units != 0) {
-        _ = db.source_pin_gc_work_units.fetchAdd(@intCast(work.completed_units), .acq_rel);
+        _ = db.source_pin_cleanup.work_units.fetchAdd(@intCast(work.completed_units), .acq_rel);
     };
     // The common document-only owner pays one bounded read-only startup scan,
     // not directory creation, locking, cursor writes or per-mutation probes.
@@ -441,10 +446,10 @@ pub fn reconcileReleasedWithBudget(db: *DB, budget: CleanupBudget) !CleanupWork 
 }
 
 fn clearCleanupDebt(db: *DB, epoch: u64) void {
-    if (db.source_pin_gc_epoch.cmpxchgStrong(epoch, 0, .acq_rel, .acquire) != null) return;
-    db.source_pin_gc_error.store(0, .release);
-    db.source_pin_gc_failure_streak.store(0, .release);
-    db.source_pin_gc_next_ns.store(0, .release);
+    if (db.source_pin_cleanup.epoch.cmpxchgStrong(epoch, 0, .acq_rel, .acquire) != null) return;
+    db.source_pin_cleanup.error_code.store(0, .release);
+    db.source_pin_cleanup.failure_streak.store(0, .release);
+    db.source_pin_cleanup.next_ns.store(0, .release);
 }
 
 fn cleanupLocated(db: *DB, found: ledger.Located) !void {
@@ -557,7 +562,7 @@ test "relational index system source pin cancellation releases a prepared cut be
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cancel-source", .{tmp.sub_path});
     defer alloc.free(path);
-    const options: @import("db.zig").OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
+    const options: @import("antfly_source_root").antfly_sources.physical_db.OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
     var db = try DB.open(alloc, path, options);
     defer db.close();
     try db.setSchemaJson(alloc, "{}");
@@ -565,12 +570,12 @@ test "relational index system source pin cancellation releases a prepared cut be
     const scope: ledger.Scope = .{ .fence = .{ .role = .merge_source, .transition_id = 78, .attempt = 1, .admission_epoch = owner.next_epoch, .peer_group_id = 3, .owner_group_id = 2, .namespace = owner.namespace, .catalog_digest = owner.catalog_digest }, .receiver_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .consumer_epoch = 1, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } };
     test_failure = .after_prepare;
     defer test_failure = .none;
-    try std.testing.expectError(error.InjectedSourcePinFailure, db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 }));
+    try std.testing.expectError(error.InjectedSourcePinFailure, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 }));
     test_failure = .none;
-    try db.batchRaftReplicatedApply(.{ .online_source = .{ .release = scope } }, .{ .term = 1, .index = 2 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .release = scope } }, .{ .term = 1, .index = 2 });
     try std.testing.expectEqual(.released, (try db.onlineSourceStatus(scope)).phase);
-    try db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 });
-    try db.batchRaftReplicatedApply(.{ .timestamp_ns = 1, .writes = &.{.{ .key = "a", .value = "{\"ok\":true}" }} }, .{ .term = 1, .index = 3 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .timestamp_ns = 1, .writes = &.{.{ .key = "a", .value = "{\"ok\":true}" }} }, .{ .term = 1, .index = 3 });
     db.close();
     db = try DB.open(alloc, path, options);
     try std.testing.expectEqual(.released, (try db.onlineSourceStatus(scope)).phase);
@@ -582,13 +587,13 @@ test "relational index system source pin interrupted cleanup reserves slot acros
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cleanup-source", .{tmp.sub_path});
     defer alloc.free(path);
-    const options: @import("db.zig").OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
+    const options: @import("antfly_source_root").antfly_sources.physical_db.OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
     var db = try DB.open(alloc, path, options);
     defer db.close();
     try db.setSchemaJson(alloc, "{}");
     const owner = try db.relationalTopologyIdentity();
     const scope: ledger.Scope = .{ .fence = .{ .role = .merge_source, .transition_id = 79, .attempt = 1, .admission_epoch = owner.next_epoch, .peer_group_id = 3, .owner_group_id = 2, .namespace = owner.namespace, .catalog_digest = owner.catalog_digest }, .receiver_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .consumer_epoch = 1, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } };
-    try db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 });
     const old_location = try locate(&db, scope);
     const old_slot = old_location.slot;
     const old_root = try pathAlloc(alloc, path, scope);
@@ -605,7 +610,7 @@ test "relational index system source pin interrupted cleanup reserves slot acros
     garbage_dir.close(std.testing.io);
     test_failure = .before_cleanup;
     defer test_failure = .none;
-    try std.testing.expectError(error.InjectedSourcePinFailure, db.batchRaftReplicatedApply(.{ .online_source = .{ .release = scope } }, .{ .term = 1, .index = 2 }));
+    try std.testing.expectError(error.InjectedSourcePinFailure, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .release = scope } }, .{ .term = 1, .index = 2 }));
     try std.testing.expect(try exists(std.testing.io, old_root));
     var next = scope;
     next.consumer_epoch = 2;
@@ -618,18 +623,18 @@ test "relational index system source pin interrupted cleanup reserves slot acros
         defer exporting.deinit();
         // Admission's fair cleanup pass skips an exporting slot without
         // blocking the apply fence, and cannot erase its cleanup ownership.
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = next } } }, .{ .term = 1, .index = 3 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = next } } }, .{ .term = 1, .index = 3 });
         try std.testing.expect(old_slot != (try locate(&db, next)).slot);
         try std.testing.expect(try exists(std.testing.io, old_root));
         const next_slot = (try locate(&db, next)).slot;
         test_failure = .before_cleanup;
-        try std.testing.expectError(error.InjectedSourcePinFailure, db.batchRaftReplicatedApply(.{ .online_source = .{ .release = next } }, .{ .term = 1, .index = 4 }));
+        try std.testing.expectError(error.InjectedSourcePinFailure, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .release = next } }, .{ .term = 1, .index = 4 }));
         test_failure = .none;
         try drainCleanupForTest(&db, next);
         var third = scope;
         third.consumer_epoch = 3;
         third.copy_attempt.sequence = 3;
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = third } } }, .{ .term = 1, .index = 5 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = third } } }, .{ .term = 1, .index = 5 });
         // Busy first slot cannot starve a later ready cleanup.
         try std.testing.expectEqual(next_slot, (try locate(&db, third)).slot);
     }
@@ -659,7 +664,7 @@ test "relational index system source pin interrupted cleanup reserves slot acros
     }
     healthy_dir.close(std.testing.io);
     test_failure = .before_cleanup;
-    try std.testing.expectError(error.InjectedSourcePinFailure, db.batchRaftReplicatedApply(.{ .online_source = .{ .release = healthy } }, .{ .term = 1, .index = 6 }));
+    try std.testing.expectError(error.InjectedSourcePinFailure, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .release = healthy } }, .{ .term = 1, .index = 6 }));
     test_failure = .none;
     db.close();
     db = try DB.open(alloc, path, options);
@@ -670,14 +675,14 @@ test "relational index system source pin interrupted cleanup reserves slot acros
         if (db.sourcePinCleanupStatus().failures != 0) break;
     }
     try std.testing.expectEqualStrings("OnlineSourceCorrupt", db.sourcePinCleanupStatus().last_error.?);
-    db.source_pin_gc_next_ns.store(0, .release);
-    const units_before = db.source_pin_gc_work_units.load(.acquire);
+    db.source_pin_cleanup.next_ns.store(0, .release);
+    const units_before = db.source_pin_cleanup.work_units.load(.acquire);
     try std.testing.expect(try db.runSourcePinCleanupStep());
-    try std.testing.expect(db.source_pin_gc_work_units.load(.acquire) > units_before);
+    try std.testing.expect(db.source_pin_cleanup.work_units.load(.acquire) > units_before);
     // Useful later-slot work keeps the next pass prompt despite the earlier
     // damaged cursor, while zero-progress errors retain exponential backoff.
     try std.testing.expect(db.sourcePinCleanupStatus().next_attempt_ns <= @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_ms);
-    try db.batchRaftReplicatedApply(.{ .timestamp_ns = 7, .writes = &.{.{ .key = "healthy", .value = "{\"ok\":true}" }} }, .{ .term = 1, .index = 7 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .timestamp_ns = 7, .writes = &.{.{ .key = "healthy", .value = "{\"ok\":true}" }} }, .{ .term = 1, .index = 7 });
     for (0..100) |_| {
         attempt: {
             _ = reconcileReleasedWithBudget(&db, .{ .max_entries = 128, .max_metadata_bytes = 128 * 1024, .max_duration_ns = std.time.ns_per_s }) catch |err| {
@@ -697,10 +702,10 @@ test "relational index system source pin interrupted cleanup reserves slot acros
     var last = scope;
     last.consumer_epoch = 4;
     last.copy_attempt.sequence = 4;
-    try db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = last } } }, .{ .term = 1, .index = 8 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = last } } }, .{ .term = 1, .index = 8 });
     try std.testing.expectEqual(old_slot, (try locate(&db, last)).slot);
     try cleanupLocated(&db, old_location);
-    try db.batchRaftReplicatedApply(.{ .online_source = .{ .release = scope } }, .{ .term = 1, .index = 2 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .release = scope } }, .{ .term = 1, .index = 2 });
     try std.testing.expectEqual(.pinned, (try db.onlineSourceStatus(last)).snapshot_phase);
 }
 
@@ -739,7 +744,7 @@ test "relational index system source pin prepared reopen pages abandoned staging
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-gc", .{tmp.sub_path});
     defer alloc.free(path);
-    const options: @import("db.zig").OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
+    const options: @import("antfly_source_root").antfly_sources.physical_db.OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
     var scope: ledger.Scope = undefined;
     {
         var db = try DB.open(alloc, path, options);
@@ -749,7 +754,7 @@ test "relational index system source pin prepared reopen pages abandoned staging
         scope = .{ .fence = .{ .role = .merge_source, .transition_id = 89, .attempt = 1, .admission_epoch = owner.next_epoch, .peer_group_id = 3, .owner_group_id = 2, .namespace = owner.namespace, .catalog_digest = owner.catalog_digest }, .receiver_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .consumer_epoch = 1, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } };
         test_failure = .after_prepare;
         defer test_failure = .none;
-        try std.testing.expectError(error.InjectedSourcePinFailure, db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 }));
+        try std.testing.expectError(error.InjectedSourcePinFailure, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 }));
         const root = try pathAlloc(alloc, path, scope);
         defer alloc.free(root);
         const abandoned = try std.fmt.allocPrint(alloc, "{s}.staging/abandoned", .{root});
@@ -779,11 +784,11 @@ test "relational index system source pin prepared reopen pages abandoned staging
     const progress = try db.onlineSourceStatus(scope);
     try std.testing.expectEqual(.pinned, progress.snapshot_phase);
     try std.testing.expectEqual(@as(u64, 1), progress.admitted_applied_index);
-    try db.batchRaftReplicatedApply(.{ .timestamp_ns = 2, .writes = &.{.{ .key = "after", .value = "{\"ok\":true}" }} }, .{ .term = 1, .index = 2 });
+    try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .timestamp_ns = 2, .writes = &.{.{ .key = "after", .value = "{\"ok\":true}" }} }, .{ .term = 1, .index = 2 });
 }
 
 test "relational index system source pin prepared crash blocks markers then reopens exact immutable artifact" {
-    const db_mod = @import("db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -792,21 +797,67 @@ test "relational index system source pin prepared crash blocks markers then reop
     for ([_]FailurePoint{ .after_prepare, .after_seal }, 0..) |point, trial| {
         const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/source-{d}", .{ tmp.sub_path, trial });
         defer alloc.free(path);
-        const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
+        const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
+        const graph_key = try @import("../internal_keys.zig").graphEdgeArtifactKeyAlloc(alloc, "a", "g", "links", "neighbor");
+        defer alloc.free(graph_key);
+        const graph_value = try @import("enrichment/artifact_codec.zig").encodeGraphEdgeAlloc(alloc, null, 1, 1, 0, 0, "");
+        defer alloc.free(graph_value);
         var scope: ledger.Scope = undefined;
         {
             var db = try db_mod.DB.open(alloc, path, options);
             defer db.close();
             try db.setSchemaJson(alloc, schema);
-            try db.batchRaftReplicatedApply(.{ .timestamp_ns = 111, .writes = &.{.{ .key = "a", .value = "{\"id\":1}" }} }, .{ .term = 1, .index = 1 });
+            try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .timestamp_ns = 111, .writes = &.{.{ .key = "a", .value = "{\"id\":1}" }} }, .{ .term = 1, .index = 1 });
+            // A parent may already accept a child generation. Private source
+            // decoding must still export its exact pinned row cut, without
+            // making that accepted scope portable as a database backup.
+            const admission = @import("relational_integrity_generation_admission.zig");
+            const accepted = try (admission.Scope{
+                .child_table_id = 9,
+                .child_table_name = "children",
+                .constraint_name = "parent_fk",
+                .revision = 1,
+                .phase = .active,
+                .active_generation = @splat(4),
+                .plan_id = @splat(5),
+                .decision_digest = @splat(6),
+            }).encode(alloc);
+            defer alloc.free(accepted);
+            try db.core.store.put(&try admission.scopeKey("children", "parent_fk"), accepted);
+            var ordinary: std.Io.Writer.Allocating = .init(alloc);
+            defer ordinary.deinit();
+            try std.testing.expectError(error.CoordinatedConstraintPortableBackupUnsupported, portable.exportPortableToWriterWithOptions(alloc, db.core.store, &ordinary.writer, .{}));
+            if (trial == 0) {
+                try db.core.store.putBatch(&.{.{ .key = graph_key, .value = graph_value }}, &.{});
+                const publication = @import("artifact_publication.zig");
+                const provenance = @import("artifact_producer_provenance.zig");
+                var namespace: publication.Namespace = undefined;
+                @import("doc_identity.zig").encodeNamespace(&namespace, options.identity_namespace.?);
+                const source = publication.Source{ .document_key = "a", .content_digest = @splat(3), .timestamp = 111, .input_position = .{ .raft = .{ .term = 1, .index = 1 } } };
+                const mutation = publication.Mutation{ .family = .graph, .key = graph_key, .value = graph_value, .source_index = 0 };
+                const command: publication.Command = .{ .namespace = namespace, .authority_epoch = 1, .catalog_digest = @splat(2), .producer_kind = .graph, .producer_name = "g", .producer_generation = 1, .producer_artifact_name = "g", .sources = (&source)[0..1], .mutations = (&mutation)[0..1], .publication_digest = @splat(5) };
+                var value_digest: publication.Digest = undefined;
+                std.crypto.hash.sha2.Sha256.hash(graph_value, &value_digest, .{});
+                const effect = provenance.Effect{ .family = .graph, .key = graph_key, .source_index = 0, .value_digest = value_digest, .value_bytes = graph_value.len };
+                const logical: provenance.Proof = .{ .namespace = namespace, .authority_epoch = 1, .catalog_digest = @splat(2), .producer_kind = .graph, .producer_name = "g", .producer_generation = 1, .producer_artifact_name = "g", .publication_digest = command.publication_digest, .input_digest = command.inputDigest(), .sources = (&source)[0..1], .artifact_sources = &.{}, .effects = (&effect)[0..1] };
+                const encoded = try provenance.encodeAlloc(alloc, logical);
+                defer alloc.free(encoded);
+                var indexed = try provenance.prepareDocumentReferences(alloc, command);
+                defer indexed.deinit();
+                var writer = try db.core.store.beginWriteTxn();
+                errdefer writer.abort();
+                try publication.stageAuthority(&writer, .{ .mode = .activate, .namespace = namespace, .authority_epoch = 1, .catalog_digest = @splat(2), .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
+                try provenance.stageIndexed(&writer, command, encoded, .{ .raft = .{ .term = 1, .index = 1 } }, &indexed);
+                try writer.commit();
+            }
             const owner = try db.relationalTopologyIdentity();
             scope = .{ .fence = .{ .role = .merge_source, .transition_id = 77, .attempt = 1, .admission_epoch = owner.next_epoch, .peer_group_id = 3, .owner_group_id = 2, .namespace = owner.namespace, .catalog_digest = owner.catalog_digest }, .receiver_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .consumer_epoch = 1, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } };
             test_failure = point;
             defer test_failure = .none;
-            try std.testing.expectError(error.InjectedSourcePinFailure, db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 2 }));
+            try std.testing.expectError(error.InjectedSourcePinFailure, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 2 }));
             try std.testing.expectEqual(.prepared, (try db.onlineSourceStatus(scope)).snapshot_phase);
-            try std.testing.expectError(error.OnlineSourcePinPending, db.batchRaftReplicatedApply(.{ .transaction = .{ .prepare = .{ .txn_id = @splat(4), .topology_epoch = 1 } } }, .{ .term = 1, .index = 3 }));
-            try std.testing.expectError(error.OnlineSourcePinPending, db.batchRaftReplicatedApply(.{}, .{ .term = 1, .index = 3 }));
+            try std.testing.expectError(error.OnlineSourcePinPending, @import("../server_db_adapter.zig").applyOrdered(&db, .{ .transaction = .{ .prepare = .{ .txn_id = @splat(4), .topology_epoch = 1 } } }, .{ .term = 1, .index = 3 }));
+            try std.testing.expectError(error.OnlineSourcePinPending, @import("../server_db_adapter.zig").applyOrdered(&db, .{}, .{ .term = 1, .index = 3 }));
             // Even direct transaction metadata cannot bypass the prepared gate.
             {
                 var txn = try db.core.store.beginWriteTxn();
@@ -819,10 +870,10 @@ test "relational index system source pin prepared crash blocks markers then reop
         var db = try db_mod.DB.open(alloc, path, options);
         defer db.close();
         try std.testing.expectEqual(.pinned, (try db.onlineSourceStatus(scope)).snapshot_phase);
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 2 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 2 });
         try db.setSchemaJson(alloc, schema);
         try std.testing.expectError(error.IntegrityTopologyBusy, db.setSchemaJson(alloc, changed));
-        try db.batchRaftReplicatedApply(.{ .timestamp_ns = 222, .writes = &.{.{ .key = "a", .value = "{\"id\":2}" }} }, .{ .term = 1, .index = 3 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .timestamp_ns = 222, .writes = &.{.{ .key = "a", .value = "{\"id\":2}" }} }, .{ .term = 1, .index = 3 });
         var canceled = std.atomic.Value(bool).init(true);
         try std.testing.expectError(error.Canceled, db.prepareOnlineSourcePublication(scope, Cancellation.fromAtomic(&canceled)));
         const root = try pathAlloc(alloc, path, scope);
@@ -849,6 +900,23 @@ test "relational index system source pin prepared crash blocks markers then reop
         const proof: portable.SourceCopyProof = .{ .scope = scope, .applied_index = 2, .retained_start = certificate.cut.retained_start };
         const artifact = try std.fmt.allocPrint(alloc, "{s}/source.afb2", .{root});
         defer alloc.free(artifact);
+        if (trial == 0) {
+            // The online reader must accept the same certified source-proof
+            // block as the one-pass and checkpointed restore paths.
+            const verifier = @import("../portable_source_verifier.zig");
+            const verified_file = try std.Io.Dir.cwd().openFile(std.testing.io, artifact, .{});
+            defer verified_file.close(std.testing.io);
+            for (0..256) |_| {
+                if ((try verifier.step(alloc, std.testing.io, verified_file, root, scope.pin(), certificate, .none, .{})).complete) break;
+            } else return error.TestExpectedSourceVerificationCompletion;
+            var objects = try verifier.ObjectReader.open(alloc, std.testing.io, verified_file, root, scope.pin(), certificate);
+            defer objects.deinit();
+            var proof_seen = false;
+            for (0..objects.objectCount()) |ordinal| {
+                if ((try objects.object(@intCast(ordinal))).kind == .source_proof_batch) proof_seen = true;
+            }
+            try std.testing.expect(proof_seen);
+        }
         const bytes = try backup.readFileAlloc(alloc, std.testing.io, artifact, 8 * 1024 * 1024);
         defer alloc.free(bytes);
         const decoder_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/decoder-{d}", .{ tmp.sub_path, trial });
@@ -858,6 +926,35 @@ test "relational index system source pin prepared crash blocks markers then reop
         try std.testing.expectError(error.SourceCopyRestoreUnsupported, portable.importPortableWithOptions(alloc, decoder.core.store, bytes, .{}));
         try portable.importPortableWithOptions(alloc, decoder.core.store, bytes, .{ .source_copy = proof, .unpublished_staging = true });
         try portable.validateCompleteSourceCopyImage(alloc, decoder.core.store, proof);
+        try std.testing.expectError(error.NotFound, decoder.core.store.get(alloc, &try @import("relational_integrity_generation_admission.zig").scopeKey("children", "parent_fk")));
+        if (trial == 0) {
+            const restored_graph = try decoder.core.store.get(alloc, graph_key);
+            defer alloc.free(restored_graph);
+            try std.testing.expectEqualSlices(u8, graph_value, restored_graph);
+            var namespace: @import("artifact_publication.zig").Namespace = undefined;
+            @import("doc_identity.zig").encodeNamespace(&namespace, options.identity_namespace.?);
+            const imported_key = @import("source_proof_batch.zig").importKey(namespace, @splat(5));
+            const imported = try decoder.core.store.get(alloc, &imported_key);
+            defer alloc.free(imported);
+            var decoded = try @import("source_proof_batch.zig").decodeValue(alloc, namespace, @splat(5), imported);
+            defer decoded.deinit();
+            try std.testing.expectEqualSlices(u8, &.{1}, decoded.bitmap);
+            try std.testing.expectError(error.NotFound, decoder.core.store.get(alloc, @import("artifact_publication.zig").authority_key));
+            const paged_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/paged-proof", .{tmp.sub_path});
+            defer alloc.free(paged_path);
+            var paged = try db_mod.DB.open(alloc, paged_path, .{ .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+            defer paged.close();
+            const source_file = try std.Io.Dir.cwd().openFile(std.testing.io, artifact, .{});
+            defer source_file.close(std.testing.io);
+            const source_size = (try source_file.stat(std.testing.io)).size;
+            for (0..128) |_| {
+                if (try portable.importSourceCopyFilePage(alloc, paged.core.store, std.testing.io, source_file, source_size, proof, scope.pin(), 1, .none)) break;
+            } else return error.TestExpectedSourceImportCompletion;
+            const paged_proof = try paged.core.store.get(alloc, &imported_key);
+            defer alloc.free(paged_proof);
+            try std.testing.expectEqualSlices(u8, imported, paged_proof);
+            try std.testing.expectError(error.NotFound, paged.core.store.get(alloc, @import("artifact_publication.zig").authority_key));
+        }
         try std.testing.expectError(error.SourceCopyRestoreUnsupported, portable.validateCompleteDatabaseImageAlloc(alloc, decoder.core.store));
         const primary_key = try @import("../internal_keys.zig").relationalRowKeyAlloc(alloc, "a");
         defer alloc.free(primary_key);
@@ -868,7 +965,7 @@ test "relational index system source pin prepared crash blocks markers then reop
         try std.testing.expect(!std.mem.eql(u8, pinned_primary, live_primary));
         // Distinct later live writes cannot alter the certified artifact.
         try std.testing.expect(certificate.eql(try db.prepareOnlineSourcePublication(scope, .none)));
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = certificate } } }, .{ .term = 1, .index = 4 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = certificate } } }, .{ .term = 1, .index = 4 });
         try std.testing.expectEqual(.published, (try db.onlineSourceStatus(scope)).snapshot_phase);
         _ = try backup.writeFileDurable(std.testing.io, artifact, "corrupt");
         try std.testing.expectError(error.BackupSealSourceChanged, publicationCertificateIfPresent(&db, scope, .none));
@@ -877,9 +974,9 @@ test "relational index system source pin prepared crash blocks markers then reop
         try std.testing.expectError(error.FileNotFound, db.prepareOnlineSourcePublication(scope, .none));
         // A missing published artifact is not recaptured from the later row.
         try std.testing.expect(!try exists(std.testing.io, artifact));
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .release = scope } }, .{ .term = 1, .index = 5 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .release = scope } }, .{ .term = 1, .index = 5 });
         // An old applied admission never resurrects a released pin.
-        try db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 2 });
+        try @import("../server_db_adapter.zig").applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 2 });
         try db.setSchemaJson(alloc, changed);
         try std.testing.expectError(error.OnlineSourceScopeChanged, db.prepareOnlineSourcePublication(scope, .none));
     }

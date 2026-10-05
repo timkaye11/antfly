@@ -46,7 +46,7 @@ fn tempTestPath(alloc: Allocator, label: []const u8) ![:0]u8 {
         nonce,
     });
     defer alloc.free(path);
-    return try alloc.dupeZ(u8, path);
+    return try alloc.dupeSentinel(u8, path, 0);
 }
 
 // ============================================================================
@@ -66,6 +66,7 @@ pub const AntflyType = enum(u8) {
     blob = 9,
     html = 10,
     search_as_you_type = 11,
+    substring = 12,
 };
 
 pub const MissingNullPolicy = enum(u8) {
@@ -96,6 +97,7 @@ pub fn parseAntflyType(value: []const u8) ?AntflyType {
     if (std.mem.eql(u8, value, "blob")) return .blob;
     if (std.mem.eql(u8, value, "html")) return .html;
     if (std.mem.eql(u8, value, "search_as_you_type")) return .search_as_you_type;
+    if (std.mem.eql(u8, value, "substring")) return .substring;
     return null;
 }
 
@@ -253,6 +255,7 @@ pub const TableSchema = struct {
     ttl_field: []const u8 = "_timestamp",
     enforce_types: bool = false,
     storage_mode: StorageMode = .document,
+    external_base_source: ?@import("../serverless/external_source/schema_binding.zig").OwnedExternalTableBinding = null,
     /// Immutable provenance of the validation contract, persisted per epoch.
     /// Runtime-only embedders have no public constraints to restore. A schema
     /// derived from the public API must never silently lose those constraints.
@@ -279,7 +282,7 @@ const schema_version_prefix = "\x00\x00__metadata__:schema_v";
 /// Current durable runtime-schema format. Catalog compatibility checks use the
 /// same exported constant so a writer can never silently drift from the format
 /// it advertises in transactional table metadata.
-pub const storage_format_version: u32 = 14;
+pub const storage_format_version: u32 = 15;
 
 /// Serialize a TableSchema to bytes. Caller owns the returned slice.
 pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
@@ -329,6 +332,7 @@ pub fn serializeTextProjectionSchema(alloc: Allocator, schema: TableSchema) ![]u
     var projection_schema = schema;
     projection_schema.declared_fields = &.{};
     projection_schema.storage_mode = .document;
+    projection_schema.external_base_source = null;
     projection_schema.relational_columns = &.{};
     const projection_documents = try alloc.dupe(FullTextDocument, schema.full_text_documents);
     defer alloc.free(projection_documents);
@@ -345,6 +349,10 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
     std.debug.assert(format_version >= 11 and format_version <= storage_format_version);
     if (!exactFieldsValid(schema.exact_fields)) return error.InvalidSchema;
     try validateRelationalSchema(alloc, schema);
+    if (schema.external_base_source) |source| {
+        if (schema.storage_mode != .relational) return error.InvalidSchema;
+        try source.binding.validateReadOnlyMvp();
+    }
     if (format_version < 12 and (schema.declared_fields.len != 0 or schema.exact_fields.len != 0)) {
         return error.InvalidSchema;
     }
@@ -380,12 +388,12 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
         try appendOptStr(&buf, alloc, tmpl.path_match);
         try appendOptStr(&buf, alloc, tmpl.path_unmatch);
         try appendOptStr(&buf, alloc, tmpl.match_mapping_type);
-        try buf.append(alloc, @intFromEnum(tmpl.mapping.field_type));
+        try buf.append(alloc, @backingInt(tmpl.mapping.field_type));
         try buf.append(alloc, if (tmpl.mapping.do_index) 1 else 0);
         try buf.append(alloc, if (tmpl.mapping.store) 1 else 0);
         try buf.append(alloc, if (tmpl.mapping.doc_values) 1 else 0);
         try buf.append(alloc, if (tmpl.mapping.sortable) 1 else 0);
-        try buf.append(alloc, @intFromEnum(tmpl.mapping.missing_null_policy));
+        try buf.append(alloc, @backingInt(tmpl.mapping.missing_null_policy));
         try buf.append(alloc, if (tmpl.mapping.include_in_all) 1 else 0);
         try appendStr(&buf, alloc, tmpl.mapping.analyzer);
     }
@@ -396,12 +404,12 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
         try appendU32(&buf, alloc, @intCast(schema.declared_fields.len));
         for (schema.declared_fields) |field| {
             try appendStr(&buf, alloc, field.field);
-            try buf.append(alloc, @intFromEnum(field.mapping.field_type));
+            try buf.append(alloc, @backingInt(field.mapping.field_type));
             try buf.append(alloc, if (field.mapping.do_index) 1 else 0);
             try buf.append(alloc, if (field.mapping.store) 1 else 0);
             try buf.append(alloc, if (field.mapping.doc_values) 1 else 0);
             try buf.append(alloc, if (field.mapping.sortable) 1 else 0);
-            try buf.append(alloc, @intFromEnum(field.mapping.missing_null_policy));
+            try buf.append(alloc, @backingInt(field.mapping.missing_null_policy));
             try buf.append(alloc, if (field.mapping.include_in_all) 1 else 0);
             try appendStr(&buf, alloc, field.mapping.analyzer);
         }
@@ -413,12 +421,12 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
         for (schema.exact_fields) |field| {
             try appendStr(&buf, alloc, field.source_field);
             try appendStr(&buf, alloc, field.field);
-            try buf.append(alloc, @intFromEnum(field.mapping.field_type));
+            try buf.append(alloc, @backingInt(field.mapping.field_type));
             try buf.append(alloc, if (field.mapping.do_index) 1 else 0);
             try buf.append(alloc, if (field.mapping.store) 1 else 0);
             try buf.append(alloc, if (field.mapping.doc_values) 1 else 0);
             try buf.append(alloc, if (field.mapping.sortable) 1 else 0);
-            try buf.append(alloc, @intFromEnum(field.mapping.missing_null_policy));
+            try buf.append(alloc, @backingInt(field.mapping.missing_null_policy));
             try buf.append(alloc, if (field.mapping.include_in_all) 1 else 0);
             try appendStr(&buf, alloc, field.mapping.analyzer);
         }
@@ -465,23 +473,30 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
     }
 
     if (format_version >= 13) {
-        try buf.append(alloc, @intFromEnum(schema.storage_mode));
+        try buf.append(alloc, @backingInt(schema.storage_mode));
         try buf.append(alloc, @intFromBool(schema.requires_public_schema));
         try appendU32(&buf, alloc, @intCast(schema.relational_columns.len));
         for (schema.relational_columns) |column| {
             try appendStr(&buf, alloc, column.name);
             try appendStr(&buf, alloc, column.path);
-            try buf.append(alloc, @intFromEnum(column.column_type));
+            try buf.append(alloc, @backingInt(column.column_type));
             try buf.append(alloc, if (column.required) 1 else 0);
             try buf.append(alloc, if (column.allows_null) 1 else 0);
             try buf.append(alloc, if (column.is_json) 1 else 0);
-            try buf.append(alloc, @intFromEnum(column.json_kind));
+            try buf.append(alloc, @backingInt(column.json_kind));
         }
     }
 
-    const result = try alloc.dupe(u8, buf.items);
-    buf.deinit(alloc);
-    return result;
+    if (format_version >= 15) {
+        try buf.append(alloc, @intFromBool(schema.external_base_source != null));
+        if (schema.external_base_source) |source| {
+            const bytes = try std.json.Stringify.valueAlloc(alloc, source.binding, .{});
+            defer alloc.free(bytes);
+            try appendStr(&buf, alloc, bytes);
+        }
+    } else if (schema.external_base_source != null) return error.UnsupportedVersion;
+
+    return buf.toOwnedSlice(alloc);
 }
 
 /// Deserialize a TableSchema from bytes. Dupes all string data so the result
@@ -561,7 +576,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
         const match_mapping_type: ?[]const u8 = if (has_match_mapping_type) try alloc.dupe(u8, readStr(data, &pos)) else null;
         errdefer if (match_mapping_type) |p| alloc.free(p);
 
-        const field_type: AntflyType = @enumFromInt(data[pos]);
+        const field_type: AntflyType = @fromBackingInt(@intCast(data[pos]));
         pos += 1;
         const do_index = data[pos] == 1;
         pos += 1;
@@ -621,7 +636,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
         for (fields) |*field| {
             const field_name = try alloc.dupe(u8, readStr(data, &pos));
             errdefer alloc.free(field_name);
-            const field_type: AntflyType = @enumFromInt(data[pos]);
+            const field_type: AntflyType = @fromBackingInt(@intCast(data[pos]));
             pos += 1;
             const do_index = data[pos] == 1;
             pos += 1;
@@ -680,7 +695,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
             errdefer alloc.free(source_field);
             const field_name = try alloc.dupe(u8, readStr(data, &pos));
             errdefer alloc.free(field_name);
-            const field_type: AntflyType = @enumFromInt(data[pos]);
+            const field_type: AntflyType = @fromBackingInt(@intCast(data[pos]));
             pos += 1;
             const do_index = data[pos] == 1;
             pos += 1;
@@ -991,8 +1006,23 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
         break :blk columns;
     } else &.{};
 
+    const external = if (fmt_version >= 15 and data[pos] == 1) blk: {
+        pos += 1;
+        const bytes = readStr(data, &pos);
+        var parsed = try std.json.parseFromSlice(@import("../serverless/external_source/catalog_binding.zig").Binding, alloc, bytes, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        if (storage_mode != .relational) return error.InvalidSchema;
+        try parsed.value.validateReadOnlyMvp();
+        const borrowed: @import("../serverless/external_source/schema_binding.zig").OwnedExternalTableBinding = .{ .binding = parsed.value, .table_id = undefined, .source_uri = undefined, .schema_fingerprint = undefined };
+        break :blk try @import("../serverless/external_source/schema_binding.zig").cloneAlloc(alloc, borrowed);
+    } else blk: {
+        if (fmt_version >= 15) pos += 1;
+        break :blk null;
+    };
+
     const result: TableSchema = .{
         .version = version,
+        .external_base_source = external,
         .default_type = default_type,
         .ttl_duration_ns = ttl_duration_ns,
         .ttl_field = ttl_field,
@@ -1097,12 +1127,12 @@ fn validateSerializedSchema(data: []const u8) !void {
         try cursor.readOptStr();
         if (format_version >= 7) try cursor.readOptStr();
         if (format_version >= 7) try cursor.readOptStr();
-        if ((try cursor.readU8()) >= std.meta.fields(AntflyType).len) return error.InvalidSchema;
+        if ((try cursor.readU8()) >= std.meta.fieldNames(AntflyType).len) return error.InvalidSchema;
         try cursor.readBool();
         try cursor.readBool();
         try cursor.readBool();
         if (format_version >= 9) try cursor.readBool();
-        if (format_version >= 11 and (try cursor.readU8()) != @intFromEnum(MissingNullPolicy.missing_rejected))
+        if (format_version >= 11 and (try cursor.readU8()) != @backingInt(MissingNullPolicy.missing_rejected))
             return error.InvalidSchema;
         try cursor.readBool();
         try cursor.readStr();
@@ -1113,9 +1143,9 @@ fn validateSerializedSchema(data: []const u8) !void {
         try cursor.ensureCount(declared_count, 15);
         for (0..declared_count) |_| {
             try cursor.readStr();
-            if ((try cursor.readU8()) >= std.meta.fields(AntflyType).len) return error.InvalidSchema;
+            if ((try cursor.readU8()) >= std.meta.fieldNames(AntflyType).len) return error.InvalidSchema;
             inline for (0..4) |_| try cursor.readBool();
-            if ((try cursor.readU8()) != @intFromEnum(MissingNullPolicy.missing_rejected)) return error.InvalidSchema;
+            if ((try cursor.readU8()) != @backingInt(MissingNullPolicy.missing_rejected)) return error.InvalidSchema;
             try cursor.readBool();
             try cursor.readStr();
         }
@@ -1125,9 +1155,9 @@ fn validateSerializedSchema(data: []const u8) !void {
         for (0..exact_count) |_| {
             try cursor.readStr();
             try cursor.readStr();
-            if ((try cursor.readU8()) >= std.meta.fields(AntflyType).len) return error.InvalidSchema;
+            if ((try cursor.readU8()) >= std.meta.fieldNames(AntflyType).len) return error.InvalidSchema;
             inline for (0..4) |_| try cursor.readBool();
-            if ((try cursor.readU8()) != @intFromEnum(MissingNullPolicy.missing_rejected)) return error.InvalidSchema;
+            if ((try cursor.readU8()) != @backingInt(MissingNullPolicy.missing_rejected)) return error.InvalidSchema;
             try cursor.readBool();
             try cursor.readStr();
         }
@@ -1202,7 +1232,7 @@ fn validateSerializedSchema(data: []const u8) !void {
 
     if (format_version >= 13) {
         switch (try cursor.readU8()) {
-            @intFromEnum(StorageMode.document), @intFromEnum(StorageMode.relational) => {},
+            @backingInt(StorageMode.document), @backingInt(StorageMode.relational) => {},
             else => return error.InvalidSchema,
         }
         try cursor.readBool(); // immutable public-validation provenance
@@ -1211,12 +1241,16 @@ fn validateSerializedSchema(data: []const u8) !void {
         for (0..column_count) |_| {
             try cursor.readStr();
             try cursor.readStr();
-            if ((try cursor.readU8()) >= std.meta.fields(RelationalColumnType).len) return error.InvalidSchema;
+            if ((try cursor.readU8()) >= std.meta.fieldNames(RelationalColumnType).len) return error.InvalidSchema;
             try cursor.readBool();
             try cursor.readBool();
             try cursor.readBool();
-            if ((try cursor.readU8()) >= std.meta.fields(RelationalJsonKind).len) return error.InvalidSchema;
+            if ((try cursor.readU8()) >= std.meta.fieldNames(RelationalJsonKind).len) return error.InvalidSchema;
         }
+    }
+    if (format_version >= 15) {
+        if (try cursor.readU8() > 1) return error.InvalidSchema;
+        if (data[cursor.pos - 1] == 1) try cursor.readStr();
     }
     try cursor.finish();
 }
@@ -1248,6 +1282,10 @@ fn validateRelationalSchema(alloc: Allocator, schema: TableSchema) !void {
 
 /// Free a schema returned by deserializeSchema.
 pub fn freeSchema(alloc: Allocator, s: TableSchema) void {
+    if (s.external_base_source) |source| {
+        var owned = source;
+        owned.deinit(alloc);
+    }
     alloc.free(s.default_type);
     alloc.free(s.ttl_field);
     for (s.exact_fields) |field| {
@@ -1612,7 +1650,7 @@ const RuntimeStoreHandle = struct {
     store: backend_erased.Store,
     owned: bool,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         if (self.owned) self.store.deinit();
     }
 };
@@ -2330,7 +2368,7 @@ pub fn parseDateTimeToNs(text: []const u8) ?u64 {
 /// cannot later disappear from a declared native column.
 pub fn fieldTypeAcceptsRuntimeValue(field_type: AntflyType, value: std.json.Value) bool {
     return switch (field_type) {
-        .text, .keyword, .link, .blob, .html, .search_as_you_type => value == .string,
+        .text, .keyword, .link, .blob, .html, .search_as_you_type, .substring => value == .string,
         .numeric => jsonNumberIsFinite(value),
         .boolean => value == .bool,
         .datetime => switch (value) {
@@ -2380,151 +2418,14 @@ fn jsonValueToFiniteF64(value: std.json.Value) ?f64 {
     return if (std.math.isFinite(number)) number else null;
 }
 
-pub fn formatDateTimeNsAlloc(alloc: Allocator, ns: u64) ![]u8 {
-    const seconds = ns / std.time.ns_per_s;
-    const nanos = ns % std.time.ns_per_s;
-    const days: i64 = @intCast(seconds / 86_400);
-    const seconds_of_day = seconds % 86_400;
-    const civil = civilFromDays(days);
-    if (civil.year < 0 or civil.year > 9999) return error.InvalidDateTime;
-    return try std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>9}Z", .{
-        @as(u64, @intCast(civil.year)),
-        civil.month,
-        civil.day,
-        seconds_of_day / 3_600,
-        (seconds_of_day % 3_600) / 60,
-        seconds_of_day % 60,
-        nanos,
-    });
-}
-
-pub fn parseRfc3339ToNs(text: []const u8) ?u64 {
-    if (text.len < 20) return null;
-    if (text[4] != '-' or text[7] != '-' or
-        (text[10] != 'T' and text[10] != 't') or
-        text[13] != ':' or text[16] != ':') return null;
-
-    const year = std.fmt.parseInt(i64, text[0..4], 10) catch return null;
-    const month = std.fmt.parseInt(i64, text[5..7], 10) catch return null;
-    const day = std.fmt.parseInt(i64, text[8..10], 10) catch return null;
-    const hour = std.fmt.parseInt(i64, text[11..13], 10) catch return null;
-    const minute = std.fmt.parseInt(i64, text[14..16], 10) catch return null;
-    const second = std.fmt.parseInt(i64, text[17..19], 10) catch return null;
-
-    var idx: usize = 19;
-    var nanos: u64 = 0;
-    if (idx < text.len and text[idx] == '.') {
-        idx += 1;
-        const frac_start = idx;
-        while (idx < text.len and text[idx] >= '0' and text[idx] <= '9') : (idx += 1) {}
-        const frac = text[frac_start..idx];
-        if (frac.len == 0 or frac.len > 9) return null;
-        var frac_ns = std.fmt.parseInt(u64, frac, 10) catch return null;
-        var scale: usize = frac.len;
-        while (scale < 9) : (scale += 1) frac_ns *= 10;
-        nanos = frac_ns;
-    }
-    if (idx >= text.len) return null;
-    var offset_seconds: i64 = 0;
-    if (text[idx] == 'Z' or text[idx] == 'z') {
-        idx += 1;
-    } else if (text[idx] == '+' or text[idx] == '-') {
-        if (idx + 6 > text.len or text[idx + 3] != ':') return null;
-        const offset_hour = std.fmt.parseInt(i64, text[idx + 1 .. idx + 3], 10) catch return null;
-        const offset_minute = std.fmt.parseInt(i64, text[idx + 4 .. idx + 6], 10) catch return null;
-        if (offset_hour > 23 or offset_minute > 59) return null;
-        offset_seconds = offset_hour * 3_600 + offset_minute * 60;
-        if (text[idx] == '-') offset_seconds = -offset_seconds;
-        idx += 6;
-    } else {
-        return null;
-    }
-    if (idx != text.len) return null;
-
-    const local_ns = civilDateTimeToSignedNs(year, month, day, hour, minute, second, nanos) orelse return null;
-    const offset_ns = @as(i128, offset_seconds) * std.time.ns_per_s;
-    return std.math.cast(u64, local_ns - offset_ns);
-}
-
-pub fn parseDateToNs(value: []const u8) ?u64 {
-    if (value.len != 10 or value[4] != '-' or value[7] != '-') return null;
-    const year = std.fmt.parseInt(i64, value[0..4], 10) catch return null;
-    const month = std.fmt.parseInt(i64, value[5..7], 10) catch return null;
-    const day = std.fmt.parseInt(i64, value[8..10], 10) catch return null;
-    return civilDateTimeToNs(year, month, day, 0, 0, 0, 0);
-}
+const datetime = @import("../datetime.zig");
+pub const formatDateTimeNsAlloc = datetime.formatDateTimeNsAlloc;
+pub const parseRfc3339ToNs = datetime.parseRfc3339ToNs;
+pub const parseDateToNs = datetime.parseDateToNs;
+pub const parseRfc3339ToSignedNs = datetime.parseRfc3339ToSignedNs;
 
 fn isValidDate(value: []const u8) bool {
     return parseDateToNs(value) != null;
-}
-
-fn civilDateTimeToNs(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64, nanos: u64) ?u64 {
-    return std.math.cast(u64, civilDateTimeToSignedNs(year, month, day, hour, minute, second, nanos) orelse return null);
-}
-
-fn civilDateTimeToSignedNs(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64, nanos: u64) ?i128 {
-    if (month < 1 or month > 12) return null;
-    const max_day = daysInMonth(year, month) orelse return null;
-    if (day < 1 or day > max_day) return null;
-    if (hour < 0 or hour > 23) return null;
-    if (minute < 0 or minute > 59) return null;
-    // Leap-second validation requires an up-to-date leap-second table. Reject
-    // `:60` instead of accepting it at arbitrary minutes and silently
-    // normalizing it to the following minute.
-    if (second < 0 or second > 59) return null;
-    if (nanos >= std.time.ns_per_s) return null;
-
-    const days = daysFromCivil(year, month, day);
-    const seconds = @as(i128, days) * 86_400 + hour * 3_600 + minute * 60 + second;
-    return seconds * std.time.ns_per_s + nanos;
-}
-
-fn daysInMonth(year: i64, month: i64) ?i64 {
-    return switch (month) {
-        1, 3, 5, 7, 8, 10, 12 => 31,
-        4, 6, 9, 11 => 30,
-        2 => if (isLeapYear(year)) 29 else 28,
-        else => null,
-    };
-}
-
-fn isLeapYear(year: i64) bool {
-    return @mod(year, 4) == 0 and (@mod(year, 100) != 0 or @mod(year, 400) == 0);
-}
-
-const CivilDate = struct {
-    year: i64,
-    month: u8,
-    day: u8,
-};
-
-fn civilFromDays(days_since_epoch: i64) CivilDate {
-    const z = days_since_epoch + 719_468;
-    const era = @divFloor(if (z >= 0) z else z - 146_096, 146_097);
-    const doe = z - era * 146_097;
-    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36_524) - @divFloor(doe, 146_096), 365);
-    var year = yoe + era * 400;
-    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
-    const mp = @divFloor(5 * doy + 2, 153);
-    const day = doy - @divFloor(153 * mp + 2, 5) + 1;
-    const month = mp + if (mp < 10) @as(i64, 3) else @as(i64, -9);
-    year += if (month <= 2) @as(i64, 1) else @as(i64, 0);
-    return .{
-        .year = year,
-        .month = @intCast(month),
-        .day = @intCast(day),
-    };
-}
-
-fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
-    var y = year;
-    y -= if (month <= 2) @as(i64, 1) else @as(i64, 0);
-    const era = @divFloor(if (y >= 0) y else y - 399, 400);
-    const yoe = y - era * 400;
-    const mp = month + (if (month > 2) @as(i64, -3) else @as(i64, 9));
-    const doy = @divFloor(153 * mp + 2, 5) + day - 1;
-    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
-    return era * 146_097 + doe - 719_468;
 }
 
 // ============================================================================
@@ -2703,7 +2604,7 @@ test "schema serialize/deserialize round-trip" {
     defer alloc.free(data);
 
     var format_pos: usize = 4;
-    try std.testing.expectEqual(@as(u32, 14), readU32(data, &format_pos));
+    try std.testing.expectEqual(storage_format_version, readU32(data, &format_pos));
 
     const loaded = try deserializeSchema(alloc, data);
     defer freeSchema(alloc, loaded);

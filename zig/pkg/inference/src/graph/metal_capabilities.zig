@@ -468,6 +468,12 @@ fn metalConvGeneralHasResidentShape(query: CapabilityQuery) bool {
         .conv_general => |attrs| attrs,
         else => return false,
     };
+    if (attrs.transposed) return false;
+    if (@as(usize, attrs.num_spatial) > attrs.dilations.len) return false;
+    for (0..attrs.num_spatial) |axis| {
+        if (attrs.dilations[axis] != 1 or attrs.output_padding[axis] != 0) return false;
+    }
+
     const input_shape = nodeInputShape(query, 0) orelse return false;
     const weight_shape = nodeInputShape(query, 1) orelse return false;
     if (input_shape.dtype != .f32 or weight_shape.dtype != .f32 or query.graph.node(query.node_id).output_shape.dtype != .f32) return false;
@@ -600,7 +606,7 @@ fn metalBroadcastHasResidentShape(query: CapabilityQuery) bool {
     const output_elems = shapeElementCount(output_shape) orelse return false;
     if (input_elems > std.math.maxInt(u32) or output_elems > std.math.maxInt(u32)) return false;
 
-    var mapped_output_axes = [_]bool{false} ** ml.graph.shape.max_rank;
+    var mapped_output_axes = @as([ml.graph.shape.max_rank]bool, @splat(false));
     for (0..rank) |input_axis| {
         const output_axis: usize = attrs.broadcast_axes[input_axis];
         if (output_axis >= output_rank or mapped_output_axes[output_axis]) return false;
@@ -1296,6 +1302,35 @@ test "metal diagnostics keep formerly host-assisted transpose dot and conv resid
     try expectMetalNodeAcceptedResident(&g, seeds, fused_conv1);
     try expectMetalNodeAcceptedResident(&g, seeds, conv2_general);
     try expectMetalNodeAcceptedResident(&g, seeds, fused_conv2);
+}
+test "metal rejects ConvTranspose instead of executing ordinary convolution" {
+    const allocator = std.testing.allocator;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var builder = Builder.init(&graph);
+
+    const input = try builder.parameter("input", Shape.init(.f32, &.{ 1, 1, 2, 2 }));
+    const weight = try builder.parameter("weight", Shape.init(.f32, &.{ 1, 1, 2, 2 }));
+    const transposed = try graph.addNode(.{
+        .op = .{ .conv_general = .{
+            .transposed = true,
+            .num_spatial = 2,
+        } },
+        .output_shape = Shape.init(.f32, &.{ 1, 1, 3, 3 }),
+        .inputs = .{ input, weight, null_node, null_node },
+        .num_inputs = 2,
+    });
+
+    const seeds = try partition.allocTensorDescriptorSeeds(allocator, &graph);
+    defer allocator.free(seeds);
+    try partition.seedAllParameterResidency(seeds, &graph, .metal, 0);
+    const decision = decideMetalEagerGraph(.{
+        .graph = &graph,
+        .node_id = transposed,
+        .op = graph.node(transposed).op,
+        .tensor_descs = seeds,
+    });
+    try std.testing.expect(!decision.can_execute);
 }
 
 test "metal planner keeps clipclap l2 normalize tail resident" {

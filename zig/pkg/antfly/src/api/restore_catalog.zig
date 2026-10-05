@@ -19,8 +19,10 @@ const std = @import("std");
 const metadata = @import("../metadata/api.zig");
 const tables = @import("../metadata/table_manager.zig");
 const routing = @import("table_catalog.zig");
-const reads = @import("table_reads.zig");
-const writes = @import("table_writes.zig");
+const reads = @import("table_read_source.zig");
+const read_adapters = @import("antfly_source_root").antfly_sources.table_reads;
+const writes = @import("table_write_source.zig");
+const write_adapters = @import("antfly_source_root").antfly_sources.table_writes;
 const Scope = @import("../storage/db/restore_staging_contract.zig").Scope;
 
 pub const Owner = struct { group_id: u64, scope: Scope };
@@ -46,7 +48,7 @@ pub const Catalog = struct {
     plan_id: [16]u8,
     plan_digest: [32]u8,
     authority: Authority,
-    io: ?@import("../runtime_io_abi.zig").Borrow = null,
+    io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
 
     /// All snapshot/owner slices are immutable and borrowed for this Catalog's
     /// lifetime. The driver owns their arena through completion of a page/2PC.
@@ -143,9 +145,9 @@ pub const Catalog = struct {
 };
 
 pub const Sources = struct {
-    reader: reads.HostedProvisionedTableReadSource,
-    writer: writes.HostedProvisionedTableWriteSource,
-    pub fn bind(self: *Sources, catalog: *Catalog, reader: reads.HostedProvisionedTableReadSource, writer: writes.HostedProvisionedTableWriteSource) void {
+    reader: read_adapters.HostedProvisionedTableReadSource,
+    writer: write_adapters.HostedProvisionedTableWriteSource,
+    pub fn bind(self: *Sources, catalog: *Catalog, reader: read_adapters.HostedProvisionedTableReadSource, writer: write_adapters.HostedProvisionedTableWriteSource) void {
         self.reader = reader;
         self.writer = writer;
         self.reader.catalog = catalog.source();
@@ -164,9 +166,35 @@ pub const ValidationCursor = struct {
 /// queue or a public query route. Templates are lightweight hosted sources.
 pub const ValidationPort = struct {
     status: @import("http_server.zig").StatusSource,
+    /// Optional caller-owned benchmark probe. Normal restore paths leave it
+    /// null and pay no clock-read or atomic-update cost.
+    timings: ?*ValidationTimings = null,
     /// Internal embedding boundary. Implementations borrow the exact private
     /// catalog for the session lifetime and must not fall back to live names.
     factory: ?SourceFactory = null,
+
+    pub const ValidationTimings = struct {
+        prepare_calls: std.atomic.Value(u64) = .init(0),
+        step_calls: std.atomic.Value(u64) = .init(0),
+        prepare_progress_ns: std.atomic.Value(u64) = .init(0),
+        prepare_snapshot_ns: std.atomic.Value(u64) = .init(0),
+        prepare_projection_ns: std.atomic.Value(u64) = .init(0),
+        prepare_bind_ns: std.atomic.Value(u64) = .init(0),
+        step_progress_ns: std.atomic.Value(u64) = .init(0),
+        step_validate_ns: std.atomic.Value(u64) = .init(0),
+
+        fn add(self: *@This(), comptime field: []const u8, elapsed_ns: u64) void {
+            _ = @field(self.*, field).fetchAdd(elapsed_ns, .monotonic);
+        }
+    };
+
+    fn timingStart(self: @This()) u64 {
+        return if (self.timings != null) @import("antfly_platform").time.monotonicNs() else 0;
+    }
+
+    fn timingRecord(self: @This(), comptime field: []const u8, started_ns: u64) void {
+        if (self.timings) |timings| timings.add(field, @import("antfly_platform").time.monotonicNs() - started_ns);
+    }
 
     pub const SourcePair = struct {
         reader: @import("table_read_source.zig").TableReadSource,
@@ -191,11 +219,11 @@ pub const ValidationPort = struct {
             return BoundaryAbi.call("bind", self.boundary_dispatch, self.bind, .{ self.ptr, self.secondary, catalog });
         }
 
-        pub fn hosted(reader: *reads.HostedProvisionedTableReadSource, writer: *writes.HostedProvisionedTableWriteSource) @This() {
+        pub fn hosted(reader: *read_adapters.HostedProvisionedTableReadSource, writer: *write_adapters.HostedProvisionedTableWriteSource) @This() {
             return .{ .ptr = reader, .secondary = writer, .bind = bindHosted };
         }
 
-        pub fn local(reader: *reads.ProvisionedTableReadSource, writer: *writes.ProvisionedTableWriteSource) @This() {
+        pub fn local(reader: *read_adapters.ProvisionedTableReadSource, writer: *write_adapters.ProvisionedTableWriteSource) @This() {
             return .{ .ptr = reader, .secondary = writer, .bind = bindLocal };
         }
 
@@ -208,8 +236,8 @@ pub const ValidationPort = struct {
                     self.alloc.destroy(self);
                 }
             };
-            const reader: *reads.HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-            const writer: *writes.HostedProvisionedTableWriteSource = @ptrCast(@alignCast(secondary.?));
+            const reader: *read_adapters.HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+            const writer: *write_adapters.HostedProvisionedTableWriteSource = @ptrCast(@alignCast(secondary.?));
             const owned = try catalog.alloc.create(Owned);
             owned.alloc = catalog.alloc;
             catalog.io = reader.catalog.io;
@@ -220,15 +248,15 @@ pub const ValidationPort = struct {
         fn bindLocal(ptr: *anyopaque, secondary: ?*anyopaque, catalog: *Catalog) !SourcePair {
             const Owned = struct {
                 alloc: std.mem.Allocator,
-                reader: reads.ProvisionedTableReadSource,
-                writer: writes.ProvisionedTableWriteSource,
+                reader: read_adapters.ProvisionedTableReadSource,
+                writer: write_adapters.ProvisionedTableWriteSource,
                 fn release(raw: *anyopaque) void {
                     const self: *@This() = @ptrCast(@alignCast(raw));
                     self.alloc.destroy(self);
                 }
             };
-            const reader: *reads.ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-            const writer: *writes.ProvisionedTableWriteSource = @ptrCast(@alignCast(secondary.?));
+            const reader: *read_adapters.ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+            const writer: *write_adapters.ProvisionedTableWriteSource = @ptrCast(@alignCast(secondary.?));
             const owned = try catalog.alloc.create(Owned);
             owned.* = .{ .alloc = catalog.alloc, .reader = reader.*, .writer = writer.* };
             catalog.io = reader.catalog.io;
@@ -248,16 +276,22 @@ pub const ValidationPort = struct {
     /// slice. Authority is checked independently before every page.
     pub fn prepare(self: @This(), alloc: std.mem.Allocator, job: @import("../metadata/restore_staging.zig").Job, request: @import("operation.zig").RequestContext) !*ValidationSession {
         try request.ensureActive();
+        if (self.timings) |timings| _ = timings.prepare_calls.fetchAdd(1, .monotonic);
         const staging = @import("../metadata/restore_staging.zig");
+        var started_ns = self.timingStart();
         const current = (try self.status.getRestoreStagingProgress(alloc, job.plan.id, request)) orelse return error.RestoreStagingScopeChanged;
+        self.timingRecord("prepare_progress_ns", started_ns);
         if (current.state != .importing and current.state != .validating) return error.RestoreStagingScopeChanged;
+        started_ns = self.timingStart();
         var live = (try self.status.linearizableSnapshot(request)) orelse return error.CatalogRoutingUnavailable;
+        self.timingRecord("prepare_snapshot_ns", started_ns);
         errdefer self.status.freeAdminSnapshot(&live);
         const session = try alloc.create(ValidationSession);
         errdefer alloc.destroy(session);
         session.* = .{ .alloc = alloc, .port = self, .arena = std.heap.ArenaAllocator.init(alloc), .live = live, .catalog = undefined, .request = request };
         errdefer session.arena.deinit();
         const owned = session.arena.allocator();
+        started_ns = self.timingStart();
         // Own the plan bytes; the driver's next metadata update may replace its
         // previous Job even while this slice retains the routing projection.
         const plan_bytes = try std.json.Stringify.valueAlloc(owned, job.plan, .{});
@@ -280,8 +314,11 @@ pub const ValidationPort = struct {
         snapshot.tables = private_tables.items;
         snapshot.ranges = private_ranges.items;
         session.catalog = try Catalog.init(alloc, snapshot, owners.items, .{ .ptr = session, .verify = ValidationSession.verify });
+        self.timingRecord("prepare_projection_ns", started_ns);
         const factory = self.factory orelse return error.RestoreValidationPending;
+        started_ns = self.timingStart();
         session.bound = try factory.bindSources(&session.catalog);
+        self.timingRecord("prepare_bind_ns", started_ns);
         return session;
     }
 };
@@ -311,11 +348,54 @@ pub const ValidationSession = struct {
     pub fn step(self: *@This(), alloc: std.mem.Allocator, cursor: *ValidationCursor, request: @import("operation.zig").RequestContext) !bool {
         try request.ensureActive();
         self.request = request;
+        if (self.port.timings) |timings| _ = timings.step_calls.fetchAdd(1, .monotonic);
+        var started_ns = self.port.timingStart();
         const current = (try self.port.status.getRestoreStagingProgress(alloc, self.catalog.plan_id, request)) orelse return error.RestoreStagingScopeChanged;
+        self.port.timingRecord("step_progress_ns", started_ns);
         if (current.state != .importing and current.state != .validating) return error.RestoreStagingScopeChanged;
-        return validateSlice(alloc, &self.catalog, self.bound.reader, self.bound.writer, cursor);
+        started_ns = self.port.timingStart();
+        const done = try validateWindow(alloc, &self.catalog, self.bound.reader, self.bound.writer, cursor, request);
+        self.port.timingRecord("step_validate_ns", started_ns);
+        return done;
     }
 };
+
+/// Owner-local activation receipts are authoritative. Advance a bounded
+/// window within one phase; the cohort-wide UNIQUE/FK barrier stays intact.
+fn validateWindow(alloc: std.mem.Allocator, catalog: *Catalog, reader: reads.TableReadSource, writer: writes.TableWriteSource, cursor: *ValidationCursor, request: @import("operation.zig").RequestContext) !bool {
+    const capability = request.fanout_io orelse request.deadline_io;
+    if (capability == null or cursor.phase == .complete or cursor.owner_index >= catalog.snapshot.ranges.len)
+        return validateSlice(alloc, catalog, reader, writer, cursor);
+    const Slot = struct {
+        arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
+        cursor: ValidationCursor,
+        failure: ?anyerror = null,
+        fn run(slot: *@This(), c: *Catalog, r: reads.TableReadSource, w: writes.TableWriteSource) void {
+            _ = validateSlice(slot.arena.allocator(), c, r, w, &slot.cursor) catch |err| {
+                slot.failure = err;
+                return;
+            };
+        }
+    };
+    var slots: [4]Slot = undefined;
+    const count = @min(slots.len, catalog.snapshot.ranges.len - cursor.owner_index);
+    for (slots[0..count], 0..) |*slot, offset| slot.* = .{ .cursor = .{ .phase = cursor.phase, .owner_index = cursor.owner_index + @as(u32, @intCast(offset)) } };
+    defer for (slots[0..count]) |*slot| slot.arena.deinit();
+    var receiver = try capability.?.receive();
+    const io = receiver.io();
+    var tasks: std.Io.Group = .init;
+    for (slots[0..count]) |*slot| tasks.async(io, Slot.run, .{ slot, catalog, reader, writer });
+    tasks.await(io) catch return error.Cancelled;
+    try request.ensureActive();
+    for (slots[0..count]) |slot| if (slot.failure) |err| return err;
+    // A pending owner blocks the scheduling prefix, but not its independent
+    // siblings. A retry observes their existing durable receipts.
+    for (slots[0..count]) |slot| {
+        if (slot.cursor.owner_index != cursor.owner_index + 1) break;
+        cursor.owner_index += 1;
+    }
+    return false;
+}
 
 /// One bounded native activation page, through the same typed planner and 2PC
 /// used for ordinary writes. The caller persists this small scheduling cursor
@@ -359,7 +439,7 @@ pub fn validateSlice(alloc: std.mem.Allocator, catalog: *Catalog, reader: reads.
 }
 
 test "distributed txn staged mixed restore rebuilds fresh FK claims with durable 2PC and hides invalid cohorts" {
-    const db_mod = @import("../storage/db/db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const types = @import("../storage/db/types.zig");
     const native = @import("../storage/db/restore_staging_contract.zig");
     const activation = @import("../storage/db/relational_integrity_activation_contract.zig");
@@ -378,7 +458,9 @@ test "distributed txn staged mixed restore rebuilds fresh FK claims with durable
     const child_schema =
         \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"parent_fk","child_columns":["id"],"parent_table":"parent","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
     ;
-    for ([_]bool{ false, true }, 0..) |invalid, trial| {
+    for (0..4) |trial| {
+        const invalid = trial % 2 != 0;
+        const concurrent = trial >= 2;
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const owned = arena.allocator();
@@ -438,7 +520,7 @@ test "distributed txn staged mixed restore rebuilds fresh FK claims with durable
         const Fixture = struct {
             dbs: [3]*db_mod.DB,
             catalog: *Catalog,
-            sequence: u8 = 0,
+            sequence: std.atomic.Value(u8) = .init(0),
             active: bool = true,
             fn verify(ptr: *anyopaque, _: [16]u8, _: [32]u8) !bool {
                 return @as(*@This(), @ptrCast(@alignCast(ptr))).active;
@@ -487,8 +569,8 @@ test "distributed txn staged mixed restore rebuilds fresh FK claims with durable
             fn commit(ptr: *anyopaque, allocator: std.mem.Allocator, requests: []const contract.TableCommitRequest, sync: types.SyncLevel, cancellation: types.CancellationToken) !?contract.CommitOutcome {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 try cancellation.check();
-                self.sequence += 1;
-                return try distributed.executeMultiTableCommit(allocator, self.catalog.source(), .{ .ptr = self, .vtable = &.{ .begin_group = begin, .prepare_group = prepare, .resolve_group = resolve, .status_group = status } }, @splat(self.sequence), @as(u64, self.sequence) * 1000, @as(u64, self.sequence) * 1000 + 1, requests, sync, null);
+                const sequence = self.sequence.fetchAdd(1, .monotonic) + 1;
+                return try distributed.executeMultiTableCommit(allocator, self.catalog.source(), .{ .ptr = self, .vtable = &.{ .begin_group = begin, .prepare_group = prepare, .resolve_group = resolve, .status_group = status } }, @splat(sequence), @as(u64, sequence) * 1000, @as(u64, sequence) * 1000 + 1, requests, sync, null);
             }
         };
         var private_catalog: Catalog = undefined;
@@ -496,9 +578,13 @@ test "distributed txn staged mixed restore rebuilds fresh FK claims with durable
         private_catalog = try Catalog.init(alloc, .{ .status = .{ .metadata_group_id = 1, .metadata_incarnation = @splat(1), .metrics = .{} }, .tables = &table_records, .ranges = &range_records, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} }, &scopes, .{ .ptr = &fixture, .verify = Fixture.verify });
         const reader: reads.TableReadSource = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = Fixture.scan, .query = Fixture.query } };
         const writer: writes.TableWriteSource = .{ .ptr = &fixture, .vtable = &.{ .batch = Fixture.batch, .commit_batch_with_cancellation = Fixture.commit } };
+        var threaded: std.Io.Threaded = .init(alloc, .{ .async_limit = .limited(4) });
+        defer threaded.deinit();
+        const io = threaded.io();
+        const control: @import("operation.zig").RequestContext = if (concurrent) .{ .fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io) } else .{};
         var validation: ValidationCursor = .{};
         for (0..80) |_| {
-            const complete = validateSlice(alloc, &private_catalog, reader, writer, &validation) catch |err| {
+            const complete = validateWindow(alloc, &private_catalog, reader, writer, &validation, control) catch |err| {
                 if (invalid and err == error.ConstraintActivationFailed) break;
                 return err;
             };

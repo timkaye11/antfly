@@ -15,6 +15,10 @@
 //! Durable authority for an unpublished restore owner. Logical primary rows
 //! and native generated-artifact caches cross the source/target boundary;
 //! identities and constraints are allocated by the target schema/row pipeline.
+
+const server_test_adapter = if (builtin.is_test) @import("../server_db_adapter.zig") else struct {};
+const builtin = @import("builtin");
+const replication_ingress = @import("replication_ingress.zig");
 const std = @import("std");
 const identity = @import("doc_identity.zig");
 const activation = @import("relational_integrity_activation.zig");
@@ -43,6 +47,92 @@ pub const Scope = @import("restore_staging_contract.zig").Scope;
 pub const Progress = @import("restore_staging_contract.zig").Progress;
 
 pub const digest = @import("restore_staging_contract.zig").digest;
+
+test "restore empty generation proves pristine owner and rejects source import" {
+    for ([_][]const u8{ "{}", "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}" }) |definition| {
+        const db = @import("antfly_source_root").antfly_sources.physical_db;
+        const alloc = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/empty-owner", .{tmp.sub_path});
+        defer alloc.free(path);
+        const options: db.OpenOptions = .{ .identity_namespace = .{ .table_id = 10, .shard_id = 11, .range_id = 11 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
+        var target = try db.DB.open(alloc, path, options);
+        defer target.close();
+        try target.setSchemaJson(alloc, definition);
+        const schema = try @import("../schema.zig").serializeSchema(alloc, target.core.schema orelse .{});
+        defer alloc.free(schema);
+        const scope: Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(0), .source_namespace = .{ .table_id = 4, .shard_id = 5, .range_id = 5 }, .target_namespace = options.identity_namespace.?, .target_schema_digest = digest(schema), .empty_generation = true };
+        try target.reserveRestoreStagingScoped(alloc, scope);
+        const count_key = &@import("../internal_keys.zig").range_document_count_key;
+        var count: [8]u8 = undefined;
+        std.mem.writeInt(u64, &count, 1, .little);
+        try target.core.store.putBatch(&.{.{ .key = count_key, .value = &count }}, &.{});
+        try std.testing.expectError(error.RestoreStagingTargetNotEmpty, target.beginRestoreStaging(alloc, scope));
+        {
+            var state = (try target.restoreStagingStatus(alloc)).?;
+            defer state.deinit();
+            try std.testing.expectEqual(Phase.reserved, state.value.phase);
+        }
+        try target.core.store.putBatch(&.{}, &.{count_key});
+        const orphan = @import("relational_index_records.zig").forward_namespace ++ "orphan";
+        try target.core.store.putBatch(&.{.{ .key = orphan, .value = "" }}, &.{});
+        try std.testing.expectError(error.RestoreStagingTargetNotEmpty, target.beginRestoreStaging(alloc, scope));
+        try target.core.store.putBatch(&.{}, &.{orphan});
+        try target.beginRestoreStaging(alloc, scope);
+        try target.beginRestoreStaging(alloc, scope);
+        {
+            var state = (try target.restoreStagingStatus(alloc)).?;
+            defer state.deinit();
+            try std.testing.expectEqual(Phase.imported, state.value.phase);
+            try std.testing.expectEqual(@as(u64, 0), state.value.rows);
+            try std.testing.expectEqual(@as(u64, 0), (try identity.visibilitySummaryFromStore(target.core.store)).?.live_ordinals);
+        }
+        try std.testing.expectError(error.InvalidRestoreStagingCommand, target.prepareRestoreStagingPage(alloc, scope, &target, 128, .none));
+        _ = try target.finishRestoreStaging(alloc, scope.digest(), .validated);
+        _ = try target.finishRestoreStaging(alloc, scope.digest(), .published);
+    }
+}
+
+test "restore graph empty generation rejects physical artifacts before staging" {
+    const db = @import("antfly_source_root").antfly_sources.physical_db;
+    const alloc = std.testing.allocator;
+    for ([_]enum { clean, edge, primary_artifact }{ .clean, .edge, .primary_artifact }) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-empty-owner", .{tmp.sub_path});
+        defer alloc.free(path);
+        const namespace: identity.Namespace = .{ .table_id = 10, .shard_id = 11, .range_id = 11 };
+        var target = try db.DB.open(alloc, path, .{ .identity_namespace = namespace, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+        defer target.close();
+        try target.setSchemaJson(alloc, "{}");
+        try target.addIndex(.{ .name = "links", .kind = .graph, .config_json = "{}" });
+        const schema = try @import("../schema.zig").serializeSchema(alloc, target.core.schema orelse .{});
+        defer alloc.free(schema);
+        const scope: Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(0), .source_namespace = .{ .table_id = 4, .shard_id = 5, .range_id = 5 }, .target_namespace = namespace, .target_schema_digest = digest(schema), .empty_generation = true, .graph_retirement_digest = @splat(7) };
+        try target.reserveRestoreStagingScoped(alloc, scope);
+        if (case == .edge) try target.core.index_manager.graphIndex("links").?.index.batchApply(&.{.{ .source = "a", .target = "b", .edge_type = "link" }}, &.{});
+        if (case == .primary_artifact) {
+            const keys = @import("../internal_keys.zig");
+            var state = std.ArrayListUnmanaged(u8).empty;
+            defer state.deinit(alloc);
+            try keys.appendDocumentPrefix(&state, alloc, "orphan");
+            try state.append(alloc, keys.graph_asset_state_kind);
+            try keys.appendEncodedComponent(&state, alloc, "links");
+            try keys.appendEncodedComponent(&state, alloc, "source");
+            try target.core.store.putBatch(&.{.{ .key = state.items, .value = "orphan" }}, &.{});
+        }
+        if (case != .clean) {
+            try std.testing.expectError(error.RestoreStagingTargetNotEmpty, target.beginRestoreStaging(alloc, scope));
+        } else {
+            try target.beginRestoreStaging(alloc, scope);
+            var state = (try target.restoreStagingStatus(alloc)).?;
+            defer state.deinit();
+            try std.testing.expectEqual(Phase.imported, state.value.phase);
+        }
+    }
+}
+
 pub fn optional(txn: anytype) !?[]const u8 {
     return txn.get(key) catch |err| switch (err) {
         error.NotFound => null,
@@ -77,12 +167,13 @@ pub fn requireMutableScope(alloc: Allocator, txn: anytype, expected: ?Digest) !v
 }
 
 /// Internal PreparedRow import admission, consumed under the DB apply fence.
-pub const BatchAdmission = struct { expected: Digest, next: []const u8, scope: Digest, rewrite: bool = false, source_effects: u32 = 0, artifact_page: bool = false, projection_page: bool = false };
+pub const BatchAdmission = struct { expected: Digest, next: []const u8, scope: Digest, rewrite: bool = false, source_effects: u32 = 0, artifact_page: bool = false, projection_page: bool = false, source_generation_proof_page: bool = false };
 pub fn validateImport(alloc: Allocator, txn: anytype, admission: BatchAdmission, row_count: usize, delete_count: usize) !void {
     const raw = (try optional(txn)) orelse return error.RestoreStagingScopeChanged;
     if (!std.mem.eql(u8, &digest(raw), &admission.expected)) return error.RestoreStagingProgressChanged;
     var before = try Progress.decode(alloc, raw);
     defer before.deinit();
+    if (before.value.scope.empty_generation) return error.InvalidRestoreStagingCommand;
     var after = Progress.decode(alloc, admission.next) catch |err| {
         if (err == error.OutOfMemory) return err;
         return error.InvalidRestoreStagingCommand;
@@ -93,6 +184,26 @@ pub fn validateImport(alloc: Allocator, txn: anytype, admission: BatchAdmission,
         after.value.rows != std.math.add(u64, before.value.rows, row_count +| delete_count) catch return error.InvalidRestoreStagingCommand)
         return error.InvalidRestoreStagingCommand;
     if (admission.rewrite != (before.value.scope.rewrite != null)) return error.InvalidRestoreStagingCommand;
+    if (admission.source_generation_proof_page) {
+        if (admission.rewrite or admission.artifact_page or admission.projection_page or
+            before.value.source_generation_proofs_complete or !after.value.source_generation_proofs_complete or
+            before.value.phase != .importing or after.value.phase != .importing or
+            row_count != 0 or delete_count != 0 or admission.source_effects != 0 or
+            before.value.rows != 0 or before.value.cursor.len != 0 or before.value.artifact_cursor.len != 0 or
+            before.value.projection_cursor.len != 0 or before.value.artifacts_complete or before.value.rows_complete or
+            before.value.rows != after.value.rows or
+            !std.mem.eql(u8, before.value.cursor, after.value.cursor) or
+            !std.mem.eql(u8, before.value.artifact_cursor, after.value.artifact_cursor) or
+            !std.mem.eql(u8, before.value.projection_cursor, after.value.projection_cursor) or
+            before.value.artifacts_complete != after.value.artifacts_complete or
+            before.value.rows_complete != after.value.rows_complete or
+            !std.mem.eql(u8, &before.value.logical_digest, &after.value.logical_digest) or
+            !std.meta.eql(before.value.rewrite, after.value.rewrite)) return error.InvalidRestoreStagingCommand;
+        return;
+    }
+    if (!before.value.source_generation_proofs_complete) return error.InvalidRestoreStagingCommand;
+    if (before.value.source_generation_proofs_complete != after.value.source_generation_proofs_complete)
+        return error.InvalidRestoreStagingCommand;
     if (admission.projection_page) {
         if (admission.artifact_page or admission.rewrite or !before.value.scope.preserve_artifacts or !before.value.artifacts_complete or
             !before.value.rows_complete or !after.value.rows_complete or !after.value.artifacts_complete or
@@ -185,7 +296,7 @@ test "native restore artifact phase cannot skip row fencing or mutate logical pr
         .target_schema_digest = @splat(5),
         .preserve_artifacts = true,
     };
-    const before: Progress = .{ .scope = scope };
+    const before: Progress = .{ .scope = scope, .source_generation_proofs_complete = true };
     const raw = try before.encode(alloc);
     defer alloc.free(raw);
     const Read = struct {
@@ -217,131 +328,16 @@ test "native restore artifact phase cannot skip row fencing or mutate logical pr
     try std.testing.expectError(error.InvalidRestoreStagingCommand, validateImport(alloc, &read, admission, 0, 0));
 }
 
-fn applyTestPage(alloc: Allocator, db: *@import("db.zig").DB, req: @import("types.zig").BatchRequest, index: u64, ha: bool) !void {
-    if (!ha) return db.batchRaftReplicatedApply(req, .{ .term = 1, .index = index });
-    const payload = try @import("../hot_standby/effects.zig").encodeBatchMutationRequestAlloc(alloc, req);
+fn applyTestPage(alloc: Allocator, db: *@import("antfly_source_root").antfly_sources.physical_db.DB, req: @import("types.zig").BatchRequest, index: u64, ha: bool) !void {
+    if (!ha) return server_test_adapter.applyOrdered(&db, req, .{ .term = 1, .index = index });
+    const payload = try @import("replication_effects.zig").encodeBatchMutationRequestAlloc(alloc, req);
     defer alloc.free(payload);
-    try db.applyHAReplicationRecord(.{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = index, .previous_lsn = index - 1, .payload = payload });
-    try std.testing.expectEqual(index, try db.haAppliedReplicationLsn());
-}
-
-test "relational integrity restore staging Raft controls retain HA append obligations and replay original import timestamps" {
-    const db_mod = @import("db.zig");
-    const primary_mod = @import("../hot_standby/primary.zig");
-    const effects = @import("../hot_standby/effects.zig");
-    const types = @import("types.zig");
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const owned = arena.allocator();
-    const source_path = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/source-ha", .{tmp.sub_path});
-    var source_options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
-    {
-        var source = try db_mod.DB.open(alloc, source_path, source_options);
-        defer source.close();
-        try source.setSchemaJson(alloc, "{}");
-        try source.batch(.{ .timestamp_ns = 1234, .writes = &.{.{ .key = "row", .value = "{\"id\":1}" }} });
-    }
-    source_options.open_mode = .query_readonly;
-    var source = try db_mod.DB.open(alloc, source_path, source_options);
-    defer source.close();
-    for ([_]bool{ false, true }, 0..) |synchronous, trial| {
-        const path = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/primary-{d}", .{ tmp.sub_path, trial });
-        const replica_path = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/standby-{d}", .{ tmp.sub_path, trial });
-        const log_path = try std.fmt.allocPrintSentinel(owned, ".zig-cache/tmp/{s}/log-{d}", .{ tmp.sub_path, trial }, 0);
-        const slots_path = try std.fmt.allocPrintSentinel(owned, ".zig-cache/tmp/{s}/slots-{d}", .{ tmp.sub_path, trial }, 0);
-        var primary = try primary_mod.Primary.open(alloc, log_path, slots_path, .{ .cluster_id = 1, .timeline_id = 1, .epoch = 1, .table_id = 10, .shard_id = 11 }, .{});
-        defer primary.close();
-        try primary.createSlot("standby", 0);
-        const Ack = struct {
-            calls: usize = 0,
-            fn wait(ptr: *anyopaque, stream: *primary_mod.Primary, lsn: u64, _: primary_mod.SyncPolicy) !void {
-                const self: *@This() = @ptrCast(@alignCast(ptr));
-                self.calls += 1;
-                if (self.calls == 1) return error.InjectedRestoreMirrorWaitFailure;
-                try stream.standbyStatusUpdate("standby", 1, lsn, lsn);
-            }
-        };
-        var ack: Ack = .{};
-        const target_options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 10, .shard_id = 11, .range_id = 11 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
-        var target = try db_mod.DB.open(alloc, path, target_options);
-        defer target.close();
-        var replica = try db_mod.DB.open(alloc, replica_path, target_options);
-        defer replica.close();
-        try target.setSchemaJson(alloc, "{}");
-        try replica.setSchemaJson(alloc, "{}");
-        const schema = try @import("../schema.zig").serializeSchema(owned, target.core.schema orelse .{});
-        const scope: Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = source_options.identity_namespace.?, .target_namespace = target_options.identity_namespace.?, .target_schema_digest = digest(schema) };
-        try target.reserveRestoreStagingScoped(alloc, scope);
-        try replica.reserveRestoreStagingScoped(alloc, scope);
-        const bootstrap: OwnerBootstrap = .{ .scope = scope, .table_name = "docs", .schema_json = "{}", .indexes_json = "{}", .byte_range = .{ .start = "", .end = "" } };
-        try target.installRestoreStagingBootstrap(alloc, bootstrap);
-        try target.installRestoreStagingBootstrap(alloc, bootstrap);
-        var changed_bootstrap = bootstrap;
-        changed_bootstrap.table_name = "another-table";
-        try std.testing.expectError(error.RestoreStagingScopeChanged, target.installRestoreStagingBootstrap(alloc, changed_bootstrap));
-        {
-            var stored_bootstrap = (try target.readRestoreStagingBootstrap(alloc)) orelse return error.TestUnexpectedResult;
-            defer stored_bootstrap.deinit();
-            try std.testing.expectEqualStrings("docs", stored_bootstrap.value.table_name);
-        }
-        target.ha_async_batch_mirror = .{
-            .primary = &primary,
-            .sync_policy = .{ .mode = if (synchronous) .remote_write else .async, .standby_names = &.{"standby"}, .failure_policy = .block },
-            .sync_wait_ctx = &ack,
-            .sync_wait_fn = Ack.wait,
-        };
-        const begin: types.BatchRequest = .{ .restore_staging = .{ .begin = scope } };
-        if (synchronous) {
-            try std.testing.expectError(error.InjectedRestoreMirrorWaitFailure, target.batchRaftReplicatedApply(begin, .{ .term = 1, .index = 1 }));
-            try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
-        }
-        try target.batchRaftReplicatedApply(begin, .{ .term = 1, .index = 1 });
-        try target.batchRaftReplicatedApply(begin, .{ .term = 1, .index = 1 });
-        try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
-        var raft_index: u64 = 2;
-        while (true) : (raft_index += 1) {
-            var page = try target.prepareRestoreStagingPage(alloc, scope, &source, 128, .none);
-            defer page.deinit();
-            if (page.batch) |batch| {
-                try target.batchRaftReplicatedApply(batch, .{ .term = 1, .index = raft_index });
-                try target.batchRaftReplicatedApply(batch, .{ .term = 1, .index = raft_index });
-            }
-            if (page.phase == .imported) break;
-        }
-        for ([_]Phase{ .validated, .published }) |phase| {
-            raft_index += 1;
-            try target.batchRaftReplicatedApply(.{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = phase } } }, .{ .term = 1, .index = raft_index });
-        }
-        var saw_import = false;
-        for (1..primary.lastLsn() + 1) |lsn| {
-            var entry = (try primary.log.entryAt(alloc, lsn)) orelse return error.TestUnexpectedResult;
-            defer entry.deinit(alloc);
-            var decoded = try effects.decodeBatchMutationRequest(alloc, entry.record);
-            defer decoded.deinit();
-            if (decoded.value.request.restore_staging.? == .begin) {
-                const restored_bootstrap = decoded.value.restore_staging_bootstrap orelse return error.TestUnexpectedResult;
-                try std.testing.expectEqualStrings("docs", restored_bootstrap.table_name);
-                try std.testing.expectEqualSlices(u8, &scope.digest(), &restored_bootstrap.scope.digest());
-                try replica.installRestoreStagingBootstrap(alloc, restored_bootstrap);
-            } else try std.testing.expect(decoded.value.restore_staging_bootstrap == null);
-            if (decoded.value.request.restore_staging.? == .import_page and decoded.value.request.writes.len != 0) {
-                saw_import = true;
-                try std.testing.expectEqual(@as(u64, 1234), decoded.value.request.restore_staging.?.import_page.timestamps[0].timestamp);
-            }
-            try replica.applyHAReplicationRecord(entry.record);
-        }
-        try std.testing.expect(saw_import);
-        var found = (try replica.lookup(alloc, "row", .{})) orelse return error.TestUnexpectedResult;
-        defer found.deinit(alloc);
-        try std.testing.expectEqualStrings("{\"id\":1}", found.json);
-    }
+    try replication_ingress.applyRecord(db, .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = index, .previous_lsn = index - 1, .payload = payload });
+    try std.testing.expectEqual(index, try db.replicationAppliedSequence());
 }
 
 test "relational integrity restore staging imports typed and document rows with restart and exact timestamps" {
-    const db_mod = @import("db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const types = @import("types.zig");
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

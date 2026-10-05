@@ -14,8 +14,8 @@
 
 const std = @import("std");
 const ant_json = @import("antfly-json");
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
-const request_context = @import("execution_context.zig");
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
+const request_context = @import("antfly_inference_execution_context");
 pub const RequestContext = request_context.RequestContext;
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
@@ -26,16 +26,16 @@ const google_auth = @import("antfly_google").auth;
 const common_secrets = @import("../common/secrets.zig");
 const credential_source_identity = @import("../common/credential_source_identity.zig");
 const credential_safety = @import("../common/credential_safety.zig");
-const provider_defaults = @import("../common/provider_defaults.zig");
+const provider_defaults = @import("antfly_inference_provider_defaults");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const embeddings_openapi = @import("antfly_embeddings_openapi");
 const embeddings_types = @import("antfly_embeddings");
 const scraping = @import("antfly_scraping");
-const inference_types = @import("types.zig");
-const bedrock_provider = @import("bedrock.zig");
-const vertex_provider = @import("vertex.zig");
-const openai_provider = @import("openai.zig");
-const antfly_provider_mod = @import("local.zig");
+const inference_types = @import("antfly_inference_types");
+const bedrock_provider = @import("antfly_inference_bedrock");
+const vertex_provider = @import("antfly_inference_vertex");
+const openai_provider = @import("antfly_inference_openai");
+const antfly_provider_mod = @import("antfly_inference_local");
 const chunking_types = @import("../chunking/types.zig");
 const inference_chunker = @import("inference_chunker");
 const transcribing = @import("antfly_transcribing");
@@ -50,17 +50,17 @@ const template_remote = if (builtin.os.tag == .freestanding or builtin.is_test)
 else
     @import("../template_remote.zig");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
-const http_common = @import("../raft/transport/http_common.zig");
-const std_http_listener = @import("../raft/transport/std_http_listener.zig");
+const http_common = @import("../common/http/http_common.zig");
+const std_http_listener = @import("../common/http/std_http_listener.zig");
 const enrichment_types = @import("../storage/db/enrichment/enrichment_types.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
-const inference_work = @import("work.zig");
-const embedding_wire = @import("embedding_wire.zig");
-const remote_capabilities = @import("remote_capabilities.zig");
-const execution_context = @import("execution_context.zig");
+const inference_work = @import("antfly_inference_work");
+const embedding_wire = @import("antfly_inference_embedding_wire");
+const remote_capabilities = @import("antfly_inference_remote_capabilities");
+const execution_context = @import("antfly_inference_execution_context");
 const shared_vector = @import("antfly_vector").vector;
 const antfly_image = @import("antfly_image");
-var traced_local_batches = std.atomic.Value(u64).init(0);
+var traced_local_batches = @import("antfly_platform").atomic.Value(u64).init(0);
 
 pub const SparseEmbedding = db_embedder.SparseEmbedding;
 
@@ -83,34 +83,8 @@ pub const ProviderKind = enum {
 /// Antfly assigns retrieval roles from the operation: artifact/index writes
 /// are documents and semantic-search inputs are queries. Provider adapters
 /// translate these canonical roles to their wire-specific spelling.
-pub const EmbeddingTaskType = enum {
-    retrieval_query,
-    retrieval_document,
-
-    pub fn canonical(self: EmbeddingTaskType) []const u8 {
-        return switch (self) {
-            .retrieval_query => "RETRIEVAL_QUERY",
-            .retrieval_document => "RETRIEVAL_DOCUMENT",
-        };
-    }
-
-    pub fn cohereInputType(self: EmbeddingTaskType) []const u8 {
-        return switch (self) {
-            .retrieval_query => "search_query",
-            .retrieval_document => "search_document",
-        };
-    }
-};
-
-pub const EmbeddingRequestContext = struct {
-    request: RequestContext,
-    task_type: EmbeddingTaskType = .retrieval_document,
-    instruction: ?[]const u8 = null,
-
-    pub fn check(self: EmbeddingRequestContext) !void {
-        return self.request.check();
-    }
-};
+pub const EmbeddingTaskType = @import("antfly_inference_request_types").EmbeddingTaskType;
+pub const EmbeddingRequestContext = @import("antfly_inference_request_types").EmbeddingRequestContext;
 
 pub const AntflyProvider = struct {
     ptr: *anyopaque,
@@ -379,6 +353,8 @@ pub const AntflyProvider = struct {
     /// Dense and raster responses use the owned numeric-row ABI, not JSON.
     typed_dense_results: bool = false,
     /// Canonical generation request/response on the admitted runtime route.
+    decide_json: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, ?RequestContext) anyerror![]u8 = null,
+
     generate_json: ?*const fn (
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -386,23 +362,19 @@ pub const AntflyProvider = struct {
         context: ?RequestContext,
     ) anyerror![]u8 = null,
 
+    pub fn decideJson(self: AntflyProvider, alloc: std.mem.Allocator, body: []const u8, context: ?RequestContext) ![]u8 {
+        const callback = self.decide_json orelse return error.UnsupportedDecisionProvider;
+        return AntflyProviderBoundary.call("decide_json", self.boundary_dispatch, callback, .{ self.ptr, alloc, body, context });
+    }
+
     pub fn generateJson(self: AntflyProvider, alloc: std.mem.Allocator, body: []const u8, context: ?RequestContext) ![]u8 {
         const callback = self.generate_json orelse return error.UnsupportedGeneratorProvider;
         return AntflyProviderBoundary.call("generate_json", self.boundary_dispatch, callback, .{ self.ptr, alloc, body, context });
     }
 };
 
-pub const ClassificationRequest = struct {
-    texts: []const []const u8,
-    labels: []const []const u8,
-    hypothesis_template: ?[]const u8 = null,
-    multi_label: bool = false,
-};
-
-pub const ClassificationScore = struct {
-    label: []const u8,
-    score: f32,
-};
+pub const ClassificationRequest = @import("antfly_inference_request_types").ClassificationRequest;
+pub const ClassificationScore = @import("antfly_inference_request_types").ClassificationScore;
 
 pub fn deinitRewrittenTexts(alloc: std.mem.Allocator, texts: []const []const u8) void {
     for (texts) |text| alloc.free(text);
@@ -451,7 +423,7 @@ const BedrockCredentialPool = struct {
         return cache;
     }
 
-    fn deinit(self: *BedrockCredentialPool) void {
+    pub fn deinit(self: *BedrockCredentialPool) void {
         var iterator = self.by_region.iterator();
         while (iterator.next()) |entry| {
             entry.value_ptr.*.deinit(self.alloc);
@@ -487,7 +459,7 @@ pub const ProviderRuntime = struct {
     /// Lazily publish one service-scoped transport. Provider request objects
     /// retain per-request URLs, authentication, cancellation, and deadlines;
     /// the client owns only reusable DNS/TLS/connection state.
-    fn httpClient(self: *ProviderRuntime) !*httpx.Client {
+    pub fn httpClient(self: *ProviderRuntime) !*httpx.Client {
         if (self.http_client.load(.acquire)) |client| return client;
         lockAtomic(&self.http_mutex);
         defer self.http_mutex.unlock();
@@ -697,7 +669,7 @@ pub const ManagedEmbeddingEntry = struct {
         return &fallback.*.?;
     }
 
-    fn deinit(self: *ManagedEmbeddingEntry, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *ManagedEmbeddingEntry, alloc: std.mem.Allocator) void {
         std.debug.assert(self.alloc.ptr == alloc.ptr);
         if (self.quota) |*quota| quota.release();
         alloc.free(self.index_name);
@@ -4457,7 +4429,7 @@ const CatalogSemanticExecutionBinding = struct {
     project_id: []u8,
     embedded: bool,
 
-    fn deinit(self: *CatalogSemanticExecutionBinding, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *CatalogSemanticExecutionBinding, alloc: std.mem.Allocator) void {
         alloc.free(self.endpoint);
         if (self.region.len > 0) alloc.free(self.region);
         if (self.project_id.len > 0) alloc.free(self.project_id);
@@ -4655,11 +4627,11 @@ fn buildManagedEmbeddingEntry(
         @constCast("");
     errdefer if (source_table.len > 0) alloc.free(source_table);
     const api_key = switch (provider) {
-        .openai => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "OPENAI_API_KEY"),
-        .openrouter => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "OPENROUTER_API_KEY"),
-        .cohere => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "COHERE_API_KEY"),
-        .gemini => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "GEMINI_API_KEY"),
-        .antfly => try common_secrets.SecretValue.initConfigOrEnv(
+        .openai => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "OPENAI_API_KEY"),
+        .openrouter => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "OPENROUTER_API_KEY"),
+        .cohere => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "COHERE_API_KEY"),
+        .gemini => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "GEMINI_API_KEY"),
+        .antfly => try common_secrets.SecretValue.initConfigOrProviderDefault(
             alloc,
             embedder_cfg.api_key orelse options.inference_api_key,
             "ANTFLY_INFERENCE_API_KEY",
@@ -5423,7 +5395,7 @@ pub fn testSingleMultimodalEmbeddingAdmission() !void {
     try std.testing.expectEqual(@as(u64, 6), shape.decoded_pixels);
     try std.testing.expectEqual(@as(usize, 1), shape.max_media_parts_per_item);
 
-    var png = [_]u8{0} ** 24;
+    var png = @as([24]u8, @splat(0));
     @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
     std.mem.writeInt(u32, png[16..20], 2, .big);
     std.mem.writeInt(u32, png[20..24], 3, .big);
@@ -5904,7 +5876,7 @@ test "managed embedder metadata text-only windows respect the complete envelope 
 
 test "managed embedder metadata envelope sizing includes binary framing and payload" {
     const alloc = std.testing.allocator;
-    var png = [_]u8{0} ** 24;
+    var png = @as([24]u8, @splat(0));
     @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
     std.mem.writeInt(u32, png[16..20], 2, .big);
     std.mem.writeInt(u32, png[20..24], 3, .big);
@@ -5929,7 +5901,7 @@ test "managed embedder metadata envelope sizing includes binary framing and payl
 
 test "managed embedder metadata ceiling splits mixed batches before dispatch" {
     const alloc = std.testing.allocator;
-    var png = [_]u8{0} ** 24;
+    var png = @as([24]u8, @splat(0));
     @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
     std.mem.writeInt(u32, png[16..20], 2, .big);
     std.mem.writeInt(u32, png[20..24], 3, .big);
@@ -5969,7 +5941,7 @@ test "managed embedder metadata ceiling splits mixed batches before dispatch" {
 }
 
 test "managed embedder admission follows the selected attachment transport" {
-    var bytes = [_]u8{0} ** 24;
+    var bytes = @as([24]u8, @splat(0));
     @memcpy(bytes[0..8], "\x89PNG\r\n\x1a\n");
     std.mem.writeInt(u32, bytes[16..20], 2, .big);
     std.mem.writeInt(u32, bytes[20..24], 3, .big);
@@ -6438,7 +6410,7 @@ fn resolveOptionalConfigString(
 }
 
 fn resolveOptionalEnv(alloc: std.mem.Allocator, env_name: []const u8) ?[]u8 {
-    const name_z = alloc.dupeZ(u8, env_name) catch return null;
+    const name_z = alloc.dupeSentinel(u8, env_name, 0) catch return null;
     defer alloc.free(name_z);
     const value_z = getenv(name_z.ptr) orelse return null;
     return alloc.dupe(u8, std.mem.span(value_z)) catch null;
@@ -6500,7 +6472,10 @@ fn effectiveInputType(entry: *const ManagedEmbeddingEntry, task_type: EmbeddingT
     // Backward-compatible expert override: the legacy field applies to both
     // roles. New configurations should prefer the role-specific fields.
     if (entry.input_type.len > 0) return entry.input_type;
-    return task_type.cohereInputType();
+    return switch (task_type) {
+        .retrieval_query => "search_query",
+        .retrieval_document => "search_document",
+    };
 }
 
 fn effectiveInstruction(entry: *const ManagedEmbeddingEntry, task_type: EmbeddingTaskType) ?[]const u8 {
@@ -7040,7 +7015,7 @@ fn optionalBearerAuthHeaderOwned(
 ) !?[]u8 {
     return entry.auth_header_cache.getOwned(entry.alloc, alloc, api_key_ref, entry.secret_store) catch |err| switch (err) {
         error.SecretNotFound => switch (api_key_ref.*) {
-            .env_var => return null,
+            .env_var, .provider_default => return null,
             else => return err,
         },
         else => return err,
@@ -8491,7 +8466,7 @@ test "managed embedder openrouter defaults and credential identity stay separate
     const router = managed.findQueryEntry("router") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(ProviderKind.openrouter, router.provider);
     try std.testing.expectEqualStrings("https://openrouter.ai/api/v1", router.base_url);
-    try std.testing.expectEqualStrings("OPENROUTER_API_KEY", router.api_key.?.env_var);
+    try std.testing.expectEqualStrings("openrouter.api_key", router.api_key.?.provider_default);
     const custom = managed.findQueryEntry("custom") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("https://gateway.example/api/v1", custom.base_url);
     try std.testing.expectEqualStrings("team.router", custom.api_key.?.secret_ref);
@@ -8774,7 +8749,7 @@ pub fn testFileBackedApiKeyRotation() !void {
         headers: [2]?[]u8 = .{ null, null },
         count: usize = 0,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             for (&self.headers) |*header| {
                 if (header.*) |value| self.alloc.free(value);
                 header.* = null;

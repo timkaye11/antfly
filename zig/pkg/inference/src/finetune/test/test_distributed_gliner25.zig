@@ -20,7 +20,7 @@ test "distributed GLiNER2.5 replay is disjoint and checkpoints are rank bound" {
     const other_order = try second.epochOrder(a, 0, null);
     defer a.free(other_order);
     try std.testing.expectEqualSlices(u32, order, other_order);
-    var visited = [_]bool{false} ** 8;
+    var visited: [8]bool = @splat(false);
     for (order) |index| {
         visited[2 * index] = true;
         visited[2 * index + 1] = true;

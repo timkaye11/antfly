@@ -1,5 +1,509 @@
 # Zig runtime flakes
 
+## 2026-10-01: shared-module wiring and snapshot publication scheduling
+
+[Run 36961250636](https://github.com/antflydb/antfly/actions/runs/36961250636)
+failed both build-cache shards because serverless's transitive import graph
+included the Raft read observer. Serverless now imports only the provisioning
+contract it uses. GPU-enabled cache checks also exposed inference implementation
+imports in common archive wiring: inference-host code belongs to the inference
+owner and explicit implementation fixtures, while directory resolution is now
+independent of backend implementations. Backend-name parsing lives on the
+canonical `BackendType`. The cache audit reports the complete import path when
+a backend identity escapes its owner.
+
+The full unit gate exposed standalone roots missing shared runtime contracts,
+a deleted `hot_standby/primary_effect.zig` manifest import (the retained source
+is already covered as `db/primary_effect.zig`), obsolete catalog/recovery/HA test
+API calls, an outdated generated-client invocation, and Lite command consumers
+without their storage-owner provider archives. These roots now receive their
+explicit dependencies and providers. Shared runtime and query-cache tests run
+at their owning module boundaries rather than through unreachable cross-module
+filters; both remain in the aggregate unit and API gates.
+
+Local full-gate execution also reproduced a snapshot-publication fixture race:
+the test injected a publication failure after a Ready drain could already start
+compaction. The recorder now has separate snapshot-publication and ordinary
+persistence controls. The failure and publication hold are armed before the
+proposal, preserving durable write progress and the read-during-publication,
+retry, and compaction-fence assertions. The focused test passed 200/200
+fresh-process repetitions using `scripts/ci/zig_vopr_soak.py`'s process runner.
+
+The full storage gate also exposed stale fixture assumptions about generation
+proofs, native source clocks, key-scoped reads, topology fences, and initial
+catalog flushes. Fixtures now exercise the current authority contracts. Asset
+cleanup exposed a real batch-overlay defect: direct graph reconciliation read
+an old contender count after the same batch had retired its membership. Counts
+and membership now share the pending write/delete view, preserving the strict
+producer-absence proof. Enrichment callback contexts now retain the durable
+root incarnation required to checkpoint worker turns after reopen. Focused
+regressions exercise both graph deletion paths and reopened worker progress.
+Both graph callback regressions and the native clock/replay regression passed
+200/200 fresh-process repetitions with the same bounded process runner.
+
+Fresh review reproduced two additional failures after merging `origin/main`.
+The Lite status fixture opened `native.inspect` while its writer still held the
+store lock. It now checks the format version through the open handle's storage
+status, preserving the actual revision check without conflicting file locks.
+
+The entity-merge helper rewrote provenance edges as direct contributions, so
+producer replay recreated the merged-away target. Rewriting now discovers the
+edge's document owners through its membership range and transfers each
+producer's contender, manifest, count, and TTL lifetime in one primary mutation.
+Existing destination assertions win collisions. Resolver decisions are persisted
+through the existing curation artifact so unchanged-source re-resolution retains
+the survivor. The same commit carries source revisions, durable derived replay,
+native source-clock advancement, and the HA primary-effect outbox. This local
+administrative entry point rejects unpositioned Raft curation.
+
+Regressions cover reopen and unchanged-source re-resolution, producer deletion,
+shared ownership with a distinct topological source, collision precedence, TTL
+preservation, native authority advancement, and hosted-authority rejection.
+The three focused rewrite tests, all 16 graph TTL regressions, and all 35 Lite
+CLI tests pass in Debug with no leaks. The rewrite regressions passed 200/200 fresh processes (600 test executions)
+with zero skips, failures, or leaks using the same bounded process runner.
+An additional unfiltered DB-core run reached test 401 without reporting a
+failure before it was stopped; it is not a complete-suite qualification. Prior
+broad-suite measurements remain scoped to their original revision.
+
+A further review found that entity rewrite left acknowledged HA outboxes
+behind, synthesized document-asset replay keys for scoped unit/chunk sources,
+and drained graph replay before acquiring the primary publication fence.
+The rewrite now validates its selected graph's applied/target cut while holding
+publication and apply admission. It releases those fences before catch-up and
+rechecks after reacquiring them, so a racing primary mutation cannot leave the
+adjacency behind the primary rows being curated. Catch-up selects only that
+graph, including when index workers are disabled; it does not drain unrelated
+enrichment providers. Existing authority, restore, retirement, and hidden-child
+admission remain checked at the final primary cut.
+
+Scoped source replay uses the existing scope-aware artifact-key helper. Resolver
+curation updates parse and serialize each override object once, preserving
+unrelated decisions and escaped identities; allocation failures propagate.
+The rewrite clears only its acknowledged HA outbox after durability and authority
+checks, and retains the record on failed acknowledgement for recovery.
+
+The six rewrite regressions passed 200/200 fresh Debug processes (1,200 test
+executions), split across two local lanes using `scripts/ci/zig_vopr_soak.py`'s
+bounded process runner. There were no skipped tests, failures, leaks, or retries.
+The final binary also passed all 37 resolver runtime tests and 16 graph TTL
+regressions. The stale-adjacency test replaces a source while retaining its
+inbound target and proves that rewriting catches up only the selected graph.
+Scoped curation starts from a resolution produced through the production resolver
+seam and published through durable graph replay; unit and chunk variants both
+retain the survivor after replay and reopen. HA fixtures check both successful
+acknowledgement cleanup/reopen and retained outboxes after failed acknowledgement.
+
+The next fresh review identified two independent entity-rewrite deadlocks.
+Rewrite now acquires DB apply before graph publication, both initially and after
+catch-up, following the primary publisher lock hierarchy. Its regression probes
+that hierarchy at both admission points. After the local commit and HA append,
+the shared replication mutation lease is released before remote durability waits;
+the acknowledgement fixture must acquire exclusive seed-capture admission before
+it can complete, and still verifies acknowledged/failed outbox retirement.
+
+Multi-owner preparation retains one incrementally extended contender overlay.
+Bucket identities are owned independently of replaceable payloads. Each owner's
+reconciliation and parsed JSON use reclaimable scratch storage, while only final
+commit effects survive. TTL due-record membership uses indexed sets instead of
+repeated mutation scans. A 64-owner regression bounds overlay examinations by a
+linear function of owner count and verifies both rewritten adjacency and producer
+deletion. This establishes work growth, not a measured latency speedup.
+
+The C ABI Lite fixture also reads its format version through the open handle.
+It holds an exclusive data-file lock during that read, deterministically proving
+that status does not reopen the file as a competing external reader. The focused
+C ABI test, all 37 resolver runtime tests, and all 16 graph TTL tests pass in Debug
+with no leaks.
+
+The lock-order and HA acknowledgement regressions passed 200/200 fresh Debug
+processes (400 test executions), split across two local lanes using
+`scripts/ci/zig_vopr_soak.py`'s bounded process runner. There were no skips,
+failures, leaks, or retries. The deterministic 64-owner work-bound fixture is
+qualified separately; it is not included in that admission soak. The soak
+preceded the final resolver-only scratch-allocation cleanup, which does not
+change either admission fixture's exercised path.
+
+Aggregate test ownership is audited against the original selected union. The
+shared module gates own their contract tests; implementation gates receive
+explicit runtime dependencies and exclude only tests executed by another gate.
+Six ordered merge/split regressions belong to the server storage integration
+gate; the data-runtime selector no longer demands those absent declarations.
+The final audit retains all 19,046 named tests with zero repeated executions.
+Focused targets keep their original selections. Public API fixtures with local
+database mocks now declare standalone deployment explicitly, while the restore
+binding fixture authoritatively answers the no-policy publication probe.
+
+## 2026-10-01: full CI discovery drift and virtual HTTP teardown
+
+[Run 36903575966](https://github.com/antflydb/antfly/actions/runs/36903575966)
+failed physical storage compilation discovery after a fourth owner fixture was
+added. The bounded audit now names its three measured owner fixtures and four
+consumer fixtures explicitly. Missing and duplicate identities still fail;
+unrelated owner fixtures remain covered by their normal targets. Real build
+graph regressions prove that an unrelated, deliberately uncompilable owner
+fixture is excluded and that omitting either a required owner or consumer fails.
+The storage shard manifest also now imports `hot_standby/primary_effect.zig`
+and the Lite allocator/reclamation test sources added on main.
+
+The cancelled Zig job had already reported two deterministic API fixture
+failures. The authority fixture now exercises a partially configured dedicated
+authority, since absent dedicated fields intentionally inherit valid trusted
+principal credentials. The rewrite fixture supplies its mandatory generation
+handoff proof, including a nonzero owner retirement digest, while preserving
+the atomic admission, idempotency, and unchanged live-schema assertions.
+
+The same job timed out with a data-runtime test process still alive. Local
+Debug reproduction retained the active UNIQUE/FK three-owner history and a
+stack blocked in `Client.drainShutdown` during deferred `DataServer.deinit`.
+Admitted HTTP requests still needed virtual tasks to unwind, but teardown had
+stopped driving the scheduler. Composite shutdown now closes outbound read
+admission with the other owners. The history publishes every initialized
+node's stop, runs bounded scheduler cancellation/drain, checks that read-client
+leases are gone, and only then reclaims node state. This also runs on failure
+paths so a scenario failure can be reported instead of hidden by cleanup.
+
+Once teardown could report failures, local Debug execution also exposed a
+replicated merge stack overflow. A hardware watchpoint caught LSM open
+scratch writes overwriting a parked driver's context. The managed DB opener
+now selects `OpenOptions` before a single `DB.open`, instead of allocating a
+large DB-valued return slot for each policy branch. The original 8 MiB VOPR
+stack is retained, and the isolated merge regression passes.
+
+The embedded provisioned point-read path did not advertise authoritative
+read-index absence and still allowed a leader-loss stale fallback. The hosted
+UNIQUE/FK coordinator therefore exhausted placements on an uncertified 404
+following split cutover. Both physical and orchestration sources now expose
+the strict capability, admission preserves quorum failures, and direct
+`read_index` lookups cannot downgrade to stale. The history retains one physical
+ownership path and passes its merge/split/restart and constraint assertions.
+Apply-control shutdown also publishes its stop and wake separately from joining,
+so a borrowed scheduler can complete its uncancellable wait before reclamation.
+
+The store-report retry fixture now injects registration failures through the
+registration transport, rather than an unused snapshot-fetch seam. Its runner
+waits for the round's own completion and preserves unrelated runtime tasks
+between rounds. The focused retry regression passes.
+
+The full E2E binary build completed all 35 compilation steps at its 90-minute
+deadline and was cancelled before upload. Narrow ReleaseSafe CPU reservations
+now admit storage and inference concurrently under the existing 22 GiB budget,
+with margins above that run's rounded compiler MaxRSS. See
+[COMPILATION.md](COMPILATION.md#runtime-compilation-memory-reservations).
+These measurements identify admission serialization; they do not yet establish
+the fixed build's CI wall time.
+
+Validation: the full data-runtime target passed 53 implementation and 177
+consumer tests; the two reported API fixtures passed; all 461 hot-standby tests
+and the storage ownership audit passed; 19 build-discovery/shard tests and both
+memory-admission tests passed. The reproduced merge stack regression passed
+200/200 fresh-process repetitions using `scripts/ci/zig_vopr_soak.py`'s bounded
+process runner. The UNIQUE/FK merge/split/restart history also completed 200
+passing repetitions; one interrupted process-runner invocation was rerun before
+continuing the loop. Both soaks used the pre-merge revision; the full data-runtime
+target also passed after merging main. The mocked compilation rollover test now fixes its disk-free
+observation so a nearly full developer disk cannot alter its expected build
+sequence.
+
+## 2026-09-29: metadata WAL barriers and uncertain promotion outcomes (#919)
+
+[Issue #919](https://github.com/antflydb/antfly/issues/919) records an Autograph
+duplicate and two recovery failures in run 36609343247. Metadata logs include
+a 12,339 ms physical WAL commit for 41 encoded bytes. This is not evidence of
+a large batch or a second sync hidden inside that append. Local unchanged-main
+reproduction passed four invocations of each reported selector; it did not
+reproduce the CI disk latency.
+
+Metadata Ready persistence now owns a bounded immutable WAL record
+on an I/O worker. The Raft thread publishes its MemoryStorage delta and releases
+dependent messages only after the barrier completes. Same-term heartbeats may
+continue using the already durable term; votes, append acknowledgements and
+new-term messages remain fenced. Heartbeat extraction compacts its queue once
+in linear time, retaining skipped messages in order instead of repeatedly
+shifting the queue. Completion wakes the existing progress driver
+immediately. Failure is sticky, retirement joins the operation, and shutdown
+cannot checkpoint over an unreconciled durable tail. Incoming snapshots persist
+their payload before the WAL record on the same worker. Idle maintenance
+serializes checkpoints, log truncation, applied watermarks and superseded
+payload cleanup with Ready persistence. Local snapshot compaction retains its
+immutable builder payload until asynchronous publication completes; only then
+do storage and Raft expose the new compaction boundary. Application progress
+that advances during a checkpoint is retained in memory and carried by later
+maintenance. Deferred work is admitted before another Ready, with the same byte
+ceilings and fenced oversized-task recovery. Established durable-prefix reads
+and same-term heartbeats continue while maintenance I/O is outstanding.
+Completed appends waiting for downstream admission also retain heartbeat
+progress. Election ticks pause while the node's current term/vote is still
+behind its durability barrier; an election cannot repeatedly invalidate its
+unsent vote request during a slow write. Inbound traffic continues, and an
+established leader retains its heartbeat and quorum clocks. Snapshot completion
+rechecks both apply tasks and payload bytes before publication; another group's
+backlog cannot bypass admission. Snapshot worker startup failures retain the
+existing bounded publication retry backoff. Pending task/byte/oldest-age gauges expose
+queue pressure. A lock-free oldest-barrier timestamp preserves the existing
+progress-stall readiness deadline: short Raft rounds cannot hide a stalled
+asynchronous WAL write. Completion/retirement clears the age; elapsed time
+alone does not cancel the durable owner or mark its write failed.
+
+Commit-only HardState updates no longer append or sync when term/vote and the
+referenced entries are already durable. Later records fold in the cursor;
+recovery admits only the committed prefix proved by durable application
+completion or a snapshot. This removes redundant physical commits rather than
+weakening entry, term/vote, configuration or snapshot durability.
+
+The focused regressions hold a WAL operation for 123 virtual ticks, assert
+heartbeat progress without early append acknowledgement/application, exercise
+queue rejection and fenced recovery, and verify crash recovery after a skipped
+commit-only sync. The real WAL regression also joins an outstanding append
+before retirement and reopens the durable entries. Additional regressions hold
+an election's vote write across 123 ticks, keep durable-prefix reads live during
+checkpoint/snapshot publication, and reject a completed incoming snapshot when
+either apply-task or byte admission has become unavailable.
+
+Promotion keeps one immutable admitted batch in its existing companion state
+row until both remote success and the local receipt are known. A retry recovers
+that batch before diffing a newer resolution artifact, so a lost reply cannot
+forget an earlier provisional key. A review-band decision retains its prior
+accepted receipt while the mention exists. Deterministic tests cover both gaps;
+the CI logs do not prove which of them caused the reported duplicate.
+
+This change prevents ordinary WAL I/O from blocking Raft control progress and
+removes redundant syncs. It does not establish faster underlying filesystem
+sync latency. Graceful shutdown still joins outstanding I/O and performs its
+final durability flush; it is intentionally not a fire-and-forget operation.
+Stage timings distinguish snapshot publication, WAL append, truncation and
+applied-watermark persistence when a worker exceeds 500 ms.
+
+A preliminary soak reproduced a post-publication GET timeout after the schema
+rewrite job succeeded. This differs from the original issue’s job-progress
+timeout. The test retains the exact frontend, table/key, job result and metadata
+snapshots on a transport failure; the data ReadIndex gate reports whether it
+was still awaiting quorum or local application. Qualification remains pending
+until that failure is diagnosed and the final source passes its clean soak.
+
+Merged-main recovery smoke testing also exposed three deterministic integration
+failures. Initial FK publication now removes a changed table's legacy listing
+entry in the same transaction that installs its system-catalog binding, so the
+authoritative binding and derived listing cannot disagree. A hidden initial-FK
+placement with an absent private descriptor remains unadmitted and retries
+through the existing bounded control backoff; it no longer terminates an
+otherwise serving data process. Malformed generation authority remains fatal.
+Finally, authenticated live rewrite source-copy artifacts remain logical
+decoders: export excludes physical accepted-generation keys, and plan validation
+uses their fenced pin/certificate proof rather than repository-cohort admission
+proofs. Ordinary portable backups still require those admission proofs.
+
+Live rewrites also carry the namespace-bound accepted-generation and retirement
+summary for every source owner, including owners with empty summaries. Source
+fencing seals that immutable authority; hidden targets install only mappings for
+surviving FK declarations under fresh target IDs and generations. Removed or
+retargeted declarations retain their source proof without granting target
+acceptance. These live handoffs use the same validated descriptor projection for
+initial provisioning, cold job recovery and receipt reads. Regression coverage
+rejects missing handoffs, checks descriptor/install-receipt equality, and covers
+lost replies and native reopen. The distributed publication-reply-loss smoke
+previously stalled on an empty-only receipt guard and now completes successfully.
+
+Public restore-job views own their idempotency keys and nested result strings
+before parsed records are released. A regression overwrites the source buffers
+before inspecting the response, and the focused backup/restore target includes
+the job listing tests. Response ownership does not depend on allocator reuse.
+
+The retained-transfer fixtures use canonical artifact keys owned by their
+logical source document, including multi-fragment proofs across crash/reopen.
+The restore benchmark uses a checked allocator without per-allocation stack
+unwinding; its unchanged 30-second deadline now measures restore work rather
+than Mach-O debug-symbol lookup. These focused suites pass, but their results
+are separate from the pending final-binary recovery soak.
+
+## 2026-09-29: progressive native publication across process restart
+
+[Main e2e-full run 36526714836, job 109286926408](https://github.com/antflydb/antfly/actions/runs/36526714836/job/109286926408)
+failed `test_progressive_publication_remains_queryable_across_process_restart`:
+after restart the index had 128 native vectors and 64 covered sources, while its
+artifact target was 160 vectors. Queryability remained false throughout the
+eight-second restore wait. The original assertion did not include the
+pre-restart status, so the log alone does not establish the exact pre-restart
+native count.
+
+The native posting WAL's immutable generation is the query and restart
+authority. Status, certificate validation, and checkpoint count writers
+previously read mutable HBC cardinality that could describe the next source
+capture. A sidecar count that was absent or ahead of the recovered native
+generation could then leave the earlier durable prefix unadmitted after open.
+All three paths now read the native serving view. Both the progressive query
+gate and status use boundary certificates. An open-time proof retains a
+nonempty older native WAL prefix when its source sequence covers the projection
+checkpoint, without allowing later status reads to certify a coincidentally
+matching live count or an ahead-of-sidecar WAL generation. The restart
+regression compares the durable serving vector count and only the source
+coverage represented by its two-chunk-per-document fixture; it also prints
+its pre-restart status on a restore timeout.
+
+The unchanged main-based binary passed 40/40 focused E2E invocations on four
+workers, so that local baseline did not reproduce the CI timing failure. The
+deterministic storage regression covers both an ahead-of-WAL sidecar through
+an actual DB reopen and an absent sidecar, and verifies that uncommitted live
+cardinality cannot inflate reported serving count or mint a certificate.
+The fixed, merged-main server binary (SHA-256
+`4ef98bc7f3e9d7c82afe83e61a796b64488d1b0a8ad882628a399334e7c2311c`)
+passed 200/200 focused E2E invocations with
+`scripts/ci/zig-e2e-regression-loop.sh` (four workers, 50 repeats each).
+
+## 2026-09-27: PR #885 CUDA build cancelled before qualification
+
+[PR #885 CUDA build job](https://github.com/antflydb/antfly/actions/runs/36345949010/job/108695038652)
+was cancelled in `Build CUDA-enabled E2E executable` after 88 minutes 56
+seconds in that step, near the job's 90-minute limit. Packaging and the L4
+qualification job did not run, so this attempt has no CUDA correctness result.
+The [previous approved run of this PR](https://github.com/antflydb/antfly/actions/runs/36298230764/job/108560988152)
+built the same CUDA code successfully in 70 minutes 25 seconds and passed its
+[L4 smoke job](https://github.com/antflydb/antfly/actions/runs/36298230764/job/108570816784).
+The sole intervening commit changed a nested pytest probe in
+`test_standalone_harness.py`, outside the CUDA build. The cancellation is
+therefore a build-duration failure rather than an observed GLiNER test
+failure. This comparison rules out the final test-harness commit as a cause;
+it does not measure whether the broader Decide branch affects baseline build
+time. The public job metadata has no compiler progress detail to identify why
+this build took longer. Compare bounded-build resource samples and cache state
+on another run before changing the timeout or the Decide implementation.
+
+## 2026-09-26: L4 smoke model prefetch in run 36203548073
+
+[CI run 36203548073](https://github.com/antflydb/antfly/actions/runs/36203548073)
+also failed the [L4 Spot smoke job](https://github.com/antflydb/antfly/actions/runs/36203548073/job/108309588813)
+at its `Prefetch inference models before server startup` step. Hardware and
+CUDA runtime verification passed; the later inference validation did not run.
+For the `smoke` scope this step pulls the Gemma 4 E2B GGUF and projector from
+Hugging Face. The GLiNER2.5-Decide branch does not change this workflow or
+model pull. This is an unrelated prefetch failure and a possible transient
+CI issue rather than evidence of a GLiNER regression. The job log
+is needed to identify the exact download error and establish whether it
+recurred; the public run metadata exposes only the failed step.
+
+The same run's `zig-base / x86_64` job failed two GLiNER boundary assertions
+because the Decide dispatch change ran boundary preflight before the existing
+runtime qualification rejection. Those are deterministic regressions and are
+fixed in the GLiNER branch, rather than classified as flakes here.
+
+## 2026-09-25: non-GLiNER failures in run 36168024127
+
+[CI run 36168024127](https://github.com/antflydb/antfly/actions/runs/36168024127)
+has three failures outside the GLiNER2.5-Decide changes. They are recorded here
+for follow-up; no runtime, test, or workflow change for these failures is
+included with the GLiNER fixes.
+
+The [ordinary Antfly E2E job](https://github.com/antflydb/antfly/actions/runs/36168024127/job/108198671180)
+ran no tests. Pytest's isolation scheduler rejected the collected
+`test_index_lifecycle.py` mixed serverless-runtime group because it requires
+two Antfly process slots, while the workflow sets
+`ANTFLY_E2E_PROCESS_SLOTS=1`. This is a reproducible CI configuration mismatch,
+not evidence that an E2E assertion is flaky. A focused local run of that
+scheduler group passed with two slots. The workflow setting needs a separate
+decision because the single-slot limit also protects multi-node tests from
+concurrent disk contention.
+
+The [operator inference job](https://github.com/antflydb/antfly/actions/runs/36168024127/job/108198671285)
+failed only `TestInferenceRuntimeContract/lazy` after 240.02 seconds; its other
+11 scenarios passed. During the lazy scenario's cold model pull, the log shows
+64 MiB of a 127.3 MiB `model.safetensors` file downloaded after about
+3.7 minutes at roughly 290 KiB/s. The test's four-minute context includes
+that pull and runtime startup, so a download deadline is the likely immediate
+cause. The excerpt does not contain the scenario's final error, and one run
+does not establish how often this happens. This model is unrelated to GLiNER.
+
+The [recovery-0 job](https://github.com/antflydb/antfly/actions/runs/36168024127/job/108198671138)
+failed
+`test_fk_cascade_recovers_claims_references_and_rows[transaction_resolve-owner]`
+while batching parent rows after the injected owner fault. The request first
+received `503 write unavailable` and eventually hit a client read timeout.
+Data-node logs include `MetadataSnapshotHeadMismatch` during replica-root
+refresh and `LeaderUnavailable` during transaction prepare; metadata Raft
+status still showed a leader and matching commit indexes when diagnostics
+were captured. Those observations do not identify which condition prevented
+write recovery. Preserve the data-group leader and replica convergence
+diagnostics on recurrence before changing retry or timeout behavior. This is
+an unresolved availability failure, not a confirmed flaky assertion.
+
+## 2026-09-25: physical storage compilation isolation and retained measurements
+
+[Main run 36200131260](https://github.com/antflydb/antfly/actions/runs/36200131260)
+lost its build-cache runner during the physical storage compilation check.
+GitHub's annotation reports lost runner communication; no compiler log or
+measurement establishes the exact cause, including whether it was an OOM.
+The checker now uses the same bounded compiler wrapper as other Zig builds,
+and CI restricts its CPU affinity to eight CPUs from the runner's actual mask.
+Measurements are published atomically before each build and every 30 seconds,
+so an interrupted job retains its last observed RSS and active case. A timeout
+kills the build group, retains its report, and marks CPU accounting incomplete.
+The cache ownership assertions remain unchanged.
+
+The local matrix also exposed two concrete dependency leaks. The backup cohort
+driver imported full read/write implementations in test builds although it
+only needed their source contracts. Those literal imports pulled coordination
+code into the storage compiler manifest. The C ABI also imported the complete
+write coordinator for physical backup pin control. The driver and relational workers now import narrow contracts directly.
+Restore validation and consumer fixtures select concrete adapters through
+the compilation root instead of literal imports. Backup pin control lives
+beside its physical DB owner with a compatibility alias for existing callers. Literal DB implementation imports in source transfer, restore, relational
+code, and test helpers also bypassed root ownership. They now select the
+physical DB through the existing root mechanism, preserving implementation
+identity for physical callers while avoiding compilation in other roots.
+This keeps physical storage independent of coordination changes and consumer
+code independent of physical implementation changes without weakening the checker.
+All ten storage-owner backup regressions passed. The final API selection
+passed ten restore/backup tests, including six backup heartbeat cases, and
+all 92 transaction regressions passed with the root-selected imports. The complete nine-case
+physical compilation matrix passed on frozen source with every original
+cache and relink assertion intact (cold, warm, read/write coordination,
+physical DB/local query, owner test, consumer root, and shared contract).
+
+## 2026-09-25: PR #889 zig-base runner preemption
+
+[Job 108307916600](https://github.com/antflydb/antfly/actions/runs/36207700839/job/108307916600)
+ended during hermetic unit tests with exit code 130 and an Actions runner
+shutdown signal. No test assertion or unit watchdog fired before shutdown.
+Kubernetes events for `arc-antfly-heavy-q8vlq-runner-4f668` record scheduler
+preemption at 2026-09-26 01:48:37 UTC by higher-priority Pod
+`74c343d5-64c3-4ece-a8eb-5e2476f60e95`, followed by a memory-pressure eviction
+at 01:48:49 UTC on node `gk3-antfly-ci-pool-2-3a7329dc-9rzj`.
+ARC recorded the container's SIGTERM exit (143) and removed the failed runner.
+
+This interruption is independent of the qualification timeout below. The
+companion Colony infrastructure change requests GKE Autopilot extended duration
+for both heavy runner profiles, allowing GKE to provision system capacity first
+and defer automatic upgrades/scale-down. It requires an infrastructure rollout
+before a rerun can validate the policy. System-priority preemption and node
+memory pressure remain possible; increasing test timeouts or retrying individual
+tests would not fix runner provisioning.
+
+## 2026-09-25: VOPR qualification audit failure and cold-build timeout
+
+[PR CI run 36189107289](https://github.com/antflydb/antfly/actions/runs/36189107289)
+cancelled the VOPR `qualify` job at its 120-minute limit. The same job had
+already failed the determinism audit because a teardown diagnostic printed a
+raw pointer from `full_cluster.zig`. The earlier
+[run 36173392068](https://github.com/antflydb/antfly/actions/runs/36173392068)
+reported that audit failure after completing qualification in 99 minutes.
+Its build summary shows the physical secret backend root taking 44 minutes
+to compile in ReleaseSafe; the regular `zig-base` lane already runs that
+target. The restore-admission replay itself took 25 seconds in that run.
+
+The teardown diagnostic now prints only stable sender and shutdown state.
+Qualification runs the small audit first and replaces the broad secrets
+target with the focused secret lifecycle VOPR replay. This keeps the VOPR
+transport, runtime, restore-admission, and secret lifecycle targets in
+qualification. The runner logs do not expose which compilation was still
+active when the later job timed out, so the
+duplicate work is the documented cost source, not a proven explanation for
+every minute of that particular timeout.
+
+PR CI dispatches its reusable workflow from `main` and checks out the PR
+revision inside the job. Therefore a PR edit to the workflow's inline
+qualification command would not run before merge. The workflow now calls a
+qualification script from the checked-out revision. A branch workflow
+dispatch can use `qualification_only` to validate workflow edits before merge.
+
 ## 2026-09-23: executable chunk embeddings and transient rewrite owner routing
 
 [PR #868 CI run 35937420037](https://github.com/antflydb/antfly/actions/runs/35937420037)
@@ -1009,7 +1513,7 @@ The same handoff probe after the fix measured **6 microseconds average / 20 wors
 for the bound lock (unbound: 7 / 29). Four snapshot admission tests pass. The
 14-test lock suite passed 200/200 fresh processes (2,800 test executions),
 including four million writes across the native bound/unbound exclusion test.
-`zig build vopr-runtime-test -Doptimize=ReleaseSafe -j1` also passes: 18
+`zig build vopr-runtime-test -Doptimize=safe -j1` also passes: 18
 storage/runtime adapter tests and seven DataServer tests, with no skips or leaks.
 
 ## 2026-09-15: multi-node Autograph promotion stalls with an untransportable read timeout
@@ -1765,7 +2269,7 @@ instrumentation. Evidence: `/private/tmp/ci694-db-core-fixed-validation`.
 Run the focused regression from `zig/`:
 
 ```sh
-zig build antfly-storage-db-test -Doptimize=Debug -- \
+zig build antfly-storage-db-test -Doptimize=debug -- \
   --test-filter 'db last external dense bulk lease finalizes covered rebuilding generations'
 ```
 
@@ -2046,7 +2550,7 @@ Regressions cover polling, cached retry, and an uncached durable record across
 successful deletion, failure before deletion, an unknown outcome after deletion,
 and leadership loss. They verify a changed request can reuse an expired key and
 creates exactly one durable job, history entry, and runnable item. Run
-`zig build antfly-api-restore-jobs-test -Doptimize=Debug`.
+`zig build antfly-api-restore-jobs-test -Doptimize=debug`.
 Short-lived E2E soaks do not exercise the retention boundary.
 
 Validation: **26 restore-store tests** (including the 12 fault combinations)
@@ -3154,7 +3658,7 @@ scripts/ci/zig-e2e-regression-loop.sh \
 ```
 
 On Linux, prefix the script with `taskset -c 0-7` when those CPUs are available.
-Build with `-Doptimize=ReleaseFast -Dstrip=false` for symbolized reproduction.
+Build with `-Doptimize=fast -Dstrip=false` for symbolized reproduction.
 Local investigation logs are retained under `/private/tmp/antfly-ci690-*`.
 
 Run the deterministic regressions from `zig/`:

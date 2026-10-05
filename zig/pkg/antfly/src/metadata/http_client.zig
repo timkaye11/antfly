@@ -124,6 +124,14 @@ pub const MetadataHttpClient = struct {
     alloc: std.mem.Allocator,
     executor: http_common.RequestExecutor,
     internal_service: ?internal_service_auth.Config = null,
+    setting_authority_secret: ?[]const u8 = null,
+    setting_authority_issuer: ?[]const u8 = null,
+
+    pub fn withSettingAuthority(self: *MetadataHttpClient, secret: ?[]const u8, issuer: ?[]const u8) *MetadataHttpClient {
+        self.setting_authority_secret = secret;
+        self.setting_authority_issuer = issuer;
+        return self;
+    }
 
     pub fn init(alloc: std.mem.Allocator, executor: http_common.RequestExecutor) MetadataHttpClient {
         return .{
@@ -278,7 +286,24 @@ pub const MetadataHttpClient = struct {
     }
 
     pub fn fetchPagedSnapshot(self: *MetadataHttpClient, base_uri: []const u8, control: bool, linearizable: bool, budget: ?RequestBudget) !std.json.Parsed(metadata_api.AdminSnapshot) {
-        const uri = try join(self.alloc, base_uri, snapshot_transfer.path);
+        return self.fetchPagedSnapshotAt(base_uri, control, linearizable, budget, snapshot_transfer.path) catch |err| switch (err) {
+            // v0.2.x has the original snapshot routes, not retained transfers.
+            // Preserve the caller's proof and budget on this read-only fallback.
+            error.UnsupportedOperation => if (linearizable) self.fetchLinearizableSnapshot(base_uri, budget) else self.fetchSnapshotWithBudget(base_uri, budget),
+            else => return err,
+        };
+    }
+
+    pub fn fetchPagedPeerSnapshot(self: *MetadataHttpClient, base_uri: []const u8, budget: ?RequestBudget) !std.json.Parsed(metadata_api.AdminSnapshot) {
+        return self.fetchPagedSnapshotAt(base_uri, true, false, budget, snapshot_transfer.peer_path);
+    }
+
+    pub fn fetchPagedPlanningSnapshot(self: *MetadataHttpClient, base_uri: []const u8, budget: ?RequestBudget) !std.json.Parsed(metadata_api.AdminSnapshot) {
+        return self.fetchPagedSnapshotAt(base_uri, true, false, budget, snapshot_transfer.planning_path);
+    }
+
+    fn fetchPagedSnapshotAt(self: *MetadataHttpClient, base_uri: []const u8, control: bool, linearizable: bool, budget: ?RequestBudget, path: []const u8) !std.json.Parsed(metadata_api.AdminSnapshot) {
+        const uri = try join(self.alloc, base_uri, path);
         defer self.alloc.free(uri);
         var request: snapshot_transfer.Request = .{ .control = control, .linearizable = linearizable };
         defer if (request.token != 0) {
@@ -702,7 +727,58 @@ pub const MetadataHttpClient = struct {
         base_uri: []const u8,
         body: []const u8,
     ) !void {
-        try self.requestWithBody(base_uri, .POST, routes.Routes.internal_nodes, body, error.InvalidNodeRegistrationRequest, null, null);
+        const uri = try join(self.alloc, base_uri, routes.Routes.internal_nodes);
+        defer self.alloc.free(uri);
+        var response = try self.executeWithRetry(.{
+            .method = .POST,
+            .uri = uri,
+            .body = body,
+            .content_type = "application/json",
+            .timeout_ms = default_request_timeout_ms,
+        });
+        defer response.deinit(self.alloc);
+        // The v17 decoder preflight rejects before proposing a UUID-bearing
+        // store record. Keep this verdict distinct from an ambiguous transport
+        // or mutation failure so only that response can use legacy fallback.
+        if (response.status == 426) return error.TableTopologyProtocolUpgradeRequired;
+        try mapResponseStatus(response, error.InvalidNodeRegistrationRequest, null, null);
+    }
+
+    /// A successful authenticated response proves the metadata leader has
+    /// durably activated the store-root UUID decoder on every member that can
+    /// apply the subsequent registration. Absent/upgrade-required routes are
+    /// a safe legacy registration verdict; all other failures remain errors.
+    pub fn storeRootReadiness(self: *MetadataHttpClient, base_uri: []const u8) !bool {
+        return self.storeRootCapabilityReadiness(base_uri, routes.Routes.internal_store_root_readiness, topology_protocol.store_root_uuid_decoder_version);
+    }
+
+    /// Separate authenticated v18 admission. Old leaders do not expose this
+    /// route, so callers omit the public key rather than appending a command
+    /// their followers cannot decode.
+    pub fn storeRootSigningReadiness(self: *MetadataHttpClient, base_uri: []const u8) !bool {
+        return self.storeRootCapabilityReadiness(base_uri, routes.Routes.internal_store_root_signing_readiness, topology_protocol.store_root_signing_decoder_version);
+    }
+
+    fn storeRootCapabilityReadiness(self: *MetadataHttpClient, base_uri: []const u8, route: []const u8, required_version: u16) !bool {
+        const uri = try join(self.alloc, base_uri, route);
+        defer self.alloc.free(uri);
+        var response = try self.executeWithRetry(.{
+            .method = .POST,
+            .uri = uri,
+            .body = "",
+            .content_type = "application/json",
+            .timeout_ms = default_request_timeout_ms,
+        });
+        defer response.deinit(self.alloc);
+        if (response.status == 404 or response.status == 405 or response.status == 426) return false;
+        if (response.status != 200) return error.StoreRootReadinessUnavailable;
+        if (response.body.len > 1024) return error.InvalidStoreRootReadinessResponse;
+        var parsed = parseJson(struct { activated_version: u16 }, self.alloc, response.body) catch
+            return error.InvalidStoreRootReadinessResponse;
+        defer parsed.deinit();
+        if (parsed.value.activated_version < required_version)
+            return error.InvalidStoreRootReadinessResponse;
+        return true;
     }
 
     pub fn requestNodeShutdown(
@@ -1032,10 +1108,25 @@ pub const MetadataHttpClient = struct {
         }
     };
 
+    pub fn retirementPage(self: *MetadataHttpClient, base_uri: []const u8, request: @import("fk_initial_retirement_wire.zig").SignedPageRequest, remaining_ms: u32) !CatalogRead {
+        try request.verify();
+        return self.readSystemCatalog(base_uri, .{ .fk_initial_retirement_signed_page = request }, remaining_ms, null);
+    }
+
+    pub fn retirementAck(self: *MetadataHttpClient, base_uri: []const u8, request: @import("fk_initial_retirement_wire.zig").AckRequest, remaining_ms: u32) !@import("fk_initial_retirement_wire.zig").AckResponse {
+        const bytes = try self.forwardSystemCatalog(base_uri, .{ .fk_initial_retirement_ack = request }, .{ .remaining_ms = remaining_ms, .forwards_remaining = 2, .campaign_allowed = true }, false);
+        defer self.alloc.free(bytes);
+        var parsed = try std.json.parseFromSlice(@import("fk_initial_retirement_wire.zig").AckResponse, self.alloc, bytes, .{});
+        defer parsed.deinit();
+        try parsed.value.validate(request);
+        return parsed.value;
+    }
+
     /// Read-only retries are safe. The response proves the metadata identity;
     /// callers need no preceding status/discovery round trip on the happy path.
-    pub fn readSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: system_catalog.Call, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !CatalogRead {
-        if (input == .mutate) return error.InvalidCatalogMutation;
+    pub fn readSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: @import("../system_catalog/server_call.zig").Call, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !CatalogRead {
+        if (input == .fk_initial_retirement_page) return error.InitialFkRetirementNotActivated;
+        if (input.isMutation()) return error.InvalidCatalogMutation;
         if (remaining_ms == 0) return error.Timeout;
         if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
         const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
@@ -1044,17 +1135,46 @@ pub const MetadataHttpClient = struct {
         const uri = try join(self.alloc, base_uri, "/internal/v1/system-catalog");
         defer self.alloc.free(uri);
         var remaining_buf: [10]u8 = undefined;
+        const authority = @import("../system_catalog/setting_authority.zig");
+        // Publication status is a principal-independent stamp. The internal
+        // service credential authenticates this read; it must not require the
+        // separate setting administrator/read grant used for policy contents.
+        const grant = if (input.requiresAdministrativeGrant() or input.requiresSettingAuthorityReadGrant()) try authority.sign(self.alloc, self.setting_authority_secret orelse return error.SettingAuthorityUnavailable, self.setting_authority_issuer orelse return error.SettingAuthorityUnavailable, if (input.requiresAdministrativeGrant()) .admin else .read, body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s))) else null;
+        defer if (grant) |value| self.alloc.free(value);
         const headers = [_]http_common.RequestHeader{
             .{ .name = routes.Routes.raft_mutation_remaining_ms_header, .value = try std.fmt.bufPrint(&remaining_buf, "{d}", .{remaining_ms}) },
             .{ .name = routes.Routes.raft_mutation_forwards_remaining_header, .value = "0" },
             .{ .name = routes.Routes.raft_mutation_campaign_allowed_header, .value = "false" },
+            .{ .name = authority.header_name, .value = grant orelse "" },
         };
         var response = try internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, remaining_ms), .cancellation = cancellation }, self.internal_service);
         defer response.deinit(self.alloc);
         if (response.status != 200) return switch (response.status) {
-            400 => error.InvalidCatalogName,
+            400 => if ((input == .fk_generation_publication_status or input == .fk_generation_publication_decision or
+                input == .fk_generation_publication_source_decision or input == .fk_initial_create_status or
+                input == .fk_initial_child_decision or input == .fk_initial_parent_decision) and
+                std.mem.eql(u8, response.body, "InvalidGenerationPublication"))
+                error.InvalidGenerationPublication
+            else
+                error.InvalidCatalogName,
             404 => error.CatalogNotFound,
-            409 => error.CatalogGenerationChanged,
+            403 => error.Forbidden,
+            409 => if ((input == .store_root_enrollment_status or input == .fk_initial_retirement_signed_page) and std.mem.eql(u8, response.body, "StoreRootEnrollmentChanged"))
+                error.StoreRootEnrollmentChanged
+            else if (input == .policy_publication_status and std.mem.eql(u8, response.body, "RowPolicyCatalogChanged"))
+                error.RowPolicyCatalogChanged
+            else if ((input == .fk_generation_publication_status or input == .fk_generation_publication_decision or
+                input == .fk_generation_publication_source_decision or input == .fk_initial_create_status or
+                input == .fk_initial_child_decision or input == .fk_initial_parent_decision) and
+                std.mem.eql(u8, response.body, "GenerationPublicationNotFound"))
+                error.GenerationPublicationNotFound
+            else if ((input == .fk_generation_publication_status or input == .fk_generation_publication_decision or
+                input == .fk_generation_publication_source_decision or input == .fk_initial_create_status or
+                input == .fk_initial_child_decision or input == .fk_initial_parent_decision) and
+                std.mem.eql(u8, response.body, "GenerationPublicationChanged"))
+                error.GenerationPublicationChanged
+            else
+                error.CatalogGenerationChanged,
             413 => error.CatalogCommandTooLarge,
             426 => error.TableTopologyProtocolUpgradeRequired,
             503 => error.NotLeader,
@@ -1072,7 +1192,8 @@ pub const MetadataHttpClient = struct {
         };
     }
 
-    pub fn forwardSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: system_catalog.Call, forwarding: raft_mutation_forwarding.Context) ![]u8 {
+    pub fn forwardSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: @import("../system_catalog/server_call.zig").Call, forwarding: raft_mutation_forwarding.Context, setting_admin: bool) ![]u8 {
+        if (input.requiresAdministrativeGrant() != setting_admin) return error.Forbidden;
         const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
         defer self.alloc.free(body);
         if (body.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
@@ -1080,10 +1201,14 @@ pub const MetadataHttpClient = struct {
         defer self.alloc.free(uri);
         var remaining_buf: [10]u8 = undefined;
         var forwards_buf: [3]u8 = undefined;
+        const authority = @import("../system_catalog/setting_authority.zig");
+        const grant = if (setting_admin) try authority.sign(self.alloc, self.setting_authority_secret orelse return error.SettingAuthorityUnavailable, self.setting_authority_issuer orelse return error.SettingAuthorityUnavailable, .admin, body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s))) else null;
+        defer if (grant) |value| self.alloc.free(value);
         const headers = [_]http_common.RequestHeader{
             .{ .name = routes.Routes.raft_mutation_remaining_ms_header, .value = try std.fmt.bufPrint(&remaining_buf, "{d}", .{forwarding.remaining_ms}) },
             .{ .name = routes.Routes.raft_mutation_forwards_remaining_header, .value = try std.fmt.bufPrint(&forwards_buf, "{d}", .{forwarding.forwards_remaining}) },
             .{ .name = routes.Routes.raft_mutation_campaign_allowed_header, .value = if (forwarding.campaign_allowed) "true" else "false" },
+            .{ .name = authority.header_name, .value = grant orelse "" },
         };
         var delivery: http_common.RequestDeliveryTracker = .{};
         var response = internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, forwarding.remaining_ms), .delivery_tracker = &delivery }, self.internal_service) catch |err| {
@@ -1099,9 +1224,16 @@ pub const MetadataHttpClient = struct {
         if (response.status >= 200 and response.status < 300 and std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_committed)) return self.alloc.dupe(u8, response.body);
         if (!std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_not_proposed)) return error.MetadataMutationOutcomeUnknown;
         return switch (response.status) {
-            400 => error.InvalidCatalogMutation,
+            400 => if (input == .store_root_enroll and std.mem.eql(u8, response.body, "InvalidStoreRootEnrollment"))
+                error.InvalidStoreRootEnrollment
+            else
+                error.InvalidCatalogMutation,
+            403 => error.Forbidden,
             404 => error.CatalogNotFound,
-            409 => error.CatalogGenerationChanged,
+            409 => if ((input == .store_root_enroll or input == .store_root_enrollment_status) and std.mem.eql(u8, response.body, "StoreRootEnrollmentChanged"))
+                error.StoreRootEnrollmentChanged
+            else
+                error.CatalogGenerationChanged,
             413 => error.CatalogCommandTooLarge,
             426 => error.TableTopologyProtocolUpgradeRequired,
             503 => error.NotLeader,
@@ -2352,6 +2484,98 @@ fn consumerTests() type {
             );
         }
 
+        test "metadata node registration distinguishes definite decoder preflight from unknown rejection" {
+            const ResponseExecutor = struct {
+                status: u16,
+                calls: usize = 0,
+
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    try std.testing.expectEqual(http_common.Method.POST, req.method);
+                    try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.internal_nodes));
+                    return .{
+                        .status = self.status,
+                        .content_type = try alloc.dupe(u8, "text/plain"),
+                        .body = try alloc.dupe(u8, "upgrade required"),
+                    };
+                }
+            };
+            var upgrade = ResponseExecutor{ .status = 426 };
+            var client = MetadataHttpClient.init(std.testing.allocator, upgrade.executor());
+            try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, client.upsertNode("http://127.0.0.1:9000", "{}"));
+            try std.testing.expectEqual(@as(usize, 1), upgrade.calls);
+
+            var unknown = ResponseExecutor{ .status = 400 };
+            client = MetadataHttpClient.init(std.testing.allocator, unknown.executor());
+            try std.testing.expectError(error.InvalidNodeRegistrationRequest, client.upsertNode("http://127.0.0.1:9000", "{}"));
+            try std.testing.expectEqual(@as(usize, 1), unknown.calls);
+        }
+
+        test "store root readiness accepts only authenticated complete decoder proof" {
+            const ResponseExecutor = struct {
+                status: u16,
+                body: []const u8,
+                signing: bool = false,
+
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(http_common.Method.POST, req.method);
+                    try std.testing.expect(std.mem.endsWith(u8, req.uri, if (self.signing) routes.Routes.internal_store_root_signing_readiness else routes.Routes.internal_store_root_readiness));
+                    try std.testing.expectEqualStrings("", req.body);
+                    return .{
+                        .status = self.status,
+                        .content_type = try alloc.dupe(u8, "application/json"),
+                        .body = try alloc.dupe(u8, self.body),
+                    };
+                }
+            };
+            const cases = [_]struct { status: u16, body: []const u8, result: ?bool, err: ?anyerror }{
+                .{ .status = 200, .body = "{\"activated_version\":17}", .result = true, .err = null },
+                .{ .status = 404, .body = "", .result = false, .err = null },
+                .{ .status = 405, .body = "", .result = false, .err = null },
+                .{ .status = 426, .body = "", .result = false, .err = null },
+                .{ .status = 200, .body = "{\"activated_version\":16}", .result = null, .err = error.InvalidStoreRootReadinessResponse },
+                .{ .status = 200, .body = "not json", .result = null, .err = error.InvalidStoreRootReadinessResponse },
+                .{ .status = 200, .body = "{\"activated_version\":17,\"padding\":\"" ++ (z17RepeatString("x", 1024)) ++ "\"}", .result = null, .err = error.InvalidStoreRootReadinessResponse },
+                .{ .status = 503, .body = "", .result = null, .err = error.StoreRootReadinessUnavailable },
+            };
+            for (cases) |case| {
+                var executor = ResponseExecutor{ .status = case.status, .body = case.body };
+                var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+                if (case.err) |expected| {
+                    try std.testing.expectError(expected, client.storeRootReadiness("http://127.0.0.1:9000"));
+                } else {
+                    try std.testing.expectEqual(case.result.?, try client.storeRootReadiness("http://127.0.0.1:9000"));
+                }
+            }
+            const signing_cases = [_]struct { status: u16, body: []const u8, result: ?bool, err: ?anyerror }{
+                .{ .status = 200, .body = "{\"activated_version\":18}", .result = true, .err = null },
+                .{ .status = 200, .body = "{\"activated_version\":17}", .result = null, .err = error.InvalidStoreRootReadinessResponse },
+                .{ .status = 404, .body = "", .result = false, .err = null },
+                .{ .status = 426, .body = "", .result = false, .err = null },
+                .{ .status = 200, .body = "{\"activated_version\":18,\"padding\":\"" ++ (z17RepeatString("x", 1024)) ++ "\"}", .result = null, .err = error.InvalidStoreRootReadinessResponse },
+                .{ .status = 503, .body = "", .result = null, .err = error.StoreRootReadinessUnavailable },
+            };
+            for (signing_cases) |case| {
+                var executor = ResponseExecutor{ .status = case.status, .body = case.body, .signing = true };
+                var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+                if (case.err) |expected| {
+                    try std.testing.expectError(expected, client.storeRootSigningReadiness("http://127.0.0.1:9000"));
+                } else {
+                    try std.testing.expectEqual(case.result.?, try client.storeRootSigningReadiness("http://127.0.0.1:9000"));
+                }
+            }
+        }
+
         test "metadata http client sends bounded restore progress synchronization pages" {
             const RecordingExecutor = struct {
                 calls: usize = 0,
@@ -2725,6 +2949,51 @@ fn consumerTests() type {
             _ = try client.fetchLinearizableHead("http://127.0.0.1:9000");
             try std.testing.expectEqual(@as(usize, 1), executor.public_calls);
             try std.testing.expectEqual(@as(usize, 1), executor.internal_calls);
+        }
+
+        test "metadata http client v0.2 snapshot fallback preserves proof budget and cancellation" {
+            const Capture = struct {
+                linearizable: bool,
+                cancel_probe: bool = false,
+                cancellation: *http_common.RequestCancellation,
+                probes: usize = 0,
+                legacy_reads: usize = 0,
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expect(req.timeout_ms.? <= 1000);
+                    if (std.mem.endsWith(u8, req.uri, snapshot_transfer.path)) {
+                        self.probes += 1;
+                        if (self.cancel_probe) self.cancellation.cancel();
+                        return .{ .status = 404, .body = try alloc.dupe(u8, "unknown route") };
+                    }
+                    self.legacy_reads += 1;
+                    if (self.linearizable) {
+                        try std.testing.expectEqual(@TypeOf(req.method).POST, req.method);
+                        try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.internal_linearizable_snapshot));
+                    } else {
+                        try std.testing.expectEqual(@TypeOf(req.method).GET, req.method);
+                        try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.admin_snapshot));
+                    }
+                    return .{ .status = 200, .body = try alloc.dupe(u8, "{\"status\":{\"metadata_group_id\":91,\"metadata_epoch\":3,\"metrics\":{}},\"tables\":[],\"ranges\":[],\"stores\":[],\"placement_intents\":[],\"split_transitions\":[],\"merge_transitions\":[]}") };
+                }
+            };
+            for ([_]bool{ false, true }) |linearizable| for ([_]bool{ false, true }) |cancel_probe| {
+                var cancellation: http_common.RequestCancellation = .{};
+                var capture: Capture = .{ .linearizable = linearizable, .cancel_probe = cancel_probe, .cancellation = &cancellation };
+                var client = MetadataHttpClient.init(std.testing.allocator, .{ .ptr = &capture, .vtable = &.{ .execute = Capture.execute } });
+                const budget: RequestBudget = .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s, .cancellation = &cancellation };
+                const result = client.fetchPagedSnapshot("http://metadata.invalid", true, linearizable, budget);
+                if (cancel_probe) {
+                    try std.testing.expectError(error.Cancelled, result);
+                    try std.testing.expectEqual(@as(usize, 0), capture.legacy_reads);
+                } else {
+                    var parsed = try result;
+                    defer parsed.deinit();
+                    try std.testing.expectEqual(@as(u64, 91), parsed.value.status.metadata_group_id);
+                    try std.testing.expectEqual(@as(usize, 1), capture.legacy_reads);
+                }
+                try std.testing.expectEqual(@as(usize, 1), capture.probes);
+            };
         }
 
         test "metadata http client paged snapshot bounds admission and releases after cancellation" {
@@ -3882,7 +4151,7 @@ fn consumerTests() type {
                     self.reallocate_count += 1;
                 }
 
-                fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: @import("../api/tables.zig").CreateTableRequest) !void {
+                pub fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: @import("../api/tables.zig").CreateTableRequest) !void {
                     _ = alloc;
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expectEqualStrings("docs", table_name);
@@ -3896,7 +4165,7 @@ fn consumerTests() type {
                     try createTable(ptr, alloc, table_name, req);
                 }
 
-                fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8) !void {
+                pub fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expectEqualStrings("docs", table_name);
                     self.drop_count += 1;
@@ -3908,14 +4177,14 @@ fn consumerTests() type {
                     try dropTable(ptr, alloc, table_name);
                 }
 
-                fn updateSchema(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
+                pub fn updateSchema(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expectEqualStrings("docs", table_name);
                     try std.testing.expectEqualStrings("{\"kind\":\"demo\"}", schema_json);
                     self.update_schema_count += 1;
                 }
 
-                fn createIndex(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
+                pub fn createIndex(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expectEqualStrings("docs", table_name);
                     try std.testing.expectEqualStrings("embed_idx", index_name);
@@ -3923,14 +4192,14 @@ fn consumerTests() type {
                     self.create_index_count += 1;
                 }
 
-                fn dropIndex(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
+                pub fn dropIndex(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expectEqualStrings("docs", table_name);
                     try std.testing.expectEqualStrings("embed_idx", index_name);
                     self.drop_index_count += 1;
                 }
 
-                fn putArtifactEnrichment(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8, enrichment_json: []const u8) !void {
+                pub fn putArtifactEnrichment(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8, enrichment_json: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expectEqualStrings("docs", table_name);
                     try std.testing.expectEqualStrings("document chunks/v2", enrichment_name);
@@ -3938,7 +4207,7 @@ fn consumerTests() type {
                     self.put_artifact_enrichment_count += 1;
                 }
 
-                fn deleteArtifactEnrichment(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8) !void {
+                pub fn deleteArtifactEnrichment(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expectEqualStrings("docs", table_name);
                     try std.testing.expectEqualStrings("document chunks/v2", enrichment_name);
@@ -4221,6 +4490,121 @@ test "system catalog direct read carries identity and deadline without a discove
     try std.testing.expectEqual(@as(usize, 2), executor.calls);
 }
 
+test "store-root enrollment status is a body-bound admin read and preserves absent identity" {
+    const alloc = std.testing.allocator;
+    const authority = @import("../system_catalog/setting_authority.zig");
+    const Executor = struct {
+        fn execute(_: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog"));
+            try authority.verify("enrollment-admin-secret", "enrollment-admin-issuer", .admin, request.body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)), request.header(authority.header_name) orelse return error.TestUnexpectedResult);
+            return .{ .status = 409, .body = try a.dupe(u8, "StoreRootEnrollmentChanged") };
+        }
+    };
+    var ignored: u8 = 0;
+    var client = MetadataHttpClient.init(alloc, .{ .ptr = &ignored, .vtable = &.{ .execute = Executor.execute } });
+    _ = client.withSettingAuthority("enrollment-admin-secret", "enrollment-admin-issuer");
+    const identity: @import("store_root_enrollment.zig").Identity = .{
+        .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+        .node_id = 3,
+        .store_id = 5,
+        .root_incarnation = 7,
+        .public_key = @splat(1),
+    };
+    try std.testing.expectError(error.StoreRootEnrollmentChanged, client.readSystemCatalog("http://metadata.invalid", .{ .store_root_enrollment_status = identity }, 25, null));
+}
+
+test "system catalog policy publication status preserves explicit absence without reclassifying policy conflicts" {
+    const alloc = std.testing.allocator;
+    const Executor = struct {
+        body: []const u8,
+        status: u16 = 409,
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog"));
+            if (std.mem.indexOf(u8, request.body, "policy_publication_status") != null) {
+                try std.testing.expect(request.header(@import("../api/internal_service_auth.zig").header_name) != null);
+                try std.testing.expect(request.header(@import("../system_catalog/setting_authority.zig").header_name) == null or
+                    request.header(@import("../system_catalog/setting_authority.zig").header_name).?.len == 0);
+            }
+            if (self.status != 200) return .{ .status = self.status, .body = try a.dupe(u8, self.body) };
+            const headers = try a.alloc(http_common.Header, 2);
+            errdefer a.free(headers);
+            headers[0] = .{ .name = try a.dupe(u8, "x-antfly-catalog-metadata-group"), .value = try a.dupe(u8, "77") };
+            headers[1] = .{ .name = try a.dupe(u8, "x-antfly-catalog-metadata-incarnation"), .value = try a.dupe(u8, "11111111111111111111111111111111") };
+            return .{ .status = 200, .body = try a.dupe(u8, self.body), .headers = headers };
+        }
+    };
+    var executor = Executor{ .body = "RowPolicyCatalogChanged" };
+    var client = MetadataHttpClient.init(alloc, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    _ = client.withInternalServiceAuth("policy-status-service-secret-0123456789", "policy-status-test");
+    try std.testing.expectError(error.RowPolicyCatalogChanged, client.readSystemCatalog("http://metadata.invalid", .{ .policy_publication_status = 7 }, 25, null));
+    executor.status = 200;
+    executor.body = "null";
+    var absent = try client.readSystemCatalog("http://metadata.invalid", .{ .policy_publication_status = 7 }, 25, null);
+    defer absent.deinit(alloc);
+    try std.testing.expectEqualStrings("null", absent.body);
+    executor.status = 409;
+    executor.body = "CatalogGenerationChanged";
+    try std.testing.expectError(error.CatalogGenerationChanged, client.readSystemCatalog("http://metadata.invalid", .{ .policy_publication_status = 7 }, 25, null));
+    executor.body = "RowPolicyCatalogChanged";
+    try std.testing.expectError(error.CatalogGenerationChanged, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
+    try std.testing.expectError(error.SettingAuthorityUnavailable, client.readSystemCatalog("http://metadata.invalid", .{ .policy_publication_work = 0 }, 25, null));
+}
+
+test "system catalog FK decision preserves absent publication for initial-parent fallback" {
+    const alloc = std.testing.allocator;
+    const Executor = struct {
+        body: []const u8,
+        status: u16 = 409,
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog"));
+            return .{ .status = self.status, .body = try a.dupe(u8, self.body) };
+        }
+    };
+    var executor = Executor{ .body = "GenerationPublicationNotFound" };
+    var client = MetadataHttpClient.init(alloc, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    _ = client.withSettingAuthority("fk-decision-test-secret", "fk-decision-test");
+    const decision: @import("../system_catalog/server_call.zig").Call = .{ .fk_generation_publication_decision = .{
+        .plan_id = @splat(1),
+        .parent_table_id = 1,
+        .parent_group_id = 2,
+        .child_table_id = 3,
+        .child_table_name = "child",
+        .action = .stage,
+    } };
+    try std.testing.expectError(error.GenerationPublicationNotFound, client.readSystemCatalog("http://metadata.invalid", decision, 25, null));
+    executor.body = "GenerationPublicationChanged";
+    try std.testing.expectError(error.GenerationPublicationChanged, client.readSystemCatalog("http://metadata.invalid", decision, 25, null));
+    executor.body = "CatalogGenerationChanged";
+    try std.testing.expectError(error.CatalogGenerationChanged, client.readSystemCatalog("http://metadata.invalid", decision, 25, null));
+    executor.body = "GenerationPublicationChanged";
+    try std.testing.expectError(error.CatalogGenerationChanged, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
+    executor.body = "GenerationPublicationNotFound";
+    try std.testing.expectError(error.CatalogGenerationChanged, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
+    executor.status = 400;
+    executor.body = "InvalidGenerationPublication";
+    try std.testing.expectError(error.InvalidGenerationPublication, client.readSystemCatalog("http://metadata.invalid", decision, 25, null));
+    try std.testing.expectError(error.InvalidCatalogName, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
+}
+
+test "system catalog initial FK retirement page requires a store-bound transport" {
+    const Executor = struct {
+        calls: usize = 0,
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.UnexpectedRetirementRequest;
+        }
+    };
+    var executor = Executor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    _ = client.withSettingAuthority("retirement-read-test-secret", "retirement-read-test");
+    const call: @import("../system_catalog/server_call.zig").Call = .{ .fk_initial_retirement_page = .{ .store_id = 13, .limit = 1 } };
+    try std.testing.expectError(error.InitialFkRetirementNotActivated, client.readSystemCatalog("http://metadata.invalid", call, 25, null));
+    try std.testing.expectEqual(@as(usize, 0), executor.calls);
+}
+
 test "metadata mutation topology avoids diagnostics and owns parsed roles across compatibility fallback" {
     const a = std.testing.allocator;
     const Executor = struct {
@@ -4256,4 +4640,15 @@ test "metadata mutation topology avoids diagnostics and owns parsed roles across
     var client = MetadataHttpClient.init(a, .{ .ptr = &unavailable, .vtable = &.{ .execute = Executor.execute } });
     try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchMutationTopologyWithBudget("http://metadata.invalid", .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s }));
     try std.testing.expectEqual(@as(usize, 0), unavailable.diagnostic_calls);
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

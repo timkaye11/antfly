@@ -99,10 +99,10 @@ pub fn cleanup(alloc: std.mem.Allocator, txn: anytype, donor: ByteRange, after: 
     defer cursor.close();
     const initial = if (after.len != 0) (try integrity.parseKey(after)).kind else integrity.Kind.claim;
     for ([_]integrity.Kind{ .claim, .reference, .job }) |kind| {
-        if (@intFromEnum(kind) < @intFromEnum(initial)) continue;
+        if (@backingInt(kind) < @backingInt(initial)) continue;
         var prefix: [integrity.namespace.len + 1]u8 = undefined;
         @memcpy(prefix[0..integrity.namespace.len], integrity.namespace);
-        prefix[integrity.namespace.len] = @intFromEnum(kind);
+        prefix[integrity.namespace.len] = @backingInt(kind);
         const lower = try std.mem.concat(alloc, u8, &.{ &prefix, donor.start });
         defer alloc.free(lower);
         const resuming = kind == initial and after.len != 0;
@@ -180,8 +180,8 @@ test "relational index system online integrity shadow cleanup publication and re
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/shadow", .{tmp.sub_path});
     defer alloc.free(path);
-    const options: @import("db.zig").OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
-    var db = try @import("db.zig").DB.open(alloc, path, options);
+    const options: @import("antfly_source_root").antfly_sources.physical_db.OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
+    var db = try @import("antfly_source_root").antfly_sources.physical_db.DB.open(alloc, path, options);
     defer db.close();
     try db.updateRange(.{ .start = "\xff", .end = "" });
     const schema =
@@ -205,7 +205,7 @@ test "relational index system online integrity shadow cleanup publication and re
     defer alloc.free(donor_path);
     var donor_options = options;
     donor_options.identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 };
-    var donor = try @import("db.zig").DB.open(alloc, donor_path, donor_options);
+    var donor = try @import("antfly_source_root").antfly_sources.physical_db.DB.open(alloc, donor_path, donor_options);
     defer donor.close();
     try donor.updateRange(.{ .start = "", .end = "\xff" });
     try donor.setSchemaJson(alloc, schema);
@@ -236,14 +236,14 @@ test "relational index system online integrity shadow cleanup publication and re
         try std.testing.expectEqualDeep(generations, facts.value.integrity.?.generation_set);
         try std.testing.expectEqualDeep(donor_identity.catalog_digest, facts.value.integrity.?.catalog_digest);
     }
-    try donor.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 });
+    try @import("../server_db_adapter.zig").applyOrdered(&donor, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 1 });
     const certificate = try donor.prepareOnlineSourcePublication(scope, .none);
     try std.testing.expect(certificate.integrity != null);
     try std.testing.expectEqualDeep(generations, certificate.integrity.?.generation_set);
     var stale_certificate = certificate;
     stale_certificate.integrity.?.catalog_digest[0] ^= 1;
-    try std.testing.expectError(error.SourceSnapshotCutMismatch, donor.batchRaftReplicatedApply(.{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = stale_certificate } } }, .{ .term = 1, .index = 2 }));
-    try donor.batchRaftReplicatedApply(.{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = certificate } } }, .{ .term = 1, .index = 2 });
+    try std.testing.expectError(error.SourceSnapshotCutMismatch, @import("../server_db_adapter.zig").applyOrdered(&donor, .{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = stale_certificate } } }, .{ .term = 1, .index = 2 }));
+    try @import("../server_db_adapter.zig").applyOrdered(&donor, .{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = certificate } } }, .{ .term = 1, .index = 2 });
     const source: pages.Source = .{ .namespace = donor_identity.namespace, .pin_digest = try certificate.digest(), .applied_index = certificate.cut.applied_index, .retention = .{ .epoch = 1, .after_sequence = certificate.cut.retained_start }, .integrity = certificate.integrity };
     var checkpoint: types.MergeReplicationCheckpoint = .{ .kind = .accept, .transition_id = 9, .donor_group_id = 2, .receiver_group_id = 3, .receiver_base_start = "\xff", .receiver_base_end = "", .merged_start = "", .merged_end = "", .page_source = source, .page_receiver_namespace = options.identity_namespace };
     try db.batch(.{ .merge_checkpoint = checkpoint });
@@ -264,12 +264,12 @@ test "relational index system online integrity shadow cleanup publication and re
         \\{"version":2,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
     ));
     const Apply = struct {
-        fn run(owner: *@import("db.zig").DB, request: types.BatchRequest) !void {
+        fn run(owner: *@import("antfly_source_root").antfly_sources.physical_db.DB, request: types.BatchRequest) !void {
             var batch = request;
             batch.merge_page.?.digest = pages.commandDigest(batch);
             try owner.batch(batch);
         }
-        fn pump(from: *@import("db.zig").DB, to: *@import("db.zig").DB, copy_scope: @import("online_source_contract.zig").Scope, cert: @import("../source_snapshot.zig").Certificate, until: pages.Phase) !void {
+        fn pump(from: *@import("antfly_source_root").antfly_sources.physical_db.DB, to: *@import("antfly_source_root").antfly_sources.physical_db.DB, copy_scope: @import("online_source_contract.zig").Scope, cert: @import("../source_snapshot.zig").Certificate, until: pages.Phase) !void {
             for (0..1000) |_| {
                 const raw_progress = try to.core.store.get(std.testing.allocator, pages.key);
                 defer std.testing.allocator.free(raw_progress);
@@ -306,7 +306,7 @@ test "relational index system online integrity shadow cleanup publication and re
     try Apply.pump(&donor, &db, scope, certificate, .tail);
     try std.testing.expectEqual(@as(u64, 123), try db.getTimestamp(alloc, "parent"));
     db.close();
-    db = try @import("db.zig").DB.open(alloc, path, options);
+    db = try @import("antfly_source_root").antfly_sources.physical_db.DB.open(alloc, path, options);
     const lookup_request = try std.json.Stringify.valueAlloc(alloc, .{ .kind = "references", .address = address }, .{});
     defer alloc.free(lookup_request);
     try std.testing.expectError(error.KeyOutOfRange, db.lookup(alloc, &address.routing, .{ .relational_integrity_jobs_json = lookup_request }));
@@ -321,10 +321,10 @@ test "relational index system online integrity shadow cleanup publication and re
     const attach = try donor.beginTransactionWithId(@splat(72), 200);
     try donor.writeTransaction(attach, .{ .relational_schema_version = 1, .relational_integrity_generation_set = generations, .writes = &.{.{ .key = "parent", .value = "{\"id\":1}" }}, .integrity_commands = &.{.{ .address = address, .operation = .{ .attach = reference } }} });
     try donor.commitTransaction(attach, 222);
-    try donor.batchRaftReplicatedApply(.{ .relational_topology = .{ .fence = scope.fence, .action = .begin } }, .{ .term = 1, .index = 3 });
-    try donor.batchRaftReplicatedApply(.{ .online_source = .{ .final_fence = .{ .scope = scope, .expected_sequence = 1 } } }, .{ .term = 1, .index = 4 });
+    try @import("../server_db_adapter.zig").applyOrdered(&donor, .{ .relational_topology = .{ .fence = scope.fence, .action = .begin } }, .{ .term = 1, .index = 3 });
+    try @import("../server_db_adapter.zig").applyOrdered(&donor, .{ .online_source = .{ .final_fence = .{ .scope = scope, .expected_sequence = 1 } } }, .{ .term = 1, .index = 4 });
     donor.close();
-    donor = try @import("db.zig").DB.open(alloc, donor_path, donor_options);
+    donor = try @import("antfly_source_root").antfly_sources.physical_db.DB.open(alloc, donor_path, donor_options);
     try Apply.pump(&donor, &db, scope, certificate, .complete);
     try std.testing.expectEqual(@as(u64, 222), try db.getTimestamp(alloc, "parent"));
     try std.testing.expectError(error.KeyOutOfRange, db.lookup(alloc, &address.routing, .{ .relational_integrity_jobs_json = lookup_request }));

@@ -17,7 +17,7 @@
 const std = @import("std");
 const backups = @import("backups.zig");
 const native = @import("../storage/db/native_backup.zig");
-const fs = @import("../common/fs_paths.zig");
+const fs = @import("antfly_runtime_fs").fs_paths;
 const staging = @import("../storage/db/restore_staging_contract.zig");
 const Sha = std.crypto.hash.sha2.Sha256;
 pub const chunk_bytes = 8 * 1024 * 1024;
@@ -72,13 +72,13 @@ fn save(alloc: std.mem.Allocator, io: std.Io, root: []const u8, checkpoint: Chec
 
 /// Returns a parsed, authenticated manifest only once all decoder files are
 /// durable. Every unsuccessful slice retains its verified byte/hash prefix.
-pub fn step(alloc: std.mem.Allocator, io: std.Io, location: *backups.BackupLocation, source: @import("../metadata/restore_staging.zig").SourceArtifact, scope: staging.Scope, root: []const u8, cancellation: @import("../common/cancellation.zig").CancellationToken) !?native.LoadedManifest {
+pub fn step(alloc: std.mem.Allocator, io: std.Io, location: *backups.BackupLocation, source: @import("../metadata/restore_staging.zig").SourceArtifact, scope: staging.Scope, root: []const u8, cancellation: @import("antfly_cancellation").CancellationToken) !?native.LoadedManifest {
     return stepWithBudget(alloc, io, location, source, scope, root, cancellation, chunk_bytes);
 }
 
 /// Portable uses the identical durable SHA prefix as native objects, followed
 /// by an atomic logical-object/row cursor inside a disposable LSM decoder.
-pub fn stepPortableWithBudget(alloc: std.mem.Allocator, io: std.Io, location: *backups.BackupLocation, source: @import("../metadata/restore_staging.zig").SourceArtifact, scope: staging.Scope, owner_range: @import("../storage/docstore.zig").ByteRange, root: []const u8, cancellation: @import("../common/cancellation.zig").CancellationToken, byte_budget: usize) !bool {
+pub fn stepPortableWithBudget(alloc: std.mem.Allocator, io: std.Io, location: *backups.BackupLocation, source: @import("../metadata/restore_staging.zig").SourceArtifact, scope: staging.Scope, owner_range: @import("../storage/docstore.zig").ByteRange, root: []const u8, cancellation: @import("antfly_cancellation").CancellationToken, byte_budget: usize) !bool {
     if (byte_budget == 0 or byte_budget > chunk_bytes or source.format != .portable or !std.mem.eql(u8, &try source.digest(alloc), &scope.source_descriptor_digest)) return error.RestoreSourceProofMissing;
     if ((source.cohort_seal == null) == (source.rewrite == null)) return error.RestoreSourceProofMissing;
     try cancellation.check();
@@ -132,7 +132,7 @@ pub fn stepPortableWithBudget(alloc: std.mem.Allocator, io: std.Io, location: *b
 
 /// Shared bounded logical import after either repository checksum verification
 /// or the peer transport's exact immutable certificate verification.
-pub fn stepPortableDecoder(alloc: std.mem.Allocator, io: std.Io, artifact: std.Io.File, source: @import("../metadata/restore_staging.zig").SourceArtifact, scope: staging.Scope, owner_range: @import("../storage/docstore.zig").ByteRange, root: []const u8, cancellation: @import("../common/cancellation.zig").CancellationToken) !bool {
+pub fn stepPortableDecoder(alloc: std.mem.Allocator, io: std.Io, artifact: std.Io.File, source: @import("../metadata/restore_staging.zig").SourceArtifact, scope: staging.Scope, owner_range: @import("../storage/docstore.zig").ByteRange, root: []const u8, cancellation: @import("antfly_cancellation").CancellationToken) !bool {
     try cancellation.check();
     if (source.format != .portable or (source.cohort_seal == null) == (source.rewrite == null) or
         !std.mem.eql(u8, &try source.digest(alloc), &scope.source_descriptor_digest)) return error.RestoreSourceProofMissing;
@@ -151,14 +151,17 @@ pub fn stepPortableDecoder(alloc: std.mem.Allocator, io: std.Io, artifact: std.I
     const portable = @import("../storage/portable_backup.zig");
     // A page may only advance a manifest/layout phase, without importing a
     // row. Amortize decoder opens and coordinator RPCs across a bounded burst
-    // of these durable steps. Each page still commits its restart checkpoint;
-    // cancellation and either budget end the burst without losing progress.
+    // of these durable steps. A decoder reopen and coordinator RPC cost more
+    // than a small logical page on LSM, so allow a bounded 100 ms burst while
+    // retaining each page's own durable restart checkpoint. Cancellation is
+    // checked before every page and within the importer; neither limit may
+    // turn this into an unbounded owner request.
     const started = std.Io.Clock.awake.now(io);
     var complete = false;
-    for (0..8) |_| {
+    for (0..16) |_| {
         try cancellation.check();
         complete = if (source.rewrite) |rewrite| try portable.importSourceCopyFilePage(alloc, &store, io, artifact, source.artifact_size_bytes, .{ .scope = rewrite.source_scope orelse return error.RestoreSourceProofMissing, .applied_index = rewrite.source_applied_index, .retained_start = rewrite.retained_start }, scope.digest(), 128, cancellation) else try portable.importCohortFilePage(alloc, &store, io, artifact, source.artifact_size_bytes, .{ .seal = source.cohort_seal.?, .namespace = scope.source_namespace }, scope.digest(), 128, cancellation);
-        if (complete or started.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds() >= 25 * std.time.ns_per_ms) break;
+        if (complete or started.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds() >= 100 * std.time.ns_per_ms) break;
     }
     if (complete) try bindPortableDecoderRange(alloc, &store, owner_range);
     try fs.syncDirPortable(io, files);
@@ -195,7 +198,7 @@ pub fn bindPortableDecoderRange(alloc: std.mem.Allocator, store: *@import("../st
     try store.sync(true);
 }
 
-pub fn stepWithBudget(alloc: std.mem.Allocator, io: std.Io, location: *backups.BackupLocation, source: @import("../metadata/restore_staging.zig").SourceArtifact, scope: staging.Scope, root: []const u8, cancellation: @import("../common/cancellation.zig").CancellationToken, byte_budget: usize) !?native.LoadedManifest {
+pub fn stepWithBudget(alloc: std.mem.Allocator, io: std.Io, location: *backups.BackupLocation, source: @import("../metadata/restore_staging.zig").SourceArtifact, scope: staging.Scope, root: []const u8, cancellation: @import("antfly_cancellation").CancellationToken, byte_budget: usize) !?native.LoadedManifest {
     if (byte_budget == 0 or byte_budget > chunk_bytes) return error.InvalidBackupRange;
     try cancellation.check();
     if (source.native_manifest_size_bytes == 0 or source.native_manifest_sha256.len != 64 or !std.mem.eql(u8, &try source.digest(alloc), &scope.source_descriptor_digest)) return error.RestoreSourceProofMissing;

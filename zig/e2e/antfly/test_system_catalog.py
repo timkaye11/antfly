@@ -263,6 +263,7 @@ def test_catalog_scope_indexes_and_placement_overrides(stateful_api):
         api.delete("/tablespaces/" + name)
 
 
+@pytest.mark.reuse_antfly_process
 @pytest.mark.parametrize(
     "name",
     [
@@ -670,6 +671,7 @@ def test_catalog_constraint_drop_rejection_preserves_durable_identity(
         assert wait_until(
             lambda: api.get(path + "/constraints/status").get("state") == "enforced",
             timeout_s=30,
+            retry_not_found=True,
         )
         api.post(path + "/batch", {"inserts": {"row": {"id": 1}}})
 

@@ -18,11 +18,11 @@
 //! verification. Interrupted transfer resumes at an exact bounded byte offset.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const DB = @import("db.zig").DB;
+const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
 const pin = @import("source_pin.zig");
 const seal = @import("native_backup_seal.zig");
 const backup = @import("native_backup.zig");
-const fs = @import("../../common/fs_paths.zig");
+const fs = @import("antfly_runtime_fs").fs_paths;
 const snapshot = @import("../source_snapshot.zig");
 const Scope = @import("online_source_contract.zig").Scope;
 const Cancellation = @import("types.zig").CancellationToken;
@@ -126,7 +126,7 @@ const Lease = struct {
     fn path(self: Lease, name: []const u8) ![]u8 {
         return std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ self.root, name });
     }
-    fn deinit(self: *Lease) void {
+    pub fn deinit(self: *Lease) void {
         self.held.deinit();
         pin.reclaimReleased(self.db, self.scope) catch {};
         self.alloc.free(self.root);

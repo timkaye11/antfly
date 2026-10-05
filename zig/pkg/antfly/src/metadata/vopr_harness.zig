@@ -43,7 +43,7 @@ const test_contract_helpers = @import("../api/test_contract_helpers.zig");
 const api_table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 const api_tables = @import("../api/tables.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
-const raft_catalog = @import("../raft/catalog.zig");
+const raft_catalog = @import("../raft/storage/catalog.zig");
 const raft_host = @import("../raft/host.zig");
 const raft_metadata_apply = @import("../raft/metadata_apply.zig");
 const raft_metadata_view = @import("../raft/metadata_view.zig");
@@ -1600,19 +1600,19 @@ pub const DistributedDataVoprScenario = struct {
             .id = vopr.id.stable("event", "distributed_data.phase_completed"),
             .name = "distributed_data.phase_completed",
             .kind = if (world.completed) .client_response else .state_change,
-            .payload_digest = @intFromEnum(world.stage),
+            .payload_digest = @backingInt(world.stage),
         });
         return if (world.completed)
-            vopr.outcome.TransitionOutcome.targetReached("distributed_data.split_merge_completed", @intFromEnum(world.stage))
+            vopr.outcome.TransitionOutcome.targetReached("distributed_data.split_merge_completed", @backingInt(world.stage))
         else
             vopr.outcome.TransitionOutcome.applied();
     }
 
     pub fn observe(world: *World, builder: *vopr.observation.Builder, alloc: std.mem.Allocator) !void {
-        try builder.addNamed(alloc, "distributed_data.stage", @intFromEnum(world.stage));
+        try builder.addNamed(alloc, "distributed_data.stage", @backingInt(world.stage));
         try builder.addNamed(alloc, "distributed_data.transport_delayed", @intFromBool(world.delayed_transport));
-        try builder.addNamed(alloc, "distributed_data.split_fault", @intFromEnum(world.split_failure));
-        try builder.addNamed(alloc, "distributed_data.merge_fault", @intFromEnum(world.merge_failure));
+        try builder.addNamed(alloc, "distributed_data.split_fault", @backingInt(world.split_failure));
+        try builder.addNamed(alloc, "distributed_data.merge_fault", @backingInt(world.merge_failure));
         try builder.addNamed(alloc, "distributed_data.storage_crash_required", 1);
         try builder.addNamed(alloc, "distributed_data.acknowledged_documents", if (world.completed) 5 else 0);
     }
@@ -2671,7 +2671,7 @@ fn buildHealthyStoreStatusReports(
         var leader_store_id: ?u64 = null;
         var voter_set_known = false;
         var voter_set_fingerprint: metadata_table_manager.VoterSetFingerprint =
-            [_]u8{0} ** metadata_table_manager.voter_set_fingerprint_len;
+            @as([metadata_table_manager.voter_set_fingerprint_len]u8, @splat(0));
         for (projected_intents) |intent| {
             if (intent.record.group_id != base_status.group_id) continue;
             if (intent.store_id == 0) continue;
@@ -3674,7 +3674,7 @@ pub const MetadataHttpNodeVopr = struct {
     pub fn catalogRoutingSnapshotWithClock(
         self: MetadataHttpNodeVopr,
         deadline_ns: ?u64,
-        deadline_io: ?@import("../runtime_io_abi.zig").Borrow,
+        deadline_io: ?@import("antfly_runtime_abi").io_abi.Borrow,
     ) !metadata_api.CatalogRoutingSnapshot {
         self.cluster.scheduler_gate.lock();
         defer self.cluster.scheduler_gate.unlock();
@@ -4308,8 +4308,8 @@ pub const MetadataHttpNodeVopr = struct {
                     // A single, up-to-date candidate breaks synchronized
                     // election ties without continuously advancing terms on
                     // different replicas.
-                    self.cluster.campaignBestMetadataCandidate() catch |err| switch (err) {
-                        error.UnknownGroup => {},
+                    _ = self.cluster.campaignBestMetadataCandidate() catch |err| switch (err) {
+                        error.UnknownGroup => false,
                         else => return voprMutationError(err, operation_may_have_been_admitted),
                     };
                     for (0..16) |_| {
@@ -4810,27 +4810,45 @@ pub const MetadataHttpClusterVopr = struct {
         return .{ .cluster = self, .index = index };
     }
 
-    /// Break deterministic election lockstep without inventing authority. The
-    /// replica with the freshest log must campaign in a term strictly newer
-    /// than every observed candidate; otherwise a lagging replica that ticks
-    /// first can repeatedly consume the shared next term without ever being
-    /// eligible for an up-to-date quorum's votes.
-    pub fn campaignBestMetadataCandidate(self: *MetadataHttpClusterVopr) !void {
-        const candidate_index = bestMetadataElectionCandidateIndex(self) orelse
-            return error.UnknownGroup;
-        var max_observed_term: u64 = 0;
-        for (self.cluster.nodes, self.cluster.node_live) |*replica, live| {
-            if (!live) continue;
-            const status = replica.raftStatus(self.metadata_group_id) orelse continue;
-            max_observed_term = @max(max_observed_term, status.hard.current_term);
-        }
-        for (0..self.cluster.nodes.len + 2) |_| {
+    /// Break deterministic election lockstep without inventing authority.
+    /// Campaign the freshest follower with a quorum path, then let the Raft
+    /// driver deliver its vote responses. Leave an ongoing reachable vote
+    /// alone; Raft's election timer owns any retry it needs.
+    pub fn campaignBestMetadataCandidate(self: *MetadataHttpClusterVopr) !bool {
+        self.scheduler_gate.lock();
+        defer self.scheduler_gate.unlock();
+        if (self.currentMetadataLeaderIndex() != null) return false;
+        var skipped = std.ArrayListUnmanaged(usize).empty;
+        defer skipped.deinit(self.alloc);
+        while (skipped.items.len < self.cluster.nodes.len) {
+            const candidate_index = bestMetadataElectionCandidateIndexLocked(self, skipped.items) orelse {
+                if (skipped.items.len == 0 and self.firstMetadataReplicaIndex() == null) return error.UnknownGroup;
+                return false;
+            };
             const status = self.cluster.node(candidate_index).raftStatus(self.metadata_group_id) orelse
                 return error.UnknownGroup;
-            if (status.hard.current_term > max_observed_term) return;
-            try self.cluster.node(candidate_index).campaignGroup(self.metadata_group_id);
+            switch (status.soft.role) {
+                // Restarting a vote discards the candidate's pending replies.
+                .pre_candidate, .candidate => return false,
+                .leader => {
+                    // This local leader lacks quorum support; try another replica.
+                    try skipped.append(self.alloc, candidate_index);
+                    continue;
+                },
+                .follower => {},
+            }
+            self.cluster.node(candidate_index).campaignGroup(self.metadata_group_id) catch |err| switch (err) {
+                // A committed membership change may make an applied voter
+                // ineligible. Try the next freshest follower instead.
+                error.NotPromotable => {
+                    try skipped.append(self.alloc, candidate_index);
+                    continue;
+                },
+                else => return err,
+            };
+            return true;
         }
-        return error.MetadataElectionTermDidNotAdvance;
+        return false;
     }
 
     pub fn backendRuntime(self: *MetadataHttpClusterVopr, index: usize) *db_mod.background_runtime.BackendRuntime {
@@ -5736,10 +5754,10 @@ fn hashPlacementIntent(hasher: *std.hash.Wyhash, intent: raft_reconciler.Placeme
     hashPlacementU64(hasher, intent.record.group_id);
     hashPlacementU64(hasher, intent.record.replica_id);
     hashPlacementU64(hasher, intent.record.local_node_id);
-    hashPlacementU64(hasher, @intFromEnum(intent.record.bootstrap_mode));
+    hashPlacementU64(hasher, @backingInt(intent.record.bootstrap_mode));
     hashPlacementU64(hasher, intent.record.metadata_version);
     hashPlacementU64(hasher, intent.store_id);
-    hashPlacementU64(hasher, @intFromEnum(intent.serving_state));
+    hashPlacementU64(hasher, @backingInt(intent.serving_state));
     hashPlacementU64(hasher, intent.relocation_generation);
     hashPlacementU64(hasher, intent.relocation_source_node_id);
     hashPlacementU64(hasher, intent.relocation_source_store_id);
@@ -5757,7 +5775,7 @@ fn hashPlacementIntent(hasher: *std.hash.Wyhash, intent: raft_reconciler.Placeme
         // Preserve the historical hash for pre-versioned records so rolling
         // upgrades do not perturb otherwise unchanged placement intents.
         if (snapshot.format != .unknown) {
-            hashPlacementU64(hasher, @intFromEnum(snapshot.format));
+            hashPlacementU64(hasher, @backingInt(snapshot.format));
         }
         hasher.update(snapshot.snapshot_id);
         hasher.update(snapshot.uri);
@@ -5896,24 +5914,30 @@ fn bestMetadataLeaderIndex(cluster: *MetadataHttpClusterVopr) ?usize {
     return best_index;
 }
 
-fn bestMetadataElectionCandidateIndex(cluster: *MetadataHttpClusterVopr) ?usize {
-    cluster.scheduler_gate.lock();
-    defer cluster.scheduler_gate.unlock();
+// The caller holds scheduler_gate through candidate selection and campaign.
+fn bestMetadataElectionCandidateIndexLocked(cluster: *MetadataHttpClusterVopr, skipped: []const usize) ?usize {
     var best_index: ?usize = null;
+    var best_last_term: u64 = 0;
     var best_last_index: u64 = 0;
     var best_commit: u64 = 0;
     var best_applied: u64 = 0;
     var best_term: u64 = 0;
     for (cluster.cluster.nodes, 0..) |*sim, index| {
         if (!cluster.cluster.node_live[index]) continue;
+        if (std.mem.indexOfScalar(usize, skipped, index) != null) continue;
         const status = sim.raftStatus(cluster.metadata_group_id) orelse continue;
+        if (std.mem.indexOfScalar(u64, status.conf_state.voters, status.id) == null and
+            std.mem.indexOfScalar(u64, status.conf_state.voters_outgoing, status.id) == null) continue;
+        if (!metadataCandidateHasQuorumPath(cluster, status)) continue;
         if (best_index == null or
-            status.last_index > best_last_index or
-            (status.last_index == best_last_index and status.hard.commit_index > best_commit) or
-            (status.last_index == best_last_index and status.hard.commit_index == best_commit and status.applied_index > best_applied) or
-            (status.last_index == best_last_index and status.hard.commit_index == best_commit and status.applied_index == best_applied and status.hard.current_term > best_term))
+            status.last_term > best_last_term or
+            (status.last_term == best_last_term and status.last_index > best_last_index) or
+            (status.last_term == best_last_term and status.last_index == best_last_index and status.hard.commit_index > best_commit) or
+            (status.last_term == best_last_term and status.last_index == best_last_index and status.hard.commit_index == best_commit and status.applied_index > best_applied) or
+            (status.last_term == best_last_term and status.last_index == best_last_index and status.hard.commit_index == best_commit and status.applied_index == best_applied and status.hard.current_term > best_term))
         {
             best_index = index;
+            best_last_term = status.last_term;
             best_last_index = status.last_index;
             best_commit = status.hard.commit_index;
             best_applied = status.applied_index;
@@ -5921,6 +5945,39 @@ fn bestMetadataElectionCandidateIndex(cluster: *MetadataHttpClusterVopr) ?usize 
         }
     }
     return best_index;
+}
+
+fn metadataCandidateHasQuorumPath(cluster: *MetadataHttpClusterVopr, status: raft_engine.core.Status) bool {
+    // In the healthy fixture all configured voters can exchange messages.
+    // Keep ordinary election recovery on its existing selection path.
+    if (!cluster.virtual_network.hasConnectivityFaults()) {
+        var all_live = true;
+        for (cluster.cluster.node_live) |live| all_live = all_live and live;
+        if (all_live) return true;
+    }
+    return metadataCandidateCanReachMajority(cluster, status.id, status.conf_state.voters) and
+        (status.conf_state.voters_outgoing.len == 0 or
+            metadataCandidateCanReachMajority(cluster, status.id, status.conf_state.voters_outgoing));
+}
+
+fn metadataCandidateCanReachMajority(cluster: *MetadataHttpClusterVopr, candidate_id: u64, voters: []const u64) bool {
+    var reachable: usize = 0;
+    for (voters) |voter_id| {
+        for (cluster.cluster.configs, cluster.cluster.node_live) |config, live| {
+            if (!live or config.host.http.host.local_node_id != voter_id) continue;
+            if (voter_id == candidate_id or metadataNodesCanExchangeVotes(cluster.virtual_network, candidate_id, voter_id))
+                reachable += 1;
+            break;
+        }
+    }
+    return reachable > voters.len / 2;
+}
+
+fn metadataNodesCanExchangeVotes(network: *const raft_vopr.VirtualHttpNetwork, candidate_id: u64, voter_id: u64) bool {
+    if (network.isPartitioned(candidate_id) or network.isPartitioned(voter_id) or
+        network.isRouteUnavailable(candidate_id) or network.isRouteUnavailable(voter_id)) return false;
+    return !network.isLinkPartitioned(.{ .source_id = candidate_id, .target_id = voter_id }) and
+        !network.isLinkPartitioned(.{ .source_id = voter_id, .target_id = candidate_id });
 }
 
 fn currentGroupLeaderIndex(cluster: *MetadataHttpClusterVopr, group_id: u64) ?usize {
@@ -6742,7 +6799,7 @@ const PublicApiStatusSource = struct {
         self.node.freeCatalogRoutingSnapshot(snapshot);
     }
 
-    fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: api_tables.CreateTableRequest) !void {
+    pub fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: api_tables.CreateTableRequest) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         _ = alloc;
         try applyCreateTableMutation(self.node, table_name, req);
@@ -6757,7 +6814,7 @@ const PublicApiStatusSource = struct {
         try applyReplaceTableDefinitionMutation(self.node, expected, replacement);
     }
 
-    fn dropTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) !void {
+    pub fn dropTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) !void {
         var result = try dropTableExact(ptr, alloc, table_name);
         defer result.deinit(alloc);
     }
@@ -6771,17 +6828,17 @@ const PublicApiStatusSource = struct {
         return try applyDropTableMutation(self.node, alloc, table_name);
     }
 
-    fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
+    pub fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         try applyUpdateSchemaMutation(self.node, alloc, table_name, schema_json);
     }
 
-    fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
+    pub fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         try applyCreateIndexMutation(self.node, alloc, table_name, index_name, index_json);
     }
 
-    fn dropIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
+    pub fn dropIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         try applyDropIndexMutation(self.node, alloc, table_name, index_name);
     }
@@ -6836,7 +6893,7 @@ pub const MetadataAdminVoprSource = struct {
         };
     }
 
-    fn systemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/domain.zig").Call) ![]u8 {
+    fn systemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
         try context.ensureActive();
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (input == .mutate) return error.UnsupportedOperation;
@@ -6844,6 +6901,38 @@ pub const MetadataAdminVoprSource = struct {
         const store = target.sim().runtime.svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
         const group_id = target.cluster.metadata_group_id;
         const result = switch (input) {
+            .setting_snapshot => |scope| try store.sqlSettingSnapshotJson(alloc, group_id, scope),
+            .policy_snapshot => |request| try store.sqlPolicySnapshotJson(alloc, group_id, request.table_id, request.principal, request.database, request.roles),
+            .setting_mutate => return error.Forbidden,
+            // VOPR's public catalog façade does not own the private
+            // publication/coordination protocols. Keep these explicit so a
+            // newly added Call remains visible to exhaustive compilation.
+            .policy_install_snapshot,
+            .policy_publication_status,
+            .policy_publication_work,
+            .policy_publication_begin,
+            .policy_definition_mutate,
+            .policy_publication_mutate,
+            .fk_generation_publication_begin,
+            .fk_generation_publication_mutate,
+            .fk_generation_publication_status,
+            .fk_generation_publication_work,
+            .fk_generation_publication_decision,
+            .fk_generation_publication_source_decision,
+            .fk_initial_create_prepare,
+            .fk_initial_child_decision,
+            .fk_initial_create_begin,
+            .fk_initial_create_mutate,
+            .fk_initial_create_status,
+            .fk_generation_table_locked,
+            .fk_initial_create_work,
+            .fk_initial_retirement_page,
+            .store_root_enroll,
+            .store_root_enrollment_status,
+            .fk_initial_retirement_signed_page,
+            .fk_initial_retirement_ack,
+            .fk_initial_parent_decision,
+            => return error.UnsupportedOperation,
             .write_validation_revision => try std.json.Stringify.valueAlloc(alloc, metadata_api.MetadataHead{
                 .metadata_group_id = group_id,
                 .metadata_incarnation = try target.metadataIncarnation(),
@@ -6967,7 +7056,7 @@ pub const MetadataAdminVoprSource = struct {
         self.node.freeAdminSnapshot(snapshot);
     }
 
-    fn createTable(
+    pub fn createTable(
         ptr: *anyopaque,
         _: std.mem.Allocator,
         table_name: []const u8,
@@ -6977,7 +7066,7 @@ pub const MetadataAdminVoprSource = struct {
         try applyCreateTableMutation(self.node, table_name, req);
     }
 
-    fn dropTable(
+    pub fn dropTable(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -6986,7 +7075,7 @@ pub const MetadataAdminVoprSource = struct {
         _ = try applyDropTableMutation(self.node, alloc, table_name);
     }
 
-    fn updateSchema(
+    pub fn updateSchema(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -6996,7 +7085,7 @@ pub const MetadataAdminVoprSource = struct {
         try applyUpdateSchemaMutation(self.node, alloc, table_name, schema_json);
     }
 
-    fn createIndex(
+    pub fn createIndex(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -7007,7 +7096,7 @@ pub const MetadataAdminVoprSource = struct {
         try applyCreateIndexMutation(self.node, alloc, table_name, index_name, index_json);
     }
 
-    fn dropIndex(
+    pub fn dropIndex(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -7130,7 +7219,7 @@ const PublicApiCatalogSource = struct {
     fn iface(self: *@This()) api_table_catalog.CatalogSource {
         return .{
             .ptr = self,
-            .io = @import("../runtime_io_abi.zig").Borrow.init(&(self.node.cluster.backendRuntime(self.node.index).io() orelse std.Options.debug_io)),
+            .io = @import("antfly_runtime_abi").io_abi.Borrow.init(&(self.node.cluster.backendRuntime(self.node.index).io() orelse std.Options.debug_io)),
             .vtable = &.{
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
@@ -7238,11 +7327,11 @@ const VoprAuthManager = struct {
         );
         errdefer self.manager.deinit();
 
-        try usermgr.ensureDefaultAdminUser(&self.manager);
+        try usermgr.ensureDefaultAdminUser(&self.manager, "vopr-bootstrap-password");
         return self;
     }
 
-    fn deinit(self: *VoprAuthManager) void {
+    pub fn deinit(self: *VoprAuthManager) void {
         self.manager.deinit();
         self.policy_store.deinit();
         self.store.deinit();
@@ -7395,7 +7484,7 @@ fn PublicApiTestRig(comptime N: usize) type {
         client: api_http_client.ApiHttpClient = undefined,
         metadata_client: metadata_http_client.MetadataHttpClient = undefined,
 
-        fn initInPlace(
+        pub fn initInPlace(
             self: *@This(),
             alloc: std.mem.Allocator,
             cluster: *MetadataHttpClusterVopr,
@@ -7492,7 +7581,7 @@ fn PublicApiTestRig(comptime N: usize) type {
             return self;
         }
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.client_executor.deinit();
             deinitPublicApiStack(N, &self.listeners, &self.servers, &self.write_sources);
             for (self.api_base_uris) |uri| self.alloc.free(uri);
@@ -7547,7 +7636,7 @@ pub const VoprPublicClusterFixture = struct {
     modeled_configurators: [node_count]ModeledDbOpenConfigurator = undefined,
     resource_managers: [node_count]resource_manager_mod.ResourceManager = undefined,
     resource_manager_count: usize = 0,
-    resource_reservations: [node_count]?resource_manager_mod.BatchReservation = .{null} ** node_count,
+    resource_reservations: [node_count]?resource_manager_mod.BatchReservation = @splat(null),
     cluster: MetadataHttpClusterVopr = undefined,
     cluster_live: bool = false,
     cluster_started: bool = false,
@@ -7997,7 +8086,7 @@ pub const VoprPublicClusterFixture = struct {
     }
 
     pub fn bootstrapPhaseOrdinal(self: *const VoprPublicClusterFixture) u8 {
-        return @intFromEnum(self.bootstrap_phase);
+        return @backingInt(self.bootstrap_phase);
     }
 
     pub fn externalCatalogSource(
@@ -9511,8 +9600,8 @@ const MetadataVoprDriver = struct {
             .named("metadata.range_group_id", @intCast(cfg.range_group_id)),
             .named("metadata.split_group_id", @intCast(cfg.split_group_id)),
             .named("metadata.split_transition_id", @intCast(cfg.split_transition_id)),
-            .named("metadata.workload", @intFromEnum(cfg.workload)),
-            .named("metadata.injected_bug", @intFromEnum(cfg.injected_bug)),
+            .named("metadata.workload", @backingInt(cfg.workload)),
+            .named("metadata.injected_bug", @backingInt(cfg.injected_bug)),
         };
         std.mem.sort(vopr.trace.Parameter, &scenario_parameters, {}, struct {
             fn lessThan(_: void, lhs: vopr.trace.Parameter, rhs: vopr.trace.Parameter) bool {
@@ -9547,7 +9636,7 @@ const MetadataVoprDriver = struct {
         return self;
     }
 
-    fn deinit(self: *MetadataVoprDriver) void {
+    pub fn deinit(self: *MetadataVoprDriver) void {
         if (self.artifact) |*artifact| artifact.deinit();
         self.artifact = null;
     }
@@ -9557,7 +9646,7 @@ const MetadataVoprDriver = struct {
     }
 
     fn actionId(action: MetadataVoprAction, discriminator: u64) u64 {
-        return vopr.id.derive("antfly.metadata.action", @as(u64, @intFromEnum(action)) + 1, discriminator);
+        return vopr.id.derive("antfly.metadata.action", @as(u64, @backingInt(action)) + 1, discriminator);
     }
 
     fn appendCandidate(
@@ -10118,7 +10207,7 @@ const MetadataVoprDriver = struct {
         std.mem.sort(FaultChange, changes[0..count], {}, struct {
             fn lessThan(_: void, lhs: FaultChange, rhs: FaultChange) bool {
                 if (lhs.id != rhs.id) return lhs.id < rhs.id;
-                return @intFromEnum(lhs.phase) < @intFromEnum(rhs.phase);
+                return @backingInt(lhs.phase) < @backingInt(rhs.phase);
             }
         }.lessThan);
         for (changes[0..count]) |change| try self.trace().addFault(.{
@@ -10803,7 +10892,7 @@ const MetadataVoprScratch = struct {
         return .{ .alloc = alloc, .io_impl = io_impl, .sub_path = sub_path };
     }
 
-    fn deinit(self: *MetadataVoprScratch) void {
+    pub fn deinit(self: *MetadataVoprScratch) void {
         const path = std.fmt.allocPrint(self.alloc, ".zig-cache/tmp/{s}", .{self.sub_path}) catch null;
         if (path) |owned_path| {
             std.Io.Dir.cwd().deleteTree(self.io_impl.io(), owned_path) catch {};
@@ -11640,7 +11729,7 @@ test "metadata VOPR http cluster seeds default admin for auth-enabled public api
     try public_api.initLeaderBackedWithAuthInPlace(vopr_alloc, &cluster, roots, &auth_managers);
     defer public_api.deinit();
 
-    const admin_auth = try encodeBasicAuthorization(std.heap.page_allocator, "admin", "admin");
+    const admin_auth = try encodeBasicAuthorization(std.heap.page_allocator, "admin", "vopr-bootstrap-password");
     defer std.heap.page_allocator.free(admin_auth);
 
     for (public_api.api_base_uris) |base_uri| {
@@ -12264,6 +12353,60 @@ test "metadata VOPR http cluster drops table topology across leader restart" {
     const intents = try cluster.node(new_leader).listProjectedPlacementIntents(std.testing.allocator);
     defer cluster.node(new_leader).freeProjectedPlacementIntents(std.testing.allocator, intents);
     try std.testing.expectEqual(@as(usize, 0), intents.len);
+}
+
+test "metadata VOPR recovery skips an isolated candidate" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var stores = [_]raft_engine.core.MemoryStorage{
+        raft_engine.core.MemoryStorage.init(std.testing.allocator),
+        raft_engine.core.MemoryStorage.init(std.testing.allocator),
+        raft_engine.core.MemoryStorage.init(std.testing.allocator),
+    };
+    defer for (&stores) |*store| store.deinit();
+    var factories = [_]TestDescriptorFactory{
+        .{ .alloc = std.testing.allocator, .store = &stores[0], .peers = &.{ 1, 2, 3 } },
+        .{ .alloc = std.testing.allocator, .store = &stores[1], .peers = &.{ 1, 2, 3 } },
+        .{ .alloc = std.testing.allocator, .store = &stores[2], .peers = &.{ 1, 2, 3 } },
+    };
+    var roots: [3][]u8 = undefined;
+    var catalogs: [3][]u8 = undefined;
+    for (0..3) |index| {
+        roots[index] = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/isolated-candidate-{d}", .{ tmp.sub_path, index });
+        catalogs[index] = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/isolated-candidate-{d}.txt", .{ tmp.sub_path, index });
+    }
+    defer for (roots, catalogs) |root, catalog| {
+        std.testing.allocator.free(root);
+        std.testing.allocator.free(catalog);
+    };
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
+        makeHostVoprConfig(1, 4300, roots[0], catalogs[0]),
+        makeHostVoprConfig(2, 4300, roots[1], catalogs[1]),
+        makeHostVoprConfig(3, 4300, roots[2], catalogs[2]),
+    };
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
+        makeHostVoprDeps(&factories[0]),
+        makeHostVoprDeps(&factories[1]),
+        makeHostVoprDeps(&factories[2]),
+    };
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4300, &configs, &deps);
+    defer cluster.deinit();
+    try cluster.startAll();
+    defer cluster.stopAll();
+    try cluster.virtual_network.partitionNode(1);
+    try cluster.virtual_network.partitionNode(2);
+    try cluster.bootstrapMetadataReplicas();
+    cluster.virtual_network.healNode(2);
+
+    try cluster.node(0).campaignMetadataGroup();
+    const isolated = cluster.cluster.node(0).raftStatus(4300) orelse return error.MissingRaftStatus;
+    try std.testing.expect(isolated.soft.role == .pre_candidate or isolated.soft.role == .candidate);
+    try std.testing.expect(cluster.currentMetadataLeaderIndex() == null);
+    try std.testing.expect(try cluster.campaignBestMetadataCandidate());
+    const reachable = cluster.cluster.node(1).raftStatus(4300) orelse return error.MissingRaftStatus;
+    try std.testing.expect(reachable.soft.role == .pre_candidate or reachable.soft.role == .candidate or reachable.soft.role == .leader);
+    try std.testing.expect((try cluster.waitForMetadataLeader(32)) != null);
 }
 
 test "metadata VOPR http cluster converges placement after candidate churn" {

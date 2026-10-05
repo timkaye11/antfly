@@ -35,6 +35,38 @@ components:
       - models_dir
       - input_roots
       - output_root
+    DeciderConfig:
+      type: object
+      additionalProperties: false
+      required: [provider]
+      properties:
+        provider:
+          type: string
+          enum: [antfly, jev]
+        model:
+          type: string
+          description: Required for Antfly; Jev defaults to jev-latest.
+        url:
+          type: string
+          description: Provider base URL; endpoint path is selected by provider.
+        api_key:
+          type: string
+          description: API key or secret reference. Defaults to the provider environment variable.
+        max_rows:
+          type: integer
+          minimum: 1
+          default: 10000
+        max_input_tokens:
+          type: integer
+          minimum: 1
+          default: 1000000
+        rate_limit:
+          $ref: "../shared/provider.yaml#/components/schemas/RateLimitConfig"
+        batch_size:
+          type: integer
+          minimum: 1
+          maximum: 256
+          default: 32
     SecretsConfig:
       type: object
       additionalProperties: false
@@ -131,6 +163,30 @@ components:
           type: string
           minLength: 1
           description: Literal path to an externally managed secret file. Never written by the API.
+    PgwireConfig:
+      type: object
+      description: Optional PostgreSQL wire listener. Requires authentication. Transactions remain unsupported. Remote bindings require externally protected transport.
+      properties:
+        enabled:
+          type: boolean
+          default: false
+        bind_host:
+          type: string
+          default: "127.0.0.1"
+        bind_port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          default: 5432
+        max_connections:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          default: 32
+        externally_protected_transport:
+          type: boolean
+          default: false
+          description: Acknowledges that a TLS proxy or authenticated private transport protects a non-loopback listener. Does not enable native TLS.
     Config:
       type: object
       properties:
@@ -155,6 +211,8 @@ components:
           $ref: "#/components/schemas/GraphExecutionConfig"
         mcp:
           $ref: "#/components/schemas/McpConfig"
+        pgwire:
+          $ref: "#/components/schemas/PgwireConfig"
         backup:
           $ref: "#/components/schemas/BackupConfig"
         secrets:
@@ -431,6 +489,11 @@ components:
               - generator_config:
                   provider: openai
                   model: gpt-4.1
+        deciders:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/DeciderConfig"
+          description: Named decision providers for ai_decide and convenience functions.
         rerankers:
           type: object
           additionalProperties:

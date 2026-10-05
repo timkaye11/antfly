@@ -36,6 +36,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const data_runtime_test_mod = options.data_runtime_test_mod;
     const data_storage_test_mod = options.data_storage_test_mod;
     const lib_data_runtime_default_filters = [_][]const u8{
+        "data runtime ordered artifact upload handoff",
+        "data runtime hosted FK retirement",
+        "pure topology control bypasses only ordinary dense repair writer preflight",
         "data ownership fallback requires a single store across all roles",
         "data relational maintenance yields to raft persistence and follows elections",
         "data runtime background worker capacity is reserved and closes with its owner",
@@ -58,21 +61,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "raft batch round trips merge replay identity with checkpoint",
         "raft batch round trips merge source transition",
         "raft batch round trips merge artifacts",
-        "db replicated merge artifacts",
+        // Ordered merge/split DB regressions run in the server storage gate.
         "db replicated merge checkpoints persist phase range and watermark across reopen",
-        "db replicated merge checkpoints keep rolled back receivers live across delayed controls and reopen",
-        "db terminal merge controls preserve a subsequent split across reopen",
-        "db physical lsm split retains parent merge receipts and clears child receipts across reopen",
         "lsm backend physical split preserves L0 overwrite and tombstone order",
-        "db merge receiver fences stale copies and retains retired transitions across reopen",
-        "db merge copy attempts fence delayed leaders before finalize across reopen",
         "data runtime health metrics include replay debt and provisioned warmup counters",
+        "data runtime kernel resource metrics",
         "data runtime status refresh publishes synthetic missing status for absent local group db",
         "data runtime local group status does not open roots owned by transitions",
         "data runtime local group status provider collects and caches group statuses",
         "data runtime storage ownership fingerprint excludes transient placement progress",
         "owned local group status refresh releases merged status lifecycle strings",
         "data runtime retries storage ownership invalidation before publishing fingerprint",
+        "data store registration rejects same-process physical root replacement",
+        "unconfirmed hidden initial placement cannot retire admitted ordinary replica",
         "data descriptor factory separates bootstrap voters from transport peers",
         "data descriptor factory restores persisted voters before metadata peer discovery",
         "data runtime remote admin snapshot clone owns parser-backed slices",
@@ -121,7 +122,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data raft document apply identity prevents non-idempotent restart replay",
         "data raft replica retirement removes only retired group apply state",
         "data raft apply records transaction conflicts without stopping replica progress",
-        "db raced replicated transaction completion persists receipt and participant acknowledgement",
         "data runtime structural changes preserve writer-published runtime status",
         "data runtime startup catch-up prefers cached admin snapshot",
         "data runtime startup catch-up clears dirty bit for terminal degraded index load",
@@ -149,6 +149,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "remote metadata catalog source provides compact routing",
         "remote metadata routing negotiation upgrades the N-1 adapter",
         "data runtime treats transient metadata failures as retryable bootstrap failures",
+        "DataServer store status retries leadership and socket failures on borrowed VoprIo",
         "data runtime retries incomplete split provisioning projections",
         "data runtime metadata bootstrap retry delay is bounded and jittered",
         "data runtime heartbeat cache cannot regress to an older full report",
@@ -175,10 +176,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data raft read safety deadline and cancellation cover owner lock admission",
         "data raft read safety barrier completes only after matching ReadState apply",
         "data raft native snapshot requires an install completion receipt",
+        "data runtime native FK retirement preserves source ownership and exact cold path",
         "data raft read safety barrier rejects pre-restart responses for both read paths",
         "data raft ticker advances consensus independently of control rounds",
+        "local raft admission leaves global metadata refresh to control",
+        "restore publication recovers a cold owner through Raft admission",
         "data raft stable placement refreshes changed peer transport endpoints",
         "raft batch round trips table batch payload",
+        "raft batch round trips guarded graph owner replay afterimages",
         "raft batch round trips deterministic transaction begin",
         "raft batch round trips deterministic storage owner descriptor",
         "raft batch round trips binary initial owner range",
@@ -186,12 +191,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "raft protocol barrier rejects unsupported future versions",
         "raft proposal materializes a default batch timestamp exactly once",
         "online merge admission distinguishes unsupported peers and fences leader authority",
+        "distributed online merge admission declines both owners and direct source proposals",
         "data raft raw topology rejection advances delegate with exact typed outcome",
         "raft batch protocol preflight fingerprint fences every applying replica set",
         "raft batch protocol plan resolves only current group applying peers",
         "raft batch protocol cache reuses only short lived negative evidence",
         "raft batch protocol activation is reusable only in its accepted leader term",
         "raft batch protocol activation cleanup preserves in flight references",
+        "data raft forwarding admission waits within the borrowed deadline and cancellation",
+        "data raft apply completion notifications fence reuse deadlines and bounded ownership",
         "data raft retry clock and sleep borrow VoprIo",
         "DataServer LSM maintenance cost port composes and heals on borrowed VoprIo",
         "production DataServer replicated merge actions run on VoprIo",
@@ -208,6 +216,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "system catalog write validation cache follows revisions and bounds admission",
         "system catalog peer publication avoids schema copies workload",
         "system catalog read peer refresh forwards cancellation and remaining transport budget",
+        "system catalog read peer miss refresh shares publication and preserves budgets",
+        "system catalog read peer miss refresh bounds retries and preserves warm routes on failure",
         "system catalog read peer routing honors expired and canceled admission budgets",
         "system catalog read peer routing retains healthy relocation views across publication and invalidation",
         "system catalog remote reads survive elections without skipping peers or extending budgets",
@@ -260,8 +270,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lib_data_runtime_tests = @import("linked_tests.zig").runPair(b, lib_data_runtime_tests, implementation_tests);
     const lib_data_runtime_test_step = b.step("antfly-data-runtime-test", "Run focused data runtime tests");
     lib_data_runtime_test_step.dependOn(&run_lib_data_runtime_tests.step);
+    const private_initial_owner_predicate_tests = b.addTest(.{
+        .name = "data-private-initial-owner-predicate-tests",
+        .root_module = options.data_implementation_module,
+        .filters = &.{"ordinary unpublished placement does not require a private initial FK owner snapshot"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-data-private-initial-owner-predicate-test", "Verify hidden initial-FK owner preflight excludes ordinary unpublished placements")
+        .dependOn(&addFilteredTestRunArtifact(b, private_initial_owner_predicate_tests).step);
 
     const lib_data_storage_default_filters = [_][]const u8{
+        "membership reducer",
+        "FK retirement worker",
+        "data raft online topology arbitration persists exact rejection and scopes release across reopen",
         // Regressions previously selected only by unit-test-progress.
         "split status decodes an omitted nullable source phase",
         "derive merge transition phases",
@@ -403,7 +424,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     return .{
         .consumer = lib_data_runtime_tests,
-        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{lib_data_runtime_tests.executable}) catch @panic("OOM"),
+        // The physical implementation suite also reaches the opaque owner
+        // clients through shared runtime tests. Link the same production
+        // provider archives as the consumer executable; keeping its physical
+        // source selection does not itself satisfy those extern symbols.
+        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ lib_data_runtime_tests.executable, implementation_tests }) catch @panic("OOM"),
         .run_lib_data_runtime_tests = run_lib_data_runtime_tests,
         .run_lib_data_storage_tests = run_lib_data_storage_tests,
     };

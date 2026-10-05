@@ -215,7 +215,7 @@ pub const Builder = struct {
         const in_shape = self.graph.node(input).output_shape;
         if (axis >= in_shape.rank()) return error.ShapeMismatch;
 
-        var out_dims: [shape_mod.max_rank]i64 = .{0} ** shape_mod.max_rank;
+        var out_dims: [shape_mod.max_rank]i64 = @splat(0);
         var out_rank: usize = 0;
         if (keepdims) {
             out_rank = in_shape.rank();
@@ -284,7 +284,7 @@ pub const Builder = struct {
         @memcpy(attrs.perm[0..perm.len], perm);
 
         const in_shape = self.graph.node(input).output_shape;
-        var out_dims: [shape_mod.max_rank]i64 = .{0} ** shape_mod.max_rank;
+        var out_dims: [shape_mod.max_rank]i64 = @splat(0);
         for (perm, 0..) |p, i| {
             out_dims[i] = in_shape.dims[p];
         }
@@ -791,6 +791,23 @@ pub const Builder = struct {
         return self.graph.addNode(.{ .op = .{ .fused_boundary_training_attention_v1 = attrs }, .output_shape = layout.savedShape(), .inputs = .{ qkv, mask, null_node, null_node }, .num_inputs = 2 });
     }
 
+    /// ModernBERT training attention over packed [Q;K;V] rows; see
+    /// `ModernBertTrainingAttentionAttrs`. The i32 control is nondifferentiable.
+    pub fn modernBertTrainingAttentionV1(self: *Builder, qkv: NodeId, control: NodeId, attrs: node_mod.ModernBertTrainingAttentionAttrs) !NodeId {
+        const layout = try attrs.layout();
+        for ([_]NodeId{ qkv, control }) |id|
+            if (id == null_node or id >= self.graph.nodes.items.len) return error.InvalidGraphDependency;
+        if (!self.graph.node(qkv).output_shape.eq(layout.qkvShape()) or !self.graph.node(control).output_shape.eq(layout.controlShape()))
+            return error.InvalidModernBertTrainingAttentionShape;
+        return self.graph.addNode(.{
+            .op = .{ .fused_modernbert_training_attention_v1 = attrs },
+            .output_shape = layout.outputShape(),
+            .inputs = .{ qkv, control, null_node, null_node },
+            .num_inputs = 2,
+            .vjp_alternate = null_node,
+        });
+    }
+
     /// Training-only tiled/replay attention. Integer control is immutable and
     /// nondifferentiable; its physical storage must remain i32 on all backends.
     pub fn debertaTrainingAttentionV1(
@@ -812,6 +829,32 @@ pub const Builder = struct {
             .output_shape = layout.outputShape(),
             .inputs = .{ qkv, relative, control, null_node },
             .num_inputs = 3,
+            .vjp_alternate = null_node,
+        });
+    }
+
+    /// Training-only tiled/replay segment attention (global, sliding-window
+    /// local, and tree-packed layers all reduce to this via `ranges`+
+    /// `window`; see `SegmentTrainingAttentionAttrs`). `control` is
+    /// immutable and nondifferentiable; its physical storage must remain
+    /// i32 on all backends.
+    pub fn segmentTrainingAttentionV1(
+        self: *Builder,
+        qkv: NodeId,
+        control: NodeId,
+        attrs: node_mod.SegmentTrainingAttentionAttrs,
+    ) !NodeId {
+        const layout = try attrs.layout();
+        for ([_]NodeId{ qkv, control }) |id|
+            if (id == null_node or id >= self.graph.nodes.items.len) return error.InvalidGraphDependency;
+        if (!self.graph.node(qkv).output_shape.eq(layout.qkvShape()) or
+            !self.graph.node(control).output_shape.eq(layout.controlShape()))
+            return error.InvalidSegmentTrainingAttentionShape;
+        return self.graph.addNode(.{
+            .op = .{ .fused_segment_training_attention_v1 = attrs },
+            .output_shape = layout.outputShape(),
+            .inputs = .{ qkv, control, null_node, null_node },
+            .num_inputs = 2,
             .vjp_alternate = null_node,
         });
     }

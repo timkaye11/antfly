@@ -7,7 +7,7 @@ const backend_erased = @import("../storage/backend_erased.zig");
 const mem_backend = @import("../storage/mem_backend.zig");
 const platform_sync = @import("antfly_platform").sync;
 const platform_time = @import("antfly_platform").time;
-const runtime_error_abi = @import("../runtime_error_abi.zig");
+const runtime_error_abi = @import("antfly_runtime_abi").error_abi;
 const runtime_memory_abi = @import("runtime_memory_abi");
 
 const key_prefix = "\x00\x00__api_restore_jobs__:";
@@ -49,7 +49,7 @@ fn restoreRetryDelayMs(job_id: u64, attempt_id: u64) u64 {
 }
 
 pub const Scope = enum { table, cluster };
-pub const SourceKind = enum { table_snapshot, cluster_cohort, schema_rewrite };
+pub const SourceKind = enum { table_snapshot, cluster_cohort, schema_rewrite, empty_generation };
 pub const Phase = enum { queued, running, succeeded, failed, cancelled };
 pub const AttemptState = enum { active, cancelled, fenced };
 pub const StagingResolution = enum { active, published, canceled };
@@ -140,6 +140,7 @@ pub const StartRequest = struct {
     /// Private compound admission; stored in metadata's staging journal, not
     /// duplicated into the compact public job record.
     rewrite_plan_json: ?[]const u8 = null,
+    generation_plan_json: ?[]const u8 = null,
 };
 
 pub const ListBatch = struct {
@@ -159,7 +160,7 @@ pub const OpenedStore = struct {
     docstore: *docstore_mod.DocStore,
 
     pub fn open(alloc: std.mem.Allocator, path: []const u8) !OpenedStore {
-        const path_z = try alloc.dupeZ(u8, path);
+        const path_z = try alloc.dupeSentinel(u8, path, 0);
         errdefer alloc.free(path_z);
         const docstore = try alloc.create(docstore_mod.DocStore);
         errdefer alloc.destroy(docstore);
@@ -982,6 +983,13 @@ pub const Store = struct {
     /// Unknown admission retains the proposed identity. It must never enter
     /// the dispatch queue until a durable conditional create is confirmed.
     pub fn startRecoverable(self: *Store, alloc: std.mem.Allocator, request: StartRequest) !Admission {
+        return self.startRecoverableGuarded(alloc, request, true);
+    }
+
+    /// A feature gate may reject only a NEW job. Exact idempotent retries and
+    /// destination reauthorization retain their existing durable outcome;
+    /// checking here under the store mutex avoids a probe/insert race.
+    pub fn startRecoverableGuarded(self: *Store, alloc: std.mem.Allocator, request: StartRequest, allow_new: bool) !Admission {
         var req = request;
         var generated_key_buf: [37]u8 = undefined;
         if (req.idempotency_key == null) {
@@ -1007,7 +1015,7 @@ pub const Store = struct {
         self.lock();
         defer self.mutex.unlock();
         const now_for_prune = nowMillis();
-        if (req.source_kind == .schema_rewrite and self.replicated == null) return error.AsyncRestoreUnavailable;
+        if ((req.source_kind == .schema_rewrite or req.source_kind == .empty_generation) and self.replicated == null) return error.AsyncRestoreUnavailable;
         if (now_for_prune >= self.next_prune_at_ms) {
             const more_expired = try self.pruneExpiredLocked(now_for_prune, restore_job_prune_batch_size);
             self.next_prune_at_ms = if (more_expired) now_for_prune else now_for_prune +| restore_job_prune_interval_ms;
@@ -1091,6 +1099,8 @@ pub const Store = struct {
             }
         }
 
+        if (!allow_new) return error.RestoreNewAdmissionGuarded;
+
         const now = nowMillis();
         const job_id = admissionJobId(explicit_map_key.?);
         // A truncated-hash collision must fail closed, never overwrite a job.
@@ -1109,8 +1119,8 @@ pub const Store = struct {
             .enqueue_sequence = enqueue_sequence,
             .dispatch_sequence = dispatch_sequence,
             .not_before_ms = now,
-            .attempt_id = if (req.source_kind == .schema_rewrite) 1 else 0,
-            .staging_attempt_id = if (req.source_kind == .schema_rewrite) 1 else 0,
+            .attempt_id = if (req.source_kind == .schema_rewrite or req.source_kind == .empty_generation) 1 else 0,
+            .staging_attempt_id = if (req.source_kind == .schema_rewrite or req.source_kind == .empty_generation) 1 else 0,
             .scope = req.scope,
             .source_kind = req.source_kind,
             .table_name = req.table_name,
@@ -1150,7 +1160,7 @@ pub const Store = struct {
             var retired_expired = false;
             while (true) {
                 self.fencePersistenceLocked(job_id);
-                const committed = (if (req.rewrite_plan_json) |plan|
+                const committed = (if (req.generation_plan_json orelse req.rewrite_plan_json) |plan|
                     replicated.createWithStaging(alloc, key, encoded, plan, self.replicated_leadership_term)
                 else
                     replicated.create(alloc, key, encoded, self.replicated_leadership_term)) catch
@@ -1292,7 +1302,7 @@ pub const Store = struct {
         defer parsed.deinit();
         if (parsed.value.phase != .running or parsed.value.attempt_id != attempt_id or parsed.value.staging_attempt_id == 0 or parsed.value.staging_resolution != .active) return error.RestoreJobFenced;
         const previous = parsed.value.rewrite_progress;
-        if (@intFromEnum(progress.phase) < @intFromEnum(previous.phase) or (progress.phase == previous.phase and
+        if (@backingInt(progress.phase) < @backingInt(previous.phase) or (progress.phase == previous.phase and
             (progress.round < previous.round or (progress.round == previous.round and progress.owner < previous.owner)))) return error.RestoreJobCheckpointOrder;
         return self.updateLocked(alloc, parsed.value, .{ .phase = .running, .rewrite_progress = progress });
     }
@@ -1409,7 +1419,11 @@ pub const Store = struct {
     /// Recover a lost admission response before consulting source eligibility:
     /// an already admitted pin correctly makes a fresh source admission busy.
     pub fn existingRewriteAdmission(self: *Store, alloc: std.mem.Allocator, req: StartRequest) !?[]u8 {
-        if (req.source_kind != .schema_rewrite) return error.InvalidRestoreJobScope;
+        return self.existingGenerationAdmission(alloc, req);
+    }
+
+    pub fn existingGenerationAdmission(self: *Store, alloc: std.mem.Allocator, req: StartRequest) !?[]u8 {
+        if (req.source_kind != .schema_rewrite and req.source_kind != .empty_generation) return error.InvalidRestoreJobScope;
         const key = req.idempotency_key orelse return null;
         const id = try jobIdForIdempotency(alloc, req.idempotency_namespace, key);
         const encoded = (try self.load(alloc, id)) orelse return null;
@@ -1674,6 +1688,24 @@ pub const Store = struct {
             return pending.not_before_ms -| now_ms;
         }
         return null;
+    }
+
+    /// Owner/topology progress releases cooperative waits only. Durable failure
+    /// backoff and retained history are untouched; this is a queue operation,
+    /// not a new scheduling state or a persistence write.
+    pub fn wakeCooperativeContinuations(self: *Store) void {
+        self.lock();
+        defer self.mutex.unlock();
+        var changed = false;
+        for (self.pending.items[self.pending_head..]) |*pending| {
+            const continuation = self.continuations.getPtr(pending.job_id) orelse continue;
+            if (pending.dispatch_sequence != continuation.pending.dispatch_sequence) continue;
+            if (pending.not_before_ms == 0) continue;
+            pending.not_before_ms = 0;
+            continuation.pending.not_before_ms = 0;
+            changed = true;
+        }
+        if (changed) std.mem.sort(PendingJob, self.pending.items[self.pending_head..], {}, pendingJobLessThan);
     }
 
     pub fn requeuePending(self: *Store, job_id: u64) !void {
@@ -2434,8 +2466,10 @@ pub const Store = struct {
 };
 
 fn validateStartRequest(req: StartRequest) !void {
-    if ((req.source_kind == .schema_rewrite) != (req.rewrite_plan_json != null)) return error.InvalidRestoreJobScope;
-    if (req.source_kind == .schema_rewrite and (req.scope != .cluster or !std.mem.eql(u8, req.restore_mode, "overwrite"))) return error.InvalidRestoreJobScope;
+    if (req.rewrite_plan_json != null and req.generation_plan_json != null) return error.InvalidRestoreJobScope;
+    if ((req.source_kind == .schema_rewrite or req.source_kind == .empty_generation) != (req.rewrite_plan_json != null or req.generation_plan_json != null)) return error.InvalidRestoreJobScope;
+    if (req.source_kind == .empty_generation and req.generation_plan_json == null) return error.InvalidRestoreJobScope;
+    if ((req.source_kind == .schema_rewrite or req.source_kind == .empty_generation) and (req.scope != .cluster or !std.mem.eql(u8, req.restore_mode, "overwrite"))) return error.InvalidRestoreJobScope;
     if (req.backup_id.len == 0 or req.backup_id.len > max_restore_string_bytes or
         req.location.len == 0 or req.location.len > max_restore_string_bytes or
         req.connection.len == 0 or req.connection.len > max_restore_string_bytes or
@@ -2799,6 +2833,7 @@ fn requestFingerprintAlloc(alloc: std.mem.Allocator, req: StartRequest) ![]u8 {
     // the new shared-cohort admission from an otherwise identical request.
     if (req.source_kind == .cluster_cohort) hash.update("antfly:restore:cluster-cohort:v1\x00");
     if (req.source_kind == .schema_rewrite) hash.update("antfly:restore:schema-rewrite:v1\x00");
+    if (req.source_kind == .empty_generation) hash.update("antfly:restore:empty-generation:v1\x00");
     hash.update(canonical);
     hash.final(&digest);
     const hex = std.fmt.bytesToHex(digest, .lower);
@@ -2856,6 +2891,34 @@ fn jobKey(alloc: std.mem.Allocator, job_id: u64) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{s}{x:0>16}", .{ key_prefix, job_id });
 }
 
+test "restore admission gate rejects new jobs but retains exact idempotent outcomes" {
+    const alloc = std.testing.allocator;
+    var store = Store.initWithIo(alloc, std.testing.io);
+    defer store.deinit();
+    const request: StartRequest = .{
+        .scope = .cluster,
+        .backup_id = "cohort",
+        .location = "file:///backup",
+        .connection = "test-backups",
+        .idempotency_namespace = "restore:cluster",
+        .idempotency_key = "same-request",
+    };
+    try std.testing.expectError(error.RestoreNewAdmissionGuarded, store.startRecoverableGuarded(alloc, request, false));
+    try std.testing.expectEqual(@as(usize, 0), store.jobs.count());
+    const first = try store.startRecoverableGuarded(alloc, request, true);
+    try std.testing.expect(first == .accepted);
+    defer alloc.free(first.accepted);
+    const repeated = try store.startRecoverableGuarded(alloc, request, false);
+    try std.testing.expect(repeated == .accepted);
+    defer alloc.free(repeated.accepted);
+    try std.testing.expectEqualStrings(first.accepted, repeated.accepted);
+    try std.testing.expectEqual(@as(usize, 1), store.jobs.count());
+    var changed = request;
+    changed.backup_id = "different";
+    try std.testing.expectError(error.IdempotencyConflict, store.startRecoverableGuarded(alloc, changed, false));
+    try std.testing.expectEqual(@as(usize, 1), store.jobs.count());
+}
+
 pub fn jobIdForIdempotency(alloc: std.mem.Allocator, namespace: []const u8, key: []const u8) !u64 {
     const map_key = try idempotencyMapKeyAlloc(alloc, namespace, key);
     defer alloc.free(map_key);
@@ -2897,7 +2960,7 @@ const TestReplicatedPersistence = struct {
         return .{ .alloc = alloc };
     }
 
-    fn deinit(self: *TestReplicatedPersistence) void {
+    pub fn deinit(self: *TestReplicatedPersistence) void {
         var it = self.rows.iterator();
         while (it.next()) |entry| {
             self.alloc.free(entry.key_ptr.*);
@@ -3062,78 +3125,81 @@ test "restore jobs compound staging persistence transports plan separately and f
 }
 
 test "restore jobs compound staging persistence schema rewrite admission survives lost reply and rejects changed requests" {
-    const alloc = std.testing.allocator;
-    const Fixture = struct {
-        fn create(ptr: *anyopaque, a: std.mem.Allocator, key: []const u8, value: []const u8, plan: []const u8, term: u64) ![]u8 {
-            const self: *TestReplicatedPersistence = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqualStrings("separately-validated-staging-plan", plan);
-            self.compound_create_calls += 1;
-            return TestReplicatedPersistence.create(ptr, a, key, value, term);
-        }
-    };
-    var persistence = TestReplicatedPersistence.init(alloc);
-    defer persistence.deinit();
-    const adapter = ReplicatedPersistence.fromLocal(&persistence, .{
-        .create_with_staging = Fixture.create,
-        .load = TestReplicatedPersistence.load,
-        .get = TestReplicatedPersistence.get,
-        .put = TestReplicatedPersistence.put,
-        .delete = TestReplicatedPersistence.delete,
-        .delete_many = TestReplicatedPersistence.deleteMany,
-    });
-    const req: StartRequest = .{
-        .scope = .cluster,
-        .source_kind = .schema_rewrite,
-        .backup_id = "schema-digest",
-        .location = "metadata://schema-rewrite",
-        .connection = "internal",
-        .restore_mode = "overwrite",
-        .table_names = &.{"child"},
-        .idempotency_namespace = "basic:operator:schema:child",
-        .idempotency_key = "rewrite-1",
-        .rewrite_plan_json = "separately-validated-staging-plan",
-    };
-    var store = Store.initWithIo(alloc, std.testing.io);
-    defer store.deinit();
-    try store.attachReplicated(adapter);
-    persistence.timeout_after_new_create = true;
-    const first = try store.startRecoverable(alloc, req);
-    try std.testing.expect(first == .unknown);
-    defer alloc.free(first.unknown);
-    try std.testing.expectEqual(@as(usize, 1), persistence.compound_create_calls);
+    for ([_]SourceKind{ .schema_rewrite, .empty_generation }) |kind| {
+        const alloc = std.testing.allocator;
+        const Fixture = struct {
+            fn create(ptr: *anyopaque, a: std.mem.Allocator, key: []const u8, value: []const u8, plan: []const u8, term: u64) ![]u8 {
+                const self: *TestReplicatedPersistence = @ptrCast(@alignCast(ptr));
+                try std.testing.expectEqualStrings("separately-validated-staging-plan", plan);
+                self.compound_create_calls += 1;
+                return TestReplicatedPersistence.create(ptr, a, key, value, term);
+            }
+        };
+        var persistence = TestReplicatedPersistence.init(alloc);
+        defer persistence.deinit();
+        const adapter = ReplicatedPersistence.fromLocal(&persistence, .{
+            .create_with_staging = Fixture.create,
+            .load = TestReplicatedPersistence.load,
+            .get = TestReplicatedPersistence.get,
+            .put = TestReplicatedPersistence.put,
+            .delete = TestReplicatedPersistence.delete,
+            .delete_many = TestReplicatedPersistence.deleteMany,
+        });
+        const req: StartRequest = .{
+            .scope = .cluster,
+            .source_kind = kind,
+            .backup_id = "schema-digest",
+            .location = "metadata://schema-rewrite",
+            .connection = "internal",
+            .restore_mode = "overwrite",
+            .table_names = &.{"child"},
+            .idempotency_namespace = "basic:operator:schema:child",
+            .idempotency_key = "rewrite-1",
+            .rewrite_plan_json = if (kind == .schema_rewrite) "separately-validated-staging-plan" else null,
+            .generation_plan_json = if (kind == .empty_generation) "separately-validated-staging-plan" else null,
+        };
+        var store = Store.initWithIo(alloc, std.testing.io);
+        defer store.deinit();
+        try store.attachReplicated(adapter);
+        persistence.timeout_after_new_create = true;
+        const first = try store.startRecoverable(alloc, req);
+        try std.testing.expect(first == .unknown);
+        defer alloc.free(first.unknown);
+        try std.testing.expectEqual(@as(usize, 1), persistence.compound_create_calls);
 
-    // A fresh coordinator can recover the durable first row before probing
-    // sources whose already-admitted pins now reject fresh admission.
-    var reopened = Store.initWithIo(alloc, std.testing.io);
-    defer reopened.deinit();
-    try reopened.attachReplicated(adapter);
-    const recovered = (try reopened.existingRewriteAdmission(alloc, req)).?;
-    defer alloc.free(recovered);
-    const parsed = try std.json.parseFromSlice(JobState, alloc, recovered, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqual(Phase.queued, parsed.value.phase);
-    try std.testing.expectEqual(SourceKind.schema_rewrite, parsed.value.source_kind);
-    try std.testing.expectEqual(@as(u64, 1), parsed.value.attempt_id);
-    try std.testing.expectEqual(@as(u64, 1), parsed.value.staging_attempt_id);
-    const repeated = try reopened.startRecoverable(alloc, req);
-    try std.testing.expect(repeated == .accepted);
-    defer alloc.free(repeated.accepted);
-    try std.testing.expectEqualStrings(recovered, repeated.accepted);
-    try std.testing.expectEqual(@as(usize, 1), persistence.compound_create_calls);
-    var changed = req;
-    changed.backup_id = "changed-schema-digest";
-    try std.testing.expectError(error.IdempotencyConflict, reopened.existingRewriteAdmission(alloc, changed));
-    try std.testing.expectError(error.IdempotencyConflict, reopened.startRecoverable(alloc, changed));
+        // A fresh coordinator can recover the durable first row before probing
+        // sources whose already-admitted pins now reject fresh admission.
+        var reopened = Store.initWithIo(alloc, std.testing.io);
+        defer reopened.deinit();
+        try reopened.attachReplicated(adapter);
+        const recovered = (try reopened.existingRewriteAdmission(alloc, req)).?;
+        defer alloc.free(recovered);
+        const parsed = try std.json.parseFromSlice(JobState, alloc, recovered, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(Phase.queued, parsed.value.phase);
+        try std.testing.expectEqual(kind, parsed.value.source_kind);
+        try std.testing.expectEqual(@as(u64, 1), parsed.value.attempt_id);
+        try std.testing.expectEqual(@as(u64, 1), parsed.value.staging_attempt_id);
+        const repeated = try reopened.startRecoverable(alloc, req);
+        try std.testing.expect(repeated == .accepted);
+        defer alloc.free(repeated.accepted);
+        try std.testing.expectEqualStrings(recovered, repeated.accepted);
+        try std.testing.expectEqual(@as(usize, 1), persistence.compound_create_calls);
+        var changed = req;
+        changed.backup_id = "changed-schema-digest";
+        try std.testing.expectError(error.IdempotencyConflict, reopened.existingRewriteAdmission(alloc, changed));
+        try std.testing.expectError(error.IdempotencyConflict, reopened.startRecoverable(alloc, changed));
 
-    var ordinary = TestReplicatedPersistence.init(alloc);
-    defer ordinary.deinit();
-    var unsupported = Store.initWithIo(alloc, std.testing.io);
-    defer unsupported.deinit();
-    try unsupported.attachReplicated(ordinary.persistence());
-    const absent = try unsupported.startRecoverable(alloc, req);
-    try std.testing.expect(absent == .unknown);
-    defer alloc.free(absent.unknown);
-    try std.testing.expectEqual(@as(u32, 0), ordinary.rows.count());
+        var ordinary = TestReplicatedPersistence.init(alloc);
+        defer ordinary.deinit();
+        var unsupported = Store.initWithIo(alloc, std.testing.io);
+        defer unsupported.deinit();
+        try unsupported.attachReplicated(ordinary.persistence());
+        const absent = try unsupported.startRecoverable(alloc, req);
+        try std.testing.expect(absent == .unknown);
+        defer alloc.free(absent.unknown);
+        try std.testing.expectEqual(@as(u32, 0), ordinary.rows.count());
+    }
 }
 
 test "failed destination authorization refresh reuses the idempotent restore job" {
@@ -3851,6 +3917,15 @@ test "restore cooperative continuations preserve checkpoints without replicated 
     const pending = try store.takePendingIds(alloc, 1);
     defer alloc.free(pending);
     try std.testing.expectEqual(@as(usize, 0), pending.len);
+
+    const progress_writes = persistence.put_calls;
+    store.wakeCooperativeContinuations();
+    try std.testing.expectEqual(@as(?u64, 0), store.nextPendingDelayMs());
+    const notified = try store.takePendingIds(alloc, 1);
+    defer alloc.free(notified);
+    try std.testing.expectEqualSlices(u64, &.{job_id}, notified);
+    try std.testing.expectEqual(progress_writes, persistence.put_calls);
+    try store.requeuePending(job_id);
 
     // A lost process drops only the volatile timer. Leadership reconstruction
     // requeues the durable running job, retaining progress and fencing its token.

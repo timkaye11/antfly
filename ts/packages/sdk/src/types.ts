@@ -153,6 +153,19 @@ export interface WriteOptions {
   signal?: AbortSignal;
 }
 
+// SQL types. Integer result values are exact decimal strings.
+export type SQLRequest = components["schemas"]["SQLRequest"];
+export type SQLConnectionOpenRequest = components["schemas"]["SQLConnectionOpenRequest"];
+export type SQLConnectionResponse = components["schemas"]["SQLConnectionResponse"];
+export type SQLPrepareRequest = components["schemas"]["SQLPrepareRequest"];
+export type SQLPreparedExecutionRequest = components["schemas"]["SQLPreparedExecutionRequest"];
+export type SQLPreparedResponse = components["schemas"]["SQLPreparedResponse"];
+export type SQLResponse = components["schemas"]["SQLResponse"];
+export type SQLColumn = components["schemas"]["SQLColumn"];
+export type SQLColumnType = components["schemas"]["SQLColumnType"];
+export type SQLDiagnostic = components["schemas"]["SQLDiagnostic"];
+export type SQLMutationOutcome = components["schemas"]["SQLMutationOutcome"];
+
 // Table types
 export type Table = components["schemas"]["Table"];
 export type CommittedMutationOutcome = components["schemas"]["CommittedMutationOutcome"];
@@ -669,6 +682,9 @@ export interface QueryOptions {
   aggregations?: Record<string, AggregationRequest>;
 }
 
+export type GraphRelationshipFilter = components["schemas"]["GraphRelationshipFilter"];
+export type GraphRelationshipPropertyPredicate =
+  components["schemas"]["GraphRelationshipPropertyPredicate"];
 // System catalog resources and lifecycle requests.
 export type DatabaseCatalogRecord = components["schemas"]["DatabaseCatalogRecord"];
 export type NamespaceCatalogRecord = components["schemas"]["NamespaceCatalogRecord"];

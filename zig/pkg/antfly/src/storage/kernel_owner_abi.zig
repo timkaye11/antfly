@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 65;
+pub const abi_version: u32 = 75;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -413,6 +413,39 @@ pub const ContextMetricsResult = extern struct {
     lsm_run_table_index: ContextCacheKindStats = .{},
     lsm_run_table_block: ContextCacheKindStats = .{},
     lsm_run_table_physical_block: ContextCacheKindStats = .{},
+    /// The context's ResourceManager is the ledger storage owners charge.
+    /// Slices are indexed by the manager's slice ordinal.
+    resource_memory: ContextResourceBudgetStats = .{},
+    resource_slice_count: u32 = 0,
+    resource_slices: [context_resource_slice_capacity]ContextResourceBudgetStats = @splat(ContextResourceBudgetStats{}),
+};
+
+pub const context_resource_slice_capacity: usize = 64;
+
+pub const ContextResourceBudgetStats = extern struct {
+    used_bytes: u64 = 0,
+    peak_bytes: u64 = 0,
+    soft_limit_bytes: u64 = 0,
+    hard_limit_bytes: u64 = 0,
+    soft_limit_events: u64 = 0,
+    hard_limit_rejections: u64 = 0,
+    oversized_single_grants: u64 = 0,
+    accounting_errors: u64 = 0,
+
+    /// Project aggregate or slice counters without importing the storage
+    /// implementation across this ABI. Inapplicable counters remain zero.
+    pub fn fromResourceStats(stats: anytype) ContextResourceBudgetStats {
+        return .{
+            .used_bytes = stats.used_bytes,
+            .peak_bytes = stats.peak_bytes,
+            .soft_limit_bytes = stats.soft_limit_bytes,
+            .hard_limit_bytes = stats.hard_limit_bytes,
+            .soft_limit_events = stats.soft_limit_events,
+            .hard_limit_rejections = stats.hard_limit_rejections,
+            .oversized_single_grants = if (@hasField(@TypeOf(stats), "oversized_single_grants")) stats.oversized_single_grants else 0,
+            .accounting_errors = if (@hasField(@TypeOf(stats), "accounting_errors")) stats.accounting_errors else 0,
+        };
+    }
 };
 
 /// Process-owned data-Raft apply/projection store. Requests are deliberately
@@ -438,6 +471,8 @@ pub const MetadataApplyOpenRequest = extern struct {
     _reserved0: u16 = 0,
     context: ?*anyopaque = null,
     root_dir: BorrowedBytes = .{},
+    /// Existing process-owned durable system keyspace. Retained by the callee.
+    system_store: ?*anyopaque = null,
 };
 
 pub const MetadataApplyBatchRequest = extern struct {
@@ -515,6 +550,10 @@ pub const MetadataProjectionKind = enum(u32) {
     verify_table_create_projection = 39,
     system_catalog = 41,
     backup_cohort = 63,
+    /// Abort-only validation of a proposed initial-FK Raft command.
+    fk_initial_create_preflight = 64,
+    /// Exact immutable hidden-owner reservation; absent is an ordinary group.
+    fk_initial_group_reservation = 65,
     backup_cohort_progress = 43,
     backup_cohorts = 44,
     restore_staging_job = 45,
@@ -715,6 +754,7 @@ pub const DataApplyProjectionKind = enum(u32) {
     current_merge_receiver = 6,
     group_state_keys_page = 7,
     topology_rejection = 8,
+    merge_membership = 9,
 };
 
 /// One bounded projection read. Fields unused by `kind` must remain zero.
@@ -856,6 +896,13 @@ pub const TransactionRecoveryAcknowledgeFn = *const fn (
     BorrowedBytes,
     BorrowedBytes,
 ) callconv(.c) Status;
+pub const TransactionRecoveryAcknowledgeManyFn = *const fn (
+    ?*anyopaque,
+    *const TxnId,
+    BorrowedBytes,
+    ?[*]const BorrowedBytes,
+    usize,
+) callconv(.c) Status;
 pub const TransactionRecoveryCleanupFn = *const fn (
     ?*anyopaque,
     *const TxnId,
@@ -879,6 +926,7 @@ pub const TransactionRecoveryConfig = extern struct {
     resolve_participant_fn: ?TransactionRecoveryResolveFn = null,
     owns_recovery_fn: ?TransactionRecoveryOwnsFn = null,
     acknowledge_participant_fn: ?TransactionRecoveryAcknowledgeFn = null,
+    acknowledge_participants_fn: ?TransactionRecoveryAcknowledgeManyFn = null,
     cleanup_transaction_fn: ?TransactionRecoveryCleanupFn = null,
 };
 
@@ -978,6 +1026,10 @@ pub const CoordinatedTtlRequest = extern struct {
 pub const CoordinatedTtlEnqueueFn = *const fn (?*anyopaque, *const CoordinatedTtlRequest) callconv(.c) u8;
 
 pub const RuntimeHooksConfig = extern struct {
+    artifact_publication_ctx: ?*anyopaque = null,
+    /// Zero means queue admission only. Native producers must observe their
+    /// durable receipt before reporting output or coverage as complete.
+    artifact_publication_enqueue_fn: ?*const fn (?*anyopaque, u64, *const [24]u8, BorrowedBytes) callconv(.c) Status = null,
     native_authority_ctx: ?*const anyopaque = null,
     native_authority_fn: ?NativeAuthorityFn = null,
     resolution_candidates: ResolutionCandidateConfig = .{},
@@ -1046,6 +1098,7 @@ pub const OpenRequest = extern struct {
     /// Exact private metadata-authorized hidden owner bootstrap. Never set by
     /// ordinary public catalog opens; durable scope is checked before adoption.
     restore_bootstrap_json: BorrowedBytes = .{},
+    initial_child_bootstrap_json: BorrowedBytes = .{},
     restore_cancel_recovery: u8 = 0,
     restore_ha_replay: u8 = 0,
     /// Immutable native ownership domain; not inferred from the first row or
@@ -1054,6 +1107,9 @@ pub const OpenRequest = extern struct {
     /// This owner is being opened to apply an entry whose catalog descriptor
     /// may predate the configuration already persisted by this replica.
     historical_raft_apply: u8 = 0,
+    /// Optional result: the physical owner opened for exact topology control
+    /// while current-catalog index reconciliation remains fence-deferred.
+    owner_catalog_deferred_out: ?*u8 = null,
     _restore_reserved: [4]u8 = @splat(0),
     target_observer: TargetObserver = .{},
     transaction_recovery: TransactionRecoveryConfig = .{},
@@ -1063,6 +1119,11 @@ pub const OpenRequest = extern struct {
     initial_range_end: BorrowedBytes = .{},
     initial_range_control: ControlledJsonOperationRequest = .{},
     restore: RestoreAdmission = .{},
+    /// Immutable owner-local verifier for authenticated, statement-scoped
+    /// row-policy principal proofs. Absent for Lite and legacy runtimes, which
+    /// must reject active-policy reads and writes rather than assume a role.
+    row_policy_authority_secret: BorrowedBytes = .{},
+    row_policy_authority_issuer: BorrowedBytes = .{},
 };
 
 pub const JsonOperationRequest = extern struct {
@@ -1084,6 +1145,30 @@ pub const ReplicatedBatchAtRaftEntryRequest = extern struct {
     raft_index: u64 = 0,
 };
 
+/// Metadata-authorized hidden-child control on a native owner. This is a
+/// local operation receipt, never a data-Raft entry or source watermark.
+pub const NativeInitialChildControlRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    table_name: BorrowedBytes = .{},
+    request_json: BorrowedBytes = .{},
+    operation_term: u64 = 0,
+    operation_index: u64 = 0,
+};
+
+pub const NativeFkGenerationControlRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    table_name: BorrowedBytes = .{},
+    request_json: BorrowedBytes = .{},
+};
+
+pub extern fn antfly_storage_owner_native_fk_generation_control_json(
+    owner: ?*anyopaque,
+    request: *const NativeFkGenerationControlRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
 /// Complete offline HA-seed operations that must remain beside physical DB
 /// restore/validation code. Values are append-only because they are recorded
 /// in `FailureIdentity.operation` for cross-unit diagnostics.
@@ -1096,7 +1181,7 @@ pub const HASeedOperation = enum(u32) {
 /// Private owner discovery is physical metadata, not public catalog routing.
 pub const HiddenRestoreRequest = extern struct {
     version: u32 = abi_version,
-    operation: enum(u32) { read_bootstrap = 0, capture_snapshot = 1, capture_public_snapshot = 2 },
+    operation: enum(u32) { read_bootstrap = 0, capture_snapshot = 1, capture_public_snapshot = 2, read_initial_child = 3, cancel_initial_child_retirement = 4 },
     context: ?*anyopaque = null,
     path: BorrowedBytes = .{},
     table_name: BorrowedBytes = .{},
@@ -1259,7 +1344,7 @@ pub const MaintenanceAction = enum(u32) {
 
 pub const MaintenanceRequest = extern struct {
     version: u32 = abi_version,
-    action: u32 = @intFromEnum(MaintenanceAction.inspect),
+    action: u32 = @backingInt(MaintenanceAction.inspect),
     table_name: BorrowedBytes = .{},
     deadline_ns: u64 = 0,
     snapshot_token: BorrowedBytes = .{},
@@ -1347,7 +1432,7 @@ pub const SyncRequest = extern struct {
     cancellation_ctx: ?*anyopaque = null,
     cancellation_fn: ?CancellationCheckFn = null,
     version: u32 = abi_version,
-    sync_level: u32 = @intFromEnum(SyncLevel.write),
+    sync_level: u32 = @backingInt(SyncLevel.write),
     table_name: BorrowedBytes = .{},
 };
 
@@ -1382,7 +1467,7 @@ pub const BackupFormat = enum(u32) {
 /// all byte slices are borrowed only for this synchronous operation.
 pub const BackupRequest = extern struct {
     version: u32 = abi_version,
-    format: u32 = @intFromEnum(BackupFormat.native),
+    format: u32 = @backingInt(BackupFormat.native),
     table_name: BorrowedBytes = .{},
     backup_root: BorrowedBytes = .{},
     backup_id: BorrowedBytes = .{},
@@ -1538,7 +1623,7 @@ pub const CancellationCheckFn = *const fn (?*anyopaque) callconv(.c) u8;
 /// Cancellation is borrowed for the synchronous call and is never retained.
 pub const ArtifactOperationRequest = extern struct {
     version: u32 = abi_version,
-    operation: u32 = @intFromEnum(ArtifactOperation.reprocess_document),
+    operation: u32 = @backingInt(ArtifactOperation.reprocess_document),
     table_name: BorrowedBytes = .{},
     request_json: BorrowedBytes = .{},
     cancellation_ctx: ?*anyopaque = null,
@@ -1873,6 +1958,12 @@ pub extern fn antfly_storage_owner_replicated_batch_at_raft_entry_json(
     out_response: *OwnedBytes,
 ) callconv(.c) Status;
 
+pub extern fn antfly_storage_owner_native_initial_child_control_json(
+    owner: ?*anyopaque,
+    request: *const NativeInitialChildControlRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
 pub extern fn antfly_storage_owner_transaction_status(
     owner: ?*anyopaque,
     request: *const TransactionStatusRequest,
@@ -1884,7 +1975,7 @@ pub extern fn antfly_storage_owner_wait_for_sync(
     request: *const SyncRequest,
 ) callconv(.c) Status;
 
-pub extern fn antfly_storage_owner_apply_ha_replication_record(
+pub extern fn antfly_storage_owner_apply_hot_standby_replication_record(
     owner: ?*anyopaque,
     request: *const HAReplicationRecordRequest,
 ) callconv(.c) Status;
@@ -2198,6 +2289,11 @@ pub extern fn antfly_storage_owner_relational_transition_read(
     out_result: *OwnedBytes,
 ) callconv(.c) Status;
 pub extern fn antfly_storage_owner_merge_artifacts_page(
+    owner: ?*anyopaque,
+    request: *const MergeArtifactsPageRequest,
+    out_result: *OwnedBytes,
+) callconv(.c) Status;
+pub extern fn antfly_storage_owner_merge_cleanup_keys_page(
     owner: ?*anyopaque,
     request: *const MergeArtifactsPageRequest,
     out_result: *OwnedBytes,

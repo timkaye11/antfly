@@ -26,6 +26,8 @@ pub const State = struct {
     version: u8 = 1,
     revision: u64 = 1,
     scope: source.Scope,
+    artifact_catalog: ?@import("../storage/db/artifact_inventory.zig").Binding = null,
+    receiver_artifact_catalog: ?@import("../storage/db/artifact_inventory.zig").Binding = null,
     phase: Phase = .admit,
     certificate: ?snapshot.Certificate = null,
     acknowledged: u64 = 0,
@@ -45,6 +47,8 @@ pub const State = struct {
     pub fn validate(self: State) !void {
         try self.scope.validate();
         if (self.version != 1 or self.revision == 0) return error.InvalidOnlineMergeState;
+        if (self.artifact_catalog) |binding| if (!binding.valid()) return error.InvalidOnlineMergeState;
+        if (self.receiver_artifact_catalog) |binding| if (binding.epoch == 0 or self.artifact_catalog == null or !binding.compatible(self.artifact_catalog.?)) return error.InvalidOnlineMergeState;
         if (self.certificate) |certificate| {
             _ = try certificate.encode();
             if (!certificate.cut.namespace.eql(self.scope.fence.namespace) or self.acknowledged < certificate.cut.retained_start)
@@ -73,7 +77,7 @@ pub const State = struct {
     }
     pub fn sourceIdentity(self: State) !page.Source {
         const certificate = self.certificate orelse return error.InvalidOnlineMergeState;
-        return .{ .namespace = certificate.cut.namespace, .pin_digest = try certificate.digest(), .applied_index = certificate.cut.applied_index, .retention = .{ .epoch = self.scope.consumer_epoch, .after_sequence = certificate.cut.retained_start }, .integrity = certificate.integrity };
+        return .{ .namespace = certificate.cut.namespace, .pin_digest = try certificate.digest(), .applied_index = certificate.cut.applied_index, .retention = .{ .epoch = self.scope.consumer_epoch, .after_sequence = certificate.cut.retained_start }, .integrity = certificate.integrity, .artifact_catalog = self.artifact_catalog, .provenance_required = certificate.provenance_required };
     }
 };
 
@@ -83,7 +87,7 @@ pub fn updateAllowed(previous: State, next: State) bool {
     previous.validate() catch return false;
     next.validate() catch return false;
     if (previous.eql(next)) return true;
-    if (!std.meta.eql(previous.scope, next.scope) or previous.terminal() or
+    if (!std.meta.eql(previous.scope, next.scope) or !std.meta.eql(previous.artifact_catalog, next.artifact_catalog) or !std.meta.eql(previous.receiver_artifact_catalog, next.receiver_artifact_catalog) or previous.terminal() or
         previous.revision == std.math.maxInt(u64) or next.revision != previous.revision + 1 or next.acknowledged < previous.acknowledged) return false;
     if (previous.certificate) |certificate| if (next.certificate == null or !certificate.eql(next.certificate.?)) return false;
     if (previous.certificate == null and next.certificate != null and !(previous.phase == .publish and next.phase == .snapshot)) return false;
@@ -91,7 +95,7 @@ pub fn updateAllowed(previous: State, next: State) bool {
     if (previous.final_applied_index != 0 and (next.final_applied_index != previous.final_applied_index or next.final_sequence != previous.final_sequence or
         !std.mem.eql(u8, &next.final_cut_digest, &previous.final_cut_digest))) return false;
     if (next.phase == previous.phase) return (previous.phase == .tail or previous.phase == .final_tail) and next.acknowledged > previous.acknowledged;
-    if (next.phase == .cancel_receiver) return @intFromEnum(previous.phase) < @intFromEnum(Phase.cutover);
+    if (next.phase == .cancel_receiver) return @backingInt(previous.phase) < @backingInt(Phase.cutover);
     const successor: Phase = switch (previous.phase) {
         .admit => .publish,
         .publish => .snapshot,
@@ -108,6 +112,28 @@ pub fn updateAllowed(previous: State, next: State) bool {
     return next.phase == successor;
 }
 
+test "metadata ordered artifact inventory binding is immutable and carried by source admission" {
+    var state = testState();
+    state.artifact_catalog = .{ .epoch = 3, .digest = @splat(7), .semantic_digest = @splat(8) };
+    const action = (try decide(state, .{ .scope = state.scope }, false)).execute.source_command;
+    try std.testing.expectEqualDeep(state.artifact_catalog, action.admit.artifact_catalog);
+    var next = state;
+    next.phase = .publish;
+    next.revision += 1;
+    try std.testing.expect(updateAllowed(state, next));
+    next.artifact_catalog.?.epoch += 1;
+    try std.testing.expect(!updateAllowed(state, next));
+    next.artifact_catalog = null;
+    try std.testing.expect(!updateAllowed(state, next));
+    state.certificate = testCertificate(state);
+    state.acknowledged = state.certificate.?.cut.retained_start;
+    try std.testing.expectEqualDeep(state.artifact_catalog, (try state.sourceIdentity()).artifact_catalog);
+    var observation = try testObservation(state);
+    try std.testing.expectError(error.OnlineMergeReceiptMismatch, verify(state, observation));
+    observation.source_progress.?.artifact_catalog = state.artifact_catalog;
+    try verify(state, observation);
+}
+
 pub const Capabilities = struct {
     replicated_source_pins: bool = false,
     native_retained_snapshots: bool = false,
@@ -115,7 +141,7 @@ pub const Capabilities = struct {
     receiver_receipts: bool = false,
     transactional_headroom: bool = false,
     pub fn require(self: Capabilities) !void {
-        inline for (std.meta.fields(Capabilities)) |field| if (!@field(self, field.name)) return error.OnlineMergeUnavailable;
+        inline for (comptime std.meta.fieldNames(Capabilities)) |reflected_name| if (!@field(self, reflected_name)) return error.OnlineMergeUnavailable;
     }
 };
 
@@ -173,6 +199,7 @@ fn verify(current: State, observation: Observation) !void {
     if (!std.meta.eql(current.scope, observation.scope)) return error.OnlineMergeReceiptMismatch;
     if (observation.retained_reclaimable > observation.retained_head or observation.retained_reclaimed > observation.retained_reclaimable) return error.OnlineMergeReceiptMismatch;
     if (observation.source_progress) |progress| {
+        if (!std.meta.eql(current.artifact_catalog, progress.artifact_catalog)) return error.OnlineMergeReceiptMismatch;
         if (!std.mem.eql(u8, &progress.namespace, &current.scope.namespace()) or progress.consumer_epoch != current.scope.consumer_epoch or
             !std.mem.eql(u8, &progress.pin, &current.scope.pin())) return error.OnlineMergeReceiptMismatch;
         if (current.certificate) |certificate| if (progress.admitted_applied_index != certificate.cut.applied_index or progress.start != certificate.cut.retained_start or
@@ -196,7 +223,7 @@ pub fn decide(current: State, observation: Observation, cancel: bool) !Decision 
     // durably cancel, clean the exact legacy tuple, and revoke the new scope.
     if (current.phase == .admit and observation.ordinary_conflict) return advance(current, .cancel_receiver);
     // Once cutover might have been submitted, cancellation is no longer safe.
-    if (cancel and @intFromEnum(current.phase) < @intFromEnum(Phase.cutover)) return advance(current, .cancel_receiver);
+    if (cancel and @backingInt(current.phase) < @backingInt(Phase.cutover)) return advance(current, .cancel_receiver);
     const progress = observation.source_progress;
     switch (current.phase) {
         .admit => {
@@ -204,7 +231,7 @@ pub fn decide(current: State, observation: Observation, cancel: bool) !Decision 
                 if (value.phase != .retaining) return error.OnlineMergeReceiptMismatch;
                 if (value.snapshot_phase != .prepared) return advance(current, .publish);
             }
-            return .{ .execute = .{ .source_command = .{ .admit = .{ .scope = current.scope } } } };
+            return .{ .execute = .{ .source_command = .{ .admit = .{ .scope = current.scope, .artifact_catalog = current.artifact_catalog } } } };
         },
         .publish => {
             const value = progress orelse return error.OnlineMergeReceiptMismatch;
@@ -321,7 +348,20 @@ pub const Driver = struct {
         switch (try decide(current, observation, canceled)) {
             .wait => return current,
             .execute => |action| {
-                try self.execute(self.ptr, current, action, &observation);
+                self.execute(self.ptr, current, action, &observation) catch |err| {
+                    if ((err != error.OnlineMergeArtifactCatalogUncoordinated and err != error.OnlineMergeArtifactCatalogChanged) or
+                        @backingInt(current.phase) >= @backingInt(Phase.cutover)) return err;
+                    // A pre-gate attempt may have committed metadata before
+                    // distributed admission was disabled. A rejected new pin
+                    // or receiver checkpoint is definitively not proposed;
+                    // move the exact attempt into durable rollback instead
+                    // of retrying the same forbidden action forever. Existing
+                    // checkpointed pages can still drain forward.
+                    const next = (try advance(current, .cancel_receiver)).advance;
+                    if (!try self.compare_and_set(self.ptr, current, next, canceled))
+                        return error.OnlineMergeRevisionChanged;
+                    return next;
+                };
                 return current;
             },
             .advance => |next| {
@@ -529,13 +569,79 @@ test "metadata transition driver online observation lives through ambiguous effe
     };
     var fake: Fake = .{};
     var driver: Driver = .{ .ptr = &fake, .capabilities = .{}, .observe = Fake.observe, .execute = Fake.execute, .compare_and_set = Fake.cas, .release_observation = Fake.release };
-    inline for (std.meta.fields(Capabilities)) |field| @field(driver.capabilities, field.name) = true;
+    inline for (comptime std.meta.fieldNames(Capabilities)) |reflected_name| @field(driver.capabilities, reflected_name) = true;
     const initial = testState();
     try std.testing.expectError(error.TestLostReply, driver.step(initial, false));
     try std.testing.expectEqual(@as(usize, 1), fake.releases);
     fake.fail = false;
     try std.testing.expect(initial.eql(try driver.step(initial, false)));
     try std.testing.expectEqual(@as(usize, 2), fake.releases);
+}
+
+test "distributed online admission barrier durably cancels a pre-gate attempt" {
+    const Fake = struct {
+        durable: State,
+        effects: usize = 0,
+        fn observe(_: *anyopaque, state: State) !Observation {
+            return .{ .scope = state.scope };
+        }
+        fn execute(ptr: *anyopaque, _: State, action: Action, _: *const Observation) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = action.source_command.admit;
+            self.effects += 1;
+            return error.OnlineMergeArtifactCatalogUncoordinated;
+        }
+        fn cas(ptr: *anyopaque, previous: State, next: State, _: bool) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.durable.eql(previous)) return false;
+            self.durable = next;
+            return true;
+        }
+    };
+    const initial = testState();
+    var fake: Fake = .{ .durable = initial };
+    var driver: Driver = .{ .ptr = &fake, .capabilities = .{}, .observe = Fake.observe, .execute = Fake.execute, .compare_and_set = Fake.cas };
+    inline for (comptime std.meta.fieldNames(Capabilities)) |reflected_name| @field(driver.capabilities, reflected_name) = true;
+    const next = try driver.step(initial, false);
+    try std.testing.expectEqual(Phase.cancel_receiver, next.phase);
+    try std.testing.expect(fake.durable.eql(next));
+    try std.testing.expectEqual(@as(usize, 1), fake.effects);
+    try std.testing.expectEqual(Action.cancel_receiver, (try decide(next, .{ .scope = next.scope }, false)).execute);
+}
+
+test "metadata ordered artifact inventory drift durably cancels before effects after restart" {
+    const Fake = struct {
+        durable: State,
+        effects: usize = 0,
+        fn current(ptr: *anyopaque, _: State) !Driver.Current {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .state = self.durable, .cancel = false };
+        }
+        fn observe(_: *anyopaque, state: State) !Observation {
+            return .{ .scope = state.scope };
+        }
+        fn execute(ptr: *anyopaque, _: State, _: Action, _: *const Observation) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.effects += 1;
+            return error.OnlineMergeArtifactCatalogChanged;
+        }
+        fn cas(ptr: *anyopaque, previous: State, next: State, _: bool) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.durable.eql(previous)) return false;
+            self.durable = next;
+            return true;
+        }
+    };
+    const state = testState();
+    var fake: Fake = .{ .durable = state };
+    var driver: Driver = .{ .ptr = &fake, .capabilities = .{}, .observe = Fake.observe, .execute = Fake.execute, .compare_and_set = Fake.cas, .current_state = Fake.current };
+    inline for (comptime std.meta.fieldNames(Capabilities)) |reflected_name| @field(driver.capabilities, reflected_name) = true;
+    const cancelled = try driver.step(state, false);
+    try std.testing.expectEqual(Phase.cancel_receiver, cancelled.phase);
+    // A controller restarting from its stale local state observes the durable
+    // cancellation and does not repeat catalog preparation or admission.
+    try std.testing.expect((try driver.step(state, false)).eql(cancelled));
+    try std.testing.expectEqual(@as(usize, 1), fake.effects);
 }
 
 test "metadata transition driver online bounded effect retries survive lost metadata CAS" {
@@ -576,7 +682,7 @@ test "metadata transition driver online bounded effect retries survive lost meta
     var driver: Driver = .{ .ptr = &fake, .capabilities = .{}, .observe = Fake.observe, .execute = Fake.execute, .compare_and_set = Fake.cas };
     try std.testing.expectError(error.OnlineMergeUnavailable, driver.step(initial, false));
     try std.testing.expectEqual(@as(usize, 0), fake.observations);
-    inline for (std.meta.fields(Capabilities)) |field| @field(driver.capabilities, field.name) = true;
+    inline for (comptime std.meta.fieldNames(Capabilities)) |reflected_name| @field(driver.capabilities, reflected_name) = true;
     try std.testing.expect(initial.eql(try driver.step(initial, false)));
     try std.testing.expectEqual(@as(usize, 1), fake.effects);
     try std.testing.expectError(error.TestLostReply, driver.step(initial, false));
@@ -748,9 +854,9 @@ test "metadata transition driver online reconstructs every forward phase after e
     const initial = testState();
     var harness: Harness = .{ .durable = initial, .endpoint = .{ .scope = initial.scope } };
     var controller = initial;
-    var visited = [_]bool{false} ** std.meta.fields(Phase).len;
+    var visited = @as([@typeInfo(Phase).@"enum".field_names.len]bool, @splat(false));
     for (0..128) |_| {
-        visited[@intFromEnum(controller.phase)] = true;
+        visited[@backingInt(controller.phase)] = true;
         if (controller.terminal()) break;
         const prior = harness.effects + harness.cas_count;
         // Reconstruct the adapter for every retry; only endpoint/metadata
@@ -763,7 +869,7 @@ test "metadata transition driver online reconstructs every forward phase after e
         try std.testing.expect(std.meta.eql(initial.scope, controller.scope));
     }
     try std.testing.expectEqual(Phase.complete, controller.phase);
-    for ([_]Phase{ .admit, .publish, .snapshot, .tail, .freeze, .final_tail, .cutover, .release, .complete }) |phase| try std.testing.expect(visited[@intFromEnum(phase)]);
+    for ([_]Phase{ .admit, .publish, .snapshot, .tail, .freeze, .final_tail, .cutover, .release, .complete }) |phase| try std.testing.expect(visited[@backingInt(phase)]);
     try std.testing.expectEqual(@as(usize, 2), harness.snapshots);
     try std.testing.expectEqual(@as(usize, 4), harness.tails);
     try std.testing.expectEqual(@as(usize, 2), harness.releases);

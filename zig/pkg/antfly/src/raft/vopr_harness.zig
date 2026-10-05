@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const catalog = @import("catalog.zig");
+const catalog = @import("storage/catalog.zig");
 const host = @import("host.zig");
 const managed_host = @import("managed_host.zig");
 const metadata_mod = @import("../metadata/mod.zig");
@@ -282,7 +282,7 @@ pub const VirtualHttpNetwork = struct {
         base_uri: []u8,
         request: transport.HttpRequest,
 
-        fn deinit(self: *QueuedRequest, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *QueuedRequest, alloc: std.mem.Allocator) void {
             alloc.free(self.base_uri);
             alloc.free(@constCast(self.request.uri));
             for (self.request.headers) |header| {
@@ -539,6 +539,11 @@ pub const VirtualHttpNetwork = struct {
 
     pub fn isLinkPartitioned(self: *const VirtualHttpNetwork, link: Link) bool {
         return self.partitioned_links.contains(link);
+    }
+
+    pub fn hasConnectivityFaults(self: *const VirtualHttpNetwork) bool {
+        return self.partitioned_nodes.count() != 0 or self.partitioned_links.count() != 0 or
+            self.unavailable_nodes.count() != 0;
     }
 
     pub fn dropNext(self: *VirtualHttpNetwork) void {
@@ -2165,7 +2170,7 @@ const StorageRecorder = struct {
     alloc: std.mem.Allocator,
     stores: std.AutoHashMapUnmanaged(u64, *raft_engine.core.MemoryStorage) = .empty,
 
-    fn deinit(self: *StorageRecorder) void {
+    pub fn deinit(self: *StorageRecorder) void {
         self.stores.deinit(self.alloc);
         self.* = undefined;
     }
@@ -4772,7 +4777,7 @@ test "cluster simulation drives split transition actions deterministically" {
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -4931,7 +4936,7 @@ test "http host simulation drives queued split transitions through the service l
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -5085,7 +5090,7 @@ test "http host simulation rolls back and retries queued split transitions throu
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -5266,7 +5271,7 @@ test "http host simulation removes queued split transition mid-flight" {
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -5389,7 +5394,7 @@ test "http host simulation updates split transition to rollback mid-flight" {
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -5622,7 +5627,7 @@ test "cluster simulation drives merge transition actions deterministically" {
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -5766,7 +5771,7 @@ test "cluster simulation drives queued split transitions through service-owned m
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -6889,7 +6894,7 @@ test "cluster simulation drives queued merge transitions through service-owned m
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -7161,7 +7166,7 @@ test "http host simulation rolls back and retries queued merge transitions throu
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -7325,7 +7330,7 @@ test "http host simulation removes queued merge transition mid-flight" {
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -7429,7 +7434,7 @@ test "http host simulation updates merge transition to rollback mid-flight" {
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }

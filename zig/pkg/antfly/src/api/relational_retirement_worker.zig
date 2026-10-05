@@ -23,12 +23,21 @@ const catalog_mod = @import("../storage/db/relational_integrity_catalog.zig");
 const activation = @import("../storage/db/relational_integrity_activation_contract.zig");
 const planner = @import("relational_integrity_commit.zig");
 const reads = @import("table_read_source.zig");
-const writes = @import("table_writes.zig");
+const writes = @import("table_write_source.zig");
 const contract = @import("distributed_txn_contract.zig");
 const schema_api = @import("../schema/mod.zig");
 const schema = @import("../storage/schema.zig");
 const Allocator = std.mem.Allocator;
 const Control = @import("operation.zig").RequestContext;
+
+test "SQL catalog retirement permits only deletion of ordered indexes" {
+    const alloc = std.testing.allocator;
+    const before = "{\"version\":1,\"storage_mode\":\"relational\",\"relational_indexes\":[{\"name\":\"drop\",\"keys\":[{\"column\":\"id\"}]},{\"name\":\"retain\",\"keys\":[{\"column\":\"label\"}]}],\"unique_constraints\":[{\"name\":\"drop\",\"columns\":[\"id\"]}]}";
+    try std.testing.expect(try retainedSchemaEqual(alloc, before, "{\"version\":2,\"storage_mode\":\"relational\",\"relational_indexes\":[{\"keys\":[{\"column\":\"label\"}],\"name\":\"retain\"}],\"unique_constraints\":[]}"));
+    try std.testing.expect(!try retainedSchemaEqual(alloc, before, "{\"version\":2,\"storage_mode\":\"relational\",\"relational_indexes\":[{\"name\":\"retain\",\"keys\":[{\"column\":\"id\"}]}],\"unique_constraints\":[]}"));
+    try std.testing.expect(!try retainedSchemaEqual(alloc, before, "{\"version\":2,\"storage_mode\":\"relational\",\"relational_indexes\":[{\"name\":\"new\",\"keys\":[{\"column\":\"label\"}]}],\"unique_constraints\":[]}"));
+    try std.testing.expect(!try retainedSchemaEqual(alloc, before, "{\"version\":2,\"storage_mode\":\"document\",\"relational_indexes\":[],\"unique_constraints\":[]}"));
+}
 
 fn retainedSchemaEqual(alloc: Allocator, source: []const u8, target: []const u8) !bool {
     var before = try std.json.parseFromSlice(std.json.Value, alloc, source, .{ .parse_numbers = false });
@@ -36,6 +45,30 @@ fn retainedSchemaEqual(alloc: Allocator, source: []const u8, target: []const u8)
     var after = try std.json.parseFromSlice(std.json.Value, alloc, target, .{ .parse_numbers = false });
     defer after.deinit();
     if (before.value != .object or after.value != .object) return false;
+    // Dropping a SQL-owned UNIQUE index retires its claims and removes the
+    // corresponding ordered index in the same publication. Permit deletion
+    // only: additions or changed retained indexes need their normal lifecycle.
+    var prior_indexes: std.StringHashMapUnmanaged(std.json.Value) = .empty;
+    defer prior_indexes.deinit(alloc);
+    if (before.value.object.get("relational_indexes")) |indexes| if (indexes == .array) {
+        for (indexes.array.items) |index| {
+            const name = index.object.get("name") orelse return false;
+            try prior_indexes.put(alloc, name.string, index);
+        }
+    };
+    if (after.value.object.get("relational_indexes")) |indexes| if (indexes == .array) {
+        for (indexes.array.items) |index| {
+            const name = index.object.get("name") orelse return false;
+            const prior = prior_indexes.get(name.string) orelse return false;
+            const prior_json = try @import("../storage/db/document_content_hash.zig").canonicalJsonValueAlloc(alloc, prior);
+            defer alloc.free(prior_json);
+            const current_json = try @import("../storage/db/document_content_hash.zig").canonicalJsonValueAlloc(alloc, index);
+            defer alloc.free(current_json);
+            if (!std.mem.eql(u8, prior_json, current_json)) return false;
+        }
+    };
+    _ = before.value.object.swapRemove("relational_indexes");
+    _ = after.value.object.swapRemove("relational_indexes");
     for ([_][]const u8{ "version", "unique_constraints", "foreign_keys" }) |field| {
         _ = before.value.object.swapRemove(field);
         _ = after.value.object.swapRemove(field);
@@ -72,6 +105,11 @@ pub const Replacement = struct {
 /// intent. The returned private record is admitted with the ordinary metadata
 /// exact-definition CAS, never accepted through public TableSchema fields.
 pub fn begin(alloc: Allocator, reader: reads.TableReadSource, tables: []const records.TableRecord, ranges: []const records.RangeRecord, table_name: []const u8, target_input: []const u8, drop: bool) !Replacement {
+    return beginControlled(alloc, reader, tables, ranges, table_name, target_input, drop, .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s });
+}
+
+pub fn beginControlled(alloc: Allocator, reader: reads.TableReadSource, tables: []const records.TableRecord, ranges: []const records.RangeRecord, table_name: []const u8, target_input: []const u8, drop: bool, control: Control) !Replacement {
+    try control.ensureActive();
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
     const owned = arena.allocator();
@@ -99,7 +137,7 @@ pub fn begin(alloc: Allocator, reader: reads.TableReadSource, tables: []const re
         }
     }.less);
     if (owners.items.len == 0 or owners.items.len > 4096) return error.TopologyChanged;
-    const first = try readStatus(owned, reader, table.name, owners.items[0].start, .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s }, true);
+    const first = try readStatus(owned, reader, table.name, owners.items[0].start, control, true);
     const catalog = try catalog_mod.decode(owned, first.value.catalog);
     if (!std.mem.eql(u8, &catalog.incarnation, &(try catalog_mod.incarnationFromTableId(table.table_id))) or target_runtime.version != std.math.add(u32, catalog.schema_version, 1) catch return error.PreparedGenerationChanged) return error.PreparedGenerationChanged;
     for (definitions) |definition| {
@@ -120,6 +158,7 @@ pub fn begin(alloc: Allocator, reader: reads.TableReadSource, tables: []const re
     // A retained FK owns references under one concrete UNIQUE generation;
     // an equivalent second UNIQUE does not transfer those references.
     for (tables) |candidate| {
+        try control.ensureActive();
         if (candidate.schema_json.len == 0) continue;
         const child = if (candidate.table_id == table.table_id) target else try schema_api.parseValidatedTableSchema(owned, candidate.schema_json);
         if (child.foreign_keys) |foreign| for (foreign.value) |fk| {
@@ -129,8 +168,10 @@ pub fn begin(alloc: Allocator, reader: reads.TableReadSource, tables: []const re
                 const retiring = for (selected.items) |generation| {
                     if (std.mem.eql(u8, &generation, &binding.generation)) break true;
                 } else false;
-                if (!retiring or definition.columns.len != fk.parent_columns.len) continue;
-                const matches = for (definition.columns, fk.parent_columns) |left, right| {
+                const columns = definition.columns orelse continue;
+                if (!retiring or columns.len != fk.parent_columns.len) continue;
+                if (definition.where) |conditions| if (conditions.len != 0) continue;
+                const matches = for (columns, fk.parent_columns) |left, right| {
                     if (!std.mem.eql(u8, left, right)) break false;
                 } else true;
                 if (matches) return error.ForeignKeyReferenced;
@@ -303,7 +344,7 @@ fn runPageAttempt(alloc: Allocator, reader: reads.TableReadSource, writer: write
         .generations = job.generations,
     };
     if (!std.mem.eql(u8, &progress.job_id, &job.id) or !std.mem.eql(u8, &progress.owner, &state.value.owner)) return error.ConstraintRetirementChanged;
-    if (state.value.progress == null or @intFromEnum(progress.phase) < @intFromEnum(expected_phase)) {
+    if (state.value.progress == null or @backingInt(progress.phase) < @backingInt(expected_phase)) {
         if (state.value.progress == null and expected_phase != .fenced) return error.ConstraintRetirementChanged;
         progress.phase = expected_phase;
         const command: native.Command = .{ .routing_key = owner_start, .expected = state.value.progress, .next = try progress.encode(owned) };
@@ -332,7 +373,7 @@ fn runPageAttempt(alloc: Allocator, reader: reads.TableReadSource, writer: write
             !std.mem.eql(u8, &proof.owner, &peer.value.owner) or proof.schema_version != catalog.schema_version or
             !std.mem.eql(u8, &proof.target_schema_digest, &job.target_schema_digest) or
             !std.mem.eql(u8, std.mem.sliceAsBytes(proof.generations), std.mem.sliceAsBytes(job.generations)) or
-            (job.phase != .fencing and @intFromEnum(proof.phase) <= @intFromEnum(expected_phase)))
+            (job.phase != .fencing and @backingInt(proof.phase) <= @backingInt(expected_phase)))
         {
             arena.deinit();
             return null;
@@ -369,7 +410,7 @@ test "distributed txn retirement compares retained schema numbers without roundi
     try std.testing.expect(!try retainedSchemaEqual(alloc, "{\"checks\":[{}]}", "{\"checks\":[]}"));
 }
 
-test "distributed txn retirement drains self foreign keys before unique claims with durable checkpoints" {
+test "distributed txn retirement drains unique claims with durable checkpoints" {
     try testRetirementDrain(.none);
 }
 
@@ -479,7 +520,7 @@ test "distributed txn retirement verifies large owner barriers in bounded restar
 }
 
 fn testRetirementDrain(pressure: RetirementPressure) !void {
-    const db_mod = @import("../storage/db/db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const types = @import("../storage/db/types.zig");
     const read_gate = @import("../raft/read_gate.zig");
     const alloc = std.testing.allocator;
@@ -492,10 +533,10 @@ fn testRetirementDrain(pressure: RetirementPressure) !void {
     var db_open = true;
     defer if (db_open) db.close();
     const declaration =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"parent_fk","child_columns":["parent"],"parent_table":"rows","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent":{"type":"integer"}},"additionalProperties":false}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"pk","keys":[{"column":"id"}],"description":"SQL UNIQUE INDEX"},{"name":"retained","keys":[{"column":"parent"}]}],"unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent":{"type":"integer"}},"additionalProperties":false}}}}
     ;
     const target =
-        \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent":{"type":"integer"}},"additionalProperties":false}}}}
+        \\{"version":2,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"retained","keys":[{"column":"parent"}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent":{"type":"integer"}},"additionalProperties":false}}}}
     ;
     try db.setSchemaJson(alloc, declaration);
     const Fixture = struct {
@@ -517,7 +558,7 @@ fn testRetirementDrain(pressure: RetirementPressure) !void {
         fn batch(_: *anyopaque, _: Allocator, _: []const u8, _: types.BatchRequest) !?void {
             return error.UnexpectedCall;
         }
-        fn commitBatch(ptr: *anyopaque, allocator: Allocator, requests: []const contract.TableCommitRequest, _: types.SyncLevel, cancellation: @import("../common/cancellation.zig").CancellationToken) !?contract.CommitOutcome {
+        fn commitBatch(ptr: *anyopaque, allocator: Allocator, requests: []const contract.TableCommitRequest, _: types.SyncLevel, cancellation: @import("antfly_cancellation").CancellationToken) !?contract.CommitOutcome {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try cancellation.check();
             try std.testing.expectEqual(@as(usize, 1), requests.len);
@@ -557,6 +598,13 @@ fn testRetirementDrain(pressure: RetirementPressure) !void {
     const writer: writes.TableWriteSource = .{ .ptr = &fixture, .vtable = &.{ .batch = Fixture.batch, .commit_batch_with_cancellation = Fixture.commitBatch } };
     var tables = [_]records.TableRecord{.{ .table_id = 400, .name = "rows", .schema_json = declaration }};
     const ranges = [_]records.RangeRecord{.{ .table_id = 400, .group_id = 401, .range_id = 401, .start_key = "" }};
+    if (pressure == .none) {
+        const guarded_declaration =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"pk","keys":[{"column":"id"}],"description":"SQL UNIQUE INDEX"},{"name":"retained","keys":[{"column":"parent"}]}],"unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"parent_fk","child_columns":["parent"],"parent_table":"rows","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent":{"type":"integer"}},"additionalProperties":false}}}}
+        ;
+        const guarded_tables = [_]records.TableRecord{.{ .table_id = 400, .name = "rows", .schema_json = guarded_declaration }};
+        try std.testing.expectError(error.ForeignKeyGenerationPublicationRequired, begin(alloc, reader, &guarded_tables, &ranges, "rows", target, false));
+    }
     var initial = try planner.prepareWithCoverage(alloc, reader, &tables, &ranges, &.{.{ .table_name = "rows", .writes = &.{ .{ .key = "a", .value = "{\"id\":1}" }, .{ .key = "b", .value = "{\"id\":2,\"parent\":1}" } } }});
     defer initial.deinit();
     try commit(alloc, writer, initial.tables, .{});

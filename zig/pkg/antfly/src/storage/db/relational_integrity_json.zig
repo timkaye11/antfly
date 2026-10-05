@@ -10,12 +10,20 @@ const std = @import("std");
 
 pub fn write(value: anytype, stream: anytype) @TypeOf(stream.*).Error!void {
     const T = @TypeOf(value);
+    // std.json.Value is a semantic JSON tree. Its object representation owns
+    // hash-map pointers, which are not part of the wire format; delegate that
+    // union to std.json's value encoder instead of recursively visiting its
+    // implementation fields as if they were integrity command identities.
+    if (comptime T == std.json.Value) return stream.write(value);
     switch (@typeInfo(T)) {
         .@"struct" => |info| {
+            if (@hasDecl(T, "nativeJsonProjection")) return write(value.nativeJsonProjection(), stream);
             try stream.beginObject();
-            inline for (info.fields) |field| {
-                try stream.objectField(field.name);
-                try write(@field(value, field.name), stream);
+            inline for (info.field_names) |reflected_name| {
+                if (!@hasDecl(T, "nativeJsonSkipField") or !value.nativeJsonSkipField(reflected_name)) {
+                    try stream.objectField(reflected_name);
+                    try write(@field(value, reflected_name), stream);
+                }
             }
             try stream.endObject();
         },

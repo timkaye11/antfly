@@ -15,7 +15,7 @@
 //! Transport-neutral operations for internal group coordination.
 
 const std = @import("std");
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const batch_api = @import("batch.zig");
 const distributed_txn = @import("distributed_txn.zig");
 const distributed_graph = @import("distributed_graph.zig");
@@ -65,6 +65,7 @@ pub const Error = operation.ApiError || @import("relational_integrity_errors.zig
     PreDecisionDeadlineExceeded,
     TransactionPreDecisionOutcomeUnknown,
     RaftBatchWriteOutcomeUnknown,
+    OnlineMergeArtifactCatalogUncoordinated,
     DecisionConflict,
     TransactionConflict,
     TransactionTooLarge,
@@ -124,15 +125,15 @@ fn validatePrivateMergeSourceRollback(group_id: u64, input: db_mod.types.BatchRe
         control.receiver_group_id == 0 or control.receiver_group_id == group_id)
         return error.InvalidArgument;
     const empty: db_mod.types.BatchRequest = .{};
-    inline for (std.meta.fields(db_mod.types.BatchRequest)) |field| {
-        if (comptime !std.mem.eql(u8, field.name, "merge_source_transition") and
-            !std.mem.eql(u8, field.name, "timestamp_ns") and
-            !std.mem.eql(u8, field.name, "sync_level"))
+    inline for (@typeInfo(db_mod.types.BatchRequest).@"struct".field_names, @typeInfo(db_mod.types.BatchRequest).@"struct".field_types) |reflected_name, field_type| {
+        if (comptime !std.mem.eql(u8, reflected_name, "merge_source_transition") and
+            !std.mem.eql(u8, reflected_name, "timestamp_ns") and
+            !std.mem.eql(u8, reflected_name, "sync_level"))
         {
-            const value = @field(input, field.name);
-            if (comptime @typeInfo(field.type) == .pointer and @typeInfo(field.type).pointer.size == .slice) {
+            const value = @field(input, reflected_name);
+            if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
                 if (value.len != 0) return error.InvalidArgument;
-            } else if (!std.meta.eql(value, @field(empty, field.name))) return error.InvalidArgument;
+            } else if (!std.meta.eql(value, @field(empty, reflected_name))) return error.InvalidArgument;
         }
     }
 }
@@ -167,7 +168,7 @@ pub const BatchValidator = struct {
     ptr: *anyopaque,
     validate_fn: *const fn (*anyopaque, operation.RequestContext, []const u8, []const db_mod.types.BatchWrite) anyerror!void,
 
-    fn validate(self: BatchValidator, request: operation.RequestContext, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
+    pub fn validate(self: BatchValidator, request: operation.RequestContext, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
         return self.validate_fn(self.ptr, request, table_name, writes);
     }
 };
@@ -176,7 +177,7 @@ pub const TxnValidator = struct {
     ptr: *anyopaque,
     validate_fn: *const fn (*anyopaque, operation.RequestContext, []const u8, []const db_mod.types.TransactionWrite) anyerror!void,
 
-    fn validate(self: TxnValidator, request: operation.RequestContext, table_name: []const u8, writes: []const db_mod.types.TransactionWrite) !void {
+    pub fn validate(self: TxnValidator, request: operation.RequestContext, table_name: []const u8, writes: []const db_mod.types.TransactionWrite) !void {
         return self.validate_fn(self.ptr, request, table_name, writes);
     }
 };
@@ -188,6 +189,79 @@ pub const LookupInput = struct {
     options: db_mod.types.LookupOptions = .{},
     consistency: raft_mod.ReadConsistency = .read_index,
 };
+
+fn validateHandoffReceiptLookup(input: LookupInput, request: operation.RequestContext) Error!void {
+    const identity = std.mem.eql(u8, input.options.relational_topology_json, "{\"mode\":\"generation_handoff_identity\"}");
+    const hidden_scoped = input.options.restore_staging_scope != null and input.options.restore_staging_plan_id != null and request.catalog_route_fence_json.len == 0;
+    const published_routed = input.options.restore_staging_scope == null and input.options.restore_staging_plan_id == null and request.catalog_route_fence_json.len != 0;
+    if ((!identity and !std.mem.eql(u8, input.options.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}")) or
+        (!hidden_scoped and (!published_routed or identity)) or
+        input.key.len != 0 or input.consistency != .read_index or
+        input.options.generation_handoff_install_read_index_certified or
+        input.options.include_primary_digest or input.options.relational_integrity_catalog or input.options.relational_integrity_action or
+        input.options.relational_integrity_jobs_json.len != 0 or input.options.relational_index_status_json.len != 0 or
+        input.options.relational_activation_json.len != 0 or input.options.fields.len != 0)
+        return error.InvalidArgument;
+}
+
+test "hidden generation handoff receipt requires exact scoped read-index request" {
+    const input: LookupInput = .{ .group_id = 7, .table_name = "hidden", .key = "", .options = .{
+        .relational_topology_json = "{\"mode\":\"generation_handoff_install\"}",
+        .restore_staging_scope = @splat(1),
+        .restore_staging_plan_id = @splat(2),
+    } };
+    try validateHandoffReceiptLookup(input, .{});
+    var invalid = input;
+    invalid.options.restore_staging_scope = null;
+    try std.testing.expectError(error.InvalidArgument, validateHandoffReceiptLookup(invalid, .{}));
+    invalid = input;
+    invalid.options.restore_staging_plan_id = null;
+    try std.testing.expectError(error.InvalidArgument, validateHandoffReceiptLookup(invalid, .{}));
+    invalid = input;
+    invalid.options.relational_topology_json = "{\"mode\":\"generation_handoff_summary\"}";
+    try std.testing.expectError(error.InvalidArgument, validateHandoffReceiptLookup(invalid, .{}));
+    invalid = input;
+    invalid.consistency = .stale;
+    try std.testing.expectError(error.InvalidArgument, validateHandoffReceiptLookup(invalid, .{}));
+    try std.testing.expectError(error.InvalidArgument, validateHandoffReceiptLookup(input, .{ .catalog_route_fence_json = "{}" }));
+    invalid = input;
+    invalid.options.restore_staging_scope = null;
+    invalid.options.restore_staging_plan_id = null;
+    try validateHandoffReceiptLookup(invalid, .{ .catalog_route_fence_json = "{}" });
+    try std.testing.expectError(error.InvalidArgument, validateHandoffReceiptLookup(invalid, .{}));
+}
+
+test "hidden generation handoff identity requires exact scoped read-index request" {
+    const input: LookupInput = .{ .group_id = 7, .table_name = "hidden", .key = "", .options = .{
+        .relational_topology_json = "{\"mode\":\"generation_handoff_identity\"}",
+        .restore_staging_scope = @splat(1),
+        .restore_staging_plan_id = @splat(2),
+    } };
+    try validateHandoffReceiptLookup(input, .{});
+    var invalid = input;
+    invalid.options.restore_staging_scope = null;
+    try std.testing.expectError(error.InvalidArgument, validateHandoffReceiptLookup(invalid, .{}));
+    invalid = input;
+    invalid.options.restore_staging_plan_id = null;
+    try std.testing.expectError(error.InvalidArgument, validateHandoffReceiptLookup(invalid, .{}));
+    invalid = input;
+    invalid.consistency = .stale;
+    try std.testing.expectError(error.InvalidArgument, validateHandoffReceiptLookup(invalid, .{}));
+    invalid = input;
+    invalid.key = "row";
+    try std.testing.expectError(error.InvalidArgument, validateHandoffReceiptLookup(invalid, .{}));
+    invalid = input;
+    invalid.options.relational_integrity_catalog = true;
+    try std.testing.expectError(error.InvalidArgument, validateHandoffReceiptLookup(invalid, .{}));
+    invalid = input;
+    invalid.options.generation_handoff_install_read_index_certified = true;
+    try std.testing.expectError(error.InvalidArgument, validateHandoffReceiptLookup(invalid, .{}));
+    try std.testing.expectError(error.InvalidArgument, validateHandoffReceiptLookup(input, .{ .catalog_route_fence_json = "{}" }));
+    invalid = input;
+    invalid.options.restore_staging_scope = null;
+    invalid.options.restore_staging_plan_id = null;
+    try std.testing.expectError(error.InvalidArgument, validateHandoffReceiptLookup(invalid, .{ .catalog_route_fence_json = "{}" }));
+}
 
 pub const Operations = struct {
     reads: ?table_reads.TableReadSource,
@@ -388,6 +462,7 @@ pub const Operations = struct {
             },
         };
         _ = (writes.batchGroupLocal(alloc, group_id, table_name, input) catch |err| switch (err) {
+            error.OnlineMergeArtifactCatalogUncoordinated => return error.OnlineMergeArtifactCatalogUncoordinated,
             error.OnlineSourcePinPending => return error.RaftBatchWriteOutcomeUnknown,
             error.RetainedEffectsFull => return retainedBatchPressure(input),
             error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
@@ -505,6 +580,10 @@ pub const Operations = struct {
                     return error.InvalidArgument,
                 .acknowledge => |acknowledge| if (distributed_txn.parseParticipantRef(acknowledge.participant) == null)
                     return error.InvalidArgument,
+                .acknowledge_many => |ack| {
+                    if (ack.participants.len == 0 or ack.participants.len > 64) return error.InvalidArgument;
+                    for (ack.participants) |participant| if (distributed_txn.parseParticipantRef(participant) == null) return error.InvalidArgument;
+                },
                 .cleanup => {},
             }
             break :transaction .transaction;
@@ -563,6 +642,7 @@ pub const Operations = struct {
             break :merge .merge_replication;
         } else return error.Unavailable;
         _ = (writer.write(alloc, authority, group_id, table_name, input, forwarding, request) catch |err| switch (err) {
+            error.OnlineMergeArtifactCatalogUncoordinated => return error.OnlineMergeArtifactCatalogUncoordinated,
             error.OnlineSourcePinPending => return error.RaftBatchWriteOutcomeUnknown,
             error.RetainedEffectsFull => return retainedBatchPressure(input),
             error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
@@ -573,6 +653,11 @@ pub const Operations = struct {
             error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return error.DeadlineExceeded,
             error.Canceled, error.Cancelled => return error.Canceled,
             error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired => return error.Unavailable,
+            // A fenced or cold-reopening owner can reject ordinary writer
+            // admission before proposal. Accepted-but-unconfirmed apply is
+            // separately OutcomeUnknown. This is retryable availability,
+            // not an internal defect or a proven conflict.
+            error.StorageReadTemporarilyUnavailable => return error.Unavailable,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.RaftBatchWriteOutcomeUnknown => return error.RaftBatchWriteOutcomeUnknown,
             error.EnrichmentWaitCanceled => return error.EnrichmentWaitCanceled,
@@ -638,6 +723,10 @@ pub const Operations = struct {
 
     pub fn txnPrepare(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnPrepareRequest) Error!void {
         try ensurePreDecisionRequestActive(request);
+        if (input.req.range_guards.len != 0 and input.route_fence == null) return error.InvalidArgument;
+        if (input.route_fence) |fence| {
+            if (fence.route.group_id != group_id or fence.topology_epoch != input.topology_epoch) return error.TopologyChanged;
+        }
         const writes = self.writes orelse return error.NotFound;
         const supports_pre_decision_context =
             writes.vtable.txn_prepare_group_local_with_pre_decision_context != null;
@@ -660,6 +749,7 @@ pub const Operations = struct {
         }
         try ensurePreDecisionRequestActive(request);
         _ = (writes.txnPrepareGroupLocalWithPreDecisionContext(alloc, group_id, table_name, input.txn_id, input.topology_epoch, input.req, .{
+            .route_fence = input.route_fence,
             .deadline_ns = request.deadline_ns,
             .deadline_io = request.deadline_io,
             .cancellation = request.cancellation,
@@ -749,6 +839,22 @@ pub const Operations = struct {
             error.InvalidParticipant, error.DecisionConflict => return error.DecisionConflict,
             error.UnsupportedOperation => return error.Unsupported,
             error.UnknownGroup, error.TxnNotFound => return error.NotFound,
+            else => return error.Internal,
+        }) orelse return error.NotFound;
+    }
+
+    pub fn txnAcknowledgeMany(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnAcknowledgeManyRequest) Error!void {
+        try request.ensureActive();
+        const writes = self.writes orelse return error.NotFound;
+        _ = (distributed_txn.acknowledgeManyGroupLocalWithRequest(writes, alloc, group_id, table_name, input, request.cancellation) catch |err| switch (err) {
+            error.InvalidTxnRequest, error.RestoreStagingScopeChanged => return error.InvalidArgument,
+            error.InvalidParticipant, error.DecisionConflict => return error.DecisionConflict,
+            error.UnsupportedOperation => return error.Unsupported,
+            error.UnknownGroup, error.TxnNotFound => return error.NotFound,
+            error.RaftBatchWriteOutcomeUnknown => return error.RaftBatchWriteOutcomeUnknown,
+            error.LeaderUnavailable, error.NotLeader => return error.GroupLeaderUnavailable,
+            error.Canceled => return error.Canceled,
+            error.DeadlineExceeded => return error.DeadlineExceeded,
             else => return error.Internal,
         }) orelse return error.NotFound;
     }
@@ -959,6 +1065,12 @@ pub const Operations = struct {
                 scoped.value.scope.validate() catch return error.InvalidArgument;
                 if (scoped.value.scope.fence.owner_group_id != input.group_id or input.consistency != .read_index or
                     input.key.len != 0 or input.options.restore_staging_scope != null) return error.InvalidArgument;
+            };
+            if (probe.value.mode) |mode| if (std.mem.eql(u8, mode, "generation_handoff_install") or std.mem.eql(u8, mode, "generation_handoff_identity")) {
+                // This private receipt is looked up after cutover, when the
+                // fresh hidden owner intentionally has no public route fence.
+                // Do not generalize the exception to other hidden reads.
+                try validateHandoffReceiptLookup(input, request);
             };
             if (probe.value.transition_id != null) {
                 if (input.key.len != 0 or input.consistency != .read_index or input.options.restore_staging_scope != null or
@@ -1323,7 +1435,7 @@ const DocumentArtifactChildKeyPrefixes = struct {
     unit: []u8,
     chunk: []u8,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.unit);
         alloc.free(self.chunk);
         self.* = undefined;
@@ -1392,7 +1504,7 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     return self.failure;
                 }
-                fn validate(_: *anyopaque, _: operation.RequestContext, _: []const u8, _: []const db_mod.types.TransactionWrite) anyerror!void {}
+                pub fn validate(_: *anyopaque, _: operation.RequestContext, _: []const u8, _: []const db_mod.types.TransactionWrite) anyerror!void {}
             };
             var source = Source{ .failure = error.UnexpectedTestCall };
             const operations = Operations{
@@ -1402,12 +1514,12 @@ fn consumerTests() type {
                 .txn_validator = .{ .ptr = &source, .validate_fn = Source.validate },
             };
             const errors = @import("relational_integrity_errors.zig");
-            inline for (@typeInfo(errors.Error).error_set.?) |field| {
-                source.failure = @field(errors.Error, field.name);
+            inline for (@typeInfo(errors.Error).error_set.error_names.?) |field| {
+                source.failure = @field(errors.Error, field);
                 try std.testing.expectError(source.failure, operations.txnPrepare(std.testing.allocator, .{}, 7, "rows", .{ .txn_id = @splat(7), .req = .{} }));
             }
-            inline for (@typeInfo(@import("../schema/relational_expression_errors.zig").Error).error_set.?) |field| {
-                source.failure = @field(@import("../schema/relational_expression_errors.zig").Error, field.name);
+            inline for (@typeInfo(@import("../schema/relational_expression_errors.zig").Error).error_set.error_names.?) |field| {
+                source.failure = @field(@import("../schema/relational_expression_errors.zig").Error, field);
                 try std.testing.expectError(source.failure, operations.txnPrepare(std.testing.allocator, .{}, 7, "rows", .{ .txn_id = @splat(7), .req = .{} }));
             }
         }
@@ -1564,7 +1676,7 @@ fn consumerTests() type {
             };
 
             const Validator = struct {
-                fn validate(_: *anyopaque, _: operation.RequestContext, _: []const u8, _: []const db_mod.types.TransactionWrite) anyerror!void {}
+                pub fn validate(_: *anyopaque, _: operation.RequestContext, _: []const u8, _: []const db_mod.types.TransactionWrite) anyerror!void {}
             };
 
             const operations = Operations{
@@ -1573,7 +1685,7 @@ fn consumerTests() type {
                 .writes = Source.iface(),
                 .txn_validator = .{ .ptr = undefined, .validate_fn = Validator.validate },
             };
-            const txn_id = [_]u8{0x42} ** 16;
+            const txn_id = @as([16]u8, @splat(0x42));
             try std.testing.expectError(error.GroupLeaderUnavailable, operations.txnBegin(
                 std.testing.allocator,
                 .{},
@@ -1590,7 +1702,7 @@ fn consumerTests() type {
             ));
 
             const AdmissionValidator = struct {
-                fn validate(ptr: *anyopaque, _: operation.RequestContext, _: []const u8, _: []const db_mod.types.TransactionWrite) anyerror!void {
+                pub fn validate(ptr: *anyopaque, _: operation.RequestContext, _: []const u8, _: []const db_mod.types.TransactionWrite) anyerror!void {
                     const failure: *const anyerror = @ptrCast(@alignCast(ptr));
                     return failure.*;
                 }
@@ -1702,7 +1814,7 @@ fn consumerTests() type {
                 saw_unfenced_transaction: bool = false,
                 saw_unfenced_source: bool = false,
 
-                fn validate(ptr: *anyopaque, _: operation.RequestContext, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
+                pub fn validate(ptr: *anyopaque, _: operation.RequestContext, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     if (self.validation_error) |err| return err;
                     try std.testing.expectEqualStrings("documents", table_name);
@@ -1843,7 +1955,7 @@ fn consumerTests() type {
             ));
             try std.testing.expectEqual(@as(usize, 4), state.calls);
 
-            const txn_id = [_]u8{7} ** 16;
+            const txn_id = @as([16]u8, @splat(7));
             const transaction_participants = [_][]const u8{"table:documents:group:17"};
             _ = try operations.routedBatch(
                 std.testing.allocator,
@@ -1993,6 +2105,15 @@ fn consumerTests() type {
                 state.visibility_error = failure;
                 try std.testing.expectError(failure, operations.routedBatch(std.testing.allocator, request, 17, "documents", .{}, forwarding));
             }
+            state.visibility_error = error.StorageReadTemporarilyUnavailable;
+            try std.testing.expectError(error.Unavailable, operations.routedBatch(
+                std.testing.allocator,
+                request,
+                17,
+                "documents",
+                .{},
+                forwarding,
+            ));
         }
 
         test "typed internal query workers preserve identity generation validation" {

@@ -35,6 +35,20 @@ pub const globMatch = impl.globMatch;
 pub const patternPropertyMatches = impl.patternPropertyMatches;
 pub const shouldIgnoreSchemaValidationField = impl.shouldIgnoreSchemaValidationField;
 pub const pathContainsSchemaIgnoredField = impl.pathContainsSchemaIgnoredField;
+pub const parseTtlDurationNs = impl.parseTtlDurationNs;
+
+fn relationalUuidColumns(alloc: std.mem.Allocator, schema: ParsedTableSchema) ![]const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    errdefer names.deinit(alloc);
+    if (schema.storage_mode == .relational) {
+        for (schema.document_schemas) |document| {
+            for (document.properties) |property| {
+                if (property.format != null and std.mem.eql(u8, property.format.?, "uuid")) try names.append(alloc, property.name);
+            }
+        }
+    }
+    return names.toOwnedSlice(alloc);
+}
 
 pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
     return try impl.parseSchemaUpdateRequest(alloc, body);
@@ -73,6 +87,8 @@ pub const CompiledTableValidator = struct {
     physical_fields: []impl.PhysicalFieldValidation,
     execution: impl.CompiledValidationPlan,
     restore: impl.RelationalRestorePlan,
+    /// Borrowed names from the immutable parsed schema; only the slice is owned.
+    uuid_columns: []const []const u8,
     owns_schema: bool,
 
     pub fn init(alloc: std.mem.Allocator, schema_json: []const u8) !CompiledTableValidator {
@@ -86,11 +102,14 @@ pub const CompiledTableValidator = struct {
         errdefer freePhysicalFieldValidations(alloc, physical_fields);
         var restore = try impl.RelationalRestorePlan.init(alloc, schema, physical_fields);
         errdefer restore.deinit(alloc);
+        const uuid_columns = try relationalUuidColumns(alloc, schema);
+        errdefer alloc.free(uuid_columns);
         return .{
             .schema = schema,
             .physical_fields = physical_fields,
             .execution = try impl.CompiledValidationPlan.init(alloc, schema),
             .restore = restore,
+            .uuid_columns = uuid_columns,
             .owns_schema = false,
         };
     }
@@ -104,21 +123,67 @@ pub const CompiledTableValidator = struct {
     pub fn deinit(self: *CompiledTableValidator, alloc: std.mem.Allocator) void {
         self.execution.deinit(alloc);
         self.restore.deinit(alloc);
+        alloc.free(self.uuid_columns);
         freePhysicalFieldValidations(alloc, self.physical_fields);
         if (self.owns_schema) self.schema.deinit(alloc);
         self.* = undefined;
     }
 
     pub fn validateWrites(self: CompiledTableValidator, alloc: std.mem.Allocator, writes: anytype) !void {
+        if (self.schema.external_base_source != null and writes.len != 0) return error.ExternalLakeReadOnly;
         try impl.validateWritesWithPlan(alloc, self.schema, writes, self.physical_fields, &self.execution);
     }
 
     pub fn validateValue(self: CompiledTableValidator, alloc: std.mem.Allocator, value: *std.json.Value) !void {
         try impl.validateDocumentValueWithPlan(alloc, self.schema, value, self.physical_fields, &self.execution);
+        try self.requireCanonicalUuid(value.*);
     }
 
     pub fn prepareValue(self: CompiledTableValidator, owned_alloc: std.mem.Allocator, scratch: std.mem.Allocator, value: *std.json.Value) !void {
+        try self.canonicalizeUuid(owned_alloc, value);
         try impl.prepareDocumentValueWithPlan(owned_alloc, scratch, self.schema, value, self.physical_fields, &self.execution);
+        if (self.execution.expressions != null) try self.canonicalizeUuid(owned_alloc, value);
+    }
+
+    pub fn prepareTypedValue(self: CompiledTableValidator, owned_alloc: std.mem.Allocator, scratch: std.mem.Allocator, value: *std.json.Value, json_null_fields: []const []const u8, preserve: bool) !void {
+        if (preserve) try self.requireCanonicalUuid(value.*) else try self.canonicalizeUuid(owned_alloc, value);
+        try impl.prepareTypedDocumentValueWithPlan(owned_alloc, scratch, self.schema, value, self.physical_fields, &self.execution, json_null_fields, preserve);
+        if (self.execution.expressions != null) {
+            if (preserve) try self.requireCanonicalUuid(value.*) else try self.canonicalizeUuid(owned_alloc, value);
+        }
+    }
+
+    fn canonicalizeUuid(self: CompiledTableValidator, alloc: std.mem.Allocator, value: *std.json.Value) !void {
+        if (value.* != .object) return;
+        for (self.uuid_columns) |name| {
+            const cell = value.object.getPtr(name) orelse continue;
+            if (cell.* != .string) continue;
+            const parsed = @import("../common/uuid.zig").parse(cell.string) catch return error.InvalidBatchRequest;
+            const canonical = @import("../common/uuid.zig").format(parsed);
+            if (!std.mem.eql(u8, cell.string, &canonical)) cell.string = try alloc.dupe(u8, &canonical);
+        }
+    }
+
+    fn requireCanonicalUuid(self: CompiledTableValidator, value: std.json.Value) !void {
+        if (value != .object) return;
+        for (self.uuid_columns) |name| {
+            const cell = value.object.get(name) orelse continue;
+            if (cell != .string) continue;
+            const parsed = @import("../common/uuid.zig").parse(cell.string) catch return error.InvalidBatchRequest;
+            const canonical = @import("../common/uuid.zig").format(parsed);
+            if (!std.mem.eql(u8, cell.string, &canonical)) return error.InvalidBatchRequest;
+        }
+    }
+
+    pub fn validateTypedStoredRoot(self: CompiledTableValidator, alloc: std.mem.Allocator, value: *std.json.Value, row: anytype) !void {
+        var names: std.ArrayList([]const u8) = .empty;
+        defer names.deinit(alloc);
+        for (row.table_schema.relational_columns, 0..) |column, ordinal| {
+            if (!column.is_json or column.json_kind != .any) continue;
+            const cell = (try row.findCell(@intCast(ordinal))) orelse continue;
+            if (!cell.is_null and std.mem.eql(u8, cell.value.bytes_val, "null")) try names.append(alloc, column.name);
+        }
+        try self.prepareTypedValue(alloc, alloc, value, names.items, true);
     }
 
     /// The caller must first validate canonical bytes/hash against the runtime
@@ -135,10 +200,33 @@ pub const CompiledTableValidator = struct {
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
             const value = try row.materializeCellAlloc(arena.allocator(), cell);
-            try impl.validateRelationalRestoreProperty(alloc, self.schema, index, &value, &self.execution);
+            try impl.validateRelationalRestoreProperty(alloc, self.schema, index, &value, &self.execution, !cell.is_null and cell.is_json and value == .null);
         }
     }
 };
+
+test "relational UUID preparation canonicalizes before durable row and index extraction" {
+    const alloc = std.testing.allocator;
+    var validator = try CompiledTableValidator.init(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword","format":"uuid"}},"additionalProperties":false}}}}
+    );
+    defer validator.deinit(alloc);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"id\":\"{A0EEBC999C0B4EF8BB6D6BB9BD380A11}\"}", .{});
+    defer parsed.deinit();
+    try std.testing.expectError(error.InvalidBatchRequest, validator.validateValue(alloc, &parsed.value));
+    try validator.prepareValue(parsed.arena.allocator(), alloc, &parsed.value);
+    try std.testing.expectEqualStrings("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", parsed.value.object.get("id").?.string);
+    try validator.validateValue(alloc, &parsed.value);
+
+    var document_validator = try CompiledTableValidator.init(alloc,
+        \\{"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"id":{"type":"keyword","format":"uuid"}},"additionalProperties":false}}}}
+    );
+    defer document_validator.deinit(alloc);
+    var document = try std.json.parseFromSlice(std.json.Value, alloc, "{\"id\":\"A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11\"}", .{});
+    defer document.deinit();
+    try document_validator.prepareValue(document.arena.allocator(), alloc, &document.value);
+    try std.testing.expectEqualStrings("A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11", document.value.object.get("id").?.string);
+}
 
 const compiled_check_fixture =
     \\{"version":1,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"id","op":"gt","value":"9007199254740992"},{"name":"known","column":"name","op":"is_not_null"},{"name":"active","column":"name","op":"eq","value":"ACTIVE","collation":"ci"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"name":{"type":"keyword"}},"additionalProperties":false}}}}
@@ -358,7 +446,7 @@ fn appendUniquePhysicalFieldValidation(
     source_field: []const u8,
     field_type: storage_schema.AntflyType,
 ) !void {
-    const type_mask = @as(u16, 1) << @intCast(@intFromEnum(field_type));
+    const type_mask = @as(u16, 1) << @intCast(@backingInt(field_type));
     if (seen_types.getPtr(source_field)) |mask| {
         if (mask.* & type_mask != 0) return;
         const owned_source = try alloc.dupe(u8, source_field);
@@ -390,7 +478,7 @@ fn appendUniquePhysicalFieldValidation(
 fn physicalFieldValidationLessThan(_: void, a: impl.PhysicalFieldValidation, b: impl.PhysicalFieldValidation) bool {
     const order = std.mem.order(u8, a.source_field, b.source_field);
     if (order != .eq) return order == .lt;
-    return @intFromEnum(a.field_type) < @intFromEnum(b.field_type);
+    return @backingInt(a.field_type) < @backingInt(b.field_type);
 }
 
 fn freePhysicalFieldValidations(alloc: std.mem.Allocator, fields: []impl.PhysicalFieldValidation) void {
@@ -486,9 +574,12 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
     const default_type = try alloc.dupe(u8, if (schema.default_type.len > 0) schema.default_type else "_default");
     errdefer alloc.free(default_type);
     const ttl_field = try alloc.dupe(u8, schema.ttl_field);
+    errdefer alloc.free(ttl_field);
+    const external = if (schema.external_base_source) |source| try @import("../serverless/external_source/schema_binding.zig").cloneAlloc(alloc, source) else null;
 
     return .{
         .version = schema.version,
+        .external_base_source = external,
         .default_type = default_type,
         .ttl_duration_ns = schema.ttl_duration_ns,
         .ttl_field = ttl_field,
@@ -583,7 +674,8 @@ pub fn runtimeRelationalColumnType(property: impl.DocumentProperty) ?storage_sch
             std.mem.eql(u8, field_type, "string") or
             std.mem.eql(u8, field_type, "text") or
             std.mem.eql(u8, field_type, "html") or
-            std.mem.eql(u8, field_type, "search_as_you_type")) return .string;
+            std.mem.eql(u8, field_type, "search_as_you_type") or
+            std.mem.eql(u8, field_type, "substring")) return .string;
         if (std.mem.eql(u8, field_type, "blob")) return .blob;
         if (std.mem.eql(u8, field_type, "boolean")) return .boolean;
         if (std.mem.eql(u8, field_type, "datetime")) return .datetime;
@@ -905,14 +997,14 @@ fn declaredFieldLessThan(_: void, a: storage_schema.DeclaredField, b: storage_sc
     const field_order = std.mem.order(u8, a.field, b.field);
     if (field_order != .eq) return field_order == .lt;
     if (a.mapping.field_type != b.mapping.field_type) {
-        return @intFromEnum(a.mapping.field_type) < @intFromEnum(b.mapping.field_type);
+        return @backingInt(a.mapping.field_type) < @backingInt(b.mapping.field_type);
     }
     if (a.mapping.do_index != b.mapping.do_index) return !a.mapping.do_index;
     if (a.mapping.store != b.mapping.store) return !a.mapping.store;
     if (a.mapping.doc_values != b.mapping.doc_values) return !a.mapping.doc_values;
     if (a.mapping.sortable != b.mapping.sortable) return !a.mapping.sortable;
     if (a.mapping.missing_null_policy != b.mapping.missing_null_policy) {
-        return @intFromEnum(a.mapping.missing_null_policy) < @intFromEnum(b.mapping.missing_null_policy);
+        return @backingInt(a.mapping.missing_null_policy) < @backingInt(b.mapping.missing_null_policy);
     }
     if (a.mapping.include_in_all != b.mapping.include_in_all) return !a.mapping.include_in_all;
     return std.mem.order(u8, a.mapping.analyzer, b.mapping.analyzer) == .lt;
@@ -968,7 +1060,7 @@ fn appendShorthandRuntimeDeclaredFields(
     antfly_types: []const []const u8,
 ) !void {
     const has_primary = containsString(antfly_types, "text") or containsString(antfly_types, "html");
-    const has_search_as_you_type = containsString(antfly_types, "search_as_you_type");
+    const has_search_as_you_type = containsString(antfly_types, "search_as_you_type") or containsString(antfly_types, "substring");
 
     for (antfly_types) |type_name| {
         const field_type = parseRuntimeFieldType(type_name);
@@ -1139,6 +1231,7 @@ fn defaultDynamicTemplateAnalyzer(field_type: storage_schema.AntflyType) []const
         .html => "html",
         .keyword, .link => "keyword",
         .search_as_you_type => "search_as_you_type",
+        .substring => "substring",
         else => "standard",
     };
 }
@@ -1447,23 +1540,34 @@ fn deriveRuntimeFullTextLeaf(
     const has_primary = has_text or has_html;
     const has_keyword = containsString(types, "keyword") or containsString(types, "link");
     const has_search_as_you_type = containsString(types, "search_as_you_type");
+    const has_substring = containsString(types, "substring");
+    // Companion types always sit next to an analyzed root field.
+    const has_companion = has_search_as_you_type or has_substring;
 
     if (has_text and has_html) return;
 
-    if (has_text or (!has_primary and has_search_as_you_type)) {
+    if (has_text or (!has_primary and has_companion)) {
         try appendFullTextField(alloc, fields, path, path, primary_analyzer, should_include_in_all);
     } else if (has_html) {
         try appendFullTextField(alloc, fields, path, path, effectiveAntflyAnalyzer(property, item) orelse "html", should_include_in_all);
     }
 
     if (has_keyword) {
-        const emitted_name = if (has_primary or has_search_as_you_type)
+        const emitted_name = if (has_primary or has_companion)
             try std.fmt.allocPrint(alloc, "{s}.keyword", .{path})
         else
             try alloc.dupe(u8, path);
         defer alloc.free(emitted_name);
-        const include = should_include_in_all and !has_primary and !has_search_as_you_type;
+        const include = should_include_in_all and !has_primary and !has_companion;
         try appendFullTextField(alloc, fields, path, emitted_name, "keyword", include);
+    }
+
+    if (has_substring) {
+        // Suffix-indexed companion answering "contains" queries; see
+        // `analysis.substring_analyzer`.
+        const emitted_substring = try std.fmt.allocPrint(alloc, "{s}._substring", .{path});
+        defer alloc.free(emitted_substring);
+        try appendFullTextField(alloc, fields, path, emitted_substring, "substring", false);
     }
 
     if (has_search_as_you_type) {
@@ -1693,18 +1797,24 @@ fn appendDynamicLeafRule(
     const has_primary = has_text or has_html;
     const has_keyword = containsString(types, "keyword") or containsString(types, "link");
     const has_search_as_you_type = containsString(types, "search_as_you_type");
+    const has_substring = containsString(types, "substring");
+    const has_companion = has_search_as_you_type or has_substring;
 
     if (has_text and has_html) return;
 
-    if (has_text or (!has_primary and has_search_as_you_type)) {
+    if (has_text or (!has_primary and has_companion)) {
         try appendDynamicVariant(alloc, &variants, "", "standard", false);
     } else if (has_html) {
         try appendDynamicVariant(alloc, &variants, "", "html", false);
     }
 
     if (has_keyword) {
-        const suffix = if (has_primary or has_search_as_you_type) ".keyword" else "";
+        const suffix = if (has_primary or has_companion) ".keyword" else "";
         try appendDynamicVariant(alloc, &variants, suffix, "keyword", false);
+    }
+
+    if (has_substring) {
+        try appendDynamicVariant(alloc, &variants, "._substring", "substring", false);
     }
 
     if (has_search_as_you_type) {
@@ -1813,6 +1923,7 @@ fn inferAntflyType(field_type: []const u8) ?[]const []const u8 {
     if (std.mem.eql(u8, field_type, "keyword")) return &.{"keyword"};
     if (std.mem.eql(u8, field_type, "link")) return &.{"link"};
     if (std.mem.eql(u8, field_type, "search_as_you_type")) return &.{"search_as_you_type"};
+    if (std.mem.eql(u8, field_type, "substring")) return &.{"substring"};
     return null;
 }
 
@@ -1953,6 +2064,59 @@ test "runtime schema records declared and unindexed paths for the dynamic mapper
     try std.testing.expect(try storage_schema.schemasEqual(alloc, runtime, loaded));
     try std.testing.expectEqual(document.declared_paths.len, loaded.full_text_documents[0].declared_paths.len);
     try std.testing.expectEqual(document.unindexed_paths.len, loaded.full_text_documents[0].unindexed_paths.len);
+}
+
+test "runtime schema derives substring companions" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{
+        \\  "document_schemas": {
+        \\    "doc": {"schema": {"type":"object", "properties": {
+        \\      "title": {"type":"string", "x-antfly-types":["text","substring"]},
+        \\      "sku": {"type":"string", "x-antfly-types":["substring","keyword"]},
+        \\      "meta": {"type":"object", "additionalProperties":{"type":"string", "x-antfly-types":["substring"]}},
+        \\      "code": {"type":"substring"},
+        \\      "part": {"type":"string", "x-antfly-field":{"type":"substring"}}
+        \\    }}}
+        \\  }
+        \\}
+    );
+    defer parsed.deinit(alloc);
+
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+    const fields = runtime.full_text_documents[0].fields;
+
+    const title_root = findFullTextField(fields, "title") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("standard", title_root.analyzer);
+    const title_substring = findFullTextField(fields, "title._substring") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("substring", title_substring.analyzer);
+
+    // A lone substring type still gets an analyzed root, and keyword moves to
+    // its companion name exactly as it does next to search_as_you_type.
+    const sku_root = findFullTextField(fields, "sku") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("standard", sku_root.analyzer);
+    try std.testing.expect(findFullTextField(fields, "sku.keyword") != null);
+    try std.testing.expect(findFullTextField(fields, "sku._substring") != null);
+
+    // The bare schema spelling and the explicit mapping form both emit the
+    // analyzed root plus the companion.
+    try std.testing.expect(findFullTextField(fields, "code") != null);
+    try std.testing.expect(findFullTextField(fields, "code._substring") != null);
+    try std.testing.expect(findFullTextField(fields, "part") != null);
+    try std.testing.expect(findFullTextField(fields, "part._substring") != null);
+
+    var dynamic_substring = false;
+    for (runtime.full_text_documents[0].dynamic_rules) |rule| {
+        if (!std.mem.eql(u8, rule.parent_path, "meta")) continue;
+        for (rule.variants) |variant| {
+            if (std.mem.eql(u8, variant.suffix, "._substring")) {
+                try std.testing.expectEqualStrings("substring", variant.analyzer);
+                dynamic_substring = true;
+            }
+        }
+    }
+    try std.testing.expect(dynamic_substring);
 }
 
 test "runtime schema derives authoritative relational columns" {
@@ -2522,4 +2686,27 @@ test "runtime schema derives and validates index sort metadata" {
     );
     defer id_not_final.deinit(alloc);
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, deriveRuntimeTableSchema(alloc, id_not_final));
+}
+
+test "external lake schema binding survives durable serialization and preserves ownership" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{"version":7,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"orders","format":"iceberg","uri":"s3://bucket/orders","credentials":{"ref":"lake","scope":"orders"},"snapshot":{"mode":"snapshot_id","id":"123"},"schema_fingerprint":"schema-v7"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"integer"}},"additionalProperties":false}}}}
+    );
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    parsed.deinit(alloc);
+    defer storage_schema.freeSchema(alloc, runtime);
+    const bytes = try storage_schema.serializeSchema(alloc, runtime);
+    defer alloc.free(bytes);
+    const restored = try storage_schema.deserializeSchema(alloc, bytes);
+    defer storage_schema.freeSchema(alloc, restored);
+    try std.testing.expect(try storage_schema.schemasEqual(alloc, runtime, restored));
+    const source = restored.external_base_source.?.binding;
+    try std.testing.expectEqualStrings("123", source.snapshot_mode.snapshot_id);
+    try std.testing.expectEqualStrings("lake", source.credential_ref.?.ref_id);
+    const projection = try storage_schema.serializeTextProjectionSchema(alloc, runtime);
+    defer alloc.free(projection);
+    const text_schema = try storage_schema.deserializeSchema(alloc, projection);
+    defer storage_schema.freeSchema(alloc, text_schema);
+    try std.testing.expect(text_schema.external_base_source == null);
 }

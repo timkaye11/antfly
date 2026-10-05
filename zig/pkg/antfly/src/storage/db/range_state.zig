@@ -23,7 +23,7 @@ pub const range_key = "\x00\x00__metadata__:range";
 pub const InitialOwnerRange = struct {
     range: docstore_mod.ByteRange,
     namespace: @import("doc_identity.zig").Namespace,
-    cancellation: @import("../../common/cancellation.zig").CancellationToken = .none,
+    cancellation: @import("antfly_cancellation").CancellationToken = .none,
     deadline_ns: ?u64 = null,
 
     fn check(self: @This()) !void {
@@ -299,7 +299,7 @@ const RuntimeStoreHandle = struct {
     store: backend_erased.Store,
     owned: bool,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         if (self.owned) self.store.deinit();
     }
 };
@@ -340,7 +340,7 @@ test "range state saves and loads namespaced ranges" {
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/range-state", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
 
     var store = try docstore_mod.DocStore.open(std.testing.allocator, path_z.ptr, .{});
@@ -385,7 +385,7 @@ test "range state returns empty range for missing namespaced key" {
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/range-state-empty", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
 
     var store = try docstore_mod.DocStore.open(std.testing.allocator, path_z.ptr, .{});

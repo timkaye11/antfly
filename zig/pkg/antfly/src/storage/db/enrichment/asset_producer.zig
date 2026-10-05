@@ -14,9 +14,9 @@
 
 const std = @import("std");
 const antfly_image = @import("antfly_image");
-const inference_work = @import("../../../inference/work.zig");
-const CancellationToken = @import("../../../common/cancellation.zig").CancellationToken;
-const request_context = @import("../../../inference/execution_context.zig");
+const inference_work = @import("antfly_inference_work");
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
+const request_context = @import("antfly_inference_execution_context");
 const RequestContext = request_context.RequestContext;
 
 const Allocator = std.mem.Allocator;
@@ -56,8 +56,10 @@ pub const ProducerType = enum {
     reader,
     transcriber,
     extractor,
+    decision,
 
     pub fn parse(text: []const u8) ?ProducerType {
+        if (std.mem.eql(u8, text, "decision")) return .decision;
         if (std.mem.eql(u8, text, "copy")) return .copy;
         if (std.mem.eql(u8, text, "document_extraction")) return .document_extraction;
         if (std.mem.eql(u8, text, "generator")) return .generator;
@@ -641,7 +643,7 @@ fn requestsRequireInvocationContract(requests: []const Request) bool {
     for (requests) |request| {
         if (request.media.len > 0 or request.source_parts_json != null or
             switch (request.producer_type) {
-                .reader, .generator, .extractor, .transcriber => true,
+                .reader, .generator, .extractor, .transcriber, .decision => true,
                 .copy, .document_extraction => false,
             }) return true;
     }
@@ -1403,7 +1405,7 @@ test "asset producer preserves legacy native batch under request context" {
         .{
             .io = std.testing.io,
             .deadline_ns = null,
-            .cancellation = @import("../../../common/cancellation.zig").CancellationToken.fromAtomic(&cancelled),
+            .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&cancelled),
         },
     ));
     try std.testing.expectEqual(@as(usize, 2), probe.batch_calls);

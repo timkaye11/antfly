@@ -213,12 +213,18 @@ components:
           type: string
           enum: [document, external]
           default: document
+        source:
+          $ref: "#/components/schemas/GraphTemplateValue"
+          description: Logical source endpoint. When set, edge.edge_id is required; the artifact document remains the durable owner.
         target: { $ref: "#/components/schemas/GraphTemplateValue" }
     GraphArtifactEdgeMappingConfig:
       type: object
       additionalProperties: false
-      description: "Maps each artifact item to an edge type, weight, and public metadata."
+      description: "Maps each artifact item to a relationship identity, type, weight, and public metadata."
       properties:
+        edge_id:
+          $ref: "#/components/schemas/GraphTemplateValue"
+          description: Stable application relationship ID. Required with nodes.source. Replays update the same identity; distinct IDs preserve parallel relationships.
         type: { $ref: "#/components/schemas/GraphTemplateValue" }
         weight: { $ref: "#/components/schemas/GraphTemplateValue" }
         metadata:
@@ -604,6 +610,7 @@ components:
           items: { $ref: "#/components/schemas/FullTextArtifactIndexSource" }
         mem_only: { type: boolean }
         field: { type: string }
+        analysis_config: { $ref: "#/components/schemas/TextAnalysisConfig" }
     CreatedGraphIndexConfig:
       type: object
       description: "Credential-free normalized graph configuration returned after creation."
@@ -809,7 +816,7 @@ components:
           type: object
           additionalProperties: true
           writeOnly: true
-          description: "Write-only producer configuration. Cannot be combined with producer_json or transcriber."
+          description: "Write-only producer configuration. Cannot be combined with producer_json or transcriber. Decision producers use type=decision and config={version, decider, questions}, where decider is a frozen Antfly or Jev DeciderConfig. Outputs include answers, usage, resolved model, specification hash, version, and source fingerprint. Change version or specification to rebuild through the enrichment lifecycle."
         producer_json:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -819,7 +826,7 @@ components:
           description: "Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded."
         neighbor_context:
           $ref: "#/components/schemas/EnrichmentNeighborContextConfig"
-          description: "Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator or extractor); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission."
+          description: "Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator, extractor, or decision); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission."
         execution:
           $ref: "#/components/schemas/ExecutionPolicy"
           description: "Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity."
@@ -960,6 +967,87 @@ components:
           type: string
           minLength: 1
           description: "Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments."
+        analysis_config:
+          $ref: "#/components/schemas/TextAnalysisConfig"
+    TextAnalysisConfig:
+      type: object
+      description: |
+        Custom text analysis for a full-text index. Component maps are keyed
+        by the name that analyzers and `field_analyzers` reference. Built-in
+        analyzers (`standard`, `simple`, `keyword`, `html`, `search_as_you_type`,
+        `substring`, and the language analyzers such as `german`) are always
+        available without declaring them.
+
+        Example: split camelCase identifiers and match them as substrings.
+
+        ```json
+        {
+          "analysis_config": {
+            "field_analyzers": {"symbol": "code"},
+            "token_filters": {
+              "tails": {"type": "suffix", "config": {"min": 3, "max": 24}}
+            },
+            "analyzers": {
+              "code": {
+                "type": "custom",
+                "config": {
+                  "tokenizer": "whitespace",
+                  "token_filters": ["camel_case", "unique", "tails"]
+                }
+              }
+            }
+          }
+        }
+        ```
+      properties:
+        field_analyzers:
+          type: object
+          additionalProperties:
+            type: string
+          description: "Map of indexed field name to analyzer name. Overrides the analyzer derived from the table schema for that field."
+        char_filters:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/TextAnalysisComponent"
+          description: "Named character filters. Types: `html_strip` (alias `html`), `ascii_fold`, `zero_width_non_joiner`."
+        tokenizers:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/TextAnalysisComponent"
+          description: "Named tokenizers. Types: `unicode` (alias `unicode_words`), `whitespace`, `keyword`, `character`, `ngram` (`config.min`, `config.max`), `edge_ngram` (`config.min`, `config.max`, `config.side` of `front` or `back`)."
+        token_filters:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/TextAnalysisComponent"
+          description: "Named token filters. Types: `lowercase` (alias `to_lower`), `stop_words` (alias `stop`; optional `config.language`), `stemmer` (optional `config.language`), `ngram` and `edge_ngram` (`config.min`, `config.max`), `shingle` (`config.min`, `config.max`, `config.separator` of `space` or `none`), `suffix` (`config.min`, `config.max`; emits every suffix of each token so prefix queries answer containment), `length` (`config.min`, `config.max`), `truncate` (`config.length`), `camel_case`, `unique`, `reverse`, `elision`, `apostrophe`. Languages: english, german, french, spanish, italian, portuguese, dutch, swedish, norwegian, danish, finnish."
+        analyzers:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/TextAnalysisComponent"
+          description: "Named analyzers of type `custom`. `config.tokenizer` names a built-in or declared tokenizer; `config.char_filters` and `config.token_filters` list built-in or declared component names in application order. Configuration-free filters (`lowercase`, `stop_words`, `stemmer`, `camel_case`, `unique`, `reverse`, `elision`, `apostrophe`, `suffix`) can be listed by name without declaring them."
+        default_datetime_parser:
+          type: string
+          description: "Name of the date-time parser applied to datetime fields without a field-specific parser."
+        field_date_time_parsers:
+          type: object
+          additionalProperties:
+            type: string
+          description: "Map of field name to date-time parser name."
+        date_time_parsers:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/TextAnalysisComponent"
+          description: "Named date-time parsers. Type `sanitizedgo` accepts `config.layouts`, a list of Go reference-time layouts tried in order."
+    TextAnalysisComponent:
+      type: object
+      required: [type]
+      description: "One named analysis component: its type and type-specific configuration."
+      properties:
+        type:
+          type: string
+        config:
+          type: object
+          additionalProperties: true
     AlgebraicIndexConfig:
       type: object
       description: "Schema-derived algebraic sidecar configuration. Public requests may opt into schema derivation, while materializations remain engine-owned."
@@ -2752,6 +2840,7 @@ components:
       type: string
       enum:
         - search_as_you_type
+        - substring
         - keyword
         - text
         - html
@@ -2768,7 +2857,14 @@ components:
       description: "Configuration for graph index type"
       x-antfly-mutually-exclusive:
         - [sources, source]
+        - [ttl, ttl_duration]
       properties:
+        ttl:
+          $ref: "#/components/schemas/GraphTtlConfig"
+          description: "Creation-based edge expiration for this graph index. The duration is immutable within an index incarnation."
+        ttl_duration:
+          type: string
+          description: "Compatibility alias for ttl.duration. Do not specify together with ttl."
         metrics:
           type: object
           description: "Named published graph metrics. Serverless supports background refresh only and limits configurations to 16 metrics per graph, 64 total per publication, 64 types per filter, and 128 UTF-8 bytes per metric name."
@@ -2816,6 +2912,14 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/GraphResolverConfig"
+    GraphTtlConfig:
+      type: object
+      additionalProperties: false
+      required: [duration]
+      properties:
+        duration:
+          type: string
+          description: "Expiration duration using Antfly's integer-component duration format (ns, us, ms, s, m, h, d)."
     GraphMetricConfig:
       type: object
       additionalProperties: false
@@ -3305,6 +3409,14 @@ components:
         - type
         - weight
       properties:
+        edge_id:
+          type: string
+          minLength: 1
+          description: Application relationship ID. Absent on legacy tuple relationships. IDs are scoped to this graph index, owning document, and endpoint/type tuple.
+        owner_document:
+          type: string
+          minLength: 1
+          description: Owning fact document key in the graph index table when it differs from the logical source. The document is the authority for replay and deletion.
         source:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -3567,6 +3679,14 @@ components:
       x-go-type-skip-optional-pointer: true
       type: object
       properties:
+        edge_id:
+          type: string
+          minLength: 1
+          description: Application relationship ID. Absent on legacy tuple relationships. IDs are scoped to this graph index, owning document, and endpoint/type tuple.
+        owner_document:
+          type: string
+          minLength: 1
+          description: Owning fact document key in the graph index table when it differs from the logical source. The document is the authority for replay and deletion.
         source:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -3594,6 +3714,14 @@ components:
         remains unambiguous across tables and for equal keys in different
         tables.
       properties:
+        edge_id:
+          type: string
+          minLength: 1
+          description: Application relationship ID. Absent on legacy tuple relationships. IDs are scoped to this graph index, owning document, and endpoint/type tuple.
+        owner_document:
+          type: string
+          minLength: 1
+          description: Owning fact document key in the graph index table when it differs from the logical source. The document is the authority for replay and deletion.
         from: { $ref: '#/components/schemas/GraphPathEndpoint' }
         to: { $ref: '#/components/schemas/GraphPathEndpoint' }
         direction: { $ref: '#/components/schemas/GraphPathEdgeDirection' }
@@ -3723,6 +3851,8 @@ components:
       deprecated: true
       description: Deprecated graph_searches traversal and path parameters.
       properties:
+        edge_filter:
+          $ref: '#/components/schemas/GraphRelationshipFilter'
         edge_types:
           x-go-type-skip-optional-pointer: true
           type: array
@@ -3775,6 +3905,8 @@ components:
       deprecated: true
       description: Deprecated linear graph_searches pattern edge.
       properties:
+        edge_filter:
+          $ref: '#/components/schemas/GraphRelationshipFilter'
         types:
           x-go-type-skip-optional-pointer: true
           type: array
@@ -4200,6 +4332,47 @@ components:
       properties:
         min: { type: number, format: double, minimum: 0, x-go-type-skip-optional-pointer: false }
         max: { type: number, format: double, minimum: 0, x-go-type-skip-optional-pointer: false }
+    GraphRelationshipPropertyPredicate:
+      type: object
+      additionalProperties: false
+      required: [field, op]
+      properties:
+        field:
+          type: string
+          description: JSON pointer to /metadata/... or /edge_id, /owner_document, /source, /target, /type, /weight, /created_at, /updated_at.
+        op:
+          type: string
+          enum: [eq, ne, lt, lte, gt, gte, is_null, is_not_null]
+        value:
+          description: Non-null scalar comparison value. Omit for is_null and is_not_null.
+        value_type:
+          type: string
+          enum: [scalar, datetime]
+          default: scalar
+          description: Datetime compares RFC3339 instants rather than string ordering.
+    GraphRelationshipFilter:
+      type: object
+      additionalProperties: false
+      description: >-
+        AND predicates applied to every relationship before neighbor admission,
+        path ranking, and match counting. Missing or null properties fail comparisons,
+        including ne; use explicit null operators. Maximum 64 predicates and 64 KiB
+        of predicate fields and values. Time intervals have inclusive lower and
+        exclusive upper bounds. Missing/null valid-time bounds are open; known_at
+        requires a created_at value. Invalid timestamp properties never match.
+      properties:
+        properties:
+          type: array
+          maxItems: 64
+          items: { $ref: '#/components/schemas/GraphRelationshipPropertyPredicate' }
+        valid_at:
+          type: string
+          format: date-time
+          description: Require metadata.valid_at <= instant < metadata.invalid_at.
+        known_at:
+          type: string
+          format: date-time
+          description: Require metadata.created_at <= instant < metadata.expired_at.
     GraphTraversal:
       type: object
       additionalProperties: false
@@ -4210,6 +4383,8 @@ components:
         to traverse a relationship as undirected without storing a reciprocal
         edge.
       properties:
+        edge_filter:
+          $ref: '#/components/schemas/GraphRelationshipFilter'
         start:
           $ref: '#/components/schemas/GraphNodeSelector'
         direction:
@@ -4327,6 +4502,8 @@ components:
       required: [from, to]
       description: Find the best path from `from` to `to` in the requested stored-edge direction.
       properties:
+        edge_filter:
+          $ref: '#/components/schemas/GraphRelationshipFilter'
         from: { $ref: '#/components/schemas/GraphPathEndpoint' }
         to: { $ref: '#/components/schemas/GraphPathEndpoint' }
         direction:
@@ -4370,9 +4547,11 @@ components:
       description: >-
         Find up to `k` loopless paths from `from` to `to` in the requested
         stored-edge direction. Results are unique by ordered table-qualified
-        node identities plus stored-edge direction and type, and are ordered
+        node identities plus stored-edge direction, type, edge ID and fact owner, and are ordered
         best-first by the selected objective.
       properties:
+        edge_filter:
+          $ref: '#/components/schemas/GraphRelationshipFilter'
         from: { $ref: '#/components/schemas/GraphPathEndpoint' }
         to: { $ref: '#/components/schemas/GraphPathEndpoint' }
         direction:
@@ -4454,6 +4633,8 @@ components:
         cross-table multi-hop patterns as explicit single-hop edges with a
         table-qualified alias at each table boundary.
       properties:
+        edge_filter:
+          $ref: '#/components/schemas/GraphRelationshipFilter'
         from: { $ref: 'generated/graph_identifier.yaml#/components/schemas/GraphIdentifier' }
         to: { $ref: 'generated/graph_identifier.yaml#/components/schemas/GraphIdentifier' }
         direction:
@@ -4885,6 +5066,9 @@ components:
       deprecated: true
       description: Deprecated graph_searches pattern response row.
       properties:
+        _computed:
+          type: object
+          additionalProperties: true
         bindings:
           x-go-type-skip-optional-pointer: true
           type: object
@@ -4929,6 +5113,12 @@ components:
       required: [kind, rows, stats]
       description: A deterministic bounded prefix of projected bindings from a canonical graph MATCH query. Inspect stats.truncated to determine whether enumeration was exhaustive.
       properties:
+        computed:
+          type: array
+          description: Evaluated values parallel to returned rows, when decision evaluation was requested.
+          items:
+            type: object
+            additionalProperties: true
         kind:
           type: string
           enum: [bindings]

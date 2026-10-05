@@ -32,6 +32,7 @@
 
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
+const AtomicU64 = @import("antfly_platform").atomic.Value(u64);
 const resolver_lib = @import("antfly_resolver");
 const internal_keys = @import("../internal_keys.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
@@ -120,6 +121,19 @@ const PromotedRef = struct {
     alias: []const u8,
 };
 
+/// An admitted promotion retains its exact immutable batch until the remote
+/// outcome and local receipt are both known. Keeping it in the same row as
+/// the receipt makes admission/completion single local atomic writes, and
+/// bounds recovery state to one batch per resolution artifact.
+const PromotionIntent = struct {
+    version: u32 = 1,
+    pending: struct {
+        config_generation: u64,
+        entries: []const EntityUpsert,
+        receipt: []const u8,
+    },
+};
+
 fn promotedAlias(e: resolver_lib.ResolvedEntity) []const u8 {
     return if (e.surface_form.len > 0) e.surface_form else e.canonical_name;
 }
@@ -138,13 +152,13 @@ fn promotedRefMatches(previous: PromotedRef, e: resolver_lib.ResolvedEntity) boo
 
 fn parsePromotedKeysState(a: Allocator, raw: []const u8) !std.StringArrayHashMapUnmanaged(PromotedRef) {
     var map = std.StringArrayHashMapUnmanaged(PromotedRef).empty;
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch return map;
-    if (parsed != .object) return map;
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{});
+    if (parsed != .object) return error.InvalidPromotionReceipt;
     var it = parsed.object.iterator();
     while (it.next()) |entry| {
-        if (entry.value_ptr.* != .array) continue;
+        if (entry.value_ptr.* != .array) return error.InvalidPromotionReceipt;
         const fields = entry.value_ptr.array.items;
-        if (fields.len != 6) continue;
+        if (fields.len != 6) return error.InvalidPromotionReceipt;
         var all_strings = true;
         for (fields[0..2]) |field| {
             if (field != .string) all_strings = false;
@@ -152,7 +166,7 @@ fn parsePromotedKeysState(a: Allocator, raw: []const u8) !std.StringArrayHashMap
         for (fields[3..]) |field| {
             if (field != .string) all_strings = false;
         }
-        if (!all_strings or (fields[2] != .string and fields[2] != .null)) continue;
+        if (!all_strings or (fields[2] != .string and fields[2] != .null)) return error.InvalidPromotionReceipt;
         try map.put(a, entry.key_ptr.*, .{
             .table = fields[0].string,
             .key = fields[1].string,
@@ -165,17 +179,29 @@ fn parsePromotedKeysState(a: Allocator, raw: []const u8) !std.StringArrayHashMap
     return map;
 }
 
-fn stringifyPromotedKeysState(a: Allocator, entities: []const resolver_lib.ResolvedEntity) ![]u8 {
+fn stringifyPromotedKeysState(a: Allocator, entities: []const resolver_lib.ResolvedEntity, prior: *const std.StringArrayHashMapUnmanaged(PromotedRef)) ![]u8 {
     var state: std.json.ObjectMap = .empty;
     for (entities) |e| {
-        if (!isPromotableDecision(e.decision) or e.canonical_name.len == 0) continue;
+        // Review is a temporary decision, not proof that an earlier remote
+        // promotion vanished. Retain that receipt while this local mention
+        // exists, so a later accepted re-key still retires its old document.
+        // Truly removed mentions drop out, keeping state bounded by the
+        // current artifact rather than an ever-growing identity history.
+        const ref: PromotedRef = if (isPromotableDecision(e.decision) and e.canonical_name.len > 0) .{
+            .table = e.doc_ref.table,
+            .key = e.doc_ref.key,
+            .storage_table = e.doc_ref.storage_table,
+            .label = e.label,
+            .canonical_name = e.canonical_name,
+            .alias = promotedAlias(e),
+        } else prior.get(e.local_id) orelse continue;
         var fields = std.json.Array.init(a);
-        try fields.append(.{ .string = e.doc_ref.table });
-        try fields.append(.{ .string = e.doc_ref.key });
-        try fields.append(if (e.doc_ref.storage_table) |physical| .{ .string = physical } else .null);
-        try fields.append(.{ .string = e.label });
-        try fields.append(.{ .string = e.canonical_name });
-        try fields.append(.{ .string = promotedAlias(e) });
+        try fields.append(.{ .string = ref.table });
+        try fields.append(.{ .string = ref.key });
+        try fields.append(if (ref.storage_table) |physical| .{ .string = physical } else .null);
+        try fields.append(.{ .string = ref.label });
+        try fields.append(.{ .string = ref.canonical_name });
+        try fields.append(.{ .string = ref.alias });
         try state.put(a, e.local_id, .{ .array = fields });
     }
     return std.json.Stringify.valueAlloc(a, std.json.Value{ .object = state }, .{});
@@ -219,6 +245,28 @@ fn processResolutionArtifactWithCatalog(
     sink: EntitySink,
     resolver_configs: ?[]const ResolverConfig,
 ) !usize {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const state_key = try promotedKeysStateKeyAlloc(a, resolution_key);
+    // Recover an already admitted operation before reading the mutable
+    // resolution artifact. A lost reply must retry the same batch even when
+    // the resolver has since moved to a different canonical key or the
+    // artifact has been deleted. Catalog fencing below still governs every
+    // newly admitted decision; recovery finishes an earlier admitted one.
+    var prior_raw = try store.get(a, state_key);
+    if (prior_raw) |state_raw| {
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, a, state_raw, .{});
+        if (value == .object and value.object.get("pending") != null and value.object.get("pending").? == .object) {
+            const intent = try std.json.parseFromSliceLeaky(PromotionIntent, a, state_raw, .{});
+            if (intent.version != 1) return error.UnsupportedPromotionIntent;
+            var receipt = try parsePromotedKeysState(a, intent.pending.receipt);
+            defer receipt.deinit(a);
+            try sink.upsertBatch(gpa, intent.pending.entries);
+            try store.put(state_key, intent.pending.receipt);
+            prior_raw = try a.dupe(u8, intent.pending.receipt);
+        }
+    }
     const raw = (try store.get(gpa, resolution_key)) orelse return 0;
     defer gpa.free(raw);
 
@@ -247,12 +295,6 @@ fn processResolutionArtifactWithCatalog(
     // Collect every resolvable entity, then commit them in one batch so a
     // document's entities promote atomically (the sink uses a multi-participant
     // transaction when it supports one).
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const state_key = try promotedKeysStateKeyAlloc(a, resolution_key);
-    const prior_raw = try store.get(a, state_key);
     var prior = if (prior_raw) |state_raw| try parsePromotedKeysState(a, state_raw) else std.StringArrayHashMapUnmanaged(PromotedRef).empty;
     defer prior.deinit(a);
 
@@ -274,10 +316,9 @@ fn processResolutionArtifactWithCatalog(
                 // byte-stable replay (a retried resolution window
                 // re-emits its artifact when the handoff marker did not
                 // land). The state row proves the earlier batch
-                // committed, so re-upserting adds nothing -- and the
-                // sink's live-promotion transform clears `merged_into`,
-                // so a repeat would silently undo a curator redirect
-                // that landed on this key between the two replays.
+                // committed, so re-upserting adds nothing. Avoid a remote
+                // write even though the sink's live transform is safe to
+                // replay across a curator redirect.
                 if (promotedRefMatches(previous, e)) continue;
             } else if (same_logical_key and previous.storage_table != null and e.doc_ref.storage_table != null) {
                 // A physical table move with the same logical key cannot use
@@ -312,19 +353,24 @@ fn processResolutionArtifactWithCatalog(
         });
     }
     if (entries.items.len == 0 and promotable_count == prior.count()) return 0;
-    const state_value = try stringifyPromotedKeysState(a, parsed.entities);
+    const state_value = try stringifyPromotedKeysState(a, parsed.entities, &prior);
     if (entries.items.len == 0) {
         // Every remaining mention was a byte-stable replay, but the artifact
-        // itself may have shrunk (a mention dropped or fell into the review
-        // band). Keep the state row equal to the last artifact so it never
-        // carries a vanished mention indefinitely.
+        // itself may have shrunk. Remove vanished mentions while retaining
+        // the last accepted receipt for mentions temporarily under review.
         const unchanged = if (prior_raw) |prior_state| std.mem.eql(u8, prior_state, state_value) else promotable_count == 0;
         if (!unchanged) try store.put(state_key, state_value);
         return 0;
     }
+    const intent = try std.json.Stringify.valueAlloc(a, PromotionIntent{ .pending = .{
+        .config_generation = parsed.config_generation,
+        .entries = entries.items,
+        .receipt = state_value,
+    } }, .{});
+    try store.put(state_key, intent);
     try sink.upsertBatch(gpa, entries.items);
-    // State follows the successful batch: a crash between the two re-emits
-    // the same idempotent tombstones on the next replay.
+    // Replace the admitted intent only after the batch commits. A crash or
+    // lost reply now re-emits its exact bytes before diffing a newer artifact.
     try store.put(state_key, state_value);
     return entries.items.len;
 }
@@ -461,9 +507,9 @@ pub const PromotionRuntime = struct {
     sink_available: std.atomic.Value(bool),
     missing_sink_blocked: std.atomic.Value(bool),
     missing_sink_policy: MissingSinkPolicy,
-    applied_sequence: std.atomic.Value(u64),
-    target_sequence: std.atomic.Value(u64),
-    error_count: std.atomic.Value(u64),
+    applied_sequence: @import("antfly_platform").atomic.Value(u64),
+    target_sequence: @import("antfly_platform").atomic.Value(u64),
+    error_count: @import("antfly_platform").atomic.Value(u64),
     shutdown_flag: std.atomic.Value(bool),
     catch_up_mutex: std.atomic.Mutex = .unlocked,
     worker_started: std.atomic.Value(bool) = .init(false),
@@ -532,6 +578,16 @@ pub const PromotionRuntime = struct {
             };
         }
         if (advanced) self.wakeWorker();
+    }
+
+    pub const RetirementReadiness = enum { ready, pending, publication_not_owned };
+
+    /// Caller holds catch_up_mutex, fencing the publisher and owner changes.
+    /// Diagnostic strings are deliberately not part of the catalog contract.
+    pub fn retirementReadinessLocked(self: *PromotionRuntime) RetirementReadiness {
+        if (self.applied_sequence.load(.acquire) >= self.target_sequence.load(.acquire)) return .ready;
+        if (self.owner) |owner| if (!owner.isLocalOwner()) return .publication_not_owned;
+        return .pending;
     }
 
     pub fn stats(self: *PromotionRuntime) types.ReplayStageStats {
@@ -757,7 +813,7 @@ const MapStore = struct {
     map: std.StringHashMapUnmanaged([]u8) = .empty,
     put_count: usize = 0,
 
-    fn deinit(self: *MapStore) void {
+    pub fn deinit(self: *MapStore) void {
         var it = self.map.iterator();
         while (it.next()) |e| {
             self.alloc.free(e.key_ptr.*);
@@ -775,7 +831,7 @@ const MapStore = struct {
         self.put_count += 1;
     }
 
-    fn backendStore(self: *MapStore) BackendStore {
+    pub fn backendStore(self: *MapStore) BackendStore {
         return .{ .store_ptr = self };
     }
 
@@ -895,8 +951,9 @@ const CaptureSink = struct {
     docs: std.ArrayListUnmanaged([]u8) = .empty,
     deletes: std.ArrayListUnmanaged(bool) = .empty,
     batch_calls: usize = 0,
+    lost_replies: usize = 0,
 
-    fn deinit(self: *CaptureSink) void {
+    pub fn deinit(self: *CaptureSink) void {
         for (self.keys.items) |k| self.alloc.free(k);
         for (self.tables.items) |t| self.alloc.free(t);
         for (self.storage_tables.items) |maybe_table| if (maybe_table) |table| self.alloc.free(table);
@@ -933,6 +990,10 @@ const CaptureSink = struct {
         const self: *CaptureSink = @ptrCast(@alignCast(ptr));
         self.batch_calls += 1;
         for (entries) |e| try self.record(e.table, e.storage_table, e.key, e.doc_json, e.delete);
+        if (self.lost_replies > 0) {
+            self.lost_replies -= 1;
+            return error.HttpConnectionClosing;
+        }
     }
 };
 
@@ -1039,6 +1100,39 @@ test "processResolutionArtifact atomically moves a pinned physical destination" 
     try testing.expect(!capture.deletes.items[3]);
 }
 
+test "processResolutionArtifact recovers a lost reply before diffing a newer canonical key" {
+    const alloc = testing.allocator;
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "events_resolution_v1");
+    defer alloc.free(resolution_key);
+    const state_key = try promotedKeysStateKeyAlloc(alloc, resolution_key);
+    defer alloc.free(state_key);
+    var capture = CaptureSink{ .alloc = alloc, .lost_replies = 2 };
+    defer capture.deinit();
+    try map.put(resolution_key,
+        \\{"config_generation":1,"entities":[{"local_id":"v0","doc_ref":{"table":"events","key":"event/provisional"},"confidence":1,"decision":"new","label":"event","canonical_name":"Ada spoke."}]}
+    );
+    try testing.expectError(error.HttpConnectionClosing, processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    const intent = try alloc.dupe(u8, map.map.get(state_key).?);
+    defer alloc.free(intent);
+    try map.put(resolution_key,
+        \\{"config_generation":1,"entities":[{"local_id":"v0","doc_ref":{"table":"events","key":"event/canonical"},"confidence":1,"decision":"new","label":"event","canonical_name":"Ada spoke."}]}
+    );
+    // A second uncertain outcome cannot replace the admitted batch with a
+    // newer one or accumulate an unbounded history of provisional keys.
+    try testing.expectError(error.HttpConnectionClosing, processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try testing.expectEqualStrings(intent, map.map.get(state_key).?);
+    try testing.expectEqual(@as(usize, 2), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try testing.expectEqualStrings("event/provisional", capture.keys.items[0]);
+    try testing.expectEqualStrings("event/provisional", capture.keys.items[1]);
+    try testing.expectEqualStrings("event/provisional", capture.keys.items[2]);
+    try testing.expectEqualStrings("event/provisional", capture.keys.items[3]);
+    try testing.expect(std.mem.indexOf(u8, capture.docs.items[3], "\"merged_into\":\"event/canonical\"") != null);
+    try testing.expectEqualStrings("event/canonical", capture.keys.items[4]);
+    try testing.expectEqual(@as(usize, 0), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+}
+
 test "processResolutionArtifact tombstones the prior key when a mention re-keys" {
     const alloc = testing.allocator;
     var map = MapStore{ .alloc = alloc };
@@ -1054,6 +1148,12 @@ test "processResolutionArtifact tombstones the prior key when a mention re-keys"
     var capture = CaptureSink{ .alloc = alloc };
     defer capture.deinit();
     try testing.expectEqual(@as(usize, 1), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+
+    try map.put(resolution_key,
+        \\{"config_generation":1,"entities":[{"local_id":"v0","doc_ref":{"table":"events","key":"event/canonical"},"confidence":0.7,"decision":"review","label":"event","canonical_name":"Ada spoke."}]}
+    );
+    try testing.expectEqual(@as(usize, 0), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try testing.expectEqual(@as(usize, 1), capture.keys.items.len);
 
     // The sibling re-drive re-keys the mention onto its canonical
     // compositional identity. Promotion is upsert-only, so without the
@@ -1154,9 +1254,8 @@ test "processResolutionArtifact skips a byte-stable replay of an already-promote
 
     // A retried resolution window re-emits the identical artifact (its
     // handoff marker did not land). The entities are already durable, so the
-    // promoter must not run the live-promotion transform again: that
-    // transform clears `merged_into`, and a curator may have redirected one
-    // of these keys in the meantime.
+    // promoter must not issue redundant remote writes. Destination transforms
+    // remain replay-safe even when this source-side state has not landed.
     const puts_before_replay = map.put_count;
     try testing.expectEqual(@as(usize, 0), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
     try testing.expectEqual(puts_before_replay, map.put_count);
@@ -1279,7 +1378,7 @@ const FakeSource = struct {
         return .{ .matched_entries = matched, .last_sequence = last };
     }
 
-    fn openCursor(_: *anyopaque, _: Allocator, _: u64, _: replay_source_mod.TargetHint) anyerror!replay_source_mod.MatchingCursor {
+    pub fn openCursor(_: *anyopaque, _: Allocator, _: u64, _: replay_source_mod.TargetHint) anyerror!replay_source_mod.MatchingCursor {
         return error.Unsupported;
     }
     fn latest(ptr: *anyopaque, _: Allocator, from_sequence: u64, hint: replay_source_mod.TargetHint) anyerror!u64 {
@@ -1390,12 +1489,28 @@ test "PromotionRuntime waits on source-shard leadership before promoting" {
     try runtime.catchUp();
     try testing.expectEqual(@as(u64, 1), runtime.applied_sequence.load(.acquire));
     try testing.expectEqual(@as(usize, 0), capture.keys.items.len);
+    {
+        lockMutex(&runtime.catch_up_mutex);
+        defer runtime.catch_up_mutex.unlock();
+        try testing.expectEqual(PromotionRuntime.RetirementReadiness.publication_not_owned, runtime.retirementReadinessLocked());
+    }
     const follower_stats = runtime.stats();
     try testing.expect(follower_stats.blocked);
     try testing.expectEqualStrings("not_source_group_leader", follower_stats.blocked_reason);
 
     owner.local_owner = true;
+    {
+        lockMutex(&runtime.catch_up_mutex);
+        defer runtime.catch_up_mutex.unlock();
+        try testing.expectEqual(PromotionRuntime.RetirementReadiness.pending, runtime.retirementReadinessLocked());
+    }
+
     try runtime.catchUp();
+    {
+        lockMutex(&runtime.catch_up_mutex);
+        defer runtime.catch_up_mutex.unlock();
+        try testing.expectEqual(PromotionRuntime.RetirementReadiness.ready, runtime.retirementReadinessLocked());
+    }
     try testing.expectEqual(@as(u64, 9), runtime.applied_sequence.load(.acquire));
     try testing.expectEqual(@as(usize, 2), capture.keys.items.len);
     const leader_stats = runtime.stats();
@@ -1543,6 +1658,11 @@ test "PromotionRuntime blocked retry observes sink wake generation" {
 
     try testing.expect(!runtime.shouldDelayBlockedRetry(observed_wake_generation));
     try runtime.catchUp();
+    {
+        lockMutex(&runtime.catch_up_mutex);
+        defer runtime.catch_up_mutex.unlock();
+        try testing.expectEqual(PromotionRuntime.RetirementReadiness.ready, runtime.retirementReadinessLocked());
+    }
     try testing.expectEqual(@as(u64, 9), runtime.applied_sequence.load(.acquire));
     try testing.expectEqual(@as(usize, 2), capture.keys.items.len);
 

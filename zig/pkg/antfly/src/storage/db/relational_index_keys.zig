@@ -78,7 +78,7 @@ const CompiledExpression = struct {
         return result;
     }
 
-    fn deinit(self: *CompiledExpression, alloc: Allocator) void {
+    pub fn deinit(self: *CompiledExpression, alloc: Allocator) void {
         self.plan.deinit();
         alloc.free(self.json);
         alloc.destroy(self);
@@ -189,7 +189,7 @@ pub const TuplePlan = struct {
             hasher.update(&size);
             hasher.update(name);
             if (key.expression) |expression| hasher.update(&expression.fingerprint);
-            hasher.update(&.{ @intFromEnum(key.column_type), @intFromBool(key.descending), @intFromBool(key.nulls_first), @intFromBool(key.fold_ascii) });
+            hasher.update(&.{ @backingInt(key.column_type), @intFromBool(key.descending), @intFromBool(key.nulls_first), @intFromBool(key.fold_ascii) });
         }
         var fingerprint: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
         hasher.final(&fingerprint);
@@ -200,6 +200,20 @@ pub const TuplePlan = struct {
         for (self.keys) |key| if (key.expression) |expression| expression.deinit(self.alloc);
         self.alloc.free(self.keys);
         self.* = undefined;
+    }
+
+    /// Uniqueness inference ignores presentation order and sort direction,
+    /// while retaining the exact typed expression/collation identity.
+    pub fn sameEqualityKey(self: TuplePlan, left_index: usize, other: TuplePlan, right_index: usize) bool {
+        const left = self.keys[left_index];
+        const right = other.keys[right_index];
+        if (left.column_type != right.column_type or left.fold_ascii != right.fold_ascii) return false;
+        if (left.expression) |expression| {
+            const rhs = right.expression orelse return false;
+            return std.mem.eql(u8, &expression.fingerprint, &rhs.fingerprint);
+        }
+        if (right.expression != null) return false;
+        return std.mem.eql(u8, self.columns[left.ordinal].name, other.columns[right.ordinal].name);
     }
 
     /// Bind this logical key to another immutable source layout for cold scans

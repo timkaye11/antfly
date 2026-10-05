@@ -18,7 +18,7 @@ const storage_source_options = @import("storage_source_options");
 const kernel_owner_client = @import("../storage/kernel_owner_client.zig");
 const metadata_replica_root_client = @import("../storage/metadata_replica_root_client.zig");
 const internal_service_auth = @import("../api/internal_service_auth.zig");
-const fs_paths = @import("../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const group_ids = @import("../common/group_ids.zig");
 const build_options = @import("build_options");
 const raft_engine = @import("raft_engine");
@@ -34,7 +34,7 @@ const StorageKernelContext = if (linked_storage)
     kernel_owner_client.Context
 else
     struct {
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.* = .{};
         }
     };
@@ -80,6 +80,8 @@ const metadata_raft_election_max_ticks = 60;
 const metadata_bootstrap_campaign_retry_min_interval_ns: u64 = 500 * std.time.ns_per_ms;
 const trusted_principal_secret_key = "antfly.trusted_principal.secret";
 const trusted_principal_issuer_key = "antfly.trusted_principal.issuer";
+const setting_authority_secret_key = "antfly.setting_authority.secret";
+const setting_authority_issuer_key = "antfly.setting_authority.issuer";
 const internal_service_secret_key = "antfly.internal_service.secret";
 const internal_service_verification_secret_key = "antfly.internal_service.verification_secret";
 const internal_service_issuer_key = "antfly.internal_service.issuer";
@@ -117,6 +119,12 @@ fn metadataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
         .max_snapshot_submission_scans_per_round = 32,
         .max_pending_apply_tasks = 1024,
         .max_pending_apply_bytes = 16 * 1024 * 1024,
+        // Async Ready retains the unstable batch plus its storage message and
+        // responses. Preserve the same logical 64 MiB admission ceiling while
+        // explicitly accounting for these bounded ownership copies.
+        .max_pending_persistence_tasks = 1,
+        .max_pending_persistence_bytes = 16 * 1024 * 1024,
+        .max_single_persistence_bytes = 7 * metadata_raft_max_regular_ready_bytes + 1024 * 1024,
         .max_single_apply_ready_bytes = metadata_raft_max_single_ready_bytes,
         .max_pending_snapshot_bytes = metadata_raft_max_snapshot_transfer_bytes,
         .max_apply_tasks_per_round = 16,
@@ -153,7 +161,7 @@ const CliConfig = struct {
     auth_enabled: ?bool = null,
     help: bool = false,
 
-    fn deinit(self: *CliConfig, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *CliConfig, alloc: std.mem.Allocator) void {
         self.secret_store_paths.deinit(alloc);
         self.* = undefined;
     }
@@ -165,7 +173,7 @@ const Factory = struct {
     metadata_group_id: u64,
     metadata_peer_node_ids: []u64 = &.{},
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         if (self.metadata_peer_node_ids.len > 0) self.alloc.free(self.metadata_peer_node_ids);
         self.* = undefined;
     }
@@ -206,6 +214,8 @@ const Factory = struct {
                     .peers = peers,
                     .election_tick = 30,
                     .heartbeat_tick = 1,
+                    .async_storage_writes = true,
+                    .max_uncommitted_entries_size = metadata_raft_max_regular_ready_bytes,
                     .pre_vote = true,
                     .check_quorum = true,
                     .step_down_on_removal = true,
@@ -233,7 +243,7 @@ const ResolvedPaths = struct {
     auth_store_root_dir: []u8,
     extension_package_store_dir: []u8,
 
-    fn deinit(self: ResolvedPaths, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: ResolvedPaths, alloc: std.mem.Allocator) void {
         alloc.free(self.replica_root_dir);
         alloc.free(self.replica_catalog_path);
         alloc.free(self.snapshot_root_dir);
@@ -267,10 +277,12 @@ pub const HealthSource = struct {
 
     fn checkReady(ptr: *anyopaque) bool {
         const self: *HealthSource = @ptrCast(@alignCast(ptr));
+        const persistence_timeout_ns = if (self.raft_progress) |progress| progress.stall_timeout_ns else 5 * std.time.ns_per_s;
         return (self.supervisor == null or self.supervisor.?.currentState() == .ready) and
             self.server.metadataHttpService().probeReady() and
             self.server.server.adminListenerHealthy() and
-            (self.raft_progress == null or self.raft_progress.?.isHealthy());
+            (self.raft_progress == null or self.raft_progress.?.isHealthy()) and
+            !self.server.metadataHttpService().raft.host.http_host.host.persistenceIsStalled(persistence_timeout_ns);
     }
 
     fn writeMetrics(ptr: *anyopaque, writer: *std.Io.Writer) anyerror!void {
@@ -285,7 +297,7 @@ pub const HealthSource = struct {
         const append = antfly.common.health_server.appendPromMetric;
 
         if (self.supervisor) |supervisor| {
-            try append(writer, "antfly_runtime_supervisor_state", "gauge", "Runtime supervisor phase (0 starting, 1 ready, 2 quiescing, 3 failed, 4 stopped)", @intFromEnum(supervisor.currentState()));
+            try append(writer, "antfly_runtime_supervisor_state", "gauge", "Runtime supervisor phase (0 starting, 1 ready, 2 quiescing, 3 failed, 4 stopped)", @backingInt(supervisor.currentState()));
             try append(writer, "antfly_runtime_supervisor_cancelled", "gauge", "Whether process-level runtime cancellation has been requested", @intFromBool(supervisor.token().isCancelled()));
         }
 
@@ -345,6 +357,9 @@ pub const HealthSource = struct {
         try append(writer, "antfly_raft_runtime_pending_outbound_bytes", "gauge", "Approximate pending outbound raft bytes inside the runtime", @intCast(host_metrics.runtime_pending_outbound_bytes));
         try append(writer, "antfly_raft_runtime_pending_apply_tasks", "gauge", "Pending raft apply tasks inside the runtime", @intCast(host_metrics.runtime_pending_apply_tasks));
         try append(writer, "antfly_raft_runtime_pending_apply_bytes", "gauge", "Approximate pending raft apply bytes inside the runtime", @intCast(host_metrics.runtime_pending_apply_bytes));
+        try append(writer, "antfly_raft_runtime_pending_persistence_tasks", "gauge", "Pending asynchronous raft durability barriers", @intCast(host_metrics.runtime_pending_persistence_tasks));
+        try append(writer, "antfly_raft_runtime_pending_persistence_bytes", "gauge", "Accounted bytes owned by asynchronous raft durability barriers", @intCast(host_metrics.runtime_pending_persistence_bytes));
+        try append(writer, "antfly_raft_runtime_pending_persistence_age_ms", "gauge", "Age of the oldest pending asynchronous raft durability barrier in milliseconds", host_metrics.runtime_pending_persistence_age_ms);
         try append(writer, "antfly_raft_runtime_transport_queue_denials_total", "counter", "Total raft ready denials from outbound transport queue pressure", @intCast(host_metrics.runtime_transport_queue_denials));
         try append(writer, "antfly_raft_runtime_apply_queue_denials_total", "counter", "Total raft ready denials from apply queue pressure", @intCast(host_metrics.runtime_apply_queue_denials));
         try append(writer, "antfly_raft_runtime_oversized_outbound_ready_rejections_total", "counter", "Raft Ready batches rejected because outbound bytes exceeded the hard safety ceiling", @intCast(host_metrics.runtime_oversized_outbound_ready_rejections));
@@ -828,11 +843,30 @@ pub const Server = struct {
         self.refreshMetadataRaftStorageDiagnostics();
     }
 
-    fn raftProgressSource(self: *Server) antfly.raft.ProgressSource {
+    pub fn raftProgressSource(self: *Server) antfly.raft.ProgressSource {
         return .{
             .ptr = self,
             .run_once = runRaftProgressOnce,
+            .run_progress_once = runRaftReadyProgressOnce,
+            .acquire_owner = acquireRaftProgressOwner,
+            .release_owner = releaseRaftProgressOwner,
         };
+    }
+
+    fn acquireRaftProgressOwner(ptr: *anyopaque, wake: antfly.raft.ProgressWake) !void {
+        const self: *Server = @ptrCast(@alignCast(ptr));
+        try self.server.svc.registerManagedProgressOwner(wake);
+    }
+
+    fn releaseRaftProgressOwner(ptr: *anyopaque) void {
+        const self: *Server = @ptrCast(@alignCast(ptr));
+        self.server.svc.releaseManagedProgressOwner();
+    }
+
+    fn runRaftReadyProgressOnce(ptr: *anyopaque) !void {
+        const self: *Server = @ptrCast(@alignCast(ptr));
+        try self.server.svc.runManagedRaftProgressOnly();
+        self.refreshMetadataRaftStorageDiagnostics();
     }
 
     fn runRaftProgressOnce(ptr: *anyopaque) !void {
@@ -1068,6 +1102,10 @@ pub fn runFromIterator(
         if (secret_store_initialized) &secret_store else null,
     );
     defer if (trusted_principal_secret) |value| alloc.free(value);
+    const setting_authority_secret = try resolveMetadataRuntimeSecretValue(alloc, if (secret_store_initialized) &secret_store else null, setting_authority_secret_key);
+    defer if (setting_authority_secret) |value| alloc.free(value);
+    const setting_authority_issuer = try resolveMetadataRuntimeSecretValue(alloc, if (secret_store_initialized) &secret_store else null, setting_authority_issuer_key);
+    defer if (setting_authority_issuer) |value| alloc.free(value);
     const internal_service_secret = try resolveMetadataRuntimeSecretValue(
         alloc,
         if (secret_store_initialized) &secret_store else null,
@@ -1119,6 +1157,8 @@ pub fn runFromIterator(
         );
         return err;
     };
+    try internal_service_auth.validateCredentialIsolation(internal_service_secret, setting_authority_secret);
+    try internal_service_auth.validateCredentialIsolation(internal_service_verification_secret, setting_authority_secret);
     internal_service_auth.validateCredentialIsolation(
         internal_service_verification_secret,
         trusted_principal_secret,
@@ -1139,10 +1179,11 @@ pub fn runFromIterator(
     try ensureDirPath(setup_io.io(), resolved.snapshot_root_dir);
     try fs_paths.createDirPathPortable(setup_io.io(), resolved.auth_store_root_dir);
 
-    var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
+    var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.initWithOptions(
         alloc,
         setup_io.io(),
         if (loaded_config) |*cfg| cfg else null,
+        .{ .secret_store = if (secret_store_initialized) &secret_store else null },
     );
     defer active_audio_runtime.deinit();
 
@@ -1196,7 +1237,10 @@ pub fn runFromIterator(
             try antfly.usermgr.initDefaultEnforcer(alloc, auth_casbin_store.?.iface()),
         );
         errdefer if (user_manager) |*manager| manager.deinit();
-        try antfly.usermgr.ensureDefaultAdminUser(&user_manager.?);
+        antfly.usermgr.ensureDefaultAdminUser(&user_manager.?, init.environ_map.get("ANTFLY_BOOTSTRAP_ADMIN_PASSWORD")) catch |err| {
+            std.log.err("auth bootstrap failed: set ANTFLY_BOOTSTRAP_ADMIN_PASSWORD to a unique password of 12 to 72 bytes for a new admin or to replace legacy admin:admin credentials", .{});
+            return err;
+        };
     }
     defer if (comptime !linked_storage) if (auth_backend) |*backend| backend.close();
     defer if (auth_runtime) |*runtime| runtime.deinit();
@@ -1218,6 +1262,9 @@ pub fn runFromIterator(
     defer freeMetadataClusterPeers(alloc, cluster_peers);
     const listener = resolveRaftListener(cli, if (loaded_config) |*cfg| cfg else null);
     const admin_listener = resolveAdminListener(cli, if (loaded_config) |*cfg| cfg else null, local_node_id, listener.bind_host);
+    // Internal-service credentials protect RPC routes, not the public API
+    // exposed by the same admin listener.
+    antfly.common.listener_security.warnIfUnauthenticated("metadata admin", admin_listener.bind_host, admin_listener.bind_port, effective_auth_enabled);
 
     var native_keys: @import("../common/secret_keyring.zig").Keyring = undefined;
     var native_secrets: ?@import("secret_store.zig").Store = null;
@@ -1249,6 +1296,8 @@ pub fn runFromIterator(
             .experimental = cli.experimental,
             .trusted_principal_secret = trusted_principal_secret,
             .trusted_principal_issuer = trusted_principal_issuer,
+            .setting_authority_secret = setting_authority_secret,
+            .setting_authority_issuer = setting_authority_issuer,
             .internal_service_secret = internal_service_secret,
             .internal_service_verification_secret = internal_service_verification_secret,
             .internal_service_issuer = internal_service_issuer,
@@ -1263,6 +1312,7 @@ pub fn runFromIterator(
             .inference_api_key = if (loaded_config) |*cfg| if (cfg.inference.api_key) |value| value else null else null,
             .extension_package_store_dir = resolved.extension_package_store_dir,
             .mcp_max_tool_result_bytes = if (loaded_config) |*cfg| cfg.mcp.max_tool_result_bytes else antfly.common.config.default_mcp_max_tool_result_bytes,
+            .pgwire = if (loaded_config) |*cfg| cfg.pgwire else null,
             .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
             .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},
             .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
@@ -1557,7 +1607,7 @@ fn resolveExtensionPackageStoreDir(
     cli_path: ?[]const u8,
     local_base: []const u8,
 ) ![]u8 {
-    const env_var_z = try alloc.dupeZ(u8, antfly.extensions.wasmtime_runtime.package_store_env);
+    const env_var_z = try alloc.dupeSentinel(u8, antfly.extensions.wasmtime_runtime.package_store_env, 0);
     defer alloc.free(env_var_z);
     return try resolveExtensionPackageStoreDirWithEnv(
         alloc,
@@ -1942,7 +1992,7 @@ fn resolveMetadataRuntimeSecretValue(
 
     const env_var = try antfly.common.secrets.envVarForKey(alloc, key);
     defer alloc.free(env_var);
-    const env_var_z = try alloc.dupeZ(u8, env_var);
+    const env_var_z = try alloc.dupeSentinel(u8, env_var, 0);
     defer alloc.free(env_var_z);
     if (platform.env.getenvSlice(env_var_z)) |value| {
         const raw = try alloc.dupe(u8, value);
@@ -2666,6 +2716,45 @@ test "metadata runtime derives reconciler config from common shard allocation se
     try std.testing.expectEqual(@as(u64, 180000), derived.min_shard_merge_age_millis);
 }
 
+// Async persistence completes independently of control-round count. Tests that
+// inspect projected state wait for the exact accepted prefix through the same
+// receipt/application gate as production mutations.
+fn awaitMetadataTestPrefix(server: *Server) !void {
+    const svc = server.metadataHttpService();
+    const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (true) {
+        try svc.runRaftRoundOnly();
+        svc.runtime_mutex.lockUncancelable(std.Options.debug_io);
+        const pending = svc.raft.pending_updates.items.len;
+        const status_value = svc.raft.host.http_host.host.raftStatus(svc.metadata_group_id);
+        svc.runtime_mutex.unlock(std.Options.debug_io);
+        if (pending == 0) if (status_value) |value| {
+            if (value.last_index != 0) {
+                try svc.waitForTransitionApplied(.{ .term = value.last_term, .index = value.last_index });
+                return;
+            }
+        };
+        if (platform_time.monotonicNs() >= deadline) return error.MetadataTestPrefixTimeout;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
+
+fn awaitMetadataTestControlProjection(server: *Server) !void {
+    const svc = server.metadataHttpService();
+    const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (true) {
+        try server.runRound();
+        try awaitMetadataTestPrefix(server);
+        // Applying a lease/placement entry is distinct from the control
+        // owner's observing it. Assert readiness only after both milestones.
+        if (svc.reconcileLeaseStats().held_by_local and
+            svc.local_placement_epoch != null and
+            svc.local_placement_epoch.? == svc.placement_epoch.load(.monotonic)) return;
+        if (platform_time.monotonicNs() >= deadline) return error.MetadataTestControlProjectionTimeout;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
+
 test "metadata runtime preserves projected tables across restart" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2696,6 +2785,7 @@ test "metadata runtime preserves projected tables across restart" {
 
         var rounds: usize = 0;
         while (rounds < 8) : (rounds += 1) try server.runRound();
+        try awaitMetadataTestPrefix(&server);
 
         var snapshot = try server.metadataHttpService().adminSnapshot();
         defer server.metadataHttpService().freeAdminSnapshot(&snapshot);
@@ -2717,6 +2807,7 @@ test "metadata runtime preserves projected tables across restart" {
 
         var rounds: usize = 0;
         while (rounds < 8) : (rounds += 1) try server.runRound();
+        try awaitMetadataTestPrefix(&server);
 
         var snapshot = try server.metadataHttpService().adminSnapshot();
         defer server.metadataHttpService().freeAdminSnapshot(&snapshot);
@@ -2771,6 +2862,7 @@ test "metadata runtime bootstrapLocal skips local replica-root reconcile on the 
     try std.testing.expectEqual(@as(usize, 0), hook_ctx.runs);
 
     for (0..8) |_| try server.runRound();
+    try awaitMetadataTestPrefix(&server);
     try std.testing.expectEqual(@as(usize, 0), hook_ctx.runs);
 }
 
@@ -2832,6 +2924,7 @@ test "metadata ownership ignores retained foreign catalog before serving" {
     try restarted.start();
     try restarted.bootstrapLocal(cfg.metadata_group_id, cfg.local_node_id);
     for (0..8) |_| try restarted.runRound();
+    try awaitMetadataTestPrefix(&restarted);
     try std.testing.expectEqual(.absent, svc.raft.host.status(foreign.group_id));
 }
 
@@ -2867,8 +2960,10 @@ test "metadata ownership excludes colliding data placements across control round
                 .peer_node_ids = &.{},
             }, null, 0, false);
             for (0..8) |_| try svc.runRaftRoundOnly();
+            try awaitMetadataTestControlProjection(&server);
         }
         for (0..8) |_| try server.runRound();
+        try awaitMetadataTestPrefix(&server);
         std.debug.print("OWNERSHIP_RED placements boot={d} expects absent foreign group\n", .{boot});
         std.debug.print("OWNERSHIP_ASSERT placements boot={d} foreign_status\n", .{boot});
         try std.testing.expectEqual(.absent, svc.raft.host.status(1951));
@@ -2886,6 +2981,7 @@ test "metadata ownership excludes colliding data placements across control round
         try std.testing.expectEqual(svc.placement_epoch.load(.monotonic), svc.local_placement_epoch.?);
         try svc.upsertTable(.{ .table_id = 77, .name = if (boot == 0) "first" else "restarted" });
         for (0..8) |_| try server.runRound();
+        try awaitMetadataTestPrefix(&server);
         const tables = try svc.listProjectedTables(alloc);
         defer svc.freeProjectedTables(alloc, tables);
         std.debug.print("OWNERSHIP_ASSERT placements boot={d} table_count\n", .{boot});
@@ -2917,6 +3013,7 @@ test "metadata ownership never provisions data roots on repeated control rounds"
     try server.bootstrapLocal(group_ids.main_metadata_group_id, 3);
     try std.testing.expectEqual(@as(usize, 0), hook.calls);
     for (0..8) |_| try server.runRound();
+    try awaitMetadataTestControlProjection(&server);
     std.debug.print("OWNERSHIP_RED provisioning expects zero calls; actual={d}\n", .{hook.calls});
     try std.testing.expectEqual(@as(usize, 0), hook.calls);
     const svc = server.metadataHttpService();
@@ -2962,7 +3059,7 @@ const MetadataOwnershipTestPaths = struct {
         return .{ .local_node_id = 3, .replica_root_dir = self.replicas, .replica_catalog_path = self.catalog, .snapshot_root_dir = self.snapshots };
     }
 
-    fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
         alloc.free(self.replicas);
         alloc.free(self.catalog);
         alloc.free(self.snapshots);
@@ -3036,12 +3133,14 @@ fn exerciseMetadataOwnershipProjection(case: MetadataOwnershipProjectionCase) !v
             }
         }
         for (0..8) |_| try svc.runRaftRoundOnly();
+        try awaitMetadataTestPrefix(&server);
         switch (case) {
             .progress => {
                 try expectMetadataOwnershipRemoteProgress(svc, boot, "before_control");
                 svc.setLifecycleReconcileHook(null);
                 svc.observe_local_replica_root = true;
                 for (0..8) |_| try server.runRound();
+                try awaitMetadataTestPrefix(&server);
                 std.debug.print("OWNERSHIP_RED progress expects retained schema and restore reports\n", .{});
                 try expectMetadataOwnershipRemoteProgress(svc, boot, "after_control");
             },
@@ -3070,6 +3169,7 @@ fn exerciseMetadataOwnershipProjection(case: MetadataOwnershipProjectionCase) !v
                 svc.observe_local_replica_root = true;
                 svc.store_status_ticks = 39;
                 for (0..8) |_| try server.runRound();
+                try awaitMetadataTestPrefix(&server);
                 const stores = try svc.listProjectedStores(alloc);
                 defer svc.freeProjectedStores(alloc, stores);
                 std.debug.print("OWNERSHIP_RED backfill expects retained 7 and 250\n", .{});

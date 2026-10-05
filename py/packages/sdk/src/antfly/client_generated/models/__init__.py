@@ -1,5 +1,6 @@
 """Contains all the data models used in inputs/outputs"""
 
+from .administer_sql_settings_response_200 import AdministerSqlSettingsResponse200
 from .advance_table_storage_migration_body import AdvanceTableStorageMigrationBody
 from .advance_table_storage_migration_body_action import AdvanceTableStorageMigrationBodyAction
 from .advance_table_storage_migration_response_200 import AdvanceTableStorageMigrationResponse200
@@ -99,6 +100,8 @@ from .chunker_config_full_text_index import ChunkerConfigFullTextIndex
 from .chunker_provider import ChunkerProvider
 from .classification_step_config import ClassificationStepConfig
 from .classification_transformation_result import ClassificationTransformationResult
+from .close_prepared_sql_response_200 import ClosePreparedSQLResponse200
+from .close_sql_connection_response_200 import CloseSQLConnectionResponse200
 from .cluster_backup_request import ClusterBackupRequest
 from .cluster_backup_request_format import ClusterBackupRequestFormat
 from .cluster_backup_response import ClusterBackupResponse
@@ -286,6 +289,13 @@ from .extension_scope import ExtensionScope
 from .extension_scope_kind import ExtensionScopeKind
 from .external_io_connection import ExternalIoConnection
 from .external_io_protocol import ExternalIoProtocol
+from .external_lake_credential_ref import ExternalLakeCredentialRef
+from .external_lake_snapshot_selector import ExternalLakeSnapshotSelector
+from .external_lake_snapshot_selector_mode import ExternalLakeSnapshotSelectorMode
+from .external_lake_table_source import ExternalLakeTableSource
+from .external_lake_table_source_format import ExternalLakeTableSourceFormat
+from .external_lake_table_source_kind import ExternalLakeTableSourceKind
+from .external_lake_table_source_write_policy import ExternalLakeTableSourceWritePolicy
 from .extraction_attribute_group import ExtractionAttributeGroup
 from .extraction_attribute_label import ExtractionAttributeLabel
 from .extraction_classification import ExtractionClassification
@@ -497,6 +507,7 @@ from .graph_artifact_source_config_format import GraphArtifactSourceConfigFormat
 from .graph_binding_node import GraphBindingNode
 from .graph_binding_node_document import GraphBindingNodeDocument
 from .graph_bindings_result import GraphBindingsResult
+from .graph_bindings_result_computed_item import GraphBindingsResultComputedItem
 from .graph_bindings_result_kind import GraphBindingsResultKind
 from .graph_bindings_return import GraphBindingsReturn
 from .graph_bounded_traversal_config import GraphBoundedTraversalConfig
@@ -612,6 +623,10 @@ from .graph_query_unsupported_error import GraphQueryUnsupportedError
 from .graph_query_unsupported_error_error import GraphQueryUnsupportedErrorError
 from .graph_query_unsupported_error_reason import GraphQueryUnsupportedErrorReason
 from .graph_query_unsupported_error_status import GraphQueryUnsupportedErrorStatus
+from .graph_relationship_filter import GraphRelationshipFilter
+from .graph_relationship_property_predicate import GraphRelationshipPropertyPredicate
+from .graph_relationship_property_predicate_op import GraphRelationshipPropertyPredicateOp
+from .graph_relationship_property_predicate_value_type import GraphRelationshipPropertyPredicateValueType
 from .graph_resolver_config import GraphResolverConfig
 from .graph_resolver_config_candidate_search import GraphResolverConfigCandidateSearch
 from .graph_resolver_config_fusion_combine import GraphResolverConfigFusionCombine
@@ -635,6 +650,7 @@ from .graph_shortest_path_query import GraphShortestPathQuery
 from .graph_traversal import GraphTraversal
 from .graph_traversal_metric_freshness import GraphTraversalMetricFreshness
 from .graph_traverse_query import GraphTraverseQuery
+from .graph_ttl_config import GraphTtlConfig
 from .graph_where_and import GraphWhereAnd
 from .graph_where_not_equal import GraphWhereNotEqual
 from .graph_where_not_exists import GraphWhereNotExists
@@ -671,6 +687,8 @@ from .hierarchy_match_hit import HierarchyMatchHit
 from .hierarchy_match_hit_source import HierarchyMatchHitSource
 from .hierarchy_matches import HierarchyMatches
 from .hierarchy_projection import HierarchyProjection
+from .highlight_fragment import HighlightFragment
+from .highlight_span import HighlightSpan
 from .image_url import ImageURL
 from .image_url_content_part import ImageURLContentPart
 from .image_url_content_part_type import ImageURLContentPartType
@@ -721,6 +739,18 @@ from .inference_connection import InferenceConnection
 from .inference_connection_models import InferenceConnectionModels
 from .inference_content_security_config import InferenceContentSecurityConfig
 from .inference_credentials import InferenceCredentials
+from .inference_decide_answer import InferenceDecideAnswer
+from .inference_decide_answer_legend import InferenceDecideAnswerLegend
+from .inference_decide_answer_probabilities import InferenceDecideAnswerProbabilities
+from .inference_decide_answer_type import InferenceDecideAnswerType
+from .inference_decide_question import InferenceDecideQuestion
+from .inference_decide_question_criteria_type_0 import InferenceDecideQuestionCriteriaType0
+from .inference_decide_question_type import InferenceDecideQuestionType
+from .inference_decide_request import InferenceDecideRequest
+from .inference_decide_request_questions import InferenceDecideRequestQuestions
+from .inference_decide_response import InferenceDecideResponse
+from .inference_decide_response_answers import InferenceDecideResponseAnswers
+from .inference_decide_response_usage import InferenceDecideResponseUsage
 from .inference_dictate_request import InferenceDictateRequest
 from .inference_dictate_response import InferenceDictateResponse
 from .inference_dictate_response_object import InferenceDictateResponseObject
@@ -794,6 +824,7 @@ from .inference_model_ref import InferenceModelRef
 from .inference_models_response import InferenceModelsResponse
 from .inference_models_response_chunkers import InferenceModelsResponseChunkers
 from .inference_models_response_data_item import InferenceModelsResponseDataItem
+from .inference_models_response_deciders import InferenceModelsResponseDeciders
 from .inference_models_response_embedders import InferenceModelsResponseEmbedders
 from .inference_models_response_extractors import InferenceModelsResponseExtractors
 from .inference_models_response_generators import InferenceModelsResponseGenerators
@@ -979,6 +1010,7 @@ from .path_weight_mode import PathWeightMode
 from .pattern_edge_step import PatternEdgeStep
 from .pattern_match import PatternMatch
 from .pattern_match_bindings import PatternMatchBindings
+from .pattern_match_computed import PatternMatchComputed
 from .pattern_step import PatternStep
 from .permission import Permission
 from .permission_type import PermissionType
@@ -998,15 +1030,30 @@ from .query_candidate_budget_exceeded_error_error import QueryCandidateBudgetExc
 from .query_candidate_budget_exceeded_error_status import QueryCandidateBudgetExceededErrorStatus
 from .query_dependency_error import QueryDependencyError
 from .query_dependency_error_code import QueryDependencyErrorCode
+from .query_evaluation import QueryEvaluation
+from .query_evaluation_aggregations import QueryEvaluationAggregations
+from .query_evaluation_aggregations_additional_property import QueryEvaluationAggregationsAdditionalProperty
+from .query_evaluation_aggregations_additional_property_type import QueryEvaluationAggregationsAdditionalPropertyType
+from .query_evaluation_compute import QueryEvaluationCompute
+from .query_evaluation_order_by_item import QueryEvaluationOrderByItem
+from .query_evaluation_scope import QueryEvaluationScope
+from .query_evaluation_where import QueryEvaluationWhere
+from .query_expression import QueryExpression
+from .query_expression_call import QueryExpressionCall
+from .query_expression_criteria_type_0 import QueryExpressionCriteriaType0
+from .query_expression_questions import QueryExpressionQuestions
 from .query_filter_error import QueryFilterError
 from .query_filter_error_error import QueryFilterErrorError
 from .query_filter_error_field import QueryFilterErrorField
 from .query_filter_error_status import QueryFilterErrorStatus
 from .query_hierarchy import QueryHierarchy
+from .query_highlight import QueryHighlight
 from .query_hit import QueryHit
+from .query_hit_computed import QueryHitComputed
 from .query_hit_hierarchy import QueryHitHierarchy
 from .query_hit_hierarchy_ancestors import QueryHitHierarchyAncestors
 from .query_hit_hierarchy_level import QueryHitHierarchyLevel
+from .query_hit_highlights import QueryHitHighlights
 from .query_hit_index_scores import QueryHitIndexScores
 from .query_hit_source import QueryHitSource
 from .query_hits import QueryHits
@@ -1023,6 +1070,7 @@ from .query_result import QueryResult
 from .query_result_base import QueryResultBase
 from .query_result_base_aggregations import QueryResultBaseAggregations
 from .query_result_base_analyses import QueryResultBaseAnalyses
+from .query_result_base_evaluation import QueryResultBaseEvaluation
 from .query_result_base_graph_metric_results import QueryResultBaseGraphMetricResults
 from .query_score_details import QueryScoreDetails
 from .query_strategy import QueryStrategy
@@ -1171,6 +1219,29 @@ from .sort_field import SortField
 from .sort_profile import SortProfile
 from .sort_profile_candidate_source import SortProfileCandidateSource
 from .sort_profile_sort_lifecycle_state import SortProfileSortLifecycleState
+from .sql_column import SQLColumn
+from .sql_column_type import SQLColumnType
+from .sql_connection_open_request import SQLConnectionOpenRequest
+from .sql_connection_response import SQLConnectionResponse
+from .sql_diagnostic import SQLDiagnostic
+from .sql_mutation_outcome import SQLMutationOutcome
+from .sql_prepare_request import SQLPrepareRequest
+from .sql_prepared_execution_request import SQLPreparedExecutionRequest
+from .sql_prepared_response import SQLPreparedResponse
+from .sql_request import SQLRequest
+from .sql_response import SQLResponse
+from .sql_setting_database_default import SqlSettingDatabaseDefault
+from .sql_setting_mutation_drop import SqlSettingMutationDrop
+from .sql_setting_mutation_put import SqlSettingMutationPut
+from .sql_setting_put import SqlSettingPut
+from .sql_setting_put_kind import SqlSettingPutKind
+from .sql_setting_role_default import SqlSettingRoleDefault
+from .sql_setting_value_type_0 import SqlSettingValueType0
+from .sql_setting_value_type_1 import SqlSettingValueType1
+from .sql_setting_value_type_2 import SqlSettingValueType2
+from .sql_transaction_status import SQLTransactionStatus
+from .sqlddl_receipt import SQLDDLReceipt
+from .sqlddl_receipt_state import SQLDDLReceiptState
 from .sse_error import SSEError
 from .sse_error_reason import SSEErrorReason
 from .sse_event import SSEEvent
@@ -1193,6 +1264,8 @@ from .storage_resource_exhausted_error_error import StorageResourceExhaustedErro
 from .storage_runtime_status import StorageRuntimeStatus
 from .storage_runtime_status_engine import StorageRuntimeStatusEngine
 from .storage_status import StorageStatus
+from .store_root_enrollment_identity import StoreRootEnrollmentIdentity
+from .store_root_enrollment_request import StoreRootEnrollmentRequest
 from .stream_transcription_audio_format import StreamTranscriptionAudioFormat
 from .stt_provider import STTProvider
 from .success_message import SuccessMessage
@@ -1240,6 +1313,16 @@ from .template_field_mapping import TemplateFieldMapping
 from .template_field_mapping_missing_null_policy import TemplateFieldMappingMissingNullPolicy
 from .term_query import TermQuery
 from .term_range_query import TermRangeQuery
+from .text_analysis_component import TextAnalysisComponent
+from .text_analysis_component_config import TextAnalysisComponentConfig
+from .text_analysis_config import TextAnalysisConfig
+from .text_analysis_config_analyzers import TextAnalysisConfigAnalyzers
+from .text_analysis_config_char_filters import TextAnalysisConfigCharFilters
+from .text_analysis_config_date_time_parsers import TextAnalysisConfigDateTimeParsers
+from .text_analysis_config_field_analyzers import TextAnalysisConfigFieldAnalyzers
+from .text_analysis_config_field_date_time_parsers import TextAnalysisConfigFieldDateTimeParsers
+from .text_analysis_config_token_filters import TextAnalysisConfigTokenFilters
+from .text_analysis_config_tokenizers import TextAnalysisConfigTokenizers
 from .text_chunk_options import TextChunkOptions
 from .text_content_part import TextContentPart
 from .text_content_part_type import TextContentPartType
@@ -1270,6 +1353,7 @@ from .transaction_session_details_response import TransactionSessionDetailsRespo
 from .transaction_session_list_response import TransactionSessionListResponse
 from .transaction_session_read_snapshot import TransactionSessionReadSnapshot
 from .transaction_session_status import TransactionSessionStatus
+from .transaction_session_status_disposition import TransactionSessionStatusDisposition
 from .transaction_session_table_detail import TransactionSessionTableDetail
 from .transaction_stage_delete_request import TransactionStageDeleteRequest
 from .transaction_stage_read_request import TransactionStageReadRequest
@@ -1323,6 +1407,7 @@ from .you_search_config import YouSearchConfig
 from .you_search_config_provider import YouSearchConfigProvider
 
 __all__ = (
+    "AdministerSqlSettingsResponse200",
     "AdvanceTableStorageMigrationBody",
     "AdvanceTableStorageMigrationBodyAction",
     "AdvanceTableStorageMigrationResponse200",
@@ -1422,6 +1507,8 @@ __all__ = (
     "ChunkOptions",
     "ClassificationStepConfig",
     "ClassificationTransformationResult",
+    "ClosePreparedSQLResponse200",
+    "CloseSQLConnectionResponse200",
     "ClusterBackupRequest",
     "ClusterBackupRequestFormat",
     "ClusterBackupResponse",
@@ -1607,6 +1694,13 @@ __all__ = (
     "ExtensionScopeKind",
     "ExternalIoConnection",
     "ExternalIoProtocol",
+    "ExternalLakeCredentialRef",
+    "ExternalLakeSnapshotSelector",
+    "ExternalLakeSnapshotSelectorMode",
+    "ExternalLakeTableSource",
+    "ExternalLakeTableSourceFormat",
+    "ExternalLakeTableSourceKind",
+    "ExternalLakeTableSourceWritePolicy",
     "ExtractionAttributeGroup",
     "ExtractionAttributeLabel",
     "ExtractionClassification",
@@ -1812,6 +1906,7 @@ __all__ = (
     "GraphBindingNode",
     "GraphBindingNodeDocument",
     "GraphBindingsResult",
+    "GraphBindingsResultComputedItem",
     "GraphBindingsResultKind",
     "GraphBindingsReturn",
     "GraphBoundedTraversalConfig",
@@ -1927,6 +2022,10 @@ __all__ = (
     "GraphQueryUnsupportedErrorError",
     "GraphQueryUnsupportedErrorReason",
     "GraphQueryUnsupportedErrorStatus",
+    "GraphRelationshipFilter",
+    "GraphRelationshipPropertyPredicate",
+    "GraphRelationshipPropertyPredicateOp",
+    "GraphRelationshipPropertyPredicateValueType",
     "GraphResolverConfig",
     "GraphResolverConfigCandidateSearch",
     "GraphResolverConfigFusionCombine",
@@ -1950,6 +2049,7 @@ __all__ = (
     "GraphTraversal",
     "GraphTraversalMetricFreshness",
     "GraphTraverseQuery",
+    "GraphTtlConfig",
     "GraphWhereAnd",
     "GraphWhereNotEqual",
     "GraphWhereNotExists",
@@ -1986,6 +2086,8 @@ __all__ = (
     "HierarchyMatchHit",
     "HierarchyMatchHitSource",
     "HierarchyProjection",
+    "HighlightFragment",
+    "HighlightSpan",
     "ImageURL",
     "ImageURLContentPart",
     "ImageURLContentPartType",
@@ -2036,6 +2138,18 @@ __all__ = (
     "InferenceConnectionModels",
     "InferenceContentSecurityConfig",
     "InferenceCredentials",
+    "InferenceDecideAnswer",
+    "InferenceDecideAnswerLegend",
+    "InferenceDecideAnswerProbabilities",
+    "InferenceDecideAnswerType",
+    "InferenceDecideQuestion",
+    "InferenceDecideQuestionCriteriaType0",
+    "InferenceDecideQuestionType",
+    "InferenceDecideRequest",
+    "InferenceDecideRequestQuestions",
+    "InferenceDecideResponse",
+    "InferenceDecideResponseAnswers",
+    "InferenceDecideResponseUsage",
     "InferenceDictateRequest",
     "InferenceDictateResponse",
     "InferenceDictateResponseObject",
@@ -2109,6 +2223,7 @@ __all__ = (
     "InferenceModelsResponse",
     "InferenceModelsResponseChunkers",
     "InferenceModelsResponseDataItem",
+    "InferenceModelsResponseDeciders",
     "InferenceModelsResponseEmbedders",
     "InferenceModelsResponseExtractors",
     "InferenceModelsResponseGenerators",
@@ -2290,6 +2405,7 @@ __all__ = (
     "PatternEdgeStep",
     "PatternMatch",
     "PatternMatchBindings",
+    "PatternMatchComputed",
     "PatternStep",
     "Permission",
     "PermissionType",
@@ -2309,15 +2425,30 @@ __all__ = (
     "QueryCandidateBudgetExceededErrorStatus",
     "QueryDependencyError",
     "QueryDependencyErrorCode",
+    "QueryEvaluation",
+    "QueryEvaluationAggregations",
+    "QueryEvaluationAggregationsAdditionalProperty",
+    "QueryEvaluationAggregationsAdditionalPropertyType",
+    "QueryEvaluationCompute",
+    "QueryEvaluationOrderByItem",
+    "QueryEvaluationScope",
+    "QueryEvaluationWhere",
+    "QueryExpression",
+    "QueryExpressionCall",
+    "QueryExpressionCriteriaType0",
+    "QueryExpressionQuestions",
     "QueryFilterError",
     "QueryFilterErrorError",
     "QueryFilterErrorField",
     "QueryFilterErrorStatus",
     "QueryHierarchy",
+    "QueryHighlight",
     "QueryHit",
+    "QueryHitComputed",
     "QueryHitHierarchy",
     "QueryHitHierarchyAncestors",
     "QueryHitHierarchyLevel",
+    "QueryHitHighlights",
     "QueryHitIndexScores",
     "QueryHits",
     "QueryHitSource",
@@ -2334,6 +2465,7 @@ __all__ = (
     "QueryResultBase",
     "QueryResultBaseAggregations",
     "QueryResultBaseAnalyses",
+    "QueryResultBaseEvaluation",
     "QueryResultBaseGraphMetricResults",
     "QueryScoreDetails",
     "QueryStrategy",
@@ -2482,6 +2614,29 @@ __all__ = (
     "SortProfile",
     "SortProfileCandidateSource",
     "SortProfileSortLifecycleState",
+    "SQLColumn",
+    "SQLColumnType",
+    "SQLConnectionOpenRequest",
+    "SQLConnectionResponse",
+    "SQLDDLReceipt",
+    "SQLDDLReceiptState",
+    "SQLDiagnostic",
+    "SQLMutationOutcome",
+    "SQLPreparedExecutionRequest",
+    "SQLPreparedResponse",
+    "SQLPrepareRequest",
+    "SQLRequest",
+    "SQLResponse",
+    "SqlSettingDatabaseDefault",
+    "SqlSettingMutationDrop",
+    "SqlSettingMutationPut",
+    "SqlSettingPut",
+    "SqlSettingPutKind",
+    "SqlSettingRoleDefault",
+    "SqlSettingValueType0",
+    "SqlSettingValueType1",
+    "SqlSettingValueType2",
+    "SQLTransactionStatus",
     "SSEError",
     "SSEErrorReason",
     "SSEEvent",
@@ -2504,6 +2659,8 @@ __all__ = (
     "StorageRuntimeStatus",
     "StorageRuntimeStatusEngine",
     "StorageStatus",
+    "StoreRootEnrollmentIdentity",
+    "StoreRootEnrollmentRequest",
     "StreamTranscriptionAudioFormat",
     "STTProvider",
     "SuccessMessage",
@@ -2551,6 +2708,16 @@ __all__ = (
     "TemplateFieldMappingMissingNullPolicy",
     "TermQuery",
     "TermRangeQuery",
+    "TextAnalysisComponent",
+    "TextAnalysisComponentConfig",
+    "TextAnalysisConfig",
+    "TextAnalysisConfigAnalyzers",
+    "TextAnalysisConfigCharFilters",
+    "TextAnalysisConfigDateTimeParsers",
+    "TextAnalysisConfigFieldAnalyzers",
+    "TextAnalysisConfigFieldDateTimeParsers",
+    "TextAnalysisConfigTokenFilters",
+    "TextAnalysisConfigTokenizers",
     "TextChunkOptions",
     "TextContentPart",
     "TextContentPartType",
@@ -2581,6 +2748,7 @@ __all__ = (
     "TransactionSessionListResponse",
     "TransactionSessionReadSnapshot",
     "TransactionSessionStatus",
+    "TransactionSessionStatusDisposition",
     "TransactionSessionTableDetail",
     "TransactionStageDeleteRequest",
     "TransactionStageReadRequest",

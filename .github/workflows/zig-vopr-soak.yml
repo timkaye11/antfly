@@ -15,6 +15,10 @@ on:
     - cron: '0 10 * * *'
   workflow_dispatch:
     inputs:
+      qualification_only:
+        description: Run qualification without the full soak campaign
+        type: boolean
+        default: false
       histories:
         description: Histories per shard (0 uses scenario budgets)
         type: number
@@ -52,10 +56,11 @@ defaults:
 concurrency:
   # Approved PR callers all have github.ref == refs/heads/main. Give each
   # qualification its own group: cancel-in-progress:false still lets a newer
-  # pending request replace an older pending request in the same group.
+  # pending request replace an older pending request in the same group. This
+  # applies to both qualification and approved full campaigns.
   # The caller already cancels superseded runs for the same PR. Keep scheduled
   # and manually dispatched soak campaigns serialized by ref as before.
-  group: vopr-soak-${{ inputs.qualification_only && github.run_id || github.ref }}-${{ inputs.diagnostic_trace || 'campaign' }}
+  group: vopr-soak-${{ (inputs.head_sha != '' || inputs.qualification_only) && github.run_id || github.ref }}-${{ inputs.diagnostic_trace || 'campaign' }}
   cancel-in-progress: false
 
 jobs:
@@ -77,9 +82,9 @@ jobs:
   qualify:
     if: inputs.diagnostic_run == ''
     runs-on: arc-antfly-heavy
-    # Six cold ReleaseSafe root compiles on a per-run cache; 90 minutes was
-    # observed insufficient once honest max_rss claims serialize the heavy
-    # compiles instead of oversubscribing the 24 GiB pod into swap.
+    # The VOPR runtime roots compile under a bounded 24 GiB pod. General
+    # secrets-test coverage belongs to zig-base; keep the focused secret VOPR
+    # replay here without recompiling the large physical secret backend root.
     timeout-minutes: 120
     env:
       VOPR_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/vopr-soak/${{ github.run_id }}-${{ github.run_attempt }}-qualify
@@ -112,17 +117,17 @@ jobs:
           echo "$compiler_description"
           grep -q 'dynamically linked' <<<"$compiler_description"
           echo "$zig_path/bin" >> "$GITHUB_PATH"
+
       - name: Test soak orchestration
         run: |
           python3 -m unittest discover -s scripts/ci -p test_zig_vopr_soak.py
           python3 -m unittest discover -s scripts/ci -p test_zig_e2e_regression_loop.py
-      - name: Test production transport, runtime scheduling, and determinism boundaries
+      - name: Audit replayable VOPR sources
         working-directory: zig
-        run: |
-          python3 "$GITHUB_WORKSPACE/scripts/ci/measure_disk_usage.py" --output "$RUNNER_TEMP/vopr-qualify-disk.json" --path /mnt/cache --path "$GITHUB_WORKSPACE" -- \
-            python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly-raft-transport-test standby-vopr-test vopr-runtime-test restore-admission-vopr-test vopr-determinism-audit secrets-test \
-            -Doptimize=ReleaseSafe --summary all \
-            --cache-dir "$VOPR_LOCAL_CACHE_DIR" --global-cache-dir "$VOPR_GLOBAL_CACHE_DIR"
+        run: bash "$GITHUB_WORKSPACE/scripts/ci/zig_vopr_qualify.sh" audit
+      - name: Test production transport and runtime scheduling
+        working-directory: zig
+        run: bash "$GITHUB_WORKSPACE/scripts/ci/zig_vopr_qualify.sh" runtime
       - name: Retain qualification disk measurements
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -168,6 +173,7 @@ jobs:
           echo "$compiler_description"
           grep -q 'dynamically linked' <<<"$compiler_description"
           echo "$zig_path/bin" >> "$GITHUB_PATH"
+
       - name: Restore the pinned runner for this revision
         id: runner_cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -179,7 +185,7 @@ jobs:
         working-directory: zig
         run: |
           python3 "$GITHUB_WORKSPACE/scripts/ci/measure_disk_usage.py" --output "$RUNNER_TEMP/vopr-build-disk.json" --path /mnt/cache --path "$GITHUB_WORKSPACE" -- \
-            python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build vopr-build -Doptimize=ReleaseSafe --summary all \
+            python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build vopr-build -Doptimize=safe --summary all \
             --cache-dir "$VOPR_LOCAL_CACHE_DIR" --global-cache-dir "$VOPR_GLOBAL_CACHE_DIR"
       - name: Retain runner build disk measurements
         if: always()
@@ -400,12 +406,13 @@ jobs:
           echo "$compiler_description"
           grep -q 'dynamically linked' <<<"$compiler_description"
           echo "$zig_path/bin" >> "$GITHUB_PATH"
+
       - name: Build production executable and qualify owner publication
         id: production-build
         working-directory: zig
         run: |
           python3 "$GITHUB_WORKSPACE/scripts/ci/measure_disk_usage.py" --output "$RUNNER_TEMP/production-e2e-soak/build-disk.json" --path /mnt/cache --path "$GITHUB_WORKSPACE" -- \
-            python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly antfly-storage-owner-source-test -Doptimize=ReleaseSafe --summary all \
+            python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly antfly-storage-owner-source-test -Doptimize=safe --summary all \
             2>&1 | tee "$RUNNER_TEMP/production-e2e-soak/build.log"
           sha256sum zig-out/bin/antfly > "$RUNNER_TEMP/production-e2e-soak/binary.sha256"
           tar -C zig-out/bin -czf "$RUNNER_TEMP/production-e2e-soak/antfly.tar.gz" antfly
@@ -413,7 +420,7 @@ jobs:
         working-directory: zig
         run: |
           for iteration in $(seq 1 20); do
-            python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly-storage-owner-source-test -Doptimize=ReleaseSafe --summary all \
+            python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly-storage-owner-source-test -Doptimize=safe --summary all \
               > "$RUNNER_TEMP/production-e2e-soak/owner-$iteration.log" 2>&1
           done
       - name: Retain production binary and build evidence
@@ -454,7 +461,7 @@ jobs:
           echo "ANTFLY_E2E_REGRESSION_REPORT_DIR=$RUNNER_TEMP/production-e2e-soak/reports" >> "$GITHUB_ENV"
       - name: Install native debugger
         run: sudo apt-get update && sudo apt-get install -y gdb
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: production-soak-binary
@@ -540,7 +547,8 @@ jobs:
               assert len(reports) == 100, (profile, len(reports))
               cases = [case for report in reports for case in ET.parse(report).getroot().findall(".//testcase")]
               assert Counter(case.attrib["name"] for case in cases) == {
-                  "test_multinode_autograph_resolves_promotes_and_hydrates_entities": 50,
+                  "test_multinode_autograph_resolves_promotes_and_hydrates_entities[prefix]": 50,
+                  "test_multinode_autograph_resolves_promotes_and_hydrates_entities[exact_key]": 50,
                   "test_multinode_autograph_recovers_after_data_restart": 50,
               }, profile
               assert all(not any(case.find(tag) is not None for tag in ("failure", "error", "skipped")) for case in cases), profile
@@ -597,7 +605,7 @@ jobs:
           echo "ANTFLY_E2E_REGRESSION_REPORT_DIR=$RUNNER_TEMP/production-e2e-soak/reports" >> "$GITHUB_ENV"
       - name: Install native debugger
         run: sudo apt-get update && sudo apt-get install -y gdb
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: production-soak-binary
@@ -634,7 +642,7 @@ jobs:
           cases = [case for report in reports for case in ET.parse(report).getroot().findall(".//testcase")]
           assert Counter(case.attrib["name"] for case in cases) == {
               "test_three_by_three_cluster_backup_restore_through_metadata_public_api": 50,
-              "test_backup_restore_discovers_leader_past_stalled_status": 50,
+              "test_backup_restore_discovers_leader_past_stalled_topology": 50,
           }
           assert all(not any(case.find(tag) is not None for tag in ("failure", "error", "skipped")) for case in cases)
           PYVERIFY

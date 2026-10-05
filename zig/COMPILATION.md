@@ -62,8 +62,9 @@ The work has two related objectives:
   independently testable commands or modes even when some are co-generated.
 - The public C API is the `capi` build target and `libantfly` shared library.
   It must not retain unrelated server or runtime roots.
-- LSM is the production backend. LMDB remains available only for tests,
-  fixtures, conversion, and legacy compatibility while needed.
+- LSM is the production backend. The public Zig package, embedded library,
+  WASM bundle, and linked runtime disable LMDB. The standalone Zig LMDB port
+  and vendored C oracle remain available to explicit test/benchmark fixtures.
 - Runtime boundaries are coarse. They never cross per record, posting, edge,
   LMDB operation, or vector candidate.
 - Allocation ownership, cancellation, deadlines, operation state, callbacks,
@@ -225,7 +226,8 @@ the source-mutation matrix does not prove independence for every leaf file.
 
 These per-archive reservations, adopted from that measurement, apply only to
 native x86_64 Linux hosts building baseline x86_64 GNU, stripped ReleaseFast,
-with CPU inference and no thread sanitizer; other profiles keep their
+with CPU inference and no thread sanitizer. The same target/backend fences
+also admit the ReleaseSafe profile measured below; other profiles keep their
 previous claims.
 
 | Runtime archive | Largest sampled compiler RSS across the pair | New claim |
@@ -237,6 +239,56 @@ previous claims.
 | Serverless | 2.65 GiB | 4 GiB |
 | CLI | 1.25 GiB | 2 GiB |
 | Enrichment | 0.80 GiB | 2 GiB |
+
+The [2026-10-01 full E2E build](https://github.com/antflydb/antfly/actions/runs/36903575966/job/110509376054)
+completed all 35 build steps in stripped ReleaseSafe just as the 90-minute
+job deadline expired, preventing artifact upload. Its rounded Zig MaxRSS
+summaries support these separate admission reservations:
+
+| Runtime archive | Reported MaxRSS | ReleaseSafe claim |
+| --- | ---: | ---: |
+| Storage | 8G | 12 GiB |
+| Inference | 5G | 8 GiB |
+| Distributed | 5G | 8 GiB |
+| API | 4G | 7 GiB |
+| Serverless | 3G | 5 GiB |
+| CLI | 1G | 3 GiB |
+| Enrichment | 1G | 3 GiB |
+
+These are scheduler reservations, not process memory limits. Each leaves
+headroom above the rounded observation. Storage and inference now fit together
+inside the existing 22 GiB aggregate budget, whereas the previous 20/16 GiB
+claims serialized them. This removes that admission bottleneck without
+increasing runner size or the deadline; a matched CI rerun must establish the
+resulting wall time.
+
+### October macOS compile-memory follow-up
+
+The baseline Linux GNU reservations above remain scoped to their measured
+profiles. macOS reservations now provision 28 GiB for storage, 14 GiB for API,
+20 GiB for inference, and 4 GiB for CLI. The storage claim covers the reported
+22–23 GB peak with at least 25% headroom. The other increases are provisional
+headroom over claims reported as exceeded, **not new measured peaks**. No CPU
+kernel or Accelerate behavior changes with these scheduling reservations.
+
+Re-measure each affected unit with empty caches and `-j1` on the affected host
+and product profile. Then validate concurrent admission on a 48 GiB host with
+at least 8 GiB left outside the build budget. Do not extrapolate the historical
+Linux measurements to a different target, optimization mode, or backend set.
+
+`diagnose-zig-build-memory.sh` now assigns each polling pass a sample ID.
+Summarize its trace with:
+
+```sh
+python3 scripts/summarize_zig_compile_memory.py /tmp/build.rss.tsv \
+  --output /tmp/build.units.json
+```
+
+The report retains per-unit peak commands, recommends whole-GiB reservations
+with 25% headroom, and reports the sampled aggregate compiler RSS. Legacy
+six-column traces produce an explicitly approximate aggregate upper envelope.
+Sampling can miss short-lived peaks; retain raw traces and build provenance.
+Final reservation qualification still requires fresh cold-build evidence.
 
 ### C API composition
 
@@ -575,7 +627,7 @@ Build both the executable and canonical C API:
 ```sh
 zig build antfly capi \
   -Dtarget=aarch64-linux-musl \
-  -Doptimize=ReleaseFast \
+  -Doptimize=fast \
   -Dstrip=true \
   -Dcpu=baseline \
   -Donnx=false \
@@ -595,7 +647,7 @@ zig build antfly capi \
   --cache-dir /tmp/antfly-candidate-local-cache \
   --global-cache-dir /tmp/antfly-candidate-global-cache \
   -Dtarget=aarch64-linux-musl \
-  -Doptimize=ReleaseFast \
+  -Doptimize=fast \
   -Dstrip=true \
   -Dcpu=baseline \
   -Donnx=false \
@@ -610,20 +662,20 @@ Do not compare a cold candidate with a warm baseline.
 
 ```sh
 zig build antfly capi \
-  -Doptimize=Debug \
+  -Doptimize=debug \
   -Donnx=false \
   -Dmetal=false \
   -Dsystem-blas=false \
   -Dproduction-lsm-only=true
 
 zig build capi-test capi-smoke antfly-standalone-runtime-test \
-  -Doptimize=Debug \
+  -Doptimize=debug \
   -Donnx=false \
   -Dmetal=false \
   -Dsystem-blas=false
 
 zig build \
-  -Doptimize=Debug \
+  -Doptimize=debug \
   -Dproduction-lsm-only=false
 
 zig build lmdb-test antfly-storage-lmdb-test
@@ -659,7 +711,7 @@ zig build antfly capi \
   --cache-dir /tmp/antfly-report-local-cache \
   --global-cache-dir /tmp/antfly-report-global-cache \
   -Dtarget=aarch64-linux-musl \
-  -Doptimize=ReleaseFast \
+  -Doptimize=fast \
   -Dstrip=true \
   -Dcpu=baseline \
   -Donnx=false \

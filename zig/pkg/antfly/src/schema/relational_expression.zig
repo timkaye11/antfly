@@ -328,11 +328,12 @@ const Compiler = struct {
                 const kind = input.object.get("type") orelse return error.InvalidRelationalExpression;
                 if (kind != .string) return error.InvalidRelationalExpression;
                 node.kind = std.meta.stringToEnum(Kind, kind.string) orelse return error.InvalidRelationalExpression;
+                const value = input.object.get("value") orelse .null;
                 switch (node.kind) {
                     .string, .blob, .boolean, .datetime, .integer, .number => {},
+                    .json => if (value != .null) return error.InvalidRelationalExpressionType,
                     else => return error.InvalidRelationalExpressionType,
                 }
-                const value = input.object.get("value") orelse .null;
                 if (node.kind == .blob and value == .string and value.string.len > std.base64.standard.Encoder.calcSize(max_output_bytes)) return error.RelationalExpressionBudgetExceeded;
                 node.literal = checks.valueFromJson(self.alloc, node.kind, value, true) catch |err| switch (err) {
                     error.OutOfMemory => return err,
@@ -488,7 +489,7 @@ pub const Set = struct {
                 generated_columns[binding.ordinal] = true;
             }
         }
-        var states = [_]u2{0} ** 256;
+        var states = @as([256]u2, @splat(0));
         var written: usize = 0;
         for (bindings, 0..) |_, i| try visit(bindings, order, &states, &written, i);
         const set = try alloc.create(Set);
@@ -527,11 +528,15 @@ pub const Set = struct {
     /// Rewrite programs bind this policy durably. Ordinary restore must never
     /// call this function: it verifies historical results without computing.
     pub fn applyValuesWithPolicy(self: *const Set, alloc: Allocator, values: []Value, present: []bool, defaults: DefaultsPolicy) !void {
-        if (values.len != self.table.relational_columns.len or present.len != values.len) return error.InvalidRelationalExpressionInput;
+        return self.applyValuesWithDefaultMask(alloc, values, present, defaults, null);
+    }
+
+    pub fn applyValuesWithDefaultMask(self: *const Set, alloc: Allocator, values: []Value, present: []bool, defaults: DefaultsPolicy, default_mask: ?[]const bool) !void {
+        if (values.len != self.table.relational_columns.len or present.len != values.len or (default_mask != null and default_mask.?.len != values.len)) return error.InvalidRelationalExpressionInput;
         var budget: usize = max_allocated_bytes;
         for (self.order) |index| {
             const binding = &self.bindings[index];
-            if (!binding.generated and (present[binding.ordinal] or defaults == .preserve_absence)) continue;
+            if (!binding.generated and (present[binding.ordinal] or defaults == .preserve_absence or (default_mask != null and !default_mask.?[binding.ordinal]))) continue;
             values[binding.ordinal] = try binding.plan.evaluateNode(alloc, .{ .values = values }, @intCast(binding.plan.nodes.len - 1), &budget);
             present[binding.ordinal] = true;
         }

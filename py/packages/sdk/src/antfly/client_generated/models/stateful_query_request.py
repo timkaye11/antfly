@@ -39,7 +39,9 @@ if TYPE_CHECKING:
     from ..models.phrase_query import PhraseQuery
     from ..models.prefix_query import PrefixQuery
     from ..models.pruner import Pruner
+    from ..models.query_evaluation import QueryEvaluation
     from ..models.query_hierarchy import QueryHierarchy
+    from ..models.query_highlight import QueryHighlight
     from ..models.query_request_aggregations import QueryRequestAggregations
     from ..models.query_request_embeddings import QueryRequestEmbeddings
     from ..models.query_request_foreign_sources import QueryRequestForeignSources
@@ -63,6 +65,11 @@ class StatefulQueryRequest:
     the stateful public transport boundary for the v0.2 transition window.
 
         Attributes:
+            evaluate (QueryEvaluation | Unset): Evaluate expressions after global retrieval merging, before final
+                offset/limit. Candidates require candidate_count; matches require
+                max_rows and fail if the full qualifying population exceeds that budget.
+                Cursor pagination, reranking, pruning, and ordinary aggregations cannot
+                be combined with evaluation. NULL inputs skip inference; errors fail.
             table_target (CatalogTableTarget | Unset): An explicit native table target. Components are literal names; dots
                 do not qualify a string table name.
             table (str | Unset): Literal table name in default.public. Global queries require exactly one of table or
@@ -223,6 +230,14 @@ class StatefulQueryRequest:
                 matches are returned. `ancestors` only controls projected context and never changes result
                 cardinality. Omit `hierarchy` entirely to retain the v0.2-compatible implicit
                 source-grouped result shape.
+            highlight (QueryHighlight | Unset): Ask for highlighted fragments of the stored fields matched by
+                `full_text_search` and by named full-text queries. Matches are located
+                by re-analyzing the stored value with the field's analyzer, so stemmed
+                and stop-word-filtered terms highlight the surface form. `prefix`,
+                `wildcard`, `regexp`, and `fuzzy` clauses mark whole tokens; `match`,
+                `match_phrase`, or `prefix` on a `substring` companion
+                (`field._substring`) marks the exact contained bytes, including
+                matches that span two adjacent words.
             limit (int | Unset): Maximum number of top-level results to return. For semantic_search, this is the topk
                 parameter.
                 This does not limit nested matches attached through hierarchy.group_by.matches;
@@ -371,6 +386,7 @@ class StatefulQueryRequest:
                 - intersection: Only include nodes appearing in both
     """
 
+    evaluate: QueryEvaluation | Unset = UNSET
     table_target: CatalogTableTarget | Unset = UNSET
     table: str | Unset = UNSET
     query: QueryRequestQuery | Unset = UNSET
@@ -471,6 +487,7 @@ class StatefulQueryRequest:
     search_effort: float | Unset = 0.5
     fields: list[str] | Unset = UNSET
     hierarchy: QueryHierarchy | Unset = UNSET
+    highlight: QueryHighlight | Unset = UNSET
     limit: int | Unset = UNSET
     offset: int | Unset = UNSET
     timeout_ms: int | Unset = UNSET
@@ -521,6 +538,10 @@ class StatefulQueryRequest:
         from ..models.term_query import TermQuery
         from ..models.term_range_query import TermRangeQuery
         from ..models.wildcard_query import WildcardQuery
+
+        evaluate: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.evaluate, Unset):
+            evaluate = self.evaluate.to_dict()
 
         table_target: dict[str, Any] | Unset = UNSET
         if not isinstance(self.table_target, Unset):
@@ -730,6 +751,10 @@ class StatefulQueryRequest:
         if not isinstance(self.hierarchy, Unset):
             hierarchy = self.hierarchy.to_dict()
 
+        highlight: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.highlight, Unset):
+            highlight = self.highlight.to_dict()
+
         limit = self.limit
 
         offset = self.offset
@@ -808,6 +833,8 @@ class StatefulQueryRequest:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if evaluate is not UNSET:
+            field_dict["evaluate"] = evaluate
         if table_target is not UNSET:
             field_dict["table_target"] = table_target
         if table is not UNSET:
@@ -840,6 +867,8 @@ class StatefulQueryRequest:
             field_dict["fields"] = fields
         if hierarchy is not UNSET:
             field_dict["hierarchy"] = hierarchy
+        if highlight is not UNSET:
+            field_dict["highlight"] = highlight
         if limit is not UNSET:
             field_dict["limit"] = limit
         if offset is not UNSET:
@@ -918,7 +947,9 @@ class StatefulQueryRequest:
         from ..models.phrase_query import PhraseQuery
         from ..models.prefix_query import PrefixQuery
         from ..models.pruner import Pruner
+        from ..models.query_evaluation import QueryEvaluation
         from ..models.query_hierarchy import QueryHierarchy
+        from ..models.query_highlight import QueryHighlight
         from ..models.query_request_aggregations import QueryRequestAggregations
         from ..models.query_request_embeddings import QueryRequestEmbeddings
         from ..models.query_request_foreign_sources import QueryRequestForeignSources
@@ -933,6 +964,13 @@ class StatefulQueryRequest:
         from ..models.wildcard_query import WildcardQuery
 
         d = dict(src_dict)
+        _evaluate = d.pop("evaluate", UNSET)
+        evaluate: QueryEvaluation | Unset
+        if isinstance(_evaluate, Unset):
+            evaluate = UNSET
+        else:
+            evaluate = QueryEvaluation.from_dict(_evaluate)
+
         _table_target = d.pop("table_target", UNSET)
         table_target: CatalogTableTarget | Unset
         if isinstance(_table_target, Unset):
@@ -1707,6 +1745,13 @@ class StatefulQueryRequest:
         else:
             hierarchy = QueryHierarchy.from_dict(_hierarchy)
 
+        _highlight = d.pop("highlight", UNSET)
+        highlight: QueryHighlight | Unset
+        if isinstance(_highlight, Unset):
+            highlight = UNSET
+        else:
+            highlight = QueryHighlight.from_dict(_highlight)
+
         limit = d.pop("limit", UNSET)
 
         offset = d.pop("offset", UNSET)
@@ -1814,6 +1859,7 @@ class StatefulQueryRequest:
             expand_strategy = StatefulQueryRequestExpandStrategy(_expand_strategy)
 
         stateful_query_request = cls(
+            evaluate=evaluate,
             table_target=table_target,
             table=table,
             query=query,
@@ -1830,6 +1876,7 @@ class StatefulQueryRequest:
             search_effort=search_effort,
             fields=fields,
             hierarchy=hierarchy,
+            highlight=highlight,
             limit=limit,
             offset=offset,
             timeout_ms=timeout_ms,

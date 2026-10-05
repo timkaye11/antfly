@@ -348,6 +348,7 @@ pub const ForeignKey = struct {
 pub const UniqueConstraint = struct {
     name: []const u8,
     columns: []const []const u8 = &.{},
+    keys: []const RelationalIndexKey = &.{},
     expressions: []const UniqueExpression = &.{},
     include_columns: []const []const u8 = &.{},
     without_overlaps_period: ?[]const u8 = null,
@@ -357,6 +358,26 @@ pub const UniqueConstraint = struct {
     where: []const UniquePredicate = &.{},
     where_expressions: []const RelationalRowsExpressionCondition = &.{},
     validation_state: UniqueConstraintValidationState = .enforced,
+};
+
+/// Session-only check timing. A null generation sets the transaction default;
+/// named constraints resolve to their immutable native generation first.
+pub const ConstraintTiming = struct {
+    generation: ?[16]u8 = null,
+    deferred: bool,
+
+    pub fn isDeferred(modes: []const ConstraintTiming, generation: [16]u8, deferrable: bool, initial: ForeignKeyTiming) bool {
+        if (!deferrable) return false;
+        var i = modes.len;
+        while (i != 0) {
+            i -= 1;
+            if (modes[i].generation) |named| {
+                if (!@import("std").mem.eql(u8, &named, &generation)) continue;
+            }
+            return modes[i].deferred;
+        }
+        return initial == .deferred;
+    }
 };
 
 pub const RelationalIndexOwnerKind = enum(u8) {
@@ -621,8 +642,8 @@ pub const RelationalIndexDefinition = struct {
 
     pub fn fromIndex(index: RelationalIndex) RelationalIndexDefinition {
         var result: RelationalIndexDefinition = undefined;
-        inline for (std.meta.fields(RelationalIndexDefinition)) |field|
-            @field(result, field.name) = @field(index, field.name);
+        inline for (comptime std.meta.fieldNames(RelationalIndexDefinition)) |reflected_name|
+            @field(result, reflected_name) = @field(index, reflected_name);
         return result;
     }
 };

@@ -9,7 +9,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("antfly_platform");
-const fs_paths = @import("../../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const background_runtime = @import("../background_runtime.zig");
 
 const Allocator = std.mem.Allocator;
@@ -42,7 +42,7 @@ const OwnedPublicationMarker = struct {
     retained_name: []u8,
     had_live_generation: bool,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.retained_name);
         self.* = undefined;
     }
@@ -102,9 +102,13 @@ fn closePublicationLockWithIo(io: std.Io, file: std.Io.File) void {
 }
 
 fn closePublicationLock(file: std.Io.File) void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    file.close(io_impl.io());
+    if (comptime builtin.os.tag == .freestanding) {
+        unreachable;
+    } else {
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        file.close(io_impl.io());
+    }
 }
 
 const LeaseKind = enum { preparation, exclusive, reconciliation, read };
@@ -646,7 +650,7 @@ const ReconciliationLease = struct {
         };
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         if (!self.active) return;
         self.manager.finishReconciliation(self.path, self.id, false);
         self.active = false;
@@ -809,7 +813,7 @@ pub const ExclusiveTransition = struct {
         try self.reconcilePublished();
         const live = try self.alloc.dupe(u8, self.path);
         errdefer self.alloc.free(live);
-        const live_z = try self.alloc.dupeZ(u8, self.path);
+        const live_z = try self.alloc.dupeSentinel(u8, self.path, 0);
         errdefer self.alloc.free(live_z);
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(job_id, &digest, .{});
@@ -817,7 +821,7 @@ pub const ExclusiveTransition = struct {
             self.path, std.mem.readInt(u64, digest[0..8], .little), std.mem.readInt(u64, digest[8..16], .little),
         });
         errdefer self.alloc.free(stage);
-        const stage_z = try self.alloc.dupeZ(u8, stage);
+        const stage_z = try self.alloc.dupeSentinel(u8, stage, 0);
         errdefer self.alloc.free(stage_z);
         try fs_paths.createDirPathPortable(io, stage);
         return .{
@@ -852,11 +856,11 @@ pub const ExclusiveTransition = struct {
         if (!std.mem.eql(u8, canonical, path)) return error.InvalidGenerationTransition;
         const live_path = try self.alloc.dupe(u8, self.path);
         errdefer self.alloc.free(live_path);
-        const live_z = try self.alloc.dupeZ(u8, self.path);
+        const live_z = try self.alloc.dupeSentinel(u8, self.path, 0);
         errdefer self.alloc.free(live_z);
         const staged = try self.alloc.dupe(u8, path);
         errdefer self.alloc.free(staged);
-        const staged_z = try self.alloc.dupeZ(u8, path);
+        const staged_z = try self.alloc.dupeSentinel(u8, path, 0);
         return .{ .alloc = self.alloc, .manager = self.manager, .transition_id = self.id, .live_path = live_path, .live_path_z = live_z, .staging_path = staged, .staging_path_z = staged_z, .cleanup_scheduler = self.cleanup_scheduler, .io = self.io, .sealed = true, .preserve_unpublished = true };
     }
 
@@ -928,7 +932,7 @@ fn beginStagingGenerationWithIo(
 ) !StagedGeneration {
     const live_path = try alloc.dupe(u8, path);
     errdefer alloc.free(live_path);
-    const live_path_z = try alloc.dupeZ(u8, path);
+    const live_path_z = try alloc.dupeSentinel(u8, path, 0);
     errdefer alloc.free(live_path_z);
     // This basename is a durable publication/cleanup identity. Use the same
     // runtime's entropy as its filesystem so VOPR can replay it, while real
@@ -939,7 +943,7 @@ fn beginStagingGenerationWithIo(
     const nonce_hex = std.fmt.bytesToHex(nonce, .lower);
     const staging_path = try std.fmt.allocPrint(alloc, "{s}.restore-stage-{x}-{s}", .{ path, transition_id, nonce_hex });
     errdefer alloc.free(staging_path);
-    const staging_path_z = try alloc.dupeZ(u8, staging_path);
+    const staging_path_z = try alloc.dupeSentinel(u8, staging_path, 0);
     errdefer alloc.free(staging_path_z);
 
     if (reconcile) _ = try reconcilePublishedGenerationExclusive(alloc, io, live_path, cleanup_scheduler);
@@ -1472,7 +1476,7 @@ const RetiredGenerationCleanupBatch = struct {
         }
     }
 
-    fn deinit(ptr: *anyopaque) void {
+    pub fn deinit(ptr: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const alloc = self.alloc;
         for (self.paths) |path| alloc.free(path);
@@ -1523,6 +1527,7 @@ fn waitForRetiredCleanupRetry(self: *RetiredGenerationCleanupBatch, delay_ms: i6
 }
 
 fn deleteRetiredGenerationPaths(alloc: Allocator, io: std.Io, paths: []const []const u8, parent: []const u8) !void {
+    if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
     const lock_path = try std.fs.path.join(alloc, &.{ parent, retired_cleanup_lock_name });
     defer alloc.free(lock_path);
     const cleanup_lock = std.Io.Dir.cwd().createFile(io, lock_path, .{
@@ -1655,9 +1660,9 @@ fn rollbackPreparedPublishedGeneration(
         var retained_marker = try readPublicationMarker(alloc, io, retained_path);
         defer if (retained_marker) |*value| value.deinit(alloc);
         if (retained_marker != null) return error.InvalidGenerationRollbackRoot;
-        const live_path_z = try alloc.dupeZ(u8, live_path);
+        const live_path_z = try alloc.dupeSentinel(u8, live_path, 0);
         defer alloc.free(live_path_z);
-        const retained_path_z = try alloc.dupeZ(u8, retained_path);
+        const retained_path_z = try alloc.dupeSentinel(u8, retained_path, 0);
         defer alloc.free(retained_path_z);
         if (!exchangeDirectoriesAtomicSentinel(live_path_z, retained_path_z)) {
             return error.AtomicGenerationExchangeUnavailable;
@@ -1836,6 +1841,7 @@ fn acquirePublishedGenerationReadWithRuntimeAndIo(
     runtime: ?*background_runtime.BackendRuntime,
     io_override: ?std.Io,
 ) !?ReadLease {
+    if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
     var fallback_io_impl: std.Io.Threaded = undefined;
     var fallback_io_owned = false;
     defer if (fallback_io_owned) fallback_io_impl.deinit();
@@ -1937,9 +1943,9 @@ fn syncPublishedParent(io: std.Io, parent: []const u8) PublicationOutcome {
 }
 
 fn exchangeDirectoriesAtomic(alloc: Allocator, left: []const u8, right: []const u8) !bool {
-    const left_z = try alloc.dupeZ(u8, left);
+    const left_z = try alloc.dupeSentinel(u8, left, 0);
     defer alloc.free(left_z);
-    const right_z = try alloc.dupeZ(u8, right);
+    const right_z = try alloc.dupeSentinel(u8, right, 0);
     defer alloc.free(right_z);
     return exchangeDirectoriesAtomicSentinel(left_z, right_z);
 }

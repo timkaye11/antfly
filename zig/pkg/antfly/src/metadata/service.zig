@@ -12,13 +12,14 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const server_group_metadata = @import("../storage/server_group_metadata.zig");
 const builtin = @import("builtin");
 const std = @import("std");
 const store_report_baseline = @import("store_report_baseline.zig");
 const store_report_update = @import("store_report_update.zig");
 const storage_source_options = @import("storage_source_options");
 const control_only_storage_sources = storage_source_options.control_only;
-const fs_paths = @import("../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const common_group_ids = @import("../common/group_ids.zig");
 const common_secrets = @import("../common/secrets.zig");
 const metadata_mod = @import("domain.zig");
@@ -33,6 +34,7 @@ const metadata_reconcile_lease = @import("reconcile_lease.zig");
 const metadata_reallocation_request = @import("reallocation_request.zig");
 const metadata_runtime_status_protocol = @import("runtime_status_protocol.zig");
 const metadata_reconciler = @import("reconciler.zig");
+const fk_generation_publication = @import("fk_generation_publication.zig");
 const metadata_replication_backfill = @import("replication_backfill.zig");
 const metadata_state = @import("state.zig");
 const metadata_table_provisioner = @import("table_provisioner.zig");
@@ -46,7 +48,7 @@ const process_memory_mod = @import("antfly_platform").process_memory;
 const platform_time = @import("antfly_platform").time;
 const raft_reconciler = @import("../raft/reconciler.zig");
 const transition_state = @import("transition_state.zig");
-const raft_catalog = @import("../raft/catalog.zig");
+const raft_catalog = @import("../raft/storage/catalog.zig");
 const raft_host = @import("../raft/host.zig");
 const raft_managed_host = @import("../raft/managed_host.zig");
 const raft_service = @import("../raft/service.zig");
@@ -155,7 +157,7 @@ const EmbeddingActivityCache = struct {
         owner_fences: std.AutoHashMapUnmanaged(u64, OwnerFence) = .empty,
         entries: EntryMap = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             var entries = self.entries.iterator();
             while (entries.next()) |entry| {
                 alloc.free(@constCast(entry.key_ptr.index_name));
@@ -167,9 +169,9 @@ const EmbeddingActivityCache = struct {
         }
     };
 
-    shards: [shard_count]Shard = [_]Shard{.{}} ** shard_count,
+    shards: [shard_count]Shard = @as([shard_count]Shard, @splat(.{})),
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         for (&self.shards) |*shard| shard.deinit(alloc);
         self.* = .{};
     }
@@ -296,7 +298,7 @@ const EmbeddingActivityCache = struct {
         return self.updateWithSequence(alloc, projected, reports, now_ns, false);
     }
     fn updateWithSequence(self: *@This(), alloc: std.mem.Allocator, projected: []const metadata_table_manager.StoreRecord, reports: []const metadata_table_manager.StoreStatusReport, now_ns: u64, allow_same_sequence: bool) !void {
-        var expired_shards = [_]bool{false} ** shard_count;
+        var expired_shards = @as([shard_count]bool, @splat(false));
         for (reports) |report| {
             if (report.embedding_activity_protocol_version != embedding_activity_protocol_version) continue;
             if (report.reporter_incarnation == 0 or report.embedding_activity_sequence == 0) continue;
@@ -482,6 +484,18 @@ fn replaceTableDefinitionStampedWithReceipt(
         !std.mem.eql(u8, replacement.name, expected.name))
         return error.InvalidTableDefinitionReplacement;
     const store = service.projectedStore() orelse return error.MissingMetadataStore;
+    if (!std.mem.eql(u8, expected.schema_json, replacement.schema_json) or
+        !std.mem.eql(u8, expected.read_schema_json, replacement.read_schema_json) or
+        !std.mem.eql(u8, expected.indexes_json, replacement.indexes_json))
+    {
+        // Policy bytecode binds the typed-row layout. Reject uncoupled
+        // relational index/schema DDL before proposing a metadata mutation;
+        // apply repeats the guard at its authoritative table-record writer.
+        if (comptime @TypeOf(service.*) == MetadataService or @TypeOf(service.*) == MetadataHttpService) {
+            try service.ensureLinearizableRead();
+            try store.requirePolicyIndexMutationAllowed(service.metadata_group_id, expected.table_id);
+        }
+    }
     const baseline_fence = try store.getTableTransitionFence(
         service.metadata_group_id,
         expected.table_id,
@@ -552,7 +566,7 @@ test "table definition stamp distinguishes rejection from post-admission ambigui
             return .{};
         }
 
-        fn getTable(
+        pub fn getTable(
             self: *@This(),
             alloc: std.mem.Allocator,
             _: u64,
@@ -570,15 +584,15 @@ test "table definition stamp distinguishes rejection from post-admission ambigui
         wait_error: ?anyerror = null,
         wait_calls: usize = 0,
 
-        fn projectedStore(self: *@This()) ?*FakeStore {
+        pub fn projectedStore(self: *@This()) ?*FakeStore {
             return &self.store;
         }
 
-        fn metadataIncarnation(_: *@This()) !?metadata_api.MetadataClusterIncarnation {
+        pub fn metadataIncarnation(_: *@This()) !?metadata_api.MetadataClusterIncarnation {
             return "0123456789abcdef0123456789abcdef".*;
         }
 
-        fn proposeTransitionCommandWithReceipt(
+        pub fn proposeTransitionCommandWithReceipt(
             self: *@This(),
             _: metadata_storage.TransitionCommand,
         ) !MetadataProposalReceipt {
@@ -586,7 +600,7 @@ test "table definition stamp distinguishes rejection from post-admission ambigui
             return .{ .term = 7, .index = 19 };
         }
 
-        fn waitForTransitionApplied(self: *@This(), receipt: MetadataProposalReceipt) !void {
+        pub fn waitForTransitionApplied(self: *@This(), receipt: MetadataProposalReceipt) !void {
             try std.testing.expectEqual(@as(u64, 7), receipt.term);
             try std.testing.expectEqual(@as(u64, 19), receipt.index);
             self.wait_calls += 1;
@@ -672,6 +686,192 @@ pub const TableDropAdmission = struct {
     }
 };
 
+fn initialPlacementProofForGroup(service: anytype, range_group_id: u64) !?fk_generation_publication.InitialPlacementProof {
+    const store = service.projectedStore() orelse return error.MissingMetadataStore;
+    // A missing authority capability is not evidence that a group is ordinary.
+    // In particular the compiled owner facade must preserve this point lookup.
+    if (comptime !@hasDecl(@TypeOf(store.*), "initialGroupReservation")) return error.MetadataCapabilityUnavailable;
+    const reservation = (try store.initialGroupReservation(service.metadata_group_id, range_group_id)) orelse return null;
+    return if (reservation.retirement_scope == .hosted_store)
+        fk_generation_publication.InitialPlacementProof.fromReservation(reservation)
+    else
+        null;
+}
+
+fn cachedInitialPlacementProof(service: anytype, range_group_id: u64) !?fk_generation_publication.InitialPlacementProof {
+    const proof = try initialPlacementProofForGroup(service, range_group_id);
+    if (proof != null) {
+        if (comptime @hasDecl(@TypeOf(service.*), "cachedCoordinatedDecoderReadiness")) {
+            _ = try service.cachedCoordinatedDecoderReadiness(metadata_topology_protocol.fk_initial_create_version);
+        } else return error.TableTopologyProtocolUpgradeRequired;
+    }
+    return proof;
+}
+
+test "relational topology admission rejects missing hidden-owner authority" {
+    const Fake = struct {
+        const Store = struct {};
+        store: Store = .{},
+        metadata_group_id: u64 = 1,
+
+        pub fn projectedStore(self: *@This()) ?*Store {
+            return &self.store;
+        }
+    };
+    var fake: Fake = .{};
+    try std.testing.expectError(error.MetadataCapabilityUnavailable, initialPlacementProofForGroup(&fake, 7));
+}
+
+fn ensureInitialPlacementReadCut(service: anytype, request: api_operation.RequestContext) !void {
+    // The first proof read must cover all previously committed BEGIN entries,
+    // including one from a prior leader. A same-leader BEGIN racing this cut
+    // holds the catalog lock through apply, so the locked recheck sees it.
+    if (comptime @hasDecl(@TypeOf(service.*), "ensureLinearizableReadWithContext"))
+        try service.ensureLinearizableReadWithContext(request);
+}
+
+/// Background reconciliation retries a slow ReadIndex on its next round. The
+/// cut must finish before taking the catalog gate so a prior leader's BEGIN
+/// cannot be mistaken for an ordinary placement operation.
+fn backgroundInitialPlacementReadCut(service: anytype) !bool {
+    ensureInitialPlacementReadCut(service, .{
+        .deadline_ns = platform_time.monotonicNs() +| 250 * std.time.ns_per_ms,
+    }) catch |err| switch (err) {
+        error.DeadlineExceeded, error.MetadataLinearizableReadTimeout => return false,
+        else => return err,
+    };
+    return true;
+}
+
+fn preflightInitialPlacementForGroupWithContextImpl(service: anytype, request: api_operation.RequestContext, group_id: u64) !void {
+    try request.ensureActive();
+    if (try initialPlacementProofForGroup(service, group_id) == null) return;
+    _ = try service.ensureTableTopologyProtocolReadyWithContext(request, metadata_topology_protocol.fk_initial_create_version);
+}
+
+fn preflightProjectedPlacementWithContextImpl(service: anytype, request: api_operation.RequestContext) !void {
+    var required_version: u16 = 0;
+    const ranges = try service.listProjectedRanges(service.alloc);
+    defer service.freeProjectedRanges(service.alloc, ranges);
+    for (ranges) |range| {
+        if (try initialPlacementProofForGroup(service, range.group_id) != null)
+            required_version = @max(required_version, metadata_topology_protocol.fk_initial_create_version);
+    }
+    const placements = try service.listProjectedPlacementIntents(service.alloc);
+    defer service.freeProjectedPlacementIntents(service.alloc, placements);
+    for (placements) |placement| {
+        if (try initialPlacementProofForGroup(service, placement.record.group_id) != null)
+            required_version = @max(required_version, metadata_topology_protocol.fk_initial_create_version);
+    }
+    const tables = try service.listProjectedTables(service.alloc);
+    defer service.freeProjectedTables(service.alloc, tables);
+    for (tables) |table|
+        required_version = @max(required_version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }));
+    const splits = try service.listProjectedSplitTransitions(service.alloc);
+    defer service.freeProjectedSplitTransitions(service.alloc, splits);
+    for (splits) |split|
+        required_version = @max(required_version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_split_transition = split }));
+    const merges = try service.listProjectedMergeTransitions(service.alloc);
+    defer service.freeProjectedMergeTransitions(service.alloc, merges);
+    for (merges) |merge|
+        required_version = @max(required_version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_merge_transition = merge }));
+    if (required_version != 0)
+        _ = try service.ensureTableTopologyProtocolReadyWithContext(request, required_version);
+}
+
+fn preflightTableRecordWithContextImpl(service: anytype, request: api_operation.RequestContext, table: metadata_table_manager.TableRecord) !void {
+    const required_version = transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table });
+    if (required_version != 0)
+        _ = try service.ensureTableTopologyProtocolReadyWithContext(request, required_version);
+}
+
+fn recheckInitialPlacementProof(service: anytype, range_group_id: u64, expected: ?fk_generation_publication.InitialPlacementProof) !?fk_generation_publication.InitialPlacementProof {
+    const current = try initialPlacementProofForGroup(service, range_group_id);
+    if (!std.meta.eql(expected, current)) return error.TableTopologyProtocolUpgradeRequired;
+    return current;
+}
+
+/// The caller owns the catalog mutation gate and has preflighted the hosted
+/// placement proof. Rechecking it here prevents a changed reservation from
+/// turning a hosted operation into an ordinary placement command.
+fn upsertReplicaIntentCatalogLocked(
+    service: anytype,
+    intent: raft_reconciler.PlacementIntent,
+    expected_metadata_version: ?u64,
+    expected_version_fence: u64,
+    expected_target_drain_requested: bool,
+    preflight: ?fk_generation_publication.InitialPlacementProof,
+) !void {
+    const proof = try recheckInitialPlacementProof(service, intent.record.group_id, preflight);
+    if (proof) |identity| return service.proposeTransitionCommand(.{ .upsert_fk_initial_replica_intent = .{
+        .proof = identity,
+        .expected_metadata_version = expected_metadata_version,
+        .expected_version_fence = expected_version_fence,
+        .expected_target_drain_requested = expected_target_drain_requested,
+        .replacement = intent,
+    } });
+    try service.proposeTransitionCommand(.{ .upsert_replica_intent = .{
+        .expected_metadata_version = expected_metadata_version,
+        .expected_version_fence = expected_version_fence,
+        .expected_target_drain_requested = expected_target_drain_requested,
+        .replacement = intent,
+    } });
+}
+
+fn removeReplicaIntentCatalogLocked(
+    service: anytype,
+    group_id: u64,
+    local_node_id: u64,
+    expected_metadata_version: u64,
+    preflight: ?fk_generation_publication.InitialPlacementProof,
+) !void {
+    const proof = try recheckInitialPlacementProof(service, group_id, preflight);
+    if (proof) |identity| return service.proposeTransitionCommand(.{ .remove_fk_initial_replica_intent = .{
+        .proof = identity,
+        .group_id = group_id,
+        .local_node_id = local_node_id,
+        .expected_metadata_version = expected_metadata_version,
+    } });
+    try service.proposeTransitionCommand(.{ .remove_replica_intent = .{
+        .group_id = group_id,
+        .local_node_id = local_node_id,
+        .expected_metadata_version = expected_metadata_version,
+    } });
+}
+
+fn applyReconciliationPlanMode(service: anytype, plan: *const metadata_reconciler.ReconciliationPlan, comptime catalog_locked: bool) !void {
+    std.debug.assert(plan.placement_upserts.len == plan.placement_upsert_preconditions.len);
+    for (plan.placement_upserts, plan.placement_upsert_preconditions) |intent, precondition| {
+        if (comptime catalog_locked) {
+            // Decoder readiness is cached-only here; it cannot fan out while
+            // the catalog gate is held. The preceding ReadIndex cut and the
+            // locked proof recheck fence a prior leader's hosted BEGIN.
+            const preflight = try cachedInitialPlacementProof(service, intent.record.group_id);
+            try upsertReplicaIntentCatalogLocked(service, intent, precondition.expected_metadata_version, precondition.expected_version_fence, precondition.expected_target_drain_requested, preflight);
+        } else {
+            try service.upsertReplicaIntent(intent, precondition.expected_metadata_version, precondition.expected_version_fence, precondition.expected_target_drain_requested);
+        }
+    }
+    for (plan.table_upserts) |record| try service.upsertTable(record);
+    for (plan.split_admissions) |admission| try service.admitSplitTransition(admission);
+    for (plan.range_upserts) |record| try service.upsertRange(record);
+    for (plan.split_upserts) |record| try service.upsertSplitTransition(record);
+    for (plan.merge_upserts) |record| try service.upsertMergeTransition(record);
+    for (plan.placement_removals) |record| {
+        if (comptime catalog_locked) {
+            const preflight = try cachedInitialPlacementProof(service, record.group_id);
+            try removeReplicaIntentCatalogLocked(service, record.group_id, record.local_node_id, record.expected_metadata_version, preflight);
+        } else {
+            try service.removeReplicaIntent(record.group_id, record.local_node_id, record.expected_metadata_version);
+        }
+    }
+    for (plan.table_removals) |table_id| try service.removeTable(table_id);
+    for (plan.range_removals) |group_id| try service.removeRange(group_id);
+    for (plan.split_removals) |transition_id| try service.removeSplitTransition(transition_id);
+    for (plan.merge_removals) |transition_id| try service.removeMergeTransition(transition_id);
+    if (plan.clear_reallocation_request) |expected| try service.clearReallocationRequest(expected);
+}
+
 /// Materialize a multi-command catalog plan before admitting any part of it,
 /// then append every entry atomically in one leader term. Raft's ordered apply
 /// rule makes the terminal receipt a proof for the entire batch without adding
@@ -684,8 +884,62 @@ fn applyReconciliationPlanAndWaitAppliedWithContextImpl(
     plan: *const metadata_reconciler.ReconciliationPlan,
     request: api_operation.RequestContext,
 ) !void {
+    return applyReconciliationPlanAndWaitAppliedWithContextMode(service, alloc, plan, request, null);
+}
+
+/// A non-null guard transfers an already-held catalog gate from the workflow
+/// to this batch. Admission runs under that gate; the gate is released before
+/// waiting for the terminal Raft receipt.
+fn applyReconciliationPlanAndWaitAppliedWithContextMode(
+    service: anytype,
+    alloc: std.mem.Allocator,
+    plan: *const metadata_reconciler.ReconciliationPlan,
+    request: api_operation.RequestContext,
+    held_catalog_gate: ?*bool,
+) !void {
     try request.ensureActive();
     std.debug.assert(plan.placement_upserts.len == plan.placement_upsert_preconditions.len);
+    if (held_catalog_gate == null and (plan.placement_upserts.len != 0 or plan.placement_removals.len != 0))
+        try ensureInitialPlacementReadCut(service, request);
+
+    // Network/membership probing stays outside the catalog lock. A second
+    // point read under that lock below prevents BEGIN or group reuse from
+    // converting a preflighted ordinary command into hidden hosted work.
+    const upsert_proofs = try alloc.alloc(?fk_generation_publication.InitialPlacementProof, plan.placement_upserts.len);
+    defer alloc.free(upsert_proofs);
+    var has_hosted_placement = false;
+    for (plan.placement_upserts, upsert_proofs) |intent, *proof| {
+        proof.* = if (held_catalog_gate != null)
+            try cachedInitialPlacementProof(service, intent.record.group_id)
+        else
+            try initialPlacementProofForGroup(service, intent.record.group_id);
+        has_hosted_placement = has_hosted_placement or proof.* != null;
+    }
+    const removal_proofs = try alloc.alloc(?fk_generation_publication.InitialPlacementProof, plan.placement_removals.len);
+    defer alloc.free(removal_proofs);
+    for (plan.placement_removals, removal_proofs) |record, *proof| {
+        proof.* = if (held_catalog_gate != null)
+            try cachedInitialPlacementProof(service, record.group_id)
+        else
+            try initialPlacementProofForGroup(service, record.group_id);
+        has_hosted_placement = has_hosted_placement or proof.* != null;
+    }
+    if (has_hosted_placement and held_catalog_gate == null) {
+        if (comptime !@hasDecl(@TypeOf(service.*), "ensureTableTopologyProtocolReadyWithContext"))
+            return error.TableTopologyProtocolUpgradeRequired;
+        _ = try service.ensureTableTopologyProtocolReadyWithContext(request, metadata_topology_protocol.fk_initial_create_version);
+    }
+
+    const has_catalog_lock = comptime @hasDecl(@TypeOf(service.*), "lockCatalogMutation");
+    if (held_catalog_gate == null) {
+        if (comptime has_catalog_lock) service.lockCatalogMutation();
+    } else std.debug.assert(held_catalog_gate.?.*);
+    var catalog_locked = has_catalog_lock or held_catalog_gate != null;
+    defer {
+        if (catalog_locked and held_catalog_gate == null) {
+            if (comptime has_catalog_lock) service.unlockCatalogMutation();
+        }
+    }
 
     var commands = std.ArrayList(metadata_storage.TransitionCommand).empty;
     defer commands.deinit(alloc);
@@ -705,8 +959,17 @@ fn applyReconciliationPlanAndWaitAppliedWithContextImpl(
         return error.MetadataTopologyCommandTooLarge;
     try commands.ensureTotalCapacity(alloc, command_capacity);
 
-    for (plan.placement_upserts, plan.placement_upsert_preconditions) |intent, precondition| {
-        commands.appendAssumeCapacity(.{ .upsert_replica_intent = .{
+    for (plan.placement_upserts, plan.placement_upsert_preconditions, upsert_proofs) |intent, precondition, expected_proof| {
+        const proof = try recheckInitialPlacementProof(service, intent.record.group_id, expected_proof);
+        if (proof) |identity| {
+            commands.appendAssumeCapacity(.{ .upsert_fk_initial_replica_intent = .{
+                .proof = identity,
+                .expected_metadata_version = precondition.expected_metadata_version,
+                .expected_version_fence = precondition.expected_version_fence,
+                .expected_target_drain_requested = precondition.expected_target_drain_requested,
+                .replacement = intent,
+            } });
+        } else commands.appendAssumeCapacity(.{ .upsert_replica_intent = .{
             .expected_metadata_version = precondition.expected_metadata_version,
             .expected_version_fence = precondition.expected_version_fence,
             .expected_target_drain_requested = precondition.expected_target_drain_requested,
@@ -726,12 +989,19 @@ fn applyReconciliationPlanAndWaitAppliedWithContextImpl(
         commands.appendAssumeCapacity(.{ .upsert_split_transition = record });
     for (plan.merge_upserts) |record|
         commands.appendAssumeCapacity(.{ .upsert_merge_transition = record });
-    for (plan.placement_removals) |record|
-        commands.appendAssumeCapacity(.{ .remove_replica_intent = .{
+    for (plan.placement_removals, removal_proofs) |record, expected_proof| {
+        const proof = try recheckInitialPlacementProof(service, record.group_id, expected_proof);
+        if (proof) |identity| commands.appendAssumeCapacity(.{ .remove_fk_initial_replica_intent = .{
+            .proof = identity,
+            .group_id = record.group_id,
+            .local_node_id = record.local_node_id,
+            .expected_metadata_version = record.expected_metadata_version,
+        } }) else commands.appendAssumeCapacity(.{ .remove_replica_intent = .{
             .group_id = record.group_id,
             .local_node_id = record.local_node_id,
             .expected_metadata_version = record.expected_metadata_version,
         } });
+    }
     for (plan.table_removals) |table_id| {
         const store = service.projectedStore() orelse return error.MissingMetadataStore;
         const baseline_fence = try store.getTableTransitionFence(
@@ -770,6 +1040,11 @@ fn applyReconciliationPlanAndWaitAppliedWithContextImpl(
     // batch is accepted, cancellation remains observable only while waiting
     // for its exact terminal receipt and is reported as an ambiguous outcome.
     const receipt = try service.proposeTransitionCommandsWithReceipt(commands.items);
+    if (catalog_locked) {
+        if (comptime has_catalog_lock) service.unlockCatalogMutation();
+        catalog_locked = false;
+        if (held_catalog_gate) |guard| guard.* = false;
+    }
     service.waitForTransitionAppliedWithContext(receipt, request) catch |err| {
         // A receipt proves that admission completed. Leadership loss,
         // cancellation, or a local apply timeout after this point cannot be
@@ -807,7 +1082,7 @@ test "metadata service node lifecycle proposal distinguishes rejection from ambi
         wait_error: ?anyerror = null,
         wait_calls: usize = 0,
 
-        fn proposeTransitionCommandWithReceipt(
+        pub fn proposeTransitionCommandWithReceipt(
             self: *@This(),
             _: metadata_storage.TransitionCommand,
         ) !MetadataProposalReceipt {
@@ -815,7 +1090,7 @@ test "metadata service node lifecycle proposal distinguishes rejection from ambi
             return .{ .term = 7, .index = 19 };
         }
 
-        fn waitForTransitionApplied(self: *@This(), receipt: MetadataProposalReceipt) !void {
+        pub fn waitForTransitionApplied(self: *@This(), receipt: MetadataProposalReceipt) !void {
             try std.testing.expectEqual(@as(u64, 7), receipt.term);
             try std.testing.expectEqual(@as(u64, 19), receipt.index);
             self.wait_calls += 1;
@@ -861,7 +1136,7 @@ test "metadata reconciliation plan uses one terminal receipt for ordered apply" 
             return .{};
         }
 
-        fn getTable(
+        pub fn getTable(
             _: *@This(),
             _: std.mem.Allocator,
             _: u64,
@@ -874,12 +1149,23 @@ test "metadata reconciliation plan uses one terminal receipt for ordered apply" 
     const FakeService = struct {
         metadata_group_id: u64 = 1,
         store: FakeStore = .{},
-        tags: [2]CommandTag = undefined,
+        tags: [4]CommandTag = undefined,
         command_count: usize = 0,
         batch_count: usize = 0,
         waited: bool = false,
+        locked: bool = false,
+        recursive_lock: bool = false,
 
-        fn projectedStore(self: *@This()) ?*FakeStore {
+        pub fn lockCatalogMutation(self: *@This()) void {
+            if (self.locked) self.recursive_lock = true;
+            self.locked = true;
+        }
+
+        pub fn unlockCatalogMutation(self: *@This()) void {
+            self.locked = false;
+        }
+
+        pub fn projectedStore(self: *@This()) ?*FakeStore {
             return &self.store;
         }
 
@@ -892,6 +1178,7 @@ test "metadata reconciliation plan uses one terminal receipt for ordered apply" 
             self: *@This(),
             commands: []const metadata_storage.TransitionCommand,
         ) !MetadataProposalReceipt {
+            try std.testing.expect(self.locked);
             for (commands) |command| self.record(command);
             self.batch_count += 1;
             return .{ .term = 3, .index = 9 };
@@ -902,6 +1189,7 @@ test "metadata reconciliation plan uses one terminal receipt for ordered apply" 
             receipt: MetadataProposalReceipt,
             request: api_operation.RequestContext,
         ) !void {
+            try std.testing.expect(!self.locked);
             try request.ensureActive();
             try std.testing.expectEqual(@as(u64, 3), receipt.term);
             try std.testing.expectEqual(@as(u64, 9), receipt.index);
@@ -932,6 +1220,109 @@ test "metadata reconciliation plan uses one terminal receipt for ordered apply" 
     try std.testing.expectEqual(CommandTag.upsert_table, fake.tags[0]);
     try std.testing.expectEqual(CommandTag.upsert_range, fake.tags[1]);
     try std.testing.expect(fake.waited);
+    try std.testing.expect(!fake.recursive_lock);
+
+    fake.lockCatalogMutation();
+    var held_catalog_gate = true;
+    try applyReconciliationPlanAndWaitAppliedWithContextMode(
+        &fake,
+        std.testing.allocator,
+        &plan,
+        .{},
+        &held_catalog_gate,
+    );
+    try std.testing.expect(!held_catalog_gate);
+    try std.testing.expect(!fake.locked);
+    try std.testing.expect(!fake.recursive_lock);
+    try std.testing.expectEqual(@as(usize, 2), fake.batch_count);
+}
+
+test "metadata reconciliation never appends an ordinary placement after hidden BEGIN races preflight" {
+    const FakeStore = struct {
+        hosted: bool = false,
+        fn getTableTransitionFence(_: *@This(), _: u64, _: u64) !metadata_storage.raft_apply_store.TableTransitionFence {
+            return .{};
+        }
+        pub fn getTable(_: *@This(), _: std.mem.Allocator, _: u64, _: u64) !?metadata_table_manager.TableRecord {
+            return null;
+        }
+        pub fn initialGroupReservation(self: *@This(), _: u64, _: u64) !?fk_generation_publication.InitialGroupReservation {
+            if (!self.hosted) return null;
+            return .{
+                .plan_id = @splat(1),
+                .plan_digest = @splat(2),
+                .child_table_id = 71,
+                .range_id = 9,
+                .retirement_scope = .hosted_store,
+            };
+        }
+    };
+    const FakeService = struct {
+        metadata_group_id: u64 = 1,
+        store: FakeStore = .{},
+        appended: usize = 0,
+        locked: bool = false,
+        begin_on_lock: bool = true,
+        stale_projection: bool = false,
+        read_cuts: usize = 0,
+        last_tag: ?std.meta.Tag(metadata_storage.TransitionCommand) = null,
+        pub fn projectedStore(self: *@This()) ?*FakeStore {
+            return &self.store;
+        }
+        pub fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: api_operation.RequestContext, required: u16) !TableTopologyProtocolReadiness {
+            return tableTopologyProtocolReadiness(3, required, "0123456789abcdef0123456789abcdef".*, &.{1});
+        }
+        pub fn cachedCoordinatedDecoderReadiness(_: *@This(), required: u16) !TableTopologyProtocolReadiness {
+            return tableTopologyProtocolReadiness(3, required, "0123456789abcdef0123456789abcdef".*, &.{1});
+        }
+        pub fn ensureLinearizableReadWithContext(self: *@This(), _: api_operation.RequestContext) !void {
+            self.read_cuts += 1;
+            if (self.stale_projection) self.store.hosted = true;
+        }
+        pub fn lockCatalogMutation(self: *@This()) void {
+            self.locked = true;
+            if (self.begin_on_lock) self.store.hosted = true; // BEGIN committed after first point read.
+        }
+        pub fn unlockCatalogMutation(self: *@This()) void {
+            self.locked = false;
+        }
+        fn proposeTransitionCommandsWithReceipt(self: *@This(), commands: []const metadata_storage.TransitionCommand) !MetadataProposalReceipt {
+            if (commands.len > 0) self.last_tag = std.meta.activeTag(commands[0]);
+            self.appended += 1;
+            return .{ .term = 1, .index = 1 };
+        }
+        fn waitForTransitionAppliedWithContext(_: *@This(), _: MetadataProposalReceipt, _: api_operation.RequestContext) !void {}
+    };
+    var service: FakeService = .{};
+    const placements = [_]raft_reconciler.PlacementIntent{.{
+        .record = .{ .group_id = 91, .replica_id = 3, .local_node_id = 8 },
+        .peer_node_ids = &.{8},
+    }};
+    const preconditions = [_]metadata_reconciler.PlacementUpsertPrecondition{.{
+        .expected_metadata_version = null,
+        .expected_version_fence = 0,
+        .expected_target_drain_requested = false,
+    }};
+    var plan = metadata_reconciler.ReconciliationPlan.empty();
+    plan.placement_upserts = @constCast(placements[0..]);
+    plan.placement_upsert_preconditions = @constCast(preconditions[0..]);
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, applyReconciliationPlanAndWaitAppliedWithContextImpl(
+        &service,
+        std.testing.allocator,
+        &plan,
+        .{},
+    ));
+    try std.testing.expect(!service.locked);
+    try std.testing.expectEqual(@as(usize, 0), service.appended);
+    try std.testing.expectEqual(@as(usize, 1), service.read_cuts);
+    var ready: FakeService = .{ .store = .{ .hosted = true }, .begin_on_lock = false };
+    try applyReconciliationPlanAndWaitAppliedWithContextImpl(&ready, std.testing.allocator, &plan, .{});
+    try std.testing.expectEqual(@as(usize, 1), ready.appended);
+    try std.testing.expectEqual(std.meta.Tag(metadata_storage.TransitionCommand).upsert_fk_initial_replica_intent, ready.last_tag.?);
+    var prior_leader_commit: FakeService = .{ .stale_projection = true, .begin_on_lock = false };
+    try applyReconciliationPlanAndWaitAppliedWithContextImpl(&prior_leader_commit, std.testing.allocator, &plan, .{});
+    try std.testing.expectEqual(@as(usize, 1), prior_leader_commit.read_cuts);
+    try std.testing.expectEqual(std.meta.Tag(metadata_storage.TransitionCommand).upsert_fk_initial_replica_intent, prior_leader_commit.last_tag.?);
 }
 
 test "metadata reconciliation plan hides retryable errors after admission" {
@@ -939,14 +1330,14 @@ test "metadata reconciliation plan hides retryable errors after admission" {
         fn getTableTransitionFence(_: *@This(), _: u64, _: u64) !metadata_storage.raft_apply_store.TableTransitionFence {
             return .{};
         }
-        fn getTable(_: *@This(), _: std.mem.Allocator, _: u64, _: u64) !?metadata_table_manager.TableRecord {
+        pub fn getTable(_: *@This(), _: std.mem.Allocator, _: u64, _: u64) !?metadata_table_manager.TableRecord {
             return null;
         }
     };
     const FakeService = struct {
         metadata_group_id: u64 = 1,
         store: FakeStore = .{},
-        fn projectedStore(self: *@This()) ?*FakeStore {
+        pub fn projectedStore(self: *@This()) ?*FakeStore {
             return &self.store;
         }
         fn proposeTransitionCommandsWithReceipt(_: *@This(), _: []const metadata_storage.TransitionCommand) !MetadataProposalReceipt {
@@ -1377,18 +1768,49 @@ const MetadataRunRoundTrace = struct {
 const MetadataProposalProgressDriver = struct {
     lane: std.atomic.Mutex = .unlocked,
     wake_epoch: std.atomic.Value(u32) = .init(0),
+    owner_mutex: std.Io.Mutex = .init,
+    managed_owned: std.atomic.Value(bool) = .init(false),
+    managed_wake: ?@import("../raft/runtime_loop.zig").ProgressWake = null,
 
     const Lease = struct {
         driver: *MetadataProposalProgressDriver,
 
-        fn deinit(self: *Lease) void {
+        pub fn deinit(self: *Lease) void {
             self.driver.lane.unlock();
             self.driver.notifyWaiters();
             self.* = undefined;
         }
     };
 
+    fn registerManagedOwner(self: *MetadataProposalProgressDriver, wake: @import("../raft/runtime_loop.zig").ProgressWake) !void {
+        self.owner_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.owner_mutex.unlock(std.Options.debug_io);
+        if (self.managed_wake != null) return error.MetadataProgressAlreadyOwned;
+        self.managed_wake = wake;
+        self.managed_owned.store(true, .release);
+        self.notifyWaiters();
+    }
+
+    fn releaseManagedOwner(self: *MetadataProposalProgressDriver) void {
+        self.owner_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.owner_mutex.unlock(std.Options.debug_io);
+        self.managed_wake = null;
+        self.managed_owned.store(false, .release);
+        self.notifyWaiters();
+    }
+
+    fn notifyManagedOwner(self: *MetadataProposalProgressDriver) bool {
+        // Serialize only the borrowed notification's lifetime. Never hold
+        // this lock over Raft persistence, apply, or a proposal wait.
+        self.owner_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.owner_mutex.unlock(std.Options.debug_io);
+        const wake = self.managed_wake orelse return false;
+        wake.notify();
+        return true;
+    }
+
     fn tryAcquire(self: *MetadataProposalProgressDriver) ?Lease {
+        if (self.managed_owned.load(.acquire)) return null;
         if (!self.lane.tryLock()) return null;
         return .{ .driver = self };
     }
@@ -1455,7 +1877,7 @@ const TableTopologyProtocolProbeCoordinator = struct {
             self.publishes_completion = true;
         }
 
-        fn deinit(self: *Lease) void {
+        pub fn deinit(self: *Lease) void {
             if (self.publishes_completion) {
                 _ = self.coordinator.wake_epoch.fetchAdd(1, .release);
             }
@@ -1548,7 +1970,7 @@ test "table topology protocol probes share matching success and bounded failure"
         .required_version = 3,
         .metadata_incarnation = null,
         .protected_member_count = 2,
-        .protected_membership_fingerprint = [_]u8{7} ** std.crypto.hash.sha2.Sha256.digest_length,
+        .protected_membership_fingerprint = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(7)),
     };
     const first_completion_epoch = first.completionEpoch();
     coordinator.cached = .{
@@ -1699,7 +2121,7 @@ const LifecycleSignal = struct {
         return false;
     }
 
-    fn deinit(self: *LifecycleSignal) void {
+    pub fn deinit(self: *LifecycleSignal) void {
         var it = self.table_epochs.iterator();
         while (it.next()) |entry| self.alloc.free(entry.key_ptr.*);
         self.table_epochs.deinit(self.alloc);
@@ -1781,6 +2203,8 @@ pub const MetadataServiceConfig = struct {
     secret_store: ?*common_secrets.FileStore = null,
     internal_service_secret: ?[]const u8 = null,
     internal_service_issuer: ?[]const u8 = null,
+    setting_authority_secret: ?[]const u8 = null,
+    setting_authority_issuer: ?[]const u8 = null,
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     reallocation_protocol_peers: []const ReallocationProtocolPeer = &.{},
 };
@@ -1919,7 +2343,7 @@ test "metadata transition driver online routes capture one projection without ad
             std.debug.assert(self.locked);
             self.locked = false;
         }
-        fn projectedCoreSnapshotLocked(self: *@This()) !*const ProjectedCoreSnapshot {
+        pub fn projectedCoreSnapshotLocked(self: *@This()) !*const ProjectedCoreSnapshot {
             std.debug.assert(self.locked);
             self.captures += 1;
             return &self.core;
@@ -2065,13 +2489,13 @@ test "metadata transition driver online installs before registration and reattac
         }
         const operations: shard.ShardOperationAdapter.VTable = blk: {
             var value: shard.ShardOperationAdapter.VTable = undefined;
-            for (std.meta.fields(@TypeOf(value))) |field| {
-                if (@typeInfo(field.type) == .optional) {
-                    @field(value, field.name) = null;
+            for (@typeInfo(@TypeOf(value)).@"struct".field_names, @typeInfo(@TypeOf(value)).@"struct".field_types) |reflected_name, field_type| {
+                if (@typeInfo(field_type) == .optional) {
+                    @field(value, reflected_name) = null;
                     continue;
                 }
-                @field(value, field.name) = struct {
-                    fn call(_: *anyopaque, _: u64, _: @typeInfo(@typeInfo(field.type).pointer.child).@"fn".params[2].type.?) @typeInfo(@typeInfo(field.type).pointer.child).@"fn".return_type.? {
+                @field(value, reflected_name) = struct {
+                    fn call(_: *anyopaque, _: u64, _: @typeInfo(@typeInfo(field_type).pointer.child).@"fn".param_types[2].?) @typeInfo(@typeInfo(field_type).pointer.child).@"fn".return_type.? {
                         return error.UnexpectedTransitionEffect;
                     }
                 }.call;
@@ -2091,7 +2515,7 @@ test "metadata transition driver online installs before registration and reattac
     defer svc.deinit();
     svc.raft.disableTransitionOps();
     var capabilities: @import("online_merge.zig").Capabilities = .{};
-    inline for (std.meta.fields(@TypeOf(capabilities))) |field| @field(capabilities, field.name) = true;
+    inline for (comptime std.meta.fieldNames(@TypeOf(capabilities))) |reflected_name| @field(capabilities, reflected_name) = true;
     try installOnlineMergeDriver(&svc, .{ .ptr = &token, .vtable = &.{ .execute = Stub.request } }, capabilities);
     try std.testing.expect(svc.raft.transition_svc == null);
     const driver_ptr = svc.online_merge_runtime.?.driver.ptr;
@@ -2702,12 +3126,15 @@ fn stripRuntimeDenseNativeStatus(record: *metadata_table_manager.StoreRecord) vo
 }
 
 fn runtimeStatusRequiredRecordVersion(record: metadata_table_manager.StoreRecord) u16 {
-    if (record.relational_topology_protocol_version != 0) return metadata_runtime_status_protocol.current_record_version;
+    for (record.runtime_statuses) |status| {
+        if (status.schema_epoch != 0) return metadata_runtime_status_protocol.schema_epoch_record_version;
+    }
+    if (record.relational_topology_protocol_version != 0) return metadata_runtime_status_protocol.framed_index_record_version;
     if (record.dense_native_storage_protocol_version != 0 or
         storeHasDenseVectorProjectionPending(record) or
         storeHasDenseNativeStorageStatus(record))
     {
-        return metadata_runtime_status_protocol.current_record_version;
+        return metadata_runtime_status_protocol.framed_index_record_version;
     }
     for (record.runtime_statuses) |status| {
         if (metadata_table_manager.runtimeEnrichmentHasInferenceDiagnostics(status.enrichment)) {
@@ -2723,11 +3150,14 @@ fn runtimeStatusRequiredRecordVersion(record: metadata_table_manager.StoreRecord
 /// and cannot be erased merely to cross an older proposal boundary. Embedding
 /// activity is deliberately absent: it is an ephemeral observability overlay.
 fn runtimeStatusMandatoryRecordVersion(record: metadata_table_manager.StoreRecord) u16 {
-    if (record.relational_topology_protocol_version != 0) return metadata_runtime_status_protocol.current_record_version;
+    for (record.runtime_statuses) |status| {
+        if (status.schema_epoch != 0) return metadata_runtime_status_protocol.schema_epoch_record_version;
+    }
+    if (record.relational_topology_protocol_version != 0) return metadata_runtime_status_protocol.framed_index_record_version;
     if (record.dense_native_storage_protocol_version != 0 or
         storeHasDenseVectorProjectionPending(record) or
         storeHasDenseNativeStorageStatus(record))
-        return metadata_runtime_status_protocol.current_record_version;
+        return metadata_runtime_status_protocol.framed_index_record_version;
     if (metadata_table_manager.storeRequiresCurrentRuntimeStatusProfile(record))
         return metadata_runtime_status_protocol.previous_record_version;
     return metadata_runtime_status_protocol.v0_2_0_record_version;
@@ -2759,7 +3189,7 @@ fn stripRuntimeStatusAboveVersion(
     record: *metadata_table_manager.StoreRecord,
     supported_version: u16,
 ) void {
-    if (supported_version == metadata_runtime_status_protocol.current_record_version) return;
+    if (metadata_runtime_status_protocol.profileSatisfies(supported_version, metadata_runtime_status_protocol.framed_index_record_version)) return;
     stripRuntimeDenseNativeStatus(record);
     if (supported_version == metadata_runtime_status_protocol.inference_diagnostics_record_version) return;
     stripRuntimeInferenceDiagnostics(alloc, record);
@@ -2791,6 +3221,9 @@ fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16)
         return required_version;
     if (runtimeStatusProtocolVersionReady(service, required_version)) return required_version;
     if (required_version == metadata_runtime_status_protocol.current_record_version and
+        runtimeStatusProtocolVersionReady(service, metadata_runtime_status_protocol.framed_index_record_version))
+        return metadata_runtime_status_protocol.framed_index_record_version;
+    if (metadata_runtime_status_protocol.profileSatisfies(required_version, metadata_runtime_status_protocol.framed_index_record_version) and
         runtimeStatusProtocolVersionReady(service, metadata_runtime_status_protocol.inference_diagnostics_record_version))
         return metadata_runtime_status_protocol.inference_diagnostics_record_version;
     if (runtimeStatusProtocolVersionReady(service, metadata_runtime_status_protocol.positional_record_version))
@@ -2801,9 +3234,16 @@ fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16)
 /// New wire shapes must never be appended merely because the leader can
 /// decode them. This classifier is shared by single and batched proposals;
 /// ordinary document metadata retains its predecessor admission contract.
-pub fn transitionRequiresCoordinatedDecoder(command: metadata_storage.TransitionCommand) bool {
-    return switch (command) {
-        .apply_restore_staging, .create_restore_job_with_staging, .compare_and_set_backup_cohort, .compare_and_set_online_merge => true,
+pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    const requires_v11 = switch (command) {
+        .apply_store_root_enrollment, .ack_initial_fk_retirement => return metadata_topology_protocol.store_root_enrollment_version,
+        .apply_fk_generation_publication => return metadata_topology_protocol.fk_generation_publication_version,
+        // Initial CREATE carries the v2 reservation and retirement scope in
+        // durable metadata. Its admission proof must survive through the
+        // final append, not just the public workflow's earlier probe.
+        .apply_fk_initial_create, .upsert_fk_initial_replica_intent, .remove_fk_initial_replica_intent => return metadata_topology_protocol.fk_initial_create_version,
+        .compare_and_set_online_merge => |update| if (update.next.artifact_catalog != null) return metadata_topology_protocol.ordered_merge_artifact_version else true,
+        .apply_restore_staging, .create_restore_job_with_staging, .compare_and_set_backup_cohort => true,
         .upsert_table => |table| table.relational_retirement_json.len != 0 or table.requiresStorageMetadataExtension(),
         .compare_and_replace_table => |cas| cas.expected.relational_retirement_json.len != 0 or cas.replacement.relational_retirement_json.len != 0 or cas.expected.requiresStorageMetadataExtension() or cas.replacement.requiresStorageMetadataExtension(),
         .apply_table_topology => |mutation| switch (mutation) {
@@ -2814,31 +3254,75 @@ pub fn transitionRequiresCoordinatedDecoder(command: metadata_storage.Transition
             for (delta.upsert_tables) |table| if (table.relational_retirement_json.len != 0 or table.requiresStorageMetadataExtension()) break :blk true;
             break :blk false;
         },
-        .register_store, .upsert_store => |record| record.relational_topology_protocol_version != 0,
+        .register_store, .upsert_store => |record| {
+            if (!std.mem.eql(u8, &record.replica_root_public_key, &(@as([32]u8, @splat(0)))))
+                return metadata_topology_protocol.store_root_signing_decoder_version;
+            if (record.replica_root_incarnation != 0) return metadata_topology_protocol.store_root_uuid_decoder_version;
+            return if (record.relational_topology_protocol_version != 0) metadata_topology_protocol.coordinated_lifecycle_version else 0;
+        },
         .admit_split_transition => |admission| admission.record.table_contract.integrity_protocol != .none or admission.record.table_contract.read_schema_json.len != 0,
         .upsert_split_transition => |record| record.table_contract.integrity_protocol != .none or record.table_contract.read_schema_json.len != 0,
-        .admit_online_merge => true,
-        .upsert_merge_transition => |record| record.online != null or record.table_contract.integrity_protocol != .none or record.table_contract.read_schema_json.len != 0,
+        .admit_online_merge => |admission| if (admission.next.artifact_catalog != null) return metadata_topology_protocol.ordered_merge_artifact_version else true,
+        .upsert_merge_transition => |record| blk: {
+            if (record.online) |online| if (online.artifact_catalog != null) return metadata_topology_protocol.ordered_merge_artifact_version;
+            break :blk record.online != null or record.table_contract.integrity_protocol != .none or record.table_contract.read_schema_json.len != 0;
+        },
         else => false,
     };
+    return if (requires_v11) metadata_topology_protocol.coordinated_lifecycle_version else 0;
+}
+
+pub fn transitionRequiresCoordinatedDecoder(command: metadata_storage.TransitionCommand) bool {
+    return transitionRequiredCoordinatedDecoderVersion(command) != 0;
+}
+
+fn preflightRowPolicyTopologyCommand(service: anytype, command: metadata_storage.TransitionCommand) !void {
+    const table_id: ?u64 = switch (command) {
+        .upsert_range => |range| range.table_id,
+        .admit_split_transition => |admission| admission.record.table_contract.table_id,
+        .upsert_split_transition => |record| record.table_contract.table_id,
+        .upsert_merge_transition => |record| record.table_contract.table_id,
+        .admit_online_merge => |admission| admission.next.scope.fence.namespace.table_id,
+        .compare_and_set_online_merge => |update| update.expected.scope.fence.namespace.table_id,
+        else => null,
+    };
+    if (table_id) |id| {
+        const store = service.projectedStore() orelse return error.MissingMetadataStore;
+        try store.requirePolicyTopologyMutationAllowed(service.metadata_group_id, id);
+    }
+    if (command == .remove_range or command == .complete_restore_range) {
+        const store = service.projectedStore() orelse return error.MissingMetadataStore;
+        const range_group_id = switch (command) {
+            .remove_range => |record| record.group_id,
+            .complete_restore_range => |record| record.group_id,
+            else => unreachable,
+        };
+        const range = try store.getRange(service.alloc, service.metadata_group_id, range_group_id);
+        defer if (range) |value| metadata_table_manager.freeRange(service.alloc, value);
+        if (range) |value| try store.requirePolicyTopologyMutationAllowed(service.metadata_group_id, value.table_id);
+    }
 }
 
 /// Call before acquiring a catalog lock. Remote membership probes belong at
 /// workflow admission; the final proposal path below only consumes a proof.
 pub fn ensureCoordinatedDecoderWithContext(service: anytype, command: metadata_storage.TransitionCommand, request: api_operation.RequestContext) !void {
-    if (!transitionRequiresCoordinatedDecoder(command)) return;
+    const required_version = transitionRequiredCoordinatedDecoderVersion(command);
+    if (required_version == 0) return;
     if (comptime !@hasDecl(@TypeOf(service.*), "ensureTableTopologyProtocolReadyWithContext"))
         return error.TableTopologyProtocolUpgradeRequired;
-    _ = try service.ensureTableTopologyProtocolReadyWithContext(request, metadata_topology_protocol.coordinated_lifecycle_version);
+    _ = try service.ensureTableTopologyProtocolReadyWithContext(request, required_version);
 }
 
 fn prepareCoordinatedDecoderAdmission(service: anytype, commands: []const metadata_storage.TransitionCommand) !?TableTopologyProtocolReadiness {
-    for (commands) |command| if (transitionRequiresCoordinatedDecoder(command)) {
-        if (comptime !@hasDecl(@TypeOf(service.*), "cachedCoordinatedDecoderReadiness"))
-            return error.TableTopologyProtocolUpgradeRequired;
-        return try service.cachedCoordinatedDecoderReadiness();
-    };
-    return null;
+    if (comptime @TypeOf(service.*) == MetadataService or @TypeOf(service.*) == MetadataHttpService) {
+        for (commands) |command| try preflightRowPolicyTopologyCommand(service, command);
+    }
+    var required_version: u16 = 0;
+    for (commands) |command| required_version = @max(required_version, transitionRequiredCoordinatedDecoderVersion(command));
+    if (required_version == 0) return null;
+    if (comptime !@hasDecl(@TypeOf(service.*), "cachedCoordinatedDecoderReadiness"))
+        return error.TableTopologyProtocolUpgradeRequired;
+    return try service.cachedCoordinatedDecoderReadiness(required_version);
 }
 
 /// Caller holds the runtime lock through this check and Raft append. A proof
@@ -2899,10 +3383,11 @@ fn runtimeStatusProtocolSafeCommand(
             const supported_version = highestSupportedRuntimeStatusVersion(service, required_version);
             if (supported_version == required_version and !storeHasRuntimeEmbeddingActivity(record)) return command;
             // Native projection/authority fields are readiness fences. False
-            // is not a conservative downgrade, so registration must wait for
-            // the framed profile just like an upsert.
-            if (required_version == metadata_runtime_status_protocol.current_record_version and
-                supported_version != required_version)
+            // is not a conservative downgrade, so registration must retain
+            // every mandatory profile fact just like an upsert.
+            const mandatory_version = runtimeStatusMandatoryRecordVersion(record);
+            if (metadata_runtime_status_protocol.profileSatisfies(mandatory_version, metadata_runtime_status_protocol.framed_index_record_version) and
+                !metadata_runtime_status_protocol.profileSatisfies(supported_version, mandatory_version))
             {
                 return error.RuntimeStatusProtocolUnavailable;
             }
@@ -2919,7 +3404,7 @@ fn runtimeStatusProtocolSafeCommand(
 const EncodedTransitionBatch = struct {
     entries: [][]const u8,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         for (self.entries) |entry| alloc.free(entry);
         alloc.free(self.entries);
         self.* = undefined;
@@ -3082,7 +3567,7 @@ test "metadata service synchronizes restore progress as one bounded proposal bat
             return .{ .term = 2, .index = 8 };
         }
 
-        fn waitForTransitionApplied(self: *@This(), receipt: MetadataProposalReceipt) !void {
+        pub fn waitForTransitionApplied(self: *@This(), receipt: MetadataProposalReceipt) !void {
             try std.testing.expectEqual(@as(u64, 2), receipt.term);
             try std.testing.expectEqual(@as(u64, 8), receipt.index);
             self.waited = true;
@@ -3113,7 +3598,7 @@ test "metadata service rejects conflicting restore progress batch identities" {
             return error.UnexpectedProposal;
         }
 
-        fn waitForTransitionApplied(_: *@This(), _: MetadataProposalReceipt) !void {
+        pub fn waitForTransitionApplied(_: *@This(), _: MetadataProposalReceipt) !void {
             return error.UnexpectedProposal;
         }
     };
@@ -3153,7 +3638,7 @@ test "metadata restore progress batch never reports non-admission after receipt"
             return .{ .term = 2, .index = 8 };
         }
 
-        fn waitForTransitionApplied(_: *@This(), _: MetadataProposalReceipt) !void {
+        pub fn waitForTransitionApplied(_: *@This(), _: MetadataProposalReceipt) !void {
             return error.NotLeader;
         }
     };
@@ -3182,7 +3667,7 @@ test "metadata service catalog reconciliation batch admits compact plans beyond 
     const FakeService = struct {
         alloc: std.mem.Allocator,
 
-        fn runtimeStatusRepairProtocolReady(_: *@This()) bool {
+        pub fn runtimeStatusRepairProtocolReady(_: *@This()) bool {
             return true;
         }
     };
@@ -3208,7 +3693,7 @@ fn transitionCarriesNativeRestoreIdentity(command: metadata_storage.TransitionCo
     };
 }
 
-fn nativeRestoreIdentityProtocolReady(service: anytype) bool {
+pub fn nativeRestoreIdentityProtocolReady(service: anytype) bool {
     const Service = @TypeOf(service.*);
     if (comptime @hasDecl(Service, "nativeRestoreIdentityProtocolReady"))
         return service.nativeRestoreIdentityProtocolReady();
@@ -3259,7 +3744,7 @@ const LinearizableMetadataReadTracker = struct {
     requests: std.AutoHashMapUnmanaged(u64, bool) = .empty,
     downstream: ?raft_state_machine.ReadStateObserver = null,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.requests.deinit(self.alloc);
         self.* = undefined;
     }
@@ -3724,7 +4209,7 @@ fn SharedStoreReports(comptime T: type, comptime free: anytype) type {
             self.pending = &.{};
             alloc.free(incoming);
         }
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             if (self.leaves.root) |root| root.release(alloc);
             alloc.free(self.pending);
             alloc.free(self.items);
@@ -3741,7 +4226,7 @@ fn SharedStoreReports(comptime T: type, comptime free: anytype) type {
 }
 const StoreCapabilities = struct {
     const Kind = enum { repair, vector_projection, native_storage, artifact_source, reporter_fence, inference, native_restore, relational_topology };
-    flags: std.EnumSet(Kind) = .initEmpty(),
+    flags: std.EnumSet(Kind) = .empty,
     fn fromStores(stores: []const metadata_table_manager.StoreRecord) StoreCapabilities {
         var out: StoreCapabilities = .{};
         if (storesHaveRuntimeRepairStatus(stores)) out.flags.insert(.repair);
@@ -3771,7 +4256,7 @@ test "catalog projection capability counts cover every enum tag and last-owner r
         snapshot.adjustCapabilities(facts, false);
         try std.testing.expectEqual(@as(usize, 0), snapshot.capabilities().flags.count());
     }
-    snapshot.adjustCapabilities(.{ .flags = .initFull() }, true);
+    snapshot.adjustCapabilities(.{ .flags = .full }, true);
     try std.testing.expectEqual(std.enums.values(StoreCapabilities.Kind).len, snapshot.capabilities().flags.count());
     snapshot.deinitStores(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), snapshot.capabilities().flags.count());
@@ -3779,7 +4264,7 @@ test "catalog projection capability counts cover every enum tag and last-owner r
 
 test "catalog projection store lease includes relational rollout capability" {
     const alloc = std.testing.allocator;
-    const record = try metadata_table_manager.cloneStore(alloc, .{ .store_id = 1, .node_id = 1, .relational_topology_protocol_version = 1 });
+    const record = try metadata_table_manager.cloneStore(alloc, .{ .store_id = 1, .node_id = 1, .relational_topology_protocol_version = metadata_table_manager.relational_topology_protocol_version });
     const lease = StoreProjectionLease.create(alloc, record, null, false, false) catch |err| {
         metadata_table_manager.freeStore(alloc, record);
         return err;
@@ -3914,7 +4399,7 @@ const ProjectedCoreSnapshot = struct {
         self.capability_counts = .initFill(0);
     }
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         self.deinitStores(alloc);
         for (self.placement_intents) |intent| alloc.free(intent.peer_node_ids);
         if (self.placement_intents.len > 0) alloc.free(self.placement_intents);
@@ -4013,7 +4498,7 @@ const CoreProjectionChanges = struct {
     };
     const Pending = struct {
         all: bool = true,
-        kinds: std.EnumSet(metadata_storage.raft_apply_store.ProjectionSignalKind) = .initEmpty(),
+        kinds: std.EnumSet(metadata_storage.raft_apply_store.ProjectionSignalKind) = .empty,
         stores: [256]StoreChange = undefined,
         store_count: usize = 0,
         all_stores: bool = false,
@@ -4079,14 +4564,14 @@ const CoreProjectionChanges = struct {
         self.pending.store_count += 1;
     }
     fn take(self: *@This()) Pending {
-        return self.takeKinds(.initFull());
+        return self.takeKinds(.full);
     }
     fn takeKinds(self: *@This(), kinds: std.EnumSet(metadata_storage.raft_apply_store.ProjectionSignalKind)) Pending {
         self.mutex.lockUncancelable(std.Options.debug_io);
         defer self.mutex.unlock(std.Options.debug_io);
         const all = self.pending.all;
         if (self.pending.all) {
-            self.pending.kinds = .initFull();
+            self.pending.kinds = .full;
             self.pending.all_stores = true;
             self.pending.all = false;
         }
@@ -4114,7 +4599,7 @@ const ProjectedCoreSnapshotCache = struct {
     transition_epoch: u64 = 0,
     snapshot: ?ProjectedCoreSnapshot = null,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.snapshot) |*snapshot| snapshot.deinit(alloc);
         self.* = .{};
     }
@@ -4125,7 +4610,7 @@ const TransitionReadinessCache = struct {
     epoch: u64 = 0,
     ready_by_group: std.AutoHashMapUnmanaged(u64, transition_state.StablePlacementReadiness) = .empty,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         self.ready_by_group.deinit(alloc);
         self.* = .{};
     }
@@ -4141,7 +4626,7 @@ const TransitionReadinessInputs = struct {
     stores: []const metadata_table_manager.StoreRecord,
     placement_intents: []raft_reconciler.PlacementIntent,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         self.store_view.deinit(alloc);
         for (self.placement_intents) |intent| raft_reconciler.freeIntentOwned(alloc, intent);
         alloc.free(self.placement_intents);
@@ -4301,7 +4786,7 @@ const StoreReadView = struct {
         for (self.leases, self.stores) |lease, *record| record.* = try lease.materializedRecord(alloc);
     }
 
-    fn deinit(self: *StoreReadView, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *StoreReadView, alloc: std.mem.Allocator) void {
         if (self.owned_records) for (self.stores) |record| metadata_table_manager.freeStore(alloc, record);
         for (self.leases) |lease| lease.release(alloc);
         alloc.free(self.leases);
@@ -4620,7 +5105,7 @@ fn isExpectedCdcRoundError(err: anyerror) bool {
 }
 
 test "metadata durable cutover acknowledgement is attempt scoped" {
-    const fingerprint = [_]u8{0x5a} ** std.crypto.hash.sha2.Sha256.digest_length;
+    const fingerprint = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0x5a));
     const expected = metadata_table_manager.ReplicationSourceStatusRecord{
         .table_id = 41,
         .source_ordinal = 2,
@@ -4633,7 +5118,7 @@ test "metadata durable cutover acknowledgement is attempt scoped" {
         .cutover_intent_id = 99,
         .cutover_authority_id = 1001,
         .cutover_config_fingerprint = fingerprint,
-        .cutover_provider_identity = [_]u8{0x6b} ** std.crypto.hash.sha2.Sha256.digest_length,
+        .cutover_provider_identity = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0x6b)),
     };
     try std.testing.expect(replicationCutoverIntentApplied(expected, expected));
 
@@ -5310,9 +5795,9 @@ pub const MetadataService = struct {
         if (!tableTopologyReadinessEqual(expected, current)) return error.NotLeader;
     }
 
-    pub fn cachedCoordinatedDecoderReadiness(self: *MetadataService) !TableTopologyProtocolReadiness {
+    pub fn cachedCoordinatedDecoderReadiness(self: *MetadataService, required_version: u16) !TableTopologyProtocolReadiness {
         // In-process replicas all use this binary; this check is local only.
-        return self.ensureTableTopologyProtocolReadyWithContext(.{}, metadata_topology_protocol.coordinated_lifecycle_version);
+        return self.ensureTableTopologyProtocolReadyWithContext(.{}, required_version);
     }
 
     pub fn proposeTransitionCommand(self: *MetadataService, command: metadata_storage.TransitionCommand) !void {
@@ -5513,7 +5998,11 @@ pub const MetadataService = struct {
                 .unavailable => return error.MetadataMutationOutcomeUnknown,
                 .pending => {},
             }
-            if (progress_driver_lease == null) {
+            if (self.proposal_progress_driver.managed_owned.load(.acquire)) {
+                if (progress_driver_lease) |*lease| lease.deinit();
+                progress_driver_lease = null;
+                _ = self.proposal_progress_driver.notifyManagedOwner();
+            } else if (progress_driver_lease == null) {
                 progress_driver_lease = self.proposal_progress_driver.tryAcquire();
             }
             const now_ns = platform_time.monotonicNs();
@@ -5741,7 +6230,8 @@ pub const MetadataService = struct {
     }
 
     pub fn upsertStore(self: *MetadataService, record: metadata_table_manager.StoreRecord) !void {
-        const readiness = if (record.relational_topology_protocol_version != 0) try self.ensureTableTopologyProtocolReadyWithContext(.{}, metadata_topology_protocol.relational_integrity_topology_version) else null;
+        const required_version = transitionRequiredCoordinatedDecoderVersion(.{ .upsert_store = record });
+        const readiness = if (required_version != 0) try self.ensureTableTopologyProtocolReadyWithContext(.{}, required_version) else null;
         self.lockCatalogMutation();
         defer self.unlockCatalogMutation();
         if (readiness) |token| try self.validateTableTopologyProtocolReadinessWithContext(.{}, token);
@@ -5750,7 +6240,7 @@ pub const MetadataService = struct {
         try self.proposeTransitionCommand(.{ .upsert_store = record });
     }
 
-    fn runtimeStatusProtocolReady(self: *MetadataService, required_version: u16) bool {
+    pub fn runtimeStatusProtocolReady(self: *MetadataService, required_version: u16) bool {
         if (!metadata_runtime_status_protocol.profileSatisfies(
             metadata_runtime_status_protocol.current_record_version,
             required_version,
@@ -5773,7 +6263,7 @@ pub const MetadataService = struct {
         return local_member;
     }
 
-    fn nativeRestoreIdentityProtocolReady(self: *MetadataService) bool {
+    pub fn nativeRestoreIdentityProtocolReady(self: *MetadataService) bool {
         // The in-process service supports only a local metadata membership;
         // Version-specific readiness proves the complete V15 restore contract.
         return self.runtimeStatusProtocolReady(
@@ -5782,7 +6272,8 @@ pub const MetadataService = struct {
     }
 
     pub fn registerStore(self: *MetadataService, record: metadata_table_manager.StoreRecord) !void {
-        const readiness = if (record.relational_topology_protocol_version != 0) try self.ensureTableTopologyProtocolReadyWithContext(.{}, metadata_topology_protocol.relational_integrity_topology_version) else null;
+        const required_version = transitionRequiredCoordinatedDecoderVersion(.{ .register_store = record });
+        const readiness = if (required_version != 0) try self.ensureTableTopologyProtocolReadyWithContext(.{}, required_version) else null;
         self.lockCatalogMutation();
         defer self.unlockCatalogMutation();
         if (readiness) |token| try self.validateTableTopologyProtocolReadinessWithContext(.{}, token);
@@ -5840,20 +6331,17 @@ pub const MetadataService = struct {
         expected_version_fence: u64,
         expected_target_drain_requested: bool,
     ) !void {
-        try self.proposeTransitionCommand(.{ .upsert_replica_intent = .{
-            .expected_metadata_version = expected_metadata_version,
-            .expected_version_fence = expected_version_fence,
-            .expected_target_drain_requested = expected_target_drain_requested,
-            .replacement = intent,
-        } });
+        const preflight = try cachedInitialPlacementProof(self, intent.record.group_id);
+        self.lockCatalogMutation();
+        defer self.unlockCatalogMutation();
+        try upsertReplicaIntentCatalogLocked(self, intent, expected_metadata_version, expected_version_fence, expected_target_drain_requested, preflight);
     }
 
     pub fn removeReplicaIntent(self: *MetadataService, group_id: u64, local_node_id: u64, expected_metadata_version: u64) !void {
-        try self.proposeTransitionCommand(.{ .remove_replica_intent = .{
-            .group_id = group_id,
-            .local_node_id = local_node_id,
-            .expected_metadata_version = expected_metadata_version,
-        } });
+        const preflight = try cachedInitialPlacementProof(self, group_id);
+        self.lockCatalogMutation();
+        defer self.unlockCatalogMutation();
+        try removeReplicaIntentCatalogLocked(self, group_id, local_node_id, expected_metadata_version, preflight);
     }
 
     pub fn upsertTable(self: *MetadataService, record: metadata_table_manager.TableRecord) !void {
@@ -6325,18 +6813,50 @@ pub const MetadataService = struct {
     pub fn reconcileOnceIfLeaseHeld(self: *MetadataService, loop: *metadata_control_loop.MetadataControlLoop) !?metadata_control_loop.ReconcileSummary {
         const has_reconcile_lease = try self.ensureReconcileLease();
         if (!has_reconcile_lease) return null;
+        if (!try backgroundInitialPlacementReadCut(self)) {
+            self.lifecycle_reconcile_requested.store(true, .release);
+            return null;
+        }
         return try loop.reconcileOnce(self);
     }
 
     pub fn reconcilePreparedIfLeaseHeld(self: *MetadataService, loop: *metadata_control_loop.MetadataControlLoop) !?metadata_control_loop.ReconcileSummary {
         const has_reconcile_lease = try self.ensureReconcileLease();
         if (!has_reconcile_lease) return null;
+        if (!try backgroundInitialPlacementReadCut(self)) {
+            self.lifecycle_reconcile_requested.store(true, .release);
+            return null;
+        }
         return try loop.reconcilePrepared(self);
+    }
+
+    pub fn ensureReconciliationPlacementReadCut(self: *MetadataService) !void {
+        if (!try backgroundInitialPlacementReadCut(self)) return error.MetadataLinearizableReadTimeout;
+    }
+
+    pub fn ensureReconciliationPlacementReadCutWithContext(self: *MetadataService, request: api_operation.RequestContext) !void {
+        try ensureInitialPlacementReadCut(self, request);
+    }
+
+    pub fn preflightInitialPlacementForGroupWithContext(self: *MetadataService, request: api_operation.RequestContext, group_id: u64) !void {
+        try preflightInitialPlacementForGroupWithContextImpl(self, request, group_id);
+    }
+
+    pub fn preflightProjectedPlacementWithContext(self: *MetadataService, request: api_operation.RequestContext) !void {
+        try preflightProjectedPlacementWithContextImpl(self, request);
+    }
+
+    pub fn preflightTableRecordWithContext(self: *MetadataService, request: api_operation.RequestContext, table: metadata_table_manager.TableRecord) !void {
+        try preflightTableRecordWithContextImpl(self, request, table);
     }
 
     pub fn reconcileSeededFromProjectedIfLeaseHeld(self: *MetadataService, loop: *metadata_control_loop.MetadataControlLoop) !?metadata_control_loop.ReconcileSummary {
         const has_reconcile_lease = try self.ensureReconcileLease();
         if (!has_reconcile_lease) return null;
+        if (!try backgroundInitialPlacementReadCut(self)) {
+            self.lifecycle_reconcile_requested.store(true, .release);
+            return null;
+        }
         return try loop.reconcileSeededFromProjected(self);
     }
 
@@ -6387,26 +6907,12 @@ pub const MetadataService = struct {
     }
 
     pub fn applyReconciliationPlan(self: *MetadataService, plan: *const metadata_reconciler.ReconciliationPlan) !void {
-        std.debug.assert(plan.placement_upserts.len == plan.placement_upsert_preconditions.len);
-        for (plan.placement_upserts, plan.placement_upsert_preconditions) |intent, precondition| {
-            try self.upsertReplicaIntent(
-                intent,
-                precondition.expected_metadata_version,
-                precondition.expected_version_fence,
-                precondition.expected_target_drain_requested,
-            );
-        }
-        for (plan.table_upserts) |record| try self.upsertTable(record);
-        for (plan.split_admissions) |admission| try self.admitSplitTransition(admission);
-        for (plan.range_upserts) |record| try self.upsertRange(record);
-        for (plan.split_upserts) |record| try self.upsertSplitTransition(record);
-        for (plan.merge_upserts) |record| try self.upsertMergeTransition(record);
-        for (plan.placement_removals) |record| try self.removeReplicaIntent(record.group_id, record.local_node_id, record.expected_metadata_version);
-        for (plan.table_removals) |table_id| try self.removeTable(table_id);
-        for (plan.range_removals) |group_id| try self.removeRange(group_id);
-        for (plan.split_removals) |transition_id| try self.removeSplitTransition(transition_id);
-        for (plan.merge_removals) |transition_id| try self.removeMergeTransition(transition_id);
-        if (plan.clear_reallocation_request) |expected| try self.clearReallocationRequest(expected);
+        try applyReconciliationPlanMode(self, plan, false);
+    }
+
+    /// Called by the control loop while it owns the catalog mutation gate.
+    pub fn applyReconciliationPlanCatalogLocked(self: *MetadataService, plan: *const metadata_reconciler.ReconciliationPlan) !void {
+        try applyReconciliationPlanMode(self, plan, true);
     }
 
     pub fn applyReconciliationPlanAndWaitAppliedWithContext(
@@ -6415,6 +6921,15 @@ pub const MetadataService = struct {
         request: api_operation.RequestContext,
     ) !void {
         return applyReconciliationPlanAndWaitAppliedWithContextImpl(self, self.alloc, plan, request);
+    }
+
+    pub fn applyReconciliationPlanAndWaitAppliedCatalogLockedWithContext(
+        self: *MetadataService,
+        plan: *const metadata_reconciler.ReconciliationPlan,
+        request: api_operation.RequestContext,
+        held_catalog_gate: *bool,
+    ) !void {
+        return applyReconciliationPlanAndWaitAppliedWithContextMode(self, self.alloc, plan, request, held_catalog_gate);
     }
 
     pub fn observeSplitTransition(self: *MetadataService, transition_id: u64) !?transition_state.SplitObservation {
@@ -7326,14 +7841,12 @@ pub const MetadataService = struct {
         return projected;
     }
 
-    fn statusProjectedReconcileLease(self: *MetadataService, now_ms: u64) !?metadata_reconcile_lease.ReconcileLeaseRecord {
+    pub fn statusProjectedReconcileLease(self: *MetadataService, now_ms: u64) !?metadata_reconcile_lease.ReconcileLeaseRecord {
         return try self.getCachedProjectedReconcileLease(now_ms, self.isLocalMetadataLeader());
     }
 
     fn runLifecycleReconcileHookIfRequested(self: *MetadataService) !void {
-        const hook = self.lifecycle_reconcile_hook orelse return;
-        if (!self.lifecycle_reconcile_requested.swap(false, .acq_rel)) return;
-        try hook.run();
+        try runRequestedLifecycleReconcile(self.lifecycle_reconcile_hook, &self.lifecycle_reconcile_requested);
     }
 
     fn runReplicationBackfillRound(self: *MetadataService) !void {
@@ -7425,6 +7938,8 @@ pub const MetadataHttpService = struct {
     local_data_owner: bool,
     reallocation_protocol_peers: []const ReallocationProtocolPeer,
     store_status_ticks: usize,
+    restore_owner_progress_generation: std.atomic.Value(u64) = .init(1),
+    restore_owner_progress_event: std.Io.Event = .unset,
     projection_epoch: std.atomic.Value(u64) = .init(1),
     catalog_epoch: std.atomic.Value(u64) = .init(1),
     projected_core_epoch: std.atomic.Value(u64) = .init(1),
@@ -7501,7 +8016,7 @@ pub const MetadataHttpService = struct {
     probe_ready: std.atomic.Value(bool) = .init(false),
     runtime_status_protocol_cache_mutex: std.Io.Mutex = .init,
     runtime_status_protocol_ready_fingerprint: RuntimeStatusMembershipFingerprint =
-        [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
+        @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0)),
     runtime_status_protocol_ready_version: u16 = 0,
     runtime_status_protocol_probe_mutex: std.Io.Mutex = .init,
     runtime_status_protocol_activated_version: std.atomic.Value(u16) = .init(0),
@@ -7517,6 +8032,8 @@ pub const MetadataHttpService = struct {
     secret_store: ?*common_secrets.FileStore = null,
     internal_service_secret: ?[]const u8 = null,
     internal_service_issuer: ?[]const u8 = null,
+    setting_authority_secret: ?[]const u8 = null,
+    setting_authority_issuer: ?[]const u8 = null,
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     backend_runtime_mutex: std.Io.Mutex = .init,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
@@ -7580,6 +8097,8 @@ pub const MetadataHttpService = struct {
             .secret_store = cfg.secret_store,
             .internal_service_secret = cfg.internal_service_secret,
             .internal_service_issuer = cfg.internal_service_issuer,
+            .setting_authority_secret = cfg.setting_authority_secret,
+            .setting_authority_issuer = cfg.setting_authority_issuer,
             .destination_authorizer = cfg.destination_authorizer,
             .linearizable_read_tracker = read_tracker,
             .raft = try raft_service.ManagedHttpHostService.init(alloc, host_cfg, http_deps, cfg.raft, deps.raft),
@@ -7780,6 +8299,10 @@ pub const MetadataHttpService = struct {
     fn metadataHttpServiceProjectionSignal(ptr: *anyopaque, signal: metadata_storage.raft_apply_store.ProjectionSignal) void {
         const self: *MetadataHttpService = @ptrCast(@alignCast(ptr));
         self.core_projection_changes.mark(signal);
+        if ((signal.kind == .store and signal.store_reports_changed) or signal.kind == .restore_job or signal.kind == .schema_progress or signal.kind == .restore_progress) {
+            _ = self.restore_owner_progress_generation.fetchAdd(1, .release);
+            self.restore_owner_progress_event.set(self.raft.host.http_host.host.deps.io);
+        }
         if (projectionSignalChangesCatalog(signal.kind)) {
             _ = self.catalog_epoch.fetchAdd(1, .release);
         }
@@ -7868,8 +8391,8 @@ pub const MetadataHttpService = struct {
         }
     }
 
-    pub fn cachedCoordinatedDecoderReadiness(self: *MetadataHttpService) !TableTopologyProtocolReadiness {
-        return self.ensureTableTopologyProtocolReadyMode(.{}, metadata_topology_protocol.coordinated_lifecycle_version, true);
+    pub fn cachedCoordinatedDecoderReadiness(self: *MetadataHttpService, required_version: u16) !TableTopologyProtocolReadiness {
+        return self.ensureTableTopologyProtocolReadyMode(.{}, required_version, true);
     }
 
     pub fn proposeTransitionCommand(self: *MetadataHttpService, command: metadata_storage.TransitionCommand) !void {
@@ -8076,7 +8599,11 @@ pub const MetadataHttpService = struct {
                 .unavailable => return error.MetadataMutationOutcomeUnknown,
                 .pending => {},
             }
-            if (progress_driver_lease == null) {
+            if (self.proposal_progress_driver.managed_owned.load(.acquire)) {
+                if (progress_driver_lease) |*lease| lease.deinit();
+                progress_driver_lease = null;
+                _ = self.proposal_progress_driver.notifyManagedOwner();
+            } else if (progress_driver_lease == null) {
                 progress_driver_lease = self.proposal_progress_driver.tryAcquire();
             }
             const now_ns = platform_time.monotonicNs();
@@ -8159,7 +8686,8 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn upsertStore(self: *MetadataHttpService, record: metadata_table_manager.StoreRecord) !void {
-        const readiness = if (record.relational_topology_protocol_version != 0) try self.ensureTableTopologyProtocolReadyWithContext(.{}, metadata_topology_protocol.relational_integrity_topology_version) else null;
+        const required_version = transitionRequiredCoordinatedDecoderVersion(.{ .upsert_store = record });
+        const readiness = if (required_version != 0) try self.ensureTableTopologyProtocolReadyWithContext(.{}, required_version) else null;
         self.lockCatalogMutation();
         defer self.unlockCatalogMutation();
         if (readiness) |token| try self.validateTableTopologyProtocolReadinessWithContext(.{}, token);
@@ -8168,7 +8696,7 @@ pub const MetadataHttpService = struct {
         try self.proposeTransitionCommand(.{ .upsert_store = record });
     }
 
-    fn runtimeStatusProtocolReady(self: *MetadataHttpService, required_version: u16) bool {
+    pub fn runtimeStatusProtocolReady(self: *MetadataHttpService, required_version: u16) bool {
         if (metadata_runtime_status_protocol.profileSatisfies(
             self.runtimeStatusProtocolActivationVersion(),
             required_version,
@@ -8245,7 +8773,7 @@ pub const MetadataHttpService = struct {
         return store.getDenseNativeStorageProtocolActivationVersion(self.metadata_group_id) catch 0;
     }
 
-    fn nativeRestoreIdentityProtocolReady(self: *MetadataHttpService) bool {
+    pub fn nativeRestoreIdentityProtocolReady(self: *MetadataHttpService) bool {
         if (metadata_runtime_status_protocol.profileSatisfies(
             self.runtimeStatusProtocolActivationVersion(),
             metadata_runtime_status_protocol.native_restore_identity_record_version,
@@ -8332,7 +8860,7 @@ pub const MetadataHttpService = struct {
                 if (common_version != null) ctx.service.lifecycle_signal.notify(null);
             }
 
-            fn deinit(ptr: *anyopaque) void {
+            pub fn deinit(ptr: *anyopaque) void {
                 const ctx: *@This() = @ptrCast(@alignCast(ptr));
                 // A job rejected or cancelled before run must release the
                 // single-flight gate as well.
@@ -8533,7 +9061,8 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn registerStore(self: *MetadataHttpService, record: metadata_table_manager.StoreRecord) !void {
-        const readiness = if (record.relational_topology_protocol_version != 0) try self.ensureTableTopologyProtocolReadyWithContext(.{}, metadata_topology_protocol.relational_integrity_topology_version) else null;
+        const required_version = transitionRequiredCoordinatedDecoderVersion(.{ .register_store = record });
+        const readiness = if (required_version != 0) try self.ensureTableTopologyProtocolReadyWithContext(.{}, required_version) else null;
         self.lockCatalogMutation();
         defer self.unlockCatalogMutation();
         if (readiness) |token| try self.validateTableTopologyProtocolReadinessWithContext(.{}, token);
@@ -8828,20 +9357,17 @@ pub const MetadataHttpService = struct {
         expected_version_fence: u64,
         expected_target_drain_requested: bool,
     ) !void {
-        try self.proposeTransitionCommand(.{ .upsert_replica_intent = .{
-            .expected_metadata_version = expected_metadata_version,
-            .expected_version_fence = expected_version_fence,
-            .expected_target_drain_requested = expected_target_drain_requested,
-            .replacement = intent,
-        } });
+        const preflight = try cachedInitialPlacementProof(self, intent.record.group_id);
+        self.lockCatalogMutation();
+        defer self.unlockCatalogMutation();
+        try upsertReplicaIntentCatalogLocked(self, intent, expected_metadata_version, expected_version_fence, expected_target_drain_requested, preflight);
     }
 
     pub fn removeReplicaIntent(self: *MetadataHttpService, group_id: u64, local_node_id: u64, expected_metadata_version: u64) !void {
-        try self.proposeTransitionCommand(.{ .remove_replica_intent = .{
-            .group_id = group_id,
-            .local_node_id = local_node_id,
-            .expected_metadata_version = expected_metadata_version,
-        } });
+        const preflight = try cachedInitialPlacementProof(self, group_id);
+        self.lockCatalogMutation();
+        defer self.unlockCatalogMutation();
+        try removeReplicaIntentCatalogLocked(self, group_id, local_node_id, expected_metadata_version, preflight);
     }
 
     pub fn upsertTable(self: *MetadataHttpService, record: metadata_table_manager.TableRecord) !void {
@@ -8907,11 +9433,7 @@ pub const MetadataHttpService = struct {
                 if (!self.raft.host.http_host.host.isLocalLeader(
                     self.metadata_group_id,
                 )) return error.NotLeader;
-                if (self.raft.pending_updates.items.len > 0) {
-                    _ = try self.raft.syncPendingRaftProgressOnly();
-                } else {
-                    try self.raft.runRaftProgressOnly();
-                }
+                _ = try self.runRequestRaftProgressLocked();
             }
             platform_clock.Clock.real().sleepMs(1);
         }
@@ -9009,11 +9531,7 @@ pub const MetadataHttpService = struct {
                 defer self.unlockRuntime();
                 if (!self.raft.host.http_host.host.isLocalLeader(self.metadata_group_id))
                     return error.NotLeader;
-                if (self.raft.pending_updates.items.len > 0) {
-                    _ = try self.raft.syncPendingRaftProgressOnly();
-                } else {
-                    try self.raft.runRaftProgressOnly();
-                }
+                _ = try self.runRequestRaftProgressLocked();
             }
             platform_clock.Clock.real().sleepMs(1);
         }
@@ -9090,11 +9608,7 @@ pub const MetadataHttpService = struct {
                 if (!self.raft.host.http_host.host.isLocalLeader(
                     self.metadata_group_id,
                 )) return error.NotLeader;
-                if (self.raft.pending_updates.items.len > 0) {
-                    _ = try self.raft.syncPendingRaftProgressOnly();
-                } else {
-                    try self.raft.runRaftProgressOnly();
-                }
+                _ = try self.runRequestRaftProgressLocked();
             }
             platform_clock.Clock.real().sleepMs(1);
         }
@@ -9216,9 +9730,16 @@ pub const MetadataHttpService = struct {
     // Proposal-time admission must not instantiate the network/activation path:
     // activation itself proposes a command, and callers may hold mutation locks.
     fn ensureTableTopologyProtocolReadyMode(self: *MetadataHttpService, request: api_operation.RequestContext, required_version: u16, comptime cached_only: bool) !TableTopologyProtocolReadiness {
-        try request.ensureActive();
+        var zig017_return_error: ?anyerror = null;
+        (request.ensureActive() catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        });
         if (required_version == 0 or required_version > metadata_topology_protocol.current_version)
-            return error.TableTopologyProtocolUpgradeRequired;
+            return zig017_failure: {
+                zig017_return_error = error.TableTopologyProtocolUpgradeRequired;
+                break :zig017_failure error.TableTopologyProtocolUpgradeRequired;
+            };
         const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
         // Status.conf_state borrows the Raft group's membership arrays. Copy
         // the required IDs while the runtime lock protects those arrays, then
@@ -9227,29 +9748,47 @@ pub const MetadataHttpService = struct {
             self.lockRuntime();
             defer self.unlockRuntime();
             const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse
-                return error.TableTopologyProtocolUpgradeRequired;
+                return zig017_failure: {
+                    zig017_return_error = error.TableTopologyProtocolUpgradeRequired;
+                    break :zig017_failure error.TableTopologyProtocolUpgradeRequired;
+                };
             if (raft_status.soft.role != .leader or raft_status.soft.leader_id == null or
                 raft_status.soft.leader_id.? != local_node_id)
-                return error.NotLeader;
+                return zig017_failure: {
+                    zig017_return_error = error.NotLeader;
+                    break :zig017_failure error.NotLeader;
+                };
             break :locked .{
                 .term = raft_status.hard.current_term,
-                .required_node_ids = try collectReallocationBarrierNodeIds(
+                .required_node_ids = (collectReallocationBarrierNodeIds(
                     self.alloc,
                     raft_status.conf_state,
                     self.reallocation_protocol_peers,
-                ),
+                ) catch |zig017_err| {
+                    zig017_return_error = zig017_err;
+                    return zig017_err;
+                }),
             };
         };
         const required_node_ids = observation.required_node_ids;
         defer self.alloc.free(required_node_ids);
-        const incarnation = (try self.metadataIncarnation()) orelse
-            return error.TableTopologyProtocolUpgradeRequired;
-        const expected_readiness = try tableTopologyProtocolReadiness(
+        const incarnation = ((self.metadataIncarnation() catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        })) orelse
+            return zig017_failure: {
+                zig017_return_error = error.TableTopologyProtocolUpgradeRequired;
+                break :zig017_failure error.TableTopologyProtocolUpgradeRequired;
+            };
+        const expected_readiness = (tableTopologyProtocolReadiness(
             observation.term,
             required_version,
             incarnation,
             required_node_ids,
-        );
+        ) catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        });
         if (cached_only and required_node_ids.len == 1 and required_node_ids[0] == local_node_id) return expected_readiness;
 
         const required_activation: metadata_topology_protocol.Activation = .{
@@ -9259,7 +9798,10 @@ pub const MetadataHttpService = struct {
             .membership_fingerprint = expected_readiness.protected_membership_fingerprint,
         };
         if (self.projectedStore()) |store| {
-            if (try store.topologyActivation(self.metadata_group_id)) |activation| {
+            if ((store.topologyActivation(self.metadata_group_id) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            })) |activation| {
                 if (activation.satisfies(required_activation)) return expected_readiness;
             }
         }
@@ -9269,10 +9811,16 @@ pub const MetadataHttpService = struct {
         // probe can share its outcome even after scheduler delays.
         var joined_completion_epoch: ?u32 = null;
         var probe_lease = while (true) {
-            try request.ensureActive();
+            (request.ensureActive() catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
             const observed_epoch = self.table_topology_protocol_probe.currentEpoch();
             if (self.table_topology_protocol_probe.tryAcquire()) |lease| break lease;
-            if (cached_only) return error.TableTopologyProtocolUpgradeRequired;
+            if (cached_only) return zig017_failure: {
+                zig017_return_error = error.TableTopologyProtocolUpgradeRequired;
+                break :zig017_failure error.TableTopologyProtocolUpgradeRequired;
+            };
             if (joined_completion_epoch == null) joined_completion_epoch = observed_epoch +% 1;
             self.table_topology_protocol_probe.waitForHandoff(
                 observed_epoch,
@@ -9286,9 +9834,15 @@ pub const MetadataHttpService = struct {
             joined_completion_epoch,
         )) |outcome| switch (outcome) {
             .ready => return expected_readiness,
-            .upgrade_required => return error.TableTopologyProtocolUpgradeRequired,
+            .upgrade_required => return zig017_failure: {
+                zig017_return_error = error.TableTopologyProtocolUpgradeRequired;
+                break :zig017_failure error.TableTopologyProtocolUpgradeRequired;
+            },
         };
-        if (cached_only) return error.TableTopologyProtocolUpgradeRequired;
+        if (cached_only) return zig017_failure: {
+            zig017_return_error = error.TableTopologyProtocolUpgradeRequired;
+            break :zig017_failure error.TableTopologyProtocolUpgradeRequired;
+        };
         // Every path below performs a real network observation (including a
         // failed one), so its lease publishes exactly one new cohort epoch.
         probe_lease.publishCompletion();
@@ -9296,7 +9850,7 @@ pub const MetadataHttpService = struct {
         // consumed by concurrent waiters as success.
         self.table_topology_protocol_probe.cached = null;
         const completion_epoch = probe_lease.completionEpoch();
-        errdefer |err| if (err == error.TableTopologyProtocolUpgradeRequired) {
+        errdefer if (zig017_return_error) |err| if (err == error.TableTopologyProtocolUpgradeRequired) {
             const failed_at_ns = platform_time.monotonicNs();
             self.table_topology_protocol_probe.cached = .{
                 .completion_epoch = completion_epoch,
@@ -9337,11 +9891,17 @@ pub const MetadataHttpService = struct {
                 };
             }
         };
-        const slots = try self.alloc.alloc(ProbeSlot, required_node_ids.len);
+        const slots = (self.alloc.alloc(ProbeSlot, required_node_ids.len) catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        });
         defer self.alloc.free(slots);
         for (slots) |*slot| slot.* = .{};
         for (required_node_ids, slots) |node_id, *slot| {
-            try request.ensureActive();
+            (request.ensureActive() catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
             slot.node_id = node_id;
             if (node_id == local_node_id) {
                 slot.status = .{
@@ -9354,11 +9914,20 @@ pub const MetadataHttpService = struct {
             }
             const peer = findReallocationProtocolPeer(self.reallocation_protocol_peers, node_id) orelse {
                 std.log.warn("table topology protocol blocked: metadata member {d} is not configured", .{node_id});
-                return error.TableTopologyProtocolUpgradeRequired;
+                return zig017_failure: {
+                    zig017_return_error = error.TableTopologyProtocolUpgradeRequired;
+                    break :zig017_failure error.TableTopologyProtocolUpgradeRequired;
+                };
             };
             const orchestration_url = peer.orchestration_url orelse
-                return error.TableTopologyProtocolUpgradeRequired;
-            if (orchestration_url.len == 0) return error.TableTopologyProtocolUpgradeRequired;
+                return zig017_failure: {
+                    zig017_return_error = error.TableTopologyProtocolUpgradeRequired;
+                    break :zig017_failure error.TableTopologyProtocolUpgradeRequired;
+                };
+            if (orchestration_url.len == 0) return zig017_failure: {
+                zig017_return_error = error.TableTopologyProtocolUpgradeRequired;
+                break :zig017_failure error.TableTopologyProtocolUpgradeRequired;
+            };
             slot.base_uri = orchestration_url;
         }
         // Validate the complete route set before scheduling any fibers so an
@@ -9366,7 +9935,10 @@ pub const MetadataHttpService = struct {
         const probe_io = self.raft.host.http_host.outboundIo();
         var batch_start: usize = 0;
         while (batch_start < slots.len) : (batch_start += table_topology_protocol_probe_concurrency) {
-            try request.ensureActive();
+            (request.ensureActive() catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
             const batch_end = @min(batch_start + table_topology_protocol_probe_concurrency, slots.len);
             var probe_group: std.Io.Group = .init;
             for (slots[batch_start..batch_end]) |*slot| {
@@ -9381,14 +9953,23 @@ pub const MetadataHttpService = struct {
             }
             probe_group.await(probe_io) catch |err| {
                 std.log.warn("table topology protocol fanout failed err={s}", .{@errorName(err)});
-                return error.TableTopologyProtocolUpgradeRequired;
+                return zig017_failure: {
+                    zig017_return_error = error.TableTopologyProtocolUpgradeRequired;
+                    break :zig017_failure error.TableTopologyProtocolUpgradeRequired;
+                };
             };
         }
-        try request.ensureActive();
+        (request.ensureActive() catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        });
         for (slots) |slot| {
             if (slot.err) |err| {
                 std.log.warn("table topology protocol probe failed member={d} err={s}", .{ slot.node_id, @errorName(err) });
-                return error.TableTopologyProtocolUpgradeRequired;
+                return zig017_failure: {
+                    zig017_return_error = error.TableTopologyProtocolUpgradeRequired;
+                    break :zig017_failure error.TableTopologyProtocolUpgradeRequired;
+                };
             }
             if (!tableTopologyProtocolCompatible(
                 slot.status,
@@ -9401,7 +9982,10 @@ pub const MetadataHttpService = struct {
                     "table topology protocol blocked member={d} reports node={d} group={d} protocol={d}",
                     .{ slot.node_id, slot.status.metadata_raft_local_node_id, slot.status.metadata_group_id, slot.status.table_topology_protocol_version },
                 );
-                return error.TableTopologyProtocolUpgradeRequired;
+                return zig017_failure: {
+                    zig017_return_error = error.TableTopologyProtocolUpgradeRequired;
+                    break :zig017_failure error.TableTopologyProtocolUpgradeRequired;
+                };
             }
         }
         // Record only after every protected member has demonstrated support.
@@ -9410,16 +9994,31 @@ pub const MetadataHttpService = struct {
         activation.version = metadata_topology_protocol.current_version;
         for (slots) |slot| activation.version = @min(activation.version, slot.status.table_topology_protocol_version);
         if (activation.version >= metadata_topology_protocol.durable_activation_version) {
-            const bytes = try std.json.Stringify.valueAlloc(self.alloc, activation, .{});
+            const bytes = (std.json.Stringify.valueAlloc(self.alloc, activation, .{}) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
             defer self.alloc.free(bytes);
             const receipt = blk: {
                 self.lockCatalogMutation();
                 defer self.unlockCatalogMutation();
-                try self.validateTableTopologyProtocolReadinessWithContext(request, expected_readiness);
-                break :blk try self.proposeTransitionCommandWithReceiptInTerm(.{ .activate_topology_protocol = bytes }, observation.term);
+                (self.validateTableTopologyProtocolReadinessWithContext(request, expected_readiness) catch |zig017_err| {
+                    zig017_return_error = zig017_err;
+                    return zig017_err;
+                });
+                break :blk (self.proposeTransitionCommandWithReceiptInTerm(.{ .activate_topology_protocol = bytes }, observation.term) catch |zig017_err| {
+                    zig017_return_error = zig017_err;
+                    return zig017_err;
+                });
             };
-            try self.waitForTransitionAppliedWithContext(receipt, request);
-            try self.validateTableTopologyProtocolReadinessWithContext(request, expected_readiness);
+            (self.waitForTransitionAppliedWithContext(receipt, request) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
+            (self.validateTableTopologyProtocolReadinessWithContext(request, expected_readiness) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
         }
         self.table_topology_protocol_probe.cached = .{
             .completion_epoch = completion_epoch,
@@ -9582,6 +10181,7 @@ pub const MetadataHttpService = struct {
             self.internal_service_secret,
             self.internal_service_issuer,
         );
+        _ = client.withSettingAuthority(self.setting_authority_secret, self.setting_authority_issuer);
         return client;
     }
 
@@ -9628,14 +10228,50 @@ pub const MetadataHttpService = struct {
     /// Drains accepted proposals and inbound consensus work without becoming a
     /// second owner of election and heartbeat time.
     pub fn runRaftProgressOnly(self: *MetadataHttpService) !void {
+        if (self.proposal_progress_driver.notifyManagedOwner()) return;
         try self.ensureLifecycleListenerRegistered();
         self.lockRuntime();
         defer self.unlockRuntime();
+        _ = try self.runRequestRaftProgressLocked();
+    }
+
+    /// The managed driver is the sole Ready owner while registered. Requests
+    /// only coalesce wakeups; they cannot inherit persistence or tick work.
+    pub fn registerManagedProgressOwner(self: *MetadataHttpService, wake: @import("../raft/runtime_loop.zig").ProgressWake) !void {
+        try self.proposal_progress_driver.registerManagedOwner(wake);
+        errdefer self.proposal_progress_driver.releaseManagedOwner();
+        try self.raft.host.http_host.host.registerProgressWake(.{ .ptr = wake.ptr, .notify_fn = wake.notify_fn });
+    }
+
+    pub fn releaseManagedProgressOwner(self: *MetadataHttpService) void {
+        self.raft.host.http_host.host.releaseProgressWake();
+        self.proposal_progress_driver.releaseManagedOwner();
+    }
+
+    fn runRequestRaftProgressLocked(self: *MetadataHttpService) !bool {
+        if (self.proposal_progress_driver.notifyManagedOwner()) return false;
+        try self.runManagedRaftProgressLocked();
+        return true;
+    }
+
+    fn runManagedRaftProgressLocked(self: *MetadataHttpService) !void {
         if (self.raft.pending_updates.items.len > 0) {
             _ = try self.raft.syncPendingRaftProgressOnly();
         } else {
             try self.raft.runRaftProgressOnly();
         }
+    }
+
+    pub fn runManagedRaftProgressOnly(self: *MetadataHttpService) !void {
+        try self.ensureLifecycleListenerRegistered();
+        var diagnostics: MetadataRaftDiagnosticsSnapshot = .{};
+        self.lockRuntime();
+        {
+            defer self.unlockRuntime();
+            try self.runManagedRaftProgressLocked();
+            diagnostics = self.raftDiagnosticsSnapshotLocked();
+        }
+        if (diagnostics.last_runtime_round) |round| logMetadataRaftRoundDiagnostics(round);
     }
 
     pub fn listRaftQuarantinesForAdmin(
@@ -9797,11 +10433,7 @@ pub const MetadataHttpService = struct {
         self.lockRuntime();
         {
             defer self.unlockRuntime();
-            if (self.raft.pending_updates.items.len > 0) {
-                _ = try self.raft.syncPendingRaftProgressOnly();
-            } else {
-                try self.raft.runRaftProgressOnly();
-            }
+            _ = try self.runRequestRaftProgressLocked();
         }
         if (!try self.ensureMetadataIncarnation()) {
             self.probe_ready.store(false, .release);
@@ -9869,18 +10501,50 @@ pub const MetadataHttpService = struct {
         // remains available during rolling upgrades; constrained admission uses
         // only the resulting exact-membership cache while holding that lane.
         _ = self.ensureTableTopologyProtocolReadyWithContext(.{ .deadline_ns = platform_time.monotonicNs() +| 250 * std.time.ns_per_ms }, metadata_topology_protocol.relational_integrity_topology_version) catch {};
+        if (!try backgroundInitialPlacementReadCut(self)) {
+            self.lifecycle_reconcile_requested.store(true, .release);
+            return null;
+        }
         return try loop.reconcileOnce(self);
     }
 
     pub fn reconcilePreparedIfLeaseHeld(self: *MetadataHttpService, loop: *metadata_control_loop.MetadataControlLoop) !?metadata_control_loop.ReconcileSummary {
         const has_reconcile_lease = try self.ensureReconcileLease();
         if (!has_reconcile_lease) return null;
+        if (!try backgroundInitialPlacementReadCut(self)) {
+            self.lifecycle_reconcile_requested.store(true, .release);
+            return null;
+        }
         return try loop.reconcilePrepared(self);
+    }
+
+    pub fn ensureReconciliationPlacementReadCut(self: *MetadataHttpService) !void {
+        if (!try backgroundInitialPlacementReadCut(self)) return error.MetadataLinearizableReadTimeout;
+    }
+
+    pub fn ensureReconciliationPlacementReadCutWithContext(self: *MetadataHttpService, request: api_operation.RequestContext) !void {
+        try ensureInitialPlacementReadCut(self, request);
+    }
+
+    pub fn preflightInitialPlacementForGroupWithContext(self: *MetadataHttpService, request: api_operation.RequestContext, group_id: u64) !void {
+        try preflightInitialPlacementForGroupWithContextImpl(self, request, group_id);
+    }
+
+    pub fn preflightProjectedPlacementWithContext(self: *MetadataHttpService, request: api_operation.RequestContext) !void {
+        try preflightProjectedPlacementWithContextImpl(self, request);
+    }
+
+    pub fn preflightTableRecordWithContext(self: *MetadataHttpService, request: api_operation.RequestContext, table: metadata_table_manager.TableRecord) !void {
+        try preflightTableRecordWithContextImpl(self, request, table);
     }
 
     pub fn reconcileSeededFromProjectedIfLeaseHeld(self: *MetadataHttpService, loop: *metadata_control_loop.MetadataControlLoop) !?metadata_control_loop.ReconcileSummary {
         const has_reconcile_lease = try self.ensureReconcileLease();
         if (!has_reconcile_lease) return null;
+        if (!try backgroundInitialPlacementReadCut(self)) {
+            self.lifecycle_reconcile_requested.store(true, .release);
+            return null;
+        }
         return try loop.reconcileSeededFromProjected(self);
     }
 
@@ -9925,26 +10589,12 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn applyReconciliationPlan(self: *MetadataHttpService, plan: *const metadata_reconciler.ReconciliationPlan) !void {
-        std.debug.assert(plan.placement_upserts.len == plan.placement_upsert_preconditions.len);
-        for (plan.placement_upserts, plan.placement_upsert_preconditions) |intent, precondition| {
-            try self.upsertReplicaIntent(
-                intent,
-                precondition.expected_metadata_version,
-                precondition.expected_version_fence,
-                precondition.expected_target_drain_requested,
-            );
-        }
-        for (plan.table_upserts) |record| try self.upsertTable(record);
-        for (plan.split_admissions) |admission| try self.admitSplitTransition(admission);
-        for (plan.range_upserts) |record| try self.upsertRange(record);
-        for (plan.split_upserts) |record| try self.upsertSplitTransition(record);
-        for (plan.merge_upserts) |record| try self.upsertMergeTransition(record);
-        for (plan.placement_removals) |record| try self.removeReplicaIntent(record.group_id, record.local_node_id, record.expected_metadata_version);
-        for (plan.table_removals) |table_id| try self.removeTable(table_id);
-        for (plan.range_removals) |group_id| try self.removeRange(group_id);
-        for (plan.split_removals) |transition_id| try self.removeSplitTransition(transition_id);
-        for (plan.merge_removals) |transition_id| try self.removeMergeTransition(transition_id);
-        if (plan.clear_reallocation_request) |expected| try self.clearReallocationRequest(expected);
+        try applyReconciliationPlanMode(self, plan, false);
+    }
+
+    /// Called by the control loop while it owns the catalog mutation gate.
+    pub fn applyReconciliationPlanCatalogLocked(self: *MetadataHttpService, plan: *const metadata_reconciler.ReconciliationPlan) !void {
+        try applyReconciliationPlanMode(self, plan, true);
     }
 
     pub fn applyReconciliationPlanAndWaitAppliedWithContext(
@@ -9953,6 +10603,15 @@ pub const MetadataHttpService = struct {
         request: api_operation.RequestContext,
     ) !void {
         return applyReconciliationPlanAndWaitAppliedWithContextImpl(self, self.alloc, plan, request);
+    }
+
+    pub fn applyReconciliationPlanAndWaitAppliedCatalogLockedWithContext(
+        self: *MetadataHttpService,
+        plan: *const metadata_reconciler.ReconciliationPlan,
+        request: api_operation.RequestContext,
+        held_catalog_gate: *bool,
+    ) !void {
+        return applyReconciliationPlanAndWaitAppliedWithContextMode(self, self.alloc, plan, request, held_catalog_gate);
     }
 
     pub fn observeSplitTransition(self: *MetadataHttpService, transition_id: u64) !?transition_state.SplitObservation {
@@ -10209,24 +10868,23 @@ pub const MetadataHttpService = struct {
                 next_request_ns = now_ns + linearizable_metadata_read_retry_ns;
             }
             var raft_diagnostics_snapshot: MetadataRaftDiagnosticsSnapshot = .{};
+            var drove_progress = false;
             self.lockRuntime();
             {
                 defer self.unlockRuntime();
-                // The cadence driver owns election and heartbeat time. A
-                // read waiter may drain inbound/Ready work, but ticking here
-                // makes the Raft clock run faster with concurrent read load.
-                if (self.raft.pending_updates.items.len > 0) {
-                    _ = try self.raft.syncPendingRaftProgressOnly();
-                } else {
-                    try self.raft.runRaftProgressOnly();
-                }
+                // Registered runtimes coalesce a wake instead of persisting
+                // on the request thread. Standalone callers retain their
+                // fallback drain without advancing election time.
+                drove_progress = try self.runRequestRaftProgressLocked();
                 raft_diagnostics_snapshot = self.raftDiagnosticsSnapshotLocked();
                 latest_raft_diagnostics_snapshot = raft_diagnostics_snapshot;
             }
-            raft_rounds += 1;
-            if (raft_diagnostics_snapshot.last_runtime_round) |round| {
-                if (round.elapsed_ns > slowest_round.elapsed_ns) slowest_round = round;
-                logMetadataRaftRoundDiagnostics(round);
+            if (drove_progress) {
+                raft_rounds += 1;
+                if (raft_diagnostics_snapshot.last_runtime_round) |round| {
+                    if (round.elapsed_ns > slowest_round.elapsed_ns) slowest_round = round;
+                    logMetadataRaftRoundDiagnostics(round);
+                }
             }
             if (self.linearizable_read_tracker.isComplete(request_id)) return;
             try request.ensureActive();
@@ -10404,6 +11062,66 @@ pub const MetadataHttpService = struct {
             .projected_core_epoch = self.projected_core_epoch.load(.acquire),
             .transition_readiness_epoch = self.transition_readiness_epoch.load(.acquire),
         };
+    }
+
+    pub fn planningSnapshot(self: *MetadataHttpService) !metadata_api.AdminSnapshot {
+        var inputs = try self.captureTransitionReadinessInputs();
+        defer inputs.deinit(self.alloc);
+        var snapshot: metadata_api.AdminSnapshot = .{
+            .planning_view = true,
+            .status = try self.metadataStatus(),
+            .tables = &.{},
+            .ranges = &.{},
+            .stores = &.{},
+            .placement_intents = &.{},
+            .split_transitions = &.{},
+            .merge_transitions = &.{},
+        };
+        errdefer self.freeAdminSnapshot(&snapshot);
+        const lease = lease: {
+            self.lockComponents();
+            defer self.unlockComponents();
+            self.catalog_projection_reader.lock();
+            defer self.catalog_projection_reader.unlock();
+            break :lease try self.catalog_projection_reader.validationLeaseLocked(self.alloc, self.metadata_group_id, self.catalogProjectionSource());
+        };
+        var catalog = lease;
+        defer catalog.deinit();
+        const source = catalog.snapshot();
+        var tables: std.ArrayListUnmanaged(metadata_table_manager.TableRecord) = .empty;
+        errdefer {
+            for (tables.items) |table| metadata_table_manager.freeTable(self.alloc, table);
+            tables.deinit(self.alloc);
+        }
+        try tables.ensureTotalCapacity(self.alloc, source.tables.len);
+        for (source.tables) |table| tables.appendAssumeCapacity(try metadata_table_manager.cloneTable(self.alloc, .{ .table_id = table.table_id, .name = table.name }));
+        snapshot.tables = try tables.toOwnedSlice(self.alloc);
+        // Ownership transferred; an error later must not free the table array twice.
+        tables = .empty;
+        snapshot.ranges = try cloneProjectedRangesOwned(self.alloc, source.ranges);
+        snapshot.merged_group_statuses = try metadata_state.mergeHealthyGroupStatuses(self.alloc, snapshot.tables, snapshot.ranges, inputs.placement_intents, &.{}, inputs.stores, &.{}, &.{}, &.{}, &.{});
+        return snapshot;
+    }
+
+    pub fn peerSnapshot(self: *MetadataHttpService) !metadata_api.AdminSnapshot {
+        var inputs = try self.captureTransitionReadinessInputs();
+        defer inputs.deinit(self.alloc);
+        var snapshot: metadata_api.AdminSnapshot = .{
+            .peer_view = true,
+            .status = try self.metadataStatus(),
+            .tables = &.{},
+            .ranges = &.{},
+            .stores = &.{},
+            .placement_intents = &.{},
+            .split_transitions = &.{},
+            .merge_transitions = &.{},
+        };
+        errdefer self.freeAdminSnapshot(&snapshot);
+        snapshot.stores = try cloneProjectedStoresOwned(self.alloc, inputs.stores);
+        snapshot.placement_intents = try cloneProjectedPlacementIntentsOwned(self.alloc, inputs.placement_intents);
+        snapshot.merged_group_statuses = try metadata_state.mergeHealthyGroupStatuses(self.alloc, &.{}, &.{}, snapshot.placement_intents, &.{}, snapshot.stores, &.{}, &.{}, &.{}, &.{});
+        snapshot.peer_view_revision = try @import("peer_view.zig").revision(self.alloc, snapshot);
+        return snapshot;
     }
 
     pub fn controlSnapshot(self: *MetadataHttpService) !metadata_api.AdminSnapshot {
@@ -11258,7 +11976,7 @@ pub const MetadataHttpService = struct {
         self.component_projection_mutex.unlock(std.Options.debug_io);
     }
     fn componentKinds() std.EnumSet(metadata_storage.raft_apply_store.ProjectionSignalKind) {
-        var kinds: std.EnumSet(metadata_storage.raft_apply_store.ProjectionSignalKind) = .initFull();
+        var kinds: std.EnumSet(metadata_storage.raft_apply_store.ProjectionSignalKind) = .full;
         kinds.remove(.store);
         return kinds;
     }
@@ -11849,14 +12567,12 @@ pub const MetadataHttpService = struct {
         return projected;
     }
 
-    fn statusProjectedReconcileLease(self: *MetadataHttpService, now_ms: u64) !?metadata_reconcile_lease.ReconcileLeaseRecord {
+    pub fn statusProjectedReconcileLease(self: *MetadataHttpService, now_ms: u64) !?metadata_reconcile_lease.ReconcileLeaseRecord {
         return try self.getCachedProjectedReconcileLease(now_ms, self.raft.host.http_host.host.isLocalLeader(self.metadata_group_id));
     }
 
     fn runLifecycleReconcileHookIfRequested(self: *MetadataHttpService) !void {
-        const hook = self.lifecycle_reconcile_hook orelse return;
-        if (!self.lifecycle_reconcile_requested.swap(false, .acq_rel)) return;
-        try hook.run();
+        try runRequestedLifecycleReconcile(self.lifecycle_reconcile_hook, &self.lifecycle_reconcile_requested);
     }
 
     fn runReplicationBackfillRound(self: *MetadataHttpService) !void {
@@ -12094,20 +12810,20 @@ test "relational topology admission rejects lifecycle proposals before encoding 
             return true;
         }
 
-        fn proof() !TableTopologyProtocolReadiness {
-            return tableTopologyProtocolReadiness(3, metadata_topology_protocol.coordinated_lifecycle_version, "0123456789abcdef0123456789abcdef".*, &.{ 1, 2, 3 });
+        fn proof(required: u16) !TableTopologyProtocolReadiness {
+            return tableTopologyProtocolReadiness(3, required, "0123456789abcdef0123456789abcdef".*, &.{ 1, 2, 3 });
         }
 
         pub fn ensureTableTopologyProtocolReadyWithContext(self: *@This(), _: api_operation.RequestContext, required: u16) !TableTopologyProtocolReadiness {
             self.probes += 1;
             for (self.member_versions) |version| if (version < required) return error.TableTopologyProtocolUpgradeRequired;
-            const ready = try proof();
+            const ready = try proof(required);
             self.cache.cached = .{ .completion_epoch = 1, .readiness = ready };
             return ready;
         }
 
-        pub fn cachedCoordinatedDecoderReadiness(self: *@This()) !TableTopologyProtocolReadiness {
-            const expected = try proof();
+        pub fn cachedCoordinatedDecoderReadiness(self: *@This(), required: u16) !TableTopologyProtocolReadiness {
+            const expected = try proof(required);
             const outcome = self.cache.reusableOutcome(expected, 0, null) orelse return error.TableTopologyProtocolUpgradeRequired;
             if (outcome != .ready) return error.TableTopologyProtocolUpgradeRequired;
             return expected;
@@ -12161,12 +12877,96 @@ test "relational topology admission rejects lifecycle proposals before encoding 
     try std.testing.expect(!transitionRequiresCoordinatedDecoder(.{ .upsert_restore_job = .{ .key = "1", .value = "{}" } }));
     try std.testing.expect(!transitionRequiresCoordinatedDecoder(.{ .create_restore_job = .{ .key = "1", .value = "{}" } }));
     try std.testing.expect(!transitionRequiresCoordinatedDecoder(.{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{plain} } }));
+    const root_bound_store: metadata_table_manager.StoreRecord = .{
+        .store_id = 17,
+        .node_id = 1,
+        .reporter_incarnation = 3,
+        .replica_root_incarnation = 0x1234,
+    };
+    const root_command: metadata_storage.TransitionCommand = .{ .register_store = root_bound_store };
+    try std.testing.expectEqual(metadata_topology_protocol.store_root_uuid_decoder_version, transitionRequiredCoordinatedDecoderVersion(root_command));
+    var signing_store = root_bound_store;
+    signing_store.replica_root_public_key = @splat(7);
+    try std.testing.expectEqual(metadata_topology_protocol.store_root_signing_decoder_version, transitionRequiredCoordinatedDecoderVersion(.{ .register_store = signing_store }));
+    try std.testing.expectEqual(metadata_topology_protocol.store_root_signing_decoder_version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_store = signing_store }));
+    const signing_command: metadata_storage.TransitionCommand = .{ .register_store = signing_store };
+    var signing_service: Fake = .{ .member_versions = &.{ 18, 17, 18 } }; // One v17 learner still blocks v18 bytes.
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&signing_service, signing_command, .{}));
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, signing_service.propose(&.{signing_command}));
+    try std.testing.expectEqual(@as(usize, 0), signing_service.appended);
+    signing_service.member_versions = &.{ 18, 18, 18 };
+    try ensureCoordinatedDecoderWithContext(&signing_service, signing_command, .{});
+    signing_service.cache.cached.?.readiness.term += 1;
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, signing_service.propose(&.{signing_command}));
+    try std.testing.expectEqual(@as(usize, 0), signing_service.appended);
+    try ensureCoordinatedDecoderWithContext(&signing_service, signing_command, .{});
+    try signing_service.propose(&.{signing_command});
+    try std.testing.expectEqual(@as(usize, 1), signing_service.appended);
+    const initial_create_command: metadata_storage.TransitionCommand = .{ .apply_fk_initial_create = "{}" };
+    const generation_command: metadata_storage.TransitionCommand = .{ .apply_fk_generation_publication = "{}" };
+    try std.testing.expectEqual(metadata_topology_protocol.fk_generation_publication_version, transitionRequiredCoordinatedDecoderVersion(generation_command));
+    var mixed_generation: Fake = .{ .member_versions = &.{ 19, 18, 19 } };
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&mixed_generation, generation_command, .{}));
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, mixed_generation.propose(&.{generation_command}));
+    try std.testing.expectEqual(@as(usize, 0), mixed_generation.appended);
+    mixed_generation.member_versions = &.{ 19, 19, 19 };
+    try ensureCoordinatedDecoderWithContext(&mixed_generation, generation_command, .{});
+    mixed_generation.cache.cached.?.readiness.term += 1;
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, mixed_generation.propose(&.{generation_command}));
+    try std.testing.expectEqual(@as(usize, 0), mixed_generation.appended);
+    try ensureCoordinatedDecoderWithContext(&mixed_generation, generation_command, .{});
+    try mixed_generation.propose(&.{generation_command});
+    try std.testing.expectEqual(@as(usize, 1), mixed_generation.appended);
+    try std.testing.expectEqual(metadata_topology_protocol.fk_initial_create_version, transitionRequiredCoordinatedDecoderVersion(initial_create_command));
+    const hidden_remove: metadata_storage.TransitionCommand = .{ .remove_fk_initial_replica_intent = .{
+        .proof = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .child_table_id = 71, .range_id = 9 },
+        .group_id = 9171,
+        .local_node_id = 8,
+        .expected_metadata_version = 1,
+    } };
+    try std.testing.expectEqual(metadata_topology_protocol.fk_initial_create_version, transitionRequiredCoordinatedDecoderVersion(hidden_remove));
+    try std.testing.expectEqual(@as(u16, 0), transitionRequiredCoordinatedDecoderVersion(.{ .remove_replica_intent = .{
+        .group_id = 9171,
+        .local_node_id = 8,
+        .expected_metadata_version = 1,
+    } }));
+    var old_voter: Fake = .{ .member_versions = &.{ 17, 16, 17 } };
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&old_voter, root_command, .{}));
+    try std.testing.expectEqual(@as(usize, 0), old_voter.appended);
+    var mixed: Fake = .{ .member_versions = &.{ 17, 17, 16 } }; // Learner must decode too.
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&mixed, root_command, .{}));
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, mixed.propose(&.{ legacy, root_command }));
+    try std.testing.expectEqual(@as(usize, 0), mixed.appended);
+    mixed.member_versions = &.{ 17, 17, 17 };
+    try ensureCoordinatedDecoderWithContext(&mixed, root_command, .{});
+    try mixed.propose(&.{root_command});
+    try std.testing.expectEqual(@as(usize, 1), mixed.appended);
+    mixed.cache.cached.?.readiness.term += 1;
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, mixed.propose(&.{ legacy, root_command }));
+    try std.testing.expectEqual(@as(usize, 1), mixed.appended);
+    try ensureCoordinatedDecoderWithContext(&mixed, root_command, .{});
+    mixed.cache.cached.?.readiness.protected_membership_fingerprint[0] ^= 1;
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, mixed.propose(&.{ legacy, root_command }));
+    try std.testing.expectEqual(@as(usize, 1), mixed.appended);
+    try ensureCoordinatedDecoderWithContext(&mixed, root_command, .{});
+    try mixed.propose(&.{ legacy, root_command });
+    try std.testing.expectEqual(@as(usize, 3), mixed.appended);
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, mixed.propose(&.{initial_create_command}));
+    mixed.member_versions = &.{ 19, 19, 19 };
+    try ensureCoordinatedDecoderWithContext(&mixed, initial_create_command, .{});
+    try mixed.propose(&.{initial_create_command});
+    try std.testing.expectEqual(@as(usize, 4), mixed.appended);
+    mixed.cache.cached.?.readiness.term += 1;
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, mixed.propose(&.{initial_create_command}));
+    try std.testing.expectEqual(@as(usize, 4), mixed.appended);
 }
 
 test "relational topology admission requires metadata decoder capability beyond framed status" {
     try std.testing.expectEqual(@as(u16, 11), metadata_topology_protocol.source_scope_version);
-    try std.testing.expectEqual(metadata_topology_protocol.current_version, metadata_topology_protocol.coordinated_lifecycle_version);
-    try std.testing.expectEqual(metadata_topology_protocol.current_version, metadata_topology_protocol.relational_integrity_topology_version);
+    // The latest metadata protocol can advance independently of the minimum
+    // decoder version required by coordinated relational lifecycle entries.
+    try std.testing.expect(metadata_topology_protocol.current_version >= metadata_topology_protocol.coordinated_lifecycle_version);
+    try std.testing.expectEqual(metadata_topology_protocol.coordinated_lifecycle_version, metadata_topology_protocol.relational_integrity_topology_version);
     const incarnation: metadata_mod.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
     var status: MetadataStatus = .{ .metadata_group_id = 42, .metadata_incarnation = incarnation, .metadata_raft_local_node_id = 7, .metrics = .{}, .table_topology_protocol_version = 6, .runtime_status_record_version = metadata_runtime_status_protocol.current_record_version };
     try std.testing.expect(runtimeStatusProtocolCompatible(status, 42, 7, incarnation, metadata_runtime_status_protocol.current_record_version));
@@ -12204,7 +13004,7 @@ test "metadata runtime status capability cache is scoped to incarnation and memb
     try std.testing.expect(!std.mem.eql(
         u8,
         &fingerprint,
-        &([_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length),
+        &(@as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0))),
     ));
 
     var changed_conf_state = conf_state;
@@ -12276,7 +13076,7 @@ test "metadata service transition commands negotiate runtime status payload vers
         alloc: std.mem.Allocator,
         ready_version: u16,
 
-        fn runtimeStatusProtocolReady(self: *@This(), required_version: u16) bool {
+        pub fn runtimeStatusProtocolReady(self: *@This(), required_version: u16) bool {
             return self.ready_version >= required_version;
         }
     };
@@ -12423,7 +13223,7 @@ test "metadata service transition commands negotiate runtime status payload vers
 test "runtime status native authority cannot downgrade to inference-only V16" {
     const FakeService = struct {
         alloc: std.mem.Allocator = std.testing.allocator,
-        fn runtimeStatusProtocolReady(_: *@This(), required: u16) bool {
+        pub fn runtimeStatusProtocolReady(_: *@This(), required: u16) bool {
             return metadata_runtime_status_protocol.profileSatisfies(16, required);
         }
     };
@@ -12452,7 +13252,7 @@ test "metadata service projects optional activity without freezing older status"
         proposed_activity: bool = false,
         proposed_native_restore_version: u16 = 0,
 
-        fn runtimeStatusProtocolReady(self: *@This(), required_version: u16) bool {
+        pub fn runtimeStatusProtocolReady(self: *@This(), required_version: u16) bool {
             return self.ready_version >= required_version;
         }
 
@@ -12734,16 +13534,16 @@ test "metadata service gates mandatory native restore identity until protocol ac
         alloc: std.mem.Allocator,
         ready: bool,
 
-        fn runtimeStatusRepairProtocolReady(_: *@This()) bool {
+        pub fn runtimeStatusRepairProtocolReady(_: *@This()) bool {
             return true;
         }
 
-        fn runtimeStatusProtocolReady(_: *@This(), required_version: u16) bool {
+        pub fn runtimeStatusProtocolReady(_: *@This(), required_version: u16) bool {
             _ = required_version;
             return true;
         }
 
-        fn nativeRestoreIdentityProtocolReady(self: *@This()) bool {
+        pub fn nativeRestoreIdentityProtocolReady(self: *@This()) bool {
             return self.ready;
         }
     };
@@ -12773,11 +13573,11 @@ test "metadata service never downgrades vector projection readiness debt" {
         alloc: std.mem.Allocator,
         ready: bool,
 
-        fn runtimeStatusRepairProtocolReady(self: *@This()) bool {
+        pub fn runtimeStatusRepairProtocolReady(self: *@This()) bool {
             return self.ready;
         }
 
-        fn runtimeStatusProtocolReady(self: *@This(), required_version: u16) bool {
+        pub fn runtimeStatusProtocolReady(self: *@This(), required_version: u16) bool {
             _ = required_version;
             return self.ready;
         }
@@ -12843,7 +13643,7 @@ test "metadata service defers reporter fence transitions while activation is unk
         upserts: usize = 0,
         last_reporter_incarnation: u64 = 0,
 
-        fn runtimeStatusProtocolReady(_: *@This(), required_version: u16) bool {
+        pub fn runtimeStatusProtocolReady(_: *@This(), required_version: u16) bool {
             _ = required_version;
             return false;
         }
@@ -12898,19 +13698,19 @@ test "metadata service defers reporter fence transitions while activation is unk
     try std.testing.expectEqual(@as(u64, 0), projected[1].reporter_incarnation);
 }
 
-test "relational integrity metadata topology heartbeat selects current profile and preserves group reports" {
+test "relational integrity metadata topology heartbeat selects framed profile and preserves group reports" {
     const alloc = std.testing.allocator;
     const FakeService = struct {
         alloc: std.mem.Allocator,
         ready: bool = false,
-        current_profile_probes: usize = 0,
+        framed_profile_probes: usize = 0,
         upserts: usize = 0,
         groups: usize = 0,
         topology: u16 = 0,
 
-        fn runtimeStatusProtocolReady(self: *@This(), required: u16) bool {
-            if (required == metadata_runtime_status_protocol.current_record_version) {
-                self.current_profile_probes += 1;
+        pub fn runtimeStatusProtocolReady(self: *@This(), required: u16) bool {
+            if (required == metadata_runtime_status_protocol.framed_index_record_version) {
+                self.framed_profile_probes += 1;
                 return self.ready;
             }
             return false;
@@ -12950,7 +13750,7 @@ test "relational integrity metadata topology heartbeat selects current profile a
         try std.testing.expectEqual(@as(usize, 1), service.upserts);
         try std.testing.expectEqual(@as(usize, 1), service.groups);
         try std.testing.expectEqual(metadata_table_manager.relational_topology_protocol_version, service.topology);
-        try std.testing.expectEqual(@as(usize, 2), service.current_profile_probes);
+        try std.testing.expectEqual(@as(usize, 2), service.framed_profile_probes);
     }
 }
 
@@ -12959,7 +13759,7 @@ test "metadata service defers vector projection readiness transitions while acti
         alloc: std.mem.Allocator,
         upserts: usize = 0,
 
-        fn runtimeStatusRepairProtocolReady(_: *@This()) bool {
+        pub fn runtimeStatusRepairProtocolReady(_: *@This()) bool {
             return false;
         }
 
@@ -13007,7 +13807,7 @@ test "metadata service status reporting never proposes deletion of committed rep
         upserts: usize = 0,
         proposed_repair_status: bool = false,
 
-        fn runtimeStatusProtocolReady(_: *@This(), required_version: u16) bool {
+        pub fn runtimeStatusProtocolReady(_: *@This(), required_version: u16) bool {
             _ = required_version;
             return false;
         }
@@ -13460,7 +14260,7 @@ fn scheduleReplicationBackfillJob(service: anytype) !void {
             };
         }
 
-        fn deinit(ptr: *anyopaque) void {
+        pub fn deinit(ptr: *anyopaque) void {
             const ctx: *@This() = @ptrCast(@alignCast(ptr));
             ctx.service.cdc_job_in_flight.store(false, .release);
             const alloc = ctx.alloc;
@@ -14045,15 +14845,25 @@ fn reportStoreStatusesWithCapabilities(
     // Relational topology is a framed V17 admission fact too. Asking only
     // for V15 here can silently discard every ordinary group heartbeat at
     // the mandatory-profile fence below, even when all voters support V17.
-    const current_profile_required = vector_projection_transition_possible or
+    const framed_profile_required = vector_projection_transition_possible or
         native_storage_transition_possible or relational_topology_transition_possible;
-    const native_required_version = if (current_profile_required)
-        metadata_runtime_status_protocol.current_record_version
+    var schema_epoch_required = false;
+    for (reports) |report| {
+        for (report.runtime_statuses) |status| {
+            if (status.schema_epoch != 0) schema_epoch_required = true;
+        }
+    }
+    const native_required_version = if (schema_epoch_required)
+        metadata_runtime_status_protocol.schema_epoch_record_version
+    else if (framed_profile_required)
+        metadata_runtime_status_protocol.framed_index_record_version
     else
         required_version;
     const supported_version = highestSupportedRuntimeStatusVersion(service, native_required_version);
-    if (current_profile_required and
-        supported_version != metadata_runtime_status_protocol.current_record_version)
+    if (schema_epoch_required and supported_version != metadata_runtime_status_protocol.schema_epoch_record_version)
+        return error.RuntimeStatusProtocolUnavailable;
+    if (framed_profile_required and
+        !metadata_runtime_status_protocol.profileSatisfies(supported_version, metadata_runtime_status_protocol.framed_index_record_version))
     {
         return error.RuntimeStatusProtocolUnavailable;
     }
@@ -14484,7 +15294,7 @@ fn collectLocalGroupStatusReport(
     defer db_mod.types.freeDBStats(alloc, stats);
 
     const now_realtime_ms = platform_clock.Clock.real().nowRealtimeMs();
-    const created_at_millis = (try db.getGroupCreatedAtMillis(alloc, group_id)) orelse now_realtime_ms;
+    const created_at_millis = (try server_group_metadata.getGroupCreatedAtMillis(db, alloc, group_id)) orelse now_realtime_ms;
     const readiness = if (replica_root_dir) |root_dir|
         try transition_state.readinessForLocalGroup(
             alloc,
@@ -14824,7 +15634,7 @@ const ServiceGroupMembership = struct {
     local_voter: bool = false,
     voter_count: u16 = 0,
     voter_set_known: bool = false,
-    voter_set_fingerprint: metadata_table_manager.VoterSetFingerprint = [_]u8{0} ** metadata_table_manager.voter_set_fingerprint_len,
+    voter_set_fingerprint: metadata_table_manager.VoterSetFingerprint = @as([metadata_table_manager.voter_set_fingerprint_len]u8, @splat(0)),
     joint_consensus: bool = false,
     raft_term: u64 = 0,
     raft_membership_index: u64 = 0,
@@ -14932,7 +15742,7 @@ pub const StoreStatusBackfillMarker = struct {
         corrupt,
         valid: []const u8,
 
-        fn deinit(self: State, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: State, alloc: std.mem.Allocator) void {
             switch (self) {
                 .valid => |resume_key| alloc.free(resume_key),
                 else => {},
@@ -15691,8 +16501,55 @@ pub const TableProjectionExpectation = struct {
     indexes_json: ?[]const u8 = null,
 };
 
+fn runRequestedLifecycleReconcile(optional_hook: ?LifecycleReconcileHook, requested: *std.atomic.Value(bool)) !void {
+    const hook = optional_hook orelse return;
+    if (!requested.swap(false, .acq_rel)) return;
+    hook.run() catch |err| {
+        // Consuming a wake is not completing its durable work. Preserve it for
+        // the next scheduled control round without spinning or requiring new
+        // external catalog activity to recover from temporary unavailability.
+        requested.store(true, .release);
+        return err;
+    };
+}
+
+test "metadata lifecycle reconciles hidden generation after a transient control failure" {
+    const Capture = struct {
+        calls: usize = 0,
+        fn run(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls == 1) return error.StorageReadTemporarilyUnavailable;
+        }
+    };
+    var capture: Capture = .{};
+    const hook: LifecycleReconcileHook = .{ .ptr = &capture, .vtable = &.{ .run = Capture.run } };
+    var requested = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, runRequestedLifecycleReconcile(hook, &requested));
+    try std.testing.expect(requested.load(.acquire));
+    try runRequestedLifecycleReconcile(hook, &requested);
+    try std.testing.expect(!requested.load(.acquire));
+    try runRequestedLifecycleReconcile(hook, &requested);
+    try std.testing.expectEqual(@as(usize, 2), capture.calls);
+}
+
 fn lifecycleKeyMatchesMetadataNamespace(metadata_group_id: u64, signal: metadata_storage.raft_apply_store.CommittedKeySignal) bool {
     if (signal.metadata_group_id != metadata_group_id) return false;
+
+    // Hidden generations participate in placement before they have public
+    // table/range keys. A phase commit that exposes or retires such an owner
+    // must wake reconciliation on its own, without waiting for a heartbeat or
+    // unrelated public DDL. Match job records, not per-row restore progress.
+    var hidden_prefix_buf: [160]u8 = undefined;
+    const initial_prefix = fk_generation_publication.initialPrefixForGroup(&hidden_prefix_buf, metadata_group_id) catch return false;
+    if (std.mem.startsWith(u8, signal.key, initial_prefix)) return true;
+    // Ordinary ADD/DROP pins its table cut until publication completes. A
+    // finalization deferred under that lock needs a fresh reconcile when the
+    // lock is released, even if no owner reports or table writes follow it.
+    const fk_lock_prefix = fk_generation_publication.tableLockPrefix(&hidden_prefix_buf, metadata_group_id) catch return false;
+    if (std.mem.startsWith(u8, signal.key, fk_lock_prefix)) return true;
+    const restore_prefix = @import("restore_staging.zig").prefix(&hidden_prefix_buf, metadata_group_id) catch return false;
+    if (std.mem.startsWith(u8, signal.key, restore_prefix) and std.mem.startsWith(u8, signal.key[restore_prefix.len..], "job:")) return true;
 
     var node_prefix_buf: [96]u8 = undefined;
     const node_prefix = metadata_storage.raft_apply_store.nodePrefixForGroup(&node_prefix_buf, metadata_group_id) catch return false;
@@ -15737,6 +16594,25 @@ fn lifecycleKeyMatchesMetadataNamespace(metadata_group_id: u64, signal: metadata
     var reallocation_request_key_buf: [96]u8 = undefined;
     const reallocation_request_key = metadata_storage.raft_apply_store.reallocationRequestKeyForGroup(&reallocation_request_key_buf, metadata_group_id) catch return false;
     return std.mem.eql(u8, signal.key, reallocation_request_key);
+}
+
+test "metadata lifecycle reconciles hidden generation phase commits without public topology keys" {
+    var key_buf: [192]u8 = undefined;
+    const group_id: u64 = 19;
+    const initial_key = try fk_generation_publication.initialKey(&key_buf, group_id, 42);
+    try std.testing.expect(lifecycleKeyMatchesMetadataNamespace(group_id, .{ .metadata_group_id = group_id, .key = initial_key }));
+    try std.testing.expect(!lifecycleKeyMatchesMetadataNamespace(group_id + 1, .{ .metadata_group_id = group_id, .key = initial_key }));
+    const other_key = try fk_generation_publication.initialKey(&key_buf, group_id + 1, 42);
+    try std.testing.expect(!lifecycleKeyMatchesMetadataNamespace(group_id, .{ .metadata_group_id = group_id, .key = other_key }));
+    const lock_key = try fk_generation_publication.tableLockKey(&key_buf, group_id, 42);
+    try std.testing.expect(lifecycleKeyMatchesMetadataNamespace(group_id, .{ .metadata_group_id = group_id, .key = lock_key }));
+    const other_lock = try fk_generation_publication.tableLockKey(&key_buf, group_id + 1, 42);
+    try std.testing.expect(!lifecycleKeyMatchesMetadataNamespace(group_id, .{ .metadata_group_id = group_id, .key = other_lock }));
+    const restore = @import("restore_staging.zig");
+    const restore_key = try restore.jobKey(&key_buf, group_id, @splat(1));
+    try std.testing.expect(lifecycleKeyMatchesMetadataNamespace(group_id, .{ .metadata_group_id = group_id, .key = restore_key }));
+    const progress_key = try restore.progressKey(&key_buf, group_id, @splat(1));
+    try std.testing.expect(!lifecycleKeyMatchesMetadataNamespace(group_id, .{ .metadata_group_id = group_id, .key = progress_key }));
 }
 
 fn waitForTableLifecycleConvergence(
@@ -16286,7 +17162,7 @@ fn projectedProvisioningFingerprint(alloc: std.mem.Allocator, service: anytype) 
         hasher.update(std.mem.asBytes(&intent.record.group_id));
         hasher.update(std.mem.asBytes(&intent.record.replica_id));
         hasher.update(std.mem.asBytes(&intent.record.local_node_id));
-        hasher.update(std.mem.asBytes(&@intFromEnum(intent.record.bootstrap_mode)));
+        hasher.update(std.mem.asBytes(&@backingInt(intent.record.bootstrap_mode)));
         hasher.update(std.mem.asBytes(&intent.record.metadata_version));
         hasher.update(std.mem.asBytes(&intent.store_id));
         hasher.update(std.mem.asBytes(&@as(u64, intent.peer_node_ids.len)));
@@ -16298,7 +17174,7 @@ fn projectedProvisioningFingerprint(alloc: std.mem.Allocator, service: anytype) 
             // Keep the legacy fingerprint stable while making an explicitly
             // versioned locator a distinct provisioning input.
             if (snapshot.format != .unknown) {
-                hasher.update(std.mem.asBytes(&@intFromEnum(snapshot.format)));
+                hasher.update(std.mem.asBytes(&@backingInt(snapshot.format)));
             }
             hashProjectedProvisioningBytes(&hasher, snapshot.snapshot_id);
             hashProjectedProvisioningBytes(&hasher, snapshot.uri);
@@ -18866,7 +19742,7 @@ test "metadata service lifecycle round uses cached backfill markers" {
     const ProviderCapture = struct {
         calls: usize = 0,
 
-        fn collect(
+        pub fn collect(
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
             _: []const u8,
@@ -20055,7 +20931,7 @@ test "metadata service clears restore intent once all placement replicas report 
         placement_reads: usize = 0,
         progress_reads: usize = 0,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             if (self.upserted_table) |record| metadata_table_manager.freeTable(self.alloc, record);
             if (self.completed_restore) |identity| metadata_table_manager.freeRestoreIntentIdentity(self.alloc, identity);
         }
@@ -20109,14 +20985,14 @@ test "metadata service clears restore intent once all placement replicas report 
             alloc.free(records);
         }
 
-        fn listProjectedRestoreProgress(self: *@This(), alloc: std.mem.Allocator) ![]metadata_table_manager.RestoreProgressRecord {
+        pub fn listProjectedRestoreProgress(self: *@This(), alloc: std.mem.Allocator) ![]metadata_table_manager.RestoreProgressRecord {
             self.progress_reads += 1;
             const out = try alloc.alloc(metadata_table_manager.RestoreProgressRecord, self.progress.len);
             for (self.progress, 0..) |record, i| out[i] = try metadata_table_manager.cloneRestoreProgress(alloc, record);
             return out;
         }
 
-        fn freeProjectedRestoreProgress(_: *@This(), alloc: std.mem.Allocator, records: []metadata_table_manager.RestoreProgressRecord) void {
+        pub fn freeProjectedRestoreProgress(_: *@This(), alloc: std.mem.Allocator, records: []metadata_table_manager.RestoreProgressRecord) void {
             for (records) |record| metadata_table_manager.freeRestoreProgress(alloc, record);
             alloc.free(records);
         }
@@ -20565,6 +21441,36 @@ test "metadata http service catalog cache is independent from volatile projectio
     try std.testing.expectEqual(live_raft.votes_rejected, fallback_status.metadata_raft_votes_rejected);
     try std.testing.expectEqual(live_raft.votes_unknown, fallback_status.metadata_raft_votes_unknown);
 
+    var large_schema: [65536]u8 = @splat(' ');
+    large_schema[0] = '{';
+    large_schema[1] = '}';
+    const table_receipt = try svc.proposeTransitionCommandWithReceipt(.{ .upsert_table = .{ .table_id = 777, .name = "compact-view", .schema_json = &large_schema } });
+    try svc.waitForTransitionApplied(table_receipt);
+    const range_receipt = try svc.proposeTransitionCommandWithReceipt(.{ .upsert_range = .{ .group_id = 77701, .table_id = 777, .start_key = "" } });
+    try svc.waitForTransitionApplied(range_receipt);
+    var full_view = try svc.controlSnapshot();
+    defer svc.freeAdminSnapshot(&full_view);
+    try std.testing.expectEqual(@as(usize, 1), full_view.tables.len);
+    var peers_view = try svc.peerSnapshot();
+    defer svc.freeAdminSnapshot(&peers_view);
+    var planning_view = try svc.planningSnapshot();
+    defer svc.freeAdminSnapshot(&planning_view);
+    try std.testing.expect(peers_view.peer_view and planning_view.planning_view);
+    try std.testing.expectEqual(@as(usize, 0), peers_view.tables.len);
+    try std.testing.expectEqual(@as(usize, 0), peers_view.ranges.len);
+    try std.testing.expectEqual(@as(usize, 1), planning_view.tables.len);
+    try std.testing.expectEqual(@as(usize, 0), planning_view.tables[0].schema_json.len);
+    try std.testing.expectEqual(@as(u64, 77701), planning_view.ranges[0].group_id);
+    const full_bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, full_view, .{});
+    defer std.testing.allocator.free(full_bytes);
+    const peers_bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, peers_view, .{});
+    defer std.testing.allocator.free(peers_bytes);
+    const planning_bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, planning_view, .{});
+    defer std.testing.allocator.free(planning_bytes);
+    try std.testing.expect(peers_bytes.len * 10 < full_bytes.len);
+    try std.testing.expect(planning_bytes.len * 10 < full_bytes.len);
+    std.debug.print("compact-view bytes full={d} peers={d} planning={d}\n", .{ full_bytes.len, peers_bytes.len, planning_bytes.len });
+
     // Teardown closes callback admission permanently. A concurrent catalog
     // reader must observe cancellation instead of silently proceeding after
     // the listener pair was detached from Raft.
@@ -20697,6 +21603,61 @@ test "metadata http service linearizable reads leave elections to the cadence dr
     try std.testing.expectEqual(before_read, svc.raft.host.http_host.host.runtime_host.virtualTimeMs());
     try svc.runLifecycleRound();
     try std.testing.expectEqual(before_read, svc.raft.host.http_host.host.runtime_host.virtualTimeMs());
+
+    const WakeProbe = struct {
+        calls: usize = 0,
+        fn notify(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+    };
+    var wake_probe = WakeProbe{};
+    try svc.registerManagedProgressOwner(.{ .ptr = &wake_probe, .notify_fn = WakeProbe.notify });
+    defer svc.releaseManagedProgressOwner();
+    try std.testing.expectError(error.MetadataProgressAlreadyOwned, svc.registerManagedProgressOwner(.{ .ptr = &wake_probe, .notify_fn = WakeProbe.notify }));
+    const applied_before = svc.raft.host.http_host.host.raftStatus(2910).?.applied_index;
+    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .upsert_table = .{ .table_id = 100, .name = "owned_progress" } });
+    try svc.runRaftProgressOnly();
+    try std.testing.expect(wake_probe.calls > 0);
+    // No managed driver has drained the notification yet. A request must not
+    // persist/apply this accepted proposal or ReadIndex on its own thread.
+    try std.testing.expectEqual(applied_before, svc.raft.host.http_host.host.raftStatus(2910).?.applied_index);
+    try std.testing.expectError(error.DeadlineExceeded, svc.ensureLinearizableReadWithContext(.{ .deadline_ns = platform_time.monotonicNs() + 20 * std.time.ns_per_ms }));
+    try std.testing.expectEqual(applied_before, svc.raft.host.http_host.host.raftStatus(2910).?.applied_index);
+    for (0..16) |_| {
+        try svc.runManagedRaftProgressOnly();
+        if (svc.raft.host.http_host.host.raftStatus(2910).?.applied_index >= receipt.index) break;
+    }
+    try svc.waitForTransitionApplied(receipt);
+    try std.testing.expectEqual(before_read, svc.raft.host.http_host.host.runtime_host.virtualTimeMs());
+    // A peer response must wake the same owner without request-side progress
+    // or waiting for an election tick. Removing ownership fences callbacks.
+    const inbound_before = wake_probe.calls;
+    const host = svc.raft.host.http_host.host;
+    const response = raft_engine.core.Message{
+        .msg_type = .heartbeat_response,
+        .from = 1,
+        .to = 1,
+        .term = host.raftStatus(2910).?.hard.current_term,
+    };
+    const inbound = raft_engine.runtime.transport_iface.PeerBatch{
+        .peer_id = 1,
+        .groups = &.{.{ .group_id = 2910, .messages = &.{response} }},
+    };
+    try host.enqueueInboundBatch(inbound);
+    try std.testing.expectEqual(inbound_before + 1, wake_probe.calls);
+    try std.testing.expectEqual(@as(usize, 1), host.metrics.pending_inbound_messages);
+    try std.testing.expectEqual(before_read, host.runtime_host.virtualTimeMs());
+    try svc.runManagedRaftProgressOnly();
+    svc.releaseManagedProgressOwner();
+    const retired_calls = wake_probe.calls;
+    try host.enqueueInboundBatch(inbound);
+    try std.testing.expectEqual(retired_calls, wake_probe.calls);
+    // Registering again discovers debt accepted while no owner existed.
+    try svc.registerManagedProgressOwner(.{ .ptr = &wake_probe, .notify_fn = WakeProbe.notify });
+    try std.testing.expectEqual(retired_calls + 1, wake_probe.calls);
+    try svc.runManagedRaftProgressOnly();
+    try std.testing.expectEqual(before_read, host.runtime_host.virtualTimeMs());
 }
 
 test "metadata http projected clone helpers clean up on allocation failure" {
@@ -20808,7 +21769,7 @@ test "metadata http projected clone helpers clean up on allocation failure" {
         }
     };
 
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "metadata service local replica root reconcile permit hook defers reconcile work" {
@@ -21056,7 +22017,7 @@ test "metadata service store report workload benchmark selected admission end to
     const Fake = struct {
         alloc: std.mem.Allocator,
         upserts: usize = 0,
-        fn runtimeStatusProtocolReady(_: *@This(), _: u16) bool {
+        pub fn runtimeStatusProtocolReady(_: *@This(), _: u16) bool {
             return true;
         }
         fn upsertStore(self: *@This(), _: metadata_table_manager.StoreRecord) !void {
@@ -21110,7 +22071,7 @@ test "metadata service repeated store reports fence sequential candidates and pr
         upserts: usize = 0,
         generation: u64 = 0,
         capacity: u64 = 0,
-        fn runtimeStatusProtocolReady(_: *@This(), _: u16) bool {
+        pub fn runtimeStatusProtocolReady(_: *@This(), _: u16) bool {
             return true;
         }
         fn upsertStore(self: *@This(), record: metadata_table_manager.StoreRecord) !void {
@@ -21220,7 +22181,7 @@ test "metadata service sparse leases preserve pinned groups through allocation f
             try std.testing.expect(!removed.capabilities.flags.contains(.repair));
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
 test "metadata service projection journal keeps group bursts sparse and isolates overflow" {

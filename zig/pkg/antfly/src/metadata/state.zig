@@ -77,6 +77,9 @@ pub const MetadataState = struct {
     projected_node_ids: []u64 = &.{},
     projected_store_node_ids: []u64 = &.{},
     projected_store_candidates: []CandidatePlacementInfo = &.{},
+    /// Exact hidden initial-FK groups from the durable provisioning cut. They
+    /// participate in placement without entering the public desired catalog.
+    initial_fk_owner_group_ids: []u64 = &.{},
     projected_store_topology_present: bool = false,
     committed_nodes: std.ArrayListUnmanaged(metadata_table_manager.NodeRecord) = .empty,
     committed_stores: std.ArrayListUnmanaged(metadata_table_manager.StoreRecord) = .empty,
@@ -102,6 +105,7 @@ pub const MetadataState = struct {
         if (self.placement_candidate_node_ids.len > 0) self.alloc.free(self.placement_candidate_node_ids);
         if (self.projected_node_ids.len > 0) self.alloc.free(self.projected_node_ids);
         if (self.projected_store_node_ids.len > 0) self.alloc.free(self.projected_store_node_ids);
+        if (self.initial_fk_owner_group_ids.len > 0) self.alloc.free(self.initial_fk_owner_group_ids);
         if (self.projected_store_candidates.len > 0) {
             for (self.projected_store_candidates) |candidate| {
                 self.alloc.free(candidate.role);
@@ -165,6 +169,14 @@ pub const MetadataState = struct {
         defer if (provisioning == null) service.freeProjectedTables(self.alloc, projected_tables);
         const projected_ranges = if (provisioning) |projection| projection.ranges else try service.listProjectedRanges(self.alloc);
         defer if (provisioning == null) service.freeProjectedRanges(self.alloc, projected_ranges);
+        const initial_fk_groups: []u64 = if (provisioning) |projection| blk: {
+            if (projection.initial_fk_owners.len == 0) break :blk &.{};
+            const ids = try self.alloc.alloc(u64, projection.initial_fk_owners.len);
+            for (projection.initial_fk_owners, ids) |owner, *id| id.* = owner.child_group_id;
+            break :blk ids;
+        } else &.{};
+        var initial_fk_groups_owned = true;
+        errdefer if (initial_fk_groups_owned and initial_fk_groups.len > 0) self.alloc.free(initial_fk_groups);
         const projected_nodes = try listProjectedNodes(self, service);
         defer freeProjectedNodes(self, service, projected_nodes);
         const projected_stores = try listProjectedStores(self, service);
@@ -175,6 +187,9 @@ pub const MetadataState = struct {
         defer service.freeProjectedMergeTransitions(self.alloc, merge_records);
 
         _ = try self.projected.replaceProjectedTopology(projected_tables, projected_ranges);
+        if (self.initial_fk_owner_group_ids.len > 0) self.alloc.free(self.initial_fk_owner_group_ids);
+        self.initial_fk_owner_group_ids = initial_fk_groups;
+        initial_fk_groups_owned = false;
         self.clearCommitted();
         self.clearCommittedNodes();
         self.clearCommittedStores();
@@ -294,6 +309,7 @@ pub const MetadataState = struct {
                 .placement_version_fences = placement_version_fences,
                 .tables = tables,
                 .ranges = ranges,
+                .initial_fk_owner_group_ids = self.initial_fk_owner_group_ids,
                 .stores = self.committed_stores.items,
                 .merged_group_statuses = merged_group_statuses,
                 .restore_progresses = restore_progresses,
@@ -334,7 +350,7 @@ pub const MetadataState = struct {
     }
 };
 
-fn listProjectedPlacementVersionFences(
+pub fn listProjectedPlacementVersionFences(
     state: *MetadataState,
     service: anytype,
 ) ![]metadata_reconciler.PlacementVersionFence {
@@ -349,7 +365,7 @@ fn listProjectedPlacementVersionFences(
     return try state.alloc.alloc(metadata_reconciler.PlacementVersionFence, 0);
 }
 
-fn getProjectedReallocationRequest(service: anytype) !?reallocation_request.ReallocationRequestRecord {
+pub fn getProjectedReallocationRequest(service: anytype) !?reallocation_request.ReallocationRequestRecord {
     const ServiceType = @TypeOf(service);
     const ServiceDeclType = switch (@typeInfo(ServiceType)) {
         .pointer => |pointer| pointer.child,
@@ -361,7 +377,7 @@ fn getProjectedReallocationRequest(service: anytype) !?reallocation_request.Real
     return null;
 }
 
-fn listProjectedNodes(self: *MetadataState, service: anytype) ![]metadata_table_manager.NodeRecord {
+pub fn listProjectedNodes(self: *MetadataState, service: anytype) ![]metadata_table_manager.NodeRecord {
     const ServiceType = @TypeOf(service);
     const ServiceDeclType = switch (@typeInfo(ServiceType)) {
         .pointer => |pointer| pointer.child,
@@ -373,7 +389,7 @@ fn listProjectedNodes(self: *MetadataState, service: anytype) ![]metadata_table_
     return try self.alloc.alloc(metadata_table_manager.NodeRecord, 0);
 }
 
-fn freeProjectedNodes(self: *MetadataState, service: anytype, records: []metadata_table_manager.NodeRecord) void {
+pub fn freeProjectedNodes(self: *MetadataState, service: anytype, records: []metadata_table_manager.NodeRecord) void {
     const ServiceType = @TypeOf(service);
     const ServiceDeclType = switch (@typeInfo(ServiceType)) {
         .pointer => |pointer| pointer.child,
@@ -386,7 +402,7 @@ fn freeProjectedNodes(self: *MetadataState, service: anytype, records: []metadat
     self.alloc.free(records);
 }
 
-fn listProjectedStores(self: *MetadataState, service: anytype) ![]metadata_table_manager.StoreRecord {
+pub fn listProjectedStores(self: *MetadataState, service: anytype) ![]metadata_table_manager.StoreRecord {
     const ServiceType = @TypeOf(service);
     const ServiceDeclType = switch (@typeInfo(ServiceType)) {
         .pointer => |pointer| pointer.child,
@@ -398,7 +414,7 @@ fn listProjectedStores(self: *MetadataState, service: anytype) ![]metadata_table
     return try self.alloc.alloc(metadata_table_manager.StoreRecord, 0);
 }
 
-fn freeProjectedStores(self: *MetadataState, service: anytype, records: []metadata_table_manager.StoreRecord) void {
+pub fn freeProjectedStores(self: *MetadataState, service: anytype, records: []metadata_table_manager.StoreRecord) void {
     const ServiceType = @TypeOf(service);
     const ServiceDeclType = switch (@typeInfo(ServiceType)) {
         .pointer => |pointer| pointer.child,
@@ -411,7 +427,7 @@ fn freeProjectedStores(self: *MetadataState, service: anytype, records: []metada
     self.alloc.free(records);
 }
 
-fn listProjectedRestoreProgress(self: *MetadataState, service: anytype) ![]metadata_table_manager.RestoreProgressRecord {
+pub fn listProjectedRestoreProgress(self: *MetadataState, service: anytype) ![]metadata_table_manager.RestoreProgressRecord {
     const ServiceType = @TypeOf(service);
     const ServiceDeclType = switch (@typeInfo(ServiceType)) {
         .pointer => |pointer| pointer.child,
@@ -423,7 +439,7 @@ fn listProjectedRestoreProgress(self: *MetadataState, service: anytype) ![]metad
     return try self.alloc.alloc(metadata_table_manager.RestoreProgressRecord, 0);
 }
 
-fn freeProjectedRestoreProgress(self: *MetadataState, service: anytype, records: []metadata_table_manager.RestoreProgressRecord) void {
+pub fn freeProjectedRestoreProgress(self: *MetadataState, service: anytype, records: []metadata_table_manager.RestoreProgressRecord) void {
     const ServiceType = @TypeOf(service);
     const ServiceDeclType = switch (@typeInfo(ServiceType)) {
         .pointer => |pointer| pointer.child,
@@ -436,7 +452,7 @@ fn freeProjectedRestoreProgress(self: *MetadataState, service: anytype, records:
     self.alloc.free(records);
 }
 
-fn listProjectedSchemaProgress(self: *MetadataState, service: anytype) ![]metadata_table_manager.SchemaProgressRecord {
+pub fn listProjectedSchemaProgress(self: *MetadataState, service: anytype) ![]metadata_table_manager.SchemaProgressRecord {
     const ServiceType = @TypeOf(service);
     const ServiceDeclType = switch (@typeInfo(ServiceType)) {
         .pointer => |pointer| pointer.child,
@@ -448,7 +464,7 @@ fn listProjectedSchemaProgress(self: *MetadataState, service: anytype) ![]metada
     return try self.alloc.alloc(metadata_table_manager.SchemaProgressRecord, 0);
 }
 
-fn freeProjectedSchemaProgress(self: *MetadataState, service: anytype, records: []metadata_table_manager.SchemaProgressRecord) void {
+pub fn freeProjectedSchemaProgress(self: *MetadataState, service: anytype, records: []metadata_table_manager.SchemaProgressRecord) void {
     const ServiceType = @TypeOf(service);
     const ServiceDeclType = switch (@typeInfo(ServiceType)) {
         .pointer => |pointer| pointer.child,

@@ -56,7 +56,7 @@ fn isUriUnreserved(ch: u8) bool {
         ch == '-' or ch == '.' or ch == '_' or ch == '~';
 }
 
-fn percentEncodePathComponent(alloc: std.mem.Allocator, value: []const u8) ![]u8 {
+pub fn percentEncodePathComponent(alloc: std.mem.Allocator, value: []const u8) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
     for (value) |ch| {
@@ -769,6 +769,106 @@ pub const ApiHttpClient = struct {
         return parsed.value;
     }
 
+    pub fn fetchRestoreParentActivation(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("restore_parent_activation.zig").Request, input_context: @import("operation.zig").RequestContext) !@import("restore_parent_activation.zig").Response {
+        const context = try input_context.platformDeadline();
+        try context.ensureActive();
+        try request.validate(group_id);
+        const encoded_name = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(encoded_name);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, encoded_name, routes.Routes.restore_parent_activation_suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+        defer self.alloc.free(body);
+        if (body.len > 4096) return error.InvalidRestoreStaging;
+        const control: backup_contract.BackupOperationControl = .{ .deadline_ns = context.deadline_ns orelse (platform_time.monotonicNs() + 30 * std.time.ns_per_s), .cancellation = context.cancellation };
+        var cancellation = http_common.RequestCancellation{ .borrowed_context = context.cancellation.ptr, .borrowed_is_cancelled = context.cancellation.is_cancelled_fn };
+        var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = &cancellation });
+        defer response.deinit(self.alloc);
+        switch (response.status) {
+            200 => {},
+            400, 409 => return error.RestoreStagingScopeChanged,
+            408, 504 => return error.Timeout,
+            404, 503 => return error.RestoreValidationPending,
+            else => return error.UnexpectedHttpStatus,
+        }
+        const parsed = try std.json.parseFromSlice(@import("restore_parent_activation.zig").Response, self.alloc, response.body, .{});
+        defer parsed.deinit();
+        return parsed.value;
+    }
+
+    fn fetchFkGenerationControl(self: *ApiHttpClient, comptime Response: type, suffix: []const u8, base_uri: []const u8, group_id: u64, table_name: []const u8, request: anytype, input_context: @import("operation.zig").RequestContext) !Response {
+        const context = try input_context.platformDeadline();
+        try context.ensureActive();
+        try request.validate(group_id);
+        const encoded_name = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(encoded_name);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, encoded_name, suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+        defer self.alloc.free(body);
+        if (body.len > 4096) return error.InvalidGenerationPublication;
+        const control: backup_contract.BackupOperationControl = .{ .deadline_ns = context.deadline_ns orelse (platform_time.monotonicNs() + 30 * std.time.ns_per_s), .cancellation = context.cancellation };
+        var cancellation = http_common.RequestCancellation{ .borrowed_context = context.cancellation.ptr, .borrowed_is_cancelled = context.cancellation.is_cancelled_fn };
+        var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = &cancellation });
+        defer response.deinit(self.alloc);
+        switch (response.status) {
+            200 => {},
+            400, 409 => return error.GenerationAdmissionChanged,
+            408, 504 => return error.Timeout,
+            404, 503 => return error.GenerationAdmissionPending,
+            else => return error.UnexpectedHttpStatus,
+        }
+        const parsed = try std.json.parseFromSlice(Response, self.alloc, response.body, .{});
+        defer parsed.deinit();
+        try parsed.value.validate(request);
+        return parsed.value;
+    }
+
+    pub fn fetchFkGenerationParent(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_fk_generation_publication.zig").Request, context: @import("operation.zig").RequestContext) !@import("relational_fk_generation_publication.zig").Receipt {
+        return self.fetchFkGenerationControl(@import("relational_fk_generation_publication.zig").Receipt, routes.Routes.fk_generation_parent_suffix, base_uri, group_id, table_name, request, context);
+    }
+
+    pub fn fetchFkGenerationSource(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_fk_generation_publication.zig").SourceRequest, context: @import("operation.zig").RequestContext) !@import("relational_fk_generation_publication.zig").SourceReceipt {
+        return self.fetchFkGenerationControl(@import("relational_fk_generation_publication.zig").SourceReceipt, routes.Routes.fk_generation_source_suffix, base_uri, group_id, table_name, request, context);
+    }
+
+    pub fn fetchFkInitialChild(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_fk_generation_publication.zig").InitialChildRequest, context: @import("operation.zig").RequestContext) !@import("relational_fk_generation_publication.zig").InitialChildReceipt {
+        return self.fetchFkGenerationControl(@import("relational_fk_generation_publication.zig").InitialChildReceipt, routes.Routes.fk_initial_child_suffix, base_uri, group_id, table_name, request, context);
+    }
+
+    pub fn fetchRowPolicyInstall(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("row_policy_install.zig").Request, input_context: @import("operation.zig").RequestContext) !@import("row_policy_install.zig").Response {
+        const context = try input_context.platformDeadline();
+        try context.ensureActive();
+        try @import("row_policy_install.zig").validate(request, group_id);
+        const encoded_name = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(encoded_name);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, encoded_name, routes.Routes.row_policy_install_suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+        defer self.alloc.free(body);
+        if (body.len > 4096) return error.InvalidRowPolicyPublication;
+        const control: backup_contract.BackupOperationControl = .{ .deadline_ns = context.deadline_ns orelse (platform_time.monotonicNs() + 30 * std.time.ns_per_s), .cancellation = context.cancellation };
+        var cancellation = http_common.RequestCancellation{ .borrowed_context = context.cancellation.ptr, .borrowed_is_cancelled = context.cancellation.is_cancelled_fn };
+        var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = &cancellation });
+        defer response.deinit(self.alloc);
+        switch (response.status) {
+            200 => {},
+            400, 409 => return error.RowPolicyCatalogChanged,
+            408, 504 => return error.Timeout,
+            404, 503 => return error.RowPolicyInstallationPending,
+            else => return error.UnexpectedHttpStatus,
+        }
+        const parsed = try std.json.parseFromSlice(@import("row_policy_install.zig").Response, self.alloc, response.body, .{});
+        defer parsed.deinit();
+        return parsed.value;
+    }
+
     pub fn fetchBackupShardCohort(
         self: *ApiHttpClient,
         base_uri: []const u8,
@@ -1114,7 +1214,7 @@ pub const ApiHttpClient = struct {
             status: u16 = 0,
             error_body: std.ArrayListUnmanaged(u8) = .empty,
 
-            fn deinit(adapter: *@This()) void {
+            pub fn deinit(adapter: *@This()) void {
                 adapter.error_body.deinit(adapter.alloc);
             }
 
@@ -1827,6 +1927,7 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            400 => return error.InvalidGraphExpandWireRequest,
             408 => return error.Timeout,
             404 => return error.UnknownGroup,
             409 => return remoteGroupConflictError(resp.body),
@@ -1877,6 +1978,7 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            400 => return error.InvalidGraphHydrateWireRequest,
             408 => return error.Timeout,
             404 => return error.UnknownGroup,
             409 => return remoteGroupConflictError(resp.body),
@@ -1927,6 +2029,7 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            400 => return error.InvalidGraphEdgesWireRequest,
             408 => return error.Timeout,
             404 => return error.UnknownGroup,
             409 => return remoteGroupConflictError(resp.body),
@@ -2546,6 +2649,12 @@ pub const ApiHttpClient = struct {
             }
             if (resp.status == 409) {
                 if (@import("relational_integrity_errors.zig").decode(resp.body)) |reason| return reason;
+                if (std.mem.eql(u8, std.mem.trim(u8, resp.body, " \t\r\n"), "OnlineMergeArtifactCatalogUncoordinated")) {
+                    if (forwarding != null and (outcome == null or
+                        !std.mem.eql(u8, outcome.?, internal_batch_forwarding.outcome_not_proposed_v1)))
+                        return error.RaftBatchWriteOutcomeUnknown;
+                    return error.OnlineMergeArtifactCatalogUncoordinated;
+                }
                 return remoteGroupConflictError(resp.body);
             }
             if (resp.status == 429 and std.mem.eql(u8, std.mem.trim(u8, resp.body, " \t\r\n"), "RetainedEffectsFull")) {
@@ -2558,6 +2667,8 @@ pub const ApiHttpClient = struct {
                 if (forwarding == null or (outcome != null and
                     std.mem.eql(u8, outcome.?, internal_batch_forwarding.outcome_not_proposed_v1)))
                 {
+                    if (forwarding != null and std.mem.eql(u8, std.mem.trim(u8, resp.body, " \t\r\n"), internal_batch_forwarding.admission_unavailable_body))
+                        return error.StorageReadTemporarilyUnavailable;
                     return error.LeaderUnavailable;
                 }
                 return error.RaftBatchWriteOutcomeUnknown;
@@ -3164,6 +3275,12 @@ pub const ApiHttpClient = struct {
         return try fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_acknowledge_suffix, body, null, null);
     }
 
+    pub fn fetchGroupTxnAcknowledgeMany(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, body: []const u8) !EmptyResponse {
+        // This private capability route is absent on v0.2.x. Only a definite
+        // unsupported response enables the worker's idempotent single-ACK path.
+        return fetchInternalPostEmptyWithCapabilities(self, base_uri, group_id, table_name, routes.Routes.txn_acknowledge_many_suffix, body, null, null, true);
+    }
+
     pub fn fetchGroupOnlineMergeIo(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("online_merge_io.zig").contract.Request, timeout_ms: u32, cancellation: ?*const http_common.RequestCancellation) !QueryResponse {
         try request.validate();
         if (group_id != request.ownerGroup()) return error.OnlineSourceScopeChanged;
@@ -3351,6 +3468,20 @@ pub const ApiHttpClient = struct {
         timeout_ms: ?u32,
         cancellation: ?*const http_common.RequestCancellation,
     ) !EmptyResponse {
+        return fetchInternalPostEmptyWithCapabilities(self, base_uri, group_id, table_name, suffix_name, body, timeout_ms, cancellation, false);
+    }
+
+    fn fetchInternalPostEmptyWithCapabilities(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        suffix_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+        cancellation: ?*const http_common.RequestCancellation,
+        unsupported_route: bool,
+    ) !EmptyResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -3371,6 +3502,9 @@ pub const ApiHttpClient = struct {
             .cancellation = cancellation,
         });
         defer resp.deinit(self.alloc);
+        if (unsupported_route) if (resp.header(internal_batch_forwarding.outcome_header)) |outcome| {
+            if (std.mem.eql(u8, outcome, internal_batch_forwarding.outcome_unknown_v1)) return error.RaftBatchWriteOutcomeUnknown;
+        };
         switch (resp.status) {
             200 => return .{},
             202 => {
@@ -3380,7 +3514,7 @@ pub const ApiHttpClient = struct {
                     return error.CommitVisibilityNotSatisfied;
                 return error.UnexpectedHttpStatus;
             },
-            404 => return error.UnknownGroup,
+            404 => return if (unsupported_route) error.UnsupportedOperation else error.UnknownGroup,
             405 => return error.UnsupportedOperation,
             409 => return remoteGroupTxnResolveConflictError(resp.body),
             503 => return error.GroupLeaderUnavailable,
@@ -3965,10 +4099,10 @@ test "relational row query remote transaction prepare preserves scalar validatio
     };
     var executor: Executor = .{ .status = 400, .body = "" };
     var client = ApiHttpClient.init(std.testing.allocator, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
-    inline for (@typeInfo(@import("../schema/relational_expression_errors.zig").Error).error_set.?) |field| {
-        const reason = @field(@import("../schema/relational_expression_errors.zig").Error, field.name);
+    inline for (@typeInfo(@import("../schema/relational_expression_errors.zig").Error).error_set.error_names.?) |field| {
+        const reason = @field(@import("../schema/relational_expression_errors.zig").Error, field);
         executor.status = @import("relational_row_errors.zig").status(reason);
-        executor.body = field.name;
+        executor.body = field;
         try std.testing.expectError(reason, client.fetchGroupTxnPrepare("http://127.0.0.1:1", 7, "rows", "{}"));
     }
     executor.status = 500;
@@ -4011,6 +4145,13 @@ fn remotePublicBatchError(alloc: std.mem.Allocator, status: u16, body: []const u
             return remoteGroupConflictError(message);
         },
         503 => {
+            if (message.len > 0 and message.len <= 1024 and message[0] == '{') {
+                if (std.json.parseFromSlice(struct { code: ?[]const u8 = null, retryable: bool = false }, alloc, message, .{ .ignore_unknown_fields = true })) |parsed| {
+                    defer parsed.deinit();
+                    if (parsed.value.code) |code| if (parsed.value.retryable and std.mem.eql(u8, code, "transaction_precommit_aborted"))
+                        return error.TransactionPrepareAbortedUnavailable;
+                } else |_| {}
+            }
             if (std.mem.eql(u8, message, "write unavailable")) return error.LeaderUnavailable;
             if (std.mem.eql(u8, message, "doc identity unavailable")) return error.DocIdentityUnavailable;
             if (std.mem.eql(u8, message, "maintenance routes unavailable on query-only runtime")) {
@@ -4084,6 +4225,26 @@ test "retained quota client preserves certified rejection and committed pending"
     executor.pending = true;
     try std.testing.expectError(error.EnrichmentRetryInProgress, client.fetchGroupBatchWithForwarding("http://node:8080", 7, "docs", "{}", 1000, forwarding, null, null));
     try std.testing.expectError(error.CommitVisibilityNotSatisfied, client.fetchGroupTxnResolve("http://node:8080", 7, "docs", "{}"));
+}
+
+test "online merge catalog rejection requires a not-proposed receipt before cancellation" {
+    const alloc = std.testing.allocator;
+    const Executor = struct {
+        certified: bool = false,
+        fn execute(ptr: *anyopaque, allocator: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return @import("http_route_helpers.zig").textResponseWithHeaders(allocator, 409, "OnlineMergeArtifactCatalogUncoordinated", if (self.certified) &.{.{
+                .name = internal_batch_forwarding.outcome_header,
+                .value = internal_batch_forwarding.outcome_not_proposed_v1,
+            }} else &.{});
+        }
+    };
+    var executor: Executor = .{};
+    var client = ApiHttpClient.init(alloc, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    const forwarding: internal_batch_forwarding.Context = .{ .remaining_ms = 1000, .forwards_remaining = 1, .campaign_allowed = false };
+    try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, client.fetchGroupBatchWithForwarding("http://node:8080", 7, "docs", "{}", 1000, forwarding, null, null));
+    executor.certified = true;
+    try std.testing.expectError(error.OnlineMergeArtifactCatalogUncoordinated, client.fetchGroupBatchWithForwarding("http://node:8080", 7, "docs", "{}", 1000, forwarding, null, null));
 }
 
 fn isRetainedPreDecisionPressure(resp: http_common.HttpResponse) bool {
@@ -4304,7 +4465,7 @@ fn consumerTests() type {
                 .table_name = "docs",
                 .index_name = "semantic_idx",
                 .indexes_json = "{}",
-                .indexes_digest = [_]u8{0x11} ** std.crypto.hash.sha2.Sha256.digest_length,
+                .indexes_digest = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0x11)),
             };
             var executor = Executor{ .status = 200, .body = "{\"state\":\"accepted\",\"serviceable\":false,\"error_code\":null}" };
             var client = ApiHttpClient.init(std.testing.allocator, executor.iface());
@@ -4318,16 +4479,16 @@ fn consumerTests() type {
             try std.testing.expectEqual(metadata_mod.IndexActivationProgress.State.observed, observed.state);
             try std.testing.expect(observed.serviceable);
 
-            inline for (std.meta.fields(metadata_mod.IndexActivationProgress.FailureCode)) |field| {
+            inline for (comptime std.meta.fieldNames(metadata_mod.IndexActivationProgress.FailureCode)) |reflected_name| {
                 executor.body = try std.fmt.allocPrint(
                     std.testing.allocator,
                     "{{\"state\":\"action_required\",\"serviceable\":false,\"error_code\":\"{s}\"}}",
-                    .{field.name},
+                    .{reflected_name},
                 );
                 defer std.testing.allocator.free(@constCast(executor.body));
                 const progress = try client.activateGroupIndex("http://127.0.0.1:8080", target);
                 try std.testing.expectEqual(metadata_mod.IndexActivationProgress.State.action_required, progress.state);
-                try std.testing.expectEqual(@field(metadata_mod.IndexActivationProgress.FailureCode, field.name), progress.error_code.?);
+                try std.testing.expectEqual(@field(metadata_mod.IndexActivationProgress.FailureCode, reflected_name), progress.error_code.?);
             }
 
             executor = .{ .status = 400, .body = "InvalidArgument" };
@@ -4359,6 +4520,9 @@ fn consumerTests() type {
                 "transaction outcome is unknown; do not retry this stateless batch",
             ));
             try std.testing.expectEqual(error.LeaderUnavailable, remotePublicBatchError(alloc, 503, "write unavailable"));
+            try std.testing.expectEqual(error.TransactionPrepareAbortedUnavailable, remotePublicBatchError(alloc, 503, "{\"code\":\"transaction_precommit_aborted\",\"retryable\":true}"));
+            try std.testing.expectEqual(error.UnexpectedHttpStatus, remotePublicBatchError(alloc, 503, "{\"code\":\"transaction_precommit_aborted\",\"retryable\":false}"));
+            try std.testing.expectEqual(error.UnexpectedHttpStatus, remotePublicBatchError(alloc, 503, "{\"code\":\"transaction_precommit_aborted\",\"retryable\":true,\"padding\":\"" ++ (z17RepeatString("x", 1024)) ++ "\"}"));
             try std.testing.expectEqual(error.HAReadOnlyStandby, remotePublicBatchError(alloc, 409, "standby is read-only"));
         }
 
@@ -5180,6 +5344,8 @@ fn consumerTests() type {
                 const Mode = enum {
                     unmarked_unavailable,
                     marked_not_proposed,
+                    marked_owner_unavailable,
+                    unmarked_owner_unavailable,
                     unmarked_timeout,
                     marked_timeout,
                     failure_before_send,
@@ -5214,6 +5380,16 @@ fn consumerTests() type {
                                 .value = internal_batch_forwarding.outcome_not_proposed_v1,
                             }},
                         ),
+                        .marked_owner_unavailable => try http_route_helpers.textResponseWithHeaders(
+                            alloc,
+                            503,
+                            internal_batch_forwarding.admission_unavailable_body,
+                            &.{.{
+                                .name = internal_batch_forwarding.outcome_header,
+                                .value = internal_batch_forwarding.outcome_not_proposed_v1,
+                            }},
+                        ),
+                        .unmarked_owner_unavailable => try http_route_helpers.textResponse(alloc, 503, internal_batch_forwarding.admission_unavailable_body),
                         .unmarked_timeout => try http_route_helpers.textResponse(alloc, 504, "request deadline exceeded"),
                         .marked_timeout => try http_route_helpers.textResponseWithHeaders(
                             alloc,
@@ -5268,6 +5444,12 @@ fn consumerTests() type {
 
             executor.mode = .marked_not_proposed;
             try std.testing.expectError(error.LeaderUnavailable, OutcomeExecutor.fetch(&client));
+
+            executor.mode = .marked_owner_unavailable;
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, OutcomeExecutor.fetch(&client));
+
+            executor.mode = .unmarked_owner_unavailable;
+            try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, OutcomeExecutor.fetch(&client));
 
             executor.mode = .unmarked_timeout;
             try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, OutcomeExecutor.fetch(&client));
@@ -5325,9 +5507,9 @@ fn consumerTests() type {
                     .metadata_group_id = 3,
                     .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
                     .table_id = 7,
-                    .definition_digest = [_]u8{0x11} ** 32,
+                    .definition_digest = @as([32]u8, @splat(0x11)),
                     .topology_range_count = 1,
-                    .topology_digest = [_]u8{0x22} ** 32,
+                    .topology_digest = @as([32]u8, @splat(0x22)),
                     .writer_not_after_unix_ns = 123,
                 },
             ));
@@ -5362,9 +5544,9 @@ fn consumerTests() type {
                     .metadata_group_id = 3,
                     .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
                     .table_id = 7,
-                    .definition_digest = [_]u8{0x11} ** 32,
+                    .definition_digest = @as([32]u8, @splat(0x11)),
                     .topology_range_count = 1,
-                    .topology_digest = [_]u8{0x22} ** 32,
+                    .topology_digest = @as([32]u8, @splat(0x22)),
                     .writer_not_after_unix_ns = 123,
                 },
                 .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s },
@@ -5399,9 +5581,9 @@ fn consumerTests() type {
                     .metadata_group_id = 3,
                     .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
                     .table_id = 7,
-                    .definition_digest = [_]u8{0x11} ** 32,
+                    .definition_digest = @as([32]u8, @splat(0x11)),
                     .topology_range_count = 1,
-                    .topology_digest = [_]u8{0x22} ** 32,
+                    .topology_digest = @as([32]u8, @splat(0x22)),
                     .writer_not_after_unix_ns = 123,
                 },
                 .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s },
@@ -5594,7 +5776,7 @@ fn consumerTests() type {
                 empty_splits: [0]@import("../metadata/transition_state.zig").SplitTransitionRecord = .{},
                 empty_merges: [0]@import("../metadata/transition_state.zig").MergeTransitionRecord = .{},
 
-                fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+                pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
                     if (self.owns_created_table and self.created_table != null) {
                         metadata_table_manager.freeTable(alloc, self.created_table.?);
                     }
@@ -5650,7 +5832,7 @@ fn consumerTests() type {
 
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
 
-                fn createTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: @import("tables.zig").CreateTableRequest) !void {
+                pub fn createTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: @import("tables.zig").CreateTableRequest) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.created = true;
                     _ = table_name;
@@ -5667,7 +5849,7 @@ fn consumerTests() type {
                     self.owns_created_table = false;
                 }
 
-                fn dropTable(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8) !void {
+                pub fn dropTable(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     if (self.owns_created_table and self.created_table != null) {
                         metadata_table_manager.freeTable(alloc, self.created_table.?);
@@ -5677,7 +5859,7 @@ fn consumerTests() type {
                     self.owns_created_table = false;
                 }
 
-                fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, schema_json: []const u8) !void {
+                pub fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, schema_json: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     if (self.created_table) |*table| {
                         const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
@@ -5716,7 +5898,7 @@ fn consumerTests() type {
                     };
                 }
 
-                fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, index_name: []const u8, index_json: []const u8) !void {
+                pub fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, index_name: []const u8, index_json: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     const next = try @import("indexes.zig").addIndexToTableIndexesJson(alloc, self.indexes_json, index_name, index_json);
                     if (!std.mem.eql(u8, self.indexes_json, "{\"full_text_index_v0\":{}}")) alloc.free(self.indexes_json);
@@ -5735,7 +5917,7 @@ fn consumerTests() type {
                     self.owns_created_table = true;
                 }
 
-                fn dropIndex(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, index_name: []const u8) !void {
+                pub fn dropIndex(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, index_name: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     const next = (try @import("indexes.zig").removeIndexFromTableIndexesJson(alloc, self.indexes_json, index_name)) orelse return error.IndexNotFound;
                     if (!std.mem.eql(u8, self.indexes_json, "{\"full_text_index_v0\":{}}")) alloc.free(self.indexes_json);
@@ -6159,7 +6341,7 @@ fn consumerTests() type {
                     return error.UnsupportedOperation;
                 }
 
-                fn commitTransaction(
+                pub fn commitTransaction(
                     _: *anyopaque,
                     _: std.mem.Allocator,
                     _: []const txn_api.TableCommitRequest,
@@ -6318,4 +6500,15 @@ fn consumerTests() type {
 }
 comptime {
     if (@import("builtin").is_test) _ = consumer_tests;
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

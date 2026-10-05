@@ -18,7 +18,7 @@ const std = @import("std");
 const graph_mod = @import("../graph/graph.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
-const distributed_graph = @import("distributed_graph.zig");
+const distributed_graph = @import("local_graph.zig");
 const platform_time = @import("antfly_platform").time;
 const distributed_stats_mod = @import("../search/distributed_stats.zig");
 const db_mod = @import("../storage/db/control_root.zig");
@@ -690,9 +690,9 @@ pub const graph_paths = @import("../graph/paths.zig");
 
 pub const graph_query_mod = @import("../graph/query.zig");
 
-pub const public_limits = @import("public_limits.zig");
+pub const public_limits = @import("antfly_public_limits");
 
-pub const table_read_source = @import("table_read_source.zig");
+pub const table_read_source = @import("../storage/db/dynamic_field_capability.zig");
 
 pub const fusion_mod = @import("../search/fusion.zig");
 
@@ -700,7 +700,7 @@ pub const regex_mod = @import("../search/regex.zig");
 
 pub const ObservedDynamicFieldCapabilitySet = table_read_source.ObservedDynamicFieldCapabilitySet;
 
-pub const DynamicFieldObservationQuery = table_read_source.DynamicFieldObservationQuery;
+pub const DynamicFieldObservationQuery = table_read_source.ObservationQuery;
 
 pub const backend_current_root_generation: u64 = 0;
 
@@ -3236,7 +3236,7 @@ pub fn parseStorageKernelDocumentArtifactManifestsResponse(alloc: std.mem.Alloca
 }
 
 pub fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) ![]u8 {
-    return try encodeQueryRequestWithGraphWireMode(alloc, req, false, false);
+    return try encodeQueryRequestWithGraphWireMode(alloc, req, false, false, false);
 }
 
 pub fn encodeQueryRequestWithGraphWireMode(
@@ -3244,6 +3244,7 @@ pub fn encodeQueryRequestWithGraphWireMode(
     req: db_mod.types.SearchRequest,
     allow_legacy_graph: bool,
     include_aggregations: bool,
+    preserve_projection: bool,
 ) ![]u8 {
     if (searchRequestHasUnserializableResolvedDocFilter(req)) return error.UnsupportedQueryRequest;
     if (req.dense != null and req.dense_queries.len > 0) return error.UnsupportedQueryRequest;
@@ -3266,12 +3267,34 @@ pub fn encodeQueryRequestWithGraphWireMode(
         try out.appendSlice(alloc, req.aggregations_json);
     }
 
-    if (!req.include_all_fields) {
+    // This envelope describes worker retrieval, not the coordinator's final
+    // projection. Deferred projection needs the complete stored document for
+    // coordinator-owned expressions/rerankers even after their stages have
+    // been removed from the shard request. Omitting fields is the established
+    // all-fields wire representation and also works with older workers.
+    // Canonical hierarchy requests require an explicit projection at both
+    // ingress and storage. Their parser reconstructs deferred projection from
+    // these fields, so retain them rather than emitting an invalid envelope.
+    const requires_hierarchy_fields = req.hierarchy_children != null or
+        req.hierarchy_grouped_matches or req.hierarchy_group_level == .unit;
+    if (!req.include_all_fields and (preserve_projection or requires_hierarchy_fields or !(req.include_stored and req.defer_stored_projection))) {
         try appendJsonFieldNames(alloc, &out, &first, "fields", req.fields);
+    }
+    if (req.highlight) |highlight| {
+        try appendJsonFieldName(alloc, &out, &first, "highlight");
+        const encoded = try std.json.Stringify.valueAlloc(alloc, .{
+            .fields = highlight.fields,
+            .fragment_size = highlight.fragment_size,
+            .max_fragments = highlight.max_fragments,
+        }, .{});
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
     }
     if (req.hierarchy_children != null or
         req.hierarchy_grouped_matches or
-        req.hierarchy_group_level == .unit)
+        req.hierarchy_group_level == .unit or
+        req.hierarchy_include_source or
+        req.hierarchy_include_unit)
     {
         try appendQueryHierarchyField(alloc, &out, &first, req);
     }
@@ -3442,16 +3465,28 @@ pub fn encodeQueryRequestWithGraphWireMode(
 }
 
 pub fn encodeStorageKernelQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) ![]u8 {
+    return try encodeStorageKernelQueryRequestForExecution(alloc, req, false);
+}
+
+pub fn encodeStorageKernelQueryRequestForExecution(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, raw_search_result: bool) ![]u8 {
     // The compiled storage boundary remains in-process and must preserve the
     // deprecated public graph dialect for single-group compatibility. Generic
     // inter-node shard forwarding continues to reject that stateful dialect.
     // Complete physical queries also own aggregation. Raw shard calls retain
     // these search semantics and defer finalization through execution options.
-    return try encodeQueryRequestWithGraphWireMode(alloc, req, true, true);
+    // A complete physical query also encodes the final public response. Its
+    // projection cannot be omitted as it is for coordinator-owned retrieval.
+    return try encodeQueryRequestWithGraphWireMode(alloc, req, true, true, !raw_search_result);
 }
 
 pub const StorageKernelLookupWireRequest = struct {
     key: []const u8,
+    row_policy_principal_proof: []const u8 = "",
+    row_policy_database: []const u8 = "",
+    row_policy_receipt: ?struct {
+        generation: u64,
+        phase: @import("../system_catalog/policies.zig").Publication.Phase,
+    } = null,
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
     include_primary_digest: bool = false,
@@ -3466,6 +3501,9 @@ pub const StorageKernelLookupWireRequest = struct {
 
     pub fn options(self: StorageKernelLookupWireRequest) db_mod.types.LookupOptions {
         return .{
+            .row_policy_principal_proof = self.row_policy_principal_proof,
+            .row_policy_database = self.row_policy_database,
+            .row_policy_receipt = if (self.row_policy_receipt) |receipt| .{ .generation = receipt.generation, .phase = receipt.phase } else null,
             .fields = self.fields,
             .include_all_fields = self.include_all_fields,
             .include_primary_digest = self.include_primary_digest,
@@ -3482,18 +3520,18 @@ pub const StorageKernelLookupWireRequest = struct {
 
     pub fn jsonStringify(self: StorageKernelLookupWireRequest, stream: anytype) @TypeOf(stream.*).Error!void {
         try stream.beginObject();
-        inline for (@typeInfo(StorageKernelLookupWireRequest).@"struct".fields) |field| {
-            try stream.objectField(field.name);
-            if (comptime std.mem.eql(u8, field.name, "key") or std.mem.eql(u8, field.name, "restore_staging_scope") or std.mem.eql(u8, field.name, "restore_staging_plan_id")) {
-                try @import("../storage/db/relational_integrity_json.zig").write(@field(self, field.name), stream);
-            } else try stream.write(@field(self, field.name));
+        inline for (comptime std.meta.fieldNames(StorageKernelLookupWireRequest)) |reflected_name| {
+            try stream.objectField(reflected_name);
+            if (comptime std.mem.eql(u8, reflected_name, "key") or std.mem.eql(u8, reflected_name, "restore_staging_scope") or std.mem.eql(u8, reflected_name, "restore_staging_plan_id")) {
+                try @import("../storage/db/relational_integrity_json.zig").write(@field(self, reflected_name), stream);
+            } else try stream.write(@field(self, reflected_name));
         }
         try stream.endObject();
     }
 };
 
 pub fn integrityLookupMode(opts: db_mod.types.LookupOptions) bool {
-    return opts.relational_integrity_catalog or opts.relational_integrity_action or opts.relational_integrity_jobs_json.len != 0 or opts.relational_index_status_json.len != 0 or opts.relational_activation_json.len != 0 or opts.relational_topology_json.len != 0;
+    return opts.row_policy_receipt != null or opts.relational_integrity_catalog or opts.relational_integrity_action or opts.relational_integrity_jobs_json.len != 0 or opts.relational_index_status_json.len != 0 or opts.relational_activation_json.len != 0 or opts.relational_topology_json.len != 0;
 }
 
 test "compiled lookup wire preserves binary scope and every integrity control" {
@@ -3511,10 +3549,17 @@ test "compiled lookup wire preserves binary scope and every integrity control" {
         .relational_activation_json = "{\"mode\":\"status\"}",
         .relational_index_status_json = "{\"name\":\"by_id\",\"schema_version\":2}",
         .relational_topology_json = "{\"mode\":\"identity\"}",
+        .fk_generation_source_control = true,
+        .fk_generation_source_read_index_certified = true,
+        .generation_handoff_install_read_index_certified = true,
+        .row_policy_receipt = .{ .generation = 9, .phase = .pending_install },
         .execution_deadline_ns = 1234,
     };
     const encoded = try encodeStorageKernelLookupRequest(alloc, "\xff\x00\x80", options);
     defer alloc.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "fk_generation_source_control") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "fk_generation_source_read_index_certified") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "generation_handoff_install_read_index_certified") == null);
     var decoded = try std.json.parseFromSlice(StorageKernelLookupWireRequest, alloc, encoded, .{});
     defer decoded.deinit();
     try std.testing.expectEqualStrings("\xff\x00\x80", decoded.value.key);
@@ -3527,6 +3572,8 @@ test "compiled lookup wire preserves binary scope and every integrity control" {
     try std.testing.expectEqualStrings(options.relational_activation_json, actual.relational_activation_json);
     try std.testing.expectEqualStrings(options.relational_index_status_json, actual.relational_index_status_json);
     try std.testing.expectEqualStrings(options.relational_topology_json, actual.relational_topology_json);
+    try std.testing.expectEqual(@as(u64, 9), actual.row_policy_receipt.?.generation);
+    try std.testing.expectEqual(@as(@import("../system_catalog/policies.zig").Publication.Phase, .pending_install), actual.row_policy_receipt.?.phase);
     try std.testing.expectEqualStrings("id", actual.fields[0]);
     try std.testing.expect(actual.execution_deadline_ns == null and actual.execution_io == null and actual.cancellation == null);
 }
@@ -3538,6 +3585,9 @@ pub fn encodeStorageKernelLookupRequest(
 ) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, StorageKernelLookupWireRequest{
         .key = key,
+        .row_policy_principal_proof = opts.row_policy_principal_proof,
+        .row_policy_database = opts.row_policy_database,
+        .row_policy_receipt = if (opts.row_policy_receipt) |receipt| .{ .generation = receipt.generation, .phase = receipt.phase } else null,
         .fields = opts.fields,
         .include_all_fields = opts.include_all_fields,
         .include_primary_digest = opts.include_primary_digest,
@@ -3607,6 +3657,9 @@ pub const StorageKernelScanWireRequest = struct {
     filter_query_json: []const u8 = "",
     include_content_hashes: bool = false,
     relational_query_json: []const u8 = "",
+    row_policy_principal_proof: []const u8 = "",
+    row_policy_database: []const u8 = "",
+    relational_query: ?db_mod.types.RelationalRowQuery = null,
 
     pub fn options(self: StorageKernelScanWireRequest) db_mod.types.ScanOptions {
         return .{
@@ -3619,16 +3672,19 @@ pub const StorageKernelScanWireRequest = struct {
             .filter_query_json = self.filter_query_json,
             .include_content_hashes = self.include_content_hashes,
             .relational_query_json = self.relational_query_json,
+            .row_policy_principal_proof = self.row_policy_principal_proof,
+            .row_policy_database = self.row_policy_database,
+            .relational_query = self.relational_query,
         };
     }
 
     pub fn jsonStringify(self: StorageKernelScanWireRequest, stream: anytype) @TypeOf(stream.*).Error!void {
         try stream.beginObject();
-        inline for (@typeInfo(StorageKernelScanWireRequest).@"struct".fields) |field| {
-            try stream.objectField(field.name);
-            if (comptime std.mem.eql(u8, field.name, "from_key") or std.mem.eql(u8, field.name, "to_key")) {
-                try @import("../storage/db/relational_integrity_json.zig").write(@field(self, field.name), stream);
-            } else try stream.write(@field(self, field.name));
+        inline for (comptime std.meta.fieldNames(StorageKernelScanWireRequest)) |reflected_name| {
+            try stream.objectField(reflected_name);
+            if (comptime std.mem.eql(u8, reflected_name, "from_key") or std.mem.eql(u8, reflected_name, "to_key")) {
+                try @import("../storage/db/relational_integrity_json.zig").write(@field(self, reflected_name), stream);
+            } else try stream.write(@field(self, reflected_name));
         }
         try stream.endObject();
     }
@@ -3652,6 +3708,9 @@ pub fn encodeStorageKernelScanRequest(
         .filter_query_json = opts.filter_query_json,
         .include_content_hashes = opts.include_content_hashes,
         .relational_query_json = opts.relational_query_json,
+        .row_policy_principal_proof = opts.row_policy_principal_proof,
+        .row_policy_database = opts.row_policy_database,
+        .relational_query = opts.relational_query,
     }, .{});
 }
 
@@ -3665,7 +3724,7 @@ pub fn encodeStorageKernelScanNdjson(
     for (result.hashes, 0..) |entry, i| {
         const json = if (include_documents) result.documents[i].json else null;
         if (entry.relational_schema_version) |version| {
-            try appendRelationalScanLine(alloc, &out, .{ .id = entry.id, .hash = entry.hash, .document_json = json, .content_hash = entry.content_hash, .relational_schema_version = version, .relational_cursor = entry.relational_cursor }, version);
+            try appendRelationalScanLine(alloc, &out, .{ .id = entry.id, .hash = entry.hash, .document_json = json, .content_hash = entry.content_hash, .relational_schema_version = version, .relational_cursor = entry.relational_cursor, .json_null_fields = entry.json_null_fields }, version);
         } else try appendScanLine(alloc, &out, entry.id, json, entry.content_hash);
     }
     return try out.toOwnedSlice(alloc);
@@ -3780,19 +3839,34 @@ pub fn appendQueryHierarchyField(
         try appendJsonString(alloc, out, children.parent_id);
         try out.appendSlice(alloc, "},\"level\":\"unit\"}");
     } else {
-        try out.appendSlice(alloc, "\"group_by\":{\"level\":");
-        try appendJsonString(alloc, out, @tagName(req.hierarchy_group_level));
-        if (req.hierarchy_grouped_matches) {
-            try out.appendSlice(alloc, ",\"matches\":{");
-            try out.appendSlice(alloc, "\"limit\":");
-            try out.print(alloc, "{d}", .{req.max_chunks_per_parent});
-            try out.appendSlice(alloc, ",\"fields\":");
-            try appendJsonStringArray(alloc, out, req.hierarchy_match_fields);
+        // `group_by` is its own opt-in control (grouped matches, or explicit
+        // unit-level grouping); `ancestors` (hydrating a chunk hit's source/
+        // unit document, independent of any grouping) is a second, separate
+        // opt-in. Only emit each clause when the caller actually asked for
+        // it - unconditionally writing `group_by` here previously forced a
+        // stray `"group_by":{"level":"source"}` onto every ancestors-only
+        // request once this function started being called for that case
+        // too, which flips the reparsed request's return_mode from member to
+        // parent on the internal wire hop (issue #930).
+        const needs_group_by = req.hierarchy_grouped_matches or req.hierarchy_group_level == .unit;
+        var wrote_group_by = false;
+        if (needs_group_by) {
+            try out.appendSlice(alloc, "\"group_by\":{\"level\":");
+            try appendJsonString(alloc, out, @tagName(req.hierarchy_group_level));
+            if (req.hierarchy_grouped_matches) {
+                try out.appendSlice(alloc, ",\"matches\":{");
+                try out.appendSlice(alloc, "\"limit\":");
+                try out.print(alloc, "{d}", .{req.max_chunks_per_parent});
+                try out.appendSlice(alloc, ",\"fields\":");
+                try appendJsonStringArray(alloc, out, req.hierarchy_match_fields);
+                try out.append(alloc, '}');
+            }
             try out.append(alloc, '}');
+            wrote_group_by = true;
         }
-        try out.append(alloc, '}');
         if (req.hierarchy_include_source or req.hierarchy_include_unit) {
-            try out.appendSlice(alloc, ",\"ancestors\":{");
+            if (wrote_group_by) try out.append(alloc, ',');
+            try out.appendSlice(alloc, "\"ancestors\":{");
             var first_ancestor = true;
             if (req.hierarchy_include_source) {
                 try out.appendSlice(alloc, "\"source\":{\"fields\":");
@@ -4694,6 +4768,7 @@ pub fn parseRemoteSearchResultInner(alloc: std.mem.Allocator, body: []const u8) 
         hit.ancestor_unit_data = try remoteHierarchyAncestorDocumentAlloc(alloc, item.hierarchy, .unit);
         hit.artifact_ref = try parseRemoteHierarchyArtifactRefAlloc(alloc, item.hierarchy);
         hit.chunk_hits = try parseRemoteHierarchyMatchesAlloc(alloc, item.hierarchy);
+        hit.highlights = try parseRemoteHighlightsAlloc(alloc, item._highlights);
         hits[i] = hit;
         initialized += 1;
     }
@@ -4748,18 +4823,18 @@ pub fn parseRemoteSearchResultInner(alloc: std.mem.Allocator, body: []const u8) 
 /// strings are cloned by SearchResult before the response arena is released.
 fn remoteSortProfile(wire: metadata_openapi.SortProfile) !db_mod.types.SortProfile {
     var profile: db_mod.types.SortProfile = .{};
-    inline for (@typeInfo(db_mod.types.SortProfile).@"struct".fields) |field| {
-        if (@hasField(metadata_openapi.SortProfile, field.name)) {
-            if (@field(wire, field.name)) |value| {
-                if (field.type == []const u8) {
-                    @field(profile, field.name) = if (@typeInfo(@TypeOf(value)) == .@"enum") @tagName(value) else value;
-                } else if (field.type == db_mod.types.SortProfileField) {
+    inline for (@typeInfo(db_mod.types.SortProfile).@"struct".field_names, @typeInfo(db_mod.types.SortProfile).@"struct".field_types) |reflected_name, field_type| {
+        if (@hasField(metadata_openapi.SortProfile, reflected_name)) {
+            if (@field(wire, reflected_name)) |value| {
+                if (field_type == []const u8) {
+                    @field(profile, reflected_name) = if (@typeInfo(@TypeOf(value)) == .@"enum") @tagName(value) else value;
+                } else if (field_type == db_mod.types.SortProfileField) {
                     if (value.len > profile.sort_rejection_field.bytes.len) return error.InvalidRemoteResponse;
-                    @field(profile, field.name) = .init(value);
-                } else if (@typeInfo(field.type) == .int) {
-                    @field(profile, field.name) = std.math.cast(field.type, value) orelse return error.InvalidRemoteResponse;
+                    @field(profile, reflected_name) = .init(value);
+                } else if (@typeInfo(field_type) == .int) {
+                    @field(profile, reflected_name) = std.math.cast(field_type, value) orelse return error.InvalidRemoteResponse;
                 } else {
-                    @field(profile, field.name) = value;
+                    @field(profile, reflected_name) = value;
                 }
             }
         }
@@ -4863,6 +4938,51 @@ pub fn parseRemoteArtifactKind(value: []const u8) !db_mod.types.ArtifactKind {
     if (std.mem.eql(u8, value, "asset")) return .asset;
     if (std.mem.eql(u8, value, "embedding")) return .embedding;
     return error.InvalidQueryRequest;
+}
+
+fn parseRemoteHighlightsAlloc(
+    alloc: std.mem.Allocator,
+    maybe_value: ?std.json.ArrayHashMap([]const metadata_openapi.HighlightFragment),
+) ![]db_mod.types.HighlightedField {
+    const value = maybe_value orelse return &.{};
+    if (value.map.count() == 0) return &.{};
+
+    var out = std.ArrayListUnmanaged(db_mod.types.HighlightedField).empty;
+    errdefer {
+        for (out.items) |*item| db_mod.types.freeHighlightedField(alloc, item);
+        out.deinit(alloc);
+    }
+    var it = value.map.iterator();
+    while (it.next()) |entry| {
+        const field = try alloc.dupe(u8, entry.key_ptr.*);
+        errdefer alloc.free(field);
+        var fragments = std.ArrayListUnmanaged(db_mod.types.HighlightFragment).empty;
+        errdefer {
+            for (fragments.items) |*fragment| db_mod.types.freeHighlightFragment(alloc, fragment);
+            fragments.deinit(alloc);
+        }
+        for (entry.value_ptr.*) |fragment| {
+            if (fragment.offset < 0) return error.InvalidQueryRequest;
+            const text = try alloc.dupe(u8, fragment.text);
+            errdefer alloc.free(text);
+            const spans = try alloc.alloc(db_mod.types.HighlightSpan, fragment.spans.len);
+            errdefer alloc.free(spans);
+            for (fragment.spans, spans) |span, *dst| {
+                if (span.start < 0 or span.end < span.start or span.end > @as(i64, @intCast(fragment.text.len))) return error.InvalidQueryRequest;
+                dst.* = .{ .start = @intCast(span.start), .end = @intCast(span.end) };
+            }
+            try fragments.append(alloc, .{
+                .text = text,
+                .offset = std.math.cast(u32, fragment.offset) orelse return error.InvalidQueryRequest,
+                .item = if (fragment.item) |index| (std.math.cast(u32, index) orelse return error.InvalidQueryRequest) else null,
+                .spans = spans,
+            });
+        }
+        // Keep fragments owned by their cleanup until the destination can accept them.
+        try out.ensureUnusedCapacity(alloc, 1);
+        out.appendAssumeCapacity(.{ .field = field, .fragments = try fragments.toOwnedSlice(alloc) });
+    }
+    return try out.toOwnedSlice(alloc);
 }
 
 pub fn parseRemoteIndexScoresAlloc(
@@ -5408,6 +5528,10 @@ pub fn cloneRemoteCanonicalGraphNodePathEdges(
         errdefer alloc.free(target);
         const edge_type = try alloc.dupe(u8, item.type);
         errdefer alloc.free(edge_type);
+        const edge_id = if (item.edge_id) |id| try alloc.dupe(u8, id) else "";
+        errdefer if (edge_id.len > 0) alloc.free(edge_id);
+        const owner_document = if (item.owner_document) |owner| try alloc.dupe(u8, owner) else "";
+        errdefer if (owner_document.len > 0) alloc.free(owner_document);
         const metadata = if (item.metadata) |metadata| try std.json.Stringify.valueAlloc(alloc, metadata, .{}) else "";
         errdefer if (metadata.len > 0) alloc.free(metadata);
         edges[i] = .{
@@ -5415,6 +5539,8 @@ pub fn cloneRemoteCanonicalGraphNodePathEdges(
             .target = target,
             .edge_type = edge_type,
             .weight = item.weight,
+            .edge_id = edge_id,
+            .owner_document = owner_document,
             .metadata = metadata,
             .traversal_direction = switch (item.direction) {
                 .out => .out,
@@ -5435,6 +5561,8 @@ pub fn freeRemoteGraphNodePathEdgeItems(
         alloc.free(edge.source);
         alloc.free(edge.target);
         alloc.free(edge.edge_type);
+        if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+        if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
         if (edge.metadata.len > 0) alloc.free(edge.metadata);
     }
     if (edges.len > 0) alloc.free(edges);
@@ -5503,6 +5631,8 @@ pub fn parseRemoteCanonicalGraphPath(
             alloc.free(edge.source);
             alloc.free(edge.target);
             alloc.free(edge.edge_type);
+            if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+            if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
             if (edge.metadata.len > 0) alloc.free(edge.metadata);
         }
         alloc.free(edges);
@@ -5564,6 +5694,8 @@ pub fn parseRemoteCanonicalPathEdges(
             alloc.free(edge.source);
             alloc.free(edge.target);
             alloc.free(edge.edge_type);
+            if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+            if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
             if (edge.metadata.len > 0) alloc.free(edge.metadata);
         }
         if (edges.len > 0) alloc.free(edges);
@@ -5577,6 +5709,10 @@ pub fn parseRemoteCanonicalPathEdges(
         errdefer alloc.free(target);
         const edge_type = try alloc.dupe(u8, item.type);
         errdefer alloc.free(edge_type);
+        const edge_id = if (item.edge_id) |id| try alloc.dupe(u8, id) else "";
+        errdefer if (edge_id.len > 0) alloc.free(edge_id);
+        const owner_document = if (item.owner_document) |owner| try alloc.dupe(u8, owner) else "";
+        errdefer if (owner_document.len > 0) alloc.free(owner_document);
         const metadata = if (item.metadata) |metadata| try std.json.Stringify.valueAlloc(alloc, metadata, .{}) else "";
         errdefer if (metadata.len > 0) alloc.free(metadata);
         edges[i] = .{
@@ -5584,6 +5720,8 @@ pub fn parseRemoteCanonicalPathEdges(
             .target = target,
             .edge_type = edge_type,
             .weight = item.weight,
+            .edge_id = edge_id,
+            .owner_document = owner_document,
             .metadata = metadata,
             .traversal_direction = switch (item.direction) {
                 .out => .out,
@@ -5703,9 +5841,16 @@ pub fn appendRelationalScanLine(alloc: std.mem.Allocator, out: *std.ArrayListUnm
     const header = try std.fmt.allocPrint(alloc, "{{\"_id\":{f},\"version\":\"{d}\",\"schema_version\":{d},\"row\":", .{ std.json.fmt(entry.id, .{}), entry.hash, schema_version });
     defer alloc.free(header);
     const cursor_bytes = if (entry.relational_cursor) |cursor| cursor.len +| 12 else @as(usize, 0);
-    if (header.len +| projected.len +| cursor_bytes +| 2 > (16 * 1024 * 1024) -| out.items.len) return error.RelationalRowsOutputBudgetExceeded;
+    const null_fields = if (entry.json_null_fields.len != 0) try std.json.Stringify.valueAlloc(alloc, entry.json_null_fields, .{}) else null;
+    defer if (null_fields) |bytes| alloc.free(bytes);
+    const null_bytes = if (null_fields) |bytes| bytes.len +| 20 else @as(usize, 0);
+    if (header.len +| projected.len +| cursor_bytes +| null_bytes +| 2 > (16 * 1024 * 1024) -| out.items.len) return error.RelationalRowsOutputBudgetExceeded;
     try out.appendSlice(alloc, header);
     try out.appendSlice(alloc, projected);
+    if (null_fields) |bytes| {
+        try out.appendSlice(alloc, ",\"json_null_fields\":");
+        try out.appendSlice(alloc, bytes);
+    }
     if (entry.relational_cursor) |cursor| {
         try out.appendSlice(alloc, ",\"cursor\":");
         try appendJsonString(alloc, out, cursor);
@@ -5991,8 +6136,8 @@ pub fn remoteOptionalConfigFingerprint(value: ?[]const u8) !u64 {
 }
 
 pub fn graphMetricPhaseFromName(name: []const u8) ?graph_mod.GraphIndex.GraphMetricBuildPhase {
-    inline for (@typeInfo(graph_mod.GraphIndex.GraphMetricBuildPhase).@"enum".fields) |field| {
-        if (std.mem.eql(u8, name, field.name)) return @enumFromInt(field.value);
+    inline for (@typeInfo(graph_mod.GraphIndex.GraphMetricBuildPhase).@"enum".field_names, @typeInfo(graph_mod.GraphIndex.GraphMetricBuildPhase).@"enum".field_values) |reflected_name, field_value| {
+        if (std.mem.eql(u8, name, reflected_name)) return @fromBackingInt(field_value);
     }
     return null;
 }
@@ -6056,15 +6201,15 @@ pub fn parseRemoteGraphMetricBuildPages(
 }
 
 pub fn graphMetricBuildPageRangeKindFromName(name: []const u8) ?graph_mod.GraphIndex.GraphMetricBuildPageRangeKind {
-    inline for (@typeInfo(graph_mod.GraphIndex.GraphMetricBuildPageRangeKind).@"enum".fields) |field| {
-        if (std.mem.eql(u8, name, field.name)) return @enumFromInt(field.value);
+    inline for (@typeInfo(graph_mod.GraphIndex.GraphMetricBuildPageRangeKind).@"enum".field_names, @typeInfo(graph_mod.GraphIndex.GraphMetricBuildPageRangeKind).@"enum".field_values) |reflected_name, field_value| {
+        if (std.mem.eql(u8, name, reflected_name)) return @fromBackingInt(field_value);
     }
     return null;
 }
 
 pub fn graphMetricBuildPageStateFromName(name: []const u8) ?graph_mod.GraphIndex.GraphMetricBuildPageState {
-    inline for (@typeInfo(graph_mod.GraphIndex.GraphMetricBuildPageState).@"enum".fields) |field| {
-        if (std.mem.eql(u8, name, field.name)) return @enumFromInt(field.value);
+    inline for (@typeInfo(graph_mod.GraphIndex.GraphMetricBuildPageState).@"enum".field_names, @typeInfo(graph_mod.GraphIndex.GraphMetricBuildPageState).@"enum".field_values) |reflected_name, field_value| {
+        if (std.mem.eql(u8, name, reflected_name)) return @fromBackingInt(field_value);
     }
     return null;
 }
@@ -6241,7 +6386,7 @@ pub fn appendGraphMetricRerankField(
     try out.append(alloc, '}');
 }
 
-fn appendGraphMetricPersonalizationFields(
+pub fn appendGraphMetricPersonalizationFields(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
     first: *bool,
@@ -6317,4 +6462,48 @@ pub fn replaceOwnedCapabilityState(alloc: std.mem.Allocator, state: *[]const u8,
     const owned = try alloc.dupe(u8, replacement);
     alloc.free(state.*);
     state.* = owned;
+}
+
+test "ancestors-only hierarchy survives the internal wire re-encode without a stray group_by (issue #930)" {
+    const alloc = std.testing.allocator;
+    // Every public query - even one served entirely by a single local
+    // shard - is parsed once from the caller's JSON and then re-encoded via
+    // encodeQueryRequestWithGraphWireMode into an internal wire request that
+    // gets parsed a second time for execution. A request that only uses
+    // hierarchy.ancestors (no group_by/children) must survive that hop.
+    const body =
+        \\{
+        \\  "full_text_search": {"match": "needle", "field": "content"},
+        \\  "hierarchy": {"ancestors": {"source": {"fields": ["title", "url"]}}}
+        \\}
+    ;
+    var first = try query_contract.parseQueryRequest(alloc, null, "docs", body);
+    defer first.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.ReturnMode.member, first.req.return_mode);
+    try std.testing.expect(first.req.hierarchy_include_source);
+    try std.testing.expect(!first.req.hierarchy_include_unit);
+    try std.testing.expect(!first.req.hierarchy_source_include_all_fields);
+    try std.testing.expectEqual(@as(usize, 2), first.req.hierarchy_source_fields.len);
+    try std.testing.expectEqualStrings("title", first.req.hierarchy_source_fields[0]);
+    try std.testing.expectEqualStrings("url", first.req.hierarchy_source_fields[1]);
+
+    const encoded = try encodeQueryRequest(alloc, first.req);
+    defer alloc.free(encoded);
+    // Two distinct mistakes both corrupt this hop: omitting "hierarchy"
+    // entirely (drops hierarchy_include_source, so ancestors.source never
+    // hydrates) and unconditionally writing "group_by" once this control is
+    // forwarded at all (flips the reparsed request's return_mode from member
+    // to parent).
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"ancestors\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"group_by\"") == null);
+
+    var second = try query_contract.parseQueryRequest(alloc, null, "docs", encoded);
+    defer second.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.ReturnMode.member, second.req.return_mode);
+    try std.testing.expect(second.req.hierarchy_include_source);
+    try std.testing.expect(!second.req.hierarchy_include_unit);
+    try std.testing.expect(!second.req.hierarchy_source_include_all_fields);
+    try std.testing.expectEqual(@as(usize, 2), second.req.hierarchy_source_fields.len);
+    try std.testing.expectEqualStrings("title", second.req.hierarchy_source_fields[0]);
+    try std.testing.expectEqualStrings("url", second.req.hierarchy_source_fields[1]);
 }
