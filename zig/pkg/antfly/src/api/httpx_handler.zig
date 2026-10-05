@@ -4005,6 +4005,12 @@ pub const AntflyApiHandler = struct {
         var identity: ?AuthenticatedIdentity = null;
         defer if (identity) |*value| value.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        // Router matching accepts empty path segments. Enforce the training
+        // capability here rather than relying on the raw URI's admin prefix.
+        if (identity) |authenticated| {
+            if (!http_server_mod.permissionsAllow(authenticated.permissions, .@"*", "*", .admin))
+                return jsonErrorResponse(ctx, 403, "forbidden");
+        }
         const node = self.api_server.cfg.node_config orelse return jsonErrorResponse(ctx, 404, "training is disabled");
         const parsed_config = node.training orelse return jsonErrorResponse(ctx, 404, "training is disabled");
         if (!parsed_config.value.enabled) return jsonErrorResponse(ctx, 404, "training is disabled");
@@ -12517,17 +12523,32 @@ test "httpx antfly routes require auth and enforce admin middleware" {
     defer me_body.deinit();
     try std.testing.expectEqualStrings("admin", me_body.value.username);
 
-    const training_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/training/peers", .{base_url});
-    defer alloc.free(training_url);
-    var training_unauthorized = try getWithRetry(&client, client_io.io(), training_url, null, 20);
-    defer training_unauthorized.deinit();
-    try std.testing.expectEqual(@as(u16, 401), training_unauthorized.status.code);
-    var training_forbidden = try getWithRetry(&client, client_io.io(), training_url, &reader_headers, 20);
-    defer training_forbidden.deinit();
-    try std.testing.expectEqual(@as(u16, 403), training_forbidden.status.code);
-    var training_disabled = try getWithRetry(&client, client_io.io(), training_url, &admin_headers, 20);
-    defer training_disabled.deinit();
-    try std.testing.expectEqual(@as(u16, 404), training_disabled.status.code);
+    // Exercise real router matching: repeated slashes must not allow a
+    // restricted identity past authorization, even when training is disabled.
+    for ([_][]const u8{
+        "/db/v1/training/peers",
+        "/db/v1//training/peers",
+        "/db/v1///training/peers",
+        "/db/v1/training//peers",
+    }) |path| {
+        const training_url = try std.fmt.allocPrint(alloc, "{s}{s}", .{ base_url, path });
+        defer alloc.free(training_url);
+        for ([_]httpx.Method{ .GET, .POST }) |method| {
+            const body: ?[]const u8 = if (method == .POST) "{\"ssh_destination\":\"blocked-peer\"}" else null;
+            var training_unauthorized = try requestWithRetry(&client, client_io.io(), method, training_url, body, null, 20);
+            defer training_unauthorized.deinit();
+            try std.testing.expectEqual(@as(u16, 401), training_unauthorized.status.code);
+            for ([_][]const u8{ reader_auth, key_auth }) |restricted_auth| {
+                const headers = [_][2][]const u8{.{ "authorization", restricted_auth }};
+                var training_forbidden = try requestWithRetry(&client, client_io.io(), method, training_url, body, &headers, 20);
+                defer training_forbidden.deinit();
+                try std.testing.expectEqual(@as(u16, 403), training_forbidden.status.code);
+            }
+            var training_disabled = try requestWithRetry(&client, client_io.io(), method, training_url, body, &admin_headers, 20);
+            defer training_disabled.deinit();
+            try std.testing.expectEqual(@as(u16, 404), training_disabled.status.code);
+        }
+    }
 }
 
 test "httpx SQL rejects unsupported shapes and releases dynamic admission" {
