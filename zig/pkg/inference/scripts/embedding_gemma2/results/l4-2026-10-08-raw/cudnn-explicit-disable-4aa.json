@@ -1,0 +1,26 @@
+{
+  "binary_sha256": "4aa4dda5e08ca2ecd7bbb72dfb7e5663a9d4c76714e1fe2695ea65ca46a60076",
+  "environment": {
+    "ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_CUDNN": "0",
+    "LD_LIBRARY_PATH_prefix": "/tmp/antfly-embeddinggemma2/cudnn-native-runtime-9.24.0.43/lib",
+    "cudnn_version": 92400
+  },
+  "gates": [
+    {
+      "backend": "cuda",
+      "case": "image",
+      "cosine": 0.9999724397730955,
+      "dimensions": 768,
+      "pass": true
+    },
+    {
+      "backend": "cuda",
+      "case": "mixed_ordered",
+      "cosine": 0.9999222523949987,
+      "dimensions": 768,
+      "pass": true
+    }
+  ],
+  "pass": true,
+  "schema": "antfly.embedding_gemma2.cudnn_explicit_disable.v1"
+}

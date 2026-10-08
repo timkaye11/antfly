@@ -1,0 +1,456 @@
+{
+  "backend": "cuda",
+  "gates": [
+    {
+      "case": "document",
+      "gate": "oracle_cosine",
+      "pass": true,
+      "threshold": 0.999,
+      "value": 0.999912076353429
+    },
+    {
+      "case": "document",
+      "gate": "unit_norm",
+      "pass": true,
+      "value": 0.9999999654529245
+    },
+    {
+      "case": "document",
+      "gate": "backend_provenance",
+      "pass": true,
+      "value": "cuda"
+    },
+    {
+      "case": "document:128",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "value": 0.9999519252937223
+    },
+    {
+      "case": "document:128",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "value": 1.0
+    },
+    {
+      "case": "document:256",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "value": 0.9999321254125408
+    },
+    {
+      "case": "document:256",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "value": 1.0000000000000002
+    },
+    {
+      "case": "document:512",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "value": 0.9999168027636691
+    },
+    {
+      "case": "document:512",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "value": 1.0000000000000002
+    },
+    {
+      "case": "query",
+      "gate": "oracle_cosine",
+      "pass": true,
+      "threshold": 0.999,
+      "value": 0.9999703483453725
+    },
+    {
+      "case": "query",
+      "gate": "unit_norm",
+      "pass": true,
+      "value": 1.00000020946468
+    },
+    {
+      "case": "query",
+      "gate": "backend_provenance",
+      "pass": true,
+      "value": "cuda"
+    },
+    {
+      "case": "query:128",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "value": 0.9999786734589736
+    },
+    {
+      "case": "query:128",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "value": 1.0000000000000002
+    },
+    {
+      "case": "query:256",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "value": 0.9999719389890473
+    },
+    {
+      "case": "query:256",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "value": 0.9999999999999999
+    },
+    {
+      "case": "query:512",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "value": 0.9999722077898371
+    },
+    {
+      "case": "query:512",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "value": 1.0000000000000002
+    },
+    {
+      "case": "code_query",
+      "gate": "oracle_cosine",
+      "pass": true,
+      "threshold": 0.999,
+      "value": 0.99997256248369
+    },
+    {
+      "case": "code_query",
+      "gate": "unit_norm",
+      "pass": true,
+      "value": 1.0000001611908
+    },
+    {
+      "case": "code_query",
+      "gate": "backend_provenance",
+      "pass": true,
+      "value": "cuda"
+    },
+    {
+      "case": "code_query:128",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "value": 0.9999816964348105
+    },
+    {
+      "case": "code_query:128",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "value": 1.0
+    },
+    {
+      "case": "code_query:256",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "value": 0.999975127576439
+    },
+    {
+      "case": "code_query:256",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "value": 1.0000000000000004
+    },
+    {
+      "case": "code_query:512",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "value": 0.9999718080446924
+    },
+    {
+      "case": "code_query:512",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "value": 1.0
+    },
+    {
+      "case": "image",
+      "gate": "oracle_cosine",
+      "pass": true,
+      "threshold": 0.999,
+      "value": 0.9999666846548553
+    },
+    {
+      "case": "image",
+      "gate": "unit_norm",
+      "pass": true,
+      "value": 1.0000005301250352
+    },
+    {
+      "case": "image",
+      "gate": "backend_provenance",
+      "pass": true,
+      "value": "cuda"
+    },
+    {
+      "case": "image:128",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "value": 0.9999839908146713
+    },
+    {
+      "case": "image:128",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "value": 1.0000000000000004
+    },
+    {
+      "case": "image:256",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "value": 0.999971957400646
+    },
+    {
+      "case": "image:256",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "value": 1.0000000000000004
+    },
+    {
+      "case": "image:512",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "value": 0.9999669243672786
+    },
+    {
+      "case": "image:512",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "value": 1.0000000000000004
+    },
+    {
+      "case": "audio",
+      "gate": "oracle_cosine",
+      "pass": true,
+      "threshold": 0.999,
+      "value": 0.999852064467774
+    },
+    {
+      "case": "audio",
+      "gate": "unit_norm",
+      "pass": true,
+      "value": 0.9999999890413449
+    },
+    {
+      "case": "audio",
+      "gate": "backend_provenance",
+      "pass": true,
+      "value": "cuda"
+    },
+    {
+      "case": "audio:128",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "value": 0.9999070899106826
+    },
+    {
+      "case": "audio:128",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "value": 1.0000000000000002
+    },
+    {
+      "case": "audio:256",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "value": 0.9998626041656843
+    },
+    {
+      "case": "audio:256",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "value": 1.0
+    },
+    {
+      "case": "audio:512",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "value": 0.9998547445273869
+    },
+    {
+      "case": "audio:512",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "value": 1.0
+    },
+    {
+      "case": "mixed_ordered",
+      "gate": "oracle_cosine",
+      "pass": true,
+      "threshold": 0.999,
+      "value": 0.9999375206676818
+    },
+    {
+      "case": "mixed_ordered",
+      "gate": "unit_norm",
+      "pass": true,
+      "value": 1.0000000946255836
+    },
+    {
+      "case": "mixed_ordered",
+      "gate": "backend_provenance",
+      "pass": true,
+      "value": "cuda"
+    },
+    {
+      "case": "mixed_ordered:128",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "value": 0.999966371049362
+    },
+    {
+      "case": "mixed_ordered:128",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "value": 1.0
+    },
+    {
+      "case": "mixed_ordered:256",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "value": 0.999950202268787
+    },
+    {
+      "case": "mixed_ordered:256",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "value": 1.0
+    },
+    {
+      "case": "mixed_ordered:512",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "value": 0.999940177520133
+    },
+    {
+      "case": "mixed_ordered:512",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "value": 1.0
+    },
+    {
+      "case": "document:0",
+      "gate": "batch_single_cosine",
+      "pass": true,
+      "value": 1.0000000000000007
+    },
+    {
+      "case": "document:1",
+      "gate": "batch_single_cosine",
+      "pass": true,
+      "value": 1.0000000000000007
+    },
+    {
+      "case": "query:0",
+      "gate": "batch_single_cosine",
+      "pass": true,
+      "value": 1.0000000000000007
+    },
+    {
+      "case": "query:1",
+      "gate": "batch_single_cosine",
+      "pass": true,
+      "value": 1.0000000000000007
+    },
+    {
+      "case": "code_query:0",
+      "gate": "batch_single_cosine",
+      "pass": true,
+      "value": 0.9999999999999998
+    },
+    {
+      "case": "code_query:1",
+      "gate": "batch_single_cosine",
+      "pass": true,
+      "value": 0.9999999999999998
+    },
+    {
+      "case": "image:0",
+      "gate": "mixed_batch_single_cosine",
+      "pass": true,
+      "value": 1.0000000000000009
+    },
+    {
+      "case": "image:1",
+      "gate": "mixed_batch_single_cosine",
+      "pass": true,
+      "value": 1.0000000000000009
+    },
+    {
+      "case": "audio:0",
+      "gate": "mixed_batch_single_cosine",
+      "pass": true,
+      "value": 0.9999999999999998
+    },
+    {
+      "case": "audio:1",
+      "gate": "mixed_batch_single_cosine",
+      "pass": true,
+      "value": 0.9999999999999998
+    },
+    {
+      "case": "mixed_ordered:0",
+      "gate": "mixed_batch_single_cosine",
+      "pass": true,
+      "value": 1.000000000000001
+    },
+    {
+      "case": "mixed_ordered:1",
+      "gate": "mixed_batch_single_cosine",
+      "pass": true,
+      "value": 1.000000000000001
+    },
+    {
+      "case": "oversize",
+      "expected": "INPUT_TOO_LONG",
+      "gate": "negative_contract",
+      "pass": true,
+      "status": 400,
+      "value": "INPUT_TOO_LONG"
+    },
+    {
+      "case": "malformed_media",
+      "expected": "INVALID_REQUEST",
+      "gate": "negative_contract",
+      "pass": true,
+      "status": 400,
+      "value": "INVALID_REQUEST"
+    },
+    {
+      "case": "unknown_task",
+      "expected": "INVALID_REQUEST",
+      "gate": "negative_contract",
+      "pass": true,
+      "status": 400,
+      "value": "INVALID_REQUEST"
+    },
+    {
+      "case": "dimensions_zero",
+      "expected": "INVALID_REQUEST",
+      "gate": "negative_contract",
+      "pass": true,
+      "status": 400,
+      "value": "INVALID_REQUEST"
+    },
+    {
+      "case": "dimensions_769",
+      "expected": "INVALID_REQUEST",
+      "gate": "negative_contract",
+      "pass": true,
+      "status": 400,
+      "value": "INVALID_REQUEST"
+    }
+  ],
+  "model": "embeddinggemma-2",
+  "oracle_runtime": {
+    "device": "cuda",
+    "precision": "bf16",
+    "torch": "2.14.0+cu130",
+    "transformers": "5.19.0.dev0"
+  },
+  "pass": true,
+  "schema": "antfly.embedding_gemma2.cuda_qualification.v1"
+}

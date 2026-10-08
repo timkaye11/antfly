@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const audio_mod = @import("pipelines/audio.zig");
 const build_options = @import("build_options");
 const backends = @import("backends/backends.zig");
 const metal_runtime = if (build_options.enable_metal) @import("backends/metal_runtime.zig") else struct {
@@ -27,6 +28,9 @@ const graph_executor_stats = @import("graph/executor_stats.zig");
 const model_manager_mod = @import("server/model_manager.zig");
 const native_backend_guard = @import("native_backend_guard.zig");
 const sparse_embedding_mod = @import("pipelines/sparse_embedding.zig");
+const embedding_mod = @import("pipelines/embedding.zig");
+const gemma2_model = @import("models/embedding_gemma2.zig");
+const data_uri = @import("antfly_scraping").data_uri;
 
 const print = std.debug.print;
 
@@ -58,6 +62,10 @@ const Options = struct {
     order: std.ArrayListUnmanaged(InputRef) = .empty,
     graph_runtime_strategy: ?graph_runtime.Strategy = null,
     print_timing: bool = false,
+    combined: bool = false,
+    content_json_path: ?[]const u8 = null,
+    task_type: ?[]const u8 = null,
+    dimensions: ?usize = null,
 
     pub fn deinit(self: *Options, allocator: std.mem.Allocator) void {
         self.texts.deinit(allocator);
@@ -71,7 +79,11 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     var opts = try parseArgs(allocator, args);
     defer opts.deinit(allocator);
 
-    if (opts.order.items.len == 0) {
+    // This one-shot command owns its process and accelerator lifetime. Enable
+    // the established offline boundary for managed media tower operations.
+    @import("execution_control.zig").allowUninterruptibleInProcess();
+
+    if (opts.order.items.len == 0 and opts.content_json_path == null) {
         printUsage();
         return error.InvalidArguments;
     }
@@ -97,6 +109,11 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
     const model = try model_manager.loadFromDir(opts.model_dir);
     const loaded_model_at = std.Io.Timestamp.now(io, .awake);
+    if (model.manifest.embedding_style == .embedding_gemma2) {
+        try runEmbeddingGemma2(allocator, &stdout.interface, model, &opts);
+        return;
+    }
+    if (opts.combined or opts.content_json_path != null or opts.task_type != null or opts.dimensions != null) return error.OrderedEmbeddingContentNotSupported;
     if (model.manifest.hasCapability("sparse")) {
         if (opts.image_paths.items.len > 0 or opts.audio_paths.items.len > 0) {
             print("error: sparse embedding models only support --text inputs\n", .{});
@@ -254,6 +271,21 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Options {
             opts.graph_runtime_strategy = graph_runtime.parseStrategy(arg["--graph-runtime=".len..]) orelse return error.InvalidGraphRuntime;
         } else if (std.mem.eql(u8, arg, "--print-timing")) {
             opts.print_timing = true;
+        } else if (std.mem.eql(u8, arg, "--combined")) {
+            opts.combined = true;
+        } else if (std.mem.eql(u8, arg, "--content-json")) {
+            i += 1;
+            if (i >= args.len) return error.MissingContentJsonValue;
+            opts.content_json_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--task-type")) {
+            i += 1;
+            if (i >= args.len) return error.MissingTaskTypeValue;
+            _ = try gemma2_model.taskPrefix(args[i]);
+            opts.task_type = args[i];
+        } else if (std.mem.eql(u8, arg, "--dimensions")) {
+            i += 1;
+            if (i >= args.len) return error.MissingDimensionsValue;
+            opts.dimensions = try parseEmbeddingDimensions(args[i]);
         } else if (std.mem.eql(u8, arg, "--text")) {
             i += 1;
             if (i >= args.len) return error.MissingTextValue;
@@ -281,6 +313,172 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Options {
     return opts;
 }
 
+fn runEmbeddingGemma2(allocator: std.mem.Allocator, writer: *std.Io.Writer, model: *model_manager_mod.LoadedModel, opts: *const Options) !void {
+    if (opts.content_json_path != null and opts.order.items.len > 0) return error.ConflictingEmbeddingInputs;
+    var pipeline = model.embeddingPipeline(allocator);
+    pipeline.print_timing = opts.print_timing;
+    var dimensions = opts.dimensions;
+    if (opts.task_type) |task| pipeline.config.text_prefix = try gemma2_model.taskPrefix(task);
+    var groups = std.ArrayListUnmanaged(embedding_mod.EmbeddingContentInput).empty;
+    defer {
+        for (groups.items) |group| allocator.free(group.content);
+        groups.deinit(allocator);
+    }
+    var owned_media = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_media.items) |bytes| allocator.free(bytes);
+        owned_media.deinit(allocator);
+    }
+    var parsed: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed) |*value| value.deinit();
+    if (opts.content_json_path) |path| {
+        const json = try c_file.readFileMax(allocator, path, 64 * 1024 * 1024);
+        defer allocator.free(json);
+        parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{ .allocate = .alloc_always });
+        const root = parsed.?.value;
+        const input = if (root == .object) root.object.get("input") orelse root else root;
+        if (root == .object) {
+            if (root.object.get("dimensions")) |value| {
+                if (value != .integer or value.integer < 1 or value.integer > 768) return error.InvalidEmbeddingDimensions;
+                const body_dimensions: usize = @intCast(value.integer);
+                if (dimensions) |flag_dimensions| if (flag_dimensions != body_dimensions) return error.ConflictingEmbeddingDimensions;
+                dimensions = body_dimensions;
+            }
+            if (root.object.get("task_type")) |task| {
+                if (task != .string) return error.InvalidEmbeddingTaskType;
+                pipeline.config.text_prefix = try gemma2_model.taskPrefix(task.string);
+            }
+        }
+        if (input == .array) {
+            for (input.array.items) |item| try appendCliContentInput(allocator, &groups, &owned_media, item);
+        } else try appendCliContentInput(allocator, &groups, &owned_media, input);
+    } else {
+        try owned_media.ensureUnusedCapacity(allocator, opts.image_paths.items.len + opts.audio_paths.items.len);
+        const images = try loadFiles(allocator, opts.image_paths.items);
+        defer allocator.free(images);
+        for (images) |bytes| owned_media.appendAssumeCapacity(@constCast(bytes));
+        const audio = try loadFiles(allocator, opts.audio_paths.items);
+        defer allocator.free(audio);
+        for (audio) |bytes| owned_media.appendAssumeCapacity(@constCast(bytes));
+        const parts = try allocator.alloc(embedding_mod.EmbeddingContentPart, opts.order.items.len);
+        var parts_owned = true;
+        defer if (parts_owned) allocator.free(parts);
+        for (opts.order.items, 0..) |item, index| parts[index] = switch (item.modality) {
+            .text => .{ .text = opts.texts.items[item.index] },
+            .image => .{ .image = images[item.index] },
+            .audio => .{ .audio = .{ .bytes = audio[item.index] } },
+        };
+        if (opts.combined) {
+            try groups.append(allocator, .{ .content = parts });
+            parts_owned = false;
+        } else {
+            for (parts) |part| {
+                const single = try allocator.alloc(embedding_mod.EmbeddingContentPart, 1);
+                errdefer allocator.free(single);
+                single[0] = part;
+                try groups.append(allocator, .{ .content = single });
+            }
+        }
+    }
+    const embeddings = try pipeline.embedContent(groups.items);
+    defer freeEmbeddings(allocator, embeddings);
+    var buffer = std.ArrayListUnmanaged(u8).empty;
+    defer buffer.deinit(allocator);
+    try buffer.appendSlice(allocator, "{\"model\":");
+    try jsonEncodeString(&buffer, allocator, opts.model_dir);
+    try buffer.appendSlice(allocator, ",\"backend\":");
+    try jsonEncodeString(&buffer, allocator, @tagName(model.session.backend()));
+    try buffer.appendSlice(allocator, ",\"embeddings\":[");
+    for (embeddings, 0..) |embedding, index| {
+        if (index > 0) try buffer.append(allocator, ',');
+        const width = dimensions orelse embedding.len;
+        if (width > embedding.len) return error.InvalidEmbeddingDimensions;
+        const selected = embedding[0..width];
+        if (width < embedding.len) {
+            var squared_norm: f32 = 0;
+            for (selected) |value| squared_norm += value * value;
+            if (!std.math.isFinite(squared_norm) or squared_norm <= 0) return error.InvalidEmbeddingOutput;
+            const scale = 1.0 / @sqrt(squared_norm);
+            for (selected) |*value| value.* *= scale;
+        }
+        try appendEmbeddingJson(&buffer, allocator, selected);
+    }
+    try buffer.appendSlice(allocator, "],\"usage\":{\"prompt_tokens\":");
+    var count_buffer: [32]u8 = undefined;
+    try buffer.appendSlice(allocator, try std.fmt.bufPrint(&count_buffer, "{d}", .{pipeline.last_input_tokens}));
+    try buffer.appendSlice(allocator, "}}\n");
+    try writer.writeAll(buffer.items);
+    try writer.flush();
+}
+
+fn parseEmbeddingDimensions(value: []const u8) !usize {
+    const dimensions = std.fmt.parseInt(usize, value, 10) catch return error.InvalidEmbeddingDimensions;
+    if (dimensions == 0 or dimensions > 768) return error.InvalidEmbeddingDimensions;
+    return dimensions;
+}
+
+fn appendCliContentInput(allocator: std.mem.Allocator, groups: *std.ArrayListUnmanaged(embedding_mod.EmbeddingContentInput), owned: *std.ArrayListUnmanaged([]u8), item: std.json.Value) !void {
+    const values: []const std.json.Value = if (item == .object and item.object.contains("content")) content: {
+        const value = item.object.get("content").?;
+        if (value != .array or value.array.items.len == 0) return error.InvalidOrderedEmbeddingContent;
+        break :content value.array.items;
+    } else &.{item};
+    const parts = try allocator.alloc(embedding_mod.EmbeddingContentPart, values.len);
+    errdefer allocator.free(parts);
+    for (values, 0..) |value, index| parts[index] = try cliContentPart(allocator, owned, value);
+    try groups.append(allocator, .{ .content = parts });
+}
+
+fn cliContentPart(allocator: std.mem.Allocator, owned: *std.ArrayListUnmanaged([]u8), item: std.json.Value) !embedding_mod.EmbeddingContentPart {
+    if (item == .string) return .{ .text = item.string };
+    if (item != .object) return error.InvalidOrderedEmbeddingContent;
+    const kind = item.object.get("type") orelse return error.ContentPartTypeRequired;
+    if (kind != .string) return error.ContentPartTypeRequired;
+    if (std.mem.eql(u8, kind.string, "text")) {
+        const value = item.object.get("text") orelse return error.TextContentPartMissingText;
+        if (value != .string) return error.TextContentPartMissingText;
+        return .{ .text = value.string };
+    }
+    const media = std.mem.eql(u8, kind.string, "media");
+    const image_url = std.mem.eql(u8, kind.string, "image_url");
+    if (!media and !image_url) return error.UnsupportedMediaMimeType;
+    const value = if (media) item.object.get("data") orelse return error.MediaContentPartMissingData else item.object.get("image_url") orelse return error.ImageUrlContentPartMissingUrl;
+    const encoded = if (value == .string) value.string else if (image_url and value == .object) url: {
+        const v = value.object.get("url") orelse return error.ImageUrlContentPartMissingUrl;
+        if (v != .string) return error.ImageUrlContentPartMissingUrl;
+        break :url v.string;
+    } else return error.InvalidMediaBase64;
+    const mime_value = if (media) item.object.get("mime_type") orelse return error.MediaContentPartMissingMimeType else null;
+    if (mime_value) |mime| if (mime != .string) return error.MediaContentPartMissingMimeType;
+    var mime: []const u8 = if (mime_value) |v| v.string else "image/";
+    var uri_mime: ?[]u8 = null;
+    defer if (uri_mime) |value_mime| allocator.free(value_mime);
+    const decoded = if (data_uri.hasScheme(encoded)) uri: {
+        const value_uri = try data_uri.decodeAlloc(allocator, encoded);
+        uri_mime = value_uri.media_type;
+        if (uri_mime) |actual| {
+            if (media and !std.ascii.eqlIgnoreCase(try data_uri.mediaTypeEssence(mime), try data_uri.mediaTypeEssence(actual))) {
+                allocator.free(value_uri.data);
+                return error.MediaDataMimeTypeMismatch;
+            }
+            mime = actual;
+        }
+        break :uri value_uri.data;
+    } else raw: {
+        if (image_url) return error.NativeEmbedRequiresInlineImage;
+        const len = try data_uri.validateCanonicalStandardBase64(encoded);
+        const bytes = try allocator.alloc(u8, len);
+        errdefer allocator.free(bytes);
+        try std.base64.standard.Decoder.decode(bytes, encoded);
+        break :raw bytes;
+    };
+    errdefer allocator.free(decoded);
+    if (decoded.len == 0) return error.InvalidMediaBase64;
+    if (!std.ascii.startsWithIgnoreCase(mime, "image/") and !std.ascii.startsWithIgnoreCase(mime, "audio/")) return error.UnsupportedMediaMimeType;
+    try owned.append(allocator, decoded);
+    return if (std.ascii.startsWithIgnoreCase(mime, "image/")) .{ .image = decoded } else .{ .audio = .{ .bytes = decoded, .decode_options = .{ .format_hint = audio_mod.detectFormatFromMime(mime) } } };
+}
+
 fn loadFiles(allocator: std.mem.Allocator, paths: []const []const u8) ![][]const u8 {
     const out = try allocator.alloc([]const u8, paths.len);
     for (out) |*bytes| bytes.* = &.{};
@@ -291,14 +489,8 @@ fn loadFiles(allocator: std.mem.Allocator, paths: []const []const u8) ![][]const
         allocator.free(out);
     }
 
-    var loaded: usize = 0;
-    errdefer {
-        for (out[0..loaded]) |bytes| allocator.free(bytes);
-    }
-
     for (paths, 0..) |path, i| {
         out[i] = try c_file.readFile(allocator, path);
-        loaded += 1;
     }
     return out;
 }
@@ -496,6 +688,9 @@ fn printUsage() void {
         \\  graph-runtime controls imported static graph execution; default is environment fallback, then interpreter.
         \\  Benchmark gates: TERMITE_GRAPH_RUNTIME_FAIL_CLOSED=1, TERMITE_GRAPH_EXECUTOR_STATS=1, TERMITE_GRAPH_PARTITION_REPORT=1.
         \\  --print-timing prints phase timings to stderr.
+        \\  EmbeddingGemma 2: --task-type <task>, --dimensions 1..768 (trained: 128/256/512/768).
+        \\  --combined embeds repeated input flags as one ordered EmbeddingGemma 2 input.
+        \\  --content-json <path> accepts API input JSON with ordered content groups and inline media.
         \\
     , .{});
 }
@@ -532,6 +727,35 @@ test "parseArgs preserves multimodal input order" {
     try std.testing.expectEqual(Modality.audio, opts.order.items[2].modality);
     try std.testing.expectEqual(Modality.text, opts.order.items[3].modality);
     try std.testing.expectEqual(@as(usize, 1), opts.order.items[3].index);
+}
+
+test "EmbeddingGemma 2 CLI parses ordered content tasks and MRL dimensions" {
+    var opts = try parseArgs(std.testing.allocator, &.{ "/tmp/model", "--combined", "--task-type", "CODE_RETRIEVAL", "--dimensions", "128", "--text", "find a sort function" });
+    defer opts.deinit(std.testing.allocator);
+    try std.testing.expect(opts.combined);
+    try std.testing.expectEqualStrings("CODE_RETRIEVAL", opts.task_type.?);
+    try std.testing.expectEqual(@as(usize, 128), opts.dimensions.?);
+    try std.testing.expectError(error.InvalidEmbeddingDimensions, parseEmbeddingDimensions("0"));
+    try std.testing.expectError(error.InvalidEmbeddingDimensions, parseEmbeddingDimensions("769"));
+    try std.testing.expectError(error.InvalidEmbeddingDimensions, parseEmbeddingDimensions("-1"));
+}
+
+test "EmbeddingGemma 2 CLI content groups preserve caller order and reject nesting" {
+    const allocator = std.testing.allocator;
+    var json = try std.json.parseFromSlice(std.json.Value, allocator, "{\"content\":[{\"type\":\"text\",\"text\":\"hello\"},\" world\"]}", .{});
+    defer json.deinit();
+    var groups = std.ArrayListUnmanaged(embedding_mod.EmbeddingContentInput).empty;
+    defer {
+        for (groups.items) |group| allocator.free(group.content);
+        groups.deinit(allocator);
+    }
+    var owned = std.ArrayListUnmanaged([]u8).empty;
+    defer owned.deinit(allocator);
+    try appendCliContentInput(allocator, &groups, &owned, json.value);
+    try std.testing.expectEqual(@as(usize, 1), groups.items.len);
+    try std.testing.expectEqualStrings("hello", groups.items[0].content[0].text);
+    try std.testing.expectEqualStrings(" world", groups.items[0].content[1].text);
+    try std.testing.expectError(error.ContentPartTypeRequired, cliContentPart(allocator, &owned, json.value));
 }
 
 test "embed auto backend keeps external onnx runtime opt-in" {

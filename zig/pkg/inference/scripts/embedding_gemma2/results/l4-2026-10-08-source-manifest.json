@@ -1,0 +1,622 @@
+{
+  "base_commit": "ac2d3779ee7052621435a4e14922256e2b5b0735",
+  "captured_utc": "2026-10-08T02:29:26.412347+00:00",
+  "files": [
+    {
+      "bytes": 4006336,
+      "path": "go/pkg/sdk/oapi/client.gen.go",
+      "sha256": "8f0ce2fdb467657059b8c8c1171f77de8ee4664b3f755f2b85b84294cdc6fb12"
+    },
+    {
+      "bytes": 1317695,
+      "path": "openapi.yaml",
+      "sha256": "52f5b9e4dbe83593dbdd0dd198872c333c580dc3f1f55c9d3a9c39b6608bd6bc"
+    },
+    {
+      "bytes": 8459,
+      "path": "py/packages/sdk/fix_generated_client.py",
+      "sha256": "cfe8e2f062ffb56d3d2484ad58740aaec660cdaf1c56ab22a12fe156a00ac2a5"
+    },
+    {
+      "bytes": 137569,
+      "path": "py/packages/sdk/src/antfly/client_generated/models/__init__.py",
+      "sha256": "df38e7eedab4be30c82346866e2aaf03ee62703229d102fd28ab2dec9540e8bb"
+    },
+    {
+      "bytes": 12425,
+      "path": "py/packages/sdk/src/antfly/client_generated/models/inference_embed_request.py",
+      "sha256": "0e28a25328a70826716fd1106051b3977706a94bdfcd72e13aa5ab10de2c26ff"
+    },
+    {
+      "bytes": 551,
+      "path": "py/packages/sdk/src/antfly/client_generated/models/inference_embed_request_task_type.py",
+      "sha256": "a17259bd750159e66f252a1ff8f8be094f1a0d1555252b0eb5a418996a7804ac"
+    },
+    {
+      "bytes": 5985,
+      "path": "py/packages/sdk/src/antfly/client_generated/models/inference_embed_response.py",
+      "sha256": "4139d690d0007bebef0791a74fd5460c3981d8ac36bfebb7c397a634c4bec3d9"
+    },
+    {
+      "bytes": 3585,
+      "path": "py/packages/sdk/src/antfly/client_generated/models/inference_embedding_content_input.py",
+      "sha256": "a1a7210bf0b9a86cf35d47c11a8a4bc9d6de79ae8cf156679ba19fe92122d1b6"
+    },
+    {
+      "bytes": 1964,
+      "path": "py/packages/sdk/tests/test_embedding_input_union.py",
+      "sha256": "e1265c24218a9d88351a87d541acfe9167fb3c17672dde79a5141fe57dcfc6cd"
+    },
+    {
+      "bytes": 4412,
+      "path": "py/packages/sdk/tests/test_fix_generated_client.py",
+      "sha256": "0ecb776405806b1d606f199593e4afbb82402139652b37d456bc18e79a04c0dc"
+    },
+    {
+      "bytes": 1317695,
+      "path": "rs/crates/sdk/openapi.yaml",
+      "sha256": "52f5b9e4dbe83593dbdd0dd198872c333c580dc3f1f55c9d3a9c39b6608bd6bc"
+    },
+    {
+      "bytes": 158785,
+      "path": "specs/openapi/inference/api.yaml",
+      "sha256": "6c6502be87514894a391bfb96c2494b3a3abeeaf734f6402cf0c72a3231814b4"
+    },
+    {
+      "bytes": 1277687,
+      "path": "ts/packages/sdk/src/public-api.d.ts",
+      "sha256": "a0b4e5511ec1fb4576e1ab05a381b4a8057e4d6ae2b1b6c0cf8a8c93e72eb21b"
+    },
+    {
+      "bytes": 36774,
+      "path": "zig/lib/image/src/processing.zig",
+      "sha256": "2a4132099f8a975a213b60242a0c9a6cada4c98a6ca5cab3154d5fb1c9e3e89c"
+    },
+    {
+      "bytes": 127238,
+      "path": "zig/pkg/inference/build.zig",
+      "sha256": "5d063290ebf4740a16b1f420f2af9446629954513bd6ab41aa82d16da0f89888"
+    },
+    {
+      "bytes": 5154,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/PRODUCTION_REVIEW.md",
+      "sha256": "97ba8401a75fb7867b0aa980ae78aca13f4f75e7168b79f6b71ac6643c65ce1a"
+    },
+    {
+      "bytes": 22490,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/README.md",
+      "sha256": "f80a67486b32f15326335eee0f99fc360215c4c3ddf251e9ab2df1a5516c9f4a"
+    },
+    {
+      "bytes": 7772,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/audio_ops_differential.cu",
+      "sha256": "011f2502871b334a5fbe3a7c5dc0addffcc57356e40438020d48abed141859ff"
+    },
+    {
+      "bytes": 11442,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/benchmark_paired.py",
+      "sha256": "b6ea6af96857ebed1f9898b425d054c98f072d82b8ab0310842ef55cab88a837"
+    },
+    {
+      "bytes": 944,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/build_audio_ops_differential.sh",
+      "sha256": "b6069baf896adb1b2eafb66c189db5df3fce60ba742d8e8cbf815c2a54608747"
+    },
+    {
+      "bytes": 953,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/build_flash_differential.sh",
+      "sha256": "6a275737c6dfb2787c6adff8c0b1ec9abf3a43d6742c2acada980837f9eb766c"
+    },
+    {
+      "bytes": 951,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/build_vision_attention_differential.sh",
+      "sha256": "8d416323bc61212255bc09a8439cc4cdddd8e0598c7003f6dfbdd0dd053c4c1b"
+    },
+    {
+      "bytes": 3862,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/capture_official_audio.py",
+      "sha256": "5b465287856e71607f148535bcaa4f5076ec9cf9ae1335ea707995bc88d27084"
+    },
+    {
+      "bytes": 5692,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/capture_official_intermediates.py",
+      "sha256": "4e079e4e5b2b2c812330b6753118e2aac75d96085c52e223639ca497cd4054bf"
+    },
+    {
+      "bytes": 4078,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/contract.py",
+      "sha256": "4e27ea2a9e6b7c0c0fb9aa8414e70ebb9b34b02ce5e64fae130a07d00ee294fd"
+    },
+    {
+      "bytes": 10542,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/cudnn_sdpa_backend_proof.c",
+      "sha256": "7a22a3dd40d5027412354a5b5bbc6919f3fb97ab9fe294fccaee2d53c3410bc3"
+    },
+    {
+      "bytes": 3264,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/cudnn_sdpa_differential.py",
+      "sha256": "8610c39f0fac1717a70658fd5f06193aa5792b32cda02f49eac8a76b63c7d57d"
+    },
+    {
+      "bytes": 11444,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/cudnn_text_gqa_backend_proof.c",
+      "sha256": "05935a6107e6006003cffcd8f7674b6c84ba9acefe3b4fc0b7c1fa534b8b4a84"
+    },
+    {
+      "bytes": 3847,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/cudnn_text_gqa_differential.py",
+      "sha256": "43f8feb556a6b3425f64799b89ad7ffad0f00d47ae27de90a3283976ea90d4de"
+    },
+    {
+      "bytes": 17321,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/cudnn_text_local_band_backend_proof.c",
+      "sha256": "b2ffe0b18a9759da6d4e11b94396cf6606f383ac69ccec554fcfe7fbd57f5d50"
+    },
+    {
+      "bytes": 8689,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/cudnn_text_local_band_differential.py",
+      "sha256": "44b155b7e3643a5971ef1a869ebc15d9222d90b98acec6c236a7e30c855298f8"
+    },
+    {
+      "bytes": 14945,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/flash_differential.cu",
+      "sha256": "ff395ff6c653269018810e5d86bdc673da4b1f49e9f51600dd638b0f0a1cebcf"
+    },
+    {
+      "bytes": 6891,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/flash_differential.py",
+      "sha256": "506cf605eeb8ac0efc0fb122cc7f33beb7c1f2112eccb4123cd330b69593fb6c"
+    },
+    {
+      "bytes": 8356,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/oracle.py",
+      "sha256": "67a4c860704eb0759c01061af5cd37f7f545c860549912ff4514284318450ced"
+    },
+    {
+      "bytes": 13298,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/pytorch_worker.py",
+      "sha256": "a9f8791704fd624afe621eddb118b9895719936786c5ea0b1a032832e338f498"
+    },
+    {
+      "bytes": 3244,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/qualify_audio_matrix.py",
+      "sha256": "72de315906f945fe3c379c632518c0846d29d4e8f7411678545f3077c5b89f6e"
+    },
+    {
+      "bytes": 5173,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/qualify_cli.py",
+      "sha256": "0498e6b01040fd77ec292dd2a509037882168d841e1057ae4aa3f0dfebf54d36"
+    },
+    {
+      "bytes": 6065,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/qualify_concurrency_endpoint.py",
+      "sha256": "78e34d637a89500c414b6ff71e60a295ac29b8614a5d54856cfd020f5beb2c7e"
+    },
+    {
+      "bytes": 8490,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/qualify_contract_endpoint.py",
+      "sha256": "a8ca1e40d302ae07a21f570b9b03e1ec8f21c044b13a5bf2759dc2c44a55ecfe"
+    },
+    {
+      "bytes": 9336,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/qualify_endpoint.py",
+      "sha256": "e5a27593a60f300f148841e7fcd335813339eb929961895ac152abad89bc203f"
+    },
+    {
+      "bytes": 4777,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/qualify_extended_matrix.py",
+      "sha256": "36def16738179e0dc9bfc153d8c58d9c031905cc180bd08def39b632b2d486d7"
+    },
+    {
+      "bytes": 3693,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/qualify_input_cap_endpoint.py",
+      "sha256": "977df784316668447397f5d93d066658c75c4f968782a52240e21d6ae0ee3bad"
+    },
+    {
+      "bytes": 5538,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/qualify_large_batch_endpoint.py",
+      "sha256": "0d68dc70cbbcfdeef57fb944fbcd6ce61103c547bbdcdcf006cf9d9814f835be"
+    },
+    {
+      "bytes": 571,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/requirements.txt",
+      "sha256": "75c900a9990b6ade70c6ba6adab747e5a057473fc220a45bc40db614fbb09869"
+    },
+    {
+      "bytes": 1179,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-07-attention-production-dispatch.json",
+      "sha256": "d056384dcaa2f5123343d541a203727e70d9be3e7d3ccabc48153c0b2ac4bec5"
+    },
+    {
+      "bytes": 3503,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-07-cudnn-sdpa.json",
+      "sha256": "72ab00193d4b2f3a034bec2abf7be78c1edcf44edcd6bd84ba47beea195a4b19"
+    },
+    {
+      "bytes": 7010,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-07-raw/paired-audio.json",
+      "sha256": "15170bcd8ab4c9778b073984e57b55ddc0b2a5e6bf2617034ab79315f42e2b4a"
+    },
+    {
+      "bytes": 7126,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-07-raw/paired-b1-s128-compiled.json",
+      "sha256": "520bbd4685ff136a8f185d5a61a392959c53e587de8a2b0b153d438fa09475d3"
+    },
+    {
+      "bytes": 7008,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-07-raw/paired-b1-s8192.json",
+      "sha256": "49aebbb561a17d56b41b5cef18776b2312a76e6b9ede2db022af8abc520ce6ff"
+    },
+    {
+      "bytes": 7465,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-07-raw/paired-b32-s2048.json",
+      "sha256": "d1f7d902a0fea92181f74c8db0818f0d5a798c49ee5271b7fc92ac09255b2a23"
+    },
+    {
+      "bytes": 7150,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-07-raw/paired-b8-s512.json",
+      "sha256": "46428a6da560e863a6ec547600d2a1cfeccd14cdb83cbdd41d310b744569b4ee"
+    },
+    {
+      "bytes": 7125,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-07-raw/paired-image.json",
+      "sha256": "c76c974adfb437db28648ec634d5b62ade706d4c50298b8f9fe3f91e3ea2bccc"
+    },
+    {
+      "bytes": 7082,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-07-raw/paired-mixed.json",
+      "sha256": "d788fce47d13d541349287f0d8992dbac1b6b3979cd0a48cd5ae9a9975076e70"
+    },
+    {
+      "bytes": 880,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-07-shared-softmax.json",
+      "sha256": "675b390c3432330b5ed8a3b77c28650eb6b49ebbcbfe9b7206d146ccd8cec10a"
+    },
+    {
+      "bytes": 1296,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-07-vision-lt.json",
+      "sha256": "b0a652b7c3d2d74541583e35d3b9367289372a7134f6b6277bd20d944fabfe20"
+    },
+    {
+      "bytes": 17802,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-07.json",
+      "sha256": "ca3485d5a1af011ec87d19b54757c863b7669276fb2516a5a3d16a97f000881f"
+    },
+    {
+      "bytes": 2115,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-08-audio-ops.json",
+      "sha256": "e343f1cc9bda3329ba66a3f9f36261b162d1ff1bbb5932251ced2350422721fa"
+    },
+    {
+      "bytes": 2944,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-08-audio-profile.json",
+      "sha256": "cce8e20f149578014467264a50e10d4db2aafc3e9fdc314a7561e93e9d5334f1"
+    },
+    {
+      "bytes": 1491,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-08-b32-s2048-profile.json",
+      "sha256": "1bf53cd3f15e059d9a76a8ead00044dc897d5108bc772aab33b8ebee5ce7aa5a"
+    },
+    {
+      "bytes": 1844,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-08-c2b-diagnostic.json",
+      "sha256": "276f5ecc0651d01cedd5ea4a5ec00c1722d176176ec797deb45f20c59abf4fa4"
+    },
+    {
+      "bytes": 965,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-08-cudnn-text-gqa.json",
+      "sha256": "afe9b0ebcafeaa5f56f73f98774870c0e0ff8f5fe7c93e178e410eca52c1b448"
+    },
+    {
+      "bytes": 3913,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-08-cudnn-text-local-band.json",
+      "sha256": "f0bf16885cd8f62e02f0c6ef301e6db31aa29a6fb1ed8f1e90f31835f12d1b19"
+    },
+    {
+      "bytes": 1610,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-08-intermediate-image.json",
+      "sha256": "1b0d8dece00cfbd18b1510e8f29e72028059a9d4bac49e4a633e7abd7991cc18"
+    },
+    {
+      "bytes": 1472,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-08-pytorch-compiled-text.json",
+      "sha256": "08318c1dd605e5d59dfe7b7b1e63741dd015ecbfb1925716bfb96df13acc9a4a"
+    },
+    {
+      "bytes": 6921,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-08-raw/concurrency-final-4aa4dda.json",
+      "sha256": "b7a64439f640f81561bfd9770fb2e56a8a821121a3604081f430c93ea71d92bb"
+    },
+    {
+      "bytes": 3158,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-08-raw/contracts-final-4aa4dda.json",
+      "sha256": "ddcfc3f8b8efb534e91d4e0834ce2777f654839bb9ee3360fd2e7e9de8d2e0f0"
+    },
+    {
+      "bytes": 7134,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-08-raw/formal-final-b1s128.json",
+      "sha256": "69dc2af7a0a1ec76e47c30faee87f7931ac6c5ce7b3255f431219a93103abcbc"
+    },
+    {
+      "bytes": 7048,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-08-raw/formal-final-b8s512.json",
+      "sha256": "2c777fc0bd28f3a7fef9d94a7b39a13b9dd1969d5692e251c9be0c44bd7fc0d9"
+    },
+    {
+      "bytes": 6974,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-08-raw/formal-final-mixed_ordered-rerun.json",
+      "sha256": "56fa5ef8ff64e66bf7a9c7a484d04d4afba01b3d4cb1496d6297d39e3e07dfc2"
+    },
+    {
+      "bytes": 1389,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-08-raw/large-final-4aa4dda.json",
+      "sha256": "41051b935c096721e1c0be494b6d4ca84e9e09e5295710f023b7b62f1e0f1d17"
+    },
+    {
+      "bytes": 2469,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-08-raw/quick-final-audio.json",
+      "sha256": "d5d83e1415073e7dbc667f23a17fa6c230d4a5db3d7cdb8061b2d9292e6707b1"
+    },
+    {
+      "bytes": 2501,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-08-raw/quick-final-b1s128.json",
+      "sha256": "a9dbb3855e25d36cead658fa5c9495d25f3048f41adf26e854ad264eab7ed4a9"
+    },
+    {
+      "bytes": 2881,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-08-raw/quick-final-b32s2048.json",
+      "sha256": "a222bfb14737febe9398e90f4c6bc69188593a5ce284ab67d8d7b260f8df8f8c"
+    },
+    {
+      "bytes": 2563,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-08-raw/quick-final-b8s512.json",
+      "sha256": "1f26db7bd660bea6148cb8801d9885dc2bc1c858202a20906ad747fffda5349d"
+    },
+    {
+      "bytes": 2468,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-08-raw/quick-final-image.json",
+      "sha256": "3f422a99ac7da5639b3c3cba2737da423c9b5e9fe65517f5a0031b8029a86488"
+    },
+    {
+      "bytes": 2469,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/results/l4-2026-10-08-raw/quick-final-mixed_ordered.json",
+      "sha256": "21d5dc32e415d275e28e2bdba2eaa8eafbf65a0da6716b47bf200013fe89f90c"
+    },
+    {
+      "bytes": 12229,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/select_pytorch_baseline.py",
+      "sha256": "368628d49a6ff56313bd8ac364ec4438970359e2d7c525f1b209acb391e7c723"
+    },
+    {
+      "bytes": 2935,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/test_benchmark_paired.py",
+      "sha256": "3ca342c9655d6230204362ca37ab4435e3353d8b1ff911d33133af6682183369"
+    },
+    {
+      "bytes": 2144,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/test_contract.py",
+      "sha256": "1740e59628ff8d9a4ba10a57cf0ef10f8a1b638b7060af1e439510d2f0f40131"
+    },
+    {
+      "bytes": 3396,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/test_multimodal_worker.py",
+      "sha256": "856a7463601cf8757be80971b6bd9e44c9ea6d3a9cf2beadacb9a077872a690b"
+    },
+    {
+      "bytes": 1900,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/test_pytorch_worker.py",
+      "sha256": "4b3b9b9ac5d28be1c64fe6b7ad0521e6a6309bc821bfa10fce786d0795ea3799"
+    },
+    {
+      "bytes": 2405,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/test_workloads.py",
+      "sha256": "a1f975340a732ee3ecf0a7a6bee19d4acc971b4a6db4dfcc27862db527debf3c"
+    },
+    {
+      "bytes": 13509,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/vision_attention_differential.cu",
+      "sha256": "ac0644843641276e58875e2ba91f33d5ec006713d96ccab84e63340c5fb6c65d"
+    },
+    {
+      "bytes": 4946,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/vision_attention_differential.py",
+      "sha256": "ee55f9ef547e96214b39ffb0c1e9ce60ffa721a8539c6840687406b0c3ed856e"
+    },
+    {
+      "bytes": 19003,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/workloads.json",
+      "sha256": "b9565db68fe18f68fcb0cdf237c49752415dde8a8f3b83963a257d8b49f26cf2"
+    },
+    {
+      "bytes": 4973,
+      "path": "zig/pkg/inference/scripts/embedding_gemma2/workloads.py",
+      "sha256": "7692b18ef0b06a99353b9ef50233830ceaeca8cbbbb68ce599c74a58848cdf69"
+    },
+    {
+      "bytes": 20564,
+      "path": "zig/pkg/inference/scripts/regen-cuda-artifacts.sh",
+      "sha256": "b0f529756488eeb6b80f406313ff60fd31a6e76ba8e0a9672244f0618eb25802"
+    },
+    {
+      "bytes": 7251,
+      "path": "zig/pkg/inference/src/api/generated/inference_api/root.zig",
+      "sha256": "ce75a6b52348daaad9063dba18d771138a83d5c963d90f15482957313a8acf8f"
+    },
+    {
+      "bytes": 193381,
+      "path": "zig/pkg/inference/src/api/generated/inference_api/types.zig",
+      "sha256": "d7aa60f19d03d88fb770be2f07a59c7ac2d0cc820f933f5ea326e1f4228b828c"
+    },
+    {
+      "bytes": 24027,
+      "path": "zig/pkg/inference/src/architectures/embedding_gemma2.zig",
+      "sha256": "8b06658c78ffa88e5ce3af17ec4187d011fa7f8d54b7b693a7e3d8524148012b"
+    },
+    {
+      "bytes": 7014,
+      "path": "zig/pkg/inference/src/architectures/embedding_gemma2_resample.zig",
+      "sha256": "eace62eecfe9ed9e8f12ee6af5471fad1ebe264267eef69d905cd88bd5939579"
+    },
+    {
+      "bytes": 9417,
+      "path": "zig/pkg/inference/src/architectures/gemma4_hf_weights.zig",
+      "sha256": "c44c092426af378696da0b566dc6c7fcafc826aabc189a1607413b4dfd55b97b"
+    },
+    {
+      "bytes": 6060,
+      "path": "zig/pkg/inference/src/architectures/gemma4_mel_sparse.zig",
+      "sha256": "7f63610271422857b3d448701688ac5caf3ac8a86c89c8fbd660aa81984489d0"
+    },
+    {
+      "bytes": 169583,
+      "path": "zig/pkg/inference/src/architectures/gemma4_projector.zig",
+      "sha256": "5b45cc79078a2864225c24665c08294fe178b933863280be040df014a9f0b619"
+    },
+    {
+      "bytes": 516496,
+      "path": "zig/pkg/inference/src/architectures/session_factory.zig",
+      "sha256": "e627bbe853dcc5e1039360dd4f1753a9c90fc930ccb6046558944fd43879d38e"
+    },
+    {
+      "bytes": 4255234,
+      "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+      "sha256": "a8cc0e112b5a259de577ec5098ca6d54c4709a26935a7e29ea66a6d607372811"
+    },
+    {
+      "bytes": 84799,
+      "path": "zig/pkg/inference/src/backends/session.zig",
+      "sha256": "e7c5f8e236c0ea880bc215ae0286aa989ae853f5f96f23b85d2429c11f00384d"
+    },
+    {
+      "bytes": 16231,
+      "path": "zig/pkg/inference/src/inference.zig",
+      "sha256": "5d269f37892d03dd7778dc7e4b5263a04d957c336441214893bbe6e2f5f70dee"
+    },
+    {
+      "bytes": 21765,
+      "path": "zig/pkg/inference/src/models/embedding_gemma2.zig",
+      "sha256": "1c6489471a9037b525d28bb0c10498f5de4e93eabab2245563cc974a1279075d"
+    },
+    {
+      "bytes": 348474,
+      "path": "zig/pkg/inference/src/models/manifest.zig",
+      "sha256": "a0ae9f1bcfb8e128653cedb6a5fe92be3772c19b1e4895e67ea4cca1b842a68b"
+    },
+    {
+      "bytes": 2147,
+      "path": "zig/pkg/inference/src/models/models.zig",
+      "sha256": "b98fe05df0fa8dcd8c08a0f20d7aeb8dcd5aead4863291655d4f782323e880ff"
+    },
+    {
+      "bytes": 37836,
+      "path": "zig/pkg/inference/src/native_embed.zig",
+      "sha256": "89cea7388e51c1d2bac49ab828d5464a5525fd1dcb23c8f33fa0019978dae49b"
+    },
+    {
+      "bytes": 963245,
+      "path": "zig/pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels.cu",
+      "sha256": "4334535fc76c80161c11c836c76a9705455a5b7d0358f26a4bc38b5a2a350e16"
+    },
+    {
+      "bytes": 49284528,
+      "path": "zig/pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels.fatbin",
+      "sha256": "34810af057ad753ba8ee62c84b3e21cf56598f93f9c88f4ff37fead0ccea3ae0"
+    },
+    {
+      "bytes": 10359409,
+      "path": "zig/pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels.ptx",
+      "sha256": "1da22ed0dfad2a509beff3d7c0b5676291354e4cba7cc0a09a65e610f92188dd"
+    },
+    {
+      "bytes": 5633216,
+      "path": "zig/pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels_sm89.cubin",
+      "sha256": "c790628287abe8584f3d4f1edc4ed5bec1e01eed50685546033b4bf202c91046"
+    },
+    {
+      "bytes": 65708,
+      "path": "zig/pkg/inference/src/ops/cuda/cublaslt.zig",
+      "sha256": "ef217fb8a8f91b18856a9f4ef305babf30e61425bc39661a02fd9f0e3da4f352"
+    },
+    {
+      "bytes": 1136136,
+      "path": "zig/pkg/inference/src/ops/cuda/cuda_compute.zig",
+      "sha256": "7026151bdaea50ef0409760cdd0e9b2a45aaa8b61f71b4513a6a6436568eb303"
+    },
+    {
+      "bytes": 20970,
+      "path": "zig/pkg/inference/src/ops/cuda/cudnn_sdpa.zig",
+      "sha256": "79c50710131a85c8c121516a05c873e440348be2b5b7d48c72da6718c4f6450c"
+    },
+    {
+      "bytes": 7749,
+      "path": "zig/pkg/inference/src/ops/cuda/cudnn_sdpa_smoke.zig",
+      "sha256": "05b800947a7560fe7d02f7bc1fac16cb276625e4084e2a613cea980e9b40d6c2"
+    },
+    {
+      "bytes": 14559,
+      "path": "zig/pkg/inference/src/ops/cuda/dense_lt.zig",
+      "sha256": "3d88b9ba4c4ce3bf47bfc0e1dd51021a23fa7077ef2799c0ff34bc4990cbfc9b"
+    },
+    {
+      "bytes": 25939,
+      "path": "zig/pkg/inference/src/ops/cuda/embedding_gemma2.zig",
+      "sha256": "a1e70b0d7ee3299d84299f553d1c24af01a651e319c80c877788fb5cdd0afa0c"
+    },
+    {
+      "bytes": 5173,
+      "path": "zig/pkg/inference/src/ops/cuda/embedding_gemma2_vision.zig",
+      "sha256": "f47df7d41dd5fc7cc79870ce02da982ec2d5bce7a245ddcfc87cedddb5f9517d"
+    },
+    {
+      "bytes": 26328,
+      "path": "zig/pkg/inference/src/ops/cuda/kernels/embedding_gemma2.cuh",
+      "sha256": "599c42bb6e2770f50a4d55b7b20301f63036cfbf1b6895d837e70f1f04000689"
+    },
+    {
+      "bytes": 283963,
+      "path": "zig/pkg/inference/src/ops/ops.zig",
+      "sha256": "1858dd5759ae5b7cff30ea7cec11023aa5bb22967a2a15aef7809191f3b265e5"
+    },
+    {
+      "bytes": 174345,
+      "path": "zig/pkg/inference/src/pipelines/embedding.zig",
+      "sha256": "f0cd54fb3aa2a24550211013b1879f7eed979c3db9e97849dc59b379c72ccc89"
+    },
+    {
+      "bytes": 19774,
+      "path": "zig/pkg/inference/src/pipelines/embedding_gemma2_content.zig",
+      "sha256": "d880f565467bbad105b278aa48cb44eb532d07b29383b655364526691c4c4428"
+    },
+    {
+      "bytes": 207923,
+      "path": "zig/pkg/inference/src/registry/download.zig",
+      "sha256": "b478d91cb792a533c91cf71b48971b5f6770e6e0dfaface04cda816d3cdd228b"
+    },
+    {
+      "bytes": 7007,
+      "path": "zig/pkg/inference/src/registry/embedding_gemma2_catalog.zig",
+      "sha256": "e7881db3b5c8f8f0dca74d3a9453becdb6d21ae727c9301bef99001717131ded"
+    },
+    {
+      "bytes": 115603,
+      "path": "zig/pkg/inference/src/registry/registry.zig",
+      "sha256": "5dbfc1d118d292b5193c3adc43daaed71c1e38d261ab049a046746d8c9e47a69"
+    },
+    {
+      "bytes": 793,
+      "path": "zig/pkg/inference/src/registry_test_root.zig",
+      "sha256": "8b219671b385584f1e4079384c34766f9f13c4a072305dcf7f0efded9c5ec923"
+    },
+    {
+      "bytes": 571121,
+      "path": "zig/pkg/inference/src/server/model_manager.zig",
+      "sha256": "477b54291a44b83a6070b5d0bdb593d55b8a0da56291c3c517f058e8b692a74b"
+    },
+    {
+      "bytes": 1652907,
+      "path": "zig/pkg/inference/src/server/server.zig",
+      "sha256": "04aea21acbfc621ef5365878ea7bf0fc6a32ea965a0349f5ebaff1d93a2e5a49"
+    }
+  ],
+  "schema": "antfly.embedding_gemma2.build_source.v1"
+}

@@ -22,6 +22,13 @@ const driver_mod = @import("driver.zig");
 const execution_plan = @import("execution_plan.zig");
 const kernels_mod = @import("kernels.zig");
 const cublaslt_mod = @import("cublaslt.zig");
+const cudnn_sdpa_mod = @import("cudnn_sdpa.zig");
+const cuda_artifact = @import("artifact.zig");
+const embedding_gemma2_cuda = @import("embedding_gemma2.zig");
+const embedding_gemma2_vision = @import("embedding_gemma2_vision.zig");
+const embedding_gemma2_model = @import("../../models/embedding_gemma2.zig");
+const embedding_gemma2_arch = @import("../../architectures/embedding_gemma2.zig");
+const InferenceExecutionControl = @import("../../execution_control.zig").InferenceExecutionControl;
 const scratch_mod = @import("scratch.zig");
 const weight_source_mod = @import("../../models/weight_source.zig");
 const tensor_store_mod = @import("../../models/tensor_store.zig");
@@ -78,6 +85,11 @@ pub const CudaTensor = struct {
     owns_training_upload_host: bool = true,
     owns_shape: bool = true,
     owned_by_tensor: bool = true,
+};
+
+const ImmutableScalarCacheEntry = union(enum) {
+    missing,
+    value: f32,
 };
 
 pub const CudaTensorCoreQuantLayout = enum {
@@ -444,8 +456,34 @@ pub const CapabilityProfile = enum {
     gemma4,
     gemma4_training,
     qwen3_embedding,
+    embedding_gemma2,
     qwen3_vl_generation,
 };
+
+/// Device-only gate that runs before model weights are mapped or uploaded.
+/// Library and symbol availability remain part of `requireProfile` after
+/// CudaCompute initialization; this rejects architectures whose numeric path
+/// cannot run on the selected GPU at all.
+pub fn profileSupportsDevice(profile: CapabilityProfile, compute_major: i32, compute_minor: i32) bool {
+    _ = compute_minor;
+    return switch (profile) {
+        .embedding_gemma2 => compute_major >= 8,
+        else => true,
+    };
+}
+
+pub fn preflightProfileDevice(profile: CapabilityProfile) !void {
+    const info = try context_mod.probeDefault();
+    if (!profileSupportsDevice(profile, info.compute_major, info.compute_minor))
+        return error.CudaBf16Unsupported;
+}
+
+test "EmbeddingGemma2 CUDA profile rejects pre-Ampere devices before loading weights" {
+    try std.testing.expect(!profileSupportsDevice(.embedding_gemma2, 7, 5));
+    try std.testing.expect(profileSupportsDevice(.embedding_gemma2, 8, 0));
+    try std.testing.expect(profileSupportsDevice(.embedding_gemma2, 8, 9));
+    try std.testing.expect(profileSupportsDevice(.gemma4, 7, 5));
+}
 
 pub const KernelJitRouteScope = kernels_mod.JitRouteScope;
 
@@ -457,7 +495,7 @@ fn jitModelProfile(profile: CapabilityProfile) kernels_mod.JitModelProfile {
         .deberta_reranker => .deberta_reranker,
         .gliner2, .gliner2_training => .gliner2,
         .florence2 => .florence2,
-        .gemma4, .gemma4_training => .gemma4,
+        .gemma4, .gemma4_training, .embedding_gemma2 => .gemma4,
         .qwen3_embedding => .qwen3_embedding,
         .qwen3_vl_generation => .qwen3_vl_generation,
     };
@@ -2133,9 +2171,11 @@ pub const CudaCompute = struct {
     /// Exact reuse avoids pinning a large cached allocation to a scalar.
     resident_training_cache: bool = false,
     allocator: std.mem.Allocator,
+    capability_profile: ?CapabilityProfile = null,
     ctx: context_mod.CudaContext,
     kernels: kernels_mod.KernelModule,
     resident_weights: std.StringHashMapUnmanaged(CudaTensor) = .{},
+    immutable_scalar_cache: std.StringHashMapUnmanaged(ImmutableScalarCacheEntry) = .{},
     /// Frozen load-time contract for the qualified resident Gemma 4 A4B path.
     /// A non-null value is fail-closed: generic MoE fallback is not permitted.
     a4b_inference: ?backend_contracts.A4bInferenceConfig = null,
@@ -2221,11 +2261,22 @@ pub const CudaCompute = struct {
     // avoids ten independent grow/synchronize cycles and makes the complete
     // retained workspace visible to admission before any CUDA allocation.
     deberta_materialized_scratch: scratch_mod.DeviceScratch = .{},
+    // Official EmbeddingGemma2 vision attention keeps Q/K/V staging and its
+    // bounded score/probability tiles in one session-owned arena.
+    embedding_gemma2_vision_attention_scratch: scratch_mod.DeviceScratch = .{},
+    embedding_gemma2_cudnn_attention_scratch: scratch_mod.DeviceScratch = .{},
+    embedding_gemma2_cudnn: ?cudnn_sdpa_mod.Module = null,
+    embedding_gemma2_cudnn_unavailable: bool = false,
     cublaslt_workspace_scratch: scratch_mod.DeviceScratch = .{},
     cublaslt: ?cublaslt_mod.CublasLt = null,
     training_blas: ?@import("libraries.zig").CublasF32 = null,
     training_math: ?@import("training_math.zig").Module = null,
     boundary_attention: ?@import("boundary_attention.zig").Module = null,
+    /// Lazily loaded because only EmbeddingGemma 2 needs the bidirectional
+    /// BF16 encoder kernels. Session serialization owns its mutable stats and
+    /// all scratch remains in the ordinary CudaCompute arena.
+    embedding_gemma2: ?embedding_gemma2_cuda.Module = null,
+    embedding_gemma2_weights_validated: bool = false,
     /// Opt-in diagnostic access to borrowed LayerNorm backward tensors. The
     /// observer owns readback budgets and must finish before returning. Never
     /// installed by ordinary inference/training or timed benchmark commands.
@@ -2270,6 +2321,383 @@ pub const CudaCompute = struct {
     pub fn enableResidentBoundaryAttention(self: *CudaCompute) !void {
         if (self.ctx.info.compute_major != 8) return;
         if (self.boundary_attention == null) self.boundary_attention = try @import("boundary_attention.zig").Module.init(&self.ctx);
+    }
+
+    pub fn embeddingGemma2Module(self: *CudaCompute) !*embedding_gemma2_cuda.Module {
+        if (self.embedding_gemma2 == null) self.embedding_gemma2 = try embedding_gemma2_cuda.Module.init(&self.ctx);
+        return &self.embedding_gemma2.?;
+    }
+
+    /// Narrow bridge used by the dedicated architecture. It preserves the
+    /// opaque ComputeTensor API everywhere else while keeping this resident
+    /// path free of host staging.
+    pub fn embeddingGemma2Tensor(tensor: CT) *CudaTensor {
+        return tensorFromCt(tensor);
+    }
+
+    pub fn embeddingGemma2Weight(self: *CudaCompute, name: []const u8) !*CudaTensor {
+        return tensorFromCt(try getWeight(self, name));
+    }
+
+    fn embeddingGemma2Bf16Weight(self: *CudaCompute, name: []const u8) !buffer_mod.DeviceBuffer {
+        const tensor = try self.embeddingGemma2Weight(name);
+        if (tensor.dtype == .bf16) return tensor.buffer;
+        if (tensor.bf16_mirror.ptr != 0 and tensor.bf16_mirror.len >= tensor.elem_count * @sizeOf(u16)) return tensor.bf16_mirror;
+        if (tensor.dtype != .f32) return error.EmbeddingGemma2RequiresBf16Weights;
+        const mirror = try allocDeviceBuffer(self, tensor.elem_count * @sizeOf(u16));
+        errdefer {
+            var owned = mirror;
+            releaseDeviceBuffer(self, &owned);
+        }
+        try self.kernels.launchF32ToBf16(&self.ctx, mirror, tensor.buffer, tensor.elem_count);
+        tensor.bf16_mirror = mirror;
+        tensor.owns_bf16_mirror = true;
+        self.stats.bf16_mirror_weight_count += 1;
+        self.stats.bf16_mirror_weight_bytes += mirror.len;
+        return mirror;
+    }
+
+    fn validateEmbeddingGemma2WeightShape(self: *CudaCompute, name: []const u8, expected: []const i64) !void {
+        const tensor = try self.embeddingGemma2Weight(name);
+        if (tensor.dtype != .bf16 and tensor.dtype != .f32)
+            return error.EmbeddingGemma2RequiresBf16Weights;
+        if (!std.mem.eql(i64, tensor.shape, expected)) return error.InvalidWeightShape;
+    }
+
+    fn validateEmbeddingGemma2Weights(self: *CudaCompute, config: embedding_gemma2_model.Config) !void {
+        if (self.embedding_gemma2_weights_validated) return;
+        const hidden: i64 = @intCast(config.hidden_size);
+        const intermediate: i64 = @intCast(config.intermediate_size);
+        const output_dim: i64 = @intCast(config.outputDim());
+        try self.validateEmbeddingGemma2WeightShape(embedding_gemma2_arch.WeightNames.token_embedding, &.{ @intCast(config.vocab_size), hidden });
+        try self.validateEmbeddingGemma2WeightShape(embedding_gemma2_arch.WeightNames.ple_projection, &.{ @intCast(config.num_hidden_layers * config.hidden_size), hidden });
+        try self.validateEmbeddingGemma2WeightShape(embedding_gemma2_arch.WeightNames.ple_norm, &.{hidden});
+        try self.validateEmbeddingGemma2WeightShape(embedding_gemma2_arch.WeightNames.final_norm, &.{hidden});
+        try self.validateEmbeddingGemma2WeightShape(embedding_gemma2_arch.WeightNames.output_projection, &.{ output_dim, hidden });
+        var name_buf: [256]u8 = undefined;
+        for (0..config.num_hidden_layers) |layer_index| {
+            const lc = try config.layer(layer_index);
+            const query_width: i64 = @intCast(lc.queryWidth());
+            const kv_width: i64 = @intCast(lc.keyValueWidth());
+            const head_dim: i64 = @intCast(lc.head_dim);
+            try self.validateEmbeddingGemma2WeightShape(try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "input_layernorm.weight"), &.{hidden});
+            try self.validateEmbeddingGemma2WeightShape(try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "self_attn.q_proj.weight"), &.{ query_width, hidden });
+            try self.validateEmbeddingGemma2WeightShape(try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "self_attn.k_proj.weight"), &.{ kv_width, hidden });
+            try self.validateEmbeddingGemma2WeightShape(try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "self_attn.v_proj.weight"), &.{ kv_width, hidden });
+            try self.validateEmbeddingGemma2WeightShape(try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "self_attn.o_proj.weight"), &.{ hidden, query_width });
+            try self.validateEmbeddingGemma2WeightShape(try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "self_attn.q_norm.weight"), &.{head_dim});
+            try self.validateEmbeddingGemma2WeightShape(try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "self_attn.k_norm.weight"), &.{head_dim});
+            inline for (.{ "post_attention_layernorm.weight", "pre_feedforward_layernorm.weight", "post_feedforward_layernorm.weight", "ple_block.post_per_layer_input_norm.weight" }) |suffix|
+                try self.validateEmbeddingGemma2WeightShape(try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, suffix), &.{hidden});
+            inline for (.{ "mlp.gate_proj.weight", "mlp.up_proj.weight" }) |suffix|
+                try self.validateEmbeddingGemma2WeightShape(try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, suffix), &.{ intermediate, hidden });
+            try self.validateEmbeddingGemma2WeightShape(try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "mlp.down_proj.weight"), &.{ hidden, intermediate });
+            inline for (.{ "ple_block.per_layer_input_gate.weight", "ple_block.per_layer_projection.weight" }) |suffix|
+                try self.validateEmbeddingGemma2WeightShape(try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, suffix), &.{ hidden, hidden });
+            try self.validateEmbeddingGemma2WeightShape(try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "layer_scalar"), &.{1});
+        }
+        self.embedding_gemma2_weights_validated = true;
+    }
+
+    pub fn createEmbeddingGemma2Tensor(self: *CudaCompute, shape: []const i64, dtype: tensor_mod.DType) !CT {
+        var count: usize = 1;
+        for (shape) |dim| {
+            if (dim < 0) return error.InvalidShape;
+            count = try std.math.mul(usize, count, @intCast(dim));
+        }
+        const bytes = try std.math.mul(usize, count, dtype.byteSize());
+        const device = try allocDeviceBuffer(self, bytes);
+        errdefer {
+            var owned = device;
+            releaseDeviceBuffer(self, &owned);
+        }
+        const owned_shape = try self.allocator.dupe(i64, shape);
+        errdefer self.allocator.free(owned_shape);
+        return createTensorWithDType(self, device, owned_shape, count, dtype);
+    }
+
+    pub const EmbeddingGemma2Input = union(enum) {
+        token_ids: []const i64,
+        input_embeddings: []const f32,
+    };
+
+    fn embeddingGemma2EncoderSequence(sequence: usize, maximum: usize) usize {
+        if (sequence < 128 or sequence % 64 == 0) return sequence;
+        const rounded = std.math.add(usize, sequence, 63) catch return sequence;
+        const candidate = rounded / 64 * 64;
+        return if (candidate <= maximum) candidate else sequence;
+    }
+
+    fn traceEmbeddingGemma2Bf16(
+        self: *CudaCompute,
+        allocator: std.mem.Allocator,
+        name: []const u8,
+        device: buffer_mod.DeviceBuffer,
+        count: usize,
+    ) !void {
+        if (!platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_TRACE", false)) return;
+        const raw = try allocator.alloc(u16, count);
+        defer allocator.free(raw);
+        try device.copyToHost(&self.ctx, std.mem.sliceAsBytes(raw));
+        try self.ctx.synchronize();
+        var min: f32 = std.math.inf(f32);
+        var max: f32 = -std.math.inf(f32);
+        var sum: f64 = 0;
+        var l2: f64 = 0;
+        var first: [16]f32 = @splat(0);
+        for (raw, 0..) |bits, i| {
+            const value: f32 = @bitCast(@as(u32, bits) << 16);
+            min = @min(min, value);
+            max = @max(max, value);
+            sum += value;
+            l2 += @as(f64, value) * @as(f64, value);
+            if (i < first.len) first[i] = value;
+        }
+        std.log.info("embedding_gemma2_trace name={s} count={} min={d} max={d} mean={d} l2={d} first16={any}", .{
+            name, count, min, max, sum / @as(f64, @floatFromInt(count)), @sqrt(l2), first,
+        });
+    }
+
+    /// Complete resident BF16 text encoder. All layer intermediates stay on
+    /// device; the sole D2H transfer is the normalized B x requested_dim
+    /// result. Projections use cuBLASLt BF16-output matmuls; the bounded exact
+    /// kernel remains a fail-closed fallback and is counted in runtime stats.
+    pub fn runEmbeddingGemma2(
+        self: *CudaCompute,
+        allocator: std.mem.Allocator,
+        config: embedding_gemma2_model.Config,
+        input: EmbeddingGemma2Input,
+        attention_mask: []const i64,
+        batch: usize,
+        sequence: usize,
+        requested_dim: usize,
+        control: ?InferenceExecutionControl,
+    ) ![]f32 {
+        try config.validate();
+        if (!config.isOfficialTextTopology()) return error.UnsupportedEmbeddingGemma2Topology;
+        const validated_input: embedding_gemma2_arch.Input = switch (input) {
+            .token_ids => |values| .{ .token_ids = values },
+            .input_embeddings => |values| .{ .input_embeddings = values },
+        };
+        try (embedding_gemma2_arch.Request{
+            .input = validated_input,
+            .attention_mask = attention_mask,
+            .batch = batch,
+            .sequence = sequence,
+        }).validate(config);
+        if (control) |value| try value.check();
+        if (requested_dim == 0 or requested_dim > config.outputDim()) return error.InvalidEmbeddingGemma2Shape;
+        const hidden: usize = config.hidden_size;
+        const intermediate: usize = config.intermediate_size;
+        const max_row_width = @max(intermediate, @max(config.outputDim(), 2048));
+        var encoder_sequence = sequence;
+        var encoder_input = input;
+        var encoder_attention_mask = attention_mask;
+        var padded_ids: ?[]i64 = null;
+        defer if (padded_ids) |values| allocator.free(values);
+        var padded_embeddings: ?[]f32 = null;
+        defer if (padded_embeddings) |values| allocator.free(values);
+        var padded_mask: ?[]i64 = null;
+        defer if (padded_mask) |values| allocator.free(values);
+        // The SM89 local-attention kernel consumes complete 64-query tiles.
+        // For medium/long requests, zero-mask a short tail instead of sending
+        // it through the exact one-warp path. Short requests stay unpadded so
+        // their 24 layer GEMMs are not inflated up to 64 rows.
+        const padding_qualified = self.ctx.info.compute_major == 8 and self.ctx.info.compute_minor == 9 and
+            cuda_artifact.hasBf16WmmaCodeFor(self.ctx.info.compute_major, self.ctx.info.compute_minor);
+        const candidate = if (padding_qualified) embeddingGemma2EncoderSequence(sequence, config.maxInputTokens()) else sequence;
+        if (candidate != sequence) {
+            encoder_sequence = candidate;
+            const padded_rows = try std.math.mul(usize, batch, candidate);
+            const padded_kernel_elements = std.math.mul(usize, padded_rows, max_row_width) catch return error.InvalidEmbeddingGemma2Shape;
+            if (padded_rows > std.math.maxInt(u32) or batch > std.math.maxInt(u32) or padded_kernel_elements > std.math.maxInt(u32))
+                return error.InvalidEmbeddingGemma2Shape;
+            const mask_values = try allocator.alloc(i64, padded_rows);
+            padded_mask = mask_values;
+            @memset(mask_values, 0);
+            for (0..batch) |bi| @memcpy(
+                mask_values[bi * candidate ..][0..sequence],
+                attention_mask[bi * sequence ..][0..sequence],
+            );
+            encoder_attention_mask = mask_values;
+            switch (input) {
+                .token_ids => |ids| {
+                    const values = try allocator.alloc(i64, padded_rows);
+                    padded_ids = values;
+                    @memset(values, 0);
+                    for (0..batch) |bi| @memcpy(
+                        values[bi * candidate ..][0..sequence],
+                        ids[bi * sequence ..][0..sequence],
+                    );
+                    encoder_input = .{ .token_ids = values };
+                },
+                .input_embeddings => |embeddings| {
+                    const padded_count = std.math.mul(usize, padded_rows, config.hidden_size) catch return error.InvalidEmbeddingGemma2Shape;
+                    const values = try allocator.alloc(f32, padded_count);
+                    padded_embeddings = values;
+                    @memset(values, 0);
+                    const source_stride = try std.math.mul(usize, sequence, config.hidden_size);
+                    const padded_stride = try std.math.mul(usize, candidate, config.hidden_size);
+                    for (0..batch) |bi| @memcpy(
+                        values[bi * padded_stride ..][0..source_stride],
+                        embeddings[bi * source_stride ..][0..source_stride],
+                    );
+                    encoder_input = .{ .input_embeddings = values };
+                },
+            }
+        }
+        const rows = try std.math.mul(usize, batch, encoder_sequence);
+        var all_attention_tokens_valid = true;
+        for (encoder_attention_mask) |value| all_attention_tokens_valid = all_attention_tokens_valid and value == 1;
+        const max_kernel_elements = std.math.mul(usize, rows, max_row_width) catch return error.InvalidEmbeddingGemma2Shape;
+        if (rows > std.math.maxInt(u32) or batch > std.math.maxInt(u32) or max_kernel_elements > std.math.maxInt(u32))
+            return error.InvalidEmbeddingGemma2Shape;
+        const module = try self.embeddingGemma2Module();
+        try self.validateEmbeddingGemma2Weights(config);
+        const stats_before = module.stats();
+        defer if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_STATS", false)) {
+            const after = module.stats();
+            std.log.info(
+                "embedding_gemma2_stats batch={} sequence={} encoder_sequence={} requested_dim={} cublaslt_matmuls={} scalar_matmul_fallbacks={} attention_scalar_fallbacks={} attention_launches={} kernel_launches={} output_bytes={}",
+                .{
+                    batch,
+                    sequence,
+                    encoder_sequence,
+                    requested_dim,
+                    after.cublaslt_matmuls - stats_before.cublaslt_matmuls,
+                    after.scalar_matmul_fallbacks - stats_before.scalar_matmul_fallbacks,
+                    after.attention_scalar_fallbacks - stats_before.attention_scalar_fallbacks,
+                    after.attention_launches - stats_before.attention_launches,
+                    after.launches - stats_before.launches,
+                    after.output_bytes - stats_before.output_bytes,
+                },
+            );
+        };
+        var owned = std.ArrayListUnmanaged(buffer_mod.DeviceBuffer).empty;
+        defer {
+            for (owned.items) |*b| releaseDeviceBuffer(self, b);
+            owned.deinit(allocator);
+        }
+        // Every request allocation below may be referenced by queued driver
+        // work. Declared after cleanup so LIFO drains before buffers are freed.
+        errdefer self.ctx.synchronize() catch {};
+        const allocBuf = struct {
+            fn f(list: *std.ArrayListUnmanaged(buffer_mod.DeviceBuffer), a: std.mem.Allocator, compute: *CudaCompute, bytes: usize) !buffer_mod.DeviceBuffer {
+                var b = try allocDeviceBuffer(compute, bytes);
+                errdefer releaseDeviceBuffer(compute, &b);
+                try list.append(a, b);
+                return b;
+            }
+        }.f;
+        const weight = struct {
+            fn f(c: *CudaCompute, name: []const u8) !buffer_mod.DeviceBuffer {
+                return c.embeddingGemma2Bf16Weight(name);
+            }
+        }.f;
+        const view = struct {
+            fn f(b: buffer_mod.DeviceBuffer, off: usize, len: usize) !buffer_mod.DeviceBuffer {
+                if (off > b.len or len > b.len - off) return error.InvalidCudaState;
+                return .{ .ptr = b.ptr + off, .len = len };
+            }
+        }.f;
+        const mask = try allocBuf(&owned, allocator, self, rows * 8);
+        try mask.copyFromHost(&self.ctx, std.mem.sliceAsBytes(encoder_attention_mask));
+        const immutable = try allocBuf(&owned, allocator, self, rows * hidden * 2);
+        switch (encoder_input) {
+            .token_ids => |ids| {
+                if (ids.len != rows) return error.InvalidEmbeddingGemma2Shape;
+                const idbuf = try allocBuf(&owned, allocator, self, rows * 8);
+                try idbuf.copyFromHost(&self.ctx, std.mem.sliceAsBytes(ids));
+                try module.launchLookup(&self.ctx, immutable, try weight(self, embedding_gemma2_arch.WeightNames.token_embedding), idbuf, @intCast(rows), config.vocab_size, @intCast(hidden), 22.625);
+            },
+            .input_embeddings => |values| {
+                if (values.len != rows * hidden) return error.InvalidEmbeddingGemma2Shape;
+                const f32buf = try allocBuf(&owned, allocator, self, values.len * 4);
+                try f32buf.copyFromHost(&self.ctx, std.mem.sliceAsBytes(values));
+                try self.kernels.launchF32ToBf16(&self.ctx, immutable, f32buf, values.len);
+            },
+        }
+        try self.traceEmbeddingGemma2Bf16(allocator, "input_scaled", immutable, rows * hidden);
+        const hidden_buf = try allocBuf(&owned, allocator, self, rows * hidden * 2);
+        try hidden_buf.copyFromDevice(&self.ctx, immutable, rows * hidden * 2);
+        // Reused arena slices. Q/K/V maxima are 2048/1024 elements per row.
+        const a = try allocBuf(&owned, allocator, self, rows * @max(intermediate, 2048) * 2);
+        const bbuf = try allocBuf(&owned, allocator, self, rows * @max(intermediate, 2048) * 2);
+        const c = try allocBuf(&owned, allocator, self, rows * @max(intermediate, 2048) * 2);
+        const d = try allocBuf(&owned, allocator, self, rows * @max(intermediate, 2048) * 2);
+        const attention_scores = try allocBuf(&owned, allocator, self, 4 * 256 * encoder_sequence * 4);
+        const attention_probs = try allocBuf(&owned, allocator, self, 4 * 256 * encoder_sequence * 2);
+        var name_buf: [256]u8 = undefined;
+        for (0..config.num_hidden_layers) |layer_index| {
+            if (control) |value| try value.check();
+            const lc = try config.layer(layer_index);
+            const qw = lc.queryWidth();
+            const kvw = lc.keyValueWidth();
+            const in_norm = try weight(self, try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "input_layernorm.weight"));
+            try module.launchRmsNorm(&self.ctx, a, hidden_buf, in_norm, @intCast(rows), @intCast(hidden), config.rms_norm_eps);
+            if (layer_index == 0) try self.traceEmbeddingGemma2Bf16(allocator, "l0_input_norm", a, rows * hidden);
+            try embeddingGemma2Matmul(self, module, bbuf, a, try weight(self, try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "self_attn.q_proj.weight")), rows, hidden, qw);
+            try embeddingGemma2Matmul(self, module, c, a, try weight(self, try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "self_attn.k_proj.weight")), rows, hidden, kvw);
+            try embeddingGemma2Matmul(self, module, d, a, try weight(self, try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "self_attn.v_proj.weight")), rows, hidden, kvw);
+            try module.launchRmsNorm(&self.ctx, a, bbuf, try weight(self, try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "self_attn.q_norm.weight")), @intCast(rows * lc.num_attention_heads), lc.head_dim, config.rms_norm_eps);
+            try module.launchRmsNorm(&self.ctx, bbuf, c, try weight(self, try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "self_attn.k_norm.weight")), @intCast(rows * lc.num_key_value_heads), lc.head_dim, config.rms_norm_eps);
+            try module.launchRmsNorm(&self.ctx, c, d, null, @intCast(rows * lc.num_key_value_heads), lc.head_dim, config.rms_norm_eps);
+            const ash = embedding_gemma2_cuda.Attention{ .batch = @intCast(batch), .seq = @intCast(encoder_sequence), .q_heads = lc.num_attention_heads, .kv_heads = lc.num_key_value_heads, .head_dim = lc.head_dim, .local_radius = if (lc.kind == .sliding_attention) config.sliding_window else 0 };
+            try module.launchRope(&self.ctx, a, bbuf, mask, ash, lc.rope_theta, 1.0);
+            if (layer_index == 0) {
+                try self.traceEmbeddingGemma2Bf16(allocator, "l0_q_rope", a, rows * qw);
+                try self.traceEmbeddingGemma2Bf16(allocator, "l0_k_rope", bbuf, rows * kvw);
+                try self.traceEmbeddingGemma2Bf16(allocator, "l0_v_norm", c, rows * kvw);
+            }
+            try embeddingGemma2Attention(self, module, d, a, bbuf, c, mask, attention_scores, attention_probs, ash, all_attention_tokens_valid, control);
+            if (layer_index == 0) try self.traceEmbeddingGemma2Bf16(allocator, "l0_attention", d, rows * qw);
+            try embeddingGemma2Matmul(self, module, a, d, try weight(self, try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "self_attn.o_proj.weight")), rows, qw, hidden);
+            try module.launchRmsNorm(&self.ctx, bbuf, a, try weight(self, try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "post_attention_layernorm.weight")), @intCast(rows), @intCast(hidden), config.rms_norm_eps);
+            try module.launchResidual(&self.ctx, hidden_buf, hidden_buf, bbuf, null, @intCast(rows * hidden), 1, 0);
+            if (layer_index == 0) try self.traceEmbeddingGemma2Bf16(allocator, "l0_attn_residual", hidden_buf, rows * hidden);
+            try module.launchRmsNorm(&self.ctx, a, hidden_buf, try weight(self, try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "pre_feedforward_layernorm.weight")), @intCast(rows), @intCast(hidden), config.rms_norm_eps);
+            try embeddingGemma2Matmul(self, module, bbuf, a, try weight(self, try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "mlp.gate_proj.weight")), rows, hidden, intermediate);
+            try embeddingGemma2Matmul(self, module, c, a, try weight(self, try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "mlp.up_proj.weight")), rows, hidden, intermediate);
+            try module.launchGeluMul(&self.ctx, d, bbuf, c, @intCast(rows * intermediate));
+            try embeddingGemma2Matmul(self, module, a, d, try weight(self, try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "mlp.down_proj.weight")), rows, intermediate, hidden);
+            try module.launchRmsNorm(&self.ctx, bbuf, a, try weight(self, try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "post_feedforward_layernorm.weight")), @intCast(rows), @intCast(hidden), config.rms_norm_eps);
+            try module.launchResidual(&self.ctx, hidden_buf, hidden_buf, bbuf, null, @intCast(rows * hidden), 1, 0);
+            if (layer_index == 0) try self.traceEmbeddingGemma2Bf16(allocator, "l0_ffn_residual", hidden_buf, rows * hidden);
+            // Projection-only PLE: project one layer slice from immutable input.
+            const ple_all = try weight(self, embedding_gemma2_arch.WeightNames.ple_projection);
+            const ple_w = try view(ple_all, layer_index * hidden * hidden * 2, hidden * hidden * 2);
+            try embeddingGemma2Matmul(self, module, a, immutable, ple_w, rows, hidden, hidden);
+            try module.launchScale(&self.ctx, a, a, @intCast(rows * hidden), 1.0 / @sqrt(@as(f32, @floatFromInt(hidden))));
+            try module.launchRmsNorm(&self.ctx, bbuf, a, try weight(self, embedding_gemma2_arch.WeightNames.ple_norm), @intCast(rows), @intCast(hidden), config.rms_norm_eps);
+            if (layer_index == 0) try self.traceEmbeddingGemma2Bf16(allocator, "ple0", bbuf, rows * hidden);
+            try embeddingGemma2Matmul(self, module, a, hidden_buf, try weight(self, try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "ple_block.per_layer_input_gate.weight")), rows, hidden, hidden);
+            try module.launchGeluPle(&self.ctx, c, a, bbuf, @intCast(rows * hidden));
+            try embeddingGemma2Matmul(self, module, a, c, try weight(self, try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "ple_block.per_layer_projection.weight")), rows, hidden, hidden);
+            try module.launchRmsNorm(&self.ctx, bbuf, a, try weight(self, try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "ple_block.post_per_layer_input_norm.weight")), @intCast(rows), @intCast(hidden), config.rms_norm_eps);
+            try module.launchResidual(&self.ctx, hidden_buf, hidden_buf, bbuf, null, @intCast(rows * hidden), 1, 0);
+            try module.launchScaleDevice(&self.ctx, hidden_buf, hidden_buf, try weight(self, try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "layer_scalar")), @intCast(rows * hidden));
+            if (layer_index == 0) try self.traceEmbeddingGemma2Bf16(allocator, "l0_output", hidden_buf, rows * hidden);
+        }
+        try module.launchRmsNorm(&self.ctx, a, hidden_buf, try weight(self, embedding_gemma2_arch.WeightNames.final_norm), @intCast(rows), @intCast(hidden), config.rms_norm_eps);
+        try embeddingGemma2Matmul(self, module, bbuf, a, try weight(self, embedding_gemma2_arch.WeightNames.output_projection), rows, hidden, config.outputDim());
+        const full = try allocBuf(&owned, allocator, self, batch * config.outputDim() * 4);
+        try module.launchMeanL2(&self.ctx, full, bbuf, mask, @intCast(batch), @intCast(encoder_sequence), config.outputDim());
+        if (control) |value| try value.check();
+        var host_full = try allocator.alloc(f32, batch * config.outputDim());
+        defer allocator.free(host_full);
+        try full.copyToHost(&self.ctx, std.mem.sliceAsBytes(host_full));
+        try self.ctx.synchronize();
+        if (control) |value| try value.check();
+        var result = try allocator.alloc(f32, batch * requested_dim);
+        for (0..batch) |bi| {
+            const dst = result[bi * requested_dim ..][0..requested_dim];
+            @memcpy(dst, host_full[bi * config.outputDim() ..][0..requested_dim]);
+            var norm_sq: f32 = 0;
+            for (dst) |x| norm_sq += x * x;
+            const inv: f32 = if (norm_sq > 0) 1.0 / @sqrt(norm_sq) else 0;
+            for (dst) |*x| x.* *= inv;
+        }
+        return result;
     }
 
     pub fn initWithDeviceMemoryLimit(allocator: std.mem.Allocator, limit: usize) !CudaCompute {
@@ -2437,6 +2865,7 @@ pub const CudaCompute = struct {
         if (profile) |value| logKernelJitCompletion(jit_config, value, scope, load_context, &kernels);
         return .{
             .allocator = allocator,
+            .capability_profile = profile,
             .ctx = ctx,
             .kernels = kernels,
             .cublaslt = cublaslt,
@@ -2474,6 +2903,9 @@ pub const CudaCompute = struct {
         var pair_mirror_it = self.bf16_pair_mirror_cache.valueIterator();
         while (pair_mirror_it.next()) |buf| buf.free(&self.ctx);
         self.bf16_pair_mirror_cache.deinit(self.allocator);
+        var scalar_it = self.immutable_scalar_cache.iterator();
+        while (scalar_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.immutable_scalar_cache.deinit(self.allocator);
         var it = self.resident_weights.iterator();
         while (it.next()) |entry| {
             var tensor = entry.value_ptr.*;
@@ -2538,9 +2970,32 @@ pub const CudaCompute = struct {
         self.deberta_qr_f16_scratch.deinit(&self.ctx);
         self.deberta_kr_f16_scratch.deinit(&self.ctx);
         self.deberta_materialized_scratch.deinit(&self.ctx);
+        self.embedding_gemma2_vision_attention_scratch.deinit(&self.ctx);
+        self.embedding_gemma2_cudnn_attention_scratch.deinit(&self.ctx);
         self.cublaslt_workspace_scratch.deinit(&self.ctx);
         if (self.training_blas) |*blas| blas.deinit();
         self.training_blas = null;
+        if (self.embedding_gemma2) |*module| module.deinit(&self.ctx);
+        self.embedding_gemma2 = null;
+        if (self.embedding_gemma2_cudnn) |*module| {
+            if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_STATS", false)) {
+                const stats = module.stats();
+                std.log.info("embedding_gemma2_cudnn_stats executes={} vision_executes={} text_executes={} plan_hits={} plan_misses={} plan_declines={} workspace_high_water={}", .{
+                    stats.executes,
+                    stats.vision_executes,
+                    stats.text_executes,
+                    stats.plan_hits,
+                    stats.plan_misses,
+                    stats.plan_declines,
+                    stats.workspace_high_water,
+                });
+            }
+            module.deinit();
+        } else if (self.embedding_gemma2_cudnn_unavailable and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_STATS", false)) {
+            std.log.info("embedding_gemma2_cudnn_stats unavailable=true", .{});
+        }
+        self.embedding_gemma2_cudnn = null;
+        self.embedding_gemma2_weights_validated = false;
         if (self.training_math) |*math| math.deinit(&self.ctx);
         self.training_math = null;
         if (self.boundary_attention) |*attention| attention.deinit(&self.ctx);
@@ -2597,6 +3052,7 @@ pub const CudaCompute = struct {
                 cudaFrozenBf16InputGradientCublasLtEnabled() and
                 self.ctx.info.compute_major >= 8 and
                 self.cublaslt != null,
+            .embedding_gemma2 => self.ctx.info.compute_major >= 8 and self.cublaslt != null,
             .qwen3_embedding => self.kernels.hasQwen3EmbeddingPrimitives(),
             .qwen3_vl_generation => self.kernels.hasQwen3VlGenerationPrimitives(),
         };
@@ -7259,6 +7715,142 @@ fn cublasLtWorkspace(self: *CudaCompute) buffer_mod.DeviceBuffer {
     return self.cublaslt_workspace_scratch.acquire(&self.ctx, bytes) catch .{};
 }
 
+fn embeddingGemma2Matmul(self: *CudaCompute, module: *embedding_gemma2_cuda.Module, dst: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize) !void {
+    if (!platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_SCALAR_MATMUL", false)) if (self.cublaslt) |*blas| {
+        const workspace = cublasLtWorkspace(self);
+        blas.matmulBf16WeightBf16Out(&self.ctx, dst, input, weight, workspace, rows, in_dim, out_dim) catch |err| {
+            std.log.debug("EmbeddingGemma2 cuBLASLt BF16 output fallback: rows={d} in={d} out={d} err={s}", .{ rows, in_dim, out_dim, @errorName(err) });
+            return module.launchMatmul(&self.ctx, dst, input, weight, @intCast(rows), @intCast(in_dim), @intCast(out_dim));
+        };
+        module.noteCublasLtMatmul();
+        return;
+    };
+    try module.launchMatmul(&self.ctx, dst, input, weight, @intCast(rows), @intCast(in_dim), @intCast(out_dim));
+}
+
+fn embeddingGemma2TextCudnn(
+    self: *CudaCompute,
+    embedding_module: *embedding_gemma2_cuda.Module,
+    out: buffer_mod.DeviceBuffer,
+    q: buffer_mod.DeviceBuffer,
+    k: buffer_mod.DeviceBuffer,
+    v: buffer_mod.DeviceBuffer,
+    shape: embedding_gemma2_cuda.Attention,
+) !bool {
+    if (self.capability_profile != .embedding_gemma2 or self.ctx.info.compute_major < 8 or
+        self.embedding_gemma2_cudnn_unavailable or
+        !platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_CUDNN", true)) return false;
+    if (self.embedding_gemma2_cudnn == null) {
+        self.embedding_gemma2_cudnn = cudnn_sdpa_mod.Module.init(self.ctx.stream) catch {
+            self.embedding_gemma2_cudnn_unavailable = true;
+            return false;
+        };
+    }
+    const key = cudnn_sdpa_mod.Key{
+        .batch = shape.batch,
+        .q_heads = shape.q_heads,
+        .kv_heads = shape.kv_heads,
+        .sequence = shape.seq,
+        .dim = shape.head_dim,
+        .scale = 1.0,
+        .local_window_radius = if (shape.seq > 513) @intCast(shape.local_radius) else 0,
+    };
+    const cudnn = &self.embedding_gemma2_cudnn.?;
+    const workspace_bytes = (try cudnn.workspaceBytesFor(key)) orelse return false;
+    const max_workspace: usize = 32 * 1024 * 1024;
+    if (workspace_bytes > max_workspace) return false;
+    if (self.run_budget) |budget| {
+        const limit = budget.limits.scratch_limit_bytes;
+        const growth = workspace_bytes -| self.embedding_gemma2_cudnn_attention_scratch.buffer.len;
+        if (limit != 0 and growth > limit -| budget.scratchTotalBytes()) return false;
+    }
+    const workspace = self.embedding_gemma2_cudnn_attention_scratch.acquire(&self.ctx, workspace_bytes) catch return false;
+    const workspace_ptr = if (workspace_bytes == 0) @as(usize, 0) else workspace.ptr;
+    if (!try cudnn.executeText(key, q.ptr, k.ptr, v.ptr, out.ptr, workspace_ptr)) return false;
+    embedding_module.noteAttentionLaunch();
+    return true;
+}
+
+fn embeddingGemma2Attention(
+    self: *CudaCompute,
+    module: *embedding_gemma2_cuda.Module,
+    out: buffer_mod.DeviceBuffer,
+    q: buffer_mod.DeviceBuffer,
+    k: buffer_mod.DeviceBuffer,
+    v: buffer_mod.DeviceBuffer,
+    mask: buffer_mod.DeviceBuffer,
+    scores: buffer_mod.DeviceBuffer,
+    probs: buffer_mod.DeviceBuffer,
+    shape: embedding_gemma2_cuda.Attention,
+    all_tokens_valid: bool,
+    control: ?InferenceExecutionControl,
+) !void {
+    if (shape.local_radius != 0) {
+        if (all_tokens_valid and shape.local_radius == 512 and shape.q_heads == 4 and shape.kv_heads == 2 and
+            shape.head_dim == 256 and shape.seq <= 8192 and shape.batch >= 1 and
+            @as(usize, shape.batch) * shape.seq >= 1024 and
+            try embeddingGemma2TextCudnn(self, module, out, q, k, v, shape)) return;
+        // WMMA fragment element ownership used for in-register alpha scaling
+        // is qualified on SM89. Other SM80+ devices retain the exact warp
+        // route until hardware differential evidence establishes their map.
+        if (self.ctx.info.compute_major == 8 and self.ctx.info.compute_minor == 9 and
+            cuda_artifact.hasBf16WmmaCodeFor(self.ctx.info.compute_major, self.ctx.info.compute_minor))
+            return module.launchLocalFlashAttention(&self.ctx, out, q, k, v, mask, shape);
+        module.noteAttentionFallback();
+        return module.launchAttention(&self.ctx, out, q, k, v, mask, shape);
+    }
+    const blas = &(self.cublaslt orelse {
+        module.noteAttentionFallback();
+        return module.launchAttention(&self.ctx, out, q, k, v, mask, shape);
+    });
+    const workspace = cublasLtWorkspace(self);
+    const tile: usize = 256;
+    const seq: usize = shape.seq;
+    const dim: usize = shape.head_dim;
+    const q_heads: usize = shape.q_heads;
+    const kv_heads: usize = shape.kv_heads;
+    const heads_per_kv = q_heads / kv_heads;
+    const score_stride = tile * seq;
+    var failed = false;
+    outer: for (0..shape.batch) |bi| {
+        for (0..kv_heads) |kvh| {
+            const qh = kvh * heads_per_kv;
+            var qt: usize = 0;
+            while (qt < seq) : (qt += tile) {
+                if (control) |value| try value.check();
+                const tile_rows = @min(tile, seq - qt);
+                const q_offset = ((bi * seq + qt) * q_heads + qh) * dim * 2;
+                const kv_offset = ((bi * seq) * kv_heads + kvh) * dim * 2;
+                const out_offset = q_offset;
+                const q_view = buffer_mod.DeviceBuffer{ .ptr = q.ptr + q_offset, .len = q.len - q_offset };
+                const k_view = buffer_mod.DeviceBuffer{ .ptr = k.ptr + kv_offset, .len = k.len - kv_offset };
+                const v_view = buffer_mod.DeviceBuffer{ .ptr = v.ptr + kv_offset, .len = v.len - kv_offset };
+                const out_view = buffer_mod.DeviceBuffer{ .ptr = out.ptr + out_offset, .len = out.len - out_offset };
+                blas.matmulEmbeddingGemma2Attention(&self.ctx, scores, q_view, k_view, workspace, tile_rows, seq, dim, q_heads * dim, kv_heads * dim, seq, heads_per_kv, dim, 0, score_stride, true, true, 1.0) catch {
+                    failed = true;
+                    break :outer;
+                };
+                module.noteCublasLtMatmul();
+                module.launchAttentionSoftmax(&self.ctx, probs, scores, mask, shape.seq, @intCast(qt), @intCast(tile_rows), @intCast(bi), @intCast(heads_per_kv), @intCast(tile)) catch {
+                    failed = true;
+                    break :outer;
+                };
+                blas.matmulEmbeddingGemma2Attention(&self.ctx, out_view, probs, v_view, workspace, tile_rows, dim, seq, seq, kv_heads * dim, q_heads * dim, heads_per_kv, score_stride, 0, dim, false, false, 1.0) catch {
+                    failed = true;
+                    break :outer;
+                };
+                module.noteCublasLtMatmul();
+            }
+        }
+    }
+    if (failed) {
+        module.noteAttentionFallback();
+        try module.launchAttention(&self.ctx, out, q, k, v, mask, shape);
+    } else {
+        module.noteAttentionLaunch();
+    }
+}
+
 fn runCublasLtBf16Matmul(
     self: *CudaCompute,
     dst: buffer_mod.DeviceBuffer,
@@ -9063,6 +9655,51 @@ fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
     };
 }
 
+fn putImmutableScalarCache(allocator: std.mem.Allocator, cache: *std.StringHashMapUnmanaged(ImmutableScalarCacheEntry), name: []const u8, entry: ImmutableScalarCacheEntry) !void {
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_name);
+    try cache.put(allocator, owned_name, entry);
+}
+
+fn validateImmutableScalarTensorMetadata(tensor: *const CudaTensor) !void {
+    if (tensor.elem_count != 1 or !((tensor.shape.len == 0) or (tensor.shape.len == 1 and tensor.shape[0] == 1)))
+        return error.InvalidTensorShape;
+    switch (tensor.dtype) {
+        .f32, .f16, .bf16 => {},
+        else => return error.UnsupportedTensorType,
+    }
+}
+
+fn validateImmutableScalarValue(value: f32) !void {
+    if (!std.math.isFinite(value)) return error.InvalidTensorData;
+}
+
+fn immutableResidentScalarF32Op(ctx: *anyopaque, name: []const u8) anyerror!ops.ImmutableScalarF32Lookup {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (self.capability_profile != .embedding_gemma2) return .unsupported;
+    if (name.len == 0) return error.InvalidTensorShape;
+
+    if (self.immutable_scalar_cache.get(name)) |cached| return switch (cached) {
+        .missing => .missing,
+        .value => |value| .{ .value = value },
+    };
+
+    const tensor = getWeight(self, name) catch |err| switch (err) {
+        error.WeightNotFound, error.MissingWeight => {
+            try putImmutableScalarCache(self.allocator, &self.immutable_scalar_cache, name, .missing);
+            return .missing;
+        },
+        else => return err,
+    };
+    const scalar = tensorFromCt(tensor);
+    try validateImmutableScalarTensorMetadata(scalar);
+    var host: [1]f32 = undefined;
+    _ = try downloadTensorToFloat32(self, scalar, self.allocator, &host);
+    try validateImmutableScalarValue(host[0]);
+    try putImmutableScalarCache(self.allocator, &self.immutable_scalar_cache, name, .{ .value = host[0] });
+    return .{ .value = host[0] };
+}
+
 fn acquireWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const weight = tensorFromCt(try getWeight(ctx, name));
@@ -10821,6 +11458,155 @@ fn tensorDTypeOp(_: *anyopaque, tensor: CT) anyerror!tensor_mod.DType {
 
 fn tensorShapeOp(_: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror![]i64 {
     return allocator.dupe(i64, tensorFromCt(tensor).shape);
+}
+
+fn tensorShapeMatchesOp(_: *anyopaque, tensor: CT, shape: []const i64) anyerror!?bool {
+    const actual = tensorFromCt(tensor).shape;
+    return std.mem.eql(i64, actual, shape);
+}
+
+fn gemma4AudioLocalAttentionOp(
+    ctx: *anyopaque,
+    q: CT,
+    k: CT,
+    v: CT,
+    rel: CT,
+    q_dim_scales: CT,
+    valid: CT,
+    params: ops.Gemma4AudioLocalAttentionParams,
+) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (self.ctx.info.compute_major < 8) return null;
+    const derived_hidden = std.math.mul(usize, params.heads, params.head_dim) catch return error.InvalidTensorShape;
+    const count = std.math.mul(usize, params.rows, params.hidden) catch return error.InvalidTensorShape;
+    const relative_count = std.math.mul(usize, params.context_left, params.hidden) catch return error.InvalidTensorShape;
+    if (params.rows == 0 or params.hidden == 0 or params.heads == 0 or
+        params.head_dim == 0 or derived_hidden != params.hidden or
+        params.rows > std.math.maxInt(i32) or params.hidden > std.math.maxInt(u32) or
+        params.heads > 65535 or params.head_dim > std.math.maxInt(u32) or
+        params.chunk == 0 or params.chunk > std.math.maxInt(i32) or
+        params.context_left < 2 or params.context_left > params.context or params.context > 24 or
+        !std.math.isFinite(params.k_scale) or !std.math.isFinite(params.logit_cap) or
+        params.logit_cap <= 0 or !std.math.isFinite(params.invalid_value))
+        return error.InvalidTensorShape;
+    inline for (.{ q, k, v, rel, q_dim_scales, valid }) |tensor| {
+        if (tensorFromCt(tensor).dtype != .f32) return null;
+    }
+    const matrix_shape = [_]i64{ @intCast(params.rows), @intCast(params.hidden) };
+    inline for (.{ q, k, v }) |tensor| {
+        const actual = tensorFromCt(tensor);
+        if (actual.elem_count != count or !std.mem.eql(i64, actual.shape, &matrix_shape)) return error.InvalidTensorShape;
+    }
+    const relative_shape = [_]i64{ @intCast(params.context_left), @intCast(params.hidden) };
+    const relative = tensorFromCt(rel);
+    if (relative.elem_count != relative_count or !std.mem.eql(i64, relative.shape, &relative_shape)) return error.InvalidTensorShape;
+    const scale_shape = [_]i64{@intCast(params.head_dim)};
+    const scales = tensorFromCt(q_dim_scales);
+    if (scales.elem_count != params.head_dim or !std.mem.eql(i64, scales.shape, &scale_shape)) return error.InvalidTensorShape;
+    const valid_shape = [_]i64{@intCast(params.rows)};
+    const validity = tensorFromCt(valid);
+    if (validity.elem_count != params.rows or !std.mem.eql(i64, validity.shape, &valid_shape)) return error.InvalidTensorShape;
+    const shape = [_]i64{ @intCast(params.rows), @intCast(params.hidden) };
+    const out = try self.createEmbeddingGemma2Tensor(&shape, .f32);
+    errdefer freeTensor(self, out);
+    var queued = false;
+    errdefer if (queued) synchronizeAndDrainDeferredDeviceFrees(self) catch {};
+    const module = try self.embeddingGemma2Module();
+    queued = true;
+    try module.launchAudioAttention(
+        &self.ctx,
+        tensorFromCt(out).buffer,
+        tensorFromCt(q).buffer,
+        tensorFromCt(k).buffer,
+        tensorFromCt(v).buffer,
+        tensorFromCt(rel).buffer,
+        tensorFromCt(q_dim_scales).buffer,
+        tensorFromCt(valid).buffer,
+        params,
+    );
+    queued = false;
+    return out;
+}
+
+fn gemma4AudioClampScalarOp(ctx: *anyopaque, input: CT, min_value: ?f32, max_value: ?f32) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (self.ctx.info.compute_major < 8) return null;
+    const source = tensorFromCt(input);
+    if (source.dtype != .f32) return null;
+    if (min_value == null and max_value == null) return null;
+    if (source.elem_count == 0 or source.elem_count > std.math.maxInt(u32)) return error.InvalidTensorShape;
+    if (min_value) |value| if (!std.math.isFinite(value)) return error.InvalidTensorShape;
+    if (max_value) |value| if (!std.math.isFinite(value)) return error.InvalidTensorShape;
+    if (min_value != null and max_value != null and min_value.? > max_value.?) return error.InvalidTensorShape;
+    var shape_count: usize = 1;
+    for (source.shape) |dimension| {
+        if (dimension < 0) return error.InvalidTensorShape;
+        shape_count = std.math.mul(usize, shape_count, @intCast(dimension)) catch return error.InvalidTensorShape;
+    }
+    if (shape_count != source.elem_count) return error.InvalidTensorShape;
+    const out = try self.createEmbeddingGemma2Tensor(source.shape, .f32);
+    errdefer freeTensor(self, out);
+    var queued = false;
+    errdefer if (queued) synchronizeAndDrainDeferredDeviceFrees(self) catch {};
+    const module = try self.embeddingGemma2Module();
+    queued = true;
+    try module.launchAudioClamp(&self.ctx, tensorFromCt(out).buffer, source.buffer, @intCast(source.elem_count), min_value, max_value);
+    queued = false;
+    return out;
+}
+
+fn gemma4AudioGluRowsOp(ctx: *anyopaque, input: CT, rows: usize, dim: usize) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (self.ctx.info.compute_major < 8) return null;
+    const source = tensorFromCt(input);
+    if (source.dtype != .f32) return null;
+    const output_count = std.math.mul(usize, rows, dim) catch return error.InvalidTensorShape;
+    const input_count = std.math.mul(usize, output_count, 2) catch return error.InvalidTensorShape;
+    if (rows == 0 or dim == 0 or rows > std.math.maxInt(u32) or dim > std.math.maxInt(u32) or output_count > std.math.maxInt(u32) or source.elem_count != input_count) return error.InvalidTensorShape;
+    const input_shape = [_]i64{ @intCast(rows), @intCast(dim * 2) };
+    if (!std.mem.eql(i64, source.shape, &input_shape)) return error.InvalidTensorShape;
+    const shape = [_]i64{ @intCast(rows), @intCast(dim) };
+    const out = try self.createEmbeddingGemma2Tensor(&shape, .f32);
+    errdefer freeTensor(self, out);
+    var queued = false;
+    errdefer if (queued) synchronizeAndDrainDeferredDeviceFrees(self) catch {};
+    const module = try self.embeddingGemma2Module();
+    queued = true;
+    try module.launchAudioGluRows(&self.ctx, tensorFromCt(out).buffer, source.buffer, @intCast(rows), @intCast(dim));
+    queued = false;
+    return out;
+}
+
+fn gemma4AudioDepthwiseCausalConv1dOp(ctx: *anyopaque, input: CT, weight: CT, rows: usize, dim: usize, kernel_size: usize) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (self.ctx.info.compute_major < 8) return null;
+    const source = tensorFromCt(input);
+    const filter = tensorFromCt(weight);
+    if (source.dtype != .f32 or filter.dtype != .f32) return null;
+    const count = std.math.mul(usize, rows, dim) catch return error.InvalidTensorShape;
+    const weight_count = std.math.mul(usize, kernel_size, dim) catch return error.InvalidTensorShape;
+    if (rows == 0 or dim == 0 or kernel_size == 0 or rows > std.math.maxInt(u32) or dim > std.math.maxInt(u32) or kernel_size > std.math.maxInt(u32) or count > std.math.maxInt(u32) or source.elem_count != count or filter.elem_count != weight_count) return error.InvalidTensorShape;
+    const expected_input = [_]i64{ @intCast(rows), @intCast(dim) };
+    const expected_weight = [_]i64{ @intCast(kernel_size), @intCast(dim) };
+    if (!std.mem.eql(i64, source.shape, &expected_input) or !std.mem.eql(i64, filter.shape, &expected_weight)) return error.InvalidTensorShape;
+    const out = try self.createEmbeddingGemma2Tensor(&expected_input, .f32);
+    errdefer freeTensor(self, out);
+    var queued = false;
+    errdefer if (queued) synchronizeAndDrainDeferredDeviceFrees(self) catch {};
+    const module = try self.embeddingGemma2Module();
+    queued = true;
+    try module.launchAudioDepthwiseConv(&self.ctx, tensorFromCt(out).buffer, source.buffer, filter.buffer, @intCast(rows), @intCast(dim), @intCast(kernel_size));
+    queued = false;
+    return out;
+}
+
+test "Gemma 4 audio CUDA hooks decline pre-Ampere before touching tensors" {
+    var self: CudaCompute = undefined;
+    self.ctx.info.compute_major = 7;
+    try std.testing.expect((try gemma4AudioClampScalarOp(&self, undefined, -1, 1)) == null);
+    try std.testing.expect((try gemma4AudioGluRowsOp(&self, undefined, 1, 1)) == null);
+    try std.testing.expect((try gemma4AudioDepthwiseCausalConv1dOp(&self, undefined, undefined, 1, 1, 1)) == null);
+    try std.testing.expect((try gemma4AudioLocalAttentionOp(&self, undefined, undefined, undefined, undefined, undefined, undefined, undefined)) == null);
 }
 
 fn copyTensorFromBackendOp(ctx: *anyopaque, src_ctx: *anyopaque, src_kind: ops.BackendKind, src_tensor_ct: CT) anyerror!?CT {
@@ -18376,6 +19162,9 @@ fn packedGegluExact(ctx: *anyopaque, input: CT, rows: usize, width: usize) anyer
     errdefer self.allocator.free(shape);
     var device = try allocDeviceBuffer(self, try checkedMul(count, @sizeOf(f32)));
     errdefer device.free(&self.ctx);
+    // Later tile failures may occur after earlier work references `device`.
+    // Drain the stream before the error path releases that request buffer.
+    errdefer self.ctx.synchronize() catch {};
     try self.kernels.launchLayaPackedGegluF32(&self.ctx, device, tensor.buffer, rows, width);
     self.stats.laya_packed_geglu += 1;
     self.stats.launch_elementwise += 1;
@@ -18485,6 +19274,271 @@ fn sdpa(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn_b
 
 fn sdpaFull(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, attn_bias_ct: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!?CT {
     return try sdpaLaunch(ctx, q_ct, k_ct, v_ct, null, attn_bias_ct, batch, seq_len, num_heads, head_dim);
+}
+
+fn tryEmbeddingGemma2VisionCudnn(
+    self: *CudaCompute,
+    q_tensor: *const CudaTensor,
+    k_tensor: *const CudaTensor,
+    v_tensor: *const CudaTensor,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+) !?CT {
+    if (self.embedding_gemma2_cudnn_unavailable or
+        !platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_CUDNN", true)) return null;
+    if (self.embedding_gemma2_cudnn == null) {
+        self.embedding_gemma2_cudnn = cudnn_sdpa_mod.Module.init(self.ctx.stream) catch {
+            self.embedding_gemma2_cudnn_unavailable = true;
+            return null;
+        };
+    }
+    const cudnn = &self.embedding_gemma2_cudnn.?;
+    const workspace_bytes = (try cudnn.workspaceBytes(seq_len)) orelse return null;
+    const count = try checkedMul(seq_len, try checkedMul(num_heads, head_dim));
+    const activation_bytes = try checkedMul(count, @sizeOf(u16));
+    var cursor: usize = 0;
+    const q_offset = try appendDebertaWorkspaceRegion(&cursor, activation_bytes);
+    const k_offset = try appendDebertaWorkspaceRegion(&cursor, activation_bytes);
+    const v_offset = try appendDebertaWorkspaceRegion(&cursor, activation_bytes);
+    const o_offset = try appendDebertaWorkspaceRegion(&cursor, activation_bytes);
+    const workspace_offset = try appendDebertaWorkspaceRegion(&cursor, workspace_bytes);
+    const arena_bytes = try alignDebertaWorkspaceOffset(cursor);
+    if (self.run_budget) |budget| {
+        const limit = budget.limits.scratch_limit_bytes;
+        const growth = arena_bytes -| self.embedding_gemma2_cudnn_attention_scratch.buffer.len;
+        if (limit != 0 and growth > limit -| budget.scratchTotalBytes()) return null;
+    }
+    const arena = self.embedding_gemma2_cudnn_attention_scratch.acquire(&self.ctx, arena_bytes) catch return null;
+    const q_bf16 = debertaWorkspaceRegion(arena, q_offset, activation_bytes);
+    const k_bf16 = debertaWorkspaceRegion(arena, k_offset, activation_bytes);
+    const v_bf16 = debertaWorkspaceRegion(arena, v_offset, activation_bytes);
+    const o_bf16 = debertaWorkspaceRegion(arena, o_offset, activation_bytes);
+    const workspace = debertaWorkspaceRegion(arena, workspace_offset, workspace_bytes);
+
+    const shape = try dupeShape(self.allocator, q_tensor.shape);
+    errdefer self.allocator.free(shape);
+    var output = try allocDeviceBuffer(self, try checkedMul(count, @sizeOf(f32)));
+    errdefer releaseDeviceBuffer(self, &output);
+    // From the first cast onward, fallback is forbidden: queued work may
+    // reference the session arena. Drain before output cleanup on failure.
+    errdefer self.ctx.synchronize() catch {};
+    try self.kernels.launchF32ToBf16(&self.ctx, q_bf16, q_tensor.buffer, count);
+    try self.kernels.launchF32ToBf16(&self.ctx, k_bf16, k_tensor.buffer, count);
+    try self.kernels.launchF32ToBf16(&self.ctx, v_bf16, v_tensor.buffer, count);
+    const workspace_ptr = if (workspace_bytes == 0) @as(usize, 0) else workspace.ptr;
+    if (!try cudnn.execute(seq_len, q_bf16.ptr, k_bf16.ptr, v_bf16.ptr, o_bf16.ptr, workspace_ptr))
+        return error.CudnnFailure;
+    const module = try self.embeddingGemma2Module();
+    try module.launchBf16ToF32(&self.ctx, output, o_bf16, @intCast(count));
+    self.stats.launch_attention += 1;
+    return createTensor(self, output, shape, count);
+}
+
+fn embeddingGemma2VisionF32Tensor(
+    self: *CudaCompute,
+    module: *embedding_gemma2_cuda.Module,
+    input: buffer_mod.DeviceBuffer,
+    rows: usize,
+    width: usize,
+) !CT {
+    const count = try checkedMul(rows, width);
+    const shape = try allocShape2(self.allocator, rows, width);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, try checkedMul(count, @sizeOf(f32)));
+    errdefer releaseDeviceBuffer(self, &device);
+    errdefer self.ctx.synchronize() catch {};
+    try module.launchBf16ToF32(&self.ctx, device, input, @intCast(count));
+    return createTensor(self, device, shape, count);
+}
+
+fn runEmbeddingGemma2VisionTowerOp(ctx: *anyopaque, input_ct: CT, sequence: usize, grid_x: usize, grid_y: usize) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (!platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_VISION_BF16", true)) return null;
+    if (self.capability_profile != .embedding_gemma2 or self.cublaslt == null or self.ctx.info.compute_major < 8) return null;
+    const plan = embedding_gemma2_vision.Plan{ .sequence = sequence, .grid_x = grid_x, .grid_y = grid_y };
+    try plan.validate();
+    const input = tensorFromCt(input_ct);
+    try ensureF32(input);
+    const hidden = embedding_gemma2_vision.hidden_size;
+    const intermediate = embedding_gemma2_vision.intermediate_size;
+    const count = try checkedMul(sequence, hidden);
+    try ensureCount(input, count);
+
+    // Validate the complete immutable weight contract before queueing work.
+    var names: embedding_gemma2_vision.WeightNameStorage = .{};
+    for (0..embedding_gemma2_vision.layer_count) |layer| {
+        const w = try embedding_gemma2_vision.layerWeights(&names, layer);
+        inline for (.{ w.input_norm, w.post_attention_norm, w.pre_ffn_norm, w.post_ffn_norm }) |name|
+            try self.validateEmbeddingGemma2WeightShape(name, &.{hidden});
+        inline for (.{ w.q, w.k, w.v, w.out }) |name|
+            try self.validateEmbeddingGemma2WeightShape(name, &.{ hidden, hidden });
+        inline for (.{ w.q_norm, w.k_norm }) |name|
+            try self.validateEmbeddingGemma2WeightShape(name, &.{embedding_gemma2_vision.head_dim});
+        inline for (.{ w.gate, w.up }) |name|
+            try self.validateEmbeddingGemma2WeightShape(name, &.{ intermediate, hidden });
+        try self.validateEmbeddingGemma2WeightShape(w.down, &.{ hidden, intermediate });
+    }
+
+    const module = try self.embeddingGemma2Module();
+    var owned = std.ArrayListUnmanaged(buffer_mod.DeviceBuffer).empty;
+    defer {
+        for (owned.items) |*buffer| releaseDeviceBuffer(self, buffer);
+        owned.deinit(self.allocator);
+    }
+    errdefer self.ctx.synchronize() catch {};
+    const allocBuf = struct {
+        fn f(list: *std.ArrayListUnmanaged(buffer_mod.DeviceBuffer), allocator: std.mem.Allocator, compute: *CudaCompute, bytes: usize) !buffer_mod.DeviceBuffer {
+            var buffer = try allocDeviceBuffer(compute, bytes);
+            errdefer releaseDeviceBuffer(compute, &buffer);
+            try list.append(allocator, buffer);
+            return buffer;
+        }
+    }.f;
+    const weight = struct {
+        fn f(compute: *CudaCompute, name: []const u8) !buffer_mod.DeviceBuffer {
+            return compute.embeddingGemma2Bf16Weight(name);
+        }
+    }.f;
+    const hidden_bytes = try checkedMul(count, @sizeOf(u16));
+    const intermediate_count = try checkedMul(sequence, intermediate);
+    const intermediate_bytes = try checkedMul(intermediate_count, @sizeOf(u16));
+    const state = try allocBuf(&owned, self.allocator, self, hidden_bytes);
+    const a = try allocBuf(&owned, self.allocator, self, intermediate_bytes);
+    const b = try allocBuf(&owned, self.allocator, self, intermediate_bytes);
+    const c = try allocBuf(&owned, self.allocator, self, intermediate_bytes);
+    const d = try allocBuf(&owned, self.allocator, self, intermediate_bytes);
+    try self.kernels.launchF32ToBf16(&self.ctx, state, input.buffer, count);
+
+    const chunks = try checkedMul(sequence, embedding_gemma2_vision.head_count * 2);
+    const positions = try self.allocator.alloc(u32, try checkedMul(chunks, 3));
+    defer self.allocator.free(positions);
+    @memset(positions, 0);
+    for (0..sequence) |token| for (0..embedding_gemma2_vision.head_count) |head| {
+        positions[(token * embedding_gemma2_vision.head_count + head) * 2] = @intCast(token % grid_x);
+        positions[(token * embedding_gemma2_vision.head_count + head) * 2 + 1] = @intCast(token / grid_x);
+    };
+
+    for (0..embedding_gemma2_vision.layer_count) |layer| {
+        const w = try embedding_gemma2_vision.layerWeights(&names, layer);
+        try module.launchRmsNorm(&self.ctx, a, state, try weight(self, w.input_norm), @intCast(sequence), hidden, embedding_gemma2_vision.rms_norm_eps);
+        try embeddingGemma2Matmul(self, module, b, a, try weight(self, w.q), sequence, hidden, hidden);
+        try embeddingGemma2Matmul(self, module, c, a, try weight(self, w.k), sequence, hidden, hidden);
+        try embeddingGemma2Matmul(self, module, d, a, try weight(self, w.v), sequence, hidden, hidden);
+        try module.launchRmsNorm(&self.ctx, a, b, try weight(self, w.q_norm), @intCast(sequence * embedding_gemma2_vision.head_count), embedding_gemma2_vision.head_dim, embedding_gemma2_vision.rms_norm_eps);
+        try module.launchRmsNorm(&self.ctx, b, c, try weight(self, w.k_norm), @intCast(sequence * embedding_gemma2_vision.head_count), embedding_gemma2_vision.head_dim, embedding_gemma2_vision.rms_norm_eps);
+        try module.launchRmsNorm(&self.ctx, c, d, null, @intCast(sequence * embedding_gemma2_vision.head_count), embedding_gemma2_vision.head_dim, embedding_gemma2_vision.rms_norm_eps);
+
+        const q_base = try embeddingGemma2VisionF32Tensor(self, module, a, chunks, embedding_gemma2_vision.head_dim / 2);
+        defer freeTensor(ctx, q_base);
+        const k_base = try embeddingGemma2VisionF32Tensor(self, module, b, chunks, embedding_gemma2_vision.head_dim / 2);
+        defer freeTensor(ctx, k_base);
+        const q_rope = (try mrope(ctx, q_base, chunks, embedding_gemma2_vision.head_dim / 2, embedding_gemma2_vision.rope_theta, 1.0, positions, .{ embedding_gemma2_vision.head_dim / 4, 0, 0 })) orelse return error.CudaKernelUnavailable;
+        defer freeTensor(ctx, q_rope);
+        const q_scaled = (try multiplyScalar(ctx, q_rope, embedding_gemma2_vision.q_attention_scale)) orelse return error.CudaKernelUnavailable;
+        defer freeTensor(ctx, q_scaled);
+        const k_rope = (try mrope(ctx, k_base, chunks, embedding_gemma2_vision.head_dim / 2, embedding_gemma2_vision.rope_theta, 1.0, positions, .{ embedding_gemma2_vision.head_dim / 4, 0, 0 })) orelse return error.CudaKernelUnavailable;
+        defer freeTensor(ctx, k_rope);
+        const v_f32 = try embeddingGemma2VisionF32Tensor(self, module, c, sequence, hidden);
+        defer freeTensor(ctx, v_f32);
+        const attention = (try sdpaEmbeddingGemma2Vision(ctx, q_scaled, k_rope, v_f32, 1, sequence, embedding_gemma2_vision.head_count, embedding_gemma2_vision.head_dim)) orelse return error.CudaKernelUnavailable;
+        defer freeTensor(ctx, attention);
+        try self.kernels.launchF32ToBf16(&self.ctx, d, tensorFromCt(attention).buffer, count);
+        try embeddingGemma2Matmul(self, module, a, d, try weight(self, w.out), sequence, hidden, hidden);
+        try module.launchRmsNorm(&self.ctx, b, a, try weight(self, w.post_attention_norm), @intCast(sequence), hidden, embedding_gemma2_vision.rms_norm_eps);
+        try module.launchResidual(&self.ctx, state, state, b, null, @intCast(count), 1, 0);
+        try module.launchRmsNorm(&self.ctx, a, state, try weight(self, w.pre_ffn_norm), @intCast(sequence), hidden, embedding_gemma2_vision.rms_norm_eps);
+        try embeddingGemma2Matmul(self, module, b, a, try weight(self, w.gate), sequence, hidden, intermediate);
+        try embeddingGemma2Matmul(self, module, c, a, try weight(self, w.up), sequence, hidden, intermediate);
+        try module.launchGeluMul(&self.ctx, d, b, c, @intCast(intermediate_count));
+        try embeddingGemma2Matmul(self, module, a, d, try weight(self, w.down), sequence, intermediate, hidden);
+        try module.launchRmsNorm(&self.ctx, b, a, try weight(self, w.post_ffn_norm), @intCast(sequence), hidden, embedding_gemma2_vision.rms_norm_eps);
+        try module.launchResidual(&self.ctx, state, state, b, null, @intCast(count), 1, 0);
+    }
+    return try embeddingGemma2VisionF32Tensor(self, module, state, sequence, hidden);
+}
+
+fn sdpaEmbeddingGemma2Vision(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    // This route is qualified only for the official HF vision tower. Keeping
+    // the topology exact prevents silently changing other Qwen/Gemma models.
+    if (batch != 1 or seq_len == 0 or seq_len > 3136 or num_heads != 12 or head_dim != 64 or self.cublaslt == null or self.ctx.info.compute_major < 8) return null;
+    const q_tensor = tensorFromCt(q_ct);
+    const k_tensor = tensorFromCt(k_ct);
+    const v_tensor = tensorFromCt(v_ct);
+    try ensureF32(q_tensor);
+    try ensureF32(k_tensor);
+    try ensureF32(v_tensor);
+    const hidden = try checkedMul(num_heads, head_dim);
+    const count = try checkedMul(seq_len, hidden);
+    try ensureCount(q_tensor, count);
+    try ensureCount(k_tensor, count);
+    try ensureCount(v_tensor, count);
+
+    if (try tryEmbeddingGemma2VisionCudnn(self, q_tensor, k_tensor, v_tensor, seq_len, num_heads, head_dim)) |result|
+        return result;
+
+    const tile: usize = 1024;
+    const activation_bytes = try checkedMul(count, @sizeOf(u16));
+    const score_elements = try checkedMul(try checkedMul(num_heads, tile), seq_len);
+    const score_bytes = try checkedMul(score_elements, @sizeOf(f32));
+    const probability_bytes = try checkedMul(score_elements, @sizeOf(u16));
+    var cursor: usize = 0;
+    const q_offset = try appendDebertaWorkspaceRegion(&cursor, activation_bytes);
+    const k_offset = try appendDebertaWorkspaceRegion(&cursor, activation_bytes);
+    const v_offset = try appendDebertaWorkspaceRegion(&cursor, activation_bytes);
+    const scores_offset = try appendDebertaWorkspaceRegion(&cursor, score_bytes);
+    const probs_offset = try appendDebertaWorkspaceRegion(&cursor, probability_bytes);
+    const arena_bytes = try alignDebertaWorkspaceOffset(cursor);
+    if (self.run_budget) |budget| {
+        const limit = budget.limits.scratch_limit_bytes;
+        if (limit != 0 and arena_bytes > limit -| budget.scratchTotalBytes()) return null;
+    }
+    const arena = self.embedding_gemma2_vision_attention_scratch.acquire(&self.ctx, arena_bytes) catch return null;
+    const q_bf16 = debertaWorkspaceRegion(arena, q_offset, activation_bytes);
+    const k_bf16 = debertaWorkspaceRegion(arena, k_offset, activation_bytes);
+    const v_bf16 = debertaWorkspaceRegion(arena, v_offset, activation_bytes);
+    const scores = debertaWorkspaceRegion(arena, scores_offset, score_bytes);
+    const probs = debertaWorkspaceRegion(arena, probs_offset, probability_bytes);
+    // Once the first conversion may have entered the stream, failures are
+    // fail-closed errors rather than nullable declines. This prevents the
+    // generic fallback from racing work that still references this arena.
+    var work_queued = true;
+    var output_cleanup_registered = false;
+    errdefer if (work_queued and !output_cleanup_registered) self.ctx.synchronize() catch {};
+    try self.kernels.launchF32ToBf16(&self.ctx, q_bf16, q_tensor.buffer, count);
+    try self.kernels.launchF32ToBf16(&self.ctx, k_bf16, k_tensor.buffer, count);
+    try self.kernels.launchF32ToBf16(&self.ctx, v_bf16, v_tensor.buffer, count);
+
+    const shape = try dupeShape(self.allocator, q_tensor.shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, try checkedMul(count, @sizeOf(f32)));
+    errdefer releaseDeviceBuffer(self, &device);
+    // Registered after device cleanup so Zig's LIFO order drains the stream
+    // before releasing an output referenced by earlier tiles.
+    errdefer self.ctx.synchronize() catch {};
+    output_cleanup_registered = true;
+    const module = try self.embeddingGemma2Module();
+    const blas = &self.cublaslt.?;
+    const workspace = cublasLtWorkspace(self);
+    const score_stride = try checkedMul(tile, seq_len);
+    var qt: usize = 0;
+    while (qt < seq_len) : (qt += tile) {
+        const rows = @min(tile, seq_len - qt);
+        const q_bytes = try checkedMul(try checkedMul(qt, hidden), @sizeOf(u16));
+        const out_bytes = try checkedMul(try checkedMul(qt, hidden), @sizeOf(f32));
+        const q_view: buffer_mod.DeviceBuffer = .{ .ptr = q_bf16.ptr + q_bytes, .len = q_bf16.len - q_bytes };
+        const out_view: buffer_mod.DeviceBuffer = .{ .ptr = device.ptr + out_bytes, .len = device.len - out_bytes };
+        // The projector pre-multiplies Q by sqrt(64); alpha restores the
+        // official scale-1 attention logits.
+        try blas.matmulEmbeddingGemma2Attention(&self.ctx, scores, q_view, k_bf16, workspace, rows, seq_len, head_dim, hidden, hidden, seq_len, num_heads, head_dim, head_dim, score_stride, true, true, 1.0 / 8.0);
+        try module.launchAttentionSoftmax(&self.ctx, probs, scores, .{}, @intCast(seq_len), @intCast(qt), @intCast(rows), 0, @intCast(num_heads), @intCast(tile));
+        try blas.matmulEmbeddingGemma2Attention(&self.ctx, out_view, probs, v_bf16, workspace, rows, head_dim, seq_len, seq_len, hidden, hidden, num_heads, score_stride, head_dim, head_dim, false, true, 1.0);
+    }
+    self.stats.launch_attention += 1;
+    const result = try createTensor(self, device, shape, count);
+    work_queued = false;
+    return result;
 }
 
 fn sdpaQwen3VlVision(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
@@ -23198,6 +24252,7 @@ const vtable = ops.ComputeBackend.VTable{
     .backendKind = &backendKind,
     .deinitBackend = &deinitBackend,
     .freeTensor = &freeTensor,
+    .immutableResidentScalarF32 = &immutableResidentScalarF32Op,
     .beginRequest = &beginRequest,
     .convertDType = &convertDTypeOp,
     .provisionKvDeviceWriteHook = &provisionKvDeviceWriteHook,
@@ -23322,6 +24377,8 @@ const vtable = ops.ComputeBackend.VTable{
     .layaActionFeatures = &layaActionFeatures,
     .packedGegluExact = &packedGegluExact,
     .scaledDotProductAttentionQwen3VlVision = &sdpaQwen3VlVision,
+    .scaledDotProductAttentionEmbeddingGemma2Vision = &sdpaEmbeddingGemma2Vision,
+    .runEmbeddingGemma2VisionTower = &runEmbeddingGemma2VisionTowerOp,
     .scaledDotProductAttentionFull = &sdpaFull,
     .causalSelfAttention = &causalSelfAttention,
     .crossAttention = &crossAttention,
@@ -23355,6 +24412,11 @@ const vtable = ops.ComputeBackend.VTable{
     .copyTensorFromBackend = &copyTensorFromBackendOp,
     .tensorDType = &tensorDTypeOp,
     .tensorShape = &tensorShapeOp,
+    .tensorShapeMatches = &tensorShapeMatchesOp,
+    .clampScalar = &gemma4AudioClampScalarOp,
+    .gluRows = &gemma4AudioGluRowsOp,
+    .depthwiseCausalConv1d = &gemma4AudioDepthwiseCausalConv1dOp,
+    .gemma4AudioLocalAttention = &gemma4AudioLocalAttentionOp,
     .evalTensor = &evalTensorOp,
     .debertaTrainingAttentionV1 = &gliner25.debertaTrainingAttentionV1,
     .debertaTrainingAttentionBackwardV1 = &gliner25.debertaTrainingAttentionBackwardV1,
@@ -23440,6 +24502,83 @@ test "cuda shape helpers reject incompatible shapes" {
     try std.testing.expect(try checkedMul(2, 3) == 6);
     try std.testing.expect(sameShape(&.{ 2, 3 }, &.{ 2, 3 }));
     try std.testing.expect(!sameShape(&.{ 2, 3 }, &.{ 3, 2 }));
+}
+
+test "cuda tensor shape metadata matches exact dimensions and rank" {
+    var stored_shape = [_]i64{ 1, 2520, 768 };
+    var tensor = CudaTensor{
+        .buffer = .{},
+        .dtype = .f32,
+        .shape = &stored_shape,
+        .elem_count = 1 * 2520 * 768,
+        .owns_buffer = false,
+        .owns_shape = false,
+        .owned_by_tensor = false,
+    };
+    const ct: CT = @ptrCast(&tensor);
+
+    try std.testing.expect((try tensorShapeMatchesOp(undefined, ct, &.{ 1, 2520, 768 })).?);
+    try std.testing.expect(!(try tensorShapeMatchesOp(undefined, ct, &.{ 1, 2521, 768 })).?);
+    try std.testing.expect(!(try tensorShapeMatchesOp(undefined, ct, &.{ 2520, 768 })).?);
+    try std.testing.expect(vtable.tensorShapeMatches != null);
+}
+
+test "immutable scalar cache owns names and distinguishes missing values" {
+    const allocator = std.testing.allocator;
+    var cache: std.StringHashMapUnmanaged(ImmutableScalarCacheEntry) = .{};
+    defer {
+        var it = cache.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        cache.deinit(allocator);
+    }
+
+    var mutable_name = [_]u8{ 'a', '.', 'b' };
+    try putImmutableScalarCache(allocator, &cache, &mutable_name, .missing);
+    mutable_name[0] = 'x';
+    try std.testing.expect(cache.get("a.b").? == .missing);
+    try putImmutableScalarCache(allocator, &cache, "c.d", .{ .value = 0.390625 });
+    try std.testing.expectEqual(@as(f32, 0.390625), cache.get("c.d").?.value);
+}
+
+test "immutable scalar metadata rejects malformed or non-finite values" {
+    var scalar_shape = [_]i64{1};
+    var rank0_shape = [_]i64{};
+    var rank2_shape = [_]i64{ 1, 1 };
+    var bad_count_shape = [_]i64{2};
+    var tensor = CudaTensor{
+        .buffer = .{},
+        .dtype = .bf16,
+        .shape = &scalar_shape,
+        .elem_count = 1,
+        .owns_buffer = false,
+        .owns_shape = false,
+        .owned_by_tensor = false,
+    };
+    try validateImmutableScalarTensorMetadata(&tensor);
+    tensor.shape = &rank0_shape;
+    try validateImmutableScalarTensorMetadata(&tensor);
+    tensor.shape = &rank2_shape;
+    try std.testing.expectError(error.InvalidTensorShape, validateImmutableScalarTensorMetadata(&tensor));
+    tensor.shape = &scalar_shape;
+    try validateImmutableScalarValue(1.25);
+    try std.testing.expectError(error.InvalidTensorData, validateImmutableScalarValue(std.math.nan(f32)));
+    tensor.dtype = .i32;
+    try std.testing.expectError(error.UnsupportedTensorType, validateImmutableScalarTensorMetadata(&tensor));
+    tensor.dtype = .f32;
+    tensor.shape = &bad_count_shape;
+    try std.testing.expectError(error.InvalidTensorShape, validateImmutableScalarTensorMetadata(&tensor));
+    tensor.elem_count = 2;
+    try std.testing.expectError(error.InvalidTensorShape, validateImmutableScalarTensorMetadata(&tensor));
+}
+
+test "embedding gemma2 encoder padding preserves short and maximum sequences" {
+    try std.testing.expectEqual(@as(usize, 15), CudaCompute.embeddingGemma2EncoderSequence(15, 8192));
+    try std.testing.expectEqual(@as(usize, 128), CudaCompute.embeddingGemma2EncoderSequence(128, 8192));
+    try std.testing.expectEqual(@as(usize, 320), CudaCompute.embeddingGemma2EncoderSequence(270, 8192));
+    try std.testing.expectEqual(@as(usize, 320), CudaCompute.embeddingGemma2EncoderSequence(311, 8192));
+    try std.testing.expectEqual(@as(usize, 8192), CudaCompute.embeddingGemma2EncoderSequence(8191, 8192));
+    try std.testing.expectEqual(@as(usize, 8191), CudaCompute.embeddingGemma2EncoderSequence(8191, 8000));
+    try std.testing.expectEqual(std.math.maxInt(usize), CudaCompute.embeddingGemma2EncoderSequence(std.math.maxInt(usize), std.math.maxInt(usize)));
 }
 
 test "cuda batched dot plan supports every attention matrix-axis layout" {

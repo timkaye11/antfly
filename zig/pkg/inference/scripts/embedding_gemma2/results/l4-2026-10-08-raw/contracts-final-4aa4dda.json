@@ -1,0 +1,130 @@
+{
+  "gates": [
+    {
+      "case": "8192",
+      "gate": "expanded_token_boundary",
+      "pass": true,
+      "prompt_tokens": 8192,
+      "status": 200
+    },
+    {
+      "case": "expanded_8193",
+      "expected": "INPUT_TOO_LONG",
+      "expected_status": 400,
+      "gate": "negative_contract",
+      "pass": true,
+      "status": 400,
+      "value": "INPUT_TOO_LONG"
+    },
+    {
+      "case": "dimensions_zero",
+      "expected": "INVALID_REQUEST",
+      "expected_status": 400,
+      "gate": "negative_contract",
+      "pass": true,
+      "status": 400,
+      "value": "INVALID_REQUEST"
+    },
+    {
+      "case": "dimensions_769",
+      "expected": "INVALID_REQUEST",
+      "expected_status": 400,
+      "gate": "negative_contract",
+      "pass": true,
+      "status": 400,
+      "value": "INVALID_REQUEST"
+    },
+    {
+      "case": "unknown_task",
+      "expected": "INVALID_REQUEST",
+      "expected_status": 400,
+      "gate": "negative_contract",
+      "pass": true,
+      "status": 400,
+      "value": "INVALID_REQUEST"
+    },
+    {
+      "case": "text_only_image_placeholder",
+      "expected": "INVALID_MEDIA_LAYOUT",
+      "expected_status": 400,
+      "gate": "negative_contract",
+      "pass": true,
+      "status": 400,
+      "value": "INVALID_MEDIA_LAYOUT"
+    },
+    {
+      "case": "text_only_audio_placeholder",
+      "expected": "INVALID_MEDIA_LAYOUT",
+      "expected_status": 400,
+      "gate": "negative_contract",
+      "pass": true,
+      "status": 400,
+      "value": "INVALID_MEDIA_LAYOUT"
+    },
+    {
+      "case": "text_only_video_placeholder",
+      "expected": "INVALID_MEDIA_LAYOUT",
+      "expected_status": 400,
+      "gate": "negative_contract",
+      "pass": true,
+      "status": 400,
+      "value": "INVALID_MEDIA_LAYOUT"
+    },
+    {
+      "case": "empty_content",
+      "expected": "INVALID_REQUEST",
+      "expected_status": 400,
+      "gate": "negative_contract",
+      "pass": true,
+      "status": 400,
+      "value": "INVALID_REQUEST"
+    },
+    {
+      "case": "nested_content",
+      "expected": "INVALID_REQUEST",
+      "expected_status": 400,
+      "gate": "negative_contract",
+      "pass": true,
+      "status": 400,
+      "value": "INVALID_REQUEST"
+    },
+    {
+      "case": "malformed_image",
+      "expected": "INVALID_IMAGE",
+      "expected_status": 400,
+      "gate": "negative_contract",
+      "pass": true,
+      "status": 400,
+      "value": "INVALID_IMAGE"
+    },
+    {
+      "case": "malformed_audio",
+      "expected": "INVALID_AUDIO",
+      "expected_status": 400,
+      "gate": "negative_contract",
+      "pass": true,
+      "status": 400,
+      "value": "INVALID_AUDIO"
+    },
+    {
+      "case": "nonfinite_pcm",
+      "expected": "INVALID_AUDIO",
+      "expected_status": 400,
+      "gate": "negative_contract",
+      "pass": true,
+      "status": 400,
+      "value": "INVALID_AUDIO"
+    },
+    {
+      "backend": "cuda",
+      "case": "resident_session",
+      "gate": "cancel_then_reuse",
+      "norm": 1.0000000258853723,
+      "pass": true,
+      "status": 200
+    }
+  ],
+  "model": "embeddinggemma-2",
+  "pass": true,
+  "schema": "antfly.embedding_gemma2.endpoint_contract.v1"
+}

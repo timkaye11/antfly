@@ -1,0 +1,196 @@
+{
+  "build": {
+    "base_git_revision": "ac2d3779ee7052621435a4e14922256e2b5b0735",
+    "binary_bytes": 46233640,
+    "binary_sha256": "bda59bbadd9fdc2d1af83abb2312d751eb8df780a54140bc75b676d76f1f73b9",
+    "binary_verification": "l4-2026-10-08-binary-verification.json",
+    "cuda": true,
+    "cuda_artifact": "sm89",
+    "optimize": "ReleaseFast",
+    "published_utc": "2026-10-08T02:55:33.823Z",
+    "source_manifest": "l4-2026-10-08-source-manifest.json",
+    "source_manifest_sha256": "e0975c97287f640dc874a805cf4e586931e41bf8ae78d67435f0dab0d2c2f51e",
+    "strip": true
+  },
+  "cuda_artifacts": {
+    "fatbin_sha256": "34810af057ad753ba8ee62c84b3e21cf56598f93f9c88f4ff37fead0ccea3ae0",
+    "ptx_sha256": "1da22ed0dfad2a509beff3d7c0b5676291354e4cba7cc0a09a65e610f92188dd",
+    "sm89_cubin_sha256": "c790628287abe8584f3d4f1edc4ed5bec1e01eed50685546033b4bf202c91046"
+  },
+  "date": "2026-10-08",
+  "final_quality": {
+    "audio_matrix": {
+      "failing_case": "1s mono 44100 Hz",
+      "minimum_cosine": 0.9989237257952991,
+      "pass": false,
+      "raw_report": "l4-2026-10-08-raw/audio-matrix-final-bda59bb.json"
+    },
+    "cli": {
+      "gates_passed": 60,
+      "gates_total": 60,
+      "pass": true,
+      "raw_report": "l4-2026-10-08-raw/cli-final-oct8-bda59bb.json"
+    },
+    "http": {
+      "gates_passed": 71,
+      "gates_total": 71,
+      "pass": true,
+      "raw_report": "l4-2026-10-08-raw/http-final-bda59bb.json"
+    }
+  },
+  "hardware": {
+    "compute_capability": "8.9",
+    "cuda_runtime": "13.0",
+    "cudnn": "9.24.0.43",
+    "driver": "580.159.03",
+    "gpu": "NVIDIA L4"
+  },
+  "inherited_unchanged_runtime_evidence": {
+    "binary_sha256": "4aa4dda5e08ca2ecd7bbb72dfb7e5663a9d4c76714e1fe2695ea65ca46a60076",
+    "capacity_b8_b32_8192": true,
+    "concurrency_26": true,
+    "contract_14": true,
+    "cudnn_absent_or_disabled_oracle_contract_concurrency_cap": true,
+    "extended_matrix_20": true,
+    "raw_directory": "l4-2026-10-08-raw",
+    "reason": "final source manifest changes only the bit-exact sparse mel helper and projector call site"
+  },
+  "limits": {
+    "audio_44100_quality_gate_passed": false,
+    "image_performance_gate_passed": false,
+    "quantized_tier_supported": false,
+    "secondary_gpu_architectures_measured": false,
+    "unmeasured_text_matrix_cells": 41,
+    "video_supported": false
+  },
+  "model": {
+    "bundle_artifacts": 13,
+    "id": "google/embeddinggemma-2",
+    "revision": "914f7f89142e33e77833254d9c9b90c3cef7303b",
+    "weight_bytes": 1488915288,
+    "weight_sha256": "197a32965d4b1105faf060417baa899e193fb73cd401f42ec9295234d5553d79"
+  },
+  "paired_performance": {
+    "cells": {
+      "audio": {
+        "minimum_cosine": 0.9998595091552008,
+        "native_p50_ms": 30.881983984727412,
+        "native_p95_ms": 32.79608301818371,
+        "p95_latency_ratio": 0.5648953305215095,
+        "pass": true,
+        "pytorch_p50_ms": 47.01686999760568,
+        "pytorch_p95_ms": 58.05692001013085,
+        "raw_report": "l4-2026-10-08-raw/formal-final-bda-audio.json",
+        "throughput_ratio_ci95": [
+          1.5443448039935235,
+          1.6273281367462686
+        ]
+      },
+      "b1s128": {
+        "minimum_cosine": 0.9999424625328516,
+        "native_p50_ms": 10.679750004783273,
+        "native_p95_ms": 11.941928998567164,
+        "p95_latency_ratio": 0.6420209679447682,
+        "pass": true,
+        "pytorch_p50_ms": 17.11284404154867,
+        "pytorch_p95_ms": 18.600528012029827,
+        "raw_report": "l4-2026-10-08-raw/formal-final-bda-b1s128.json",
+        "throughput_ratio_ci95": [
+          1.5794365879028909,
+          1.6216640419426662
+        ]
+      },
+      "b1s8192": {
+        "minimum_cosine": 0.9999609651351733,
+        "native_p50_ms": 227.0347320009023,
+        "native_p95_ms": 230.31632200581953,
+        "p95_latency_ratio": 0.4830871766050472,
+        "pass": true,
+        "pytorch_p50_ms": 472.03791001811624,
+        "pytorch_p95_ms": 476.7593369469978,
+        "raw_report": "l4-2026-10-08-raw/formal-final-bda-b1s8192.json",
+        "throughput_ratio_ci95": [
+          2.0773332053417737,
+          2.082776654755392
+        ]
+      },
+      "b32s2048": {
+        "minimum_cosine": 0.9999499345763483,
+        "native_p50_ms": 1359.863385965582,
+        "native_p95_ms": 1378.9991989615373,
+        "p95_latency_ratio": 0.8233143568871494,
+        "pass": true,
+        "pytorch_p50_ms": 1652.9277130030096,
+        "pytorch_p95_ms": 1674.936416966375,
+        "raw_report": "l4-2026-10-08-raw/formal-final-bda-b32s2048.json",
+        "throughput_ratio_ci95": [
+          1.213563449775014,
+          1.2172856077615335
+        ]
+      },
+      "b8s512": {
+        "minimum_cosine": 0.9999594414534411,
+        "native_p50_ms": 63.59717599116266,
+        "native_p95_ms": 65.00015797792003,
+        "p95_latency_ratio": 0.9269436548870892,
+        "pass": true,
+        "pytorch_p50_ms": 67.63482902897522,
+        "pytorch_p95_ms": 70.12309500714764,
+        "raw_report": "l4-2026-10-08-raw/formal-final-bda-b8s512.json",
+        "throughput_ratio_ci95": [
+          1.0605461515575603,
+          1.0691843707789443
+        ]
+      },
+      "image": {
+        "minimum_cosine": 0.9999641518184414,
+        "native_p50_ms": 69.09118901239708,
+        "native_p95_ms": 70.29423303902149,
+        "p95_latency_ratio": 1.0849909658561034,
+        "pass": false,
+        "pytorch_p50_ms": 61.82986201019958,
+        "pytorch_p95_ms": 64.78785100625828,
+        "raw_report": "l4-2026-10-08-raw/formal-final-bda-image.json",
+        "throughput_ratio_ci95": [
+          0.8941755768647387,
+          0.9031225825590431
+        ]
+      },
+      "mixed_ordered": {
+        "minimum_cosine": 0.9999289181470467,
+        "native_p50_ms": 86.65303396992385,
+        "native_p95_ms": 101.7223900416866,
+        "p95_latency_ratio": 1.0493620618026325,
+        "pass": true,
+        "pytorch_p50_ms": 84.35053704306483,
+        "pytorch_p95_ms": 96.93736198823899,
+        "raw_report": "l4-2026-10-08-raw/formal-final-bda-mixed_ordered.json",
+        "throughput_ratio_ci95": [
+          0.9597658076587725,
+          1.0010294470339332
+        ]
+      }
+    },
+    "gate": "throughput ratio lower 95% CI >= 0.90 and p95 latency ratio <= 1.10",
+    "independent_audit": "l4-2026-10-08-paired-audit.json",
+    "passed": 6,
+    "total": 7
+  },
+  "production_claim": false,
+  "reference": {
+    "attention": "sdpa",
+    "compile": "default for paired performance; none for audio-rate matrix",
+    "torch": "2.14.0+cu130",
+    "torch_cpu_threads": 1,
+    "transformers": "5.19.0.dev0"
+  },
+  "schema": "antfly.embedding_gemma2.l4_qualification.v2",
+  "status": "gaps_remain",
+  "supporting_proofs": {
+    "attention_dispatch": "l4-2026-10-07-attention-production-dispatch.json",
+    "audio_ops": "l4-2026-10-08-audio-ops.json",
+    "cudnn_text_gqa": "l4-2026-10-08-cudnn-text-gqa.json",
+    "cudnn_text_local_band": "l4-2026-10-08-cudnn-text-local-band.json",
+    "sparse_mel": "l4-2026-10-08-sparse-mel.json"
+  }
+}

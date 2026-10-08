@@ -1,0 +1,46 @@
+{
+  "schema": "antfly.embedding_gemma2.intermediate_image.v1",
+  "status": "intermediate_candidate",
+  "binary_sha256": "92ae2d0ecdbacb97bee74e38c3c019d407eb9f943ade0b4a4cd4ca7794f76d6f",
+  "device": "NVIDIA L4 SM89",
+  "quality": {
+    "text_and_image_gates_passed": 49,
+    "text_and_image_gates_total": 49,
+    "image_oracle_cosine": 0.9999666846548553,
+    "report": "/tmp/antfly-embeddinggemma2/intermediate-92ae-http-text-image.json"
+  },
+  "image_latency_ms": {
+    "warmup": [61.925, 63.035, 63.773, 66.716, 63.364],
+    "measured": [63.696, 61.982, 62.604, 63.25, 63.148, 63.685, 62.632, 63.799, 62.908, 62.513],
+    "p50": 63.028,
+    "p95": 63.74235,
+    "instrumentation_enabled": true
+  },
+  "kernel_census": {
+    "sequence": 270,
+    "encoder_sequence": 320,
+    "cublaslt_matmuls": 257,
+    "attention_launches": 24,
+    "kernel_launches": 438,
+    "scalar_matmul_fallbacks": 0,
+    "attention_scalar_fallbacks": 0,
+    "cudnn": {
+      "executes": 16,
+      "vision_executes": 16,
+      "text_executes": 0,
+      "plan_hits": 31,
+      "plan_misses": 1,
+      "plan_declines": 0,
+      "workspace_high_water": 0,
+      "log": "/tmp/antfly-embeddinggemma2/intermediate-92ae-image-cli.log"
+    }
+  },
+  "known_failure": {
+    "case": "audio",
+    "status": 500,
+    "public_error": "INFERENCE_FAILED",
+    "internal_error": "TensorNotFound",
+    "fix_status": "queued for the final combined build"
+  },
+  "interpretation": "This candidate validates the image optimization but is not the final combined binary. Formal paired performance and audio qualification are deferred to the next build."
+}

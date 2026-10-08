@@ -1,0 +1,47 @@
+{
+  "schema": "antfly.embedding_gemma2.vision_attention_differential.v1",
+  "device": "NVIDIA L4",
+  "compute_capability": "8.9",
+  "production_candidate": {
+    "query_tile": 1024,
+    "batch": 1,
+    "sequence": 2394,
+    "heads": 12,
+    "head_dim": 64,
+    "input": "FP32 Q/K/V cast to BF16",
+    "logits": "cuBLASLt BF16 QK to FP32, alpha=0.125 for Q pre-scaled by 8",
+    "softmax": "FP32 accumulation to BF16 probabilities",
+    "output": "cuBLASLt BF16 PV with FP32 accumulation/output"
+  },
+  "numerical_gate": {
+    "reference": "Explicit FP32 QK/softmax, probabilities cast BF16, FP32 PV output; Q input pre-scaled by 8 and QK alpha=0.125",
+    "lengths": [
+      17,
+      513,
+      2394
+    ],
+    "qk_scales": [
+      0.0,
+      0.1,
+      1.0
+    ],
+    "padded_batch_2_length": 2394,
+    "minimum_cosine": 0.9999962449073792,
+    "maximum_abs_error": 0.01332855224609375,
+    "required_cosine": 0.999
+  },
+  "timing_ms_per_layer": {
+    "batch_1_sequence_2394": {
+      "scale_0": 2.190131187438965,
+      "scale_0_1": 2.2784000396728517,
+      "scale_1": 2.454937553405762
+    },
+    "previous_production_kernel_nsys": 5.5602743
+  },
+  "workspace": {
+    "score_probability_tile_mib": 175.34,
+    "cublaslt_mib": 32,
+    "qkv_bf16_staging_mib": 10.52,
+    "bounded": true
+  }
+}

@@ -33,6 +33,7 @@ const InferenceExecutionControl = @import("../execution_control.zig").InferenceE
 const bert = @import("../models/bert.zig");
 const t5_mod = @import("../models/t5.zig");
 const gpt_mod = @import("../models/gpt.zig");
+const embedding_gemma2_model = @import("../models/embedding_gemma2.zig");
 const safetensors_mod = @import("../models/safetensors.zig");
 const whisper_mod = @import("../models/whisper.zig");
 const florence_mod = @import("../models/florence.zig");
@@ -48,6 +49,7 @@ const nomic_bert_arch = @import("nomic_bert.zig");
 const layoutlmv3_arch = @import("layoutlmv3.zig");
 const t5_arch = @import("t5.zig");
 const gpt_arch = @import("gpt.zig");
+const embedding_gemma2_arch = @import("embedding_gemma2.zig");
 const deepseek_v4_arch = @import("deepseek_v4.zig");
 const whisper_arch = @import("whisper.zig");
 const clip_arch = @import("clip.zig");
@@ -92,6 +94,7 @@ const CudaCapabilityProfile = if (build_options.enable_cuda) cuda_compute_mod.Ca
     gemma4,
     gemma4_training,
     qwen3_embedding,
+    embedding_gemma2,
     qwen3_vl_generation,
 };
 const GpuHostedQuantExecutionMode = @import("../ops/gpu_hosted_store.zig").QuantExecutionMode;
@@ -394,6 +397,7 @@ const ArchType = enum {
     deberta,
     t5,
     gpt,
+    embedding_gemma2,
     whisper,
     florence,
     clip,
@@ -411,6 +415,7 @@ const ArchConfig = union(ArchType) {
     deberta: deberta_mod.Config,
     t5: t5_mod.Config,
     gpt: gpt_mod.Config,
+    embedding_gemma2: embedding_gemma2_model.Config,
     whisper: whisper_mod.Config,
     florence: florence_mod.Config,
     clip: clip_mod.Config,
@@ -782,6 +787,7 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
         .deberta => "deberta",
         .t5 => "", // T5 weights use full names (encoder.block.0.*, decoder.block.0.*)
         .gpt => "", // GPT weights use full names (model.layers.0.*, h.0.*)
+        .embedding_gemma2 => "", // Preserve canonical language_model/tower names.
         .whisper => "", // Whisper uses full names (encoder.*, model.decoder.*)
         .florence => "", // Florence2 uses full names (davit.*, model.decoder.*)
         .clip => "", // CLIP uses full names (text_model.*, vision_model.*)
@@ -1076,6 +1082,7 @@ pub fn createPjrtSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
         .deberta => "deberta",
         .t5 => "",
         .gpt => "",
+        .embedding_gemma2 => "",
         .whisper => "",
         .florence => "",
         .clip => "",
@@ -1630,6 +1637,8 @@ fn createCudaSessionWithRequiredProfile(
     defer model_manifest.deinit();
     try model_manifest.requireRecognizedGlinerArchitecture();
     if (model_manifest.gliner_architecture == .boundary) return error.UnsupportedGlinerBoundaryBackend;
+    if (model_manifest.embedding_style == .embedding_gemma2)
+        try cuda_compute_mod.preflightProfileDevice(.embedding_gemma2);
     const a4b_inference = if (required_profile_override == null)
         try resolveCudaA4bInferenceConfigForModelListing(
             allocator,
@@ -1920,6 +1929,7 @@ fn cudaProfileForArch(
                 null,
             else => null,
         },
+        .embedding_gemma2 => .embedding_gemma2,
         else => null,
     };
 }
@@ -2069,7 +2079,7 @@ fn loadSafetensorsIntoResident(
         try transposeGpt2Conv1dResidentGpuHostedWeights(allocator, resident_weights, stream);
     }
     return switch (arch_config) {
-        .t5, .gpt, .whisper, .florence, .clip, .clap, .modern_bert, .nomic_bert => "",
+        .t5, .gpt, .embedding_gemma2, .whisper, .florence, .clip, .clap, .modern_bert, .nomic_bert => "",
         .gliner, .gliner_boundary => "encoder",
         .deberta => "deberta",
         .layoutlmv3 => "layoutlmv3",
@@ -2528,6 +2538,9 @@ fn detectArchitectureWithGgufFile(
                     }
                 }
                 return .{ .gpt = cfg };
+            }
+            if (std.mem.eql(u8, model_type, "embedding_gemma2")) {
+                return .{ .embedding_gemma2 = try embedding_gemma2_model.parseConfig(allocator, config_bytes) };
             }
             if (whisper_mod.isWhisperModel(model_type)) {
                 return .{ .whisper = try whisper_mod.parseConfig(allocator, config_bytes) };
@@ -6992,6 +7005,7 @@ const arch_vtable = Session.VTable{
     .runWithControl = &archRunWithControl,
     .runResident = &archRunResident,
     .runResidentTextEmbedding = &archRunResidentTextEmbedding,
+    .runResidentTextEmbeddingWithControl = &archRunResidentTextEmbeddingWithControl,
     .runResidentWithControl = &archRunResidentWithControl,
     .inputInfo = &archInputInfo,
     .outputInfo = &archOutputInfo,
@@ -7096,6 +7110,73 @@ fn parseBertRunInputs(inputs: []const Tensor) !BertRunInputs {
     };
 }
 
+fn parseEmbeddingGemma2Inputs(inputs: []const Tensor, cfg: embedding_gemma2_model.Config) !embedding_gemma2_arch.Request {
+    var ids: ?[]const i64 = null;
+    var embeddings: ?[]const f32 = null;
+    var mask: ?[]const i64 = null;
+    var shape: ?[2]usize = null;
+    for (inputs) |tensor| {
+        if (std.mem.eql(u8, tensor.name, "input_ids")) {
+            const matrix = try validateI64Matrix(tensor, shape);
+            ids = matrix.values;
+            shape = matrix.shape;
+        } else if (std.mem.eql(u8, tensor.name, "attention_mask")) {
+            const matrix = try validateI64Matrix(tensor, shape);
+            mask = matrix.values;
+            shape = matrix.shape;
+        } else if (std.mem.eql(u8, tensor.name, "inputs_embeds")) {
+            if (tensor.dtype != .f32 or tensor.shape.len != 3 or tensor.shape[0] <= 0 or tensor.shape[1] <= 0 or tensor.shape[2] != cfg.hidden_size or !tensor.isAlignedFor(f32))
+                return error.InvalidInputShape;
+            const matrix_shape = [2]usize{ @intCast(tensor.shape[0]), @intCast(tensor.shape[1]) };
+            if (shape) |expected| if (!std.mem.eql(usize, &matrix_shape, &expected)) return error.InvalidInputShape;
+            const tokens = std.math.mul(usize, matrix_shape[0], matrix_shape[1]) catch return error.InvalidInputShape;
+            const count = std.math.mul(usize, tokens, cfg.hidden_size) catch return error.InvalidInputShape;
+            const byte_count = std.math.mul(usize, count, @sizeOf(f32)) catch return error.InvalidInputShape;
+            if (tensor.data.len != byte_count) return error.InvalidInputShape;
+            embeddings = tensor.asFloat32();
+            shape = matrix_shape;
+        }
+    }
+    const resolved_shape = shape orelse return error.MissingInputs;
+    const attention_mask = mask orelse return error.MissingInputs;
+    const input: embedding_gemma2_arch.Input = if (embeddings) |values|
+        .{ .input_embeddings = values }
+    else if (ids) |values|
+        .{ .token_ids = values }
+    else
+        return error.MissingInputs;
+    const request = embedding_gemma2_arch.Request{
+        .input = input,
+        .attention_mask = attention_mask,
+        .batch = resolved_shape[0],
+        .sequence = resolved_shape[1],
+    };
+    try request.validate(cfg);
+    return request;
+}
+
+fn validateEmbeddingGemma2Output(values: []const f32, batch: usize, dimension: usize) !void {
+    if (batch == 0 or dimension == 0) return error.InvalidEmbeddingOutput;
+    const expected = std.math.mul(usize, batch, dimension) catch return error.InvalidEmbeddingOutput;
+    if (values.len != expected) return error.InvalidEmbeddingOutput;
+    for (0..batch) |row| {
+        var norm_squared: f32 = 0;
+        for (values[row * dimension ..][0..dimension]) |value| {
+            if (!std.math.isFinite(value)) return error.InvalidEmbeddingOutput;
+            norm_squared += value * value;
+        }
+        if (!std.math.isFinite(norm_squared) or norm_squared == 0) return error.InvalidEmbeddingOutput;
+    }
+}
+
+test "EmbeddingGemma2 output validation is batch exact and finite" {
+    try validateEmbeddingGemma2Output(&.{ 0.6, 0.8, 0.8, 0.6 }, 2, 2);
+    try std.testing.expectError(error.InvalidEmbeddingOutput, validateEmbeddingGemma2Output(&.{ 0.6, 0.8 }, 2, 2));
+    try std.testing.expectError(error.InvalidEmbeddingOutput, validateEmbeddingGemma2Output(&.{ 0.6, 0.8, 0, 0 }, 2, 2));
+    try std.testing.expectError(error.InvalidEmbeddingOutput, validateEmbeddingGemma2Output(&.{ 0.6, std.math.nan(f32) }, 1, 2));
+    try std.testing.expectError(error.InvalidEmbeddingOutput, validateEmbeddingGemma2Output(&.{}, std.math.maxInt(usize), 2));
+}
+
 test "BERT session inputs require matching aligned i64 matrices" {
     const allocator = std.testing.allocator;
     const shape = [_]i64{ 1, 2 };
@@ -7190,9 +7271,76 @@ fn archRunResidentTextEmbedding(
     request: ResidentTextEmbeddingRequest,
     allocator: std.mem.Allocator,
 ) !?ResidentOutputs {
+    return archRunResidentTextEmbeddingImpl(ptr, inputs, request, allocator, null);
+}
+
+fn archRunResidentTextEmbeddingWithControl(
+    ptr: *anyopaque,
+    inputs: []const Tensor,
+    request: ResidentTextEmbeddingRequest,
+    allocator: std.mem.Allocator,
+    control: InferenceExecutionControl,
+) !?ResidentOutputs {
+    return archRunResidentTextEmbeddingImpl(ptr, inputs, request, allocator, control);
+}
+
+fn archRunResidentTextEmbeddingImpl(
+    ptr: *anyopaque,
+    inputs: []const Tensor,
+    request: ResidentTextEmbeddingRequest,
+    allocator: std.mem.Allocator,
+    control: ?InferenceExecutionControl,
+) !?ResidentOutputs {
+    if (control) |active| try active.check();
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
-    if (self.task == .classifier or self.task == .extractor or self.backend_type != .metal) return null;
+    if (self.task == .classifier or self.task == .extractor) return null;
     if (request.pooling != .mean) return null;
+    if (self.arch_config == .embedding_gemma2) {
+        const cfg = self.arch_config.embedding_gemma2;
+        const encoder_request = try parseEmbeddingGemma2Inputs(inputs, cfg);
+        const embedding = switch (self.backend_type) {
+            .cuda => if (comptime build_options.enable_cuda) try self.backend_data.cuda.compute.runEmbeddingGemma2(
+                allocator,
+                cfg,
+                switch (encoder_request.input) {
+                    .token_ids => |values| .{ .token_ids = values },
+                    .input_embeddings => |values| .{ .input_embeddings = values },
+                },
+                encoder_request.attention_mask,
+                encoder_request.batch,
+                encoder_request.sequence,
+                cfg.outputDim(),
+                control,
+            ) else return error.CudaNotEnabled,
+            .native => blk: {
+                var reference_cb = try makeComputeBackend(self, allocator, null);
+                defer reference_cb.deinit();
+                reference_cb.execution_control = control;
+                break :blk try embedding_gemma2_arch.forwardReference(&reference_cb, allocator, cfg, encoder_request, cfg.outputDim());
+            },
+            else => return null,
+        };
+        defer allocator.free(embedding);
+        try validateEmbeddingGemma2Output(embedding, encoder_request.batch, cfg.outputDim());
+        const cb = try allocator.create(ops.ComputeBackend);
+        errdefer allocator.destroy(cb);
+        cb.* = try makeComputeBackend(self, allocator, null);
+        errdefer cb.deinit();
+        const output_shape = [_]i32{ @intCast(encoder_request.batch), @intCast(cfg.outputDim()) };
+        const output = try cb.fromFloat32Shape(embedding, &output_shape);
+        errdefer cb.free(output);
+        const outputs = try allocator.alloc(ops.CT, 1);
+        errdefer allocator.free(outputs);
+        outputs[0] = output;
+        return .{
+            .outputs = outputs,
+            .backend = cb,
+            .allocator = allocator,
+            .backend_owner = cb,
+            .deinit_backend_owner = &deinitResidentComputeBackend,
+        };
+    }
+    if (self.backend_type != .metal) return null;
     const cfg = switch (self.arch_config) {
         .nomic_bert => |cfg| cfg,
         else => return null,
@@ -7308,6 +7456,15 @@ pub fn getGptConfig(session: Session) ?gpt_mod.Config {
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
     return switch (self.arch_config) {
         .gpt => |cfg| cfg,
+        else => null,
+    };
+}
+
+pub fn getEmbeddingGemma2Config(session: Session) ?embedding_gemma2_model.Config {
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    return switch (self.arch_config) {
+        .embedding_gemma2 => |cfg| cfg,
         else => null,
     };
 }
@@ -9174,6 +9331,34 @@ fn archRunImpl(
             return result;
         },
         .gliner_boundary => return error.BoundaryExtractionRequiresSchema,
+        .embedding_gemma2 => |cfg| {
+            const encoder_request = try parseEmbeddingGemma2Inputs(inputs, cfg);
+            const embedding = switch (self.backend_type) {
+                .cuda => if (comptime build_options.enable_cuda) try self.backend_data.cuda.compute.runEmbeddingGemma2(
+                    allocator,
+                    cfg,
+                    switch (encoder_request.input) {
+                        .token_ids => |values| .{ .token_ids = values },
+                        .input_embeddings => |values| .{ .input_embeddings = values },
+                    },
+                    encoder_request.attention_mask,
+                    encoder_request.batch,
+                    encoder_request.sequence,
+                    cfg.outputDim(),
+                    control,
+                ) else return error.CudaNotEnabled,
+                .native => try embedding_gemma2_arch.forwardReference(&cb, allocator, cfg, encoder_request, cfg.outputDim()),
+                else => return error.UnsupportedBackend,
+            };
+            defer allocator.free(embedding);
+            try validateEmbeddingGemma2Output(embedding, encoder_request.batch, cfg.outputDim());
+            const shape = [_]i64{ @intCast(encoder_request.batch), @intCast(cfg.outputDim()) };
+            var output_tensor = try Tensor.initFloat32(allocator, "sentence_embedding", &shape, embedding);
+            errdefer output_tensor.deinit();
+            const result = try allocator.alloc(Tensor, 1);
+            result[0] = output_tensor;
+            return result;
+        },
         .gliner => |cfg| {
             var decision_positions_tensor: ?Tensor = null;
             var decision_mask_tensor: ?Tensor = null;
@@ -9913,6 +10098,9 @@ fn archOutputInfo(ptr: *anyopaque) []const TensorInfo {
         };
     }
     return switch (self.arch_config) {
+        .embedding_gemma2 => &.{
+            .{ .name = "sentence_embedding", .dtype = .f32, .shape = &.{ -1, 768 } },
+        },
         .clap => &.{
             .{ .name = "text_embeds", .dtype = .f32, .shape = &.{ -1, -1 } },
         },

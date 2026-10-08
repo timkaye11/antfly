@@ -2839,12 +2839,15 @@ pub const LoadedModel = struct {
             // otherwise a short BGE-M3 request is padded to its full 8K window.
             // The pipeline still preserves explicitly fixed input dimensions.
             .trim_padding_to_batch_max = isJinaStyleEmbeddingManifest(&self.manifest) or
+                self.manifest.embedding_style == .embedding_gemma2 or
                 @import("../models/bert.zig").isBertModel(self.manifest.config_model_arch) or
                 self.manifest.bert_model_type == .roberta or
                 generic_encoder != null or
                 session_factory.supportsResidentTextEncoder(self.session),
             .resident_qwen3_embedding = isJinaStyleEmbeddingManifest(&self.manifest),
             .resident_text_encoder = resident_text_encoder,
+            .resident_embedding_gemma2 = self.manifest.embedding_style == .embedding_gemma2,
+            .strict_max_length = self.manifest.embedding_style == .embedding_gemma2,
             .preprocess_io = self.executor_io,
             // Last-token pooling reads the EOS position; guarantee exactly
             // one trailing EOS regardless of tokenizer.json snapshot age.
@@ -3569,6 +3572,8 @@ fn attachSessionRunAdmission(
             .attention_heads = manifest.num_attention_heads,
             .quadratic_attention = backend_runtime.backend == .onnx and
                 backend_runtime.onnx_execution_provider != .cuda,
+            .embedding_gemma2_cuda = manifest.embedding_style == .embedding_gemma2 and
+                backend_runtime.backend == .cuda,
         } else .{},
     };
 }
@@ -3579,6 +3584,18 @@ pub const ModelHandle = struct {
 
     pub fn get(self: *const ModelHandle) *LoadedModel {
         return self.model orelse unreachable;
+    }
+
+    /// Create another lifetime pin for the exact same published generation.
+    /// This is used when admission metadata must remain borrowed for the whole
+    /// request while execution independently transfers a handle into recovery.
+    pub fn duplicate(self: *const ModelHandle) ModelHandle {
+        const model = self.model orelse unreachable;
+        self.manager.lockLoadedModels();
+        std.debug.assert(model.active_handles > 0);
+        model.active_handles += 1;
+        self.manager.unlockLoadedModels();
+        return .{ .manager = self.manager, .model = model };
     }
 
     pub fn pin(self: *ModelHandle) void {
@@ -5850,6 +5867,28 @@ pub const ModelManager = struct {
         return .{ .manager = self, .model = model };
     }
 
+    /// Look up the already-published generation selected by the current
+    /// backend policy without starting a load. Unlike the legacy alias lookup,
+    /// this resolves backend-qualified cache keys and never returns a default
+    /// alias whose backend is outside the effective preference set.
+    pub fn acquireLoadedModelForCurrentPolicy(self: *ModelManager, model_dir: []const u8) !?ModelHandle {
+        var required_backend_scratch: [1]backends.BackendType = undefined;
+        const effective_backends = try self.session_manager.requiredBackendCandidates(
+            self.session_manager.preferred_backends,
+            &required_backend_scratch,
+        );
+        self.lockLoadedModels();
+        defer self.unlockLoadedModels();
+        const model = try self.lookupLoadedModelLocked(
+            model_dir,
+            effective_backends,
+            true,
+            inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, true),
+        ) orelse return null;
+        model.active_handles += 1;
+        return .{ .manager = self, .model = model };
+    }
+
     /// Pin one handle for every currently published model. Callers may release
     /// load_lock before taking per-model locks without racing model eviction or
     /// retirement destruction. Metrics/listing observation does not renew TTL;
@@ -8062,22 +8101,30 @@ test "loaded model snapshot preserves TTL while ordinary inference release recor
     var inference = manager.acquireLoadedModel("model") orelse return error.MissingTestModel;
     defer inference.release();
     try std.testing.expectEqual(@as(usize, 2), model.active_handles);
+    var duplicate = inference.duplicate();
+    defer duplicate.release();
+    try std.testing.expect(duplicate.get() == inference.get());
+    try std.testing.expectEqual(@as(usize, 3), model.active_handles);
     const before_release = platform.time.monotonicNs();
     inference.release();
     const used_at = model.last_used_ns;
     try std.testing.expect(used_at >= before_release and used_at > 1);
+    try std.testing.expectEqual(@as(usize, 2), model.active_handles);
+    duplicate.release();
+    const duplicate_used_at = model.last_used_ns;
+    try std.testing.expect(duplicate_used_at >= used_at);
     try std.testing.expectEqual(@as(usize, 1), model.active_handles);
     observation.deinit();
-    try std.testing.expectEqual(used_at, model.last_used_ns);
+    try std.testing.expectEqual(duplicate_used_at, model.last_used_ns);
     try std.testing.expectEqual(@as(usize, 0), model.active_handles);
 
     manager.lockLoadedModels();
-    const not_yet = manager.takeLruModelLocked(used_at + std.time.ns_per_ms - 1, true, null);
+    const not_yet = manager.takeLruModelLocked(duplicate_used_at + std.time.ns_per_ms - 1, true, null);
     manager.unlockLoadedModels();
     defer if (not_yet) |removed| allocator.free(removed.key);
     try std.testing.expect(not_yet == null);
     manager.lockLoadedModels();
-    const expired = manager.takeLruModelLocked(used_at + std.time.ns_per_ms, true, null);
+    const expired = manager.takeLruModelLocked(duplicate_used_at + std.time.ns_per_ms, true, null);
     manager.unlockLoadedModels();
     defer if (expired) |removed| allocator.free(removed.key);
     try std.testing.expect(expired != null and expired.?.model == &model);

@@ -1,0 +1,40 @@
+{
+  "blas_contract": "BLAS path unchanged.",
+  "helper_tests": {
+    "passed": 3,
+    "selected": 3,
+    "skipped": 0
+  },
+  "integration_tests": {
+    "passed": 33,
+    "selected": 34,
+    "skip": "BLAS-vs-FFT test: BLAS unavailable",
+    "skipped": 1
+  },
+  "nonfinite_contract": "Each nonfinite magnitude row uses the original dense ascending loop, preserving Inf*0 and NaN*0 behavior.",
+  "production_scope": [
+    "src/architectures/gemma4_mel_sparse.zig",
+    "src/architectures/gemma4_projector.zig"
+  ],
+  "release_fast_benchmark": {
+    "bitwise_equal": true,
+    "command": "cd zig/pkg/inference && zig build-exe -OReleaseFast -lc -femit-bin=/tmp/eg2-mel-sparse-bench --dep gemma4_mel_sparse -Mroot=scripts/embedding_gemma2/mel_sparse_benchmark.zig -Mgemma4_mel_sparse=src/architectures/gemma4_mel_sparse.zig && /tmp/eg2-mel-sparse-bench",
+    "comparison": "raw mel sums before the shared log transform",
+    "dense_ns": 4244344599,
+    "dense_terms": 32896,
+    "estimated_saved_ms_per_request": 4.1548,
+    "frames": 99,
+    "frequencies": 257,
+    "iterations": 1000,
+    "mel_bins": 128,
+    "nonzero_span_terms": 506,
+    "outputs_compared": 12672,
+    "source": "/tmp/eg2_mel_sparse_actual_bench.zig",
+    "span_percent": 1.54,
+    "sparse_ns": 89578412,
+    "speedup": 47.38,
+    "tracked_source": "zig/pkg/inference/scripts/embedding_gemma2/mel_sparse_benchmark.zig"
+  },
+  "schema": "antfly.embedding_gemma2.sparse_mel_validation.v1",
+  "source_manifest_sha256": "e0975c97287f640dc874a805cf4e586931e41bf8ae78d67435f0dab0d2c2f51e"
+}

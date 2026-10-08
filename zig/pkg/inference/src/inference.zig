@@ -51,6 +51,7 @@ pub const codecs = @import("codecs/codecs.zig");
 pub const compiled_artifact = @import("compiled_artifact.zig");
 pub const graph = @import("graph/root.zig");
 pub const architectures = struct {
+    pub const embedding_gemma2 = @import("architectures/embedding_gemma2.zig");
     pub const clipclap_format = @import("architectures/clipclap_format.zig");
     pub const deberta = @import("architectures/deberta.zig");
     pub const deberta_graph = @import("architectures/deberta_graph.zig");
@@ -167,6 +168,8 @@ test {
     _ = linalg;
     _ = graph;
     _ = architectures;
+    _ = architectures.embedding_gemma2;
+    _ = @import("pipelines/embedding_gemma2_content.zig");
     _ = architectures.deberta_graph;
     _ = @import("architectures/gliner_head.zig");
     _ = @import("architectures/gliner_head_graph.zig");
@@ -257,6 +260,7 @@ test {
         _ = native_compute.cuda;
         _ = @import("ops/cuda/a4b_prepared_pack.zig");
         _ = @import("ops/cuda/kernels.zig");
+        _ = @import("ops/cuda/embedding_gemma2.zig");
         // Keep focused boundary-kernel tests discoverable without relying on
         // an unrelated device test to instantiate the resident adapter.
         _ = @import("ops/cuda/gliner25.zig");

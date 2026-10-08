@@ -1,0 +1,26 @@
+{
+  "schema": "antfly.embedding_gemma2.shared_softmax_differential.v1",
+  "device": "NVIDIA L4",
+  "compute_capability": "8.9",
+  "kernel_source": "src/ops/cuda/kernels/embedding_gemma2.cuh",
+  "kernel": "termite_embedding_gemma2_attention_softmax_bf16",
+  "tile_capacity": 256,
+  "topology": {"query_heads": 4, "kv_heads": 1, "head_dim": 512, "local_radius": 0},
+  "matrix": {
+    "batches": [1, 2],
+    "lengths": [17, 513, 8192],
+    "qk_scales": [0.0, 0.1, 1.0],
+    "batch_2_valid_fraction": 0.75,
+    "cases": 18
+  },
+  "result": {
+    "passed": 18,
+    "minimum_candidate_vs_exact_warp_cosine": 0.9999947547912598,
+    "minimum_candidate_vs_pytorch_sdpa_cosine": 0.9999949336051941,
+    "maximum_abs_error": 0.03125
+  },
+  "s8192_timing_ms": {
+    "batch_1_range": [17.43052864074707, 18.327552795410156],
+    "batch_2_range": [32.080894470214844, 38.41126251220703]
+  }
+}

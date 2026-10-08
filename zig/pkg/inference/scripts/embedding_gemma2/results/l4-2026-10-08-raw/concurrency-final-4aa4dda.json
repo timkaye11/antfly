@@ -1,0 +1,299 @@
+{
+  "gates": [
+    {
+      "capacity_retries": 0,
+      "case": "document",
+      "cosine": 1.0000000000000007,
+      "gate": "concurrent_same_session",
+      "pass": true,
+      "request": 0,
+      "retry_codes": {},
+      "status": 200
+    },
+    {
+      "capacity_retries": 0,
+      "case": "query",
+      "cosine": 1.0000000000000007,
+      "gate": "concurrent_same_session",
+      "pass": true,
+      "request": 1,
+      "retry_codes": {},
+      "status": 200
+    },
+    {
+      "capacity_retries": 0,
+      "case": "code_query",
+      "cosine": 0.9999999999999998,
+      "gate": "concurrent_same_session",
+      "pass": true,
+      "request": 2,
+      "retry_codes": {},
+      "status": 200
+    },
+    {
+      "capacity_retries": 0,
+      "case": "image",
+      "cosine": 1.0000000000000009,
+      "gate": "concurrent_same_session",
+      "pass": true,
+      "request": 3,
+      "retry_codes": {},
+      "status": 200
+    },
+    {
+      "capacity_retries": 0,
+      "case": "audio",
+      "cosine": 0.9999999999999998,
+      "gate": "concurrent_same_session",
+      "pass": true,
+      "request": 4,
+      "retry_codes": {},
+      "status": 200
+    },
+    {
+      "capacity_retries": 0,
+      "case": "mixed_ordered",
+      "cosine": 1.000000000000001,
+      "gate": "concurrent_same_session",
+      "pass": true,
+      "request": 5,
+      "retry_codes": {},
+      "status": 200
+    },
+    {
+      "capacity_retries": 0,
+      "case": "document",
+      "cosine": 1.0000000000000007,
+      "gate": "concurrent_same_session",
+      "pass": true,
+      "request": 6,
+      "retry_codes": {},
+      "status": 200
+    },
+    {
+      "capacity_retries": 0,
+      "case": "query",
+      "cosine": 1.0000000000000007,
+      "gate": "concurrent_same_session",
+      "pass": true,
+      "request": 7,
+      "retry_codes": {},
+      "status": 200
+    },
+    {
+      "capacity_retries": 0,
+      "case": "code_query",
+      "cosine": 0.9999999999999998,
+      "gate": "concurrent_same_session",
+      "pass": true,
+      "request": 8,
+      "retry_codes": {},
+      "status": 200
+    },
+    {
+      "capacity_retries": 0,
+      "case": "image",
+      "cosine": 1.0000000000000009,
+      "gate": "concurrent_same_session",
+      "pass": true,
+      "request": 9,
+      "retry_codes": {},
+      "status": 200
+    },
+    {
+      "capacity_retries": 0,
+      "case": "audio",
+      "cosine": 0.9999999999999998,
+      "gate": "concurrent_same_session",
+      "pass": true,
+      "request": 10,
+      "retry_codes": {},
+      "status": 200
+    },
+    {
+      "capacity_retries": 0,
+      "case": "mixed_ordered",
+      "cosine": 1.000000000000001,
+      "gate": "concurrent_same_session",
+      "pass": true,
+      "request": 11,
+      "retry_codes": {},
+      "status": 200
+    },
+    {
+      "capacity_retries": 0,
+      "case": "document",
+      "cosine": 1.0000000000000007,
+      "gate": "concurrent_same_session",
+      "pass": true,
+      "request": 12,
+      "retry_codes": {},
+      "status": 200
+    },
+    {
+      "capacity_retries": 0,
+      "case": "query",
+      "cosine": 1.0000000000000007,
+      "gate": "concurrent_same_session",
+      "pass": true,
+      "request": 13,
+      "retry_codes": {},
+      "status": 200
+    },
+    {
+      "capacity_retries": 0,
+      "case": "code_query",
+      "cosine": 0.9999999999999998,
+      "gate": "concurrent_same_session",
+      "pass": true,
+      "request": 14,
+      "retry_codes": {},
+      "status": 200
+    },
+    {
+      "capacity_retries": 0,
+      "case": "image",
+      "cosine": 1.0000000000000009,
+      "gate": "concurrent_same_session",
+      "pass": true,
+      "request": 15,
+      "retry_codes": {},
+      "status": 200
+    },
+    {
+      "capacity_retries": 0,
+      "case": "audio",
+      "cosine": 0.9999999999999998,
+      "gate": "concurrent_same_session",
+      "pass": true,
+      "request": 16,
+      "retry_codes": {},
+      "status": 200
+    },
+    {
+      "capacity_retries": 1,
+      "case": "mixed_ordered",
+      "cosine": 1.000000000000001,
+      "gate": "concurrent_same_session",
+      "pass": true,
+      "request": 17,
+      "retry_codes": {
+        "SERVICE_UNAVAILABLE": 1
+      },
+      "status": 200
+    },
+    {
+      "capacity_retries": 0,
+      "case": "document",
+      "cosine": 1.0000000000000007,
+      "gate": "concurrent_same_session",
+      "pass": true,
+      "request": 18,
+      "retry_codes": {},
+      "status": 200
+    },
+    {
+      "capacity_retries": 0,
+      "case": "query",
+      "cosine": 1.0000000000000007,
+      "gate": "concurrent_same_session",
+      "pass": true,
+      "request": 19,
+      "retry_codes": {},
+      "status": 200
+    },
+    {
+      "capacity_retries": 0,
+      "case": "code_query",
+      "cosine": 0.9999999999999998,
+      "gate": "concurrent_same_session",
+      "pass": true,
+      "request": 20,
+      "retry_codes": {},
+      "status": 200
+    },
+    {
+      "capacity_retries": 0,
+      "case": "image",
+      "cosine": 1.0000000000000009,
+      "gate": "concurrent_same_session",
+      "pass": true,
+      "request": 21,
+      "retry_codes": {},
+      "status": 200
+    },
+    {
+      "capacity_retries": 0,
+      "case": "audio",
+      "cosine": 0.9999999999999998,
+      "gate": "concurrent_same_session",
+      "pass": true,
+      "request": 22,
+      "retry_codes": {},
+      "status": 200
+    },
+    {
+      "capacity_retries": 0,
+      "case": "mixed_ordered",
+      "cosine": 1.000000000000001,
+      "gate": "concurrent_same_session",
+      "pass": true,
+      "request": 23,
+      "retry_codes": {},
+      "status": 200
+    },
+    {
+      "gate": "partial_sibling_preservation",
+      "message": null,
+      "pass": true,
+      "request_error": null,
+      "status": 200,
+      "success_indexes": [
+        0,
+        4
+      ]
+    },
+    {
+      "errors": [
+        {
+          "code": "INVALID_IMAGE",
+          "index": 1,
+          "message": "unsupported or corrupt image input",
+          "retry_after_ms": null,
+          "retryable": false,
+          "stage": "image_decode",
+          "status": 400
+        },
+        {
+          "code": "INVALID_AUDIO",
+          "index": 2,
+          "message": "unsupported, empty, or corrupt audio input",
+          "retry_after_ms": null,
+          "retryable": false,
+          "stage": "inference",
+          "status": 400
+        },
+        {
+          "code": "INVALID_MEDIA_LAYOUT",
+          "index": 3,
+          "message": "media placeholders must reference each supplied image or audio part exactly once",
+          "retry_after_ms": null,
+          "retryable": false,
+          "stage": "inference",
+          "status": 400
+        }
+      ],
+      "gate": "partial_error_deduplication",
+      "pass": true,
+      "summary": {
+        "failed": 3,
+        "succeeded": 2,
+        "total": 5
+      }
+    }
+  ],
+  "pass": true,
+  "rounds": 4,
+  "schema": "antfly.embedding_gemma2.concurrency.v1",
+  "workers": 8
+}

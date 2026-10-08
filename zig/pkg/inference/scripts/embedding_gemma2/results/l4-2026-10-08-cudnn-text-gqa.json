@@ -1,0 +1,22 @@
+{
+  "schema": "antfly.embedding_gemma2.cudnn_text_gqa.v1",
+  "device": "NVIDIA L4 SM89",
+  "runtime": "nvidia-cudnn-cu13 9.24.0.43",
+  "prototype_source": "../cudnn_text_gqa_backend_proof.c",
+  "oracle_driver": "../cudnn_text_gqa_differential.py",
+  "shape": {"batch": 8, "query_heads": 4, "kv_heads": 2, "sequence": 512, "head_dim": 256},
+  "attention": {"scale": 1.0, "mask": "all-valid", "local_radius": 512},
+  "cudnn": {"workspace_bytes": 0, "average_ms_100": 0.213443},
+  "production_local_q64_ms": 1.7758822631835938,
+  "pytorch_comparison": {
+    "device": "cuda",
+    "dtype": "bfloat16",
+    "reduction_dtype": "float64",
+    "zero_vector_policy": "both_zero_is_one; exactly_one_zero_is_zero",
+    "finite": true,
+    "cosine_float64": 0.9999598139595417,
+    "max_abs": 0.0000247955322265625,
+    "mean_abs": 0.000002946744945449167
+  },
+  "production_zig_smoke": {"vision_executes": 1, "text_executes": 1, "plan_misses": 2, "workspace_high_water": 0}
+}

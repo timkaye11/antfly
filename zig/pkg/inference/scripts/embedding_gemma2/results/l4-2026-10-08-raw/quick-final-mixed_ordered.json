@@ -1,0 +1,98 @@
+{
+  "correctness": {
+    "backend": "cuda",
+    "embedding_width": 768,
+    "minimum_cosine": 0.9999289181470467,
+    "usage": {
+      "prompt_tokens": 311,
+      "total_tokens": 311
+    }
+  },
+  "gates": {
+    "p95_latency_ratio_max": 1.1,
+    "throughput_ratio_lower_95": 0.9
+  },
+  "latency_ms": {
+    "antfly": {
+      "p50": 96.27132501918823,
+      "p95": 102.54639200866222,
+      "p99": 102.54639200866222
+    },
+    "pytorch": {
+      "p50": 86.96204796433449,
+      "p95": 89.10776901757345,
+      "p99": 89.10776901757345
+    }
+  },
+  "p95_latency_ratio": 1.1508131461403603,
+  "pass": false,
+  "raw_latency_ms": {
+    "antfly": [
+      96.28239599987864,
+      102.54639200866222,
+      83.0708589637652,
+      113.26575401471928,
+      83.0441169673577,
+      96.27132501918823,
+      82.2819119784981,
+      99.78057298576459,
+      82.18254998791963,
+      99.802726006601
+    ],
+    "pytorch": [
+      83.03407399216667,
+      93.47044199239463,
+      85.37892799358815,
+      86.96204796433449,
+      82.56255701417103,
+      87.57345494814217,
+      89.10776901757345,
+      87.56092598196119,
+      84.77036299882457,
+      88.35155999986455
+    ]
+  },
+  "runtime": {
+    "antfly": null,
+    "pytorch": {
+      "attention": "sdpa",
+      "backend": "pytorch_cuda",
+      "compile": "default",
+      "compute_capability": "8.9",
+      "cuda_runtime": "13.0",
+      "cudnn": 92400,
+      "device": "NVIDIA L4",
+      "model_id": "google/embeddinggemma-2",
+      "numpy": "2.4.6",
+      "nvidia_driver": "580.159.03",
+      "pillow": "12.3.0",
+      "platform": "Linux-6.1.0-49-cloud-amd64-x86_64-with-glibc2.36",
+      "precision": "bfloat16_weights_fp32_pooling",
+      "python": "3.11.2",
+      "revision": "914f7f89142e33e77833254d9c9b90c3cef7303b",
+      "scipy": "1.17.1",
+      "tokenizers": "0.23.2",
+      "torch": "2.14.0+cu130",
+      "torch_cpu_threads": 1,
+      "torch_interop_threads": 2,
+      "total_memory_bytes": 23659151360,
+      "transformers": "5.19.0.dev0",
+      "weight_sha256": "197a32965d4b1105faf060417baa899e193fb73cd401f42ec9295234d5553d79"
+    }
+  },
+  "schema": "antfly.embedding_gemma2.paired_benchmark.v1",
+  "throughput_ratio_ci95": [
+    0.87052096430691,
+    0.9814164195250299
+  ],
+  "workload": {
+    "batch_size": 1,
+    "case": "mixed_ordered",
+    "corpus": null,
+    "expanded_tokens": null,
+    "expected_token_lengths": null,
+    "iterations": 10,
+    "task_type": "RETRIEVAL_QUERY",
+    "warmup": 20
+  }
+}

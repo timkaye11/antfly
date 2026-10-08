@@ -1,0 +1,49 @@
+{
+  "schema": "antfly.embedding_gemma2.input_cap.v1",
+  "pass": true,
+  "max_input_tokens_per_item": 512,
+  "gates": [
+    {
+      "case": "text512",
+      "pass": true,
+      "status": 200,
+      "expected_status": 200,
+      "error": null,
+      "usage": {
+        "prompt_tokens": 512,
+        "total_tokens": 512
+      },
+      "backend": "cuda"
+    },
+    {
+      "case": "text513",
+      "pass": true,
+      "status": 400,
+      "expected_status": 400,
+      "error": "INPUT_TOO_LONG",
+      "usage": null,
+      "backend": null
+    },
+    {
+      "case": "image270",
+      "pass": true,
+      "status": 200,
+      "expected_status": 200,
+      "error": null,
+      "usage": {
+        "prompt_tokens": 270,
+        "total_tokens": 270
+      },
+      "backend": "cuda"
+    },
+    {
+      "case": "images538",
+      "pass": true,
+      "status": 400,
+      "expected_status": 400,
+      "error": "INPUT_TOO_LONG",
+      "usage": null,
+      "backend": null
+    }
+  ]
+}

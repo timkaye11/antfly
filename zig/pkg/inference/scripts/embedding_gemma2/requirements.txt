@@ -1,0 +1,13 @@
+# The model was published against an unreleased Transformers implementation.
+# This exact source revision exposes EmbeddingGemma2Model and Processor.
+# Install torch==2.14.0+cu130 from PyTorch's official cu130 wheel index first.
+# This public-version constraint prevents transitive dependencies from
+# replacing that qualified CUDA wheel.
+torch==2.14.0
+transformers @ git+https://github.com/huggingface/transformers.git@a96730c8c97b8efbf35bbaf7f5da33ec99231a49
+sentence-transformers==6.1.0
+pillow==12.3.0
+numpy==2.4.6
+scipy==1.17.1
+tokenizers==0.23.2
+torchvision==0.29.1

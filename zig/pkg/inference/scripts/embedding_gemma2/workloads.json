@@ -1,0 +1,765 @@
+{
+  "cells": [
+    {
+      "batch_size": 1,
+      "corpus": "natural_text",
+      "dimensions": 768,
+      "id": "text-natural_text-b1-s16",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 16,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "batch_size": 1,
+      "corpus": "source_code",
+      "dimensions": 768,
+      "id": "text-source_code-b1-s16",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 16,
+      "task_type": "CODE_RETRIEVAL"
+    },
+    {
+      "batch_size": 1,
+      "corpus": "heterogeneous_padding",
+      "dimensions": 768,
+      "id": "text-heterogeneous_padding-b1-s16",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 16,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "batch_size": 1,
+      "corpus": "natural_text",
+      "dimensions": 768,
+      "id": "text-natural_text-b1-s128",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 128,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "batch_size": 1,
+      "corpus": "source_code",
+      "dimensions": 768,
+      "id": "text-source_code-b1-s128",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 128,
+      "task_type": "CODE_RETRIEVAL"
+    },
+    {
+      "batch_size": 1,
+      "corpus": "heterogeneous_padding",
+      "dimensions": 768,
+      "id": "text-heterogeneous_padding-b1-s128",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 128,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "batch_size": 1,
+      "corpus": "natural_text",
+      "dimensions": 768,
+      "id": "text-natural_text-b1-s512",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 512,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "batch_size": 1,
+      "corpus": "source_code",
+      "dimensions": 768,
+      "id": "text-source_code-b1-s512",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 512,
+      "task_type": "CODE_RETRIEVAL"
+    },
+    {
+      "batch_size": 1,
+      "corpus": "heterogeneous_padding",
+      "dimensions": 768,
+      "id": "text-heterogeneous_padding-b1-s512",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 512,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "batch_size": 1,
+      "corpus": "natural_text",
+      "dimensions": 768,
+      "id": "text-natural_text-b1-s2048",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 2048,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "batch_size": 1,
+      "corpus": "source_code",
+      "dimensions": 768,
+      "id": "text-source_code-b1-s2048",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 2048,
+      "task_type": "CODE_RETRIEVAL"
+    },
+    {
+      "batch_size": 1,
+      "corpus": "heterogeneous_padding",
+      "dimensions": 768,
+      "id": "text-heterogeneous_padding-b1-s2048",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 2048,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "batch_size": 1,
+      "corpus": "natural_text",
+      "dimensions": 768,
+      "id": "text-natural_text-b1-s8192",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 8192,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "batch_size": 1,
+      "corpus": "source_code",
+      "dimensions": 768,
+      "id": "text-source_code-b1-s8192",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 8192,
+      "task_type": "CODE_RETRIEVAL"
+    },
+    {
+      "batch_size": 1,
+      "corpus": "heterogeneous_padding",
+      "dimensions": 768,
+      "id": "text-heterogeneous_padding-b1-s8192",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 8192,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "batch_size": 8,
+      "corpus": "natural_text",
+      "dimensions": 768,
+      "id": "text-natural_text-b8-s16",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 16,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "batch_size": 8,
+      "corpus": "source_code",
+      "dimensions": 768,
+      "id": "text-source_code-b8-s16",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 16,
+      "task_type": "CODE_RETRIEVAL"
+    },
+    {
+      "batch_size": 8,
+      "corpus": "heterogeneous_padding",
+      "dimensions": 768,
+      "id": "text-heterogeneous_padding-b8-s16",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 16,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "batch_size": 8,
+      "corpus": "natural_text",
+      "dimensions": 768,
+      "id": "text-natural_text-b8-s128",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 128,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "batch_size": 8,
+      "corpus": "source_code",
+      "dimensions": 768,
+      "id": "text-source_code-b8-s128",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 128,
+      "task_type": "CODE_RETRIEVAL"
+    },
+    {
+      "batch_size": 8,
+      "corpus": "heterogeneous_padding",
+      "dimensions": 768,
+      "id": "text-heterogeneous_padding-b8-s128",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 128,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "batch_size": 8,
+      "corpus": "natural_text",
+      "dimensions": 768,
+      "id": "text-natural_text-b8-s512",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 512,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "batch_size": 8,
+      "corpus": "source_code",
+      "dimensions": 768,
+      "id": "text-source_code-b8-s512",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 512,
+      "task_type": "CODE_RETRIEVAL"
+    },
+    {
+      "batch_size": 8,
+      "corpus": "heterogeneous_padding",
+      "dimensions": 768,
+      "id": "text-heterogeneous_padding-b8-s512",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 512,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "batch_size": 8,
+      "corpus": "natural_text",
+      "dimensions": 768,
+      "id": "text-natural_text-b8-s2048",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 2048,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "batch_size": 8,
+      "corpus": "source_code",
+      "dimensions": 768,
+      "id": "text-source_code-b8-s2048",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 2048,
+      "task_type": "CODE_RETRIEVAL"
+    },
+    {
+      "batch_size": 8,
+      "corpus": "heterogeneous_padding",
+      "dimensions": 768,
+      "id": "text-heterogeneous_padding-b8-s2048",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 2048,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "batch_size": 8,
+      "corpus": "natural_text",
+      "dimensions": 768,
+      "id": "text-natural_text-b8-s8192",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 8192,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "batch_size": 8,
+      "corpus": "source_code",
+      "dimensions": 768,
+      "id": "text-source_code-b8-s8192",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 8192,
+      "task_type": "CODE_RETRIEVAL"
+    },
+    {
+      "batch_size": 8,
+      "corpus": "heterogeneous_padding",
+      "dimensions": 768,
+      "id": "text-heterogeneous_padding-b8-s8192",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 8192,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "batch_size": 32,
+      "corpus": "natural_text",
+      "dimensions": 768,
+      "id": "text-natural_text-b32-s16",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 16,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "batch_size": 32,
+      "corpus": "source_code",
+      "dimensions": 768,
+      "id": "text-source_code-b32-s16",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 16,
+      "task_type": "CODE_RETRIEVAL"
+    },
+    {
+      "batch_size": 32,
+      "corpus": "heterogeneous_padding",
+      "dimensions": 768,
+      "id": "text-heterogeneous_padding-b32-s16",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 16,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "batch_size": 32,
+      "corpus": "natural_text",
+      "dimensions": 768,
+      "id": "text-natural_text-b32-s128",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 128,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "batch_size": 32,
+      "corpus": "source_code",
+      "dimensions": 768,
+      "id": "text-source_code-b32-s128",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 128,
+      "task_type": "CODE_RETRIEVAL"
+    },
+    {
+      "batch_size": 32,
+      "corpus": "heterogeneous_padding",
+      "dimensions": 768,
+      "id": "text-heterogeneous_padding-b32-s128",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 128,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "batch_size": 32,
+      "corpus": "natural_text",
+      "dimensions": 768,
+      "id": "text-natural_text-b32-s512",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 512,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "batch_size": 32,
+      "corpus": "source_code",
+      "dimensions": 768,
+      "id": "text-source_code-b32-s512",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 512,
+      "task_type": "CODE_RETRIEVAL"
+    },
+    {
+      "batch_size": 32,
+      "corpus": "heterogeneous_padding",
+      "dimensions": 768,
+      "id": "text-heterogeneous_padding-b32-s512",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 512,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "batch_size": 32,
+      "corpus": "natural_text",
+      "dimensions": 768,
+      "id": "text-natural_text-b32-s2048",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 2048,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "batch_size": 32,
+      "corpus": "source_code",
+      "dimensions": 768,
+      "id": "text-source_code-b32-s2048",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 2048,
+      "task_type": "CODE_RETRIEVAL"
+    },
+    {
+      "batch_size": 32,
+      "corpus": "heterogeneous_padding",
+      "dimensions": 768,
+      "id": "text-heterogeneous_padding-b32-s2048",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 2048,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "batch_size": 32,
+      "corpus": "natural_text",
+      "dimensions": 768,
+      "id": "text-natural_text-b32-s8192",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 8192,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "batch_size": 32,
+      "corpus": "source_code",
+      "dimensions": 768,
+      "id": "text-source_code-b32-s8192",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 8192,
+      "task_type": "CODE_RETRIEVAL"
+    },
+    {
+      "batch_size": 32,
+      "corpus": "heterogeneous_padding",
+      "dimensions": 768,
+      "id": "text-heterogeneous_padding-b32-s8192",
+      "lane": "paired_http",
+      "modality": "text",
+      "target_expanded_tokens": 8192,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "height": 32,
+      "id": "image-32x32",
+      "lane": "quality",
+      "modality": "image",
+      "task_type": "RETRIEVAL_DOCUMENT",
+      "width": 32
+    },
+    {
+      "height": 96,
+      "id": "image-128x96",
+      "lane": "quality",
+      "modality": "image",
+      "task_type": "RETRIEVAL_DOCUMENT",
+      "width": 128
+    },
+    {
+      "height": 896,
+      "id": "image-896x896",
+      "lane": "quality",
+      "modality": "image",
+      "task_type": "RETRIEVAL_DOCUMENT",
+      "width": 896
+    },
+    {
+      "height": 256,
+      "id": "image-1536x256",
+      "lane": "quality",
+      "modality": "image",
+      "task_type": "RETRIEVAL_DOCUMENT",
+      "width": 1536
+    },
+    {
+      "height": 1536,
+      "id": "image-256x1536",
+      "lane": "quality",
+      "modality": "image",
+      "task_type": "RETRIEVAL_DOCUMENT",
+      "width": 256
+    },
+    {
+      "channels": 1,
+      "id": "audio-0p1s-16000hz",
+      "lane": "quality",
+      "modality": "audio",
+      "sample_rate": 16000,
+      "seconds": 0.1,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "channels": 1,
+      "id": "audio-1s-16000hz",
+      "lane": "quality",
+      "modality": "audio",
+      "sample_rate": 16000,
+      "seconds": 1,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "channels": 1,
+      "id": "audio-10s-16000hz",
+      "lane": "quality",
+      "modality": "audio",
+      "sample_rate": 16000,
+      "seconds": 10,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "channels": 1,
+      "id": "audio-31s-16000hz",
+      "lane": "quality",
+      "modality": "audio",
+      "sample_rate": 16000,
+      "seconds": 31,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "channels": 1,
+      "id": "audio-1s-8000hz",
+      "lane": "quality",
+      "modality": "audio",
+      "sample_rate": 8000,
+      "seconds": 1,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "channels": 1,
+      "id": "audio-1s-44100hz",
+      "lane": "quality",
+      "modality": "audio",
+      "sample_rate": 44100,
+      "seconds": 1,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "channels": 1,
+      "id": "audio-10s-48000hz",
+      "lane": "quality",
+      "modality": "audio",
+      "sample_rate": 48000,
+      "seconds": 10,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "id": "mixed-text-image-audio",
+      "lane": "quality",
+      "modality": "mixed",
+      "order": [
+        "text",
+        "image",
+        "audio"
+      ]
+    },
+    {
+      "id": "mixed-audio-text-image",
+      "lane": "quality",
+      "modality": "mixed",
+      "order": [
+        "audio",
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "mixed-image-image-text",
+      "lane": "quality",
+      "modality": "mixed",
+      "order": [
+        "image",
+        "image",
+        "text"
+      ]
+    },
+    {
+      "id": "mixed-audio-audio-text",
+      "lane": "quality",
+      "modality": "mixed",
+      "order": [
+        "audio",
+        "audio",
+        "text"
+      ]
+    },
+    {
+      "id": "task-retrieval_document",
+      "lane": "quality",
+      "modality": "text",
+      "target_expanded_tokens": 128,
+      "task_type": "RETRIEVAL_DOCUMENT"
+    },
+    {
+      "id": "task-retrieval_query",
+      "lane": "quality",
+      "modality": "text",
+      "target_expanded_tokens": 128,
+      "task_type": "RETRIEVAL_QUERY"
+    },
+    {
+      "id": "task-code_retrieval",
+      "lane": "quality",
+      "modality": "text",
+      "target_expanded_tokens": 128,
+      "task_type": "CODE_RETRIEVAL"
+    },
+    {
+      "id": "task-classification",
+      "lane": "quality",
+      "modality": "text",
+      "target_expanded_tokens": 128,
+      "task_type": "CLASSIFICATION"
+    },
+    {
+      "id": "task-clustering",
+      "lane": "quality",
+      "modality": "text",
+      "target_expanded_tokens": 128,
+      "task_type": "CLUSTERING"
+    },
+    {
+      "id": "task-question_answering",
+      "lane": "quality",
+      "modality": "text",
+      "target_expanded_tokens": 128,
+      "task_type": "QUESTION_ANSWERING"
+    },
+    {
+      "id": "task-fact_checking",
+      "lane": "quality",
+      "modality": "text",
+      "target_expanded_tokens": 128,
+      "task_type": "FACT_CHECKING"
+    },
+    {
+      "id": "task-semantic_similarity",
+      "lane": "quality",
+      "modality": "text",
+      "target_expanded_tokens": 128,
+      "task_type": "SEMANTIC_SIMILARITY"
+    },
+    {
+      "dimensions": 128,
+      "id": "mrl-128",
+      "lane": "quality",
+      "modality": "text",
+      "target_expanded_tokens": 128,
+      "task_type": "RETRIEVAL_QUERY"
+    },
+    {
+      "dimensions": 256,
+      "id": "mrl-256",
+      "lane": "quality",
+      "modality": "text",
+      "target_expanded_tokens": 128,
+      "task_type": "RETRIEVAL_QUERY"
+    },
+    {
+      "dimensions": 512,
+      "id": "mrl-512",
+      "lane": "quality",
+      "modality": "text",
+      "target_expanded_tokens": 128,
+      "task_type": "RETRIEVAL_QUERY"
+    },
+    {
+      "dimensions": 768,
+      "id": "mrl-768",
+      "lane": "quality",
+      "modality": "text",
+      "target_expanded_tokens": 128,
+      "task_type": "RETRIEVAL_QUERY"
+    }
+  ],
+  "contract": {
+    "batch_sizes": [
+      1,
+      8,
+      32
+    ],
+    "max_expanded_tokens": 8192,
+    "sequence_lengths": [
+      16,
+      128,
+      512,
+      2048,
+      8192
+    ],
+    "task_types": [
+      "RETRIEVAL_DOCUMENT",
+      "RETRIEVAL_QUERY",
+      "CODE_RETRIEVAL",
+      "CLASSIFICATION",
+      "CLUSTERING",
+      "QUESTION_ANSWERING",
+      "FACT_CHECKING",
+      "SEMANTIC_SIMILARITY"
+    ],
+    "trained_dimensions": [
+      128,
+      256,
+      512,
+      768
+    ]
+  },
+  "negative_cases": [
+    {
+      "expect": "reject",
+      "id": "expanded-8193",
+      "reason": "expanded_token_limit",
+      "target_expanded_tokens": 8193
+    },
+    {
+      "expect": "reject",
+      "id": "all-padding-mask",
+      "reason": "empty_effective_sequence"
+    },
+    {
+      "expect": "reject",
+      "id": "malformed-image",
+      "reason": "media_decode"
+    },
+    {
+      "expect": "reject",
+      "id": "malformed-audio",
+      "reason": "media_decode"
+    },
+    {
+      "expect": "reject",
+      "id": "non-finite-result",
+      "reason": "finite_embedding_contract"
+    },
+    {
+      "expect": "subsequent_success",
+      "id": "cancel-then-reuse-session",
+      "reason": "resident_session_cleanup"
+    },
+    {
+      "expect": "reject",
+      "id": "unknown-task-prefix",
+      "reason": "task_type_allowlist"
+    },
+    {
+      "expect": "reject",
+      "id": "dimensions-zero",
+      "reason": "invalid_dimensions"
+    },
+    {
+      "expect": "reject",
+      "id": "dimensions-769",
+      "reason": "invalid_dimensions"
+    }
+  ],
+  "schema": "antfly.embedding_gemma2.workloads.v1"
+}

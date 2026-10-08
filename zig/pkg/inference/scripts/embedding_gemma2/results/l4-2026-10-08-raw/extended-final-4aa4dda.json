@@ -1,0 +1,207 @@
+{
+  "minimum_cosine": 0.999761220399132,
+  "pass": true,
+  "rows": [
+    {
+      "backend": "cuda",
+      "case": "image-32x32",
+      "cosine": 0.99996470711959,
+      "norm": 0.9999999499845831,
+      "usage": {
+        "prompt_tokens": 260,
+        "total_tokens": 260
+      }
+    },
+    {
+      "backend": "cuda",
+      "case": "image-128x96",
+      "cosine": 0.9998870786218915,
+      "norm": 1.000000078361871,
+      "usage": {
+        "prompt_tokens": 270,
+        "total_tokens": 270
+      }
+    },
+    {
+      "backend": "cuda",
+      "case": "image-896x896",
+      "cosine": 0.9999683876393152,
+      "norm": 0.9999999662050741,
+      "usage": {
+        "prompt_tokens": 260,
+        "total_tokens": 260
+      }
+    },
+    {
+      "backend": "cuda",
+      "case": "image-1536x256",
+      "cosine": 0.9999800445965825,
+      "norm": 1.000000270706479,
+      "usage": {
+        "prompt_tokens": 244,
+        "total_tokens": 244
+      }
+    },
+    {
+      "backend": "cuda",
+      "case": "image-256x1536",
+      "cosine": 0.999761220399132,
+      "norm": 0.9999999497920615,
+      "usage": {
+        "prompt_tokens": 244,
+        "total_tokens": 244
+      }
+    },
+    {
+      "backend": "cuda",
+      "case": "mixed-text-image-audio",
+      "cosine": 0.9998696729546469,
+      "norm": 1.0000002787786952,
+      "usage": {
+        "prompt_tokens": 309,
+        "total_tokens": 309
+      }
+    },
+    {
+      "backend": "cuda",
+      "case": "mixed-audio-text-image",
+      "cosine": 0.9998643166982167,
+      "norm": 1.0000001347342986,
+      "usage": {
+        "prompt_tokens": 309,
+        "total_tokens": 309
+      }
+    },
+    {
+      "backend": "cuda",
+      "case": "mixed-image-image-text",
+      "cosine": 0.9998222204166999,
+      "norm": 0.9999997529618371,
+      "usage": {
+        "prompt_tokens": 550,
+        "total_tokens": 550
+      }
+    },
+    {
+      "backend": "cuda",
+      "case": "mixed-audio-audio-text",
+      "cosine": 0.9999364641184451,
+      "norm": 0.999999789861517,
+      "usage": {
+        "prompt_tokens": 68,
+        "total_tokens": 68
+      }
+    },
+    {
+      "backend": "cuda",
+      "case": "split-text",
+      "cosine": 0.999980901846424,
+      "norm": 1.0000000834481177,
+      "usage": {
+        "prompt_tokens": 11,
+        "total_tokens": 11
+      }
+    },
+    {
+      "backend": "cuda",
+      "case": "manual-image-marker",
+      "cosine": 0.9998634387494602,
+      "norm": 1.0000000994104568,
+      "usage": {
+        "prompt_tokens": 279,
+        "total_tokens": 279
+      }
+    },
+    {
+      "backend": "cuda",
+      "case": "manual-audio-marker",
+      "cosine": 0.9999047842793441,
+      "norm": 0.9999998748940511,
+      "usage": {
+        "prompt_tokens": 38,
+        "total_tokens": 38
+      }
+    },
+    {
+      "backend": "cuda",
+      "case": "task-retrieval_document",
+      "cosine": 0.9999658523502807,
+      "norm": 0.9999998011207225,
+      "usage": {
+        "prompt_tokens": 128,
+        "total_tokens": 128
+      }
+    },
+    {
+      "backend": "cuda",
+      "case": "task-retrieval_query",
+      "cosine": 0.9999743273329462,
+      "norm": 1.0000000511179272,
+      "usage": {
+        "prompt_tokens": 128,
+        "total_tokens": 128
+      }
+    },
+    {
+      "backend": "cuda",
+      "case": "task-code_retrieval",
+      "cosine": 0.9999718264177957,
+      "norm": 1.0000002520500302,
+      "usage": {
+        "prompt_tokens": 128,
+        "total_tokens": 128
+      }
+    },
+    {
+      "backend": "cuda",
+      "case": "task-classification",
+      "cosine": 0.9999572897271656,
+      "norm": 0.999999983568415,
+      "usage": {
+        "prompt_tokens": 128,
+        "total_tokens": 128
+      }
+    },
+    {
+      "backend": "cuda",
+      "case": "task-clustering",
+      "cosine": 0.9999754102760152,
+      "norm": 0.9999999281465864,
+      "usage": {
+        "prompt_tokens": 128,
+        "total_tokens": 128
+      }
+    },
+    {
+      "backend": "cuda",
+      "case": "task-question_answering",
+      "cosine": 0.999943657965609,
+      "norm": 0.9999998493681778,
+      "usage": {
+        "prompt_tokens": 128,
+        "total_tokens": 128
+      }
+    },
+    {
+      "backend": "cuda",
+      "case": "task-fact_checking",
+      "cosine": 0.9999463122458611,
+      "norm": 0.9999997509150902,
+      "usage": {
+        "prompt_tokens": 128,
+        "total_tokens": 128
+      }
+    },
+    {
+      "backend": "cuda",
+      "case": "task-semantic_similarity",
+      "cosine": 0.9999843665284676,
+      "norm": 1.0000001792303341,
+      "usage": {
+        "prompt_tokens": 128,
+        "total_tokens": 128
+      }
+    }
+  ],
+  "schema": "antfly.embedding_gemma2.extended_matrix.v1"
+}

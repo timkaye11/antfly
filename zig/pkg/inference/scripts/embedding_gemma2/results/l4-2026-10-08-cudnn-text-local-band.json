@@ -1,0 +1,115 @@
+{
+  "all_finite": true,
+  "cases": [
+    {
+      "amplitude": 0.0,
+      "average_ms": 7.11684,
+      "batch": 32,
+      "cosine_float64": 1.0,
+      "finite": true,
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "sequence": 2048,
+      "workspace_bytes": 0
+    },
+    {
+      "amplitude": 0.1,
+      "average_ms": 8.99986,
+      "batch": 32,
+      "cosine_float64": 0.9999950568729701,
+      "finite": true,
+      "max_abs": 1.9073486328125e-05,
+      "mean_abs": 6.25094155266127e-07,
+      "sequence": 2048,
+      "workspace_bytes": 0
+    },
+    {
+      "amplitude": 1.0,
+      "average_ms": 9.0073,
+      "batch": 32,
+      "cosine_float64": 0.999998586116515,
+      "finite": true,
+      "max_abs": 0.0009765625,
+      "mean_abs": 3.698326081474413e-05,
+      "sequence": 2048,
+      "workspace_bytes": 0
+    },
+    {
+      "amplitude": 0.0,
+      "average_ms": 0.887624,
+      "batch": 1,
+      "cosine_float64": 1.0,
+      "finite": true,
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "sequence": 8192,
+      "workspace_bytes": 0
+    },
+    {
+      "amplitude": 0.1,
+      "average_ms": 1.1079,
+      "batch": 1,
+      "cosine_float64": 0.9999959240723565,
+      "finite": true,
+      "max_abs": 1.1444091796875e-05,
+      "mean_abs": 5.10423394634992e-07,
+      "sequence": 8192,
+      "workspace_bytes": 0
+    },
+    {
+      "amplitude": 1.0,
+      "average_ms": 1.10998,
+      "batch": 1,
+      "cosine_float64": 0.999998625243344,
+      "finite": true,
+      "max_abs": 0.0009765625,
+      "mean_abs": 3.372144578491637e-05,
+      "sequence": 8192,
+      "workspace_bytes": 0
+    }
+  ],
+  "cudnn_version": 92400,
+  "device": "NVIDIA L4 SM89",
+  "head_dim": 256,
+  "kv_heads": 2,
+  "mask": "abs(query_position - key_position) <= 512",
+  "minimum_cosine": 0.9999950568729701,
+  "query_heads": 4,
+  "reference": "torch.nn.functional.scaled_dot_product_attention BF16, chunked query rows",
+  "scale": 1.0,
+  "strict_boundary": {
+    "expected_1_over_513_bf16": 0.001953125,
+    "expected_1_over_514_bf16": 0.00194549560546875,
+    "passed": true,
+    "sequence": 515,
+    "values": {
+      "q0_excludes_k513": 0.0,
+      "q0_includes_k512": 0.001953125,
+      "q513_excludes_k0": 0.0,
+      "q513_includes_k1": 0.00194549560546875,
+      "q514_excludes_k1": 0.0,
+      "q514_includes_k512": 0.001953125
+    }
+  },
+  "zig_abi_smoke": {
+    "boundary_bf16": {
+      "q0_exclude513": "0x0000",
+      "q0_include512": "0x3b00",
+      "q513_exclude0": "0x0000",
+      "q513_include1": "0x3aff",
+      "q514_exclude1": "0x0000",
+      "q514_include512": "0x3b00"
+    },
+    "build_command": "cd zig/pkg/inference && ZIG_GLOBAL_CACHE_DIR=/tmp/antfly-gliner25-zig-cache ZIG_LOCAL_CACHE_DIR=/tmp/antfly-cudnn-canonical-cache /tmp/antfly-gliner25-toolchain/zig-x86_64-linux-0.17.0/zig build-exe src/ops/cuda/cudnn_sdpa_smoke.zig -OReleaseSafe -lc -femit-bin=/tmp/cudnn-sdpa-canonical-smoke",
+    "canonical_source_recheck": "passed after canonical Apache header normalization",
+    "module_sha256": "79c50710131a85c8c121516a05c873e440348be2b5b7d48c72da6718c4f6450c",
+    "pre_canonical_header_module_sha256": "53ed2a4a021f1b41689d2264a6b2bc616ed529f75435283b9d4c79d8c6e6b9c0",
+    "pre_canonical_header_smoke_sha256": "c816ad7fbdd30ac07987cf22055415ed1c10c367ef800e177784774b018e199c",
+    "present_command": "LD_LIBRARY_PATH=/tmp/antfly-embeddinggemma2/cudnn-native-runtime-9.24.0.43/lib:/usr/local/cuda-13.2/lib64:/usr/lib/x86_64-linux-gnu /tmp/cudnn-sdpa-canonical-smoke",
+    "present_result": "plain vision, plain text, band text, cache isolation and exact BF16 sentinel boundary passed; workspace 0",
+    "pure_tests": "2/2 passed",
+    "smoke_sha256": "05b800947a7560fe7d02f7bc1fac16cb276625e4084e2a613cea980e9b40d6c2",
+    "unavailable_command": "env -u LD_LIBRARY_PATH /tmp/cudnn-sdpa-canonical-smoke --expect-unavailable",
+    "unavailable_result": "cuDNN unavailable fallback smoke passed"
+  }
+}

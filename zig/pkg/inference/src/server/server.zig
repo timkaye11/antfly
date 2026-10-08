@@ -1535,6 +1535,7 @@ pub const max_generate_batch_items: usize = 128;
 pub const max_serial_family_batch_items: usize = 128;
 pub const max_read_batch_images: usize = 64;
 pub const max_generate_media_parts_per_item: usize = 8;
+pub const max_ordered_embedding_media_parts_per_item: usize = 32;
 const max_chunk_results = lib_chunker.max_chunk_results;
 const max_chunk_target_tokens = lib_chunker.max_chunk_target_tokens;
 const max_chunk_audio_window_ms = lib_chunker.max_chunk_audio_window_ms;
@@ -1804,6 +1805,11 @@ const LoadedEmbeddingRecoveryOptions = struct {
     pin_on_success: bool = false,
     failure_stage: ?*EmbeddingRuntimeFailureStage = null,
     execution_control: ?InferenceExecutionControl = null,
+    /// Optional generation already pinned while its manifest was used for
+    /// admission. The first recovery attempt consumes this handle so the
+    /// validated manifest and executed runtime cannot refer to different
+    /// generations. A retry after retirement acquires the replacement.
+    initial_handle: ?*model_manager_mod.ModelHandle = null,
 };
 
 const EmbeddingRuntimeFailureStage = enum { acquire, execute };
@@ -1855,6 +1861,13 @@ fn runLoadedEmbeddingRuntimeWithRecovery(
             };
             if (self.options.failure_stage) |stage| stage.* = .acquire;
             if (self.options.execution_control) |control| try control.check();
+            if (self.options.initial_handle) |initial| {
+                if (initial.model != null) {
+                    const handle = initial.*;
+                    initial.model = null;
+                    return handle;
+                }
+            }
             return if (self.options.preferred_backends) |preferred_backends|
                 if (self.options.execution_control) |control|
                     try self.node.model_manager.acquireFromDirWithPreferredBackendsAndControl(
@@ -3700,6 +3713,8 @@ pub const Node = struct {
             mime_type: []const u8,
             data: []const u8,
         },
+        /// One embedding from ordered parts; nested groups are unsupported.
+        content: []const DirectDenseEmbedPart,
     };
 
     pub const DirectGeneratePreflight = struct {
@@ -6251,6 +6266,7 @@ pub const Node = struct {
     }
 
     fn tryEmbedParsedViaBroker(self: *Node, allocator: std.mem.Allocator, io: std.Io, model: *model_manager_mod.LoadedModel, parsed: *const ParsedDenseEmbedInputs, control: InferenceExecutionControl, task_type: EmbeddingTaskType, instruction: ?[]const u8, audio_working_bytes: usize) !?[][]f32 {
+        if (parsed.groups.items.len > 0 or model.manifest.embedding_style == .embedding_gemma2) return null;
         const contract = try resolvedInferenceExecutorContract(self, "embed", &model.manifest);
         if (contract.batch.mode != .native or contract.batch.max_items <= 1 or model.manifest.hasCapability("sparse")) return null;
         if (parsed.texts.items.len > 0) {
@@ -6926,17 +6942,20 @@ pub const Node = struct {
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(ctx));
                 if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+                const resident_embedding_gemma2 = model.manifest.embedding_style == .embedding_gemma2;
                 var max_input_tokens: usize = 0;
-                for (attempt.parsed.texts.items) |item| {
-                    max_input_tokens = @max(
-                        max_input_tokens,
-                        try countTokenizerTokens(
-                            attempt.allocator,
-                            attempt.io,
-                            model.getTokenizer(),
-                            item.text,
-                        ),
-                    );
+                if (!resident_embedding_gemma2) {
+                    for (attempt.parsed.texts.items) |item| {
+                        max_input_tokens = @max(
+                            max_input_tokens,
+                            try countTokenizerTokens(
+                                attempt.allocator,
+                                attempt.io,
+                                model.getTokenizer(),
+                                item.text,
+                            ),
+                        );
+                    }
                 }
                 try validateDenseEmbedExecutorInvocation(
                     attempt.executor_contract,
@@ -6956,6 +6975,12 @@ pub const Node = struct {
                 var pipeline = try prepareInitialDenseEmbeddingPipeline(model, attempt.allocator, attempt.parsed, attempt.control);
                 pipeline.execution_control = attempt.control;
                 pipeline.config.max_audio_decode_working_bytes = attempt.audio_decode_working_bytes;
+                if (resident_embedding_gemma2) {
+                    pipeline.config.max_length = narrowedEmbeddingGemma2InputLimit(
+                        pipeline.config.max_length,
+                        attempt.executor_contract.batch.max_input_tokens_per_item,
+                    );
+                }
                 const owned_prefix = try applyDenseEmbeddingRequestOptions(attempt.allocator, &pipeline, &model.manifest, .{
                     .model = "",
                     .input = .null,
@@ -10485,10 +10510,27 @@ pub const Node = struct {
             return requestModelResolutionError(ctx, err);
         defer ctx.allocator.free(model_path);
 
-        var admission_manifest = manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err|
+        // A published model already owns an immutable manifest for the exact
+        // runtime generation that will serve this request. Pin and borrow it
+        // instead of rescanning the artifact catalog (including safetensors
+        // headers) on every warm request. Cold admission still reads the
+        // filesystem before loading any tokenizer, weights, or accelerator.
+        var admission_model = self.model_manager.acquireLoadedModelForCurrentPolicy(model_path) catch |err|
             return modelLoadFailureResponse(ctx, err);
-        defer admission_manifest.deinit();
-        const executor_contract = resolvedInferenceExecutorContract(self, "embed", &admission_manifest) catch |err|
+        defer if (admission_model) |*handle| handle.release();
+        var owned_admission_manifest: ?manifest_mod.ModelManifest = null;
+        defer if (owned_admission_manifest) |*manifest| manifest.deinit();
+        if (admission_model == null) {
+            owned_admission_manifest = manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err|
+                return modelLoadFailureResponse(ctx, err);
+        }
+        const admission_manifest: *const manifest_mod.ModelManifest = if (admission_model) |*handle|
+            &handle.get().manifest
+        else
+            &owned_admission_manifest.?;
+        var execution_model: ?model_manager_mod.ModelHandle = if (admission_model) |*handle| handle.duplicate() else null;
+        defer if (execution_model) |*handle| handle.release();
+        const executor_contract = resolvedInferenceExecutorContract(self, "embed", admission_manifest) catch |err|
             return inferenceExecutorContractFailureResponse(ctx, err);
         const trace_resolve_finished = if (tracing) embedding_trace.now() else 0;
 
@@ -10564,7 +10606,10 @@ pub const Node = struct {
                 .executor_contract = executor_contract,
                 .execution_control = execution_control,
             };
-            runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{ .execution_control = execution_control }, &attempt, Attempt.run) catch |err|
+            runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{
+                .execution_control = execution_control,
+                .initial_handle = if (execution_model != null) &execution_model.? else null,
+            }, &attempt, Attempt.run) catch |err|
                 {
                     if (isInferenceExecutorContractError(err)) return inferenceExecutorContractFailureResponse(ctx, err);
                     return inferenceFailureResponse(ctx, err);
@@ -10587,8 +10632,8 @@ pub const Node = struct {
             .control = execution_control,
         };
         var inputs = switch (request.error_policy) {
-            .fail_fast => parseDenseEmbedInputsWithBudgetContextAndAttachments(self, ctx.allocator, &admission_manifest, request.input, &media_budget, download_context, borrowed_attachments),
-            .per_item => parseDenseEmbedInputsPerItemWithBudgetContextAndAttachments(self, ctx.allocator, &admission_manifest, request.input, &media_budget, download_context, borrowed_attachments),
+            .fail_fast => parseDenseEmbedInputsWithBudgetContextAndAttachments(self, ctx.allocator, admission_manifest, request.input, &media_budget, download_context, borrowed_attachments),
+            .per_item => parseDenseEmbedInputsPerItemWithBudgetContextAndAttachments(self, ctx.allocator, admission_manifest, request.input, &media_budget, download_context, borrowed_attachments),
         } catch |err| {
             if (isRemoteContentRequestError(err)) return remoteContentErrorResponse(ctx, err);
             if (isDenseEmbedRequestAbort(err)) return inferenceFailureResponse(ctx, err);
@@ -10629,8 +10674,18 @@ pub const Node = struct {
 
         if (inputs.images.items.len > 0) {
             var decoded_budget = ReadDecodedImageBudget.init(media_admission, effectiveRequestContentSecurity(self).max_image_dimension);
-            for (inputs.images.items) |image| decoded_budget.addImage(image.bytes) catch |err|
-                return readImageErrorResponse(ctx, err);
+            for (inputs.images.items) |image| {
+                decoded_budget.addImage(image.bytes) catch |err| {
+                    if (try recordDenseEmbedImageBudgetFailure(
+                        ctx.allocator,
+                        &inputs,
+                        request.error_policy,
+                        image.index,
+                        err,
+                    )) continue;
+                    return readImageErrorResponse(ctx, err);
+                };
+            }
             const required_units = @max(reserved_units, decoded_budget.requiredUnits());
             if (try self.growSlotUnits(ctx, reserved_units, required_units)) |resp| return resp;
             reserved_units = required_units;
@@ -10644,7 +10699,7 @@ pub const Node = struct {
             audio_decode_working_bytes = audio_admission.max_decode_working_bytes;
         }
 
-        validateDenseEmbedExecutorInvocation(executor_contract, &admission_manifest, &inputs, 0) catch |err|
+        validateDenseEmbedExecutorInvocation(executor_contract, admission_manifest, &inputs, 0) catch |err|
             return inferenceExecutorContractFailureResponse(ctx, err);
 
         if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
@@ -10663,12 +10718,14 @@ pub const Node = struct {
             execution_control: InferenceExecutionControl,
             result: ?ExecutionResult = null,
             prompt_tokens: usize = 0,
-            executor_contract: ResolvedInferenceExecutorContract,
-            admission_manifest: *const manifest_mod.ModelManifest,
+            backend: ?[]const u8 = null,
+            normalize_response: bool = false,
 
             fn run(attempt_ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(attempt_ctx));
                 if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+                attempt.backend = if (model.manifest.embedding_style == .embedding_gemma2) @tagName(model.session.backend()) else null;
+                attempt.normalize_response = model.manifest.normalize;
                 // Group by modality before model asset locks, preserving the
                 // original input indexes when compatible calls are combined.
                 if (attempt.request.error_policy == .fail_fast and attempt.trace == null and attempt.inputs.parse_errors.items.len == 0) {
@@ -10705,7 +10762,10 @@ pub const Node = struct {
                     attempt.request,
                 );
                 defer if (owned_request_prefix) |prefix| attempt.allocator.free(prefix);
-                attempt.prompt_tokens = if (attempt.inputs.texts.items.len > 0)
+                const resident_embedding_gemma2 = pipeline.config.resident_embedding_gemma2;
+                attempt.prompt_tokens = if (resident_embedding_gemma2)
+                    0 // The strict frontend publishes its expanded count below.
+                else if (attempt.inputs.texts.items.len > 0)
                     countParsedDenseEmbedTextTokens(
                         attempt.allocator,
                         attempt.io,
@@ -10716,10 +10776,19 @@ pub const Node = struct {
                 else
                     estimateParsedDenseEmbedPromptTokens(attempt.inputs);
                 var max_input_tokens: usize = 0;
-                for (attempt.inputs.texts.items) |item| {
-                    max_input_tokens = @max(max_input_tokens, try countTokenizerTokens(attempt.allocator, attempt.io, model.getTokenizer(), item.text));
+                if (!resident_embedding_gemma2) {
+                    for (attempt.inputs.texts.items) |item| {
+                        max_input_tokens = @max(max_input_tokens, try countTokenizerTokens(attempt.allocator, attempt.io, model.getTokenizer(), item.text));
+                    }
                 }
-                try validateDenseEmbedExecutorInvocation(attempt.executor_contract, attempt.admission_manifest, attempt.inputs, max_input_tokens);
+                const active_contract = try resolvedInferenceExecutorContract(attempt.node, "embed", &model.manifest);
+                if (resident_embedding_gemma2) {
+                    pipeline.config.max_length = narrowedEmbeddingGemma2InputLimit(
+                        pipeline.config.max_length,
+                        active_contract.batch.max_input_tokens_per_item,
+                    );
+                }
+                try validateDenseEmbedExecutorInvocation(active_contract, &model.manifest, attempt.inputs, max_input_tokens);
 
                 attempt.result = switch (attempt.request.error_policy) {
                     .fail_fast => .{ .fail_fast = try embedDenseInputs(
@@ -10739,6 +10808,7 @@ pub const Node = struct {
                         &asset_lease,
                     ) },
                 };
+                if (resident_embedding_gemma2) attempt.prompt_tokens = pipeline.last_input_tokens;
                 asset_lease.release();
             }
         };
@@ -10749,8 +10819,6 @@ pub const Node = struct {
             .request = request,
             .node = self,
             .audio_decode_working_bytes = audio_decode_working_bytes,
-            .executor_contract = executor_contract,
-            .admission_manifest = &admission_manifest,
             .trace = if (trace) |*value| value else null,
             .execution_control = execution_control,
         };
@@ -10760,6 +10828,7 @@ pub const Node = struct {
             .failure_stage = &failure_stage,
             .trace = attempt.trace,
             .execution_control = execution_control,
+            .initial_handle = if (execution_model != null) &execution_model.? else null,
         }, &attempt, Attempt.run) catch |err| {
             if (isInferenceExecutorContractError(err)) return inferenceExecutorContractFailureResponse(ctx, err);
             if (isEmbedRequestOptionError(err)) {
@@ -10787,7 +10856,7 @@ pub const Node = struct {
                     ctx.allocator.free(embeddings);
                 }
                 if (httpx.numeric_response.requested(ctx.header("Accept"))) {
-                    const frame = buildDenseNumericFrame(ctx.allocator, embeddings, requested_dimensions, admission_manifest.normalize) catch |err| switch (err) {
+                    const frame = buildDenseNumericFrame(ctx.allocator, embeddings, requested_dimensions, attempt.normalize_response) catch |err| switch (err) {
                         error.InvalidEmbeddingDimensions => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "dimensions exceeds the model embedding size" }),
                         error.NumericResponseTooLarge => return ctx.status(413).json(.{ .@"error" = "RESPONSE_TOO_LARGE", .message = "numeric response exceeds the 4 MiB frame limit" }),
                         else => return err,
@@ -10795,7 +10864,7 @@ pub const Node = struct {
                     errdefer ctx.allocator.free(frame);
                     return publishNumericFrame(ctx, frame);
                 }
-                const response = buildEmbedDenseResponse(arena.allocator(), request.model, embeddings, requested_dimensions, admission_manifest.normalize, attempt.prompt_tokens) catch |err| switch (err) {
+                var response = buildEmbedDenseResponse(arena.allocator(), request.model, embeddings, requested_dimensions, attempt.normalize_response, attempt.prompt_tokens) catch |err| switch (err) {
                     error.InvalidEmbeddingDimensions => {
                         return ctx.status(400).json(.{
                             .@"error" = "INVALID_REQUEST",
@@ -10804,6 +10873,7 @@ pub const Node = struct {
                     },
                     else => return err,
                 };
+                response.backend = attempt.backend;
                 logEmbedTiming("embed.response_build", inputs.total_count, response_build_start);
                 const response_json_start = embedTimingStart();
                 const http_response = try ctx.json(response);
@@ -10813,7 +10883,7 @@ pub const Node = struct {
             .per_item => |partial_value| {
                 var partial = partial_value;
                 defer partial.deinit(ctx.allocator);
-                const response = buildEmbedDensePartialResponse(arena.allocator(), request.model, &partial, requested_dimensions, admission_manifest.normalize, attempt.prompt_tokens) catch |err| switch (err) {
+                var response = buildEmbedDensePartialResponse(arena.allocator(), request.model, &partial, requested_dimensions, attempt.normalize_response, attempt.prompt_tokens) catch |err| switch (err) {
                     error.InvalidEmbeddingDimensions => {
                         return ctx.status(400).json(.{
                             .@"error" = "INVALID_REQUEST",
@@ -10822,6 +10892,7 @@ pub const Node = struct {
                     },
                     else => return err,
                 };
+                response.backend = attempt.backend;
                 logEmbedTiming("embed.response_build", inputs.total_count, response_build_start);
                 const response_json_start = embedTimingStart();
                 const http_response = try ctx.json(response);
@@ -22951,6 +23022,11 @@ pub fn resolveInferenceBatchCapabilities(
         0
     else if (std.mem.eql(u8, resolved_task, "generate"))
         max_generate_media_parts_per_item
+    else if (std.mem.eql(u8, resolved_task, "embed") and accepts_image and accepts_audio)
+        // Unified multimodal embedders may consume repeated ordered image and
+        // audio parts in one item. Context and aggregate byte/pixel budgets
+        // remain authoritative; explicit capabilities below can narrow this.
+        max_ordered_embedding_media_parts_per_item
     else
         1;
     var max_text_bytes_per_item: ?usize = null;
@@ -22999,6 +23075,20 @@ pub fn resolveInferenceBatchCapabilities(
         .max_candidates_per_request = max_candidates_per_request,
         .max_schema_bytes = max_schema_bytes,
     };
+}
+
+test "unified multimodal embedding contract admits bounded ordered media parts" {
+    const implementation = ResolvedExecutorBatchImplementation{
+        .mode = .native,
+        .preferred_items = 1,
+        .max_items = 8,
+        .per_item_failures = true,
+    };
+    const resolved = try resolveInferenceBatchCapabilities("embed", &.{}, implementation, 10 * 1024 * 1024, 16 * 1024 * 1024, true, true, false);
+    try std.testing.expectEqual(max_ordered_embedding_media_parts_per_item, resolved.max_media_parts_per_item);
+
+    const narrowed = try resolveInferenceBatchCapabilities("embed", &.{"inference.batch.max_media_parts_per_item=2"}, implementation, 10 * 1024 * 1024, 16 * 1024 * 1024, true, true, false);
+    try std.testing.expectEqual(@as(usize, 2), narrowed.max_media_parts_per_item);
 }
 
 /// The exact task-neutral contract used by both catalog publication and every
@@ -29812,7 +29902,9 @@ fn parseEmbeddingTaskType(value: []const u8) ?EmbeddingTaskType {
     if (std.mem.eql(u8, value, "RETRIEVAL_DOCUMENT")) return .RETRIEVAL_DOCUMENT;
     if (std.mem.eql(u8, value, "QUESTION_ANSWERING")) return .QUESTION_ANSWERING;
     if (std.mem.eql(u8, value, "FACT_VERIFICATION")) return .FACT_VERIFICATION;
+    if (std.mem.eql(u8, value, "FACT_CHECKING")) return .FACT_VERIFICATION;
     if (std.mem.eql(u8, value, "CODE_RETRIEVAL_QUERY")) return .CODE_RETRIEVAL_QUERY;
+    if (std.mem.eql(u8, value, "CODE_RETRIEVAL")) return .CODE_RETRIEVAL_QUERY;
     if (std.mem.eql(u8, value, "CLASSIFICATION")) return .CLASSIFICATION;
     if (std.mem.eql(u8, value, "CLUSTERING")) return .CLUSTERING;
     if (std.mem.eql(u8, value, "SEMANTIC_SIMILARITY")) return .SEMANTIC_SIMILARITY;
@@ -29843,10 +29935,13 @@ const ParsedDenseEmbedInputs = struct {
     texts: std.ArrayListUnmanaged(ParsedTextEmbedInput) = .empty,
     images: std.ArrayListUnmanaged(ParsedBinaryEmbedInput) = .empty,
     audio: std.ArrayListUnmanaged(ParsedBinaryEmbedInput) = .empty,
+    groups: std.ArrayListUnmanaged(ParsedDenseEmbedGroup) = .empty,
     parse_errors: std.ArrayListUnmanaged(EmbedItemError) = .empty,
     total_count: usize = 0,
 
     pub fn deinit(self: *ParsedDenseEmbedInputs, allocator: std.mem.Allocator) void {
+        for (self.groups.items) |group| allocator.free(group.parts);
+        self.groups.deinit(allocator);
         self.texts.deinit(allocator);
         for (self.images.items) |item| if (item.owned) allocator.free(@constCast(item.bytes));
         self.images.deinit(allocator);
@@ -29855,6 +29950,146 @@ const ParsedDenseEmbedInputs = struct {
         self.parse_errors.deinit(allocator);
     }
 };
+
+const ParsedDenseEmbedGroup = struct {
+    index: usize,
+    parts: []const embedding_mod.EmbeddingContentPart,
+};
+
+fn recordDenseEmbedImageBudgetFailure(
+    allocator: std.mem.Allocator,
+    inputs: *ParsedDenseEmbedInputs,
+    policy: EmbedErrorPolicy,
+    index: usize,
+    err: anyerror,
+) !bool {
+    if (policy != .per_item or err != error.ImageDecodeFailed) return false;
+    for (inputs.parse_errors.items) |failure| {
+        if (failure.index == index) return true;
+    }
+    try inputs.parse_errors.append(allocator, embedItemFailure(index, err, "image_decode"));
+    return true;
+}
+
+fn denseEmbedInputHasParseError(inputs: *const ParsedDenseEmbedInputs, index: usize) bool {
+    const error_index = std.math.cast(i64, index) orelse return false;
+    for (inputs.parse_errors.items) |failure| {
+        if (failure.index == error_index) return true;
+    }
+    return false;
+}
+
+test "dense embedding per-item image budget failures are indexed once" {
+    const allocator = std.testing.allocator;
+    var inputs: ParsedDenseEmbedInputs = .{};
+    defer inputs.deinit(allocator);
+
+    try std.testing.expect(try recordDenseEmbedImageBudgetFailure(allocator, &inputs, .per_item, 2, error.ImageDecodeFailed));
+    try std.testing.expect(try recordDenseEmbedImageBudgetFailure(allocator, &inputs, .per_item, 2, error.ImageDecodeFailed));
+    try std.testing.expectEqual(@as(usize, 1), inputs.parse_errors.items.len);
+    try std.testing.expectEqual(@as(i64, 2), inputs.parse_errors.items[0].index);
+    try std.testing.expectEqualStrings("INVALID_IMAGE", inputs.parse_errors.items[0].code);
+    try std.testing.expect(!try recordDenseEmbedImageBudgetFailure(allocator, &inputs, .fail_fast, 3, error.ImageDecodeFailed));
+    try std.testing.expect(!try recordDenseEmbedImageBudgetFailure(allocator, &inputs, .per_item, 3, error.ImageBatchTooLarge));
+
+    try inputs.images.append(allocator, .{ .index = 2, .bytes = "bad", .mime_type = "image/png", .owned = false });
+    inputs.total_count = 3;
+    var contract = ResolvedInferenceExecutorContract{
+        .task = "embed",
+        .batch = .{
+            .mode = .serial_compatibility,
+            .preferred_items = 1,
+            .max_items = 3,
+            .max_encoded_media_bytes = 3,
+            .max_decoded_pixels = 1,
+            .max_media_parts_per_item = 1,
+            .per_item_failures = true,
+        },
+        .accepts_text = true,
+        .accepts_image = true,
+        .accepts_audio = false,
+        .accepts_document = false,
+    };
+    const manifest = manifest_mod.ModelManifest{ .allocator = allocator };
+    try validateDenseEmbedExecutorInvocation(contract, &manifest, &inputs, 0);
+    contract.batch.max_encoded_media_bytes = 2;
+    try std.testing.expectError(
+        error.InferenceEncodedBytesExceeded,
+        validateDenseEmbedExecutorInvocation(contract, &manifest, &inputs, 0),
+    );
+}
+
+const DenseEmbeddingContentInputs = struct {
+    inputs: []embedding_mod.EmbeddingContentInput,
+    singles: []embedding_mod.EmbeddingContentPart,
+
+    fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.inputs);
+        allocator.free(self.singles);
+    }
+};
+
+fn denseEmbeddingContentInputs(allocator: std.mem.Allocator, parsed: *const ParsedDenseEmbedInputs) !DenseEmbeddingContentInputs {
+    const inputs = try allocator.alloc(embedding_mod.EmbeddingContentInput, parsed.total_count);
+    errdefer allocator.free(inputs);
+    const singles = try allocator.alloc(embedding_mod.EmbeddingContentPart, parsed.total_count);
+    errdefer allocator.free(singles);
+    for (inputs, 0..) |*item, index| {
+        singles[index] = .{ .text = "" };
+        item.* = .{ .content = singles[index .. index + 1] };
+    }
+    for (parsed.texts.items) |item| singles[item.index] = .{ .text = item.text };
+    for (parsed.images.items) |item| singles[item.index] = .{ .image = item.bytes };
+    for (parsed.audio.items) |item| singles[item.index] = .{ .audio = .{ .bytes = item.bytes, .decode_options = .{ .mime_hint = item.mime_type } } };
+    for (parsed.groups.items) |group| inputs[group.index].content = group.parts;
+    return .{ .inputs = inputs, .singles = singles };
+}
+
+test "EmbeddingGemma2 groups preserve order and rollback failed siblings" {
+    const allocator = std.testing.allocator;
+    var json = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\[{"content":[{"type":"text","text":"first"},{"type":"media","mime_type":"image/png","data":"AQ=="},{"type":"text","text":"last"}]},{"content":[{"type":"media","mime_type":"image/png","data":"Ag=="},{"content":[]}]},"sibling"]
+    , .{});
+    defer json.deinit();
+    var node: Node = undefined;
+    node.config = .{};
+    var manifest_inputs = [_][]const u8{ "text", "image", "audio" };
+    const manifest = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .embedder, .embedding_style = .embedding_gemma2, .inputs = &manifest_inputs };
+    var parsed = try parseDenseEmbedInputsPerItem(&node, allocator, &manifest, json.value);
+    defer parsed.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 3), parsed.total_count);
+    try std.testing.expectEqual(@as(usize, 1), parsed.groups.items.len);
+    try std.testing.expectEqual(@as(usize, 1), parsed.images.items.len);
+    try std.testing.expectEqual(@as(usize, 1), parsed.parse_errors.items.len);
+    try std.testing.expectEqual(@as(i64, 1), parsed.parse_errors.items[0].index);
+    var content = try denseEmbeddingContentInputs(allocator, &parsed);
+    defer content.deinit(allocator);
+    try std.testing.expectEqualStrings("first", content.inputs[0].content[0].text);
+    try std.testing.expectEqualSlices(u8, &.{1}, content.inputs[0].content[1].image);
+    try std.testing.expectEqualStrings("last", content.inputs[0].content[2].text);
+    try std.testing.expectEqualStrings("sibling", content.inputs[2].content[0].text);
+}
+
+fn narrowedEmbeddingGemma2InputLimit(model_limit: usize, executor_limit: ?usize) usize {
+    return if (executor_limit) |limit| @min(model_limit, limit) else model_limit;
+}
+
+test "EmbeddingGemma2 strict frontend honors narrower executor token limits" {
+    try std.testing.expectEqual(@as(usize, 8192), narrowedEmbeddingGemma2InputLimit(8192, null));
+    try std.testing.expectEqual(@as(usize, 8192), narrowedEmbeddingGemma2InputLimit(8192, 16_384));
+    try std.testing.expectEqual(@as(usize, 512), narrowedEmbeddingGemma2InputLimit(8192, 512));
+}
+
+test "EmbeddingGemma2 grouped attachments keep global uniqueness" {
+    const allocator = std.testing.allocator;
+    var json = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\[{"content":[{"type":"attachment","attachment_index":0},{"type":"text","text":"caption"}]},{"content":[{"type":"attachment","attachment_index":1}]}]
+    , .{});
+    defer json.deinit();
+    try validateEmbedAttachmentReferences(allocator, json.value, 2);
+    json.value.array.items[1].object.getPtr("content").?.array.items[0].object.getPtr("attachment_index").?.* = .{ .integer = 0 };
+    try std.testing.expectError(error.DuplicateAttachmentReference, validateEmbedAttachmentReferences(allocator, json.value, 2));
+}
 
 fn validateDenseEmbedExecutorInvocation(
     contract: ResolvedInferenceExecutorContract,
@@ -29865,10 +30100,25 @@ fn validateDenseEmbedExecutorInvocation(
     var encoded_media_bytes: usize = 0;
     var decoded_pixels: u64 = 0;
     var max_text_bytes: usize = 0;
+    var max_media_parts: usize = if (inputs.images.items.len + inputs.audio.items.len > 0) 1 else 0;
     for (inputs.texts.items) |item| max_text_bytes = @max(max_text_bytes, item.text.len);
+    for (inputs.groups.items) |group| {
+        var text_bytes: usize = 0;
+        var media_parts: usize = 0;
+        for (group.parts) |part| switch (part) {
+            .text => |text| text_bytes = std.math.add(usize, text_bytes, text.len) catch return error.InferenceEncodedBytesExceeded,
+            .image, .audio => media_parts += 1,
+        };
+        max_text_bytes = @max(max_text_bytes, text_bytes);
+        max_media_parts = @max(max_media_parts, media_parts);
+    }
     for (inputs.images.items) |item| {
         encoded_media_bytes = std.math.add(usize, encoded_media_bytes, item.bytes.len) catch
             return error.InferenceEncodedBytesExceeded;
+        // Per-item admission has already produced the public error for this
+        // index. Preserve byte and item accounting, but do not reopen the
+        // same malformed payload and promote it to a request-wide failure.
+        if (denseEmbedInputHasParseError(inputs, item.index)) continue;
         const physical_mime = image_pipeline.mimeEssenceForEncoded(item.bytes) orelse
             return error.InvalidInferenceMedia;
         if (item.mime_type) |declared| try validateEncodedImageMime(declared, item.bytes);
@@ -29895,7 +30145,7 @@ fn validateDenseEmbedExecutorInvocation(
         .input_tokens_per_item = max_input_tokens,
         .encoded_media_bytes = encoded_media_bytes,
         .decoded_pixels = decoded_pixels,
-        .media_parts_per_item = if (inputs.images.items.len + inputs.audio.items.len > 0) 1 else 0,
+        .media_parts_per_item = max_media_parts,
         .has_text = inputs.texts.items.len > 0,
         .has_image = inputs.images.items.len > 0,
         .has_audio = inputs.audio.items.len > 0,
@@ -30172,27 +30422,35 @@ fn validateEmbedAttachmentReferences(
     input: std.json.Value,
     attachment_count: usize,
 ) !void {
-    var seen = try allocator.alloc(bool, attachment_count);
+    const seen = try allocator.alloc(bool, attachment_count);
     defer if (seen.len > 0) allocator.free(seen);
     @memset(seen, false);
     var references: usize = 0;
-    if (input == .array) for (input.array.items) |item| {
-        if (item != .object) continue;
-        const type_value = item.object.get("type") orelse continue;
-        if (type_value != .string or !std.mem.eql(u8, type_value.string, "attachment")) continue;
-        if (attachment_count == 0) return error.UnexpectedAttachmentReference;
-        const index_value = item.object.get("attachment_index") orelse
-            return error.AttachmentIndexMustBeInteger;
-        if (index_value != .integer or index_value.integer < 0)
-            return error.AttachmentIndexMustBeInteger;
-        const index: usize = std.math.cast(usize, index_value.integer) orelse
-            return error.AttachmentIndexOutOfBounds;
-        if (index >= attachment_count) return error.AttachmentIndexOutOfBounds;
-        if (seen[index]) return error.DuplicateAttachmentReference;
-        seen[index] = true;
-        references += 1;
-    };
+    try visitEmbedAttachmentReferences(input, seen, &references, 0);
     if (references != attachment_count) return error.AttachmentReferenceRequired;
+}
+
+fn visitEmbedAttachmentReferences(input: std.json.Value, seen: []bool, references: *usize, depth: usize) !void {
+    if (depth > 3) return error.InvalidOrderedEmbeddingContent;
+    if (input == .array) {
+        for (input.array.items) |item| try visitEmbedAttachmentReferences(item, seen, references, depth + 1);
+        return;
+    }
+    if (input != .object) return;
+    if (input.object.get("content")) |content| {
+        try visitEmbedAttachmentReferences(content, seen, references, depth + 1);
+        return;
+    }
+    const type_value = input.object.get("type") orelse return;
+    if (type_value != .string or !std.mem.eql(u8, type_value.string, "attachment")) return;
+    if (seen.len == 0) return error.UnexpectedAttachmentReference;
+    const index_value = input.object.get("attachment_index") orelse return error.AttachmentIndexMustBeInteger;
+    if (index_value != .integer or index_value.integer < 0) return error.AttachmentIndexMustBeInteger;
+    const index = std.math.cast(usize, index_value.integer) orelse return error.AttachmentIndexOutOfBounds;
+    if (index >= seen.len) return error.AttachmentIndexOutOfBounds;
+    if (seen[index]) return error.DuplicateAttachmentReference;
+    seen[index] = true;
+    references.* += 1;
 }
 
 test "framed embedding attachments require one unique reference each" {
@@ -30233,6 +30491,20 @@ fn applyDenseEmbeddingRequestOptions(
     manifest: *const manifest_mod.ModelManifest,
     request: ParsedEmbedRequest,
 ) !?[]u8 {
+    if (manifest.embedding_style == .embedding_gemma2) {
+        if (request.instruction != null) return error.InstructionNotSupportedForModel;
+        pipeline.config.text_prefix = switch (request.task_type orelse .RETRIEVAL_DOCUMENT) {
+            .RETRIEVAL_DOCUMENT => manifest.embedding_profile.document.prefix,
+            .RETRIEVAL_QUERY => manifest.embedding_profile.query.prefix,
+            .QUESTION_ANSWERING => "task: question answering | query: ",
+            .FACT_VERIFICATION => "task: fact checking | query: ",
+            .CODE_RETRIEVAL_QUERY => "task: code retrieval | query: ",
+            .CLASSIFICATION => "task: classification | query: ",
+            .CLUSTERING => "task: clustering | query: ",
+            .SEMANTIC_SIMILARITY => "task: sentence similarity | query: ",
+        };
+        return null;
+    }
     if (!manifest.hasEmbeddingTaskProfile()) {
         if (request.instruction != null) return error.InstructionNotSupportedForModel;
         return null;
@@ -30416,6 +30688,10 @@ fn parseDenseEmbedInputsWithBudgetOptionalContext(
 
             parsed.total_count = arr.items.len;
         },
+        .object => {
+            try appendDenseEmbedInput(self, allocator, manifest, &parsed, input, 0, media_budget, request_context, attachments);
+            parsed.total_count = 1;
+        },
         else => return error.InputMustBeStringOrArrayOfStringsOrContentParts,
     }
 
@@ -30460,7 +30736,13 @@ fn parseDirectDenseEmbedInputsOptionalContext(
     const preflight = try directDenseEmbedPreflight(parts);
     try media_budget.add(preflight.shape.borrowed_bytes);
 
-    for (parts, 0..) |part, index| switch (part) {
+    for (parts, 0..) |part, index| try appendDirectDenseEmbedPart(self, allocator, manifest, &parsed, part, index, media_budget, request_context);
+    parsed.total_count = parts.len;
+    return parsed;
+}
+
+fn appendDirectDenseEmbedPart(self: *Node, allocator: std.mem.Allocator, manifest: *const manifest_mod.ModelManifest, parsed: *ParsedDenseEmbedInputs, part: Node.DirectDenseEmbedPart, index: usize, media_budget: *RequestMediaBudget, request_context: ?InferenceDownloadRequestContext) !void {
+    switch (part) {
         .text => |text| {
             if (!model_caps.modelAcceptsInput(manifest, "text")) return error.ModelDoesNotSupportTextInput;
             try parsed.texts.append(allocator, .{ .index = index, .text = text });
@@ -30469,7 +30751,7 @@ fn parseDirectDenseEmbedInputsOptionalContext(
             self,
             allocator,
             manifest,
-            &parsed,
+            parsed,
             url,
             index,
             media_budget,
@@ -30479,16 +30761,36 @@ fn parseDirectDenseEmbedInputsOptionalContext(
             try appendDenseEmbedBinary(
                 allocator,
                 manifest,
-                &parsed,
+                parsed,
                 media.data,
                 media.mime_type,
                 index,
                 false,
             );
         },
-    };
-    parsed.total_count = parts.len;
-    return parsed;
+        .content => |children| {
+            if (manifest.embedding_style != .embedding_gemma2) return error.OrderedEmbeddingContentNotSupported;
+            if (children.len == 0) return error.InvalidOrderedEmbeddingContent;
+            const ordered = try allocator.alloc(embedding_mod.EmbeddingContentPart, children.len);
+            errdefer allocator.free(ordered);
+            for (children, 0..) |child, child_index| {
+                if (child == .content) return error.InvalidOrderedEmbeddingContent;
+                const text_start = parsed.texts.items.len;
+                const image_start = parsed.images.items.len;
+                const audio_start = parsed.audio.items.len;
+                try appendDirectDenseEmbedPart(self, allocator, manifest, parsed, child, index, media_budget, request_context);
+                ordered[child_index] = if (parsed.texts.items.len > text_start)
+                    .{ .text = parsed.texts.items[text_start].text }
+                else if (parsed.images.items.len > image_start)
+                    .{ .image = parsed.images.items[image_start].bytes }
+                else if (parsed.audio.items.len > audio_start)
+                    .{ .audio = .{ .bytes = parsed.audio.items[audio_start].bytes, .decode_options = .{ .mime_hint = parsed.audio.items[audio_start].mime_type } } }
+                else
+                    return error.InvalidOrderedEmbeddingContent;
+            }
+            try parsed.groups.append(allocator, .{ .index = index, .parts = ordered });
+        },
+    }
 }
 
 fn parseDenseEmbedInputsPerItem(
@@ -30564,6 +30866,13 @@ fn parseDenseEmbedInputsPerItemWithBudgetOptionalContext(
                     try parsed.parse_errors.append(allocator, embedInputItemFailure(index, err));
                 };
             }
+        },
+        .object => {
+            parsed.total_count = 1;
+            appendDenseEmbedInput(self, allocator, manifest, &parsed, input, 0, media_budget, request_context, attachments) catch |err| {
+                if (isDenseEmbedRequestAbort(err)) return err;
+                try parsed.parse_errors.append(allocator, embedInputItemFailure(0, err));
+            };
         },
         else => return error.InputMustBeStringOrArrayOfStringsOrContentParts,
     }
@@ -30652,6 +30961,39 @@ fn appendDenseEmbedInput(
     if (item != .object) return error.InputMustBeStringOrArrayOfStringsOrContentParts;
 
     const obj = item.object;
+    if (obj.get("content")) |content| {
+        if (manifest.embedding_style != .embedding_gemma2) return error.OrderedEmbeddingContentNotSupported;
+        if (content != .array or content.array.items.len == 0) return error.InvalidOrderedEmbeddingContent;
+        const text_start = parsed.texts.items.len;
+        const image_start = parsed.images.items.len;
+        const audio_start = parsed.audio.items.len;
+        errdefer {
+            parsed.texts.shrinkRetainingCapacity(text_start);
+            for (parsed.images.items[image_start..]) |image_item| if (image_item.owned) allocator.free(@constCast(image_item.bytes));
+            parsed.images.shrinkRetainingCapacity(image_start);
+            for (parsed.audio.items[audio_start..]) |audio_item| if (audio_item.owned) allocator.free(@constCast(audio_item.bytes));
+            parsed.audio.shrinkRetainingCapacity(audio_start);
+        }
+        const parts = try allocator.alloc(embedding_mod.EmbeddingContentPart, content.array.items.len);
+        errdefer allocator.free(parts);
+        for (content.array.items, 0..) |part, part_index| {
+            if (part == .object and part.object.contains("content")) return error.InvalidOrderedEmbeddingContent;
+            const texts_before = parsed.texts.items.len;
+            const images_before = parsed.images.items.len;
+            const audio_before = parsed.audio.items.len;
+            try appendDenseEmbedInput(self, allocator, manifest, parsed, part, index, media_budget, request_context, attachments);
+            parts[part_index] = if (parsed.texts.items.len > texts_before)
+                .{ .text = parsed.texts.items[texts_before].text }
+            else if (parsed.images.items.len > images_before)
+                .{ .image = parsed.images.items[images_before].bytes }
+            else if (parsed.audio.items.len > audio_before)
+                .{ .audio = .{ .bytes = parsed.audio.items[audio_before].bytes, .decode_options = .{ .mime_hint = parsed.audio.items[audio_before].mime_type } } }
+            else
+                return error.InvalidOrderedEmbeddingContent;
+        }
+        try parsed.groups.append(allocator, .{ .index = index, .parts = parts });
+        return;
+    }
     const type_value = obj.get("type") orelse return error.ContentPartTypeRequired;
     if (type_value != .string) return error.ContentPartTypeMustBeString;
     const part_type = type_value.string;
@@ -30727,7 +31069,9 @@ fn appendDenseEmbedInput(
 
 fn embedInputParseErrorMessage(err: anyerror) []const u8 {
     return switch (err) {
-        error.InputMustBeStringOrArrayOfStringsOrContentParts => "input must be a string, array of strings, or array of content parts",
+        error.InputMustBeStringOrArrayOfStringsOrContentParts => "input must be text, content parts, or ordered content groups",
+        error.InvalidOrderedEmbeddingContent => "content must be a nonempty array of parts; nested groups are unsupported",
+        error.OrderedEmbeddingContentNotSupported => "model does not support ordered embedding content groups",
         error.ContentPartTypeRequired => "content part missing 'type' field",
         error.ContentPartTypeMustBeString => "content part 'type' must be a string",
         error.TextContentPartMissingText => "text content part missing 'text' field",
@@ -30761,6 +31105,17 @@ fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
         .message = "insufficient inference capacity is currently available",
     };
     return switch (err) {
+        error.EmbeddingSequenceTooLong => .{
+            .status = 400,
+            .code = "INPUT_TOO_LONG",
+            .message = "expanded embedding input exceeds the model context limit",
+        },
+        error.InvalidAudioSamples => .{ .status = 400, .code = "INVALID_AUDIO", .message = "audio samples must be finite" },
+        error.UnsupportedAudioFormat, error.EmptyAudioInput, error.InvalidAudioInput => .{ .status = 400, .code = "INVALID_AUDIO", .message = "unsupported, empty, or corrupt audio input" },
+        error.AudioTooLarge => .{ .status = 400, .code = "AUDIO_TOO_LARGE", .message = "audio decoding exceeds the configured memory limit" },
+        error.MediaPlaceholderMismatch => .{ .status = 400, .code = "INVALID_MEDIA_LAYOUT", .message = "media placeholders must reference each supplied image or audio part exactly once" },
+        error.EmptyEmbeddingInput, error.InvalidImageInput => .{ .status = 400, .code = "INVALID_INPUT", .message = "embedding input must contain nonempty content" },
+        error.NonFiniteEmbeddingOutput, error.ZeroEmbeddingOutput => .{ .status = 500, .code = "INVALID_EMBEDDING_OUTPUT", .message = "embedding output is nonfinite or has zero norm" },
         error.ImageDecodeFailed => .{
             .status = 400,
             .code = "INVALID_IMAGE",
@@ -30811,6 +31166,7 @@ const EmbedResponseStrict = struct {
     data: []const api.EmbeddingObject,
     model: []const u8,
     usage: api.EmbeddingUsage,
+    backend: ?[]const u8 = null,
 };
 
 const EmbedDensePartialResponse = struct {
@@ -30820,6 +31176,7 @@ const EmbedDensePartialResponse = struct {
     errors: []const EmbedItemError,
     summary: EmbedPartialSummary,
     usage: api.EmbeddingUsage,
+    backend: ?[]const u8 = null,
 };
 
 const DenseEmbedPartialResult = struct {
@@ -30883,6 +31240,10 @@ fn embedItemFailure(index: usize, err: anyerror, stage: []const u8) EmbedItemErr
 }
 
 fn embedInputItemFailure(index: usize, err: anyerror) EmbedItemError {
+    if (isEmbeddingInputContractError(err) or err == error.NonFiniteEmbeddingOutput or err == error.ZeroEmbeddingOutput) {
+        const failure = embedDenseInputFailure(err);
+        return .{ .index = @intCast(index), .code = failure.code, .message = failure.message, .stage = "inference", .retryable = false, .status = failure.status };
+    }
     if (remoteContentRequestFailure(err)) |failure| {
         return .{
             .index = @intCast(index),
@@ -30923,6 +31284,7 @@ fn embedInputItemFailure(index: usize, err: anyerror) EmbedItemError {
         error.ModelDoesNotSupportTextInput,
         error.ModelDoesNotSupportImageInput,
         error.ModelDoesNotSupportAudioInput,
+        error.OrderedEmbeddingContentNotSupported,
         => .{
             .index = @intCast(index),
             .code = "UNSUPPORTED_INPUT_MODALITY",
@@ -30940,6 +31302,7 @@ fn embedInputItemFailure(index: usize, err: anyerror) EmbedItemError {
         error.MediaContentPartMissingData,
         error.MediaContentPartMissingMimeType,
         error.UnknownContentPartType,
+        error.InvalidOrderedEmbeddingContent,
         => .{
             .index = @intCast(index),
             .code = "INVALID_INPUT",
@@ -30959,6 +31322,22 @@ fn embedInputItemFailure(index: usize, err: anyerror) EmbedItemError {
     };
 }
 
+fn isEmbeddingInputContractError(err: anyerror) bool {
+    return switch (err) {
+        error.EmbeddingSequenceTooLong,
+        error.InvalidAudioSamples,
+        error.UnsupportedAudioFormat,
+        error.EmptyAudioInput,
+        error.InvalidAudioInput,
+        error.AudioTooLarge,
+        error.MediaPlaceholderMismatch,
+        error.EmptyEmbeddingInput,
+        error.InvalidImageInput,
+        => true,
+        else => false,
+    };
+}
+
 fn prepareInitialDenseEmbeddingPipeline(
     model: *model_manager_mod.LoadedModel,
     allocator: std.mem.Allocator,
@@ -30967,6 +31346,8 @@ fn prepareInitialDenseEmbeddingPipeline(
 ) !embedding_mod.EmbeddingPipeline {
     try model.lockEmbeddingAssetsWithControl(control);
     defer model.unlockEmbeddingAssets();
+    if (model.manifest.embedding_style == .embedding_gemma2)
+        return model.embeddingPipelineLocked(allocator);
     if (inputs.audio.items.len > 0) {
         // Audio is deliberately the only optional phase admitted up front.
         // Text/image assets are admitted after the audio outputs are copied.
@@ -31072,6 +31453,11 @@ fn embedDenseInputs(
     audio_asset_guard: *AudioEmbeddingAssetGuard,
     asset_lease: *model_manager_mod.EmbeddingAssetLease,
 ) ![][]f32 {
+    if (pipeline.config.resident_embedding_gemma2) {
+        var content = try denseEmbeddingContentInputs(allocator, inputs);
+        defer content.deinit(allocator);
+        return pipeline.embedContent(content.inputs);
+    }
     const embeddings = try allocator.alloc([]f32, inputs.total_count);
     errdefer allocator.free(embeddings);
 
@@ -31162,6 +31548,36 @@ fn embedDenseInputsPartial(
     var errors = std.ArrayListUnmanaged(EmbedItemError).empty;
     errdefer errors.deinit(allocator);
     try errors.appendSlice(allocator, inputs.parse_errors.items);
+
+    if (pipeline.config.resident_embedding_gemma2) {
+        var content = try denseEmbeddingContentInputs(allocator, inputs);
+        defer content.deinit(allocator);
+        var successful_tokens: usize = 0;
+        for (content.inputs, 0..) |item, index| {
+            var parse_failed = false;
+            for (inputs.parse_errors.items) |failure| {
+                if (failure.index == @as(i64, @intCast(index))) {
+                    parse_failed = true;
+                    break;
+                }
+            }
+            if (parse_failed) continue;
+            const embeddings = pipeline.embedContent(&.{item}) catch |err| {
+                if (shouldAbortDensePartialFallback(err)) return err;
+                try errors.append(allocator, embedInputItemFailure(index, err));
+                continue;
+            };
+            defer allocator.free(embeddings);
+            if (embeddings.len != 1) return error.InvalidEmbeddingOutput;
+            result.embeddings[index] = embeddings[0];
+            successful_tokens +|= pipeline.last_input_tokens;
+        }
+        pipeline.last_input_tokens = successful_tokens;
+        const owned_errors = try errors.toOwnedSlice(allocator);
+        allocator.free(result.errors);
+        result.errors = owned_errors;
+        return result;
+    }
 
     var primary_admission = PartialPrimaryDenseEmbeddingAdmission{};
     if (inputs.audio.items.len > 0) {
@@ -32895,6 +33311,13 @@ fn directDenseEmbedPreflight(parts: []const Node.DirectDenseEmbedPart) !DirectDe
     var shape: RequestMediaAdmissionShape = .{};
     var has_audio = false;
     for (parts) |part| switch (part) {
+        .content => |children| {
+            if (children.len == 0) return error.InvalidOrderedEmbeddingContent;
+            for (children) |child| if (child == .content) return error.InvalidOrderedEmbeddingContent;
+            const grouped = try directDenseEmbedPreflight(children);
+            shape.merge(grouped.shape);
+            has_audio = has_audio or grouped.has_audio;
+        },
         .text => {},
         .image_url => |url| shape.addImageUrlSlice(url),
         .media => |media| {
@@ -33015,23 +33438,36 @@ fn estimateGenerateRequestTextBytes(body: api.GenerateRequest) usize {
 
 fn denseEmbedRequestMediaShape(input: std.json.Value) RequestMediaAdmissionShape {
     var shape: RequestMediaAdmissionShape = .{};
-    if (input != .array) return shape;
-    for (input.array.items) |part| {
-        if (part != .object) continue;
-        const part_type = part.object.get("type") orelse continue;
-        if (part_type != .string) continue;
-        if (std.mem.eql(u8, part_type.string, "image_url")) {
-            const image_url = part.object.get("image_url") orelse continue;
-            shape.addImageUrl(image_url);
-            continue;
-        }
-        if (!std.mem.eql(u8, part_type.string, "media")) continue;
-        const data = part.object.get("data") orelse continue;
-        const mime = part.object.get("mime_type") orelse continue;
-        if (data != .string or mime != .string) continue;
-        shape.addInline(data.string.len, std.ascii.startsWithIgnoreCase(mime.string, "image/"));
-    }
+    visitDenseEmbedRequestMediaShape(&shape, input, 0);
     return shape;
+}
+
+fn visitDenseEmbedRequestMediaShape(shape: *RequestMediaAdmissionShape, input: std.json.Value, depth: usize) void {
+    if (depth > 3) {
+        shape.invalid_inline_media = true;
+        return;
+    }
+    if (input == .array) {
+        for (input.array.items) |part| visitDenseEmbedRequestMediaShape(shape, part, depth + 1);
+        return;
+    }
+    if (input != .object) return;
+    if (input.object.get("content")) |parts| {
+        visitDenseEmbedRequestMediaShape(shape, parts, depth + 1);
+        return;
+    }
+    const part_type = input.object.get("type") orelse return;
+    if (part_type != .string) return;
+    if (std.mem.eql(u8, part_type.string, "image_url")) {
+        shape.addImageUrl(input.object.get("image_url") orelse return);
+        return;
+    }
+    if (!std.mem.eql(u8, part_type.string, "media")) return;
+    const data = input.object.get("data") orelse return;
+    const mime = input.object.get("mime_type") orelse return;
+    if (data != .string or mime != .string) return;
+    shape.addEncodedInline(data.string, std.ascii.startsWithIgnoreCase(mime.string, "image/"));
+    shape.has_audio = shape.has_audio or std.ascii.startsWithIgnoreCase(mime.string, "audio/");
 }
 
 fn denseEmbedRequestMediaShapeWithAttachments(

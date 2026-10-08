@@ -18067,6 +18067,10 @@ export interface components {
         InferenceImageURLContentPart: components["schemas"]["ImageURLContentPart"];
         InferenceMediaContentPart: components["schemas"]["MediaContentPart"];
         InferenceContentPart: components["schemas"]["ContentPart"];
+        /** @description One ordered input producing one combined embedding. Supported by EmbeddingGemma 2. Parts are concatenated in order, including text, images, and audio; video is unsupported. The expanded input, including task prompts, BOS/EOS, and media tokens, must fit within 8192 tokens. Overflow is rejected without truncation. */
+        InferenceEmbeddingContentInput: {
+            content: components["schemas"]["ContentPart"][];
+        };
         /** @description OpenAI-compatible embedding request with inference multimodal content-part extension */
         InferenceEmbedRequest: {
             /** @description Model name to use for embedding generation */
@@ -18077,21 +18081,24 @@ export interface components {
              *     - a single string
              *     - an array of strings
              *     - an array of OpenAI-style content parts for multimodal embedding
+             *     - an object with an ordered content array, producing one embedding
+             *     - an array of ordered content objects, producing one embedding per object
+             *     Legacy arrays of content parts continue to produce one embedding per part.
              */
-            input: string | string[] | components["schemas"]["ContentPart"][];
+            input: string | string[] | components["schemas"]["ContentPart"][] | components["schemas"]["InferenceEmbeddingContentInput"] | components["schemas"]["InferenceEmbeddingContentInput"][];
             /**
              * @description Encoding format for the embeddings (only "float" supported)
              * @default float
              * @enum {string}
              */
             encoding_format?: "float";
-            /** @description Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. For normalized models the truncated vector is L2-re-normalized (Matryoshka semantics, matching the OpenAI dimensions parameter). Not supported for sparse models. */
+            /** @description Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. For normalized models the truncated vector is L2-re-normalized (Matryoshka semantics, matching the OpenAI dimensions parameter). EmbeddingGemma 2 is trained for 768, 512, 256, and 128 dimensions. Not supported for sparse models. */
             dimensions?: number;
             /**
-             * @description Optional embedding task type using Google embedding task-type names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix. For Qwen3-Embedding models, RETRIEVAL_QUERY uses the model's built-in web-retrieval instruction, RETRIEVAL_DOCUMENT is embedded raw, and every other task type requires an explicit instruction.
+             * @description Optional embedding task type using Google embedding task-type names. EmbeddingGemma 2 applies its official prompt for each of the eight task types to text-bearing inputs and rejects custom instructions. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix. For Qwen3-Embedding models, RETRIEVAL_QUERY uses the model's built-in web-retrieval instruction, RETRIEVAL_DOCUMENT is embedded raw, and every other task type requires an explicit instruction.
              * @enum {string}
              */
-            task_type?: "RETRIEVAL_QUERY" | "RETRIEVAL_DOCUMENT" | "QUESTION_ANSWERING" | "FACT_VERIFICATION" | "CODE_RETRIEVAL_QUERY" | "CLASSIFICATION" | "CLUSTERING" | "SEMANTIC_SIMILARITY";
+            task_type?: "RETRIEVAL_QUERY" | "RETRIEVAL_DOCUMENT" | "QUESTION_ANSWERING" | "FACT_VERIFICATION" | "FACT_CHECKING" | "CODE_RETRIEVAL_QUERY" | "CODE_RETRIEVAL" | "CLASSIFICATION" | "CLUSTERING" | "SEMANTIC_SIMILARITY";
             /** @description Task description for instruction-aware embedding models (Qwen3-Embedding), rendered inside the query instruction wrapper ("Instruct: {instruction}\nQuery:{input}"). Optional for RETRIEVAL_QUERY, which has a model-owned default; required for other non-document task types; rejected for document tasks and models without instruction support. */
             instruction?: string;
             /**
@@ -18113,6 +18120,8 @@ export interface components {
         };
         /** @description OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors */
         InferenceEmbedResponse: {
+            /** @description Execution backend reported for EmbeddingGemma 2 qualification. CUDA requests fail if the resident text encoder cannot execute; this field does not describe preprocessing placement. */
+            backend?: string | null;
             /**
              * @description Object type, always "list"
              * @enum {string}

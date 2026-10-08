@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
@@ -28,6 +28,8 @@ class InferenceEmbedResponse:
         data (list[InferenceEmbeddingObject]): List of embedding objects
         model (str): Model used for embedding generation
         usage (InferenceEmbeddingUsage): Token usage information
+        backend (None | str | Unset): Execution backend reported for EmbeddingGemma 2 qualification. CUDA requests fail
+            if the resident text encoder cannot execute; this field does not describe preprocessing placement.
         errors (list[InferenceEmbeddingItemError] | Unset): Indexed per-input failures. Only populated when request
             error_policy is per_item.
         summary (InferenceEmbeddingBatchSummary | Unset): Counts for per-item embedding responses
@@ -37,6 +39,7 @@ class InferenceEmbedResponse:
     data: list[InferenceEmbeddingObject]
     model: str
     usage: InferenceEmbeddingUsage
+    backend: None | str | Unset = UNSET
     errors: list[InferenceEmbeddingItemError] | Unset = UNSET
     summary: InferenceEmbeddingBatchSummary | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -52,6 +55,12 @@ class InferenceEmbedResponse:
         model = self.model
 
         usage = self.usage.to_dict()
+
+        backend: None | str | Unset
+        if isinstance(self.backend, Unset):
+            backend = UNSET
+        else:
+            backend = self.backend
 
         errors: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.errors, Unset):
@@ -74,6 +83,8 @@ class InferenceEmbedResponse:
                 "usage": usage,
             }
         )
+        if backend is not UNSET:
+            field_dict["backend"] = backend
         if errors is not UNSET:
             field_dict["errors"] = errors
         if summary is not UNSET:
@@ -102,6 +113,15 @@ class InferenceEmbedResponse:
 
         usage = InferenceEmbeddingUsage.from_dict(d.pop("usage"))
 
+        def _parse_backend(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        backend = _parse_backend(d.pop("backend", UNSET))
+
         _errors = d.pop("errors", UNSET)
         errors: list[InferenceEmbeddingItemError] | Unset = UNSET
         if _errors is not UNSET:
@@ -123,6 +143,7 @@ class InferenceEmbedResponse:
             data=data,
             model=model,
             usage=usage,
+            backend=backend,
             errors=errors,
             summary=summary,
         )

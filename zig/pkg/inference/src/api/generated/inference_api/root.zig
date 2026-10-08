@@ -53,6 +53,7 @@ pub const DocumentTokenClassificationResult = types.DocumentTokenClassificationR
 pub const EmbedRequest = types.EmbedRequest;
 pub const EmbedResponse = types.EmbedResponse;
 pub const EmbeddingBatchSummary = types.EmbeddingBatchSummary;
+pub const EmbeddingContentInput = types.EmbeddingContentInput;
 pub const EmbeddingItemError = types.EmbeddingItemError;
 pub const EmbeddingObject = types.EmbeddingObject;
 pub const EmbeddingUsage = types.EmbeddingUsage;

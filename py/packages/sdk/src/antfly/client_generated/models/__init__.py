@@ -782,6 +782,7 @@ from .inference_embed_request_task_type import InferenceEmbedRequestTaskType
 from .inference_embed_response import InferenceEmbedResponse
 from .inference_embed_response_object import InferenceEmbedResponseObject
 from .inference_embedding_batch_summary import InferenceEmbeddingBatchSummary
+from .inference_embedding_content_input import InferenceEmbeddingContentInput
 from .inference_embedding_item_error import InferenceEmbeddingItemError
 from .inference_embedding_item_error_stage import InferenceEmbeddingItemErrorStage
 from .inference_embedding_object import InferenceEmbeddingObject
@@ -2189,6 +2190,7 @@ __all__ = (
     "InferenceDictationTranscript",
     "InferenceDictationWord",
     "InferenceEmbeddingBatchSummary",
+    "InferenceEmbeddingContentInput",
     "InferenceEmbeddingItemError",
     "InferenceEmbeddingItemErrorStage",
     "InferenceEmbeddingObject",

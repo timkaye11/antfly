@@ -1,0 +1,415 @@
+{
+  "backend": "cuda",
+  "gates": [
+    {
+      "case": "document",
+      "gate": "oracle_cosine",
+      "pass": true,
+      "threshold": 0.999,
+      "value": 0.9999120763628616
+    },
+    {
+      "case": "document",
+      "gate": "unit_norm",
+      "pass": true,
+      "value": 0.9999999662238837
+    },
+    {
+      "case": "document",
+      "gate": "backend_provenance",
+      "pass": true,
+      "value": "cuda"
+    },
+    {
+      "case": "document",
+      "expected": 15,
+      "gate": "expanded_token_usage",
+      "pass": true,
+      "value": 15
+    },
+    {
+      "case": "document:128",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "threshold": 0.999,
+      "value": 0.9999519252967687
+    },
+    {
+      "case": "document:128",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "threshold": 0.99999,
+      "value": 0.9999999999999998
+    },
+    {
+      "case": "document:256",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "threshold": 0.999,
+      "value": 0.9999321254082759
+    },
+    {
+      "case": "document:256",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "threshold": 0.99999,
+      "value": 1.0
+    },
+    {
+      "case": "document:512",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "threshold": 0.999,
+      "value": 0.9999168027697747
+    },
+    {
+      "case": "document:512",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "threshold": 0.99999,
+      "value": 0.9999999999999993
+    },
+    {
+      "case": "query",
+      "gate": "oracle_cosine",
+      "pass": true,
+      "threshold": 0.999,
+      "value": 0.9999703483452362
+    },
+    {
+      "case": "query",
+      "gate": "unit_norm",
+      "pass": true,
+      "value": 1.0000002050429464
+    },
+    {
+      "case": "query",
+      "gate": "backend_provenance",
+      "pass": true,
+      "value": "cuda"
+    },
+    {
+      "case": "query",
+      "expected": 14,
+      "gate": "expanded_token_usage",
+      "pass": true,
+      "value": 14
+    },
+    {
+      "case": "query:128",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "threshold": 0.999,
+      "value": 0.9999786734633042
+    },
+    {
+      "case": "query:128",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "threshold": 0.99999,
+      "value": 0.9999999999999996
+    },
+    {
+      "case": "query:256",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "threshold": 0.999,
+      "value": 0.9999719389838327
+    },
+    {
+      "case": "query:256",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "threshold": 0.99999,
+      "value": 0.9999999999999998
+    },
+    {
+      "case": "query:512",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "threshold": 0.999,
+      "value": 0.9999722077934391
+    },
+    {
+      "case": "query:512",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "threshold": 0.99999,
+      "value": 0.999999999999999
+    },
+    {
+      "case": "code_query",
+      "gate": "oracle_cosine",
+      "pass": true,
+      "threshold": 0.999,
+      "value": 0.9999725624939613
+    },
+    {
+      "case": "code_query",
+      "gate": "unit_norm",
+      "pass": true,
+      "value": 1.0000001606434024
+    },
+    {
+      "case": "code_query",
+      "gate": "backend_provenance",
+      "pass": true,
+      "value": "cuda"
+    },
+    {
+      "case": "code_query",
+      "expected": 14,
+      "gate": "expanded_token_usage",
+      "pass": true,
+      "value": 14
+    },
+    {
+      "case": "code_query:128",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "threshold": 0.999,
+      "value": 0.9999816964010745
+    },
+    {
+      "case": "code_query:128",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "threshold": 0.99999,
+      "value": 0.9999999999999991
+    },
+    {
+      "case": "code_query:256",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "threshold": 0.999,
+      "value": 0.9999751275688227
+    },
+    {
+      "case": "code_query:256",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "threshold": 0.99999,
+      "value": 1.0000000000000009
+    },
+    {
+      "case": "code_query:512",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "threshold": 0.999,
+      "value": 0.9999718080559336
+    },
+    {
+      "case": "code_query:512",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "threshold": 0.99999,
+      "value": 1.0000000000000004
+    },
+    {
+      "case": "image",
+      "gate": "oracle_cosine",
+      "pass": true,
+      "threshold": 0.999,
+      "value": 0.999972439770941
+    },
+    {
+      "case": "image",
+      "gate": "unit_norm",
+      "pass": true,
+      "value": 0.999999963989097
+    },
+    {
+      "case": "image",
+      "gate": "backend_provenance",
+      "pass": true,
+      "value": "cuda"
+    },
+    {
+      "case": "image",
+      "expected": 270,
+      "gate": "expanded_token_usage",
+      "pass": true,
+      "value": 270
+    },
+    {
+      "case": "image:128",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "threshold": 0.999,
+      "value": 0.9999874137842684
+    },
+    {
+      "case": "image:128",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "threshold": 0.99999,
+      "value": 0.9999999999999994
+    },
+    {
+      "case": "image:256",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "threshold": 0.999,
+      "value": 0.9999784787300252
+    },
+    {
+      "case": "image:256",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "threshold": 0.99999,
+      "value": 1.0
+    },
+    {
+      "case": "image:512",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "threshold": 0.999,
+      "value": 0.9999734323706626
+    },
+    {
+      "case": "image:512",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "threshold": 0.99999,
+      "value": 0.9999999999999986
+    },
+    {
+      "case": "audio",
+      "gate": "oracle_cosine",
+      "pass": true,
+      "threshold": 0.999,
+      "value": 0.9998520644731271
+    },
+    {
+      "case": "audio",
+      "gate": "unit_norm",
+      "pass": true,
+      "value": 0.9999999902043322
+    },
+    {
+      "case": "audio",
+      "gate": "backend_provenance",
+      "pass": true,
+      "value": "cuda"
+    },
+    {
+      "case": "audio",
+      "expected": 29,
+      "gate": "expanded_token_usage",
+      "pass": true,
+      "value": 29
+    },
+    {
+      "case": "audio:128",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "threshold": 0.999,
+      "value": 0.9999070899164685
+    },
+    {
+      "case": "audio:128",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "threshold": 0.99999,
+      "value": 0.9999999999999993
+    },
+    {
+      "case": "audio:256",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "threshold": 0.999,
+      "value": 0.9998626041848081
+    },
+    {
+      "case": "audio:256",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "threshold": 0.99999,
+      "value": 0.9999999999999994
+    },
+    {
+      "case": "audio:512",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "threshold": 0.999,
+      "value": 0.9998547445462238
+    },
+    {
+      "case": "audio:512",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "threshold": 0.99999,
+      "value": 0.9999999999999988
+    },
+    {
+      "case": "mixed_ordered",
+      "gate": "oracle_cosine",
+      "pass": true,
+      "threshold": 0.999,
+      "value": 0.9999222523917654
+    },
+    {
+      "case": "mixed_ordered",
+      "gate": "unit_norm",
+      "pass": true,
+      "value": 0.9999999751611711
+    },
+    {
+      "case": "mixed_ordered",
+      "gate": "backend_provenance",
+      "pass": true,
+      "value": "cuda"
+    },
+    {
+      "case": "mixed_ordered",
+      "expected": 311,
+      "gate": "expanded_token_usage",
+      "pass": true,
+      "value": 311
+    },
+    {
+      "case": "mixed_ordered:128",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "threshold": 0.999,
+      "value": 0.9999609248697052
+    },
+    {
+      "case": "mixed_ordered:128",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "threshold": 0.99999,
+      "value": 0.9999999999999984
+    },
+    {
+      "case": "mixed_ordered:256",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "threshold": 0.999,
+      "value": 0.9999405262945682
+    },
+    {
+      "case": "mixed_ordered:256",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "threshold": 0.99999,
+      "value": 0.9999999999999997
+    },
+    {
+      "case": "mixed_ordered:512",
+      "gate": "mrl_oracle_cosine",
+      "pass": true,
+      "threshold": 0.999,
+      "value": 0.9999288509237364
+    },
+    {
+      "case": "mixed_ordered:512",
+      "gate": "truncate_renormalize",
+      "pass": true,
+      "threshold": 0.99999,
+      "value": 0.999999999999998
+    }
+  ],
+  "pass": true,
+  "schema": "antfly.embedding_gemma2.cli_qualification.v1"
+}

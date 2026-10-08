@@ -1,0 +1,172 @@
+{
+  "schema": "antfly.embedding_gemma2.final_paired_audit.v1",
+  "binary_sha256": "bda59bbadd9fdc2d1af83abb2312d751eb8df780a54140bc75b676d76f1f73b9",
+  "cells": 7,
+  "passed": 6,
+  "pairs": 700,
+  "warmups_per_cell": 20,
+  "thresholds_unchanged": true,
+  "results": [
+    {
+      "report": "formal-final-bda-audio.json",
+      "report_sha256": "296da50f253145bb0d56f520ae684c56c00e60a5ae9b61055228b3fc228c6e83",
+      "pass": true,
+      "latency_ms": {
+        "antfly": {
+          "p50": 30.881983984727412,
+          "p95": 32.79608301818371,
+          "p99": 36.11304902005941
+        },
+        "pytorch": {
+          "p50": 47.01686999760568,
+          "p95": 58.05692001013085,
+          "p99": 86.43405797192827
+        }
+      },
+      "cosine": 0.9998595091552008,
+      "throughput_ratio_ci95": [
+        1.5443448039935235,
+        1.6273281367462686
+      ],
+      "p95_latency_ratio": 0.5648953305215095
+    },
+    {
+      "report": "formal-final-bda-b1s128.json",
+      "report_sha256": "3695b1dc2ae3602b058c5b82286422ef4cef302a97a05a83e9febece7b7a5f93",
+      "pass": true,
+      "latency_ms": {
+        "antfly": {
+          "p50": 10.679750004783273,
+          "p95": 11.941928998567164,
+          "p99": 13.200293004047126
+        },
+        "pytorch": {
+          "p50": 17.11284404154867,
+          "p95": 18.600528012029827,
+          "p99": 20.9939630003646
+        }
+      },
+      "cosine": 0.9999424625328516,
+      "throughput_ratio_ci95": [
+        1.5794365879028909,
+        1.6216640419426662
+      ],
+      "p95_latency_ratio": 0.6420209679447682
+    },
+    {
+      "report": "formal-final-bda-b1s8192.json",
+      "report_sha256": "199467c12f562c9c5ffa82bb3e536ae9464689b0edd2edf406ba3059ed08c3fb",
+      "pass": true,
+      "latency_ms": {
+        "antfly": {
+          "p50": 227.0347320009023,
+          "p95": 230.31632200581953,
+          "p99": 231.35010403348133
+        },
+        "pytorch": {
+          "p50": 472.03791001811624,
+          "p95": 476.7593369469978,
+          "p99": 480.34486395772547
+        }
+      },
+      "cosine": 0.9999609651351733,
+      "throughput_ratio_ci95": [
+        2.0773332053417737,
+        2.082776654755392
+      ],
+      "p95_latency_ratio": 0.4830871766050472
+    },
+    {
+      "report": "formal-final-bda-b32s2048.json",
+      "report_sha256": "613de3a11117a2995819e9c8fcc55c0c0f1de34f6af0d02c33cb7d38cb4e9c01",
+      "pass": true,
+      "latency_ms": {
+        "antfly": {
+          "p50": 1359.863385965582,
+          "p95": 1378.9991989615373,
+          "p99": 1384.0656600077637
+        },
+        "pytorch": {
+          "p50": 1652.9277130030096,
+          "p95": 1674.936416966375,
+          "p99": 1678.35408099927
+        }
+      },
+      "cosine": 0.9999499345763483,
+      "throughput_ratio_ci95": [
+        1.213563449775014,
+        1.2172856077615335
+      ],
+      "p95_latency_ratio": 0.8233143568871494
+    },
+    {
+      "report": "formal-final-bda-b8s512.json",
+      "report_sha256": "9180b67d45acb295998d054d3f1be10de7114b5ddcad71aeae6adddea9331079",
+      "pass": true,
+      "latency_ms": {
+        "antfly": {
+          "p50": 63.59717599116266,
+          "p95": 65.00015797792003,
+          "p99": 65.5085519538261
+        },
+        "pytorch": {
+          "p50": 67.63482902897522,
+          "p95": 70.12309500714764,
+          "p99": 71.79478905163705
+        }
+      },
+      "cosine": 0.9999594414534411,
+      "throughput_ratio_ci95": [
+        1.0605461515575603,
+        1.0691843707789443
+      ],
+      "p95_latency_ratio": 0.9269436548870892
+    },
+    {
+      "report": "formal-final-bda-image.json",
+      "report_sha256": "c86a469a0444a51ddfc66f73a8cf50e5845b74d27d210472737afd7d227bbb0e",
+      "pass": false,
+      "latency_ms": {
+        "antfly": {
+          "p50": 69.09118901239708,
+          "p95": 70.29423303902149,
+          "p99": 71.17458200082183
+        },
+        "pytorch": {
+          "p50": 61.82986201019958,
+          "p95": 64.78785100625828,
+          "p99": 65.96867297776043
+        }
+      },
+      "cosine": 0.9999641518184414,
+      "throughput_ratio_ci95": [
+        0.8941755768647387,
+        0.9031225825590431
+      ],
+      "p95_latency_ratio": 1.0849909658561034
+    },
+    {
+      "report": "formal-final-bda-mixed_ordered.json",
+      "report_sha256": "9923ee209fa044a5b06135a25c21c27de8cd9bd6f42bd7d2e939093895e70d1e",
+      "pass": true,
+      "latency_ms": {
+        "antfly": {
+          "p50": 86.65303396992385,
+          "p95": 101.7223900416866,
+          "p99": 110.34641397418454
+        },
+        "pytorch": {
+          "p50": 84.35053704306483,
+          "p95": 96.93736198823899,
+          "p99": 109.79492403566837
+        }
+      },
+      "cosine": 0.9999289181470467,
+      "throughput_ratio_ci95": [
+        0.9597658076587725,
+        1.0010294470339332
+      ],
+      "p95_latency_ratio": 1.0493620618026325
+    }
+  ]
+}

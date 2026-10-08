@@ -1,0 +1,208 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+/* Direct cuDNN C-backend SDPA proof. This is a qualification tool, not runtime code. */
+#include <cudnn.h>
+#include <cuda_runtime_api.h>
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define CUDNN_CHECK(call) do { \
+    cudnnStatus_t status_ = (call); \
+    if (status_ != CUDNN_STATUS_SUCCESS) { \
+        fprintf(stderr, "%s:%d %s: %s\n", __FILE__, __LINE__, #call, cudnnGetErrorString(status_)); \
+        exit(2); \
+    } \
+} while (0)
+#define CUDA_CHECK(call) do { \
+    cudaError_t status_ = (call); \
+    if (status_ != cudaSuccess) { \
+        fprintf(stderr, "%s:%d %s: %s\n", __FILE__, __LINE__, #call, cudaGetErrorString(status_)); \
+        exit(2); \
+    } \
+} while (0)
+
+static void set_attr(cudnnBackendDescriptor_t descriptor, cudnnBackendAttributeName_t name,
+                     cudnnBackendAttributeType_t type, int64_t count, void const *value) {
+    CUDNN_CHECK(cudnnBackendSetAttribute(descriptor, name, type, count, value));
+}
+
+static cudnnBackendDescriptor_t make_tensor(int64_t uid, int64_t batch, int64_t heads,
+                                             int64_t sequence, int64_t width, int by_value) {
+    cudnnBackendDescriptor_t tensor;
+    CUDNN_CHECK(cudnnBackendCreateDescriptor(CUDNN_BACKEND_TENSOR_DESCRIPTOR, &tensor));
+    int64_t dimensions[4] = {batch, heads, sequence, width};
+    int64_t strides[4] = {sequence * heads * width, width, heads * width, 1};
+    int64_t alignment = 16;
+    cudnnDataType_t data_type = by_value ? CUDNN_DATA_FLOAT : CUDNN_DATA_BFLOAT16;
+    set_attr(tensor, CUDNN_ATTR_TENSOR_UNIQUE_ID, CUDNN_TYPE_INT64, 1, &uid);
+    set_attr(tensor, CUDNN_ATTR_TENSOR_DATA_TYPE, CUDNN_TYPE_DATA_TYPE, 1, &data_type);
+    set_attr(tensor, CUDNN_ATTR_TENSOR_BYTE_ALIGNMENT, CUDNN_TYPE_INT64, 1, &alignment);
+    if (by_value) {
+        int64_t one = 1;
+        int is_by_value = 1;
+        set_attr(tensor, CUDNN_ATTR_TENSOR_DIMENSIONS, CUDNN_TYPE_INT64, 1, &one);
+        set_attr(tensor, CUDNN_ATTR_TENSOR_STRIDES, CUDNN_TYPE_INT64, 1, &one);
+        set_attr(tensor, CUDNN_ATTR_TENSOR_IS_BY_VALUE, CUDNN_TYPE_BOOLEAN, 1, &is_by_value);
+    } else {
+        set_attr(tensor, CUDNN_ATTR_TENSOR_DIMENSIONS, CUDNN_TYPE_INT64, 4, dimensions);
+        set_attr(tensor, CUDNN_ATTR_TENSOR_STRIDES, CUDNN_TYPE_INT64, 4, strides);
+    }
+    CUDNN_CHECK(cudnnBackendFinalize(tensor));
+    return tensor;
+}
+
+static uint16_t to_bfloat16(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    bits += 0x7fffu + ((bits >> 16) & 1u);
+    return (uint16_t)(bits >> 16);
+}
+
+static void write_values(char const *path, uint16_t const *values, size_t count) {
+    FILE *file = fopen(path, "wb");
+    if (file == NULL || fwrite(values, sizeof(*values), count, file) != count || fclose(file) != 0) {
+        fprintf(stderr, "failed to write %s\n", path);
+        exit(2);
+    }
+}
+
+int main(int argc, char **argv) {
+    int64_t batch = argc > 2 ? strtoll(argv[2], NULL, 10) : 1;
+    int64_t heads = 12;
+    int64_t sequence = argc > 1 ? strtoll(argv[1], NULL, 10) : 2394;
+    int64_t width = 64;
+    float amplitude = argc > 3 ? strtof(argv[3], NULL) : 0.1f;
+    int64_t uids[5] = {1, 2, 3, 4, 5};
+
+    cudnnHandle_t handle;
+    cudaStream_t stream;
+    CUDNN_CHECK(cudnnCreate(&handle));
+    CUDA_CHECK(cudaStreamCreate(&stream));
+    CUDNN_CHECK(cudnnSetStream(handle, stream));
+
+    cudnnBackendDescriptor_t tensors[5];
+    for (int i = 0; i < 4; ++i) tensors[i] = make_tensor(i + 1, batch, heads, sequence, width, 0);
+    tensors[4] = make_tensor(5, 1, 1, 1, 1, 1);
+
+    cudnnBackendDescriptor_t operation;
+    CUDNN_CHECK(cudnnBackendCreateDescriptor(CUDNN_BACKEND_OPERATION_SDPA_FWD_DESCRIPTOR, &operation));
+    set_attr(operation, CUDNN_ATTR_OPERATION_SDPA_FWD_QDESC, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1, &tensors[0]);
+    set_attr(operation, CUDNN_ATTR_OPERATION_SDPA_FWD_KDESC, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1, &tensors[1]);
+    set_attr(operation, CUDNN_ATTR_OPERATION_SDPA_FWD_VDESC, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1, &tensors[2]);
+    set_attr(operation, CUDNN_ATTR_OPERATION_SDPA_FWD_ODESC, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1, &tensors[3]);
+    set_attr(operation, CUDNN_ATTR_OPERATION_SDPA_FWD_SCALEDESC, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1, &tensors[4]);
+    CUDNN_CHECK(cudnnBackendFinalize(operation));
+
+    cudnnBackendDescriptor_t graph;
+    CUDNN_CHECK(cudnnBackendCreateDescriptor(CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR, &graph));
+    set_attr(graph, CUDNN_ATTR_OPERATIONGRAPH_HANDLE, CUDNN_TYPE_HANDLE, 1, &handle);
+    set_attr(graph, CUDNN_ATTR_OPERATIONGRAPH_OPS, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1, &operation);
+    CUDNN_CHECK(cudnnBackendFinalize(graph));
+
+    cudnnBackendDescriptor_t heuristic;
+    CUDNN_CHECK(cudnnBackendCreateDescriptor(CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR, &heuristic));
+    cudnnBackendHeurMode_t mode = CUDNN_HEUR_MODE_A;
+    set_attr(heuristic, CUDNN_ATTR_ENGINEHEUR_OPERATION_GRAPH, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1, &graph);
+    set_attr(heuristic, CUDNN_ATTR_ENGINEHEUR_MODE, CUDNN_TYPE_HEUR_MODE, 1, &mode);
+    CUDNN_CHECK(cudnnBackendFinalize(heuristic));
+
+    int64_t config_count = 0;
+    CUDNN_CHECK(cudnnBackendGetAttribute(heuristic, CUDNN_ATTR_ENGINEHEUR_RESULTS,
+                                         CUDNN_TYPE_BACKEND_DESCRIPTOR, 0, &config_count, NULL));
+    if (config_count == 0) return 3;
+    cudnnBackendDescriptor_t *configs = calloc((size_t)config_count, sizeof(*configs));
+    for (int64_t i = 0; i < config_count; ++i)
+        CUDNN_CHECK(cudnnBackendCreateDescriptor(CUDNN_BACKEND_ENGINECFG_DESCRIPTOR, &configs[i]));
+    int64_t returned = 0;
+    CUDNN_CHECK(cudnnBackendGetAttribute(heuristic, CUDNN_ATTR_ENGINEHEUR_RESULTS,
+                                         CUDNN_TYPE_BACKEND_DESCRIPTOR, config_count, &returned, configs));
+
+    cudnnBackendDescriptor_t plan = NULL;
+    int64_t selected = -1;
+    for (int64_t i = 0; i < returned; ++i) {
+        CUDNN_CHECK(cudnnBackendCreateDescriptor(CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR, &plan));
+        set_attr(plan, CUDNN_ATTR_EXECUTION_PLAN_HANDLE, CUDNN_TYPE_HANDLE, 1, &handle);
+        set_attr(plan, CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1, &configs[i]);
+        if (cudnnBackendFinalize(plan) == CUDNN_STATUS_SUCCESS) { selected = i; break; }
+        CUDNN_CHECK(cudnnBackendDestroyDescriptor(plan));
+        plan = NULL;
+    }
+    if (selected < 0) return 4;
+
+    int64_t workspace_bytes = 0, actual = 0;
+    CUDNN_CHECK(cudnnBackendGetAttribute(plan, CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE,
+                                         CUDNN_TYPE_INT64, 1, &actual, &workspace_bytes));
+    size_t count = (size_t)(batch * sequence * heads * width);
+    size_t bytes = count * sizeof(uint16_t);
+    uint16_t *host[4];
+    void *pointers[5];
+    for (int i = 0; i < 4; ++i) host[i] = malloc(bytes);
+    for (size_t i = 0; i < count; ++i) {
+        host[0][i] = to_bfloat16(8.0f * amplitude * sinf((float)i * 0.001f));
+        host[1][i] = to_bfloat16(amplitude * cosf((float)i * 0.0013f));
+        host[2][i] = to_bfloat16(amplitude * sinf((float)i * 0.0007f));
+    }
+    for (int i = 0; i < 4; ++i) CUDA_CHECK(cudaMalloc(&pointers[i], bytes));
+    for (int i = 0; i < 3; ++i) CUDA_CHECK(cudaMemcpy(pointers[i], host[i], bytes, cudaMemcpyHostToDevice));
+    float attention_scale = 0.125f;
+    pointers[4] = &attention_scale;
+    void *workspace = NULL;
+    if (workspace_bytes != 0) CUDA_CHECK(cudaMalloc(&workspace, (size_t)workspace_bytes));
+
+    cudnnBackendDescriptor_t variant_pack;
+    CUDNN_CHECK(cudnnBackendCreateDescriptor(CUDNN_BACKEND_VARIANT_PACK_DESCRIPTOR, &variant_pack));
+    set_attr(variant_pack, CUDNN_ATTR_VARIANT_PACK_UNIQUE_IDS, CUDNN_TYPE_INT64, 5, uids);
+    set_attr(variant_pack, CUDNN_ATTR_VARIANT_PACK_DATA_POINTERS, CUDNN_TYPE_VOID_PTR, 5, pointers);
+    set_attr(variant_pack, CUDNN_ATTR_VARIANT_PACK_WORKSPACE, CUDNN_TYPE_VOID_PTR, 1, &workspace);
+    CUDNN_CHECK(cudnnBackendFinalize(variant_pack));
+
+    for (int i = 0; i < 10; ++i) CUDNN_CHECK(cudnnBackendExecute(handle, plan, variant_pack));
+    cudaEvent_t begin, end;
+    CUDA_CHECK(cudaEventCreate(&begin));
+    CUDA_CHECK(cudaEventCreate(&end));
+    CUDA_CHECK(cudaEventRecord(begin, stream));
+    for (int i = 0; i < 100; ++i) CUDNN_CHECK(cudnnBackendExecute(handle, plan, variant_pack));
+    CUDA_CHECK(cudaEventRecord(end, stream));
+    CUDA_CHECK(cudaEventSynchronize(end));
+    float elapsed_ms;
+    CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, begin, end));
+    CUDA_CHECK(cudaMemcpy(host[3], pointers[3], bytes, cudaMemcpyDeviceToHost));
+    write_values("/tmp/cudnn_sdpa_q.bf16", host[0], count);
+    write_values("/tmp/cudnn_sdpa_k.bf16", host[1], count);
+    write_values("/tmp/cudnn_sdpa_v.bf16", host[2], count);
+    write_values("/tmp/cudnn_sdpa_out.bf16", host[3], count);
+    printf("version=%zu batch=%ld sequence=%ld amplitude=%g configs=%ld selected=%ld workspace=%ld avg_ms=%g\n",
+           cudnnGetVersion(), batch, sequence, amplitude, returned, selected, workspace_bytes, elapsed_ms / 100.0f);
+
+    CUDNN_CHECK(cudnnBackendDestroyDescriptor(variant_pack));
+    CUDA_CHECK(cudaEventDestroy(begin));
+    CUDA_CHECK(cudaEventDestroy(end));
+    if (workspace != NULL) CUDA_CHECK(cudaFree(workspace));
+    for (int i = 0; i < 4; ++i) { CUDA_CHECK(cudaFree(pointers[i])); free(host[i]); }
+    CUDNN_CHECK(cudnnBackendDestroyDescriptor(plan));
+    for (int64_t i = 0; i < config_count; ++i) CUDNN_CHECK(cudnnBackendDestroyDescriptor(configs[i]));
+    free(configs);
+    CUDNN_CHECK(cudnnBackendDestroyDescriptor(heuristic));
+    CUDNN_CHECK(cudnnBackendDestroyDescriptor(graph));
+    CUDNN_CHECK(cudnnBackendDestroyDescriptor(operation));
+    for (int i = 0; i < 5; ++i) CUDNN_CHECK(cudnnBackendDestroyDescriptor(tensors[i]));
+    CUDNN_CHECK(cudnnDestroy(handle));
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    return 0;
+}

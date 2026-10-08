@@ -1,0 +1,79 @@
+{
+  "minimum_cosine": 0.9989237257952991,
+  "pass": false,
+  "rows": [
+    {
+      "channels": 1,
+      "cosine": 0.9999723238995408,
+      "dimensions": 768,
+      "duration_seconds": 0.1,
+      "native_backend": "cuda",
+      "sample_rate": 16000
+    },
+    {
+      "channels": 1,
+      "cosine": 0.9997887256929755,
+      "dimensions": 768,
+      "duration_seconds": 1,
+      "native_backend": "cuda",
+      "sample_rate": 8000
+    },
+    {
+      "channels": 1,
+      "cosine": 0.9998520644677735,
+      "dimensions": 768,
+      "duration_seconds": 1,
+      "native_backend": "cuda",
+      "sample_rate": 16000
+    },
+    {
+      "channels": 2,
+      "cosine": 0.9998730796106908,
+      "dimensions": 768,
+      "duration_seconds": 1,
+      "native_backend": "cuda",
+      "sample_rate": 16000
+    },
+    {
+      "channels": 1,
+      "cosine": 0.9989237257952991,
+      "dimensions": 768,
+      "duration_seconds": 1,
+      "native_backend": "cuda",
+      "sample_rate": 44100
+    },
+    {
+      "channels": 1,
+      "cosine": 0.9997232397622473,
+      "dimensions": 768,
+      "duration_seconds": 1,
+      "native_backend": "cuda",
+      "sample_rate": 48000
+    },
+    {
+      "channels": 1,
+      "cosine": 0.999365511741018,
+      "dimensions": 768,
+      "duration_seconds": 10,
+      "native_backend": "cuda",
+      "sample_rate": 48000
+    },
+    {
+      "channels": 1,
+      "cosine": 0.9996792030864753,
+      "dimensions": 768,
+      "duration_seconds": 10,
+      "native_backend": "cuda",
+      "sample_rate": 16000
+    },
+    {
+      "channels": 1,
+      "cosine": 0.9992463955192739,
+      "dimensions": 768,
+      "duration_seconds": 31,
+      "native_backend": "cuda",
+      "sample_rate": 16000
+    }
+  ],
+  "schema": "antfly.embedding_gemma2.audio_matrix.v1"
+}

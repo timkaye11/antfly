@@ -27,6 +27,93 @@ SQL_OPERATIONS = [
     for operation in ("execute_sql", "prepare_sql", "execute_prepared_sql", "close_prepared_sql")
 ]
 NDJSON_RESPONSE = "response_200 = cast(str, response.content)"
+EMBED_REQUEST = Path("models/inference_embed_request.py")
+
+
+def _fix_embedding_input_union(source: str) -> str:
+    """Replace ambiguous generated list-union dispatch with discriminated parsing."""
+    to_dict_start = source.index("    def to_dict(self) -> dict[str, Any]:")
+    from_dict_start = source.index("    @classmethod\n    def from_dict", to_dict_start)
+    generated_to_dict = source[to_dict_start:from_dict_start]
+    if generated_to_dict.count("if isinstance(self.input_, list):") != 3:
+        raise RuntimeError(f"unexpected generated shape in {EMBED_REQUEST}: to_dict list union")
+
+    input_start = generated_to_dict.index("        input_: dict[str, Any]")
+    encoding_start = generated_to_dict.index("        encoding_format:", input_start)
+    fixed_input = """        input_: dict[str, Any] | list[dict[str, Any]] | list[str] | str
+        if isinstance(self.input_, str):
+            input_ = self.input_
+        elif isinstance(self.input_, InferenceEmbeddingContentInput):
+            input_ = self.input_.to_dict()
+        elif isinstance(self.input_, list):
+            if all(isinstance(item, str) for item in self.input_):
+                input_ = list(self.input_)
+            elif all(isinstance(item, InferenceEmbeddingContentInput) for item in self.input_):
+                input_ = [item.to_dict() for item in self.input_]
+            elif all(isinstance(item, (TextContentPart, ImageURLContentPart, MediaContentPart)) for item in self.input_):
+                input_ = [item.to_dict() for item in self.input_]
+            else:
+                raise TypeError("input list must contain only strings, content parts, or ordered content inputs")
+        else:
+            raise TypeError("input must be a string, list, or ordered content input")
+
+"""
+    generated_to_dict = generated_to_dict[:input_start] + fixed_input + generated_to_dict[encoding_start:]
+    generated_to_dict = generated_to_dict.replace(
+        "        from ..models.inference_embedding_content_input import InferenceEmbeddingContentInput\n",
+        "        from ..models.inference_embedding_content_input import InferenceEmbeddingContentInput\n"
+        "        from ..models.media_content_part import MediaContentPart\n",
+        1,
+    )
+    source = source[:to_dict_start] + generated_to_dict + source[from_dict_start:]
+
+    parser_start = source.index("        def _parse_input_(", from_dict_start)
+    parser_end = source.index("\n        input_ = _parse_input_", parser_start)
+    generated_parser = source[parser_start:parser_end]
+    if generated_parser.count("if not isinstance(data, list):") != 3:
+        raise RuntimeError(f"unexpected generated shape in {EMBED_REQUEST}: from_dict list union")
+    fixed_parser = """        def _parse_input_(
+            data: object,
+        ) -> (
+            InferenceEmbeddingContentInput
+            | list[ImageURLContentPart | MediaContentPart | TextContentPart]
+            | list[InferenceEmbeddingContentInput]
+            | list[str]
+            | str
+        ):
+            if isinstance(data, str):
+                return data
+            if isinstance(data, dict):
+                if "content" not in data:
+                    raise TypeError("ordered embedding input must contain content")
+                return InferenceEmbeddingContentInput.from_dict(data)
+            if not isinstance(data, list):
+                raise TypeError("input must be a string, list, or ordered content input")
+            if all(isinstance(item, str) for item in data):
+                return cast(list[str], data)
+            if not all(isinstance(item, dict) for item in data):
+                raise TypeError("input list must contain only strings or objects")
+            object_items = cast(list[dict[str, Any]], data)
+            ordered = ["content" in item for item in object_items]
+            if any(ordered):
+                if not all(ordered):
+                    raise TypeError("ordered content inputs cannot be mixed with legacy content parts")
+                return [InferenceEmbeddingContentInput.from_dict(item) for item in object_items]
+
+            content_parts: list[ImageURLContentPart | MediaContentPart | TextContentPart] = []
+            for item in object_items:
+                kind = item.get("type")
+                if kind == "text":
+                    content_parts.append(TextContentPart.from_dict(item))
+                elif kind == "image_url":
+                    content_parts.append(ImageURLContentPart.from_dict(item))
+                elif kind == "media":
+                    content_parts.append(MediaContentPart.from_dict(item))
+                else:
+                    raise TypeError(f"unsupported content part type: {kind!r}")
+            return content_parts
+"""
+    return source[:parser_start] + fixed_parser + source[parser_end:]
 
 
 def fix_generated_client(root: Path) -> None:
@@ -70,6 +157,9 @@ def fix_generated_client(root: Path) -> None:
                 raise RuntimeError(f"unexpected generated shape in {operation}: {original}")
             source = source.replace(original, replacement)
         updates[path] = source
+
+    path = root / EMBED_REQUEST
+    updates[path] = _fix_embedding_input_union(path.read_text(encoding="utf-8"))
 
     for path, source in updates.items():
         path.write_text(source, encoding="utf-8")

@@ -1,0 +1,48 @@
+{
+  "schema": "antfly.embedding_gemma2.audio_ops_differential.v1",
+  "date_utc": "2026-10-08",
+  "device": "NVIDIA L4 (SM89)",
+  "driver": "580.159.03",
+  "toolkit": "CUDA 13.2.78",
+  "build_command": "scripts/embedding_gemma2/build_audio_ops_differential.sh /tmp/embedding_gemma2_audio_ops_differential",
+  "run_commands": [
+    "/tmp/embedding_gemma2_audio_ops_differential 5",
+    "/tmp/embedding_gemma2_audio_ops_differential 15"
+  ],
+  "contracts": {
+    "clamp": "all elements finite/NaN/signed-Inf checked for two-sided, lower-only, and upper-only bounds",
+    "glu": "all [25,2048] row-major concatenated input elements checked against FP32 host reference",
+    "depthwise_causal_conv1d": "all [25,1024] output elements checked for kernel sizes 5 and 15 with [kernel,channel] weights"
+  },
+  "results": [
+    {
+      "kernel_size": 5,
+      "passed": true,
+      "clamp_ms": 0.002732032,
+      "glu_ms": 0.002953216,
+      "conv_ms": 0.0027863041,
+      "max_conv_abs_error": 8.94069672e-08
+    },
+    {
+      "kernel_size": 15,
+      "passed": true,
+      "clamp_ms": 0.002731008,
+      "glu_ms": 0.0027719678,
+      "conv_ms": 0.0034283521,
+      "max_conv_abs_error": 1.1920929e-07
+    }
+  ],
+  "sha256": {
+    "source": "011f2502871b334a5fbe3a7c5dc0addffcc57356e40438020d48abed141859ff",
+    "build_script": "b6069baf896adb1b2eafb66c189db5df3fce60ba742d8e8cbf815c2a54608747",
+    "production_header": "599c42bb6e2770f50a4d55b7b20301f63036cfbf1b6895d837e70f1f04000689",
+    "portable_ptx": "1da22ed0dfad2a509beff3d7c0b5676291354e4cba7cc0a09a65e610f92188dd",
+    "fatbin": "34810af057ad753ba8ee62c84b3e21cf56598f93f9c88f4ff37fead0ccea3ae0",
+    "sm89_cubin": "c790628287abe8584f3d4f1edc4ed5bec1e01eed50685546033b4bf202c91046",
+    "proof_binary": "9484653cbfc84c40f2b2f36c1721cb45fb1bb9b5b28b71c0d5e8afabe36d7826"
+  },
+  "notes": [
+    "Timings are CUDA-event diagnostics from a standalone Release-style nvcc -O3 binary, not endpoint latency gates.",
+    "The build emits SM89 SASS only; it deliberately omits forward-compatible PTX because the qualification driver predates CUDA 13.2 PTX support."
+  ]
+}

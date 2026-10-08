@@ -1,0 +1,114 @@
+{
+  "attention_scale": 0.125,
+  "classification": "standalone_prototype_not_production_binary",
+  "compute": "FP32",
+  "cudnn_version": 92400,
+  "dimensions": {
+    "batch": 1,
+    "head_dim": 64,
+    "heads": 12
+  },
+  "direct_c_backend": {
+    "cached_execute_ms": 0.302193,
+    "configs": 3,
+    "driver": "../cudnn_sdpa_differential.py",
+    "pass": true,
+    "selected": 0,
+    "source": "../cudnn_sdpa_backend_proof.c",
+    "source_external": null
+  },
+  "hardware": "NVIDIA L4 SM89",
+  "io": "BF16",
+  "layout": "logical BHSD, physical contiguous BSHD",
+  "numerical_reduction": "float64 cosine and norms over exact BF16 outputs",
+  "pass": true,
+  "q_prescaled": 8.0,
+  "reference": "PyTorch scaled_dot_product_attention over exact dumped BF16 inputs",
+  "rows": [
+    {
+      "amplitude": 0.0,
+      "cosine": 1.0,
+      "finite": true,
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "run": "version=92400 batch=1 sequence=17 amplitude=0 configs=3 selected=0 workspace=0 avg_ms=0.00641024",
+      "sequence": 17
+    },
+    {
+      "amplitude": 0.1,
+      "cosine": 1.0,
+      "finite": true,
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "run": "version=92400 batch=1 sequence=17 amplitude=0.1 configs=3 selected=0 workspace=0 avg_ms=0.00630784",
+      "sequence": 17
+    },
+    {
+      "amplitude": 1.0,
+      "cosine": 1.0,
+      "finite": true,
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "run": "version=92400 batch=1 sequence=17 amplitude=1 configs=3 selected=0 workspace=0 avg_ms=0.006144",
+      "sequence": 17
+    },
+    {
+      "amplitude": 0.0,
+      "cosine": 1.0,
+      "finite": true,
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "run": "version=92400 batch=1 sequence=513 amplitude=0 configs=3 selected=0 workspace=0 avg_ms=0.0277504",
+      "sequence": 513
+    },
+    {
+      "amplitude": 0.1,
+      "cosine": 0.9998803816167391,
+      "finite": true,
+      "max_abs": 1.049041748046875e-05,
+      "mean_abs": 1.3941693168817437e-06,
+      "run": "version=92400 batch=1 sequence=513 amplitude=0.1 configs=3 selected=0 workspace=0 avg_ms=0.0277504",
+      "sequence": 513
+    },
+    {
+      "amplitude": 1.0,
+      "cosine": 0.9999579191042127,
+      "finite": true,
+      "max_abs": 0.0005950927734375,
+      "mean_abs": 5.1211249228799716e-05,
+      "run": "version=92400 batch=1 sequence=513 amplitude=1 configs=3 selected=0 workspace=0 avg_ms=0.0277811",
+      "sequence": 513
+    },
+    {
+      "amplitude": 0.0,
+      "cosine": 1.0,
+      "finite": true,
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "run": "version=92400 batch=1 sequence=2394 amplitude=0 configs=3 selected=0 workspace=0 avg_ms=0.302193",
+      "sequence": 2394
+    },
+    {
+      "amplitude": 0.1,
+      "cosine": 0.9999492423448432,
+      "finite": true,
+      "max_abs": 3.635883331298828e-06,
+      "mean_abs": 3.5676487186719896e-07,
+      "run": "version=92400 batch=1 sequence=2394 amplitude=0.1 configs=3 selected=0 workspace=0 avg_ms=0.307395",
+      "sequence": 2394
+    },
+    {
+      "amplitude": 1.0,
+      "cosine": 0.9999812064506182,
+      "finite": true,
+      "max_abs": 9.918212890625e-05,
+      "mean_abs": 1.1978753718722146e-05,
+      "run": "version=92400 batch=1 sequence=2394 amplitude=1 configs=3 selected=0 workspace=0 avg_ms=0.308756",
+      "sequence": 2394
+    }
+  ],
+  "runtime_package": "nvidia-cudnn-cu13 9.24.0.43",
+  "runtime_soname": "libcudnn.so.9",
+  "schema": "antfly.embedding_gemma2.cudnn_sdpa_differential.v1",
+  "workspace_bytes": 0
+}

@@ -1489,13 +1489,13 @@ pub const DocumentTokenClassificationResult = struct {
 pub const EmbedRequest = struct {
     /// Model name to use for embedding generation
     model: []const u8,
-    /// Input content to embed. Supports: - a single string - an array of strings - an array of OpenAI-style content parts for multimodal embedding
+    /// Input content to embed. Supports: - a single string - an array of strings - an array of OpenAI-style content parts for multimodal embedding - an object with an ordered content array, producing one embedding - an array of ordered content objects, producing one embedding per object Legacy arrays of content parts continue to produce one embedding per part.
     input: std.json.Value,
     /// Encoding format for the embeddings (only "float" supported)
     encoding_format: ?[]const u8 = null,
-    /// Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. For normalized models the truncated vector is L2-re-normalized (Matryoshka semantics, matching the OpenAI dimensions parameter). Not supported for sparse models.
+    /// Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. For normalized models the truncated vector is L2-re-normalized (Matryoshka semantics, matching the OpenAI dimensions parameter). EmbeddingGemma 2 is trained for 768, 512, 256, and 128 dimensions. Not supported for sparse models.
     dimensions: ?i64 = null,
-    /// Optional embedding task type using Google embedding task-type names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix. For Qwen3-Embedding models, RETRIEVAL_QUERY uses the model's built-in web-retrieval instruction, RETRIEVAL_DOCUMENT is embedded raw, and every other task type requires an explicit instruction.
+    /// Optional embedding task type using Google embedding task-type names. EmbeddingGemma 2 applies its official prompt for each of the eight task types to text-bearing inputs and rejects custom instructions. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix. For Qwen3-Embedding models, RETRIEVAL_QUERY uses the model's built-in web-retrieval instruction, RETRIEVAL_DOCUMENT is embedded raw, and every other task type requires an explicit instruction.
     task_type: ?[]const u8 = null,
     /// Task description for instruction-aware embedding models (Qwen3-Embedding), rendered inside the query instruction wrapper ("Instruct: {instruction}\nQuery:{input}"). Optional for RETRIEVAL_QUERY, which has a model-owned default; required for other non-document task types; rejected for document tasks and models without instruction support.
     instruction: ?[]const u8 = null,
@@ -1560,6 +1560,8 @@ pub const EmbedRequest = struct {
 
 /// OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors
 pub const EmbedResponse = struct {
+    /// Execution backend reported for EmbeddingGemma 2 qualification. CUDA requests fail if the resident text encoder cannot execute; this field does not describe preprocessing placement.
+    backend: OpenApiOptionalNullable([]const u8) = .absent,
     /// Object type, always "list"
     object: []const u8,
     /// List of embedding objects
@@ -1573,6 +1575,7 @@ pub const EmbedResponse = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "backend", "backend", false },
         .{ "object", "object", false },
         .{ "data", "data", false },
         .{ "model", "model", false },
@@ -1591,6 +1594,17 @@ pub const EmbedResponse = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        switch (self.backend) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("backend");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("backend");
+                try jw.write(value);
+            },
+        }
         try jw.objectField("object");
         try jw.write(self.object);
         try jw.objectField("data");
@@ -1616,6 +1630,11 @@ pub const EmbeddingBatchSummary = struct {
     total: i64,
     succeeded: i64,
     failed: i64,
+};
+
+/// One ordered input producing one combined embedding. Supported by EmbeddingGemma 2. Parts are concatenated in order, including text, images, and audio; video is unsupported. The expanded input, including task prompts, BOS/EOS, and media tokens, must fit within 8192 tokens. Overflow is rejected without truncation.
+pub const EmbeddingContentInput = struct {
+    content: []const antfly_generating_openapi.ContentPart,
 };
 
 /// Per-input embedding failure for error_policy=per_item responses

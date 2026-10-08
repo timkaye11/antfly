@@ -1,0 +1,39 @@
+{
+  "schema": "antfly.embedding_gemma2.profile.v1",
+  "status": "historical_candidate_profile",
+  "binary_sha256": "f1d7951c56de62a0416910bf350885078c4a3bebd2b2f72088905f08e6ec6b1e",
+  "device": "NVIDIA L4 SM89",
+  "workload": {
+    "batch": 32,
+    "expanded_tokens_per_item": 2048,
+    "corpus": "natural_text",
+    "task_type": "RETRIEVAL_DOCUMENT",
+    "prompt_tokens": 65536,
+    "fixture_sha256": "1c7f5feb7ce31e6a16944bbc88de289865a191960d92b8724ba1ee7a6990b423"
+  },
+  "encoder_ms": 2163.808,
+  "gpu_kernel_total_ms": 1996.0,
+  "kernel_groups_ms": {
+    "local_attention_20_layers": 1197.389,
+    "dense_main_gemm_213_calls": 222.822,
+    "rms_norm_217_calls": 140.196,
+    "global_qk_gemm_1024_calls": 60.702,
+    "global_pv_gemm_1024_calls": 54.070,
+    "global_softmax_1024_calls": 36.155,
+    "gelu_mul_24_calls": 80.067,
+    "residual_72_calls": 58.995,
+    "rope_24_calls": 45.494
+  },
+  "local_attention": {
+    "layers": 20,
+    "average_ms_per_layer": 59.869,
+    "gpu_time_fraction": 0.60
+  },
+  "raw_profile": {
+    "path": "/tmp/eg2-b32-s2048-f1-cli.nsys-rep",
+    "bytes": 921120,
+    "sha256": "1990d5bb14508fe1ab2827081c5a12e1273f9cb66f704d158ed30f4bb92f9a28",
+    "retention": "external qualification artifact; compact kernel totals are durable here"
+  },
+  "interpretation": "The superseded resident local-attention kernel dominates this historical binary. This profile motivates the cuDNN banded path; it is not performance evidence for the new combined binary."
+}

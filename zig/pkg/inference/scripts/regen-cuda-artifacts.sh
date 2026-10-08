@@ -198,6 +198,24 @@ tmp_sm89="$(mktemp "${TMPDIR:-/tmp}/inference_cuda_kernels.XXXXXX.sm89.cubin")"
 trap 'rm -f "$tmp_ptx" "$tmp_fatbin" "$tmp_sm89"' EXIT
 
 required_symbols=(
+  termite_embedding_gemma2_lookup_bf16
+  termite_gemma4_audio_local_attention_f32
+  termite_gemma4_audio_clamp_f32
+  termite_gemma4_audio_glu_rows_f32
+  termite_gemma4_audio_depthwise_causal_conv1d_f32
+  termite_embedding_gemma2_rms_norm_bf16
+  termite_embedding_gemma2_rope_bf16
+  termite_embedding_gemma2_attention_bf16
+  termite_embedding_gemma2_attention_local_flash_bf16
+  termite_embedding_gemma2_attention_softmax_bf16
+  termite_embedding_gemma2_matmul_bf16
+  termite_embedding_gemma2_gelu_mul_bf16
+  termite_embedding_gemma2_bf16_to_f32
+  termite_embedding_gemma2_scale_bf16
+  termite_embedding_gemma2_scale_device_bf16
+  termite_embedding_gemma2_gelu_ple_bf16
+  termite_embedding_gemma2_residual_bf16
+  termite_embedding_gemma2_mean_l2_f32
   termite_laya_local_attention_f32
   termite_laya_attention_warp_f32
   termite_laya_packed_geglu_f32

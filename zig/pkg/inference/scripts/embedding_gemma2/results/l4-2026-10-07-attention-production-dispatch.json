@@ -1,0 +1,31 @@
+{
+  "schema": "antfly.embedding_gemma2.attention_production_dispatch.v1",
+  "device": "NVIDIA L4",
+  "compute_capability": "8.9",
+  "source": "scripts/embedding_gemma2/flash_differential.{cu,py}",
+  "routes": {
+    "local": "Q64 WMMA full tiles plus exact warp tail",
+    "global": "bounded cuBLASLt QK/PV plus canonical production softmax tile_capacity=256"
+  },
+  "matrix": {
+    "lengths": [1, 15, 16, 17, 129, 513, 2048, 8192],
+    "batches": [1, 2],
+    "qk_scales": [0.0, 0.1, 1.0],
+    "attention_kinds": ["local", "global"],
+    "batch_2_valid_fraction": 0.75,
+    "cases": 96
+  },
+  "result": {
+    "passed": 96,
+    "minimum_candidate_vs_exact_warp_cosine": 0.999994695186615,
+    "minimum_candidate_vs_pytorch_sdpa_cosine": 0.9999948143959045,
+    "minimum_exact_warp_vs_pytorch_sdpa_cosine": 0.9999966025352478,
+    "maximum_abs_error": 0.03125
+  },
+  "s8192_batch_1_timing_ms": {
+    "local_candidate_range": [6.913023948669434, 7.269375801086426],
+    "local_exact_warp_range": [46.14246368408203, 47.97439956665039],
+    "global_candidate_range": [17.286144256591797, 18.82521629333496],
+    "global_exact_warp_range": [624.9451293945312, 642.9655151367188]
+  }
+}

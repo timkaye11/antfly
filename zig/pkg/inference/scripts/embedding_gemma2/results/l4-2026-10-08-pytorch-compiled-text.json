@@ -1,0 +1,43 @@
+{
+  "schema": "antfly.embedding_gemma2.pytorch_compiled_text.v1",
+  "status": "reference_specialization_audit",
+  "device": "NVIDIA L4 SM89",
+  "model": {
+    "id": "google/embeddinggemma-2",
+    "revision": "914f7f89142e33e77833254d9c9b90c3cef7303b",
+    "weight_sha256": "197a32965d4b1105faf060417baa899e193fb73cd401f42ec9295234d5553d79"
+  },
+  "runtime": {
+    "attention": "sdpa",
+    "compile": "default",
+    "precision": "bfloat16_weights_fp32_pooling",
+    "torch": "2.14.0+cu130",
+    "transformers": "5.19.0.dev0",
+    "cuda_runtime": "13.0",
+    "cudnn": 92400,
+    "nvidia_driver": "580.159.03",
+    "torch_cpu_threads": 1,
+    "torch_inductor_compile_threads": 1
+  },
+  "cells": [
+    {
+      "batch": 1,
+      "expanded_tokens": 8192,
+      "corpus": "natural_text",
+      "task_type": "RETRIEVAL_DOCUMENT",
+      "first_request_ms": 92918.301,
+      "warm_http_ms": [462.382, 457.222, 457.522, 456.49, 459.258],
+      "warm_median_ms": 457.522
+    },
+    {
+      "batch": 32,
+      "expanded_tokens": 2048,
+      "corpus": "natural_text",
+      "task_type": "RETRIEVAL_DOCUMENT",
+      "first_request_ms": 189839.459,
+      "warm_http_ms": [1731.553, 1768.587, 1712.657, 1677.619, 1715.044],
+      "warm_median_ms": 1715.044
+    }
+  ],
+  "interpretation": "These bounded warm samples select the strongest known reference configuration. Final paired pass/fail requires exact-cell parity and 100 interleaved samples against the new combined native binary."
+}

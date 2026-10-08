@@ -1028,6 +1028,16 @@ pub fn build(b: *std.Build) void {
     );
     qwen3_embedding_python_contracts_step.dependOn(&qwen3_embedding_python_contracts.step);
 
+    const embedding_gemma2_python_contracts = b.addSystemCommand(&.{
+        "python3", "-B",                       "-m", "unittest",  "discover",
+        "-s",      "scripts/embedding_gemma2", "-p", "test_*.py",
+    });
+    const embedding_gemma2_python_contracts_step = b.step(
+        "test-embeddinggemma2-python-contracts",
+        "Test EmbeddingGemma 2 oracle, workload, and paired benchmark contracts",
+    );
+    embedding_gemma2_python_contracts_step.dependOn(&embedding_gemma2_python_contracts.step);
+
     const metal_gemma4_tool_calling_test = b.addSystemCommand(&.{
         "bash",
         "scripts/gemma4/test_metal_gemma4_tool_calling.sh",
@@ -1526,8 +1536,10 @@ pub fn build(b: *std.Build) void {
     });
     // The standalone default includes both owners. Requesting test-finetune
     // alongside test still reaches the same run node and executes it once.
-    if (suite.selected_test_filters.len == 0)
+    if (suite.selected_test_filters.len == 0) {
         default_test_step.dependOn(&b.top_level_steps.get("test-finetune-unit").?.step);
+        default_test_step.dependOn(embedding_gemma2_python_contracts_step);
+    }
     const install_tests = b.addInstallArtifact(tests, .{
         .dest_sub_path = "antfly-inference-tests",
     });

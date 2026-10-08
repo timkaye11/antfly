@@ -1,0 +1,77 @@
+{
+  "pass": true,
+  "rows": [
+    {
+      "backend": "cuda",
+      "batch_size": 8,
+      "embedding_rows": 8,
+      "embedding_width": 768,
+      "maximum_norm_error": 3.8065025420586096e-07,
+      "minimum_batch_single_cosine": 0.9999659768564284,
+      "pass": true,
+      "token_lengths": [
+        8192,
+        2048,
+        512,
+        128,
+        8192,
+        2048,
+        512,
+        128
+      ],
+      "usage": {
+        "prompt_tokens": 21760,
+        "total_tokens": 21760
+      }
+    },
+    {
+      "backend": "cuda",
+      "batch_size": 32,
+      "embedding_rows": 32,
+      "embedding_width": 768,
+      "maximum_norm_error": 3.8065025420586096e-07,
+      "minimum_batch_single_cosine": 0.9999659768564284,
+      "pass": true,
+      "token_lengths": [
+        8192,
+        2048,
+        512,
+        128,
+        8192,
+        2048,
+        512,
+        128,
+        8192,
+        2048,
+        512,
+        128,
+        8192,
+        2048,
+        512,
+        128,
+        8192,
+        2048,
+        512,
+        128,
+        8192,
+        2048,
+        512,
+        128,
+        8192,
+        2048,
+        512,
+        128,
+        8192,
+        2048,
+        512,
+        128
+      ],
+      "usage": {
+        "prompt_tokens": 87040,
+        "total_tokens": 87040
+      }
+    }
+  ],
+  "schema": "antfly.embedding_gemma2.large_batch.v1",
+  "status": "complete"
+}

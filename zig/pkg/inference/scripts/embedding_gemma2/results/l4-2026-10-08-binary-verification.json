@@ -1,0 +1,11 @@
+{
+  "schema": "antfly.embedding_gemma2.final_binary_verification.v1",
+  "binary": "zig/pkg/inference/zig-out/bin/antfly-inference",
+  "binary_sha256": "bda59bbadd9fdc2d1af83abb2312d751eb8df780a54140bc75b676d76f1f73b9",
+  "binary_bytes": 46233640,
+  "binary_mtime_utc": "2026-10-08T02:55:33.823256+00:00",
+  "immutable_backup": "/tmp/antfly-embeddinggemma2/binaries/antfly-inference-bda59bbadd9f",
+  "source_manifest_sha256": "e0975c97287f640dc874a805cf4e586931e41bf8ae78d67435f0dab0d2c2f51e",
+  "frozen_runtime_build_files": 39,
+  "frozen_runtime_build_changed": []
+}

@@ -1,0 +1,39 @@
+{
+  "schema": "antfly.embedding_gemma2.c2b_diagnostic.v1",
+  "status": "diagnostic_candidate_with_host_clamp_workaround",
+  "binary_sha256": "c2b762ec445bb7d7e0f705c1d925a1f7bef6d759b00fd6d789f50dea26d7e2d1",
+  "device": "NVIDIA L4 SM89",
+  "quality": {
+    "http_gates_passed": 71,
+    "http_gates_total": 71,
+    "minimum_cosine": 0.9998775329238004,
+    "environment_override": "TERMITE_GEMMA4_AUDIO_HOST_OPS=clamp",
+    "report": "/tmp/antfly-embeddinggemma2/c2b-http-workaround.json"
+  },
+  "long_text": [
+    {"batch": 32, "expanded_tokens": 2048, "warm_http_ms": [1403.418, 1414.527], "minimum_compiled_reference_cosine": 0.9999499345763483, "compiled_reference_median_ms": 1715.044},
+    {"batch": 1, "expanded_tokens": 8192, "warm_http_ms": [235.34, 237.055], "minimum_compiled_reference_cosine": 0.9999607617142635, "compiled_reference_median_ms": 457.522}
+  ],
+  "band_census": {
+    "text_executes": 20,
+    "plan_hits": 39,
+    "plan_misses": 1,
+    "plan_declines": 0,
+    "workspace_high_water": 0,
+    "log": "/tmp/antfly-embeddinggemma2/c2b-b32-cli.log"
+  },
+  "vision_census": {
+    "vision_executes": 16,
+    "plan_hits": 31,
+    "plan_misses": 1,
+    "plan_declines": 0,
+    "workspace_high_water": 0,
+    "log": "/tmp/antfly-embeddinggemma2/c2b-image-cli.log"
+  },
+  "quick_latency_ms": {
+    "image": {"mixed_workload_p50": 81.307, "mixed_workload_p95": 84.51865, "isolated_p50": 72.988, "isolated_p95": 77.59205},
+    "audio": {"p50": 138.9665, "p95": 141.32325},
+    "mixed": {"p50": 210.627, "p95": 212.78555}
+  },
+  "interpretation": "The workaround establishes full-model banded-attention parity and benefit but is not a production configuration. Audio and mixed miss the compiled-reference target, so proven audio device hooks and the optional-bound fix require a new combined binary before formal qualification."
+}
