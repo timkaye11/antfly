@@ -3695,6 +3695,98 @@ void termite_metal_generated_pipeline_destroy(termite_metal_generated_pipeline *
     }
 }
 
+// Borrowed page-aligned backing stays owned by the Zig executor.
+void *termite_metal_qwen4exp_alias(termite_metal_decode_runtime *runtime, void *data, size_t bytes) {
+    if (runtime == NULL || data == NULL || bytes == 0 || ((uintptr_t)data % (size_t)getpagesize()) != 0 || bytes % (size_t)getpagesize() != 0) return NULL;
+    @autoreleasepool {
+        id<MTLBuffer> buffer = [runtime->device newBufferWithBytesNoCopy:data length:bytes
+            options:MTLResourceStorageModeShared deallocator:nil];
+        return buffer == nil ? NULL : (__bridge_retained void *)buffer;
+    }
+}
+
+// Only bounded, already-admitted allocations are allowed here, never a model
+// mmap. Keep the same allocation identities resident across small decode frames.
+void *termite_metal_qwen4exp_residency_create(
+    termite_metal_decode_runtime *runtime, void *const *handles, size_t count,
+    size_t admitted_bytes
+) {
+    if (runtime == NULL || handles == NULL || count == 0) return NULL;
+    if (@available(macOS 15.0, *)) {
+        @autoreleasepool {
+            size_t total = 0;
+            for (size_t i = 0; i < count; ++i) {
+                id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)handles[i];
+                if (buffer == nil || buffer.device != runtime->device ||
+                    buffer.length > admitted_bytes - total) return NULL;
+                total += buffer.length;
+            }
+            MTLResidencySetDescriptor *descriptor = [[MTLResidencySetDescriptor alloc] init];
+            descriptor.label = @"antfly bounded Qwen4Exp buffers";
+            descriptor.initialCapacity = count;
+            NSError *error = nil;
+            id<MTLResidencySet> set = [runtime->device newResidencySetWithDescriptor:descriptor error:&error];
+            if (set == nil || error != nil) return NULL;
+            for (size_t i = 0; i < count; ++i) [set addAllocation:(__bridge id<MTLBuffer>)handles[i]];
+            [set commit];
+            [runtime->queue addResidencySet:set];
+            [set requestResidency];
+            return (__bridge_retained void *)set;
+        }
+    }
+    return NULL;
+}
+
+void termite_metal_qwen4exp_residency_release(termite_metal_decode_runtime *runtime, void *handle) {
+    if (handle == NULL) return;
+    if (@available(macOS 15.0, *)) {
+        id<MTLResidencySet> set = (__bridge_transfer id<MTLResidencySet>)handle;
+        [runtime->queue removeResidencySet:set];
+        [set endResidency];
+        [set removeAllAllocations];
+        [set commit];
+    }
+}
+
+// Experimental Qwen4Exp dispatch. Inside a frame, the caller must submit and
+// wait before reading outputs or reusing any shared expert slot.
+int termite_metal_qwen4exp_dispatch(
+    termite_metal_decode_runtime *runtime,
+    const termite_metal_generated_pipeline *generated,
+    void *const *handles, const size_t *offsets, const size_t *lengths,
+    size_t count, const void *params, size_t params_bytes, size_t threads
+) {
+    if (runtime == NULL || generated == NULL || generated->pipeline == nil ||
+        handles == NULL || offsets == NULL || lengths == NULL || params == NULL ||
+        count != 8 || params_bytes != 48 || threads == 0 ||
+        generated->device != runtime->device) return -1;
+    @autoreleasepool {
+        for (size_t i = 0; i < count; ++i) {
+            id<MTLBuffer> b = (__bridge id<MTLBuffer>)handles[i];
+            if (b == nil || offsets[i] > b.length || lengths[i] > b.length - offsets[i] ||
+                offsets[i] % 4 != 0) return -2;
+        }
+        const bool batched = runtime->active_frame_cb != nil;
+        id<MTLCommandBuffer> cb = batched ? runtime->active_frame_cb : [runtime->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = batched
+            ? termite_metal_tracked_compute_command_encoder_for(cb, TERMITE_METAL_COMPUTE_SOURCE_OTHER)
+            : [cb computeCommandEncoder];
+        if (cb == nil || enc == nil) return -3;
+        [enc setComputePipelineState:generated->pipeline];
+        for (size_t i = 0; i < count; ++i) {
+            [enc setBuffer:(__bridge id<MTLBuffer>)handles[i] offset:offsets[i] atIndex:i];
+        }
+        [enc setBytes:params length:params_bytes atIndex:8];
+        const size_t width = MIN((size_t)256, generated->pipeline.maxTotalThreadsPerThreadgroup);
+        [enc dispatchThreads:MTLSizeMake(threads, 1, 1) threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+        [enc endEncoding];
+        if (batched) return 0;
+        [cb commit];
+        [cb waitUntilCompleted];
+        return cb.status == MTLCommandBufferStatusCompleted ? 0 : -4;
+    }
+}
+
 // Temporary, opt-in decode profiler used to identify the high-frequency
 // kernels inside a coalesced Metal frame.  Keeping this below the generated
 // pipeline helpers avoids changing their microbenchmark dispatches; all model
@@ -20412,6 +20504,8 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
                 use_reduce = YES;
                 reduce_shmem_floats = 64u;
                 reduce_threadgroups = MTLSizeMake((descriptor->out_dim + 1u) / 2u, descriptor->rows, 1);
+                // The reduction kernel partitions input blocks across four SIMD groups.
+                reduce_threads = MTLSizeMake(128, 1, 1);
             } else {
                 pipeline = pipeline != nil ? pipeline : runtime->q5_1_pipeline;
             }
@@ -34124,6 +34218,26 @@ static void termite_metal_decode_runtime_prepare_quantized_linear_slot_from_buff
             resident ? 1 : 0,
             residency_changed ? 1 : 0);
     }
+}
+
+// Keep one MTLBuffer identity per physical allocation. The Qwen pager already
+// owns shared buffers; creating another no-copy alias on every projection
+// obscures Metal residency accounting and needlessly retains aliases.
+int termite_metal_qwen4exp_prepare_linear(
+    termite_metal_decode_runtime *runtime, void *handle, uint32_t format,
+    size_t offset, size_t bytes, size_t in_dim, size_t out_dim
+) {
+    if (runtime == NULL || handle == NULL) return -1;
+    id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)handle;
+    if (buffer.contents == NULL || offset > buffer.length || bytes > buffer.length - offset) return -2;
+    size_t values = 0, block_bytes = 0;
+    const int rc = termite_metal_decode_runtime_validate_quantized_linear_slot(
+        runtime, format, 0, (const uint8_t *)buffer.contents + offset, bytes,
+        in_dim, out_dim, &values, &block_bytes);
+    if (rc != 0) return rc;
+    termite_metal_decode_runtime_prepare_quantized_linear_slot_from_buffer(
+        runtime, format, 0, buffer, offset, in_dim, out_dim, values, block_bytes);
+    return 0;
 }
 
 int termite_metal_decode_runtime_prepare_quantized_linear_slot(

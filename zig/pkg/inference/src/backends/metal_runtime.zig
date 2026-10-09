@@ -47318,3 +47318,17 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
     };
     return &result;
 }
+
+/// Experimental Qwen4Exp kernels. An active frame defers completion until
+/// submit_frame/wait_frame; otherwise this dispatch completes synchronously.
+pub extern fn termite_metal_qwen4exp_dispatch(
+    runtime: ?*RawMetalDecodeRuntime,
+    pipeline: ?*RawMetalGeneratedPipeline,
+    handles: [*]const ?*anyopaque,
+    offsets: [*]const usize,
+    lengths: [*]const usize,
+    count: usize,
+    params: *const anyopaque,
+    params_bytes: usize,
+    threads: usize,
+) c_int;

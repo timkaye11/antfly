@@ -108,6 +108,31 @@ pub fn create(ctx: Context) Suite {
     runtime_build.configureOnnxRuntime(b, tests.root_module, ctx.backend.enable_onnx, ctx.backend.onnx_root);
     tests.root_module.link_libc = ctx.backend.link_libc;
 
+    // Storage and paging contracts must be testable on the 16 GiB target host
+    // without reserving the full decoder/training aggregate's 14 GiB envelope.
+    const qwen4exp_module = b.createModule(.{
+        .root_source_file = ctx.path("src/qwen4exp_test_root.zig"),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+    });
+    var imports = tests.root_module.import_table.iterator();
+    while (imports.next()) |entry| qwen4exp_module.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    qwen4exp_module.addImport("inference_internal", qwen4exp_module);
+    runtime_build.applyCBindings(qwen4exp_module, ctx.graph.c_bindings);
+    if (ctx.backend.enable_system_blas) runtime_build.configureSystemBlas(b, qwen4exp_module, ctx.target, ctx.backend.blas_root);
+    runtime_build.configureMetal(b, qwen4exp_module, ctx.target, ctx.backend.enable_metal, ctx.paths);
+    runtime_build.configureOnnxRuntime(b, qwen4exp_module, ctx.backend.enable_onnx, ctx.backend.onnx_root);
+    qwen4exp_module.link_libc = ctx.backend.link_libc;
+    const qwen4exp_tests = b.addTest(.{
+        .name = "qwen4exp-tests",
+        .max_rss = 4 * 1024 * 1024 * 1024,
+        .root_module = qwen4exp_module,
+        .filters = if (main_test_filters.len != 0) main_test_filters else &.{ "Qwen4Exp", "split GGUF", "expert slot arena" },
+        .test_runner = runtime_filter_test_runner,
+    });
+    const run_qwen4exp_tests = ctx.addRunArtifact(qwen4exp_tests);
+    ctx.step("test-qwen4exp", "Test split GGUF storage and bounded Qwen4Exp paging").dependOn(&run_qwen4exp_tests.step);
+
     // Keep the standalone server's CLI and configuration parsing covered too.
     // `src/inference.zig` does not import `src/main.zig`, so tests declared by
     // the executable root otherwise compile only when invoked manually.

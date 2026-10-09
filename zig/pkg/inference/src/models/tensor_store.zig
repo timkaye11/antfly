@@ -86,9 +86,14 @@ pub const TensorRangeRef = struct {
     dtype: DType,
     shape: []const i64,
     owned_path: ?[]u8 = null,
+    owned_shape: ?[]i64 = null,
+    /// Encoded GGUF format. Quantized ranges have dtype=u8; callers must use
+    /// this format rather than interpreting the encoded bytes as dense values.
+    gguf_type: ?gguf_mod.tensor_types.TensorType = null,
 
     pub fn deinit(self: *TensorRangeRef, allocator: std.mem.Allocator) void {
         if (self.owned_path) |path| allocator.free(path);
+        if (self.owned_shape) |shape| allocator.free(shape);
         self.* = .{
             .name = &.{},
             .path = &.{},
@@ -475,8 +480,22 @@ pub const GgufStore = struct {
         };
     }
 
-    fn describeTensorRangeImpl(_: *GgufStore, _: std.mem.Allocator, _: []const u8) !?TensorRangeRef {
-        return null;
+    fn describeTensorRangeImpl(self: *GgufStore, allocator: std.mem.Allocator, name: []const u8) !?TensorRangeRef {
+        const path = self.path orelse return null;
+        const tensor = gguf_mod.tensor_catalog.Catalog.init(&self.parsed).find(name) orelse return error.TensorNotFound;
+        const bytes = gguf_mod.tensor_types.byteLen(tensor.tensor_type, tensor.dimensions) orelse return error.UnsupportedTensorType;
+        const byte_len = std.math.cast(usize, bytes) orelse return error.TensorTooLarge;
+        const shape = try normalizedShapeFromDims(allocator, tensor.dimensions);
+        return .{
+            .name = tensor.name,
+            .path = path,
+            .byte_offset = tensor.data_offset,
+            .byte_len = byte_len,
+            .dtype = ggufDenseTensorDType(tensor.tensor_type) orelse .u8,
+            .shape = shape,
+            .owned_shape = shape,
+            .gguf_type = tensor.tensor_type,
+        };
     }
 
     fn loadTensorRefImpl(self: *GgufStore, tensor_ref: *const LazyTensorRef) !weight_source_mod.LoadedWeight {
@@ -1012,6 +1031,148 @@ fn ggufListNames(self: *GgufStore, allocator: std.mem.Allocator) ![][]const u8 {
 
 fn ggufNoopDeinit(_: *GgufStore) void {}
 
+/// One logical GGUF backed by several read-only files. The combined tensor
+/// table owns only its slice: names, dimensions and metadata belong to shards.
+/// Offsets remain shard-local and must be resolved through this store.
+pub const SplitGgufStore = struct {
+    allocator: std.mem.Allocator,
+    shards: []*GgufStore,
+    owners: std.StringHashMapUnmanaged(*GgufStore) = .empty,
+    combined: gguf_mod.format.File,
+
+    const vtable = TensorStore.VTable{
+        .kind = @ptrCast(&kindImpl),
+        .weightSource = @ptrCast(&weightSourceImpl),
+        .describeTensor = @ptrCast(&describeTensorImpl),
+        .describeTensorRange = @ptrCast(&describeTensorRangeImpl),
+        .loadTensorRef = @ptrCast(&loadTensorRefImpl),
+        .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
+        .discardTensorFileCache = @ptrCast(&discardTensorFileCacheImpl),
+        .preserveFileCacheOnDeinit = @ptrCast(&preserveFileCacheOnDeinitImpl),
+        .ggufFile = @ptrCast(&ggufFileImpl),
+        .deinit = @ptrCast(&deinitSelf),
+    };
+    const source_vtable = weight_source_mod.WeightSource.VTable{
+        .getTensor = @ptrCast(&getTensor),
+        .listNames = @ptrCast(&listNames),
+        .deinit = @ptrCast(&noopDeinit),
+    };
+
+    pub fn open(allocator: std.mem.Allocator, path: []const u8) !TensorStore {
+        const initial = try GgufStore.initAbsolute(allocator, path);
+        var initial_owned = true;
+        defer if (initial_owned) initial.tensorStore().deinit();
+        const first_view = gguf_mod.metadata.View.init(&initial.parsed);
+        const count = integer(first_view, "split.count") orelse return initialStore(initial, &initial_owned);
+        if (count == 0 or count > 1024) return error.InvalidGgufSplitCount;
+        if (count == 1) {
+            if ((integer(first_view, "split.no") orelse 0) != 0) return error.InvalidGgufSplitIndex;
+            return initialStore(initial, &initial_owned);
+        }
+        const index = integer(first_view, "split.no") orelse return error.InvalidGgufSplitIndex;
+        if (index >= count) return error.InvalidGgufSplitIndex;
+        const total = integer(first_view, "split.tensors.count") orelse return error.InvalidGgufSplitTensorCount;
+        const suffix = try std.fmt.allocPrint(allocator, "-{d:0>5}-of-{d:0>5}.gguf", .{ index + 1, count });
+        defer allocator.free(suffix);
+        if (!std.mem.endsWith(u8, path, suffix)) return error.InvalidGgufSplitFilename;
+        const prefix = path[0 .. path.len - suffix.len];
+        const shards = try allocator.alloc(*GgufStore, @intCast(count));
+        errdefer allocator.free(shards);
+        var opened: usize = 0;
+        errdefer for (shards[0..opened]) |shard| shard.tensorStore().deinit();
+        for (shards, 0..) |*slot, i| {
+            if (i == index) {
+                slot.* = initial;
+                initial_owned = false;
+            } else {
+                const shard_path = try std.fmt.allocPrint(allocator, "{s}-{d:0>5}-of-{d:0>5}.gguf", .{ prefix, i + 1, count });
+                defer allocator.free(shard_path);
+                slot.* = try GgufStore.initAbsolute(allocator, shard_path);
+            }
+            opened += 1;
+            const view = gguf_mod.metadata.View.init(&slot.*.parsed);
+            if (integer(view, "split.count") != count or integer(view, "split.no") != i or
+                integer(view, "split.tensors.count") != total)
+                return error.InconsistentGgufSplit;
+        }
+        var tensors = std.ArrayListUnmanaged(gguf_mod.format.TensorInfo).empty;
+        errdefer tensors.deinit(allocator);
+        var owners: std.StringHashMapUnmanaged(*GgufStore) = .empty;
+        errdefer owners.deinit(allocator);
+        for (shards) |shard| {
+            for (shard.parsed.tensors) |tensor| {
+                const result = try owners.getOrPut(allocator, tensor.name);
+                if (result.found_existing) return error.DuplicateGgufTensor;
+                result.value_ptr.* = shard;
+                try tensors.append(allocator, tensor);
+            }
+        }
+        if (tensors.items.len != total) return error.InvalidGgufSplitTensorCount;
+        const self = try allocator.create(SplitGgufStore);
+        errdefer allocator.destroy(self);
+        self.* = .{ .allocator = allocator, .shards = shards, .owners = owners, .combined = shards[0].parsed };
+        self.combined.tensors = try tensors.toOwnedSlice(allocator);
+        self.combined.header.tensor_count = total;
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn integer(view: gguf_mod.metadata.View, key: []const u8) ?u64 {
+        return view.getU64(key) orelse if (view.getI64(key)) |n| std.math.cast(u64, n) else null;
+    }
+    fn initialStore(initial: *GgufStore, owned: *bool) TensorStore {
+        owned.* = false;
+        return initial.tensorStore();
+    }
+    fn owner(self: *SplitGgufStore, name: []const u8) !*GgufStore {
+        return self.owners.get(name) orelse error.TensorNotFound;
+    }
+    fn kindImpl(_: *SplitGgufStore) StoreKind {
+        return .gguf;
+    }
+    fn weightSourceImpl(self: *SplitGgufStore) !?weight_source_mod.WeightSource {
+        return .{ .ptr = self, .vtable = &source_vtable };
+    }
+    fn describeTensorImpl(self: *SplitGgufStore, allocator: std.mem.Allocator, name: []const u8) !LazyTensorRef {
+        return (try self.owner(name)).describeTensorImpl(allocator, name);
+    }
+    fn describeTensorRangeImpl(self: *SplitGgufStore, allocator: std.mem.Allocator, name: []const u8) !?TensorRangeRef {
+        return (try self.owner(name)).describeTensorRangeImpl(allocator, name);
+    }
+    fn loadTensorRefImpl(self: *SplitGgufStore, ref: *const LazyTensorRef) !weight_source_mod.LoadedWeight {
+        return ggufGetTensorRef(try self.owner(ref.source_name orelse ref.name), ref);
+    }
+    fn loadQuantizedStorageRefImpl(self: *SplitGgufStore, ref: *const LazyTensorRef) !?weight_source_mod.QuantizedStorage {
+        return ggufGetQuantizedStorageRef(try self.owner(ref.source_name orelse ref.name), ref);
+    }
+    fn getTensor(self: *SplitGgufStore, name: []const u8) !weight_source_mod.LoadedWeight {
+        return ggufGetTensor(try self.owner(name), name);
+    }
+    fn listNames(self: *SplitGgufStore, allocator: std.mem.Allocator) ![][]const u8 {
+        const names = try allocator.alloc([]const u8, self.combined.tensors.len);
+        for (self.combined.tensors, names) |tensor, *name| name.* = tensor.name;
+        return names;
+    }
+    fn noopDeinit(_: *SplitGgufStore) void {}
+    fn discardTensorFileCacheImpl(self: *SplitGgufStore, name: []const u8) void {
+        const shard = self.owners.get(name) orelse return;
+        shard.discardTensorFileCache(name);
+    }
+    fn preserveFileCacheOnDeinitImpl(self: *SplitGgufStore) void {
+        for (self.shards) |shard| shard.preserveFileCacheOnDeinitImpl();
+    }
+    fn ggufFileImpl(self: *SplitGgufStore) ?*const gguf_mod.format.File {
+        return &self.combined;
+    }
+    fn deinitSelf(self: *SplitGgufStore) void {
+        const allocator = self.allocator;
+        self.owners.deinit(allocator);
+        allocator.free(self.combined.tensors);
+        for (self.shards) |shard| shard.tensorStore().deinit();
+        allocator.free(self.shards);
+        allocator.destroy(self);
+    }
+};
+
 pub const CompositeGlinerStore = struct {
     allocator: std.mem.Allocator,
     encoder: *GgufStore,
@@ -1321,7 +1482,7 @@ pub fn openFromManifest(allocator: std.mem.Allocator, manifest: manifest_mod.Mod
         store.tensorStore().deinit();
     }
     return switch (manifest.nativeWeightArtifactKind() orelse return error.NoTensorStoreFound) {
-        .gguf => (try GgufStore.initAbsolute(allocator, manifest.gguf_path.?)).tensorStore(),
+        .gguf => try SplitGgufStore.open(allocator, manifest.gguf_path.?),
         .safetensors => (try SafetensorsStore.initAbsolute(allocator, manifest.safetensors_path.?)).tensorStore(),
         .sharded_safetensors => (try ShardedSafetensorsStore.initAbsolute(
             allocator,
@@ -1799,4 +1960,73 @@ fn padToAlignment(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8
     const rem = data.items.len % alignment;
     if (rem == 0) return;
     try data.appendNTimes(allocator, 0, alignment - rem);
+}
+
+fn writeSplitFixture(allocator: std.mem.Allocator, dir: []const u8, index: u16, count: u16, total: i32, name: ?[]const u8) ![]u8 {
+    const path = try std.fmt.allocPrint(allocator, "{s}/fixture-{d:0>5}-of-{d:0>5}.gguf", .{ dir, index + 1, count });
+    errdefer allocator.free(path);
+    const metadata = [_]gguf_mod.format.MetadataEntry{
+        .{ .key = "general.architecture", .value = .{ .string = "qwen4exp" } },
+        .{ .key = "split.no", .value = .{ .u16 = index } },
+        .{ .key = "split.count", .value = .{ .u16 = count } },
+        .{ .key = "split.tensors.count", .value = .{ .i32 = total } },
+    };
+    const specs = [_]gguf_mod.writer.TensorSpec{.{ .name = name orelse "", .dimensions = &.{2}, .tensor_type = .{ .known = .F32 } }};
+    var layout = try gguf_mod.writer.buildLayout(allocator, &metadata, if (name != null) &specs else &.{});
+    defer layout.deinit(allocator);
+    var data = std.ArrayListUnmanaged(u8).empty;
+    defer data.deinit(allocator);
+    try data.appendSlice(allocator, layout.header_bytes);
+    try padToAlignment(allocator, &data, layout.alignment);
+    if (name != null) {
+        try appendLe(u32, allocator, &data, @bitCast(@as(f32, 3.0)));
+        try appendLe(u32, allocator, &data, @bitCast(@as(f32, 7.0)));
+    }
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = data.items });
+    return path;
+}
+
+test "split GGUF resolves metadata-only first shard and shard-local byte ranges" {
+    const a = std.testing.allocator;
+    const dir = try testScratchDir(a, "split-gguf");
+    defer a.free(dir);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir) catch {};
+    const first = try writeSplitFixture(a, dir, 0, 2, 1, null);
+    defer a.free(first);
+    const second = try writeSplitFixture(a, dir, 1, 2, 1, "output.weight");
+    defer a.free(second);
+    // Opening either numbered file resolves the same logical model.
+    for ([_][]const u8{ first, second }) |path| {
+        const store = try SplitGgufStore.open(a, path);
+        defer store.deinit();
+        try std.testing.expectEqual(@as(usize, 1), store.ggufFile().?.tensors.len);
+        var ref = try store.describeTensor(a, "output.weight");
+        defer ref.deinit(a);
+        var weight = try store.loadTensorRef(&ref);
+        defer weight.deinit();
+        try std.testing.expectEqualSlices(f32, &.{ 3, 7 }, weight.tensor.asFloat32());
+        var range = (try store.describeTensorRange(a, "output.weight")).?;
+        defer range.deinit(a);
+        try std.testing.expectEqualStrings(second, range.path);
+        var bytes: [8]u8 = undefined;
+        try c_file.readRegionInto(a, range.path, range.byte_offset, &bytes);
+        try std.testing.expectEqualSlices(u8, weight.tensor.data, &bytes);
+    }
+    try std.Io.Dir.cwd().deleteFile(compat.testingIo(), second);
+    try std.testing.expectError(error.FileNotFound, SplitGgufStore.open(a, first));
+}
+
+test "split GGUF rejects duplicate tensors and inconsistent tensor totals" {
+    const a = std.testing.allocator;
+    const dir = try testScratchDir(a, "split-gguf-invalid");
+    defer a.free(dir);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir) catch {};
+    const first = try writeSplitFixture(a, dir, 0, 2, 2, "duplicate");
+    defer a.free(first);
+    const second = try writeSplitFixture(a, dir, 1, 2, 2, "duplicate");
+    defer a.free(second);
+    try std.testing.expectError(error.DuplicateGgufTensor, SplitGgufStore.open(a, first));
+    const rewritten = try writeSplitFixture(a, dir, 1, 2, 3, "other");
+    defer a.free(rewritten);
+    try std.testing.expectError(error.InconsistentGgufSplit, SplitGgufStore.open(a, first));
 }

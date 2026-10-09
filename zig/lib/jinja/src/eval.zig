@@ -346,6 +346,8 @@ pub const Eval = struct {
                     .is_none => Value.bln(val == .none),
                     .is_not_none => Value.bln(val != .none),
                     .is_boolean => Value.bln(val == .boolean),
+                    .is_true => Value.bln(val == .boolean and val.boolean),
+                    .is_false => Value.bln(val == .boolean and !val.boolean),
                 };
             },
             .call => |c| {
@@ -563,26 +565,36 @@ pub const Eval = struct {
         };
 
         const len: i64 = @intCast(items.len);
-        var start: i64 = 0;
-        var stop: i64 = len;
-
-        if (sl.start) |s| {
-            const sv = try self.evalExpr(s);
-            if (sv == .integer) start = sv.integer;
+        const step_value = if (sl.step) |step| try self.evalExpr(step) else Value.int(1);
+        if (step_value != .integer or step_value.integer == 0) return error.InvalidSliceStep;
+        const step = step_value.integer;
+        const low: i64 = if (step > 0) 0 else -1;
+        const high: i64 = if (step > 0) len else len - 1;
+        var start: i64 = if (step > 0) 0 else len - 1;
+        var stop: i64 = if (step > 0) len else -1;
+        if (sl.start) |expr| {
+            const value = try self.evalExpr(expr);
+            if (value == .integer) {
+                start = value.integer;
+                if (start < 0) start += len;
+                start = std.math.clamp(start, low, high);
+            }
         }
-        if (sl.stop) |s| {
-            const sv = try self.evalExpr(s);
-            if (sv == .integer) stop = sv.integer;
+        if (sl.stop) |expr| {
+            const value = try self.evalExpr(expr);
+            if (value == .integer) {
+                stop = value.integer;
+                if (stop < 0) stop += len;
+                stop = std.math.clamp(stop, low, high);
+            }
         }
-
-        // Normalize negative indices
-        if (start < 0) start = @max(0, len + start);
-        if (stop < 0) stop = @max(0, len + stop);
-        start = @min(start, len);
-        stop = @min(stop, len);
-        if (start >= stop) return .{ .list = &.{} };
-
-        return .{ .list = items[@intCast(start)..@intCast(stop)] };
+        if (step == 1) return .{ .list = items[@intCast(start)..@intCast(@max(start, stop))] };
+        var result = std.ArrayListUnmanaged(Value).empty;
+        var index = start;
+        while (if (step > 0) index < stop else index > stop) : (index +|= step) {
+            try result.append(self.arena, items[@intCast(index)]);
+        }
+        return .{ .list = try result.toOwnedSlice(self.arena) };
     }
 
     fn applyFilter(self: *Eval, val: Value, name: []const u8, args: []const *ast.Expr) !Value {
@@ -1225,4 +1237,44 @@ test "eval is defined and is not defined" {
     var eval = Eval.init(a, &ctx);
     const result = try eval.exec(nodes);
     try std.testing.expectEqualStrings("AB", result);
+}
+
+test "eval Qwen4Exp undefined and boolean identity tests" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const nodes = try @import("parser.zig").Parser.parse(
+        "{% if missing is undefined and present is not undefined %}A{% endif %}" ++
+            "{% if enabled is true and disabled is false %}B{% endif %}" ++
+            "{% if present is true or zero is false %}wrong{% endif %}" ++
+            "{% if enabled is not false and disabled is not true %}C{% endif %}",
+        a,
+    );
+    var ctx = ValueMap{};
+    try ctx.put(a, "present", Value.int(1));
+    try ctx.put(a, "zero", Value.int(0));
+    try ctx.put(a, "enabled", Value.bln(true));
+    try ctx.put(a, "disabled", Value.bln(false));
+    var eval = Eval.init(a, &ctx);
+    try std.testing.expectEqualStrings("ABC", try eval.exec(nodes));
+}
+
+test "eval Qwen4Exp tuple membership and reversed message slices" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const nodes = try @import("parser.zig").Parser.parse(
+        "{% if 'low' in ('xhigh', 'medium', 'low') %}A{% endif %}" ++
+            "{% for x in (0,1,2,3)[::-1] %}{{ x }}{% endfor %}" ++
+            "|{% for x in (0,1,2,3)[3:0:-2] %}{{ x }}{% endfor %}" ++
+            "|{% for x in (0,1,2,3)[::2] %}{{ x }}{% endfor %}" ++
+            "|{% for x in (0,1,2,3)[:-1:-1] %}wrong{% endfor %}" ++
+            "{% for x in ()[::-1] %}wrong{% endfor %}",
+        a,
+    );
+    var ctx = ValueMap{};
+    var eval = Eval.init(a, &ctx);
+    try std.testing.expectEqualStrings("A3210|31|02|", try eval.exec(nodes));
+    const invalid = try @import("parser.zig").Parser.parse("{{ (1,)[::0] }}", a);
+    try std.testing.expectError(error.InvalidSliceStep, eval.exec(invalid));
 }

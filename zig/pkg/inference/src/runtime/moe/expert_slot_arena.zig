@@ -42,222 +42,245 @@ pub const ArenaError = error{
     DuplicateRouteExpert,
 };
 
-pub const Observation = struct {
-    route_slots: [max_route_width]u8 = @as([max_route_width]u8, @splat(invalid_slot)),
-    /// True when this route entry was absent (or reverse-map-invalid) before
-    /// observeRoute repaired the directory. Arena owners use this to upload
-    /// exactly the slots whose weight bytes changed.
-    repaired: [max_route_width]bool = @as([max_route_width]bool, @splat(false)),
-    count: usize = 0,
-    hit_count: usize = 0,
-    miss_count: usize = 0,
-    all_hit_before_update: bool = false,
-
-    pub fn slots(self: *const Observation) []const u8 {
-        return self.route_slots[0..self.count];
-    }
+/// Compile-time limits keep the existing A4B layout stable while allowing
+/// independently qualified geometries without increasing every session's state.
+pub const Geometry = struct {
+    layers: usize = max_layers,
+    experts: usize = max_experts,
+    slots: usize = max_slots,
+    route_width: usize = max_route_width,
 };
 
-pub const LayerSnapshot = struct {
-    epoch: u64,
-    expert_for_slot: [max_slots]u16,
-    slot_for_expert: [max_experts]u8,
-    use_count: [max_slots]u64,
-    last_access_epoch: [max_slots]u64,
-    layer_observation_count: u64,
-};
+pub fn ArenaTypes(comptime geometry: Geometry) type {
+    if (geometry.layers == 0 or geometry.experts == 0 or geometry.experts >= invalid_expert or
+        geometry.slots == 0 or geometry.slots >= invalid_slot or geometry.route_width == 0 or
+        geometry.route_width > geometry.slots) @compileError("invalid expert arena geometry");
+    return struct {
+        pub const RouteObservation = struct {
+            route_slots: [geometry.route_width]u8 = @as([geometry.route_width]u8, @splat(invalid_slot)),
+            /// True when this route entry was absent (or reverse-map-invalid) before
+            /// observeRoute repaired the directory. Arena owners use this to upload
+            /// exactly the slots whose weight bytes changed.
+            repaired: [geometry.route_width]bool = @as([geometry.route_width]bool, @splat(false)),
+            count: usize = 0,
+            hit_count: usize = 0,
+            miss_count: usize = 0,
+            all_hit_before_update: bool = false,
 
-/// Mutating operations are not thread-safe. An arena belongs to one compute
-/// executor, and callers must serialize route observation, device publication,
-/// and rollback as one transaction.
-pub const ExpertSlotArena = struct {
-    active_slots: u8,
-    epoch: u64 = 0,
-    expert_for_slot: [max_layers][max_slots]u16 =
-        @as([max_layers][max_slots]u16, @splat(@as([max_slots]u16, @splat(invalid_expert)))),
-    slot_for_expert: [max_layers][max_experts]u8 =
-        @as([max_layers][max_experts]u8, @splat(@as([max_experts]u8, @splat(invalid_slot)))),
-    use_count: [max_layers][max_slots]u64 =
-        @as([max_layers][max_slots]u64, @splat(@as([max_slots]u64, @splat(0)))),
-    last_access_epoch: [max_layers][max_slots]u64 =
-        @as([max_layers][max_slots]u64, @splat(@as([max_slots]u64, @splat(0)))),
-    layer_observation_count: [max_layers]u64 = @as([max_layers]u64, @splat(0)),
-
-    pub fn init(active_slots: usize) ArenaError!ExpertSlotArena {
-        if (active_slots == 0 or active_slots > max_slots) return error.InvalidCapacity;
-        return .{ .active_slots = @intCast(active_slots) };
-    }
-
-    pub fn snapshotLayer(self: *const ExpertSlotArena, layer: usize) ArenaError!LayerSnapshot {
-        if (layer >= max_layers) return error.LayerOutOfRange;
-        return .{
-            .epoch = self.epoch,
-            .expert_for_slot = self.expert_for_slot[layer],
-            .slot_for_expert = self.slot_for_expert[layer],
-            .use_count = self.use_count[layer],
-            .last_access_epoch = self.last_access_epoch[layer],
-            .layer_observation_count = self.layer_observation_count[layer],
+            pub fn slots(self: *const RouteObservation) []const u8 {
+                return self.route_slots[0..self.count];
+            }
         };
-    }
 
-    pub fn restoreLayer(
-        self: *ExpertSlotArena,
-        layer: usize,
-        snapshot: LayerSnapshot,
-    ) ArenaError!void {
-        if (layer >= max_layers) return error.LayerOutOfRange;
-        self.epoch = snapshot.epoch;
-        self.expert_for_slot[layer] = snapshot.expert_for_slot;
-        self.slot_for_expert[layer] = snapshot.slot_for_expert;
-        self.use_count[layer] = snapshot.use_count;
-        self.last_access_epoch[layer] = snapshot.last_access_epoch;
-        self.layer_observation_count[layer] = snapshot.layer_observation_count;
-    }
+        pub const DirectorySnapshot = struct {
+            epoch: u64,
+            expert_for_slot: [geometry.slots]u16,
+            slot_for_expert: [geometry.experts]u8,
+            use_count: [geometry.slots]u64,
+            last_access_epoch: [geometry.slots]u64,
+            layer_observation_count: u64,
+        };
 
-    pub fn observeRoute(
-        self: *ExpertSlotArena,
-        layer: usize,
-        expert_count: usize,
-        experts: []const u32,
-    ) ArenaError!Observation {
-        if (layer >= max_layers) return error.LayerOutOfRange;
-        if (expert_count == 0 or expert_count > max_experts) return error.ExpertOutOfRange;
-        if (experts.len == 0 or experts.len > max_route_width or experts.len > self.active_slots) {
-            return error.RouteTooWide;
-        }
-        for (experts, 0..) |expert, index| {
-            if (expert >= expert_count) return error.ExpertOutOfRange;
-            for (experts[0..index]) |prior| {
-                if (prior == expert) return error.DuplicateRouteExpert;
+        /// Mutating operations are not thread-safe. An arena belongs to one compute
+        /// executor, and callers must serialize route observation, device publication,
+        /// and rollback as one transaction.
+        pub const Directory = struct {
+            const Self = @This();
+            active_slots: u8,
+            epoch: u64 = 0,
+            expert_for_slot: [geometry.layers][geometry.slots]u16 =
+                @as([geometry.layers][geometry.slots]u16, @splat(@as([geometry.slots]u16, @splat(invalid_expert)))),
+            slot_for_expert: [geometry.layers][geometry.experts]u8 =
+                @as([geometry.layers][geometry.experts]u8, @splat(@as([geometry.experts]u8, @splat(invalid_slot)))),
+            use_count: [geometry.layers][geometry.slots]u64 =
+                @as([geometry.layers][geometry.slots]u64, @splat(@as([geometry.slots]u64, @splat(0)))),
+            last_access_epoch: [geometry.layers][geometry.slots]u64 =
+                @as([geometry.layers][geometry.slots]u64, @splat(@as([geometry.slots]u64, @splat(0)))),
+            layer_observation_count: [geometry.layers]u64 = @as([geometry.layers]u64, @splat(0)),
+
+            pub fn init(active_slots: usize) ArenaError!Self {
+                if (active_slots == 0 or active_slots > geometry.slots) return error.InvalidCapacity;
+                return .{ .active_slots = @intCast(active_slots) };
             }
-        }
 
-        self.epoch +|= 1;
-        self.layer_observation_count[layer] +|= 1;
-        if (self.layer_observation_count[layer] % use_count_decay_interval == 0) {
-            for (self.use_count[layer][0..self.active_slots]) |*count| count.* >>= 1;
-        }
-        var result = Observation{ .count = experts.len };
-        var pinned = @as([max_slots]bool, @splat(false));
-
-        // Observe first, before installing misses. This is the only state a
-        // zero-sync device route is allowed to use as its all-hit proof.
-        for (experts, 0..) |expert_u32, route_index| {
-            const expert: usize = @intCast(expert_u32);
-            const slot = self.slot_for_expert[layer][expert];
-            if (slot == invalid_slot or slot >= self.active_slots) {
-                result.miss_count += 1;
-                continue;
+            pub fn snapshotLayer(self: *const Self, layer: usize) ArenaError!DirectorySnapshot {
+                if (layer >= geometry.layers) return error.LayerOutOfRange;
+                return .{
+                    .epoch = self.epoch,
+                    .expert_for_slot = self.expert_for_slot[layer],
+                    .slot_for_expert = self.slot_for_expert[layer],
+                    .use_count = self.use_count[layer],
+                    .last_access_epoch = self.last_access_epoch[layer],
+                    .layer_observation_count = self.layer_observation_count[layer],
+                };
             }
-            const slot_index: usize = slot;
-            if (self.expert_for_slot[layer][slot_index] != expert) {
-                // A reverse-map mismatch fails closed as a miss and is
-                // repaired below instead of exposing a stale arena offset.
-                self.slot_for_expert[layer][expert] = invalid_slot;
-                result.miss_count += 1;
-                continue;
+
+            pub fn restoreLayer(
+                self: *Self,
+                layer: usize,
+                snapshot: DirectorySnapshot,
+            ) ArenaError!void {
+                if (layer >= geometry.layers) return error.LayerOutOfRange;
+                self.epoch = snapshot.epoch;
+                self.expert_for_slot[layer] = snapshot.expert_for_slot;
+                self.slot_for_expert[layer] = snapshot.slot_for_expert;
+                self.use_count[layer] = snapshot.use_count;
+                self.last_access_epoch[layer] = snapshot.last_access_epoch;
+                self.layer_observation_count[layer] = snapshot.layer_observation_count;
             }
-            result.route_slots[route_index] = slot;
-            result.hit_count += 1;
-            pinned[slot_index] = true;
-            self.noteUse(layer, slot_index);
-        }
-        result.all_hit_before_update = result.miss_count == 0;
 
-        // Install misses without evicting any slot used by this route. Empty
-        // slots win; otherwise use LFU with recency and slot index tie-breaks.
-        for (experts, 0..) |expert_u32, route_index| {
-            if (result.route_slots[route_index] != invalid_slot) continue;
-            result.repaired[route_index] = true;
-            const expert: usize = @intCast(expert_u32);
-            const victim = self.chooseVictim(layer, pinned) orelse unreachable;
-            const prior = self.expert_for_slot[layer][victim];
-            if (prior != invalid_expert and prior < expert_count and
-                self.slot_for_expert[layer][prior] == victim)
-            {
-                self.slot_for_expert[layer][prior] = invalid_slot;
-            }
-            self.expert_for_slot[layer][victim] = @intCast(expert);
-            self.slot_for_expert[layer][expert] = @intCast(victim);
-            self.use_count[layer][victim] = 0;
-            self.noteUse(layer, victim);
-            pinned[victim] = true;
-            result.route_slots[route_index] = @intCast(victim);
-        }
-        return result;
-    }
-
-    pub fn writeExpertToSlotMap(
-        self: *const ExpertSlotArena,
-        layer: usize,
-        expert_count: usize,
-        output: []u32,
-    ) ArenaError!void {
-        if (layer >= max_layers) return error.LayerOutOfRange;
-        if (expert_count == 0 or expert_count > max_experts or output.len < expert_count) {
-            return error.ExpertOutOfRange;
-        }
-        for (output[0..expert_count], 0..) |*slot, expert| {
-            const mapped = self.slot_for_expert[layer][expert];
-            slot.* = if (mapped == invalid_slot or mapped >= self.active_slots)
-                std.math.maxInt(u32)
-            else
-                mapped;
-        }
-    }
-
-    /// A layer becomes eligible for optimistic device routing only after every
-    /// physical slot has authoritative weight bytes.  The first synchronized
-    /// route fills exactly `top_k` slots for qualified A4B (`top_k ==
-    /// active_slots`); checking the reverse directory keeps this predicate
-    /// independent of that model-specific equality and fails closed if a
-    /// directory entry is inconsistent.
-    pub fn layerIsFullyPopulated(self: *const ExpertSlotArena, layer: usize) bool {
-        if (layer >= max_layers) return false;
-        for (0..self.active_slots) |slot| {
-            const expert = self.expert_for_slot[layer][slot];
-            if (expert == invalid_expert or expert >= max_experts) return false;
-            if (self.slot_for_expert[layer][expert] != slot) return false;
-        }
-        return true;
-    }
-
-    pub fn layersAreFullyPopulated(self: *const ExpertSlotArena, layer_count: usize) bool {
-        if (layer_count == 0 or layer_count > max_layers) return false;
-        for (0..layer_count) |layer| {
-            if (!self.layerIsFullyPopulated(layer)) return false;
-        }
-        return true;
-    }
-
-    fn noteUse(self: *ExpertSlotArena, layer: usize, slot: usize) void {
-        self.use_count[layer][slot] +|= 1;
-        self.last_access_epoch[layer][slot] = self.epoch;
-    }
-
-    fn chooseVictim(self: *const ExpertSlotArena, layer: usize, pinned: [max_slots]bool) ?usize {
-        var best: ?usize = null;
-        for (0..self.active_slots) |slot| {
-            if (pinned[slot]) continue;
-            if (self.expert_for_slot[layer][slot] == invalid_expert) return slot;
-            if (best) |current| {
-                const use = self.use_count[layer][slot];
-                const current_use = self.use_count[layer][current];
-                const age = self.last_access_epoch[layer][slot];
-                const current_age = self.last_access_epoch[layer][current];
-                if (use < current_use or
-                    (use == current_use and age < current_age) or
-                    (use == current_use and age == current_age and slot < current))
-                {
-                    best = slot;
+            pub fn observeRoute(
+                self: *Self,
+                layer: usize,
+                expert_count: usize,
+                experts: []const u32,
+            ) ArenaError!RouteObservation {
+                if (layer >= geometry.layers) return error.LayerOutOfRange;
+                if (expert_count == 0 or expert_count > geometry.experts) return error.ExpertOutOfRange;
+                if (experts.len == 0 or experts.len > geometry.route_width or experts.len > self.active_slots) {
+                    return error.RouteTooWide;
                 }
-            } else {
-                best = slot;
+                for (experts, 0..) |expert, index| {
+                    if (expert >= expert_count) return error.ExpertOutOfRange;
+                    for (experts[0..index]) |prior| {
+                        if (prior == expert) return error.DuplicateRouteExpert;
+                    }
+                }
+
+                self.epoch +|= 1;
+                self.layer_observation_count[layer] +|= 1;
+                if (self.layer_observation_count[layer] % use_count_decay_interval == 0) {
+                    for (self.use_count[layer][0..self.active_slots]) |*count| count.* >>= 1;
+                }
+                var result = RouteObservation{ .count = experts.len };
+                var pinned = @as([geometry.slots]bool, @splat(false));
+
+                // Observe first, before installing misses. This is the only state a
+                // zero-sync device route is allowed to use as its all-hit proof.
+                for (experts, 0..) |expert_u32, route_index| {
+                    const expert: usize = @intCast(expert_u32);
+                    const slot = self.slot_for_expert[layer][expert];
+                    if (slot == invalid_slot or slot >= self.active_slots) {
+                        result.miss_count += 1;
+                        continue;
+                    }
+                    const slot_index: usize = slot;
+                    if (self.expert_for_slot[layer][slot_index] != expert) {
+                        // A reverse-map mismatch fails closed as a miss and is
+                        // repaired below instead of exposing a stale arena offset.
+                        self.slot_for_expert[layer][expert] = invalid_slot;
+                        result.miss_count += 1;
+                        continue;
+                    }
+                    result.route_slots[route_index] = slot;
+                    result.hit_count += 1;
+                    pinned[slot_index] = true;
+                    self.noteUse(layer, slot_index);
+                }
+                result.all_hit_before_update = result.miss_count == 0;
+
+                // Install misses without evicting any slot used by this route. Empty
+                // slots win; otherwise use LFU with recency and slot index tie-breaks.
+                for (experts, 0..) |expert_u32, route_index| {
+                    if (result.route_slots[route_index] != invalid_slot) continue;
+                    result.repaired[route_index] = true;
+                    const expert: usize = @intCast(expert_u32);
+                    const victim = self.chooseVictim(layer, pinned) orelse unreachable;
+                    const prior = self.expert_for_slot[layer][victim];
+                    if (prior != invalid_expert and prior < expert_count and
+                        self.slot_for_expert[layer][prior] == victim)
+                    {
+                        self.slot_for_expert[layer][prior] = invalid_slot;
+                    }
+                    self.expert_for_slot[layer][victim] = @intCast(expert);
+                    self.slot_for_expert[layer][expert] = @intCast(victim);
+                    self.use_count[layer][victim] = 0;
+                    self.noteUse(layer, victim);
+                    pinned[victim] = true;
+                    result.route_slots[route_index] = @intCast(victim);
+                }
+                return result;
             }
-        }
-        return best;
-    }
-};
+
+            pub fn writeExpertToSlotMap(
+                self: *const Self,
+                layer: usize,
+                expert_count: usize,
+                output: []u32,
+            ) ArenaError!void {
+                if (layer >= geometry.layers) return error.LayerOutOfRange;
+                if (expert_count == 0 or expert_count > geometry.experts or output.len < expert_count) {
+                    return error.ExpertOutOfRange;
+                }
+                for (output[0..expert_count], 0..) |*slot, expert| {
+                    const mapped = self.slot_for_expert[layer][expert];
+                    slot.* = if (mapped == invalid_slot or mapped >= self.active_slots)
+                        std.math.maxInt(u32)
+                    else
+                        mapped;
+                }
+            }
+
+            /// A layer becomes eligible for optimistic device routing only after every
+            /// physical slot has authoritative weight bytes.  The first synchronized
+            /// route fills exactly `top_k` slots for qualified A4B (`top_k ==
+            /// active_slots`); checking the reverse directory keeps this predicate
+            /// independent of that model-specific equality and fails closed if a
+            /// directory entry is inconsistent.
+            pub fn layerIsFullyPopulated(self: *const Self, layer: usize) bool {
+                if (layer >= geometry.layers) return false;
+                for (0..self.active_slots) |slot| {
+                    const expert = self.expert_for_slot[layer][slot];
+                    if (expert == invalid_expert or expert >= geometry.experts) return false;
+                    if (self.slot_for_expert[layer][expert] != slot) return false;
+                }
+                return true;
+            }
+
+            pub fn layersAreFullyPopulated(self: *const Self, layer_count: usize) bool {
+                if (layer_count == 0 or layer_count > geometry.layers) return false;
+                for (0..layer_count) |layer| {
+                    if (!self.layerIsFullyPopulated(layer)) return false;
+                }
+                return true;
+            }
+
+            fn noteUse(self: *Self, layer: usize, slot: usize) void {
+                self.use_count[layer][slot] +|= 1;
+                self.last_access_epoch[layer][slot] = self.epoch;
+            }
+
+            fn chooseVictim(self: *const Self, layer: usize, pinned: [geometry.slots]bool) ?usize {
+                var best: ?usize = null;
+                for (0..self.active_slots) |slot| {
+                    if (pinned[slot]) continue;
+                    if (self.expert_for_slot[layer][slot] == invalid_expert) return slot;
+                    if (best) |current| {
+                        const use = self.use_count[layer][slot];
+                        const current_use = self.use_count[layer][current];
+                        const age = self.last_access_epoch[layer][slot];
+                        const current_age = self.last_access_epoch[layer][current];
+                        if (use < current_use or
+                            (use == current_use and age < current_age) or
+                            (use == current_use and age == current_age and slot < current))
+                        {
+                            best = slot;
+                        }
+                    } else {
+                        best = slot;
+                    }
+                }
+                return best;
+            }
+        };
+    };
+}
+
+pub const ExpertSlotArena = ArenaTypes(.{}).Directory;
+pub const Qwen4ExpArena = ArenaTypes(.{ .layers = 48, .experts = 512, .route_width = 10 }).Directory;
+
+pub const Observation = ArenaTypes(.{}).RouteObservation;
+pub const LayerSnapshot = ArenaTypes(.{}).DirectorySnapshot;
 
 test "expert slot arena distinguishes cold repair from proven all-hit" {
     var arena = try ExpertSlotArena.init(8);
@@ -339,4 +362,19 @@ test "expert slot arena only checkpoints after every requested layer is full" {
     try std.testing.expect(arena.layersAreFullyPopulated(2));
     try std.testing.expect(!arena.layersAreFullyPopulated(0));
     try std.testing.expect(!arena.layersAreFullyPopulated(max_layers + 1));
+}
+
+test "Qwen4Exp expert slot arena supports layer 47 and expert 511 transactionally" {
+    var arena = try Qwen4ExpArena.init(10);
+    const first = [_]u32{ 502, 503, 504, 505, 506, 507, 508, 509, 510, 511 };
+    const cold = try arena.observeRoute(47, 512, &first);
+    try std.testing.expectEqual(@as(usize, 10), cold.miss_count);
+    try std.testing.expect((try arena.observeRoute(47, 512, &first)).all_hit_before_update);
+    const snapshot = try arena.snapshotLayer(47);
+    const replacement = [_]u32{ 0, 503, 504, 505, 506, 507, 508, 509, 510, 511 };
+    try std.testing.expectEqual(@as(usize, 1), (try arena.observeRoute(47, 512, &replacement)).miss_count);
+    try arena.restoreLayer(47, snapshot);
+    try std.testing.expect((try arena.observeRoute(47, 512, &first)).all_hit_before_update);
+    try std.testing.expectError(error.LayerOutOfRange, arena.observeRoute(48, 512, &first));
+    try std.testing.expectError(error.ExpertOutOfRange, arena.observeRoute(47, 512, &.{512}));
 }

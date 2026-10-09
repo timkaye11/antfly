@@ -27,6 +27,7 @@ pub const tensor_store = @import("tensor_store.zig");
 pub const gguf = @import("../gguf/root.zig");
 pub const bert = @import("bert.zig");
 pub const t5 = @import("t5.zig");
+pub const qwen4exp = @import("qwen4exp.zig");
 pub const gpt = @import("gpt.zig");
 pub const whisper = @import("whisper.zig");
 pub const florence = @import("florence.zig");
@@ -47,6 +48,7 @@ test {
     _ = bert;
     _ = t5;
     _ = gpt;
+    _ = qwen4exp;
     _ = whisper;
     _ = florence;
     _ = clip;

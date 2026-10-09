@@ -473,6 +473,36 @@ pub fn readRegionInto(allocator: std.mem.Allocator, path: []const u8, offset: u6
     try readRegionFromFd(fd, buf, offset);
 }
 
+/// Persistent, position-independent bounded reads. Uncached Darwin reads avoid
+/// duplicating an SSD expert cache in the OS file cache. The owner closes once
+/// all readers have finished; this object never owns a mapped weight region.
+pub const RangeReader = struct {
+    fd: std.posix.fd_t,
+    size: u64,
+
+    pub fn open(allocator: std.mem.Allocator, path: []const u8, uncached: bool) !RangeReader {
+        const path_z = try allocator.dupeSentinel(u8, path, 0);
+        defer allocator.free(path_z);
+        const fd = try openReadOnlyZ(path_z);
+        errdefer closeFd(fd);
+        if (comptime builtin.os.tag == .macos and builtin.link_libc) {
+            // Darwin F_NOCACHE is per descriptor, not a system-wide setting.
+            if (uncached and std.c.fcntl(fd, 48, @as(c_int, 1)) == -1) return error.FileCachePolicyFailed;
+        }
+        return .{ .fd = fd, .size = @intCast(try fileSizeFromFd(fd)) };
+    }
+
+    pub fn deinit(self: *RangeReader) void {
+        closeFd(self.fd);
+        self.* = undefined;
+    }
+
+    pub fn read(self: *const RangeReader, offset: u64, destination: []u8) !void {
+        if (offset > self.size or destination.len > self.size - offset) return error.RegionOutOfBounds;
+        try readRegionFromFd(self.fd, destination, offset);
+    }
+};
+
 fn readRegionFromFd(fd: std.posix.fd_t, buf: []u8, offset: u64) !void {
     var total: usize = 0;
     while (total < buf.len) {

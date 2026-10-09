@@ -59,5 +59,20 @@ pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile 
     const bench_server_step = ctx.step("bench-server", "Build the production HTTP server without the other CLI commands");
     bench_server_step.dependOn(&install_bench_server.step);
 
+    const qwen4exp = b.addExecutable(.{
+        .name = "antfly-qwen4exp",
+        .max_rss = 4 * 1024 * 1024 * 1024,
+        .root_module = b.createModule(.{
+            .root_source_file = ctx.path("src/qwen4exp_main.zig"),
+            .target = ctx.target,
+            .optimize = ctx.optimize,
+        }),
+    });
+    qwen4exp.root_module.addImport("inference", ctx.graph.inference_mod);
+    qwen4exp.root_module.addImport("antfly_platform", ctx.graph.platform_mod);
+    qwen4exp.root_module.link_libc = ctx.backend.link_libc;
+    const install_qwen4exp = b.addInstallArtifact(qwen4exp, .{});
+    ctx.step("qwen4exp", "Build the experimental SSD-backed Qwen4Exp text CLI").dependOn(&install_qwen4exp.step);
+
     return exe;
 }

@@ -1,0 +1,6 @@
+[
+  {"name":"chat","prompt":"Explain how mixture-of-experts language models use routing, expert caches, and SSD streaming. Discuss the tradeoffs for a small computer, including why more memory can help and why loading experts early can sometimes hurt.","max_tokens":128},
+  {"name":"code","prompt":"Write a Python function implementing an LRU cache with a fixed positive capacity. Include get and put methods, clearly specify the behavior for a missing key, and give a small executable example that checks eviction order.","max_tokens":128},
+  {"name":"structured","prompt":"Return only valid JSON containing a shopping list for three vegetarian dinners. Use an object with keys meals and ingredients. Each meal must have a name and an array of ingredient names. Each ingredient must have a name, quantity, and unit.","max_tokens":128},
+  {"name":"prose","prompt":"Write a scene in which a lighthouse keeper receives an unexpected letter during a storm. Use concrete sensory details and dialogue. Reveal the contents of the letter gradually, and give the scene a clear ending.","max_tokens":128}
+]

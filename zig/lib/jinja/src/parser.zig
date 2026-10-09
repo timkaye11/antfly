@@ -484,6 +484,8 @@ pub const Parser = struct {
                 const test_tok = try self.expect(.ident);
                 const unary_op: ast.UnaryOp = if (std.mem.eql(u8, test_tok.value, "defined"))
                     if (negated) .is_not_defined else .is_defined
+                else if (std.mem.eql(u8, test_tok.value, "undefined"))
+                    if (negated) .is_defined else .is_not_defined
                 else if (std.mem.eql(u8, test_tok.value, "string"))
                     .is_string
                 else if (std.mem.eql(u8, test_tok.value, "iterable"))
@@ -496,12 +498,16 @@ pub const Parser = struct {
                     if (negated) .is_not_none else .is_none
                 else if (std.mem.eql(u8, test_tok.value, "boolean"))
                     .is_boolean
+                else if (std.mem.eql(u8, test_tok.value, "true"))
+                    .is_true
+                else if (std.mem.eql(u8, test_tok.value, "false"))
+                    .is_false
                 else
                     return error.UnexpectedToken;
 
                 const node = try self.allocExpr();
                 // For negated tests other than defined/none, wrap in not
-                if (negated and unary_op != .is_not_defined and unary_op != .is_not_none) {
+                if (negated and unary_op != .is_defined and unary_op != .is_not_defined and unary_op != .is_not_none) {
                     const inner = try self.allocExpr();
                     inner.* = .{ .unary_op = .{ .op = unary_op, .operand = left } };
                     node.* = .{ .unary_op = .{ .op = .not, .operand = inner } };
@@ -666,40 +672,25 @@ pub const Parser = struct {
                     expr = node;
                 },
                 .lbracket => {
-                    _ = self.nextToken(); // consume [
-
-                    // Check for slice: [start:stop]
-                    const next = self.peekToken();
-                    if (next.kind == .colon) {
-                        // [:stop]
-                        _ = self.nextToken(); // consume :
-                        var stop: ?*Expr = null;
-                        if (self.peekToken().kind != .rbracket) {
-                            stop = try self.parseExpr();
+                    _ = self.nextToken();
+                    const start: ?*Expr = if (self.peekToken().kind == .colon) null else try self.parseExpr();
+                    if (self.peekToken().kind == .colon) {
+                        _ = self.nextToken();
+                        const stop: ?*Expr = if (self.peekToken().kind == .colon or self.peekToken().kind == .rbracket) null else try self.parseExpr();
+                        var step: ?*Expr = null;
+                        if (self.peekToken().kind == .colon) {
+                            _ = self.nextToken();
+                            if (self.peekToken().kind != .rbracket) step = try self.parseExpr();
                         }
                         _ = try self.expect(.rbracket);
                         const node = try self.allocExpr();
-                        node.* = .{ .slice = .{ .obj = expr, .start = null, .stop = stop } };
+                        node.* = .{ .slice = .{ .obj = expr, .start = start, .stop = stop, .step = step } };
                         expr = node;
                     } else {
-                        const key = try self.parseExpr();
-                        if (self.peekToken().kind == .colon) {
-                            // [start:stop]
-                            _ = self.nextToken(); // consume :
-                            var stop: ?*Expr = null;
-                            if (self.peekToken().kind != .rbracket) {
-                                stop = try self.parseExpr();
-                            }
-                            _ = try self.expect(.rbracket);
-                            const node = try self.allocExpr();
-                            node.* = .{ .slice = .{ .obj = expr, .start = key, .stop = stop } };
-                            expr = node;
-                        } else {
-                            _ = try self.expect(.rbracket);
-                            const node = try self.allocExpr();
-                            node.* = .{ .get_item = .{ .obj = expr, .key = key } };
-                            expr = node;
-                        }
+                        _ = try self.expect(.rbracket);
+                        const node = try self.allocExpr();
+                        node.* = .{ .get_item = .{ .obj = expr, .key = start.? } };
+                        expr = node;
                     }
                 },
                 .lparen => {
@@ -814,9 +805,25 @@ pub const Parser = struct {
                 return node;
             },
             .lparen => {
-                const expr = try self.parseExpr();
+                var items = std.ArrayListUnmanaged(*Expr).empty;
+                if (self.peekToken().kind != .rparen) {
+                    const first = try self.parseExpr();
+                    if (self.peekToken().kind != .comma) {
+                        _ = try self.expect(.rparen);
+                        return first;
+                    }
+                    try items.append(self.arena, first);
+                    while (self.peekToken().kind == .comma) {
+                        _ = self.nextToken();
+                        if (self.peekToken().kind == .rparen) break;
+                        try items.append(self.arena, try self.parseExpr());
+                    }
+                }
                 _ = try self.expect(.rparen);
-                return expr;
+                const node = try self.allocExpr();
+                // Template sequences are immutable; tuples share list evaluation.
+                node.* = .{ .list = try items.toOwnedSlice(self.arena) };
+                return node;
             },
             .lbracket => {
                 var items = std.ArrayListUnmanaged(*Expr).empty;
