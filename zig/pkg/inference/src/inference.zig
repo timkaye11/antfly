@@ -34,7 +34,9 @@ pub const audio = @import("inference_audio");
 pub const chunker = @import("inference_chunker");
 pub const pipelines = @import("pipelines/pipelines.zig");
 pub const extractors = @import("extractors/mod.zig");
-pub const server = if (build_options.skip_openapi) struct {} else @import("server/server.zig");
+pub const server = if (build_options.skip_openapi) struct {
+    pub const model_manager = @import("server/model_manager.zig");
+} else @import("server/server.zig");
 pub const executor_microbatch = @import("server/executor_microbatch.zig");
 pub const tensor_microbatch = @import("server/tensor_microbatch.zig");
 pub const cache = @import("cache/cache.zig");

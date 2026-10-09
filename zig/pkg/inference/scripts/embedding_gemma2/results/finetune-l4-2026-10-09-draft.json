@@ -1,0 +1,479 @@
+{
+  "as_built_source": {
+    "binary_sha256": "d5001bb5e4809042a735aadee1c0cc23075a8c93b93cae69817070e5286b5748",
+    "manifest": "finetune-v22-source-manifest.json",
+    "manifest_sha256": "0eac5ecc929658411d6133c7b068596637e369a36ccda36af6d44855f34fa402",
+    "snapshot_note": "Source hashes were captured before compilation and all 3714 were verified unchanged at completion; documentation and evidence were updated afterward."
+  },
+  "blocking_gaps": [
+    "Official full-corpus three-seed quality for the five reviewed dataset/language roles has not run.",
+    "Seven-cell, 100-pair resident alternating performance qualification has not run.",
+    "Secondary GPU architectures were regenerated and symbol-checked, but remain numerically unmeasured."
+  ],
+  "candidate": "V22",
+  "cli_final_validation": {
+    "binary_bytes": 47014184,
+    "binary_path": "/dev/shm/antfly-eg2-final-cli-install/bin/antfly-inference",
+    "binary_sha256": "a1eff7684a2115be6dd15c85f12ab5bafca76e3f9b8cb8f3b76806ce227be8f0",
+    "bounded_cuda_retrieval": {
+      "dimensions": [
+        128,
+        256,
+        512,
+        768
+      ],
+      "documents": 8,
+      "production_quality_eligible": false,
+      "queries": 8,
+      "report": "/tmp/antfly-eg2-native-training-export-final-v22-evidence/bounded-cuda-retrieval-final-cli.json",
+      "report_sha256": "73e9f87ee6e5fdbd4278aa3f9061bdcf040c6c410c7e1631c51a11afdc111aa4"
+    },
+    "bounded_cuda_retrieval_status": "passed",
+    "build_pass": true,
+    "candidate": "V22",
+    "cuda_artifacts": "sm89",
+    "dispatch_checks": [
+      {
+        "action": "prepare",
+        "domain": "dataset",
+        "log": "/tmp/antfly-eg2-final-cli-v22-dataset-help.log",
+        "log_sha256": "b043623da6ef911e9a6e949697445132465cc9d29e06a4a118efdb1f88a67a26",
+        "pass": true,
+        "subject": "embeddinggemma2-lora"
+      },
+      {
+        "action": "run",
+        "domain": "train",
+        "log": "/tmp/antfly-eg2-final-cli-v22-train-help.log",
+        "log_sha256": "af6b6a9cac304294b6c7310f02f7508886c69e3a5551217cb4afe3f075c941a0",
+        "pass": true,
+        "subject": "embeddinggemma2"
+      },
+      {
+        "action": "export",
+        "domain": "adapter",
+        "log": "/tmp/antfly-eg2-final-cli-v22-adapter-help.log",
+        "log_sha256": "27b1cccf45e6d1efd5872b8eaa7bb851ed5d24ff19babbdee724281f3d0506ff",
+        "pass": true,
+        "subject": "embeddinggemma2-lora"
+      },
+      {
+        "action": "run",
+        "domain": "eval",
+        "log": "/tmp/antfly-eg2-final-cli-v22-eval-help.log",
+        "log_sha256": "5c1fad5bd7fd0f989e85240c2941c36c92a26eac6cda694151ae7097186b17c7",
+        "pass": true,
+        "subject": "embeddinggemma2-retrieval"
+      }
+    ],
+    "export_log": {
+      "path": "/tmp/antfly-eg2-final-cli-v22-export.log",
+      "sha256": "2b560359e5bb8a085d38cbcb41b96f93def168729a8c6aeda6987ac38dc53ba8"
+    },
+    "export_matches_verified_bundle": true,
+    "export_status": "passed",
+    "export_weight_sha256": "7fa18fe526b91102343ddebfb566f8355a4703a31fac1237a19054b14a714111",
+    "openapi_enabled": true,
+    "optimize": "ReleaseFast",
+    "pass": true,
+    "prepare_log": {
+      "path": "/tmp/antfly-eg2-final-cli-v22-prepare.log",
+      "sha256": "c712df7726d2dc1f9dd4c6fccb80e2709865a8e4fe0833db002503a11526b8f5"
+    },
+    "prepare_status": "passed",
+    "prepared_manifest_sha256": "b0be48523bad3d5056d517ed5782c1ac20b43175c093184825e4b4f10644166b",
+    "supervised_training": {
+      "checkpoint_sha256": "4c705849fae861e16308eecc0d1507d1c36c0572582dc632e374c1c27c1f3506",
+      "exact_qualified_checkpoint_match": true,
+      "log": "/tmp/antfly-eg2-final-cli-v22-train.log",
+      "log_sha256": "22a4b9119f76c8f4303a5ab45f7efb4af0f6c4ba3529e4fe856548f6439739fe",
+      "optimizer_steps": 2
+    },
+    "supervised_training_status": "passed"
+  },
+  "date_utc": "2026-10-09",
+  "final_artifacts": [
+    {
+      "path": "/home/timkaye/tim/antfly/zig/pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels_sm89.cubin",
+      "sha256": "eda3b1fcff4d43dd9a4b5ed418c52071fb3644dba5c12f9e4342da3b659a72ab"
+    },
+    {
+      "path": "/home/timkaye/tim/antfly/zig/pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels.ptx",
+      "sha256": "3acf65dc9d54e8ed63a43dfcbb16ffa0b46cfbb318ed50e7784498af66c8a1d0"
+    },
+    {
+      "path": "/home/timkaye/tim/antfly/zig/pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels.fatbin",
+      "sha256": "84a2ef55740f93ddfa44fd34376b98eb3fd591afc45a38ccfa7f3f5de435027d"
+    }
+  ],
+  "gates": {
+    "bounded_export_retrieval": {
+      "pass": true,
+      "production_quality_eligible": false,
+      "raw": {
+        "path": "/tmp/antfly-eg2-native-training-export-final-v22-evidence/bounded-cuda-retrieval-final-cli.json",
+        "sha256": "73e9f87ee6e5fdbd4278aa3f9061bdcf040c6c410c7e1631c51a11afdc111aa4"
+      },
+      "scope": "bounded public fixture through final CLI and actual CUDA merged model"
+    },
+    "export_functional": {
+      "adapter_tensors": 338,
+      "byte_identical_untouched_tensors": 1207,
+      "candidate": "final-exporter-V22",
+      "checkpoint_sha256": "4c705849fae861e16308eecc0d1507d1c36c0572582dc632e374c1c27c1f3506",
+      "exact_merged_elements_vs_pytorch_fp32": 117833728,
+      "exporter_binary": {
+        "path": "/tmp/antfly-eg2-training-build-cache/o/d25438164727b1126e05cfa07c7cbf8f/export-embeddinggemma2-lora",
+        "sha256": "9b871f7ad5fa616ff402408cb83f546a16420a226f2a65e60d22c41f024f9f8d"
+      },
+      "final_checkpoint_binding": {
+        "path": "/tmp/antfly-eg2-native-training-export-final-v22-evidence/final-checkpoint-binding.json",
+        "sha256": "699b667251db1a2246e7af81b5abaca565d9e86a7824d1fbd783768819a044cb"
+      },
+      "merged_targets": 169,
+      "merged_weight_bytes": 1488915344,
+      "merged_weight_sha256": "7fa18fe526b91102343ddebfb566f8355a4703a31fac1237a19054b14a714111",
+      "pass": true,
+      "peft_reload_exact": true,
+      "raw": {
+        "path": "/tmp/antfly-eg2-native-training-export-final-v22-evidence/verification.json",
+        "sha256": "a3702e170e607172f649eab18fcb6b827b5c9fc045622a59c99c9fc0f9aafb2d"
+      },
+      "scope": "verified exact checkpoint bytes shared by V21 and final V22; text-only merged bundle and FP32 PEFT adapter"
+    },
+    "final_artifact_attention_softmax": {
+      "pass": true,
+      "raw": [
+        {
+          "path": "/tmp/eg2-softmax-v22-artifact-matrix.json",
+          "sha256": "f60642dac750da052017762797ef8dd7c6fc0606c6ad7a9f19f6f5412c6aa986"
+        },
+        {
+          "path": "/tmp/eg2-softmax-v22-artifact-allmask.json",
+          "sha256": "631e170ee7d0e2fb16ae313b56b577f85dd8ba2e2597a8c055078d0fd8bd9fb8"
+        }
+      ],
+      "scope": "actual SM89 forward/VJP, F32/BF16, partial and fully masked batches; invalid rows zero",
+      "sequences": [
+        17,
+        20,
+        22,
+        32,
+        64,
+        128,
+        512
+      ]
+    },
+    "final_artifact_contrastive_loss": {
+      "pass": true,
+      "raw": [
+        {
+          "path": "/tmp/eg2-actual-v22-ce-matrix.json",
+          "sha256": "22e78906777d677be43e22aa27494c4dd54cc8c5deb903f33f0718a0f5b56a86"
+        },
+        {
+          "path": "/tmp/eg2-actual-v22-ce-target-only.json",
+          "sha256": "a72721d187bf9986f1dc6e60682e4be8cf9a5a8fc37f93d6d9a651b62555c1b0"
+        },
+        {
+          "path": "/tmp/eg2-actual-v22-ce-invalid.json",
+          "sha256": "87d4fed4219de921ea382483d9d8602e09d4131ff3c55ae38bb73d930db068d7"
+        }
+      ],
+      "scope": "actual SM89 exact loss/coefficients for F32 and BF16-rounded inputs, scales 1/.125, odd query counts and production candidate counts; invalid targets fail closed",
+      "shape_scale_runs": 44,
+      "target_only_mask_runs": 14
+    },
+    "final_artifact_driver_load": {
+      "cuda_driver_version": 13000,
+      "pass": true,
+      "raw": {
+        "path": "/tmp/eg2-final-v22-driver-artifact-load.json",
+        "sha256": "34582b4b766a086848a453f01ec548655975d2adf488ac7a1d4a9cc08a5929b1"
+      },
+      "scope": "L4 driver module load and symbol resolution; fatbin numerical execution not measured"
+    },
+    "final_artifact_mrl_masked_pool": {
+      "masked_pool_cells": 66,
+      "pass": true,
+      "raw": [
+        {
+          "path": "/tmp/eg2-actual-v22-mrl-pool.json",
+          "sha256": "6dee49b7b0dfb27bb2a5baab81f314b670ae171cea5d8a16ca19ed56d621d4d4"
+        },
+        {
+          "path": "/tmp/eg2-actual-v22-masked-pool-matrix.json",
+          "sha256": "66e84e820204fd6754d14174b9a84c7622a0421b69517127305d4506e5fb7683"
+        }
+      ],
+      "raw_format_note": "These byte-preserved temporary probe reports retain literal trailing backslash-n bytes; the masked-pool writer also retains its historical v19 schema label. Their artifact SHA binds V22.",
+      "real_s22_exact": true,
+      "scope": "actual final SM89 MRL forward/VJP and masked-pool reduction-order differential"
+    },
+    "native_reference_numeric": {
+      "candidate": "V22",
+      "failed_checks": 0,
+      "gradient_summaries": [
+        {
+          "active_lora_A_tensors": 0,
+          "active_lora_B_tensors": 169,
+          "active_reference_tensors": 169,
+          "expected_activity": true,
+          "global_cosine": 1.0,
+          "global_relative_l2": 0.0,
+          "inactive_reference_tensors": 169,
+          "maximum_active_reference_l2": 0.2768353338427487,
+          "maximum_active_tensor_relative_l2": 0.0,
+          "minimum_active_reference_l2": 0.008798074336759314,
+          "minimum_active_tensor_cosine": 1.0,
+          "pass": true,
+          "step": 0,
+          "worst_cosine_tensor": "language_model.embedding_projection.lora_B.weight",
+          "worst_relative_l2_tensor": "language_model.embedding_projection.lora_B.weight"
+        },
+        {
+          "active_lora_A_tensors": 169,
+          "active_lora_B_tensors": 169,
+          "active_reference_tensors": 338,
+          "expected_activity": true,
+          "global_cosine": 0.9998994736872614,
+          "global_relative_l2": 0.014179177610048105,
+          "inactive_reference_tensors": 0,
+          "maximum_active_reference_l2": 0.3819529675121949,
+          "maximum_active_tensor_relative_l2": 0.03313211756476815,
+          "minimum_active_reference_l2": 0.00015845364090584304,
+          "minimum_active_tensor_cosine": 0.999476566140166,
+          "pass": true,
+          "step": 1,
+          "worst_cosine_tensor": "language_model.layers.1.self_attn.k_proj.lora_B.weight",
+          "worst_relative_l2_tensor": "language_model.layers.1.self_attn.k_proj.lora_B.weight"
+        }
+      ],
+      "pass": true,
+      "raw": {
+        "path": "/dev/shm/antfly-eg2-native-training-parity-v22/numeric-strong.json",
+        "sha256": "ef211105f20026315e7f1abaec96865e1c99cdf7d426406d108f57fee2358460"
+      },
+      "scope": "authenticated tiny BF16 two-step pre-clip gradient and master comparison",
+      "thresholds": {
+        "active_reference_l2_min": 1e-07,
+        "global_cosine_min": 0.999,
+        "global_relative_l2_max": 0.02,
+        "per_tensor_cosine_min": 0.98,
+        "per_tensor_relative_l2_max": 0.1
+      },
+      "total_checks": 1356
+    },
+    "native_resume": {
+      "candidate": "V22",
+      "next_step_state_sha256": "d3192dbacd53f7be689ae48c7073bb93ec740a449685af09e7a18c2a0555bc00",
+      "pass": true,
+      "raw": {
+        "path": "/dev/shm/antfly-eg2-native-training-parity-v22/report.json",
+        "sha256": "ff1c17a8a0d6b463cbdcfdd665fc027e7a97fc06564b0cdd1de8653de7e83400"
+      },
+      "tensor_count": 1014
+    },
+    "official_three_seed_quality": {
+      "pass": false,
+      "status": "not-run"
+    },
+    "paired_collector_functional": {
+      "active_document_tokens": {
+        "maximum": 22,
+        "mean": 21.333333333333332,
+        "microbatches": 3,
+        "minimum": 20
+      },
+      "active_query_tokens": {
+        "maximum": 16,
+        "mean": 16.0,
+        "microbatches": 2,
+        "minimum": 16
+      },
+      "candidate": "V22",
+      "compiler_pause_audit": {
+        "path": "/tmp/antfly-eg2-paired-v22-compiler-pause-audit.json",
+        "sha256": "ddefd963b3bffad2065a95e910a93fa9aecf63b49f44016b2696be1185cfbcbb"
+      },
+      "compiler_paused_during_collection": true,
+      "native_attention": "eager",
+      "native_raw": {
+        "path": "/dev/shm/antfly-eg2-paired-final-v22/native.json",
+        "sha256": "4a102216cbd428da948cea4a2412b7a87d17713e64c8c186a1d35439c5f929a6"
+      },
+      "native_step_ms": [
+        143.006619,
+        91.675299
+      ],
+      "observed_candidate_counts": [
+        4,
+        2
+      ],
+      "observed_query_counts": [
+        2,
+        2
+      ],
+      "pass": true,
+      "peak_device_bytes": {
+        "native": 1040187392,
+        "reference": 1971322880
+      },
+      "peak_host_bytes": {
+        "native": 828067840,
+        "reference": 2405945344
+      },
+      "production_qualified": false,
+      "protocol": "resident-alternating-two-barriers-v1",
+      "reason": "one small case and two pairs, short active lengths, and deduplicated candidates; production requires seven reviewed workloads and 100 pairs per cell",
+      "reference_attention": "sdpa",
+      "reference_raw": {
+        "path": "/dev/shm/antfly-eg2-paired-final-v22/reference.json",
+        "sha256": "56ca23949687d5fd667746ae902eeb98277087242a4fb3280109e0556db70dba"
+      },
+      "reference_step_ms": [
+        1217.9411179968156,
+        858.2357859704643
+      ]
+    },
+    "production_seven_cell_paired_performance": {
+      "pass": false,
+      "status": "not-run"
+    },
+    "public_dataset_fixture": {
+      "legacy_bounded_policy": true,
+      "manifest": {
+        "path": "/tmp/antfly-eg2-public-fixture-smoke-v2/dataset_manifest.json",
+        "sha256": "0d9bdda4d8993139a3704b5956ac488f2bf1419d5d32c4a0ebfcec624e8f2448"
+      },
+      "miner_policy": "deterministic-train-only-v1",
+      "pass": true,
+      "production_qualified": false,
+      "reason": "bounded functional fixture, not official full-corpus quality evaluation",
+      "validation": {
+        "path": "/tmp/antfly-eg2-public-fixture-smoke-v2/validation.json",
+        "sha256": "472942f84300a5990e3acec66ba93ea53553e6666254999fc63a87f69d7ed665"
+      }
+    },
+    "reference_eager_preclip": {
+      "final_state_sha256": "94dd6d715ee9fffba1a4bef440375bca67472b821f2ebb31ed0ccf0edbb72e77",
+      "losses": [
+        0.12880191206932068,
+        0.154483824968338
+      ],
+      "pass": true,
+      "resume_raw": {
+        "path": "/tmp/antfly-eg2-training-reference-eager-preclip-v1/resume-qualified.json",
+        "sha256": "e7164a788aea365ecd3858b3928f6bc4007eefaa51843b511f9a77ee18696881"
+      },
+      "two_step_raw": {
+        "path": "/tmp/antfly-eg2-training-reference-eager-preclip-v1/reference-bf16-2step.json",
+        "sha256": "eba8a56568c843a6577a46a543d889128671296ba77e3a177e080741441ef1ee"
+      }
+    }
+  },
+  "hardware": {
+    "cuda_compiler": "13.2",
+    "driver": "580.159.03",
+    "gpu": "NVIDIA L4",
+    "qualification_scope": "single-SM89-device-development"
+  },
+  "historical_evidence_index": {
+    "path": "finetune-l4-2026-10-08-draft.json",
+    "sha256": "4a82fb68b47bbbf45e9dc049db316d5ad64fd40d3b5d265f9a3163b1925102b0"
+  },
+  "production_qualified": false,
+  "raw_evidence_policy": "Volatile raw tensors/reports remain under /tmp and /dev/shm, identified by SHA-256. Completed identical state/trace files share byte-verified hard links without changing paths or bytes. The index makes no production promotion claim.",
+  "reproducible_tools": [
+    "../finetune_reference.py",
+    "../generate_finetune_initial_adapter.py",
+    "../prepare_training_dataset.py",
+    "../validate_finetune_dataset.py",
+    "../qualify_finetune_numeric.py",
+    "../qualify_finetune_resume.py",
+    "../qualify_finetune_quality.py",
+    "../run_finetune_paired.py",
+    "../benchmark_finetune_paired.py",
+    "../evaluate_finetune_full_corpus.py"
+  ],
+  "reviewed_profile": {
+    "alpha": 32.0,
+    "compute_profile": "bf16-edges-fp32-masters-v1",
+    "gradient_trace_stage": "pre-clip",
+    "inputs": [
+      "text"
+    ],
+    "mrl_dimensions": [
+      128,
+      256,
+      512,
+      768
+    ],
+    "native_attention": "eager",
+    "numeric_reference_attention": "eager",
+    "padding_policy": "per-micro-active-v1",
+    "performance_reference_attention": "sdpa",
+    "precision": "bf16",
+    "rank": 16,
+    "tasks": [
+      "retrieval",
+      "code_retrieval"
+    ]
+  },
+  "schema_version": 1,
+  "scope": "EmbeddingGemma2 text/code LoRA training, checkpoint/resume, export, bounded evaluation, and qualification harness",
+  "status": "draft-unqualified",
+  "tests_current": {
+    "cuda_source_policy": {
+      "log": {
+        "path": "/tmp/antfly-eg2-source-policy-final-v22.log",
+        "sha256": "4717cc0f4b58b8f294a7955065629f360bd2b83c62b7121c60d661009a02b1d6"
+      },
+      "pass": true
+    },
+    "python_full_dependency_overlay": {
+      "log": {
+        "path": "/tmp/antfly-eg2-python-all-final-v20.log",
+        "sha256": "59dde6149b997ffbf7b0ef6d8765b1a15474a0bf9da157f9dda6ffbf815d3eb7"
+      },
+      "passed": 55,
+      "skipped": 0
+    },
+    "serving_text_only_capability": {
+      "log": {
+        "path": "/tmp/antfly-eg2-final-capability-tests-v22.log",
+        "sha256": "880ae5d418cb7c413bc227f727eac6936b0fd50038cd2ce05bbe4f6cdf9ac3fb"
+      },
+      "passed": 1
+    },
+    "zig_focused_targets": {
+      "passed": 100,
+      "targets": [
+        {
+          "log": {
+            "path": "/tmp/antfly-eg2-final-job-tests-v22.log",
+            "sha256": "09aa9724c2eb8bd0bf2d5b80a8fd0f18d939af263d76ecab8225886bfcc1256f"
+          },
+          "name": "test-embedding-gemma2-job",
+          "passed": 48
+        },
+        {
+          "log": {
+            "path": "/tmp/antfly-eg2-final-graph-tests-v22.log",
+            "sha256": "1d0ae341fae86653cd657018e340ecdb239412df53c8ce52e26f55bf76590754"
+          },
+          "name": "test-embedding-gemma2-graph",
+          "passed": 46
+        },
+        {
+          "log": {
+            "path": "/tmp/antfly-eg2-final-model-tests-v22.log",
+            "sha256": "d98b8fdd9008714d138a1627f550b1219f26c80cb100f8cf7f590bdbd8d842a9"
+          },
+          "name": "test-embedding-gemma2-model-training",
+          "passed": 6
+        }
+      ]
+    }
+  }
+}

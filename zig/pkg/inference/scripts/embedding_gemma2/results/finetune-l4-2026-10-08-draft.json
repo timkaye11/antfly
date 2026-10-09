@@ -1,0 +1,252 @@
+{
+  "as_built_source": {
+    "manifest": "finetune-v13-source-manifest.json",
+    "manifest_sha256": "0e8331698bb45fb1a34b9eb84ec575c4f91cb848f9af35135f483cf571e55c93"
+  },
+  "blocking_gaps": [
+    "V13 BF16 numeric step zero passes at 0.963% global relative L2; step one still fails at 5.437% and five active per-tensor gates.",
+    "Official full-corpus three-seed quality for the five reviewed dataset/language roles has not run.",
+    "Seven-cell, 100-pair resident alternating performance qualification has not run.",
+    "V9 export remains historical exact-checkpoint evidence; its reproducible merged weights were pruned after SHA verification, with adapter/checkpoints/provenance/reports preserved.",
+    "Secondary GPU architectures are unmeasured."
+  ],
+  "date_utc": "2026-10-08",
+  "gates": {
+    "elementwise_vjp_differential": {
+      "pass": true,
+      "raw": {
+        "path": "/tmp/eg2-native-elementwise-vjp-report.json",
+        "sha256": "fce4573549d1c2a63b006a4f69551593e6e4cc4f23316639ad413b092ee8ee6c"
+      },
+      "scope": "RMSNorm, GELU, BF16 softmax boundaries, local/global RoPE; independent supplied cotangents"
+    },
+    "native_reference_numeric": {
+      "candidate": "V13",
+      "failed_active_per_tensor_gates": 5,
+      "first_pooled_forward_relative_l2": 5.132697025880283e-08,
+      "pass": false,
+      "raw": {
+        "path": "/tmp/antfly-eg2-native-training-parity-v13/numeric-strong.json",
+        "sha256": "767415f2b74925610fe0e8ce944f9262f21e9ca4205529dfb3a9ab6c94d3a7f8"
+      },
+      "steps": [
+        {
+          "global_cosine": 0.9999536175384578,
+          "global_relative_l2": 0.009631347229769813,
+          "pass": true,
+          "step": 0
+        },
+        {
+          "global_cosine": 0.9985534145179382,
+          "global_relative_l2": 0.05437229280863437,
+          "pass": false,
+          "step": 1
+        }
+      ],
+      "thresholds": {
+        "global_cosine_min": 0.999,
+        "global_relative_l2_max": 0.02,
+        "per_tensor_cosine_min": 0.98,
+        "per_tensor_relative_l2_max": 0.1
+      }
+    },
+    "native_resume": {
+      "candidate": "V13",
+      "next_step_state_sha256": "7e4c02b3fc70bd91b1b8bfc0c2973354b603539b3c15e6971d25f37860fa111e",
+      "pass": true,
+      "raw": {
+        "path": "/tmp/antfly-eg2-native-training-parity-v13/report.json",
+        "sha256": "3b61acb7c501e440e44e3d3ecc107334098d866a9e1060db47d6d69df8919d09"
+      },
+      "tensor_count": 1014
+    },
+    "official_three_seed_quality": {
+      "pass": false,
+      "status": "not-run"
+    },
+    "paired_collector_functional": {
+      "candidate": "V12",
+      "native_attention": "eager",
+      "native_raw": {
+        "path": "/tmp/antfly-eg2-paired-smoke-v4/native.json",
+        "sha256": "1558711d47111f49795ce30082b61ea8898b3d08eaa2ce716657389417bd6353"
+      },
+      "native_step_ms": [
+        137.56404,
+        94.003523
+      ],
+      "pass": true,
+      "peak_device_bytes": {
+        "native": 1040187392,
+        "reference": 1971322880
+      },
+      "peak_host_bytes": {
+        "native": 831811584,
+        "reference": 2418860032
+      },
+      "production_qualified": false,
+      "protocol": "resident-alternating-two-barriers-v1",
+      "reason": "one cell and two pairs; production requires exactly seven reviewed cells and 100 pairs per cell",
+      "reference_attention": "sdpa",
+      "reference_raw": {
+        "path": "/tmp/antfly-eg2-paired-smoke-v4/reference.json",
+        "sha256": "464011b666831a3cbb4a70985ea3f50d3b2a11cd73d4cd3bd4265034ebb4c951"
+      },
+      "reference_step_ms": [
+        1314.5627220510505,
+        868.9357449766248
+      ]
+    },
+    "production_seven_cell_paired_performance": {
+      "pass": false,
+      "status": "not-run"
+    },
+    "projection_vjp_shape_differential": {
+      "pass": true,
+      "raw_after": {
+        "path": "/tmp/eg2-projection-vjp-fixed-compare.json",
+        "sha256": "19a6d4a8c39e85fa30ed7ee719d38e203199c4f224e2445ba43bb8978a2b69f2"
+      },
+      "raw_before": {
+        "path": "/tmp/eg2-projection-vjp-matrix-compare-v2.json",
+        "sha256": "cc39c1af4893b56463b4c506a19a295c330b06eb4d1eb09d752a82de67e0b18f"
+      },
+      "scope": "six formerly divergent gate/global-Q width2048 cases, rows34/40/44, all seven checks bit-exact vs Torch"
+    },
+    "public_dataset_fixture": {
+      "legacy_bounded_policy": true,
+      "manifest": {
+        "path": "/tmp/antfly-eg2-public-fixture-smoke-v2/dataset_manifest.json",
+        "sha256": "0d9bdda4d8993139a3704b5956ac488f2bf1419d5d32c4a0ebfcec624e8f2448"
+      },
+      "miner_policy": "deterministic-train-only-v1",
+      "pass": true,
+      "production_qualified": false,
+      "reason": "bounded functional fixture, not official full-corpus quality evaluation",
+      "validation": {
+        "path": "/tmp/antfly-eg2-public-fixture-smoke-v2/validation.json",
+        "sha256": "472942f84300a5990e3acec66ba93ea53553e6666254999fc63a87f69d7ed665"
+      }
+    },
+    "real_training_microbatch_forward": {
+      "attention": "explicit-loaded-eager",
+      "candidate": "V12",
+      "exact_bf16_stages": 123,
+      "pass": true,
+      "raw": [
+        {
+          "path": "/tmp/eg2-v12-real-queries-eager-comparison.json",
+          "sha256": "7ee09a6fc1f5d3f0a5d5fed0ba7239f8bcf57c0f553193e7d0c09cdd78b12f0f"
+        },
+        {
+          "path": "/tmp/eg2-v12-real-documents-0-forward.json",
+          "sha256": "b1e009d0e4860c79e93bf62a4b3ee32f93cf3c9f906a4d26d1df25dba1222550"
+        },
+        {
+          "path": "/tmp/eg2-v12-real-documents-1-forward.json",
+          "sha256": "30235df3a24a181c8171d85b2da3d410a52b6fdc998e78a6111e2bca83ec7832"
+        }
+      ],
+      "shapes": [
+        "B2/S17 queries",
+        "B2/S22 documents",
+        "B2/S20 documents"
+      ],
+      "total_stages": 123
+    },
+    "reference_eager_preclip": {
+      "final_state_sha256": "94dd6d715ee9fffba1a4bef440375bca67472b821f2ebb31ed0ccf0edbb72e77",
+      "losses": [
+        0.12880191206932068,
+        0.154483824968338
+      ],
+      "pass": true,
+      "resume_raw": {
+        "path": "/tmp/antfly-eg2-training-reference-eager-preclip-v1/resume-qualified.json",
+        "sha256": "e7164a788aea365ecd3858b3928f6bc4007eefaa51843b511f9a77ee18696881"
+      },
+      "two_step_raw": {
+        "path": "/tmp/antfly-eg2-training-reference-eager-preclip-v1/reference-bf16-2step.json",
+        "sha256": "eba8a56568c843a6577a46a543d889128671296ba77e3a177e080741441ef1ee"
+      }
+    },
+    "v9_export_functional": {
+      "bounded_evaluator": {
+        "documents": 4,
+        "production_quality_eligible": false,
+        "qualification_scope": "bounded-candidate-corpus",
+        "queries": 4
+      },
+      "merged_artifact_pruned": {
+        "path": "/tmp/antfly-eg2-native-training-export-v9/merged-artifact-pruned.json",
+        "sha256": "ae677f381327d02bf347a4039cb61a3d40c130e06853bffff87d31d0176c812c"
+      },
+      "merged_bf16_model_sha256": "fe9f0974faba38bad8acdc6c62f34a76b5dbd61e429678128603b3f0c3c760b2",
+      "pass": true,
+      "peft_fp32_tensor_count": 338,
+      "provenance": {
+        "path": "/tmp/antfly-eg2-native-training-export-v9/antfly_finetune_provenance.json"
+      },
+      "scope": "historical-exact-V9-checkpoint-only"
+    }
+  },
+  "hardware": {
+    "gpu": "NVIDIA L4",
+    "qualification_scope": "single-SM89-device-development"
+  },
+  "production_qualified": false,
+  "raw_evidence_policy": "Volatile raw tensors and reports remain under /tmp and are identified by SHA-256. This compact repository index contains no full gradient tensors and makes no promotion claim.",
+  "reproducible_tools": [
+    "../finetune_reference.py",
+    "../generate_finetune_initial_adapter.py",
+    "../prepare_training_dataset.py",
+    "../validate_finetune_dataset.py",
+    "../qualify_finetune_numeric.py",
+    "../qualify_finetune_resume.py",
+    "../qualify_finetune_quality.py",
+    "../run_finetune_paired.py",
+    "../benchmark_finetune_paired.py",
+    "../evaluate_finetune_full_corpus.py"
+  ],
+  "reviewed_profile": {
+    "alpha": 32.0,
+    "compute_profile": "bf16-edges-fp32-masters-v1",
+    "gradient_trace_stage": "pre-clip",
+    "inputs": [
+      "text"
+    ],
+    "mrl_dimensions": [
+      128,
+      256,
+      512,
+      768
+    ],
+    "native_attention": "eager",
+    "numeric_reference_attention": "eager",
+    "padding_policy": "per-micro-active-v1",
+    "performance_reference_attention": "sdpa",
+    "precision": "bf16",
+    "rank": 16,
+    "tasks": [
+      "retrieval",
+      "code_retrieval"
+    ]
+  },
+  "schema_version": 1,
+  "scope": "EmbeddingGemma2 text/code LoRA training, checkpoint/resume, export, bounded evaluation, and qualification harness",
+  "status": "draft-unqualified",
+  "tests_current": {
+    "python_full_dependency_overlay": {
+      "passed": 55,
+      "skipped": 0
+    },
+    "zig_focused_targets": {
+      "passed": 95,
+      "targets": [
+        "test-embedding-gemma2-job",
+        "test-embedding-gemma2-graph",
+        "test-embedding-gemma2-model-training"
+      ]
+    }
+  }
+}

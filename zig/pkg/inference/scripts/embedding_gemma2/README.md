@@ -199,3 +199,234 @@ This is a draft-support result because the 44.1 kHz audio quality gate and the
 image throughput-confidence gate remain open. Forty-one of the 45 broader
 text matrix cells and secondary GPU architectures are unmeasured. Video and
 quantized tiers remain outside this release.
+
+## Text/code LoRA qualification
+
+Fine-tuning support uses a separate, fail-closed contract. The native job is
+CUDA-only, admits ranks 8/16/32 with finite alpha up to 1024 (the qualification
+lane uses rank 16/alpha 32), trains the text encoder and embedding projection,
+defaults to query/document caps of 128/512 tokens while admitting either cap
+up to 512, and
+optimizes the average contrastive loss over MRL dimensions 128/256/512/768.
+Export produces both PEFT-compatible FP32 adapter tensors and an atomically
+published merged BF16 bundle. The bundle pins the exact base revision and
+weight hash, copies the twelve executable sidecars, and advertises only the
+text input modality (including the code-retrieval task prefix). Media
+capability may be restored only after a separate
+tuned-checkpoint retention qualification.
+
+The public-data preparation manifest must pin dataset revision, configuration,
+license and snapshot digest. `validate_finetune_dataset.py` rejects normalized
+content overlap across train, validation and held-out splits, mining outside
+the training corpus, and known positives reused as negatives. Hard-negative
+mining therefore runs only over the immutable training split.
+
+`prepare_training_dataset.py` materializes a bounded functional public fixture
+from revision-pinned MS MARCO triplets, CodeSearchNet Python/Go, and the BEIR
+SciFact/NFCorpus corpus/query/qrels repositories. It streams the larger Hub
+datasets, excludes project groups across splits, merges duplicate normalized
+queries within a split, and decontaminates normalized query/positive content
+with held-out precedence. Source-provided MS MARCO negatives remain intact.
+The default CodeSearchNet fallback is deterministic cross-project sampling,
+not hard-negative mining. Pass `--frozen-base-model` with a local frozen
+SentenceTransformer bundle to select the highest-cosine admissible training
+candidate instead. The output remains a bounded fixture rather than an
+official benchmark run:
+
+The preserved initial smoke fixture records the older policy name
+`deterministic-train-only-v1`. The validator admits that name only when the
+manifest is explicitly bounded and makes no frozen-model mining claim. New
+fixtures use the more precise
+`deterministic-train-only-cross-group-random-v1` policy name; historical
+metadata is never rewritten or promoted to a hard-negative result.
+
+```sh
+python prepare_training_dataset.py \
+  --output-dir /absolute/path/to/public-fixture \
+  --train-cap 1000 --validation-cap 100 --test-cap 100 --seed 42 \
+  --frozen-base-model /absolute/path/to/embeddinggemma-2
+python validate_finetune_dataset.py \
+  --manifest /absolute/path/to/public-fixture/dataset_manifest.json \
+  --report /absolute/path/to/public-fixture/validation.json
+```
+
+The reference environment additionally pins `peft==0.21.2` and reads the
+authenticated native prepared shards directly, so both trainers consume the
+same token IDs, split order, hard-negative mask, and initialization:
+
+```sh
+python -m pip install --index-url https://download.pytorch.org/whl/cu130 \
+  'torch==2.14.0+cu130'
+python -m pip install -r requirements.txt
+python generate_finetune_initial_adapter.py \
+  --model /absolute/path/to/embeddinggemma-2 \
+  --output-dir /absolute/path/to/shared-initial-adapter \
+  --rank 16 --alpha 32 --seed 42
+python finetune_reference.py \
+  --model /absolute/path/to/embeddinggemma-2 \
+  --prepared-dir /absolute/path/to/native-prepared-shards \
+  --initial-adapter /absolute/path/to/shared-initial-adapter/adapter_model.safetensors \
+  --output /absolute/path/to/reference.json \
+  --steps 2 --total-steps 100 --precision bf16 --attention eager \
+  --trace-tensors-dir /absolute/path/to/reference-traces
+```
+
+The native commands are also available through the unified CLI. Copy
+`testdata/embeddinggemma2_lora_job.example.json`, replace its absolute paths,
+and run:
+
+```sh
+antfly-inference finetune dataset prepare embeddinggemma2-lora \
+  /absolute/path/to/embeddinggemma-2 retrieval.jsonl \
+  /absolute/path/to/native-prepared-shards \
+  --query-max-tokens 128 --document-max-tokens 512 --max-negatives 4 \
+  --source-manifest /absolute/path/to/public-fixture/dataset_manifest.json
+antfly-inference finetune train run embeddinggemma2 job.json
+# Resume into a fresh output_dir: copy job.json to resume-job.json and change
+# only output_dir. The semantic fingerprint permits this relocation while the
+# trainer still validates the same base, dataset, tokenizer, and job settings.
+antfly-inference finetune train run embeddinggemma2 resume-job.json \
+  --resume-from /absolute/path/to/checkpoint-N
+antfly-inference finetune adapter export embeddinggemma2-lora \
+  job.json /absolute/path/to/checkpoint-N /absolute/path/to/new-merged-bundle
+antfly-inference finetune eval run embeddinggemma2-retrieval \
+  job.json /absolute/path/to/new-merged-bundle --split validation --backend cuda
+```
+
+For public datasets, `--source-manifest` copies and hashes the exact validated
+multi-source manifest into the prepared bundle. Native preparation checks
+record content and train positive/negative inventories against that manifest.
+Opening prepared data verifies the bound copy before training; the prepared
+manifest hash carries this identity through checkpoint, resume, and export.
+Custom datasets may omit it, but cannot qualify as official public-source
+evidence. The optional `--source-repo` and `--source-revision` flags describe a
+single source and do not authenticate a mixed public fixture.
+
+The standalone evaluator scores only the candidate corpus present in the
+prepared shard. Its JSON therefore always records
+`qualification_scope="bounded-candidate-corpus"` and
+`production_quality_eligible=false`; it cannot be relabeled as an official
+full-corpus result. Promotion quality reports require the exact official
+MS MARCO, CodeSearchNet Python/Go, SciFact, and NFCorpus query/corpus/qrels
+identities and complete paired query coverage across every seed and MRL size.
+
+The export command validates the full 169-target layout and all 1,014 FP32
+master/AdamW tensors before it writes PEFT FP32 A/B weights and a merged BF16
+bundle atomically. Untouched base tensors remain byte-identical. The merged
+manifest authoritatively advertises only `inputs=["text"]`, so serving must
+reject image and audio requests. Reindex downstream corpora after changing from the
+base model to the tuned model; embeddings from those identities must not be
+mixed.
+
+`qualify_finetune_numeric.py` gates a tiny FP32 gradient case and at least two
+real BF16 optimizer steps, including resume-state equivalence.
+For numeric parity, `--trace-tensors-dir` writes embeddings, every adapter
+gradient, and post-step FP32 adapter masters to bounded SafeTensors files; the
+JSON report references those tensors instead of expanding them into text.
+`qualify_finetune_resume.py` first compares an uninterrupted report with the
+matching checkpoint/resume report; its two state hashes are then included in
+the native and reference numeric inputs.
+`qualify_finetune_quality.py` requires seeds 17/29/43 and every MRL dimension
+for MS MARCO, CodeSearchNet Python/Go, BEIR SciFact and NFCorpus.
+`evaluate_finetune_full_corpus.py evaluate` produces one official dataset,
+dimension, and seed cell from authenticated corpus/query/qrels JSONL files
+and separate native CUDA endpoints for the frozen base and tuned candidate.
+It retains bounded vector chunks and exact top-100 rankings, making one full
+corpus pass per query chunk. This trades additional embedding work for memory.
+Titles use the same document formatting as preparation; MRL truncation and
+normalization start from the full 768-vector. Query IDs, graded nDCG@10,
+MRR@10, Recall@100, and artifact provenance are preserved per query.
+
+The official evaluation manifest uses schema
+`antfly.embedding_gemma2.official_retrieval_sources.v1` and exact immutable
+corpus/query/qrels inventories for all five reviewed roles. It is distinct
+from the training-source manifest bound into prepared shards. The `merge`
+subcommand requires all 60 cells and per-seed checkpoint/model artifacts;
+the quality gate then checks their hashes and exact paired query coverage.
+Use `--help` on each subcommand for artifact and endpoint arguments. The
+performance gate similarly requires the measured native binary, its source
+manifest, and the reference source directory; bare passing report assertions
+cannot replace these inputs.
+
+`run_finetune_paired.py` launches both resident trainers from a manifest such
+as `{"cells":[{"id":"b2-q32-d64-n1","job":"/absolute/job.json","initial_adapter":"/absolute/shared-initial/adapter_model.safetensors"}]}`.
+It synchronizes the GPU before each timed step, alternates execution with a
+file grant, and holds each trainer at a second barrier until both timings are
+recorded. Tokenization, batch preparation, trace copies, and checkpoint I/O
+remain outside the interval. Smaller collections are protocol smoke tests;
+the production shape is exactly seven cells, at least one warmup, and 100
+measured pairs per cell. `benchmark_finetune_paired.py` validates those raw
+reports and requires matching hardware, dataset, job, initialization, rank,
+alpha, batch, token, and negative-count provenance. It enforces a throughput
+ratio lower 95% bound of 0.90, p95 ratio at most 1.10, 20 GiB device memory,
+and 8 GiB host memory.
+
+The seven production cells are frozen rather than supplied ad hoc:
+
+| Logical batch | Microbatch | Query cap | Document cap | Negatives | Rank | Alpha |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 16 | 2 | 32 | 128 | 0 | 16 | 32 |
+| 32 | 2 | 32 | 128 | 0 | 16 | 32 |
+| 64 | 2 | 32 | 128 | 0 | 16 | 32 |
+| 32 | 2 | 128 | 512 | 0 | 16 | 32 |
+| 64 | 2 | 128 | 512 | 0 | 16 | 32 |
+| 32 | 2 | 128 | 512 | 1 | 16 | 32 |
+| 64 | 2 | 128 | 512 | 4 | 16 | 32 |
+
+Every measured step must contain the full logical query batch and at least
+`batch * (1 + negatives)` distinct candidates. Mean active query and document
+lengths must each reach 90% of their configured cap. These requirements stop
+small or deduplicated fixtures from being reported as the reviewed batch,
+token, or hard-negative workload.
+
+The V22 native smoke completes two optimizer steps and passes the strict
+pre-clipping PyTorch gradient gate. Step-zero gradients are bit-identical;
+step one has cosine 0.99989947 and relative L2 1.41792%, within the unchanged
+0.999/2% global limits. Every active tensor passes the unchanged 0.98/10%
+per-tensor limits; all 1,356 numerical checks pass. Checkpoint/resume reproduces
+all 1,014 final-state tensors exactly. This gate covers the authenticated tiny
+BF16 case, rather than every admitted workload or a complete training run.
+
+The final generated SM89 artifact independently matches PyTorch for attention
+softmax forward/VJP at sequence lengths 17/20/22/32/64/128/512, including
+partial and fully masked batches. Masked pooling passes 66 shape/mask cases
+and the actual S22 training case. Contrastive loss and coefficients are exact
+across 44 shape/scale cases with F32 and BF16-rounded inputs, including odd
+query counts and production candidate counts, plus 14 target-only-mask cases.
+These corrections preserve the frozen inference path and match the reference
+reduction and rounding order at the training boundaries.
+
+The rebuilt exporter accumulates each complete FP32 LoRA delta before adding
+it once to the base weight and rounding to BF16. Independent PyTorch merge
+verification matches all 117,833,728 adapted elements across 169 targets;
+1,207 untouched tensors remain byte-identical. All 338 FP32 adapter tensors
+match checkpoint masters and reload exactly through PEFT. The final V22
+checkpoint is byte-identical to the checkpoint used for that verified export.
+Merged bundles retain the text-only capability restriction.
+
+Preparation, checkpoint, and export publish through exclusively created
+staging directories and clean up only directories they own. Canonical path
+checks reject output/input overlap through ancestors, symlinks, and `..`.
+Export also honors the configured host-memory ceiling with an explicit mmap
+reserve. Focused regressions cover these protections and the FP32 merge
+rounding boundary.
+
+The fresh V22 resident collector ran one warmup and two measured pairs with
+the compiler paused. Native steps took 143.01/91.68 ms versus
+1217.94/858.24 ms for explicitly loaded SDPA PyTorch. External peaks were
+1.040 GB device/0.828 GB host for native and 1.971 GB/2.406 GB for PyTorch.
+This small case has active queries of 16 tokens, mean active documents of
+21.33 tokens, and 4/2 deduplicated candidates across the measured steps.
+It verifies collection and artifact binding; it cannot satisfy the reviewed
+production workload, cell-count, or sample-count requirements.
+
+The focused Zig targets pass 100 checks, the serving text-only regression
+passes one additional check, and the Python harness suite passes all 55 tests.
+
+The current compact evidence index is
+[`results/finetune-l4-2026-10-09-draft.json`](results/finetune-l4-2026-10-09-draft.json).
+Historical development results remain in the October 8 index. Official
+full-corpus quality for all three seeds, the seven-cell 100-pair performance
+qualification, and numerical measurement on secondary GPU architectures
+remain unrun. The implementation remains unqualified for production until
+those required gates pass.

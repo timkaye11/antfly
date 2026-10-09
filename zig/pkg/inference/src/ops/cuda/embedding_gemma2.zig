@@ -40,10 +40,27 @@ pub const Attention = struct {
 pub const Stats = struct {
     launches: u64 = 0,
     cublaslt_matmuls: u64 = 0,
+    cublas_f32_matmuls: u64 = 0,
     attention_launches: u64 = 0,
     attention_scalar_fallbacks: u64 = 0,
     scalar_matmul_fallbacks: u64 = 0,
     output_bytes: u64 = 0,
+};
+
+pub const Contrastive = struct {
+    queries: u32,
+    candidates: u32,
+    width: u32,
+    temperature: f32,
+    objective_weight: f32,
+
+    pub fn validate(self: Contrastive) !void {
+        if (self.queries == 0 or self.queries > 64 or self.candidates == 0 or self.candidates > 384 or
+            self.width == 0 or self.width > 768 or !std.math.isFinite(self.temperature) or self.temperature <= 0 or
+            !std.math.isFinite(@as(f32, 1) / self.temperature) or
+            !std.math.isFinite(self.objective_weight) or self.objective_weight <= 0)
+            return error.InvalidEmbeddingGemma2TrainingShape;
+    }
 };
 
 pub const Module = struct {
@@ -54,18 +71,46 @@ pub const Module = struct {
     audio_glu_rows: driver.CUfunction,
     audio_depthwise_conv: driver.CUfunction,
     rms_norm: driver.CUfunction,
+    training_rms_norm: driver.CUfunction,
+    rms_norm_input_vjp: driver.CUfunction,
+    training_rms_norm_input_vjp: driver.CUfunction,
     rope: driver.CUfunction,
+    rope_vjp: driver.CUfunction,
+    training_rope: driver.CUfunction,
+    training_rope_vjp: driver.CUfunction,
     attention: driver.CUfunction,
     local_flash_attention: driver.CUfunction,
     attention_softmax: driver.CUfunction,
     matmul: driver.CUfunction,
     gelu_mul: driver.CUfunction,
+    gelu_mul_vjp: driver.CUfunction,
     bf16_to_f32: driver.CUfunction,
+    f32_to_bf16: driver.CUfunction,
+    training_pack_bhsd_bf16: driver.CUfunction,
+    training_unpack_bhsd_bf16: driver.CUfunction,
+    pack_bshd_bf16_f32: driver.CUfunction,
+    pack_bshd_f32: driver.CUfunction,
+    unpack_bhsd_f32: driver.CUfunction,
+    unpack_bhsd_f32_bf16: driver.CUfunction,
     scale: driver.CUfunction,
     scale_device: driver.CUfunction,
+    scale_device_f32_bf16: driver.CUfunction,
+    accumulate_f32: driver.CUfunction,
+    accumulate_bf16_boundary_f32: driver.CUfunction,
     gelu_ple: driver.CUfunction,
     residual: driver.CUfunction,
+    residual_vjp: driver.CUfunction,
+    contrastive_prob: driver.CUfunction,
+    contrastive_query_vjp: driver.CUfunction,
+    contrastive_candidate_vjp: driver.CUfunction,
+    training_contrastive_ce: driver.CUfunction,
+    training_softmax: driver.CUfunction,
+    training_softmax_vjp: driver.CUfunction,
     mean_l2: driver.CUfunction,
+    training_mean_l2: driver.CUfunction,
+    mean_l2_vjp: driver.CUfunction,
+    mrl_normalize: driver.CUfunction,
+    mrl_normalize_vjp: driver.CUfunction,
     stats_: Stats = .{},
 
     pub fn init(ctx: *Context) !Module {
@@ -84,18 +129,46 @@ pub const Module = struct {
             .audio_glu_rows = try function(ctx, m, "termite_gemma4_audio_glu_rows_f32"),
             .audio_depthwise_conv = try function(ctx, m, "termite_gemma4_audio_depthwise_causal_conv1d_f32"),
             .rms_norm = try function(ctx, m, "termite_embedding_gemma2_rms_norm_bf16"),
+            .training_rms_norm = try function(ctx, m, "termite_embedding_gemma2_training_rms_norm_bf16"),
+            .rms_norm_input_vjp = try function(ctx, m, "termite_embedding_gemma2_rms_norm_input_vjp_f32"),
+            .training_rms_norm_input_vjp = try function(ctx, m, "termite_embedding_gemma2_training_rms_norm_input_vjp_f32"),
             .rope = try function(ctx, m, "termite_embedding_gemma2_rope_bf16"),
+            .rope_vjp = try function(ctx, m, "termite_embedding_gemma2_rope_vjp_f32"),
+            .training_rope = try function(ctx, m, "termite_embedding_gemma2_training_rope_bf16"),
+            .training_rope_vjp = try function(ctx, m, "termite_embedding_gemma2_training_rope_vjp_f32"),
             .attention = try function(ctx, m, "termite_embedding_gemma2_attention_bf16"),
             .local_flash_attention = try function(ctx, m, "termite_embedding_gemma2_attention_local_flash_bf16"),
             .attention_softmax = try function(ctx, m, "termite_embedding_gemma2_attention_softmax_bf16"),
             .matmul = try function(ctx, m, "termite_embedding_gemma2_matmul_bf16"),
             .gelu_mul = try function(ctx, m, "termite_embedding_gemma2_gelu_mul_bf16"),
+            .gelu_mul_vjp = try function(ctx, m, "termite_embedding_gemma2_gelu_mul_vjp_f32"),
             .bf16_to_f32 = try function(ctx, m, "termite_embedding_gemma2_bf16_to_f32"),
+            .f32_to_bf16 = try function(ctx, m, "termite_embedding_gemma2_f32_to_bf16"),
+            .training_pack_bhsd_bf16 = try function(ctx, m, "termite_embedding_gemma2_training_pack_bhsd_bf16"),
+            .training_unpack_bhsd_bf16 = try function(ctx, m, "termite_embedding_gemma2_training_unpack_bhsd_bf16"),
+            .pack_bshd_bf16_f32 = try function(ctx, m, "termite_embedding_gemma2_pack_bshd_bf16_f32"),
+            .pack_bshd_f32 = try function(ctx, m, "termite_embedding_gemma2_pack_bshd_f32"),
+            .unpack_bhsd_f32 = try function(ctx, m, "termite_embedding_gemma2_unpack_bhsd_f32"),
+            .unpack_bhsd_f32_bf16 = try function(ctx, m, "termite_embedding_gemma2_unpack_bhsd_f32_bf16"),
             .scale = try function(ctx, m, "termite_embedding_gemma2_scale_bf16"),
             .scale_device = try function(ctx, m, "termite_embedding_gemma2_scale_device_bf16"),
+            .scale_device_f32_bf16 = try function(ctx, m, "termite_embedding_gemma2_scale_device_f32_bf16"),
+            .accumulate_f32 = try function(ctx, m, "termite_embedding_gemma2_accumulate_f32"),
+            .accumulate_bf16_boundary_f32 = try function(ctx, m, "termite_embedding_gemma2_accumulate_bf16_boundary_f32"),
             .gelu_ple = try function(ctx, m, "termite_embedding_gemma2_gelu_ple_bf16"),
             .residual = try function(ctx, m, "termite_embedding_gemma2_residual_bf16"),
+            .residual_vjp = try function(ctx, m, "termite_embedding_gemma2_residual_vjp_f32"),
+            .contrastive_prob = try function(ctx, m, "termite_embedding_gemma2_contrastive_prob_f32"),
+            .contrastive_query_vjp = try function(ctx, m, "termite_embedding_gemma2_contrastive_query_vjp_f32"),
+            .contrastive_candidate_vjp = try function(ctx, m, "termite_embedding_gemma2_contrastive_candidate_vjp_f32"),
+            .training_contrastive_ce = try function(ctx, m, "termite_embedding_gemma2_training_contrastive_ce_f32"),
+            .training_softmax = try function(ctx, m, "termite_embedding_gemma2_training_softmax_f32"),
+            .training_softmax_vjp = try function(ctx, m, "termite_embedding_gemma2_training_softmax_vjp_f32"),
             .mean_l2 = try function(ctx, m, "termite_embedding_gemma2_mean_l2_f32"),
+            .training_mean_l2 = try function(ctx, m, "termite_embedding_gemma2_training_mean_l2_f32"),
+            .mean_l2_vjp = try function(ctx, m, "termite_embedding_gemma2_mean_l2_vjp_f32"),
+            .mrl_normalize = try function(ctx, m, "termite_embedding_gemma2_mrl_normalize_f32"),
+            .mrl_normalize_vjp = try function(ctx, m, "termite_embedding_gemma2_mrl_normalize_vjp_f32"),
         };
     }
 
@@ -111,6 +184,9 @@ pub const Module = struct {
 
     pub fn noteCublasLtMatmul(self: *Module) void {
         self.stats_.cublaslt_matmuls += 1;
+    }
+    pub fn noteCublasF32Matmul(self: *Module) void {
+        self.stats_.cublas_f32_matmuls += 1;
     }
     pub fn noteAttentionFallback(self: *Module) void {
         self.stats_.attention_scalar_fallbacks += 1;
@@ -231,6 +307,7 @@ pub const Module = struct {
     }
 
     pub fn launchRmsNorm(self: *Module, ctx: *Context, out: Buffer, input: Buffer, weight: ?Buffer, rows: u32, width: u32, eps: f32) !void {
+        if (rows == 0 or width == 0 or !std.math.isFinite(eps) or eps <= 0) return error.InvalidEmbeddingGemma2Shape;
         const bytes = @as(usize, rows) * width * 2;
         try require(out, bytes);
         try require(input, bytes);
@@ -246,8 +323,70 @@ pub const Module = struct {
         self.stats_.launches += 1;
     }
 
+    pub fn launchTrainingRmsNorm(self: *Module, ctx: *Context, out: Buffer, input: Buffer, weight: ?Buffer, rows: u32, width: u32, eps: f32) !void {
+        if (rows == 0 or (width != 256 and width != 512) or !std.math.isFinite(eps) or eps <= 0) return error.InvalidEmbeddingGemma2Shape;
+        const bytes = try std.math.mul(usize, try std.math.mul(usize, rows, width), @sizeOf(u16));
+        try require(out, bytes);
+        try require(input, bytes);
+        if (weight) |wbuf| try require(wbuf, @as(usize, width) * 2);
+        const row_power = std.math.floorPowerOfTwo(u32, @min(rows, 16));
+        const block_height: u32 = @max(1, row_power);
+        const vectors = width / 4;
+        const block_width: u32 = @min(vectors, 512 / block_height);
+        var op = out.ptr;
+        var ip = input.ptr;
+        var wp = if (weight) |wbuf| wbuf.ptr else 0;
+        var r = rows;
+        var w = width;
+        var e = eps;
+        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&ip), @ptrCast(&wp), @ptrCast(&r), @ptrCast(&w), @ptrCast(&e) };
+        try launch(ctx, self.training_rms_norm, &args, .{ std.math.divCeil(u32, rows, block_height) catch return error.InvalidEmbeddingGemma2Shape, 1, 1 }, .{ block_width, block_height, 1 });
+        self.stats_.launches += 1;
+    }
+
+    pub fn launchRmsNormInputVjp(self: *Module, ctx: *Context, dx: Buffer, dy: Buffer, input: Buffer, weight: ?Buffer, rows: u32, width: u32, eps: f32) !void {
+        if (rows == 0 or width == 0 or !std.math.isFinite(eps) or eps <= 0) return error.InvalidEmbeddingGemma2Shape;
+        const count = std.math.mul(usize, rows, width) catch return error.InvalidEmbeddingGemma2Shape;
+        try require(dx, try std.math.mul(usize, count, @sizeOf(f32)));
+        try require(dy, try std.math.mul(usize, count, @sizeOf(f32)));
+        try require(input, try std.math.mul(usize, count, @sizeOf(u16)));
+        if (weight) |wbuf| try require(wbuf, try std.math.mul(usize, width, @sizeOf(u16)));
+        var dxp = dx.ptr;
+        var dyp = dy.ptr;
+        var xp = input.ptr;
+        var wp = if (weight) |wbuf| wbuf.ptr else 0;
+        var r = rows;
+        var w = width;
+        var e = eps;
+        var args = [_]?*anyopaque{ @ptrCast(&dxp), @ptrCast(&dyp), @ptrCast(&xp), @ptrCast(&wp), @ptrCast(&r), @ptrCast(&w), @ptrCast(&e) };
+        try launch(ctx, self.rms_norm_input_vjp, &args, .{ rows, 1, 1 }, .{ 256, 1, 1 });
+        self.stats_.launches += 1;
+    }
+
+    pub fn launchTrainingRmsNormInputVjp(self: *Module, ctx: *Context, dx: Buffer, dy: Buffer, input: Buffer, weight: ?Buffer, rows: u32, width: u32, eps: f32) !void {
+        if (rows == 0 or (width != 256 and width != 512) or !std.math.isFinite(eps) or eps <= 0) return error.InvalidEmbeddingGemma2Shape;
+        const count = try std.math.mul(usize, rows, width);
+        try require(dx, count * 4);
+        try require(dy, count * 4);
+        try require(input, count * 2);
+        if (weight) |wbuf| try require(wbuf, @as(usize, width) * 2);
+        const height: u32 = @max(1, std.math.floorPowerOfTwo(u32, @min(rows, 16)));
+        const block_width: u32 = @min(width / 4, 512 / height);
+        var dxp = dx.ptr;
+        var dyp = dy.ptr;
+        var xp = input.ptr;
+        var wp = if (weight) |wbuf| wbuf.ptr else 0;
+        var r = rows;
+        var w = width;
+        var e = eps;
+        var args = [_]?*anyopaque{ @ptrCast(&dxp), @ptrCast(&dyp), @ptrCast(&xp), @ptrCast(&wp), @ptrCast(&r), @ptrCast(&w), @ptrCast(&e) };
+        try launch(ctx, self.training_rms_norm_input_vjp, &args, .{ std.math.divCeil(u32, rows, height) catch return error.InvalidEmbeddingGemma2Shape, 1, 1 }, .{ block_width, height, 1 });
+        self.stats_.launches += 1;
+    }
+
     pub fn launchRope(self: *Module, ctx: *Context, q: Buffer, k: Buffer, mask: Buffer, shape: Attention, theta: f32, rope_scale: f32) !void {
         try shape.validate();
+        if (!std.math.isFinite(theta) or theta <= 0 or !std.math.isFinite(rope_scale) or rope_scale <= 0) return error.InvalidEmbeddingGemma2Shape;
         try require(q, @as(usize, shape.batch) * shape.seq * shape.q_heads * shape.head_dim * 2);
         try require(k, @as(usize, shape.batch) * shape.seq * shape.kv_heads * shape.head_dim * 2);
         if (mask.ptr != 0) try require(mask, @as(usize, shape.batch) * shape.seq * 8);
@@ -264,6 +403,80 @@ pub const Module = struct {
         var args = [_]?*anyopaque{ @ptrCast(&qp), @ptrCast(&kp), @ptrCast(&mp), @ptrCast(&b), @ptrCast(&s), @ptrCast(&qh), @ptrCast(&kh), @ptrCast(&d), @ptrCast(&t), @ptrCast(&rs) };
         const token_rows = try std.math.mul(u32, shape.batch, shape.seq);
         try launch(ctx, self.rope, &args, .{ token_rows, (shape.head_dim / 2 + 127) / 128, shape.q_heads }, .{ 128, 1, 1 });
+        self.stats_.launches += 1;
+    }
+
+    pub fn launchRopeVjp(self: *Module, ctx: *Context, dq: Buffer, dk: Buffer, dq_rotated: Buffer, dk_rotated: Buffer, mask: Buffer, shape: Attention, theta: f32, rope_scale: f32) !void {
+        try shape.validate();
+        if (!std.math.isFinite(theta) or theta <= 0 or !std.math.isFinite(rope_scale) or rope_scale <= 0) return error.InvalidEmbeddingGemma2Shape;
+        const q_count = std.math.mul(usize, try std.math.mul(usize, shape.batch, shape.seq), try std.math.mul(usize, shape.q_heads, shape.head_dim)) catch return error.InvalidEmbeddingGemma2Shape;
+        const kv_count = std.math.mul(usize, try std.math.mul(usize, shape.batch, shape.seq), try std.math.mul(usize, shape.kv_heads, shape.head_dim)) catch return error.InvalidEmbeddingGemma2Shape;
+        for ([_]Buffer{ dq, dq_rotated }) |buffer| try require(buffer, try std.math.mul(usize, q_count, @sizeOf(f32)));
+        for ([_]Buffer{ dk, dk_rotated }) |buffer| try require(buffer, try std.math.mul(usize, kv_count, @sizeOf(f32)));
+        if (mask.ptr != 0) try require(mask, try std.math.mul(usize, try std.math.mul(usize, shape.batch, shape.seq), @sizeOf(i64)));
+        var dqp = dq.ptr;
+        var dkp = dk.ptr;
+        var dqrp = dq_rotated.ptr;
+        var dkrp = dk_rotated.ptr;
+        var mp = mask.ptr;
+        var b = shape.batch;
+        var s = shape.seq;
+        var qh = shape.q_heads;
+        var kh = shape.kv_heads;
+        var d = shape.head_dim;
+        var t = theta;
+        var rs = rope_scale;
+        var args = [_]?*anyopaque{ @ptrCast(&dqp), @ptrCast(&dkp), @ptrCast(&dqrp), @ptrCast(&dkrp), @ptrCast(&mp), @ptrCast(&b), @ptrCast(&s), @ptrCast(&qh), @ptrCast(&kh), @ptrCast(&d), @ptrCast(&t), @ptrCast(&rs) };
+        const token_rows = try std.math.mul(u32, shape.batch, shape.seq);
+        try launch(ctx, self.rope_vjp, &args, .{ token_rows, (shape.head_dim / 2 + 127) / 128, shape.q_heads }, .{ 128, 1, 1 });
+        self.stats_.launches += 1;
+    }
+
+    pub fn launchTrainingRope(self: *Module, ctx: *Context, q: Buffer, k: Buffer, mask: Buffer, shape: Attention, theta: f32, rope_scale: f32) !void {
+        try shape.validate();
+        if (!std.math.isFinite(theta) or theta <= 0 or !std.math.isFinite(rope_scale) or rope_scale <= 0) return error.InvalidEmbeddingGemma2Shape;
+        try require(q, @as(usize, shape.batch) * shape.seq * shape.q_heads * shape.head_dim * 2);
+        try require(k, @as(usize, shape.batch) * shape.seq * shape.kv_heads * shape.head_dim * 2);
+        if (mask.ptr != 0) try require(mask, @as(usize, shape.batch) * shape.seq * 8);
+        var qp = q.ptr;
+        var kp = k.ptr;
+        var mp = mask.ptr;
+        var b = shape.batch;
+        var s = shape.seq;
+        var qh = shape.q_heads;
+        var kh = shape.kv_heads;
+        var d = shape.head_dim;
+        var t = theta;
+        var rs = rope_scale;
+        var args = [_]?*anyopaque{ @ptrCast(&qp), @ptrCast(&kp), @ptrCast(&mp), @ptrCast(&b), @ptrCast(&s), @ptrCast(&qh), @ptrCast(&kh), @ptrCast(&d), @ptrCast(&t), @ptrCast(&rs) };
+        const token_rows = try std.math.mul(u32, shape.batch, shape.seq);
+        try launch(ctx, self.training_rope, &args, .{ token_rows, (shape.head_dim / 2 + 127) / 128, shape.q_heads }, .{ 128, 1, 1 });
+        self.stats_.launches += 1;
+    }
+
+    pub fn launchTrainingRopeVjp(self: *Module, ctx: *Context, dq: Buffer, dk: Buffer, dq_rotated: Buffer, dk_rotated: Buffer, mask: Buffer, shape: Attention, theta: f32, rope_scale: f32) !void {
+        try shape.validate();
+        if (!std.math.isFinite(theta) or theta <= 0 or !std.math.isFinite(rope_scale) or rope_scale <= 0) return error.InvalidEmbeddingGemma2Shape;
+        const q_count = std.math.mul(usize, try std.math.mul(usize, shape.batch, shape.seq), try std.math.mul(usize, shape.q_heads, shape.head_dim)) catch return error.InvalidEmbeddingGemma2Shape;
+        const kv_count = std.math.mul(usize, try std.math.mul(usize, shape.batch, shape.seq), try std.math.mul(usize, shape.kv_heads, shape.head_dim)) catch return error.InvalidEmbeddingGemma2Shape;
+        for ([_]Buffer{ dq, dq_rotated }) |buffer| try require(buffer, try std.math.mul(usize, q_count, @sizeOf(f32)));
+        for ([_]Buffer{ dk, dk_rotated }) |buffer| try require(buffer, try std.math.mul(usize, kv_count, @sizeOf(f32)));
+        if (mask.ptr != 0) try require(mask, try std.math.mul(usize, try std.math.mul(usize, shape.batch, shape.seq), @sizeOf(i64)));
+        var dqp = dq.ptr;
+        var dkp = dk.ptr;
+        var dqrp = dq_rotated.ptr;
+        var dkrp = dk_rotated.ptr;
+        var mp = mask.ptr;
+        var b = shape.batch;
+        var s = shape.seq;
+        var qh = shape.q_heads;
+        var kh = shape.kv_heads;
+        var d = shape.head_dim;
+        var t = theta;
+        var rs = rope_scale;
+        var args = [_]?*anyopaque{ @ptrCast(&dqp), @ptrCast(&dkp), @ptrCast(&dqrp), @ptrCast(&dkrp), @ptrCast(&mp), @ptrCast(&b), @ptrCast(&s), @ptrCast(&qh), @ptrCast(&kh), @ptrCast(&d), @ptrCast(&t), @ptrCast(&rs) };
+        const token_rows = try std.math.mul(u32, shape.batch, shape.seq);
+        try launch(ctx, self.training_rope_vjp, &args, .{ token_rows, (shape.head_dim / 2 + 127) / 128, shape.q_heads }, .{ 128, 1, 1 });
         self.stats_.launches += 1;
     }
 
@@ -404,6 +617,22 @@ pub const Module = struct {
         try self.launch1d(ctx, self.gelu_mul, &args, count);
     }
 
+    pub fn launchGeluMulVjp(self: *Module, ctx: *Context, dgate: Buffer, dup: Buffer, dy: Buffer, gate: Buffer, up: Buffer, count: u32) !void {
+        if (count == 0) return error.InvalidEmbeddingGemma2Shape;
+        const f32_bytes = try std.math.mul(usize, count, @sizeOf(f32));
+        const bf16_bytes = try std.math.mul(usize, count, @sizeOf(u16));
+        for ([_]Buffer{ dgate, dup, dy }) |buffer| try require(buffer, f32_bytes);
+        for ([_]Buffer{ gate, up }) |buffer| try require(buffer, bf16_bytes);
+        var dgp = dgate.ptr;
+        var dup_ptr = dup.ptr;
+        var dyp = dy.ptr;
+        var gp = gate.ptr;
+        var uptr = up.ptr;
+        var n = count;
+        var args = [_]?*anyopaque{ @ptrCast(&dgp), @ptrCast(&dup_ptr), @ptrCast(&dyp), @ptrCast(&gp), @ptrCast(&uptr), @ptrCast(&n) };
+        try self.launch1d(ctx, self.gelu_mul_vjp, &args, count);
+    }
+
     pub fn launchBf16ToF32(self: *Module, ctx: *Context, out: Buffer, input: Buffer, count: u32) !void {
         try require(out, @as(usize, count) * @sizeOf(f32));
         try require(input, @as(usize, count) * @sizeOf(u16));
@@ -412,6 +641,15 @@ pub const Module = struct {
         var n = count;
         var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&ip), @ptrCast(&n) };
         try self.launch1d(ctx, self.bf16_to_f32, &args, count);
+    }
+    pub fn launchF32ToBf16(self: *Module, ctx: *Context, out: Buffer, input: Buffer, count: u32) !void {
+        try require(out, @as(usize, count) * @sizeOf(u16));
+        try require(input, @as(usize, count) * @sizeOf(f32));
+        var op = out.ptr;
+        var ip = input.ptr;
+        var n = count;
+        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&ip), @ptrCast(&n) };
+        try self.launch1d(ctx, self.f32_to_bf16, &args, count);
     }
     pub fn launchScale(self: *Module, ctx: *Context, out: Buffer, input: Buffer, count: u32, scale_value: f32) !void {
         const bytes = @as(usize, count) * 2;
@@ -452,7 +690,130 @@ pub const Module = struct {
         var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&rp), @ptrCast(&bp), @ptrCast(&pp), @ptrCast(&n), @ptrCast(&bs), @ptrCast(&ps) };
         try self.launch1d(ctx, self.residual, &args, count);
     }
+    pub fn launchResidualVjp(self: *Module, ctx: *Context, dresidual: Buffer, dbranch: Buffer, dout: Buffer, ple: ?Buffer, count: u32, branch_scale: f32, ple_scale: f32) !void {
+        if (count == 0 or !std.math.isFinite(branch_scale) or !std.math.isFinite(ple_scale)) return error.InvalidEmbeddingGemma2Shape;
+        const f32_bytes = try std.math.mul(usize, count, @sizeOf(f32));
+        for ([_]Buffer{ dresidual, dbranch, dout }) |buffer| try require(buffer, f32_bytes);
+        if (ple) |p| try require(p, try std.math.mul(usize, count, @sizeOf(u16)));
+        var drp = dresidual.ptr;
+        var dbp = dbranch.ptr;
+        var dop = dout.ptr;
+        var pp = if (ple) |p| p.ptr else 0;
+        var n = count;
+        var bs = branch_scale;
+        var ps = ple_scale;
+        var args = [_]?*anyopaque{ @ptrCast(&drp), @ptrCast(&dbp), @ptrCast(&dop), @ptrCast(&pp), @ptrCast(&n), @ptrCast(&bs), @ptrCast(&ps) };
+        try self.launch1d(ctx, self.residual_vjp, &args, count);
+    }
+    pub fn launchContrastive(self: *Module, ctx: *Context, probabilities: Buffer, losses: Buffer, dqueries: Buffer, dcandidates: Buffer, queries: Buffer, candidates: Buffer, valid: Buffer, targets: Buffer, shape: Contrastive, loss_scale: f32) !void {
+        try shape.validate();
+        if (!std.math.isFinite(loss_scale) or loss_scale <= 0) return error.InvalidEmbeddingGemma2TrainingShape;
+        const probability_count = try std.math.mul(usize, shape.queries, shape.candidates);
+        const query_count = try std.math.mul(usize, shape.queries, shape.width);
+        const candidate_count = try std.math.mul(usize, shape.candidates, shape.width);
+        try require(probabilities, try std.math.mul(usize, probability_count, @sizeOf(f32)));
+        try require(losses, try std.math.mul(usize, shape.queries, @sizeOf(f32)));
+        try require(dqueries, try std.math.mul(usize, query_count, @sizeOf(f32)));
+        try require(dcandidates, try std.math.mul(usize, candidate_count, @sizeOf(f32)));
+        try require(queries, try std.math.mul(usize, query_count, @sizeOf(f32)));
+        try require(candidates, try std.math.mul(usize, candidate_count, @sizeOf(f32)));
+        if (valid.ptr != 0) try require(valid, probability_count);
+        try require(targets, try std.math.mul(usize, shape.queries, @sizeOf(u32)));
+        var pp = probabilities.ptr;
+        var lp = losses.ptr;
+        var dqp = dqueries.ptr;
+        var dcp = dcandidates.ptr;
+        var qp = queries.ptr;
+        var cp = candidates.ptr;
+        var vp = valid.ptr;
+        var tp = targets.ptr;
+        var q = shape.queries;
+        var c = shape.candidates;
+        var w = shape.width;
+        var inverse_temperature: f32 = 1.0 / shape.temperature;
+        var objective_weight = shape.objective_weight;
+        var probability_args = [_]?*anyopaque{ @ptrCast(&pp), @ptrCast(&lp), @ptrCast(&qp), @ptrCast(&cp), @ptrCast(&vp), @ptrCast(&tp), @ptrCast(&q), @ptrCast(&c), @ptrCast(&w), @ptrCast(&inverse_temperature), @ptrCast(&objective_weight) };
+        try launchShared(ctx, self.contrastive_prob, &probability_args, .{ q, 1, 1 }, .{ 256, 1, 1 }, 8 * @sizeOf(f32));
+        const gradient_scale = loss_scale * objective_weight * inverse_temperature / @as(f32, @floatFromInt(shape.queries));
+        var gs = gradient_scale;
+        var query_args = [_]?*anyopaque{ @ptrCast(&dqp), @ptrCast(&pp), @ptrCast(&cp), @ptrCast(&tp), @ptrCast(&q), @ptrCast(&c), @ptrCast(&w), @ptrCast(&gs) };
+        try launch(ctx, self.contrastive_query_vjp, &query_args, .{ (w + 255) / 256, q, 1 }, .{ 256, 1, 1 });
+        var candidate_args = [_]?*anyopaque{ @ptrCast(&dcp), @ptrCast(&pp), @ptrCast(&qp), @ptrCast(&tp), @ptrCast(&q), @ptrCast(&c), @ptrCast(&w), @ptrCast(&gs) };
+        try launch(ctx, self.contrastive_candidate_vjp, &candidate_args, .{ (w + 255) / 256, c, 1 }, .{ 256, 1, 1 });
+        self.stats_.launches += 3;
+    }
+    pub fn launchContrastiveCoefficients(self: *Module, ctx: *Context, coefficients: Buffer, losses: Buffer, logits: Buffer, valid: Buffer, targets: Buffer, shape: Contrastive, loss_scale: f32) !void {
+        try shape.validate();
+        if (!std.math.isFinite(loss_scale) or loss_scale <= 0) return error.InvalidEmbeddingGemma2TrainingShape;
+        const count = try std.math.mul(usize, shape.queries, shape.candidates);
+        const bytes = try std.math.mul(usize, count, @sizeOf(f32));
+        try require(coefficients, bytes);
+        try require(logits, bytes);
+        try require(losses, try std.math.mul(usize, shape.queries, @sizeOf(f32)));
+        if (valid.ptr != 0) try require(valid, count);
+        try require(targets, try std.math.mul(usize, shape.queries, @sizeOf(u32)));
+        var cp = coefficients.ptr;
+        var lp = losses.ptr;
+        var ip = logits.ptr;
+        var vp = valid.ptr;
+        var tp = targets.ptr;
+        var q = shape.queries;
+        var c = shape.candidates;
+        var inverse_temperature: f32 = 1.0 / shape.temperature;
+        var objective_weight = shape.objective_weight;
+        var scale = loss_scale;
+        var args = [_]?*anyopaque{ @ptrCast(&cp), @ptrCast(&lp), @ptrCast(&ip), @ptrCast(&vp), @ptrCast(&tp), @ptrCast(&q), @ptrCast(&c), @ptrCast(&inverse_temperature), @ptrCast(&objective_weight), @ptrCast(&scale) };
+        var lanes: u32 = 1;
+        while (lanes < c and lanes < 32) lanes *= 2;
+        try launchShared(ctx, self.training_contrastive_ce, &args, .{ q, 1, 1 }, .{ lanes, 1, 1 }, 0);
+        self.stats_.launches += 1;
+    }
+
+    pub fn launchTrainingSoftmax(self: *Module, ctx: *Context, probabilities: Buffer, scores: Buffer, mask: Buffer, shape: Attention) !void {
+        try shape.validate();
+        if (shape.seq > 512) return error.InvalidEmbeddingGemma2TrainingShape;
+        const elements = std.math.mul(usize, try std.math.mul(usize, shape.batch, shape.q_heads), try std.math.mul(usize, shape.seq, shape.seq)) catch return error.InvalidEmbeddingGemma2TrainingShape;
+        const bytes = try std.math.mul(usize, elements, @sizeOf(f32));
+        try require(probabilities, bytes);
+        try require(scores, bytes);
+        if (mask.ptr != 0) try require(mask, try std.math.mul(usize, try std.math.mul(usize, shape.batch, shape.seq), @sizeOf(i64)));
+        var pp = probabilities.ptr;
+        var sp = scores.ptr;
+        var mp = mask.ptr;
+        var b = shape.batch;
+        var s = shape.seq;
+        var h = shape.q_heads;
+        var radius = shape.local_radius;
+        var args = [_]?*anyopaque{ @ptrCast(&pp), @ptrCast(&sp), @ptrCast(&mp), @ptrCast(&b), @ptrCast(&s), @ptrCast(&h), @ptrCast(&radius) };
+        try launchShared(ctx, self.training_softmax, &args, .{ s, h, b }, .{ 32, 1, 1 }, 0);
+        self.stats_.launches += 1;
+    }
+    pub fn launchTrainingSoftmaxVjp(self: *Module, ctx: *Context, dscores: Buffer, dprobabilities: Buffer, probabilities: Buffer, shape: Attention) !void {
+        try shape.validate();
+        if (shape.seq > 512) return error.InvalidEmbeddingGemma2TrainingShape;
+        const elements = std.math.mul(usize, try std.math.mul(usize, shape.batch, shape.q_heads), try std.math.mul(usize, shape.seq, shape.seq)) catch return error.InvalidEmbeddingGemma2TrainingShape;
+        const bytes = try std.math.mul(usize, elements, @sizeOf(f32));
+        for ([_]Buffer{ dscores, dprobabilities, probabilities }) |buffer| try require(buffer, bytes);
+        var dsp = dscores.ptr;
+        var dpp = dprobabilities.ptr;
+        var pp = probabilities.ptr;
+        var b = shape.batch;
+        var s = shape.seq;
+        var h = shape.q_heads;
+        var args = [_]?*anyopaque{ @ptrCast(&dsp), @ptrCast(&dpp), @ptrCast(&pp), @ptrCast(&b), @ptrCast(&s), @ptrCast(&h) };
+        try launchShared(ctx, self.training_softmax_vjp, &args, .{ s, h, b }, .{ 32, 1, 1 }, 0);
+        self.stats_.launches += 1;
+    }
     pub fn launchMeanL2(self: *Module, ctx: *Context, out: Buffer, projected: Buffer, mask: Buffer, batch: u32, seq: u32, width: u32) !void {
+        return self.launchMeanL2Impl(ctx, self.mean_l2, out, projected, mask, batch, seq, width);
+    }
+
+    pub fn launchTrainingMeanL2(self: *Module, ctx: *Context, out: Buffer, projected: Buffer, mask: Buffer, batch: u32, seq: u32, width: u32) !void {
+        if (batch == 0 or batch > 2 or seq == 0 or seq > 512 or width != 768) return error.InvalidEmbeddingGemma2TrainingShape;
+        return self.launchMeanL2Impl(ctx, self.training_mean_l2, out, projected, mask, batch, seq, width);
+    }
+
+    fn launchMeanL2Impl(self: *Module, ctx: *Context, kernel: driver.CUfunction, out: Buffer, projected: Buffer, mask: Buffer, batch: u32, seq: u32, width: u32) !void {
         try require(out, @as(usize, batch) * width * 4);
         try require(projected, @as(usize, batch) * seq * width * 2);
         if (mask.ptr != 0) try require(mask, @as(usize, batch) * seq * 8);
@@ -463,9 +824,165 @@ pub const Module = struct {
         var s = seq;
         var w = width;
         var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&pp), @ptrCast(&mp), @ptrCast(&b), @ptrCast(&s), @ptrCast(&w) };
-        try launch(ctx, self.mean_l2, &args, .{ batch, 1, 1 }, .{ 256, 1, 1 });
+        try launch(ctx, kernel, &args, .{ batch, 1, 1 }, .{ 256, 1, 1 });
         self.stats_.launches += 1;
         self.stats_.output_bytes += @as(u64, batch) * width * 4;
+    }
+    pub fn launchMeanL2Vjp(self: *Module, ctx: *Context, dprojected: Buffer, dembedding: Buffer, projected: Buffer, mask: Buffer, batch: u32, seq: u32, width: u32) !void {
+        if (batch == 0 or batch > 2 or seq == 0 or seq > 512 or width != 768) return error.InvalidEmbeddingGemma2TrainingShape;
+        const projected_elements = std.math.mul(usize, try std.math.mul(usize, batch, seq), width) catch return error.InvalidEmbeddingGemma2TrainingShape;
+        try require(dprojected, try std.math.mul(usize, projected_elements, @sizeOf(f32)));
+        try require(projected, try std.math.mul(usize, projected_elements, @sizeOf(u16)));
+        try require(dembedding, try std.math.mul(usize, try std.math.mul(usize, batch, width), @sizeOf(f32)));
+        if (mask.ptr != 0) try require(mask, try std.math.mul(usize, try std.math.mul(usize, batch, seq), @sizeOf(i64)));
+        var dp = dprojected.ptr;
+        var de = dembedding.ptr;
+        var p = projected.ptr;
+        var m = mask.ptr;
+        var b = batch;
+        var s = seq;
+        var w = width;
+        var args = [_]?*anyopaque{ @ptrCast(&dp), @ptrCast(&de), @ptrCast(&p), @ptrCast(&m), @ptrCast(&b), @ptrCast(&s), @ptrCast(&w) };
+        try launchShared(ctx, self.mean_l2_vjp, &args, .{ batch, 1, 1 }, .{ 256, 1, 1 }, 16 * @sizeOf(f32));
+        self.stats_.launches += 1;
+    }
+    pub fn launchScaleDeviceF32Bf16(self: *Module, ctx: *Context, out: Buffer, input: Buffer, scale: Buffer, count: usize) !void {
+        if (count == 0 or count > std.math.maxInt(u32)) return error.InvalidEmbeddingGemma2TrainingShape;
+        try require(out, try std.math.mul(usize, count, @sizeOf(f32)));
+        try require(input, try std.math.mul(usize, count, @sizeOf(f32)));
+        try require(scale, @sizeOf(u16));
+        var op = out.ptr;
+        var ip = input.ptr;
+        var sp = scale.ptr;
+        var n: u32 = @intCast(count);
+        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&ip), @ptrCast(&sp), @ptrCast(&n) };
+        try self.launch1d(ctx, self.scale_device_f32_bf16, &args, count);
+    }
+    pub fn launchAccumulateF32(self: *Module, ctx: *Context, destination: Buffer, source: Buffer, count: usize) !void {
+        if (count == 0 or count > std.math.maxInt(u32)) return error.InvalidEmbeddingGemma2TrainingShape;
+        const bytes = try std.math.mul(usize, count, @sizeOf(f32));
+        try require(destination, bytes);
+        try require(source, bytes);
+        var dp = destination.ptr;
+        var sp = source.ptr;
+        var n: u32 = @intCast(count);
+        var args = [_]?*anyopaque{ @ptrCast(&dp), @ptrCast(&sp), @ptrCast(&n) };
+        try self.launch1d(ctx, self.accumulate_f32, &args, count);
+    }
+
+    pub fn launchAccumulateBf16BoundaryF32(self: *Module, ctx: *Context, destination: Buffer, source: Buffer, count: usize) !void {
+        const bytes = std.math.mul(usize, count, @sizeOf(f32)) catch return error.InvalidEmbeddingGemma2TrainingShape;
+        try require(destination, bytes);
+        try require(source, bytes);
+        const count32 = std.math.cast(u32, count) orelse return error.InvalidEmbeddingGemma2TrainingShape;
+        var dp = destination.ptr;
+        var sp = source.ptr;
+        var n = count32;
+        var args = [_]?*anyopaque{ @ptrCast(&dp), @ptrCast(&sp), @ptrCast(&n) };
+        try self.launch1d(ctx, self.accumulate_bf16_boundary_f32, &args, count32);
+    }
+    pub fn launchPackBshdBf16F32(self: *Module, ctx: *Context, out: Buffer, input: Buffer, batch: u32, sequence: u32, heads: u32, dim: u32) !void {
+        const count = try attentionTensorCount(batch, sequence, heads, dim);
+        try require(out, try std.math.mul(usize, count, @sizeOf(f32)));
+        try require(input, try std.math.mul(usize, count, @sizeOf(u16)));
+        var op = out.ptr;
+        var ip = input.ptr;
+        var b = batch;
+        var s = sequence;
+        var h = heads;
+        var d = dim;
+        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&ip), @ptrCast(&b), @ptrCast(&s), @ptrCast(&h), @ptrCast(&d) };
+        try self.launch1d(ctx, self.pack_bshd_bf16_f32, &args, count);
+    }
+    pub fn launchTrainingPackBhsdBf16(self: *Module, ctx: *Context, out: Buffer, input: Buffer, batch: u32, sequence: u32, source_heads: u32, target_heads: u32, dim: u32, input_f32: bool) !void {
+        if (source_heads == 0 or target_heads % source_heads != 0) return error.InvalidEmbeddingGemma2TrainingShape;
+        const source_count = try attentionTensorCount(batch, sequence, source_heads, dim);
+        const count = try attentionTensorCount(batch, sequence, target_heads, dim);
+        try require(out, try std.math.mul(usize, count, @sizeOf(u16)));
+        try require(input, try std.math.mul(usize, source_count, if (input_f32) @sizeOf(f32) else @sizeOf(u16)));
+        var op = out.ptr;
+        var ip = input.ptr;
+        var b = batch;
+        var s = sequence;
+        var sh = source_heads;
+        var th = target_heads;
+        var d = dim;
+        var f: u32 = @intFromBool(input_f32);
+        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&ip), @ptrCast(&b), @ptrCast(&s), @ptrCast(&sh), @ptrCast(&th), @ptrCast(&d), @ptrCast(&f) };
+        try self.launch1d(ctx, self.training_pack_bhsd_bf16, &args, count);
+    }
+
+    pub fn launchTrainingUnpackBhsdBf16(self: *Module, ctx: *Context, out: Buffer, input: Buffer, batch: u32, sequence: u32, source_heads: u32, target_heads: u32, dim: u32, output_f32: bool) !void {
+        if (target_heads == 0 or source_heads % target_heads != 0) return error.InvalidEmbeddingGemma2TrainingShape;
+        const source_count = try attentionTensorCount(batch, sequence, source_heads, dim);
+        const count = try attentionTensorCount(batch, sequence, target_heads, dim);
+        try require(input, try std.math.mul(usize, source_count, @sizeOf(u16)));
+        try require(out, try std.math.mul(usize, count, if (output_f32) @sizeOf(f32) else @sizeOf(u16)));
+        var op = out.ptr;
+        var ip = input.ptr;
+        var b = batch;
+        var s = sequence;
+        var sh = source_heads;
+        var th = target_heads;
+        var d = dim;
+        var f: u32 = @intFromBool(output_f32);
+        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&ip), @ptrCast(&b), @ptrCast(&s), @ptrCast(&sh), @ptrCast(&th), @ptrCast(&d), @ptrCast(&f) };
+        try self.launch1d(ctx, self.training_unpack_bhsd_bf16, &args, count);
+    }
+
+    pub fn launchPackBshdF32(self: *Module, ctx: *Context, out: Buffer, input: Buffer, batch: u32, sequence: u32, heads: u32, dim: u32) !void {
+        const count = try attentionTensorCount(batch, sequence, heads, dim);
+        const bytes = try std.math.mul(usize, count, @sizeOf(f32));
+        try require(out, bytes);
+        try require(input, bytes);
+        var op = out.ptr;
+        var ip = input.ptr;
+        var b = batch;
+        var s = sequence;
+        var h = heads;
+        var d = dim;
+        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&ip), @ptrCast(&b), @ptrCast(&s), @ptrCast(&h), @ptrCast(&d) };
+        try self.launch1d(ctx, self.pack_bshd_f32, &args, count);
+    }
+    pub fn launchUnpackBhsdF32(self: *Module, ctx: *Context, out: Buffer, input: Buffer, batch: u32, sequence: u32, heads: u32, dim: u32, bf16: bool) !void {
+        const count = try attentionTensorCount(batch, sequence, heads, dim);
+        try require(out, try std.math.mul(usize, count, if (bf16) @sizeOf(u16) else @sizeOf(f32)));
+        try require(input, try std.math.mul(usize, count, @sizeOf(f32)));
+        var op = out.ptr;
+        var ip = input.ptr;
+        var b = batch;
+        var s = sequence;
+        var h = heads;
+        var d = dim;
+        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&ip), @ptrCast(&b), @ptrCast(&s), @ptrCast(&h), @ptrCast(&d) };
+        try self.launch1d(ctx, if (bf16) self.unpack_bhsd_f32_bf16 else self.unpack_bhsd_f32, &args, count);
+    }
+    pub fn launchMrlNormalize(self: *Module, ctx: *Context, out: Buffer, input: Buffer, rows: u32, width: u32) !void {
+        if (rows == 0 or rows > 384 or width == 0 or width > 768) return error.InvalidEmbeddingGemma2TrainingShape;
+        try require(input, try std.math.mul(usize, try std.math.mul(usize, rows, 768), @sizeOf(f32)));
+        try require(out, try std.math.mul(usize, try std.math.mul(usize, rows, width), @sizeOf(f32)));
+        var op = out.ptr;
+        var ip = input.ptr;
+        var r = rows;
+        var w = width;
+        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&ip), @ptrCast(&r), @ptrCast(&w) };
+        try launchShared(ctx, self.mrl_normalize, &args, .{ rows, 1, 1 }, .{ 256, 1, 1 }, 8 * @sizeOf(f32));
+        self.stats_.launches += 1;
+    }
+    pub fn launchMrlNormalizeVjp(self: *Module, ctx: *Context, dinput: Buffer, dout: Buffer, input: Buffer, rows: u32, width: u32, objective_weight: f32) !void {
+        if (rows == 0 or rows > 384 or width == 0 or width > 768 or !std.math.isFinite(objective_weight)) return error.InvalidEmbeddingGemma2TrainingShape;
+        try require(dinput, try std.math.mul(usize, try std.math.mul(usize, rows, 768), @sizeOf(f32)));
+        try require(input, try std.math.mul(usize, try std.math.mul(usize, rows, 768), @sizeOf(f32)));
+        try require(dout, try std.math.mul(usize, try std.math.mul(usize, rows, width), @sizeOf(f32)));
+        var dip = dinput.ptr;
+        var dop = dout.ptr;
+        var ip = input.ptr;
+        var r = rows;
+        var w = width;
+        var weight = objective_weight;
+        var args = [_]?*anyopaque{ @ptrCast(&dip), @ptrCast(&dop), @ptrCast(&ip), @ptrCast(&r), @ptrCast(&w), @ptrCast(&weight) };
+        try launchShared(ctx, self.mrl_normalize_vjp, &args, .{ rows, 1, 1 }, .{ 256, 1, 1 }, 16 * @sizeOf(f32));
+        self.stats_.launches += 1;
     }
     fn launch1d(self: *Module, ctx: *Context, f: driver.CUfunction, args: []?*anyopaque, n: usize) !void {
         if (n == 0) return;
@@ -473,6 +990,13 @@ pub const Module = struct {
         self.stats_.launches += 1;
     }
 };
+
+fn attentionTensorCount(batch: u32, sequence: u32, heads: u32, dim: u32) !usize {
+    if (batch == 0 or batch > 2 or sequence == 0 or sequence > 512 or heads == 0 or heads > 4 or (dim != 256 and dim != 512))
+        return error.InvalidEmbeddingGemma2TrainingShape;
+    const rows = std.math.mul(usize, batch, sequence) catch return error.InvalidEmbeddingGemma2TrainingShape;
+    return std.math.mul(usize, try std.math.mul(usize, rows, heads), dim) catch error.InvalidEmbeddingGemma2TrainingShape;
+}
 
 fn function(ctx: *Context, m: driver.CUmodule, name: [:0]const u8) !driver.CUfunction {
     var f: driver.CUfunction = null;
@@ -497,4 +1021,11 @@ test "EmbeddingGemma 2 attention shape contract" {
     try (Attention{ .batch = 1, .seq = 8192, .q_heads = 4, .kv_heads = 2, .head_dim = 256, .local_radius = 512 }).validate();
     try (Attention{ .batch = 2, .seq = 17, .q_heads = 4, .kv_heads = 1, .head_dim = 512, .local_radius = 0 }).validate();
     try std.testing.expectError(error.InvalidEmbeddingGemma2Shape, (Attention{ .batch = 1, .seq = 8193, .q_heads = 4, .kv_heads = 2, .head_dim = 256, .local_radius = 512 }).validate());
+}
+
+test "EmbeddingGemma 2 resident contrastive objective bounds logical batch" {
+    try (Contrastive{ .queries = 64, .candidates = 384, .width = 768, .temperature = 0.05, .objective_weight = 0.25 }).validate();
+    try std.testing.expectError(error.InvalidEmbeddingGemma2TrainingShape, (Contrastive{ .queries = 65, .candidates = 384, .width = 768, .temperature = 0.05, .objective_weight = 0.25 }).validate());
+    try std.testing.expectError(error.InvalidEmbeddingGemma2TrainingShape, (Contrastive{ .queries = 1, .candidates = 1, .width = 768, .temperature = 0, .objective_weight = 1 }).validate());
+    try std.testing.expectError(error.InvalidEmbeddingGemma2TrainingShape, (Contrastive{ .queries = 1, .candidates = 1, .width = 769, .temperature = 0.05, .objective_weight = 1 }).validate());
 }

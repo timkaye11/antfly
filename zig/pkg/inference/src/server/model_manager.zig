@@ -2847,6 +2847,8 @@ pub const LoadedModel = struct {
             .resident_qwen3_embedding = isJinaStyleEmbeddingManifest(&self.manifest),
             .resident_text_encoder = resident_text_encoder,
             .resident_embedding_gemma2 = self.manifest.embedding_style == .embedding_gemma2,
+            .allow_image = self.manifest.inputs.len == 0 or model_caps.modelAcceptsInput(&self.manifest, "image"),
+            .allow_audio = self.manifest.inputs.len == 0 or model_caps.modelAcceptsInput(&self.manifest, "audio"),
             .strict_max_length = self.manifest.embedding_style == .embedding_gemma2,
             .preprocess_io = self.executor_io,
             // Last-token pooling reads the EOS position; guarantee exactly

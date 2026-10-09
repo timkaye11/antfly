@@ -2328,6 +2328,75 @@ pub const CudaCompute = struct {
         return &self.embedding_gemma2.?;
     }
 
+    /// Narrow resident-training access.  Callers must release every returned
+    /// buffer through the paired method; allocation remains charged to the
+    /// same CUDA session cache and run budget as inference.
+    pub fn allocEmbeddingGemma2TrainingBuffer(self: *CudaCompute, bytes: usize) !buffer_mod.DeviceBuffer {
+        if (self.capability_profile != .embedding_gemma2 or bytes == 0) return error.InvalidEmbeddingGemma2TrainingShape;
+        return allocDeviceBuffer(self, bytes);
+    }
+
+    pub fn releaseEmbeddingGemma2TrainingBuffer(self: *CudaCompute, value: *buffer_mod.DeviceBuffer) void {
+        releaseDeviceBuffer(self, value);
+    }
+
+    pub fn embeddingGemma2TrainingContext(self: *CudaCompute) *context_mod.CudaContext {
+        return &self.ctx;
+    }
+
+    pub const EmbeddingGemma2TrainingAllocationStats = struct {
+        limit: usize,
+        live: usize,
+        peak: usize,
+    };
+
+    /// Applies to every physical DeviceBuffer owned by this CUDA context,
+    /// including loaded base weights, BF16 mirrors, adapter state, tape, and
+    /// cached temporaries. Driver/library-private allocations remain outside
+    /// this meter and require deployment headroom.
+    pub fn setEmbeddingGemma2TrainingDeviceLimit(self: *CudaCompute, bytes: usize) !void {
+        if (self.capability_profile != .embedding_gemma2) return error.InvalidEmbeddingGemma2TrainingShape;
+        try self.ctx.device_allocations.setLimit(bytes);
+    }
+
+    pub fn embeddingGemma2TrainingAllocationStats(self: *CudaCompute) EmbeddingGemma2TrainingAllocationStats {
+        const value = self.ctx.device_allocations.snapshot();
+        return .{ .limit = value.limit, .live = value.live, .peak = value.peak };
+    }
+
+    pub fn embeddingGemma2TrainingCublasLt(self: *CudaCompute) !*cublaslt_mod.CublasLt {
+        if (self.capability_profile != .embedding_gemma2) return error.InvalidEmbeddingGemma2TrainingShape;
+        return if (self.cublaslt) |*value| value else error.CublasLtUnavailable;
+    }
+
+    pub fn embeddingGemma2TrainingBlas(self: *CudaCompute) !*@import("libraries.zig").CublasF32 {
+        if (self.capability_profile != .embedding_gemma2) return error.InvalidEmbeddingGemma2TrainingShape;
+        return trainingBlas(self);
+    }
+
+    pub fn synchronizeEmbeddingGemma2Training(self: *CudaCompute) !void {
+        try self.ctx.synchronize();
+    }
+
+    pub fn fillEmbeddingGemma2TrainingF32(self: *CudaCompute, value: buffer_mod.DeviceBuffer, count: usize, scalar: f32) !void {
+        if (self.capability_profile != .embedding_gemma2 or count == 0 or count > std.math.maxInt(u32))
+            return error.InvalidEmbeddingGemma2TrainingShape;
+        const bytes = std.math.mul(usize, count, @sizeOf(f32)) catch return error.InvalidEmbeddingGemma2TrainingShape;
+        if (bytes > value.len or !std.math.isFinite(scalar)) return error.InvalidEmbeddingGemma2TrainingShape;
+        try self.kernels.launchFillF32(&self.ctx, value, count, scalar);
+    }
+
+    pub fn convertEmbeddingGemma2TrainingF32ToBf16(self: *CudaCompute, output: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, count: usize) !void {
+        if (self.capability_profile != .embedding_gemma2 or count == 0) return error.InvalidEmbeddingGemma2TrainingShape;
+        const kernel_count = std.math.cast(u32, count) orelse return error.InvalidEmbeddingGemma2TrainingShape;
+        const input_bytes = std.math.mul(usize, count, @sizeOf(f32)) catch return error.InvalidEmbeddingGemma2TrainingShape;
+        const output_bytes = std.math.mul(usize, count, @sizeOf(u16)) catch return error.InvalidEmbeddingGemma2TrainingShape;
+        if (input.ptr == 0 or output.ptr == 0 or input.len < input_bytes or output.len < output_bytes)
+            return error.InvalidEmbeddingGemma2TrainingShape;
+        const module = try self.embeddingGemma2Module();
+        try module.launchF32ToBf16(&self.ctx, output, input, kernel_count);
+    }
+
     /// Narrow bridge used by the dedicated architecture. It preserves the
     /// opaque ComputeTensor API everywhere else while keeping this resident
     /// path free of host staging.
@@ -2339,7 +2408,7 @@ pub const CudaCompute = struct {
         return tensorFromCt(try getWeight(self, name));
     }
 
-    fn embeddingGemma2Bf16Weight(self: *CudaCompute, name: []const u8) !buffer_mod.DeviceBuffer {
+    pub fn embeddingGemma2Bf16Weight(self: *CudaCompute, name: []const u8) !buffer_mod.DeviceBuffer {
         const tensor = try self.embeddingGemma2Weight(name);
         if (tensor.dtype == .bf16) return tensor.buffer;
         if (tensor.bf16_mirror.ptr != 0 and tensor.bf16_mirror.len >= tensor.elem_count * @sizeOf(u16)) return tensor.bf16_mirror;
@@ -2355,6 +2424,14 @@ pub const CudaCompute = struct {
         self.stats.bf16_mirror_weight_count += 1;
         self.stats.bf16_mirror_weight_bytes += mirror.len;
         return mirror;
+    }
+
+    pub fn scaleEmbeddingGemma2TrainingF32(self: *CudaCompute, output: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, count: usize, scalar: f32) !void {
+        if (self.capability_profile != .embedding_gemma2 or count == 0 or count > std.math.maxInt(u32) or !std.math.isFinite(scalar))
+            return error.InvalidEmbeddingGemma2TrainingShape;
+        const bytes = std.math.mul(usize, count, @sizeOf(f32)) catch return error.InvalidEmbeddingGemma2TrainingShape;
+        if (output.len < bytes or input.len < bytes) return error.InvalidEmbeddingGemma2TrainingShape;
+        try self.kernels.launchScaleF32(&self.ctx, output, input, count, scalar);
     }
 
     fn validateEmbeddingGemma2WeightShape(self: *CudaCompute, name: []const u8, expected: []const i64) !void {
@@ -2414,6 +2491,23 @@ pub const CudaCompute = struct {
         const owned_shape = try self.allocator.dupe(i64, shape);
         errdefer self.allocator.free(owned_shape);
         return createTensorWithDType(self, device, owned_shape, count, dtype);
+    }
+
+    pub fn borrowEmbeddingGemma2TrainingF32(self: *CudaCompute, device: buffer_mod.DeviceBuffer, element_count: usize) !CT {
+        const bytes = std.math.mul(usize, element_count, @sizeOf(f32)) catch return error.InvalidEmbeddingGemma2TrainingShape;
+        if (self.capability_profile != .embedding_gemma2 or device.ptr == 0 or element_count == 0 or device.len < bytes)
+            return error.InvalidEmbeddingGemma2TrainingShape;
+        const shape = try self.allocator.alloc(i64, 1);
+        errdefer self.allocator.free(shape);
+        shape[0] = std.math.cast(i64, element_count) orelse return error.InvalidEmbeddingGemma2TrainingShape;
+        const tensor = try createTensorWithDType(self, device, shape, element_count, .f32);
+        const handle = tensorFromCt(tensor);
+        handle.owns_buffer = false;
+        // The seeded transaction validates ownership before invoking the
+        // resident CUDA optimizer. This borrowed view belongs to this compute
+        // session even though its underlying slab remains state-owned.
+        handle.resident_owner = self;
+        return tensor;
     }
 
     pub const EmbeddingGemma2Input = union(enum) {
@@ -4019,17 +4113,19 @@ pub const CudaCompute = struct {
     }
 
     pub fn insertBf16WeightFromTensor(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
+        // This API consumes the key on every path. Keeping ownership here
+        // makes loader error handling unambiguous and avoids both early-path
+        // leaks and caller-side double frees after a map insertion failure.
+        errdefer self.allocator.free(owned_key);
         if (tensor.dtype != .bf16) return error.UnsupportedTensorType;
         const elem_count = tensor.elementCount();
         if (tensor.data.len != elem_count * @sizeOf(u16)) return error.InvalidShape;
         const shape = try self.allocator.dupe(i64, tensor.shape);
         errdefer self.allocator.free(shape);
         var device = try allocDeviceBuffer(self, tensor.data.len);
-        errdefer device.free(&self.ctx);
+        errdefer releaseDeviceBuffer(self, &device);
         try copyFromHostTracked(self, device, tensor.data);
         try synchronizeAndDrainDeferredDeviceFrees(self);
-        self.stats.resident_weight_bytes += tensor.data.len;
-        errdefer self.allocator.free(owned_key);
         try self.resident_weights.put(self.allocator, owned_key, .{
             .buffer = device,
             .dtype = .bf16,
@@ -4040,6 +4136,7 @@ pub const CudaCompute = struct {
             .owns_shape = false,
             .owned_by_tensor = false,
         });
+        self.stats.resident_weight_bytes += tensor.data.len;
     }
 
     pub fn insertF16WeightFromTensor(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
@@ -7826,7 +7923,7 @@ fn embeddingGemma2Attention(
                 const k_view = buffer_mod.DeviceBuffer{ .ptr = k.ptr + kv_offset, .len = k.len - kv_offset };
                 const v_view = buffer_mod.DeviceBuffer{ .ptr = v.ptr + kv_offset, .len = v.len - kv_offset };
                 const out_view = buffer_mod.DeviceBuffer{ .ptr = out.ptr + out_offset, .len = out.len - out_offset };
-                blas.matmulEmbeddingGemma2Attention(&self.ctx, scores, q_view, k_view, workspace, tile_rows, seq, dim, q_heads * dim, kv_heads * dim, seq, heads_per_kv, dim, 0, score_stride, true, true, 1.0) catch {
+                blas.matmulEmbeddingGemma2Attention(&self.ctx, scores, q_view, k_view, workspace, tile_rows, seq, dim, q_heads * dim, kv_heads * dim, seq, heads_per_kv, dim, 0, score_stride, false, true, true, 1.0) catch {
                     failed = true;
                     break :outer;
                 };
@@ -7835,7 +7932,7 @@ fn embeddingGemma2Attention(
                     failed = true;
                     break :outer;
                 };
-                blas.matmulEmbeddingGemma2Attention(&self.ctx, out_view, probs, v_view, workspace, tile_rows, dim, seq, seq, kv_heads * dim, q_heads * dim, heads_per_kv, score_stride, 0, dim, false, false, 1.0) catch {
+                blas.matmulEmbeddingGemma2Attention(&self.ctx, out_view, probs, v_view, workspace, tile_rows, dim, seq, seq, kv_heads * dim, q_heads * dim, heads_per_kv, score_stride, 0, dim, false, false, false, 1.0) catch {
                     failed = true;
                     break :outer;
                 };
@@ -19531,9 +19628,9 @@ fn sdpaEmbeddingGemma2Vision(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, batc
         const out_view: buffer_mod.DeviceBuffer = .{ .ptr = device.ptr + out_bytes, .len = device.len - out_bytes };
         // The projector pre-multiplies Q by sqrt(64); alpha restores the
         // official scale-1 attention logits.
-        try blas.matmulEmbeddingGemma2Attention(&self.ctx, scores, q_view, k_bf16, workspace, rows, seq_len, head_dim, hidden, hidden, seq_len, num_heads, head_dim, head_dim, score_stride, true, true, 1.0 / 8.0);
+        try blas.matmulEmbeddingGemma2Attention(&self.ctx, scores, q_view, k_bf16, workspace, rows, seq_len, head_dim, hidden, hidden, seq_len, num_heads, head_dim, head_dim, score_stride, false, true, true, 1.0 / 8.0);
         try module.launchAttentionSoftmax(&self.ctx, probs, scores, .{}, @intCast(seq_len), @intCast(qt), @intCast(rows), 0, @intCast(num_heads), @intCast(tile));
-        try blas.matmulEmbeddingGemma2Attention(&self.ctx, out_view, probs, v_bf16, workspace, rows, head_dim, seq_len, seq_len, hidden, hidden, num_heads, score_stride, head_dim, head_dim, false, true, 1.0);
+        try blas.matmulEmbeddingGemma2Attention(&self.ctx, out_view, probs, v_bf16, workspace, rows, head_dim, seq_len, seq_len, hidden, hidden, num_heads, score_stride, head_dim, head_dim, false, false, true, 1.0);
     }
     self.stats.launch_attention += 1;
     const result = try createTensor(self, device, shape, count);

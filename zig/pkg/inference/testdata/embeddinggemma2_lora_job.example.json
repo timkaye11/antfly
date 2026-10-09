@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "backend": "cuda",
+  "model_dir": "/absolute/path/to/embeddinggemma-2",
+  "prepared_dir": "/absolute/path/to/native-prepared-shards",
+  "output_dir": "/absolute/path/to/native-training-run",
+  "device_id": 0,
+  "lora": {
+    "rank": 16,
+    "alpha": 32.0,
+    "dropout": 0.0,
+    "targets": "encoder_and_embedding_projection"
+  },
+  "logical_batch_size": 64,
+  "microbatch_size": 2,
+  "query_max_tokens": 128,
+  "document_max_tokens": 512,
+  "max_negatives": 4,
+  "temperature": 0.05,
+  "epochs": 1,
+  "seed": 42,
+  "checkpoint_every_steps": 50,
+  "max_device_bytes": 21474836480,
+  "max_host_bytes": 8589934592
+}

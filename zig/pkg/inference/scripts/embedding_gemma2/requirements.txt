@@ -6,6 +6,8 @@
 torch==2.14.0
 transformers @ git+https://github.com/huggingface/transformers.git@a96730c8c97b8efbf35bbaf7f5da33ec99231a49
 sentence-transformers==6.1.0
+peft==0.21.2
+datasets==4.4.1
 pillow==12.3.0
 numpy==2.4.6
 scipy==1.17.1

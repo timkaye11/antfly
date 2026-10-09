@@ -1019,6 +1019,7 @@ pub const CublasLt = struct {
         stride_a_usize: usize,
         stride_b_usize: usize,
         stride_d_usize: usize,
+        transpose_a: bool,
         transpose_b: bool,
         output_f32: bool,
         alpha_value: f32,
@@ -1026,9 +1027,11 @@ pub const CublasLt = struct {
         try self.validateContext(ctx);
         if (rows == 0 or n == 0 or k == 0 or batch_count_usize == 0 or batch_count_usize > std.math.maxInt(i32))
             return error.CublasLtUnsupported;
+        const a_rows = if (transpose_a) k else rows;
+        const a_cols = if (transpose_a) rows else k;
         const b_rows = if (transpose_b) n else k;
         const b_cols = if (transpose_b) k else n;
-        if (lda < k or ldb < b_cols or ldd < n) return error.CublasLtUnsupported;
+        if (lda < a_cols or ldb < b_cols or ldd < n) return error.CublasLtUnsupported;
         const lda_i64 = std.math.cast(i64, lda) orelse return error.CublasLtUnsupported;
         const ldb_i64 = std.math.cast(i64, ldb) orelse return error.CublasLtUnsupported;
         const ldd_i64 = std.math.cast(i64, ldd) orelse return error.CublasLtUnsupported;
@@ -1039,8 +1042,8 @@ pub const CublasLt = struct {
         const output_type = if (output_f32) CUDA_R_32F else CUDA_R_16BF;
         const output_bytes_per_element: usize = if (output_f32) 4 else 2;
         const a_last_batch = std.math.mul(usize, batch_count_usize - 1, stride_a_usize) catch return error.CublasLtUnsupported;
-        const a_last_row = std.math.mul(usize, rows - 1, lda) catch return error.CublasLtUnsupported;
-        const a_elements = std.math.add(usize, std.math.add(usize, a_last_batch, a_last_row) catch return error.CublasLtUnsupported, k) catch return error.CublasLtUnsupported;
+        const a_last_row = std.math.mul(usize, a_rows - 1, lda) catch return error.CublasLtUnsupported;
+        const a_elements = std.math.add(usize, std.math.add(usize, a_last_batch, a_last_row) catch return error.CublasLtUnsupported, a_cols) catch return error.CublasLtUnsupported;
         const b_last_batch = std.math.mul(usize, batch_count_usize - 1, stride_b_usize) catch return error.CublasLtUnsupported;
         const b_last_row = std.math.mul(usize, b_rows - 1, ldb) catch return error.CublasLtUnsupported;
         const b_elements = std.math.add(usize, std.math.add(usize, b_last_batch, b_last_row) catch return error.CublasLtUnsupported, b_cols) catch return error.CublasLtUnsupported;
@@ -1066,11 +1069,11 @@ pub const CublasLt = struct {
         var pref: MatmulPreference = null;
         try self.check(self.fns.cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F));
         defer _ = self.fns.cublasLtMatmulDescDestroy(op);
-        var ta: c_int = CUBLAS_OP_N;
+        var ta: c_int = if (transpose_a) CUBLAS_OP_T else CUBLAS_OP_N;
         var tb: c_int = if (transpose_b) CUBLAS_OP_T else CUBLAS_OP_N;
         try self.check(self.fns.cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &ta, @sizeOf(c_int)));
         try self.check(self.fns.cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &tb, @sizeOf(c_int)));
-        try self.check(self.fns.cublasLtMatrixLayoutCreate(&ad, CUDA_R_16BF, rows, k, lda_i64));
+        try self.check(self.fns.cublasLtMatrixLayoutCreate(&ad, CUDA_R_16BF, a_rows, a_cols, lda_i64));
         defer _ = self.fns.cublasLtMatrixLayoutDestroy(ad);
         try self.check(self.fns.cublasLtMatrixLayoutCreate(&bd, CUDA_R_16BF, b_rows, b_cols, ldb_i64));
         defer _ = self.fns.cublasLtMatrixLayoutDestroy(bd);

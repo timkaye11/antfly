@@ -128,6 +128,10 @@ pub const EmbeddingConfig = struct {
     resident_text_encoder: bool = false,
     /// Bidirectional EmbeddingGemma 2 uses its own resident encoder contract.
     resident_embedding_gemma2: bool = false,
+    /// Authoritative manifest input restrictions apply before media decoding,
+    /// including native mixed-content and direct CLI pipeline entrypoints.
+    allow_image: bool = true,
+    allow_audio: bool = true,
     /// Reject context overflow instead of allowing tokenizer truncation.
     strict_max_length: bool = false,
     /// For CLIP/SigLIP multimodal models: image size for vision encoder.
@@ -406,6 +410,8 @@ pub const EmbeddingPipeline = struct {
         for (inputs) |item| {
             if (item.content.len == 0) return error.EmptyEmbeddingInput;
             for (item.content) |part| if (part != .text) {
+                if ((part == .image and !self.config.allow_image) or
+                    (part == .audio and !self.config.allow_audio)) return error.UnsupportedInput;
                 text_only = false;
             };
         }
@@ -997,6 +1003,7 @@ pub const EmbeddingPipeline = struct {
     };
 
     pub fn embedImagesReported(self: *EmbeddingPipeline, images: []const []const u8) anyerror!ImageBatchResult {
+        if (images.len > 0 and !self.config.allow_image) return error.UnsupportedInput;
         if (images.len == 0) return .{ .vectors = try self.allocator.alloc([]f32, 0), .execution = .serial };
         if (self.config.resident_embedding_gemma2) {
             const parts = try self.allocator.alloc(EmbeddingContentPart, images.len);
@@ -1024,6 +1031,7 @@ pub const EmbeddingPipeline = struct {
     /// Native broker entry point: invalid media occupies an indexed error slot
     /// and never enters the encoder. Healthy rows retain their original order.
     pub fn embedImagesIndexed(self: *EmbeddingPipeline, images: []const []const u8, errors: []?anyerror) !ImageBatchResult {
+        if (images.len > 0 and !self.config.allow_image) return error.UnsupportedInput;
         if (errors.len != images.len) return error.InvalidInputShape;
         if (images.len == 0) return .{ .vectors = try self.allocator.alloc([]f32, 0), .execution = .serial };
         if (self.config.resident_embedding_gemma2) {
@@ -1441,6 +1449,7 @@ pub const EmbeddingPipeline = struct {
     /// Embed a batch of supported encoded audio clips, returning [batch][embed_dim] embeddings.
     /// Requires an audio_session (CLAP model).
     pub fn embedAudio(self: *EmbeddingPipeline, audio_clips: []const []const u8) ![][]f32 {
+        if (audio_clips.len > 0 and !self.config.allow_audio) return error.UnsupportedInput;
         if (audio_clips.len > 0 and !self.config.resident_embedding_gemma2) {
             const audio_session = self.audio_session orelse if (sessionHasInput(self.session, "input_features")) self.session else return error.NoAudioSession;
             const feature_plan = try clapBatchPlan(audio_session, audio_clips.len);
@@ -1461,6 +1470,7 @@ pub const EmbeddingPipeline = struct {
         self: *EmbeddingPipeline,
         audio_clips: []const EncodedAudioClip,
     ) ![][]f32 {
+        if (audio_clips.len > 0 and !self.config.allow_audio) return error.UnsupportedInput;
         if (audio_clips.len == 0) return try self.allocator.alloc([]f32, 0);
         if (self.config.resident_embedding_gemma2) {
             const parts = try self.allocator.alloc(EmbeddingContentPart, audio_clips.len);
@@ -1512,6 +1522,7 @@ pub const EmbeddingPipeline = struct {
     /// feature scratch share one budget. Flush a window before decoding the
     /// next clip when it does not fit, without retrying a failed model forward.
     pub fn embedEncodedAudioIndexed(self: *EmbeddingPipeline, clips: []const EncodedAudioClip, errors: []?anyerror) !ImageBatchResult {
+        if (clips.len > 0 and !self.config.allow_audio) return error.UnsupportedInput;
         if (errors.len != clips.len) return error.InvalidInputShape;
         if (self.config.resident_embedding_gemma2) {
             const parts = try self.allocator.alloc(EmbeddingContentPart, clips.len);
@@ -1602,6 +1613,7 @@ pub const EmbeddingPipeline = struct {
         self: *EmbeddingPipeline,
         audio_clips: []const audio.PcmAudioInterleaved,
     ) ![][]f32 {
+        if (audio_clips.len > 0 and !self.config.allow_audio) return error.UnsupportedInput;
         if (audio_clips.len == 0) return try self.allocator.alloc([]f32, 0);
 
         const audio_session = self.audio_session orelse if (sessionHasInput(self.session, "input_features")) self.session else return error.NoAudioSession;
@@ -1654,6 +1666,7 @@ pub const EmbeddingPipeline = struct {
     }
 
     pub fn embedAudioPcmReported(self: *EmbeddingPipeline, audio_clips: []const audio.PcmAudio) anyerror!ImageBatchResult {
+        if (audio_clips.len > 0 and !self.config.allow_audio) return error.UnsupportedInput;
         if (audio_clips.len == 0) return .{ .vectors = try self.allocator.alloc([]f32, 0), .execution = .serial };
         try self.lockExecution();
         defer self.unlockExecution();
@@ -3799,6 +3812,21 @@ test "audio microbatch isolates corrupt clips and bounds decoded windows" {
     try std.testing.expectEqual(@as(usize, 0), fake.collapsed_batch_attempts);
     try std.testing.expectEqual(@as(usize, 2), fake.run_count);
     try std.testing.expectEqual(.fallback, result.execution);
+}
+
+test "text-only embedding capability rejects media before decoder or backend access" {
+    var pipeline: EmbeddingPipeline = undefined;
+    pipeline.allocator = std.testing.allocator;
+    pipeline.config = .{ .allow_image = false, .allow_audio = false, .resident_embedding_gemma2 = true };
+    const malformed = [_][]const u8{"this must never reach a decoder"};
+    var errors = [_]?anyerror{null};
+    try std.testing.expectError(error.UnsupportedInput, pipeline.embedImagesReported(&malformed));
+    try std.testing.expectError(error.UnsupportedInput, pipeline.embedImagesIndexed(&malformed, &errors));
+    try std.testing.expectError(error.UnsupportedInput, pipeline.embedAudio(&malformed));
+    try std.testing.expectError(error.UnsupportedInput, pipeline.embedEncodedAudio(&.{.{ .bytes = malformed[0] }}));
+    try std.testing.expectError(error.UnsupportedInput, pipeline.embedEncodedAudioIndexed(&.{.{ .bytes = malformed[0] }}, &errors));
+    try std.testing.expectError(error.UnsupportedInput, pipeline.embedContent(&.{.{ .content = &.{.{ .image = malformed[0] }} }}));
+    try std.testing.expectError(error.UnsupportedInput, pipeline.embedContent(&.{.{ .content = &.{.{ .audio = .{ .bytes = malformed[0] } }} }}));
 }
 
 test "selectProjectedOutput skips collapsed pooled output for image batch" {
