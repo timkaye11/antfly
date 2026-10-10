@@ -123,6 +123,42 @@ test('compatibility entrypoints enforce task and head restrictions', { skip: !wa
   } finally { runtime.unload(); }
 });
 
+test('legacy classification rejects omitted and empty labels during validation and execution', { skip: !wasmPath, timeout: 120000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'antfly-web-legacy-'));
+  const runtime = await session();
+  try {
+    // Sparse FP16 data exercises the full legacy inventory without retaining
+    // hundreds of megabytes on the JS heap. Invalid requests run no encoder.
+    const inventory = await readFile(new URL('../src/web/extraction_span_inventory.zig', import.meta.url), 'utf8');
+    const header = {}; let offset = 0;
+    for (const [, name, dims] of inventory.matchAll(/\.name = "([^"]+)", \.shape = &\.\{([^}]*)\}/g)) {
+      const shape = dims.split(',').map(Number), size = shape.reduce((a, b) => a * b, 1) * 2;
+      const canonical = /^(encoder\.|embeddings\.)/.test(name) ? `encoder.${name}` : name;
+      header[canonical] = { dtype: 'F16', shape, data_offsets: [offset, offset + size] };
+      offset += size;
+    }
+    const bytes = Buffer.from(JSON.stringify(header)), prefix = Buffer.alloc(8);
+    prefix.writeBigUInt64LE(BigInt(bytes.length));
+    const path = join(directory, 'model.safetensors'), file = await open(path, 'w');
+    try { await file.write(prefix); await file.write(bytes); await file.truncate(8 + bytes.length + offset); }
+    finally { await file.close(); }
+    const files = new Map([
+      ['config.json', json({ model_type: 'extractor', model_name: 'microsoft/deberta-v3-base', max_width: 8 })],
+      ['encoder_config/config.json', json({ model_type: 'deberta-v2', hidden_size: 768, num_hidden_layers: 12, num_attention_heads: 12, intermediate_size: 3072, vocab_size: 128011, max_position_embeddings: 512 })],
+      ['tokenizer_config.json', json({})], ['tokenizer.json', layaFixture().get('tokenizer.json')],
+      ['model.safetensors', await openAsBlob(path)],
+    ]);
+    await runtime.load(files, 'fp16');
+    const request = { schema_version: 1, model: 'local', text: 'state', task: 'classification' };
+    for (const labels of [undefined, []]) for (const task of ['extract', undefined]) for (const validate of [true, false]) {
+      const invalid = labels === undefined ? request : { ...request, labels };
+      assert.throws(() => runtime.run(invalid, validate, task), /NoLabelsProvided/);
+      assert(runtime.handle, 'invalid requests preserve the loaded model');
+    }
+    assert.equal(runtime.run({ ...request, labels: ['search', 'fetch'] }, true, 'extract').value.valid, true);
+  } finally { runtime.unload(); await rm(directory, { recursive: true, force: true }); }
+});
+
 // Sparse files keep the fixed 24-layer/262144-token checkpoint fixture off
 // the JS heap. Nonzero embeddings/projection exercise every real encoder op.
 async function embeddingFixture(directory) {

@@ -97,6 +97,7 @@ pub fn run(a: std.mem.Allocator, compute: *WasmCompute, config: Config, tok: Tok
     const req = parsed.value;
     if (req.schema_version != 1) return error.UnsupportedExtractionSchemaVersion;
     if (req.text.len > 256 * 1024 or req.labels.len > 128 or req.relation_labels.len > 64) return error.ExtractionRequestLimitExceeded;
+    if (req.task == .classification and req.labels.len == 0) return error.NoLabelsProvided;
     if (!std.math.isFinite(req.threshold) or req.threshold < 0 or req.threshold > 1) return error.InvalidExtractionThreshold;
     const schema_json = try std.json.Stringify.valueAlloc(a, .{ .labels = req.labels, .relation_labels = req.relation_labels, .schema = req.schema }, .{});
     defer a.free(schema_json);
