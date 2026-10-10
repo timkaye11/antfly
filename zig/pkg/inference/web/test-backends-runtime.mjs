@@ -83,6 +83,46 @@ test('ModernBERT marker and boundary execute extraction and typed decisions', { 
   } finally { runtime.unload(); }
 });
 
+test('compatibility entrypoints enforce task and head restrictions', { skip: !wasmPath }, async () => {
+  const runtime = await session();
+  const extraction = { schema_version: 2, model: 'local', inputs: [{ content: 'state state' }], schema: { classifications: [{ name: 'tool', mode: 'single', labels: ['search', 'fetch'] }] } };
+  try {
+    for (const declaration of [
+      { tasks: ['decide'], capabilities: ['typed_decisions'] },
+      { tasks: ['extract'], capabilities: ['extraction'] },
+    ]) {
+      const files = await modernFixture(true);
+      files.set('model_manifest.json', json(declaration));
+      await runtime.load(files, 'fp32');
+      for (const task of ['extract', undefined]) for (const validate of [false, true]) {
+        assert.throws(() => runtime.run(extraction, validate, task), /UnsupportedInferenceTask|UnsupportedExtractionFeature/);
+      }
+      if (declaration.tasks.includes('decide')) assert.equal(runtime.run(request, false, 'decide').value.answers[0].choice, 'search');
+      runtime.unload();
+    }
+    for (const boundary of [false, true]) {
+      const files = await modernFixture(boundary);
+      files.set('model_manifest.json', json({ tasks: ['extract', 'decide'], capabilities: ['typed_decisions'] }));
+      const loaded = await runtime.load(files, 'fp32');
+      assert.deepEqual(loaded.execution.tasks, ['decide']);
+      for (const task of ['extract', undefined]) assert.throws(() => runtime.run(extraction, true, task), /UnsupportedInferenceTask/);
+      runtime.unload();
+    }
+    const files = await modernFixture(true);
+    files.set('antfly_catalog.json', json({ tasks: ['extract'], capabilities: ['classification'] }));
+    const loaded = await runtime.load(files, 'fp32');
+    assert.deepEqual(loaded.execution.capabilities, ['classification']);
+    for (const task of ['extract', undefined]) assert.equal(runtime.run(extraction, false, task).value.data[0].classifications[0].label, 'search');
+    assert.throws(() => runtime.run(request, true, 'decide'), /UnsupportedInferenceTask/);
+    runtime.unload();
+    // Older Laya envelopes still work under the decider role correction.
+    await runtime.load(layaFixture(), 'fp32');
+    const legacy = { schema_version: 2, model: 'local', inputs: [{ content: 'state state' }], schema: { classifications: [{ name: 'tool', instruction: 'question', mode: 'single', labels: ['search', 'fetch'] }] } };
+    assert.equal(runtime.run(legacy, true).value.valid, true);
+    assert.equal(runtime.run(legacy, false).value.data.length, 1);
+  } finally { runtime.unload(); }
+});
+
 // Sparse files keep the fixed 24-layer/262144-token checkpoint fixture off
 // the JS heap. Nonzero embeddings/projection exercise every real encoder op.
 async function embeddingFixture(directory) {

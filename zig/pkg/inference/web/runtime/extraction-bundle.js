@@ -40,7 +40,24 @@ export async function readJson(files, path, max = 1024 * 1024) {
   if (!file || file.size > max) throw new Error(`Missing or oversized ${path}`);
   return JSON.parse(await file.text());
 }
-export async function inspectBundle(input, precision) {
+// Catalog restrictions remain separate from pinned model manifests. Neither
+// declaration can broaden the other when both specify the same field.
+export async function readModelManifest(files) {
+  const manifest = files.has('model_manifest.json') ? await readJson(files, 'model_manifest.json') : undefined;
+  if (!files.has('antfly_catalog.json')) return manifest;
+  const catalog = await readJson(files, 'antfly_catalog.json', 65536);
+  const result = { ...manifest };
+  for (const key of ['tasks', 'capabilities']) {
+    const values = catalog[key];
+    if (values === undefined) continue;
+    if (!Array.isArray(values) || values.some(v => typeof v !== 'string')) throw new Error('Invalid catalog capability metadata');
+    const declared = manifest?.[key];
+    if (declared !== undefined && (!Array.isArray(declared) || declared.some(v => typeof v !== 'string'))) throw new Error('Invalid model capability metadata');
+    result[key] = declared === undefined ? values : declared.filter(v => values.includes(v));
+  }
+  return result;
+}
+export async function inspectBundle(input, precision, signal) {
   const files = normalizeFiles(input);
   // Accept both the native importer layout and the pinned upstream folder.
   const upstreamLaya = !files.has('config.json') && files.has('rl_agent_config.json') && files.has('encoder/config.json');
@@ -72,7 +89,7 @@ export async function inspectBundle(input, precision) {
   const encoderConfig = isLaya || isEmbedding ? config : await readJson(files, 'encoder_config/config.json');
   await readJson(files, 'tokenizer_config.json');
   if (!files.has('tokenizer.json') || files.get('tokenizer.json').size > 32 * 1024 ** 2) throw new Error('Missing or oversized tokenizer.json');
-  const manifest = files.has('model_manifest.json') ? await readJson(files, 'model_manifest.json') : undefined;
+  const manifest = await readModelManifest(files);
   const descriptor = resolveAdapter(config, encoderConfig, manifest);
   if (!descriptor.availability.available) throw Object.assign(new Error(descriptor.availability.reason), { code: descriptor.availability.code });
   const architecture = descriptor.adapter;
@@ -109,7 +126,7 @@ export async function inspectBundle(input, precision) {
   if (!['laya', 'embedding_similarity'].includes(architecture) && !(architecture === 'decide' && ['modernbert', 'modern_bert'].includes(encoderConfig.model_type)) && selectedPrecision === 'bf16') throw new Error('BF16 browser bundles are supported for Laya/OpenDecider');
   if (architecture === 'embedding_similarity' && !['bf16', 'fp32'].includes(selectedPrecision)) throw new Error('EmbeddingGemma2 supports native BF16/FP32 SafeTensors');
   if (architecture === 'boundary' && ['modernbert', 'modern_bert'].includes(encoderConfig.model_type) && selectedPrecision !== 'fp32') throw new Error('ModernBERT boundary requires its native FP32 artifact profile');
-  const reason = await configurationReason(files, config, encoderConfig, selectedPrecision);
+  const reason = await configurationReason(files, config, encoderConfig, selectedPrecision, signal);
   if (reason) throw Object.assign(new Error(reason), { code: 'UNSUPPORTED_ARCHITECTURE' });
   const bytes = weights.reduce((sum, p) => sum + files.get(p).size, 0);
   integer(bytes, LIMITS.bundle);

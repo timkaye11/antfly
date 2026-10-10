@@ -56,7 +56,9 @@ export function resolveAdapter(config, encoderConfig = config, manifest) {
     declaredTasks = [...new Set([...declaredTasks.filter(t => !['extract', 'classify'].includes(t)), 'embed', 'decide'])];
     declaredCapabilities = [...new Set([...declaredCapabilities.filter(c => !['classification', 'extraction', 'typed_decisions'].includes(c)), 'embedding_similarity'])];
   }
-  const tasks = adapter.tasks.filter(t => declaredTasks.includes(t) && (t !== 'decide' || declaredCapabilities.includes(adapter.id === 'embedding_similarity' ? 'embedding_similarity' : 'typed_decisions')));
+  const tasks = adapter.tasks.filter(t => declaredTasks.includes(t) && (t === 'decide'
+    ? declaredCapabilities.includes(adapter.id === 'embedding_similarity' ? 'embedding_similarity' : 'typed_decisions')
+    : adapter.capabilities.some(c => !['typed_decisions', 'embedding_similarity'].includes(c) && declaredCapabilities.includes(c))));
   const capabilities = adapter.capabilities.filter(c => declaredCapabilities.includes(c) && tasks.includes(['typed_decisions', 'embedding_similarity'].includes(c) ? 'decide' : 'extract'));
   return {
     adapter: adapter.id, family: adapter.family(config), architecture: adapter.architecture,
@@ -65,18 +67,18 @@ export function resolveAdapter(config, encoderConfig = config, manifest) {
     availability: { available: !reason, ...(reason ? { reason, code: 'UNSUPPORTED_ARCHITECTURE' } : {}) },
   };
 }
-export async function inspectModel(input, precision) {
-  const { normalizeFiles, readJson } = await import('./extraction-bundle.js');
+export async function inspectModel(input, precision, signal) {
+  const { normalizeFiles, readJson, readModelManifest } = await import('./extraction-bundle.js');
   const files = normalizeFiles(input);
   const upstreamLaya = !files.has('config.json') && files.has('rl_agent_config.json');
   let config = await readJson(files, upstreamLaya ? 'encoder/config.json' : 'config.json');
   if (upstreamLaya) config = { ...config, laya: await readJson(files, 'rl_agent_config.json') };
-  const manifest = files.has('model_manifest.json') ? await readJson(files, 'model_manifest.json') : undefined;
+  const manifest = await readModelManifest(files);
   const encoder = config.laya || ['embedding_gemma2', 'embedding_gemma2_text'].includes(config.model_type) || manifest?.capabilities?.includes('embedding_similarity') ? config : await readJson(files, 'encoder_config/config.json');
   const result = resolveAdapter(config, encoder, manifest);
   if (result.availability.available) {
     const { configurationReason } = await import('./model-configuration.js');
-    const reason = await configurationReason(files, config, encoder, precision);
+    const reason = await configurationReason(files, config, encoder, precision, signal);
     if (reason) {
       result.availability = { available: false, reason, code: 'UNSUPPORTED_ARCHITECTURE' };
       result.execution = { ...result.execution, tasks: [], capabilities: [], decisionKinds: [] };

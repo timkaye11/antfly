@@ -254,6 +254,38 @@ fn leaveEncoder(raw: *anyopaque) void {
     model.compute.use_gpu = false;
 }
 pub fn run(handle: u32, json: []const u8, validate_only: bool) !void {
+    // Compatibility envelopes retain their old wire format, but must obey the
+    // same advertised task/head restrictions as the public task entrypoint.
+    clearResult();
+    last_error = "";
+    const model = try get(handle);
+    if (!model.ready) return error.ModelNotReady;
+    try wire.scanJsonEnvelope(json, limits);
+    const task_name: []const u8 = if (model.config == .laya) "decide" else "extract";
+    if (model.metadata.value.tasks) |tasks| {
+        if (!model_caps.hasCapability(tasks, task_name)) return error.UnsupportedInferenceTask;
+    }
+    if (model.config == .laya) {
+        if (model.metadata.value.capabilities) |caps| {
+            if (!model_caps.hasCapability(caps, "typed_decisions")) return error.UnsupportedInferenceTask;
+        }
+    } else {
+        if (!adapter(model).extraction) return error.UnsupportedInferenceTask;
+        var arena = std.heap.ArenaAllocator.init(model.budget.allocator());
+        defer arena.deinit();
+        const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), json, .{ .duplicate_field_behavior = .@"error" });
+        try decision_api.validateExtractionBoundary(parsed.value);
+        if (model.config == .span) {
+            if (model.metadata.value.capabilities) |caps| {
+                if (parsed.value == .object) {
+                    const field = parsed.value.object.get("task");
+                    const extraction_task = if (field) |v| if (v == .string) v.string else "" else "entities";
+                    const capability: []const u8 = if (std.mem.eql(u8, extraction_task, "classification")) "classification" else if (std.mem.eql(u8, extraction_task, "relations")) "relations" else "extraction";
+                    if (!model_caps.hasCapability(caps, capability) or !model_caps.modelSupportsCapability("extractor", "gliner2", caps, capability)) return error.UnsupportedExtractionFeature;
+                }
+            }
+        } else try validateCapabilities(model, parsed.value);
+    }
     return runWithDecision(handle, json, validate_only, null);
 }
 
@@ -288,18 +320,6 @@ pub fn runTask(handle: u32, json: []const u8, task: u32, validate_only: bool) !v
     const a = arena.allocator();
     if (task == 0) {
         if (!selected.extraction) return error.UnsupportedInferenceTask;
-        const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{ .duplicate_field_behavior = .@"error" });
-        try decision_api.validateExtractionBoundary(parsed.value);
-        if (model.config == .span) {
-            if (model.metadata.value.capabilities) |caps| {
-                if (parsed.value == .object) {
-                    const field = parsed.value.object.get("task");
-                    const task_name = if (field) |v| if (v == .string) v.string else "" else "entities";
-                    const capability: []const u8 = if (std.mem.eql(u8, task_name, "classification")) "classification" else if (std.mem.eql(u8, task_name, "relations")) "relations" else "extraction";
-                    if (!model_caps.modelSupportsCapability("extractor", "gliner2", caps, capability)) return error.UnsupportedExtractionFeature;
-                }
-            }
-        } else try validateCapabilities(model, parsed.value);
         return run(handle, json, validate_only);
     }
     if (task != 1) return error.UnsupportedInferenceTask;
@@ -351,7 +371,7 @@ fn validateSchemaCapabilities(model: *const Model, caps: []const []const u8, sch
     const fields = .{ "entities", "entity_definitions", "entity_attributes", "structures", "relations", "classifications" };
     const requirements = .{ "extraction", "extraction", "extraction", "extraction", "relations", "classification" };
     inline for (fields, requirements) |field, capability| {
-        if (schema.object.contains(field) and !model_caps.modelSupportsCapability("extractor", family, caps, capability)) return error.UnsupportedExtractionFeature;
+        if (schema.object.contains(field) and (!model_caps.hasCapability(caps, capability) or !model_caps.modelSupportsCapability("extractor", family, caps, capability))) return error.UnsupportedExtractionFeature;
     }
 }
 

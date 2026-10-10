@@ -165,7 +165,10 @@ V1 extraction offsets are UTF-8 bytes; v2 reports `offset_unit` per input.
 encoded_tokens }` inside a `ValidationResult`. Invalid requests leave the model
 usable. `InferenceClient`, `run()`, `validateRequest()`, `runExtension()` and
 `validateExtension()` remain compatibility APIs for the earlier model-specific
-wire; new consumers should use `Inference` and the public task methods.
+wire; new consumers should use `Inference` and the public task methods. Compatibility
+methods enforce the same declared task and capability restrictions. Catalog
+downloads retain their declarations in `antfly_catalog.json`; when a pinned
+model manifest also declares a field, execution uses their intersection.
 
 ## Lifecycle and recovery
 

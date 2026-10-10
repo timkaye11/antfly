@@ -63,10 +63,21 @@ export async function downloadCatalogModel(
     throw new Error(
       "This catalog precision has not been published yet. Load a local bundle instead."
     );
+  const declarations: Record<string, readonly string[]> = {};
+  for (const key of ["tasks", "capabilities"] as const) {
+    const values = model[key];
+    if (values === undefined) continue;
+    if (!Array.isArray(values) || values.some((value) => typeof value !== "string"))
+      throw new Error("Invalid catalog capability metadata");
+    declarations[key] = [...values];
+  }
+  const catalog = new Blob([JSON.stringify(declarations)], { type: "application/json" });
+  if (catalog.size > 65536) throw new Error("Catalog capability metadata exceeds size limit");
   const paths = new Set<string>();
   let total = 0;
   for (const pin of model.files) {
     validatePin(pin);
+    if (pin.path === "antfly_catalog.json") throw new Error("Reserved catalog path");
     if (paths.has(pin.path)) throw new Error("Duplicate catalog path");
     paths.add(pin.path);
     total += pin.size_bytes;
@@ -209,6 +220,7 @@ export async function downloadCatalogModel(
       }
       files.set(pin.path, file);
     }
+    if (Object.keys(declarations).length) files.set("antfly_catalog.json", catalog);
     return files;
   } finally {
     worker.terminate();

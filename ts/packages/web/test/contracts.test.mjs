@@ -365,3 +365,33 @@ test("public extraction and decisions dispatch distinct tasks and validation ope
   assert(Object.isFrozen(client.model.execution.limits));
   client.dispose();
 });
+
+test("cancellation during configuration probing releases load and permits retry", async () => {
+  const { configurationReason } = await import(
+    "../dist/runtime-assets/runtime/model-configuration.js"
+  );
+  const entered = deferred();
+  let probeSignal;
+  globalThis.fetch = async (url, options) => {
+    if (!String(url).endsWith(".wasm")) return Response.json(RUNTIME_COMPATIBILITY);
+    probeSignal = options.signal;
+    entered.resolve();
+    return new Promise((_resolve, reject) =>
+      probeSignal.addEventListener("abort", () => reject(probeSignal.reason), { once: true })
+    );
+  };
+  inferenceFixture.inspect = (files, precision, signal) =>
+    configurationReason(files, {}, {}, precision, signal);
+  const client = new InferenceClient(assets);
+  const loading = client.loadModel(bundle());
+  const rejected = assert.rejects(loading, code("CANCELLED"));
+  await entered.promise;
+  client.cancel();
+  await rejected;
+  assert(probeSignal.aborted);
+  assert.equal(client.busy, false);
+  inferenceFixture.inspect = undefined;
+  await client.loadModel(bundle());
+  assert.equal(client.state.status, "ready");
+  client.dispose();
+});

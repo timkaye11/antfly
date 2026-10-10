@@ -135,3 +135,21 @@ test("native role corrections keep older Laya metadata usable as a decider", () 
   assert.deepEqual(result.capabilities, ["typed_decisions"]);
   assert.deepEqual(result.execution.tasks, ["decide"]);
 });
+
+test("explicit empty or decision-only capabilities cannot inherit extraction tasks", () => {
+  for (const capabilities of [[], ["typed_decisions"], ["future"]]) {
+    const model = resolveAdapter(
+      marker,
+      { model_type: "modernbert" },
+      {
+        tasks: ["extract", "decide"],
+        capabilities,
+      }
+    );
+    assert.equal(model.execution.tasks.includes("extract"), false);
+    assert.equal(
+      model.execution.tasks.includes("decide"),
+      capabilities.includes("typed_decisions")
+    );
+  }
+});

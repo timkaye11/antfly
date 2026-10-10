@@ -72,8 +72,16 @@ type Gpu = {
 };
 type AssetModule = {
   INFERENCE_RUNTIME_ID: string;
-  inspectModel: (files: BundleFiles, precision?: WeightPrecision) => Promise<ModelInspection>;
-  inspectBundle: (files: BundleFiles, precision?: WeightPrecision) => Promise<BundleInfo>;
+  inspectModel: (
+    files: BundleFiles,
+    precision?: WeightPrecision,
+    signal?: AbortSignal
+  ) => Promise<ModelInspection>;
+  inspectBundle: (
+    files: BundleFiles,
+    precision?: WeightPrecision,
+    signal?: AbortSignal
+  ) => Promise<BundleInfo>;
   InferenceWeb: new () => Runtime;
   WebGPUOps: new () => Gpu;
 };
@@ -223,15 +231,19 @@ export class Inference {
       throw failure(error, "RUNTIME_INCOMPATIBLE");
     }
   }
-  async inspectModel(files: BundleFiles, precision?: WeightPrecision): Promise<ModelInspection> {
-    await this.verifyCompatibility();
+  async inspectModel(
+    files: BundleFiles,
+    precision?: WeightPrecision,
+    signal?: AbortSignal
+  ): Promise<ModelInspection> {
+    await this.verifyCompatibility(signal);
     const { inspectModel } = await moduleAt(this.assets, "runtime/model-adapters.js");
-    return inspectModel(files, precision);
+    return inspectModel(files, precision, signal);
   }
-  async inspectBundle(files: BundleFiles, precision?: WeightPrecision) {
-    await this.verifyCompatibility();
+  async inspectBundle(files: BundleFiles, precision?: WeightPrecision, signal?: AbortSignal) {
+    await this.verifyCompatibility(signal);
     const { inspectBundle } = await moduleAt(this.assets, "runtime/extraction-bundle.js");
-    const result = await inspectBundle(files, precision);
+    const result = await inspectBundle(files, precision, signal);
     return {
       ...modelIdentity(result),
       precision: result.precision,
@@ -324,7 +336,7 @@ export class Inference {
       await this.verifyCompatibility(controller.signal);
       check();
       progress({ stage: "inspect", loaded: 0, total: 1 });
-      const inspected = await this.inspectBundle(files, options.precision);
+      const inspected = await this.inspectBundle(files, options.precision, controller.signal);
       check();
       const capabilities = await detectCapabilities();
       check();

@@ -1,22 +1,51 @@
 // Copyright 2026 Antfly, Inc. SPDX-License-Identifier: Apache-2.0
 import { createWasmAbi } from './wasm-abi.js';
 
-let cpuModule;
-async function configurationModule() {
-  if (!cpuModule) {
-    cpuModule = (async () => {
-      const response = await fetch(new URL('../antfly-extraction-cpu.wasm', import.meta.url));
+let cpuModule, compilation;
+export function withSignal(promise, signal) {
+  if (!signal) return promise;
+  return new Promise((resolve, reject) => {
+    const cleanup = () => signal.removeEventListener('abort', abort);
+    const abort = () => { cleanup(); reject(signal.reason); };
+    // Always attach both handlers, including when cancellation won the race.
+    promise.then(value => { cleanup(); resolve(value); }, error => { cleanup(); reject(error); });
+    if (signal.aborted) abort();
+    else signal.addEventListener('abort', abort, { once: true });
+  });
+}
+async function configurationModule(signal) {
+  signal?.throwIfAborted();
+  if (cpuModule) return cpuModule;
+  if (!compilation) {
+    const job = { controller: new AbortController(), waiters: 0, settled: false };
+    compilation = job;
+    job.promise = (async () => {
+      const response = await fetch(new URL('../antfly-extraction-cpu.wasm', import.meta.url), { signal: job.controller.signal });
       if (!response.ok) throw new Error(`Configuration runtime unavailable (${response.status})`);
-      return WebAssembly.compile(await response.arrayBuffer());
-    })().catch(error => { cpuModule = undefined; throw error; });
+      const module = await WebAssembly.compile(await response.arrayBuffer());
+      job.controller.signal.throwIfAborted();
+      cpuModule = module;
+      return module;
+    })().finally(() => {
+      job.settled = true;
+      if (compilation === job) compilation = undefined;
+    });
   }
-  return cpuModule;
+  const job = compilation;
+  job.waiters++;
+  try { return await withSignal(job.promise, signal); }
+  finally {
+    if (--job.waiters === 0 && !job.settled) {
+      if (compilation === job) compilation = undefined;
+      job.controller.abort();
+    }
+  }
 }
 
 // An isolated instance runs the loader's configuration parser without weights,
 // a tokenizer, GPU admission, or any changes to the active inference session.
-export async function configurationReason(files, config, encoderConfig, precision = 'fp32') {
-  const wasm = (await WebAssembly.instantiate(await configurationModule(), { env: {} })).exports;
+export async function configurationReason(files, config, encoderConfig, precision = 'fp32', signal) {
+  const wasm = (await withSignal(WebAssembly.instantiate(await configurationModule(signal), { env: {} }), signal)).exports;
   if (wasm.extraction_abi_version?.() !== 2) throw new Error('Extraction WASM ABI mismatch; rebuild browser assets');
   const abi = createWasmAbi(wasm);
   const metadata = { config: JSON.stringify(config), encoder_config: JSON.stringify(encoderConfig), tokenizer_config: '{}', precision };
