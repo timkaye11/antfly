@@ -7,7 +7,7 @@ import pytest
 
 from antfly_lake_maintenance.controller import Controller
 from antfly_lake_maintenance.server import resolve
-from antfly_lake_maintenance.store import Conflict, Store, digest, encode
+from antfly_lake_maintenance.store import Conflict, Store, Unavailable, digest, encode
 
 
 def test_authority_concurrent_owners_do_not_lose_transitions(tmp_path):
@@ -78,6 +78,40 @@ def test_unsent_writer_recovery_cannot_release_sent_request(tmp_path):
     with pytest.raises(Conflict):
         controller.recover_writer()
     assert original_state()["writer"]["phase"] == "sent"
+
+
+@pytest.mark.parametrize("protected_expiry", [100_000_000_000, 70_000_000_000])
+def test_committed_writer_reclaims_expired_readers_and_preserves_grace(
+    tmp_path, protected_expiry
+):
+    controller = object.__new__(Controller)
+    controller.config = {"authority_uri": tmp_path.as_uri() + "/", "max_readers": 2}
+    controller.store = Store()
+    controller.now_ns = lambda: 100_000_000_000
+    protected = {"id": "protected", "expires_ns": protected_expiry}
+    controller.store.mutate(
+        controller.key("HEAD.json"),
+        lambda state: state.update(
+            writer={"operation": "committed", "phase": "sent"},
+            readers={"expired": {"expires_ns": 1}, "protected": protected},
+        ),
+    )
+    lease = {"id": "new", "expires_ns": 220_000_000_000}
+    controller._finish_writer("committed", lease)
+    state = controller.state()
+    assert state["writer"] is None
+    assert state["readers"] == {"protected": protected, "new": lease}
+    # Reclaiming expired readers must not bypass the active-reader limit.
+    controller.store.mutate(
+        controller.key("HEAD.json"),
+        lambda state: state.update(writer={"operation": "next", "phase": "sent"}),
+    )
+    with pytest.raises(Unavailable, match="commit reader admission budget exceeded"):
+        controller._finish_writer(
+            "next", {"id": "extra", "expires_ns": 220_000_000_000}
+        )
+    assert controller.state()["readers"] == state["readers"]
+    assert controller.state()["writer"]["operation"] == "next"
 
 
 def test_failed_planner_cannot_release_prepared_job(tmp_path):

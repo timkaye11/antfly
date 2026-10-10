@@ -167,17 +167,7 @@ class Controller:
                 raise Conflict("catalog admission is fenced")
             # The load occurred outside admission. Writer exclusion plus an
             # authoritative reread below prevents pinning a raced incarnation.
-            if len(state["readers"]) >= self.config.get("max_readers", 1024):
-                expired = [
-                    key
-                    for key, value in state["readers"].items()
-                    if value["expires_ns"] + 30_000_000_000 < self.now_ns()
-                ]
-                for key in expired:
-                    del state["readers"][key]
-            if len(state["readers"]) >= self.config.get("max_readers", 1024):
-                raise Unavailable("reader admission budget exceeded")
-            state["readers"][identifier] = lease
+            self._add_reader(state, lease, "reader admission budget exceeded")
 
         self.store.mutate(self.key("HEAD.json"), admit)
         latest = self.provider.load(namespace, name)
@@ -402,14 +392,29 @@ class Controller:
                 self._finish_writer(operation)
             raise
 
+    def _add_reader(self, state, lease, budget_error):
+        limit = self.config.get("max_readers", 1024)
+        if len(state["readers"]) >= limit:
+            now = self.now_ns()
+            expired = [
+                key
+                for key, value in state["readers"].items()
+                if value["expires_ns"] + 30_000_000_000 < now
+            ]
+            for key in expired:
+                del state["readers"][key]
+        if len(state["readers"]) >= limit:
+            raise Unavailable(budget_error)
+        state["readers"][lease["id"]] = lease
+
     def _finish_writer(self, operation, lease=None):
         def finish(state):
             if not state["writer"] or state["writer"]["operation"] != operation:
                 raise Conflict("writer admission changed")
             if lease is not None:
-                if len(state["readers"]) >= self.config.get("max_readers", 1024):
-                    raise Unavailable("commit reader admission budget exceeded")
-                state["readers"][lease["id"]] = lease
+                self._add_reader(
+                    state, lease, "commit reader admission budget exceeded"
+                )
             state["writer"] = None
 
         self.store.mutate(self.key("HEAD.json"), finish)
