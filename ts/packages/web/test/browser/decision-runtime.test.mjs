@@ -150,3 +150,67 @@ test("Laya WebGPU pointer/Q8 parity and explicit packed CPU fallback", {
     await server.close();
   }
 });
+
+test("ModernBERT marker and boundary run through the public browser worker", {
+  timeout: 60000,
+}, async () => {
+  const { modernFixture } = await import(
+    "../../../../../zig/pkg/inference/web/model-backend-test-fixtures.mjs"
+  );
+  const server = await startRuntimeServer();
+  const browser = await chromium.launch();
+  try {
+    const page = await browser.newPage();
+    await page.goto(server.url);
+    for (const boundary of [false, true]) {
+      const payload = await Promise.all(
+        [...(await modernFixture(boundary))].map(async ([path, file]) => [
+          path,
+          Array.from(new Uint8Array(await file.arrayBuffer())),
+        ])
+      );
+      const result = await page.evaluate(async (payload) => {
+        const { Inference } = await import("/client/inference.js");
+        const inference = await Inference.create();
+        try {
+          const files = new Map(
+            payload.map(([path, bytes]) => [path, new Blob([new Uint8Array(bytes)])])
+          );
+          const model = await inference.loadModel(files, { backend: "wasm", precision: "fp32" });
+          const request = {
+            model: "local",
+            input: "state state",
+            questions: [
+              {
+                name: "tool",
+                type: "choice",
+                instructions: "question",
+                choices: [{ value: "search" }, { value: "fetch" }],
+              },
+            ],
+          };
+          const validation = await inference.validateDecision(request);
+          const decision = await inference.decide(request);
+          const extraction = await inference.extract({
+            schema_version: 2,
+            model: "local",
+            inputs: [{ content: "state state" }],
+            schema: {
+              classifications: [{ name: "tool", mode: "single", labels: ["search", "fetch"] }],
+            },
+          });
+          return { model, validation, decision, extraction };
+        } finally {
+          await inference.dispose();
+        }
+      }, payload);
+      assert.equal(result.validation.value.valid, true);
+      assert.equal(result.decision.value.answers[0].choice, "search");
+      assert.equal(result.extraction.value.data[0].classifications[0].label, "search");
+      assert.deepEqual(result.model.execution.tasks, ["extract", "decide"]);
+    }
+  } finally {
+    await browser.close();
+    await server.close();
+  }
+});

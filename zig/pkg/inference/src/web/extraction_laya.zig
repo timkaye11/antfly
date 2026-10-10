@@ -25,7 +25,7 @@ pub fn parseConfig(a: std.mem.Allocator, json: []const u8, precision: []const u8
     const cfg = try encoder.parseConfig(a, json);
     const laya = cfg.laya orelse return error.InvalidLayaConfig;
     if (cfg.global_attn_every_n_layers == 0 or cfg.local_attention_window == 0 or cfg.intermediate_size == 0 or cfg.vocab_size == 0 or !std.math.isFinite(cfg.layer_norm_eps) or cfg.layer_norm_eps <= 0 or !std.math.isFinite(cfg.global_rope_theta) or cfg.global_rope_theta <= 0 or !std.math.isFinite(cfg.local_rope_theta) or cfg.local_rope_theta <= 0) return error.InvalidLayaConfig;
-    if (cfg.checkpoint_layout != .huggingface_fused_qkv_no_bias or cfg.hidden_size > 1024 or cfg.num_hidden_layers > 32 or cfg.intermediate_size > 4096 or cfg.vocab_size > 65536 or laya.max_len > 2048) return error.UnsupportedLayaConfig;
+    if (cfg.checkpoint_layout != .huggingface_fused_qkv_no_bias or cfg.hidden_size > 1024 or cfg.num_hidden_layers > 32 or cfg.intermediate_size > 4096 or cfg.vocab_size > 262144 or laya.max_len > 2048) return error.UnsupportedLayaConfig;
     return cfg;
 }
 

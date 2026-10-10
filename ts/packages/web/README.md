@@ -132,17 +132,26 @@ inspection results establishes numerical or native production qualification.
 | Configuration / model family | Browser tasks | Limits / unavailable routes |
 | --- | --- | --- |
 | Legacy GLiNER2 span | extract | Supported DeBERTa base geometry; v1 wire |
-| GLiNER boundary (including multilingual DeBERTa Decide) | extract, decide | Supported DeBERTa backbone/artifacts; ModernBERT boundary unavailable |
-| GLiNER marker-head Decide | extract, decide | DeBERTa adapter; ModernBERT Decide-1B unavailable until encoder/weight and bounded compact-artifact support exist |
-| Laya / OpenDecider | decide | Supported ModernBERT geometry; vocabulary above 65,536 and oversized encoder/sequence geometry unavailable |
-| Embedding-similarity deciders | unavailable | Requires embedding, artifact identity, prototypes and calibration adapters |
+| GLiNER boundary (including multilingual DeBERTa Decide) | extract, decide | DeBERTa and FP32 ModernBERT backbones, including the optional linear neck |
+| GLiNER marker-head Decide | extract, decide | DeBERTa and ModernBERT marker encoders; unused legacy heads are skipped |
+| Laya / OpenDecider | decide | ModernBERT vocabulary up to 262,144, including multilingual models; bounded geometry/sequence sizes |
+| EmbeddingGemma2 | decide | Text choice and multi-choice, exact artifact identity, prototypes and qualified calibrations; FP32/BF16 |
 
 Support depends on configuration, declared capabilities, tensor layout, selected
 precision and request geometry. This table describes adapters, not qualification
 of every checkpoint bearing a family name. Browser limits include one input per
 request, 256 KiB text, 512 KiB JSON, 64 KiB lowered schema and 16 decision questions.
-Trained decisions support choice, score and predicate; multi-choice, examples,
-embedding policies and model identity are rejected until their own adapter exists.
+Trained decisions support choice, score and predicate. EmbeddingGemma2 supports
+choice and multi-choice with descriptions/examples, cosine scoring, abstention,
+model identity and optional qualified calibration files (`calibrations/<id>.json`).
+Multi-choice requires per-choice similarity thresholds or a matching calibration.
+Embedding validation tokenizes inputs/prototypes without running the encoder.
+The text adapter loads no media towers and does not expose an `embed` method.
+Embedding requests allow at most 128 encoded texts, 2,048 tokens per text and
+8,192 tokens in total. Source bundles/files are bounded to 3 GiB; model weights
+and scratch share a 1.5 GiB host budget within WASM32's 2 GiB memory ceiling.
+Large FP32 checkpoints may need compact artifacts to fit that resident budget.
+BF16 stays packed and is converted to exact FP32 per matrix or embedding row.
 
 The request's `model` string labels the response; `loadModel()` selects the bundle.
 V1 extraction offsets are UTF-8 bytes; v2 reports `offset_unit` per input.

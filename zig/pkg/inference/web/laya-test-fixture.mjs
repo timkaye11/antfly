@@ -1,8 +1,8 @@
 // Copyright 2026 Antfly, Inc. SPDX-License-Identifier: Apache-2.0
 // Tiny deterministic checkpoint exercises the real streamed WASM adapter.
-export function layaFixture(extra = {}, precision = 'fp32') {
+export function layaFixture(extra = {}, precision = 'fp32', vocabSize = 32) {
   const h = 64, f = 96, vocab = ['[PAD]', '[UNK]', '[CLS]', '[SEP]', '[MASK]', 'state', 'question', 'choice', 'score', 'noul', ':', 'input', 'yes', 'no', 'false', 'true', 'low', 'medium', 'high', 'search', 'fetch', 'none'];
-  const config = { model_type: 'modernbert', hidden_size: h, num_hidden_layers: 2, num_attention_heads: 2, intermediate_size: f, vocab_size: 32, max_position_embeddings: 512, local_attention: 8, global_attn_every_n_layers: 2, layer_norm_eps: 1e-5, pad_token_id: 0, cls_token_id: 2, sep_token_id: 3, laya: { head_layers: 1, max_len: 512, head_max_len: 192, mask_token: '[MASK]', ...extra } };
+  const config = { model_type: 'modernbert', hidden_size: h, num_hidden_layers: 2, num_attention_heads: 2, intermediate_size: f, vocab_size: vocabSize, max_position_embeddings: 512, local_attention: 8, global_attn_every_n_layers: 2, layer_norm_eps: 1e-5, pad_token_id: 0, cls_token_id: 2, sep_token_id: 3, laya: { head_layers: 1, max_len: 512, head_max_len: 192, mask_token: '[MASK]', ...extra } };
   const tensors = {}, chunks = []; let offset = 0, seed = 17;
   const add = (name, shape, norm = false) => {
     const data = new Float32Array(shape.reduce((a, b) => a * b, 1));
@@ -21,7 +21,7 @@ export function layaFixture(extra = {}, precision = 'fp32') {
   };
   const pair = (name, input, output) => { add(name + '.weight', [output, input]); add(name + '.bias', [output]); };
   const norm = (name, bias = true) => { add(name + '.weight', [h], true); if (bias) add(name + '.bias', [h]); };
-  add('encoder.embeddings.tok_embeddings.weight', [32, h]); norm('encoder.embeddings.norm', false); norm('encoder.final_norm', false);
+  add('encoder.embeddings.tok_embeddings.weight', [vocabSize, h]); norm('encoder.embeddings.norm', false); norm('encoder.final_norm', false);
   for (let i = 0; i < 2; i++) {
     const p = `encoder.layers.${i}`;
     if (i) norm(p + '.attn_norm', false);

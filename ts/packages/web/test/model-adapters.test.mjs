@@ -21,22 +21,43 @@ test("configuration adapters preserve metadata and restrict executable tasks", (
   assert.deepEqual(model.execution.decisionKinds, []);
   assert.throws(() => resolveAdapter(marker, {}, { tasks: "extract" }), /metadata/);
 });
-test("unsupported native decider routes report reasons rather than trained substitutes", () => {
-  for (const [config, encoder, manifest, reason] of [
-    [marker, { model_type: "modernbert" }, undefined, /Decide-1B/],
-    [{ model_type: "embedding_gemma2_text" }, undefined, undefined, /calibration/],
-    [{ architecture: "boundary" }, { model_type: "modernbert" }, undefined, /boundary/],
+test("native decider routes expose their executable capabilities", () => {
+  for (const [config, encoder, kinds] of [
+    [marker, { model_type: "modernbert" }, ["choice", "score", "predicate"]],
+    [{ architecture: "boundary" }, { model_type: "modernbert" }, ["choice", "score", "predicate"]],
     [
       { model_type: "modernbert", vocab_size: 262144, laya: {} },
+      undefined,
+      ["choice", "score", "predicate"],
+    ],
+    [{ model_type: "embedding_gemma2_text" }, undefined, ["choice", "multi_choice"]],
+  ]) {
+    const result = resolveAdapter(config, encoder);
+    assert.equal(result.availability.available, true);
+    assert(result.execution.tasks.includes("decide"));
+    assert.deepEqual(result.execution.decisionKinds, kinds);
+  }
+});
+test("unsupported geometry and unknown embedding encoders report reasons", () => {
+  for (const [config, encoder, manifest, reason] of [
+    [marker, { model_type: "modernbert", hidden_size: 4096 }, undefined, /geometry/],
+    [
+      { architecture: "boundary" },
+      { model_type: "modernbert", num_hidden_layers: 100 },
+      undefined,
+      /geometry/,
+    ],
+    [
+      { model_type: "modernbert", vocab_size: 262145, laya: {} },
       undefined,
       undefined,
       /vocabulary/,
     ],
     [
-      { model_type: "embedding_gemma2" },
+      { model_type: "unknown_embedding_encoder" },
       undefined,
       { tasks: ["embed", "decide"], capabilities: ["embedding_similarity"] },
-      /calibration/,
+      /encoder adapter/,
     ],
   ]) {
     const result = resolveAdapter(config, encoder, manifest);

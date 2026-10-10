@@ -149,6 +149,7 @@ const WasmBuf = struct {
     shape: ?[]i64 = null,
     i32_data: ?[]i32 = null,
     f16_data: ?[]f16 = null,
+    bf16_data: ?[]u16 = null,
     quant_raw: ?[]const u8 = null, // raw quantized bytes (owned)
     quant_type: ?tensor_types.TensorType = null,
     gpu_tensor: ?wasm_extern.GpuBufferId = null,
@@ -245,6 +246,7 @@ const WasmBuf = struct {
         if (self.f16_data) |f16d| {
             self.allocator.free(f16d);
         }
+        if (self.bf16_data) |data| self.allocator.free(data);
         if (self.quant_raw) |raw| {
             self.allocator.free(raw);
         }
@@ -299,6 +301,11 @@ const WasmBuf = struct {
                 return .{ .data = out, .allocated = true };
             }
             return error.HostQuantizedWeightUnavailable;
+        }
+        if (self.bf16_data) |data| {
+            const out = try alloc.alloc(f32, data.len);
+            for (data, out) |bits, *value| value.* = @bitCast(@as(u32, bits) << 16);
+            return .{ .data = out, .allocated = true };
         }
         if (self.f16_data) |f16d| {
             const out = try alloc.alloc(f32, f16d.len);
@@ -574,6 +581,16 @@ fn cloneDenseBufPreservingGpu(self: *WasmCompute, buf: *WasmBuf) !CT {
 }
 
 fn dupSliceWithGpu(self: *WasmCompute, buf: *WasmBuf, start_elem: usize, elem_count: usize) !CT {
+    if (buf.bf16_data) |data| {
+        const output = try self.allocator.alloc(f32, elem_count);
+        for (data[start_elem..][0..elem_count], output) |bits, *value| value.* = @bitCast(@as(u32, bits) << 16);
+        return fromBuf(WasmBuf.fromSlice(self.allocator, output, true));
+    }
+    if (buf.f16_data) |data| {
+        const output = try self.allocator.alloc(f32, elem_count);
+        for (data[start_elem..][0..elem_count], output) |value, *out| out.* = @floatCast(value);
+        return fromBuf(WasmBuf.fromSlice(self.allocator, output, true));
+    }
     const output = try self.allocator.dupe(f32, buf.data[start_elem .. start_elem + elem_count]);
     const out_buf = if (build_options.enable_webgpu and self.use_gpu) blk: {
         if (buf.gpu_tensor) |src_gpu| {
@@ -1111,11 +1128,10 @@ pub const WasmCompute = struct {
                 @memcpy(std.mem.sliceAsBytes(buf.f16_data.?), raw);
             },
             .BF16 => {
-                // CPU fallback for current OpenDecider imports. Preserve the
-                // exact BF16 value in F32; no lossy conversion through F16.
-                buf.data = try self.allocator.alloc(f32, count);
-                buf.owned_weight_data = true;
-                for (buf.data, 0..) |*value, i| value.* = @bitCast(@as(u32, std.mem.readInt(u16, raw[i * 2 ..][0..2], .little)) << 16);
+                // Keep large embedding tables packed; CPU kernels materialize
+                // one matrix or the requested embedding rows as exact F32.
+                buf.bf16_data = try self.allocator.alloc(u16, count);
+                for (buf.bf16_data.?, 0..) |*value, i| value.* = std.mem.readInt(u16, raw[i * 2 ..][0..2], .little);
             },
             .Q8_0, .Q4_0, .Q4_K => {
                 buf.quant_raw = try self.allocator.dupe(u8, raw);
@@ -1179,6 +1195,11 @@ pub const WasmCompute = struct {
         if (w.quant_type) |kind| {
             const raw = w.quant_raw orelse return error.HostQuantizedWeightUnavailable;
             for (ids, 0..) |id, i| try quant_codec.dequantizeRow(kind, raw, dim, @intCast(id), out[i * dim ..][0..dim]);
+        } else if (w.bf16_data) |data| {
+            for (ids, 0..) |id, i| {
+                const start: usize = @as(usize, @intCast(id)) * dim;
+                for (data[start..][0..dim], out[i * dim ..][0..dim]) |bits, *value| value.* = @bitCast(@as(u32, bits) << 16);
+            }
         } else if (w.f16_data) |f16d| {
             for (0..total) |i| {
                 const idx: usize = @intCast(ids[i]);
@@ -1242,6 +1263,7 @@ pub const WasmCompute = struct {
 
     fn shouldPreferGpuLinear(self: *WasmCompute, inp: *WasmBuf, weight: *WasmBuf, rows: usize, out_dim: usize) bool {
         if (!(build_options.enable_webgpu and self.use_gpu)) return false;
+        if (weight.bf16_data != null) return false;
         return self.resident_dense_gpu or inp.gpu_tensor != null or self.gpu_weights.hasResident(weight) or rows * out_dim >= WEBGPU_MATMUL_THRESHOLD;
     }
 
@@ -1744,6 +1766,18 @@ pub const WasmCompute = struct {
         return fromBuf(try setBufShape2D(buf, batch * seq, heads * dim));
     }
 
+    fn multiplyScalarOp(ctx: *anyopaque, input: CT, scale: f32) anyerror!?CT {
+        const self: *WasmCompute = @ptrCast(@alignCast(ctx));
+        const values = try toFloat32Op(ctx, input, self.allocator);
+        defer self.allocator.free(values);
+        for (values) |*value| value.* *= scale;
+        const shape = toBuf(input).shape;
+        const result = try fromFloat32Op(ctx, values);
+        errdefer freeTensorOp(ctx, result);
+        if (shape) |dimensions| toBuf(result).shape = try self.allocator.dupe(i64, dimensions);
+        return result;
+    }
+
     fn fromFloat32Op(ctx: *anyopaque, data: []const f32) anyerror!CT {
         const self: *WasmCompute = @ptrCast(@alignCast(ctx));
         const out = try self.allocator.alloc(f32, data.len);
@@ -1781,7 +1815,7 @@ pub const WasmCompute = struct {
             };
         }
         if (buf.quant_type != null) return null;
-        if (buf.f16_data != null) return null;
+        if (buf.f16_data != null or buf.bf16_data != null) return null;
         try buf.ensureHostData();
         return .{
             .dtype = .f32,
@@ -1793,6 +1827,7 @@ pub const WasmCompute = struct {
         const buf = toBuf(tensor);
         if (buf.i32_data != null) return .i32;
         if (buf.f16_data != null) return .f16;
+        if (buf.bf16_data != null) return .bf16;
         if (buf.quant_type != null) return .f32;
         return .f32;
     }
@@ -1895,7 +1930,7 @@ pub const WasmCompute = struct {
 
     fn toFloat32Op(_: *anyopaque, tensor: CT, alloc: std.mem.Allocator) anyerror![]f32 {
         const buf = toBuf(tensor);
-        if (buf.quant_type != null) {
+        if (buf.quant_type != null or buf.bf16_data != null) {
             const view = try buf.viewF32(alloc);
             if (!view.allocated) {
                 const out = try alloc.dupe(f32, view.data);
@@ -5002,7 +5037,7 @@ pub const WasmCompute = struct {
         output_buf.* = .{ .data = output, .len = output.len, .owned = true, .allocator = self.allocator, .shape = shape };
 
         if (comptime gpu_enabled) {
-            const dense = lhs.quant_type == null and lhs.f16_data == null and rhs.quant_type == null and rhs.f16_data == null;
+            const dense = lhs.quant_type == null and lhs.f16_data == null and lhs.bf16_data == null and rhs.quant_type == null and rhs.f16_data == null and rhs.bf16_data == null;
             if (self.use_gpu and dense and plan.lc == 1 and plan.m != 0 and plan.n != 0 and plan.k != 0 and
                 (lhs.gpu_tensor != null or rhs.gpu_tensor != null or plan.output_count >= WEBGPU_MATMUL_THRESHOLD))
             {
@@ -5357,6 +5392,7 @@ pub const WasmCompute = struct {
         .concat = concatOp,
         .add = addOp,
         .multiply = multiplyOp,
+        .multiplyScalar = multiplyScalarOp,
         .scaledDotProductAttention = scaledDotProductAttentionOp,
         .slidingWindowAttention = slidingWindowAttentionOp,
         .causalSelfAttention = causalSelfAttentionOp,

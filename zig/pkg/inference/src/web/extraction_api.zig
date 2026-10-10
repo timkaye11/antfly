@@ -22,6 +22,9 @@ const regex = @import("../pipelines/extraction_regex.zig");
 const laya = @import("extraction_laya.zig");
 const decision_api = @import("antfly_decisions");
 const model_caps = @import("../models/capabilities.zig");
+const embedding = @import("embedding_decisions.zig");
+const gemma = @import("../architectures/embedding_gemma2.zig");
+const embedding_identity = @import("../models/embedding_gemma2_identity.zig");
 const LayaCache = @import("../architectures/laya_trunk_cache.zig").Cache;
 
 pub const Metadata = struct {
@@ -30,6 +33,10 @@ pub const Metadata = struct {
     tokenizer_config: []const u8,
     precision: []const u8,
     gliner_config: []const u8 = "{}",
+    processor_config: []const u8 = "{}",
+    sentence_config: []const u8 = "{}",
+    pooling_config: []const u8 = "{}",
+    calibrations: []const u8 = "{}",
     tasks: ?[]const []const u8 = null,
     capabilities: ?[]const []const u8 = null,
 };
@@ -41,10 +48,12 @@ pub const Model = struct {
     encoder_gpu: bool,
     metadata: std.json.Parsed(Metadata),
     tokenizer: ?*HfTokenizer = null,
-    config: union(enum) { span: legacy.Config, decide: decide.Config, boundary: boundary.Config, laya: laya.Config },
+    config: union(enum) { span: legacy.Config, decide: decide.Config, boundary: boundary.Config, laya: laya.Config, embedding: gemma.Config },
     descriptors: std.ArrayListUnmanaged(access.Descriptor) = .empty,
     identity: ?bundle.Identity = null,
     tokenizer_digest: ?bundle.Digest = null,
+    embedding_tokenizer_digest: [32]u8 = undefined,
+    embedding_model_identity: [64]u8 = undefined,
     ready: bool = false,
     handle: u32,
 
@@ -100,8 +109,17 @@ pub fn create(json: []const u8) !u32 {
     errdefer parsed.deinit();
     const root = try std.json.parseFromSlice(std.json.Value, a, parsed.value.config, .{});
     defer root.deinit();
+    const model_type = if (root.value == .object) root.value.object.get("model_type") else null;
+    const is_embedding = model_type != null and model_type.? == .string and gemma.isModel(model_type.?.string);
     const is_laya = root.value == .object and root.value.object.contains("laya");
-    const config: @FieldType(Model, "config") = if (is_laya) .{ .laya = try laya.parseConfig(a, parsed.value.config, parsed.value.precision) } else switch (try boundary.detectArchitecture(a, parsed.value.config)) {
+    const config: @FieldType(Model, "config") = if (is_embedding) blk: {
+        var cfg = try gemma.parseConfig(a, parsed.value.config);
+        // Decisions are text-only: media towers are not loaded into the browser.
+        cfg.vision = false;
+        cfg.audio = false;
+        try embedding_identity.validateProcessor(a, parsed.value.processor_config);
+        break :blk .{ .embedding = cfg };
+    } else if (is_laya) .{ .laya = try laya.parseConfig(a, parsed.value.config, parsed.value.precision) } else switch (try boundary.detectArchitecture(a, parsed.value.config)) {
         .boundary => .{ .boundary = try boundary.parseConfig(a, parsed.value.config, parsed.value.encoder_config) },
         .span => if (try boundary.declaresSpanArchitecture(a, parsed.value.config)) .{ .decide = try decide.parseConfig(a, parsed.value.config, parsed.value.encoder_config) } else .{ .span = try legacy.parseConfig(a, parsed.value.config, parsed.value.encoder_config) },
         else => return error.UnsupportedGlinerArchitecture,
@@ -113,7 +131,7 @@ pub fn create(json: []const u8) !u32 {
     model.laya_cache.precision = .f32;
     model.encoder_gpu = model.compute.use_gpu;
     // Boundary heads stay on CPU; an encoder scope temporarily enables GPU.
-    if (config == .boundary) model.compute.use_gpu = false;
+    if (config == .boundary or config == .embedding or (config == .decide and config.decide == .modern_bert)) model.compute.use_gpu = false;
     if (config == .laya) model.compute.resident_dense_gpu = true;
     model.metadata = parsed;
     model.config = config;
@@ -132,6 +150,8 @@ pub fn tokenizer(handle: u32, json: []const u8) !void {
     const model = try get(handle);
     if (model.ready or model.tokenizer != null) return error.InvalidLoadState;
     if (json.len > 32 * 1024 * 1024) return error.TokenizerLimitExceeded;
+    if (model.config == .embedding) try embedding_identity.validateTokenizer(model.budget.allocator(), json);
+    std.crypto.hash.sha2.Sha256.hash(json, &model.embedding_tokenizer_digest, .{});
     model.tokenizer = try HfTokenizer.loadFromBytesWithOptions(model.budget.allocator(), json, .{ .strict_unigram_normalizer = true });
     model.tokenizer_digest = bundle.Digest.of(json);
 }
@@ -160,7 +180,9 @@ pub fn weight(handle: u32, metadata: []const u8, bytes: []const u8) !void {
     try model.descriptors.ensureUnusedCapacity(a, 1);
     if (model.config == .boundary) {
         var found = false;
-        for (policy.specs(model.config.boundary.backbone)) |spec| {
+        var derived: ?policy.Derived = if (model.config.boundary.backbone == .modern_bert) try policy.modernBertSpecs(a, model.config.boundary.encoder, model.config.boundary.neck) else null;
+        defer if (derived) |*d| d.deinit();
+        for (if (derived) |d| d.specs else policy.specs(model.config.boundary.backbone)) |spec| {
             if (!std.mem.eql(u8, spec.name, name)) continue;
             found = true;
             if (!std.mem.eql(i64, spec.shape, shape)) return error.InvalidGlinerBoundaryTensorShape;
@@ -172,13 +194,15 @@ pub fn weight(handle: u32, metadata: []const u8, bytes: []const u8) !void {
     // Inventories use the checkpoint namespace; DeBERTa's compute contract
     // uses names relative to the outer encoder module for both families.
     const stripped = if (std.mem.startsWith(u8, name, "encoder.")) name[8..] else name;
-    const prefixed = if (model.config == .laya) try std.fmt.allocPrint(a, "model.{s}", .{stripped}) else null;
+    const modern_encoder = model.config == .laya or (model.config == .decide and model.config.decide == .modern_bert) or (model.config == .boundary and model.config.boundary.backbone == .modern_bert);
+    const prefixed = if (modern_encoder and !std.mem.startsWith(u8, stripped, "classifier.") and (model.config != .boundary or std.mem.startsWith(u8, name, "encoder."))) try std.fmt.allocPrint(a, "model.{s}", .{stripped}) else null;
     defer if (prefixed) |value| a.free(value);
     const runtime_name = prefixed orelse stripped;
     if (model.config == .laya and kind != .F32 and kind != .F16 and kind != .BF16) return error.UnsupportedLayaArtifact;
-    if (model.config != .laya and kind == .BF16) return error.UnsupportedTensorType;
+    if (!modern_encoder and model.config != .embedding and kind == .BF16) return error.UnsupportedTensorType;
+    if (model.config == .embedding and kind != .F32 and kind != .BF16) return error.UnsupportedEmbeddingGemma2Precision;
     if (model.config == .span) try legacy.validateWeight(runtime_name, shape);
-    if (model.config == .decide) try decide.validateWeight(runtime_name, shape);
+    if (model.config == .decide) try decide.validateWeight(model.config.decide, stripped, shape);
     if (model.config == .laya) {
         try laya.registerWeight(a, &model.compute, model.config.laya, name, runtime_name, shape, bytes, kind);
     } else try model.compute.registerShapedWeight(runtime_name, shape, bytes, kind);
@@ -189,14 +213,26 @@ pub fn finalize(handle: u32, digest: []const u8, size: u64) !void {
     if (model.ready or model.tokenizer == null or digest.len != 64 or size == 0) return error.InvalidLoadState;
     for (digest) |c| if (!std.ascii.isHex(c)) return error.InvalidDigest;
     if (model.config == .boundary) {
-        _ = try policy.validate(model.budget.allocator(), model.config.boundary.backbone, try boundaryPrecision(model), model.descriptors.items, null);
+        if (model.config.boundary.backbone == .modern_bert) {
+            _ = try policy.validateDerived(model.budget.allocator(), model.config.boundary.encoder, model.config.boundary.neck, model.descriptors.items, null);
+        } else _ = try policy.validate(model.budget.allocator(), model.config.boundary.backbone, try boundaryPrecision(model), model.descriptors.items, null);
         model.identity = .{ .backbone = model.config.boundary.backbone, .precision = try boundaryPrecision(model), .weight = .{ .sha256 = digest[0..64].*, .size_bytes = size }, .sidecars = .{
             bundle.Digest.of(model.metadata.value.config), bundle.Digest.of(model.metadata.value.encoder_config), model.tokenizer_digest.?, bundle.Digest.of(model.metadata.value.tokenizer_config),
         } };
+    } else if (model.config == .embedding) {
+        try embedding.validateWeights(model.budget.allocator(), model.config.embedding, model.descriptors.items);
+        var digests: [7][32]u8 = undefined;
+        const metadata = model.metadata.value;
+        std.crypto.hash.sha2.Sha256.hash(metadata.config, &digests[0], .{});
+        digests[1] = model.embedding_tokenizer_digest;
+        const sidecars = .{ metadata.tokenizer_config, metadata.processor_config, metadata.sentence_config, metadata.pooling_config };
+        inline for (sidecars, 2..) |bytes, i| std.crypto.hash.sha2.Sha256.hash(bytes, &digests[i], .{});
+        _ = try std.fmt.hexToBytes(&digests[6], digest);
+        model.embedding_model_identity = embedding_identity.fromDigests(digests);
     } else if (model.config == .laya) {
         try laya.validateWeights(model.budget.allocator(), model.config.laya, model.descriptors.items);
     } else if (model.config == .decide) {
-        try decide.validateWeights(&model.compute);
+        try decide.validateWeights(model.config.decide, &model.compute);
     } else {
         try legacy.validateWeights(&model.compute, model.config.span);
     }
@@ -233,6 +269,7 @@ fn adapter(model: *const Model) Adapter {
         .decide => .{ .extraction = true, .decisions = .span_marker },
         .boundary => .{ .extraction = true, .decisions = .boundary },
         .laya => .{ .extraction = false, .decisions = .laya },
+        .embedding => .{ .extraction = false, .decisions = null },
     };
 }
 
@@ -266,6 +303,14 @@ pub fn runTask(handle: u32, json: []const u8, task: u32, validate_only: bool) !v
         return run(handle, json, validate_only);
     }
     if (task != 1) return error.UnsupportedInferenceTask;
+    if (model.config == .embedding) {
+        if (model.metadata.value.capabilities) |caps| if (!model_caps.hasCapability(caps, "embedding_similarity")) return error.UnsupportedInferenceTask;
+        const request = try decision_api.parse(a, json);
+        const bytes = try embedding.run(model.budget.allocator(), &model.compute, model.config.embedding, model.tokenizer.?.tokenizer(), request, &model.embedding_model_identity, model.metadata.value.calibrations, validate_only);
+        defer model.budget.allocator().free(bytes);
+        result = try ctx.allocator.dupe(u8, bytes);
+        return;
+    }
     const contract = selected.decisions orelse return error.UnsupportedInferenceTask;
     if (model.metadata.value.capabilities) |capabilities| {
         if (!model_caps.hasCapability(capabilities, "typed_decisions")) return error.UnsupportedInferenceTask;
@@ -317,6 +362,7 @@ fn runWithDecision(handle: u32, json: []const u8, validate_only: bool, decision:
     if (!model.ready) return error.ModelNotReady;
     if (json.len > limits.max_request_bytes) return error.ExtractionRequestLimitExceeded;
     const a = model.budget.allocator();
+    if (model.config == .embedding) return error.UnsupportedInferenceTask;
     if (model.config == .laya) {
         const bytes = try laya.run(a, &model.compute, &model.laya_cache, model.config.laya, model.tokenizer.?.tokenizer(), json, validate_only);
         defer a.free(bytes);
@@ -334,7 +380,9 @@ fn runWithDecision(handle: u32, json: []const u8, validate_only: bool, decision:
     var request = try wire.parseJson(a, json, .{ .limits = limits, .compiler = .{ .regex_context = &validator, .validate_regex_fn = regex.Context.validateCompile } });
     defer request.deinit();
     if (model.config == .decide) {
-        const seq = model.config.decide.max_position_embeddings;
+        // @min narrows its inferred integer range; request-wide multiplication
+        // needs usize even when each sequence has a small bounded ceiling.
+        const seq: usize = @min(@as(u32, 2048), model.config.decide.maxPositionEmbeddings());
         const options: span_v2.Options = .{
             .decide_request = decision,
             .max_response_bytes = 4 * 1024 * 1024,
@@ -349,7 +397,7 @@ fn runWithDecision(handle: u32, json: []const u8, validate_only: bool, decision:
             result = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .valid = true, .encoded_tokens = plan.prompt_tokens }, .{});
         } else {
             var cb = model.compute.computeBackend();
-            const bytes = try span_v2.executePlanned(&cb, a, .{ .deberta = model.config.decide }, &request, &plan, options);
+            const bytes = try span_v2.executePlanned(&cb, a, model.config.decide, &request, &plan, options);
             defer a.free(bytes);
             result = try ctx.allocator.dupe(u8, bytes);
         }

@@ -380,7 +380,7 @@ pub fn encodeNative(cb: *const compute.ComputeBackend, allocator: Allocator, con
     // The host encoder contract is also implemented by WasmCompute. Device
     // admission/qualification remains the responsibility of the caller.
     if (cb.kind() != .native and cb.kind() != .wasm) return error.UnsupportedGlinerBoundaryBackend;
-    if (config.encoder.family != .deberta) return error.UnsupportedGlinerBoundaryEncoder;
+    if (config.encoder.family != .deberta and cb.kind() != .wasm) return error.UnsupportedGlinerBoundaryEncoder;
     try cb.checkExecutionControl();
     const checked = try plan(config, prepared, options);
     if (options.scope) |scope| scope.enter(scope.ptr);
@@ -388,7 +388,23 @@ pub fn encodeNative(cb: *const compute.ComputeBackend, allocator: Allocator, con
     var combined = CombinedControl{ .first = cb.execution_control, .second = options.control };
     var request_backend = cb.*;
     request_backend.execution_control = combined.view();
-    const states = try deberta.forward(&request_backend, allocator, config.encoder.toDeberta(), prepared.input_ids, prepared.attention_mask, checked.batch, prepared.sequence_length);
+    const states = if (config.encoder.family == .deberta)
+        try deberta.forward(&request_backend, allocator, config.encoder.toDeberta(), prepared.input_ids, prepared.attention_mask, checked.batch, prepared.sequence_length)
+    else blk: {
+        const e = config.encoder;
+        const modern = @import("../modern_bert.zig");
+        const cfg: modern.Config = .{ .vocab_size = e.vocab_size, .hidden_size = e.hidden_size, .num_hidden_layers = e.num_hidden_layers, .num_attention_heads = e.num_attention_heads, .intermediate_size = e.intermediate_size, .max_position_embeddings = e.max_position_embeddings, .global_rope_theta = e.global_rope_theta, .local_rope_theta = e.local_rope_theta, .global_attn_every_n_layers = e.global_attn_every_n_layers, .local_attention_window = e.local_attention_window, .layer_norm_eps = e.layer_norm_eps, .rope_interleaved = false, .checkpoint_layout = .huggingface_fused_qkv_no_bias };
+        const hidden = try modern.forwardCT(&request_backend, allocator, cfg, prepared.input_ids, prepared.attention_mask, checked.batch, prepared.sequence_length);
+        defer request_backend.free(hidden);
+        if (config.neck == .none) break :blk try request_backend.toFloat32(hidden, allocator);
+        const w = try request_backend.getWeight(boundary.neck_prefix ++ ".weight");
+        defer request_backend.free(w);
+        const b = try request_backend.getWeight(boundary.neck_prefix ++ ".bias");
+        defer request_backend.free(b);
+        const mapped = try request_backend.linear(hidden, w, b, prepared.input_ids.len, e.hidden_size, e.hidden_size);
+        defer request_backend.free(mapped);
+        break :blk try request_backend.toFloat32(mapped, allocator);
+    };
     defer allocator.free(states);
     var result = try routePlanned(allocator, config, prepared, states, checked, .{ .limits = options.limits, .control = request_backend.execution_control });
     errdefer result.deinit();

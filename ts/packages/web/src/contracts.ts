@@ -1,7 +1,7 @@
 // Copyright 2026 Antfly, Inc. SPDX-License-Identifier: Apache-2.0
 export type WeightPrecision = "q8_0" | "q4_k" | "q4_0" | "fp32" | "fp16_encoder" | "fp16" | "bf16";
 export type Backend = "auto" | "wasm" | "webgpu";
-export type RuntimeArchitecture = "span" | "boundary" | "modernbert";
+export type RuntimeArchitecture = "span" | "boundary" | "modernbert" | "embedding";
 export type ModelFamily = "gliner2" | "gliner25" | "decide" | "laya" | "opendecider" | "embedding";
 export type InferenceTask = "extract" | "decide";
 export type DecisionKind = "choice" | "multi_choice" | "score" | "predicate";

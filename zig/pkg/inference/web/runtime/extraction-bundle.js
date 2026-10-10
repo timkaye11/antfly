@@ -2,7 +2,7 @@
 // Browser bundle inspection is independent of the inference implementation.
 import { resolveAdapter } from './model-adapters.js';
 const decoder = new TextDecoder('utf-8', { fatal: true });
-export const LIMITS = Object.freeze({ file: 1024 ** 3, bundle: 1536 * 1024 ** 2, header: 16 * 1024 ** 2, tensor: 512 * 1024 ** 2, text: 256 * 1024, schema: 64 * 1024 });
+export const LIMITS = Object.freeze({ file: 3 * 1024 ** 3, bundle: 3 * 1024 ** 3, header: 16 * 1024 ** 2, tensor: 512 * 1024 ** 2, text: 256 * 1024, schema: 64 * 1024 });
 const blockTypes = new Map([[0, [1, 4]], [1, [1, 2]], [2, [32, 18]], [8, [32, 34]], [12, [256, 144]], [30, [1, 2]]]);
 function integer(n, max = Number.MAX_SAFE_INTEGER) {
   if (!Number.isSafeInteger(n) || n < 0 || n > max) throw new Error('Invalid or oversized bundle integer');
@@ -67,7 +67,8 @@ export async function inspectBundle(input, precision) {
       }
     }
   }
-  const encoderConfig = isLaya ? config : await readJson(files, 'encoder_config/config.json');
+  const isEmbedding = ['embedding_gemma2', 'embedding_gemma2_text'].includes(config.model_type);
+  const encoderConfig = isLaya || isEmbedding ? config : await readJson(files, 'encoder_config/config.json');
   await readJson(files, 'tokenizer_config.json');
   if (!files.has('tokenizer.json') || files.get('tokenizer.json').size > 32 * 1024 ** 2) throw new Error('Missing or oversized tokenizer.json');
   const manifest = files.has('model_manifest.json') ? await readJson(files, 'model_manifest.json') : undefined;
@@ -76,7 +77,11 @@ export async function inspectBundle(input, precision) {
   const architecture = descriptor.adapter;
   const variants = [...files.keys()].filter(p => /(^|\/)model\.gguf$/.test(p) || /(^|\/)encoder_model\.gguf$/.test(p));
   let weights;
-  if (architecture === 'laya') {
+  if (architecture === 'embedding_similarity') {
+    for (const path of ['processor_config.json', 'config_sentence_transformers.json', '1_Pooling/config.json']) await readJson(files, path);
+    if (!files.has('model.safetensors')) throw new Error('EmbeddingGemma2 requires model.safetensors');
+    weights = ['model.safetensors'];
+  } else if (architecture === 'laya') {
     if (!files.has('model.safetensors')) throw new Error('Laya requires a complete model.safetensors');
     weights = ['model.safetensors'];
   } else if (architecture === 'boundary') {
@@ -95,17 +100,19 @@ export async function inspectBundle(input, precision) {
   if (architecture === 'boundary' && weights.length !== 1) throw new Error('Select exactly one boundary model variant');
   let receipt = null;
   if (files.has('antfly_inference_bundle.json')) receipt = await readJson(files, 'antfly_inference_bundle.json', 65536);
-  const layaTensors = architecture === 'laya' && !precision ? await tensorDirectory(files.get(weights[0]), 'safetensors') : null;
+  const layaTensors = (['laya', 'embedding_similarity'].includes(architecture) || (architecture === 'decide' && ['modernbert', 'modern_bert'].includes(encoderConfig.model_type))) && weights[0].endsWith('.safetensors') && !precision ? await tensorDirectory(files.get(weights[0]), 'safetensors') : null;
   const layaPrecision = layaTensors ? (layaTensors.some(t => t.kind === 30) ? 'bf16' : layaTensors.some(t => t.kind === 1) ? 'fp16' : 'fp32') : null;
   const selectedPrecision = precision || receipt?.precision || layaPrecision || (weights.every(p => p.endsWith('.safetensors')) ? 'fp32' : /q4_k/i.test(weights[0]) ? 'q4_k' : /q8_0/i.test(weights[0]) ? 'q8_0' : /q4_0/i.test(weights[0]) ? 'q4_0' : null);
   if (!['fp32', 'fp16', 'bf16', 'fp16_encoder', 'q8_0', 'q4_k', 'q4_0'].includes(selectedPrecision)) throw new Error('Unknown precision: provide a bundle receipt or select precision explicitly');
   if (architecture === 'laya' && !['fp16', 'fp32', 'bf16'].includes(selectedPrecision)) throw new Error('Laya supports dense FP16/FP32/BF16 SafeTensors, not GLiNER quantized bundles');
-  if (architecture !== 'laya' && selectedPrecision === 'bf16') throw new Error('BF16 browser bundles are supported for Laya/OpenDecider');
+  if (!['laya', 'embedding_similarity'].includes(architecture) && !(architecture === 'decide' && ['modernbert', 'modern_bert'].includes(encoderConfig.model_type)) && selectedPrecision === 'bf16') throw new Error('BF16 browser bundles are supported for Laya/OpenDecider');
+  if (architecture === 'embedding_similarity' && !['bf16', 'fp32'].includes(selectedPrecision)) throw new Error('EmbeddingGemma2 supports native BF16/FP32 SafeTensors');
+  if (architecture === 'boundary' && ['modernbert', 'modern_bert'].includes(encoderConfig.model_type) && selectedPrecision !== 'fp32') throw new Error('ModernBERT boundary requires its native FP32 artifact profile');
   const bytes = weights.reduce((sum, p) => sum + files.get(p).size, 0);
   integer(bytes, LIMITS.bundle);
   // Packed attention uses main's segment-aware CPU implementation. Keep a
   // whole request on CPU rather than crossing the GPU bridge per segment.
-  const cpuReason = architecture === 'laya' && config.laya.packing?.mode && config.laya.packing.mode !== 'none'
+  const cpuReason = architecture === 'embedding_similarity' ? 'EmbeddingGemma2 uses WASM CPU segment attention.' : architecture === 'decide' && ['modernbert', 'modern_bert'].includes(encoderConfig.model_type) ? 'ModernBERT marker decisions use WASM CPU.' : architecture === 'laya' && config.laya.packing?.mode && config.laya.packing.mode !== 'none'
     ? 'Packed Laya uses WASM CPU segment attention.'
     : architecture === 'laya' && selectedPrecision !== 'fp16' ? 'Laya GPU residency requires an FP16 bundle; this bundle uses WASM CPU.' : undefined;
   return { ...descriptor, runtimeArchitecture: descriptor.architecture, architecture, config, encoderConfig, precision: selectedPrecision, weights, bytes, files, receipt, qualified: false, cpuReason };

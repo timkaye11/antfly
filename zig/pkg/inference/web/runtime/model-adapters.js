@@ -8,20 +8,20 @@ const adapters = [
     id: 'laya', family: c => c.laya.format === 'opendecider' ? 'opendecider' : 'laya', architecture: 'modernbert',
     matches: c => ['modernbert', 'modern_bert'].includes(c.model_type) && c.laya && typeof c.laya === 'object',
     tasks: ['decide'], capabilities: ['typed_decisions'], kinds: trainedKinds,
-    unavailable: c => c.vocab_size > 65536 || c.hidden_size > 1024 || c.num_hidden_layers > 32 || c.intermediate_size > 4096 || c.laya.max_len > 2048
+    unavailable: c => c.vocab_size > 262144 || c.hidden_size > 1024 || c.num_hidden_layers > 32 || c.intermediate_size > 4096 || c.laya.max_len > 2048
       ? 'This Laya encoder exceeds the browser vocabulary, geometry, or sequence budget.' : undefined,
   },
   {
     id: 'boundary', family: () => 'gliner25', architecture: 'boundary',
     matches: c => c.architecture === 'boundary', tasks: ['extract', 'decide'],
     capabilities: ['extraction', 'classification', 'relations', 'typed_decisions'], kinds: trainedKinds,
-    unavailable: (_c, e) => ['modernbert', 'modern_bert'].includes(e.model_type) ? 'ModernBERT boundary execution is not implemented by this browser adapter.' : undefined,
+    unavailable: (_c, e) => e.hidden_size > 2048 || e.num_hidden_layers > 48 || e.intermediate_size > 8192 ? 'This boundary encoder exceeds the browser geometry budget.' : undefined,
   },
   {
     id: 'decide', family: () => 'decide', architecture: 'span',
     matches: c => c.model_type === 'extractor' && !c.boundary_head && c.architecture === 'span' && c.config_version === 3 && c.architecture_version === 1 && c.span_head?.span_mode === 'markerV0',
     tasks: ['extract', 'decide'], capabilities: ['classification', 'typed_decisions'], kinds: trainedKinds,
-    unavailable: (_c, e) => ['modernbert', 'modern_bert'].includes(e.model_type) ? 'ModernBERT Decide-1B needs a browser encoder/weight adapter and a compact artifact within the memory budget.' : undefined,
+    unavailable: (_c, e) => e.hidden_size > 2048 || e.num_hidden_layers > 48 || e.intermediate_size > 8192 || e.vocab_size > 262144 ? 'This marker encoder exceeds the browser geometry budget.' : undefined,
   },
   {
     id: 'span', family: () => 'gliner2', architecture: 'span',
@@ -34,7 +34,7 @@ const adapters = [
     id: 'embedding_similarity', family: () => 'embedding', architecture: 'embedding',
     matches: (c, _e, m) => ['embedding_gemma2', 'embedding_gemma2_text'].includes(c.model_type) || m?.capabilities?.includes('embedding_similarity'),
     tasks: ['decide'], capabilities: ['embedding_similarity'], kinds: ['choice', 'multi_choice'],
-    unavailable: () => 'Embedding-similarity decisions require a browser embedding/identity/calibration adapter; no trained-head substitution is performed.',
+    unavailable: c => !['embedding_gemma2', 'embedding_gemma2_text'].includes(c.model_type) ? 'No embedding-similarity encoder adapter matches this configuration.' : undefined,
   },
 ];
 export function resolveAdapter(config, encoderConfig = config, manifest) {
