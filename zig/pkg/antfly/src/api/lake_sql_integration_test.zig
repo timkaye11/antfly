@@ -176,6 +176,9 @@ fn acceptedTransactionFixture(isolation: @import("antfly_local_sources").sql_ses
             const self: *@This() = @ptrCast(@alignCast(raw));
             return .{ .status = .{ .metadata_group_id = 1, .metrics = .{} }, .tables = &self.table, .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
         }
+        fn admin(raw: *anyopaque) !metadata_api.AdminSnapshot {
+            return (try snapshot(raw, .{})).?;
+        }
         fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
         fn catalog(raw: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -210,8 +213,13 @@ fn acceptedTransactionFixture(isolation: @import("antfly_local_sources").sql_ses
     defer a.free(source.table[0].schema_json);
     var backend = try local.storage_background_runtime.BackendRuntimeHandle.init(a, .{});
     defer backend.deinit();
-    var server = server_mod.ApiHttpServer.init(a, .{ .node_config = &config, .backend_runtime = backend.ptr(), .deployment_mode = .standalone, .native_lake_artifact_base_dir = directory.path() }, .{ .ptr = &source, .vtable = &.{ .status = undefined, .linearizable_snapshot = Source.snapshot, .free_admin_snapshot = Source.free, .replace_table_definition = Source.replace, .system_catalog = Source.catalog, .supports_query_definitions = true } }, .{ .ptr = &source, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined } }, null);
+    var server = server_mod.ApiHttpServer.init(a, .{ .node_config = &config, .backend_runtime = backend.ptr(), .deployment_mode = .standalone, .native_lake_artifact_base_dir = directory.path() }, .{ .ptr = &source, .vtable = &.{ .status = undefined, .linearizable_snapshot = Source.snapshot, .admin_snapshot = Source.admin, .free_admin_snapshot = Source.free, .replace_table_definition = Source.replace, .system_catalog = Source.catalog, .supports_query_definitions = true } }, .{ .ptr = &source, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined } }, null);
     defer server.deinit();
+    // Keep publication deterministic while retaining runtime-backed reads.
+    // This fixture invokes the production reconciliation path explicitly.
+    const installation_owner = server.index_installation_owner_id;
+    server.index_installation_owner_id = 0;
+    defer server.index_installation_owner_id = installation_owner;
     var initial = try lake_api.execute(a, &server, "events", 7, null, .{}, .{ .action = .create, .body = "{\"commit_id\":\"create\",\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"amount\",\"type\":\"long\",\"required\":true}]}}" });
     defer initial.deinit(a);
     var accepted = try lake_api.execute(a, &server, "events", 7, null, .{}, .{ .action = .changes, .body = "{\"batch_id\":\"first\",\"source\":\"test\",\"epoch\":\"1\",\"checkpoint\":\"1\",\"key_fields\":[\"amount\"],\"changes\":[{\"op\":\"upsert\",\"row\":{\"amount\":1}}]}" });
@@ -231,7 +239,18 @@ fn acceptedTransactionFixture(isolation: @import("antfly_local_sources").sql_ses
     if (isolation == .serializable) try std.testing.expectError(error.SqlWriteConflict, adapter.validateAcceptedSerializable(a, transaction.txn_id));
     var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, source.table[0].schema_json)).?;
     defer binding.deinit(a);
-    try std.testing.expect(try @import("../serverless/lake_ingestion.zig").drain(a, binding.binding, .{ .node_config = &config, .catalog_table_id = 7 }, .{ .io = std.testing.io }));
+    // Use the production reconciliation path with local artifact fallback,
+    // rather than calling the drain directly and bypassing worker admission.
+    try std.testing.expect(config.storage.artifacts.connection == null);
+    {
+        const runtime = server.cfg.backend_runtime;
+        server.cfg.backend_runtime = null;
+        defer server.cfg.backend_runtime = runtime;
+        try std.testing.expectError(error.LakeIndexBuildInProgress, server.reconcileProjectedSchemaUpdate(a, "events", source.table[0].schema_json, false));
+    }
+    var published = try @import("../serverless/configured_object_store_support.zig").executeLakeCatalogAlloc(a, binding.binding, .{ .node_config = &config, .catalog_table_id = 7 }, .{}, .load);
+    defer published.deinit(a);
+    try std.testing.expectEqual(@as(u64, 1), try @import("../serverless/lake_ingestion.zig").coverage(a, published.table));
     // New request and recompiled/prepared statement reuse the durable cut.
     // The current catalog now contains both rows, unlike the initial empty
     // snapshot plus the single copied WAL image held by this transaction.

@@ -507,16 +507,33 @@ class Controller:
 
     def _native_pins(self, registry):
         active = set()
-        count = 0
+        reclaimed = 0
+        limit = self.config.get("max_readers", 1024)
         for obj in self.store.inventory(registry + "pins/"):
-            count += 1
-            if count > self.config.get("max_readers", 1024):
-                raise Unavailable("native reader inventory budget exceeded")
             result = self.store.get(obj.uri)
             if result is None:
-                raise Unavailable("native reader inventory changed")
-            if int(result[0]) + 30_000_000_000 >= self.now_ns():
-                active.add(obj.uri.rsplit("/", 1)[-1])
+                # Another bounded cleanup turn may have removed this pin.
+                continue
+            if int(result[0]) + 30_000_000_000 < self.now_ns():
+                if reclaimed == limit:
+                    # Prior removals make durable progress. Replaying this
+                    # admission rescans active pins before retiring anything.
+                    raise PlanningPending()
+                try:
+                    self.store.delete_current(obj.uri, result[1])
+                except Conflict:
+                    raise PlanningPending() from None
+                reclaimed += 1
+                # GCS exact-generation deletion can remove an old generation
+                # after renewal. Include the current pin if one now exists.
+                result = self.store.get(obj.uri)
+                if result is None:
+                    continue
+                if int(result[0]) + 30_000_000_000 < self.now_ns():
+                    raise PlanningPending()
+            active.add(obj.uri.rsplit("/", 1)[-1])
+            if len(active) > limit:
+                raise Unavailable("native reader inventory budget exceeded")
         return active
 
     def run_job(self, request_hash, body):
@@ -650,7 +667,11 @@ class Controller:
                 self.store.immutable(
                     registry + "retired/" + digest(snapshot.encode()), snapshot.encode()
                 )
-            if self._native_pins(registry) & {
+            try:
+                active_pins = self._native_pins(registry)
+            except PlanningPending:
+                return {**base, "state": "running"}
+            if active_pins & {
                 digest(item.encode()) for item in plan["retired_snapshots"]
             }:
                 return {**base, "state": "running"}

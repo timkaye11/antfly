@@ -16364,7 +16364,7 @@ pub const ApiHttpServer = struct {
         const local = @import("antfly_local_sources");
         var ingested = false;
         if (schema.external_base_source) |source_binding| {
-            if (source_binding.binding.write_policy == .iceberg_writer and self.cfg.node_config != null and self.cfg.node_config.?.storage.artifacts.connection != null) {
+            if (source_binding.binding.write_policy == .iceberg_writer and self.cfg.node_config != null) {
                 const ingest_cancel: @import("objectstore").CancellationToken = .{ .ptr = self, .is_cancelled_fn = struct {
                     fn canceled(raw: *const anyopaque) bool {
                         const server: *const ApiHttpServer = @ptrCast(@alignCast(raw));

@@ -165,3 +165,87 @@ def test_job_registry_matches_native_root_and_nested_prefixes(artifact_prefix):
     job["reader_registry"]["prefix"] = "/" + prefix
     with pytest.raises(ValueError, match="does not match configured authority"):
         controller._job_registry(job)
+
+
+def test_native_pin_cleanup_progresses_past_expired_inventory_limit(tmp_path):
+    from antfly_lake_maintenance.planning import PlanningPending
+    from antfly_lake_maintenance.store import Unavailable
+
+    controller = object.__new__(Controller)
+    controller.config = {"max_readers": 2}
+    controller.store = Store()
+    controller.now_ns = lambda: 1_000_000_000_000
+    registry = tmp_path.as_uri() + "/snapshots/"
+    controller.store.put(registry + "pins/000-active", b"2000000000000", absent=True)
+    for index in range(5):
+        controller.store.put(registry + f"pins/100-expired-{index}", b"1", absent=True)
+    for _ in range(2):
+        with pytest.raises(PlanningPending):
+            controller._native_pins(registry)
+    assert controller._native_pins(registry) == {"000-active"}
+    assert len(list(controller.store.inventory(registry + "pins/"))) == 1
+    for index in range(2):
+        controller.store.put(
+            registry + f"pins/200-active-{index}", b"2000000000000", absent=True
+        )
+    with pytest.raises(Unavailable, match="native reader inventory budget"):
+        controller._native_pins(registry)
+
+
+def test_native_pin_cleanup_preserves_concurrent_renewal(tmp_path):
+    from antfly_lake_maintenance.planning import PlanningPending
+
+    class RenewingStore(Store):
+        def delete_current(self, uri, version):
+            self.put(uri, b"2000000000000", version=version)
+            super().delete_current(uri, version)
+
+    controller = object.__new__(Controller)
+    controller.config = {"max_readers": 2}
+    controller.store = RenewingStore()
+    controller.now_ns = lambda: 1_000_000_000_000
+    registry = tmp_path.as_uri() + "/snapshots/"
+    controller.store.put(registry + "pins/renewed", b"1", absent=True)
+    with pytest.raises(PlanningPending):
+        controller._native_pins(registry)
+    assert controller._native_pins(registry) == {"renewed"}
+
+
+def test_native_pin_cleanup_rereads_after_exact_generation_deletion(tmp_path):
+    class RenewingStore(Store):
+        def delete_current(self, uri, version):
+            # GCS may delete the specified old generation while retaining a
+            # concurrently renewed current generation.
+            self.put(uri, b"2000000000000", version=version)
+
+    controller = object.__new__(Controller)
+    controller.config = {"max_readers": 2}
+    controller.store = RenewingStore()
+    controller.now_ns = lambda: 1_000_000_000_000
+    registry = tmp_path.as_uri() + "/snapshots/"
+    controller.store.put(registry + "pins/renewed", b"1", absent=True)
+    assert controller._native_pins(registry) == {"renewed"}
+
+
+def test_s3_mutable_pin_deletion_uses_current_etag_condition():
+    from botocore.exceptions import ClientError
+
+    class S3:
+        def delete_object(self, **kwargs):
+            assert kwargs == {
+                "Bucket": "archive",
+                "Key": "pins/expired",
+                "IfMatch": '"old"',
+            }
+            raise ClientError(
+                {
+                    "Error": {"Code": "PreconditionFailed"},
+                    "ResponseMetadata": {"HTTPStatusCode": 412},
+                },
+                "DeleteObject",
+            )
+
+    store = Store()
+    store._s3 = S3()
+    with pytest.raises(Conflict, match="delete object changed"):
+        store.delete_current("s3://archive/pins/expired", '"old"')

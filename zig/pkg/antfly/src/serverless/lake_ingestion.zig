@@ -236,3 +236,40 @@ test "external lake filesystem maintenance reads ingestion artifacts in the same
     const maintenance = try destinationFiles(a, opened, uri, .{});
     try std.testing.expectEqualStrings("manifest-content", try catalog.row_commit.read(a, maintenance, artifact));
 }
+
+test "external lake filesystem retirement validates live roots and subsequent ingestion" {
+    const alloc = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("lake-filesystem-retirement");
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const uri = try std.fmt.allocPrint(a, "file://{s}", .{directory.path()});
+    var opened = try local.serverless_object_store_support.OpenedObjectStore.initFileUriWithOptions(alloc, uri, "archive", .{ .ensure_bucket = true });
+    defer opened.deinit();
+    const files = try destinationFiles(a, opened, uri, .{});
+    var managed: catalog.managed.Managed = .{ .client = opened.client, .bucket = opened.bucket, .prefix = opened.prefix, .source_uri = uri };
+    _ = try managed.create(a, "create", "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true}]}}", 1);
+    const row = try std.json.parseFromSliceLeaky(V, a, "{\"id\":1}", .{});
+    const batch: Batch = .{ .batch_id = "first", .source = "test", .epoch = "1", .checkpoint = "1", .key_fields = &.{"id"}, .changes = &.{.{ .op = .upsert, .row = row }} };
+    const initial = try managed.load(a);
+    const first = try catalog.row_commit.prepare(a, initial, files, batch, 1, 2);
+    _ = try managed.commit(a, .{ .id = "first", .expected_metadata_location = initial.metadata_location, .body = first.body, .timestamp_ms = 2 });
+    const parent = try managed.load(a);
+    const orphan = try catalog.row_commit.upload(a, files, "data/orphan.parquet", "orphan");
+    const retired = try managed.retire(a, .{ .id = "retire", .expected_metadata_location = parent.metadata_location, .expected_version = parent.version.?, .objects = &.{orphan} });
+    try std.testing.expect(retired.retirement_root != null);
+    var reopened = managed;
+    const current = try reopened.load(a);
+    var next = batch;
+    next.batch_id = "second";
+    next.expected_checkpoint = "1";
+    next.checkpoint = "2";
+    const second = try catalog.row_commit.prepare(a, current, files, next, 2, 3);
+    _ = try reopened.commit(a, .{ .id = "second", .expected_metadata_location = current.metadata_location, .body = second.body, .timestamp_ms = 3 });
+    const latest = try reopened.load(a);
+    const root = try catalog.metadata.parse(a, latest.metadata_json);
+    const snapshots = (try catalog.metadata.get(root, "snapshots")).array.items;
+    const live_uri = try catalog.metadata.str(try catalog.metadata.get(snapshots[snapshots.len - 1], "manifest-list"));
+    try std.testing.expectError(error.LakeObjectStillReferenced, reopened.retire(a, .{ .id = "retire-live", .expected_metadata_location = latest.metadata_location, .expected_version = latest.version.?, .objects = &.{live_uri} }));
+}
