@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc. SPDX-License-Identifier: Apache-2.0
+import './configuration-test-runtime.mjs';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { openAsBlob } from 'node:fs';
@@ -9,11 +10,11 @@ import { ExtractionSession } from './runtime/extraction-session.js';
 import { createWasmAbi } from './runtime/wasm-abi.js';
 import { layaFixture } from './laya-test-fixture.mjs';
 
-const config = { model_type: 'extractor', architecture: 'span', config_version: 3, architecture_version: 1, span_head: { span_mode: 'markerV0' } };
+const config = { model_type: 'extractor', architecture: 'span', config_version: 3, architecture_version: 1, span_head: { span_mode: 'markerV0' }, model_name: 'microsoft/deberta-v3-large', counting_layer: 'count_lstm', token_pooling: 'first', use_moe: false };
 function bundle(extra = {}) {
-  return new Map(Object.entries({ 'config.json': { ...config, ...extra }, 'encoder_config/config.json': {}, 'tokenizer_config.json': {}, 'tokenizer.json': {} }).map(([p, v]) => [p, new Blob([JSON.stringify(v)])]).concat([['gliner2-encoder.Q8_0.gguf', new Blob(['encoder'])], ['gliner_head.gguf', new Blob(['head'])]]));
+  return new Map(Object.entries({ 'config.json': { ...config, ...extra }, 'encoder_config/config.json': { hidden_size: 1024, num_hidden_layers: 24, num_attention_heads: 16, intermediate_size: 4096, vocab_size: 128011 }, 'tokenizer_config.json': {}, 'tokenizer.json': {} }).map(([p, v]) => [p, new Blob([JSON.stringify(v)])]).concat([['gliner2-encoder.Q8_0.gguf', new Blob(['encoder'])], ['gliner_head.gguf', new Blob(['head'])]]));
 }
-test('Decide version-3 marker contract and matching split GGUF head', async () => {
+test('Decide version-3 marker contract and matching split GGUF head', { skip: !process.env.EXTRACTION_WASM }, async () => {
   const files = bundle(), info = await inspectBundle(files);
   assert.equal(info.architecture, 'decide'); assert.equal(info.precision, 'q8_0');
   assert.deepEqual(info.weights, ['gliner2-encoder.Q8_0.gguf', 'gliner_head.gguf']);

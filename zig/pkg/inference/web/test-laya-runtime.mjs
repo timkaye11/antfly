@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc. SPDX-License-Identifier: Apache-2.0
+import './configuration-test-runtime.mjs';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { openAsBlob } from 'node:fs';
@@ -11,14 +12,14 @@ import { layaFixture, layaRequest } from './laya-test-fixture.mjs';
 
 function bundle() {
   return new Map(Object.entries({
-    'encoder/config.json': { model_type: 'modernbert', rope_parameters: { full_attention: { rope_theta: 160000, rope_type: 'default' } } },
+    'encoder/config.json': { model_type: 'modernbert', rope_parameters: { full_attention: { rope_theta: 160000, rope_type: 'default' }, sliding_attention: { rope_theta: 10000, rope_type: 'default' } } },
     'rl_agent_config.json': { temperature: [1, 2, 3] },
     'tokenizer/tokenizer_config.json': { mask_token: '[MASK]' },
     'tokenizer/tokenizer.json': {},
     'model.safetensors': {},
   }).map(([path, value]) => [path, new Blob([JSON.stringify(value)])]));
 }
-test('Laya upstream and native folders share a normalized config without mutating input', async () => {
+test('Laya upstream and native folders share a normalized config without mutating input', { skip: !process.env.EXTRACTION_WASM }, async () => {
   const files = bundle();
   const upstream = await inspectBundle(files, 'fp16');
   assert.equal(upstream.architecture, 'laya');

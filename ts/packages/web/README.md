@@ -118,8 +118,11 @@ The shared contract also describes `embedding_similarity` answers, whose cosine
 similarities and abstention policies have distinct semantics. The browser does
 not substitute trained heads for embedding-similarity decisions.
 
-`inspectModel(files)` reads configuration and optional `model_manifest.json`
-without allocating model weights. Its `tasks` and `capabilities` retain advertised
+`inspectModel(files)` reads model configuration sidecars and optional
+`model_manifest.json` without allocating model weights. It fetches the prepared
+CPU WASM asset and checks configuration with the same parser used by loading,
+in an isolated instance that leaves the active model untouched.
+Its `tasks` and `capabilities` retain advertised
 metadata, including native config-owned role corrections for Laya and embedding
 models; `execution` intersects declared support with the browser adapter.
 `availability` reports known architecture/budget blocks with a reason.
@@ -128,6 +131,9 @@ validates tokenizer, tensors and inventory before a model becomes usable.
 `model.execution` describes supported tasks, decision kinds and request limits.
 A declaration cannot enable an unimplemented browser route. None of these
 inspection results establishes numerical or native production qualification.
+When a bundle includes `antfly_inference_bundle.json`, loading verifies every
+receipt pin, including capability manifests, embedding sidecars and calibration
+policies. Missing, duplicated or mismatched pinned files reject the bundle.
 
 | Configuration / model family | Browser tasks | Limits / unavailable routes |
 | --- | --- | --- |

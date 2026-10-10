@@ -44,22 +44,27 @@ export class ExtractionSession {
     const directories = [];
     for (const path of bundle.weights) directories.push(await tensorDirectory(bundle.files.get(path), path.endsWith('.gguf') ? 'gguf' : 'safetensors'));
     if (bundle.architecture === 'laya' && directories[0].some(t => ![0, 1, 30].includes(t.kind) || bundle.precision === 'fp32' && t.kind !== 0 || bundle.precision === 'fp16' && t.kind === 30)) throw new Error('Laya tensor precision does not match the selected dense precision');
+    // Verify all receipt pins before creating a model, including capability
+    // manifests, embedding sidecars, and calibration policies.
+    const pins = new Map();
+    const verifiedHashes = new Map();
+    for (const pin of bundle.receipt?.files ?? []) {
+      if (pins.has(pin.path)) throw new Error(`Duplicate integrity pin: ${pin.path}`);
+      pins.set(pin.path, pin);
+      const file = bundle.files.get(pin.path);
+      if (!file || pin.size_bytes !== file.size) throw new Error(`Integrity check failed: ${pin.path}`);
+      const hash = await this.hash(file, loaded => progress({ stage: 'verify', file: pin.path, loaded, total: file.size }));
+      if (hash !== pin.sha256) throw new Error(`Integrity check failed: ${pin.path}`);
+      verifiedHashes.set(pin.path, hash);
+    }
     try {
       this.handle = this.check(this.text(JSON.stringify(metadata), (ptr, len) => this.wasm.extraction_create(ptr, len)));
       const tokenizer = new Uint8Array(await bundle.files.get('tokenizer.json').arrayBuffer());
       this.check(this.bytes(tokenizer, (ptr, len) => this.wasm.extraction_tokenizer(this.handle, ptr, len)));
-      // Integrity receipts are checked for every consumed file, not merely
-      // trusted because the directory happens to have the expected name.
-      const pins = new Map((bundle.receipt?.files ?? []).map(pin => [pin.path, pin]));
-      for (const path of ['config.json', 'encoder_config/config.json', 'tokenizer.json', 'tokenizer_config.json']) {
-        if (!pins.has(path)) continue;
-        const file = bundle.files.get(path), pin = pins.get(path);
-        if (pin.size_bytes !== file.size || await this.hash(file) !== pin.sha256) throw new Error(`Integrity check failed: ${path}`);
-      }
       let weightHash, weightBytes = 0;
       for (let index = 0; index < bundle.weights.length; index++) {
         const path = bundle.weights[index], file = bundle.files.get(path);
-        weightHash = await this.hash(file, loaded => progress({ stage: 'verify', file: path, loaded, total: file.size }));
+        weightHash = verifiedHashes.get(path) ?? await this.hash(file, loaded => progress({ stage: 'verify', file: path, loaded, total: file.size }));
         const pin = pins.get(path);
         if (pin && (pin.size_bytes !== file.size || pin.sha256 !== weightHash)) throw new Error(`Integrity check failed: ${path}`);
         weightBytes += file.size;

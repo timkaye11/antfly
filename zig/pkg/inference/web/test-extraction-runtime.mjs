@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc. SPDX-License-Identifier: Apache-2.0
+import './configuration-test-runtime.mjs';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { readFile, readdir } from 'node:fs/promises';

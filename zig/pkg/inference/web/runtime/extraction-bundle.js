@@ -1,6 +1,7 @@
 // Copyright 2026 Antfly, Inc. SPDX-License-Identifier: Apache-2.0
 // Browser bundle inspection is independent of the inference implementation.
 import { resolveAdapter } from './model-adapters.js';
+import { configurationReason } from './model-configuration.js';
 const decoder = new TextDecoder('utf-8', { fatal: true });
 export const LIMITS = Object.freeze({ file: 3 * 1024 ** 3, bundle: 3 * 1024 ** 3, header: 16 * 1024 ** 2, tensor: 512 * 1024 ** 2, text: 256 * 1024, schema: 64 * 1024 });
 const blockTypes = new Map([[0, [1, 4]], [1, [1, 2]], [2, [32, 18]], [8, [32, 34]], [12, [256, 144]], [30, [1, 2]]]);
@@ -108,6 +109,8 @@ export async function inspectBundle(input, precision) {
   if (!['laya', 'embedding_similarity'].includes(architecture) && !(architecture === 'decide' && ['modernbert', 'modern_bert'].includes(encoderConfig.model_type)) && selectedPrecision === 'bf16') throw new Error('BF16 browser bundles are supported for Laya/OpenDecider');
   if (architecture === 'embedding_similarity' && !['bf16', 'fp32'].includes(selectedPrecision)) throw new Error('EmbeddingGemma2 supports native BF16/FP32 SafeTensors');
   if (architecture === 'boundary' && ['modernbert', 'modern_bert'].includes(encoderConfig.model_type) && selectedPrecision !== 'fp32') throw new Error('ModernBERT boundary requires its native FP32 artifact profile');
+  const reason = await configurationReason(files, config, encoderConfig, selectedPrecision);
+  if (reason) throw Object.assign(new Error(reason), { code: 'UNSUPPORTED_ARCHITECTURE' });
   const bytes = weights.reduce((sum, p) => sum + files.get(p).size, 0);
   integer(bytes, LIMITS.bundle);
   // Packed attention uses main's segment-aware CPU implementation. Keep a

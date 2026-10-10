@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc. SPDX-License-Identifier: Apache-2.0
+import './configuration-test-runtime.mjs';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { readFile, mkdtemp, open, rm } from 'node:fs/promises';
@@ -10,6 +11,7 @@ import { layaFixture } from './laya-test-fixture.mjs';
 import { modernFixture } from './model-backend-test-fixtures.mjs';
 import { ExtractionSession } from './runtime/extraction-session.js';
 import { createWasmAbi } from './runtime/wasm-abi.js';
+import { inspectModel } from './runtime/model-adapters.js';
 const json = value => new Blob([JSON.stringify(value)]);
 const wasmPath = process.env.EXTRACTION_WASM;
 async function session() {
@@ -17,6 +19,46 @@ async function session() {
   return new ExtractionSession(instance.exports, createWasmAbi(instance.exports));
 }
 const request = { model: 'local', input: 'state state', questions: [{ name: 'tool', type: 'choice', choices: [{ value: 'search' }, { value: 'fetch' }], instructions: 'question' }] };
+test('inspection uses native configuration validation without model weights', { skip: !wasmPath }, async () => {
+  const files = await modernFixture();
+  files.delete('model.safetensors');
+  assert.equal((await inspectModel(files)).availability.available, true);
+  const config = JSON.parse(await files.get('config.json').text());
+  Object.assign(config, { model_name: 'microsoft/deberta-v3-base', token_pooling: 'first', use_moe: false });
+  files.set('config.json', json(config));
+  files.set('encoder_config/config.json', json({ model_type: 'deberta-v2', hidden_size: 768, num_hidden_layers: 12, num_attention_heads: 12, intermediate_size: 3072, vocab_size: 128011 }));
+  const unsupported = await inspectModel(files);
+  assert.equal(unsupported.availability.available, false);
+  assert.equal(unsupported.availability.reason, 'UnsupportedGlinerDecideConfig');
+  assert.deepEqual(unsupported.execution.tasks, []);
+  const large = { model_type: 'deberta-v2', hidden_size: 1024, num_hidden_layers: 24, num_attention_heads: 16, intermediate_size: 4096, vocab_size: 128011 };
+  config.model_name = 'microsoft/deberta-v3-large';
+  files.set('config.json', json(config)); files.set('encoder_config/config.json', json(large));
+  assert.equal((await inspectModel(files)).availability.available, true);
+  large.position_buckets = 128;
+  files.set('encoder_config/config.json', json(large));
+  assert.equal((await inspectModel(files)).availability.available, false);
+  const runtime = await session();
+  try {
+    await runtime.load(await modernFixture(), 'fp32');
+    const before = runtime.run(request, false, 'decide').value;
+    await inspectModel(files);
+    assert.deepEqual(runtime.run(request, false, 'decide').value, before);
+  } finally { runtime.unload(); }
+});
+test('receipts verify sidecars, policies and manifests before model creation', { skip: !wasmPath }, async () => {
+  const runtime = await session();
+  const files = await modernFixture();
+  for (const path of ['processor_config.json', 'config_sentence_transformers.json', '1_Pooling/config.json', 'calibrations/policy.json', 'model_manifest.json']) {
+    files.set(path, json(path === 'model_manifest.json' ? { tasks: ['decide'], capabilities: ['typed_decisions'] } : {}));
+    files.set('antfly_inference_bundle.json', json({ precision: 'fp32', files: [{ path, size_bytes: files.get(path).size, sha256: '0'.repeat(64) }] }));
+    await assert.rejects(runtime.load(files, 'fp32'), new RegExp(`Integrity check failed: ${path.replaceAll('.', '\\.')}`));
+    assert.equal(runtime.handle, 0);
+  }
+  const file = files.get('model_manifest.json');
+  files.set('antfly_inference_bundle.json', json({ precision: 'fp32', files: [{ path: 'model_manifest.json', size_bytes: file.size, sha256: createHash('sha256').update(Buffer.from(await file.arrayBuffer())).digest('hex') }] }));
+  try { await runtime.load(files, 'fp32'); assert(runtime.handle); } finally { runtime.unload(); }
+});
 test('ModernBERT marker and boundary execute extraction and typed decisions', { skip: !wasmPath, timeout: 120000 }, async () => {
   const runtime = await session();
   try {

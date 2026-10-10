@@ -97,6 +97,8 @@ test("preparation builds both backends, checks ABI and publishes a complete immu
     await writeFile(join(zigRoot, "build.zig.zon"), ".{}\n");
     await writeFile(join(zigRoot, "pkg/inference/build.zig"), "// fixture inference build\n");
     await writeFile(join(zigRoot, "pkg/inference/build.zig.zon"), ".{}\n");
+    const resource = join(zigRoot, "pkg/inference/src/processor.json");
+    await writeFile(resource, '{"processor_class":"original"}\n');
     await cp(assets, copy, { recursive: true });
     const manifest = JSON.parse(await readFile(join(copy, "runtime-manifest.json")));
     manifest.sourceFingerprint = await sourceFingerprint(zigRoot);
@@ -124,7 +126,7 @@ test("preparation builds both backends, checks ABI and publishes a complete immu
       prepareRuntime({ zigRoot, out: output, zig: compiler, assets: copy }),
       /already exists/
     );
-    await writeFile(join(zigRoot, "build.zig"), "// different revision\n");
+    await writeFile(resource, '{"processor_class":"changed"}\n');
     await assert.rejects(
       prepareRuntime({ zigRoot, out: output, zig: compiler, assets: copy }),
       /do not match/

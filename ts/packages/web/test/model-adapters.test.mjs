@@ -66,7 +66,41 @@ test("unsupported geometry and unknown embedding encoders report reasons", () =>
     assert.deepEqual(result.execution.tasks, []);
   }
 });
-test("metadata inspection needs no weights and supports upstream Laya folders", async () => {
+test("metadata inspection needs no weights and supports upstream Laya folders", async (t) => {
+  // The npm package ships JS assets; preparation supplies the CPU WASM.
+  const previousFetch = globalThis.fetch;
+  const previousCompile = WebAssembly.compile;
+  const previousInstantiate = WebAssembly.instantiate;
+  t.after(() => {
+    globalThis.fetch = previousFetch;
+    WebAssembly.compile = previousCompile;
+    WebAssembly.instantiate = previousInstantiate;
+  });
+  globalThis.fetch = async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(0) });
+  WebAssembly.compile = async () => ({});
+  let reason = "";
+  WebAssembly.instantiate = async () => {
+    const memory = { buffer: new ArrayBuffer(65536) };
+    return {
+      exports: {
+        memory,
+        extraction_abi_version: () => 2,
+        wasm_alloc: () => 1024,
+        wasm_dealloc: () => {},
+        extraction_create: (ptr, len) => {
+          const metadata = JSON.parse(
+            new TextDecoder().decode(new Uint8Array(memory.buffer, ptr, len))
+          );
+          assert.equal(JSON.parse(metadata.config).model_type, "modernbert");
+          new Uint8Array(memory.buffer, 0, reason.length).set(new TextEncoder().encode(reason));
+          return reason ? 0 : 1;
+        },
+        extraction_unload: () => {},
+        extraction_error_ptr: () => 0,
+        extraction_error_len: () => reason.length,
+      },
+    };
+  };
   const files = new Map([
     [
       "encoder/config.json",
@@ -83,6 +117,13 @@ test("metadata inspection needs no weights and supports upstream Laya folders", 
   assert.deepEqual(result.execution.tasks, ["decide"]);
   assert.deepEqual(result.execution.capabilities, ["typed_decisions"]);
   assert(!files.has("config.json"));
+  reason = "UnsupportedLayaConfig";
+  const unsupported = await inspectModel(files);
+  assert.equal(unsupported.availability.available, false);
+  assert.equal(unsupported.availability.reason, reason);
+  assert.deepEqual(unsupported.execution.tasks, []);
+  assert.deepEqual(unsupported.execution.capabilities, []);
+  assert.deepEqual(unsupported.execution.decisionKinds, []);
 });
 
 test("native role corrections keep older Laya metadata usable as a decider", () => {

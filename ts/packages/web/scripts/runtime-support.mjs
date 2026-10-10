@@ -10,7 +10,8 @@ export async function walk(root, extensions) {
       if (entry.name.startsWith(".") || ["node_modules", "zig-out"].includes(entry.name)) continue;
       const path = join(dir, entry.name);
       if (entry.isDirectory()) await visit(path);
-      else if (entry.isFile() && extensions.some((ext) => path.endsWith(ext))) result.push(path);
+      else if (entry.isFile() && (!extensions || extensions.some((ext) => path.endsWith(ext))))
+        result.push(path);
     }
   }
   await visit(root);
@@ -18,8 +19,10 @@ export async function walk(root, extensions) {
 }
 export async function sourceFingerprint(zigRoot) {
   const paths = [];
+  // Include embedded resources as well as Zig sources. Their bytes are
+  // compiler inputs even when their extension is JSON, text, or binary.
   for (const dir of ["pkg/inference/src", "pkg/inference/build", "lib", "build_support"])
-    paths.push(...(await walk(join(zigRoot, dir), [".zig", ".zon"])));
+    paths.push(...(await walk(join(zigRoot, dir))));
   for (const name of [
     "build.zig",
     "build.zig.zon",

@@ -9,6 +9,7 @@ import {
   layaRequest,
 } from "../../../../../zig/pkg/inference/web/laya-test-fixture.mjs";
 import { ExtractionSession } from "../../../../../zig/pkg/inference/web/runtime/extraction-session.js";
+import "../../../../../zig/pkg/inference/web/configuration-test-runtime.mjs";
 import { createWasmAbi } from "../../../../../zig/pkg/inference/web/runtime/wasm-abi.js";
 import { startRuntimeServer } from "./server.mjs";
 
