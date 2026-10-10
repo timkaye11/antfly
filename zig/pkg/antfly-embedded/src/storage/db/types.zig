@@ -15,6 +15,9 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+pub const SparseOrdinalSelection = @import("../../sparse/ordinal_lookup.zig").Selection;
+pub const SparseOrdinalWorkBudget = @import("../../sparse/ordinal_lookup.zig").WorkBudget;
+pub const SparseOrdinalKeyFilter = @import("../../sparse/ordinal_lookup.zig").KeyFilter;
 pub const SparseOrdinalLookup = @import("../../sparse/ordinal_lookup.zig").Lookup;
 const graph_mod = @import("../../graph/graph.zig");
 const traversal_mod = @import("../../graph/traversal.zig");
@@ -1849,6 +1852,12 @@ pub const SearchRequest = struct {
     index_name: ?[]const u8 = null,
     primary_text_index_name: ?[]const u8 = null,
     remote_snapshot: ?[]const u8 = null,
+    /// Borrowed, trusted coordinator control; never accepted from public JSON.
+    native_query_cut: ?@import("native_query_cut_contract.zig").Request = null,
+    lake_read: ?struct {
+        visibility: enum { accepted, published } = .accepted,
+        through: ?struct { table_id: u64, object_generation: u64, wal_lsn: u64 } = null,
+    } = null,
     aggregations_json: []const u8 = "",
     count_only: bool = false,
     profile: bool = false,
@@ -1941,6 +1950,10 @@ pub const SearchRequest = struct {
     native_key_predicate: ?struct {
         ptr: *anyopaque,
         allows: *const fn (*anyopaque, []const u8) anyerror!bool,
+        /// Changes only when exact query-owned constraints become materialized.
+        constraint_revision: ?*const fn (*anyopaque) u64 = null,
+        select_constraints: ?*const fn (*anyopaque, Allocator, SparseOrdinalLookup) anyerror!?SparseOrdinalSelection = null,
+        select_range: ?*const fn (*anyopaque, Allocator, SparseOrdinalLookup, u32, u32) anyerror!?SparseOrdinalSelection = null,
         select_ordinals: ?*const fn (*anyopaque, Allocator, SparseOrdinalLookup) anyerror!?@import("../../encoding/roaring.zig").RoaringBitmap = null,
     } = null,
     resolved_doc_filter_owned: bool = false,
@@ -1990,6 +2003,7 @@ const hierarchy_children_validated_fields = [_][]const u8{
 const hierarchy_children_supported_internal_fields = [_][]const u8{
     "response_table_name",
     "prepared_read_table_id",
+    "native_query_cut",
     "document_lookup_groups",
     "filter_query_json",
     "exclusion_query_json",
@@ -2021,6 +2035,7 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "index_name",
     "primary_text_index_name",
     "remote_snapshot",
+    "lake_read",
     "aggregations_json",
     "count_only",
     "profile",
@@ -2835,6 +2850,10 @@ pub const SearchResult = struct {
     hits: []SearchHit,
     total_hits: u32,
     total_hits_relation: TotalHitsRelation = .exact,
+    /// Trusted in-process proof that the native exact sorter exhausted this
+    /// cursor window or filled its requested limit. Corpus totals alone cannot
+    /// prove exhaustion after search_after/search_before. Not a public wire flag.
+    ordered_window_complete: bool = false,
     identity_read_generation: ?u64 = null,
     /// Snapshot vector for a distributed result. Shard generations are
     /// independent, so a multi-shard replay must use these tokens rather than
@@ -4835,6 +4854,7 @@ pub const AsyncIndexingStats = struct {
 
 pub const DerivedWorkerStats = struct {
     workers: u64 = 0,
+    failed_workers: u64 = 0,
     workers_with_replay_debt: u64 = 0,
     max_replay_lag_sequences: u64 = 0,
     recoverable_retries: u64 = 0,
@@ -4992,6 +5012,7 @@ pub fn accumulateAsyncIndexingStats(dst: *AsyncIndexingStats, src: AsyncIndexing
     dst.derived_workers.workers += src.derived_workers.workers;
     dst.derived_workers.workers_with_replay_debt += src.derived_workers.workers_with_replay_debt;
     dst.derived_workers.max_replay_lag_sequences = @max(dst.derived_workers.max_replay_lag_sequences, src.derived_workers.max_replay_lag_sequences);
+    dst.derived_workers.failed_workers += src.derived_workers.failed_workers;
     dst.derived_workers.recoverable_retries += src.derived_workers.recoverable_retries;
     dst.derived_workers.writer_locked_retries += src.derived_workers.writer_locked_retries;
     dst.derived_workers.resource_budget_retries += src.derived_workers.resource_budget_retries;

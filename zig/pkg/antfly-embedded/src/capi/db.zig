@@ -837,6 +837,9 @@ fn enterHandleInternal(ptr: ?*anyopaque, access: HandleAccess, pinned: bool) ?Ha
         if (!pinned) @import("sql_commit.zig").recover(root) catch |err| {
             guard.entry_error = capi.mapError(err);
         };
+        if (!pinned and guard.entry_error == null) @import("sql_ddl.zig").recover(root) catch |err| {
+            guard.entry_error = capi.mapError(err);
+        };
         return guard;
     }
     const effective_access = if (lock_handle.embedded_path != null) HandleAccess.exclusive else access;
@@ -856,6 +859,10 @@ fn enterHandleInternal(ptr: ?*anyopaque, access: HandleAccess, pinned: bool) ?Ha
     const guard: HandleGuard = .{ .handle = handle, .lock_handle = lock_handle, .parent_slot = parent_slot, .slot = slot, .access = effective_access };
     if (lock_handle.embedded_path != null) {
         @import("sql_commit.zig").recover(lock_handle) catch {
+            guard.leave();
+            return null;
+        };
+        @import("sql_ddl.zig").recover(lock_handle) catch {
             guard.leave();
             return null;
         };
@@ -2227,7 +2234,7 @@ pub export fn antfly_db_open(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) ca
 
 pub fn openDefaultDirectoryHandle(path: []const u8) !*Handle {
     const alloc = std.heap.c_allocator;
-    var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 }, .prefer_existing_identity_namespace = true });
+    var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 }, .prefer_existing_identity_namespace = true, .online_source_authority = .native });
     errdefer db.close();
     const handle = alloc.create(Handle) catch return error.OutOfMemory;
     errdefer alloc.destroy(handle);
@@ -2533,6 +2540,7 @@ pub fn openLiteHandleAllocWithRuntime(
         .open_mode = resolved.open_mode,
         .external_derived_checkpoints = false,
         .backend_runtime = if (owned_runtime) |runtime| runtime.runtime else backend_runtime,
+        .online_source_authority = .native,
     };
     if (resolved.map_size) |map_size| opts.map_size = map_size;
     opts.no_sync = resolved.no_sync;
@@ -2628,6 +2636,7 @@ pub fn dbOpenOptionsFromResolved(resolved: LiteResolvedOpenOptions, lite: bool) 
     var opts = db_mod.OpenOptions{
         .open_mode = resolved.open_mode,
         .external_derived_checkpoints = !lite,
+        .online_source_authority = .native,
     };
     if (resolved.map_size) |map_size| opts.map_size = map_size;
     opts.no_sync = resolved.no_sync;
@@ -5179,7 +5188,6 @@ pub export fn antfly_db_sql_json(handle_ptr: ?*anyopaque, request_json: capi.Sli
     defer guard.leave();
     const handle = guard.handle;
     if (handle.parent_id != null) return .invalid_argument;
-    if (request_json.bytes().len > 2 * 1024 * 1024) return .invalid_argument;
     // Managed owners require Raft routing and credentials supplied by API SQL.
     if (handle.storage_owner_context != null or handle.storage_owner_path != null or handle.storage_owner_group_id != 0 or handle.readable_lease_hook != null) return .unsupported;
     executeEmbeddedSql(handle, "default", request_json.bytes(), out_buf) catch |err| {
@@ -5197,6 +5205,11 @@ pub export fn antfly_db_sql_json(handle_ptr: ?*anyopaque, request_json: capi.Sli
 }
 
 pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json: []const u8, out_buf: *capi.Buffer) !void {
+    const session = try @import("sql_session.zig").requestSession(handle, request_json);
+    errdefer if (session) |value| {
+        if (value.active) value.failed = true;
+    };
+    if (request_json.len > @import("sql.zig").runtime.resource_limits.request_bytes) return error.SqlRequestTooLarge;
     // Lite has no authenticated principal capability. Hold a raw lease for
     // the entire statement, including DDL paths that do not call row APIs,
     // so policy activation cannot race an already-admitted SQL statement.
@@ -5204,7 +5217,7 @@ pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json:
     defer row_policy_lease.release();
     const sql = @import("sql.zig");
     const Budget = antfly.capi_dependencies.sql_memory_budget;
-    var preparation_budget = Budget{ .backing = handle.alloc, .limit = 8 * 1024 * 1024 };
+    var preparation_budget = Budget{ .backing = handle.alloc, .limit = sql.runtime.resource_limits.preparation_bytes };
     const temporary = preparation_budget.allocator();
     const Request = struct {
         statement: []const u8,
@@ -5215,17 +5228,13 @@ pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json:
         namespace: ?[]const u8 = null,
     };
     var parsed = std.json.parseFromSlice(Request, temporary, request_json, .{ .allocate = .alloc_always }) catch |err| {
-        if (err == error.OutOfMemory and preparation_budget.exhausted) return error.SqlProgramLimitExceeded;
+        if (err == error.OutOfMemory and preparation_budget.exhausted) return error.SqlWorkingMemoryLimitExceeded;
         return error.InvalidSqlParameters;
     };
     defer parsed.deinit();
     if (parsed.value.database != null or parsed.value.namespace != null) return error.UnsupportedSqlExecution;
-    const session = if (parsed.value.session_id) |id| handle.sql_sessions.get(id) orelse return error.SqlConnectionNotFound else null;
-    errdefer if (session) |value| {
-        if (value.active) value.failed = true;
-    };
     var compiled = sql.compiler.compile(temporary, parsed.value.statement, .{}) catch |err| {
-        if (err == error.OutOfMemory and preparation_budget.exhausted) return error.SqlProgramLimitExceeded;
+        if (err == error.OutOfMemory and preparation_budget.exhausted) return error.SqlWorkingMemoryLimitExceeded;
         return err;
     };
     defer compiled.deinit();
@@ -5263,8 +5272,11 @@ pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json:
     }
     try @import("tables.zig").load(handle);
     try @import("sql_commit.zig").recover(handle);
+    try @import("sql_ddl.zig").recover(handle);
     var adapter = sql.Adapter(antfly){ .transaction = session, .handle = handle, .db = handle.database(), .table_name = table_name, .read_only = !liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
-    var result = sql.runtime.execute(handle.alloc, adapter.backend(), &compiled, parsed.value.parameters, .{ .result_rows = parsed.value.limit }) catch |err| {
+    var error_context: antfly.capi_dependencies.sql_errors.Context = .{};
+    var result = sql.runtime.execute(handle.alloc, adapter.backend(), &compiled, parsed.value.parameters, .{ .result_rows = parsed.value.limit, .error_context = &error_context }) catch |err| {
+        if (err == error.SqlNotNullViolation) out_buf.* = try stringifyJson(.{ .@"error" = error_context.diagnostic(err) });
         if (err == error.SqlMutationOutcomeUnknown) if (adapter.outcome_transaction_id) |txn_id| {
             out_buf.* = embeddedSqlUnknownReceipt(&commit_receipt, txn_id);
         };
@@ -5282,7 +5294,7 @@ pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json:
             out_buf.* = embeddedSqlCommitReceipt(&commit_receipt, result.output);
             return;
         }
-        if (err == error.OutOfMemory and encoding_budget.exhausted) return error.SqlProgramLimitExceeded;
+        if (err == error.OutOfMemory and encoding_budget.exhausted) return error.SqlWorkingMemoryLimitExceeded;
         return err;
     };
     defer encoding_budget.allocator().free(bytes);
@@ -7377,3 +7389,65 @@ comptime {
 }
 
 pub const antfly_sources = @import("../source_owner_storage.zig");
+
+test "issue1015 concurrent Lite handles sustain primary writes and full-text catch-up" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("issue1015-many-lite-handles");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const Worker = struct {
+        path: [:0]u8,
+        ordinal: usize,
+        start: *std.atomic.Value(bool),
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+            self.exercise() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn exercise(self: *@This()) !void {
+            var handle: ?*anyopaque = null;
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(self.path, &handle));
+            defer antfly_db_close(handle);
+            for (0..200) |i| {
+                var request_buffer: [256]u8 = undefined;
+                const request = try std.fmt.bufPrint(&request_buffer, "{{\"inserts\":{{\"k:{d}:{d}\":{{\"search_text\":\"raft snapshot number {d}\"}}}},\"sync_level\":\"write\"}}", .{ self.ordinal, i, i });
+                var output: capi.Buffer = .{};
+                defer antfly_buffer_free(&output);
+                try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(handle, .{ .ptr = request.ptr, .len = request.len }, &output));
+                if (i % 50 == 0) {
+                    const query = "{\"full_text_search\":{\"match\":{\"field\":\"search_text\",\"text\":\"raft\"}},\"limit\":5}";
+                    var hits: capi.Buffer = .{};
+                    defer antfly_buffer_free(&hits);
+                    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_json(handle, .{ .ptr = query.ptr, .len = query.len }, &hits));
+                }
+            }
+            // Primary availability alone is insufficient: every secondary must
+            // catch up too, so degradation cannot hide a dead derived worker.
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(handle));
+        }
+    };
+    var start = std.atomic.Value(bool).init(false);
+    var workers: [32]Worker = undefined;
+    var threads: [32]std.Thread = undefined;
+    var spawned: usize = 0;
+    defer {
+        start.store(true, .release);
+        for (threads[0..spawned]) |thread| thread.join();
+        for (workers[0..spawned]) |worker| alloc.free(worker.path);
+    }
+    for (&workers, &threads, 0..) |*worker, *thread, ordinal| {
+        const path = try std.fmt.allocPrintSentinel(alloc, "{s}/db-{d}.aflite", .{ directory.path(), ordinal }, 0);
+        errdefer alloc.free(path);
+        worker.* = .{ .path = path, .ordinal = ordinal, .start = &start };
+        thread.* = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Worker.run, .{worker});
+        spawned += 1;
+    }
+    start.store(true, .release);
+    for (threads[0..spawned]) |thread| thread.join();
+    const joined = spawned;
+    spawned = 0;
+    defer for (workers[0..joined]) |worker| alloc.free(worker.path);
+    for (workers[0..joined]) |worker| if (worker.failure) |err| return err;
+}

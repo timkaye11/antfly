@@ -42,7 +42,7 @@ test "external lake incremental native publication appends replaces removes and 
     var uploaded = try client.putObject("antfly", "part.parquet", first, .{});
     uploaded.deinit(a);
     const schema_json = try std.fmt.allocPrint(a,
-        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"lake","format":"parquet","uri":"file://{s}","schema_fingerprint":"schema"}},"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"body":{{"type":"string"}},"dense":{{"type":"string"}},"sparse":{{"type":"string"}}}},"additionalProperties":false}}}}}}}}
+        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"lake","format":"parquet","uri":"file://{s}","schema_fingerprint":"schema"}},"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"body":{{"type":"string","x-antfly-field":{{"type":"text"}}}},"dense":{{"type":"string"}},"sparse":{{"type":"string"}}}},"additionalProperties":false}}}}}}}}
     , .{directory.path()});
     defer a.free(schema_json);
     var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema_json)).?;
@@ -55,6 +55,9 @@ test "external lake incremental native publication appends replaces removes and 
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const ca = arena.allocator();
+    const analyzed = try local.search_analysis.default_analyzer.analyze(ca, "needle replacement");
+    try std.testing.expectEqual(@as(usize, 2), analyzed.len);
+    const needles = [_][]const u8{ analyzed[0].term, analyzed[1].term, "absent" };
     const Clock = struct {
         fn now(_: *const anyopaque) !u64 {
             return 101;
@@ -99,6 +102,9 @@ test "external lake incremental native publication appends replaces removes and 
                 const native = @import("lake_index_native_text.zig");
                 const root = try native.loadRoot(ca, store, declaration.artifact, .none, null);
                 try std.testing.expectEqual(expected, root.file_groups.len);
+                try std.testing.expectEqual(@as(u8, 1), root.statistics_version);
+                try std.testing.expect(root.term_statistics != null);
+                for (root.file_groups) |group| try std.testing.expectEqual(group.segments.len, group.summaries.len);
                 var writer = try native.loadWriter(a, store, root, .none, null, null);
                 defer writer.deinit();
                 const snapshot = writer.acquireSnapshot();
@@ -116,6 +122,31 @@ test "external lake incremental native publication appends replaces removes and 
                 var pooled = try corpora.acquire(std.testing.io, store, declaration.artifact, root, schema_json, .{ .cache = &read_cache, .scope = @splat(1), .context = .{} }, .{}, .none);
                 defer pooled.deinit();
                 try std.testing.expectEqual(expected, pooled.snapshot.liveDocCount());
+                try std.testing.expect(pooled.snapshot.text_statistics != null);
+                const field = "body";
+                var frequencies: [3]u32 = undefined;
+                var authoritative: [3]u32 = undefined;
+                try pooled.snapshot.termDocFreqs(a, field, &needles, &frequencies);
+                try snapshot.termDocFreqs(a, field, &needles, &authoritative);
+                try std.testing.expectEqualSlices(u32, &authoritative, &frequencies);
+                if (frequencies[0] != expected) std.debug.print("statistics phase={d} index={s} field={s} expected={d} actual={d}\n", .{ phase, declaration.name, field, expected, frequencies[0] });
+                try std.testing.expectEqual(@as(u32, @intCast(expected)), frequencies[0]);
+                try std.testing.expectEqual(@as(u32, if (phase >= 2) 1 else 0), frequencies[1]);
+                try std.testing.expectEqual(@as(u32, 0), frequencies[2]);
+                const search = local.search_search;
+                for ([_]local.section_inverted.BM25Config{ .{}, .{ .k1 = 2, .b = 0.25 }, .{ .k1 = 0, .b = 1 } }) |config| for ([_]f32{ 1, 0, -2 }) |boost| {
+                    const request: search.SearchRequest = .{ .query = .{ .bool_query = .{ .must = &.{.{ .term = .{ .field = field, .term = needles[0], .boost = boost } }}, .should = &.{.{ .term = .{ .field = field, .term = needles[1] } }} } }, .k = 10, .include_stored = false, .bm25_config = config };
+                    var direct = try search.execute(a, snapshot, request);
+                    defer direct.deinit();
+                    var persisted = try search.execute(a, pooled.snapshot, request);
+                    defer persisted.deinit();
+                    try std.testing.expectEqual(direct.total_hits, persisted.total_hits);
+                    try std.testing.expectEqual(direct.hits.len, persisted.hits.len);
+                    for (direct.hits, persisted.hits) |left, right| {
+                        try std.testing.expectEqual(left.doc_id, right.doc_id);
+                        try std.testing.expectEqual(@as(u32, @bitCast(left.score)), @as(u32, @bitCast(right.score)));
+                    }
+                };
                 var warm = try corpora.acquire(std.testing.io, store, declaration.artifact, root, schema_json, .{ .cache = &read_cache, .scope = @splat(1), .context = .{} }, .{}, .none);
                 defer warm.deinit();
                 try std.testing.expect(warm.snapshot != pooled.snapshot);
@@ -132,6 +163,14 @@ test "external lake incremental native publication appends replaces removes and 
                     defer constrained.deinit();
                     try std.testing.expectEqual(expected, constrained.snapshot.liveDocCount());
                     try std.testing.expectEqual(@as(usize, 1), constrained_corpora.entries.count());
+                    if (phase == 0 and root.seekable) {
+                        var seekable_cache: @import("lake_index_native_text_cache.zig").Cache = .{ .max_bytes = 1, .max_seekable_bytes = encoded_bytes };
+                        defer seekable_cache.deinit();
+                        var seekable_pin = try seekable_cache.acquire(std.testing.io, store, declaration.artifact, root, schema_json, .{ .cache = &read_cache, .scope = @splat(1), .context = .{} }, .{}, .none);
+                        defer seekable_pin.deinit();
+                        try std.testing.expectEqual(expected, seekable_pin.snapshot.liveDocCount());
+                        try std.testing.expectEqual(encoded_bytes, seekable_cache.bytes);
+                    }
                     if (phase == 0) {
                         // Two active publication roots sharing all segments
                         // must fit in one corpus reservation plus two roots.
@@ -198,5 +237,108 @@ test "external lake incremental native publication appends replaces removes and 
             else => return error.TestUnexpectedResult,
         };
         if (phase == 1) try std.testing.expectEqual(@as(usize, 4), reused);
+    }
+}
+
+test "external lake managed chunks publish independent vectors and replace their complete source membership" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("native-chunk-publication");
+    defer directory.cleanup();
+    var fs = try local.storage_object_storage.FilesystemObjectStorage.init(a, directory.path());
+    defer fs.deinit();
+    var client = fs.client();
+    try client.makeBucket("antfly");
+    const first = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{}, &.{
+        .{ .column_id = "body", .field_id = 1, .converted_type = 0, .values = &.{"alpha beta gamma delta"} },
+        .{ .column_id = "dense", .field_id = 2, .converted_type = 0, .values = &.{"[1,0]"} },
+        .{ .column_id = "sparse", .field_id = 3, .converted_type = 0, .values = &.{"{\"1\":2}"} },
+    });
+    defer a.free(first);
+    const replacement = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{}, &.{
+        .{ .column_id = "body", .field_id = 1, .converted_type = 0, .values = &.{"replacement epsilon"} },
+        .{ .column_id = "dense", .field_id = 2, .converted_type = 0, .values = &.{"[0,1]"} },
+        .{ .column_id = "sparse", .field_id = 3, .converted_type = 0, .values = &.{"{\"2\":3}"} },
+    });
+    defer a.free(replacement);
+    var uploaded = try client.putObject("antfly", "part.parquet", first, .{});
+    uploaded.deinit(a);
+    const schema_json = try std.fmt.allocPrint(a,
+        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"lake","format":"parquet","uri":"file://{s}","schema_fingerprint":"schema"}},"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"body":{{"type":"string"}},"dense":{{"type":"string"}},"sparse":{{"type":"string"}}}},"additionalProperties":false}}}}}}}}
+    , .{directory.path()});
+    defer a.free(schema_json);
+    var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema_json)).?;
+    defer binding.deinit(a);
+    const artifact_path = try std.fs.path.join(a, &.{ directory.path(), "artifacts" });
+    defer a.free(artifact_path);
+    var artifact_fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, artifact_path);
+    defer artifact_fs.deinit();
+    var store = artifact_fs.artifactStore();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const Clock = struct {
+        fn now(_: *const anyopaque) !u64 {
+            return 101;
+        }
+    };
+    var clock: u8 = 0;
+    var table: local.common_topology_records.TableRecord = .{ .table_id = 7, .name = "lake", .schema_json = schema_json, .indexes_json =
+        \\{"semantic":{"type":"embeddings","field":"body","dimension":2,"embedder":{"provider":"antfly","model":"local-model"},"template":"{{body}} {{dense}}","chunker":{"provider":"mock","text":{"target_tokens":1,"overlap_tokens":0}}},"sparse_chunks":{"type":"embeddings","field":"body","sparse":true,"embedder":{"provider":"antfly","model":"local-model","sparse":true},"chunker":{"provider":"mock","text":{"target_tokens":1,"overlap_tokens":0}}}}
+    };
+    const Provider = struct {
+        calls: usize = 0,
+        sparse_calls: usize = 0,
+        fn dense(raw: *anyopaque, alloc: std.mem.Allocator, _: []const u8, texts: []const []const u8) ![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += texts.len;
+            const vectors = try alloc.alloc([]f32, texts.len);
+            for (vectors) |*vector| vector.* = try alloc.dupe(f32, &.{ 1, 0 });
+            return vectors;
+        }
+        fn controlled(raw: *anyopaque, alloc: std.mem.Allocator, model: []const u8, texts: []const []const u8, context: local.inference_managed_embedder.EmbeddingRequestContext) ![][]f32 {
+            try context.check();
+            return dense(raw, alloc, model, texts);
+        }
+        fn sparse(raw: *anyopaque, alloc: std.mem.Allocator, _: []const u8, texts: []const []const u8) ![]local.storage_db_enrichment_embedder.SparseEmbedding {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.sparse_calls += texts.len;
+            const vectors = try alloc.alloc(local.storage_db_enrichment_embedder.SparseEmbedding, texts.len);
+            for (vectors) |*vector| vector.* = .{ .indices = try alloc.dupe(u32, &.{1}), .values = try alloc.dupe(f32, &.{2}) };
+            return vectors;
+        }
+        fn sparseControlled(raw: *anyopaque, alloc: std.mem.Allocator, model: []const u8, texts: []const []const u8, context: local.inference_managed_embedder.EmbeddingRequestContext) ![]local.storage_db_enrichment_embedder.SparseEmbedding {
+            try context.check();
+            return sparse(raw, alloc, model, texts);
+        }
+    };
+    var provider: Provider = .{};
+    const options: local.inference_managed_embedder.InitOptions = .{ .io = std.testing.io, .antfly_provider = .{ .ptr = &provider, .embed_dense_texts = Provider.dense, .embed_dense_texts_with_context = Provider.controlled, .embed_sparse_texts = Provider.sparse, .embed_sparse_texts_with_context = Provider.sparseControlled } };
+    for (0..2) |phase| {
+        if (phase == 1) {
+            var result = try client.putObject("antfly", "part.parquet", replacement, .{});
+            result.deinit(a);
+        }
+        var source = try serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{});
+        defer source.deinit();
+        table.lake_index_catalog_json = try publication.begin(ca, std.testing.io, table, &source, @splat(7), .{}, 100, 20);
+        const before = provider.calls;
+        const sparse_before = provider.sparse_calls;
+        table.lake_index_catalog_json = try publication.buildWithLeaseAndEmbedding(ca, &store, table, &source, @splat(7), .{ .io = std.testing.io }, .none, .{ .ptr = &clock, .now_ms = Clock.now }, null, options, null);
+        var parsed = try catalog.parse(a, table.lake_index_catalog_json);
+        defer parsed.deinit();
+        try @import("lake_index_directory.zig").hydrate(parsed.arena.allocator(), store, &parsed.value.published.?, .none, null);
+        const declarations = parsed.value.published.?.declarations;
+        try std.testing.expectEqual(@as(usize, 2), declarations.len);
+        for (declarations) |declaration| {
+            const states = if (declaration.artifact.kind == .vector_segment)
+                (try @import("lake_index_native_dense.zig").loadRoot(ca, store, declaration.artifact, .none, null)).file_states
+            else
+                (try @import("lake_index_native_sparse.zig").loadRoot(ca, store, declaration.artifact, .none, null)).file_states;
+            try std.testing.expectEqual(@as(usize, 1), states.len);
+            try std.testing.expectEqual(@as(u16, 108), states[0].key_width);
+            const count = states[0].count;
+            try std.testing.expect(count > 1);
+            try std.testing.expectEqual(count, if (declaration.artifact.kind == .vector_segment) provider.calls - before else provider.sparse_calls - sparse_before);
+        }
     }
 }

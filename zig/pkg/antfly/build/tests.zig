@@ -291,9 +291,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{ "system catalog", "catalog rename", "catalog names", "metadata raft apply store projects backup restore bootstrap source in placement intents" },
     });
+    const relation_namespace_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{ "system catalog relation namespace transaction", "relation mutation ownership" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("system-catalog-relation-store-test", "Verify namespace and schema transaction rollback and restart")
+        .dependOn(&addFilteredTestRunArtifact(b, relation_namespace_tests).step);
+    const relation_coordinator_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{ "relational topology admission rejects lifecycle proposals before encoding", "relation reconciliation worker", "relation mutation admission", "table definition stamp distinguishes rejection", "system catalog relation replacement" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-relation-coordinator-test", "Verify relation control and tracked-writer decoder admission")
+        .dependOn(&addFilteredTestRunArtifact(b, relation_coordinator_tests).step);
     const system_catalog_store_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
-        .filters = &.{ "metadata raft apply store", "metadata replay", "system catalog", "row-policy publication", "metadata.table storage extension", "relational integrity restore staging", "FK generation publication", "policy definition command serializes" },
+        .filters = &.{ "metadata raft apply store", "metadata replay", "system catalog", "row-policy publication", "metadata.table storage extension", "relational integrity restore staging", "FK generation publication", "policy definition command serializes", "standalone metadata" },
     });
     const system_catalog_store_step = b.step("antfly-system-catalog-store-test", "Run catalog report persistence, snapshot, drain, and migration regressions");
     system_catalog_store_step.dependOn(&b.addRunArtifact(system_catalog_store_tests).step);
@@ -343,6 +357,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const system_catalog_api_step = b.step("antfly-system-catalog-api-test", "Run qualified catalog HTTP authorization and protocol tests");
     system_catalog_api_step.dependOn(&b.addRunArtifact(system_catalog_api_tests).step);
+    const sql_index_ddl_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "SQL catalog", "SQL index DDL", "SQL pgwire" } });
+    b.step("antfly-sql-index-ddl-test", "Verify qualified SQL index ownership, authorization and guarded schema admission")
+        .dependOn(&b.addRunArtifact(sql_index_ddl_tests).step);
     const system_catalog_test_step = b.step("antfly-system-catalog-test", "Run system catalog durability, identity, and routing tests");
     system_catalog_test_step.dependOn(&b.addRunArtifact(system_catalog_tests).step);
     const system_catalog_transport_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[1], .filters = &.{"system catalog"} });
@@ -410,6 +427,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         auth.addImport("antfly_platform", platform_mod);
         module.addImport("usermgr_storage", auth);
     }
+    const sql_expression_apply_tests = b.addTest(.{
+        .root_module = data_implementation_module,
+        .filters = &.{"SQL expression apply failures preserve exact semantic rejections"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-sql-expression-apply-contract-test", "Run deterministic SQL expression rejection classification")
+        .dependOn(&addFilteredTestRunArtifact(b, sql_expression_apply_tests).step);
+
     const raft_runtime_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/raft_runtime_test_root.zig"),
         .target = target,
@@ -1836,6 +1861,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "httpx inference connection requires inference write permission",
         "httpx inference connection propagates failures after stream commit",
         "httpx retrieval SSE",
+        "httpx retrieval read failures preserve retryable JSON and conflict status",
         "retrieval agent sse",
         "retrieval agent streaming emits go-shaped tree",
         "inference connection invocation forwards streaming and deadline through stable target ABI",
@@ -2039,7 +2065,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, lite_reader_test_mod, true, true);
     const lite_reader_tests = b.addTest(.{
         .root_module = lite_reader_test_mod,
-        .filters = &.{ "search.search.", "search.query.", "search.aggregation.", "datetime.", "index.", "merger.", "segment.", "section.inverted.", "section.typed_doc_values.", "section.doc_values.", "section.vector_section." },
+        .filters = &.{ "search.search.", "search.query.", "search.scorer.", "search.aggregation.", "datetime.", "index.", "merger.", "segment.", "section.inverted.", "section.typed_doc_values.", "section.doc_values.", "section.vector_section." },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lite-bounded-reader-test", "Verify segment scratch reuse and stored search result ownership")
@@ -2617,6 +2643,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lake-integration-test", "Run public lake binding and SQL cursor integration tests").dependOn(&addFilteredTestRunArtifact(b, lake_integration_tests).step);
+    const filtered_topk_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lake_filtered_topk_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, filtered_topk_mod, true, true);
+    const filtered_topk_tests = b.addTest(.{
+        .root_module = filtered_topk_mod,
+        .filters = &.{ "producer top k", "deferred membership refines", "streaming boolean", "search.scorer.", "sparse exclusion masks", "public ordering seeks complete ties", "warm tie pagination", "sparse predicate planning", "text statistics" },
+        .max_rss = 8 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("lake-filtered-topk-test", "Verify bounded native membership, exclusion masks and cached public ties")
+        .dependOn(&addFilteredTestRunArtifact(b, filtered_topk_tests).step);
     const lake_refinement_bench_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lake_refinement_bench_root.zig"),
         .target = target,
@@ -4648,8 +4688,26 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     usermgr_storage_standalone_runtime_test_mod.addImport("antfly_root", standalone_runtime_test_mod);
     usermgr_storage_standalone_runtime_test_mod.addImport("antfly_platform", platform_mod);
     standalone_runtime_test_mod.addImport("usermgr_storage", usermgr_storage_standalone_runtime_test_mod);
+    // Catalog point reads reach the durable storage-owner ABI, including its
+    // handle cleanup. Isolate this root so linking the production provider
+    // does not change unrelated standalone/restore test compositions.
+    const system_catalog_standalone_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/standalone_runtime_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    standalone_runtime_imports.configure(b, system_catalog_standalone_test_mod, true, true);
+    system_catalog_standalone_test_mod.addImport("antfly_openapi_specs", standalone_runtime_imports.runtime.embedded_openapi);
+    const catalog_usermgr_storage_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    catalog_usermgr_storage_mod.addImport("antfly_root", system_catalog_standalone_test_mod);
+    catalog_usermgr_storage_mod.addImport("antfly_platform", platform_mod);
+    system_catalog_standalone_test_mod.addImport("usermgr_storage", catalog_usermgr_storage_mod);
     const system_catalog_standalone_tests = b.addTest(.{
-        .root_module = standalone_runtime_test_mod,
+        .root_module = system_catalog_standalone_test_mod,
         .filters = &.{"system catalog"},
     });
     const system_catalog_standalone_step = b.step("antfly-system-catalog-standalone-test", "Run standalone catalog checkpoint and rollback tests");
@@ -4661,7 +4719,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // Clone standalone_runtime_test_mod instead of reusing it directly so
     // only this one compile carries the storage owner archive; root
     // composition links it below rather than every standalone runtime
-    // consumer (system_catalog_standalone_tests, standalone_restore_tests).
+    // consumer (standalone_restore_tests and the separately linked catalog root).
     const lib_standalone_runtime_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/standalone_runtime_test_root.zig"),
         .target = target,
@@ -5131,6 +5189,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("vector-payload-bench", "Build real-file source payload and hash benchmarks").dependOn(&install_vector_payload_bench.step);
 
     const vector_payload_test_mod = makeLmdbModule(b, "pkg/antfly/src/vector_payload_store_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    vector_payload_test_mod.addImport("antfly_test_error_logs", b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/test_error_logs.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
     antfly_imports.configureRuntimeContracts(vector_payload_test_mod);
     vector_payload_test_mod.addImport("bloom", bloom_mod);
     vector_payload_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
@@ -5861,7 +5924,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const lite_merge_publication_runtime_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = &.{ "db text merge descriptor admission failures retry without quarantine", "db text merge shutdown cancels a worker blocked on descriptor admission" },
+        .filters = &.{ "db text merge descriptor admission failures retry without quarantine", "db text merge shutdown cancels a worker blocked on descriptor admission", "db text merge backpressure drains sustained segment debt to low watermark", "db text merge producer admission isolates quarantined dimensions" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lite-merge-publication-runtime-test", "Verify incremental merge publication handoff and shutdown")
@@ -7236,7 +7299,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .storage_test_step = lib_storage_test_step,
         // Runtime/restore and VOPR CLI/meta/registry slices each share a root.
         // Register both roots once to link their production ABI providers.
-        .linked_consumer_tests = std.mem.concat(b.allocator, *std.Build.Step.Compile, &.{ api_tests_addTests_result.linked_consumer_tests, data_tests_addTests_result.linked_consumer_tests, &.{ lite_cmd_tests, provisioned_query_visibility_tests.consumer.executable, graph_metric_remote_wire_tests.consumer.executable, lib_standalone_runtime_tests, vopr_cli } }) catch @panic("OOM"),
+        .linked_consumer_tests = std.mem.concat(b.allocator, *std.Build.Step.Compile, &.{ api_tests_addTests_result.linked_consumer_tests, data_tests_addTests_result.linked_consumer_tests, &.{ lite_cmd_tests, provisioned_query_visibility_tests.consumer.executable, graph_metric_remote_wire_tests.consumer.executable, lib_standalone_runtime_tests, system_catalog_standalone_tests, vopr_cli } }) catch @panic("OOM"),
     };
 }
 

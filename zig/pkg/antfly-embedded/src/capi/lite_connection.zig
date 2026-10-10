@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Connection lifetimes are independent of writer ownership. A kernel lease
 //! covers a complete exported operation (including SQL's commit coordinator).
@@ -184,8 +196,9 @@ pub const Connection = struct {
 
     fn maintenanceLoop(self: *Connection) void {
         const io = h.handleLockIo();
+        var next_wait_ms: i64 = 1000;
         while (!self.stopping.load(.acquire)) {
-            self.wake.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(1000), .clock = .awake } }) catch {};
+            self.wake.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(next_wait_ms), .clock = .awake } }) catch {};
             self.wake.reset();
             if (self.stopping.load(.acquire)) break;
             self.mutex.lockUncancelable(io);
@@ -214,15 +227,11 @@ pub const Connection = struct {
             }
             if (self.maintenance_pending) {
                 self.maintenance_pending = false;
-                root.db.runUntilIdleWithoutWaitingForEnrichmentRetriesWithCancellation(cancellation) catch {
-                    self.maintenance_pending = true;
-                };
+                self.maintenance_pending = (root.db.runBackgroundMaintenanceWithCancellation(cancellation) catch true) or self.maintenance_pending;
                 var tables = root.embedded_tables.valueIterator();
                 while (tables.next()) |table| {
                     if (self.stopping.load(.acquire)) break;
-                    table.*.db.runUntilIdleWithoutWaitingForEnrichmentRetriesWithCancellation(cancellation) catch {
-                        self.maintenance_pending = true;
-                    };
+                    self.maintenance_pending = (table.*.db.runBackgroundMaintenanceWithCancellation(cancellation) catch true) or self.maintenance_pending;
                 }
             }
             if (!self.stopping.load(.acquire)) {
@@ -237,6 +246,9 @@ pub const Connection = struct {
                 root.owned_lite_backend.?.native_docstore.?.maintainOnce(false) catch {};
             }
             self.collectRetired();
+            // Keep durable page work moving without retaining the path lease
+            // or spinning on a temporarily blocked maintenance page.
+            next_wait_ms = if (self.maintenance_pending) 100 else 1000;
         }
     }
 

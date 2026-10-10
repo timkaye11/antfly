@@ -196,6 +196,9 @@ pub const SegmentData = union(enum) {
 pub const SegmentShared = struct {
     const deletion_writer_bit: u32 = 1 << 31;
 
+    /// Private visibility state may borrow an immutable physical reader.
+    physical_parent: ?*SegmentEntry = null,
+
     ref_count: u32,
     residency_mutex: std.atomic.Mutex = .unlocked,
     // One process-level accounting owner per physical mapping. The manager
@@ -658,6 +661,12 @@ pub const SegmentEntry = struct {
         const alloc = self.reader.alloc;
         const seg_id = self.id;
         const cleanup = self.shared.retired_cleanup;
+        if (self.shared.physical_parent) |parent| {
+            destroyShared(alloc, self.shared);
+            parent.releaseRef();
+            alloc.destroy(parent);
+            return;
+        }
         self.data.madviseDiscardCleanPages();
         self.reader.deinit();
         self.data.deinit(alloc);
@@ -929,10 +938,6 @@ pub const IndexSnapshot = struct {
     epoch: u64,
     segments: []SegmentEntry,
     global_total_field_len: std.StringHashMapUnmanaged(u64),
-    // TODO: Profile significant_terms term-doc-freq lookups before adding a
-    // persisted term-stat sidecar. If this cache shows up hot across snapshot
-    // rebuilds/reopens, consider a sidecar keyed by segment/snapshot identity
-    // instead of re-walking dictionaries/postings.
     term_doc_freq_cache_mu: std.atomic.Mutex,
     // Bounded singleflight stripes. Warm hits avoid these; cold readers of
     // the same term batch reuse the first reader's exact, generation-bound result.
@@ -944,9 +949,78 @@ pub const IndexSnapshot = struct {
     term_doc_freq_cache_misses: u64,
     bm25_bound_table_cache_mu: std.atomic.Mutex,
     bm25_bound_table_cache: BM25BoundTableCache,
+    // Scalars only: no source, reader, query capability or borrowed navigation.
+    text_summary_mu: std.atomic.Mutex = .unlocked,
+    text_summaries: std.StringHashMapUnmanaged(TextTermSummary) = .empty,
+    text_summary_key_bytes: usize = 0,
     /// Query facades share scoring state only with this exact immutable corpus.
     /// The owner contains no query capability; cache misses use this facade.
     scoring_owner: ?*IndexSnapshot = null,
+
+    /// Installed only on a query facade. Shared scoring caches retain values,
+    /// never the caller's credentials, publication lease or read capability.
+    text_statistics: ?TextStatistics = null,
+    pub const TextStatistics = struct {
+        ptr: *anyopaque,
+        check: *const fn (*anyopaque) anyerror!void,
+        frequencies: *const fn (*anyopaque, Allocator, []const u8, []const []const u8, []u32) anyerror!void,
+        summary: *const fn (*anyopaque, Allocator, usize, []const u8, []const u8, f32, inverted.BM25Config) anyerror!TextTermSummary,
+    };
+    pub const TextTermSummary = struct { frequency: u32, tf_upper: f32 };
+    fn textSummaryKey(a: Allocator, segment: usize, field: []const u8, term: []const u8, average: f32, config: inverted.BM25Config) ![]u8 {
+        const key = try a.alloc(u8, 28 + field.len + term.len);
+        std.mem.writeInt(u64, key[0..8], segment, .little);
+        std.mem.writeInt(u32, key[8..12], @bitCast(average), .little);
+        std.mem.writeInt(u32, key[12..16], @bitCast(config.k1), .little);
+        std.mem.writeInt(u32, key[16..20], @bitCast(config.b), .little);
+        std.mem.writeInt(u64, key[20..28], field.len, .little);
+        @memcpy(key[28..][0..field.len], field);
+        @memcpy(key[28 + field.len ..], term);
+        return key;
+    }
+    pub fn cachedTextTermSummary(self: *const IndexSnapshot, a: Allocator, segment: usize, field: []const u8, term: []const u8, average: f32, config: inverted.BM25Config) !?TextTermSummary {
+        if (self.text_statistics) |reader| try reader.check(reader.ptr);
+        if (self.segments[segment].query_source) |source| if (source == .ranges) if (source.ranges.check_read_context) |check| try check(source.ranges.ptr);
+        const key = try textSummaryKey(a, segment, field, term, average, config);
+        defer a.free(key);
+        const owner = self.scoringCache();
+        while (!owner.text_summary_mu.tryLock()) spinOrYield();
+        const cached = owner.text_summaries.get(key);
+        owner.text_summary_mu.unlock();
+        if (cached) |value| return value;
+        if (self.text_statistics) |reader| {
+            const value = try reader.summary(reader.ptr, a, segment, field, term, average, config);
+            try reader.check(reader.ptr);
+            if (self.segments[segment].query_source) |source| if (source == .ranges) if (source.ranges.check_read_context) |check| try check(source.ranges.ptr);
+            try self.rememberTextTermSummary(segment, field, term, average, config, value);
+            return value;
+        }
+        return null;
+    }
+    pub fn rememberTextTermSummary(self: *const IndexSnapshot, segment: usize, field: []const u8, term: []const u8, average: f32, config: inverted.BM25Config, value: TextTermSummary) !void {
+        const owner = self.scoringCache();
+        while (!owner.text_summary_mu.tryLock()) spinOrYield();
+        defer owner.text_summary_mu.unlock();
+        if (28 + field.len + term.len > 256 * 1024) return;
+        const key = try textSummaryKey(owner.alloc, segment, field, term, average, config);
+        errdefer owner.alloc.free(key);
+        if (owner.text_summaries.contains(key)) {
+            owner.alloc.free(key);
+            return;
+        }
+        // Bounded eviction keeps hot repeated queries reusable without
+        // accumulating a per-segment cache for an archive-sized inventory.
+        while (owner.text_summaries.count() >= 4096 or key.len > 256 * 1024 - owner.text_summary_key_bytes) {
+            var it = owner.text_summaries.iterator();
+            const first = it.next() orelse break;
+            const old = first.key_ptr.*;
+            _ = owner.text_summaries.remove(old);
+            owner.text_summary_key_bytes -= old.len;
+            owner.alloc.free(old);
+        }
+        try owner.text_summaries.put(owner.alloc, key, value);
+        owner.text_summary_key_bytes += key.len;
+    }
 
     fn scoringCache(self: *const IndexSnapshot) *IndexSnapshot {
         return self.scoring_owner orelse @constCast(self);
@@ -1002,12 +1076,15 @@ pub const IndexSnapshot = struct {
             while (table_it.next()) |table| alloc.destroy(table.*);
             self.bm25_bound_table_cache.deinit(alloc);
         }
+        var summaries = self.text_summaries.keyIterator();
+        while (summaries.next()) |key| alloc.free(key.*);
+        self.text_summaries.deinit(alloc);
         self.global_total_field_len.deinit(alloc);
         if (self.scoring_owner) |owner| owner.release();
         alloc.destroy(self);
     }
 
-    fn bm25BoundTable(
+    pub fn bm25BoundTable(
         self: *const IndexSnapshot,
         avg_doc_len: f32,
         config: inverted.BM25Config,
@@ -1090,6 +1167,64 @@ pub const IndexSnapshot = struct {
         return self.searchInternal(alloc, field, terms, k, override, bm25_config, null);
     }
 
+    pub const TextSegmentPlan = struct {
+        segment_idx: usize,
+        doc_offset: u32,
+        score_upper_bound: f32,
+    };
+    /// Shared filtered/unfiltered segment bounds. Global statistics are supplied
+    /// once by the query; document offsets remain stable after score ordering.
+    pub fn planTextSegments(self: *const IndexSnapshot, alloc: Allocator, field: []const u8, terms: []const []const u8, term_doc_freqs: []const u32, global_doc_count: u32, avg_dl: f32, bm25_config: inverted.BM25Config) ![]TextSegmentPlan {
+        // Computing query-specific bounds opens every segment dictionary and
+        // walks each term's block-max table before opening them again for
+        // scoring. On a healthy tiered index (normally <= 10 segments), that
+        // fixed work costs more than it saves. Reserve global segment ordering
+        // for genuinely fragmented snapshots where pruning can amortize the
+        // prepass; WAND still performs block-level pruning inside every
+        // segment in the normal production state.
+        const use_segment_bound_planning = self.segments.len > 16;
+
+        const plans = try alloc.alloc(TextSegmentPlan, self.segments.len);
+        errdefer alloc.free(plans);
+        var doc_offset: u32 = 0;
+        for (self.segments, 0..) |*seg, segment_idx| {
+            var upper_bound: f32 = std.math.inf(f32);
+            if (use_segment_bound_planning) {
+                upper_bound = 0;
+                if (try seg.reader.invertedIndexScoped(alloc, field)) |opened| {
+                    var inv_reader = opened;
+                    defer inv_reader.deinit();
+                    for (terms, 0..) |term, term_idx| {
+                        const lookup_result = (try inv_reader.lookup(term)) orelse continue;
+                        const df = if (term_doc_freqs[term_idx] != 0) term_doc_freqs[term_idx] else lookup_result.docFreq();
+                        upper_bound += switch (lookup_result) {
+                            .postings => |p| if (p.block_max) |block_max|
+                                block_max.maxImpactAll(global_doc_count, df, avg_dl, bm25_config)
+                            else
+                                inverted.bm25MaxScore(global_doc_count, df, bm25_config),
+                            .one_hit => |hit| inverted.bm25Score(1, hit.norm_bits, global_doc_count, df, avg_dl, bm25_config),
+                        };
+                    }
+                }
+            }
+            plans[segment_idx] = .{
+                .segment_idx = segment_idx,
+                .doc_offset = doc_offset,
+                .score_upper_bound = upper_bound,
+            };
+            doc_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch return error.CountOverflow;
+        }
+        if (use_segment_bound_planning) {
+            std.mem.sort(TextSegmentPlan, plans, {}, struct {
+                fn lessThan(_: void, a: TextSegmentPlan, b: TextSegmentPlan) bool {
+                    if (a.score_upper_bound == b.score_upper_bound) return a.segment_idx < b.segment_idx;
+                    return a.score_upper_bound > b.score_upper_bound;
+                }
+            }.lessThan);
+        }
+        return plans;
+    }
+
     fn searchInternal(
         self: *const IndexSnapshot,
         alloc: Allocator,
@@ -1122,62 +1257,8 @@ pub const IndexSnapshot = struct {
         var collector = scorer_mod.TopKCollector.init(alloc, k);
         defer collector.deinit();
 
-        // Computing query-specific bounds opens every segment dictionary and
-        // walks each term's block-max table before opening them again for
-        // scoring. On a healthy tiered index (normally <= 10 segments), that
-        // fixed work costs more than it saves. Reserve global segment ordering
-        // for genuinely fragmented snapshots where pruning can amortize the
-        // prepass; WAND still performs block-level pruning inside every
-        // segment in the normal production state.
-        const use_segment_bound_planning = self.segments.len > 16;
-
-        const SegmentPlan = struct {
-            segment_idx: usize,
-            doc_offset: u32,
-            score_upper_bound: f32,
-        };
-        var single_plan_storage: [1]SegmentPlan = undefined;
-        const plans = if (self.segments.len <= single_plan_storage.len)
-            single_plan_storage[0..self.segments.len]
-        else
-            try alloc.alloc(SegmentPlan, self.segments.len);
-        defer if (self.segments.len > single_plan_storage.len) alloc.free(plans);
-        var doc_offset: u32 = 0;
-        for (self.segments, 0..) |*seg, segment_idx| {
-            var upper_bound: f32 = std.math.inf(f32);
-            if (use_segment_bound_planning) {
-                upper_bound = 0;
-                if (try seg.reader.invertedIndexScoped(alloc, field)) |opened| {
-                    var inv_reader = opened;
-                    defer inv_reader.deinit();
-                    for (terms, 0..) |term, term_idx| {
-                        const lookup_result = (try inv_reader.lookup(term)) orelse continue;
-                        const df = if (term_doc_freqs[term_idx] != 0) term_doc_freqs[term_idx] else lookup_result.docFreq();
-                        upper_bound += switch (lookup_result) {
-                            .postings => |p| if (p.block_max) |block_max|
-                                block_max.maxImpactAll(global_doc_count, df, avg_dl, bm25_config)
-                            else
-                                inverted.bm25MaxScore(global_doc_count, df, bm25_config),
-                            .one_hit => |hit| inverted.bm25Score(1, hit.norm_bits, global_doc_count, df, avg_dl, bm25_config),
-                        };
-                    }
-                }
-            }
-            plans[segment_idx] = .{
-                .segment_idx = segment_idx,
-                .doc_offset = doc_offset,
-                .score_upper_bound = upper_bound,
-            };
-            doc_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch return error.CountOverflow;
-        }
-        if (use_segment_bound_planning) {
-            std.mem.sort(SegmentPlan, plans, {}, struct {
-                fn lessThan(_: void, a: SegmentPlan, b: SegmentPlan) bool {
-                    if (a.score_upper_bound == b.score_upper_bound) return a.segment_idx < b.segment_idx;
-                    return a.score_upper_bound > b.score_upper_bound;
-                }
-            }.lessThan);
-        }
+        const plans = try self.planTextSegments(alloc, field, terms, term_doc_freqs, global_doc_count, avg_dl, bm25_config);
+        defer alloc.free(plans);
         if (diagnostics) |diag| diag.segments_considered +|= @intCast(plans.len);
 
         for (plans) |plan| {
@@ -1309,6 +1390,18 @@ pub const IndexSnapshot = struct {
     /// The caller owns the returned data.
     pub const DecompressedDoc = struct { id: []const u8, data: []u8 };
 
+    pub const StoredDocBlockCache = segment_mod.SegmentReader.StoredDocBlockCache;
+
+    /// Request-owned, bounded decoded blocks for ranked (not physical-order)
+    /// result hydration. Returned identity/body expire on the next cache get.
+    /// The snapshot must remain pinned until the cache is destroyed.
+    pub fn storedDocWithBlockCache(self: *const IndexSnapshot, cache: *StoredDocBlockCache, global_id: u32) !?segment_mod.SegmentReader.StoredDocRef {
+        const resolved = self.resolveDocId(global_id) orelse return null;
+        const segment = &self.segments[resolved.seg_idx];
+        segment.noteAccess();
+        return cache.get(&segment.reader, resolved.local_id);
+    }
+
     pub fn storedDocDecompressed(self: *const IndexSnapshot, alloc: Allocator, global_id: u32) !?DecompressedDoc {
         const resolved = self.resolveDocId(global_id) orelse return null;
         self.segments[resolved.seg_idx].noteAccess();
@@ -1405,6 +1498,7 @@ pub const IndexSnapshot = struct {
     }
 
     fn checkScoringReadContext(self: *const IndexSnapshot) !void {
+        if (self.text_statistics) |reader| try reader.check(reader.ptr);
         for (self.segments) |segment| if (segment.query_source) |source| if (source == .ranges) {
             if (source.ranges.check_read_context) |check| try check(source.ranges.ptr);
         };
@@ -1463,6 +1557,12 @@ pub const IndexSnapshot = struct {
             } else cold = true;
         };
         if (!cold) return;
+        if (self.text_statistics) |reader| {
+            try reader.frequencies(reader.ptr, alloc, field, terms, output);
+            try self.checkScoringReadContext();
+            for (terms, output, missing) |term, value, miss| if (miss) self.cacheTermDocFreq(field, term, value);
+            return;
+        }
         const scheduler = @import("sql/parallel_scheduler.zig");
         const Worker = struct {
             fn run(snapshot_ref: *const IndexSnapshot, a: Allocator, name: []const u8, needles: []const []const u8, mask: []const bool, counts: []u32, lane: usize, lanes: usize) anyerror!void {
@@ -1869,6 +1969,44 @@ pub const IndexWriter = struct {
         for (segments) |*segment| segment.retain();
         self.publishSnapshot(snapshot_ref);
         old.release();
+    }
+
+    /// Compose one corpus while giving each masked segment private tombstones.
+    /// Encoded bytes and physical readers stay shared; the source snapshot is
+    /// never mutated. Global BM25 uses this complete corpus, including its delta.
+    pub fn shareMaskedImmutableSegments(self: *IndexWriter, sources: []const ImmutableSegment, excluded: []const roaring.RoaringBitmap) !void {
+        if (sources.len != excluded.len) return error.InvalidSegment;
+        if (sources.len == 0) return;
+        var private = try IndexWriter.init(self.alloc);
+        defer private.deinit();
+        try private.shareImmutableSegments(sources);
+        const snapshot_ref = private.snapshot();
+        for (snapshot_ref.segments, excluded) |*segment, mask| {
+            if (mask.cardinality() == 0) continue;
+            if (segment.reader.doc_count == 0 or mask.rank(segment.reader.doc_count) != mask.cardinality()) return error.InvalidSegment;
+            const parent = try self.alloc.create(SegmentEntry);
+            errdefer self.alloc.destroy(parent);
+            parent.* = segment.*;
+            const shared = try SegmentEntry.createShared(self.alloc, segment.data, &segment.reader);
+            errdefer SegmentEntry.destroyShared(self.alloc, shared);
+            shared.deleted = try mask.clone(self.alloc);
+            shared.deleted_count.store(@intCast(mask.cardinality()), .release);
+            shared.physical_parent = parent;
+            // Transfer this snapshot's physical pin to parent; its new shared
+            // cell owns only visibility and metadata, never the encoded source.
+            segment.shared = shared;
+        }
+        // The temporary writer is the sole owner until all masks are admitted.
+        // Transfer the sealed snapshot into the destination atomically.
+        self.lockMutex();
+        defer self.mu.unlock();
+        if (self.snapshot().segments.len != 0) return error.InvalidSegment;
+        const next = private.acquireSnapshot();
+        const previous = self.current;
+        self.current = next;
+        self.next_epoch = private.next_epoch;
+        self.next_segment_id = private.next_segment_id;
+        previous.release();
     }
 
     /// Preserve the sealed corpus order when a fork retains readers from a
@@ -3857,11 +3995,16 @@ test "external lake query scoring caches share only the exact immutable generati
     try std.testing.expectEqual(@as(u64, 1), owner.term_doc_freq_cache_misses);
     try std.testing.expectEqual(@as(u32, 1), try second.termDocFreq(a, "body", "common"));
     try std.testing.expectEqual(@as(u64, 1), owner.term_doc_freq_cache_hits);
+    try first.rememberTextTermSummary(0, "body", "common", 2, .{}, .{ .frequency = 1, .tf_upper = 2 });
+    try std.testing.expectEqual(@as(u32, 1), (try second.cachedTextTermSummary(a, 0, "body", "common", 2, .{})).?.frequency);
+    try std.testing.expect(try second.cachedTextTermSummary(a, 0, "body", "common", 3, .{}) == null);
+    try std.testing.expect(try second.cachedTextTermSummary(a, 0, "body", "common", 2, .{ .k1 = 2 }) == null);
     // Publishing a changed corpus must not inherit the old frequency cache.
     try writer.addSegment(bytes);
     const changed = try writer.acquireSnapshotWithReadContext(&context);
     defer changed.release();
     try std.testing.expect(changed.scoringCache() != owner);
+    try std.testing.expect(try changed.cachedTextTermSummary(a, 0, "body", "common", 2, .{}) == null);
     try std.testing.expectEqual(@as(u32, 2), try changed.termDocFreq(a, "body", "common"));
     try std.testing.expectEqual(@as(u32, 1), try first.termDocFreq(a, "body", "common"));
 }
@@ -4003,4 +4146,56 @@ test "external lake range segment admission defers dictionary diagnostics across
     } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
     try std.testing.expect(unpublished[0].prepared_reader == null);
     try std.testing.expectEqual(@as(u64, 3), writer.snapshot().segments[0].id);
+}
+
+fn maskedImmutableCorpusScenario(a: Allocator) !void {
+    const bytes = try buildTestSegmentWithIds(a, &.{ .{ .id = "old", .terms = &.{.{ .term = "common", .freq = 1, .norm = 1 }} }, .{ .id = "kept", .terms = &.{.{ .term = "common", .freq = 1, .norm = 1 }} } });
+    defer a.free(bytes);
+    var archive = try IndexWriter.init(a);
+    defer archive.deinit();
+    try archive.addSegment(bytes);
+    const base = archive.acquireSnapshot();
+    defer base.release();
+    var mask = roaring.RoaringBitmap.init(a);
+    defer mask.deinit();
+    try mask.add(0);
+    var joined = try IndexWriter.init(a);
+    defer joined.deinit();
+    try joined.shareMaskedImmutableSegments(&.{.{ .snapshot = base, .ordinal = 0, .target_id = 1 }}, &.{mask});
+    const visible = joined.acquireSnapshot();
+    defer visible.release();
+    try std.testing.expectEqual(@as(u32, 2), base.liveDocCount());
+    try std.testing.expectEqual(@as(u32, 1), visible.liveDocCount());
+    try std.testing.expect(visible.segments[0].shared != base.segments[0].shared);
+    try std.testing.expect(visible.segments[0].data.bytes().ptr == base.segments[0].data.bytes().ptr);
+    // The scoring contract matches native Lucene-style immutable segment stats.
+    try std.testing.expectEqual(@as(u32, 2), visible.scoringDocCount());
+}
+test "external lake overlays mask shared archive readers without mutating other snapshots" {
+    try maskedImmutableCorpusScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, maskedImmutableCorpusScenario, .{});
+}
+
+test "external lake overlays reject private masks outside the physical corpus" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithIds(a, &.{.{ .id = "kept", .terms = &.{.{ .term = "common", .freq = 1, .norm = 1 }} }});
+    defer a.free(bytes);
+    var archive = try IndexWriter.init(a);
+    defer archive.deinit();
+    try archive.addSegment(bytes);
+    const base = archive.acquireSnapshot();
+    defer base.release();
+    var mask = roaring.RoaringBitmap.init(a);
+    defer mask.deinit();
+    try mask.add(base.segments[0].reader.doc_count);
+    var joined = try IndexWriter.init(a);
+    defer joined.deinit();
+    try std.testing.expectError(error.InvalidSegment, joined.shareMaskedImmutableSegments(&.{.{ .snapshot = base, .ordinal = 0, .target_id = 1 }}, &.{mask}));
+    try std.testing.expectEqual(@as(u32, 1), base.liveDocCount());
+    try std.testing.expectEqual(@as(u32, 0), joined.snapshot().liveDocCount());
+    try mask.remove(base.segments[0].reader.doc_count);
+    try mask.add(base.segments[0].reader.doc_count - 1);
+    try joined.shareMaskedImmutableSegments(&.{.{ .snapshot = base, .ordinal = 0, .target_id = 1 }}, &.{mask});
+    try std.testing.expectEqual(@as(u32, 0), joined.snapshot().liveDocCount());
+    try std.testing.expectEqual(@as(u32, 1), base.liveDocCount());
 }
