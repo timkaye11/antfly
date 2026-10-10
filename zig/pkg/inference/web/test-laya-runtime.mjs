@@ -103,6 +103,47 @@ test('tiny Laya WASM: packed layouts, pointer, two-stage, Q8 and OpenDecider', {
     await assert.rejects(session.load(invalid, 'fp32'), /InvalidLayaWeights/);
   } finally { session.unload(); }
 });
+test('public decisions use the native contract and reject extraction/unsupported policies', { skip: !wasmPath }, async () => {
+  const { instance } = await WebAssembly.instantiate(await readFile(wasmPath), { env: {} });
+  const session = new ExtractionSession(instance.exports, createWasmAbi(instance.exports));
+  const publicRequest = {
+    model: 'local', input: 'Please search for documentation.', questions: [
+      { name: 'tool', type: 'choice', instructions: 'Which tool?', choices: [{ value: 'search' }, { value: 'none' }] },
+      { name: 'risk', type: 'score', instructions: 'How risky?', levels: [{ label: 'safe' }, { label: 'risky' }] },
+      { name: 'act', type: 'predicate', instructions: 'Should we act?' },
+    ],
+  };
+  try {
+    const info = await session.load(layaFixture(), 'fp32');
+    assert.deepEqual(info.execution.tasks, ['decide']);
+    const before = instance.exports.extraction_live_bytes(session.handle);
+    assert(session.run(publicRequest, true, 'decide').value.encoded_tokens > 0);
+    const response = session.run(publicRequest, false, 'decide').value;
+    assert(response.usage.input_tokens > 0);
+    assert.equal(response.usage.output_tokens, 0);
+    assert.deepEqual(response.answers.map(a => [a.name, a.type, a.decision_method]), [
+      ['tool', 'choice', 'typed'], ['risk', 'score', 'typed'], ['act', 'predicate', 'typed'],
+    ]);
+    assert.deepEqual(response.answers[1].probabilities.map(p => [p.value, p.label]), [[0, 'safe'], [1, 'risky']]);
+    assert(response.answers[1].score >= 0 && response.answers[1].score <= 1);
+    assert(response.answers[2].probability >= 0 && response.answers[2].probability <= 1);
+    const batched = { ...publicRequest, inputs: [{ id: 'one', input: publicRequest.input }] }; delete batched.input;
+    const batch = session.run(batched, false, 'decide').value;
+    assert.equal(batch.data[0].id, 'one');
+    assert.deepEqual(batch.data[0].answers, response.answers);
+    for (const invalid of [
+      { ...publicRequest, model_identity: 'unsupported' },
+      { ...publicRequest, embedding_options: { task_type: 'CLASSIFICATION' } },
+      { ...publicRequest, questions: [{ ...publicRequest.questions[0], choices: [{ value: 'search', examples: ['example'] }, { value: 'none' }] }] },
+      { ...publicRequest, questions: [{ ...publicRequest.questions[0], type: 'multi_choice', similarity_thresholds: 0.5 }] },
+      { ...batched, inputs: [...batched.inputs, ...batched.inputs] },
+    ]) assert.throws(() => session.run(invalid, true, 'decide'));
+    assert.throws(() => session.run(layaRequest, true, 'extract'), /UnsupportedInferenceTask/);
+    for (let i = 0; i < 5; i++) assert.deepEqual(session.run(publicRequest, false, 'decide').value, response);
+    assert(instance.exports.extraction_live_bytes(session.handle) < before + 65536, 'public request scratch must be released');
+  } finally { session.unload(); }
+});
+
 export const request = {
   schema_version: 2, model: 'laya', inputs: [{ id: 'local', content: 'Please search for the latest documentation about browser inference.' }],
   schema: { classifications: [

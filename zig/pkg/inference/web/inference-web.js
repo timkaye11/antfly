@@ -312,8 +312,8 @@ export class InferenceWeb {
     return this._workerCall('extraction-load', { files, precision }, [], { onProgress }).then(r => r.model);
   }
 
-  runExtraction(request, validateOnly = false) {
-    return this._workerCall('extraction-run', { request, validateOnly }).then(r => r.result);
+  runExtraction(request, validateOnly = false, task) {
+    return this._workerCall('extraction-run', { request, validateOnly, task }).then(r => r.result);
   }
 
   unloadExtraction() { return this._workerCall('extraction-unload'); }

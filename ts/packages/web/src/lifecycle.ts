@@ -1,6 +1,7 @@
 // Copyright 2026 Antfly, Inc. SPDX-License-Identifier: Apache-2.0
 import type { ModelInfo } from "./contracts.js";
 export type InferenceErrorCode =
+  | "UNSUPPORTED_TASK"
   | "DISPOSED"
   | "BUSY"
   | "MODEL_NOT_LOADED"
@@ -32,7 +33,16 @@ export type InferenceState = Readonly<{
     | "error"
     | "disposed";
   model: ModelInfo | null;
-  operation: "load" | "reload" | "run" | "validate" | null;
+  operation:
+    | "load"
+    | "reload"
+    | "run"
+    | "validate"
+    | "extract"
+    | "decide"
+    | "validate-extraction"
+    | "validate-decision"
+    | null;
   recovery: "none" | "reload-on-next-run";
   error: Readonly<{ code: InferenceErrorCode; message: string }> | null;
 }>;

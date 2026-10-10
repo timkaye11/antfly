@@ -19,7 +19,7 @@ files.push(
 );
 const sources = new Map();
 const hash = createHash("sha256").update(
-  `antfly-inference:${version}:protocol=1:abi=1:zig=${zigVersion}\0`
+  `antfly-inference:${version}:protocol=2:abi=2:zig=${zigVersion}\0`
 );
 for (const path of await walk(join(pkg, "src"), [".ts"])) {
   hash.update(relative(pkg, path).replaceAll("\\", "/") + "\0");
@@ -35,9 +35,9 @@ for (const file of files.sort()) {
 }
 const compatibility = {
   manifestVersion: 1,
-  protocolVersion: 1,
+  protocolVersion: 2,
   clientVersion: version,
-  extractionAbiVersion: 1,
+  extractionAbiVersion: 2,
   runtimeId: hash.digest("hex"),
 };
 const manifest = { ...compatibility, zigVersion, sourceFingerprint: fingerprint, files: [] };

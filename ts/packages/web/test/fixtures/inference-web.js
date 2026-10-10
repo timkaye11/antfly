@@ -11,11 +11,26 @@ export class InferenceWeb {
     const fixture = globalThis.inferenceFixture;
     fixture.loads.push(files);
     await fixture.load?.(files, precision, progress);
-    return { architecture: "span", precision: "fp32", bytes: 16 };
+    return {
+      execution: {
+        tasks: ["extract", "decide"],
+        capabilities: ["extraction", "typed_decisions"],
+        decisionKinds: ["choice", "score", "predicate"],
+        limits: {
+          maxInputs: 1,
+          maxTextBytes: 262144,
+          maxRequestBytes: 524288,
+          maxSchemaBytes: 65536,
+        },
+      },
+      architecture: "span",
+      precision: "fp32",
+      bytes: 16,
+    };
   }
-  async runExtraction(request, validate) {
+  async runExtraction(request, validate, task) {
     const value =
-      (await globalThis.inferenceFixture.run?.(request, validate)) ??
+      (await globalThis.inferenceFixture.run?.(request, validate, task)) ??
       (validate ? { valid: true, encoded_tokens: 4 } : { schema_version: 1, entities: [] });
     return { value, elapsedMs: 1, wasmBytes: 1024 };
   }

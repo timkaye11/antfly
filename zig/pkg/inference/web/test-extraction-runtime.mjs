@@ -29,7 +29,7 @@ const wasmPath = process.env.EXTRACTION_WASM;
 test('real WASM ABI: staged loading, bounded errors and SHA256', { skip: !wasmPath }, async () => {
   const { instance } = await WebAssembly.instantiate(await readFile(wasmPath), { env: {} });
   const wasm = instance.exports, session = new ExtractionSession(wasm, createWasmAbi(wasm));
-  assert.equal(wasm.extraction_abi_version(), 1);
+  assert.equal(wasm.extraction_abi_version(), 2);
   assert.equal(await session.hash(new Blob(['abc'])), 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
   assert.throws(() => session.run({ schema_version: 2 }), /ModelNotLoaded/);
   session.unload(); session.unload();

@@ -761,7 +761,7 @@ importers:
 
   packages/embedded-linux-x64: {}
 
-  packages/inference-web:
+  packages/web:
     devDependencies:
       '@playwright/test':
         specifier: ^1.61.0

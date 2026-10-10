@@ -1,5 +1,16 @@
 // Copyright 2026 Antfly, Inc. SPDX-License-Identifier: Apache-2.0
 import type {
+  ExtractionRequest,
+  ExtractionRequestV2,
+  ExtractionResponse,
+  ExtractionResponseV2,
+  DecisionRequest,
+  DecisionResponse,
+  ModelCapabilities,
+  ModelInspection,
+  ModelFamily,
+  RuntimeArchitecture,
+  InferenceTask,
   Backend,
   BundleFiles,
   ExtensionInferenceRequest,
@@ -23,9 +34,14 @@ export * from "./lifecycle.js";
 export { RUNTIME_COMPATIBILITY } from "./runtime-compatibility.js";
 
 type BundleInfo = {
-  architecture: "span" | "boundary" | "decide" | "laya";
+  architecture: string;
+  family: ModelFamily;
+  runtimeArchitecture: RuntimeArchitecture;
   precision: WeightPrecision;
   bytes: number;
+  tasks?: readonly string[];
+  capabilities?: readonly string[];
+  execution?: ModelCapabilities;
   cpuReason?: string;
   config?: { laya?: { format?: string } };
 };
@@ -37,8 +53,9 @@ type Runtime = {
     progress?: (p: InferenceProgress) => void
   ) => Promise<BundleInfo>;
   runExtraction: (
-    request: InferenceRequest | ExtensionInferenceRequest,
-    validate: boolean
+    request: InferenceRequest | ExtensionInferenceRequest | DecisionRequest,
+    validate: boolean,
+    operation?: InferenceTask
   ) => Promise<Omit<RunResult<unknown>, "backend">>;
   destroy: (reason?: Error) => void;
 };
@@ -55,6 +72,7 @@ type Gpu = {
 };
 type AssetModule = {
   INFERENCE_RUNTIME_ID: string;
+  inspectModel: (files: BundleFiles, precision?: WeightPrecision) => Promise<ModelInspection>;
   inspectBundle: (files: BundleFiles, precision?: WeightPrecision) => Promise<BundleInfo>;
   InferenceWeb: new () => Runtime;
   WebGPUOps: new () => Gpu;
@@ -72,19 +90,7 @@ async function moduleAt(base: string, name: string): Promise<AssetModule> {
   return module;
 }
 function modelIdentity(info: BundleInfo): Pick<ModelInfo, "family" | "architecture"> {
-  switch (info.architecture) {
-    case "span":
-      return { family: "gliner2", architecture: "span" };
-    case "boundary":
-      return { family: "gliner25", architecture: "boundary" };
-    case "decide":
-      return { family: "decide", architecture: "span" };
-    case "laya":
-      return {
-        family: info.config?.laya?.format === "opendecider" ? "opendecider" : "laya",
-        architecture: "modernbert",
-      };
-  }
+  return { family: info.family, architecture: info.runtimeArchitecture };
 }
 function failure(error: unknown, code: InferenceErrorCode): InferenceError {
   if (error instanceof InferenceError) return error;
@@ -123,7 +129,27 @@ export async function detectCapabilities() {
         : undefined,
   };
 }
-export class InferenceClient {
+const emptyCapabilities: ModelCapabilities = {
+  tasks: [],
+  capabilities: [],
+  decisionKinds: [],
+  limits: {
+    maxInputs: 1,
+    maxTextBytes: 256 * 1024,
+    maxRequestBytes: 512 * 1024,
+    maxSchemaBytes: 64 * 1024,
+  },
+};
+function freezeCapabilities(value: ModelCapabilities): ModelCapabilities {
+  return Object.freeze({
+    ...value,
+    tasks: Object.freeze([...value.tasks]),
+    capabilities: Object.freeze([...value.capabilities]),
+    decisionKinds: Object.freeze([...value.decisionKinds]),
+    limits: Object.freeze({ ...value.limits }),
+  });
+}
+export class Inference {
   private runtime: Runtime | null = null;
   private gpu: Gpu | null = null;
   private busy = false;
@@ -134,6 +160,7 @@ export class InferenceClient {
   private requestedBackend: Backend = "auto";
   private interruption = new InferenceError("CANCELLED", "Inference cancelled");
   private compatibilityChecked = false;
+  private operationController: AbortController | null = null;
   private listeners = new Set<(state: InferenceState) => void>();
   private snapshot: InferenceState = Object.freeze({
     status: "idle",
@@ -143,6 +170,9 @@ export class InferenceClient {
     error: null,
   });
   readonly assets: string;
+  static async create(options: { assets?: string } = {}): Promise<Inference> {
+    return new Inference(options.assets);
+  }
   constructor(assets = "/inference/") {
     this.assets = new URL(assets, location.href).href;
   }
@@ -193,6 +223,11 @@ export class InferenceClient {
       throw failure(error, "RUNTIME_INCOMPATIBLE");
     }
   }
+  async inspectModel(files: BundleFiles, precision?: WeightPrecision): Promise<ModelInspection> {
+    await this.verifyCompatibility();
+    const { inspectModel } = await moduleAt(this.assets, "runtime/model-adapters.js");
+    return inspectModel(files, precision);
+  }
   async inspectBundle(files: BundleFiles, precision?: WeightPrecision) {
     await this.verifyCompatibility();
     const { inspectBundle } = await moduleAt(this.assets, "runtime/extraction-bundle.js");
@@ -203,6 +238,9 @@ export class InferenceClient {
       bytes: result.bytes,
       qualified: false as const,
       cpuReason: result.cpuReason,
+      tasks: result.tasks ?? [],
+      capabilities: result.capabilities ?? [],
+      execution: result.execution,
     };
   }
   private assertIdle() {
@@ -210,6 +248,8 @@ export class InferenceClient {
     if (this.busy) throw new InferenceError("BUSY", "Only one model operation may run at a time");
   }
   private stop(error = new InferenceError("CANCELLED", "Inference cancelled")) {
+    this.operationController?.abort(error);
+    this.operationController = null;
     this.interruption = error;
     this.generation++;
     const runtime = this.runtime,
@@ -254,6 +294,8 @@ export class InferenceClient {
     }
     this.requestedBackend = options.backend ?? "auto";
     this.stop();
+    const controller = new AbortController();
+    this.operationController = controller;
     const generation = this.generation;
     const check = () => {
       if (generation !== this.generation) throw this.interruption;
@@ -279,7 +321,7 @@ export class InferenceClient {
       check();
       if (reload) progress({ stage: "reload", loaded: 0, total: 1 });
       progress({ stage: "compatibility", loaded: 0, total: 1 });
-      await this.verifyCompatibility(options.signal);
+      await this.verifyCompatibility(controller.signal);
       check();
       progress({ stage: "inspect", loaded: 0, total: 1 });
       const inspected = await this.inspectBundle(files, options.precision);
@@ -353,6 +395,9 @@ export class InferenceClient {
       this.precision = options.precision;
       model = Object.freeze({
         ...loaded,
+        tasks: Object.freeze([...(loaded.tasks ?? inspected.tasks)]),
+        capabilities: Object.freeze([...(loaded.capabilities ?? inspected.capabilities)]),
+        execution: freezeCapabilities(loaded.execution ?? inspected.execution ?? emptyCapabilities),
         family: inspected.family,
         architecture: inspected.architecture,
         qualified: false,
@@ -369,6 +414,7 @@ export class InferenceClient {
       // init can create a device after cancel/dispose; the local owner must
       // destroy it even when another generation has detached the client.
       pendingGpu?.destroy();
+      if (this.operationController === controller) this.operationController = null;
       options.signal?.removeEventListener("abort", abort);
       this.busy = false;
     }
@@ -376,6 +422,31 @@ export class InferenceClient {
     check();
     return model;
   }
+  extract(
+    request: InferenceRequestV1,
+    options?: RunOptions
+  ): Promise<RunResult<InferenceResponseV1>>;
+  extract(
+    request: ExtractionRequestV2,
+    options?: RunOptions
+  ): Promise<RunResult<ExtractionResponseV2>>;
+  extract(request: ExtractionRequest, options?: RunOptions): Promise<RunResult<ExtractionResponse>>;
+  extract(request: ExtractionRequest, options: RunOptions = {}) {
+    return this.execute<ExtractionResponse>(request, options, false, "extract");
+  }
+  decide(request: DecisionRequest, options: RunOptions = {}): Promise<RunResult<DecisionResponse>> {
+    return this.execute(request, options, false, "decide");
+  }
+  validateExtraction(
+    request: ExtractionRequest,
+    options: RunOptions = {}
+  ): Promise<ValidationResult> {
+    return this.execute(request, options, true, "extract");
+  }
+  validateDecision(request: DecisionRequest, options: RunOptions = {}): Promise<ValidationResult> {
+    return this.execute(request, options, true, "decide");
+  }
+  /** @deprecated Use extract() or decide() with their public task contracts. */
   run(request: InferenceRequestV1, options?: RunOptions): Promise<RunResult<InferenceResponseV1>>;
   run(request: InferenceRequestV2, options?: RunOptions): Promise<RunResult<InferenceResponseV2>>;
   run(request: InferenceRequest, options?: RunOptions): Promise<RunResult<InferenceResponse>>;
@@ -398,9 +469,10 @@ export class InferenceClient {
     return this.execute(request, options, true);
   }
   private async execute<T>(
-    request: InferenceRequest | ExtensionInferenceRequest,
+    request: InferenceRequest | ExtensionInferenceRequest | DecisionRequest,
     options: RunOptions,
-    validateOnly: boolean
+    validateOnly: boolean,
+    task?: InferenceTask
   ): Promise<RunResult<T>> {
     this.assertIdle();
     if (options.signal?.aborted) throw failure(options.signal.reason, "CANCELLED");
@@ -413,6 +485,11 @@ export class InferenceClient {
     this.assertIdle();
     if (!this.runtime || !this.model)
       throw new InferenceError("MODEL_NOT_LOADED", "Load a model first");
+    if (task && !this.model.execution.tasks.includes(task))
+      throw new InferenceError(
+        "UNSUPPORTED_TASK",
+        `The loaded model does not support ${task} in this browser runtime`
+      );
     this.busy = true;
     const generation = this.generation,
       backend = this.model.backend;
@@ -427,7 +504,15 @@ export class InferenceClient {
     this.setState({
       status: validateOnly ? "validating" : "running",
       model,
-      operation: validateOnly ? "validate" : "run",
+      operation: task
+        ? validateOnly
+          ? task === "extract"
+            ? "validate-extraction"
+            : "validate-decision"
+          : task
+        : validateOnly
+          ? "validate"
+          : "run",
       recovery: "none",
       error: null,
     });
@@ -439,7 +524,7 @@ export class InferenceClient {
         total: 1,
       });
       check();
-      const result = await this.runtime.runExtraction(request, validateOnly);
+      const result = await this.runtime.runExtraction(request, validateOnly, task);
       check();
       options.onProgress?.({ stage: "complete", loaded: 1, total: 1 });
       check();
@@ -498,3 +583,6 @@ export class InferenceClient {
   }
 }
 export { clearModelCache, downloadCatalogModel } from "./model-cache.js";
+
+/** @deprecated Use Inference from @antfly/web/inference. */
+export { Inference as InferenceClient };

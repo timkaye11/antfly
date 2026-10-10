@@ -662,7 +662,7 @@ self.onmessage = async (e) => {
         break;
       }
       case 'extraction-run': {
-        const result = extraction.run(e.data.request, e.data.validateOnly);
+        const result = extraction.run(e.data.request, e.data.validateOnly, e.data.task);
         self.postMessage({ type: 'extraction-run-done', id, result });
         break;
       }

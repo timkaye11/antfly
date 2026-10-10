@@ -1,5 +1,6 @@
 // Copyright 2026 Antfly, Inc. SPDX-License-Identifier: Apache-2.0
 // Browser bundle inspection is independent of the inference implementation.
+import { resolveAdapter } from './model-adapters.js';
 const decoder = new TextDecoder('utf-8', { fatal: true });
 export const LIMITS = Object.freeze({ file: 1024 ** 3, bundle: 1536 * 1024 ** 2, header: 16 * 1024 ** 2, tensor: 512 * 1024 ** 2, text: 256 * 1024, schema: 64 * 1024 });
 const blockTypes = new Map([[0, [1, 4]], [1, [1, 2]], [2, [32, 18]], [8, [32, 34]], [12, [256, 144]], [30, [1, 2]]]);
@@ -69,9 +70,10 @@ export async function inspectBundle(input, precision) {
   const encoderConfig = isLaya ? config : await readJson(files, 'encoder_config/config.json');
   await readJson(files, 'tokenizer_config.json');
   if (!files.has('tokenizer.json') || files.get('tokenizer.json').size > 32 * 1024 ** 2) throw new Error('Missing or oversized tokenizer.json');
-  const isDecide = config.model_type === 'extractor' && !config.boundary_head && config.architecture === 'span' && config.config_version === 3 && config.architecture_version === 1 && config.span_head?.span_mode === 'markerV0';
-  const architecture = isLaya ? 'laya' : config.architecture === 'boundary' ? 'boundary' : isDecide ? 'decide' : config.model_type === 'extractor' && !config.boundary_head && (!config.config_version || config.config_version < 3) ? 'span' : null;
-  if (!architecture) throw new Error('Unsupported extraction architecture');
+  const manifest = files.has('model_manifest.json') ? await readJson(files, 'model_manifest.json') : undefined;
+  const descriptor = resolveAdapter(config, encoderConfig, manifest);
+  if (!descriptor.availability.available) throw Object.assign(new Error(descriptor.availability.reason), { code: descriptor.availability.code });
+  const architecture = descriptor.adapter;
   const variants = [...files.keys()].filter(p => /(^|\/)model\.gguf$/.test(p) || /(^|\/)encoder_model\.gguf$/.test(p));
   let weights;
   if (architecture === 'laya') {
@@ -106,7 +108,7 @@ export async function inspectBundle(input, precision) {
   const cpuReason = architecture === 'laya' && config.laya.packing?.mode && config.laya.packing.mode !== 'none'
     ? 'Packed Laya uses WASM CPU segment attention.'
     : architecture === 'laya' && selectedPrecision !== 'fp16' ? 'Laya GPU residency requires an FP16 bundle; this bundle uses WASM CPU.' : undefined;
-  return { architecture, config, encoderConfig, precision: selectedPrecision, weights, bytes, files, receipt, qualified: false, cpuReason };
+  return { ...descriptor, runtimeArchitecture: descriptor.architecture, architecture, config, encoderConfig, precision: selectedPrecision, weights, bytes, files, receipt, qualified: false, cpuReason };
 }
 
 export async function tensorDirectory(file, format) {

@@ -9,7 +9,7 @@ import { RUNTIME_COMPATIBILITY } from "../dist/index.js";
 import { prepareRuntime } from "../scripts/prepare-runtime.mjs";
 import { digest, sourceFingerprint, verifyWasm } from "../scripts/runtime-support.mjs";
 const assets = fileURLToPath(new URL("../dist/runtime-assets/", import.meta.url));
-function abiWasm(version = 1) {
+function abiWasm(version = 2) {
   const name = Buffer.from("extraction_abi_version");
   const exports = [1, name.length, ...name, 0, 0];
   return new Uint8Array([
@@ -137,8 +137,8 @@ test("preparation rejects WASM with an incompatible extraction ABI", async () =>
   const root = await mkdtemp(join(tmpdir(), "antfly-runtime-abi-"));
   try {
     const path = join(root, "wrong.wasm");
-    await writeFile(path, abiWasm(2));
-    await assert.rejects(verifyWasm(path, 1), /ABI mismatch/);
+    await writeFile(path, abiWasm(1));
+    await assert.rejects(verifyWasm(path, 2), /ABI mismatch/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

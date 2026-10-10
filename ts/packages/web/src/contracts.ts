@@ -2,7 +2,20 @@
 export type WeightPrecision = "q8_0" | "q4_k" | "q4_0" | "fp32" | "fp16_encoder" | "fp16" | "bf16";
 export type Backend = "auto" | "wasm" | "webgpu";
 export type RuntimeArchitecture = "span" | "boundary" | "modernbert";
-export type ModelFamily = "gliner2" | "gliner25" | "decide" | "laya" | "opendecider";
+export type ModelFamily = "gliner2" | "gliner25" | "decide" | "laya" | "opendecider" | "embedding";
+export type InferenceTask = "extract" | "decide";
+export type DecisionKind = "choice" | "multi_choice" | "score" | "predicate";
+export type ModelCapabilities = Readonly<{
+  tasks: readonly string[];
+  capabilities: readonly string[];
+  decisionKinds: readonly DecisionKind[];
+  limits: Readonly<{
+    maxInputs: number;
+    maxTextBytes: number;
+    maxRequestBytes: number;
+    maxSchemaBytes: number;
+  }>;
+}>;
 export type InferenceProgress = {
   stage:
     | "inspect"
@@ -24,6 +37,9 @@ export type BundleFiles = Map<string, Blob> | File[];
 export type ModelInfo = Readonly<{
   family: ModelFamily;
   architecture: RuntimeArchitecture;
+  tasks: readonly string[];
+  capabilities: readonly string[];
+  execution: ModelCapabilities;
   precision: WeightPrecision;
   bytes: number;
   backend: "wasm" | "webgpu";
@@ -86,9 +102,11 @@ export type ClassificationTask = {
   default?: string;
   examples?: [string, string][];
 };
-export type LayaQuestion = Omit<ClassificationTask, "mode" | "prompt" | "instruction"> &
+export type LayaQuestion = Pick<ClassificationTask, "name" | "labels" | "label_definitions"> &
   ({ prompt: string; instruction?: never } | { instruction: string; prompt?: never }) & {
     mode?: "single" | "ordinal" | "boolean";
+    multi_label?: false;
+    top_k?: 1;
   };
 export type ExtractionSchema = {
   entities?: string[];
@@ -170,6 +188,7 @@ export type LayaRequestV2 = {
 };
 export type InferenceRequestV2 = ExtractionRequestV2 | DecideRequestV2 | LayaRequestV2;
 export type InferenceRequest = InferenceRequestV1 | InferenceRequestV2;
+export type ExtractionRequest = InferenceRequestV1 | ExtractionRequestV2;
 /** Explicit escape hatch for features not yet represented by these types.
  * The runtime still validates the entire request and rejects unknown features. */
 export type ExtensionInferenceRequest = Record<string, unknown> & {
@@ -301,6 +320,7 @@ type EnvelopeV2<T> = {
   usage: InferenceUsage;
 };
 export type ExtractionResponseV2 = EnvelopeV2<ExtractionOutputV2>;
+export type ExtractionResponse = InferenceResponseV1 | ExtractionResponseV2;
 export type LayaResponseV2 = EnvelopeV2<{
   id?: string;
   classifications: ClassificationV2[];
@@ -321,6 +341,8 @@ export type CatalogModel = {
   name: string;
   family: ModelFamily;
   architecture: RuntimeArchitecture;
+  tasks?: readonly string[];
+  capabilities?: readonly string[];
   precision: WeightPrecision;
   files: CatalogFile[];
   /** Catalog checkpoint verification only; does not qualify browser execution. */
@@ -333,3 +355,92 @@ export type Precision = WeightPrecision;
 export type Progress = InferenceProgress;
 /** @deprecated Use InferenceRequest. */
 export type Request = InferenceRequest;
+
+/** The native /decisions named-question contract. */
+export type EmbeddingDecisionOptions = {
+  calibration_id?: string;
+  min_similarity?: number;
+  min_margin?: number;
+};
+type DecisionQuestionBase = { name: string; instructions: string };
+export type DecisionQuestion = DecisionQuestionBase &
+  (
+    | {
+        type: "choice";
+        choices: { value: string; description?: string; examples?: string[] }[];
+        embedding_options?: EmbeddingDecisionOptions;
+      }
+    | {
+        type: "multi_choice";
+        choices: { value: string; description?: string; examples?: string[] }[];
+        similarity_thresholds?: number | Record<string, number>;
+        embedding_options?: EmbeddingDecisionOptions;
+      }
+    | { type: "score"; levels: { label: string; description?: string }[] }
+    | { type: "predicate" }
+  );
+export type DecisionRequest = {
+  model: string;
+  model_identity?: string;
+  questions: DecisionQuestion[];
+  embedding_options?: {
+    task_type?: "CLUSTERING" | "CLASSIFICATION";
+    dimensions?: 128 | 256 | 512 | 768;
+  };
+} & (
+  | { input: string; inputs?: never }
+  | { input?: never; inputs: { id?: string; input: string }[] }
+);
+type TypedAnswerBase = {
+  name: string;
+  decision_method: "typed";
+  confidence: number;
+  confidence_method: "max_probability" | "normalized_inverse_entropy";
+  act_probability?: number;
+};
+export type TypedDecisionAnswer = TypedAnswerBase &
+  (
+    | { type: "choice"; choice: string; probabilities: { value: string; probability: number }[] }
+    | {
+        type: "score";
+        score: number;
+        probabilities: { value: number; label: string; probability: number }[];
+      }
+    | { type: "predicate"; probability: number }
+  );
+export type EmbeddingDecisionAnswer = {
+  name: string;
+  decision_method: "embedding_similarity";
+  similarity_metric: "cosine";
+  similarities: { value: string; similarity: number }[];
+  margin: number;
+  status: string;
+  abstention_reason?: string;
+  prototype_set_hash: string;
+  calibration_id?: string;
+} & (
+  | { type: "choice"; choice: string | null }
+  | { type: "multi_choice"; choices: string[]; similarity_thresholds: Record<string, number> }
+);
+export type DecisionAnswer = TypedDecisionAnswer | EmbeddingDecisionAnswer;
+export type DecisionResponse = {
+  model: string;
+  usage: { input_tokens: number; output_tokens: number };
+  renderer_version?: string;
+  model_identity?: string;
+} & (
+  | { answers: DecisionAnswer[]; data?: never }
+  | { answers?: never; data: { input_index: number; id?: string; answers: DecisionAnswer[] }[] }
+);
+export type ModelInspection = {
+  family: ModelFamily;
+  architecture: RuntimeArchitecture | "embedding";
+  tasks: readonly string[];
+  capabilities: readonly string[];
+  execution: ModelCapabilities;
+  availability: Readonly<{
+    available: boolean;
+    reason?: string;
+    code?: "UNSUPPORTED_ARCHITECTURE" | "MODEL_LIMIT_EXCEEDED";
+  }>;
+};

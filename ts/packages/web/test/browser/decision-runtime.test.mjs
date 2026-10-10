@@ -17,6 +17,72 @@ const gpu = process.env.EXTRACTION_GPU === "1";
 const wasmPath = new URL("../../../../../zig/zig-out/antfly-extraction-cpu.wasm", import.meta.url);
 const launch = () => chromium.launch({ args: ["--enable-unsafe-webgpu", "--use-angle=metal"] });
 
+test("public Inference decisions run through the browser worker on WASM", {
+  timeout: 30000,
+}, async () => {
+  const server = await startRuntimeServer();
+  const browser = await chromium.launch();
+  try {
+    const page = await browser.newPage();
+    await page.goto(server.url);
+    const payload = await Promise.all(
+      [...layaFixture()].map(async ([p, b]) => [
+        p,
+        Array.from(new Uint8Array(await b.arrayBuffer())),
+      ])
+    );
+    const result = await page.evaluate(async (payload) => {
+      const { Inference } = await import("/client/inference.js");
+      const inference = await Inference.create();
+      const files = new Map(payload.map(([p, b]) => [p, new Blob([new Uint8Array(b)])]));
+      try {
+        const inspection = await inference.inspectModel(files);
+        const model = await inference.loadModel(files, { backend: "wasm", precision: "fp32" });
+        const request = {
+          model: "local",
+          input: "Please search.",
+          questions: [{ name: "act", type: "predicate", instructions: "Should we act?" }],
+        };
+        const validation = await inference.validateDecision(request);
+        const decision = await inference.decide(request);
+        let unsupported;
+        try {
+          await inference.extract({
+            schema_version: 2,
+            model: "local",
+            inputs: [{ content: "x" }],
+            schema: { entities: ["person"] },
+          });
+        } catch (error) {
+          unsupported = error.code;
+        }
+        return {
+          inspection,
+          model,
+          validation,
+          decision,
+          unsupported,
+          status: inference.state.status,
+        };
+      } finally {
+        inference.dispose();
+      }
+    }, payload);
+    assert.deepEqual(result.inspection.execution.tasks, ["decide"]);
+    assert.equal(result.model.family, "laya");
+    assert.equal(result.model.architecture, "modernbert");
+    assert.equal(result.model.backend, "wasm");
+    assert(result.validation.value.encoded_tokens > 0);
+    assert.equal(result.decision.value.answers[0].type, "predicate");
+    assert.equal(result.decision.value.answers[0].decision_method, "typed");
+    assert.equal(result.unsupported, "UNSUPPORTED_TASK");
+    assert.equal(result.status, "ready");
+  } finally {
+    await browser.close();
+    await server.close();
+  }
+});
+
 test("Laya WebGPU pointer/Q8 parity and explicit packed CPU fallback", {
   skip: !gpu,
   timeout: 180000,

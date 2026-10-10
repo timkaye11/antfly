@@ -257,7 +257,11 @@ test("validation has its own result and observable operation", async () => {
   assert(states.some((s) => s.status === "validating" && s.operation === "validate"));
 });
 test("mismatched client/runtime manifests fail before allocating a GPU or worker", async () => {
-  globalThis.fetch = async () => Response.json({ ...RUNTIME_COMPATIBILITY, protocolVersion: 2 });
+  globalThis.fetch = async () =>
+    Response.json({
+      ...RUNTIME_COMPATIBILITY,
+      protocolVersion: RUNTIME_COMPATIBILITY.protocolVersion + 1,
+    });
   const client = new InferenceClient(assets);
   await assert.rejects(client.loadModel(bundle()), code("RUNTIME_INCOMPATIBLE"));
   assert.equal(inferenceFixture.runtimes.length, 0);
@@ -302,4 +306,62 @@ test("ready notifications permit the next operation without clearing its concurr
   finish.resolve();
   await running;
   assert.equal(client.state.status, "ready");
+});
+
+test("cancellation aborts a stalled manifest fetch and releases the operation lock", async () => {
+  let signal;
+  globalThis.fetch = (_url, options) =>
+    new Promise((_resolve, reject) => {
+      signal = options.signal;
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
+  const client = new InferenceClient(assets);
+  const loading = client.loadModel(bundle());
+  client.cancel();
+  await assert.rejects(loading, code("CANCELLED"));
+  assert(signal.aborted);
+  globalThis.fetch = async () => Response.json(RUNTIME_COMPATIBILITY);
+  await client.loadModel(bundle());
+  assert.equal(client.state.status, "ready");
+});
+
+test("public extraction and decisions dispatch distinct tasks and validation operations", async () => {
+  const { Inference } = await import("../dist/inference.js");
+  const client = await Inference.create({ assets });
+  await client.loadModel(bundle());
+  const calls = [],
+    states = [];
+  client.subscribe((state) => states.push(state.operation));
+  inferenceFixture.run = async (request, validate, task) => {
+    calls.push({ request, validate, task });
+    return validate
+      ? { valid: true, encoded_tokens: 4 }
+      : task === "decide"
+        ? { model: "local", answers: [] }
+        : { schema_version: 1, entities: [] };
+  };
+  const decision = {
+    model: "local",
+    input: "hello",
+    questions: [{ name: "needed", type: "predicate", instructions: "Is action needed?" }],
+  };
+  await client.extract(request);
+  assert.deepEqual((await client.decide(decision)).value.answers, []);
+  await client.validateExtraction(request);
+  await client.validateDecision(decision);
+  assert.deepEqual(
+    calls.map((c) => [c.task, c.validate]),
+    [
+      ["extract", false],
+      ["decide", false],
+      ["extract", true],
+      ["decide", true],
+    ]
+  );
+  assert(
+    states.includes("extract") && states.includes("decide") && states.includes("validate-decision")
+  );
+  assert(Object.isFrozen(client.model.execution.tasks));
+  assert(Object.isFrozen(client.model.execution.limits));
+  client.dispose();
 });

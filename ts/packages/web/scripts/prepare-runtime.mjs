@@ -80,7 +80,7 @@ export async function prepareRuntime({
     );
     await rename(staging, destination);
     console.log(
-      `Prepared ${destination}\nServe this directory as an immutable asset URL and pass that URL to InferenceClient.`
+      `Prepared ${destination}\nServe this directory as an immutable asset URL and pass that URL to Inference.`
     );
     return destination;
   } finally {
@@ -93,7 +93,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     const key = { "--zig-root": "zigRoot", "--out": "out", "--zig": "zig" }[process.argv[i]];
     if (!key || !process.argv[i + 1])
       throw new Error(
-        "Usage: antfly-inference-prepare --zig-root <matching checkout/zig> --out <public/inference> [--zig <compiler>]"
+        "Usage: antfly-web-prepare --zig-root <matching checkout/zig> --out <public/inference> [--zig <compiler>]"
       );
     options[key] = key === "zig" ? process.argv[i + 1] : resolve(process.argv[i + 1]);
   }

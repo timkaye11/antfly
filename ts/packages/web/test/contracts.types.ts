@@ -62,3 +62,56 @@ async function contracts(client: InferenceClient) {
   void [v1Version, valid, tokens, missing, invalidMode];
 }
 void contracts;
+
+import { Inference, type LayaQuestion, type DecisionRequest } from "../src/inference.js";
+async function publicTasks(inference: Inference, request: DecisionRequest) {
+  const result = await inference.decide(request);
+  const inputTokens: number = result.value.usage.input_tokens;
+  void inputTokens;
+  const answers = result.value.answers ?? result.value.data?.[0].answers ?? [];
+  for (const answer of answers) {
+    if (answer.decision_method === "typed" && answer.type === "predicate") {
+      const probability: number = answer.probability;
+      void probability;
+    }
+  }
+  inference.decide({
+    schema_version: 2,
+    model: "local",
+    // @ts-expect-error Decisions use input, not extraction content.
+    inputs: [{ content: "hello" }],
+    schema: {},
+  });
+  const threshold: LayaQuestion = {
+    name: "q",
+    labels: ["a", "b"],
+    instruction: "Choose",
+    // @ts-expect-error Laya does not implement threshold.
+    threshold: 0.5,
+  };
+  // @ts-expect-error Laya supports top_k=1 only.
+  const top: LayaQuestion = { name: "q", labels: ["a", "b"], instruction: "Choose", top_k: 2 };
+  const multi: LayaQuestion = {
+    name: "q",
+    labels: ["a", "b"],
+    instruction: "Choose",
+    // @ts-expect-error Laya does not implement multi-label questions.
+    multi_label: true,
+  };
+  void [threshold, top, multi];
+}
+void publicTasks;
+
+async function extractionResult(inference: Inference) {
+  const result = await inference.extract({
+    schema_version: 2,
+    model: "local",
+    inputs: [{ content: "hello" }],
+    schema: { entities: ["person"] },
+  });
+  const entities = result.value.data[0].entities;
+  void entities;
+  // @ts-expect-error Extraction output has no model-specific typed decisions.
+  result.value.data[0].decisions;
+}
+void extractionResult;

@@ -4,7 +4,7 @@ const api = @import("extraction_api.zig");
 const host = @import("host_abi.zig");
 const Len = host.HostLen;
 export fn extraction_abi_version() u32 {
-    return 1;
+    return 2;
 }
 export fn extraction_create(ptr: [*]const u8, len: Len) u32 {
     return api.create(host.sliceConst(u8, ptr, len)) catch |err| api.fail(err);
@@ -23,6 +23,10 @@ export fn extraction_finalize(handle: u32, digest: [*]const u8, size: u64) u32 {
 }
 export fn extraction_run(handle: u32, ptr: [*]const u8, len: Len, validate_only: u32) u32 {
     api.run(handle, host.sliceConst(u8, ptr, len), validate_only != 0) catch |err| return api.fail(err);
+    return 1;
+}
+export fn inference_run(handle: u32, ptr: [*]const u8, len: Len, task: u32, validate_only: u32) u32 {
+    api.runTask(handle, host.sliceConst(u8, ptr, len), task, validate_only != 0) catch |err| return api.fail(err);
     return 1;
 }
 export fn extraction_result_ptr() [*]const u8 {

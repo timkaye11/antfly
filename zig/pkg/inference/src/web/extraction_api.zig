@@ -20,6 +20,8 @@ const decide = @import("extraction_decide.zig");
 const span_v2 = @import("../extractors/gliner_span_v2_executor.zig");
 const regex = @import("../pipelines/extraction_regex.zig");
 const laya = @import("extraction_laya.zig");
+const decision_api = @import("antfly_decisions");
+const model_caps = @import("../models/capabilities.zig");
 const LayaCache = @import("../architectures/laya_trunk_cache.zig").Cache;
 
 pub const Metadata = struct {
@@ -28,6 +30,8 @@ pub const Metadata = struct {
     tokenizer_config: []const u8,
     precision: []const u8,
     gliner_config: []const u8 = "{}",
+    tasks: ?[]const []const u8 = null,
+    capabilities: ?[]const []const u8 = null,
 };
 
 pub const Model = struct {
@@ -214,6 +218,99 @@ fn leaveEncoder(raw: *anyopaque) void {
     model.compute.use_gpu = false;
 }
 pub fn run(handle: u32, json: []const u8, validate_only: bool) !void {
+    return runWithDecision(handle, json, validate_only, null);
+}
+
+// Local model adapters share the public task boundary with native inference.
+// Extending the configuration union extends dispatch without changing JS APIs.
+const Adapter = struct {
+    extraction: bool,
+    decisions: ?decision_api.legacy.ExecutionContract,
+};
+fn adapter(model: *const Model) Adapter {
+    return switch (model.config) {
+        .span => .{ .extraction = true, .decisions = null },
+        .decide => .{ .extraction = true, .decisions = .span_marker },
+        .boundary => .{ .extraction = true, .decisions = .boundary },
+        .laya => .{ .extraction = false, .decisions = .laya },
+    };
+}
+
+pub fn runTask(handle: u32, json: []const u8, task: u32, validate_only: bool) !void {
+    clearResult();
+    last_error = "";
+    const model = try get(handle);
+    if (!model.ready) return error.ModelNotReady;
+    try wire.scanJsonEnvelope(json, limits);
+    const selected = adapter(model);
+    if (model.metadata.value.tasks) |tasks| {
+        if (!model_caps.hasCapability(tasks, if (task == 0) "extract" else "decide")) return error.UnsupportedInferenceTask;
+    }
+    var arena = std.heap.ArenaAllocator.init(model.budget.allocator());
+    defer arena.deinit();
+    const a = arena.allocator();
+    if (task == 0) {
+        if (!selected.extraction) return error.UnsupportedInferenceTask;
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{ .duplicate_field_behavior = .@"error" });
+        try decision_api.validateExtractionBoundary(parsed.value);
+        if (model.config == .span) {
+            if (model.metadata.value.capabilities) |caps| {
+                if (parsed.value == .object) {
+                    const field = parsed.value.object.get("task");
+                    const task_name = if (field) |v| if (v == .string) v.string else "" else "entities";
+                    const capability: []const u8 = if (std.mem.eql(u8, task_name, "classification")) "classification" else if (std.mem.eql(u8, task_name, "relations")) "relations" else "extraction";
+                    if (!model_caps.modelSupportsCapability("extractor", "gliner2", caps, capability)) return error.UnsupportedExtractionFeature;
+                }
+            }
+        } else try validateCapabilities(model, parsed.value);
+        return run(handle, json, validate_only);
+    }
+    if (task != 1) return error.UnsupportedInferenceTask;
+    const contract = selected.decisions orelse return error.UnsupportedInferenceTask;
+    if (model.metadata.value.capabilities) |capabilities| {
+        if (!model_caps.hasCapability(capabilities, "typed_decisions")) return error.UnsupportedInferenceTask;
+    }
+    const request = try decision_api.parse(a, json);
+    if (request.items.len != 1 or request.inner.questions.len > 16) return error.DecideRequestLimitExceeded;
+    if (request.inner.model_identity != null) return error.UnsupportedDecideModel;
+    for (request.policies) |question_policy| if (question_policy.embedding_configured or question_policy.kind == .multi_choice) return error.UnsupportedDecideModel;
+    for (request.inner.questions) |question| for (question.examples) |examples| if (examples.len != 0) return error.UnsupportedDecideModel;
+    const lowered = try decision_api.extractionValue(a, request, contract);
+    if (lowered.schema_bytes > limits.max_total_schema_bytes) return error.ExtractionSchemaLimitExceeded;
+    const bytes = try std.json.Stringify.valueAlloc(a, lowered.value, .{});
+    try runWithDecision(handle, bytes, validate_only, if (model.config == .decide) request else null);
+    if (validate_only or model.config == .decide) return;
+    const extracted = result;
+    result = &.{};
+    defer ctx.allocator.free(extracted);
+    const public_response = try decision_api.trainedResponse(a, request, extracted, contract);
+    if (public_response.len > 4 * 1024 * 1024) return error.ExtractionOutputLimitExceeded;
+    result = try ctx.allocator.dupe(u8, public_response);
+}
+
+// The native capability resolver remains authoritative for serving capabilities.
+// Browser adapters only restrict its result; they never grant undeclared heads.
+fn validateCapabilities(model: *const Model, value: std.json.Value) !void {
+    const caps = model.metadata.value.capabilities orelse return;
+    if (value != .object) return;
+    if (value.object.get("schema")) |schema| try validateSchemaCapabilities(model, caps, schema);
+    if (value.object.get("inputs")) |inputs| if (inputs == .array) {
+        for (inputs.array.items) |item| if (item == .object) {
+            if (item.object.get("schema")) |schema| try validateSchemaCapabilities(model, caps, schema);
+        };
+    };
+}
+fn validateSchemaCapabilities(model: *const Model, caps: []const []const u8, schema: std.json.Value) !void {
+    if (schema != .object) return;
+    const family: []const u8 = if (model.config == .boundary) "gliner2.5" else "gliner2";
+    const fields = .{ "entities", "entity_definitions", "entity_attributes", "structures", "relations", "classifications" };
+    const requirements = .{ "extraction", "extraction", "extraction", "extraction", "relations", "classification" };
+    inline for (fields, requirements) |field, capability| {
+        if (schema.object.contains(field) and !model_caps.modelSupportsCapability("extractor", family, caps, capability)) return error.UnsupportedExtractionFeature;
+    }
+}
+
+fn runWithDecision(handle: u32, json: []const u8, validate_only: bool, decision: ?decision_api.Request) !void {
     clearResult();
     last_error = "";
     const model = try get(handle);
@@ -239,6 +336,7 @@ pub fn run(handle: u32, json: []const u8, validate_only: bool) !void {
     if (model.config == .decide) {
         const seq = model.config.decide.max_position_embeddings;
         const options: span_v2.Options = .{
+            .decide_request = decision,
             .max_response_bytes = 4 * 1024 * 1024,
             .processor = .{ .max_batch_items = 1, .max_text_bytes = 256 * 1024, .max_sequence_tokens = seq, .max_batch_tokens = seq },
             .max_prompt_tokens = seq,

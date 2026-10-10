@@ -1,11 +1,15 @@
 {
-  "name": "@antfly/inference-web",
+  "name": "@antfly/web",
   "version": "0.1.0",
   "type": "module",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./inference": {
+      "types": "./dist/inference.d.ts",
+      "import": "./dist/inference.js"
     }
   },
   "scripts": {
@@ -20,7 +24,7 @@
     "typescript": "~5.9.3",
     "@playwright/test": "^1.61.0"
   },
-  "description": "Browser-local GLiNER extraction and Laya decisions backed by Antfly WASM and WebGPU",
+  "description": "Local browser inference with extensible extraction and decision adapters backed by Antfly WASM and WebGPU",
   "license": "Apache-2.0",
   "files": [
     "dist",
@@ -31,11 +35,11 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "bin": {
-    "antfly-inference-prepare": "./scripts/prepare-runtime.mjs"
+    "antfly-web-prepare": "./scripts/prepare-runtime.mjs"
   },
   "repository": {
     "type": "git",
     "url": "https://github.com/antflydb/antfly.git",
-    "directory": "ts/packages/inference-web"
+    "directory": "ts/packages/web"
   }
 }

@@ -25,10 +25,10 @@ export class ExtractionSession {
   }
   async load(files, precision, progress = () => {}) {
     if (this.handle) throw new Error('Unload the current model first');
-    if (this.wasm.extraction_abi_version?.() !== 1) throw new Error('Extraction WASM ABI mismatch; rebuild browser assets');
+    if (this.wasm.extraction_abi_version?.() !== 2) throw new Error('Extraction WASM ABI mismatch; rebuild browser assets');
     const bundle = await inspectBundle(files, precision);
     const read = path => bundle.files.get(path).text();
-    const metadata = { config: bundle.architecture === 'laya' ? JSON.stringify(bundle.config) : await read('config.json'), encoder_config: bundle.architecture === 'laya' ? JSON.stringify(bundle.encoderConfig) : await read('encoder_config/config.json'), tokenizer_config: await read('tokenizer_config.json'), precision: bundle.precision };
+    const metadata = { config: bundle.architecture === 'laya' ? JSON.stringify(bundle.config) : await read('config.json'), encoder_config: bundle.architecture === 'laya' ? JSON.stringify(bundle.encoderConfig) : await read('encoder_config/config.json'), tokenizer_config: await read('tokenizer_config.json'), precision: bundle.precision, tasks: bundle.execution.tasks, capabilities: bundle.capabilities };
     const directories = [];
     for (const path of bundle.weights) directories.push(await tensorDirectory(bundle.files.get(path), path.endsWith('.gguf') ? 'gguf' : 'safetensors'));
     if (bundle.architecture === 'laya' && directories[0].some(t => ![0, 1, 30].includes(t.kind) || bundle.precision === 'fp32' && t.kind !== 0 || bundle.precision === 'fp16' && t.kind === 30)) throw new Error('Laya tensor precision does not match the selected dense precision');
@@ -61,15 +61,15 @@ export class ExtractionSession {
         }
       }
       this.check(this.text(weightHash, ptr => this.wasm.extraction_finalize(this.handle, ptr, BigInt(weightBytes))));
-      return { architecture: bundle.architecture, precision: bundle.precision, bytes: bundle.bytes, backend: 'requested', qualified: false };
+      return { family: bundle.family, runtimeArchitecture: bundle.runtimeArchitecture, tasks: bundle.tasks, capabilities: bundle.capabilities, execution: bundle.execution, architecture: bundle.architecture, precision: bundle.precision, bytes: bundle.bytes, backend: 'requested', qualified: false };
     } catch (error) { this.unload(); throw error; }
   }
-  run(request, validateOnly = false) {
+  run(request, validateOnly = false, task) {
     const start = performance.now();
     const bytes = encoder.encode(JSON.stringify(request));
     if (bytes.length > 512 * 1024) throw new Error('Extraction request exceeds 512 KiB');
     try {
-      this.check(this.bytes(bytes, (ptr, len) => this.wasm.extraction_run(this.handle, ptr, len, Number(validateOnly))));
+      this.check(this.bytes(bytes, (ptr, len) => task ? this.wasm.inference_run(this.handle, ptr, len, task === 'decide' ? 1 : 0, Number(validateOnly)) : this.wasm.extraction_run(this.handle, ptr, len, Number(validateOnly))));
     } catch (error) {
       if (error instanceof WebAssembly.RuntimeError) {
         const detail = decoder.decode(this.abi.view(Uint8Array, this.wasm.extraction_error_ptr(), Number(this.wasm.extraction_error_len())));

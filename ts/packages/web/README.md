@@ -1,19 +1,28 @@
-# @antfly/inference-web
+# @antfly/web
 
-Browser orchestration for GLiNER2, GLiNER2.5, GLiNER2.5-Decide and Laya /
-OpenDecider. Tokenization and inference stay in Antfly's Zig runtime.
-The playground UI and model catalog live in Colony at
-`ts/apps/www-antfly/content/labs/tim-kaye/gliner-playground`.
+Local browser inference backed by Antfly's Zig WASM runtime and optional WebGPU.
+Import `Inference` from `@antfly/web/inference`. This entrypoint loads inference
+assets independently; a future `@antfly/web/db` entrypoint can expose `Database`
+without coupling database consumers to inference assets. Local resources use
+`Inference` / `Database`; `Client` names are reserved for remote service clients.
+The root entrypoint currently re-exports inference for convenience.
+
+The public API separates extraction from decisions. Internal adapters select
+execution from configuration and artifact contracts, never model names. Native
+Antfly decision parsing, request lowering, response presentation and capability
+checks are reused in WASM. Advertised metadata, browser execution support and
+production qualification are separate: browser execution is always
+`qualified: false` today.
 
 ## Build and test
 
-From `ts/`, run `pnpm --filter @antfly/inference-web build`, `typecheck`, and
+From `ts/`, run `pnpm --filter @antfly/web build`, `typecheck`, and
 `test`. The package emits ESM JavaScript and declarations into `dist/`, together
 with matching runtime JavaScript, workers, shaders and a compatibility manifest.
 `typecheck` also checks positive and negative consumer contract examples.
 
-The existing npm workflow accepts `ts/antfly/inference-web/v*` after an
-`@antfly/inference-web` package has been published once and its trusted publisher
+The existing npm workflow accepts `ts/antfly/web/v*` after an
+`@antfly/web` package has been published once and its trusted publisher
 is configured for `.github/workflows/ts-npm-publish.yml` (environment `npm`)
 with direct publish permission. An npm maintainer must bootstrap that first
 release. No package or runtime release is implied by this source change.
@@ -24,17 +33,17 @@ The npm package bundles runtime JavaScript and shaders. Prepare a complete
 runtime directory with the package's command and a matching source checkout:
 
 ```sh
-pnpm exec antfly-inference-prepare \
+pnpm exec antfly-web-prepare \
   --zig-root /path/to/antfly/zig \
   --out ./public/inference \
   --zig /path/to/pinned/zig
 ```
 
 In this workspace the equivalent is
-`pnpm --filter @antfly/inference-web prepare:runtime --zig-root ../../../zig --out /absolute/public/inference --zig /path/to/pinned/zig`.
+`pnpm --filter @antfly/web prepare:runtime --zig-root ../../../zig --out /absolute/public/inference --zig /path/to/pinned/zig`.
 The compiler must match `scripts/ci/toolchain-policy.json` (currently Zig 0.17.0).
 The command checks the checkout's source fingerprint against the package,
-builds CPU and WebGPU WASM serially with `-j1`, checks extraction ABI version 1,
+builds CPU and WebGPU WASM serially with `-j1`, checks extraction ABI version 2,
 and copies all matching assets into
 `<out>/<package-version>-<runtime-id-prefix>/`. It checks packaged asset hashes,
 checks the source fingerprint again after compilation, and writes the final
@@ -53,16 +62,16 @@ The manifest hashes support deployment integrity checks. Preparation establishes
 asset compatibility; it does not establish numerical or production qualification.
 
 ```ts
-import { InferenceClient, downloadCatalogModel } from "@antfly/inference-web";
+import { Inference, downloadCatalogModel } from "@antfly/web/inference";
 const assets = "/inference/0.1.0-<runtime-id-prefix>/";
-const client = new InferenceClient(assets);
+const client = await Inference.create({ assets });
 const unsubscribe = client.subscribe((state) => {
   renderStatus(state.status, state.error?.code, state.recovery);
 });
 // Use the same directory for the cache's hashing worker.
 const files = await downloadCatalogModel(catalogEntry, { assets });
 await client.loadModel(files, { backend: "auto", precision: catalogEntry.precision });
-const result = await client.run({
+const result = await client.extract({
   schema_version: 2,
   model: "local",
   inputs: [{ content: "John works at Apple." }],
@@ -80,37 +89,68 @@ Use HTTPS (or localhost) and same-origin assets. WebGPU requires COOP
 model download hosts. Inference input and local bundles are not uploaded.
 Downloaded files are hash checked before reuse from OPFS.
 
-## Requests, results and model names
+## Tasks and model support
 
-`InferenceRequest` and `InferenceResponse` are versioned unions. GLiNER2 uses
-`InferenceRequestV1` / `InferenceResponseV1`; GLiNER2.5 uses
-`ExtractionRequestV2` / `ExtractionResponseV2`; Decide uses
-`DecideRequestV2`; Laya and OpenDecider use `LayaRequestV2` / `LayaResponseV2`.
-V1 inference responses use UTF-8 byte offsets. V2 extraction outputs report
-`offset_unit` for each input. A v2 result is a union because the loaded model
-selects the runtime: test for `"decisions" in result.value.data[0]` to access
-Laya's typed choice, score and boolean decisions. Runtime validation rejects
-unsupported features for the loaded family.
+`extract()` / `validateExtraction()` accept extraction requests and return
+extraction output / validation geometry. Legacy GLiNER2 uses schema version 1;
+boundary and marker-head extraction use version 2. Typed ordinal and predicate
+questions belong to `decide()` / `validateDecision()`, using the same named-array
+contract as native `/decisions`:
 
-`validateRequest()` returns a separate `ValidationResult`, whose `value` is
-`{ valid: true, encoded_tokens: number }`. Validation failures reject with
-`INVALID_REQUEST` and leave the loaded model usable. `runExtension()` and
-`validateExtension()` accept `ExtensionInferenceRequest` for advanced or future
-wire fields that the public types do not yet describe. Extensions still undergo
-strict Zig validation; the escape hatch does not enable unsupported features.
+```ts
+const result = await client.decide({
+  model: "local",
+  input: "Please look up the latest documentation.",
+  questions: [
+    { name: "tool", type: "choice", instructions: "Which tool is needed?",
+      choices: [{ value: "search" }, { value: "none" }] },
+    { name: "urgency", type: "score", instructions: "How urgent is this?",
+      levels: [{ label: "low" }, { label: "high" }] },
+    { name: "act", type: "predicate", instructions: "Should we act now?" },
+  ],
+});
+// Single-input responses have answers; inputs: [...] produces data: [...].
+if (result.value.answers) renderAnswers(result.value.answers);
+```
 
-The request's `model` string labels the response. It never selects a bundle or
-switches models; call `loadModel()` to select one. `ModelInfo.family` distinguishes
-`gliner2`, `gliner25`, `decide`, `laya` and `opendecider`.
-`ModelInfo.architecture` describes the runtime as `span`, `boundary` or
-`modernbert`. Catalog entries use the same separate fields.
+A trained head returns `decision_method: "typed"` with probabilities/confidence.
+The shared contract also describes `embedding_similarity` answers, whose cosine
+similarities and abstention policies have distinct semantics. The browser does
+not substitute trained heads for embedding-similarity decisions.
 
-`WeightPrecision` and `InferenceProgress` replace the old generic `Precision`
-and `Progress` names. `Request`, `Progress` and `Precision` remain deprecated
-type aliases. Update catalog entries to add `family`, and change old architecture
-values `decide` to `span`, and `laya` to `modernbert`. This also removes writable
-`client.model` and the old third `run(..., validateOnly)` argument; use
-`validateRequest()` for validation.
+`inspectModel(files)` reads configuration and optional `model_manifest.json`
+without allocating model weights. Its `tasks` and `capabilities` retain advertised
+metadata, including native config-owned role corrections for Laya and embedding
+models; `execution` intersects declared support with the browser adapter.
+`availability` reports known architecture/budget blocks with a reason.
+`inspectBundle()` additionally checks artifact layout/precision; `loadModel()`
+validates tokenizer, tensors and inventory before a model becomes usable.
+`model.execution` describes supported tasks, decision kinds and request limits.
+A declaration cannot enable an unimplemented browser route. None of these
+inspection results establishes numerical or native production qualification.
+
+| Configuration / model family | Browser tasks | Limits / unavailable routes |
+| --- | --- | --- |
+| Legacy GLiNER2 span | extract | Supported DeBERTa base geometry; v1 wire |
+| GLiNER boundary (including multilingual DeBERTa Decide) | extract, decide | Supported DeBERTa backbone/artifacts; ModernBERT boundary unavailable |
+| GLiNER marker-head Decide | extract, decide | DeBERTa adapter; ModernBERT Decide-1B unavailable until encoder/weight and bounded compact-artifact support exist |
+| Laya / OpenDecider | decide | Supported ModernBERT geometry; vocabulary above 65,536 and oversized encoder/sequence geometry unavailable |
+| Embedding-similarity deciders | unavailable | Requires embedding, artifact identity, prototypes and calibration adapters |
+
+Support depends on configuration, declared capabilities, tensor layout, selected
+precision and request geometry. This table describes adapters, not qualification
+of every checkpoint bearing a family name. Browser limits include one input per
+request, 256 KiB text, 512 KiB JSON, 64 KiB lowered schema and 16 decision questions.
+Trained decisions support choice, score and predicate; multi-choice, examples,
+embedding policies and model identity are rejected until their own adapter exists.
+
+The request's `model` string labels the response; `loadModel()` selects the bundle.
+V1 extraction offsets are UTF-8 bytes; v2 reports `offset_unit` per input.
+`validateExtraction()` and `validateDecision()` return `{ valid: true,
+encoded_tokens }` inside a `ValidationResult`. Invalid requests leave the model
+usable. `InferenceClient`, `run()`, `validateRequest()`, `runExtension()` and
+`validateExtension()` remain compatibility APIs for the earlier model-specific
+wire; new consumers should use `Inference` and the public task methods.
 
 ## Lifecycle and recovery
 
@@ -138,7 +178,7 @@ the client. Only one model operation may run at a time.
 `InferenceError.code` is stable across rejected operations and state snapshots:
 `CANCELLED`, `DEVICE_LOST`, `GPU_FAILED`, `RUNTIME_FAILED`,
 `RUNTIME_INCOMPATIBLE`, `MODEL_LOAD_FAILED`, `INVALID_REQUEST`,
-`MODEL_NOT_LOADED`, `BUSY`, and `DISPOSED`. Cancellation errors retain the
+`MODEL_NOT_LOADED`, `UNSUPPORTED_TASK`, `BUSY`, and `DISPOSED`. Cancellation errors retain the
 `AbortError` name. Error messages provide detail, while UI decisions should use
 codes and `state.recovery`.
 
@@ -173,8 +213,8 @@ Colony UI:
 
 ```sh
 cd ts
-pnpm --filter @antfly/inference-web exec playwright install chromium
-EXTRACTION_GPU=1 pnpm --filter @antfly/inference-web test:browser
+pnpm --filter @antfly/web exec playwright install chromium
+EXTRACTION_GPU=1 pnpm --filter @antfly/web test:browser
 ```
 
 These GPU tests currently request Chromium's Metal WebGPU backend on macOS.
