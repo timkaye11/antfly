@@ -28,6 +28,13 @@ const Binding = local.serverless_external_source_catalog_binding.Binding;
 const Options = configured.BindingObjectStoreOpenOptions;
 const Context = catalog.types.Context;
 const Attempt = struct { id: []const u8, expected: []const u8, body: []const u8, timestamp_ms: i64 };
+fn attemptId(a: A, lsn: u64, table: catalog.types.Table) ![]u8 {
+    // Retirement advances managed HEAD without changing metadata_location.
+    // A definitively rejected intent must get a new identity at that authority.
+    const authority = try std.json.Stringify.valueAlloc(a, .{ table.metadata_location, table.version, table.record_key }, .{});
+    defer a.free(authority);
+    return std.fmt.allocPrint(a, "wal-{d}-{s}", .{ lsn, catalog.types.digestHex(authority) });
+}
 pub fn openQueue(a: A, binding: Binding, options: Options) !local.serverless_object_store_support.OpenedObjectStore {
     if (binding.write_policy != .iceberg_writer or binding.catalog == null) return error.ExternalLakeReadOnly;
     const config = options.node_config orelse return error.NativeArtifactStorageRequired;
@@ -151,7 +158,7 @@ pub fn drain(a: A, binding: Binding, options: Options, context: Context) !bool {
         const timestamp: i64 = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
         const destination = try destinationFiles(scratch, files, binding.source_uri, context);
         const built = try catalog.row_commit.prepare(scratch, current.table, destination, parsed.value, record.lsn, timestamp);
-        attempt = .{ .id = try std.fmt.allocPrint(scratch, "wal-{d}-{s}", .{ record.lsn, catalog.types.digestHex(current.table.metadata_location) }), .expected = current.table.metadata_location, .body = built.body, .timestamp_ms = timestamp };
+        attempt = .{ .id = try attemptId(scratch, record.lsn, current.table), .expected = current.table.metadata_location, .body = built.body, .timestamp_ms = timestamp };
         const bytes = try std.json.Stringify.valueAlloc(scratch, attempt, .{});
         var stored = client.putObject(opened.bucket, intent_key, bytes, .{ .if_none_match = true, .cancellation = catalog.types.contextCancellation(&context) }) catch |err| switch (err) {
             error.PreconditionFailed, error.ObjectAlreadyExists => return true,
@@ -272,4 +279,62 @@ test "external lake filesystem retirement validates live roots and subsequent in
     const snapshots = (try catalog.metadata.get(root, "snapshots")).array.items;
     const live_uri = try catalog.metadata.str(try catalog.metadata.get(snapshots[snapshots.len - 1], "manifest-list"));
     try std.testing.expectError(error.LakeObjectStillReferenced, reopened.retire(a, .{ .id = "retire-live", .expected_metadata_location = latest.metadata_location, .expected_version = latest.version.?, .objects = &.{live_uri} }));
+}
+
+test "external lake filesystem WAL retries a rejected intent after metadata preserving retirement" {
+    const alloc = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("lake-wal-retirement-retry");
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json = try std.json.Stringify.valueAlloc(a, .{ .deployment_mode = "standalone", .storage = .{ .engine = "local", .local = .{ .base_dir = directory.path() } } }, .{});
+    var config = try local.common_config.Config.parseFromSlice(alloc, json);
+    defer config.deinit();
+    const binding: Binding = .{ .table_id = "events", .format = .iceberg, .source_uri = try std.fmt.allocPrint(a, "file://{s}/warehouse", .{directory.path()}), .schema_fingerprint = "schema", .write_policy = .iceberg_writer, .catalog = .{ .type = .managed } };
+    const options: Options = .{ .node_config = &config, .catalog_table_id = 7 };
+    var opened = try configured.openBindingObjectStoreAlloc(alloc, binding, options);
+    defer opened.deinit();
+    var client = opened.client;
+    var managed: catalog.managed.Managed = .{ .client = client, .bucket = opened.bucket, .prefix = opened.prefix, .source_uri = binding.source_uri };
+    _ = try managed.create(a, "create", "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true}]}}", 1);
+    const parent = try managed.load(a);
+    const payload = "{\"batch_id\":\"first\",\"source\":\"test\",\"epoch\":\"1\",\"checkpoint\":\"1\",\"key_fields\":[\"id\"],\"changes\":[{\"op\":\"upsert\",\"row\":{\"id\":1}}]}";
+    const lsn = try accept(a, binding, options, .{}, payload);
+    const batch = try std.json.parseFromSliceLeaky(Batch, a, payload, .{});
+    const files = try destinationFiles(a, opened, binding.source_uri, .{});
+    const prepared = try catalog.row_commit.prepare(a, parent, files, batch, lsn, 2);
+    const attempt: Attempt = .{ .id = try attemptId(a, lsn, parent), .expected = parent.metadata_location, .body = prepared.body, .timestamp_ms = 2 };
+    const commit: catalog.types.Commit = .{ .id = attempt.id, .expected_metadata_location = attempt.expected, .body = attempt.body, .timestamp_ms = attempt.timestamp_ms };
+    var queue = try openQueue(alloc, binding, options);
+    defer queue.deinit();
+    var queue_client = queue.client;
+    const active_key = try std.fmt.allocPrint(a, "{s}/active/{d}.json", .{ try prefix(a, queue.prefix, binding, options), lsn });
+    var active = try queue_client.putObject(queue.bucket, active_key, try std.json.Stringify.valueAlloc(a, attempt, .{}), .{});
+    active.deinit(queue_client.allocator);
+    // Seed the durable catalog intent at the crash point immediately before
+    // its HEAD CAS. Retirement then wins that CAS while preserving metadata.
+    const candidate = try catalog.metadata.applyAlloc(a, parent.metadata_json, parent.metadata_location, commit);
+    const relative = try std.fmt.allocPrint(a, "metadata/antfly-{s}.metadata.json", .{catalog.types.digestHex(candidate)});
+    const metadata_key = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ opened.prefix, if (opened.prefix.len == 0) "" else "/", relative });
+    var metadata_object = try client.putObject(opened.bucket, metadata_key, candidate, .{});
+    metadata_object.deinit(client.allocator);
+    const rejected: catalog.managed.Record = .{ .commit_id = attempt.id, .request_hash = &catalog.types.commitHash(commit), .metadata_location = try std.fmt.allocPrint(a, "{s}/{s}", .{ binding.source_uri, relative }), .metadata_key = metadata_key, .metadata_hash = &catalog.types.digestHex(candidate), .previous_record = parent.record_key, .previous_version = parent.version };
+    const intent_key = try std.fmt.allocPrint(a, "{s}{s}metadata/antfly-catalog/intents/{s}.json", .{ opened.prefix, if (opened.prefix.len == 0) "" else "/", catalog.types.digestHex(attempt.id) });
+    var intent = try client.putObject(opened.bucket, intent_key, try std.json.Stringify.valueAlloc(a, rejected, .{}), .{});
+    intent.deinit(client.allocator);
+    const orphan = try catalog.row_commit.upload(a, files, "data/orphan.parquet", "orphan");
+    _ = try managed.retire(a, .{ .id = "retire", .expected_metadata_location = parent.metadata_location, .expected_version = parent.version.?, .objects = &.{orphan} });
+    const retired = try managed.load(a);
+    try std.testing.expectEqualStrings(parent.metadata_location, retired.metadata_location);
+    try std.testing.expect(!std.mem.eql(u8, parent.version.?, retired.version.?));
+    try std.testing.expectError(error.LakeCommitConflict, managed.commit(a, commit));
+    // First pass resolves the saved rejection, second pass plans at the new
+    // catalog version, and a third pass proves publication is complete.
+    try std.testing.expect(try drain(a, binding, options, .{}));
+    try std.testing.expect(try drain(a, binding, options, .{}));
+    try std.testing.expect(!try drain(a, binding, options, .{}));
+    const published = try managed.load(a);
+    try std.testing.expectEqual(lsn, try coverage(a, published));
+    try std.testing.expectEqual(catalog.types.Outcome.not_committed, try managed.resolve(a, attempt.id, &catalog.types.commitHash(commit)));
 }
