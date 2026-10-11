@@ -30,6 +30,8 @@ class InferenceEmbedResponse:
         usage (InferenceEmbeddingUsage): Token usage information
         backend (None | str | Unset): Execution backend reported for EmbeddingGemma 2 qualification. CUDA requests fail
             if the resident text encoder cannot execute; this field does not describe preprocessing placement.
+        model_identity (str | Unset): EmbeddingGemma 2 SHA256 identity of actual weights, tokenizer, processor and
+            recipe. Dimensions and retrieval roles must also match index configuration.
         errors (list[InferenceEmbeddingItemError] | Unset): Indexed per-input failures. Only populated when request
             error_policy is per_item.
         summary (InferenceEmbeddingBatchSummary | Unset): Counts for per-item embedding responses
@@ -40,6 +42,7 @@ class InferenceEmbedResponse:
     model: str
     usage: InferenceEmbeddingUsage
     backend: None | str | Unset = UNSET
+    model_identity: str | Unset = UNSET
     errors: list[InferenceEmbeddingItemError] | Unset = UNSET
     summary: InferenceEmbeddingBatchSummary | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -61,6 +64,8 @@ class InferenceEmbedResponse:
             backend = UNSET
         else:
             backend = self.backend
+
+        model_identity = self.model_identity
 
         errors: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.errors, Unset):
@@ -85,6 +90,8 @@ class InferenceEmbedResponse:
         )
         if backend is not UNSET:
             field_dict["backend"] = backend
+        if model_identity is not UNSET:
+            field_dict["model_identity"] = model_identity
         if errors is not UNSET:
             field_dict["errors"] = errors
         if summary is not UNSET:
@@ -122,6 +129,8 @@ class InferenceEmbedResponse:
 
         backend = _parse_backend(d.pop("backend", UNSET))
 
+        model_identity = d.pop("model_identity", UNSET)
+
         _errors = d.pop("errors", UNSET)
         errors: list[InferenceEmbeddingItemError] | Unset = UNSET
         if _errors is not UNSET:
@@ -144,6 +153,7 @@ class InferenceEmbedResponse:
             model=model,
             usage=usage,
             backend=backend,
+            model_identity=model_identity,
             errors=errors,
             summary=summary,
         )

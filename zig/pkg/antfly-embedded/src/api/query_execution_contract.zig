@@ -101,6 +101,7 @@ pub const BackgroundTextStatsFieldRequestInput = struct {
 };
 
 pub const TextStatsRequestInput = struct {
+    _native_cut: ?std.json.Value = null,
     _identity_read_generation: ?u64 = null,
     _resolved_doc_filter: ?std.json.Value = null,
     query_request: ?std.json.Value = null,
@@ -109,6 +110,7 @@ pub const TextStatsRequestInput = struct {
 };
 
 pub const AlgebraicPartialsRequestInput = struct {
+    _native_cut: ?std.json.Value = null,
     index_name: ?[]const u8 = null,
     _identity_read_generation: ?u64 = null,
     tensor_access_paths: ?[]const AlgebraicTensorAccessPathInput = null,
@@ -3308,6 +3310,12 @@ pub fn encodeQueryRequestWithGraphWireMode(
     if (req.order_by.len > 0) try appendQueryOrderByField(alloc, &out, &first, req.order_by);
     if (req.search_after.len > 0) try appendQueryCursorField(alloc, &out, &first, "search_after", req.search_after);
     if (req.search_before.len > 0) try appendQueryCursorField(alloc, &out, &first, "search_before", req.search_before);
+    if (req.native_query_cut) |cut| {
+        try appendJsonFieldName(alloc, &out, &first, "_native_cut");
+        const encoded = try std.json.Stringify.valueAlloc(alloc, cut.forDeadline(req.execution_deadline_ns), .{});
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
+    }
     if (req.remote_snapshot) |snapshot| try appendJsonFieldString(alloc, &out, &first, "remote_snapshot", snapshot);
     if (req.count_only) {
         try appendJsonFieldBool(alloc, &out, &first, "count", true);
@@ -5926,26 +5934,11 @@ pub const CivilDate = struct {
     day: i64,
 };
 
-pub fn formatRfc3339Ns(alloc: std.mem.Allocator, value_ns: u64) ![]u8 {
-    const secs_total: u64 = @divFloor(value_ns, std.time.ns_per_s);
-    const nanos: u64 = @mod(value_ns, std.time.ns_per_s);
-    const days: i64 = @intCast(@divFloor(secs_total, 86_400));
-    const secs_of_day: u64 = @mod(secs_total, 86_400);
-    const date = civilFromDays(days);
-    const year: u64 = @intCast(date.year);
-    const month: u64 = @intCast(date.month);
-    const day: u64 = @intCast(date.day);
-    const hour: u64 = secs_of_day / 3_600;
-    const minute: u64 = (secs_of_day % 3_600) / 60;
-    const second: u64 = secs_of_day % 60;
-    if (nanos == 0) {
-        return try std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
-            year, month, day, hour, minute, second,
-        });
-    }
-    return try std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>9}Z", .{
-        year, month, day, hour, minute, second, nanos,
-    });
+pub fn formatRfc3339Ns(alloc: std.mem.Allocator, value_ns: i128) ![]u8 {
+    const text = try @import("../datetime.zig").formatDateTimeSignedNsAlloc(alloc, value_ns);
+    if (@mod(value_ns, std.time.ns_per_s) != 0) return text;
+    defer alloc.free(text);
+    return try std.fmt.allocPrint(alloc, "{s}Z", .{text[0..19]});
 }
 
 pub fn civilFromDays(days_since_epoch: i64) CivilDate {

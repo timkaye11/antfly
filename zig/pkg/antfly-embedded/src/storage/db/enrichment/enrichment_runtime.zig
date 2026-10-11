@@ -2146,6 +2146,9 @@ const EnrichmentErrorDisposition = enum {
 
 fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
     if (document_extraction_mod.remoteContentErrorIsPermanent(err)) return .terminal_request;
+    // These stages describe deterministic failures of the fetched PDF bytes.
+    // Retrying the same immutable input cannot repair its structure or streams.
+    if (document_extraction_mod.failureStage(err, "").len != 0) return .terminal_request;
     return switch (err) {
         error.OutOfMemory,
         error.InvalidDenseArtifactTargetCounter,
@@ -2679,6 +2682,9 @@ test "enrichment distinguishes transient capacity from permanent resource limits
 
 test "enrichment retries unknown errors and isolates known permanent errors" {
     try std.testing.expectEqual(EnrichmentErrorDisposition.retryable_request, enrichmentErrorDisposition(error.UnexpectedEndOfInput));
+    for ([_]anyerror{ error.MissingPdfEof, error.InvalidPdfHeader, error.MalformedXrefStream, error.InvalidFlateStream, error.InvalidPageTree }) |err| {
+        try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(err));
+    }
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.UnsupportedEmbeddingProvider));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.InvalidEmbeddingDimensions));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.ReadRequestFailed));
@@ -3310,10 +3316,16 @@ fn scopedAssetProducer(
         .request = guard.cancellation,
         .inherited = producer.invocation_context.cancellation,
     };
-    const deadline_ns = if (producer.invocation_context.deadline_ns) |inherited|
-        if (guard.deadline_ns) |deadline| @min(inherited, deadline) else inherited
+    // InvocationContext consumes the native monotonic epoch, while the
+    // visibility guard belongs to the runtime's imported or manual clock.
+    const native_deadline = if (guard.deadline_ns) |deadline|
+        platform_time.monotonicNs() +| (deadline -| guard.clock.nowRealtimeNs())
     else
-        guard.deadline_ns;
+        null;
+    const deadline_ns = if (producer.invocation_context.deadline_ns) |inherited|
+        if (native_deadline) |deadline| @min(inherited, deadline) else inherited
+    else
+        native_deadline;
     return producer.withInvocationContext(.{
         .io = producer.invocation_context.io orelse runtime.config.io,
         .deadline_ns = deadline_ns,
@@ -6013,6 +6025,21 @@ test "enrichment provider deadlines and progress cross native clock boundaries" 
         };
         const provider = assetProviderRequestContext(&runtime);
         try provider.check();
+        var invocation_cancellation: AssetInvocationCancellation = undefined;
+        const Stub = struct {
+            fn produce(_: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
+                return error.UnexpectedProviderInvocation;
+            }
+        };
+        const asset = scopedAssetProducer(&runtime, .{ .ptr = &cancelled, .vtable = &.{ .produce = Stub.produce } }, &invocation_cancellation);
+        try asset.invocation_context.check();
+        const native_deadline = asset.invocation_context.deadline_ns.?;
+        try std.testing.expect(native_deadline > platform_time.monotonicNs());
+        try std.testing.expect(native_deadline - platform_time.monotonicNs() <= std.time.ns_per_s);
+        const inherited_deadline = platform_time.monotonicNs() + 100 * std.time.ns_per_ms;
+        const inherited_asset = scopedAssetProducer(&runtime, .{ .ptr = &cancelled, .vtable = &.{ .produce = Stub.produce }, .invocation_context = .{ .deadline_ns = inherited_deadline } }, &invocation_cancellation);
+        try std.testing.expectEqual(inherited_deadline, inherited_asset.invocation_context.deadline_ns.?);
+
         const remaining = (try provider.remainingTimeoutMs()).?;
         try std.testing.expect(remaining > 0 and remaining <= 1_000);
         // Provider progress returns its native deadline to the runtime epoch.
@@ -6027,6 +6054,8 @@ test "enrichment provider deadlines and progress cross native clock boundaries" 
         try std.testing.expectEqual(epoch, runtime.active_deadline_ns);
         clock.advanceMs(1_000);
         try std.testing.expectError(error.Timeout, assetProviderRequestContext(&runtime).check());
+        const expired_asset = scopedAssetProducer(&runtime, .{ .ptr = &cancelled, .vtable = &.{ .produce = Stub.produce } }, &invocation_cancellation);
+        try std.testing.expectError(error.Timeout, expired_asset.invocation_context.check());
         runtime.active_provider_guard = .{};
         const fallback = assetProviderRequestContext(&runtime);
         try fallback.check();
@@ -7160,7 +7189,19 @@ fn runForegroundCatchUpPassOwned(
     runtime.mutex.unlock(io);
     if (already_failed) return;
     try scavengeSharedPdfConsumerAttempts(runtime);
-    const pending = try enrichment_worker.collectPendingDocumentGroups(runtime.alloc, runtime.replay_source, runtime.applied_sequence);
+    // A worker pass checkpoints a complete bounded prefix. Rebuilding and
+    // sorting the full remaining corpus on every retry makes discovery cost
+    // grow with ingestion backlog instead of the work this pass can publish.
+    // Cap distinct work at 128 documents while letting repeated updates
+    // coalesce across up to 4096 records before paying for another checkpoint.
+    // The byte limit also bounds discovery of large repeated-update records;
+    // one complete record may exceed either soft limit.
+    const replay_window = try runtime.replay_source.collectEnrichmentDocumentGroupsWindow(runtime.alloc, runtime.applied_sequence, .{
+        .max_records = 4096,
+        .max_document_groups = 128,
+        .max_input_bytes = 4 * 1024 * 1024,
+    });
+    const pending = replay_window.groups;
     defer enrichment_worker.freePendingDocumentGroups(runtime.alloc, pending);
     var replay_cursor_assets = try loadReplayCursorForPass(runtime, runtime.applied_sequence, .assets);
     defer if (replay_cursor_assets) |*cursor| cursor.deinit(runtime.alloc);
@@ -7184,9 +7225,10 @@ fn runForegroundCatchUpPassOwned(
     };
     try drain_result;
     try replay_lease_guard.check();
-    if (pending.len == 0) {
-        max_seen = target_sequence;
-    }
+    // Empty records still consume a bounded window. Advance only through the
+    // scanned prefix; an empty group list does not prove the tail is empty.
+    max_seen = @max(max_seen, replay_window.last_sequence);
+    if (pending.len == 0 and replay_window.last_sequence == 0) max_seen = target_sequence;
 
     if (max_seen > runtime.applied_sequence) {
         setActiveFailureFingerprint(runtime, 0);
@@ -8392,7 +8434,7 @@ const SharedPdfWindowScheduler = struct {
             break :blk try documentExtractionFingerprintFromDigestAlloc(alloc, &borrowed.entry().source_identity, config_json, config.content_type, config.filename, downloaded.content_type, &borrowed.entry().content_sha256);
         };
         defer alloc.free(fingerprint);
-        return skipRuntimeDocumentExtractionByFingerprint(self.runtime, request.doc_key, artifact, fingerprint, state, manifest, try documentExtractionManifestGeneration(alloc, manifest));
+        return skipRuntimeDocumentExtractionByFingerprint(self.runtime, request.doc_key, artifact, fingerprint, state, manifest, try documentExtractionManifestGeneration(alloc, manifest), request.producer_json);
     }
 
     fn ensureSpool(self: *@This()) !void {
@@ -11463,6 +11505,13 @@ pub fn servicePendingArtifactUnitJobs(runtime: *EnrichmentRuntime, document: []c
     const store = runtime.artifact_store orelse return;
     if (runtime.config.root_incarnation == 0) return;
     const unit_jobs = @import("../artifact_unit_jobs.zig");
+    {
+        // Most documents have no unit outbox. Check absence with point reads
+        // before acquiring a cursor-capable primary snapshot.
+        var probe = try store.beginProbeTxnWithBlockCacheAdmission(.transient);
+        defer probe.abort();
+        if (!try unit_jobs.documentMayHaveJobs(&probe, runtime.config.root_incarnation, document)) return;
+    }
     var budget = if (runtime.config.resource_manager orelse runtime.index_manager.resource_manager) |manager|
         resource_manager_mod.BudgetedAllocator.init(manager, .document_extraction_working_set, runtime.alloc, 1)
     else
@@ -11580,10 +11629,15 @@ fn processPendingDocumentGroup(
         if (shared_windows.failure(request_index)) |err| {
             setActiveFailureFingerprint(runtime, requestFailureFingerprint(request));
             if (shouldYieldRequestError(runtime, err)) return err;
-            if (request.kind == .asset or request.kind == .chunk_text)
-                try failed_artifacts.put(runtime.alloc, requestArtifactName(request), err);
-            try recordIsolatedRequestError(runtime, window, request, err);
-            continue;
+            // An asset owner must publish its failure manifest before settling
+            // debt. Reuse the cached failed preparation through processAsset;
+            // sibling consumers can record dependency failure immediately.
+            if (request.kind != .asset) {
+                if (request.kind == .chunk_text)
+                    try failed_artifacts.put(runtime.alloc, requestArtifactName(request), err);
+                try recordIsolatedRequestError(runtime, window, request, err);
+                continue;
+            }
         }
         if (requestCanBatchPlainDense(request)) {
             try deferred_plain_dense.append(runtime.alloc, request);
@@ -12903,6 +12957,22 @@ fn applyAssetProducerBatchOutput(
 /// check independent of source transport prevents an idempotent replay from
 /// entering document preparation merely because its origin lacks ETag-style
 /// metadata.
+fn runtimeDocumentExtractionReprocessPending(
+    runtime: *EnrichmentRuntime,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    producer_json: []const u8,
+    generation: u64,
+) !bool {
+    const intent = @import("../artifact_reprocess_intent.zig");
+    const intent_key = try intent.keyAlloc(runtime.alloc, doc_key, artifact_name);
+    defer runtime.alloc.free(intent_key);
+    const requested = try storeGetOptionalAllocWithRetry(runtime, intent_key);
+    defer if (requested) |raw| runtime.alloc.free(raw);
+    if (requested) |raw| return intent.pending(raw, producer_json, generation);
+    return false;
+}
+
 fn skipRuntimeDocumentExtractionByFingerprint(
     runtime: *EnrichmentRuntime,
     doc_key: []const u8,
@@ -12911,7 +12981,9 @@ fn skipRuntimeDocumentExtractionByFingerprint(
     existing_state: ?[]const u8,
     existing_manifest: ?[]const u8,
     generation: u64,
+    producer_json: []const u8,
 ) !bool {
+    if (try runtimeDocumentExtractionReprocessPending(runtime, doc_key, artifact_name, producer_json, generation)) return false;
     const state = existing_state orelse return false;
     if (!documentExtractionStateFingerprintMatches(runtime.alloc, state, fingerprint) or
         !documentExtractionStateHasChunkUnitFingerprints(runtime.alloc, state)) return false;
@@ -12967,6 +13039,7 @@ fn processDocumentExtractionAsset(
     }
     const from_generation = if (existing_manifest) |value| try documentExtractionManifestGeneration(runtime.alloc, value) else 0;
     const to_generation = from_generation + 1;
+    const force_reprocess = try runtimeDocumentExtractionReprocessPending(runtime, request.doc_key, artifact_name, request.producer_json, from_generation);
 
     // A prior owner may have crashed after spilling finalized units. Scavenge
     // under the current lease epoch before either fingerprint fast path so an
@@ -12984,6 +13057,7 @@ fn processDocumentExtractionAsset(
             existing_state,
             existing_manifest,
             from_generation,
+            request.producer_json,
         )) return;
     }
 
@@ -13074,6 +13148,7 @@ fn processDocumentExtractionAsset(
         existing_state,
         existing_manifest,
         from_generation,
+        request.producer_json,
     )) return;
     // Retained collection state grows independently from the fixed PDF
     // invocation peak. Keeping separate ledgers prevents completed OCR text
@@ -13117,11 +13192,31 @@ fn processDocumentExtractionAsset(
     // at its live size, while each render/provider window owns a short-lived
     // atomic lease below.
     var prepared_pdf_source_lease: ?PreparedDocumentSourceCache.PreparedPdfLease = if (source_is_pdf)
-        try prepared_sources.preparePdf(
+        prepared_sources.preparePdf(
             &prepared_source_lease,
             configured_pdf_decode_limits,
             runtime.syncWaitTimeoutMs(),
-        )
+        ) catch |err| {
+            if (shouldYieldRequestError(runtime, err)) return err;
+            try writeDocumentExtractionFailureManifest(
+                runtime,
+                request.doc_key,
+                artifact_name,
+                source_url,
+                source_fingerprint,
+                if (config.content_type.len > 0) config.content_type else downloaded.content_type,
+                @errorName(err),
+                "PDF preparation failed",
+                document_extraction_mod.failureStage(err, "pdf_inspection"),
+                manifest_key,
+                previous_child_ranges,
+                existing_state,
+                from_generation,
+                window,
+            );
+            try recordIsolatedRequestError(runtime, window, request, err);
+            return;
+        }
     else
         null;
     defer if (prepared_pdf_source_lease) |*lease| lease.deinit();
@@ -13326,7 +13421,7 @@ fn processDocumentExtractionAsset(
     defer collection_alloc.free(new_state);
 
     if (existing_state) |state| {
-        if (std.mem.eql(u8, state, new_state)) {
+        if (!force_reprocess and std.mem.eql(u8, state, new_state)) {
             if (existing_manifest) |value| {
                 if (!(try documentExtractionManifestHasLastError(runtime.alloc, value))) {
                     _ = try ensureRuntimeDocumentExtractionNavigationIndex(
@@ -30699,9 +30794,14 @@ const AllocatedStoreReader = struct {
     alloc: Allocator,
 
     pub fn read(self: *@This(), key: []const u8) ![]u8 {
-        var txn = try self.runtime.store.beginRead();
+        // This read returns one owned value and needs no transaction-wide
+        // snapshot. A short point lease avoids retaining a full read view
+        // while copying the source value for the caller.
+        var txn = try self.runtime.store.beginProbe();
         defer txn.abort();
-        return self.alloc.dupe(u8, try txn.get(key));
+        // The lease ends after the owned copy. Ordinary probe gets already
+        // copy values, which would duplicate large source documents twice.
+        return self.alloc.dupe(u8, try txn.getLeased(key));
     }
 
     fn readDocument(self: *@This(), key: []const u8) ![]u8 {
@@ -30711,6 +30811,66 @@ const AllocatedStoreReader = struct {
         return try self.runtime.index_manager.materializeStoredValueAlloc(self.alloc, key, raw);
     }
 };
+
+test "enrichment point reads avoid mutable backlog snapshots and return owned current values" {
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    const lsm = @import("../../lsm_backend.zig");
+    var backend = lsm.Backend.init(alloc, .{ .read_snapshot_rotate_mutable_bytes = std.math.maxInt(usize) });
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var document_store = try @import("../../docstore.zig").DocStore.openRuntime(alloc, &store);
+    defer document_store.close();
+    {
+        var write = try store.beginWrite();
+        for (0..512) |i| {
+            var key_buf: [32]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+            try write.put(key, "original");
+        }
+        try write.commit();
+    }
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .store = store,
+        .artifact_store = &document_store,
+        .io_impl = null,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .root_incarnation = 1 },
+        .ownership = undefined,
+    };
+    var reader = AllocatedStoreReader{ .runtime = &runtime, .alloc = alloc };
+    const before = backend.snapshotMaintenanceStats().mutable_snapshot_clone_calls;
+    const before_read = backend.snapshotReadStats();
+    const owned = try reader.read("doc:0");
+    defer alloc.free(owned);
+    const after_read = backend.snapshotReadStats();
+    try std.testing.expectEqual(before_read.point_value_copies, after_read.point_value_copies);
+    try std.testing.expectEqual(before_read.point_value_borrows + 1, after_read.point_value_borrows);
+    {
+        var write = try store.beginWrite();
+        try write.put("doc:0", "updated");
+        try write.commit();
+    }
+    for (0..32) |_| {
+        try servicePendingArtifactUnitJobs(&runtime, "doc:0", .{});
+        const current = try reader.read("doc:0");
+        defer alloc.free(current);
+        try std.testing.expectEqualStrings("updated", current);
+    }
+    try std.testing.expectEqualStrings("original", owned);
+    try std.testing.expectError(error.NotFound, reader.read("missing"));
+    try std.testing.expectEqual(before, backend.snapshotMaintenanceStats().mutable_snapshot_clone_calls);
+}
 
 fn storeGetAlloc(runtime: anytype, key: []const u8) ![]u8 {
     if (comptime @hasDecl(@typeInfo(@TypeOf(runtime)).pointer.child, "getAlloc")) return runtime.getAlloc(key);
@@ -31787,7 +31947,9 @@ test "document extraction missing OCR model is a terminal unit failure" {
 
     try std.testing.expectEqualStrings("failed_ocr", units[0].extraction_status.?);
     try std.testing.expect(!units[0].ocr_used);
-    try std.testing.expectEqual(@as(?bool, true), units[0].ocr_failure_retryable);
+    // A missing configured model is terminal until the operator repairs the
+    // configuration; it must not schedule an automatic retry loop.
+    try std.testing.expectEqual(@as(?bool, false), units[0].ocr_failure_retryable);
     try std.testing.expect(std.mem.indexOf(u8, units[0].extraction_warning.?, "ModelNotFound") != null);
 }
 
@@ -32098,7 +32260,7 @@ test "ordered artifact inventory unit chunk callback reconstructs publishes and 
             return error.TestUnexpectedResult;
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ runtime, request, unit_key });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ runtime, request, unit_key });
     harness.calls = 1;
     try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedUnitChunks(runtime, request, "chunks", unit_key));
     try harness.apply(&db, 6);
@@ -32656,7 +32818,7 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
                     try std.testing.expectEqualDeep(page.claim, prepared.record.claim);
                 }
             };
-            try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &read, db.root_incarnation, vector_request, plan.plan(), progress });
+            try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &read, db.root_incarnation, vector_request, plan.plan(), progress });
         }
         var previous_page: ?census.Page = null;
         defer if (previous_page) |*page| page.deinit();
@@ -32776,7 +32938,7 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
                     try closure.requireCurrent(txn, root);
                 }
             };
-            if (pass == 0) try std.testing.checkAllAllocationFailures(alloc, ClosureAllocations.run, .{ &snapshot, db.root_incarnation, vector_request, plan.plan() });
+            if (pass == 0) try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, ClosureAllocations.run, .{ &snapshot, db.root_incarnation, vector_request, plan.plan() });
         }
         {
             var writer = try db.core.store.beginWriteTxn();

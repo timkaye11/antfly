@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 
+from ..types import UNSET, Unset
+
 if TYPE_CHECKING:
     from ..models.image_url_content_part import ImageURLContentPart
     from ..models.media_content_part import MediaContentPart
@@ -22,9 +24,11 @@ class InferenceEmbeddingContentInput:
 
         Attributes:
             content (list[ImageURLContentPart | MediaContentPart | TextContentPart]):
+            title (str | Unset): Document title, allowed only with RETRIEVAL_DOCUMENT and at least one text part.
     """
 
     content: list[ImageURLContentPart | MediaContentPart | TextContentPart]
+    title: str | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.image_url_content_part import ImageURLContentPart
@@ -42,6 +46,8 @@ class InferenceEmbeddingContentInput:
 
             content.append(content_item)
 
+        title = self.title
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -49,6 +55,8 @@ class InferenceEmbeddingContentInput:
                 "content": content,
             }
         )
+        if title is not UNSET:
+            field_dict["title"] = title
 
         return field_dict
 
@@ -90,8 +98,11 @@ class InferenceEmbeddingContentInput:
 
             content.append(content_item)
 
+        title = d.pop("title", UNSET)
+
         inference_embedding_content_input = cls(
             content=content,
+            title=title,
         )
 
         return inference_embedding_content_input

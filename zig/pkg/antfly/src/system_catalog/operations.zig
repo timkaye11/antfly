@@ -76,7 +76,16 @@ pub fn storeRootEnrollmentStatus(svc: anytype, alloc: std.mem.Allocator, context
 pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: Request) ![]u8 {
     try context.ensureActive();
     if (request.mutation.table_id != 0 or request.mutation.storage_name.len != 0) return error.InvalidCatalogMutation;
-    const required_version = if (request.mutation.kind == .table and request.mutation.action == .drop) protocol.system_catalog_drop_version else protocol.system_catalog_version;
+    var object_create = false;
+    if (request.create_table_json) |json| {
+        var create_req = try tables_api.parseStoredCreateTableRequest(alloc, json);
+        defer create_req.deinit(alloc);
+        const storage_settings = create_req.storage orelse @import("antfly_local_sources").common_table_storage.Settings{};
+        try storage_settings.validateCreate(create_req.num_shards, if (create_req.replication_sources_json) |sources| !std.mem.eql(u8, sources, "[]") else false);
+        try tables_api.validateObjectCreateDefinition(alloc, create_req);
+        object_create = storage_settings.engine == .object;
+    }
+    const required_version = if (object_create) protocol.object_table_engine_version else if (request.mutation.kind == .table and request.mutation.action == .drop) protocol.system_catalog_drop_version else protocol.system_catalog_version;
     const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, required_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
@@ -100,12 +109,15 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
         if (try fk_publication.schemaHasForeignKeys(a, table.schema_json)) return error.ForeignKeyGenerationPublicationRequired;
         const policy = admission.placement_policy;
         try policy.validate();
-        if (policy.placement_role) |role| table.placement_role = role;
-        if (policy.desired_replica_count) |count| table.desired_replica_count = count;
-        if (req.num_shards == null) if (policy.min_ranges) |count| {
-            table.min_ranges = count;
-        };
+        if (table.storage.engine == .local) {
+            if (policy.placement_role) |role| table.placement_role = role;
+            if (policy.desired_replica_count) |count| table.desired_replica_count = count;
+            if (req.num_shards == null) if (policy.min_ranges) |count| {
+                table.min_ranges = count;
+            };
+        }
         const generation = try svc.captureTableCreateGeneration(a, table.table_id);
+        if (table.storage.engine == .object) table.object_storage_generation = generation;
         const ranges = try tables_api.deriveInitialRangesForGeneration(a, table, generation);
         command.mutation.table_id = table.table_id;
         command.mutation.storage_name = storage_name;
@@ -126,8 +138,8 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
         const policy = admission.placement_policy;
         var replacement = current;
         replacement.placement_role = policy.placement_role orelse "data";
-        replacement.desired_replica_count = policy.desired_replica_count orelse 3;
-        replacement.min_ranges = policy.min_ranges orelse 1;
+        replacement.desired_replica_count = if (replacement.storage.engine == .object) 0 else policy.desired_replica_count orelse 3;
+        replacement.min_ranges = if (replacement.storage.engine == .object) 0 else policy.min_ranges orelse 1;
         command.placement_update = .{ .expected = current, .replacement = replacement };
     }
     const result = try store.prepareSystemCatalogResult(alloc, svc.metadata_group_id, command);
@@ -474,7 +486,7 @@ fn listTablesJson(svc: anytype, alloc: std.mem.Allocator, context: operation.Req
     return result;
 }
 
-pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: @import("server_call.zig").Call) ![]u8 {
+pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: @import("server_call.zig").Call) anyerror![]u8 {
     return switch (input) {
         .lake_index_lifecycle_read => |table_id| @import("../metadata/lake_index_lifecycle.zig").readOnService(svc, alloc, table_id, context),
         .lake_index_lifecycle_work => |after| @import("../metadata/lake_index_lifecycle.zig").workOnService(svc, alloc, after, context),
@@ -594,6 +606,31 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             const result = try store.resolveSystemCatalogIdentities(alloc, svc.metadata_group_id, request);
             defer result.deinit(alloc);
             break :blk std.json.Stringify.valueAlloc(alloc, result, .{});
+        },
+        .relation_schema_mutate => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try context.ensureActive();
+            try request.validate();
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            const before = (try store.getTable(alloc, svc.metadata_group_id, request.guard.owner.table_id)) orelse return error.CatalogGenerationChanged;
+            defer table_manager.freeTable(alloc, before);
+            if (try tables_api.schemaVersion(before.schema_json) != request.guard.owner.schema_version) return error.CatalogGenerationChanged;
+            const after = try tables_api.applySchemaMutationRecord(alloc, &before, .replace, request.schema_json);
+            defer table_manager.freeTable(alloc, after);
+            break :blk call(svc, alloc, context, .{ .relation_replace = .{ .guard = request.guard, .expected = before, .replacement = after } });
+        },
+        .relation_replace => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try context.ensureActive();
+            try request.validate();
+            try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, request.replacement.indexes_json);
+            try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, request.replacement.indexes_json);
+            const version = try tables_api.schemaVersion(request.replacement.schema_json);
+            const stamp = try svc.replaceRelationTableDefinitionStampedWithContext(context, request.expected, request.replacement, request.guard);
+            // A response allocation failure after the durable receipt cannot
+            // become a replayable pre-admission error on the forwarding hop.
+            break :blk std.json.Stringify.valueAlloc(alloc, @import("server_call.zig").RelationReplacementResult{ .schema_version = version, .stamp = stamp }, .{}) catch return error.MetadataMutationOutcomeUnknown;
         },
         .mutate => |request| mutate(svc, alloc, context, request),
     };

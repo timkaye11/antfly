@@ -64,6 +64,13 @@ pub const Namespace = struct {
     /// always retained normally. This is a read hint and is deliberately not
     /// part of namespace identity or persisted state.
     block_cache_admission: BlockCacheAdmission = .retain,
+    /// Opt-in owner-bounded local point borrowing; ordinary point APIs keep
+    /// their owned-result contract. This hint is not namespace identity.
+    borrow_local_point_results: bool = false,
+    /// Current-tip batch readers release source generations at the end of the
+    /// call. Copy source-owned values at resolution; disk results already carry
+    /// a block pin or transaction allocation. Not part of namespace identity.
+    own_source_point_results: bool = false,
 
     pub const BlockCacheAdmission = enum {
         retain,

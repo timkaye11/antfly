@@ -244,6 +244,14 @@ required_symbols=(
   termite_embedding_gemma2_scale_device_f32_bf16
   termite_embedding_gemma2_accumulate_f32
   termite_embedding_gemma2_accumulate_bf16_boundary_f32
+  termite_gliner_encoder_attention_f32
+  termite_gliner_qkv_rope_f32
+  termite_gliner_encoder_attention_tc_f16
+  termite_gliner_encoder_attention_tc_f16_m64
+  termite_gliner_boundary_attention_f32
+  termite_gliner_boundary_attention_tc_f16
+  termite_gliner_boundary_attention_tc_f16_m64
+  termite_gliner_boundary_attention_tc_f16_compact
   termite_laya_local_attention_f32
   termite_laya_attention_warp_f32
   termite_laya_packed_geglu_f32

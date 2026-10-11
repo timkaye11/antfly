@@ -1867,7 +1867,7 @@ pub fn cloneGraphMetricStatusesFromGraph(
             .config_fingerprint = status.config_fingerprint,
             .maintenance_paused = status.maintenance_paused,
             .build_queued = status.build_queued,
-            .published_generation = if (status.published_edge_generation != 0) status.published_edge_generation else status.published_generation,
+            .published_generation = status.published_edge_generation,
             .edge_generation = status.edge_generation,
             .target_edge_generation = status.target_edge_generation,
             .queued_generation = status.queued_generation,
@@ -3225,6 +3225,102 @@ pub const CompiledPatternFilter = union(enum) {
         geo_bbox: std.json.Value,
         geo_shape: std.json.Value,
 
+        /// Admit only the exact canonical integer term representation. Integer
+        /// and floating JSON terms have distinct kinds in the shared matcher.
+        pub fn integerTerm(self: FieldPredicate) !?i64 {
+            if (self != .term or self.term.kind != pathfact_mod.kindFromJsonValue(.{ .integer = 0 })) return null;
+            const value = std.fmt.parseInt(i64, self.term.value, 10) catch return null;
+            var bytes: [32]u8 = undefined;
+            const canonical = try std.fmt.bufPrint(&bytes, "{d}", .{value});
+            return if (std.mem.eql(u8, canonical, self.term.value)) value else null;
+        }
+
+        /// A batch kernel is admitted only when it has the same scalar domain
+        /// as the authoritative matcher. Mixed wide integer/float bounds retain
+        /// its exact scalar comparison instead of rounding integer endpoints.
+        pub fn NumericKernel(comptime T: type) type {
+            return struct {
+                lower: ?T = null,
+                upper: ?T = null,
+                inclusive_lower: bool = true,
+                inclusive_upper: bool = true,
+                fn operand(value: std.json.Value) ?T {
+                    if (T == i64) return if (value == .integer) value.integer else null;
+                    return switch (value) {
+                        .float => |number| if (std.math.isFinite(number)) number else null,
+                        .integer => |number| if (number >= -9007199254740992 and number <= 9007199254740992) @floatFromInt(number) else null,
+                        else => null,
+                    };
+                }
+            };
+        }
+        pub fn numericKernel(self: FieldPredicate, comptime T: type) !?NumericKernel(T) {
+            const Kernel = NumericKernel(T);
+            if (self == .term) {
+                if (T == i64) {
+                    const value = (try self.integerTerm()) orelse return null;
+                    return .{ .lower = value, .upper = value };
+                }
+                if (self.term.kind != pathfact_mod.kindFromJsonValue(.{ .float = 0 })) return null;
+                const value = std.fmt.parseFloat(f64, self.term.value) catch return null;
+                // Canonical term matching distinguishes signed zero spellings.
+                if (!std.math.isFinite(value) or value == 0) return null;
+                var bytes: [64]u8 = undefined;
+                const canonical = try jsonScalarTermSlice(.{ .float = value }, &bytes);
+                if (!std.mem.eql(u8, canonical, self.term.value)) return null;
+                return .{ .lower = value, .upper = value };
+            }
+            if (self == .standard_range) {
+                if (self.standard_range != .object) return null;
+                const bounds = (try self.standardBounds()).?;
+                if (bounds.lower == null and bounds.upper == null) return null;
+                var result: Kernel = .{};
+                if (bounds.lower) |bound| {
+                    result.lower = Kernel.operand(bound.value) orelse return null;
+                    result.inclusive_lower = bound.inclusive;
+                }
+                if (bounds.upper) |bound| {
+                    result.upper = Kernel.operand(bound.value) orelse return null;
+                    result.inclusive_upper = bound.inclusive;
+                }
+                return result;
+            }
+            if (T == f64 and self == .numeric_range) {
+                const range = self.numeric_range;
+                if (range != .object) return null;
+                var result: Kernel = .{};
+                if (range.object.get("min")) |value| result.lower = try jsonNumberFromValue(value);
+                if (range.object.get("max")) |value| result.upper = try jsonNumberFromValue(value);
+                if (result.lower) |value| if (!std.math.isFinite(value)) return null;
+                if (result.upper) |value| if (!std.math.isFinite(value)) return null;
+                if (result.lower == null and result.upper == null) return null;
+                result.inclusive_lower = try jsonPatternBoolOrDefault(range.object.get("inclusive_min"), true);
+                result.inclusive_upper = try jsonPatternBoolOrDefault(range.object.get("inclusive_max"), false);
+                return result;
+            }
+            return null;
+        }
+        pub fn booleanTerm(self: FieldPredicate) ?bool {
+            if (self == .bool_field) {
+                if (self.bool_field != .object) return null;
+                const value = self.bool_field.object.get("value") orelse return null;
+                return if (value == .bool) value.bool else null;
+            }
+            if (self != .term or self.term.kind != pathfact_mod.kindFromJsonValue(.{ .bool = false })) return null;
+            if (std.mem.eql(u8, self.term.value, "true")) return true;
+            if (std.mem.eql(u8, self.term.value, "false")) return false;
+            return null;
+        }
+        pub fn nullTerm(self: FieldPredicate) bool {
+            return self == .term and self.term.kind == pathfact_mod.kindFromJsonValue(.null) and std.mem.eql(u8, self.term.value, "null");
+        }
+
+        /// Canonical bounds shared by index planners and the row evaluator.
+        pub fn standardBounds(self: FieldPredicate) !?struct { lower: ?PatternJsonRangeBound, upper: ?PatternJsonRangeBound } {
+            if (self != .standard_range) return null;
+            return .{ .lower = try standardPatternRangeLowerBound(self.standard_range), .upper = try standardPatternRangeUpperBound(self.standard_range) };
+        }
+
         /// Conservative zone-map test in the same numeric domain as the row
         /// predicate. Equality is retained at exclusive boundaries so pruning
         /// can never remove a matching row through floating-point rounding.
@@ -3266,6 +3362,9 @@ pub const CompiledPatternFilter = union(enum) {
             const value = cell orelse return self.matches(alloc, &.{});
             if (self == .exists) return true;
             if (value.is_null) return self.matches(alloc, &.{.null});
+            // Exact NUMERIC requires a typed predicate kernel. Do not compare
+            // canonical binary as text or silently round it through f64.
+            if (value.is_numeric) return error.UnsupportedSqlExecution;
             if (value.is_dense_vector and (self == .term or self == .terms)) {
                 const bytes = value.value.bytes_val;
                 if (bytes.len % 4 != 0) return error.InvalidData;
@@ -3568,6 +3667,7 @@ fn matcherMatchesOrdinal(
 
     var number_buf: [64]u8 = undefined;
     const root: std.json.Value = switch (cell.value) {
+        .datetime_ns => |v| .{ .number_string = try std.fmt.bufPrint(&number_buf, "{d}", .{v}) },
         .u64_val => |value| if (value <= std.math.maxInt(i64))
             .{ .integer = @intCast(value) }
         else
@@ -3929,6 +4029,16 @@ const PatternFieldString = struct {
 const PatternScalar = struct {
     kind: pathfact_mod.Kind,
     value: []const u8,
+
+    pub fn jsonValue(self: PatternScalar) !std.json.Value {
+        return switch (self.kind) {
+            .string => .{ .string = self.value },
+            .number => if (std.fmt.parseInt(i64, self.value, 10)) |v| .{ .integer = v } else |_| .{ .number_string = self.value },
+            .bool => .{ .bool = std.mem.eql(u8, self.value, "true") },
+            .null => .null,
+            else => error.InvalidArgument,
+        };
+    }
 };
 
 const PatternFieldScalar = struct {
@@ -4503,15 +4613,36 @@ fn jsonValueMatchesStandardRange(value: std.json.Value, lower: ?PatternJsonRange
         }
         return false;
     }
-    if (value == .integer or value == .float) {
-        const candidate = try jsonNumberFromValue(value);
-        const min_value = if (lower) |bound| try jsonNumberFromValue(bound.value) else null;
-        const max_value = if (upper) |bound| try jsonNumberFromValue(bound.value) else null;
-        if (min_value) |min| {
-            if (candidate < min or (!(lower.?.inclusive) and candidate == min)) return false;
+    // Temporal strings and typed nanosecond columns share one signed order.
+    // Ordinary numeric predicates retain scalar comparison; wide integer
+    // timestamp representations use the same signed order as temporal strings.
+    const temporal_bounds = (if (lower) |bound| bound.value == .string and jsonTemporalNsFromValue(bound.value) != null else false) or
+        (if (upper) |bound| bound.value == .string and jsonTemporalNsFromValue(bound.value) != null else false);
+    const wide_integer_bounds = (if (lower) |bound| bound.value == .number_string and jsonTemporalNsFromValue(bound.value) != null else false) or
+        (if (upper) |bound| bound.value == .number_string and jsonTemporalNsFromValue(bound.value) != null else false);
+    if (temporal_bounds or wide_integer_bounds or ((value == .string or value == .number_string) and jsonTemporalNsFromValue(value) != null)) {
+        if (jsonTemporalNsFromValue(value)) |candidate| {
+            const min = if (lower) |bound| jsonTemporalNsFromValue(bound.value) else null;
+            const max = if (upper) |bound| jsonTemporalNsFromValue(bound.value) else null;
+            if ((lower == null or min != null) and (upper == null or max != null)) {
+                if (min) |ns| if (candidate < ns or (candidate == ns and !lower.?.inclusive)) return false;
+                if (max) |ns| if (candidate > ns or (candidate == ns and !upper.?.inclusive)) return false;
+                return true;
+            }
         }
-        if (max_value) |max| {
-            if (candidate > max or (!(upper.?.inclusive) and candidate == max)) return false;
+    }
+    if (value == .integer or value == .float) {
+        // Keep integers exact, including mixed integer/float comparisons.
+        // This is the same scalar order used by relational predicate indexes.
+        if (lower) |bound| {
+            if (bound.value != .integer and bound.value != .float) return error.InvalidArgument;
+            const order = try @import("../../../sql/scalar.zig").compare(value, bound.value);
+            if (order == .lt or (!bound.inclusive and order == .eq)) return false;
+        }
+        if (upper) |bound| {
+            if (bound.value != .integer and bound.value != .float) return error.InvalidArgument;
+            const order = try @import("../../../sql/scalar.zig").compare(value, bound.value);
+            if (order == .gt or (!bound.inclusive and order == .eq)) return false;
         }
         return true;
     }
@@ -4579,11 +4710,11 @@ fn jsonPatternBoolOrDefault(value: ?std.json.Value, default_value: bool) !bool {
 fn jsonValuesContainDateRange(values: []const std.json.Value, range_query: std.json.Value) !bool {
     if (range_query != .object) return error.InvalidArgument;
     const start_ns = if (range_query.object.get("start_ns")) |value|
-        try jsonU64FromValue(value)
+        try jsonDateNsFromValue(value)
     else
         null;
     const end_ns = if (range_query.object.get("end_ns")) |value|
-        try jsonU64FromValue(value)
+        try jsonDateNsFromValue(value)
     else
         null;
     if (start_ns == null and end_ns == null) return error.InvalidArgument;
@@ -4826,11 +4957,15 @@ fn jsonU64FromValue(value: std.json.Value) !u64 {
     };
 }
 
-fn jsonDateNsFromValue(value: std.json.Value) !u64 {
+pub fn jsonTemporalNsFromValue(value: std.json.Value) ?i128 {
+    return @import("../../../datetime.zig").rangeNanoseconds(value);
+}
+
+pub fn jsonDateNsFromValue(value: std.json.Value) !i128 {
     return switch (value) {
-        .string => |text| (try parsePatternRfc3339ToNs(text)) orelse error.InvalidArgument,
-        .integer, .float, .number_string => try jsonU64FromValue(value),
-        else => error.InvalidArgument,
+        .float => try jsonU64FromValue(value), // retain legacy integral-float admission
+        .string => |text| @import("../../../datetime.zig").parseDateTimeToSignedNs(text) orelse error.InvalidArgument,
+        else => jsonTemporalNsFromValue(value) orelse error.InvalidArgument,
     };
 }
 
@@ -7632,7 +7767,10 @@ test "db query result shape executeSingleNonPatternQueryWithSets hides metric st
             metric_status[0] = .{
                 .name = try alloc_inner.dupe(u8, "pagerank"),
                 .state = .fresh,
-                .published_generation = 5,
+                // The public status reports the published edge generation,
+                // independently of the metric image's publication identifier.
+                .published_generation = 17,
+                .published_edge_generation = 5,
                 .edge_generation = 5,
                 .target_edge_generation = 5,
                 .progress = 1.0,
@@ -7823,4 +7961,52 @@ test "fuseNamedSets member identity separates tables and ignores public id alias
         try std.testing.expectEqualStrings("doc:a", hit.id);
         try std.testing.expectEqual(@as(usize, if (std.mem.eql(u8, hit.source_table.?, "a")) 2 else 1), hit.index_scores.len);
     }
+}
+
+test "external lake shared standard range preserves exact integer order above 2^53 and mixed float boundaries" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const parsed = try std.json.parseFromSlice(std.json.Value, ca,
+        \\{"range":{"amount":{"gt":9007199254740992}}}
+    , .{});
+    const filter = try compilePatternFilter(ca, parsed.value);
+    for ([_]std.json.Value{ .{ .integer = 9007199254740993 }, .{ .integer = 9007199254740994 } }) |value| {
+        var doc: std.json.Value = .{ .object = .empty };
+        try doc.object.put(ca, "amount", value);
+        try std.testing.expect(try filter.matches(ca, "doc", doc));
+    }
+    var doc: std.json.Value = .{ .object = .empty };
+    try doc.object.put(ca, "amount", .{ .float = 9007199254740992.0 });
+    try std.testing.expect(!try filter.matches(ca, "doc", doc));
+}
+
+test "external lake shared temporal ranges compare signed nanoseconds and offset strings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"range":{"ts":{"gte":"1969-12-31T23:59:59.999999999Z","lt":"1970-01-01T01:00:00.000000001+01:00"}}}
+    , .{});
+    const filter = try compilePatternFilter(a, parsed.value);
+    for ([_]std.json.Value{ .{ .integer = -1 }, .{ .integer = 0 }, .{ .string = "1970-01-01T01:00:00+01:00" } }) |value| {
+        var doc: std.json.Value = .{ .object = .empty };
+        try doc.object.put(a, "ts", value);
+        try std.testing.expect(try filter.matches(a, "doc", doc));
+    }
+    for ([_]std.json.Value{ .{ .integer = -2 }, .{ .integer = 1 }, .null }) |value| {
+        var doc: std.json.Value = .{ .object = .empty };
+        try doc.object.put(a, "ts", value);
+        try std.testing.expect(!try filter.matches(a, "doc", doc));
+    }
+}
+
+test "external lake temporal numeric ranges preserve timestamps beyond i64" {
+    const lower: PatternJsonRangeBound = .{ .value = .{ .integer = std.math.minInt(i64) }, .inclusive = true };
+    const upper: PatternJsonRangeBound = .{ .value = .{ .number_string = "9223372036854775809" }, .inclusive = false };
+    try std.testing.expect(try jsonValueMatchesStandardRange(.{ .number_string = "9223372036854775808" }, lower, upper));
+    try std.testing.expect(try jsonValueMatchesStandardRange(.{ .integer = 0 }, lower, upper));
+    try std.testing.expect(!try jsonValueMatchesStandardRange(.{ .number_string = "9223372036854775809" }, lower, upper));
+    try std.testing.expect(!try jsonValueMatchesStandardRange(.{ .number_string = "-9223372036854775809" }, lower, upper));
 }

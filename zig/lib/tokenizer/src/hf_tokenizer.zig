@@ -143,6 +143,7 @@ pub const HfTokenizer = struct {
     handle_chinese_chars: bool,
     replace_space_with: ?[]const u8,
     unigram_normalizer: unicode_normalizer.Profile = .{},
+    bpe_normalizer: unicode_normalizer.Profile = .{},
     unigram_min_score: f64 = std.math.inf(f64),
     // A generic unsupported normalizer keeps the complete legacy encoding
     // behavior. This is selected internally, never by a strict load option.
@@ -797,6 +798,7 @@ pub const HfTokenizer = struct {
         .encodeIntoParallel = @ptrCast(&encodeIntoParallel),
         .encodeIntoParallelStable = @ptrCast(&encodeIntoParallelStable),
         .encodeForModel = @ptrCast(&encodeForModel),
+        .encodeForModelUnpadded = @ptrCast(&encodeForModelUnpadded),
         .encodeGeneration = @ptrCast(&encodeGeneration),
         .decode = @ptrCast(&decode),
         .specialTokens = @ptrCast(&getSpecialTokens),
@@ -814,7 +816,7 @@ pub const HfTokenizer = struct {
         // The normalizer can compose/reorder codepoints and collapse spaces.
         // Until normalized alignment tracking is implemented, do not expose
         // offsets from the unnormalized fast path. GLiNER owns its word maps.
-        if (self.unigram_normalizer.len != 0) return null;
+        if (self.unigram_normalizer.len != 0 or self.bpe_normalizer.len != 0) return null;
         if (self.model_type == .word_piece and self.pre_tokenizer_type == .bert) {
             return try self.encodeWordPieceWithOffsets(allocator, text);
         }
@@ -1470,6 +1472,23 @@ pub const HfTokenizer = struct {
             self.unigram_normalizer = profile;
             return;
         }
+        if (self.model_type == .bpe) {
+            // ModernBERT/Ettin tokenizers normalize to NFC before byte-level
+            // BPE. Keep supported ordered profiles intact; legacy profiles
+            // such as Lowercase retain their existing complete behavior.
+            var profile = unicode_normalizer.Profile{};
+            errdefer profile.deinit(self.allocator);
+            profile.parse(self.allocator, .{ .object = obj }) catch |err| switch (err) {
+                error.UnsupportedTokenizerNormalizer => {
+                    profile.deinit(self.allocator);
+                    self.parseLegacyNormalizer(obj);
+                    return;
+                },
+                else => return err,
+            };
+            self.bpe_normalizer = profile;
+            return;
+        }
         self.parseLegacyNormalizer(obj);
     }
 
@@ -1817,6 +1836,12 @@ pub const HfTokenizer = struct {
         const cache_reader = self.enterBpeCacheRead();
         defer if (cache_reader) |cache| self.leaveBpeCacheRead(cache);
 
+        if (self.bpe_normalizer.len != 0) {
+            var ids = std.ArrayListUnmanaged(i32).empty;
+            errdefer ids.deinit(allocator);
+            try self.encodeNormalizedBpe(allocator, text, &ids);
+            return ids.toOwnedSlice(allocator);
+        }
         if (self.unigram_normalizer.len != 0) {
             var ids = std.ArrayListUnmanaged(i32).empty;
             errdefer ids.deinit(allocator);
@@ -1857,6 +1882,8 @@ pub const HfTokenizer = struct {
         const cache_reader = self.enterBpeCacheRead();
         defer if (cache_reader) |cache| self.leaveBpeCacheRead(cache);
 
+        if (self.bpe_normalizer.len != 0)
+            return self.encodeNormalizedBpe(allocator, text, ids);
         if (self.unigram_normalizer.len != 0)
             return self.encodeNormalizedUnigram(allocator, text, null, ids);
 
@@ -3302,6 +3329,7 @@ pub const HfTokenizer = struct {
             self.byte_level_pretokenizer != .gpt2 or
             self.do_lowercase or
             self.replace_space_with != null or
+            self.bpe_normalizer.len != 0 or
             self.end_of_word_suffix.len != 0)
         {
             if (segments_out != null) {
@@ -3806,6 +3834,29 @@ pub const HfTokenizer = struct {
         ids: *std.ArrayListUnmanaged(i32),
     ) !void {
         return self.encodeWithAddedTokensMetaspaceOverride(allocator, text, null, ids);
+    }
+
+    fn encodeNormalizedBpe(
+        self: *HfTokenizer,
+        allocator: std.mem.Allocator,
+        text: []const u8,
+        ids: *std.ArrayListUnmanaged(i32),
+    ) !void {
+        // Protect structural tokens before normalizing the text between them,
+        // matching the checkpoint's normalized=false added-token markers.
+        var cursor: usize = 0;
+        while (cursor < text.len) {
+            if (self.matchAddedTokenAt(text[cursor..])) |match| {
+                try ids.append(allocator, match.id);
+                cursor += match.len;
+                continue;
+            }
+            const end = self.findNextAddedToken(text, cursor) orelse text.len;
+            const normalized = try self.bpe_normalizer.normalize(allocator, text[cursor..end]);
+            defer allocator.free(normalized);
+            try self.encodeWithAddedTokens(allocator, normalized, ids);
+            cursor = end;
+        }
     }
 
     fn encodeNormalizedUnigram(
@@ -7231,16 +7282,24 @@ pub const HfTokenizer = struct {
     }
 
     fn encodeForModel(ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, max_length: usize) anyerror!@import("tokenizer.zig").EncodeResult {
+        return encodeForModelWithPadding(ptr, allocator, text, max_length, true);
+    }
+
+    fn encodeForModelUnpadded(ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, max_length: usize) anyerror!@import("tokenizer.zig").EncodeResult {
+        return encodeForModelWithPadding(ptr, allocator, text, max_length, false);
+    }
+
+    fn encodeForModelWithPadding(ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, max_length: usize, padded: bool) anyerror!@import("tokenizer.zig").EncodeResult {
         const self: *HfTokenizer = @ptrCast(@alignCast(ptr));
         if (self.model_type == .word_piece and self.pre_tokenizer_type == .bert) {
             var raw = try self.encodeWordPieceWithOffsets(allocator, text);
             defer raw.deinit(allocator);
-            return HfTokenizer.wrapModelEncodingWithOffsets(self, allocator, raw.ids.items, raw.offsets.items, max_length);
+            return HfTokenizer.wrapModelEncodingWithOffsets(self, allocator, raw.ids.items, raw.offsets.items, max_length, padded);
         }
         if (self.model_type == .unigram and self.pre_tokenizer_type == .metaspace and self.metaspace_split and self.unigram_normalizer.len == 0) {
             var raw = try self.encodeUnigramWithOffsets(allocator, text);
             defer raw.deinit(allocator);
-            return HfTokenizer.wrapModelEncodingWithOffsets(self, allocator, raw.ids.items, raw.offsets.items, max_length);
+            return HfTokenizer.wrapModelEncodingWithOffsets(self, allocator, raw.ids.items, raw.offsets.items, max_length, padded);
         }
         {
             const raw_ids = try self.encode(allocator, text);
@@ -7252,9 +7311,10 @@ pub const HfTokenizer = struct {
             const wrap_len = plan.prepend.len + plan.append.len;
             const max_tokens = if (max_length > wrap_len) max_length - wrap_len else 0;
             const token_count = @min(raw_ids.len, max_tokens);
-            const ids = try allocator.alloc(i32, max_length);
+            const allocation_length = if (padded) max_length else @min(max_length, wrap_len + token_count + 1);
+            const ids = try allocator.alloc(i32, allocation_length);
             errdefer allocator.free(ids);
-            const mask = try allocator.alloc(i32, max_length);
+            const mask = try allocator.alloc(i32, allocation_length);
 
             var pos: usize = 0;
             for (plan.prepend) |tid| {
@@ -7274,7 +7334,7 @@ pub const HfTokenizer = struct {
                 mask[pos] = 1;
                 pos += 1;
             }
-            for (pos..max_length) |i| {
+            for (pos..allocation_length) |i| {
                 ids[i] = special.pad_id;
                 mask[i] = 0;
             }
@@ -7525,6 +7585,7 @@ pub const HfTokenizer = struct {
         raw_ids: []const i32,
         raw_offsets: []const [2]u32,
         max_length: usize,
+        padded: bool,
     ) !@import("tokenizer.zig").EncodeResult {
         const special = self.getSpecialTokens();
         const legacy_wrap = [2]i32{ special.cls_id, special.sep_id };
@@ -7532,11 +7593,12 @@ pub const HfTokenizer = struct {
         const wrap_len = plan.prepend.len + plan.append.len;
         const max_tokens = if (max_length > wrap_len) max_length - wrap_len else 0;
         const token_count = @min(raw_ids.len, max_tokens);
-        const ids = try allocator.alloc(i32, max_length);
+        const allocation_length = if (padded) max_length else @min(max_length, wrap_len + token_count + 1);
+        const ids = try allocator.alloc(i32, allocation_length);
         errdefer allocator.free(ids);
-        const mask = try allocator.alloc(i32, max_length);
+        const mask = try allocator.alloc(i32, allocation_length);
         errdefer allocator.free(mask);
-        const offsets = try allocator.alloc([2]u32, max_length);
+        const offsets = try allocator.alloc([2]u32, allocation_length);
 
         var pos: usize = 0;
         for (plan.prepend) |tid| {
@@ -7559,7 +7621,7 @@ pub const HfTokenizer = struct {
             offsets[pos] = .{ 0, 0 };
             pos += 1;
         }
-        for (pos..max_length) |i| {
+        for (pos..allocation_length) |i| {
             ids[i] = special.pad_id;
             mask[i] = 0;
             offsets[i] = .{ 0, 0 };
@@ -7675,6 +7737,7 @@ pub const HfTokenizer = struct {
     pub fn deinitSelf(self: *HfTokenizer) void {
         const allocator = self.allocator;
         self.unigram_normalizer.deinit(allocator);
+        self.bpe_normalizer.deinit(allocator);
         for (self.arena_strings.items) |s| {
             allocator.free(s);
         }
@@ -11343,6 +11406,44 @@ test "clip byte-level bpe honors split pretokenizer array merges and end suffix"
     try std.testing.expectEqualSlices(i32, &.{ 1, 1, 1, 1, 0, 0 }, encoded.attention_mask);
 }
 
+test "NFC byte-level BPE preserves added tokens and canonical composition exclusions" {
+    const a = std.testing.allocator;
+    const tok = try HfTokenizer.loadFromBytes(a,
+        \\{"model":{"type":"BPE","vocab":{"à":1,"¤":2,"¡":3,"¼":4,"Ã":5,"©":6,"Ġ":7,"<é>":20},"merges":[]},
+        \\ "normalizer":{"type":"NFC"},
+        \\ "pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false,"use_regex":true},
+        \\ "added_tokens":[{"id":20,"content":"<é>","special":true,"normalized":false}]}
+    );
+    defer tok.deinitSelf();
+    const text = "e\u{0301}<e\u{0301}>\u{095c}";
+    // é is C3 A9; U+095C normalizes to U+0921 U+093C (E0 A4 A1 E0 A4 BC).
+    const expected = [_]i32{ 5, 6, 20, 1, 2, 3, 1, 2, 4 };
+    const raw = try tok.encode(a, text);
+    defer a.free(raw);
+    try std.testing.expectEqualSlices(i32, &expected, raw);
+    var ids = std.ArrayListUnmanaged(i32).empty;
+    defer ids.deinit(a);
+    try tok.encodeInto(a, text, &ids);
+    try std.testing.expectEqualSlices(i32, &expected, ids.items);
+    var model = try tok.tokenizer().encodeForModel(a, text, expected.len);
+    defer model.deinit();
+    try std.testing.expectEqualSlices(i32, &expected, model.ids);
+    var generation = try tok.tokenizer().encodeForGenerationConfigured(a, text, expected.len, false);
+    defer generation.deinit();
+    try std.testing.expectEqualSlices(i32, &expected, generation.ids);
+
+    // Force parallel eligibility by size. Normalization must still happen
+    // before byte-level regex segmentation, including combining sequences.
+    const count = HfTokenizer.parallel_bpe_min_bytes / 4 + 1;
+    const large = try a.alloc(u8, count * 4);
+    defer a.free(large);
+    for (0..count) |i| @memcpy(large[i * 4 ..][0..4], "e\u{0301} ");
+    ids.clearRetainingCapacity();
+    try tok.tokenizer().encodeIntoParallel(std.testing.io, a, large, &ids, 4);
+    try std.testing.expectEqual(count * 3, ids.items.len);
+    for (0..count) |i| try std.testing.expectEqualSlices(i32, &.{ 5, 6, 7 }, ids.items[i * 3 ..][0..3]);
+}
+
 test "sequence normalizer applies lowercase before byte-level bpe" {
     const allocator = std.testing.allocator;
 
@@ -11441,6 +11542,96 @@ test "clip roberta processing pads with eos when no pad token is declared" {
     try std.testing.expectEqual(@as(i32, 49407), encoded.ids[2]);
     try std.testing.expectEqual(@as(i32, 49407), encoded.ids[3]);
     try std.testing.expectEqual(@as(i32, 0), encoded.attention_mask[3]);
+}
+
+const bpe_nfc_fixture =
+    \\{"model":{"type":"BPE","vocab":{"Ã":0,"©":1,"Ã©":2,"e":3,"Ì":4,"ģ":5},"merges":["Ã ©"]},"normalizer":{"type":"NFC"},"pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false},"added_tokens":[{"id":50374,"content":"[L]","normalized":false,"special":true}]}
+;
+
+test "GLiNER2.5 Decide-1B BPE applies NFC before merges and protects markers" {
+    const a = std.testing.allocator;
+    const tok = try HfTokenizer.loadFromBytes(a, bpe_nfc_fixture);
+    defer tok.deinitSelf();
+    const cases = [_]struct { text: []const u8, ids: []const i32 }{
+        .{ .text = "é", .ids = &.{2} },
+        .{ .text = "é", .ids = &.{2} },
+        .{ .text = "é[L]é", .ids = &.{ 2, 50374, 2 } },
+        .{ .text = "[L]é", .ids = &.{ 50374, 2 } },
+        .{ .text = "", .ids = &.{} },
+    };
+    var reused = std.ArrayListUnmanaged(i32).empty;
+    defer reused.deinit(a);
+    for (cases) |case| {
+        const ids = try tok.encode(a, case.text);
+        defer a.free(ids);
+        try std.testing.expectEqualSlices(i32, case.ids, ids);
+        reused.clearRetainingCapacity();
+        try tok.encodeInto(a, case.text, &reused);
+        try std.testing.expectEqualSlices(i32, case.ids, reused.items);
+        reused.clearRetainingCapacity();
+        try tok.encodeIntoParallelImpl(std.testing.io, a, case.text, &reused, 2, null, null);
+        try std.testing.expectEqualSlices(i32, case.ids, reused.items);
+    }
+}
+
+test "BPE normalized parallel encoding preserves NFC across the parallel threshold" {
+    const a = std.testing.allocator;
+    const tok = try HfTokenizer.loadFromBytes(a, bpe_nfc_fixture);
+    defer tok.deinitSelf();
+    const repetitions = HfTokenizer.parallel_bpe_min_bytes / "é".len + 1;
+    const text = try a.alloc(u8, repetitions * "é".len);
+    defer a.free(text);
+    for (0..repetitions) |index| @memcpy(text[index * "é".len ..][0.."é".len], "é");
+    var ids = std.ArrayListUnmanaged(i32).empty;
+    defer ids.deinit(a);
+    try tok.encodeIntoParallelImpl(std.testing.io, a, text, &ids, 2, null, null);
+    try std.testing.expectEqual(repetitions, ids.items.len);
+    for (ids.items) |id| try std.testing.expectEqual(@as(i32, 2), id);
+}
+
+fn bpeNfcAllocationFailure(a: std.mem.Allocator) !void {
+    const tok = try HfTokenizer.loadFromBytes(a, bpe_nfc_fixture);
+    defer tok.deinitSelf();
+    const ids = try tok.encode(a, "é[L]é");
+    defer a.free(ids);
+    try std.testing.expectEqualSlices(i32, &.{ 2, 50374, 2 }, ids);
+}
+
+test "BPE NFC normalization releases every failed allocation" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, bpeNfcAllocationFailure, .{});
+}
+
+test "GLiNER2.5 family pinned full tokenizers match multilingual golden IDs" {
+    const a = std.testing.allocator;
+    const root = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_FAMILY_TOKENIZER_DIR") orelse return error.SkipZigTest;
+    const fixtures = @import("gliner_family_fixtures.zig");
+    for (fixtures.models) |model| {
+        const path = try std.fs.path.join(a, &.{ root, model.directory, "tokenizer.json" });
+        defer a.free(path);
+        const file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{});
+        defer file.close(std.testing.io);
+        const stat = try file.stat(std.testing.io);
+        if (stat.size > 32 * 1024 * 1024) return error.InvalidTokenizerJson;
+        const bytes = try a.alloc(u8, stat.size);
+        defer a.free(bytes);
+        try std.testing.expectEqual(bytes.len, try file.readPositionalAll(std.testing.io, bytes, 0));
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
+        const hex = std.fmt.bytesToHex(hash, .lower);
+        try std.testing.expectEqualStrings(model.sha256, &hex);
+        const tok = try HfTokenizer.loadFromBytesWithOptions(a, bytes, .{ .strict_unigram_normalizer = true });
+        defer tok.deinitSelf();
+        for (model.cases) |case| {
+            errdefer std.debug.print("family tokenizer {s}: {s}\n", .{ model.model_id, case.text });
+            const ids = try tok.encode(a, case.text);
+            defer a.free(ids);
+            try std.testing.expectEqualSlices(i32, case.ids, ids);
+            var reused = std.ArrayListUnmanaged(i32).empty;
+            defer reused.deinit(a);
+            try tok.encodeInto(a, case.text, &reused);
+            try std.testing.expectEqualSlices(i32, case.ids, reused.items);
+        }
+    }
 }
 
 test "bpe encode basic" {
@@ -12010,6 +12201,17 @@ test "TemplateProcessing appends exactly one trailing eos and no leading token" 
         if (mask > 0 and id == 9) eos_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), eos_count);
+    // The unpadded path must preserve wrapping and truncation while avoiding
+    // full-context allocations for short embedding inputs.
+    for ([_]usize{ 1, 2, 3, 8, 32768 }) |maximum| {
+        var padded = try tok.tokenizer().encodeForModel(allocator, "abc", maximum);
+        defer padded.deinit();
+        var unpadded = try tok.tokenizer().encodeForModelUnpadded(allocator, "abc", maximum);
+        defer unpadded.deinit();
+        try std.testing.expect(unpadded.ids.len <= 3);
+        try std.testing.expectEqualSlices(i32, padded.ids[0..unpadded.ids.len], unpadded.ids);
+        try std.testing.expectEqualSlices(i32, padded.attention_mask[0..unpadded.ids.len], unpadded.attention_mask);
+    }
 }
 
 test "TemplateProcessing eos survives max-length truncation" {

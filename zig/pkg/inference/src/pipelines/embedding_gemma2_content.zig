@@ -224,7 +224,7 @@ pub fn prepare(
             },
             .audio => |clip| {
                 if (clip.bytes.len == 0) return error.InvalidAudioInput;
-                const encoded = try gemma4_projector.encodeEmbeddingGemma2Audio(cb, allocator, clip.bytes, clip.decode_options, max_audio_decode_working_bytes);
+                const encoded = try gemma4_projector.encodeEmbeddingGemma2AudioBounded(cb, allocator, clip.bytes, clip.decode_options, max_audio_decode_working_bytes);
                 errdefer allocator.free(encoded.embeddings);
                 if (encoded.embeddings.len != std.math.mul(usize, encoded.tokens, hidden_size) catch return error.InvalidMediaEmbeddingShape)
                     return error.InvalidMediaEmbeddingShape;

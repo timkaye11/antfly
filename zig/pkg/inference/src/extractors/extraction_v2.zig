@@ -257,6 +257,21 @@ fn note(options: ParseOptions, index: ?usize, stage: []const u8) void {
     if (options.failure) |failure| failure.* = .{ .input_index = index, .stage = stage };
 }
 
+/// Extraction geometry; typed decisions lower matching bounds into this contract.
+pub fn parseLongDocument(raw: Value) !LongDocument {
+    const config = try asObject(raw);
+    try keys(config, &.{ "mode", "window_words", "overlap_words", "max_windows", "record_identity" });
+    var result = LongDocument{};
+    result.mode = try enumeration(@FieldType(LongDocument, "mode"), config, "mode", .reject);
+    result.window_words = try unsigned(config, "window_words", 1024, 1, 4096);
+    result.overlap_words = try unsigned(config, "overlap_words", 32, 0, 4095);
+    result.max_windows = try unsigned(config, "max_windows", 128, 1, 128);
+    result.record_identity = try enumeration(@FieldType(LongDocument, "record_identity"), config, "record_identity", .occurrence);
+    if (result.mode == .reject and config.count() > @intFromBool(config.contains("mode"))) return error.ConflictingExtractionOptions;
+    if (result.mode == .window and result.overlap_words >= result.window_words) return error.InvalidExtractionOptions;
+    return result;
+}
+
 pub fn parseOptions(value: Value) !Options {
     const object = try asObject(value);
     try keys(object, &.{ "threshold", "word_splitter", "flat_ner", "overlap", "offset_unit", "include_confidence", "include_spans", "long_document", "decoder", "joint_ie", "reader", "resolver" });
@@ -277,15 +292,7 @@ pub fn parseOptions(value: Value) !Options {
         options.overlap = policy;
     }
     if (object.get("long_document")) |raw| {
-        const config = try asObject(raw);
-        try keys(config, &.{ "mode", "window_words", "overlap_words", "max_windows", "record_identity" });
-        options.long_document.mode = try enumeration(@FieldType(LongDocument, "mode"), config, "mode", .reject);
-        options.long_document.window_words = try unsigned(config, "window_words", 1024, 1, 4096);
-        options.long_document.overlap_words = try unsigned(config, "overlap_words", 32, 0, 4095);
-        options.long_document.max_windows = try unsigned(config, "max_windows", 128, 1, 128);
-        options.long_document.record_identity = try enumeration(@FieldType(LongDocument, "record_identity"), config, "record_identity", .occurrence);
-        if (options.long_document.mode == .reject and config.count() > @intFromBool(config.contains("mode"))) return error.ConflictingExtractionOptions;
-        if (options.long_document.mode == .window and options.long_document.overlap_words >= options.long_document.window_words) return error.InvalidExtractionOptions;
+        options.long_document = try parseLongDocument(raw);
     }
     if (object.get("decoder")) |raw| {
         const config = try asObject(raw);
@@ -456,6 +463,10 @@ pub fn errorDetails(err: anyerror) ?ErrorDetails {
         error.GlinerBoundaryPaddedSequenceLimitExceeded => .{ .status = 413, .code = "EXTRACTION_LIMIT_EXCEEDED", .message = "GLiNER boundary extraction exceeds the qualified padded_sequence_tokens limit" },
         error.AdvancedExtractionSchemaRequiresVersion2, error.UnsupportedExtractionSchemaVersion, error.UnsupportedExtractionFeature, error.UnsupportedExtractionLongDocument, error.UnsupportedExtractionModel, error.UnsupportedExtractionBackend, error.UnsupportedGlinerBoundaryRuntime, error.UnsupportedExtractionInput, error.UnsupportedExtractionFieldType, error.UnsupportedExtractionValidator, error.UnsupportedBoundaryHypothesisTemplate, error.UnsupportedDecisionSchema, error.UnsupportedDecisionWindowing, error.UnsupportedDecisionHypothesisTemplate, error.UnsupportedDecisionBackend, error.ConstrainedClassificationTopKUnsupported, error.UnsupportedGlinerBoundaryBackend, error.UnsupportedGlinerBoundaryTask, error.RegexValidationUnavailable, error.UnsupportedGlinerSpanV2Task, error.UnsupportedGlinerSpanLongDocument => .{ .status = 400, .code = "UNSUPPORTED_EXTRACTION_FEATURE", .message = "the selected extraction version or runtime does not support a requested feature" },
         error.InvalidDecisionRequest, error.InvalidDecisionTask, error.InvalidExtractionRequest, error.UnknownExtractionRequestField, error.InvalidExtractionOptions, error.ConflictingExtractionOptions, error.ClassificationConstraintsRequireTasks, error.ConflictingClassificationMode, error.ConflictingClassificationPrompt, error.ConflictingExtractionFieldType, error.ConflictingFieldCardinality, error.ConflictingStructureChoices, error.DuplicateClassificationTask, error.DuplicateClassificationLabel, error.DuplicateExtractionLabel, error.DuplicateRelation, error.EmptyExtractionSchema, error.EmptyStructureFields, error.EntityAttributesRequireEntities, error.EntityDefinitionsRequireEntities, error.InvalidClassificationExample, error.InvalidClassificationTopK, error.InvalidClassificationCalibration, error.InvalidClassificationCardinality, error.InvalidClassificationDefault, error.InvalidClassificationLabel, error.InvalidClassificationTask, error.InvalidExtractionBoolean, error.InvalidExtractionEnum, error.InvalidExtractionLabels, error.InvalidExtractionName, error.InvalidExtractionNumber, error.InvalidExtractionReference, error.InvalidExtractionRegex, error.InvalidExtractionSchema, error.InvalidExtractionThreshold, error.InvalidInverseRelation, error.InvalidJointCandidateLimit, error.InvalidJointConstraint, error.InvalidJointSchema, error.InvalidRelationEndpoints, error.InvalidStructureAnchor, error.InvalidSymmetricRelation, error.MissingExtractionSchemaField, error.MixedExtractionOperations, error.MixedJointExtractionSchema, error.ReservedAttributeGroup, error.ReservedExtractionMarker, error.UnknownExtractionReference, error.UnknownExtractionSchemaField, error.UnknownJointConstraintType, error.InvalidConstraint, error.InvalidConstraintCardinality, error.InvalidOrdinalConstraint, error.InvalidOrdinalTask, error.MissingClassificationDefault, error.UnknownConstraintField, error.UnknownConstraintLabel, error.UnknownConstraintTask, error.UnknownConstraintType, error.InvalidJointDecisionThreshold, error.InvalidUtf8, error.DuplicateField, error.UnexpectedToken, error.SyntaxError, error.UnexpectedEndOfInput, error.InvalidNumber, error.Overflow => .{ .status = 400, .code = "INVALID_EXTRACTION_REQUEST", .message = "extraction request, schema, references, or options are invalid" },
+        error.UnsupportedEmbeddingDecisionKind => .{ .status = 400, .code = "UNSUPPORTED_EXTRACTION_FEATURE", .message = "embedding similarity supports single and multi label sets" },
+        error.EmbeddingMultiLabelThresholdRequired => .{ .status = 400, .code = "INVALID_EXTRACTION_REQUEST", .message = "multi-label embedding similarity requires explicit raw cosine thresholds" },
+        error.InvalidEmbeddingCalibration, error.EmbeddingCalibrationMismatch, error.UnqualifiedEmbeddingCalibration => .{ .status = 400, .code = "INVALID_CALIBRATION", .message = "calibration artifact is unqualified or does not match the exact model, renderer, dimensions and categories" },
+        error.EmbeddingInputTooLong => .{ .status = 413, .code = "EXTRACTION_LIMIT_EXCEEDED", .message = "EmbeddingGemma 2 expanded inputs must fit 8192 tokens" },
         error.UnsupportedExtractionRegex, error.UnsupportedExtractionRegexFlags => .{ .status = 400, .code = "UNSUPPORTED_EXTRACTION_FEATURE", .message = "the requested regex construct or flags are not supported by the bounded validator" },
         error.ExtractionRegexLimitExceeded => .{ .status = 413, .code = "EXTRACTION_LIMIT_EXCEEDED", .message = "regex validation exceeds its configured compilation or execution limit" },
         else => null,

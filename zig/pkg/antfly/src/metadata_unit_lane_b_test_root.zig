@@ -38,6 +38,7 @@ const replication_backfill = @import("metadata/replication_backfill.zig");
 
 comptime {
     _ = service;
+    _ = @import("metadata/relation_reconciliation_worker.zig");
     _ = catalog_projection_reader;
     _ = admin_read_operations;
     _ = admin_mutation_operations;
@@ -68,3 +69,8 @@ pub const antfly_sources = @import("source_owner_physical.zig");
 
 /// Server fixtures retain this compilation root's source and type identity.
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
+
+comptime {
+    _ = transition_actions.TransitionAction;
+    _ = transition_actions.TransitionDecision;
+}

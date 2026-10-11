@@ -159,18 +159,21 @@ const HttpxTransport = struct {
             owned.deinit();
             alloc.destroy(owned);
         };
+        var client_config: httpx.ClientConfig = if (request_timeout_ms) |timeout_ms| .{
+            .timeouts = .{
+                .connect_ms = timeout_ms,
+                .read_ms = timeout_ms,
+                .write_ms = timeout_ms,
+                .request_ms = timeout_ms,
+            },
+        } else .{};
+        // Small immutable objects still need room for provider error envelopes
+        // so HTTP status mapping preserves missing, denied and transient errors.
+        client_config.max_error_response_size = 4096;
         return .{
             .alloc = alloc,
             .io_impl = io_impl,
-            .client = if (request_timeout_ms) |timeout_ms|
-                httpx.Client.initWithConfig(alloc, shared_io orelse io_impl.?.io(), .{ .timeouts = .{
-                    .connect_ms = timeout_ms,
-                    .read_ms = timeout_ms,
-                    .write_ms = timeout_ms,
-                    .request_ms = timeout_ms,
-                } })
-            else
-                httpx.Client.init(alloc, shared_io orelse io_impl.?.io()),
+            .client = httpx.Client.initWithConfig(alloc, shared_io orelse io_impl.?.io(), client_config),
         };
     }
 
@@ -707,7 +710,16 @@ pub const JsonApiClient = struct {
         meta.content_length = @intCast(response.body.len);
         if (opts.skip_metadata_probe) {
             if (response.etag) |value| meta.etag = try alloc.dupe(u8, value);
-            if (response.generation) |value| meta.version_id = try alloc.dupe(u8, value);
+            if (response.generation) |value| {
+                if (opts.version_id) |expected| {
+                    if (!std.mem.eql(u8, value, expected)) return error.PreconditionFailed;
+                }
+                meta.version_id = try alloc.dupe(u8, value);
+            } else if (opts.version_id) |value| {
+                // The generation-qualified URL selects exactly this immutable
+                // version even when the media response omits its generation.
+                meta.version_id = try alloc.dupe(u8, value);
+            }
         }
         if (response.content_type) |value| {
             if (meta.content_type) |current| alloc.free(current);
@@ -719,6 +731,7 @@ pub const JsonApiClient = struct {
         response.deinit(alloc);
 
         return .{
+            .conditional_etag_verified = opts.if_match_etag != null,
             .body = body,
             .metadata = meta,
         };
@@ -1674,6 +1687,41 @@ test "gcs local grpc reference path can be discovered when present" {
     }
 }
 
+test "json api bounded HTTP reads preserve provider errors and success ceilings" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Case = struct { status: u16, bytes: usize, expected: anyerror };
+    for ([_]Case{
+        .{ .status = 404, .bytes = 352, .expected = error.FileNotFound },
+        .{ .status = 403, .bytes = 352, .expected = error.AccessDenied },
+        .{ .status = 503, .bytes = 352, .expected = error.RemoteUnavailable },
+        .{ .status = 404, .bytes = 4097, .expected = error.ResponseTooLarge },
+        .{ .status = 200, .bytes = 2, .expected = error.ResponseTooLarge },
+    }) |case| {
+        const payload = @as([4097]u8, @splat('e'));
+        var server = try httpx.testing_mod.TestServer.start(a, io, &.{.{
+            .path = "/storage/v1/b/bucket/o/small",
+            .respond = .{ .status = case.status, .body = payload[0..case.bytes] },
+        }});
+        defer server.deinit();
+        var json_client = try JsonApiClient.init(a, .{
+            .endpoint = try std.fmt.allocPrint(a, "{s}/storage/v1", .{server.baseUrl()}),
+            .upload_endpoint = try std.fmt.allocPrint(a, "{s}/upload/storage/v1", .{server.baseUrl()}),
+            .io = io,
+        });
+        var client = json_client.client();
+        defer client.deinit();
+        json_client.owned_httpx.?.client.config.retry_policy.max_retries = 0;
+        var serving = try io.concurrent(httpx.testing_mod.TestServer.handleOne, .{&server});
+        defer _ = serving.cancel(io) catch {};
+        try std.testing.expectError(case.expected, client.getObject("bucket", "small", .{
+            .skip_metadata_probe = true,
+            .max_response_bytes = 1,
+        }));
+        try serving.await(io);
+    }
+}
+
 test "json api client pins media reads to the generation returned by metadata" {
     try testGenerationPinnedReads(std.testing.allocator, std.testing.allocator);
 }
@@ -1781,6 +1829,8 @@ fn testGenerationPinnedReads(alloc: Allocator, client_alloc: Allocator) !void {
     try std.testing.expectEqualStrings("bucket", direct.metadata.bucket);
     try std.testing.expectEqualStrings("folder/doc.txt", direct.metadata.key);
     try std.testing.expectEqualStrings("etag-media", direct.metadata.etag.?);
+    try std.testing.expect(direct.conditional_etag_verified);
+    try std.testing.expectEqualStrings("42", direct.metadata.version_id.?);
     try std.testing.expectEqualStrings("text/plain", direct.metadata.content_type.?);
     try std.testing.expectEqual(@as(usize, 3), state.calls);
 }
@@ -2135,6 +2185,24 @@ test "json api client round-trips against env-configured endpoint" {
     var get = try client.getObject(bucket, key, .{});
     defer get.deinit(alloc);
     try std.testing.expectEqualStrings("hello-gcs", get.body);
+
+    var pinned = try client.getObject(bucket, key, .{
+        .version_id = meta.version_id.?,
+        .if_match_etag = meta.etag.?,
+        .range = .{ .offset = 0, .length = 5 },
+        .skip_metadata_probe = true,
+        .max_response_bytes = 5,
+    });
+    defer pinned.deinit(alloc);
+    try std.testing.expectEqualStrings("hello", pinned.body);
+    try std.testing.expect(pinned.conditional_etag_verified);
+    try std.testing.expectEqualStrings(meta.version_id.?, pinned.metadata.version_id.?);
+    try std.testing.expectError(error.PreconditionFailed, client.getObject(bucket, key, .{
+        .if_match_etag = "definitely-not-the-current-etag",
+        .range = .{ .offset = 0, .length = 5 },
+        .skip_metadata_probe = true,
+        .max_response_bytes = 5,
+    }));
 
     var listed = try client.listObjects(bucket, .{
         .prefix = "zig-objectstore-gcs/",

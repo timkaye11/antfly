@@ -1099,6 +1099,42 @@ pub fn build(b: *std.Build) void {
     );
     metal_prefill_bucket_bench_step.dependOn(&run_metal_prefill_bucket_bench.step);
 
+    const embeddinggemma2_bench = b.addExecutable(.{
+        .name = "antfly-embeddinggemma2-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/embeddinggemma2.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    embeddinggemma2_bench.root_module.addImport("build_options", build_options_mod);
+    embeddinggemma2_bench.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.identities.addImports(embeddinggemma2_bench.root_module);
+    embeddinggemma2_bench.root_module.link_libc = true;
+    const install_embeddinggemma2_bench = b.addInstallArtifact(embeddinggemma2_bench, .{});
+    b.step("build-embeddinggemma2-bench", "Build the prepared-text encoder benchmark without running it").dependOn(&install_embeddinggemma2_bench.step);
+    const run_embeddinggemma2_bench = b.addRunArtifact(embeddinggemma2_bench);
+    run_embeddinggemma2_bench.addPassthruArgs();
+    b.step("bench-embeddinggemma2", "Run the synchronized prepared-text encoder benchmark").dependOn(&run_embeddinggemma2_bench.step);
+
+    const embeddinggemma2_attention_check = b.addExecutable(.{
+        .name = "antfly-embeddinggemma2-attention-check",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/embeddinggemma2_attention.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    embeddinggemma2_attention_check.root_module.addImport("build_options", build_options_mod);
+    embeddinggemma2_attention_check.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.identities.addImports(embeddinggemma2_attention_check.root_module);
+    embeddinggemma2_attention_check.root_module.link_libc = true;
+    const install_embeddinggemma2_attention_check = b.addInstallArtifact(embeddinggemma2_attention_check, .{});
+    b.step("build-embeddinggemma2-attention-check", "Build independent sampled 8K attention parity checks").dependOn(&install_embeddinggemma2_attention_check.step);
+    const run_embeddinggemma2_attention_check = b.addRunArtifact(embeddinggemma2_attention_check);
+    run_embeddinggemma2_attention_check.addPassthruArgs();
+    b.step("check-embeddinggemma2-attention", "Check full 8K attention against independently computed F64 rows").dependOn(&run_embeddinggemma2_attention_check.step);
+
     const metal_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-metal-bench",
         .root_module = b.createModule(.{
@@ -1268,6 +1304,46 @@ pub fn build(b: *std.Build) void {
     if (target.result.os.tag == .macos and targetRunsOnBuildHost(b, target)) {
         quant_kernel_metal_local_check_step.dependOn(q4_pair_route_tail);
     }
+
+    // Focused E2B prefill qualification suite. It remains a separate local
+    // check because it allocates production-sized Q4_0 weights. Verify the
+    // qualified routes against their independently disabled baselines.
+    const e2b_q4_mm_cases = [_]struct { rows: []const u8, in_dim: []const u8, out_dim: []const u8, route: []const u8 }{
+        .{ .rows = "32", .in_dim = "1536", .out_dim = "6144", .route = "aligned" },
+        .{ .rows = "31", .in_dim = "1536", .out_dim = "12288", .route = "aligned-tail" },
+        .{ .rows = "32", .in_dim = "12288", .out_dim = "1536", .route = "aligned" },
+        .{ .rows = "31", .in_dim = "6144", .out_dim = "1536", .route = "aligned-tail" },
+    };
+    var e2b_prefill_route_tail: ?*std.Build.Step = null;
+    for (e2b_q4_mm_cases) |case| {
+        const check = b.addRunArtifact(metal_bench_exe);
+        check.setEnvironmentVariable("TERMITE_METAL_ENABLE_E2B_Q4_0_MM_SG_ALIGNED", "1");
+        check.setEnvironmentVariable("TERMITE_METAL_DISABLE_E2B_Q4_0_MM_SG_ALIGNED", "0");
+        check.addArg("--skip-unless-apple-m4");
+        check.addArgs(&.{ "--mode", "linear", "--rows", case.rows, "--in", case.in_dim, "--out", case.out_dim, "--warmup", "1", "--iters", "3", "--compare-q4-e2b-disabled-baseline", "--expect-q4-route", case.route });
+        if (e2b_prefill_route_tail) |tail| check.step.dependOn(tail);
+        e2b_prefill_route_tail = &check.step;
+    }
+    const e2b_q4_pair_cases = [_]struct { rows: []const u8, out_dim: []const u8, route: []const u8 }{
+        .{ .rows = "32", .out_dim = "6144", .route = "m32-n64-aligned" },
+        .{ .rows = "31", .out_dim = "6144", .route = "m32-n64-tail" },
+        .{ .rows = "32", .out_dim = "12288", .route = "m32-n64-aligned" },
+        .{ .rows = "31", .out_dim = "12288", .route = "m32-n64-tail" },
+    };
+    for (e2b_q4_pair_cases) |case| {
+        const check = b.addRunArtifact(metal_bench_exe);
+        check.setEnvironmentVariable("TERMITE_METAL_ENABLE_E2B_Q4_0_PAIR_ACTIVATION_MM", "1");
+        check.setEnvironmentVariable("TERMITE_METAL_DISABLE_E2B_Q4_0_PAIR_ACTIVATION_MM", "0");
+        check.addArg("--skip-unless-apple-m4");
+        check.addArgs(&.{ "--mode", "ffn", "--rows", case.rows, "--in", "1536", "--out", case.out_dim, "--warmup", "1", "--iters", "3", "--compare-q4-e2b-disabled-baseline", "--expect-q4-pair-mm-route", case.route });
+        if (e2b_prefill_route_tail) |tail| check.step.dependOn(tail);
+        e2b_prefill_route_tail = &check.step;
+    }
+    const e2b_prefill_route_check_step = b.step(
+        "bench-metal-gemma4-e2b-prefill-routes",
+        "Run E2B Q4_0 aligned linear and fused FFN prefill route qualification on Apple M4",
+    );
+    e2b_prefill_route_check_step.dependOn(e2b_prefill_route_tail.?);
 
     workflows_benches.addPagedAttention(workflow_ctx);
 

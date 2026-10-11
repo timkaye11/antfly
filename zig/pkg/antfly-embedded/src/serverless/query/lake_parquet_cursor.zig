@@ -83,6 +83,29 @@ pub const Cursor = struct {
         self.a.free(self.columns);
         self.output.deinit();
     }
+    pub fn retainColumns(self: *Cursor, a: A) !?types.ColumnOwner {
+        for (self.columns) |column| if (column.cached == null) return null;
+        const Owner = struct {
+            a: A,
+            leases: []@import("lake_decoded_cache.zig").Lease,
+            fn release(raw: *anyopaque) void {
+                const self_: *@This() = @ptrCast(@alignCast(raw));
+                for (self_.leases) |lease| lease.release();
+                self_.a.free(self_.leases);
+                self_.a.destroy(self_);
+            }
+        };
+        const owner = try a.create(Owner);
+        errdefer a.destroy(owner);
+        owner.* = .{ .a = a, .leases = try a.alloc(@import("lake_decoded_cache.zig").Lease, self.columns.len) };
+        var bytes: usize = 0;
+        for (self.columns, owner.leases) |column, *lease| {
+            lease.* = column.cached.?.retain();
+            bytes +|= lease.item.budget.live;
+            if (lease.item.dependency) |dependency| bytes +|= dependency.budget.live;
+        }
+        return .{ .ptr = owner, .release_fn = Owner.release, .retained_bytes = bytes };
+    }
     fn read(self: *Cursor, offset: u64, len: usize) !ranges.RangeLease {
         return self.reader.readPlannedLease(self.a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = offset, .len = len }, .purpose = .parquet_column_chunk });
     }
@@ -166,7 +189,10 @@ pub const Cursor = struct {
                     }
                 }
             }
-            const parsed = try self.header(column);
+            const probe = try self.headerRead(column);
+            var probe_held = true;
+            defer if (probe_held) probe.lease.release();
+            const parsed = probe.parsed;
             const len = std.math.add(usize, parsed.header_len, parsed.header.compressed_page_size) catch return error.ParquetPageTooLarge;
             if (len > end - column.offset) return error.InvalidParquetPage;
             // Skip payloads whose row ordinals precede the next survivor.
@@ -203,9 +229,18 @@ pub const Cursor = struct {
                     return;
                 }
             };
-            const encoded_lease = try self.read(column.offset, len);
-            defer encoded_lease.release();
-            const encoded = encoded_lease.bytes;
+            // Small pages are often already complete in the header probe.
+            // Borrow it instead of issuing a second overlapping provider GET
+            // (exact range cache keys deliberately do not alias subranges).
+            const reuse_probe = len <= probe.lease.bytes.len;
+            if (!reuse_probe) {
+                // Do not raise peak range residency for larger pages.
+                probe.lease.release();
+                probe_held = false;
+            }
+            const encoded_lease = if (reuse_probe) null else try self.read(column.offset, len);
+            defer if (encoded_lease) |lease| lease.release();
+            const encoded = if (encoded_lease) |lease| lease.bytes else probe.lease.bytes[0..len];
             column.offset += len;
             switch (parsed.header.page_type) {
                 .dictionary_page => {
@@ -284,21 +319,28 @@ pub const Cursor = struct {
         return error.ParquetRowGroupRowCountMismatch;
     }
     fn header(self: *Cursor, column: *const Column) !page.ParsedHeader {
+        const probe = try self.headerRead(column);
+        defer probe.lease.release();
+        return probe.parsed;
+    }
+    const HeaderRead = struct { parsed: page.ParsedHeader, lease: ranges.RangeLease };
+    fn headerRead(self: *Cursor, column: *const Column) !HeaderRead {
         const end = std.math.add(u64, column.chunk.file_offset, column.chunk.compressed_len) catch return error.InvalidParquetPage;
         if (column.offset >= end) return error.InvalidParquetPage;
         var probe_size: usize = @intCast(@min(end - column.offset, 512));
         while (true) {
             const probe_lease = try self.read(column.offset, probe_size);
-            defer probe_lease.release();
+            errdefer probe_lease.release();
             const probe = probe_lease.bytes;
             const parsed = page.parsePageHeader(probe) catch |err| {
                 const next_size = @min(end - column.offset, @min(probe_size * 2, 64 * 1024));
                 if (next_size == probe_size) return err;
+                probe_lease.release();
                 probe_size = @intCast(next_size);
                 continue;
             };
             try parsed.header.validateResourceLimits();
-            return parsed;
+            return .{ .parsed = parsed, .lease = probe_lease };
         }
     }
     fn decodeDictionaryAlloc(a: A, chunk: external.ColumnChunk, header_value: page.Header, encoded: []const u8) !page.Dictionary {

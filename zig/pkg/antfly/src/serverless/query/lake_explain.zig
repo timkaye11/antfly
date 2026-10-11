@@ -528,6 +528,13 @@ fn chooseCacheClass(
     };
 }
 
+test "lake explain counts ordered indexes as sidecars" {
+    var accounting: ArtifactAccounting = .{};
+    try accountArtifact(&accounting, .{ .kind = .ordered_row_index, .artifact_id = "ordered", .byte_len = 40, .checksum = "len:40" });
+    try std.testing.expectEqual(@as(u32, 1), accounting.search_sidecar_count);
+    try std.testing.expectEqual(@as(u64, 40), accounting.manifest_accounted_bytes);
+}
+
 test "lake explain accounts for Antfly row fragments and stats" {
     const row_fragment_ids = [_][]const u8{"rows-1"};
     const row_fragment_stats_ids = [_][]const u8{"rows-1.stats"};
@@ -573,6 +580,7 @@ test "lake explain validates external metadata artifacts and promotion advice" {
     const artifacts = [_]artifact_ref.ArtifactRef{
         .{ .kind = .external_base_source, .artifact_id = "files-1", .byte_len = 4096, .checksum = "len:4096" },
         .{ .kind = .text_segment, .artifact_id = "text-1", .byte_len = 512, .checksum = "len:512" },
+        .{ .kind = .ordered_row_index, .artifact_id = "ordered-1", .byte_len = 64, .checksum = "len:64" },
     };
 
     const plan = try explain(.{
@@ -597,9 +605,9 @@ test "lake explain validates external metadata artifacts and promotion advice" {
     try std.testing.expectEqual(base_source.BaseSourceKind.external_iceberg, plan.source_kind);
     try std.testing.expectEqual(CacheClass.external_metadata, plan.cache_class);
     try std.testing.expectEqual(@as(u32, 1), plan.accounting.external_metadata_count);
-    try std.testing.expectEqual(@as(u32, 1), plan.accounting.search_sidecar_count);
+    try std.testing.expectEqual(@as(u32, 2), plan.accounting.search_sidecar_count);
     try std.testing.expectEqual(@as(u64, 4096), plan.cache_accounting.external_metadata_bytes);
-    try std.testing.expectEqual(@as(u64, 512), plan.cache_accounting.search_sidecar_bytes);
+    try std.testing.expectEqual(@as(u64, 576), plan.cache_accounting.search_sidecar_bytes);
     try std.testing.expect(plan.cache_accounting.over_pinned_budget);
     try std.testing.expect(plan.cache_accounting.over_payload_budget);
     try std.testing.expect(plan.cache_accounting.over_total_budget);

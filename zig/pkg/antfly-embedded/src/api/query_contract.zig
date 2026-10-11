@@ -2108,6 +2108,7 @@ fn freeOwnedMutableStrings(alloc: std.mem.Allocator, values: [][]u8) void {
 pub const OwnedQueryRequest = struct {
     fields: [][]const u8 = &.{},
     req: db_mod.types.SearchRequest = .{},
+    native_cut: ?std.json.Parsed(@typeInfo(@FieldType(db_mod.types.SearchRequest, "native_query_cut")).optional.child) = null,
 
     pub fn deinit(self: *OwnedQueryRequest, alloc: std.mem.Allocator) void {
         if (self.fields.len > 0) {
@@ -2115,6 +2116,7 @@ pub const OwnedQueryRequest = struct {
             alloc.free(self.fields);
         }
         freeSearchRequest(alloc, &self.req);
+        if (self.native_cut) |*cut| cut.deinit();
         self.* = undefined;
     }
 };
@@ -2224,10 +2226,18 @@ fn applyCommonSearchRequestOptions(
         }
     }
 
+    if (comptime @hasField(@TypeOf(request), "lake_read")) if (request.lake_read) |read| {
+        req.lake_read = .{
+            .visibility = if (read.visibility) |visibility| if (std.mem.eql(u8, visibility, "accepted")) .accepted else if (std.mem.eql(u8, visibility, "published")) .published else return error.InvalidQueryRequest else .accepted,
+            .through = if (read.through) |receipt| .{ .table_id = receipt.table_id, .object_generation = receipt.object_generation, .wal_lsn = receipt.wal_lsn } else null,
+        };
+    };
     if (request.offset) |offset| req.offset = @intCast(offset);
     if (request.count) |count| req.count_only = count;
     if (request.remote_snapshot) |snapshot| {
-        if (snapshot.len != 64) return error.InvalidQueryRequest;
+        const retained_lake = (std.mem.startsWith(u8, snapshot, "lake2:") or std.mem.startsWith(u8, snapshot, "native2:")) and snapshot.len > 64 and snapshot.len <= 512;
+        if (snapshot.len != 64 and !retained_lake) return error.InvalidQueryRequest;
+        if (retained_lake) for (snapshot) |byte| if (byte <= 0x20 or byte >= 0x7f) return error.InvalidQueryRequest;
         req.remote_snapshot = try alloc.dupe(u8, snapshot);
     }
     const has_result_page_options =
@@ -2659,6 +2669,31 @@ pub fn parseQueryRequest(
 /// computes this once and shares it with normalization, embedding, retries, and
 /// execution so no stage silently receives a fresh timeout window.
 pub fn parseQueryRequestWithDeadline(
+    alloc: std.mem.Allocator,
+    semantic_resolver: ?SemanticResolver,
+    table_name: []const u8,
+    body: []const u8,
+    execution_deadline_ns: ?u64,
+) !OwnedQueryRequest {
+    var owned = try parseQueryRequestWithDeadlineCore(alloc, semantic_resolver, table_name, body, execution_deadline_ns);
+    errdefer owned.deinit(alloc);
+    // Internal HTTP hops must retain the authenticated physical cut when the
+    // generated public contract strips private shard fields. Public admission
+    // rejects this control before entering the shared parser. Escaped member
+    // names still receive semantic parsing rather than bypassing retention.
+    if (std.mem.indexOf(u8, body, "_native_cut") != null or std.mem.indexOfScalar(u8, body, '\\') != null) {
+        var raw = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer raw.deinit();
+        if (raw.value == .object) if (raw.value.object.get("_native_cut")) |value| {
+            owned.native_cut = try std.json.parseFromValue(@typeInfo(@FieldType(db_mod.types.SearchRequest, "native_query_cut")).optional.child, alloc, value, .{ .allocate = .alloc_always });
+            try owned.native_cut.?.value.validate(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
+            owned.req.native_query_cut = owned.native_cut.?.value;
+        };
+    }
+    return owned;
+}
+
+fn parseQueryRequestWithDeadlineCore(
     alloc: std.mem.Allocator,
     semantic_resolver: ?SemanticResolver,
     table_name: []const u8,
@@ -3610,6 +3645,317 @@ fn parseJsonNumberF32(value: []const u8) !f32 {
     return @floatFromInt(try std.fmt.parseInt(i64, value, 10));
 }
 
+fn hasColumnSources(hits: []const db_mod.types.SearchHit) bool {
+    for (hits) |hit| if (hit.column_source != null) return true;
+    return false;
+}
+
+// Metadata is encoded once into small owned spans. Source segments retain
+// projected typed descriptors, borrowing scalar bytes from the hit's page.
+// The complete exact length is known before transport starts, without replaying
+// the envelope encoder or retaining a full encoded response buffer.
+const ColumnWirePlan = struct {
+    const Prepared = @import("../storage/db/column_source.zig").Prepared;
+    const Segment = union(enum) { metadata: []const u8, source: Prepared };
+    const Spill = @import("../sql/spill.zig");
+    a: std.mem.Allocator,
+    backing: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
+    segments: std.ArrayList(Segment) = .empty,
+    length: usize = 0,
+    maximum: usize,
+    resident: usize = 0,
+    budget: usize,
+    req: db_mod.types.SearchRequest,
+    sink: @import("query_response.zig").Delivery,
+    manager: ?Spill.Manager = null,
+    spill: ?Spill.File = null,
+    failure: ?anyerror = null,
+    buffer: [4096]u8 = undefined,
+    writer: std.Io.Writer = undefined,
+    spool_buffer: [16 * 1024]u8 = undefined,
+    spool: std.Io.Writer = undefined,
+    fn init(self: *@This(), a: std.mem.Allocator, sink: @import("query_response.zig").Delivery, req: db_mod.types.SearchRequest) void {
+        self.* = .{ .a = undefined, .backing = a, .arena = .init(a), .maximum = sink.max_bytes, .budget = sink.preparation_bytes, .sink = sink, .req = req };
+        self.a = self.arena.allocator();
+        self.writer = .{ .vtable = &.{ .drain = drain }, .buffer = &self.buffer };
+        self.spool = .{ .vtable = &.{ .drain = spoolDrain }, .buffer = &self.spool_buffer };
+    }
+    fn deinit(self: *@This()) void {
+        if (self.spill) |*file| file.close();
+        if (self.manager) |*manager| manager.deinit();
+        self.segments.deinit(self.backing);
+        self.arena.deinit();
+    }
+    fn checkpoint(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.req.cancellation) |token| try token.check();
+    }
+    fn spoolBytes(self: *@This(), bytes: []const u8) !void {
+        const file = &self.spill.?;
+        file.writeRaw(file.size, bytes) catch |err| return if (err == error.SqlProgramLimitExceeded) error.QueryResponseTooLarge else err;
+    }
+    fn spoolDrain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *@This() = @alignCast(@fieldParentPtr("spool", w));
+        self.spoolBytes(w.buffered()) catch |err| {
+            self.failure = err;
+            return error.WriteFailed;
+        };
+        w.end = 0;
+        var length: usize = 0;
+        for (data[0 .. data.len - 1]) |bytes| {
+            self.spoolBytes(bytes) catch |err| {
+                self.failure = err;
+                return error.WriteFailed;
+            };
+            length += bytes.len;
+        }
+        const pattern = data[data.len - 1];
+        for (0..splat) |_| self.spoolBytes(pattern) catch |err| {
+            self.failure = err;
+            return error.WriteFailed;
+        };
+        return length + pattern.len * splat;
+    }
+    fn startSpill(self: *@This()) !void {
+        if (self.spill != null or self.sink.spill_io == null) return;
+        self.manager = .{ .alloc = self.backing, .io = self.sink.spill_io.?, .context = self, .checkpoint = checkpoint, .max_bytes = @min(self.maximum, 1024 * 1024 * 1024) };
+        self.spill = try self.manager.?.create();
+        for (self.segments.items) |segment| switch (segment) {
+            .metadata => |bytes| try self.spool.writeAll(bytes),
+            .source => |prepared| try std.json.Stringify.value(prepared, .{}, &self.spool),
+        };
+        try self.spool.flush();
+        self.segments.deinit(self.backing);
+        self.segments = .empty;
+        _ = self.arena.reset(.free_all);
+        self.resident = 0;
+    }
+    fn reserve(self: *@This(), bytes: usize) !void {
+        if (self.spill == null and bytes > self.budget -| self.resident) try self.startSpill();
+        if (self.spill == null) self.resident +|= bytes;
+    }
+    fn account(self: *@This(), length: usize) !void {
+        const total = std.math.add(usize, self.length, length) catch return error.QueryResponseTooLarge;
+        if (total > self.maximum) return error.QueryResponseTooLarge;
+        self.length = total;
+    }
+    fn metadata(self: *@This(), bytes: []const u8) !void {
+        if (bytes.len == 0) return;
+        try self.account(bytes.len);
+        try self.reserve(bytes.len +| @sizeOf(Segment) * 2);
+        if (self.spill != null) return self.spoolBytes(bytes);
+        try self.segments.append(self.backing, .{ .metadata = try self.a.dupe(u8, bytes) });
+    }
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *@This() = @alignCast(@fieldParentPtr("writer", w));
+        self.metadata(w.buffered()) catch |err| {
+            self.failure = err;
+            return error.WriteFailed;
+        };
+        w.end = 0;
+        var length: usize = 0;
+        for (data[0 .. data.len - 1]) |bytes| {
+            self.metadata(bytes) catch |err| {
+                self.failure = err;
+                return error.WriteFailed;
+            };
+            length += bytes.len;
+        }
+        const pattern = data[data.len - 1];
+        for (0..splat) |_| self.metadata(pattern) catch |err| {
+            self.failure = err;
+            return error.WriteFailed;
+        };
+        return length + pattern.len * splat;
+    }
+    fn source(self: *@This(), prepared: Prepared) !void {
+        try self.writer.flush();
+        try self.account(prepared.encoded_len);
+        try self.reserve(prepared.retainedBytes() +| @sizeOf(Segment) * 2);
+        if (self.spill != null) {
+            try std.json.Stringify.value(prepared, .{}, &self.spool);
+            return self.spool.flush();
+        }
+        try self.segments.append(self.backing, .{ .source = try prepared.clone(self.a) });
+    }
+    fn emit(self: *@This(), writer: *std.Io.Writer, req: db_mod.types.SearchRequest) !void {
+        if (self.spill) |*file| {
+            var bytes: [16 * 1024]u8 = undefined;
+            var offset: u64 = 0;
+            while (offset < file.size) {
+                try checkpoint(self);
+                const count: usize = @intCast(@min(bytes.len, file.size - offset));
+                try file.readRaw(offset, bytes[0..count]);
+                try writer.writeAll(bytes[0..count]);
+                offset += count;
+            }
+            return;
+        }
+        for (self.segments.items) |segment| {
+            if (req.cancellation) |token| try token.check();
+            switch (segment) {
+                .metadata => |bytes| try writer.writeAll(bytes),
+                .source => |prepared| try std.json.Stringify.value(prepared, .{}, writer),
+            }
+        }
+    }
+};
+
+// Preserve the generated response envelope while replacing only source delivery.
+// The serializer retains no per-hit source/projection trees across writes.
+fn ColumnWireResult(comptime T: type) type {
+    return struct {
+        base: T,
+        hits: []db_mod.types.SearchHit,
+        req: db_mod.types.SearchRequest,
+        scratch: *std.heap.ArenaAllocator,
+        alloc: std.mem.Allocator,
+        failure: *?anyerror,
+        plan: ?*ColumnWirePlan = null,
+        pub fn jsonStringify(self: @This(), w: *std.json.Stringify) std.json.Stringify.Error!void {
+            try w.beginObject();
+            inline for (@typeInfo(T).@"struct".field_names) |name| {
+                if (comptime std.mem.eql(u8, name, "hits")) {
+                    try w.objectField(name);
+                    try w.beginObject();
+                    try w.objectField("total");
+                    try w.write(self.base.hits.?.total);
+                    try w.objectField("hits");
+                    try w.beginArray();
+                    var released: usize = 0;
+                    var hit_arena = std.heap.ArenaAllocator.init(self.alloc);
+                    defer hit_arena.deinit();
+                    for (self.base.hits.?.hits.?, self.hits, 0..) |base_hit, _, hit_index| {
+                        const hydrator = if (self.plan) |plan| plan.sink.hydrator else null;
+                        if (hydrator) |loader| if (hit_index % 64 == 0) {
+                            loader.load(loader.ptr, self.alloc, self.hits[hit_index..@min(self.hits.len, hit_index + 64)]) catch |err| {
+                                self.failure.* = err;
+                                return error.WriteFailed;
+                            };
+                        };
+                        const hit = self.hits[hit_index];
+                        _ = hit_arena.reset(.retain_capacity);
+                        const api_hit = if (hydrator != null) toOpenApiHit(hit_arena.allocator(), self.req, hit) catch |err| {
+                            self.failure.* = err;
+                            return error.WriteFailed;
+                        } else base_hit;
+                        if (self.req.cancellation) |token| token.check() catch |err| {
+                            self.failure.* = err;
+                            return error.WriteFailed;
+                        };
+                        try w.beginObject();
+                        inline for (@typeInfo(@TypeOf(api_hit)).@"struct".field_names) |field| {
+                            if (comptime std.mem.eql(u8, field, "_source")) {
+                                if (hit.column_source) |source| {
+                                    if (self.req.include_stored) {
+                                        try w.objectField(field);
+                                        const options: db_mod.types.LookupOptions = .{ .fields = self.req.fields, .include_all_fields = self.req.include_all_fields };
+                                        if (self.plan) |plan| {
+                                            // Prepared descriptors live only until source() either
+                                            // clones them into residency or writes them to the spool.
+                                            const prepared = source.prepare(self.scratch.allocator(), self.scratch, options) catch |err| {
+                                                self.failure.* = err;
+                                                return error.WriteFailed;
+                                            };
+                                            try w.beginWriteRaw();
+                                            plan.source(prepared) catch |err| {
+                                                self.failure.* = plan.failure orelse err;
+                                                return error.WriteFailed;
+                                            };
+                                            w.endWriteRaw();
+                                        } else source.write(self.scratch, options, w) catch |err| {
+                                            if (err != error.WriteFailed) self.failure.* = err;
+                                            return error.WriteFailed;
+                                        };
+                                    }
+                                } else try writeWireField(w, field, @field(api_hit, field));
+                            } else try writeWireField(w, field, @field(api_hit, field));
+                        }
+                        try w.endObject();
+                        if (self.plan) |plan| if (plan.spill != null and plan.sink.consume_columns) {
+                            for (self.hits[released .. hit_index + 1]) |*consumed| {
+                                if (consumed.column_source) |source| source.deinit();
+                                consumed.column_source = null;
+                            }
+                            if (plan.sink.hydrator) |loader| loader.release(loader.ptr, self.hits[released .. hit_index + 1]);
+                            released = hit_index + 1;
+                        };
+                    }
+                    try w.endArray();
+                    try writeWireField(w, "max_score", self.base.hits.?.max_score);
+                    try w.endObject();
+                } else try writeWireField(w, name, @field(self.base, name));
+            }
+            try w.endObject();
+        }
+    };
+}
+fn writeWireField(w: *std.json.Stringify, comptime name: []const u8, value: anytype) std.json.Stringify.Error!void {
+    if (@typeInfo(@TypeOf(value)) == .optional) if (value == null) return;
+    try w.objectField(name);
+    try w.write(value);
+}
+fn encodeColumnWire(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, base: anytype, hits: []db_mod.types.SearchHit, delivery: ?@import("query_response.zig").Delivery, delivered: *?usize) ![]u8 {
+    var failure: ?anyerror = null;
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const options: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
+    if (delivery) |sink| {
+        var plan: ColumnWirePlan = undefined;
+        plan.init(alloc, sink, req);
+        defer plan.deinit();
+        if (sink.hydrator != null) {
+            if (!sink.consume_columns or sink.spill_io == null) return error.InvalidArgument;
+            try plan.startSpill();
+        }
+        // Bound pinned decoded payloads too. Unique page accounting avoids
+        // charging a shared page once per hit. The set is itself budgeted.
+        if (sink.consume_columns and sink.spill_io != null) {
+            var pages: std.AutoHashMapUnmanaged(*db_mod.types.ColumnSourcePage, void) = .empty;
+            defer pages.deinit(alloc);
+            var retained: usize = 0;
+            for (hits) |hit| if (hit.column_source) |source| {
+                const entry = try pages.getOrPut(alloc, source.page);
+                if (!entry.found_existing) retained +|= source.page.retainedBytes() +| 64;
+                if (retained > sink.preparation_bytes) {
+                    try plan.startSpill();
+                    break;
+                }
+            };
+        }
+        const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .hits = hits, .req = req, .scratch = &scratch, .alloc = alloc, .failure = &failure, .plan = &plan };
+        std.json.Stringify.value(.{ .responses = &.{wrapped} }, options, &plan.writer) catch |err| return failure orelse (plan.failure orelse err);
+        plan.writer.flush() catch |err| return plan.failure orelse err;
+        // Every prepared fragment now belongs to residency or the spool.
+        // Exceptional per-hit scratch must not survive network backpressure.
+        _ = scratch.reset(.free_all);
+        if (plan.spill) |*file| {
+            try file.flush();
+            if (file.size != plan.length) return error.InvalidSqlSpill;
+            // Reserve replay buffers and surface initial disk-read failures
+            // before committing headers, including under allocator exhaustion.
+            if (file.size != 0) {
+                var probe: [1]u8 = undefined;
+                try file.readRaw(0, &probe);
+            }
+        }
+        if (failure) |err| return err;
+        const empty = try alloc.alloc(u8, 0);
+        errdefer alloc.free(empty);
+        if (req.cancellation) |token| try token.check();
+        try sink.start_fn(sink.ptr, plan.length);
+        var output: @import("query_response.zig").Delivery.Writer = .{ .sink = sink };
+        output.init(sink);
+        plan.emit(&output.writer, req) catch return error.QueryDeliveryFailed;
+        output.writer.flush() catch return error.QueryDeliveryFailed;
+        delivered.* = plan.length;
+        return empty;
+    }
+    const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .hits = hits, .req = req, .scratch = &scratch, .alloc = alloc, .failure = &failure };
+    return std.json.Stringify.valueAlloc(alloc, .{ .responses = &.{wrapped} }, options) catch |err| return failure orelse err;
+}
+
 pub fn encodeQueryResponses(
     alloc: std.mem.Allocator,
     table_name: []const u8,
@@ -3617,11 +3963,23 @@ pub fn encodeQueryResponses(
     meta: QueryResponseMeta,
     result: db_mod.types.SearchResult,
 ) !QueryResponse {
+    return encodeQueryResponsesWithDelivery(alloc, table_name, req, meta, result, null);
+}
+
+pub fn encodeQueryResponsesWithDelivery(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    req: db_mod.types.SearchRequest,
+    meta: QueryResponseMeta,
+    result: db_mod.types.SearchResult,
+    delivery: ?@import("query_response.zig").Delivery,
+) !QueryResponse {
+    var delivered: ?usize = null;
     var arena_impl = std.heap.ArenaAllocator.init(alloc);
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    const emitted_hits = if (req.count_only) &.{} else result.hits;
+    const emitted_hits = if (req.count_only) result.hits[0..0] else result.hits;
     const hits = try arena.alloc(metadata_openapi.QueryHit, emitted_hits.len);
     for (emitted_hits, 0..) |hit, i| {
         hits[i] = try toOpenApiHit(arena, req, hit);
@@ -3662,9 +4020,9 @@ pub fn encodeQueryResponses(
                 .took = meta.took_ms,
                 .status = 200,
                 .table = req.response_table_name orelse table_name,
-                .remote_snapshot = meta.remote_snapshot,
+                .remote_snapshot = meta.remote_snapshot orelse if (req.native_query_cut != null) req.remote_snapshot else null,
             };
-            break :blk try std.json.Stringify.valueAlloc(
+            break :blk if (hasColumnSources(emitted_hits) or (if (delivery) |sink| sink.hydrator != null else false)) try encodeColumnWire(alloc, req, query_results[0], emitted_hits, delivery, &delivered) else try std.json.Stringify.valueAlloc(
                 alloc,
                 metadata_openapi.QueryResponses{ .responses = query_results },
                 .{ .emit_null_optional_fields = false },
@@ -3694,9 +4052,9 @@ pub fn encodeQueryResponses(
                 .took = meta.took_ms,
                 .status = 200,
                 .table = req.response_table_name orelse table_name,
-                .remote_snapshot = meta.remote_snapshot,
+                .remote_snapshot = meta.remote_snapshot orelse if (req.native_query_cut != null) req.remote_snapshot else null,
             };
-            break :blk try std.json.Stringify.valueAlloc(
+            break :blk if (hasColumnSources(emitted_hits) or (if (delivery) |sink| sink.hydrator != null else false)) try encodeColumnWire(alloc, req, query_results[0], emitted_hits, delivery, &delivered) else try std.json.Stringify.valueAlloc(
                 alloc,
                 metadata_openapi.StatefulQueryResponses{ .responses = query_results },
                 .{ .emit_null_optional_fields = false },
@@ -3705,6 +4063,7 @@ pub fn encodeQueryResponses(
     };
 
     return .{
+        .delivered_bytes = delivered,
         .identity_read_generation = result.identity_read_generation orelse req.identity_read_generation,
         .graph_dialect = graph_dialect,
         // OpenAPI optional response fields are absent unless populated; they
@@ -6045,6 +6404,7 @@ fn buildSortProfileValue(
     try sort.put(alloc, "sort_lifecycle_state", .{ .string = profile.sort_lifecycle_state });
     try sort.put(alloc, "index_sort_coverage", .{ .string = profile.index_sort_coverage });
     try sort.put(alloc, "candidate_count", try buildProfileUnsignedValue(alloc, profile.candidate_count));
+    try sort.put(alloc, "ordered_scanned_count", try buildProfileUnsignedValue(alloc, profile.ordered_scanned_count));
     try sort.put(alloc, "cursor_rejected_count", try buildProfileUnsignedValue(alloc, profile.cursor_rejected_count));
     try sort.put(alloc, "selected_count", try buildProfileUnsignedValue(alloc, profile.selected_count));
     try sort.put(alloc, "total_us", try buildProfileUnsignedValue(alloc, profile.total_us));
@@ -6226,7 +6586,7 @@ fn freeHighlightRequest(alloc: std.mem.Allocator, value: db_mod.types.HighlightR
     if (value.fields.len > 0) alloc.free(value.fields);
 }
 
-fn highlightsJsonValue(
+pub fn highlightsJsonValue(
     alloc: std.mem.Allocator,
     items: []const db_mod.types.HighlightedField,
 ) !?std.json.ArrayHashMap([]const metadata_openapi.HighlightFragment) {
@@ -8694,9 +9054,8 @@ fn parseBlevePrefixLength(value: ?i32) !u8 {
     return @intCast(prefix_length);
 }
 
-fn parseDateTimeOptionalToNs(text: []const u8) !?u64 {
-    if (try parseRfc3339ToNs(text)) |ts| return ts;
-    return rfc3339.parseDateToUnixNs(text);
+fn parseDateTimeOptionalToNs(text: []const u8) !?i128 {
+    return @import("../datetime.zig").parseDateTimeToSignedNs(text);
 }
 
 fn parseRfc3339ToNs(text: []const u8) !?u64 {
@@ -11458,6 +11817,7 @@ fn isInternalShardFieldName(name: []const u8) bool {
         "_filter_query_json",
         "_exclusion_query_json",
         "_identity_read_generation",
+        "_native_cut",
         "_index_name",
         "_primary_text_index_name",
         "_embedding_limits",
@@ -11797,6 +12157,7 @@ fn removeInternalShardFields(object: *std.json.ObjectMap) void {
         "_filter_query_json",
         "_exclusion_query_json",
         "_identity_read_generation",
+        "_native_cut",
         "_index_name",
         "_primary_text_index_name",
         "_embedding_limits",
@@ -18519,4 +18880,182 @@ fn typedLakeSourceScenario(a: std.mem.Allocator) !void {
 test "external lake typed source preserves ownership highlights exact values and public projection" {
     try typedLakeSourceScenario(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, typedLakeSourceScenario, .{});
+}
+
+fn columnLakeSourceScenario(a: std.mem.Allocator) !void {
+    const rows = @import("../storage/rowsource/types.zig");
+    const refs = [_]rows.RowRef{.{ .relational_key = "doc" }};
+    const columns = [_]rows.ColumnVector{
+        .{ .name = "body", .values = .{ .dictionary_bytes = .{ .values = &.{"a needle in the source"}, .indices = &.{0} } } },
+        .{ .name = "amount", .values = .{ .i64 = &.{9007199254740993} } },
+        .{ .name = "nested", .values = .{ .json = &.{"{\"visible\":\"yes\",\"private\":\"omit\"}"} } },
+        .{ .name = "_hierarchy_unit_revision_token", .values = .{ .bytes = &.{"internal"} } },
+    };
+    const page = try db_mod.types.ColumnSourcePage.copy(a, .{ .snapshot = .{ .table_id = "docs", .snapshot_id = "one" }, .row_refs = &refs, .columns = &columns }, &.{0});
+    defer page.release();
+    var hit: db_mod.types.SearchHit = .{ .id = try a.dupe(u8, "doc"), .column_source = page.row(0) };
+    defer hit.deinit(a);
+    var cloned = try hit.clone(a);
+    defer cloned.deinit(a);
+    try std.testing.expect(cloned.column_source.?.page == page);
+    const search_exec = @import("../storage/db/query/search_exec.zig");
+    const queries = [_]search_exec.HighlightQuery{.{ .query = .{ .match = .{ .field = "body", .text = "needle" } }, .text_analysis = .{}, .runtime_schema = null }};
+    try search_exec.attachHighlightsWithIndexQueries(a, .{ .fields = &.{"body"} }, &queries, @as(*[1]db_mod.types.SearchHit, @ptrCast(&cloned)), null);
+    try std.testing.expectEqual(@as(usize, 1), cloned.highlights.len);
+    try std.testing.expect(cloned.stored_data == null and cloned.source_value == null);
+    var hits = [_]db_mod.types.SearchHit{cloned};
+    const result: db_mod.types.SearchResult = .{ .alloc = a, .hits = &hits, .total_hits = 1 };
+    const cases = [_]db_mod.types.SearchRequest{
+        .{},
+        .{ .fields = &.{ "amount", "nested.*", "-nested.private" }, .include_all_fields = false },
+        .{ .include_stored = false },
+        .{ .fields = &.{"-body"} },
+        .{ .fields = &.{ "amount", "body", "amount", "*", "-nested" } },
+    };
+    for (cases) |request| {
+        var response = try encodeQueryResponses(a, "docs", request, .{ .remote_snapshot = "pinned" }, result);
+        defer response.deinit(a);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const value = try cloned.column_source.?.value(&arena);
+        var owned_hit: db_mod.types.SearchHit = .{ .id = try a.dupe(u8, "doc") };
+        defer owned_hit.deinit(a);
+        owned_hit.source_value = try db_mod.types.cloneJsonValue(a, value);
+        owned_hit.highlights = try db_mod.types.cloneHighlights(a, cloned.highlights);
+        var owned_hits = [_]db_mod.types.SearchHit{owned_hit};
+        var expected = try encodeQueryResponses(a, "docs", request, .{ .remote_snapshot = "pinned" }, .{ .alloc = a, .hits = &owned_hits, .total_hits = 1 });
+        defer expected.deinit(a);
+        try std.testing.expectEqualStrings(expected.json, response.json);
+    }
+    // Exercise private spool creation, buffers, preparation and cleanup at
+    // every allocation failure, including an allocator that cannot remap.
+    const Counter = struct {
+        bytes: usize = 0,
+        fn start(_: *anyopaque, _: usize) !void {}
+        fn write(raw: *anyopaque, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.bytes += bytes.len;
+        }
+    };
+    var counter: Counter = .{};
+    var spilled = try encodeQueryResponsesWithDelivery(a, "docs", .{}, .{}, result, .{ .ptr = &counter, .start_fn = Counter.start, .write_fn = Counter.write, .spill_io = std.testing.io, .preparation_bytes = 1 });
+    defer spilled.deinit(a);
+    try std.testing.expectEqual(spilled.delivered_bytes.?, counter.bytes);
+}
+test "external lake column sources share pages and encode with typed source parity under allocation failures" {
+    try columnLakeSourceScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, columnLakeSourceScenario, .{});
+}
+
+test "external lake column response delivery preserves cancellation and malformed source errors" {
+    const a = std.testing.allocator;
+    const rows = @import("../storage/rowsource/types.zig");
+    const refs = [_]rows.RowRef{.{ .relational_key = "doc" }};
+    const columns = [_]rows.ColumnVector{.{ .name = "nested", .values = .{ .json = &.{"{invalid}"} } }};
+    const page = try db_mod.types.ColumnSourcePage.copy(a, .{ .snapshot = .{ .table_id = "docs", .snapshot_id = "one" }, .row_refs = &refs, .columns = &columns }, &.{0});
+    defer page.release();
+    var hit: db_mod.types.SearchHit = .{ .id = try a.dupe(u8, "doc"), .column_source = page.row(0) };
+    defer hit.deinit(a);
+    var hits = [_]db_mod.types.SearchHit{hit};
+    const result: db_mod.types.SearchResult = .{ .alloc = a, .hits = &hits, .total_hits = 1 };
+    const Canceled = struct {
+        fn check(_: *const anyopaque) bool {
+            return true;
+        }
+    };
+    const marker: u8 = 0;
+    try std.testing.expectError(error.Canceled, encodeQueryResponses(a, "docs", .{ .cancellation = .{ .ptr = &marker, .is_cancelled_fn = Canceled.check } }, .{}, result));
+    try std.testing.expectError(error.SyntaxError, encodeQueryResponses(a, "docs", .{}, .{}, result));
+}
+
+test "external lake streamed column delivery validates limits before headers and closes failed writes" {
+    const a = std.testing.allocator;
+    const rows = @import("../storage/rowsource/types.zig");
+    const refs = [_]rows.RowRef{.{ .relational_key = "doc" }};
+    const columns = [_]rows.ColumnVector{
+        .{ .name = "body", .values = .{ .bytes = &.{"needle"} } },
+        .{ .name = "amount", .values = .{ .i64 = &.{9007199254740993} } },
+        .{ .name = "escaped\nkey", .values = .{ .bytes = &.{"a\x00\n\t\\\"é😀"} } },
+        .{ .name = "nested", .values = .{ .json = &.{"{\"visible\":\"value\\n\",\"private\":0}"} } },
+    };
+    const page = try db_mod.types.ColumnSourcePage.copy(a, .{ .snapshot = .{ .table_id = "docs", .snapshot_id = "one" }, .row_refs = &refs, .columns = &columns }, &.{0});
+    defer page.release();
+    var hits = try a.alloc(db_mod.types.SearchHit, 600);
+    defer a.free(hits);
+    var initialized: usize = 0;
+    defer for (hits[0..initialized]) |*hit| hit.deinit(a);
+    for (hits) |*hit| {
+        hit.* = .{ .id = try a.dupe(u8, "doc"), .column_source = page.row(0) };
+        initialized += 1;
+    }
+    const result: db_mod.types.SearchResult = .{ .alloc = a, .hits = hits, .total_hits = @intCast(hits.len) };
+    var expected = try encodeQueryResponses(a, "docs", .{}, .{}, result);
+    defer expected.deinit(a);
+    const Capture = struct {
+        bytes: std.ArrayList(u8) = .empty,
+        starts: usize = 0,
+        length: usize = 0,
+        writes: usize = 0,
+        fail: bool = false,
+        fn start(raw: *anyopaque, length: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.starts += 1;
+            self.length = length;
+        }
+        fn write(raw: *anyopaque, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail) return error.ClientDisconnected;
+            self.writes += 1;
+            try self.bytes.appendSlice(std.testing.allocator, bytes);
+        }
+        fn sink(self: *@This(), limit: usize) @import("query_response.zig").Delivery {
+            return .{ .ptr = self, .start_fn = start, .write_fn = write, .max_bytes = limit, .spill_io = std.testing.io, .preparation_bytes = 128 };
+        }
+    };
+    var capture: Capture = .{};
+    defer capture.bytes.deinit(a);
+    try std.testing.expectError(error.QueryResponseTooLarge, encodeQueryResponsesWithDelivery(a, "docs", .{}, .{}, result, capture.sink(expected.json.len - 1)));
+    try std.testing.expectEqual(@as(usize, 0), capture.starts);
+    var response = try encodeQueryResponsesWithDelivery(a, "docs", .{}, .{}, result, capture.sink(expected.json.len));
+    defer response.deinit(a);
+    try std.testing.expectEqual(expected.json.len, response.delivered_bytes.?);
+    try std.testing.expectEqual(@as(usize, 0), response.json.len);
+    try std.testing.expectEqualStrings(expected.json, capture.bytes.items);
+    try std.testing.expect(capture.writes > 1);
+    try std.testing.expectEqual(@as(usize, 1), capture.starts);
+    capture.fail = true;
+    try std.testing.expectError(error.QueryDeliveryFailed, encodeQueryResponsesWithDelivery(a, "docs", .{}, .{}, result, capture.sink(expected.json.len)));
+    try std.testing.expectEqual(@as(usize, 2), capture.starts);
+    // Invalid JSON is rejected during plan preparation before a sink starts.
+    const bad_columns = [_]rows.ColumnVector{.{ .name = "bad", .values = .{ .json = &.{"{invalid}"} } }};
+    const bad_page = try db_mod.types.ColumnSourcePage.copy(a, .{ .snapshot = .{ .table_id = "docs", .snapshot_id = "one" }, .row_refs = &refs, .columns = &bad_columns }, &.{0});
+    defer bad_page.release();
+    var bad_hit: db_mod.types.SearchHit = .{ .id = try a.dupe(u8, "bad"), .column_source = bad_page.row(0) };
+    defer bad_hit.deinit(a);
+    try std.testing.expectError(error.SyntaxError, encodeQueryResponsesWithDelivery(a, "docs", .{}, .{}, .{ .alloc = a, .hits = @as(*[1]db_mod.types.SearchHit, @ptrCast(&bad_hit)), .total_hits = 1 }, capture.sink(expected.json.len)));
+    try std.testing.expectEqual(@as(usize, 2), capture.starts);
+    capture.fail = false;
+    capture.bytes.clearRetainingCapacity();
+    var consuming = capture.sink(expected.json.len);
+    consuming.consume_columns = true;
+    var consumed = try encodeQueryResponsesWithDelivery(a, "docs", .{}, .{}, result, consuming);
+    defer consumed.deinit(a);
+    try std.testing.expectEqualStrings(expected.json, capture.bytes.items);
+    for (hits) |hit| try std.testing.expect(hit.column_source == null);
+}
+
+test "external lake query parser accepts bounded retained capabilities and rejects malformed envelopes" {
+    const a = std.testing.allocator;
+    const retained_key: [175]u8 = @splat('a');
+    const token = "lake2:" ++ retained_key ++ ":42";
+    const body = try std.json.Stringify.valueAlloc(a, .{ .remote_snapshot = token }, .{});
+    defer a.free(body);
+    var parsed = try parseQueryRequest(a, null, "history", body);
+    defer parsed.deinit(a);
+    try std.testing.expectEqualStrings(token, parsed.req.remote_snapshot.?);
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(a, null, "history", "{\"remote_snapshot\":\"lake2:short\"}"));
+    const oversized_key: [513]u8 = @splat('a');
+    const oversized = try std.json.Stringify.valueAlloc(a, .{ .remote_snapshot = "lake2:" ++ oversized_key }, .{});
+    defer a.free(oversized);
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(a, null, "history", oversized));
 }

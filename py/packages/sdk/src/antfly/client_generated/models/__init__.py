@@ -20,6 +20,8 @@ from .aggregation_request import AggregationRequest
 from .aggregation_request_sub_aggregations import AggregationRequestSubAggregations
 from .aggregation_result import AggregationResult
 from .aggregation_type import AggregationType
+from .algebraic_aggregate_config import AlgebraicAggregateConfig
+from .algebraic_aggregate_config_op import AlgebraicAggregateConfigOp
 from .algebraic_aggregation_join import AlgebraicAggregationJoin
 from .algebraic_aggregation_join_kind import AlgebraicAggregationJoinKind
 from .algebraic_index_config import AlgebraicIndexConfig
@@ -105,6 +107,8 @@ from .chat_message import ChatMessage
 from .chat_message_role import ChatMessageRole
 from .chat_tool_name import ChatToolName
 from .chat_tools_config import ChatToolsConfig
+from .choice_decision_question import ChoiceDecisionQuestion
+from .choice_decision_question_type import ChoiceDecisionQuestionType
 from .chunk_options import ChunkOptions
 from .chunker_config import ChunkerConfig
 from .chunker_config_full_text_index import ChunkerConfigFullTextIndex
@@ -139,6 +143,9 @@ from .cohere_reranker_config import CohereRerankerConfig
 from .cohere_reranker_config_provider import CohereRerankerConfigProvider
 from .committed_mutation_outcome import CommittedMutationOutcome
 from .committed_mutation_outcome_status import CommittedMutationOutcomeStatus
+from .composed_query_source import ComposedQuerySource
+from .composed_source_overlay import ComposedSourceOverlay
+from .composed_table_source import ComposedTableSource
 from .confidence_step_config import ConfidenceStepConfig
 from .configure_extension_request import ConfigureExtensionRequest
 from .conjunction_query import ConjunctionQuery
@@ -162,6 +169,7 @@ from .create_full_text_index_request_type import CreateFullTextIndexRequestType
 from .create_graph_index_request import CreateGraphIndexRequest
 from .create_graph_index_request_type import CreateGraphIndexRequestType
 from .create_index_common import CreateIndexCommon
+from .create_query_source_body import CreateQuerySourceBody
 from .create_relational_index_request import CreateRelationalIndexRequest
 from .create_relational_index_request_type import CreateRelationalIndexRequestType
 from .create_table_request import CreateTableRequest
@@ -199,6 +207,14 @@ from .data_shape_decl import DataShapeDecl
 from .data_shape_kind import DataShapeKind
 from .database_catalog_record import DatabaseCatalogRecord
 from .date_range_string_query import DateRangeStringQuery
+from .decision_batch_item import DecisionBatchItem
+from .decision_choice import DecisionChoice
+from .decision_choice_probability import DecisionChoiceProbability
+from .decision_input import DecisionInput
+from .decision_level import DecisionLevel
+from .decision_level_probability import DecisionLevelProbability
+from .decision_similarity import DecisionSimilarity
+from .decision_usage import DecisionUsage
 from .delete_artifact_enrichment_response_201 import DeleteArtifactEnrichmentResponse201
 from .dense_native_storage_phase import DenseNativeStoragePhase
 from .dense_repair_backpressure_error import DenseRepairBackpressureError
@@ -251,8 +267,25 @@ from .edges_response import EdgesResponse
 from .embedder_config import EmbedderConfig
 from .embedder_config_inputs_item import EmbedderConfigInputsItem
 from .embedder_provider import EmbedderProvider
+from .embedding_choice_answer import EmbeddingChoiceAnswer
+from .embedding_choice_answer_abstention_reason import EmbeddingChoiceAnswerAbstentionReason
+from .embedding_choice_answer_decision_method import EmbeddingChoiceAnswerDecisionMethod
+from .embedding_choice_answer_similarity_metric import EmbeddingChoiceAnswerSimilarityMetric
+from .embedding_choice_answer_status import EmbeddingChoiceAnswerStatus
+from .embedding_choice_answer_type import EmbeddingChoiceAnswerType
+from .embedding_decision_acceptance import EmbeddingDecisionAcceptance
+from .embedding_decision_options import EmbeddingDecisionOptions
+from .embedding_decision_options_dimensions import EmbeddingDecisionOptionsDimensions
+from .embedding_decision_options_task_type import EmbeddingDecisionOptionsTaskType
 from .embedding_index_activity import EmbeddingIndexActivity
 from .embedding_index_activity_phase import EmbeddingIndexActivityPhase
+from .embedding_multi_choice_answer import EmbeddingMultiChoiceAnswer
+from .embedding_multi_choice_answer_abstention_reason import EmbeddingMultiChoiceAnswerAbstentionReason
+from .embedding_multi_choice_answer_decision_method import EmbeddingMultiChoiceAnswerDecisionMethod
+from .embedding_multi_choice_answer_similarity_metric import EmbeddingMultiChoiceAnswerSimilarityMetric
+from .embedding_multi_choice_answer_similarity_thresholds import EmbeddingMultiChoiceAnswerSimilarityThresholds
+from .embedding_multi_choice_answer_status import EmbeddingMultiChoiceAnswerStatus
+from .embedding_multi_choice_answer_type import EmbeddingMultiChoiceAnswerType
 from .embedding_retrieval_config import EmbeddingRetrievalConfig
 from .embedding_source_coverage_status import EmbeddingSourceCoverageStatus
 from .embedding_type_1 import EmbeddingType1
@@ -309,6 +342,7 @@ from .external_lake_snapshot_selector_mode import ExternalLakeSnapshotSelectorMo
 from .external_lake_table_source import ExternalLakeTableSource
 from .external_lake_table_source_format import ExternalLakeTableSourceFormat
 from .external_lake_table_source_kind import ExternalLakeTableSourceKind
+from .external_lake_table_source_object_mutability import ExternalLakeTableSourceObjectMutability
 from .external_lake_table_source_write_policy import ExternalLakeTableSourceWritePolicy
 from .extraction_attribute_group import ExtractionAttributeGroup
 from .extraction_attribute_label import ExtractionAttributeLabel
@@ -348,9 +382,6 @@ from .extraction_constraint_not import ExtractionConstraintNot
 from .extraction_constraint_not_type import ExtractionConstraintNotType
 from .extraction_constraint_or import ExtractionConstraintOr
 from .extraction_constraint_or_type import ExtractionConstraintOrType
-from .extraction_decision import ExtractionDecision
-from .extraction_decision_confidence_method import ExtractionDecisionConfidenceMethod
-from .extraction_decision_type import ExtractionDecisionType
 from .extraction_decoder_options import ExtractionDecoderOptions
 from .extraction_decoder_options_algorithm import ExtractionDecoderOptionsAlgorithm
 from .extraction_entity import ExtractionEntity
@@ -389,7 +420,6 @@ from .extraction_joint_schema import ExtractionJointSchema
 from .extraction_joint_schema_entities import ExtractionJointSchemaEntities
 from .extraction_joint_schema_relations import ExtractionJointSchemaRelations
 from .extraction_label_definition import ExtractionLabelDefinition
-from .extraction_label_probability import ExtractionLabelProbability
 from .extraction_long_document_metadata import ExtractionLongDocumentMetadata
 from .extraction_long_document_metadata_classification_aggregation import (
     ExtractionLongDocumentMetadataClassificationAggregation,
@@ -489,6 +519,7 @@ from .get_current_user_response_200_metadata_type_0 import GetCurrentUserRespons
 from .get_document_artifact_manifest_detail import GetDocumentArtifactManifestDetail
 from .get_table_storage_migration_response_200 import GetTableStorageMigrationResponse200
 from .global_stateful_query_request import GlobalStatefulQueryRequest
+from .global_stateful_query_request_source_ranking import GlobalStatefulQueryRequestSourceRanking
 from .google_embedder_config import GoogleEmbedderConfig
 from .google_embedder_config_provider import GoogleEmbedderConfigProvider
 from .google_generator_config import GoogleGeneratorConfig
@@ -753,18 +784,10 @@ from .inference_connection import InferenceConnection
 from .inference_connection_models import InferenceConnectionModels
 from .inference_content_security_config import InferenceContentSecurityConfig
 from .inference_credentials import InferenceCredentials
-from .inference_decide_answer import InferenceDecideAnswer
-from .inference_decide_answer_legend import InferenceDecideAnswerLegend
-from .inference_decide_answer_probabilities import InferenceDecideAnswerProbabilities
-from .inference_decide_answer_type import InferenceDecideAnswerType
-from .inference_decide_question import InferenceDecideQuestion
-from .inference_decide_question_criteria_type_0 import InferenceDecideQuestionCriteriaType0
-from .inference_decide_question_type import InferenceDecideQuestionType
+from .inference_decide_long_document import InferenceDecideLongDocument
+from .inference_decide_long_document_mode import InferenceDecideLongDocumentMode
 from .inference_decide_request import InferenceDecideRequest
-from .inference_decide_request_questions import InferenceDecideRequestQuestions
 from .inference_decide_response import InferenceDecideResponse
-from .inference_decide_response_answers import InferenceDecideResponseAnswers
-from .inference_decide_response_usage import InferenceDecideResponseUsage
 from .inference_dictate_request import InferenceDictateRequest
 from .inference_dictate_response import InferenceDictateResponse
 from .inference_dictate_response_object import InferenceDictateResponseObject
@@ -783,6 +806,7 @@ from .inference_embed_response import InferenceEmbedResponse
 from .inference_embed_response_object import InferenceEmbedResponseObject
 from .inference_embedding_batch_summary import InferenceEmbeddingBatchSummary
 from .inference_embedding_content_input import InferenceEmbeddingContentInput
+from .inference_embedding_group import InferenceEmbeddingGroup
 from .inference_embedding_item_error import InferenceEmbeddingItemError
 from .inference_embedding_item_error_stage import InferenceEmbeddingItemErrorStage
 from .inference_embedding_object import InferenceEmbeddingObject
@@ -836,6 +860,7 @@ from .inference_model_info import InferenceModelInfo
 from .inference_model_kind import InferenceModelKind
 from .inference_model_quantization import InferenceModelQuantization
 from .inference_model_ref import InferenceModelRef
+from .inference_model_ref_cuda_precision import InferenceModelRefCudaPrecision
 from .inference_models_response import InferenceModelsResponse
 from .inference_models_response_chunkers import InferenceModelsResponseChunkers
 from .inference_models_response_data_item import InferenceModelsResponseDataItem
@@ -920,6 +945,11 @@ from .inference_transient_capacity_error import InferenceTransientCapacityError
 from .inference_transient_capacity_error_reason import InferenceTransientCapacityErrorReason
 from .inference_vad_config import InferenceVadConfig
 from .inferenceschemas_config import InferenceschemasConfig
+from .ingest_lake_changes_body import IngestLakeChangesBody
+from .ingest_lake_changes_body_changes_item import IngestLakeChangesBodyChangesItem
+from .ingest_lake_changes_body_changes_item_op import IngestLakeChangesBodyChangesItemOp
+from .ingest_lake_changes_body_changes_item_row import IngestLakeChangesBodyChangesItemRow
+from .ingest_lake_changes_response_202 import IngestLakeChangesResponse202
 from .install_extension_request import InstallExtensionRequest
 from .install_manifest import InstallManifest
 from .installed_extension import InstalledExtension
@@ -935,6 +965,22 @@ from .join_profile import JoinProfile
 from .join_strategy import JoinStrategy
 from .join_type import JoinType
 from .key_range import KeyRange
+from .lake_catalog_commit_request import LakeCatalogCommitRequest
+from .lake_catalog_commit_request_requirements_item import LakeCatalogCommitRequestRequirementsItem
+from .lake_catalog_commit_request_updates_item import LakeCatalogCommitRequestUpdatesItem
+from .lake_catalog_config import LakeCatalogConfig
+from .lake_catalog_config_type import LakeCatalogConfigType
+from .lake_catalog_create_request import LakeCatalogCreateRequest
+from .lake_catalog_create_request_partition_spec import LakeCatalogCreateRequestPartitionSpec
+from .lake_catalog_create_request_properties import LakeCatalogCreateRequestProperties
+from .lake_catalog_create_request_schema import LakeCatalogCreateRequestSchema
+from .lake_catalog_create_request_write_order import LakeCatalogCreateRequestWriteOrder
+from .lake_catalog_response import LakeCatalogResponse
+from .lake_catalog_response_metadata import LakeCatalogResponseMetadata
+from .lake_catalog_response_state import LakeCatalogResponseState
+from .lake_read_receipt import LakeReadReceipt
+from .lake_read_requirement import LakeReadRequirement
+from .lake_read_requirement_visibility import LakeReadRequirementVisibility
 from .legacy_graph_document_query import LegacyGraphDocumentQuery
 from .legacy_graph_node_selector import LegacyGraphNodeSelector
 from .legacy_graph_query import LegacyGraphQuery
@@ -964,6 +1010,9 @@ from .lookup_key_response_200 import LookupKeyResponse200
 from .lookup_namespace_table_document_consistency import LookupNamespaceTableDocumentConsistency
 from .lookup_namespace_table_document_response_200 import LookupNamespaceTableDocumentResponse200
 from .lsm_storage_status import LsmStorageStatus
+from .maintain_lake_table_body import MaintainLakeTableBody
+from .maintain_lake_table_body_action import MaintainLakeTableBodyAction
+from .maintain_lake_table_response_200 import MaintainLakeTableResponse200
 from .match_all_query import MatchAllQuery
 from .match_all_query_match_all import MatchAllQueryMatchAll
 from .match_none_query import MatchNoneQuery
@@ -990,6 +1039,11 @@ from .multi_batch_request_tables import MultiBatchRequestTables
 from .multi_batch_response import MultiBatchResponse
 from .multi_batch_response_status import MultiBatchResponseStatus
 from .multi_batch_response_tables import MultiBatchResponseTables
+from .multi_choice_decision_question import MultiChoiceDecisionQuestion
+from .multi_choice_decision_question_similarity_thresholds_type_1 import (
+    MultiChoiceDecisionQuestionSimilarityThresholdsType1,
+)
+from .multi_choice_decision_question_type import MultiChoiceDecisionQuestionType
 from .multi_match_body import MultiMatchBody
 from .multi_match_body_type import MultiMatchBodyType
 from .multi_match_query import MultiMatchQuery
@@ -1031,6 +1085,8 @@ from .pattern_step import PatternStep
 from .permission import Permission
 from .permission_type import PermissionType
 from .phrase_query import PhraseQuery
+from .predicate_decision_question import PredicateDecisionQuestion
+from .predicate_decision_question_type import PredicateDecisionQuestionType
 from .prefix_query import PrefixQuery
 from .prune_stats import PruneStats
 from .pruner import Pruner
@@ -1057,7 +1113,7 @@ from .query_evaluation_where import QueryEvaluationWhere
 from .query_expression import QueryExpression
 from .query_expression_call import QueryExpressionCall
 from .query_expression_criteria_type_0 import QueryExpressionCriteriaType0
-from .query_expression_questions import QueryExpressionQuestions
+from .query_expression_questions_item import QueryExpressionQuestionsItem
 from .query_filter_error import QueryFilterError
 from .query_filter_error_error import QueryFilterErrorError
 from .query_filter_error_field import QueryFilterErrorField
@@ -1088,6 +1144,7 @@ from .query_result_base_aggregations import QueryResultBaseAggregations
 from .query_result_base_analyses import QueryResultBaseAnalyses
 from .query_result_base_evaluation import QueryResultBaseEvaluation
 from .query_result_base_graph_metric_results import QueryResultBaseGraphMetricResults
+from .query_result_base_source_ranking import QueryResultBaseSourceRanking
 from .query_score_details import QueryScoreDetails
 from .query_strategy import QueryStrategy
 from .query_string_query import QueryStringQuery
@@ -1137,6 +1194,7 @@ from .relational_row_query_request import RelationalRowQueryRequest
 from .relational_row_row import RelationalRowRow
 from .relational_scalar_expression import RelationalScalarExpression
 from .relational_unique_constraint import RelationalUniqueConstraint
+from .relational_unique_constraint_origin import RelationalUniqueConstraintOrigin
 from .rename_catalog_resource_request import RenameCatalogResourceRequest
 from .repair_issue_list_request import RepairIssueListRequest
 from .repair_run_request import RepairRunRequest
@@ -1213,9 +1271,12 @@ from .row_filter_entry_filter import RowFilterEntryFilter
 from .runtime_config_status import RuntimeConfigStatus
 from .runtime_decl import RuntimeDecl
 from .runtime_decl_mode import RuntimeDeclMode
+from .saved_query_source import SavedQuerySource
 from .scan_keys_request import ScanKeysRequest
 from .scoped_row_filter import ScopedRowFilter
 from .scoped_row_filter_filter import ScopedRowFilterFilter
+from .score_decision_question import ScoreDecisionQuestion
+from .score_decision_question_type import ScoreDecisionQuestionType
 from .secret_entry import SecretEntry
 from .secret_list import SecretList
 from .secret_status import SecretStatus
@@ -1235,16 +1296,25 @@ from .sort_field import SortField
 from .sort_profile import SortProfile
 from .sort_profile_candidate_source import SortProfileCandidateSource
 from .sort_profile_sort_lifecycle_state import SortProfileSortLifecycleState
+from .sql_array_column_schema import SQLArrayColumnSchema
+from .sql_array_column_schema_type import SQLArrayColumnSchemaType
+from .sql_array_dimension import SQLArrayDimension
+from .sql_array_element_type import SQLArrayElementType
+from .sql_array_value import SQLArrayValue
+from .sql_builtin_type import SQLBuiltinType
 from .sql_column import SQLColumn
 from .sql_column_type import SQLColumnType
 from .sql_connection_open_request import SQLConnectionOpenRequest
 from .sql_connection_response import SQLConnectionResponse
 from .sql_diagnostic import SQLDiagnostic
 from .sql_mutation_outcome import SQLMutationOutcome
+from .sql_numeric_modifier import SQLNumericModifier
+from .sql_parameter_descriptor import SQLParameterDescriptor
 from .sql_prepare_request import SQLPrepareRequest
 from .sql_prepared_execution_request import SQLPreparedExecutionRequest
 from .sql_prepared_response import SQLPreparedResponse
 from .sql_request import SQLRequest
+from .sql_request_lake_visibility import SQLRequestLakeVisibility
 from .sql_response import SQLResponse
 from .sql_setting_database_default import SqlSettingDatabaseDefault
 from .sql_setting_mutation_drop import SqlSettingMutationDrop
@@ -1319,6 +1389,7 @@ from .table_status import TableStatus
 from .table_storage_mode import TableStorageMode
 from .table_storage_settings import TableStorageSettings
 from .table_storage_settings_dense_embeddings import TableStorageSettingsDenseEmbeddings
+from .table_storage_settings_engine import TableStorageSettingsEngine
 from .table_storage_unreadable_error import TableStorageUnreadableError
 from .table_storage_unreadable_error_code import TableStorageUnreadableErrorCode
 from .tablespace_catalog_record import TablespaceCatalogRecord
@@ -1349,6 +1420,18 @@ from .topology_changed_error import TopologyChangedError
 from .topology_changed_error_action import TopologyChangedErrorAction
 from .topology_changed_error_error import TopologyChangedErrorError
 from .topology_changed_error_status import TopologyChangedErrorStatus
+from .trained_choice_answer import TrainedChoiceAnswer
+from .trained_choice_answer_confidence_method import TrainedChoiceAnswerConfidenceMethod
+from .trained_choice_answer_decision_method import TrainedChoiceAnswerDecisionMethod
+from .trained_choice_answer_type import TrainedChoiceAnswerType
+from .trained_predicate_answer import TrainedPredicateAnswer
+from .trained_predicate_answer_confidence_method import TrainedPredicateAnswerConfidenceMethod
+from .trained_predicate_answer_decision_method import TrainedPredicateAnswerDecisionMethod
+from .trained_predicate_answer_type import TrainedPredicateAnswerType
+from .trained_score_answer import TrainedScoreAnswer
+from .trained_score_answer_confidence_method import TrainedScoreAnswerConfidenceMethod
+from .trained_score_answer_decision_method import TrainedScoreAnswerDecisionMethod
+from .trained_score_answer_type import TrainedScoreAnswerType
 from .transaction_begin_request import TransactionBeginRequest
 from .transaction_begin_response import TransactionBeginResponse
 from .transaction_commit_request import TransactionCommitRequest
@@ -1443,6 +1526,8 @@ __all__ = (
     "AggregationRequestSubAggregations",
     "AggregationResult",
     "AggregationType",
+    "AlgebraicAggregateConfig",
+    "AlgebraicAggregateConfigOp",
     "AlgebraicAggregationJoin",
     "AlgebraicAggregationJoinKind",
     "AlgebraicIndexConfig",
@@ -1528,6 +1613,8 @@ __all__ = (
     "ChatMessageRole",
     "ChatToolName",
     "ChatToolsConfig",
+    "ChoiceDecisionQuestion",
+    "ChoiceDecisionQuestionType",
     "ChunkerConfig",
     "ChunkerConfigFullTextIndex",
     "ChunkerProvider",
@@ -1562,6 +1649,9 @@ __all__ = (
     "CohereRerankerConfigProvider",
     "CommittedMutationOutcome",
     "CommittedMutationOutcomeStatus",
+    "ComposedQuerySource",
+    "ComposedSourceOverlay",
+    "ComposedTableSource",
     "ConfidenceStepConfig",
     "ConfigureExtensionRequest",
     "ConjunctionQuery",
@@ -1606,6 +1696,7 @@ __all__ = (
     "CreateGraphIndexRequest",
     "CreateGraphIndexRequestType",
     "CreateIndexCommon",
+    "CreateQuerySourceBody",
     "CreateRelationalIndexRequest",
     "CreateRelationalIndexRequestType",
     "CreateTableRequest",
@@ -1622,6 +1713,14 @@ __all__ = (
     "DataShapeDecl",
     "DataShapeKind",
     "DateRangeStringQuery",
+    "DecisionBatchItem",
+    "DecisionChoice",
+    "DecisionChoiceProbability",
+    "DecisionInput",
+    "DecisionLevel",
+    "DecisionLevelProbability",
+    "DecisionSimilarity",
+    "DecisionUsage",
     "DeleteArtifactEnrichmentResponse201",
     "DenseNativeStoragePhase",
     "DenseRepairBackpressureError",
@@ -1672,8 +1771,25 @@ __all__ = (
     "EmbedderConfig",
     "EmbedderConfigInputsItem",
     "EmbedderProvider",
+    "EmbeddingChoiceAnswer",
+    "EmbeddingChoiceAnswerAbstentionReason",
+    "EmbeddingChoiceAnswerDecisionMethod",
+    "EmbeddingChoiceAnswerSimilarityMetric",
+    "EmbeddingChoiceAnswerStatus",
+    "EmbeddingChoiceAnswerType",
+    "EmbeddingDecisionAcceptance",
+    "EmbeddingDecisionOptions",
+    "EmbeddingDecisionOptionsDimensions",
+    "EmbeddingDecisionOptionsTaskType",
     "EmbeddingIndexActivity",
     "EmbeddingIndexActivityPhase",
+    "EmbeddingMultiChoiceAnswer",
+    "EmbeddingMultiChoiceAnswerAbstentionReason",
+    "EmbeddingMultiChoiceAnswerDecisionMethod",
+    "EmbeddingMultiChoiceAnswerSimilarityMetric",
+    "EmbeddingMultiChoiceAnswerSimilarityThresholds",
+    "EmbeddingMultiChoiceAnswerStatus",
+    "EmbeddingMultiChoiceAnswerType",
     "EmbeddingRetrievalConfig",
     "EmbeddingsIndexConfig",
     "EmbeddingsIndexStats",
@@ -1730,6 +1846,7 @@ __all__ = (
     "ExternalLakeTableSource",
     "ExternalLakeTableSourceFormat",
     "ExternalLakeTableSourceKind",
+    "ExternalLakeTableSourceObjectMutability",
     "ExternalLakeTableSourceWritePolicy",
     "ExtractionAttributeGroup",
     "ExtractionAttributeLabel",
@@ -1769,9 +1886,6 @@ __all__ = (
     "ExtractionConstraintNotType",
     "ExtractionConstraintOr",
     "ExtractionConstraintOrType",
-    "ExtractionDecision",
-    "ExtractionDecisionConfidenceMethod",
-    "ExtractionDecisionType",
     "ExtractionDecoderOptions",
     "ExtractionDecoderOptionsAlgorithm",
     "ExtractionEntity",
@@ -1810,7 +1924,6 @@ __all__ = (
     "ExtractionJointSchemaEntities",
     "ExtractionJointSchemaRelations",
     "ExtractionLabelDefinition",
-    "ExtractionLabelProbability",
     "ExtractionLongDocumentMetadata",
     "ExtractionLongDocumentMetadataClassificationAggregation",
     "ExtractionLongDocumentMetadataDuplicateScore",
@@ -1904,6 +2017,7 @@ __all__ = (
     "GetDocumentArtifactManifestDetail",
     "GetTableStorageMigrationResponse200",
     "GlobalStatefulQueryRequest",
+    "GlobalStatefulQueryRequestSourceRanking",
     "GoogleEmbedderConfig",
     "GoogleEmbedderConfigProvider",
     "GoogleGeneratorConfig",
@@ -2168,18 +2282,10 @@ __all__ = (
     "InferenceConnectionModels",
     "InferenceContentSecurityConfig",
     "InferenceCredentials",
-    "InferenceDecideAnswer",
-    "InferenceDecideAnswerLegend",
-    "InferenceDecideAnswerProbabilities",
-    "InferenceDecideAnswerType",
-    "InferenceDecideQuestion",
-    "InferenceDecideQuestionCriteriaType0",
-    "InferenceDecideQuestionType",
+    "InferenceDecideLongDocument",
+    "InferenceDecideLongDocumentMode",
     "InferenceDecideRequest",
-    "InferenceDecideRequestQuestions",
     "InferenceDecideResponse",
-    "InferenceDecideResponseAnswers",
-    "InferenceDecideResponseUsage",
     "InferenceDictateRequest",
     "InferenceDictateResponse",
     "InferenceDictateResponseObject",
@@ -2191,6 +2297,7 @@ __all__ = (
     "InferenceDictationWord",
     "InferenceEmbeddingBatchSummary",
     "InferenceEmbeddingContentInput",
+    "InferenceEmbeddingGroup",
     "InferenceEmbeddingItemError",
     "InferenceEmbeddingItemErrorStage",
     "InferenceEmbeddingObject",
@@ -2251,6 +2358,7 @@ __all__ = (
     "InferenceModelKind",
     "InferenceModelQuantization",
     "InferenceModelRef",
+    "InferenceModelRefCudaPrecision",
     "InferenceModelsResponse",
     "InferenceModelsResponseChunkers",
     "InferenceModelsResponseDataItem",
@@ -2333,6 +2441,11 @@ __all__ = (
     "InferenceTransientCapacityError",
     "InferenceTransientCapacityErrorReason",
     "InferenceVadConfig",
+    "IngestLakeChangesBody",
+    "IngestLakeChangesBodyChangesItem",
+    "IngestLakeChangesBodyChangesItemOp",
+    "IngestLakeChangesBodyChangesItemRow",
+    "IngestLakeChangesResponse202",
     "InstalledExtension",
     "InstalledExtensionStatus",
     "InstallExtensionRequest",
@@ -2348,6 +2461,22 @@ __all__ = (
     "JoinStrategy",
     "JoinType",
     "KeyRange",
+    "LakeCatalogCommitRequest",
+    "LakeCatalogCommitRequestRequirementsItem",
+    "LakeCatalogCommitRequestUpdatesItem",
+    "LakeCatalogConfig",
+    "LakeCatalogConfigType",
+    "LakeCatalogCreateRequest",
+    "LakeCatalogCreateRequestPartitionSpec",
+    "LakeCatalogCreateRequestProperties",
+    "LakeCatalogCreateRequestSchema",
+    "LakeCatalogCreateRequestWriteOrder",
+    "LakeCatalogResponse",
+    "LakeCatalogResponseMetadata",
+    "LakeCatalogResponseState",
+    "LakeReadReceipt",
+    "LakeReadRequirement",
+    "LakeReadRequirementVisibility",
     "LegacyGraphDocumentQuery",
     "LegacyGraphNodeSelector",
     "LegacyGraphQuery",
@@ -2377,6 +2506,9 @@ __all__ = (
     "LookupNamespaceTableDocumentConsistency",
     "LookupNamespaceTableDocumentResponse200",
     "LsmStorageStatus",
+    "MaintainLakeTableBody",
+    "MaintainLakeTableBodyAction",
+    "MaintainLakeTableResponse200",
     "MatchAllQuery",
     "MatchAllQueryMatchAll",
     "MatchNoneQuery",
@@ -2401,6 +2533,9 @@ __all__ = (
     "MultiBatchResponse",
     "MultiBatchResponseStatus",
     "MultiBatchResponseTables",
+    "MultiChoiceDecisionQuestion",
+    "MultiChoiceDecisionQuestionSimilarityThresholdsType1",
+    "MultiChoiceDecisionQuestionType",
     "MultiMatchBody",
     "MultiMatchBodyType",
     "MultiMatchQuery",
@@ -2442,6 +2577,8 @@ __all__ = (
     "Permission",
     "PermissionType",
     "PhraseQuery",
+    "PredicateDecisionQuestion",
+    "PredicateDecisionQuestionType",
     "PrefixQuery",
     "Pruner",
     "PruneStats",
@@ -2468,7 +2605,7 @@ __all__ = (
     "QueryExpression",
     "QueryExpressionCall",
     "QueryExpressionCriteriaType0",
-    "QueryExpressionQuestions",
+    "QueryExpressionQuestionsItem",
     "QueryFilterError",
     "QueryFilterErrorError",
     "QueryFilterErrorField",
@@ -2499,6 +2636,7 @@ __all__ = (
     "QueryResultBaseAnalyses",
     "QueryResultBaseEvaluation",
     "QueryResultBaseGraphMetricResults",
+    "QueryResultBaseSourceRanking",
     "QueryScoreDetails",
     "QueryStrategy",
     "QueryStringQuery",
@@ -2548,6 +2686,7 @@ __all__ = (
     "RelationalRowRow",
     "RelationalScalarExpression",
     "RelationalUniqueConstraint",
+    "RelationalUniqueConstraintOrigin",
     "RenameCatalogResourceRequest",
     "RepairIssueListRequest",
     "RepairRunRequest",
@@ -2624,9 +2763,12 @@ __all__ = (
     "RuntimeConfigStatus",
     "RuntimeDecl",
     "RuntimeDeclMode",
+    "SavedQuerySource",
     "ScanKeysRequest",
     "ScopedRowFilter",
     "ScopedRowFilterFilter",
+    "ScoreDecisionQuestion",
+    "ScoreDecisionQuestionType",
     "SecretEntry",
     "SecretList",
     "SecretStatus",
@@ -2646,6 +2788,12 @@ __all__ = (
     "SortProfile",
     "SortProfileCandidateSource",
     "SortProfileSortLifecycleState",
+    "SQLArrayColumnSchema",
+    "SQLArrayColumnSchemaType",
+    "SQLArrayDimension",
+    "SQLArrayElementType",
+    "SQLArrayValue",
+    "SQLBuiltinType",
     "SQLColumn",
     "SQLColumnType",
     "SQLConnectionOpenRequest",
@@ -2654,10 +2802,13 @@ __all__ = (
     "SQLDDLReceiptState",
     "SQLDiagnostic",
     "SQLMutationOutcome",
+    "SQLNumericModifier",
+    "SQLParameterDescriptor",
     "SQLPreparedExecutionRequest",
     "SQLPreparedResponse",
     "SQLPrepareRequest",
     "SQLRequest",
+    "SQLRequestLakeVisibility",
     "SQLResponse",
     "SqlSettingDatabaseDefault",
     "SqlSettingMutationDrop",
@@ -2731,6 +2882,7 @@ __all__ = (
     "TableStorageMode",
     "TableStorageSettings",
     "TableStorageSettingsDenseEmbeddings",
+    "TableStorageSettingsEngine",
     "TableStorageUnreadableError",
     "TableStorageUnreadableErrorCode",
     "TavilySearchConfig",
@@ -2760,6 +2912,18 @@ __all__ = (
     "TopologyChangedErrorAction",
     "TopologyChangedErrorError",
     "TopologyChangedErrorStatus",
+    "TrainedChoiceAnswer",
+    "TrainedChoiceAnswerConfidenceMethod",
+    "TrainedChoiceAnswerDecisionMethod",
+    "TrainedChoiceAnswerType",
+    "TrainedPredicateAnswer",
+    "TrainedPredicateAnswerConfidenceMethod",
+    "TrainedPredicateAnswerDecisionMethod",
+    "TrainedPredicateAnswerType",
+    "TrainedScoreAnswer",
+    "TrainedScoreAnswerConfidenceMethod",
+    "TrainedScoreAnswerDecisionMethod",
+    "TrainedScoreAnswerType",
     "TransactionBeginRequest",
     "TransactionBeginResponse",
     "TransactionCommitRequest",

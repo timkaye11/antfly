@@ -22,6 +22,7 @@ const rows = @import("../serverless/query/lake_rows.zig");
 const serving = @import("../serverless/query/lake_serving.zig");
 const operation = @import("../api/operation.zig");
 const Allocator = std.mem.Allocator;
+pub const max_selection_rows = @import("../serverless/query/lake_row_selection.zig").max_candidates;
 
 pub fn open(alloc: Allocator, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, options: @import("../serverless/lake_host.zig").OpenOptions) !catalog.Cursor {
     return openWithCache(alloc, table, request, context, options, null, null);
@@ -92,6 +93,10 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
     var stream = try @import("../serverless/query/lake_stream.zig").Stream.init(alloc, source, columns.items, pruning.items, .{ .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, .{});
     errdefer stream.deinit();
     stream.identity_only = identity_only;
+    if (request.physical_selection) |selection| {
+        if (request.row_refs != null) return error.InvalidLakeCandidateReference;
+        try stream.selectRows(selection);
+    }
     if (request.row_refs) |refs| try stream.selectRows(try @import("../serverless/query/lake_row_selection.zig").Selection.initWithMap(owned, source.inventory, refs, source.fileMap()));
     if (source.iceberg_schema != null or std.mem.startsWith(u8, binding.binding.schema_fingerprint, "parquet-schema:") or std.mem.indexOf(u8, binding.binding.schema_fingerprint, ":hash=") != null) {
         var contract: std.ArrayList(@import("../serverless/query/lake_schema.zig").Column) = .empty;
@@ -337,6 +342,11 @@ const Owner = struct {
         self.dynamic = filter;
         return true;
     }
+    fn retainColumns(raw: *anyopaque, a: Allocator) !?@import("../storage/rowsource/types.zig").ColumnOwner {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        if (self.stream.page_cursor) |*cursor| return cursor.retainColumns(a);
+        return null;
+    }
     fn nextColumns(raw: *anyopaque, alloc: Allocator, limit: u32) !catalog.ColumnPage {
         const self: *Owner = @ptrCast(@alignCast(raw));
         self.started = true;
@@ -387,7 +397,7 @@ const Owner = struct {
             }
             last_id = try @import("../storage/rowsource/identity.zig").allocId(alloc, batch.row_refs[selected[count - 1]]);
             const end = self.position == batch.rowCount() and (self.stream.page_cursor == null or self.stream.page_cursor.?.position == self.stream.page_cursor.?.group.row_count) and self.stream.file_index == self.stream.files.len and self.stream.group_index == self.stream.discovered.?.row_group_plan.row_groups.len;
-            return .{ .batch = view, .selection = selected[0..count], .after = if (end or self.primary_key != null) null else last_id };
+            return .{ .batch = view, .retain_columns = .{ .ptr = self, .retain_fn = retainColumns }, .selection = selected[0..count], .after = if (end or self.primary_key != null) null else last_id };
         }
         return .{ .batch = .{ .snapshot = .{ .table_id = self.stream.source.inventory.source_id, .snapshot_id = self.stream.source.inventory.snapshot_id }, .row_refs = &.{}, .columns = &.{} }, .selection = &.{} };
     }
@@ -1231,7 +1241,7 @@ test "lake SQL shared row group tasks and exact parallel reducers match serial g
             const self: *@This() = @ptrCast(@alignCast(raw));
             return try openPinned(alloc, table, request, .{}, &self.lake.source);
         }
-        fn mutate(_: *anyopaque, _: Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+        fn mutate(_: *anyopaque, _: Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
             return error.UnexpectedMutation;
         }
         fn checkpoint(_: *anyopaque) !void {}
@@ -1245,6 +1255,8 @@ test "lake SQL shared row group tasks and exact parallel reducers match serial g
     for ([_][]const u8{
         "SELECT amount % 7 AS bucket, SUM(amount) AS total, COUNT(*) AS n FROM events GROUP BY amount % 7 ORDER BY bucket",
         "SELECT SUM(amount), COUNT(*) FROM events",
+        "SELECT amount % 7 AS bucket, SUM(amount::NUMERIC + '0.10'::NUMERIC), AVG(amount::NUMERIC + '0.10'::NUMERIC) FROM events GROUP BY amount % 7 ORDER BY bucket",
+        "SELECT SUM(amount::NUMERIC), AVG(amount::NUMERIC), COUNT(*) FROM events",
         "SELECT amount % 7 AS bucket, COUNT(*) AS n FROM events GROUP BY amount % 7 LIMIT 3",
     }) |sql| {
         var compiled = try compiler.compile(a, sql, .{});

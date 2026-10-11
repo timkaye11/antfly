@@ -490,6 +490,25 @@ pub const MetadataApplyGroupRequest = extern struct {
     group_id: u64 = 0,
 };
 
+/// One bounded replica-local preparation operation. No cursor or native scan
+/// handle crosses this boundary. Only step carries a canonical encoded State.
+pub const MetadataRelationPublicationRequest = extern struct {
+    version: u32 = abi_version,
+    operation: enum(u32) { step = 0, cancel = 1, close = 2, expire = 3, _ } = .step,
+    group_id: u64 = 0,
+    now_ns: u64 = 0,
+    expected_state: BorrowedBytes = .{},
+};
+
+pub const MetadataRelationPublicationResult = extern struct {
+    ready: u8 = 0,
+    has_root: u8 = 0,
+    _reserved: [6]u8 = @splat(0),
+    applied_index: u64 = 0,
+    /// Canonical Generation encoding. Zero unless has_root is one.
+    root: [30]u8 = @splat(0),
+};
+
 pub const MetadataApplySnapshotRequest = extern struct {
     version: u32 = abi_version,
     _reserved0: u32 = 0,
@@ -1654,6 +1673,7 @@ pub extern fn antfly_storage_context_attach_inference_provider(
 /// Borrows the runtime secret facade until context destruction. Configure before
 /// opening any table owner; the caller retains ownership and controls its lifetime.
 pub extern fn antfly_storage_context_configure_secrets(context: ?*anyopaque, store: ?*anyopaque) callconv(.c) Status;
+pub extern fn antfly_storage_context_configure_native_queries(context: ?*anyopaque, setup: BorrowedBytes) callconv(.c) Status;
 
 /// Replaces the context-owned remote-content security snapshot before any
 /// table owner opens. The payload is a ContentSecurityConfig JSON object.
@@ -1727,6 +1747,11 @@ pub extern fn antfly_metadata_apply_store_open(
     out_store: *?*anyopaque,
 ) callconv(.c) Status;
 pub extern fn antfly_metadata_apply_store_close(store: ?*anyopaque) callconv(.c) void;
+pub extern fn antfly_metadata_apply_store_relation_publication(
+    store: ?*anyopaque,
+    request: *const MetadataRelationPublicationRequest,
+    out_result: *MetadataRelationPublicationResult,
+) callconv(.c) Status;
 pub extern fn antfly_metadata_apply_store_apply_batch(
     store: ?*anyopaque,
     request: *const MetadataApplyBatchRequest,

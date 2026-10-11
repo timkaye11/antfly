@@ -1055,6 +1055,7 @@ test "lite allocator v4 releasing the last old reader starts idle retirement" {
 }
 
 pub const OpenOptions = struct {
+    externally_locked: bool = false,
     reclamation: reclamation.Options = .{},
     read_only: bool = false,
     no_sync: bool = false,
@@ -1063,6 +1064,7 @@ pub const OpenOptions = struct {
 };
 
 pub const CreateOptions = struct {
+    externally_locked: bool = false,
     reclamation: reclamation.Options = .{},
     exclusive: bool = false,
     no_sync: bool = false,
@@ -1084,6 +1086,7 @@ const MutationRequest = struct {
 const ReadPin = struct {
     sequence: u64,
     pinned_at: std.Io.Timestamp,
+    kernel_reader: bool = false,
     previous: ?*ReadPin = null,
     next: ?*ReadPin = null,
 };
@@ -1095,7 +1098,10 @@ const ReadGeneration = struct {
     first_pin: ?*ReadPin = null,
     last_pin: ?*ReadPin = null,
     file: native.NativeFile,
+    checkpoint: native.CheckpointSlot = .{},
     references: usize = 0,
+    scoped_reader_lock: bool = false,
+    kernel_readers: usize = 0,
     retired: bool = false,
     next_retired: ?*ReadGeneration = null,
     retained_bytes: u64 = 0,
@@ -1151,6 +1157,10 @@ pub const Store = struct {
     allocator: Allocator,
     file: native.NativeFile,
     read_generation: ?*ReadGeneration = null,
+    // Admission and release never wait for the writer's disk I/O.
+    read_mutex: std.Io.Mutex = .init,
+    reader_frontier: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
+    read_outcome_unknown: bool = false,
     retired_generations: ?*ReadGeneration = null,
     /// Cached under mutex so foreground admission is independent of the number
     /// of retained generations. Status may walk them for reader diagnostics.
@@ -1209,6 +1219,7 @@ pub const Store = struct {
     pub fn openWithOptions(allocator: Allocator, path: []const u8, opts: OpenOptions) !Store {
         const policy = try reclamation.Policy.init(opts.reclamation);
         const native_opts = native.OpenOptions{
+            .externally_locked = opts.externally_locked,
             .read_only = opts.read_only,
             .wait_for_reader_lock = opts.read_only,
             .no_sync = opts.no_sync,
@@ -1236,7 +1247,7 @@ pub const Store = struct {
             _ = try result.vacuumWithCancel(null);
         }
         if (!opts.read_only) result.maintainOnce(false) catch |err| result.recordMaintenanceError(err);
-        result.maintenance_start_suppressed = false;
+        result.maintenance_start_suppressed = opts.externally_locked;
         return result;
     }
 
@@ -1267,6 +1278,7 @@ pub const Store = struct {
         else
             try native.NativeFile.createWithOptions(allocator, path, native_opts);
         file.retirement_work_pages = opts.reclamation.retirement_work_pages;
+        file.externally_locked = opts.externally_locked;
         file.reserve_retirement_capacity = true;
         if (opts.reclamation.max_storage_bytes != 0) file.max_file_bytes = opts.reclamation.max_storage_bytes;
         file.vacuum_target_indexed = opts.reclamation.page_reuse;
@@ -1276,6 +1288,7 @@ pub const Store = struct {
             .read_only = false,
             .resource_manager = opts.resource_manager,
             .maintenance_policy = policy,
+            .maintenance_start_suppressed = opts.externally_locked,
         };
     }
 
@@ -1317,35 +1330,85 @@ pub const Store = struct {
     }
 
     fn currentGenerationHasReaders(self: *Store) bool {
+        const io = self.file.runtime();
+        self.read_mutex.lockUncancelable(io);
+        defer self.read_mutex.unlock(io);
         if (self.read_generation) |generation| if (generation.references != 0) return true;
         return if (self.artifact_registry) |registry| registry.hasGeneration(self.assessment_generation) else false;
     }
 
     fn totalRetiredFileBytes(self: *Store) u64 {
+        const io = self.file.runtime();
+        self.read_mutex.lockUncancelable(io);
+        defer self.read_mutex.unlock(io);
         return self.retired_file_bytes +| (if (self.artifact_registry) |registry| registry.retired_bytes.load(.acquire) else 0);
     }
 
-    // Called with mutex held. A generation owns a separate read descriptor,
-    // so publication can retire the old inode without interrupting snapshots.
-    fn pinReadGeneration(self: *Store, pin: *ReadPin) !*ReadGeneration {
-        if (self.read_generation == null) {
-            const generation = try self.allocator.create(ReadGeneration);
-            errdefer self.allocator.destroy(generation);
-            generation.* = .{ .owner_generation = self.assessment_generation, .file = try native.NativeFile.openWithIo(self.allocator, self.file.runtime(), self.file.path, .{ .read_only = true, .internal_reader = self.file.header.indexed_reclamation, .resource_manager = self.resource_manager }) };
-            self.read_generation = generation;
-            self.file.secondary_page_cache = &generation.file.page_cache;
-        }
+    // Called with the owner mutex held, before beginning writer I/O.
+    fn initializeReadGenerationAssumeLocked(self: *Store) !void {
+        const io = self.file.runtime();
+        self.read_mutex.lockUncancelable(io);
+        defer self.read_mutex.unlock(io);
+        if (self.read_generation != null) return;
+        const generation = try self.allocator.create(ReadGeneration);
+        errdefer self.allocator.destroy(generation);
+        generation.* = .{ .owner_generation = self.assessment_generation, .checkpoint = self.file.activeCheckpoint(), .scoped_reader_lock = self.file.externally_locked, .file = try native.NativeFile.openWithIo(self.allocator, io, self.file.path, .{ .read_only = true, .internal_reader = self.file.header.indexed_reclamation or self.file.externally_locked, .resource_manager = self.resource_manager }) };
+        self.read_generation = generation;
+        self.file.secondary_page_cache = &generation.file.page_cache;
+        self.file.reader_frontier = &self.reader_frontier;
+        self.file.publication_observer = .{ .context = self, .notify = observeReadCheckpoint };
+        self.read_outcome_unknown = self.file.checkpoint_publication_uncertain or self.secret_store_uncertain;
+    }
+
+    fn observeReadCheckpoint(context: *anyopaque, checkpoint: native.CheckpointSlot, uncertain: bool) void {
+        const self: *Store = @ptrCast(@alignCast(context));
+        const io = self.file.runtime();
+        self.read_mutex.lockUncancelable(io);
+        defer self.read_mutex.unlock(io);
+        if (self.read_generation) |generation| generation.checkpoint = checkpoint;
+        self.read_outcome_unknown = uncertain or self.secret_store_uncertain;
+    }
+
+    fn publishReadCheckpointAssumeLocked(self: *Store) void {
+        const io = self.file.runtime();
+        self.read_mutex.lockUncancelable(io);
+        defer self.read_mutex.unlock(io);
+        if (self.read_generation) |generation| generation.checkpoint = self.file.activeCheckpoint();
+        self.read_outcome_unknown = self.file.checkpoint_publication_uncertain or self.secret_store_uncertain;
+    }
+
+    // Called with read_mutex held. Pins are ordered by published sequence.
+    fn pinInitializedReadGeneration(self: *Store, pin: *ReadPin) !*ReadGeneration {
         const generation = self.read_generation.?;
+        // An idle connection must not fence reclamation. Only actual read
+        // transactions hold the inode lock, including streams between calls.
+        if (generation.scoped_reader_lock and pin.kernel_reader) {
+            if (generation.kernel_readers == 0) {
+                if (!try generation.file.file.tryLock(generation.file.runtime(), .shared)) return error.FileBusy;
+            }
+            generation.kernel_readers += 1;
+        }
         if (generation.references == 0) generation.pinned_at = pin.pinned_at;
         generation.references += 1;
         pin.previous = generation.last_pin;
         if (generation.last_pin) |last| last.next = pin else generation.first_pin = pin;
         generation.last_pin = pin;
-        self.file.minimum_reader_sequence = generation.first_pin.?.sequence;
+        self.reader_frontier.store(generation.first_pin.?.sequence, .release);
         return generation;
     }
 
+    fn pinReadGeneration(self: *Store, pin: *ReadPin) !*ReadGeneration {
+        try self.initializeReadGenerationAssumeLocked();
+        const io = self.file.runtime();
+        self.read_mutex.lockUncancelable(io);
+        defer self.read_mutex.unlock(io);
+        return try self.pinInitializedReadGeneration(pin);
+    }
+
     fn retireReadGeneration(self: *Store, old_bytes: u64) void {
+        const io = self.file.runtime();
+        self.read_mutex.lockUncancelable(io);
+        defer self.read_mutex.unlock(io);
         const ordinary_pinned = if (self.read_generation) |generation| generation.references != 0 else false;
         if (self.artifact_registry) |registry| registry.retire(self.assessment_generation, old_bytes, ordinary_pinned);
         self.assessment_generation +%= 1;
@@ -1355,6 +1418,8 @@ pub const Store = struct {
         self.admission_refresh_size = 0;
         const generation = self.read_generation orelse return;
         self.read_generation = null;
+        self.reader_frontier.store(std.math.maxInt(u64), .release);
+        self.file.reader_frontier = null;
         self.file.minimum_reader_sequence = null;
         self.file.secondary_page_cache = null;
         generation.retired = true;
@@ -1370,19 +1435,26 @@ pub const Store = struct {
     }
 
     fn releaseReadGeneration(self: *Store, generation: *ReadGeneration, pin: *ReadPin) void {
-        lockStore(self);
-        defer {
-            self.mutex.unlock();
-            self.startMaintenance();
-        }
+        const io = self.file.runtime();
+        self.read_mutex.lockUncancelable(io);
         std.debug.assert(generation.references > 0);
         if (pin.previous) |previous| previous.next = pin.next else generation.first_pin = pin.next;
         if (pin.next) |next| next.previous = pin.previous else generation.last_pin = pin.previous;
+        if (generation.scoped_reader_lock and pin.kernel_reader) {
+            generation.kernel_readers -= 1;
+            if (generation.kernel_readers == 0) generation.file.file.unlock(generation.file.runtime());
+        }
         self.allocator.destroy(pin);
         generation.references -= 1;
         if (generation.first_pin) |first| generation.pinned_at = first.pinned_at;
-        if (!generation.retired) self.file.minimum_reader_sequence = if (generation.first_pin) |first| first.sequence else null;
-        if (generation.references == 0 and generation.retired) {
+        if (!generation.retired) self.reader_frontier.store(if (generation.first_pin) |first| first.sequence else std.math.maxInt(u64), .release);
+        const reclaim = generation.references == 0 and generation.retired;
+        self.read_mutex.unlock(io);
+        if (reclaim) {
+            // Only the last releaser owns this unreachable generation. Preserve
+            // owner -> reader lock ordering for admission/accounting updates.
+            lockStore(self);
+            self.read_mutex.lockUncancelable(io);
             var link = &self.retired_generations;
             while (link.* != generation) link = &link.*.?.next_retired;
             link.* = generation.next_retired;
@@ -1391,8 +1463,15 @@ pub const Store = struct {
             generation.file.close();
             self.allocator.destroy(generation);
             self.admission_refresh_size = 0;
+            self.read_mutex.unlock(io);
+            self.mutex.unlock();
         }
-        self.maintenance_wake.set(self.file.runtime());
+        self.maintenance_wake.set(io);
+        // Kick a cold maintenance worker without waiting for publication.
+        if (!self.maintenance_started.load(.acquire) and self.mutex.tryLock()) {
+            self.startMaintenanceAssumeLocked();
+            self.mutex.unlock();
+        }
     }
 
     pub fn getCatalogRecordAlloc(self: *Store, a: Allocator, key: []const u8) !?[]u8 {
@@ -1430,6 +1509,10 @@ pub const Store = struct {
         if (self.maintenance_started.load(.acquire)) return;
         lockStore(self);
         defer self.mutex.unlock();
+        self.startMaintenanceAssumeLocked();
+    }
+
+    fn startMaintenanceAssumeLocked(self: *Store) void {
         if (self.read_only or self.maintenance_start_suppressed or self.maintenance_cancel.requested.load(.acquire) or
             self.maintenance_future != null) return;
         const retirement = self.file.retirementNeedsServiceWithCancel(&self.maintenance_cancel) catch false;
@@ -1788,16 +1871,20 @@ pub const Store = struct {
         status.artifact_file_bytes = self.artifactBytes();
         status.current_file_bytes = (try self.file.file.stat(self.file.runtime())).size;
         const now = std.Io.Clock.awake.now(self.file.runtime());
-        if (self.read_generation) |generation| {
-            status.retained_readers += generation.references;
-            if (generation.references > 0) status.oldest_reader_age_ms = @intCast(@max(0, generation.pinned_at.durationTo(now).toMilliseconds()));
-        }
-        var next = self.retired_generations;
-        while (next) |generation| : (next = generation.next_retired) {
-            if (cancel) |token| try token.check();
-            status.retired_generations += 1;
-            status.retained_readers += generation.references;
-            status.oldest_reader_age_ms = @max(status.oldest_reader_age_ms, @as(u64, @intCast(@max(0, generation.pinned_at.durationTo(now).toMilliseconds()))));
+        self.read_mutex.lockUncancelable(self.file.runtime());
+        {
+            defer self.read_mutex.unlock(self.file.runtime());
+            if (self.read_generation) |generation| {
+                status.retained_readers += generation.references;
+                if (generation.references > 0) status.oldest_reader_age_ms = @intCast(@max(0, generation.pinned_at.durationTo(now).toMilliseconds()));
+            }
+            var next = self.retired_generations;
+            while (next) |generation| : (next = generation.next_retired) {
+                if (cancel) |token| try token.check();
+                status.retired_generations += 1;
+                status.retained_readers += generation.references;
+                status.oldest_reader_age_ms = @max(status.oldest_reader_age_ms, @as(u64, @intCast(@max(0, generation.pinned_at.durationTo(now).toMilliseconds()))));
+            }
         }
         if (try self.file.allocatorStatsWithCancel(cancel)) |stats| {
             status.reusable_pages = stats.reusable_pages;
@@ -2151,6 +2238,7 @@ pub const Store = struct {
     fn admitEstimatedGenerationAssumeLocked(self: *Store, compact_bytes: u64, old_bytes: u64) !void {
         const budget = self.maintenance_policy.options.max_storage_bytes;
         if (budget == 0) return;
+        if (self.artifact_registry) |registry| registry.expireIdle(self.assessment_generation);
         const retained_old: u64 = if (self.currentGenerationHasReaders()) old_bytes else 0;
         if (retained_old +| self.totalRetiredFileBytes() +| self.artifactBytes() +| compact_bytes +| self.file.estimatedGenerationReserveBytes(compact_bytes) > budget) return error.LiteStorageBudgetExceeded;
     }
@@ -2168,6 +2256,10 @@ pub const Store = struct {
         const reserve = try prepared.retirementReserveBytesWithCancel(cancel);
         const reusable = if (try prepared.allocatorStatsWithCancel(cancel)) |stats| stats.reusable_pages *| prepared.header.page_size else 0;
         const total = old_bytes +| self.totalRetiredFileBytes() +| self.artifactBytes() +| prepared_bytes;
+        // Idle cache ownership must not reserve a retired inode. This runs
+        // inside the generation fence, so expired sources can only reopen
+        // after adoption; active uses remain charged by hasGeneration.
+        if (self.artifact_registry) |registry| registry.expireIdle(self.assessment_generation);
         const retained_old: u64 = if (self.currentGenerationHasReaders()) old_bytes else 0;
         const adopted_total = retained_old +| self.totalRetiredFileBytes() +| self.artifactBytes() +| prepared_bytes;
         if (options.max_storage_bytes != 0) {
@@ -2239,6 +2331,9 @@ pub const Store = struct {
         defer self.mutex.unlock();
         if (self.secret_store_uncertain) return error.OutcomeUnknown;
         try self.refreshAdmissionAssumeLocked();
+        try self.initializeReadGenerationAssumeLocked();
+        errdefer self.publishReadCheckpointAssumeLocked();
+        try self.file.reclaimRetirementPressure();
         try self.file.beginTransaction();
         errdefer self.file.abortTransaction();
         var current: ?*MutationRequest = head;
@@ -2521,23 +2616,35 @@ pub const Txn = struct {
 
     pub fn openReadWithPrefix(store: *Store, prefix: []const u8) !Txn {
         try validatePrefix(prefix);
-        lockStore(store);
-        defer store.mutex.unlock();
-        const checkpoint = store.file.activeCheckpoint();
-        const pin = if (store.read_only) null else try store.allocator.create(ReadPin);
-        errdefer if (pin) |owned| store.allocator.destroy(owned);
-        if (pin) |owned| owned.* = .{ .sequence = checkpoint.commit_sequence, .pinned_at = std.Io.Clock.awake.now(store.file.runtime()) };
-        return .{
-            .allocator = store.allocator,
-            .store = store,
-            .read_only = true,
-            .read_pin = pin,
-            .prefix = prefix,
-            // Read-only stores already own their immutable generation. Reopening
-            // the pathname here could select a replacement inode after vacuum.
-            .read_generation = if (store.read_only) null else try store.pinReadGeneration(pin.?),
-            .checkpoint = checkpoint,
-        };
+        if (store.read_only and !store.file.externally_locked) return .{ .allocator = store.allocator, .store = store, .prefix = prefix, .checkpoint = store.file.activeCheckpoint() };
+        const io = store.file.runtime();
+        store.generation_lock.lockSharedUncancelable(io);
+        defer store.generation_lock.unlockShared(io);
+        const pin = try store.allocator.create(ReadPin);
+        errdefer store.allocator.destroy(pin);
+        store.read_mutex.lockUncancelable(io);
+        if (store.read_generation == null) {
+            store.read_mutex.unlock(io);
+            lockStore(store);
+            store.initializeReadGenerationAssumeLocked() catch |err| {
+                store.mutex.unlock();
+                return err;
+            };
+            store.mutex.unlock();
+            store.read_mutex.lockUncancelable(io);
+        }
+        defer store.read_mutex.unlock(io);
+        if (store.read_outcome_unknown) return error.OutcomeUnknown;
+        const checkpoint = store.read_generation.?.checkpoint;
+        // Nested reads borrow the current writer's publication lease. Taking
+        // another inode lock here would conflict with its page allocator's
+        // exclusive reuse lock. Persistent SQL streams open outside a writer
+        // transaction and retain their own kernel reader fence instead.
+        store.writer_mutex.lockUncancelable(io);
+        const kernel_reader = !store.file.externally_locked or !store.writer_active;
+        store.writer_mutex.unlock(io);
+        pin.* = .{ .sequence = checkpoint.commit_sequence, .pinned_at = std.Io.Clock.awake.now(io), .kernel_reader = kernel_reader };
+        return .{ .allocator = store.allocator, .store = store, .read_pin = pin, .prefix = prefix, .read_generation = try store.pinInitializedReadGeneration(pin), .checkpoint = checkpoint };
     }
 
     pub fn openWrite(store: *Store) !Txn {
@@ -2673,6 +2780,7 @@ pub const Txn = struct {
     pub const ReadScope = struct {
         parent: *Txn,
         scratch: read_scratch,
+        batch_scratch: read_scratch,
 
         pub fn get(self: *@This(), key: []const u8) ![]const u8 {
             return self.parent.getOwned(self.scratch.allocator(), key);
@@ -2683,6 +2791,19 @@ pub const Txn = struct {
         }
 
         pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
+            return self.readBatch(keys, null, values);
+        }
+
+        /// Output buffers must not overlap each other or the input keys.
+        /// Output belongs to the caller, independently of scope reset/close.
+        pub fn getManySortedInto(self: *@This(), keys: []const []const u8, buffers: []const []u8, values: []?[]const u8) !void {
+            return self.readBatch(keys, buffers, values);
+        }
+
+        fn readBatch(self: *@This(), keys: []const []const u8, buffers: ?[]const []u8, values: []?[]const u8) !void {
+            if (buffers) |out| if (out.len != keys.len) return error.InvalidBatch;
+            defer self.batch_scratch.reset();
+            const temporary = self.batch_scratch.allocator();
             if (keys.len != values.len) return error.InvalidBatch;
             @memset(values, null);
             errdefer @memset(values, null);
@@ -2694,40 +2815,58 @@ pub const Txn = struct {
                 if (i == 0 or !std.mem.eql(u8, keys[i - 1], key)) unique_count += 1;
             }
             const alloc = self.scratch.allocator();
-            const pending_keys = try alloc.alloc([]const u8, unique_count);
-            const positions = try alloc.alloc(usize, unique_count);
-            const loaded = try alloc.alloc(?[]const u8, unique_count);
+            const pending_keys = try temporary.alloc([]const u8, unique_count);
+            const positions = try temporary.alloc(usize, unique_count);
+            const loaded = try temporary.alloc(?[]const u8, unique_count);
+            const pending_buffers = if (buffers != null) try temporary.alloc([]u8, unique_count) else null;
             var count: usize = 0;
             var i: usize = 0;
             while (i < keys.len) {
                 var end = i + 1;
                 while (end < keys.len and std.mem.eql(u8, keys[i], keys[end])) : (end += 1) {}
-                const full = if (self.parent.prefix.len == 0) keys[i] else try std.mem.concat(alloc, u8, &.{ self.parent.prefix, keys[i] });
+                const full = if (self.parent.prefix.len == 0) keys[i] else try std.mem.concat(temporary, u8, &.{ self.parent.prefix, keys[i] });
                 if (self.parent.pending_tree.getEntryFor(full).node) |node| {
-                    if (self.parent.pending.items[pendingNode(node).ordinal].value) |value| @memset(values[i..end], try alloc.dupe(u8, value));
+                    if (self.parent.pending.items[pendingNode(node).ordinal].value) |value| {
+                        if (buffers) |out| {
+                            for (out[i..end], values[i..end]) |buffer, *result| {
+                                if (value.len > buffer.len) return error.BufferTooSmall;
+                                @memcpy(buffer[0..value.len], value);
+                                result.* = buffer[0..value.len];
+                            }
+                        } else @memset(values[i..end], try alloc.dupe(u8, value));
+                    }
                 } else {
                     pending_keys[count] = full;
                     positions[count] = i;
+                    if (pending_buffers) |out| out[count] = buffers.?[i];
                     count += 1;
                 }
                 i = end;
             }
             if (count == 0) return;
-            try (try self.parent.readFile()).getDocumentsAtCheckpointAlloc(alloc, self.parent.checkpoint, pending_keys[0..count], loaded[0..count]);
+            try (try self.parent.readFile()).getDocumentsAtCheckpointWithScratch(alloc, temporary, self.parent.checkpoint, pending_keys[0..count], if (pending_buffers) |out| out[0..count] else null, loaded[0..count]);
             for (loaded[0..count], positions[0..count]) |value, position| {
                 var end = position + 1;
                 while (end < keys.len and std.mem.eql(u8, keys[position], keys[end])) : (end += 1) {}
-                @memset(values[position..end], value);
+                if (buffers) |out| {
+                    if (value) |bytes| for (position..end) |index| {
+                        if (bytes.len > out[index].len) return error.BufferTooSmall;
+                        if (index != position) @memcpy(out[index][0..bytes.len], bytes);
+                        values[index] = out[index][0..bytes.len];
+                    };
+                } else @memset(values[position..end], value);
             }
         }
 
         /// Invalidates all previously returned values, retaining bounded scratch.
         pub fn reset(self: *@This()) void {
             self.scratch.reset();
+            self.batch_scratch.reset();
         }
 
         pub fn close(self: *@This()) void {
             self.scratch.deinit();
+            self.batch_scratch.deinit();
             self.* = undefined;
         }
     };
@@ -2736,7 +2875,7 @@ pub const Txn = struct {
     /// Erased adapters retain the parent automatically. Scope results are
     /// owned copies, so subsequent pending mutations cannot invalidate them.
     pub fn openReadScope(self: *Txn, allocator: Allocator) !ReadScope {
-        return .{ .parent = self, .scratch = read_scratch.init(allocator, 256 * 1024) };
+        return .{ .parent = self, .scratch = read_scratch.init(allocator, 256 * 1024), .batch_scratch = read_scratch.init(allocator, 256 * 1024) };
     }
 
     pub fn get(self: *Txn, key: []const u8) ![]const u8 {
@@ -2929,7 +3068,8 @@ pub const Txn = struct {
         return (try self.readFile()).copyIndexValueTo(value, destination, self.checkpoint);
     }
 
-    fn readFile(self: *Txn) !*native.NativeFile {
+    /// The pinned descriptor is authoritative even after inode adoption.
+    pub fn readFile(self: *Txn) !*native.NativeFile {
         if (self.read_generation) |generation| return &generation.file;
         const store = self.store orelse return error.InvalidTransactionState;
         return &store.file;
@@ -4705,6 +4845,8 @@ test "lite replay cleanup avoids external values and propagates allocation error
     const path = try testPath(a, tmp, "replay-key-only.aflite");
     defer a.free(path);
     var store = try Store.createWithOptions(budget.allocator(), path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = std.testing.io });
+    // Allocation ceilings describe foreground work, independently of retirement.
+    store.maintenance_start_suppressed = true;
     defer store.close();
     store.file.page_cache_enabled.store(false, .monotonic);
     const value = try a.alloc(u8, 4 * 1024 * 1024);
@@ -4864,6 +5006,8 @@ test "lite replay readers propagate allocation errors before and after callbacks
         const path = try testPath(a, tmp, "replay-read-errors.aflite");
         defer a.free(path);
         var store = try Store.createWithOptions(budget.allocator(), path, .{ .no_sync = true, .io = std.testing.io });
+        // Allocation ceilings describe foreground work, independently of retirement.
+        store.maintenance_start_suppressed = true;
         defer store.close();
         const large = try a.alloc(u8, 4 * 1024 * 1024);
         defer a.free(large);
@@ -4986,6 +5130,8 @@ test "lite transaction snapshot cache shares hits misses and sorted duplicate re
         const path = try testPath(a, tmp, "snapshot-read-cache.aflite");
         defer a.free(path);
         var store = try Store.createWithOptions(budget.allocator(), path, .{ .no_sync = true, .io = std.testing.io });
+        // Allocation ceilings describe foreground work, independently of retirement.
+        store.maintenance_start_suppressed = true;
         defer store.close();
         const value = try a.alloc(u8, 256 * 1024);
         defer a.free(value);
@@ -5135,6 +5281,8 @@ test "lite pending overwrites retain only borrowed versions" {
     defer a.free(path);
     var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
     var store = try Store.createWithOptions(budget.allocator(), path, .{ .no_sync = true, .io = std.testing.io });
+    // Allocation ceilings describe foreground work, independently of retirement.
+    store.maintenance_start_suppressed = true;
     defer store.close();
     const value = try a.alloc(u8, 256 * 1024);
     defer a.free(value);
@@ -5296,6 +5444,33 @@ test "lite scoped reads release values without growing parent point reads" {
     try std.testing.expect(budget.peak < 256 * 1024);
 }
 
+test "lite scoped batch buffers preserve external values after reset and close" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "scoped-batch-external.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    const payload = try a.alloc(u8, 65536);
+    defer a.free(payload);
+    for (payload, 0..) |*byte, i| byte.* = @truncate(i *% 13);
+    try store.file.putDocument("doc", payload);
+    var txn = try backend_erased.readTxnFrom(a, try store.beginRead());
+    var scope = try txn.openReadScope(a);
+    txn.abort();
+    const output = try a.alloc(u8, payload.len * 2);
+    defer a.free(output);
+    const buffers: []const []u8 = &.{ output[0..payload.len], output[payload.len..], &.{} };
+    var values: [3]?[]const u8 = undefined;
+    try scope.getManySortedInto(&.{ "doc", "doc", "missing" }, buffers, &values);
+    try scope.reset();
+    scope.close();
+    try std.testing.expectEqualSlices(u8, payload, values[0].?);
+    try std.testing.expectEqualSlices(u8, payload, values[1].?);
+    try std.testing.expect(values[2] == null);
+}
+
 test "lite scoped write reads preserve copied values across pending mutations" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5350,7 +5525,8 @@ test "lite scoped sorted reads reset scratch and preserve duplicates overlays an
     defer txn.abort();
     try txn.put("a", "pending");
     try txn.delete("b");
-    var scope = try txn.openReadScope(a);
+    var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    var scope = try txn.openReadScope(budget.allocator());
     defer scope.close();
     const keys: []const []const u8 = &.{ "a", "a", "b", "c", "d", "d" };
     var values: [6]?[]const u8 = undefined;
@@ -5366,6 +5542,29 @@ test "lite scoped sorted reads reset scratch and preserve duplicates overlays an
         try std.testing.expect(scope.scratch.arena.queryCapacity() <= 256 * 1024);
         try std.testing.expectEqual(@as(u32, 0), txn.snapshot_reads.count());
     }
+    var result_buffers: [6][16]u8 = undefined;
+    var buffers: [6][]u8 = undefined;
+    for (&result_buffers, &buffers) |*buffer, *out| out.* = buffer;
+    try scope.getManySortedInto(keys, &buffers, &values);
+    scope.reset();
+    const before = budget.alloc_calls;
+    for (0..100) |_| {
+        try scope.getManySortedInto(keys, &buffers, &values);
+        try std.testing.expectEqualStrings("pending", values[0].?);
+        try std.testing.expectEqualStrings("pending", values[1].?);
+        try std.testing.expect(values[2] == null and values[3] == null);
+        try std.testing.expectEqualStrings("disk-d", values[4].?);
+        try std.testing.expectEqualStrings("disk-d", values[5].?);
+        for (values, buffers) |value, buffer| if (value) |bytes| try std.testing.expectEqual(buffer.ptr, bytes.ptr);
+        scope.reset();
+        try std.testing.expectEqualStrings("disk-d", values[4].?);
+    }
+    try std.testing.expectEqual(before, budget.alloc_calls);
+    std.debug.print("LITE_BATCH_REUSE batches=100 new_allocations={d} retained_bytes={d}\n", .{ budget.alloc_calls - before, budget.live });
+    buffers[5] = buffers[5][0..1];
+    try std.testing.expectError(error.BufferTooSmall, scope.getManySortedInto(keys, &buffers, &values));
+    for (values) |value| try std.testing.expect(value == null);
+    buffers[5] = &result_buffers[5];
     var out: [16]u8 = undefined;
     try std.testing.expectEqualStrings("pending", try scope.getInto("a", &out));
     try std.testing.expectError(error.BufferTooSmall, scope.getInto("a", out[0..1]));
@@ -5506,4 +5705,196 @@ test "lite reclamation workspace subtracts artifact storage and future disk clai
         defer workspace.deinit();
         try std.testing.expectEqual(probe.available_bytes, workspace.options.max_storage_bytes);
     }
+}
+
+test "lite reader admission and release proceed while commit fsync is blocked" {
+    const Hook = struct {
+        var owner: ?*Store = null;
+        var entered: std.Io.Event = .unset;
+        var release: std.Io.Event = .unset;
+        var readers_done: std.Io.Event = .unset;
+        fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            if (owner) |store| if (file.handle == store.file.file.handle) {
+                entered.set(std.testing.io);
+                release.waitUncancelable(std.testing.io);
+            };
+            return std.testing.io.vtable.fileSync(userdata, file);
+        }
+        fn write(store: *Store) !void {
+            var txn = try store.beginWrite();
+            var committed = false;
+            defer if (!committed) txn.abort();
+            try txn.put("key", "new");
+            try txn.commit();
+            committed = true;
+        }
+        fn read(store: *Store) !void {
+            defer readers_done.set(std.testing.io);
+            for (0..128) |_| {
+                var txn = try store.beginRead();
+                defer txn.abort();
+                try std.testing.expectEqualStrings("old", try txn.get("key"));
+            }
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "reader-admission-fsync.aflite");
+    defer a.free(path);
+    var vtable = std.testing.io.vtable.*;
+    vtable.fileSync = Hook.sync;
+    const io = std.Io{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    var store = try Store.createWithOptions(a, path, .{ .io = io, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    var initial = try store.beginWrite();
+    try initial.put("key", "old");
+    try initial.commit();
+    var pinned = try store.beginRead();
+    defer pinned.abort();
+    Hook.entered.reset();
+    Hook.release.reset();
+    Hook.readers_done.reset();
+    Hook.owner = &store;
+    defer Hook.owner = null;
+    var writer = try std.testing.io.concurrent(Hook.write, .{&store});
+    defer {
+        Hook.release.set(std.testing.io);
+        writer.await(std.testing.io) catch {};
+    }
+    try Hook.entered.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    var readers = try std.testing.io.concurrent(Hook.read, .{&store});
+    const progress = Hook.readers_done.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } });
+    Hook.release.set(std.testing.io);
+    try readers.await(std.testing.io);
+    try writer.await(std.testing.io);
+    std.debug.print("lite reader probe: 128 readers completed during blocked sync = {any}\n", .{if (progress) |_| true else |_| false});
+    try progress;
+    var fresh = try store.beginRead();
+    defer fresh.abort();
+    try std.testing.expectEqualStrings("new", try fresh.get("key"));
+    try std.testing.expectEqualStrings("old", try pinned.get("key"));
+}
+
+test "lite prepared admission expires idle cached sources but preserves active uses" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "admission-cached-live.aflite");
+    defer a.free(path);
+    const staged_path = try testPath(a, tmp, "admission-cached-prepared.aflite");
+    defer a.free(staged_path);
+    const options: CreateOptions = .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } };
+    var live = try Store.createWithOptions(a, path, options);
+    defer live.close();
+    live.maintenance_start_suppressed = true;
+    var staged = try Store.createWithOptions(a, staged_path, options);
+    defer staged.close();
+    staged.maintenance_start_suppressed = true;
+    try live.file.putIndexCatalogRecord("run", "unchanged");
+    var source = try live.openArtifactSource("run");
+    defer source.close();
+    try std.testing.expect(source.acquireUse());
+    var active = true;
+    defer if (active) source.releaseUse();
+    source.enableIdleExpiry();
+    const old_bytes = (try live.file.file.stat(std.testing.io)).size;
+    const prepared_bytes = (try staged.file.file.stat(std.testing.io)).size;
+    const reserve = try staged.file.retirementReserveBytes();
+    live.maintenance_policy.options.max_storage_bytes = prepared_bytes + @max(old_bytes, reserve);
+    // Match the production adoption lock order; new source opens cannot enter
+    // between expiry and the final retained-inode accounting decision.
+    live.generation_lock.lockUncancelable(std.testing.io);
+    defer live.generation_lock.unlock(std.testing.io);
+    lockStore(&live);
+    defer live.mutex.unlock();
+    try std.testing.expectError(error.LiteStorageBudgetExceeded, live.admitPreparedGenerationAssumeLocked(&staged.file, old_bytes));
+    var bytes: [9]u8 = undefined;
+    try source.readInto(0, &bytes);
+    try std.testing.expectEqualStrings("unchanged", &bytes);
+    source.releaseUse();
+    active = false;
+    try live.admitPreparedGenerationAssumeLocked(&staged.file, old_bytes);
+    try std.testing.expect(!source.acquireUse());
+    try std.testing.expectEqual(@as(u64, 0), live.totalRetiredFileBytes());
+}
+
+test "lite cached source teardown and retirement progress while publication is blocked" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "source-close-retirement.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    try store.file.putIndexCatalogRecord("run", "unchanged");
+    var source = try store.openArtifactSource("run");
+    var source_open = true;
+    defer if (source_open) source.close();
+    try std.testing.expect(source.acquireUse());
+    source.enableIdleExpiry();
+    source.releaseUse();
+    const registry = store.artifact_registry.?;
+    const old_bytes = (try store.file.file.stat(io)).size;
+    const Worker = struct {
+        fn close(owned: *@import("../../segment_source.zig").Source) void {
+            owned.close();
+        }
+    };
+    lockStore(&store);
+    var locked = true;
+    defer if (locked) store.mutex.unlock();
+    const thread = try std.Thread.spawn(.{}, Worker.close, .{&source});
+    source_open = false;
+    defer thread.join();
+    // The final source release is queued behind the owner mutex. Retiring the
+    // same source must progress without waiting for that publication callback.
+    const deadline = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(5));
+    var callback_started = false;
+    while (!callback_started and std.Io.Clock.awake.now(io).nanoseconds < deadline.nanoseconds) {
+        registry.mutex.lockUncancelable(io);
+        callback_started = registry.callbacks != 0;
+        registry.mutex.unlock(io);
+        if (!callback_started) io.sleep(.fromMilliseconds(1), .awake) catch {};
+    }
+    if (callback_started) {
+        registry.expireIdle(store.assessment_generation);
+        registry.retire(store.assessment_generation, old_bytes, false);
+    }
+    store.mutex.unlock();
+    locked = false;
+    try std.testing.expect(callback_started);
+    try std.testing.expectEqual(@as(u64, 0), registry.retired_bytes.load(.acquire));
+}
+
+test "lite budget allocator accounts concurrent allocation resize and cleanup" {
+    const a = std.testing.allocator;
+    var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const Worker = struct {
+        fn run(allocator: Allocator) anyerror!void {
+            for (0..1024) |i| {
+                var bytes = try allocator.alloc(u8, 256);
+                defer allocator.free(bytes);
+                @memset(bytes, 17);
+                bytes = try allocator.realloc(bytes, 64 + i % 128);
+                try std.testing.expectEqual(@as(u8, 17), bytes[0]);
+            }
+        }
+    };
+    var workers: [4]std.Io.Future(anyerror!void) = undefined;
+    var started: usize = 0;
+    defer for (workers[0..started]) |*worker| {
+        worker.await(std.testing.io) catch {};
+    };
+    for (&workers) |*worker| {
+        worker.* = try std.testing.io.concurrent(Worker.run, .{budget.allocator()});
+        started += 1;
+    }
+    for (&workers) |*worker| try worker.await(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    try std.testing.expect(budget.peak > 0);
+    try std.testing.expect(budget.alloc_calls >= 4 * 1024);
 }

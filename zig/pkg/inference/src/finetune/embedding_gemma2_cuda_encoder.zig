@@ -18,7 +18,7 @@ const session_mod = @import("embedding_gemma2_cuda_session.zig");
 const tape_mod = @import("embedding_gemma2_cuda_tape.zig");
 const projection = @import("embedding_gemma2_cuda_projection.zig");
 const attention = @import("embedding_gemma2_cuda_attention.zig");
-const arch = @import("../architectures/embedding_gemma2.zig");
+const arch = @import("../architectures/embedding_gemma2_reference.zig");
 
 const CudaCompute = cuda_compute.CudaCompute;
 const DeviceBuffer = buffer_mod.DeviceBuffer;

@@ -56,6 +56,29 @@ Third-party dependencies retain their own licenses.
 A downloaded package has no dependency on a monorepo checkout. Development
 checkouts can use the same package entry point under `zig/pkg/antfly-embedded`.
 
+## Graph metric maintenance
+
+Active writable native databases automatically maintain configured graph metrics in
+bounded background ticks. Background metrics refresh after graph updates;
+manual metrics build after refresh or rebuild requests. Queued work resumes on
+reopen. The default combined runtime uses a fresh incarnation identity and a
+durable ownership lease. Read-only, standby, and hidden restore owners retain
+their existing background-worker gates. Databases without configured metrics
+do not start a graph metric worker or acquire its lease. Adding the first
+metric starts maintenance; removing the last metric parks the worker and
+releases its lease.
+
+Callers that drive graph maintenance themselves can open with
+`.graph_metric_maintenance = .{ .start_background_loop = false }`. The existing
+`start_index_workers`, `start_optional_runtimes`, and
+`start_optional_runtime_workers` controls also apply. Explicit coordinator and
+worker configurations retain their supplied identities and budgets. Tuning
+maintenance intervals or budgets preserves automatic identity and lease defaults;
+explicit `automatic_identity = false` and `lease_owned = false` remain available
+for external drivers. Unspecified clocks inherit the backend clock. Borrowed
+scheduler owners must call `DB.beginTeardown()` before draining their tasks,
+then close the database after the drain.
+
 ## Source organization
 
 The implementation lives directly under `src/`: `storage/` contains the local
@@ -65,3 +88,11 @@ implementations share this Apache owner. `src/root.zig` and the configured
 `src/engine/` modules expose the public Zig API; `src/source_catalog.zig` is an
 internal bridge for server consumers. See the [ownership design](../../../docs/design/embedded-source-ownership.md)
 for the embedded/server boundary.
+
+SQL JSON requests through the C API are limited to 64 MiB including statement
+text and parameters. Exceeding this limit returns a JSON SQLSTATE `54000`
+diagnostic naming the 67108864-byte limit. Preparation and execution each have
+a separate 64 MiB memory budget; the default transaction intent budget is
+128 MiB. Relational rows are limited to 16 MiB and persisted index keys to
+1 MiB. See [SQL resource limits](src/sql/COMPILER_SUPPORT.md) for accounting
+and native configuration details.

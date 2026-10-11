@@ -270,9 +270,17 @@ pub const PersistentObjectRangeCacheStats = struct {
     temporary_files_removed: usize = 0,
     writes_completed: usize = 0,
     write_errors: usize = 0,
+    /// Static error name; safe to expose after the worker/request is gone.
+    last_write_error: ?[]const u8 = null,
     writes_coalesced: usize = 0,
     writes_dropped: usize = 0,
     dropped_bytes: usize = 0,
+    drops_policy: usize = 0,
+    drops_queue: usize = 0,
+    drops_memory: usize = 0,
+    drops_capacity: usize = 0,
+    drops_allocation: usize = 0,
+    drops_closing: usize = 0,
     queued_bytes: usize = 0,
     queued_entries: usize = 0,
 };
@@ -282,6 +290,8 @@ pub const PersistentObjectRangeCacheEnqueueResult = enum {
     coalesced,
     dropped,
 };
+
+const CacheDropReason = enum { policy, queue, memory, capacity, allocation, closing };
 
 pub const PersistentObjectRangeCacheResources = struct {
     /// Called without the disk-cache mutex when eviction is blocked by pins.
@@ -743,27 +753,27 @@ const PersistentObjectRangeCacheState = struct {
         bytes: []const u8,
     ) PersistentObjectRangeCacheEnqueueResult {
         const disk_bytes = persistentObjectRangeEncodedLen(cache_key.len, bytes.len) orelse
-            return self.recordDropped(bytes.len);
+            return self.recordDropped(bytes.len, .policy);
         if (cache_key.len > self.policy.max_cache_key_bytes or disk_bytes > self.policy.max_total_bytes) {
-            return self.recordDropped(bytes.len);
+            return self.recordDropped(bytes.len, .policy);
         }
         const memory_bytes = std.math.add(usize, cache_key.len, bytes.len) catch
-            return self.recordDropped(bytes.len);
+            return self.recordDropped(bytes.len, .policy);
         var memory_reservation: ?resource_manager_mod.Reservation = if (self.resource_manager) |manager|
             manager.reserve(.lake_range_cache_queue, @intCast(memory_bytes)) catch
-                return self.recordDropped(bytes.len)
+                return self.recordDropped(bytes.len, .memory)
         else
             null;
 
         const owned_key = self.alloc.dupe(u8, cache_key) catch {
             releaseMemoryReservation(&memory_reservation);
-            return self.recordDropped(bytes.len);
+            return self.recordDropped(bytes.len, .allocation);
         };
 
         const io = self.io;
         self.mutex.lockUncancelable(io);
         if (self.closing) {
-            _ = self.recordDroppedLocked(bytes.len);
+            _ = self.recordDroppedLocked(bytes.len, .closing);
             self.mutex.unlock(io);
             self.alloc.free(owned_key);
             releaseMemoryReservation(&memory_reservation);
@@ -780,7 +790,7 @@ const PersistentObjectRangeCacheState = struct {
             memory_bytes > self.policy.max_write_queue_bytes or
             self.pending_bytes > self.policy.max_write_queue_bytes - memory_bytes)
         {
-            _ = self.recordDroppedLocked(bytes.len);
+            _ = self.recordDroppedLocked(bytes.len, .queue);
             self.mutex.unlock(io);
             self.alloc.free(owned_key);
             releaseMemoryReservation(&memory_reservation);
@@ -788,7 +798,7 @@ const PersistentObjectRangeCacheState = struct {
         }
 
         self.pending.put(self.alloc, owned_key, {}) catch {
-            _ = self.recordDroppedLocked(bytes.len);
+            _ = self.recordDroppedLocked(bytes.len, .allocation);
             self.mutex.unlock(io);
             self.alloc.free(owned_key);
             releaseMemoryReservation(&memory_reservation);
@@ -808,7 +818,7 @@ const PersistentObjectRangeCacheState = struct {
             _ = self.pending.remove(owned_key);
             decrementSaturating(&self.pending_bytes, memory_bytes);
             decrementSaturating(&self.pending_count, 1);
-            _ = self.recordDroppedLocked(bytes.len);
+            _ = self.recordDroppedLocked(bytes.len, .allocation);
             self.condition.broadcast(io);
             self.mutex.unlock(io);
             self.alloc.free(owned_key);
@@ -841,23 +851,26 @@ const PersistentObjectRangeCacheState = struct {
         _ = self.pending.remove(owned_key);
         decrementSaturating(&self.pending_bytes, memory_bytes);
         decrementSaturating(&self.pending_count, 1);
-        _ = self.recordDroppedLocked(payload_bytes);
+        _ = self.recordDroppedLocked(payload_bytes, .allocation);
         self.condition.broadcast(io);
         self.mutex.unlock(io);
         self.alloc.free(owned_key);
         releaseMemoryReservation(memory_reservation);
     }
 
-    fn recordDropped(self: *PersistentObjectRangeCacheState, byte_len: usize) PersistentObjectRangeCacheEnqueueResult {
+    fn recordDropped(self: *PersistentObjectRangeCacheState, byte_len: usize, reason: CacheDropReason) PersistentObjectRangeCacheEnqueueResult {
         const io = self.io;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        return self.recordDroppedLocked(byte_len);
+        return self.recordDroppedLocked(byte_len, reason);
     }
 
-    fn recordDroppedLocked(self: *PersistentObjectRangeCacheState, byte_len: usize) PersistentObjectRangeCacheEnqueueResult {
+    fn recordDroppedLocked(self: *PersistentObjectRangeCacheState, byte_len: usize, reason: CacheDropReason) PersistentObjectRangeCacheEnqueueResult {
         self.stats.writes_dropped += 1;
         self.stats.dropped_bytes +|= byte_len;
+        switch (reason) {
+            inline else => |tag| @field(self.stats, "drops_" ++ @tagName(tag)) +|= 1,
+        }
         return .dropped;
     }
 
@@ -1013,9 +1026,10 @@ const PersistentObjectRangeCacheState = struct {
         const manager = self.resource_manager orelse return null;
         const source = manager.capacitySource() orelse return null;
         const observation = try source.current();
-        const timestamp_ns = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
-        const now_ns: u64 = std.math.cast(u64, timestamp_ns) orelse
-            if (timestamp_ns < 0) 0 else std.math.maxInt(u64);
+        // Capacity sources timestamp observations in the native process clock.
+        // Io awake has a different origin on Darwin (UPTIME_RAW), so comparing
+        // it with CLOCK_MONOTONIC can reject every freshly observed write.
+        const now_ns = @import("antfly_platform").time.monotonicNs();
         return manager.reserveCapacity(
             self.alloc,
             source.domain_id,
@@ -1121,7 +1135,11 @@ fn persistentObjectRangeWorkerMain(state: *PersistentObjectRangeCacheState) void
         }
         state.mutex.unlock(io);
 
-        const outcome = state.writeQueued(task) catch null;
+        var write_error: ?[]const u8 = null;
+        const outcome = state.writeQueued(task) catch |err| failure: {
+            write_error = @errorName(err);
+            break :failure null;
+        };
         state.mutex.lockUncancelable(io);
         _ = state.pending.remove(task.cache_key);
         decrementSaturating(&state.pending_bytes, task.memory_bytes);
@@ -1129,11 +1147,11 @@ fn persistentObjectRangeWorkerMain(state: *PersistentObjectRangeCacheState) void
         if (outcome) |result| switch (result) {
             .written, .already_present => state.stats.writes_completed += 1,
             .capacity_unavailable => {
-                state.stats.writes_dropped += 1;
-                state.stats.dropped_bytes +|= task.bytes.len;
+                _ = state.recordDroppedLocked(task.bytes.len, .capacity);
             },
         } else {
             state.stats.write_errors += 1;
+            state.stats.last_write_error = write_error;
         }
         state.condition.broadcast(io);
         state.mutex.unlock(io);
@@ -6702,11 +6720,79 @@ test "lake persistent object range cache bounds write-behind admission" {
     const stats = persistent.statsSnapshot();
     try std.testing.expectEqual(@as(usize, 1), stats.writes_dropped);
     try std.testing.expectEqual(@as(usize, 7), stats.dropped_bytes);
+    try std.testing.expectEqual(@as(usize, 1), stats.drops_queue);
+    try std.testing.expectEqual(@as(usize, 0), stats.drops_policy);
     try std.testing.expectEqual(@as(usize, 0), stats.queued_entries);
     try std.testing.expect((try persistent.readAlloc(alloc, "long", 1)) == null);
     try std.testing.expectEqual(@as(usize, 1), persistent.statsSnapshot().read_misses);
 }
 
+test "lake persistent cache admits native-clock capacity with an offset Io awake clock" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const native_io = io_impl.io();
+    var shifted_vtable = native_io.vtable.*;
+    const Clock = struct {
+        fn now(_: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
+            if (clock == .awake) return .{ .nanoseconds = 1 };
+            return std.testing.io.vtable.now(std.testing.io.userdata, clock);
+        }
+        fn observe(_: *anyopaque) !resource_manager_mod.CapacityObservation {
+            return .{ .available_bytes = 1024 * 1024 * 1024 * 1024, .capacity_bytes = 1024 * 1024 * 1024 * 1024, .observed_at_ns = @import("antfly_platform").time.monotonicNs(), .valid_for_ns = 5 * std.time.ns_per_s };
+        }
+    };
+    shifted_vtable.now = Clock.now;
+    const io: std.Io = .{ .userdata = native_io.userdata, .vtable = &shifted_vtable };
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var tag: u8 = 0;
+    try manager.installCapacitySource(.{ .ptr = &tag, .domain_id = 7, .observe = Clock.observe });
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/clock-cache", .{tmp.sub_path});
+    defer a.free(root);
+    {
+        var cache = try PersistentObjectRangeCache.initWithPolicyAndResources(io, root, .{}, .{ .resource_manager = &manager });
+        defer cache.deinit();
+        try std.testing.expectEqual(.enqueued, cache.enqueueWrite("key", "data"));
+        cache.flush();
+        try std.testing.expectEqual(@as(usize, 1), cache.statsSnapshot().writes_completed);
+        try std.testing.expectEqual(@as(usize, 0), cache.statsSnapshot().writes_dropped);
+    }
+    var restarted = try PersistentObjectRangeCache.init(io, root);
+    defer restarted.deinit();
+    const bytes = (try restarted.readAlloc(a, "key", 4)).?;
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("data", bytes);
+    try std.testing.expectEqual(@as(usize, 1), restarted.statsSnapshot().read_hits);
+}
+
+test "lake persistent object range cache retains asynchronous write error reasons" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/writes", .{tmp.sub_path});
+    defer a.free(root);
+    const moved = try std.fmt.allocPrint(a, "{s}-moved", .{root});
+    defer a.free(moved);
+    var disk = try PersistentObjectRangeCache.init(io, root);
+    defer disk.deinit();
+    // Move only this test's private cache directory. The worker still owns
+    // its lock but the configured write destination no longer exists.
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), root, std.Io.Dir.cwd(), moved, io);
+    try std.testing.expectEqual(PersistentObjectRangeCacheEnqueueResult.enqueued, disk.enqueueWrite("key", "data"));
+    disk.flush();
+    const stats = disk.statsSnapshot();
+    try std.testing.expectEqual(@as(usize, 1), stats.write_errors);
+    try std.testing.expectEqualStrings("FileNotFound", stats.last_write_error.?);
+    try std.testing.expectEqual(@as(usize, 0), stats.writes_dropped);
+    try std.testing.expectEqual(@as(usize, 0), stats.queued_entries);
+}
 test "lake persistent object range cache evicts least recently used entries within disk ceilings" {
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
@@ -9925,6 +10011,124 @@ test "lake persistent cache holds one root owner until shutdown" {
     const bytes = (try successor.readAlloc(a, "key", 5)).?;
     defer a.free(bytes);
     try std.testing.expectEqualStrings("bytes", bytes);
+}
+
+test "external lake projected pages reuse header payload and survive restart without provider reads" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/projected-restart", .{tmp.sub_path});
+    defer a.free(root);
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+    for (0..4) |_| try appendPlainI64DataPage(&bytes, a, &.{ 10, 20 });
+    const amount_end = bytes.items.len;
+    // Unselected body data must never be pulled into the projected read.
+    try bytes.appendNTimes(a, 'x', 512 * 1024);
+    const storage = @import("../../storage/object_storage.zig");
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var put = try client.putObject("bucket", "data", bytes.items, .{});
+    defer put.deinit(a);
+    const Provider = struct {
+        base: storage.ObjectStorage,
+        calls: usize = 0,
+        bytes: usize = 0,
+        fail: bool = false,
+        vtable: storage.ObjectStorage.VTable,
+        fn get(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.fail) return error.ProviderUnavailable;
+            var base = self.base;
+            base.allocator = alloc;
+            const result = try base.getObject(bucket, key, options);
+            self.bytes += result.body.len;
+            return result;
+        }
+    };
+    var provider: Provider = .{ .base = client, .vtable = client.vtable.* };
+    provider.vtable.get_object = Provider.get;
+    const base = @import("lake_object_reader.zig").ObjectStorageRangeReader.init(.{ .allocator = a, .ptr = &provider, .vtable = &provider.vtable });
+    var chunks = [_]external_source.ColumnChunk{
+        .{ .column_id = @constCast("amount"), .file_offset = 0, .compressed_len = amount_end, .uncompressed_len = amount_end, .physical_type = @constCast("int64"), .encoding = @constCast("plain") },
+        .{ .column_id = @constCast("body"), .file_offset = amount_end, .compressed_len = bytes.items.len - amount_end, .uncompressed_len = bytes.items.len - amount_end, .physical_type = @constCast("byte_array"), .encoding = @constCast("plain") },
+    };
+    var groups = [_]external_source.RowGroup{.{ .ordinal = 0, .row_count = 8, .file_offset = 0, .total_byte_len = bytes.items.len, .column_chunks = &chunks }};
+    var files = [_]external_source.FileEntry{.{ .file_id = @constCast("data"), .object_uri = @constCast("s3://bucket/data"), .etag = put.etag.?, .byte_len = bytes.items.len, .row_count = 8, .row_groups = &groups }};
+    const inventory: external_source.Inventory = .{ .format = .parquet, .source_id = @constCast("events"), .source_uri = @constCast("s3://bucket"), .snapshot_id = @constCast("v1"), .schema_fingerprint = @constCast("v1"), .files = &files };
+    const shared = @import("lake_serving_cache.zig");
+    for (0..2) |restart| {
+        var cache = shared.Cache.init(a);
+        defer cache.deinit();
+        try cache.ensurePersistent(io, root, .{}, .{});
+        var reader: shared.Reader = .{ .cache = &cache, .base = base, .scope = @splat(0), .context = .{ .io = io } };
+        var cursor = try @import("lake_parquet_cursor.zig").Cursor.init(a, reader.reader(), inventory, "data", 0, &.{"amount"}, .{});
+        defer cursor.deinit();
+        var rows: usize = 0;
+        while (try cursor.next()) |batch| {
+            for (0..batch.rowCount()) |index| {
+                try std.testing.expectEqual(@as(i64, if (rows % 2 == 0) 10 else 20), try batch.columns[0].integerAt(index));
+                rows += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 8), rows);
+        try std.testing.expectEqual(@as(usize, 4), provider.calls);
+        try std.testing.expect(provider.bytes < 4 * amount_end);
+        try std.testing.expect(provider.bytes < 512 * 1024);
+        if (restart == 0) {
+            try std.testing.expectEqual(@as(u64, 4), cache.snapshot().provider_reads);
+        } else {
+            try std.testing.expectEqual(@as(u64, 0), cache.snapshot().provider_reads);
+            try std.testing.expectEqual(@as(u64, 4), cache.snapshot().disk_hits);
+        }
+        provider.fail = true;
+    }
+}
+
+test "lake persistent cache exposes publication failures and recovers the write worker" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    const native_io = threaded.io();
+    const Fault = struct {
+        var fail: std.atomic.Value(bool) = .init(true);
+        var original: @TypeOf(std.testing.io.vtable.dirRename) = undefined;
+        fn rename(raw: ?*anyopaque, old_dir: std.Io.Dir, old_path: []const u8, new_dir: std.Io.Dir, new_path: []const u8) std.Io.Dir.RenameError!void {
+            if (fail.load(.acquire)) return error.AccessDenied;
+            return original(raw, old_dir, old_path, new_dir, new_path);
+        }
+    };
+    Fault.fail.store(true, .release);
+    Fault.original = native_io.vtable.dirRename;
+    var vtable = native_io.vtable.*;
+    vtable.dirRename = Fault.rename;
+    const io: std.Io = .{ .userdata = native_io.userdata, .vtable = &vtable };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/write-failure", .{tmp.sub_path});
+    defer a.free(root);
+    var disk = try PersistentObjectRangeCache.init(io, root);
+    defer disk.deinit();
+    try std.testing.expectEqual(.enqueued, disk.enqueueWrite("key", "data"));
+    disk.flush();
+    const failed = disk.statsSnapshot();
+    try std.testing.expectEqual(@as(usize, 1), failed.write_errors);
+    try std.testing.expectEqualStrings("AccessDenied", failed.last_write_error.?);
+    try std.testing.expectEqual(@as(usize, 0), failed.queued_entries);
+    try std.testing.expectEqual(@as(usize, 0), failed.entries);
+    Fault.fail.store(false, .release);
+    try std.testing.expectEqual(.enqueued, disk.enqueueWrite("key", "data"));
+    disk.flush();
+    try std.testing.expectEqual(@as(usize, 1), disk.statsSnapshot().writes_completed);
+    const restored = (try disk.readAlloc(a, "key", 4)).?;
+    defer a.free(restored);
+    try std.testing.expectEqualStrings("data", restored);
 }
 
 test "lake persistent cache recovery preserves priority when capacity shrinks" {

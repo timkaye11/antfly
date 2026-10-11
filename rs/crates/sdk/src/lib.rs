@@ -691,6 +691,7 @@ pub fn antfly_embedder(model: impl Into<String>) -> types::IndexEmbedderConfig {
     types::IndexEmbedderConfig::AntflyEmbedderConfig(types::AntflyEmbedderConfig {
         api_url: None,
         model: model.into(),
+        model_identity: None,
         provider: types::AntflyEmbedderConfigProvider::Antfly,
         retrieval: None,
     })
@@ -767,6 +768,7 @@ impl Default for types::CreateGraphIndexRequest {
 impl Default for types::CreateAlgebraicIndexRequest {
     fn default() -> Self {
         Self {
+            aggregates: Vec::new(),
             derive_from_schema: None,
             description: None,
             enrichments: Vec::new(),
@@ -801,6 +803,59 @@ impl types::CreateIndexError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn relational_array_literal_round_trip() {
+        for identity in [
+            "text", "int16", "int32", "int64", "float32", "float64", "boolean", "uuid", "jsonb",
+            "numeric",
+        ] {
+            let source = serde_json::json!({
+                "op": "literal", "type": "sql_array", "sql_type": identity,
+                "value": {"dimensions": [{"length": 2, "lower_bound": -4}],
+                    "values": ["9007199254740993", null], "sql_nulls": [false, true]}
+            });
+            let expression: super::types::RelationalScalarExpression =
+                serde_json::from_value(source.clone()).unwrap();
+            let restored = serde_json::to_value(expression).unwrap();
+            assert_eq!(restored["type"], "sql_array");
+            assert_eq!(restored["sql_type"], identity);
+            assert_eq!(restored["value"], source["value"]);
+        }
+    }
+
+    #[test]
+    fn relational_numeric_cast_modifier_round_trip() {
+        let source = serde_json::json!({
+            "op": "cast", "type": "numeric", "sql_type": "numeric",
+            "numeric_modifier": {"precision": 2, "scale": -3},
+            "args": [{"op": "literal", "type": "numeric", "value": "99499"}]
+        });
+        let expression: super::types::RelationalScalarExpression =
+            serde_json::from_value(source.clone()).unwrap();
+        let restored = serde_json::to_value(expression).unwrap();
+        assert_eq!(restored["numeric_modifier"], source["numeric_modifier"]);
+        assert_eq!(restored["args"][0]["value"], "99499");
+        assert_eq!(restored["args"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn algebraic_index_aggregate_recipes_round_trip() {
+        let default = super::types::CreateAlgebraicIndexRequest::default();
+        assert!(default.aggregates.is_empty());
+
+        let recipe = serde_json::json!({
+            "name": "count_by_category",
+            "op": "count",
+            "group_by": ["category"]
+        });
+        let request: super::types::CreateAlgebraicIndexRequest = serde_json::from_value(
+            serde_json::json!({"type": "algebraic", "aggregates": [recipe.clone()]}),
+        )
+        .unwrap();
+        let encoded = serde_json::to_value(request).unwrap();
+        assert_eq!(encoded["aggregates"][0], recipe);
+    }
+
     #[test]
     fn graph_index_default_and_metric_configuration_round_trip() {
         let default = super::types::CreateGraphIndexRequest::default();

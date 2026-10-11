@@ -50,7 +50,7 @@ def _export_table(table, root):
     location = table.location().rstrip("/")
     directory = Path(unquote(urlparse(location).path))
     objects = root / "buckets" / "antfly" / "objects"
-    objects.mkdir(parents=True)
+    objects.mkdir(parents=True, exist_ok=True)
 
     def remote(value):
         if isinstance(value, str):
@@ -124,8 +124,8 @@ def test_real_iceberg_snapshots_schema_ids_partitions_deletes_and_restart(tmp_pa
         pytest.importorskip("fastavro")
         pytest.importorskip("pyarrow")
         pytest.importorskip("psycopg")
-    import pyarrow as pa
     import psycopg
+    import pyarrow as pa
     from pyiceberg.catalog.sql import SqlCatalog
     from pyiceberg.partitioning import PartitionField, PartitionSpec
     from pyiceberg.schema import Schema
@@ -267,6 +267,400 @@ def test_real_iceberg_snapshots_schema_ids_partitions_deletes_and_restart(tmp_pa
                 assert connection.execute(
                     "SELECT id, title FROM ice_events WHERE region = 'east' ORDER BY id"
                 ).fetchall() == [(4, "four"), (6, "six")]
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
+
+
+@pytest.mark.parametrize("source_format", ["parquet", "iceberg"])
+def test_indexed_metadata_conjunctions_preserve_sort_and_cursor_pages(
+    tmp_path, source_format
+):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    # Exceed the 64 native directory-block planning budget so completed broad
+    # memberships exercise lazy ordinal windows in both real source formats.
+    count = 70003
+    rows = pa.table(
+        {
+            "body": [
+                "common phrase" if i % 2 == 0 else "phrase common" for i in range(count)
+            ],
+            "category": ["story"] * 2 + ["comment"] * (count - 2),
+            "amount": range(count),
+            "sparse_native": ['{"1":1}'] * (count - 1) + ['{"1":1,"97":1}'],
+            "dense_native": ["[1,0]"] * count,
+            "label": ["other"] * (count - 3) + ["kept"] * 3,
+        }
+    )
+    root = tmp_path / source_format
+    if source_format == "iceberg":
+        pytest.importorskip("fastavro")
+        pytest.importorskip("pyiceberg")
+        from pyiceberg.catalog.sql import SqlCatalog
+        from pyiceberg.schema import Schema
+        from pyiceberg.types import LongType, NestedField, StringType
+
+        catalog = SqlCatalog(
+            "sort_pages",
+            uri=f"sqlite:///{tmp_path}/catalog.db",
+            warehouse=(tmp_path / "warehouse").as_uri(),
+        )
+        catalog.create_namespace("sort_pages")
+        table = catalog.create_table(
+            "sort_pages.items",
+            schema=Schema(
+                NestedField(1, "body", StringType(), required=False),
+                NestedField(2, "category", StringType(), required=False),
+                NestedField(3, "amount", LongType(), required=False),
+                NestedField(4, "label", StringType(), required=False),
+                NestedField(5, "sparse_native", StringType(), required=False),
+                NestedField(6, "dense_native", StringType(), required=False),
+            ),
+        )
+        table.append(rows)
+        _export_table(table, root)
+    else:
+        objects = root / "buckets" / "antfly" / "objects"
+        objects.mkdir(parents=True)
+        parquet = tmp_path / "items.parquet"
+        pq.write_table(rows, parquet, row_group_size=4096, compression="snappy")
+        payload = parquet.read_bytes()
+        (objects / "part.parquet").write_bytes(
+            b"AFOBJ001"
+            + struct.pack("<QI", len(payload), 0)
+            + hashlib.sha256(payload).hexdigest().encode()
+            + payload
+        )
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StandaloneAntflyServer(binary, "127.0.0.1", 0)
+    failed = True
+    try:
+
+        def call(method, path, body=None):
+            response = requests.request(
+                method,
+                server.api_url + path,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=60,
+            )
+            assert response.ok, response.text + "\n" + server.debug_logs()
+            value = response.json()
+            return value["responses"][0] if "responses" in value else value
+
+        call(
+            "POST",
+            "/tables/sort_pages",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "sort-pages",
+                        "format": source_format,
+                        "uri": root.as_uri(),
+                    },
+                    "relational_indexes": [
+                        {"name": "category_idx", "keys": [{"column": "category"}]},
+                        {"name": "amount_idx", "keys": [{"column": "amount"}]},
+                    ],
+                },
+                "indexes": {
+                    "body_text": {"type": "full_text", "field": "body"},
+                    "sparse_native": {
+                        "type": "embeddings",
+                        "external": True,
+                        "sparse": True,
+                    },
+                    "dense_native": {
+                        "type": "embeddings",
+                        "external": True,
+                        "dimension": 2,
+                    },
+                },
+            },
+        )
+        deadline = time.monotonic() + 300
+        while True:
+            resource = call("GET", "/tables/sort_pages/indexes/body_text")
+            sparse_resource = call("GET", "/tables/sort_pages/indexes/sparse_native")
+            dense_resource = call("GET", "/tables/sort_pages/indexes/dense_native")
+            if (
+                resource["status"]["readiness"]["queryable"]
+                and sparse_resource["status"]["readiness"]["queryable"]
+                and dense_resource["status"]["readiness"]["queryable"]
+            ):
+                break
+            assert time.monotonic() < deadline, str(resource) + server.debug_logs()
+            time.sleep(0.1)
+        category = {"term": {"path": "/category", "value": "comment"}}
+        predicates = [
+            {
+                "bool": {
+                    "filter": [
+                        category,
+                        {"range": {"path": "/amount", "gte": count - 3}},
+                    ]
+                }
+            },
+            {"conjuncts": [category, {"prefix": {"path": "/label", "value": "ke"}}]},
+        ]
+        expected = set(range(count - 3, count))
+        for restart in (False, True):
+            if restart:
+                server.restart()
+            # Positional verification composes with a Boolean scorer and
+            # indexed metadata candidate providers, including exclusions.
+            phrase_filter = {
+                "conjuncts": [
+                    category,
+                    {"range": {"path": "/amount", "gte": count - 5}},
+                ]
+            }
+            phrase_query = {
+                "conjuncts": [
+                    {"match_phrase": "common phrase", "field": "body"},
+                    {"term": "common", "field": "body"},
+                ]
+            }
+            phrase_request = {
+                "full_text_search": phrase_query,
+                "filter_query": phrase_filter,
+                "fields": ["amount"],
+                "limit": 10,
+            }
+            phrase_result = call("POST", "/tables/sort_pages/query", phrase_request)
+            assert {h["_source"]["amount"] for h in phrase_result["hits"]["hits"]} == {
+                i for i in range(count - 5, count) if i % 2 == 0
+            }
+            phrase_excluded = call(
+                "POST",
+                "/tables/sort_pages/query",
+                dict(
+                    phrase_request,
+                    exclusion_query={"term": {"path": "/amount", "value": count - 3}},
+                ),
+            )
+            assert {
+                h["_source"]["amount"] for h in phrase_excluded["hits"]["hits"]
+            } == {i for i in range(count - 5, count) if i % 2 == 0 and i != count - 3}
+            # A rare posting can probe a broad indexed physical predicate;
+            # a common posting must cross the budget into full membership.
+            sparse_base = {
+                "embeddings": {"sparse_native": {"indices": [1], "values": [1]}},
+                "indexes": ["sparse_native"],
+                "fields": ["amount"],
+                "limit": 10,
+            }
+            rare = call(
+                "POST",
+                "/tables/sort_pages/query",
+                dict(
+                    sparse_base,
+                    embeddings={"sparse_native": {"indices": [97], "values": [1]}},
+                    filter_query=category,
+                ),
+            )
+            assert [
+                (h["_source"]["amount"], h["_score"]) for h in rare["hits"]["hits"]
+            ] == [(count - 1, 1)]
+            # Cold/warm exact ID selections must retain sparse seeks even
+            # when loading the index metadata costs more than one point probe.
+            for _ in range(2):
+                point = call(
+                    "POST",
+                    "/tables/sort_pages/query",
+                    dict(
+                        sparse_base,
+                        filter_query={
+                            "conjuncts": [
+                                category,
+                                {"term": {"path": "/amount", "value": count - 1}},
+                            ]
+                        },
+                    ),
+                )
+                assert [
+                    (h["_source"]["amount"], h["_score"]) for h in point["hits"]["hits"]
+                ] == [(count - 1, 1)]
+            # Two independent indexes enforce the entire conjunction through
+            # shared candidate membership, for rare and common sparse postings.
+            multi = {
+                "conjuncts": [
+                    category,
+                    {"range": {"path": "/amount", "gte": count // 2}},
+                ]
+            }
+            for dimension in (97, 1):
+                combined = call(
+                    "POST",
+                    "/tables/sort_pages/query",
+                    dict(
+                        sparse_base,
+                        embeddings={
+                            "sparse_native": {"indices": [dimension], "values": [1]}
+                        },
+                        filter_query=multi,
+                    ),
+                )
+                assert len(combined["hits"]["hits"]) == (1 if dimension == 97 else 10)
+                assert all(
+                    h["_source"]["amount"] >= count // 2 and h["_score"] == 1
+                    for h in combined["hits"]["hits"]
+                )
+            common = call(
+                "POST",
+                "/tables/sort_pages/query",
+                dict(
+                    sparse_base,
+                    filter_query={"range": {"path": "/amount", "gte": count // 2}},
+                ),
+            )
+            assert len(common["hits"]["hits"]) == 10
+            assert all(
+                h["_source"]["amount"] >= count // 2 and h["_score"] == 1
+                for h in common["hits"]["hits"]
+            )
+            transitioned = call(
+                "POST",
+                "/tables/sort_pages/query",
+                dict(
+                    sparse_base,
+                    filter_query={
+                        "conjuncts": [
+                            category,
+                            {"range": {"path": "/amount", "lte": 4096}},
+                        ]
+                    },
+                ),
+            )
+            assert len(transitioned["hits"]["hits"]) == 10
+            assert all(
+                2 <= h["_source"]["amount"] <= 4096
+                for h in transitioned["hits"]["hits"]
+            )
+            multi_excluded = call(
+                "POST",
+                "/tables/sort_pages/query",
+                dict(sparse_base, exclusion_query=multi),
+            )
+            assert len(multi_excluded["hits"]["hits"]) == 10
+            assert all(
+                h["_source"]["amount"] < count // 2
+                for h in multi_excluded["hits"]["hits"]
+            )
+            excluded = call(
+                "POST",
+                "/tables/sort_pages/query",
+                dict(
+                    sparse_base,
+                    exclusion_query=category,
+                ),
+            )
+            assert {h["_source"]["amount"] for h in excluded["hits"]["hits"]} == {0, 1}
+            for weight in (-1, 0):
+                signed_excluded = call(
+                    "POST",
+                    "/tables/sort_pages/query",
+                    dict(
+                        sparse_base,
+                        embeddings={
+                            "sparse_native": {"indices": [1], "values": [weight]}
+                        },
+                        exclusion_query=category,
+                    ),
+                )
+                assert {
+                    (h["_source"]["amount"], h["_score"])
+                    for h in signed_excluded["hits"]["hits"]
+                } == {(0, weight), (1, weight)}
+            dense_base = dict(
+                sparse_base,
+                embeddings={"dense_native": [1, 0]},
+                indexes=["dense_native"],
+            )
+            dense = call(
+                "POST",
+                "/tables/sort_pages/query",
+                dict(
+                    dense_base,
+                    filter_query={"range": {"path": "/amount", "gte": count // 2}},
+                ),
+            )
+            assert len(dense["hits"]["hits"]) == 10
+            assert all(
+                h["_source"]["amount"] >= count // 2 for h in dense["hits"]["hits"]
+            )
+            hybrid = call(
+                "POST",
+                "/tables/sort_pages/query",
+                dict(
+                    sparse_base,
+                    embeddings={
+                        "dense_native": [1, 0],
+                        "sparse_native": {"indices": [97], "values": [1]},
+                    },
+                    indexes=["dense_native", "sparse_native"],
+                    filter_query=category,
+                ),
+            )
+            assert any(
+                h["_source"]["amount"] == count - 1 for h in hybrid["hits"]["hits"]
+            )
+            assert all(h["_source"]["amount"] >= 2 for h in hybrid["hits"]["hits"])
+            for predicate in predicates:
+                request = {
+                    "full_text_search": {"term": "common", "field": "body"},
+                    "fields": ["amount"],
+                    "filter_query": predicate,
+                    "limit": 10,
+                }
+                baseline = call("POST", "/tables/sort_pages/query", request)
+                assert {
+                    h["_source"]["amount"] for h in baseline["hits"]["hits"]
+                } == expected
+                for sort in ("_score", "_id"):
+                    ordered = dict(
+                        request, order_by=[{"field": sort, "desc": sort != "_id"}]
+                    )
+                    reference = call("POST", "/tables/sort_pages/query", ordered)
+                    assert reference["hits"]["total"] == {
+                        "value": 3,
+                        "relation": "exact",
+                    }
+                    hits = reference["hits"]["hits"]
+                    assert {h["_source"]["amount"] for h in hits} == expected
+                    first = call(
+                        "POST", "/tables/sort_pages/query", dict(ordered, limit=1)
+                    )
+                    assert first["hits"]["hits"] == hits[:1]
+                    continuation = dict(
+                        ordered,
+                        limit=1,
+                        remote_snapshot=first["remote_snapshot"],
+                    )
+                    # A cursor with no explicit order_by has implicit ID order.
+                    if sort == "_id":
+                        continuation.pop("order_by")
+                    after = call(
+                        "POST",
+                        "/tables/sort_pages/query",
+                        dict(
+                            continuation, search_after=first["hits"]["hits"][0]["_sort"]
+                        ),
+                    )
+                    assert after["hits"]["hits"] == hits[1:2]
+                    before = call(
+                        "POST",
+                        "/tables/sort_pages/query",
+                        dict(
+                            continuation,
+                            search_before=after["hits"]["hits"][0]["_sort"],
+                        ),
+                    )
+                    assert before["hits"]["hits"] == hits[:1]
         failed = False
     finally:
         server.stop(test_failed=failed)

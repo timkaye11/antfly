@@ -378,7 +378,7 @@ pub const CreateTableResponse = union(enum) {
 pub const LookupKeyParams = struct {
     /// Comma-separated list of fields to include in the response. If not specified, returns the full document. Supports: - Simple fields: "title,author" - Nested paths: "user.address.city" - Wildcards: "_chunks.*" - Exclusions: "-_chunks.*._embedding" - Special fields: "_embeddings,_summaries,_chunks"
     fields: ?[]const u8 = null,
-    /// Read consistency for the lookup. The default `read_index` routes to the primary for linearizable reads. `stale` allows a hot standby to serve the lookup at its safe-read LSN.
+    /// Read consistency for the lookup. The default `read_index` routes to the primary for linearizable reads. `stale` allows a hot standby to serve the lookup at its safe-read LSN. Owned object document tables support only explicit `stale` reads of published generations. The default `read_index` and `leader_lease` are rejected with HTTP 400. Use `sync_level=full_index` on writes to wait for publication before a stale lookup.
     consistency: ?[]const u8 = null,
 };
 
@@ -390,6 +390,10 @@ pub const ListDocumentArtifactManifestsParams = struct {
 pub const GetDocumentArtifactManifestParams = struct {
     /// Response detail level. `summary` returns typed manifest fields only. `raw` also includes opaque manifest/state JSON and requires table admin permission when authentication is enabled.
     detail: ?[]const u8 = null,
+};
+
+pub const GetLakeCommitOutcomeParams = struct {
+    request_hash: []const u8,
 };
 
 /// Success payload selected by HTTP status, never by trial-decoding another status's schema.
@@ -515,10 +519,10 @@ pub const Client = struct {
         return ApiResponse(types.InferenceChunkResponse).fromResponse(self.allocator, &resp);
     }
 
-    /// Answer named choice, ordinal score, and Boolean questions
-    /// POST /ai/v1/decide
+    /// Answer named decision questions
+    /// POST /ai/v1/decisions
     pub fn decide(self: *@This(), body: types.InferenceDecideRequest) !ApiResponse(types.InferenceDecideResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/decide", .{self.base_url});
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/decisions", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -2405,6 +2409,50 @@ pub const Client = struct {
         return ApiResponse(std.json.ArrayHashMap(std.json.Value)).fromResponse(self.allocator, &resp);
     }
 
+    /// List saved query sources
+    /// GET /db/v1/sources
+    pub fn listQuerySources(self: *@This()) !ApiResponse([]const types.SavedQuerySource) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/sources", .{self.base_url});
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse([]const types.SavedQuerySource).fromResponse(self.allocator, &resp);
+    }
+
+    /// Get saved query source
+    /// GET /db/v1/sources/{sourceName}
+    pub fn getQuerySource(self: *@This(), source_name: []const u8) !ApiResponse(types.SavedQuerySource) {
+        const encoded_source_name = try httpx.PercentEncoding.encode(self.allocator, source_name);
+        defer self.allocator.free(encoded_source_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/sources/{s}", .{ self.base_url, encoded_source_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.SavedQuerySource).fromResponse(self.allocator, &resp);
+    }
+
+    /// Create saved query source
+    /// POST /db/v1/sources/{sourceName}
+    pub fn createQuerySource(self: *@This(), source_name: []const u8, body: std.json.Value) !ApiResponse(types.SavedQuerySource) {
+        const encoded_source_name = try httpx.PercentEncoding.encode(self.allocator, source_name);
+        defer self.allocator.free(encoded_source_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/sources/{s}", .{ self.base_url, encoded_source_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.SavedQuerySource).fromResponse(self.allocator, &resp);
+    }
+
+    /// Drop saved query source
+    /// DELETE /db/v1/sources/{sourceName}
+    pub fn dropQuerySource(self: *@This(), source_name: []const u8) !ApiResponse(std.json.Value) {
+        const encoded_source_name = try httpx.PercentEncoding.encode(self.allocator, source_name);
+        defer self.allocator.free(encoded_source_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/sources/{s}", .{ self.base_url, encoded_source_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+    }
+
     /// Execute a SQL statement
     /// POST /db/v1/sql
     pub fn executeSQL(self: *@This(), body: types.SQLRequest) !ApiResponse(types.SQLResponse) {
@@ -3028,6 +3076,96 @@ pub const Client = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.IndexMaintenanceResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// getLakeCatalog
+    /// GET /db/v1/tables/{tableName}/lake/catalog
+    pub fn getLakeCatalog(self: *@This(), table_name: []const u8) !ApiResponse(types.LakeCatalogResponse) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/lake/catalog", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.LakeCatalogResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// initializeLakeCatalog
+    /// POST /db/v1/tables/{tableName}/lake/catalog
+    pub fn initializeLakeCatalog(self: *@This(), table_name: []const u8, body: types.LakeCatalogCreateRequest) !ApiResponse(types.LakeCatalogResponse) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/lake/catalog", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.LakeCatalogResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// ingestLakeChanges
+    /// POST /db/v1/tables/{tableName}/lake/changes
+    pub fn ingestLakeChanges(self: *@This(), table_name: []const u8, body: std.json.Value) !ApiResponse(std.json.Value) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/lake/changes", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+    }
+
+    /// commitLakeCatalog
+    /// POST /db/v1/tables/{tableName}/lake/commits
+    pub fn commitLakeCatalog(self: *@This(), table_name: []const u8, body: types.LakeCatalogCommitRequest) !ApiResponse(types.LakeCatalogResponse) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/lake/commits", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.LakeCatalogResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// getLakeCommitOutcome
+    /// GET /db/v1/tables/{tableName}/lake/commits/{commitId}
+    pub fn getLakeCommitOutcome(self: *@This(), table_name: []const u8, commit_id: []const u8, params: GetLakeCommitOutcomeParams) !ApiResponse(types.LakeCatalogResponse) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_commit_id = try httpx.PercentEncoding.encode(self.allocator, commit_id);
+        defer self.allocator.free(encoded_commit_id);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/lake/commits/{s}", .{ self.base_url, encoded_table_name, encoded_commit_id });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        const encoded_query_value_request_hash = try httpx.PercentEncoding.encode(self.allocator, params.request_hash);
+        defer self.allocator.free(encoded_query_value_request_hash);
+        try query_buf.appendSlice(self.allocator, &.{sep});
+        try query_buf.appendSlice(self.allocator, "request_hash=");
+        try query_buf.appendSlice(self.allocator, encoded_query_value_request_hash);
+        sep = '&';
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.LakeCatalogResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Maintain a writable Iceberg table
+    /// POST /db/v1/tables/{tableName}/lake/maintenance
+    pub fn maintainLakeTable(self: *@This(), table_name: []const u8, body: std.json.Value) !ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/lake/maintenance", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(std.json.ArrayHashMap(std.json.Value)).fromResponse(self.allocator, &resp);
     }
 
     /// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge

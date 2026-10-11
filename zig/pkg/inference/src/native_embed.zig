@@ -66,6 +66,8 @@ const Options = struct {
     content_json_path: ?[]const u8 = null,
     task_type: ?[]const u8 = null,
     dimensions: ?usize = null,
+    group: bool = false,
+    title: ?[]const u8 = null,
 
     pub fn deinit(self: *Options, allocator: std.mem.Allocator) void {
         self.texts.deinit(allocator);
@@ -107,13 +109,20 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
     defer model_manager.deinit();
 
-    const model = try model_manager.loadFromDir(opts.model_dir);
+    var model_handle = try model_manager.acquireFromDir(opts.model_dir);
+    defer model_handle.release();
+    const model = model_handle.get();
     const loaded_model_at = std.Io.Timestamp.now(io, .awake);
     if (model.manifest.embedding_style == .embedding_gemma2) {
-        try runEmbeddingGemma2(allocator, &stdout.interface, model, &opts);
-        return;
+        if (model.session.backend() == .cuda or opts.content_json_path != null) {
+            try model.verifyEmbeddingIdentity();
+            try runEmbeddingGemma2(allocator, &stdout.interface, model, &opts);
+            try model.verifyEmbeddingIdentity();
+            return;
+        }
+        return embedGemma2(allocator, io, &stdout.interface, model, opts);
     }
-    if (opts.combined or opts.content_json_path != null or opts.task_type != null or opts.dimensions != null) return error.OrderedEmbeddingContentNotSupported;
+    if (opts.combined or opts.group or opts.title != null or opts.content_json_path != null or opts.task_type != null or opts.dimensions != null) return error.UnsupportedEmbeddingOptions;
     if (model.manifest.hasCapability("sparse")) {
         if (opts.image_paths.items.len > 0 or opts.audio_paths.items.len > 0) {
             print("error: sparse embedding models only support --text inputs\n", .{});
@@ -277,10 +286,16 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingContentJsonValue;
             opts.content_json_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--group")) {
+            opts.group = true;
+        } else if (std.mem.eql(u8, arg, "--title")) {
+            i += 1;
+            if (i >= args.len) return error.MissingTitleValue;
+            opts.title = args[i];
         } else if (std.mem.eql(u8, arg, "--task-type")) {
             i += 1;
             if (i >= args.len) return error.MissingTaskTypeValue;
-            _ = try gemma2_model.taskPrefix(args[i]);
+            _ = try @import("architectures/embedding_gemma2.zig").taskPrefix(args[i]);
             opts.task_type = args[i];
         } else if (std.mem.eql(u8, arg, "--dimensions")) {
             i += 1;
@@ -318,7 +333,15 @@ fn runEmbeddingGemma2(allocator: std.mem.Allocator, writer: *std.Io.Writer, mode
     var pipeline = model.embeddingPipeline(allocator);
     pipeline.print_timing = opts.print_timing;
     var dimensions = opts.dimensions;
-    if (opts.task_type) |task| pipeline.config.text_prefix = try gemma2_model.taskPrefix(task);
+    var task_type = opts.task_type orelse "RETRIEVAL_DOCUMENT";
+    pipeline.config.text_prefix = try gemma2_model.taskPrefix(task_type);
+    var title_prefix: ?[]u8 = null;
+    defer if (title_prefix) |prefix| allocator.free(prefix);
+    if (opts.title) |title| {
+        if (!std.mem.eql(u8, opts.task_type orelse "RETRIEVAL_DOCUMENT", "RETRIEVAL_DOCUMENT") or opts.texts.items.len == 0) return error.InvalidEmbeddingTitle;
+        title_prefix = try std.fmt.allocPrint(allocator, "title: {s} | text: ", .{title});
+        pipeline.config.text_prefix = title_prefix.?;
+    }
     var groups = std.ArrayListUnmanaged(embedding_mod.EmbeddingContentInput).empty;
     defer {
         for (groups.items) |group| allocator.free(group.content);
@@ -346,7 +369,9 @@ fn runEmbeddingGemma2(allocator: std.mem.Allocator, writer: *std.Io.Writer, mode
             }
             if (root.object.get("task_type")) |task| {
                 if (task != .string) return error.InvalidEmbeddingTaskType;
-                pipeline.config.text_prefix = try gemma2_model.taskPrefix(task.string);
+                if (opts.task_type) |flag_task| if (!std.mem.eql(u8, flag_task, task.string)) return error.ConflictingEmbeddingTaskType;
+                task_type = task.string;
+                pipeline.config.text_prefix = try gemma2_model.taskPrefix(task_type);
             }
         }
         if (input == .array) {
@@ -368,7 +393,7 @@ fn runEmbeddingGemma2(allocator: std.mem.Allocator, writer: *std.Io.Writer, mode
             .image => .{ .image = images[item.index] },
             .audio => .{ .audio = .{ .bytes = audio[item.index] } },
         };
-        if (opts.combined) {
+        if (opts.combined or opts.group) {
             try groups.append(allocator, .{ .content = parts });
             parts_owned = false;
         } else {
@@ -380,12 +405,37 @@ fn runEmbeddingGemma2(allocator: std.mem.Allocator, writer: *std.Io.Writer, mode
             }
         }
     }
-    const embeddings = try pipeline.embedContent(groups.items);
+    if (opts.title != null and !opts.combined and !opts.group) return error.InvalidEmbeddingTitle;
+    const embeddings = if (model.session.backend() == .cuda) try pipeline.embedContent(groups.items) else generic: {
+        const grouped = @import("pipelines/embedding_gemma2.zig");
+        const vectors = try allocator.alloc([]f32, groups.items.len);
+        errdefer allocator.free(vectors);
+        var filled: usize = 0;
+        errdefer for (vectors[0..filled]) |vector| allocator.free(vector);
+        for (groups.items, vectors) |group, *vector| {
+            const parts = try allocator.alloc(grouped.Part, group.content.len);
+            defer allocator.free(parts);
+            for (group.content, parts) |part, *dest| dest.* = switch (part) {
+                .text => |text| .{ .text = text },
+                .image => |image| .{ .image = image },
+                .audio => |audio| .{ .audio = audio.bytes },
+            };
+            const result = try grouped.embed(allocator, model.session, model.getTokenizer(), .{ .title = opts.title, .content = parts }, .{ .task_type = task_type, .dimensions = dimensions orelse 768 }, model.embeddingExecutionLock(), pipeline.execution_control);
+            vector.* = result.vector;
+            pipeline.last_input_tokens +|= result.input_tokens;
+            filled += 1;
+        }
+        break :generic vectors;
+    };
     defer freeEmbeddings(allocator, embeddings);
     var buffer = std.ArrayListUnmanaged(u8).empty;
     defer buffer.deinit(allocator);
     try buffer.appendSlice(allocator, "{\"model\":");
     try jsonEncodeString(&buffer, allocator, opts.model_dir);
+    if (model.embedding_identity) |identity| {
+        try buffer.appendSlice(allocator, ",\"model_identity\":");
+        try jsonEncodeString(&buffer, allocator, &identity);
+    }
     try buffer.appendSlice(allocator, ",\"backend\":");
     try jsonEncodeString(&buffer, allocator, @tagName(model.session.backend()));
     try buffer.appendSlice(allocator, ",\"embeddings\":[");
@@ -479,18 +529,59 @@ fn cliContentPart(allocator: std.mem.Allocator, owned: *std.ArrayListUnmanaged([
     return if (std.ascii.startsWithIgnoreCase(mime, "image/")) .{ .image = decoded } else .{ .audio = .{ .bytes = decoded, .decode_options = .{ .format_hint = audio_mod.detectFormatFromMime(mime) } } };
 }
 
+fn embedGemma2(a: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer, model: *model_manager_mod.LoadedModel, opts: Options) !void {
+    const grouped = @import("pipelines/embedding_gemma2.zig");
+    const watchdog = if (model.session.interruption() == .process_required) try @import("hard_cancellation_watchdog.zig").HardCancellationWatchdog.create(a) else null;
+    defer if (watchdog) |owned| owned.destroy();
+    if (watchdog) |owned| try owned.start(io);
+    const control = @import("execution_control.zig").InferenceExecutionControl{ .io = io, .hard_cancellation = if (watchdog) |owned| owned.boundary() else null };
+    try model.verifyEmbeddingIdentity();
+    if (opts.title != null and !opts.group and !opts.combined) return error.InvalidEmbeddingTitle;
+    const images = try loadFiles(a, opts.image_paths.items);
+    defer freeOwnedBytes(a, images);
+    const audio = try loadFiles(a, opts.audio_paths.items);
+    defer freeOwnedBytes(a, audio);
+    const parts = try a.alloc(grouped.Part, opts.order.items.len);
+    defer a.free(parts);
+    for (opts.order.items, parts) |item, *part| part.* = switch (item.modality) {
+        .text => .{ .text = opts.texts.items[item.index] },
+        .image => .{ .image = images[item.index] },
+        .audio => .{ .audio = audio[item.index] },
+    };
+    var lease = model.acquireEmbeddingAssetLease(false);
+    defer lease.release();
+    try model.ensureEmbeddingAssets(true, false, false);
+    var vectors: std.ArrayListUnmanaged([]f32) = .empty;
+    defer {
+        for (vectors.items) |vector| a.free(vector);
+        vectors.deinit(a);
+    }
+    var tokens: usize = 0;
+    for (0..if (opts.group or opts.combined) 1 else parts.len) |i| {
+        const result = try grouped.embed(a, model.session, model.getTokenizer(), .{ .title = opts.title, .content = if (opts.group or opts.combined) parts else parts[i..][0..1] }, .{ .task_type = opts.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = opts.dimensions orelse 768 }, model.embeddingExecutionLock(), control);
+        errdefer a.free(result.vector);
+        try vectors.append(a, result.vector);
+        tokens += result.input_tokens;
+    }
+    try model.verifyEmbeddingIdentity();
+    const json = try std.json.Stringify.valueAlloc(a, .{ .model = opts.model_dir, .model_identity = model.embedding_identity.?[0..], .embeddings = vectors.items, .dimensions = opts.dimensions, .input_tokens = tokens, .grouped = opts.group }, .{});
+    defer a.free(json);
+    try writer.writeAll(json);
+    try writer.writeAll("\n");
+    try writer.flush();
+}
+
 fn loadFiles(allocator: std.mem.Allocator, paths: []const []const u8) ![][]const u8 {
     const out = try allocator.alloc([]const u8, paths.len);
-    for (out) |*bytes| bytes.* = &.{};
+    var loaded: usize = 0;
     errdefer {
-        for (out) |bytes| {
-            if (bytes.len > 0) allocator.free(bytes);
-        }
+        for (out[0..loaded]) |bytes| allocator.free(bytes);
         allocator.free(out);
     }
 
     for (paths, 0..) |path, i| {
-        out[i] = try c_file.readFile(allocator, path);
+        out[i] = try c_file.readFileMax(allocator, path, 64 * 1024 * 1024);
+        loaded += 1;
     }
     return out;
 }
@@ -691,6 +782,8 @@ fn printUsage() void {
         \\  EmbeddingGemma 2: --task-type <task>, --dimensions 1..768 (trained: 128/256/512/768).
         \\  --combined embeds repeated input flags as one ordered EmbeddingGemma 2 input.
         \\  --content-json <path> accepts API input JSON with ordered content groups and inline media.
+        \\  --group combines all text/image/audio parts in argument order into one vector.
+        \\  --title <title> requires --group or --combined and RETRIEVAL_DOCUMENT with text.
         \\
     , .{});
 }

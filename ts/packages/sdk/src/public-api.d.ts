@@ -4,6 +4,123 @@
  */
 
 export interface paths {
+    "/db/v1/tables/{tableName}/lake/catalog": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * getLakeCatalog
+         * @description Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files and automatically schedule matching index publication. A committed response does not imply that those indexes are already searchable. Native row transactions use lake/changes.
+         */
+        get: operations["getLakeCatalog"];
+        put?: never;
+        /**
+         * initializeLakeCatalog
+         * @description Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files and automatically schedule matching index publication. A committed response does not imply that those indexes are already searchable. Native row transactions use lake/changes.
+         */
+        post: operations["initializeLakeCatalog"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/lake/changes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * ingestLakeChanges
+         * @description Durably accept one complete CDC transaction for native WAL-to-Iceberg writing. A stable batch ID, source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images; deletes contain only key fields. Acceptance precedes catalog commitment and index publication. Native text searches compose a bounded accepted-WAL suffix with the pinned archive publication. Requires table admin permission and iceberg_writer policy.
+         */
+        post: operations["ingestLakeChanges"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/lake/maintenance": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Maintain a writable Iceberg table
+         * @description Plan or execute bounded compaction, snapshot/file vacuum, or covered WAL cleanup. A stable operation ID resumes saved catalog intents after uncertainty. Defaults to dry run. Destructive file vacuum requires an explicit exclusive ownership and external-reader retention agreement; only native ownership proofs authorize object deletion. Current snapshots, named refs, native serving readers and durable snapshot pins remain protected. Compact and vacuum commits automatically schedule index publication.
+         */
+        post: operations["maintainLakeTable"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/lake/commits": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * commitLakeCatalog
+         * @description Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files and automatically schedule matching index publication. A committed response does not imply that those indexes are already searchable. Native row transactions use lake/changes.
+         */
+        post: operations["commitLakeCatalog"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/lake/commits/{commitId}": {
+        parameters: {
+            query: {
+                request_hash: string;
+            };
+            header?: never;
+            path: {
+                tableName: string;
+                commitId: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * getLakeCommitOutcome
+         * @description Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files and automatically schedule matching index publication. A committed response does not imply that those indexes are already searchable. Native row transactions use lake/changes.
+         */
+        get: operations["getLakeCommitOutcome"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/status": {
         parameters: {
             query?: never;
@@ -2381,6 +2498,47 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/sources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List saved query sources */
+        get: operations["listQuerySources"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/sources/{sourceName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                sourceName: string;
+            };
+            cookie?: never;
+        };
+        /** Get saved query source */
+        get: operations["getQuerySource"];
+        put?: never;
+        /**
+         * Create saved query source
+         * @description Creates an immutable union or keyed overlay in the Antfly metadata catalog. Reads require permission on the saved name and every input table. Drop and recreate to change a definition; existing cursors cannot switch incarnations.
+         */
+        post: operations["createQuerySource"];
+        /** Drop saved query source */
+        delete: operations["dropQuerySource"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tablespaces": {
         parameters: {
             query?: never;
@@ -4080,7 +4238,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/ai/v1/decide": {
+    "/ai/v1/decisions": {
         parameters: {
             query?: never;
             header?: never;
@@ -4089,7 +4247,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Answer named choice, ordinal score, and Boolean questions */
+        /**
+         * Answer named decision questions
+         * @description Execute one text input or an Antfly batch. Embedding similarity supports choice and multi_choice; trained decision models support choice, score and predicate. Answer variants distinguish trained probabilities from raw cosine similarities.
+         */
         post: operations["decide"];
         delete?: never;
         options?: never;
@@ -4458,6 +4619,50 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        LakeCatalogCreateRequest: {
+            /** @description Stable identifier reused with exactly the same request after timeout or restart. */
+            commit_id: string;
+            /** @description Iceberg schema including schema-id and persistent field IDs. */
+            schema: {
+                [key: string]: unknown;
+            };
+            "partition-spec"?: {
+                [key: string]: unknown;
+            };
+            "write-order"?: {
+                [key: string]: unknown;
+            };
+            properties?: {
+                [key: string]: string;
+            };
+        };
+        LakeCatalogCommitRequest: {
+            commit_id: string;
+            expected_metadata_location: string;
+            /** @description Standard Iceberg REST table requirements, validated against the authoritative state. */
+            requirements: {
+                [key: string]: unknown;
+            }[];
+            /** @description Standard Iceberg REST metadata updates. Upload data/delete/manifest files before committing. A lake commit does not establish Antfly index visibility. */
+            updates: {
+                [key: string]: unknown;
+            }[];
+        };
+        LakeCatalogResponse: {
+            /** @enum {string} */
+            state: "loaded" | "lake_committed" | "committed" | "not_committed" | "unknown";
+            commit_id?: string;
+            /** @description Opaque request digest for outcome resolution. */
+            request_hash?: string;
+            metadata_location?: string;
+            metadata?: {
+                [key: string]: unknown;
+            };
+            /** @description False if lake creation committed but native schema binding still needs the same initialization request replayed. */
+            binding_ready?: boolean;
+            /** @description A catalog commit alone does not make a matching index publication searchable. */
+            searchable?: boolean;
+        };
         ChatGPTAuthorize: {
             connection_id?: string;
         };
@@ -4487,14 +4692,44 @@ export interface components {
             revocation_confirmed: boolean;
         };
         /**
-         * @description Logical SQL result type. Integer values are decimal strings to preserve exact precision in every client.
+         * @description Logical SQL result type. Integer values and numbers with element_type numeric are decimal strings to preserve exact precision in every client.
          * @enum {string}
          */
-        SQLColumnType: "string" | "uuid" | "integer" | "number" | "boolean" | "datetime" | "json" | "unknown";
+        SQLColumnType: "string" | "uuid" | "integer" | "number" | "boolean" | "datetime" | "json" | "array" | "unknown";
+        /**
+         * @description Bound SQL scalar or array-element identity, including numeric widths and exact NUMERIC. Never inferred from JSON value shape.
+         * @enum {string}
+         */
+        SQLArrayElementType: "text" | "int16" | "int32" | "int64" | "float32" | "float64" | "boolean" | "uuid" | "jsonb" | "numeric";
+        SQLArrayDimension: {
+            length: number;
+            lower_bound: number;
+        };
+        /**
+         * @description Non-NULL SQL array result. Elements are flat, row-major values using the
+         *     column's element_type. Their count equals the product of dimension
+         *     lengths. Empty arrays have no dimensions and no elements. Integer
+         *     elements are canonical decimal strings. Exact numeric elements are
+         *     decimal strings preserving display scale, or NaN, Infinity and -Infinity.
+         *     Floating elements are JSON
+         *     numbers, or the strings NaN, Infinity and -Infinity. Element null flags
+         *     distinguish SQL NULL from the JSON literal null in jsonb arrays. A NULL
+         *     array is an outer null result cell, not an empty array or this envelope.
+         */
+        SQLArrayValue: {
+            dimensions: components["schemas"]["SQLArrayDimension"][];
+            values: unknown[];
+            /** @description Exactly one flag per value. True requires a null value; false permits a JSON null only for jsonb elements. */
+            sql_nulls: boolean[];
+        };
         SQLColumn: {
             /** @description Display label. Labels need not be unique; rows use matching ordinal positions. */
             name: string;
             type: components["schemas"]["SQLColumnType"];
+            /** @description Required for array columns and exact NUMERIC number columns. Identifies scalar widths when supplied. The descriptor applies even to NULL or empty arrays. */
+            element_type?: components["schemas"]["SQLArrayElementType"];
+            /** @description Present only for constrained NUMERIC scalar or array results. Prepared result metadata is stable before execution-time constant folding. */
+            numeric_modifier?: components["schemas"]["SQLNumericModifier"];
         };
         SQLPrepareRequest: {
             statement: string;
@@ -4532,6 +4767,12 @@ export interface components {
             database: string;
             namespace: string;
         };
+        /** @description Immutable positional input contract. Element identity also preserves primitive widths; array inputs require it. Unknown slots have no SQL constraint. */
+        SQLParameterDescriptor: {
+            type: components["schemas"]["SQLColumnType"];
+            element_type?: components["schemas"]["SQLArrayElementType"];
+            nullable: boolean;
+        };
         SQLPreparedResponse: {
             prepared_id: string;
             /** Format: int64 */
@@ -4539,6 +4780,8 @@ export interface components {
             /** @description Exact decimal API owner identifier, preserved by JavaScript clients. */
             owner_node_id: string;
             parameter_types: components["schemas"]["SQLColumnType"][];
+            /** @description Precise positional contracts, aligned with parameter_types. Array arguments use the lossless SQLArrayValue envelope or PostgreSQL array text; plain JSON arrays are not SQL arrays. */
+            parameter_descriptors: components["schemas"]["SQLParameterDescriptor"][];
             columns: components["schemas"]["SQLColumn"][];
         };
         /** @description One typed setting value, matching the declared kind. */
@@ -4604,6 +4847,12 @@ export interface components {
          *     memory, and encoded results to a 16 MiB allocation budget.
          */
         SQLRequest: {
+            /**
+             * @description Read visibility for writable Iceberg sources. Accepted pins typed WAL changes over the committed snapshot; unavailable coverage fails closed. HTTP sessions and prepared executions inside a transaction retain the first accepted read cut for each table, including across savepoint rollback. Cuts expire after one hour. Serializable external reads and accepted pgwire execution are not supported.
+             * @default committed
+             * @enum {string}
+             */
+            lake_visibility?: "committed" | "accepted";
             /** @description A single SQL statement. */
             statement: string;
             /** @description Positional JSON parameter values, including null. */
@@ -4639,6 +4888,8 @@ export interface components {
          *     is JSON null; sql_nulls distinguishes it from a JSON column containing
          *     the JSON literal null. Integer-typed values are exact decimal strings; datetime
          *     values are strings. Objects and arrays in JSON columns remain JSON.
+         *     Array-typed columns contain SQLArrayValue envelopes, with their element
+         *     descriptor in the corresponding SQLColumn. They are not JSON columns.
          */
         SQLResponse: {
             columns: components["schemas"]["SQLColumn"][];
@@ -4693,6 +4944,8 @@ export interface components {
             code: string;
             /** @description Human-readable diagnostic with no sensitive parameter values. */
             message: string;
+            /** @description Public column identifier for a column constraint violation; no row values are included. */
+            column_name?: string;
             /** @description Optional one-based character position in the submitted SQL statement. */
             position?: number;
             /** @description Native transaction receipt for reconciliation when a mutation outcome is unknown. */
@@ -6724,6 +6977,12 @@ export interface components {
         };
         /** @description Immutable source embedding ownership. Omit storage when creating a table to select vector_store for a local single-shard standalone table without HA or replication, and primary_lsm for other deployments. Existing tables retain their recorded ownership; changing the creation default does not migrate data. Snapshot/backup and split operations currently reject vector_store tables; explicitly select primary_lsm when these operations are required. */
         TableStorageSettings: {
+            /**
+             * @description Durable table engine, independent of deployment. local uses the hosting process's local or Lite backend and normal shard placement. object uses external lake data with durable sidecars, or an Antfly-owned object WAL and published generations. Object tables do not allocate data Raft groups; omit num_shards and replication_sources. Metadata remains authoritative for table lifetime. Configure the shared destination through storage.artifacts. Writable object document tables initially require immutable schema and index definitions; changes require a new table and explicit migration.
+             * @default local
+             * @enum {string}
+             */
+            engine?: "local" | "object";
             /**
              * @description Explicit ownership choice. vector_store requires a fresh local single-shard standalone table without HA or replication. An explicit empty storage object keeps primary_lsm; omit the storage object to use the deployment default.
              * @default primary_lsm
@@ -10171,9 +10430,10 @@ export interface components {
             call?: "ai_decide" | "ai_choice" | "ai_score" | "ai_probability";
             input?: components["schemas"]["QueryExpression"];
             decider?: string;
+            /** @description Named decision question array using choice choices, score levels, or predicate instructions. */
             questions?: {
                 [key: string]: unknown;
-            };
+            }[];
             statement?: string;
             instructions?: string;
             /** @description Choice ID map or ordered score level array. */
@@ -10181,7 +10441,31 @@ export interface components {
                 [key: string]: string;
             } | string[];
         };
+        LakeReadReceipt: {
+            /** Format: uint64 */
+            table_id: number;
+            /** Format: uint64 */
+            object_generation: number;
+            /** Format: uint64 */
+            wal_lsn: number;
+        };
+        LakeReadRequirement: {
+            /**
+             * @description Accepted requires current WAL visibility; vector/hybrid reads wait for matching publication. Published explicitly permits the retained archive generation. Applies to native writable Iceberg reads.
+             * @enum {string}
+             */
+            visibility?: "accepted" | "published";
+            through?: components["schemas"]["LakeReadReceipt"];
+            /**
+             * Format: uint32
+             * @description Bounded readiness wait, default 5000 ms when lake_read is supplied; also bounded by query timeout and cancellation.
+             */
+            wait_ms?: number;
+        };
         QueryRequest: {
+            lake_read?: components["schemas"]["LakeReadRequirement"];
+            /** @description Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409. */
+            remote_snapshot?: string;
             evaluate?: components["schemas"]["QueryEvaluation"];
             table_target?: components["schemas"]["CatalogTableTarget"];
             /**
@@ -10751,10 +11035,45 @@ export interface components {
              */
             expand_strategy?: "union" | "intersection";
         };
-        /** @description A stateful global query. The target table is required on this route. */
-        GlobalStatefulQueryRequest: components["schemas"]["StatefulQueryRequest"] & {
-            /** @description Name of the table to query. */
+        ComposedTableSource: {
+            /** @description Literal native table name. Each source is independently authorized. */
             table: string;
+        };
+        ComposedSourceOverlay: {
+            base: components["schemas"]["ComposedTableSource"];
+            changes: components["schemas"]["ComposedTableSource"];
+            key: string[];
+            /**
+             * @description Boolean field on change rows; true hides the base row. Changes must retain one latest row/tombstone per stable key. Row-policy identities are currently unsupported for keyed composition.
+             * @default deleted
+             */
+            tombstone_field?: string;
+        };
+        SavedQuerySource: {
+            /** Format: uint64 */
+            source_id: number;
+            name: string;
+            source: components["schemas"]["ComposedQuerySource"];
+        };
+        /** @description Specify exactly one of saved, union or overlay. Union preserves duplicates and table provenance. Overlay suppresses replaced base keys and tombstones before ranking using indexed unfiltered change lookups. Inputs are streamed in bounded pages; result pages allow at most 4096 hits. Large overlay totals are lower bounds unless count is explicitly requested; exact count streams the full visible relation within the request deadline. */
+        ComposedQuerySource: {
+            /** @description Immutable source name from the Antfly catalog. Saved definitions contain literal table leaves, preventing recursive expansion. */
+            saved?: string;
+            union?: components["schemas"]["ComposedTableSource"][];
+            overlay?: components["schemas"]["ComposedSourceOverlay"];
+        };
+        /** @description A stateful global query. Specify a table target or a composed source. */
+        GlobalStatefulQueryRequest: components["schemas"]["StatefulQueryRequest"] & {
+            /** @description Name of the table to query; mutually exclusive with source. */
+            table?: string;
+            source?: components["schemas"]["ComposedQuerySource"];
+            /**
+             * @description Explicit reciprocal rank scoring across source lists after visibility resolution. Required for score ordering; shared corpus BM25 is not implemented. Constant 60, equal source weights.
+             * @enum {string}
+             */
+            source_ranking?: "rrf";
+            /** @description Opaque composed continuation retaining per-leaf native generations or archive publications and accepted WAL cuts for the configured retention period from their creation (default five minutes; maximum one hour). Publication and restart preserve the cut. Authorization, policy, recipe, source and table incarnation changes invalidate it. Leaf search_after/search_before tuples are unsupported. */
+            source_cursor?: string;
         };
         Analyses: {
             pca?: boolean;
@@ -10981,6 +11300,11 @@ export interface components {
              * @description Candidate documents considered by sort execution.
              */
             candidate_count?: number;
+            /**
+             * Format: int64
+             * @description Ordered lake entries traversed before native membership filtering.
+             */
+            ordered_scanned_count?: number;
             /**
              * Format: int64
              * @description Candidates rejected by cursor comparison.
@@ -11336,6 +11660,8 @@ export interface components {
         };
         /** @description A single query result hit */
         QueryHit: {
+            /** @description Source table provenance for composed query hits; equal IDs from union inputs remain distinct. */
+            _table?: string;
             /** @description Named query-time computed values, separate from stored source. */
             _computed?: {
                 [key: string]: unknown;
@@ -11473,6 +11799,15 @@ export interface components {
         };
         /** @description Fields shared by canonical and stateful query result envelopes. */
         QueryResultBase: {
+            /**
+             * @description Ranking contract for a composed result.
+             * @enum {string}
+             */
+            source_ranking?: "rrf" | "ordered";
+            /** @description Opaque continuation for composed queries. Pass as source_cursor with the same query; valid until the earliest retained leaf cut expires (default five minutes; maximum one hour). Publication and restart preserve it; authorization and incarnation fences remain enforced. */
+            next_source_cursor?: string;
+            /** @description Opaque snapshot to echo with ordered pagination. Native tokens retain the complete physical generation; lake tokens retain the archive publication, metadata and accepted WAL cut, for the configured retention period (default five minutes; maximum one hour). Every use rechecks access, incarnation and recipe. Unavailable retained generations return 409. */
+            remote_snapshot?: string;
             /** @description Function evaluation scope, population, usage, and scoped aggregations. */
             evaluation?: {
                 [key: string]: unknown;
@@ -12268,6 +12603,11 @@ export interface components {
                 [key: string]: unknown;
             } | null;
         };
+        /** @description PostgreSQL NUMERIC precision and signed scale. For arrays this describes every element, not dimensions. Absent means unconstrained NUMERIC. */
+        SQLNumericModifier: {
+            precision: number;
+            scale: number;
+        };
         /**
          * @description The reranking provider to use.
          * @enum {string}
@@ -12636,6 +12976,8 @@ export interface components {
          *     }
          */
         AntflyEmbedderConfig: {
+            /** @description Immutable EmbeddingGemma 2 asset and recipe identity returned by /embed. Pin this when indexing; a changed checkpoint, tokenizer, or processor rejects embedding before vector publication. */
+            model_identity?: string;
             /**
              * @description discriminator enum property added by openapi-typescript
              * @enum {string}
@@ -13041,6 +13383,11 @@ export interface components {
             };
         };
         FullTextIndexConfig: {
+            /**
+             * @description Opt in to retaining the indexed source projection in serverless full-text sidecars for cold highlighting. With field set, only that field is retained; otherwise the index source projection is retained. Increases index storage and build work. Omit or set false to hydrate highlights from the source table. Provisioned indexes already retain source independently.
+             * @default false
+             */
+            store_source?: boolean;
             /** @description Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. A source-local field overrides the shared index-level field for that stream. Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
             sources?: components["schemas"]["FullTextArtifactIndexSource"][];
             /** @description Whether to use memory-only storage */
@@ -13640,15 +13987,47 @@ export interface components {
             algebraic_planning?: components["schemas"]["GraphAlgebraicPlanningConfig"];
             resolvers?: components["schemas"]["GraphResolverConfig"][];
         };
-        /** @description Schema-derived algebraic sidecar configuration. Public requests may opt into schema derivation, while materializations remain engine-owned. */
+        AlgebraicAggregateConfig: {
+            name: string;
+            /** @enum {string} */
+            op: "count" | "sum" | "avg" | "min" | "max";
+            group_by?: string[];
+            /** @description Required except for count. Omitted count means COUNT(*); a supplied column means COUNT(column), excluding SQL NULL values. */
+            measure?: string;
+        };
+        /** @description Schema-derived algebraic index capabilities with optional declarative aggregate recipes. Physical materialization state remains engine-owned. */
         AlgebraicIndexConfig: {
-            /** @description When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API. */
+            /** @description When true, derive typed fields and capabilities from the table schema. Physical fields, laws, joins and state remain engine-owned. */
             derive_from_schema?: boolean;
+            /** @description Desired exact aggregate recipes over schema column names. Eligible SQL automatically reuses complete, snapshot-bound materializations; unsupported SQL shapes retain scanning. */
+            aggregates?: components["schemas"]["AlgebraicAggregateConfig"][];
         };
         /** @enum {string} */
-        RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not";
+        RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not" | "cast" | "case_when" | "modulo" | "in_list" | "not_in_list" | "array";
         /** @enum {string} */
-        RelationalExpressionType: "string" | "blob" | "boolean" | "datetime" | "integer" | "number";
+        RelationalExpressionType: "string" | "blob" | "boolean" | "datetime" | "integer" | "number" | "numeric" | "sql_array";
+        /**
+         * @description Exact PostgreSQL builtin identity for a relational root scalar column.
+         *     SQL array columns use SQLArrayElementType for their element identity.
+         *     Set the JSON Schema property's `x-antfly-sql-type` annotation to one of
+         *     these values. The underlying property type must match. SQL array storage
+         *     is not implied by this annotation. Existing unannotated schemas retain
+         *     their original domains.
+         *     The numeric identity uses an underlying number property and exact
+         *     PostgreSQL NUMERIC semantics, never binary float. Submit finite values
+         *     as JSON numeric lexemes or decimal strings; special values use strings
+         *     NaN, Infinity and -Infinity. Const/enum finite numeric members must be
+         *     JSON numbers, not strings. Bounds and multipleOf are exact decimals.
+         *     Public scalar NUMERIC schemas require reader capability version 22.
+         *     To constrain a NUMERIC scalar or SQL-array column, set the root
+         *     property's `x-antfly-sql-numeric-modifier` annotation to an object with
+         *     precision (1..1000) and signed scale (-1000..1000). The annotation
+         *     requires numeric identity and reader capability version 23. Assignment
+         *     rounds before constraints, indexes and generated dependents; overflow
+         *     rejects the write. Restore verifies stored values without rounding.
+         * @enum {string}
+         */
+        SQLBuiltinType: "text" | "int16" | "int32" | "int64" | "float32" | "float64" | "boolean" | "uuid" | "jsonb" | "numeric";
         /**
          * @description Immutable typed scalar expression, limited to 128 nodes and 16 levels.
          *     A literal requires type; omitted value means typed null. A column
@@ -13663,19 +14042,80 @@ export interface components {
          *     row and expression set. An integer literal may use a decimal string
          *     for exact int64 transport; blob uses base64 and datetime uses the
          *     normal relational datetime representation.
-         *     Comparisons require operands of the same type and return boolean or
+         *     Comparisons require operands of compatible types (integer and number may mix) and return boolean or
          *     SQL UNKNOWN (null); is_distinct and is_not_distinct always return a
          *     boolean. Unary is_null and is_not_null test presence/null. AND and OR
          *     evaluate left to right with SQL three-valued short-circuit semantics;
          *     NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE.
+         *     Numeric literals and arithmetic operations may specify sql_type to
+         *     retain PostgreSQL builtin overflow and float4 rounding semantics.
+         *     Without it, integer and number operations retain int64 and float64
+         *     semantics. Numeric cast requires type and sql_type, takes one numeric
+         *     argument, and performs a checked conversion when evaluated (not when
+         *     the schema is compiled). Floating-to-integer casts round ties to even.
+         *     The numeric expression type uses exact PostgreSQL NUMERIC values and
+         *     may specify sql_type numeric. Its literals accept decimal strings or
+         *     exact JSON numeric lexemes, including string-valued special values.
+         *     Exact NUMERIC programs require reader capability version 21 even when
+         *     their result is boolean or integer. Float/integer assignment casts keep
+         *     their declared PostgreSQL rounding and overflow semantics.
+         *     A cast to numeric may specify numeric_modifier for PostgreSQL precision
+         *     and signed-scale coercion. Overflow is checked when the selected cast
+         *     executes; unselected lazy branches do not fail. Modifier-bearing programs
+         *     require reader capability version 23 even with integer/boolean output.
+         *     The sql_array expression type requires sql_type on literals, including
+         *     typed NULL, to declare the element builtin. Non-null literals use the
+         *     ordinal SQL array envelope (dimensions with length/lower_bound, values,
+         *     and sql_nulls), retaining shape and lower bounds. Array columns derive
+         *     their exact element identity from the immutable schema. Comparisons,
+         *     IN, COALESCE and CASE require matching array element identities; no
+         *     element type is inferred from values. Array-dependent programs require
+         *     reader capability version 24 even with scalar output. Assignment to a
+         *     NUMERIC array column applies its precision/signed-scale modifier to
+         *     each element. Array casts require type sql_array and an explicit matching
+         *     sql_type; identity casts borrow the immutable input. Casts of numeric
+         *     arrays may additionally specify numeric_modifier, coercing each non-NULL
+         *     element with PostgreSQL precision and signed-scale semantics while
+         *     preserving dimensions, lower bounds and NULL slots. Coercion is lazy
+         *     and shares invocation admission with the surrounding expression.
+         *     Array-valued ordered index keys and element-changing array casts are
+         *     not supported by this expression contract.
+         *     The array constructor requires sql_type and zero to 32 arguments.
+         *     Constructor programs additionally require reader capability version 25,
+         *     including constructors hidden inside scalar/boolean expressions.
+         *     Scalar arguments must have the declared element domain, with explicit
+         *     width-preserving numeric casts where needed. SQL NULL arguments become
+         *     NULL elements. Array arguments must all have matching element types,
+         *     dimensions and lower bounds; one leading dimension with lower bound 1
+         *     is added. All empty/NULL subarrays produce an empty array; mixing an
+         *     empty/NULL subarray with a nonempty one is a dimension mismatch. Child
+         *     expressions execute once, with shared work/cancellation and byte limits.
+         *     case_when takes alternating boolean conditions and result expressions,
+         *     followed by a mandatory fallback result (3 to 31 arguments, at most
+         *     15 branches). Conditions are evaluated in order; only the selected
+         *     result is evaluated, and a NULL condition is not TRUE. All result
+         *     expressions must have the same physical type. Numeric SQL lowering
+         *     records builtin result-domain promotions as explicit casts. This
+         *     operation requires schema capability version 18.
+         *     modulo takes two same-domain integer or NUMERIC operands and returns the signed
+         *     remainder (minInt modulo -1 is zero); a zero divisor rejects the write.
+         *     in_list and not_in_list take one probe followed by 1 to 127 same-domain
+         *     candidates. The probe is evaluated once; NULL probes return UNKNOWN.
+         *     A matching candidate wins over NULL candidates; otherwise a NULL
+         *     candidate makes the result UNKNOWN. These operations require schema
+         *     capability version 19.
          */
         RelationalScalarExpression: {
             op: components["schemas"]["RelationalExpressionOp"];
             type?: components["schemas"]["RelationalExpressionType"];
+            /** @description Numeric builtin result identity on numeric literals, arithmetic, negate, and cast (capability version 18), or required array element identity on sql_array literals including typed NULL (capability version 24). */
+            sql_type?: components["schemas"]["SQLBuiltinType"];
+            /** @description Optional precision/signed-scale coercion; accepted only on cast with type numeric and sql_type numeric. Requires reader capability version 23. */
+            numeric_modifier?: components["schemas"]["SQLNumericModifier"];
             /** @description Typed literal value, including null. */
             value?: unknown;
             column?: string;
-            /** @description Optional binary or ASCII case-insensitive collation for binary string comparison operations only; aliases match ordered indexes. */
+            /** @description Optional binary or ASCII case-insensitive collation for string comparisons and in_list; aliases match ordered indexes. */
             collation?: string;
             args?: components["schemas"]["RelationalScalarExpression"][];
         };
@@ -13868,7 +14308,22 @@ export interface components {
             /** @description Required for object_version_digest; pins a Parquet object inventory. */
             digest?: string;
         };
-        /** @description Read-only authoritative Parquet or Iceberg source. A serving statement pins its inventory and object versions before returning rows. */
+        /** @description Catalog authority is independent of S3/GCS storage and deployment. managed uses a conditional durable head under the table root. rest uses a named HTTP connection; raw secrets are forbidden. Omit to retain explicit metadata URI/version-hint discovery. */
+        LakeCatalogConfig: {
+            /** @enum {string} */
+            type: "managed" | "rest";
+            /** @description Required for rest. Named external_io/http connection with lake_catalog_read and, for commits, lake_catalog_write capabilities. */
+            connection?: string;
+            /** @description Required for rest; catalog base URI whose origin must be allowed by the named connection. */
+            uri?: string;
+            /** @description Required nonempty namespace components for rest. */
+            namespace?: string[];
+            /** @description Required table name for rest, distinct from Antfly's logical table name. */
+            name?: string;
+            /** @description Optional REST config warehouse selector. Other fields must be omitted for managed. */
+            warehouse?: string;
+        };
+        /** @description Authoritative Parquet or Iceberg source. A serving statement pins its inventory and object versions before returning rows. Iceberg catalog commits require an explicit writable catalog binding; ordinary row mutations remain unsupported. */
         ExternalLakeTableSource: {
             /** @enum {string} */
             kind: "external";
@@ -13879,12 +14334,20 @@ export interface components {
             /** @default auto */
             schema_fingerprint?: string;
             /**
+             * @description iceberg_writer authorizes explicit Iceberg catalog commits and requires catalog plus a current snapshot selector. It does not enable ordinary row batch writes.
              * @default read_only
              * @enum {string}
              */
-            write_policy?: "read_only";
+            write_policy?: "read_only" | "iceberg_writer";
+            /**
+             * @description Set immutable only when data files are never replaced at an existing URI. Allows authenticated provider-version proofs from retained index generations to be reused for unchanged data files. Metadata and delete files are still verified.
+             * @default mutable
+             * @enum {string}
+             */
+            object_mutability?: "mutable" | "immutable";
             credentials?: components["schemas"]["ExternalLakeCredentialRef"];
             snapshot?: components["schemas"]["ExternalLakeSnapshotSelector"];
+            catalog?: components["schemas"]["LakeCatalogConfig"];
         };
         RelationalColumnExpression: {
             column: string;
@@ -13910,6 +14373,12 @@ export interface components {
             expression?: components["schemas"]["RelationalScalarExpression"];
         };
         /**
+         * @description Durable ownership kind. Index-owned uniqueness participates in ON CONFLICT inference but is not a named SQL constraint. Human-readable index descriptions never determine ownership.
+         * @default constraint
+         * @enum {string}
+         */
+        RelationalUniqueConstraintOrigin: "constraint" | "index";
+        /**
          * @description Enforcement timing for atomic mutations and transaction sessions. Deferred
          *     requires deferrable=true and validates the final transaction state.
          *     NO ACTION permits a valid final-state parent replacement; RESTRICT
@@ -13926,6 +14395,7 @@ export interface components {
          */
         RelationalUniqueConstraint: {
             name: string;
+            origin?: components["schemas"]["RelationalUniqueConstraintOrigin"];
             /** @description SQL primary-key identity. At most one per relational table; all key columns must be required and nonnullable. */
             primary?: boolean;
             columns?: string[];
@@ -14074,6 +14544,32 @@ export interface components {
                 [key: string]: components["schemas"]["DocumentSubfieldMapping"];
             };
         };
+        /**
+         * @description JSON Schema property declaration for one typed SQL-array column in a
+         *     relational table. Use it as a root property of DocumentSchema.schema.
+         *     The element identity is mandatory; a JSON Schema `array` remains a JSON
+         *     column and is never inferred to be a SQL array. Column values use the
+         *     lossless SQLArrayValue envelope: dimensions with lower bounds, flat
+         *     row-major values and explicit SQL NULL flags. Integer elements are
+         *     decimal strings, even when small. JSONB null and SQL NULL are distinct.
+         *     Float elements acquire their declared width before validation and
+         *     storage. Outer null represents a SQL NULL array when nullable is true.
+         *     Additional JSON Schema constraints apply to this envelope, not to
+         *     PostgreSQL array subscripts. SQL array index keys and SQL DDL activation
+         *     are not implied by accepting this storage schema.
+         */
+        SQLArrayColumnSchema: {
+            /** @enum {string} */
+            type: "sql_array";
+            "x-antfly-sql-type": components["schemas"]["SQLArrayElementType"];
+            /** @description Accepted only with numeric element identity. Applies assignment coercion to each non-NULL element while preserving dimensions and lower bounds. Requires reader capability version 23. */
+            "x-antfly-sql-numeric-modifier"?: components["schemas"]["SQLNumericModifier"];
+            /** @default false */
+            nullable?: boolean;
+            description?: string;
+        } & {
+            [key: string]: unknown;
+        };
         /** @description Defines the structure of a document type */
         DocumentSchema: {
             /** @description A description of the document type. */
@@ -14180,7 +14676,7 @@ export interface components {
              */
             readonly version?: number;
             storage_mode?: components["schemas"]["TableStorageMode"];
-            /** @description External tables require relational storage mode and are read-only. Omit for native tables. */
+            /** @description External tables require relational storage mode. Ordinary row writes are read-only; an explicit iceberg_writer catalog binding permits Iceberg file commits. Omit for native tables. */
             base_source?: components["schemas"]["ExternalLakeTableSource"];
             /**
              * @description Immutable typed expressions applied only to absent columns on new
@@ -14300,6 +14796,7 @@ export interface components {
             sources?: components["schemas"]["FullTextArtifactIndexSource"][];
             mem_only?: boolean;
             field?: string;
+            store_source?: boolean;
             analysis_config?: components["schemas"]["TextAnalysisConfig"];
         };
         /** @description Normalized effective full-text index configuration returned after creation. */
@@ -18069,10 +18566,20 @@ export interface components {
         InferenceContentPart: components["schemas"]["ContentPart"];
         /** @description One ordered input producing one combined embedding. Supported by EmbeddingGemma 2. Parts are concatenated in order, including text, images, and audio; video is unsupported. The expanded input, including task prompts, BOS/EOS, and media tokens, must fit within 8192 tokens. Overflow is rejected without truncation. */
         InferenceEmbeddingContentInput: {
+            /** @description Document title, allowed only with RETRIEVAL_DOCUMENT and at least one text part. */
+            title?: string;
             content: components["schemas"]["ContentPart"][];
         };
-        /** @description OpenAI-compatible embedding request with inference multimodal content-part extension */
+        /** @description EmbeddingGemma 2 ordered text, image and audio parts producing one joint vector. Video is unsupported. The expanded sequence including all media soft tokens must fit 8192 tokens. */
+        InferenceEmbeddingGroup: {
+            /** @description Document title, allowed only with RETRIEVAL_DOCUMENT and at least one text part. */
+            title?: string;
+            content: components["schemas"]["ContentPart"][];
+        };
+        /** @description OpenAI-compatible embedding request with inference multimodal content-part extension. EmbeddingGemma 2 text encoding uses official task prefixes, a shared 8192-token limit, mean pooling including prompt tokens, and normalized vectors. */
         InferenceEmbedRequest: {
+            /** @description Optional exact asset identity pin. A mismatch returns 409 before inference. */
+            model_identity?: string;
             /** @description Model name to use for embedding generation */
             model: string;
             /**
@@ -18085,7 +18592,7 @@ export interface components {
              *     - an array of ordered content objects, producing one embedding per object
              *     Legacy arrays of content parts continue to produce one embedding per part.
              */
-            input: string | string[] | components["schemas"]["ContentPart"][] | components["schemas"]["InferenceEmbeddingContentInput"] | components["schemas"]["InferenceEmbeddingContentInput"][];
+            input: string | string[] | components["schemas"]["ContentPart"][] | components["schemas"]["InferenceEmbeddingContentInput"] | components["schemas"]["InferenceEmbeddingGroup"][] | components["schemas"]["InferenceEmbeddingContentInput"][];
             /**
              * @description Encoding format for the embeddings (only "float" supported)
              * @default float
@@ -18122,6 +18629,8 @@ export interface components {
         InferenceEmbedResponse: {
             /** @description Execution backend reported for EmbeddingGemma 2 qualification. CUDA requests fail if the resident text encoder cannot execute; this field does not describe preprocessing placement. */
             backend?: string | null;
+            /** @description EmbeddingGemma 2 SHA256 identity of actual weights, tokenizer, processor and recipe. Dimensions and retrieval roles must also match index configuration. */
+            model_identity?: string;
             /**
              * @description Object type, always "list"
              * @enum {string}
@@ -18748,46 +19257,25 @@ export interface components {
             /** @description List of input modalities this model accepts, such as `text`, `image`, or `audio` */
             inputs?: string[];
         };
+        /** @description Supply exactly one of input (single text) or inputs (Antfly batch extension). Question names must be unique. Single text and named question arrays follow OpenAI Decisions conventions; local models support text input and string choice values. Request bodies are bounded at 16 MiB. */
         InferenceDecideRequest: {
             model: string;
-            state: string;
-            questions: {
-                [key: string]: components["schemas"]["InferenceDecideQuestion"];
-            };
+            /** @description Pin the exact EmbeddingGemma 2 assets and embedding recipe. */
+            model_identity?: string;
+            input?: string;
+            inputs?: components["schemas"]["DecisionInput"][];
+            long_document?: components["schemas"]["InferenceDecideLongDocument"];
+            questions: components["schemas"]["InferenceDecideQuestion"][];
+            embedding_options?: components["schemas"]["EmbeddingDecisionOptions"];
         };
-        InferenceDecideQuestion: {
-            /** @enum {string} */
-            type: "choice" | "score" | "noul";
-            instructions: string;
-            /** @description Choice uses option IDs mapped to descriptions; score uses ordered descriptions; noul omits criteria. */
-            criteria?: {
-                [key: string]: string;
-            } | string[];
-        };
+        /** @description Single-input responses have answers. Batch responses have data in input order, with one named answer array per input and aggregate usage. */
         InferenceDecideResponse: {
             model: string;
-            answers: {
-                [key: string]: components["schemas"]["InferenceDecideAnswer"];
-            };
-            usage: {
-                /** @description Encoded prompt tokens consumed by the executor, including repeated state text for split GLiNER tasks. */
-                input_tokens: number;
-                /** @description Zero for classifier executors, which emit no generated tokens. */
-                output_tokens: number;
-            };
-        };
-        InferenceDecideAnswer: {
-            /** @enum {string} */
-            type: "choice" | "score" | "noul";
-            choice?: string;
-            score?: number;
-            noul?: number;
-            legend?: {
-                [key: string]: string;
-            };
-            probabilities?: {
-                [key: string]: number;
-            };
+            model_identity?: string;
+            renderer_version?: string;
+            answers?: components["schemas"]["InferenceDecideAnswer"][];
+            data?: components["schemas"]["DecisionBatchItem"][];
+            usage: components["schemas"]["DecisionUsage"];
         };
         InferenceModelsResponse: {
             /**
@@ -18821,7 +19309,7 @@ export interface components {
             extractors: {
                 [key: string]: components["schemas"]["InferenceModelInfo"];
             };
-            /** @description Models declaring the decide task and typed_decisions capability */
+            /** @description Models declaring the decide task and either typed_decisions or embedding_similarity capability */
             deciders: {
                 [key: string]: components["schemas"]["InferenceModelInfo"];
             };
@@ -19323,6 +19811,14 @@ export interface components {
              */
             name: string;
             backend?: components["schemas"]["InferenceModelBackend"];
+            /**
+             * @description Per-model GLiNER CUDA inference precision for extractor preloads. Requires
+             *     CUDA; omitted or auto currently selects FP32. FP16 and BF16 requests
+             *     fail closed until the exact model/profile has release qualification.
+             *     Precision is part of the loaded-session cache identity.
+             * @enum {string}
+             */
+            cuda_precision?: "auto" | "fp32" | "fp16" | "bf16";
             format?: components["schemas"]["InferenceModelFormat"];
             quantization?: components["schemas"]["InferenceModelQuantization"];
             /**
@@ -19920,7 +20416,7 @@ export interface components {
          * Format: double
          * @description Finite centered-logit decisions require a threshold strictly between zero and one.
          */
-        ExtractionDecisionProbability: number;
+        ExtractionClassificationThreshold: number;
         ExtractionClassificationExample: {
             input: string;
             label: string;
@@ -19932,15 +20428,14 @@ export interface components {
             multi_label?: boolean;
             /** @description Version 1 NLI hypothesis template with {} as the label placeholder; the server uses "This example is {}." when omitted. Version 2 GLiNER boundary extraction rejects an explicit hypothesis_template; use prompt/instruction and label_definitions for model conditioning. */
             hypothesis_template?: string;
-            /** @description Maximum labels for ordinary single-label classification; the server uses 1 when omitted. Version 2 constrained or ordinal selection uses min_labels/max_labels. Advanced set-selection options or cross-task constraints on any classification in the collection reject every explicit top_k in that collection, including 1. Omit top_k when using these options. */
+            /** @description Maximum labels for ordinary single-label classification; the server uses 1 when omitted. Version 2 constrained classification uses min_labels/max_labels. Advanced set-selection options or cross-task constraints on any classification in the collection reject every explicit top_k in that collection, including 1. Omit top_k when using these options. */
             top_k?: number;
             /**
-             * @description Version 2 classification mode. Ordinal labels are ordered from lowest to highest.
-             *     Typed-decision extractors support boolean with labels ["false", "true"] in that order.
+             * @description Version 2 ordinary classification mode. Standalone ordinal scores use the decision API.
              *     Each model rejects modes it does not support.
              * @enum {string}
              */
-            mode?: "single" | "multi" | "ordinal" | "boolean";
+            mode?: "single" | "multi";
             label_definitions?: {
                 [key: string]: components["schemas"]["ExtractionLabelDefinition"];
             };
@@ -19948,7 +20443,7 @@ export interface components {
             /** @description Version 2 maximum selected labels. Explicit null means no maximum; omission preserves mode defaults. */
             max_labels?: number | null;
             ordered?: boolean;
-            threshold?: components["schemas"]["ExtractionDecisionProbability"];
+            threshold?: components["schemas"]["ExtractionClassificationThreshold"];
             candidate_threshold?: components["schemas"]["ExtractionProbability"];
             /** @enum {string} */
             activation?: "auto" | "sigmoid" | "softmax";
@@ -20167,7 +20662,7 @@ export interface components {
         ExtractionClassificationConstraint: components["schemas"]["ExtractionConstraintLabelRef"] | components["schemas"]["ExtractionConstraintAnySelected"] | components["schemas"]["ExtractionConstraintAnyOtherSelected"] | components["schemas"]["ExtractionConstraintIsDefault"] | components["schemas"]["ExtractionConstraintCardinality"] | components["schemas"]["ExtractionConstraintMinLevel"] | components["schemas"]["ExtractionConstraintMaxLevel"] | components["schemas"]["ExtractionConstraintAtLevel"] | components["schemas"]["ExtractionConstraintNot"] | components["schemas"]["ExtractionConstraintAnd"] | components["schemas"]["ExtractionConstraintOr"] | components["schemas"]["ExtractionConstraintExactlyOneOf"] | components["schemas"]["ExtractionConstraintImplies"] | components["schemas"]["ExtractionConstraintIff"] | components["schemas"]["ExtractionConstraintExcludes"];
         ExtractionJointEntity: {
             description?: string;
-            threshold?: components["schemas"]["ExtractionDecisionProbability"];
+            threshold?: components["schemas"]["ExtractionClassificationThreshold"];
             candidate_threshold?: components["schemas"]["ExtractionProbability"];
             max_candidates?: number;
             allow_nested?: boolean;
@@ -20177,7 +20672,7 @@ export interface components {
             tail: string[];
             /** @description Retained declarative metadata; model conditioning follows the pinned JointIE compiler. */
             description?: string;
-            threshold?: components["schemas"]["ExtractionDecisionProbability"];
+            threshold?: components["schemas"]["ExtractionClassificationThreshold"];
             candidate_threshold?: components["schemas"]["ExtractionProbability"];
             /** @default true */
             directed?: boolean;
@@ -20445,42 +20940,6 @@ export interface components {
             schema: components["schemas"]["ExtractionSchema"];
             options?: components["schemas"]["ExtractionOptions"];
         };
-        ExtractionLabelProbability: {
-            label: string;
-            /** Format: float */
-            probability: number;
-        };
-        /** @description Version 2 typed classification decision. Probabilities follow request label order; ordinal levels are zero-based. */
-        ExtractionDecision: {
-            name: string;
-            /** @enum {string} */
-            type: "choice" | "score" | "boolean";
-            /** @description Highest-probability label. This is distinct from the expected ordinal value. */
-            label: string;
-            probabilities: components["schemas"]["ExtractionLabelProbability"][];
-            /** Format: float */
-            confidence: number;
-            /**
-             * @description Entropy confidence is not the probability that the selected label is correct.
-             * @enum {string}
-             */
-            confidence_method: "normalized_inverse_entropy" | "max_probability";
-            /**
-             * Format: float
-             * @description Score decisions only; sum of zero-based level index times probability.
-             */
-            expected_value?: number;
-            /**
-             * Format: float
-             * @description Boolean decisions only; probability of the true label.
-             */
-            true_probability?: number;
-            /**
-             * Format: float
-             * @description Auxiliary model estimate for acting, from models with an action head (Laya). Does not authorize or execute a tool call.
-             */
-            act_probability?: number;
-        };
         ExtractionAttributeLabel: {
             label: string;
             confidence: components["schemas"]["ExtractionProbability"];
@@ -20528,8 +20987,6 @@ export interface components {
             label: string;
             /** Format: float */
             score?: number;
-        } & {
-            [key: string]: unknown;
         };
         ExtractionRecordMetadata: {
             score?: components["schemas"]["ExtractionProbability"];
@@ -20569,8 +21026,6 @@ export interface components {
             solver_optimality_scope: "retained_candidate_graph";
         };
         ExtractionObject: {
-            /** @description Typed decision results from capable extractors, alongside compatible per-label classifications. */
-            decisions?: components["schemas"]["ExtractionDecision"][];
             id?: string;
             offset_unit?: components["schemas"]["ExtractionOffsetUnit"];
             entities?: components["schemas"]["ExtractionEntity"][];
@@ -20640,6 +21095,217 @@ export interface components {
             threshold?: number;
             text?: components["schemas"]["TextChunkOptions"];
             audio?: components["schemas"]["InferenceAudioChunkConfig"];
+        };
+        DecisionInput: {
+            id?: string;
+            input: string;
+        };
+        /** @description Explicit windowing for qualified boundary decision models. Span and embedding decision models reject window mode. Omission preserves rejection of over-limit text. */
+        InferenceDecideLongDocument: {
+            /**
+             * @default reject
+             * @enum {string}
+             */
+            mode?: "reject" | "window";
+            /** @default 1024 */
+            window_words?: number;
+            /**
+             * @description Must be smaller than window_words. Only valid in window mode.
+             * @default 32
+             */
+            overlap_words?: number;
+            /** @default 128 */
+            max_windows?: number;
+        };
+        /** @description Local decision models use string choice identifiers. Embedding category examples replace the description with their normalized centroid; trained models reject examples. */
+        DecisionChoice: {
+            value: string;
+            description?: string;
+            examples?: string[];
+        };
+        /** @description Question-specific acceptance policy for embedding similarity. Trained decision models reject it. */
+        EmbeddingDecisionAcceptance: {
+            /** @description Public API identifier for a server-side fitted threshold artifact at model/calibrations/{id}.json. The server verifies qualification and the exact asset identity, prompt profile, dimensions, renderer and this question's label/prototype set. Mutually exclusive with manual thresholds; never produces probabilities. */
+            calibration_id?: string;
+            /** @description For a single choice, abstain when the highest cosine similarity is below this value. It is a similarity threshold, not an accuracy or probability estimate. */
+            min_similarity?: number;
+            /** @description For a single choice, require this gap between the highest and second-highest cosine similarities. For multi_choice, require every score to be at least this distance from its own selection threshold; otherwise abstain. */
+            min_margin?: number;
+        };
+        ChoiceDecisionQuestion: {
+            /** @enum {string} */
+            type: "choice";
+            name: string;
+            instructions: string;
+            choices: components["schemas"]["DecisionChoice"][];
+            embedding_options?: components["schemas"]["EmbeddingDecisionAcceptance"];
+        };
+        /** @description Antfly multi-label extension for embedding similarity; selected, empty and abstained are distinct results. */
+        MultiChoiceDecisionQuestion: {
+            /** @enum {string} */
+            type: "multi_choice";
+            name: string;
+            instructions: string;
+            choices: components["schemas"]["DecisionChoice"][];
+            embedding_options?: components["schemas"]["EmbeddingDecisionAcceptance"];
+            /** @description Required raw cosine cutoff for every choice, either one common cutoff or a complete choice-to-cutoff map. Alternatively supply a qualified question-specific calibration_id. Mutually exclusive with calibration_id. Scores equal to their cutoff are selected. */
+            similarity_thresholds?: number | {
+                [key: string]: number;
+            };
+        };
+        /** @description Ordered score level, from lowest to highest. Results assign zero-based numeric values to these levels. */
+        DecisionLevel: {
+            label: string;
+            description?: string;
+        };
+        ScoreDecisionQuestion: {
+            /** @enum {string} */
+            type: "score";
+            name: string;
+            instructions: string;
+            levels: components["schemas"]["DecisionLevel"][];
+        };
+        /** @description Estimate whether the condition in instructions holds for the input. The trained answer reports probability in [0,1]. */
+        PredicateDecisionQuestion: {
+            /** @enum {string} */
+            type: "predicate";
+            name: string;
+            instructions: string;
+        };
+        InferenceDecideQuestion: components["schemas"]["ChoiceDecisionQuestion"] | components["schemas"]["MultiChoiceDecisionQuestion"] | components["schemas"]["ScoreDecisionQuestion"] | components["schemas"]["PredicateDecisionQuestion"];
+        /** @description Request-wide embedding geometry defaults. Acceptance thresholds and calibration belong to individual questions. */
+        EmbeddingDecisionOptions: {
+            /**
+             * @description Prompt profile for the decision input and category prototypes. The embedding endpoint also accepts task_type; decision routing restricts it to these two profiles.
+             * @default CLUSTERING
+             * @enum {string}
+             */
+            task_type?: "CLUSTERING" | "CLASSIFICATION";
+            /**
+             * @description Truncate and renormalize embeddings to this dimension before cosine scoring.
+             * @default 768
+             * @enum {integer}
+             */
+            dimensions?: 768 | 512 | 256 | 128;
+        };
+        DecisionChoiceProbability: {
+            value: string;
+            probability: number;
+        };
+        TrainedChoiceAnswer: {
+            name: string;
+            /** @enum {string} */
+            type: "choice";
+            /** @enum {string} */
+            decision_method: "typed";
+            /** @description Model diagnostic; entropy confidence is not the probability that the chosen label is correct. */
+            confidence: number;
+            /** @enum {string} */
+            confidence_method: "normalized_inverse_entropy" | "max_probability";
+            /** @description Applicable action-head diagnostic. It does not authorize or execute an action. */
+            act_probability?: number;
+            choice: string;
+            probabilities: components["schemas"]["DecisionChoiceProbability"][];
+        };
+        DecisionLevelProbability: {
+            label: string;
+            value: number;
+            probability: number;
+        };
+        TrainedScoreAnswer: {
+            name: string;
+            /** @enum {string} */
+            type: "score";
+            /** @enum {string} */
+            decision_method: "typed";
+            /** @description Model diagnostic; entropy confidence is not the probability that the chosen label is correct. */
+            confidence: number;
+            /** @enum {string} */
+            confidence_method: "normalized_inverse_entropy" | "max_probability";
+            /** @description Applicable action-head diagnostic. It does not authorize or execute an action. */
+            act_probability?: number;
+            score: number;
+            probabilities: components["schemas"]["DecisionLevelProbability"][];
+        };
+        TrainedPredicateAnswer: {
+            name: string;
+            /** @enum {string} */
+            type: "predicate";
+            /** @enum {string} */
+            decision_method: "typed";
+            /** @description Model diagnostic; entropy confidence is not the probability that the chosen label is correct. */
+            confidence?: number;
+            /** @enum {string} */
+            confidence_method?: "normalized_inverse_entropy" | "max_probability";
+            /** @description Applicable action-head diagnostic. It does not authorize or execute an action. */
+            act_probability?: number;
+            /** @description The model-estimated probability that the condition in instructions holds. */
+            probability: number;
+        };
+        DecisionSimilarity: {
+            value: string;
+            similarity: number;
+        };
+        /** @description Raw cosine scores are neither probabilities nor confidence. Empty means no label met its threshold; abstained means the requested margin could not be established. */
+        EmbeddingChoiceAnswer: {
+            name: string;
+            /** @enum {string} */
+            type: "choice";
+            /** @enum {string} */
+            decision_method: "embedding_similarity";
+            /**
+             * @description Cosine is fixed for this embedding recipe and its threshold artifacts. Index distance settings are independent.
+             * @enum {string}
+             */
+            similarity_metric: "cosine";
+            similarities: components["schemas"]["DecisionSimilarity"][];
+            margin: number;
+            /** @enum {string} */
+            status: "selected" | "abstained";
+            prototype_set_hash: string;
+            calibration_id?: string;
+            /** @enum {string} */
+            abstention_reason?: "tie" | "min_similarity" | "min_margin";
+            /** @description Selected identifier, or null on abstention. */
+            choice: string | null;
+        };
+        /** @description Raw cosine scores are neither probabilities nor confidence. Empty means no label met its threshold; abstained means the requested margin could not be established. */
+        EmbeddingMultiChoiceAnswer: {
+            name: string;
+            /** @enum {string} */
+            type: "multi_choice";
+            /** @enum {string} */
+            decision_method: "embedding_similarity";
+            /**
+             * @description Cosine is fixed for this embedding recipe and its threshold artifacts. Index distance settings are independent.
+             * @enum {string}
+             */
+            similarity_metric: "cosine";
+            similarities: components["schemas"]["DecisionSimilarity"][];
+            margin: number;
+            /** @enum {string} */
+            status: "selected" | "empty" | "abstained";
+            prototype_set_hash: string;
+            calibration_id?: string;
+            /** @enum {string} */
+            abstention_reason?: "tie" | "min_similarity" | "min_margin";
+            choices: string[];
+            /** @description Effective cosine selection threshold for every choice, including fitted calibration thresholds. */
+            similarity_thresholds: {
+                [key: string]: number;
+            };
+        };
+        InferenceDecideAnswer: components["schemas"]["TrainedChoiceAnswer"] | components["schemas"]["TrainedScoreAnswer"] | components["schemas"]["TrainedPredicateAnswer"] | components["schemas"]["EmbeddingChoiceAnswer"] | components["schemas"]["EmbeddingMultiChoiceAnswer"];
+        DecisionBatchItem: {
+            input_index: number;
+            id?: string;
+            answers: components["schemas"]["InferenceDecideAnswer"][];
+        };
+        DecisionUsage: {
+            /** @description Encoded tokens including repeated input text for split model tasks. */
+            input_tokens: number;
+            /** @description Zero for classifiers, which generate no tokens. */
+            output_tokens: number;
         };
     };
     responses: {
@@ -20963,6 +21629,480 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    getLakeCatalog: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Authoritative catalog result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LakeCatalogResponse"];
+                };
+            };
+            /** @description Invalid or unsupported catalog request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized catalog operation */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Table or lake catalog not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Binding, incarnation, or commit conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Catalog authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Request deadline exceeded */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    initializeLakeCatalog: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LakeCatalogCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Authoritative catalog result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LakeCatalogResponse"];
+                };
+            };
+            /** @description Commit outcome is uncertain; resolve or retry the same commit ID and request. Do not checkpoint or delete files yet. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LakeCatalogResponse"];
+                };
+            };
+            /** @description Invalid or unsupported catalog request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized catalog operation */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Table or lake catalog not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Binding, incarnation, or commit conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Catalog authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Request deadline exceeded */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    ingestLakeChanges: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    batch_id: string;
+                    source: string;
+                    epoch: string;
+                    checkpoint: string;
+                    expected_checkpoint?: string | null;
+                    key_fields: string[];
+                    changes: {
+                        /** @enum {string} */
+                        op: "upsert" | "delete";
+                        row: {
+                            [key: string]: unknown;
+                        };
+                    }[];
+                };
+            };
+        };
+        responses: {
+            /** @description Durable WAL acceptance; retry the same transaction after an ambiguous response. Native text search can compose a bounded accepted-WAL overlay before catalog/index publication; SQL reads follow committed snapshots. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        state?: string;
+                        /** Format: uint64 */
+                        wal_lsn?: number;
+                        /** Format: uint64 */
+                        table_id?: number;
+                        /** Format: uint64 */
+                        object_generation?: number;
+                        searchable?: boolean;
+                    };
+                };
+            };
+            /** @description Invalid transaction or unsupported row type */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized ingestion */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Table or catalog not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Source, predecessor checkpoint or batch identity conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Durable ingestion unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Request deadline exceeded */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    maintainLakeTable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @enum {string} */
+                    action: "compact" | "vacuum" | "wal_gc" | "status" | "enrichment_status";
+                    /** @description Required for compact/vacuum/wal_gc; omitted for scheduler or enrichment status. */
+                    operation_id?: string;
+                    /** @default true */
+                    dry_run?: boolean;
+                    /** @default false */
+                    exclusive_ownership?: boolean;
+                    /**
+                     * Format: uint64
+                     * @default 16384
+                     */
+                    max_rows?: number;
+                    /**
+                     * Format: uint64
+                     * @default 33554432
+                     */
+                    max_bytes?: number;
+                    /**
+                     * Format: uint64
+                     * @default 604800000
+                     */
+                    retain_ms?: number;
+                    /** @default 2 */
+                    keep_latest?: number;
+                    /** @default 4096 */
+                    max_deleted?: number;
+                };
+            };
+        };
+        responses: {
+            /** @description Bounded maintenance result; complete false requires another pass with the same operation ID. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Invalid maintenance limits */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing admin permission, writer policy or ownership agreement */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Table or catalog not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Conditional conflict or conflicting saved operation */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Maintenance unavailable or uncertain outcome; retry the same operation ID */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Request deadline exceeded */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    commitLakeCatalog: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LakeCatalogCommitRequest"];
+            };
+        };
+        responses: {
+            /** @description Authoritative catalog result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LakeCatalogResponse"];
+                };
+            };
+            /** @description Commit outcome is uncertain; resolve or retry the same commit ID and request. Do not checkpoint or delete files yet. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LakeCatalogResponse"];
+                };
+            };
+            /** @description Invalid or unsupported catalog request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized catalog operation */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Table or lake catalog not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Binding, incarnation, or commit conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Catalog authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Request deadline exceeded */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getLakeCommitOutcome: {
+        parameters: {
+            query: {
+                request_hash: string;
+            };
+            header?: never;
+            path: {
+                tableName: string;
+                commitId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Authoritative catalog result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LakeCatalogResponse"];
+                };
+            };
+            /** @description Invalid or unsupported catalog request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized catalog operation */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Table or lake catalog not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Binding, incarnation, or commit conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Catalog authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Request deadline exceeded */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     getStatus: {
         parameters: {
             query?: never;
@@ -23911,6 +25051,10 @@ export interface operations {
                  * @description Read consistency for the lookup. The default `read_index` routes to
                  *     the primary for linearizable reads. `stale` allows a hot standby to
                  *     serve the lookup at its safe-read LSN.
+                 *     Owned object document tables support only explicit `stale` reads of
+                 *     published generations. The default `read_index` and `leader_lease`
+                 *     are rejected with HTTP 400. Use `sync_level=full_index` on writes to
+                 *     wait for publication before a stale lookup.
                  */
                 consistency?: "read_index" | "leader_lease" | "stale";
             };
@@ -24912,6 +26056,113 @@ export interface operations {
             405: components["responses"]["MethodNotAllowed"];
             409: components["responses"]["IndexMutationConflict"];
             500: components["responses"]["InternalServerError"];
+        };
+    };
+    listQuerySources: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Immutable catalog source definitions */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SavedQuerySource"][];
+                };
+            };
+        };
+    };
+    getQuerySource: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                sourceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Source definition and immutable incarnation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SavedQuerySource"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+        };
+    };
+    createQuerySource: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                sourceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    source: components["schemas"]["ComposedQuerySource"];
+                };
+            };
+        };
+        responses: {
+            /** @description Source created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SavedQuerySource"];
+                };
+            };
+            /** @description Committed with visibility pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Source already exists */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    dropQuerySource: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                sourceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Source dropped */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
         };
     };
     listTablespaces: {
@@ -28992,7 +30243,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Decision distributions and derived answers */
+            /** @description Named decision answers, diagnostics and aggregate token usage */
             200: {
                 headers: {
                     [name: string]: unknown;

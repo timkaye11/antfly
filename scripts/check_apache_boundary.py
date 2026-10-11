@@ -143,6 +143,10 @@ SOURCE_MODULES = {
     "antfly_embedded_api": ("zig/pkg/antfly-embedded/src/engine/api.zig",),
     "antfly_embedded_db": ("zig/pkg/antfly-embedded/src/engine/db.zig",),
     "antfly_embeddings": ("zig/lib/embeddings/src/mod.zig",),
+    "antfly_decisions": ("zig/lib/decisions/root.zig",),
+    "antfly_decision_openapi": (
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_decision_openapi/root.zig",
+    ),
     "antfly_embeddings_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_embeddings_openapi/root.zig",
     ),
@@ -228,6 +232,8 @@ SOURCE_MODULES = {
     "antfly_reader_config": ("zig/lib/readers/src/config.zig",),
     "antfly_readers": ("zig/lib/readers/src/mod.zig",),
     "antfly_regex": ("zig/lib/regex/src/mod.zig",),
+    "antfly_capture_regex": ("zig/lib/regex/src/captures.zig",),
+    "antfly_sql_regex": ("zig/lib/sql_regex/src/mod.zig",),
     "antfly_reranking": ("zig/lib/reranking/src/mod.zig",),
     "antfly_reranking_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_reranking_openapi/root.zig",

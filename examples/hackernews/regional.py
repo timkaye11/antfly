@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Run comparative HN checks in one temporary GKE pod in the bucket's region.
+
+Uses the caller's existing GCS authority via short-lived stdin credentials.
+Does not create IAM bindings, secrets, buckets, services, or persistent volumes.
+The pod is removed in finally and has a hard lifetime if the caller disconnects.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import uuid
+
+SDK_IMAGE = "gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:cde9dbd556000c21c08449d8e5828904ef91e690bec95207f71fa6a6685922c9"
+
+
+def compare_runs(reports):
+    """Compare exact results only when the measured source/query are identical."""
+    reference = reports[0]
+    expected = [
+        (hit["_source"]["hn_id"], hit["_score"])
+        for hit in reference["first_response"]["hits"]["hits"]
+    ]
+    for report in reports[1:]:
+        for field in ("source", "row_count", "query", "concurrency"):
+            if report[field] != reference[field]:
+                raise ValueError(f"Benchmark {field} differs between runs")
+        actual = [
+            (hit["_source"]["hn_id"], hit["_score"])
+            for hit in report["first_response"]["hits"]["hits"]
+        ]
+        if actual != expected:
+            raise ValueError("Ranked HN IDs/scores changed between runs")
+        expected_filters = reference["metadata_filters"]
+        if report["metadata_filters"].keys() != expected_filters.keys():
+            raise ValueError("Filter coverage differs between runs")
+        for name, result in expected_filters.items():
+            if report["metadata_filters"][name]["total"] != result["total"]:
+                raise ValueError(f"Exact filter total differs for {name}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--binary", type=Path, required=True, help="Linux x86_64 standalone binary"
+    )
+    parser.add_argument("--project", default="antfly-dev-01")
+    parser.add_argument("--cluster", default="antfly-dev")
+    parser.add_argument("--region", default="us-central1")
+    parser.add_argument("--namespace", default="default")
+    parser.add_argument("--bucket", default="colony-import-sources-antfly-dev-01")
+    parser.add_argument("--source-prefix", default="hn-poc/20261007")
+    parser.add_argument(
+        "--run-prefix",
+        required=True,
+        help="New GCS artifact namespace; source is read only",
+    )
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--revision", required=True, help="Binary source revision")
+    parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument(
+        "--modes",
+        nargs="+",
+        choices=("text-only", "indexed"),
+        default=["text-only", "indexed"],
+        help="Run modes separately when a full-archive build needs its own pod lifetime",
+    )
+    parser.add_argument(
+        "--cycles", type=int, default=2, help="Empty-cache/restart cycles per table"
+    )
+    parser.add_argument("--expected-rows", type=int, default=10000)
+    parser.add_argument("--build-timeout", type=int, default=300)
+    parser.add_argument("--cursor-retention-ms", type=int, default=300000)
+    parser.add_argument("--lifetime", type=int, default=2700)
+    parser.add_argument("--cpu", default="2")
+    parser.add_argument("--memory", default="8Gi")
+    parser.add_argument("--disk", default="4Gi")
+    parser.add_argument("--concurrency", type=int, default=4)
+    args = parser.parse_args()
+    if len(set(args.modes)) != len(args.modes):
+        parser.error("modes must not contain duplicates")
+    if not args.binary.is_file():
+        parser.error("binary must be an existing Linux executable")
+    if args.cycles < 1 or args.repeats < 1:
+        parser.error("cycles and repeats must be positive")
+    if (
+        args.expected_rows < 2
+        or args.build_timeout < 1
+        or args.lifetime < args.build_timeout + 120
+    ):
+        parser.error(
+            "row count must be >=2 and lifetime must exceed build timeout by 120s"
+        )
+    if args.concurrency < 1:
+        parser.error("concurrency must be positive")
+    if not 1000 <= args.cursor_retention_ms <= 3600000:
+        parser.error("cursor retention must be between 1000 and 3600000 milliseconds")
+    args.output.mkdir(parents=True, exist_ok=False)
+    # kubectl's auth plugin may cache credentials beside its kubeconfig. Keep
+    # those standard CLI files outside the delivered results and remove them.
+    credentials = tempfile.TemporaryDirectory(prefix="hackernews-kube-")
+    env = dict(os.environ, KUBECONFIG=str(Path(credentials.name) / "kubeconfig"))
+
+    def run(argv, **kwargs):
+        return subprocess.run(argv, env=env, check=True, **kwargs)
+
+    run(
+        [
+            "gcloud",
+            "container",
+            "clusters",
+            "get-credentials",
+            args.cluster,
+            "--region",
+            args.region,
+            "--project",
+            args.project,
+        ]
+    )
+    location = run(
+        [
+            "gcloud",
+            "storage",
+            "buckets",
+            "describe",
+            "gs://" + args.bucket,
+            "--project",
+            args.project,
+            "--format=value(location)",
+        ],
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if location.lower() != args.region:
+        raise ValueError(
+            f"Bucket location {location} differs from worker region {args.region}"
+        )
+    pod_name = "hackernews-benchmark-" + uuid.uuid4().hex[:12]
+    kubectl = ["kubectl", "-n", args.namespace]
+    pod = {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": pod_name, "labels": {"app": "hackernews-benchmark"}},
+        "spec": {
+            "restartPolicy": "Never",
+            "activeDeadlineSeconds": args.lifetime,
+            "automountServiceAccountToken": False,
+            "nodeSelector": {
+                "topology.kubernetes.io/region": args.region,
+                "kubernetes.io/arch": "amd64",
+            },
+            "containers": [
+                {
+                    "name": "benchmark",
+                    "image": SDK_IMAGE,
+                    "command": [
+                        "python3",
+                        "-c",
+                        f"import time; time.sleep({args.lifetime})",
+                    ],
+                    "resources": {
+                        "requests": {
+                            "cpu": args.cpu,
+                            "memory": args.memory,
+                            "ephemeral-storage": args.disk,
+                        },
+                        "limits": {
+                            "cpu": args.cpu,
+                            "memory": args.memory,
+                            "ephemeral-storage": args.disk,
+                        },
+                    },
+                }
+            ],
+        },
+    }
+    created = False
+    try:
+        run(kubectl + ["create", "-f", "-"], input=json.dumps(pod), text=True)
+        created = True
+        run(
+            kubectl
+            + ["wait", "--for=condition=Ready", "pod/" + pod_name, "--timeout=300s"]
+        )
+        worker = json.loads(
+            run(
+                kubectl + ["get", "pod", pod_name, "-o", "json"],
+                capture_output=True,
+                text=True,
+            ).stdout
+        )
+        run(kubectl + ["exec", pod_name, "--", "mkdir", "-p", "/workspace"])
+        run(kubectl + ["cp", str(args.binary), pod_name + ":/workspace/antfly"])
+        run(
+            kubectl
+            + [
+                "cp",
+                str(Path(__file__).with_name("poc.py")),
+                pod_name + ":/workspace/poc.py",
+            ]
+        )
+        run(kubectl + ["exec", pod_name, "--", "chmod", "+x", "/workspace/antfly"])
+        reports = {}
+        for mode in args.modes:
+            command = kubectl + [
+                "exec",
+                "-i",
+                pod_name,
+                "--",
+                "python3",
+                "/workspace/poc.py",
+                "--binary",
+                "/workspace/antfly",
+                "--project",
+                args.project,
+                "--bucket",
+                args.bucket,
+                "--prefix",
+                args.source_prefix,
+                "--artifact-prefix",
+                args.run_prefix + "/" + mode,
+                "--state",
+                "/workspace/" + mode,
+                "--cold-cache",
+                "--require-filters",
+                "--bearer-stdin",
+                "--repeats",
+                str(args.repeats),
+                "--expected-rows",
+                str(args.expected_rows),
+                "--build-timeout",
+                str(args.build_timeout),
+                "--concurrency",
+                str(args.concurrency),
+                "--cursor-retention-ms",
+                str(args.cursor_retention_ms),
+            ]
+            if mode == "text-only":
+                command.append("--text-only")
+            reports[mode] = []
+            for cycle in range(args.cycles):
+                label = mode + "-" + str(cycle + 1)
+                # Refresh for each cycle; OAuth credentials stay in memory.
+                token = run(
+                    ["gcloud", "auth", "print-access-token", "--project", args.project],
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                with (args.output / (label + ".log")).open("w") as log:
+                    completed = subprocess.run(
+                        command,
+                        env=env,
+                        input=token + "\n",
+                        text=True,
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                    )
+                if completed.returncode:
+                    run(
+                        kubectl
+                        + [
+                            "cp",
+                            pod_name + ":/workspace/" + mode + "/server.log",
+                            str(args.output / (label + "-server.log")),
+                        ]
+                    )
+                    raise RuntimeError(
+                        f"{label} failed; see {args.output / (label + '.log')}"
+                    )
+                run(
+                    kubectl
+                    + [
+                        "cp",
+                        pod_name + ":/workspace/" + mode + "/report.json",
+                        str(args.output / (label + ".json")),
+                    ]
+                )
+                result = json.loads((args.output / (label + ".json")).read_text())
+                reports[mode].append(result)
+                print(
+                    json.dumps(
+                        {
+                            "mode": mode,
+                            "cycle": cycle + 1,
+                            "cold_ms": result["first_search_ms"],
+                            "warm_ms": result["warm_search_ms"],
+                            "restart_ms": result["after_restart_ms"],
+                        }
+                    ),
+                    flush=True,
+                )
+        compare_runs([cycle for cycles in reports.values() for cycle in cycles])
+        digest = hashlib.sha256()
+        with args.binary.open("rb") as binary:
+            for chunk in iter(lambda: binary.read(1048576), b""):
+                digest.update(chunk)
+        report = {
+            "project": args.project,
+            "cluster": args.cluster,
+            "region": args.region,
+            "node": worker["spec"]["nodeName"],
+            "resources": worker["spec"]["containers"][0]["resources"],
+            "image": SDK_IMAGE,
+            "revision": args.revision,
+            "binary_sha256": digest.hexdigest(),
+            "runs": reports,
+            "modes": args.modes,
+            "cross_mode_comparison": len(args.modes) > 1,
+            "row_count": args.expected_rows,
+            "note": "Pinned regional qualification; compare only matching source, resources and optimization.",
+        }
+        (args.output / "regional.json").write_text(json.dumps(report, indent=2) + "\n")
+    finally:
+        try:
+            if created:
+                run(
+                    kubectl
+                    + ["delete", "pod", pod_name, "--wait=false", "--ignore-not-found"]
+                )
+        finally:
+            credentials.cleanup()
+
+
+if __name__ == "__main__":
+    main()

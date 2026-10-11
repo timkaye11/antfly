@@ -26,6 +26,7 @@ SQL_OPERATIONS = [
     Path(f"api/data_operations/{operation}.py")
     for operation in ("execute_sql", "prepare_sql", "execute_prepared_sql", "close_prepared_sql")
 ]
+EMBED_REQUEST = Path("models/inference_embed_request.py")
 NDJSON_RESPONSE = "response_200 = cast(str, response.content)"
 EMBED_REQUEST = Path("models/inference_embed_request.py")
 
@@ -35,7 +36,7 @@ def _fix_embedding_input_union(source: str) -> str:
     to_dict_start = source.index("    def to_dict(self) -> dict[str, Any]:")
     from_dict_start = source.index("    @classmethod\n    def from_dict", to_dict_start)
     generated_to_dict = source[to_dict_start:from_dict_start]
-    if generated_to_dict.count("if isinstance(self.input_, list):") != 3:
+    if generated_to_dict.count("if isinstance(self.input_, list):") not in (3, 4):
         raise RuntimeError(f"unexpected generated shape in {EMBED_REQUEST}: to_dict list union")
 
     input_start = generated_to_dict.index("        input_: dict[str, Any]")
@@ -48,7 +49,7 @@ def _fix_embedding_input_union(source: str) -> str:
         elif isinstance(self.input_, list):
             if all(isinstance(item, str) for item in self.input_):
                 input_ = list(self.input_)
-            elif all(isinstance(item, InferenceEmbeddingContentInput) for item in self.input_):
+            elif all(isinstance(item, (InferenceEmbeddingContentInput, InferenceEmbeddingGroup)) for item in self.input_):
                 input_ = [item.to_dict() for item in self.input_]
             elif all(isinstance(item, (TextContentPart, ImageURLContentPart, MediaContentPart)) for item in self.input_):
                 input_ = [item.to_dict() for item in self.input_]
@@ -57,27 +58,32 @@ def _fix_embedding_input_union(source: str) -> str:
         else:
             raise TypeError("input must be a string, list, or ordered content input")
 
+        model_identity = self.model_identity
+
 """
     generated_to_dict = generated_to_dict[:input_start] + fixed_input + generated_to_dict[encoding_start:]
     generated_to_dict = generated_to_dict.replace(
         "        from ..models.inference_embedding_content_input import InferenceEmbeddingContentInput\n",
         "        from ..models.inference_embedding_content_input import InferenceEmbeddingContentInput\n"
-        "        from ..models.media_content_part import MediaContentPart\n",
+        "        from ..models.media_content_part import MediaContentPart\n"
+        "        from ..models.inference_embedding_group import InferenceEmbeddingGroup\n",
         1,
     )
     source = source[:to_dict_start] + generated_to_dict + source[from_dict_start:]
 
+    from_dict_start = source.index("    @classmethod\n    def from_dict", to_dict_start)
+
     parser_start = source.index("        def _parse_input_(", from_dict_start)
     parser_end = source.index("\n        input_ = _parse_input_", parser_start)
     generated_parser = source[parser_start:parser_end]
-    if generated_parser.count("if not isinstance(data, list):") != 3:
+    if generated_parser.count("if not isinstance(data, list):") not in (3, 4):
         raise RuntimeError(f"unexpected generated shape in {EMBED_REQUEST}: from_dict list union")
     fixed_parser = """        def _parse_input_(
             data: object,
         ) -> (
             InferenceEmbeddingContentInput
             | list[ImageURLContentPart | MediaContentPart | TextContentPart]
-            | list[InferenceEmbeddingContentInput]
+            | list[InferenceEmbeddingContentInput | InferenceEmbeddingGroup]
             | list[str]
             | str
         ):
@@ -98,7 +104,10 @@ def _fix_embedding_input_union(source: str) -> str:
             if any(ordered):
                 if not all(ordered):
                     raise TypeError("ordered content inputs cannot be mixed with legacy content parts")
-                return [InferenceEmbeddingContentInput.from_dict(item) for item in object_items]
+                return [
+                    InferenceEmbeddingGroup.from_dict(item) if "title" in item else InferenceEmbeddingContentInput.from_dict(item)
+                    for item in object_items
+                ]
 
             content_parts: list[ImageURLContentPart | MediaContentPart | TextContentPart] = []
             for item in object_items:
