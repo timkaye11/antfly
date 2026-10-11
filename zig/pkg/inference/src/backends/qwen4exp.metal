@@ -105,6 +105,17 @@ kernel void qwen4exp_eager(
         if (p.index&(1u<<(id/p.dim))) o[id]=q4silu(a[id])*b[id];
         break;
     }
+    case 32: o[(id/p.dim)*p.stride+p.index+id%p.dim]=a[id]; break;
+    case 30: { // gather token activations for one expert from route locations
+        uint location=((device const uint*)b)[id/p.dim];
+        o[id]=a[(location/10)*p.dim+id%p.dim];
+        break;
+    }
+    case 31: { // scatter expert outputs into their original token/route positions
+        uint location=((device const uint*)b)[id/p.dim];
+        o[location*p.dim+id%p.dim]=a[id];
+        break;
+    }
     case 7: { // encoded Q8_0 embedding row; 32 values per 34 bytes
         device uchar *raw=(device uchar*)a;
         uint k=p.index*p.dim+id%p.dim, block=k/32;

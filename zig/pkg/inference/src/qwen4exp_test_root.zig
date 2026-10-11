@@ -14,6 +14,7 @@
 // limitations under the License.
 
 test {
+    _ = @import("local_text_session.zig");
     _ = @import("native_generate.zig");
     _ = @import("native_qwen4exp_generate.zig");
     _ = @import("architectures/qwen4exp_runtime.zig");

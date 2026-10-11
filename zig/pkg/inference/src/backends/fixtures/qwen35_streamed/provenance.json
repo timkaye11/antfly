@@ -1,0 +1,123 @@
+{
+  "ggml_revision": "6184e92c57dcd34de8a3e381d7641a5e75250d5f",
+  "gguf_sha256": "322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482",
+  "cases": [
+    {
+      "type": 0,
+      "source_tensor": "output_norm.weight",
+      "rows": [
+        0,
+        1,
+        2
+      ],
+      "columns": 256,
+      "note": "F32 is contiguous first 768 norm elements reshaped to 3x256",
+      "raw_sha256": "65597c9383c9dc73525a022bcc61e411bb0268660933e79157185c40c6170185",
+      "expected_sha256": "65597c9383c9dc73525a022bcc61e411bb0268660933e79157185c40c6170185"
+    },
+    {
+      "type": 8,
+      "source_tensor": "blk.0.ssm_alpha.weight",
+      "rows": [
+        0,
+        1,
+        2
+      ],
+      "columns": 256,
+      "note": "first 256 columns of each row",
+      "raw_sha256": "d169f4fbe6f69c93392c7e9d76dfccc8631a2a6b8ffd243bd8ba99f35e4714d4",
+      "expected_sha256": "57bda3937c9af9da9b611e92745fd7bb5630250a699f17f1ef336d9d6bee3fd5"
+    },
+    {
+      "type": 11,
+      "source_tensor": "blk.0.ffn_up.weight",
+      "rows": [
+        0,
+        1,
+        2
+      ],
+      "columns": 256,
+      "note": "first 256 columns of each row",
+      "raw_sha256": "b467e8aede5d976d35252aac6b4e172ba95c35331226f1aa714a6df10b953f5c",
+      "expected_sha256": "077214ec3a29a3f0d86c5b9569a88ada30ee049272c2bea56ab319ce7db02e1d"
+    },
+    {
+      "type": 12,
+      "source_tensor": "token_embd.weight",
+      "rows": [
+        0,
+        1,
+        2
+      ],
+      "columns": 256,
+      "note": "first 256 columns of each row",
+      "raw_sha256": "0d215ada8382f8a14b1202bdd5b986cdfb4f4ebdd155ca2bfa18971cde640c37",
+      "expected_sha256": "87269963da78614489c90e18eafc4deb2b451af1e90f60b29ab3c8474a17ff3e"
+    },
+    {
+      "type": 13,
+      "source_tensor": "blk.0.attn_gate.weight",
+      "rows": [
+        0,
+        1,
+        2
+      ],
+      "columns": 256,
+      "note": "first 256 columns of each row",
+      "raw_sha256": "b422be1d0b16de824d6b5789440da04fa84d36924a8e01c77889279eaf081f97",
+      "expected_sha256": "9a644c8844022fa9e7a7d2a735f4718a3a0ff4b59d9445c9fbf94d0c8ed2b077"
+    },
+    {
+      "type": 14,
+      "source_tensor": "output.weight",
+      "rows": [
+        0,
+        1,
+        2
+      ],
+      "columns": 256,
+      "note": "first 256 columns of each row",
+      "raw_sha256": "6114c3c9ea7636833e3b2f7408f9335e0e9cb587c45048842b071c57cd5f2722",
+      "expected_sha256": "1f8e4d3a4dc011b4310da161a8664841e5aca4fe12177887eb966bfe35a29292"
+    },
+    {
+      "type": 20,
+      "source_tensor": "blk.1.ffn_down.weight",
+      "rows": [
+        0,
+        1,
+        2
+      ],
+      "columns": 256,
+      "note": "first 256 columns of each row",
+      "raw_sha256": "fd422281351c9129cac636137afafa701cd4124e28c59ab0fdc16b5831fa7e6d",
+      "expected_sha256": "97bed48a971c0106266e00013690b41a20e44cf0385400a45fc736864daef2b7"
+    },
+    {
+      "type": 21,
+      "source_tensor": "blk.11.ffn_gate.weight",
+      "rows": [
+        0,
+        1,
+        2
+      ],
+      "columns": 256,
+      "note": "first 256 columns of each row",
+      "raw_sha256": "80af2977e3bfa829435647e8bc118f200354209026faf5c43c26e6b8201bfafb",
+      "expected_sha256": "77370ddd9ea94534904fa4990b7b7f1a23ab36150f7c2f76ad65192417e0e5f8"
+    },
+    {
+      "type": 23,
+      "source_tensor": "blk.0.ffn_down.weight",
+      "rows": [
+        0,
+        1,
+        2
+      ],
+      "columns": 256,
+      "note": "first 256 columns of each row",
+      "raw_sha256": "bf12ffe3c00eb96bcf138bbe736330f63d7afc5b5c8b71f08f1f1a7b6614b8f4",
+      "expected_sha256": "86a7f2043c68a138be8394770e8b8dc61926998ebc632f6abe0bde57878114bd"
+    }
+  ]
+}

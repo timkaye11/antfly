@@ -74,5 +74,20 @@ pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile 
     const install_qwen4exp = b.addInstallArtifact(qwen4exp, .{});
     ctx.step("qwen4exp", "Build the experimental SSD-backed Qwen4Exp text CLI").dependOn(&install_qwen4exp.step);
 
+    const qwen35_streamed = b.addExecutable(.{
+        .name = "antfly-qwen35-streamed",
+        .max_rss = 4 * 1024 * 1024 * 1024,
+        .root_module = b.createModule(.{
+            .root_source_file = ctx.path("src/qwen35_streamed_main.zig"),
+            .target = ctx.target,
+            .optimize = ctx.optimize,
+        }),
+    });
+    qwen35_streamed.root_module.addImport("inference", ctx.graph.inference_mod);
+    qwen35_streamed.root_module.addImport("antfly_platform", ctx.graph.platform_mod);
+    qwen35_streamed.root_module.link_libc = ctx.backend.link_libc;
+    const install_qwen35_streamed = b.addInstallArtifact(qwen35_streamed, .{});
+    ctx.step("qwen35-streamed", "Build the experimental SSD-backed Qwen3.8-27B text CLI").dependOn(&install_qwen35_streamed.step);
+
     return exe;
 }

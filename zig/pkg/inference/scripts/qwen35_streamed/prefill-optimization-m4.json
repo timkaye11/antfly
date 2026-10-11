@@ -1,0 +1,329 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-09",
+  "host": {
+    "chip": "Apple M4",
+    "ram_bytes": 17179869184,
+    "os": "macOS",
+    "backend": "Metal"
+  },
+  "git_head": "de83fd551e654945d88bb3c6d43abee120a6e6af",
+  "working_tree_dirty": true,
+  "model_sha256": "322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482",
+  "source_and_binary_sha256": {
+    "zig/pkg/inference/src/architectures/qwen35_streamed.zig": "4ba908560698544a25c675033d7d7222b6ea664b113f3602305ebdd7e916dbb4",
+    "zig/pkg/inference/src/backends/qwen35_streamed.metal": "442fdb488edc7fed938bb767eb5625a2e9bc88db01f6b6dd857a8ea738b3f686",
+    "zig/pkg/inference/src/backends/qwen35_streamed_kernels.zig": "3c36cab2596c86c88e02af723ac623471a3015257e223c69f612c3259d885c33",
+    "zig/pkg/inference/src/native_qwen35_generate.zig": "ae45fd541dcb7ca73d859217f358e2eef0fafe47a9816a6b233347fa9feb9c42",
+    "zig/pkg/inference/src/models/qwen35_streamed.zig": "7a0a7676c58e63bd571f4d8e9f3638c103d562aa4d6f07531293696b8ac1da4f",
+    "zig/pkg/inference/src/runtime/dense_weight_pager.zig": "a1c60544caca580559bcfdbda28fba76df79ffff9ef6e02e1237405ea72852f5",
+    "zig/pkg/inference/src/native_generate.zig": "df3e54649aa3d082f2ab2ab7cff7deaea07c5a119810740f07f593db653bf227",
+    "zig/pkg/inference/src/backends/qwen4exp_kernels.zig": "02ef64fb352486ecc1fadafb6762ef3dca58644e2aab0f5a5e482cccff46827f",
+    "zig/pkg/inference/src/backends/metal_kernels.m": "f1ccace83285a7d23b864f8313f789f0ea9ff0b5cd1c05380070a072e31382ab",
+    "zig/zig-out/bin/antfly-qwen35-streamed": "bc5818f2d98048214767282b8d967ffa9382613fa0ce4e6bac06092e1bee8a4c",
+    "zig/pkg/inference/scripts/qwen35_streamed/qualify.py": "af28ad7bf402ae7492d53b120eb0bc400c2672b26c980cabcc1820614543f01d"
+  },
+  "baseline_binary_sha256": "ff994d5a5bf7734585e3d779f94d216ac67b572ddfc5f2d9ab3b898453facf3a",
+  "baseline_4096": {
+    "exit_code": 0,
+    "seconds": 1326.244142458003,
+    "swapouts_delta": 0,
+    "peak_footprint_bytes": 2693204656,
+    "receipt": "/tmp/qwen38-27b-streamed-work/qualification-final/context4096/receipt.json",
+    "finish_reason": "length",
+    "failure_stage": null,
+    "context_size": 4096,
+    "prefill_chunk": 128,
+    "io_overlap": true,
+    "admitted_bytes": 3417575424,
+    "cap_bytes": 4294967296,
+    "load_ms": 20262.226375,
+    "prefill_ms": 1289057.924792,
+    "decode_ms": 16851.274375,
+    "decode_steps": 1,
+    "decode_token_ms": [
+      16850.544375
+    ],
+    "prefill_bytes_read": 459017879552,
+    "decode_bytes_read": 14344308736,
+    "cpu_dequant_bytes": 1229790904320,
+    "cpu_dequant_ns": 101220980000,
+    "generated_token_ids": [
+      830,
+      830
+    ],
+    "position": 4095,
+    "prompt_tokens": 4094,
+    "generated_tokens": 2
+  },
+  "cases": {
+    "baseline512": {
+      "load_ms": 25488.240708,
+      "prefill_ms": 146971.738834,
+      "decode_ms": 16896.675792,
+      "decode_token_ms": [
+        16896.607083
+      ],
+      "prefill_bytes_read": 57377234944,
+      "decode_bytes_read": 14344308736,
+      "cpu_dequant_ns": 15495437000,
+      "cpu_dequant_bytes": 186331955200,
+      "admitted_bytes": 3417575424,
+      "cap_bytes": 4294967296,
+      "prefill_chunk": 128,
+      "context_size": 4096,
+      "generated_token_ids": [
+        830,
+        830
+      ],
+      "position": 513,
+      "finish_reason": "length",
+      "failure_stage": null,
+      "swapouts_delta": 0,
+      "elapsed_s": 189.78588079199835,
+      "prompt_tokens": 512,
+      "peak_footprint_bytes": 2687748760,
+      "receipt": "/tmp/qwen38-27b-prefill-opt/baseline512/receipt.json"
+    },
+    "candidate128": {
+      "load_ms": 20957.764084,
+      "prefill_ms": 17128.956917,
+      "decode_ms": 0.046167,
+      "decode_token_ms": [],
+      "prefill_bytes_read": 14344308736,
+      "decode_bytes_read": 0,
+      "cpu_dequant_ns": 3080244000,
+      "cpu_dequant_bytes": 39762001920,
+      "admitted_bytes": 3477344256,
+      "cap_bytes": 4294967296,
+      "prefill_chunk": 512,
+      "context_size": 4096,
+      "generated_token_ids": [
+        830
+      ],
+      "position": 128,
+      "finish_reason": "length",
+      "failure_stage": null,
+      "swapouts_delta": 0,
+      "elapsed_s": 38.37098591600079,
+      "prompt_tokens": 128,
+      "peak_footprint_bytes": 2881801000,
+      "receipt": "/tmp/qwen38-27b-prefill-opt/gpu128/receipt.json"
+    },
+    "candidate512": {
+      "load_ms": 20951.221167,
+      "prefill_ms": 24017.284708,
+      "decode_ms": 16706.1525,
+      "decode_token_ms": [
+        16706.092875
+      ],
+      "prefill_bytes_read": 14344308736,
+      "decode_bytes_read": 14344308736,
+      "cpu_dequant_ns": 5927942000,
+      "cpu_dequant_bytes": 77028392960,
+      "admitted_bytes": 3477344256,
+      "cap_bytes": 4294967296,
+      "prefill_chunk": 512,
+      "context_size": 4096,
+      "generated_token_ids": [
+        830,
+        830
+      ],
+      "position": 513,
+      "finish_reason": "length",
+      "failure_stage": null,
+      "swapouts_delta": 0,
+      "elapsed_s": 61.73570070799906,
+      "prompt_tokens": 512,
+      "peak_footprint_bytes": 2879654696,
+      "receipt": "/tmp/qwen38-27b-prefill-opt/gpu512/receipt.json"
+    },
+    "candidate4096": {
+      "load_ms": 20915.74225,
+      "prefill_ms": 269475.167667,
+      "decode_ms": 16718.068833,
+      "decode_token_ms": [
+        16717.993875
+      ],
+      "prefill_bytes_read": 114754469888,
+      "decode_bytes_read": 14344308736,
+      "cpu_dequant_ns": 28780468000,
+      "cpu_dequant_bytes": 355362406400,
+      "admitted_bytes": 3477344256,
+      "cap_bytes": 4294967296,
+      "prefill_chunk": 512,
+      "context_size": 4096,
+      "generated_token_ids": [
+        830,
+        830
+      ],
+      "position": 4095,
+      "finish_reason": "length",
+      "failure_stage": null,
+      "swapouts_delta": 0,
+      "elapsed_s": 307.21129170899803,
+      "prompt_tokens": 4094,
+      "peak_footprint_bytes": 2880113448,
+      "receipt": "/tmp/qwen38-27b-prefill-opt/context4096/receipt.json"
+    }
+  },
+  "numerical_checks": {
+    "oracle128": {
+      "max_abs": 0.00021380186080932617,
+      "relative_l2": 9.2504942585947e-06,
+      "argmax_equal": true
+    },
+    "chunk512": {
+      "512": {
+        "max_abs": 0.00010156631469726562,
+        "relative_l2": 4.264635208528489e-06,
+        "argmax_equal": true
+      },
+      "513": {
+        "max_abs": 0.0001087188720703125,
+        "relative_l2": 4.341465228208108e-06,
+        "argmax_equal": true
+      }
+    },
+    "oracle128_layers": {
+      "count": 64,
+      "max_relative_l2": 4.246225580573082e-05,
+      "max_abs": 0.045562744140625,
+      "all_argmax_equal": true
+    }
+  },
+  "unit_tests": {
+    "passed": 18,
+    "skipped": 0
+  },
+  "prefill_speedup": {
+    "128_tokens": 1.9689857938475657,
+    "512_tokens": 6.119415271995534,
+    "4094_tokens": 4.78358705906785
+  },
+  "scope": "Same exact artifact, M4 16 GiB, external SSD, single sequence, greedy, total context 4096, 4 GiB physical-memory cap. Serial single-trial measurements; fresh application processes, uncontrolled OS/device caches.",
+  "changes": [
+    "Default and maximum prompt chunk 512, with explicit activation/tile scratch admission.",
+    "512-output-row bounded FP32 tiles and MPS GEMM for prefill; encoded decode kernels retained.",
+    "GPU tile conversion for Q8_0/Q4_K/Q5_K/Q6_K/IQ4_NL; CPU tile conversion for Q3_K/IQ3_S/IQ4_XS."
+  ],
+  "limitations": [
+    "Numerical oracle uses independent NumPy FP32 equations and pinned upstream ggml dequantization, not full llama.cpp graph execution or original BF16 weights.",
+    "Reference numerical checks cover 5-token prefill plus one decode and 128-token prefill; the 4096-token sequence is a functional and memory qualification.",
+    "Byte counts are completed application read ranges, not physical SSD traffic. F_NOCACHE does not prove a cold device cache.",
+    "Swapout deltas are system-wide observations; no global cache purge or swap reset was performed.",
+    "No HTTP serving, CUDA, multimodal, batching across sequences, or general model-catalog promotion.",
+    "512-token logits and one continued decode are compared with the previously qualified baseline; independent equation reference covers 128 prompt tokens.",
+    "Performance prompts repeat token 830; results are local measurements, not arbitrary-prompt throughput guarantees.",
+    "128/512 numerical runs capture layer outputs; full-context timing does not.",
+    "Flash Next throughput was not changed or rebenchmarked in this follow-up."
+  ],
+  "passed": true,
+  "flash_next_prior_comparison": {
+    "receipt": "/private/tmp/qwen38-perf-20261009/comparison.json",
+    "scope": "Apple M4 16 GiB, external SSD, 2 GiB expert cache, context 4096, 24 generated tokens, two serial A/B and B/A rounds; fresh application caches and uncontrolled OS caches",
+    "chat": {
+      "prompt_tokens": 57,
+      "generated_tokens": 24,
+      "variants": {
+        "baseline": {
+          "prefill_seconds_median": 75.82667916650001,
+          "first_token_ready_seconds_median": 83.9607554375,
+          "decode_tps_median": 0.7902332836761845,
+          "decode_token_p95_ms": 1581.77660475,
+          "prefill_read_GB": 50.9591552,
+          "decode_read_GB_per_token": 0.8417101913043479,
+          "peak_footprint_GiB": 6.869146592915058
+        },
+        "candidate": {
+          "prefill_seconds_median": 41.1354020625,
+          "first_token_ready_seconds_median": 47.9535142915,
+          "decode_tps_median": 0.8255707849788487,
+          "decode_token_p95_ms": 1596.35913575,
+          "prefill_read_GB": 23.3389056,
+          "decode_read_GB_per_token": 0.8177174260869565,
+          "peak_footprint_GiB": 6.872289881110191
+        }
+      },
+      "prefill_speedup": 1.843343576690731,
+      "decode_speedup": 1.04471780932622,
+      "paired_prefill_speedups": [
+        1.8761628248419782,
+        1.8104944060467083
+      ]
+    },
+    "code": {
+      "prompt_tokens": 53,
+      "generated_tokens": 24,
+      "variants": {
+        "baseline": {
+          "prefill_seconds_median": 69.397168583,
+          "first_token_ready_seconds_median": 76.2263286665,
+          "decode_tps_median": 0.8169101933848874,
+          "decode_token_p95_ms": 1523.8325,
+          "prefill_read_GB": 45.4478848,
+          "decode_read_GB_per_token": 0.7805506782608697,
+          "peak_footprint_GiB": 6.867880046367645
+        },
+        "candidate": {
+          "prefill_seconds_median": 37.4469691875,
+          "first_token_ready_seconds_median": 44.336336603999996,
+          "decode_tps_median": 0.8345476629490505,
+          "decode_token_p95_ms": 1494.10729175,
+          "prefill_read_GB": 20.8382976,
+          "decode_read_GB_per_token": 0.8014491826086956,
+          "peak_footprint_GiB": 6.871160663664341
+        }
+      },
+      "prefill_speedup": 1.8532118910751565,
+      "decode_speedup": 1.0215904633177386,
+      "paired_prefill_speedups": [
+        1.8637503900902403,
+        1.8426806630053862
+      ]
+    },
+    "note": "Prior runs with different prompts, not a matched comparison with dense 27B or a new Flash Next benchmark."
+  },
+  "final_controls": {
+    "chat": {
+      "exit_code": 0,
+      "finish_reason": "stop",
+      "swapouts_delta": 0,
+      "peak_footprint_bytes": 2882227008,
+      "receipt": "/tmp/qwen38-27b-prefill-opt/controls/chat/receipt.json",
+      "seconds": 54.316290125003434
+    },
+    "cancel": {
+      "exit_code": 1,
+      "finish_reason": "Cancelled",
+      "swapouts_delta": 0,
+      "peak_footprint_bytes": 2762246904,
+      "receipt": "/tmp/qwen38-27b-prefill-opt/controls/cancel/receipt.json",
+      "seconds": 21.991199167008745
+    },
+    "low-budget": {
+      "exit_code": 1,
+      "finish_reason": "Qwen35MemoryBudgetExceeded",
+      "swapouts_delta": 0,
+      "peak_footprint_bytes": 18612584,
+      "receipt": "/tmp/qwen38-27b-prefill-opt/controls/low-budget/receipt.json",
+      "seconds": 0.1088469160022214
+    },
+    "chunk-overflow": {
+      "exit_code": 1,
+      "finish_reason": "error: UnsupportedQwen35Chunk\n",
+      "swapouts_delta": 0,
+      "peak_footprint_bytes": 0,
+      "receipt": null,
+      "seconds": 0.11435112501203548
+    }
+  },
+  "checks": {
+    "zig_format": true,
+    "python_ruff": true,
+    "license_headers": true,
+    "git_diff_check": true,
+    "installed_binary_and_sources_match_tested_hashes": true,
+    "original_flash_next_changes_preserved": true
+  }
+}

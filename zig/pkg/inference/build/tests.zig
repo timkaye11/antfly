@@ -133,6 +133,29 @@ pub fn create(ctx: Context) Suite {
     const run_qwen4exp_tests = ctx.addRunArtifact(qwen4exp_tests);
     ctx.step("test-qwen4exp", "Test split GGUF storage and bounded Qwen4Exp paging").dependOn(&run_qwen4exp_tests.step);
 
+    const qwen35_streamed_module = b.createModule(.{
+        .root_source_file = ctx.path("src/qwen35_streamed_test_root.zig"),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+    });
+    var imports35 = tests.root_module.import_table.iterator();
+    while (imports35.next()) |entry| qwen35_streamed_module.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    qwen35_streamed_module.addImport("inference_internal", qwen35_streamed_module);
+    runtime_build.applyCBindings(qwen35_streamed_module, ctx.graph.c_bindings);
+    if (ctx.backend.enable_system_blas) runtime_build.configureSystemBlas(b, qwen35_streamed_module, ctx.target, ctx.backend.blas_root);
+    runtime_build.configureMetal(b, qwen35_streamed_module, ctx.target, ctx.backend.enable_metal, ctx.paths);
+    runtime_build.configureOnnxRuntime(b, qwen35_streamed_module, ctx.backend.enable_onnx, ctx.backend.onnx_root);
+    qwen35_streamed_module.link_libc = ctx.backend.link_libc;
+    const qwen35_streamed_tests = b.addTest(.{
+        .name = "qwen35_streamed-tests",
+        .max_rss = 4 * 1024 * 1024 * 1024,
+        .root_module = qwen35_streamed_module,
+        .filters = if (main_test_filters.len != 0) main_test_filters else &.{"Qwen35"},
+        .test_runner = runtime_filter_test_runner,
+    });
+    const run_qwen35_streamed_tests = ctx.addRunArtifact(qwen35_streamed_tests);
+    ctx.step("test-qwen35-streamed", "Test bounded Qwen3.8-27B layer paging and Metal numerics").dependOn(&run_qwen35_streamed_tests.step);
+
     // Keep the standalone server's CLI and configuration parsing covered too.
     // `src/inference.zig` does not import `src/main.zig`, so tests declared by
     // the executable root otherwise compile only when invoked manually.

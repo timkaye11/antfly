@@ -120,9 +120,12 @@ pub const Decoder = struct {
     failed: bool = false,
     read_io: ?std.Io = null,
     route_trace: ?[]u16 = null,
-    prefill_chunk: usize = 0,
+    prefill_chunk: usize = 128,
     prefill_storage: ?gpu.Buffer = null,
-    const prefill_widths = [_]usize{ 10240, 2560, 4, 2560, 20, 25600, 2560, 2560 };
+    batch_linear: bool = false,
+    prefill_tile: ?gpu.Buffer = null,
+    prefill_result: ?gpu.Buffer = null,
+    const prefill_widths = [_]usize{ 10240, 2560, 4, 2560, 20, 25600, 2560, 2560, 10, 2560, 4, 10240, 6144, 48, 48, 6144 };
 
     /// Caller holds the admission lease from Plan.acquire until after deinit.
     pub fn create(allocator: std.mem.Allocator, store: store_mod.TensorStore, plan: Plan) !*Decoder {
@@ -133,11 +136,18 @@ pub const Decoder = struct {
         if (std.c.getenv("ANTFLY_QWEN4EXP_ROUTE_TRACE") != null) self.route_trace = try allocator.alloc(u16, plan.context * 48 * 10);
         if (std.c.getenv("ANTFLY_QWEN4EXP_PREFILL_CHUNK")) |value| {
             self.prefill_chunk = try std.fmt.parseInt(usize, std.mem.span(value), 10);
-            if (self.prefill_chunk < 2 or self.prefill_chunk > 128) return error.InvalidQwen4ExpPrefillChunk;
+            if (self.prefill_chunk == 1 or self.prefill_chunk > 128) return error.InvalidQwen4ExpPrefillChunk;
+        }
+        self.batch_linear = std.c.getenv("ANTFLY_QWEN4EXP_BATCH_LINEAR") != null;
+        if (self.prefill_chunk != 0) {
             var floats: usize = 0;
-            for (prefill_widths) |width| floats += width * self.prefill_chunk;
-            // At most 22.52 MiB, inside the existing 64 MiB scratch reservation.
+            for (prefill_widths[0..if (self.batch_linear) prefill_widths.len else 9]) |width| floats += width * self.prefill_chunk;
+            // At most 34.83 MiB, inside the existing 64 MiB scratch reservation.
             self.prefill_storage = try gpu.Buffer.init(self.kernels.runtime, floats * 4);
+        }
+        if (std.c.getenv("ANTFLY_QWEN4EXP_PREFILL_MPS") != null) {
+            self.prefill_tile = try gpu.Buffer.init(self.kernels.runtime, 512 * 6144 * 4);
+            self.prefill_result = try gpu.Buffer.init(self.kernels.runtime, 32 * 512 * 4);
         }
         self.staging = try allocator.alloc(u8, 64 * MiB);
         self.ngrams = try pager.NgramCache.init(allocator, store, 64 * MiB);
@@ -196,7 +206,7 @@ pub const Decoder = struct {
             for ([_]?gpu.Buffer{ self.ngram_bytes, self.embedding_bytes, self.ple_history, self.logits }) |part| {
                 if (part) |buffer| try handles.append(allocator, buffer.handle);
             }
-            if (self.prefill_storage) |buffer| try handles.append(allocator, buffer.handle);
+            for ([_]?gpu.Buffer{ self.prefill_storage, self.prefill_tile, self.prefill_result }) |part| if (part) |buffer| try handles.append(allocator, buffer.handle);
             try self.kernels.makeResident(handles.items, plan.amounts.backendTotalBytes());
         }
         return self;
@@ -231,6 +241,8 @@ pub const Decoder = struct {
         self.allocator.free(self.staging);
         if (self.route_trace) |trace| self.allocator.free(trace);
         if (self.prefill_storage) |*buffer| buffer.deinit();
+        if (self.prefill_tile) |*buffer| buffer.deinit();
+        if (self.prefill_result) |*buffer| buffer.deinit();
     }
     pub fn deinit(self: *Decoder) void {
         self.deinitContents();
@@ -238,7 +250,7 @@ pub const Decoder = struct {
     }
     pub fn overlapEnabled(self: *const Decoder) bool {
         return self.read_io != null and self.kernels.batching_enabled and
-            (std.c.getenv("ANTFLY_QWEN4EXP_IO_OVERLAP") != null or std.c.getenv("ANTFLY_QWEN4EXP_GROUPED_EXPERTS") != null) and
+            @import("antfly_platform").env.getenvBoolDefault("ANTFLY_QWEN4EXP_IO_OVERLAP", true) and
             std.c.getenv("ANTFLY_QWEN4EXP_DISABLE_IO_OVERLAP") == null;
     }
     pub fn pagingStats(self: *const Decoder) pager.Stats {
@@ -311,13 +323,16 @@ pub const Decoder = struct {
         try self.mm(l, "attn_gate.weight", self.s(4), self.s(10));
         try self.mm(l, "ssm_beta.weight", self.s(4), self.s(11));
         try self.mm(l, "ssm_alpha.weight", self.s(4), self.s(12));
+        try self.linearState(l);
+        try self.mm(l, "ssm_out.weight", self.s(15), self.s(6));
+    }
+    fn linearState(self: *Decoder, l: usize) !void {
         try self.run(.{ .op = 9, .n = 10240, .stride = 1 }, &.{ self.s(7), try self.wr(l, "ssm_conv1d.weight"), self.states[l].ref(1) }, self.s(8));
         try self.run(.{ .op = 1, .n = 10240, .dim = 10240 }, &.{self.s(8)}, self.s(9));
         try self.norm(self.s(8), self.s(8), self.s(9), 4096, 128, 2);
         try self.run(.{ .op = 10, .n = 6144 }, &.{ self.s(9), self.s(11), self.s(12), try self.wr(l, "ssm_a"), try self.wr(l, "ssm_dt.bias"), self.states[l].ref(0) }, self.s(13));
         try self.norm(self.s(13), try self.wr(l, "ssm_norm.weight"), self.s(14), 6144, 128, 1);
         try self.run(.{ .op = 11, .n = 6144 }, &.{ self.s(14), self.s(10) }, self.s(15));
-        try self.mm(l, "ssm_out.weight", self.s(15), self.s(6));
     }
     fn rope(self: *Decoder, input: gpu.Ref, out: gpu.Ref, n: usize, dim: usize, pos: usize) !void {
         try self.run(.{ .op = 19, .n = @intCast(n), .dim = @intCast(dim), .position = @intCast(pos), .theta = self.plan.cfg.theta }, &.{input}, out);
@@ -475,6 +490,50 @@ pub const Decoder = struct {
         if (offset > data.len or bytes > data.len - offset) return error.MetalBufferRange;
         return .{ .handle = self.prefill_storage.?.handle, .offset = @intFromPtr(data.ptr) - @intFromPtr(self.prefill_storage.?.bytes.ptr) + offset, .bytes = bytes };
     }
+    fn prefillMatmul(self: *Decoder, format: u32, weight: gpu.Ref, input_dim: usize, output_dim: usize, rows: usize, input: gpu.Ref, output: gpu.Ref) !void {
+        if (format == 0 or format == 30) {
+            for (0..rows) |r| try self.kernels.matvec(format, weight.bytes, input_dim, output_dim, weight, try input.slice(r * input_dim * 4, input_dim * 4), try output.slice(r * output_dim * 4, output_dim * 4));
+        } else if (self.prefill_tile) |tile| {
+            try self.kernels.matmulTiled(format, weight, input_dim, output_dim, rows, input, output, tile.ref(), self.prefill_result.?.ref());
+        } else try self.kernels.matmul(format, weight, input_dim, output_dim, rows, input, output);
+    }
+    fn batchProjection(self: *Decoder, l: usize, name: []const u8, rows: usize, input_part: usize, output_part: usize) !void {
+        const weight = try self.w(l, name);
+        try self.kernels.beginBatch();
+        var at: usize = 0;
+        while (at < rows) {
+            const count = @min(32, rows - at);
+            try self.prefillMatmul(weight.format, weight.buffer.ref(), weight.input, weight.output, count, try self.prefillRef(input_part, at * weight.input * 4, count * weight.input * 4), try self.prefillRef(output_part, at * weight.output * 4, count * weight.output * 4));
+            at += count;
+        }
+        try self.kernels.endProfiledBatch(.attention);
+    }
+    fn prefillLinear(self: *Decoder, l: usize, tokens: []const i32, base: usize) !void {
+        for (tokens, 0..) |token, t| {
+            self.position = base + t;
+            @memcpy(self.scratch[0].bytes[0..40960], self.prefillBytes(0)[t * 40960 ..][0..40960]);
+            try self.kernels.beginBatch();
+            if (l == 1) try self.ple(@intCast(token));
+            try self.hc(l, "hc_attn", true);
+            try self.kernels.endProfiledBatch(.attention);
+            for ([_]usize{ 0, 4, 5 }, [_]usize{ 0, 9, 10 }) |scratch, part| {
+                const bytes = prefill_widths[part] * 4;
+                @memcpy(self.prefillBytes(part)[t * bytes ..][0..bytes], self.scratch[scratch].bytes[0..bytes]);
+            }
+        }
+        for ([_][]const u8{ "attn_qkv.weight", "attn_gate.weight", "ssm_beta.weight", "ssm_alpha.weight" }, 11..) |name, part| try self.batchProjection(l, name, tokens.len, 9, part);
+        for (0..tokens.len) |t| {
+            for ([_]usize{ 7, 10, 11, 12 }, 11..) |scratch, part| {
+                const bytes = prefill_widths[part] * 4;
+                @memcpy(self.scratch[scratch].bytes[0..bytes], self.prefillBytes(part)[t * bytes ..][0..bytes]);
+            }
+            try self.kernels.beginBatch();
+            try self.linearState(l);
+            try self.kernels.endProfiledBatch(.attention);
+            @memcpy(self.prefillBytes(15)[t * 6144 * 4 ..][0 .. 6144 * 4], self.scratch[15].bytes[0 .. 6144 * 4]);
+        }
+        try self.batchProjection(l, "ssm_out.weight", tokens.len, 15, 9);
+    }
     /// Layer-major bounded prefill. Attention/recurrent updates retain causal
     /// token order; routed experts are loaded once per union and use GEMMs.
     /// Only CPU copies/gathers occur on the host, never model arithmetic.
@@ -490,13 +549,20 @@ pub const Decoder = struct {
             try self.run(.{ .op = 7, .n = 10240, .dim = 2560, .index = 0 }, &.{self.embedding_bytes.?.ref()}, try self.prefillRef(0, t * 10240 * 4, 10240 * 4));
         }
         for (0..48) |l| {
+            const batched = self.batch_linear and self.plan.cfg.isLinear(l);
+            if (batched) try self.prefillLinear(l, tokens, base);
             for (tokens, 0..) |token, t| {
                 self.position = base + t;
                 @memcpy(self.scratch[0].bytes[0 .. 10240 * 4], self.prefillBytes(0)[t * 10240 * 4 ..][0 .. 10240 * 4]);
                 try self.kernels.beginBatch();
-                if (l == 1) try self.ple(@intCast(token));
-                try self.hc(l, "hc_attn", true);
-                if (self.plan.cfg.isLinear(l)) try self.linear(l) else try self.attention(l);
+                if (batched) {
+                    @memcpy(self.scratch[5].bytes[0..16], self.prefillBytes(10)[t * 16 ..][0..16]);
+                    @memcpy(self.scratch[6].bytes[0..10240], self.prefillBytes(9)[t * 10240 ..][0..10240]);
+                } else {
+                    if (l == 1) try self.ple(@intCast(token));
+                    try self.hc(l, "hc_attn", true);
+                    if (self.plan.cfg.isLinear(l)) try self.linear(l) else try self.attention(l);
+                }
                 try self.combine(self.s(6));
                 try self.hc(l, "hc_ffn", true);
                 try self.computeRouter(l);
@@ -530,34 +596,38 @@ pub const Decoder = struct {
                 var lease = try self.layers[l].acquireWithIo(experts[expert_start..expert_end], self.staging, self.read_io);
                 defer lease.releaseAfterCompletion();
                 errdefer self.kernels.cancelBatch();
+                // Each expert owns an immutable index slice until the entire
+                // group completes. GPU gathers/scatters allow scratch reuse
+                // without a CPU completion boundary for every expert.
+                try self.kernels.beginBatch();
                 for (experts[expert_start..expert_end], 0..) |expert_id, lease_index| {
-                    var locations: [128]usize = undefined;
+                    const index_offset = lease_index * self.prefill_chunk * 4;
+                    const locations = std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(self.prefillBytes(8)[index_offset..][0 .. self.prefill_chunk * 4])));
                     var count: usize = 0;
                     for (0..tokens.len) |t| {
                         const ids = std.mem.bytesAsSlice(u32, @as([]align(4) const u8, @alignCast(self.prefillBytes(4)[t * 80 ..][0..40])));
                         for (ids, 0..) |id, r| if (id == expert_id) {
-                            locations[count] = t * 10 + r;
-                            @memcpy(self.prefillBytes(6)[count * 2560 * 4 ..][0 .. 2560 * 4], self.prefillBytes(1)[t * 2560 * 4 ..][0 .. 2560 * 4]);
+                            locations[count] = @intCast(t * 10 + r);
                             count += 1;
                         };
                     }
                     if (count == 0) continue;
-                    try self.kernels.beginBatch();
-                    errdefer self.kernels.cancelBatch();
+                    const indices = try self.prefillRef(8, index_offset, count * 4);
+                    try self.run(.{ .op = 30, .n = @intCast(count * 2560), .dim = 2560 }, &.{ try self.prefillRef(1, 0, tokens.len * 2560 * 4), indices }, try self.prefillRef(6, 0, count * 2560 * 4));
                     var batch_start: usize = 0;
                     while (batch_start < count) {
                         const batch_rows: usize = @min(32, count - batch_start);
                         for (self.layers[l].projections, 0..) |projection, p| {
                             const source = lease.projection(lease_index, p);
                             const weight = gpu.Ref{ .handle = self.layer_handles[l], .offset = @intFromPtr(source.ptr) - @intFromPtr(self.layers[l].bytes.ptr), .bytes = source.len };
-                            try self.kernels.matmul(projection.format.raw(), weight, projection.input, projection.output, batch_rows, if (p == 2) self.s(9) else try self.prefillRef(6, batch_start * 2560 * 4, batch_rows * 2560 * 4), if (p == 2) try self.prefillRef(7, batch_start * 2560 * 4, batch_rows * 2560 * 4) else self.s(if (p == 0) 7 else 8));
+                            try self.prefillMatmul(projection.format.raw(), weight, projection.input, projection.output, batch_rows, if (p == 2) self.s(9) else try self.prefillRef(6, batch_start * 2560 * 4, batch_rows * 2560 * 4), if (p == 2) try self.prefillRef(7, batch_start * 2560 * 4, batch_rows * 2560 * 4) else self.s(if (p == 0) 7 else 8));
                             if (p == 1) try self.run(.{ .op = 12, .n = @intCast(batch_rows * 640) }, &.{ self.s(7), self.s(8) }, self.s(9));
                         }
                         batch_start += batch_rows;
                     }
-                    try self.kernels.endProfiledBatch(.experts);
-                    for (locations[0..count], 0..) |location, row| @memcpy(self.prefillBytes(5)[location * 2560 * 4 ..][0 .. 2560 * 4], self.prefillBytes(7)[row * 2560 * 4 ..][0 .. 2560 * 4]);
+                    try self.run(.{ .op = 31, .n = @intCast(count * 2560), .dim = 2560 }, &.{ try self.prefillRef(7, 0, count * 2560 * 4), indices }, try self.prefillRef(5, 0, tokens.len * 25600 * 4));
                 }
+                try self.kernels.endProfiledBatch(.experts);
                 expert_start = expert_end;
             }
             for (0..tokens.len) |t| {
@@ -584,6 +654,16 @@ pub const Decoder = struct {
     }
     /// A failed token poisons the recurrent state: callers must destroy the
     /// decoder rather than retrying from a partially advanced layer.
+    pub fn reset(self: *Decoder) !void {
+        if (self.failed) return error.Qwen4ExpStateInvalid;
+        try self.kernels.endBatch();
+        for (self.states) |state| for (state.parts) |part| {
+            if (part) |b| @memset(b.bytes, 0);
+        };
+        if (self.ple_history) |b| @memset(b.bytes, 0);
+        self.ngram_state = model.NgramState.init(self.plan.cfg.eos);
+        self.position = 0;
+    }
     pub fn step(self: *Decoder, token: u32) !u32 {
         return self.stepWithOutput(token, true);
     }
@@ -669,9 +749,10 @@ test "Qwen4Exp installed chunked prefill preserves complete recurrent state and 
     const a = std.testing.allocator;
     const store = try store_mod.SplitGgufStore.open(a, std.mem.span(path));
     defer store.deinit();
-    const plan = try Plan.inspect(store, 32, 2 * 1024 * MiB);
+    const test_cache_mb = if (std.c.getenv("ANTFLY_QWEN4EXP_TEST_CACHE_MB")) |value| try std.fmt.parseInt(usize, std.mem.span(value), 10) else 2048;
+    const plan = try Plan.inspect(store, 32, test_cache_mb * MiB);
     var controller: memory.AdmissionController = .{};
-    var admission = try plan.acquire(&controller, 10 * 1024 * MiB);
+    var admission = try plan.acquire(&controller, 9 * 1024 * MiB);
     defer admission.release();
     var executor = std.Io.Threaded.init(a, .{ .async_limit = .limited(pager.read_lane_count), .concurrent_limit = .limited(pager.read_lane_count), .stack_size = pager.read_stack_bytes });
     defer executor.deinit();
@@ -707,7 +788,7 @@ test "Qwen4Exp installed chunked prefill preserves complete recurrent state and 
         decoder.read_io = executor.io();
         for (tokens, 0..) |token, t| {
             _ = try decoder.step(@intCast(token));
-            if (t == 4 or t == 11 or t == 15) try expected.appendSlice(a, decoder.logits.?.floats());
+            if (t == 7 or t == 11 or t == 15) try expected.appendSlice(a, decoder.logits.?.floats());
         }
         try check.append(decoder, &expected, a);
         ngram_expected = decoder.ngram_state;
@@ -718,7 +799,7 @@ test "Qwen4Exp installed chunked prefill preserves complete recurrent state and 
         const decoder = try Decoder.create(a, store, plan);
         defer decoder.deinit();
         decoder.read_io = executor.io();
-        for ([_]usize{ 0, 5, 12 }, [_]usize{ 5, 12, 16 }, 0..) |start, end, i| {
+        for ([_]usize{ 0, 8, 12 }, [_]usize{ 8, 12, 16 }, 0..) |start, end, i| {
             _ = try decoder.prefillChunk(tokens[start..end]);
             try check.compare(decoder.logits.?.floats(), expected.items[i * 248320 ..][0..248320]);
         }
@@ -731,4 +812,10 @@ test "Qwen4Exp installed chunked prefill preserves complete recurrent state and 
         try check.compare(decoder.logits.?.floats(), expected.items[expected.items.len - 248320 ..]);
         try std.testing.expectEqual(@as(usize, 17), decoder.position);
     }
+}
+
+test "Qwen4Exp tiled prefill buffers fit the admitted scratch budget" {
+    var total: usize = 24 * 4096 * 24 * 4 + 512 * 6144 * 4 + 32 * 512 * 4;
+    for (Decoder.prefill_widths) |width| total += width * 128 * 4;
+    try std.testing.expect(total < 64 * MiB);
 }

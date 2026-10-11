@@ -20,6 +20,7 @@ const mr = @import("metal_runtime.zig");
 extern fn termite_metal_qwen4exp_alias(runtime: *mr.RawMetalDecodeRuntime, data: [*]u8, bytes: usize) ?*anyopaque;
 extern fn termite_metal_buffer_release(handle: *anyopaque) void;
 extern fn termite_metal_qwen4exp_prepare_linear(runtime: *mr.RawMetalDecodeRuntime, handle: *anyopaque, format: u32, offset: usize, bytes: usize, input: usize, output: usize) c_int;
+extern fn termite_metal_qwen4exp_apply_linear(runtime: *mr.RawMetalDecodeRuntime, format: u32, input: *anyopaque, input_offset: usize, rows: usize, input_dim: usize, output_dim: usize, output: *anyopaque, output_offset: usize) c_int;
 extern fn termite_metal_qwen4exp_residency_create(runtime: *mr.RawMetalDecodeRuntime, handles: [*]const *anyopaque, count: usize, admitted_bytes: usize) ?*anyopaque;
 extern fn termite_metal_qwen4exp_residency_release(runtime: *mr.RawMetalDecodeRuntime, handle: *anyopaque) void;
 
@@ -78,9 +79,10 @@ pub const BatchKind = enum { attention, router, experts, output };
 pub const Profile = struct {
     enabled: bool = false,
     // Host wall time: 0..27 opcodes, 28 quantized matvec, 29 paging, 30 batch wait.
+    // 31/32 grouped projection/activation, 33/34 prefill gather/scatter.
     // Inside batches, opcode timings measure encoding, not GPU execution.
-    nanoseconds: [33]u64 = @splat(0),
-    calls: [33]u64 = @splat(0),
+    nanoseconds: [35]u64 = @splat(0),
+    calls: [35]u64 = @splat(0),
     batch_wait_ns: [4]u64 = @splat(0),
     batch_gpu_ns: [4]u64 = @splat(0),
     pub fn now() u64 {
@@ -117,12 +119,14 @@ pub const Kernels = struct {
     batching_enabled: bool = true,
     residency: ?*anyopaque = null,
     pub fn init() !Kernels {
+        return initSource(@embedFile("qwen4exp.metal"), "qwen4exp_eager");
+    }
+    pub fn initSource(source: []const u8, name: [*:0]const u8) !Kernels {
         if (comptime !options.enable_metal) return error.MetalNotEnabled;
         const runtime = mr.termite_metal_decode_runtime_create() orelse return error.MetalRuntimeUnavailable;
         errdefer mr.termite_metal_decode_runtime_destroy(runtime);
         var message: [4096]u8 = @splat(0);
-        const source = @embedFile("qwen4exp.metal");
-        const pipeline = mr.termite_metal_generated_pipeline_create(source.ptr, source.len, "qwen4exp_eager", 1, &message, message.len) orelse {
+        const pipeline = mr.termite_metal_generated_pipeline_create(source.ptr, source.len, name, 1, &message, message.len) orelse {
             std.log.err("Qwen4Exp Metal kernel: {s}", .{std.mem.sliceTo(&message, 0)});
             return error.MetalKernelCompilationFailed;
         };
@@ -195,9 +199,15 @@ pub const Kernels = struct {
         self.residency = null;
     }
     pub fn run(self: *Kernels, params: Params, inputs: []const Ref, output: Ref) !void {
-        if (params.n == 0 or params.op > 29 or inputs.len > 7) return error.InvalidQwen4ExpDispatch;
+        if (params.n == 0 or params.op > 32 or inputs.len > 7) return error.InvalidQwen4ExpDispatch;
         if ((params.op == 13 or params.op == 27) and params.n != 32) return error.InvalidQwen4ExpDispatch;
         if (params.op == 2 and (params.dim == 0 or params.n % 32 != 0)) return error.InvalidQwen4ExpDispatch;
+        if (params.op == 30 or params.op == 31) {
+            if (inputs.len != 2 or params.dim == 0 or params.n % params.dim != 0 or
+                inputs[1].bytes < @as(usize, params.n / params.dim) * 4 or
+                (if (params.op == 30) output.bytes else inputs[0].bytes) < @as(usize, params.n) * 4)
+                return error.InvalidQwen4ExpDispatch;
+        }
         if (params.op == 28) {
             const block: u32 = switch (params.mode) {
                 7, 8 => 32,
@@ -207,7 +217,7 @@ pub const Kernels = struct {
             if (inputs.len != 3 or params.dim == 0 or params.dim % block != 0 or params.groups == 0 or params.groups > 2560 or params.n % (params.groups * 32) != 0 or params.n / (params.groups * 32) > 10 or params.index > 1023) return error.InvalidQwen4ExpDispatch;
         }
         const start = if (self.profile.enabled) Profile.now() else 0;
-        defer self.profile.record(if (params.op >= 28) params.op + 3 else params.op, start);
+        defer self.profile.record(if (params.op == 32) 28 else if (params.op >= 28) params.op + 3 else params.op, start);
         var handles: [8]?*anyopaque = @splat(self.dummy.handle);
         var offsets: [8]usize = @splat(0);
         var lengths: [8]usize = @splat(4);
@@ -231,8 +241,28 @@ pub const Kernels = struct {
             else => return error.UnsupportedQwen4ExpMatrixType,
         };
         if (termite_metal_qwen4exp_prepare_linear(self.runtime, weight.handle, @backingInt(quant), weight.offset, weight.bytes, input_dim, output_dim) != 0) return error.Qwen4ExpQuantPrepareFailed;
-        if (mr.termite_metal_decode_runtime_apply_quantized_linear_slot_device(self.runtime, @backingInt(quant), 0, input.handle, input.offset, rows, input_dim, output_dim, output.handle, output.offset) != 0) return error.Qwen4ExpQuantMatvecFailed;
+        if (termite_metal_qwen4exp_apply_linear(self.runtime, @backingInt(quant), input.handle, input.offset, rows, input_dim, output_dim, output.handle, output.offset) != 0) return error.Qwen4ExpQuantMatvecFailed;
         if (!self.batch_active and mr.termite_metal_decode_runtime_flush_active_frame(self.runtime) != 0) return error.MetalFrameSyncFailed;
+    }
+    pub fn matmulTiled(self: *Kernels, format: u32, weight: Ref, input_dim: usize, output_dim: usize, rows: usize, input: Ref, output: Ref, tile: Ref, result: Ref) !void {
+        if (rows < 8) return self.matmul(format, weight, input_dim, output_dim, rows, input, output);
+        if (rows > 32 or input.bytes < rows * input_dim * 4 or output.bytes < rows * output_dim * 4 or input_dim > 6144 or result.bytes < rows * 512 * 4 or tile.bytes < 512 * input_dim * 4) return error.MetalBufferRange;
+        const quant: mr.MetalQuantFormat = switch (format) {
+            7 => .q5_1,
+            8 => .q8_0,
+            12 => .q4_k,
+            13 => .q5_k,
+            else => return error.UnsupportedQwen4ExpMatrixType,
+        };
+        if (termite_metal_qwen4exp_prepare_linear(self.runtime, weight.handle, @backingInt(quant), weight.offset, weight.bytes, input_dim, output_dim) != 0) return error.Qwen4ExpQuantPrepareFailed;
+        var at: usize = 0;
+        while (at < output_dim) {
+            const count = @min(512, output_dim - at);
+            if (mr.termite_metal_decode_runtime_quant_copy_linear_slot_to_f32_device(self.runtime, @backingInt(quant), 0, at, count, input_dim, output_dim, 1, tile.handle, tile.offset) != 0) return error.Qwen4ExpQuantMatvecFailed;
+            if (mr.termite_metal_decode_runtime_dot_general_2d_f32_device(self.runtime, input.handle, input.offset, tile.handle, tile.offset, rows, count, input_dim, 1, result.handle, result.offset) != 0) return error.Qwen4ExpQuantMatvecFailed;
+            try self.run(.{ .op = 32, .n = @intCast(rows * count), .dim = @intCast(count), .stride = @intCast(output_dim), .index = @intCast(at) }, &.{result}, output);
+            at += count;
+        }
     }
     pub fn matvec(self: *Kernels, format: u32, weight_bytes: usize, input_dim: usize, output_dim: usize, weight: Ref, input: Ref, output: Ref) !void {
         if (input.bytes < input_dim * 4 or output.bytes < output_dim * 4 or weight.bytes < weight_bytes) return error.MetalBufferRange;
@@ -525,6 +555,44 @@ test "Qwen4Exp split submission drains before buffer reuse and rejects nested wo
     kernels.cancelBatch();
 }
 
+test "Qwen4Exp prefill gather scatter preserves route order across shared scratch reuse" {
+    if (comptime !options.enable_metal) return error.SkipZigTest;
+    var kernels = try Kernels.init();
+    defer kernels.deinit();
+    const width = 37;
+    const tokens = 128;
+    var input = try Buffer.init(kernels.runtime, tokens * width * 4);
+    defer input.deinit();
+    var indices = try Buffer.init(kernels.runtime, 2 * tokens * 4);
+    defer indices.deinit();
+    var scratch = try Buffer.init(kernels.runtime, (tokens * width + 16) * 4);
+    defer scratch.deinit();
+    var output = try Buffer.init(kernels.runtime, tokens * 10 * width * 4);
+    defer output.deinit();
+    for (input.floats(), 0..) |*value, i| value.* = @floatFromInt(i);
+    const locations = std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(indices.bytes[0 .. 2 * tokens * 4])));
+    for (0..tokens) |i| {
+        locations[i] = @intCast((tokens - 1 - i) * 10 + 3);
+        locations[tokens + i] = @intCast(i * 10 + 7);
+    }
+    for ([_]usize{ 1, 7, 32, 128 }) |count| {
+        @memset(output.floats(), -999);
+        const temporary = try scratch.ref().slice(64, count * width * 4);
+        try kernels.beginBatch();
+        errdefer kernels.cancelBatch();
+        for (0..2) |expert| {
+            const index = try indices.ref().slice(expert * tokens * 4, count * 4);
+            try kernels.run(.{ .op = 30, .n = @intCast(count * width), .dim = width }, &.{ input.ref(), index }, temporary);
+            try kernels.run(.{ .op = 31, .n = @intCast(count * width), .dim = width }, &.{ temporary, index }, output.ref());
+        }
+        try kernels.endBatch();
+        for (0..tokens) |token| for (0..10) |route| for (0..width) |component| {
+            const written = (route == 3 and token >= tokens - count) or (route == 7 and token < count);
+            try std.testing.expectEqual(if (written) input.floats()[token * width + component] else @as(f32, -999), output.floats()[(token * 10 + route) * width + component]);
+        };
+    }
+}
+
 test "Qwen4Exp grouped experts match independent GGUF dequantization with masks and slot permutations" {
     if (comptime !options.enable_metal) return error.SkipZigTest;
     const codec = @import("../gguf/quant_codec.zig");
@@ -593,5 +661,57 @@ test "Qwen4Exp grouped experts match independent GGUF dequantization with masks 
                 try std.testing.expectApproxEqAbs(@as(f32, @floatCast(expected)), batched.floats()[r * rows + col], 0.002);
             };
         }
+    }
+}
+
+test "Qwen4Exp batched expert reductions match sequential production projection shapes" {
+    if (comptime !options.enable_metal) return error.SkipZigTest;
+    var kernels = try Kernels.init();
+    defer kernels.deinit();
+    var tile = try Buffer.init(kernels.runtime, 512 * 6144 * 4);
+    defer tile.deinit();
+    var compact = try Buffer.init(kernels.runtime, 32 * 512 * 4);
+    defer compact.deinit();
+    for ([_]u32{ 7, 8, 12, 13 }) |format| {
+        const input_dim: usize = if (format == 7) 640 else 2560;
+        const output_dim: usize = if (format == 7) 2560 else 640;
+        const block: usize = if (format < 12) 32 else 256;
+        const block_bytes: usize = switch (format) {
+            7 => 24,
+            8 => 34,
+            12 => 144,
+            13 => 176,
+            else => unreachable,
+        };
+        const weight_bytes = input_dim / block * block_bytes * output_dim;
+        var weights = try Buffer.init(kernels.runtime, 64 + weight_bytes);
+        defer weights.deinit();
+        for (weights.bytes, 0..) |*v, i| v.* = @truncate(i * 17 + 29);
+        for (0..output_dim * input_dim / block) |b| {
+            const offset = 64 + b * block_bytes;
+            std.mem.writeInt(u16, weights.bytes[offset..][0..2], @bitCast(@as(f16, 0.03125)), .little);
+            if (format != 8) std.mem.writeInt(u16, weights.bytes[offset + 2 ..][0..2], @bitCast(@as(f16, 0.015625)), .little);
+        }
+        var input = try Buffer.init(kernels.runtime, 64 + 32 * input_dim * 4);
+        defer input.deinit();
+        for (input.floats(), 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 23)) / 23 - 0.5;
+        var expected = try Buffer.init(kernels.runtime, 64 + 32 * output_dim * 4);
+        defer expected.deinit();
+        var actual = try Buffer.init(kernels.runtime, 64 + 32 * output_dim * 4);
+        defer actual.deinit();
+        const w = try weights.ref().slice(64, weight_bytes);
+        for ([_]bool{ false, true }) |tiled| for ([_]usize{ 1, 2, 7, 8, 32 }) |rows| {
+            try kernels.beginBatch();
+            errdefer kernels.cancelBatch();
+            const x = try input.ref().slice(64, rows * input_dim * 4);
+            const y = try actual.ref().slice(64, rows * output_dim * 4);
+            if (tiled) try kernels.matmulTiled(format, w, input_dim, output_dim, rows, x, y, tile.ref(), compact.ref()) else try kernels.matmul(format, w, input_dim, output_dim, rows, x, y);
+            for (0..rows) |row| try kernels.matvec(format, weight_bytes, input_dim, output_dim, w, try input.ref().slice(64 + row * input_dim * 4, input_dim * 4), try expected.ref().slice(64 + row * output_dim * 4, output_dim * 4));
+            try kernels.endBatch();
+            for (actual.floats()[16..][0 .. rows * output_dim], expected.floats()[16..][0 .. rows * output_dim]) |got, want| {
+                try std.testing.expect(std.math.isFinite(got));
+                try std.testing.expectApproxEqAbs(want, got, @max(0.002, @abs(want) * 0.00002));
+            }
+        };
     }
 }

@@ -31,6 +31,8 @@ pub const Options = struct {
     context: usize = 4096,
     cache_mb: usize = 2048,
     combined_mb: usize = 0,
+    stream: bool = false,
+    session: bool = false,
     raw: bool = false,
     enable_thinking: ?bool = null,
     ignore_eos: bool = false,
@@ -90,7 +92,7 @@ pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options) !void {
     const prompt_ids = try tokenizer.tokenizer().encode(a, prompt);
     defer a.free(prompt_ids);
     if (prompt_ids.len == 0) return error.EmptyPrompt;
-    if (prompt_ids.len > opts.context - opts.max_tokens) return error.PromptTooLong;
+    if (!opts.session and prompt_ids.len > opts.context - opts.max_tokens) return error.PromptTooLong;
     for (prompt_ids) |id| if (id < 0 or id >= 248320) return error.InvalidQwen4ExpToken;
     // EOS is a generation-sidecar contract, separate from the ngram reset token.
     const generation_bytes = try c_file.readFileFromDir(a, sidecar_dir, "generation_config.json");
@@ -109,6 +111,15 @@ pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options) !void {
     const decoder = try decoder_mod.Decoder.create(a, store, plan);
     defer decoder.deinit();
     if (std.c.getenv("ANTFLY_QWEN4EXP_DISABLE_PARALLEL_READS") == null) decoder.read_io = read_executor.io();
+    if (opts.session) return @import("local_text_session.zig").run(a, io, decoder, &controller, tokenizer.tokenizer(), if (template) |*t| t else null, .{
+        .context = opts.context,
+        .max_tokens = opts.max_tokens,
+        .raw = opts.raw,
+        .thinking = opts.enable_thinking,
+        .eos = config.value.eos_token_id,
+        .ignore_eos = opts.ignore_eos,
+        .model = "Qwen3.8-Flash-Next",
+    });
     const loaded = std.Io.Timestamp.now(io, .awake);
     const loaded_profile = decoder.kernels.profile;
     var next: u32 = 0;
@@ -133,6 +144,7 @@ pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options) !void {
     var output: std.ArrayList(i32) = .empty;
     defer output.deinit(a);
     var reason: []const u8 = "length";
+    var printed: usize = 0;
     while (output.items.len < opts.max_tokens) {
         const eos = std.mem.indexOfScalar(u32, config.value.eos_token_id, next) != null;
         if (eos and !opts.ignore_eos) {
@@ -140,6 +152,15 @@ pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options) !void {
             break;
         }
         try output.append(a, @intCast(next));
+        if (opts.stream) {
+            const text = try tokenizer.tokenizer().decode(a, output.items);
+            defer a.free(text);
+            const end = @import("local_text_session.zig").completeUtf8Prefix(text);
+            if (end > printed) {
+                try @import("local_text_session.zig").writeStdout(text[printed..end]);
+                printed = end;
+            }
+        }
         if (output.items.len == opts.max_tokens) break;
         // Memory pressure remains observable throughout a long sequence.
         if (controller.isLiveHostUnderPressure()) {
@@ -157,7 +178,8 @@ pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options) !void {
     }
     const text = try tokenizer.tokenizer().decode(a, output.items);
     defer a.free(text);
-    std.debug.print("{s}\n", .{text});
+    try @import("local_text_session.zig").writeStdout(text[if (opts.stream) printed else 0..]);
+    try @import("local_text_session.zig").writeStdout("\n");
     if (opts.print_ids) std.debug.print("token_ids={any}\n", .{output.items});
     if (opts.print_count) std.debug.print("prompt_tokens={d} generated_tokens={d}\n", .{ prompt_ids.len, output.items.len });
     if (opts.print_finish) std.debug.print("finish_reason={s}\n", .{reason});
@@ -175,7 +197,7 @@ pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options) !void {
         misses += layer.stats.misses;
         bytes += layer.stats.bytes_read;
     }
-    const receipt = .{ .prefill_chunk = decoder.prefill_chunk, .prefill_read_group = 10, .expert_slot_counts = blk: {
+    const receipt = .{ .prefill_mps = decoder.prefill_tile != null, .batch_linear = decoder.batch_linear, .prefill_chunk = decoder.prefill_chunk, .prefill_read_group = 10, .expert_slot_counts = blk: {
         var counts: [48]usize = undefined;
         for (plan.slots, 0..) |count, i| counts[i] = count;
         break :blk counts;

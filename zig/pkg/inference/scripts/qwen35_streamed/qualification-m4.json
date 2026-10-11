@@ -1,0 +1,328 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-09",
+  "host": {
+    "chip": "Apple M4",
+    "ram_bytes": 17179869184,
+    "os": "macOS",
+    "backend": "Metal"
+  },
+  "git_head": "de83fd551e654945d88bb3c6d43abee120a6e6af",
+  "working_tree_dirty": true,
+  "scope": "Experimental local text CLI, exact UD-Q4_K_M GGUF, greedy, one sequence, 4096 total tokens",
+  "model_sha256": "322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482",
+  "source_and_binary_sha256": {
+    "zig/pkg/inference/src/architectures/qwen35_streamed.zig": "3b992f686f95ed17463a501c26936ddab7e651452af30cac41f3978cd110e413",
+    "zig/pkg/inference/src/backends/qwen35_streamed.metal": "153f9a31446b31edd6bdbfe1bbf315a74044f459003bf918ca8721b05b438cb0",
+    "zig/pkg/inference/src/backends/qwen35_streamed_kernels.zig": "869d0a05d86cae92afcbdb611bd27b7abfa2134ac328b61c3dd79c04811051cc",
+    "zig/pkg/inference/src/native_qwen35_generate.zig": "a0b90342a57ecbe7b17a38cc28116b6dd3df080906c8027a4460fa64e808766a",
+    "zig/pkg/inference/src/models/qwen35_streamed.zig": "7a0a7676c58e63bd571f4d8e9f3638c103d562aa4d6f07531293696b8ac1da4f",
+    "zig/pkg/inference/src/runtime/dense_weight_pager.zig": "a1c60544caca580559bcfdbda28fba76df79ffff9ef6e02e1237405ea72852f5",
+    "zig/pkg/inference/src/native_generate.zig": "b0992cdcd7852d95f8b50614c39d8144ba99a8b82fa9177acd667566c4b472f8",
+    "zig/pkg/inference/src/backends/qwen4exp_kernels.zig": "02ef64fb352486ecc1fadafb6762ef3dca58644e2aab0f5a5e482cccff46827f",
+    "zig/pkg/inference/src/backends/metal_kernels.m": "f1ccace83285a7d23b864f8313f789f0ea9ff0b5cd1c05380070a072e31382ab",
+    "zig/zig-out/bin/antfly-qwen35-streamed": "ff994d5a5bf7734585e3d779f94d216ac67b572ddfc5f2d9ab3b898453facf3a"
+  },
+  "unit_tests": {
+    "qwen35_streamed": {
+      "passed": 17,
+      "skipped": 0
+    },
+    "qwen4exp_regression": {
+      "passed": 35,
+      "skipped": 4,
+      "note": "Artifact-dependent tests skipped; no new Flash Next throughput claim"
+    }
+  },
+  "numerical_checks": {
+    "wide_reference_logits": {
+      "max_abs": 0.00017911195755004883,
+      "relative_l2": 6.391367605829146e-06,
+      "argmax_equal": true
+    },
+    "wide_reference_layers": {
+      "count": 64,
+      "max_relative_l2": 4.115826595807448e-05,
+      "max_abs": 0.07275390625
+    },
+    "reference_prefill": {
+      "max_abs": 2.574920654296875e-05,
+      "relative_l2": 1.8978469142894028e-06,
+      "argmax_equal": true
+    },
+    "reference_decode": {
+      "max_abs": 1.4781951904296875e-05,
+      "relative_l2": 1.3286794455780182e-06,
+      "argmax_equal": true
+    },
+    "chunk_parity": {
+      "max_abs": 2.574920654296875e-05,
+      "relative_l2": 1.8797704797179904e-06,
+      "argmax_equal": true
+    },
+    "chunk_decode_parity": {
+      "max_abs": 1.71661376953125e-05,
+      "relative_l2": 1.2891165397377335e-06,
+      "argmax_equal": true
+    },
+    "io_parity": {
+      "max_abs": 0.0,
+      "relative_l2": 0.0,
+      "argmax_equal": true
+    }
+  },
+  "cases": {
+    "wide": {
+      "exit_code": 0,
+      "seconds": 58.01411779200134,
+      "swapouts_delta": 0,
+      "peak_footprint_bytes": 2690009776,
+      "receipt": "/tmp/qwen38-27b-streamed-work/qualification-final/wide/receipt.json",
+      "finish_reason": "length",
+      "failure_stage": null,
+      "context_size": 4096,
+      "prefill_chunk": 128,
+      "io_overlap": true,
+      "admitted_bytes": 3417575424,
+      "cap_bytes": 4294967296,
+      "load_ms": 23808.512833,
+      "prefill_ms": 33726.672833,
+      "decode_ms": 0.05875,
+      "decode_steps": 0,
+      "decode_token_ms": [],
+      "prefill_bytes_read": 14344308736,
+      "decode_bytes_read": 0,
+      "cpu_dequant_bytes": 37266391040,
+      "cpu_dequant_ns": 3015898000,
+      "generated_token_ids": [
+        830
+      ],
+      "position": 128,
+      "prompt_tokens": 128,
+      "generated_tokens": 1
+    },
+    "batched": {
+      "exit_code": 0,
+      "seconds": 56.20329337500152,
+      "swapouts_delta": 0,
+      "peak_footprint_bytes": 2687257192,
+      "receipt": "/tmp/qwen38-27b-streamed-work/qualification-final/batched/receipt.json",
+      "finish_reason": "length",
+      "failure_stage": null,
+      "context_size": 4096,
+      "prefill_chunk": 128,
+      "io_overlap": true,
+      "admitted_bytes": 3417575424,
+      "cap_bytes": 4294967296,
+      "load_ms": 21756.58875,
+      "prefill_ms": 17123.770417,
+      "decode_ms": 17028.714,
+      "decode_steps": 1,
+      "decode_token_ms": [
+        17027.536417
+      ],
+      "prefill_bytes_read": 14344308736,
+      "decode_bytes_read": 14344308736,
+      "cpu_dequant_bytes": 74532782080,
+      "cpu_dequant_ns": 5713249000,
+      "generated_token_ids": [
+        11751,
+        13
+      ],
+      "position": 6,
+      "prompt_tokens": 5,
+      "generated_tokens": 2
+    },
+    "chunk1": {
+      "exit_code": 0,
+      "seconds": 123.60273170900473,
+      "swapouts_delta": 0,
+      "peak_footprint_bytes": 2629470752,
+      "receipt": "/tmp/qwen38-27b-streamed-work/qualification-final/chunk1/receipt.json",
+      "finish_reason": "length",
+      "failure_stage": null,
+      "context_size": 4096,
+      "prefill_chunk": 1,
+      "io_overlap": true,
+      "admitted_bytes": 3417575424,
+      "cap_bytes": 4294967296,
+      "load_ms": 22086.786625,
+      "prefill_ms": 84536.476417,
+      "decode_ms": 16734.002625,
+      "decode_steps": 1,
+      "decode_token_ms": [
+        16733.811375
+      ],
+      "prefill_bytes_read": 71721543680,
+      "decode_bytes_read": 14344308736,
+      "cpu_dequant_bytes": 223598346240,
+      "cpu_dequant_ns": 16982369000,
+      "generated_token_ids": [
+        11751,
+        13
+      ],
+      "position": 6,
+      "prompt_tokens": 5,
+      "generated_tokens": 2
+    },
+    "synchronous": {
+      "exit_code": 0,
+      "seconds": 74.02619925000181,
+      "swapouts_delta": 0,
+      "peak_footprint_bytes": 2683325032,
+      "receipt": "/tmp/qwen38-27b-streamed-work/qualification-final/synchronous/receipt.json",
+      "finish_reason": "length",
+      "failure_stage": null,
+      "context_size": 4096,
+      "prefill_chunk": 128,
+      "io_overlap": false,
+      "admitted_bytes": 3417575424,
+      "cap_bytes": 4294967296,
+      "load_ms": 21032.063125,
+      "prefill_ms": 26942.955375,
+      "decode_ms": 25816.338417,
+      "decode_steps": 1,
+      "decode_token_ms": [
+        25816.140334
+      ],
+      "prefill_bytes_read": 14344308736,
+      "decode_bytes_read": 14344308736,
+      "cpu_dequant_bytes": 74532782080,
+      "cpu_dequant_ns": 5717088000,
+      "generated_token_ids": [
+        11751,
+        13
+      ],
+      "position": 6,
+      "prompt_tokens": 5,
+      "generated_tokens": 2
+    },
+    "chat": {
+      "exit_code": 0,
+      "seconds": 54.95943620799517,
+      "swapouts_delta": 0,
+      "peak_footprint_bytes": 2684799664,
+      "receipt": "/tmp/qwen38-27b-streamed-work/qualification-final/chat/receipt.json",
+      "finish_reason": "stop",
+      "failure_stage": null,
+      "context_size": 4096,
+      "prefill_chunk": 128,
+      "io_overlap": true,
+      "admitted_bytes": 3417575424,
+      "cap_bytes": 4294967296,
+      "load_ms": 20867.299416,
+      "prefill_ms": 17229.3885,
+      "decode_ms": 16757.616125,
+      "decode_steps": 1,
+      "decode_token_ms": [
+        16756.712291
+      ],
+      "prefill_bytes_read": 14344308736,
+      "decode_bytes_read": 14344308736,
+      "cpu_dequant_bytes": 74532782080,
+      "cpu_dequant_ns": 5649811000,
+      "generated_token_ids": [
+        14556
+      ],
+      "position": 20,
+      "prompt_tokens": 19,
+      "generated_tokens": 1
+    },
+    "cancel": {
+      "exit_code": 1,
+      "seconds": 22.387562375006382,
+      "swapouts_delta": 0,
+      "peak_footprint_bytes": 2571979320,
+      "receipt": "/tmp/qwen38-27b-streamed-work/qualification-final/cancel/receipt.json",
+      "finish_reason": "Cancelled",
+      "failure_stage": "prefill",
+      "context_size": 4096,
+      "prefill_chunk": 128,
+      "io_overlap": true,
+      "admitted_bytes": 3417575424,
+      "cap_bytes": 4294967296,
+      "load_ms": 21119.367167,
+      "prefill_ms": 0,
+      "decode_ms": 0,
+      "decode_steps": 0,
+      "decode_token_ms": [],
+      "prefill_bytes_read": 573134592,
+      "decode_bytes_read": 0,
+      "cpu_dequant_bytes": 713031680,
+      "cpu_dequant_ns": 57435000,
+      "generated_token_ids": [],
+      "position": 0,
+      "prompt_tokens": 130,
+      "generated_tokens": 0
+    },
+    "low-budget": {
+      "exit_code": 1,
+      "seconds": 0.25646029200288467,
+      "swapouts_delta": 0,
+      "peak_footprint_bytes": 18596200,
+      "receipt": "/tmp/qwen38-27b-streamed-work/qualification-final/low-budget/receipt.json",
+      "finish_reason": "Qwen35MemoryBudgetExceeded",
+      "failure_stage": "inventory"
+    },
+    "context-overflow": {
+      "exit_code": 1,
+      "seconds": 0.25657737501023803,
+      "swapouts_delta": 0,
+      "peak_footprint_bytes": null,
+      "receipt": "/tmp/qwen38-27b-streamed-work/qualification-final/context-overflow/receipt.json"
+    },
+    "context4096": {
+      "exit_code": 0,
+      "seconds": 1326.244142458003,
+      "swapouts_delta": 0,
+      "peak_footprint_bytes": 2693204656,
+      "receipt": "/tmp/qwen38-27b-streamed-work/qualification-final/context4096/receipt.json",
+      "finish_reason": "length",
+      "failure_stage": null,
+      "context_size": 4096,
+      "prefill_chunk": 128,
+      "io_overlap": true,
+      "admitted_bytes": 3417575424,
+      "cap_bytes": 4294967296,
+      "load_ms": 20262.226375,
+      "prefill_ms": 1289057.924792,
+      "decode_ms": 16851.274375,
+      "decode_steps": 1,
+      "decode_token_ms": [
+        16850.544375
+      ],
+      "prefill_bytes_read": 459017879552,
+      "decode_bytes_read": 14344308736,
+      "cpu_dequant_bytes": 1229790904320,
+      "cpu_dequant_ns": 101220980000,
+      "generated_token_ids": [
+        830,
+        830
+      ],
+      "position": 4095,
+      "prompt_tokens": 4094,
+      "generated_tokens": 2
+    }
+  },
+  "max_native_footprint_bytes": 2693204656,
+  "system_swapouts_delta": 0,
+  "reference_128": {
+    "tokens": [
+      830
+    ],
+    "seconds": 42.377596874997835,
+    "bytes_read": 31868859296,
+    "max_rss_bytes": 472104960,
+    "reference": "ggml codecs + NumPy independent FP32 equations",
+    "model_sha256": "322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482",
+    "ggml_library_sha256": "5cde6f33b2cec66c9ee7717c78a51cb78fe5cba9d06fb1074d4918140ed1d899"
+  },
+  "limitations": [
+    "Numerical oracle uses independent NumPy FP32 equations and pinned upstream ggml dequantization, not full llama.cpp graph execution or original BF16 weights.",
+    "Reference numerical checks cover 5-token prefill plus one decode and 128-token prefill; the 4096-token sequence is a functional and memory qualification.",
+    "Byte counts are completed application read ranges, not physical SSD traffic. F_NOCACHE does not prove a cold device cache.",
+    "Swapout deltas are system-wide observations; no global cache purge or swap reset was performed.",
+    "No HTTP serving, CUDA, multimodal, batching across sequences, or general model-catalog promotion."
+  ],
+  "passed": true
+}

@@ -95,10 +95,13 @@ const ByteLevelPretokenizer = enum {
     /// Qwen3-VL. ByteLevel itself has `use_regex=false`; the preceding Split
     /// owns the pretoken boundaries.
     qwen,
+    qwen_marks,
 };
 
 const qwen_byte_level_split_regex =
     "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+
+const qwen_marks_split_regex = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 
 const MetaspacePrependScheme = enum {
     always,
@@ -1101,7 +1104,7 @@ pub const HfTokenizer = struct {
                     }
                 } else if (std.mem.eql(u8, t.string, "Sequence")) {
                     var saw_removed_inverted_split = false;
-                    var saw_qwen_byte_level_split = false;
+                    var qwen_split: ?ByteLevelPretokenizer = null;
                     // Preserve the Split semantics that precede ByteLevel. CLIP
                     // uses Removed+invert=true and intentionally discards the
                     // unmatched whitespace. Qwen and Llama use Isolated splits,
@@ -1114,11 +1117,11 @@ pub const HfTokenizer = struct {
                                         if (pt == .string) {
                                             if (std.mem.eql(u8, pt.string, "Split")) {
                                                 saw_removed_inverted_split = splitRemovesUnmatchedText(item.object);
-                                                saw_qwen_byte_level_split = splitUsesQwenByteLevelRegex(item.object);
+                                                qwen_split = qwenByteLevelRegex(item.object);
                                             } else if (std.mem.eql(u8, pt.string, "ByteLevel")) {
                                                 self.pre_tokenizer_type = if (saw_removed_inverted_split) .byte_level_split else .byte_level;
-                                                if (!saw_removed_inverted_split and saw_qwen_byte_level_split) {
-                                                    self.byte_level_pretokenizer = .qwen;
+                                                if (!saw_removed_inverted_split) {
+                                                    if (qwen_split) |kind| self.byte_level_pretokenizer = kind;
                                                 }
                                                 return;
                                             } else if (std.mem.eql(u8, pt.string, "Metaspace")) {
@@ -1148,20 +1151,22 @@ pub const HfTokenizer = struct {
             invert == .bool and invert.bool;
     }
 
-    fn splitUsesQwenByteLevelRegex(obj: std.json.ObjectMap) bool {
-        const behavior = obj.get("behavior") orelse return false;
-        const invert = obj.get("invert") orelse return false;
-        const pattern = obj.get("pattern") orelse return false;
+    fn qwenByteLevelRegex(obj: std.json.ObjectMap) ?ByteLevelPretokenizer {
+        const behavior = obj.get("behavior") orelse return null;
+        const invert = obj.get("invert") orelse return null;
+        const pattern = obj.get("pattern") orelse return null;
         if (behavior != .string or
             !std.mem.eql(u8, behavior.string, "Isolated") or
             invert != .bool or invert.bool or
             pattern != .object)
         {
-            return false;
+            return null;
         }
-        const regex = pattern.object.get("Regex") orelse return false;
-        return regex == .string and
-            std.mem.eql(u8, regex.string, qwen_byte_level_split_regex);
+        const regex = pattern.object.get("Regex") orelse return null;
+        if (regex != .string) return null;
+        if (std.mem.eql(u8, regex.string, qwen_byte_level_split_regex)) return .qwen;
+        if (std.mem.eql(u8, regex.string, qwen_marks_split_regex)) return .qwen_marks;
+        return null;
     }
 
     fn inferModelType(obj: std.json.ObjectMap) ModelType {
@@ -4268,10 +4273,10 @@ pub const HfTokenizer = struct {
         scratch: *BpeScratch,
     ) !void {
         try ids.ensureUnusedCapacity(allocator, (text.len / 3) + 8);
-        if (self.byte_level_pretokenizer == .qwen) {
+        if (self.byte_level_pretokenizer != .gpt2) {
             var start: usize = 0;
             while (start < text.len) {
-                const end = qwenPreTokenEnd(text, start);
+                const end = qwenPreTokenEnd(text, start, self.byte_level_pretokenizer == .qwen_marks);
                 try self.bpeEncodeWord(allocator, text[start..end], ids, scratch);
                 start = end;
             }
@@ -5560,9 +5565,9 @@ pub const HfTokenizer = struct {
         }
         var count: usize = 0;
         var start: usize = 0;
-        if (self.byte_level_pretokenizer == .qwen) {
+        if (self.byte_level_pretokenizer != .gpt2) {
             while (start < text.len) {
-                start = qwenPreTokenEnd(text, start);
+                start = qwenPreTokenEnd(text, start, self.byte_level_pretokenizer == .qwen_marks);
                 count +|= 1;
             }
             return count;
@@ -8231,17 +8236,26 @@ fn qwenContractionLen(text: []const u8) ?usize {
 /// scanner separate from GPT-2 is important: Qwen emits one numeric codepoint
 /// per pretoken, permits one non-CR/LF prefix before a letter run, and attaches
 /// CR/LF runs to preceding punctuation. Those distinctions change BPE merges.
-fn qwenPreTokenEnd(text: []const u8, start: usize) usize {
+fn qwenCharAt(text: []const u8, include_marks: bool, at: usize) Gpt2Char {
+    var result = gpt2CharAt(text, at);
+    if (include_marks and result.class == .other and text[at] >= 0x80) {
+        const cp = std.unicode.utf8Decode(text[at..][0..result.len]) catch return result;
+        if (@import("unicode_marks.zig").isMark(cp)) result.class = .letter;
+    }
+    return result;
+}
+
+fn qwenPreTokenEnd(text: []const u8, start: usize, include_marks: bool) usize {
     std.debug.assert(start < text.len);
     if (qwenContractionLen(text[start..])) |contraction_len| {
         return start + contraction_len;
     }
 
-    const first = gpt2CharAt(text, start);
+    const first = qwenCharAt(text, include_marks, start);
     if (first.class == .letter) {
         var end = start + first.len;
         while (end < text.len) {
-            const next = gpt2CharAt(text, end);
+            const next = qwenCharAt(text, include_marks, end);
             if (next.class != .letter) break;
             end += next.len;
         }
@@ -8253,11 +8267,11 @@ fn qwenPreTokenEnd(text: []const u8, start: usize) usize {
     if (text[start] != '\r' and text[start] != '\n' and
         first.class != .number and next_start < text.len)
     {
-        const next = gpt2CharAt(text, next_start);
+        const next = qwenCharAt(text, include_marks, next_start);
         if (next.class == .letter) {
             var end = next_start + next.len;
             while (end < text.len) {
-                const letter = gpt2CharAt(text, end);
+                const letter = qwenCharAt(text, include_marks, end);
                 if (letter.class != .letter) break;
                 end += letter.len;
             }
@@ -8271,14 +8285,14 @@ fn qwenPreTokenEnd(text: []const u8, start: usize) usize {
     //  ?[^\s\p{L}\p{N}]+[\r\n]*
     var punctuation_start = start;
     if (text[start] == ' ' and next_start < text.len and
-        gpt2CharAt(text, next_start).class == .other)
+        qwenCharAt(text, include_marks, next_start).class == .other)
     {
         punctuation_start = next_start;
     }
-    if (gpt2CharAt(text, punctuation_start).class == .other) {
+    if (qwenCharAt(text, include_marks, punctuation_start).class == .other) {
         var end = punctuation_start;
         while (end < text.len) {
-            const punctuation = gpt2CharAt(text, end);
+            const punctuation = qwenCharAt(text, include_marks, end);
             if (punctuation.class != .other) break;
             end += punctuation.len;
         }
@@ -8295,7 +8309,7 @@ fn qwenPreTokenEnd(text: []const u8, start: usize) usize {
         else
             null;
         while (end < text.len) {
-            const whitespace = gpt2CharAt(text, end);
+            const whitespace = qwenCharAt(text, include_marks, end);
             if (whitespace.class != .whitespace) break;
             if (text[end] == '\r' or text[end] == '\n') {
                 last_crlf_end = end + whitespace.len;
@@ -12051,7 +12065,7 @@ test "Qwen ByteLevel Split scanner matches reference regex boundaries" {
 
     var start: usize = 0;
     for (expected) |piece| {
-        const end = qwenPreTokenEnd(input, start);
+        const end = qwenPreTokenEnd(input, start, false);
         try std.testing.expectEqualStrings(piece, input[start..end]);
         start = end;
     }
@@ -12328,4 +12342,58 @@ fn z17RepeatString(comptime bytes: []const u8, comptime count: usize) *const [by
         break :blk repeated;
     };
     return &result;
+}
+
+test "Qwen35 Qwen4Exp mark-aware Split preserves assistant newline prefix" {
+    const allocator = std.testing.allocator;
+
+    // Qwen's Split owns the regex semantics while ByteLevel runs with
+    // use_regex=false. The exact signature selects the Qwen scanner rather
+    // than GPT-2 or CLIP pretokenization.
+    const json_str =
+        \\{
+        \\  "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
+        \\    {"type": "Split", "pattern": {"Regex": "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"}, "behavior": "Isolated", "invert": false},
+        \\    {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false}
+        \\  ]},
+        \\  "decoder": {"type": "ByteLevel"},
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "continuing_subword_prefix": null,
+        \\    "end_of_word_suffix": null,
+        \\    "byte_fallback": false,
+        \\    "vocab": {"Okay": 10, "Ġlet": 11, "Ġsee": 12, "Ċ": 13, "ĊĊ": 14, "hello": 15},
+        \\    "merges": []
+        \\  }
+        \\}
+    ;
+
+    var tok = try HfTokenizer.loadFromBytes(allocator, json_str);
+    defer tok.deinitSelf();
+
+    try std.testing.expectEqual(PreTokenizerType.byte_level, tok.pre_tokenizer_type);
+    try std.testing.expectEqual(ByteLevelPretokenizer.qwen_marks, tok.byte_level_pretokenizer);
+
+    const ids = try tok.encode(allocator, "Okay let see\n\nhello");
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i32, &.{ 10, 11, 12, 14, 15 }, ids);
+
+    const text = try tok.decode(allocator, &.{ 10, 11, 12, 14, 15 });
+    defer allocator.free(text);
+
+    try std.testing.expectEqualStrings("Okay let see\n\nhello", text);
+}
+
+test "Qwen35 Qwen4Exp mark-aware scanner matches reference Unicode and whitespace boundaries" {
+    const inputs = [_][]const u8{ "\n\nhello", " é123", "́́a", "!́a", "  a\n\nb  c", "x\u{1e5ee}y" };
+    const pieces = [_][]const []const u8{ &.{ "\n\n", "hello" }, &.{ " é", "1", "2", "3" }, &.{"́́a"}, &.{"!́a"}, &.{ " ", " a", "\n\n", "b", " ", " c" }, &.{"x\u{1e5ee}y"} };
+    for (inputs, pieces) |input, expected| {
+        var at: usize = 0;
+        for (expected) |piece| {
+            const end = qwenPreTokenEnd(input, at, true);
+            try std.testing.expectEqualStrings(piece, input[at..end]);
+            at = end;
+        }
+        try std.testing.expectEqual(input.len, at);
+    }
 }

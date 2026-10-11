@@ -16959,6 +16959,9 @@ typedef struct termite_metal_quant_matmul_descriptor {
     termite_metal_q8_0_linear_family_kind q8_family;
     termite_metal_q4_0_mmv_workload q4_0_mmv_workload;
     bool use_planned_dispatch;
+    // Qwen expert prefill uses the existing row-indexed SIMD reductions for
+    // small batches. Other callers retain their existing dispatch policy.
+    bool batched_vector_reduction;
     uint8_t planned_dispatch;
     int failure_code;
 } termite_metal_quant_matmul_descriptor;
@@ -18775,7 +18778,8 @@ static int termite_metal_decode_runtime_apply_quantized_linear_slot_device_direc
     size_t slot_out_dim,
     uint32_t format,
     size_t values_per_block,
-    size_t bytes_per_block
+    size_t bytes_per_block,
+    bool batched_vector_reduction
 ) {
     if (runtime == NULL || input_handle == NULL || output_handle == NULL) return -1;
     if (pipeline == nil || weight_buffer == nil) return -2;
@@ -18812,6 +18816,7 @@ static int termite_metal_decode_runtime_apply_quantized_linear_slot_device_direc
             .out_dim = out_dim,
             .values_per_block = values_per_block,
             .bytes_per_block = bytes_per_block,
+            .batched_vector_reduction = batched_vector_reduction,
             .failure_code = -11,
         };
         if (termite_metal_encode_quant_matmul_descriptor(runtime, command_buffer, &descriptor) != 0) return -11;
@@ -20161,6 +20166,8 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
     if (termite_metal_prepare_quant_matmul_accesses(runtime, descriptor, failure_code) != 0) return failure_code;
     id<MTLComputePipelineState> pipeline = descriptor->fallback_pipeline;
     BOOL use_reduce = NO;
+    const BOOL vector_reduction_rows = descriptor->rows == 1u ||
+        (descriptor->batched_vector_reduction && descriptor->rows <= 32u);
     const BOOL use_f16_input =
         descriptor->input_dtype == TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F16 &&
         descriptor->output_dtype == TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32;
@@ -20478,7 +20485,7 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
                 reduce_shmem_floats = 16u;
                 reduce_threadgroups = MTLSizeMake((descriptor->out_dim + 3u) / 4u, descriptor->rows, 1);
                 reduce_threads = MTLSizeMake(64, 1, 1);
-            } else if (descriptor->rows == 1 && runtime->q4_k_reduce_pipeline != nil) {
+            } else if (vector_reduction_rows && runtime->q4_k_reduce_pipeline != nil) {
                 pipeline = runtime->q4_k_reduce_pipeline;
                 use_reduce = YES;
                 reduce_shmem_floats = 128u;
@@ -20499,7 +20506,7 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
             }
             break;
         case TERMITE_METAL_QUANT_FORMAT_Q5_1:
-            if (descriptor->rows == 1 && runtime->q5_1_reduce_pipeline != nil) {
+            if (vector_reduction_rows && runtime->q5_1_reduce_pipeline != nil) {
                 pipeline = runtime->q5_1_reduce_pipeline;
                 use_reduce = YES;
                 reduce_shmem_floats = 64u;
@@ -20511,7 +20518,7 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
             }
             break;
         case TERMITE_METAL_QUANT_FORMAT_Q5_K:
-            if (descriptor->rows == 1 && runtime->q5_k_reduce_pipeline != nil) {
+            if (vector_reduction_rows && runtime->q5_k_reduce_pipeline != nil) {
                 pipeline = runtime->q5_k_reduce_pipeline;
                 use_reduce = YES;
                 reduce_shmem_floats = 32u;
@@ -36611,8 +36618,28 @@ int termite_metal_decode_runtime_apply_quantized_linear_slot_device(
         view.out_dim,
         view.format,
         view.values_per_block,
-        view.bytes_per_block
+        view.bytes_per_block,
+        false
     );
+}
+
+int termite_metal_qwen4exp_apply_linear(
+    termite_metal_decode_runtime *runtime, uint32_t format,
+    void *input_handle, size_t input_offset, size_t rows,
+    size_t in_dim, size_t out_dim, void *output_handle, size_t output_offset
+) {
+    if (runtime == NULL || rows == 0 || rows > 32) return -1;
+    if (format != TERMITE_METAL_QUANT_FORMAT_Q4_K &&
+        format != TERMITE_METAL_QUANT_FORMAT_Q5_K &&
+        format != TERMITE_METAL_QUANT_FORMAT_Q5_1 &&
+        format != TERMITE_METAL_QUANT_FORMAT_Q8_0) return -2;
+    termite_metal_quant_linear_slot_view view;
+    if (termite_metal_decode_runtime_quant_linear_slot_view(runtime, format, 0, &view) != 0) return -3;
+    return termite_metal_decode_runtime_apply_quantized_linear_slot_device_direct(
+        runtime, 0, input_handle, input_offset, rows, in_dim, out_dim,
+        output_handle, output_offset, view.pipeline, view.weight_buffer,
+        view.prepared, view.in_dim, view.out_dim, view.format,
+        view.values_per_block, view.bytes_per_block, true);
 }
 
 // Apply one row-major packed Q4_0 expert per activation row. One dispatch

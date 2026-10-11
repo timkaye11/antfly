@@ -1,0 +1,45 @@
+{
+  "architecture": "qwen35",
+  "model": "Qwen3.8-27B",
+  "text_only": true,
+  "main_layers": 64,
+  "excluded_mtp_layers": 1,
+  "llama_cpp_reference_revision": "6184e92c57dcd34de8a3e381d7641a5e75250d5f",
+  "files": [
+    {
+      "path": "Qwen3.8-27B-UD-Q4_K_M.gguf",
+      "bytes": 16464440224,
+      "sha256": "322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482",
+      "source_repo": "unsloth/Qwen3.8-27B-GGUF",
+      "source_revision": "4ca720788d1e01f1bff70c033e0d0028fd02e502"
+    },
+    {
+      "path": "config.json",
+      "bytes": 4312,
+      "sha256": "191e0af232104ed8b65258cf3fb2b842e288008baca7633c11b82a1ac7203aab",
+      "source_repo": "Qwen/Qwen3.8-27B",
+      "source_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+    },
+    {
+      "path": "generation_config.json",
+      "bytes": 202,
+      "sha256": "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e",
+      "source_repo": "Qwen/Qwen3.8-27B",
+      "source_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+    },
+    {
+      "path": "tokenizer.json",
+      "bytes": 12809320,
+      "sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+      "source_repo": "Qwen/Qwen3.8-27B",
+      "source_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+    },
+    {
+      "path": "tokenizer_config.json",
+      "bytes": 17928,
+      "sha256": "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27",
+      "source_repo": "Qwen/Qwen3.8-27B",
+      "source_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+    }
+  ]
+}
