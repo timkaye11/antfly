@@ -25,12 +25,12 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
 import platform
 import re
 import statistics
 import subprocess
 import time
+from pathlib import Path
 
 
 def digest(path):
@@ -58,9 +58,9 @@ def host():
 def swap_events(snapshot):
     text = snapshot["vm"]["stdout"]
     return {
-        name: int(re.search(rf"^{name}:\s+(\d+)", text, re.M).group(1))
+        name: int(re.search(rf"^{name}:\s+(\d+)", text, re.MULTILINE).group(1))
         for name in ("Swapins", "Swapouts")
-        if re.search(rf"^{name}:\s+(\d+)", text, re.M)
+        if re.search(rf"^{name}:\s+(\d+)", text, re.MULTILINE)
     }
 
 

@@ -20,6 +20,7 @@ const options = @import("build_options");
 const model = @import("../models/qwen4exp.zig");
 const store_mod = @import("../models/tensor_store.zig");
 const gguf = @import("../gguf/root.zig");
+const control = @import("../util/local_control.zig");
 const c_file = @import("../util/c_file.zig");
 const gpu = @import("../backends/qwen4exp_kernels.zig");
 const mr = @import("../backends/metal_runtime.zig");
@@ -118,6 +119,7 @@ pub const Decoder = struct {
     ngram_state: model.NgramState,
     position: usize = 0,
     failed: bool = false,
+    controller: ?*memory.AdmissionController = null,
     read_io: ?std.Io = null,
     route_trace: ?[]u16 = null,
     prefill_chunk: usize = 128,
@@ -133,6 +135,8 @@ pub const Decoder = struct {
         errdefer allocator.destroy(self);
         self.* = .{ .allocator = allocator, .plan = plan, .kernels = try gpu.Kernels.init(), .ngram_state = model.NgramState.init(plan.cfg.eos) };
         errdefer self.deinitContents();
+        self.kernels.cancelled = &control.cancelled;
+        try control.check();
         if (std.c.getenv("ANTFLY_QWEN4EXP_ROUTE_TRACE") != null) self.route_trace = try allocator.alloc(u16, plan.context * 48 * 10);
         if (std.c.getenv("ANTFLY_QWEN4EXP_PREFILL_CHUNK")) |value| {
             self.prefill_chunk = try std.fmt.parseInt(usize, std.mem.span(value), 10);
@@ -168,7 +172,9 @@ pub const Decoder = struct {
             self.scratch_count += 1;
         }
         for (0..48) |layer| {
+            try control.check();
             self.layers[layer] = try pager.Layer.init(allocator, store, layer, plan.slots[layer]);
+            self.layers[layer].cancelled = &control.cancelled;
             self.layer_handles[layer] = termite_metal_qwen4exp_alias(self.kernels.runtime, self.layers[layer].bytes.ptr, self.layers[layer].bytes.len) orelse {
                 self.layers[layer].deinit();
                 return error.MetalBufferAllocationFailed;
@@ -180,6 +186,7 @@ pub const Decoder = struct {
             };
         }
         for (store.ggufFile().?.tensors) |tensor| {
+            try control.check();
             if (isPagedWeight(tensor.name)) continue;
             var range = (try store.describeTensorRange(allocator, tensor.name)) orelse return error.MissingTensorRange;
             defer range.deinit(allocator);
@@ -262,6 +269,10 @@ pub const Decoder = struct {
             result.read_failures +|= layer.stats.read_failures;
         }
         return result;
+    }
+    pub fn check(self: *Decoder) !void {
+        try control.check();
+        if (self.controller) |controller| if (controller.isLiveHostUnderPressure()) return error.ResourceTemporarilyUnavailable;
     }
     fn s(self: *Decoder, index: usize) gpu.Ref {
         return self.scratch[index].ref();
@@ -543,12 +554,14 @@ pub const Decoder = struct {
         for (tokens) |token| if (token < 0 or token >= 248320) return error.Qwen4ExpContextOrTokenOutOfRange;
         errdefer self.failed = true;
         errdefer self.kernels.cancelBatch();
+        try self.check();
         const base = self.position;
         for (tokens, 0..) |token, t| {
             try self.embedding_reader.?.read(self.embedding_offset + @as(u64, @intCast(token)) * embedding_row_bytes, self.embedding_bytes.?.bytes[0..embedding_row_bytes]);
             try self.run(.{ .op = 7, .n = 10240, .dim = 2560, .index = 0 }, &.{self.embedding_bytes.?.ref()}, try self.prefillRef(0, t * 10240 * 4, 10240 * 4));
         }
         for (0..48) |l| {
+            try self.check();
             const batched = self.batch_linear and self.plan.cfg.isLinear(l);
             if (batched) try self.prefillLinear(l, tokens, base);
             for (tokens, 0..) |token, t| {
@@ -675,12 +688,14 @@ pub const Decoder = struct {
         if (self.position >= self.plan.context or token >= 248320) return error.Qwen4ExpContextOrTokenOutOfRange;
         errdefer self.failed = true;
         errdefer self.kernels.cancelBatch();
+        try self.check();
         // Only one 2720-byte Q8 row is used. Keeping the entire 644 MiB table
         // resident wastes expert-cache capacity and Metal residency work.
         try self.embedding_reader.?.read(self.embedding_offset + @as(u64, token) * embedding_row_bytes, self.embedding_bytes.?.bytes[0..embedding_row_bytes]);
         try self.run(.{ .op = 7, .n = 10240, .dim = 2560, .index = 0 }, &.{self.embedding_bytes.?.ref()}, self.s(0));
         try self.capture("embed", 0, self.s(0), 2560);
         for (0..48) |l| {
+            try self.check();
             try self.kernels.beginBatch();
             if (l == 1) try self.ple(token);
             try self.hc(l, "hc_attn", true);

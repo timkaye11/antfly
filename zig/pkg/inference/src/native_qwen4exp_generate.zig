@@ -20,8 +20,11 @@ const store_mod = @import("models/tensor_store.zig");
 const manifest_mod = @import("models/manifest.zig");
 const memory = @import("runtime/tier/memory.zig");
 const c_file = @import("util/c_file.zig");
+const sidecar = @import("util/verified_sidecar.zig");
 const generation = @import("pipelines/generation.zig");
 const hf = @import("inference_hf_tokenizer");
+const control = @import("util/local_control.zig");
+const model = @import("models/qwen4exp.zig");
 const platform = @import("antfly_platform");
 
 pub const Options = struct {
@@ -47,7 +50,23 @@ pub const Options = struct {
     logits_path: ?[]const u8 = null,
 };
 
+const RunStatus = struct { stage: []const u8 = "arguments", hash_verified: bool = false };
 pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options) !void {
+    var guard = control.Guard.init();
+    defer guard.deinit();
+    var status: RunStatus = .{};
+    runInner(a, io, opts, &status) catch |failure| {
+        if (opts.json_path) |p| {
+            const report = .{ .architecture = "qwen4exp", .experimental = true, .finish_reason = @errorName(failure), .failure_stage = status.stage, .hash_verified = status.hash_verified, .artifact_revision = model.artifact_revision, .process_memory = platform.process_memory.pressureSnapshot() };
+            if (std.json.Stringify.valueAlloc(a, report, .{ .whitespace = .indent_2 })) |json| {
+                defer a.free(json);
+                std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = json }) catch |err| std.log.err("failure receipt: {s}", .{@errorName(err)});
+            } else |_| {}
+        }
+        return failure;
+    };
+}
+fn runInner(a: std.mem.Allocator, io: std.Io, opts: Options, status: *RunStatus) !void {
     if (opts.context == 0 or opts.context > 4096 or opts.max_tokens == 0 or opts.max_tokens > opts.context) return error.UnsupportedQwen4ExpContext;
     const start = std.Io.Timestamp.now(io, .awake);
     // A shard path is unambiguous, including the metadata-only first shard.
@@ -57,12 +76,18 @@ pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options) !void {
         break :blk try a.dupe(u8, manifest.gguf_path orelse return error.Qwen4ExpGgufPathRequired);
     };
     defer a.free(path);
+    status.stage = "inventory";
     const store = try store_mod.SplitGgufStore.open(a, path);
     defer store.deinit();
     const plan = try decoder_mod.Plan.inspect(store, opts.context, try std.math.mul(usize, opts.cache_mb, 1024 * 1024));
     var controller: memory.AdmissionController = .{};
+    status.stage = "admission";
     var lease = try plan.acquire(&controller, try std.math.mul(usize, opts.combined_mb, 1024 * 1024));
     defer lease.release();
+    status.stage = "artifact_verification";
+    try store_mod.SplitGgufStore.verifyShardIdentity(store, &model.artifact_shards, &control.cancelled);
+    status.hash_verified = true;
+    status.stage = "tokenizer";
     var sidecar_dir = std.fs.path.dirname(path) orelse ".";
     if (!c_file.fileExistsInDir(a, sidecar_dir, "tokenizer.json")) sidecar_dir = std.fs.path.dirname(sidecar_dir) orelse return error.MissingQwen4ExpTokenizer;
     // Bound tokenizer parsing, vocabulary and caches independently of the
@@ -74,12 +99,12 @@ pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options) !void {
     };
     defer std.debug.assert(tokenizer_allocator.live == 0);
     const tokenizer = blk: {
-        const bytes = try c_file.readFileFromDir(a, sidecar_dir, "tokenizer.json");
+        const bytes = try sidecar.read(a, sidecar_dir, "tokenizer.json", 12809320, "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3");
         defer a.free(bytes);
         break :blk try hf.HfTokenizer.loadFromBytes(tokenizer_allocator.allocator(), bytes);
     };
     defer tokenizer.deinitSelf();
-    const template_bytes = try c_file.readFileFromDir(a, sidecar_dir, "tokenizer_config.json");
+    const template_bytes = try sidecar.read(a, sidecar_dir, "tokenizer_config.json", 17928, "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27");
     defer a.free(template_bytes);
     const template_config = try std.json.parseFromSlice(struct { chat_template: []const u8, bos_token: ?[]const u8 = null, eos_token: ?[]const u8 = null, unk_token: ?[]const u8 = null, pad_token: ?[]const u8 = null }, a, template_bytes, .{ .ignore_unknown_fields = true });
     defer template_config.deinit();
@@ -95,7 +120,7 @@ pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options) !void {
     if (!opts.session and prompt_ids.len > opts.context - opts.max_tokens) return error.PromptTooLong;
     for (prompt_ids) |id| if (id < 0 or id >= 248320) return error.InvalidQwen4ExpToken;
     // EOS is a generation-sidecar contract, separate from the ngram reset token.
-    const generation_bytes = try c_file.readFileFromDir(a, sidecar_dir, "generation_config.json");
+    const generation_bytes = try sidecar.read(a, sidecar_dir, "generation_config.json", 202, "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e");
     defer a.free(generation_bytes);
     const config = try std.json.parseFromSlice(struct { eos_token_id: []const u32 }, a, generation_bytes, .{ .ignore_unknown_fields = true });
     defer config.deinit();
@@ -108,8 +133,12 @@ pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options) !void {
     const reader = decoder_mod.pager;
     var read_executor = std.Io.Threaded.init(a, .{ .async_limit = .limited(reader.read_lane_count), .concurrent_limit = .limited(reader.read_lane_count), .stack_size = reader.read_stack_bytes });
     defer read_executor.deinit();
+    status.stage = "decoder_initialization";
+    try control.check();
     const decoder = try decoder_mod.Decoder.create(a, store, plan);
     defer decoder.deinit();
+    decoder.controller = &controller;
+    status.stage = if (opts.session) "session" else "prefill";
     if (std.c.getenv("ANTFLY_QWEN4EXP_DISABLE_PARALLEL_READS") == null) decoder.read_io = read_executor.io();
     if (opts.session) return @import("local_text_session.zig").run(a, io, decoder, &controller, tokenizer.tokenizer(), if (template) |*t| t else null, .{
         .context = opts.context,
@@ -119,9 +148,12 @@ pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options) !void {
         .eos = config.value.eos_token_id,
         .ignore_eos = opts.ignore_eos,
         .model = "Qwen3.8-Flash-Next",
+        .artifact_hash_verified = status.hash_verified,
+        .artifact_id = model.artifact_revision,
     });
     const loaded = std.Io.Timestamp.now(io, .awake);
     const loaded_profile = decoder.kernels.profile;
+    std.debug.print("Qwen4Exp: prefilling {d} tokens\n", .{prompt_ids.len});
     var next: u32 = 0;
     if (decoder.prefill_chunk > 0 and prompt_ids.len > 1) {
         var offset: usize = 0;
@@ -135,6 +167,8 @@ pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options) !void {
         if (controller.isLiveHostUnderPressure()) return error.ResourceTemporarilyUnavailable;
         next = try decoder.prefillToken(@intCast(id), i + 1 == prompt_ids.len);
     }
+    status.stage = "decode";
+    std.debug.print("Qwen4Exp: decoding\n", .{});
     const prefilled = std.Io.Timestamp.now(io, .awake);
     const prefilled_profile = decoder.kernels.profile;
     const prefilled_paging = decoder.pagingStats();
@@ -146,6 +180,7 @@ pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options) !void {
     var reason: []const u8 = "length";
     var printed: usize = 0;
     while (output.items.len < opts.max_tokens) {
+        try control.check();
         const eos = std.mem.indexOfScalar(u32, config.value.eos_token_id, next) != null;
         if (eos and !opts.ignore_eos) {
             reason = "stop";
@@ -172,6 +207,7 @@ pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options) !void {
         token_ms[timed_steps] = @as(f64, @floatFromInt(std.Io.Timestamp.durationTo(step_start, std.Io.Timestamp.now(io, .awake)).nanoseconds)) / 1e6;
         timed_steps += 1;
     }
+    status.stage = "output";
     const finished = std.Io.Timestamp.now(io, .awake);
     if (std.c.getenv("ANTFLY_QWEN4EXP_ROUTE_TRACE")) |p| {
         if (decoder.route_trace) |trace| try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = std.mem.span(p), .data = std.mem.sliceAsBytes(trace[0 .. decoder.position * 48 * 10]) });
@@ -197,7 +233,7 @@ pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options) !void {
         misses += layer.stats.misses;
         bytes += layer.stats.bytes_read;
     }
-    const receipt = .{ .prefill_mps = decoder.prefill_tile != null, .batch_linear = decoder.batch_linear, .prefill_chunk = decoder.prefill_chunk, .prefill_read_group = 10, .expert_slot_counts = blk: {
+    const receipt = .{ .hash_verified = status.hash_verified, .artifact_revision = model.artifact_revision, .artifact_shards = model.artifact_shards, .sidecars_hash_verified = true, .prefill_mps = decoder.prefill_tile != null, .batch_linear = decoder.batch_linear, .prefill_chunk = decoder.prefill_chunk, .prefill_read_group = 10, .expert_slot_counts = blk: {
         var counts: [48]usize = undefined;
         for (plan.slots, 0..) |count, i| counts[i] = count;
         break :blk counts;

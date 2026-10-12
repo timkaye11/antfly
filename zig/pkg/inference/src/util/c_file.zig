@@ -497,6 +497,10 @@ pub const RangeReader = struct {
         self.* = undefined;
     }
 
+    pub fn currentSize(self: *const RangeReader) !u64 {
+        return @intCast(try fileSizeFromFd(self.fd));
+    }
+
     pub fn read(self: *const RangeReader, offset: u64, destination: []u8) !void {
         if (offset > self.size or destination.len > self.size - offset) return error.RegionOutOfBounds;
         try readRegionFromFd(self.fd, destination, offset);

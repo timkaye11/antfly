@@ -19,6 +19,14 @@
 const std = @import("std");
 const gguf = @import("../gguf/root.zig");
 
+pub const artifact_revision = "766911a6b7369840a91dbcd95f9f997acaab6cd6";
+pub const artifact_shards = [_]@import("../util/artifact_verification.zig").Identity{
+    .{ .bytes = 10946624, .sha256 = "4448186216b3af4cc558bbce2c3213f01608f8f8b2e5267a9767971dd3ec8082" },
+    .{ .bytes = 49859583136, .sha256 = "3f342f1c1580473f1ee94ddd5b28206e8c07a70fa1a366f59d1d6c922919a6c9" },
+    .{ .bytes = 49376141504, .sha256 = "56758f40269cad5cd9b0d3d6fbae0f40f6d5be6de49e4ab392dbe83157d9cbd3" },
+    .{ .bytes = 12087983520, .sha256 = "753bda48b98ba4f1636134a90a967de1b2d3908a236c026e464777342e53510a" },
+};
+
 pub const max_layers = 48;
 pub const max_heads = 16;
 pub const Config = struct {

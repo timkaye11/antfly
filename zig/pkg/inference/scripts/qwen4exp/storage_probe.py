@@ -17,13 +17,13 @@
 """Read-only bounded Darwin uncached range-read probe; never purges global caches."""
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 import fcntl
 import json
 import os
-from pathlib import Path
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 
 def main():
@@ -50,9 +50,9 @@ def main():
                     for _ in range(count)
                 ]
 
-                def read(offset):
-                    data = os.pread(fd, block, offset)
-                    if len(data) != block:
+                def read(offset, block_bytes=block):
+                    data = os.pread(fd, block_bytes, offset)
+                    if len(data) != block_bytes:
                         raise OSError("short range read")
                     return len(data)
 

@@ -1116,6 +1116,22 @@ pub const SplitGgufStore = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
+    /// Verify the exact ordered shards backing this store, including metadata-only files.
+    pub fn verifyShardIdentity(store: TensorStore, pins: []const @import("../util/artifact_verification.zig").Identity, stop: *const std.atomic.Value(bool)) !void {
+        if (store.vtable != &vtable) return error.ExpectedSplitGguf;
+        const self: *SplitGgufStore = @ptrCast(@alignCast(store.ptr));
+        if (self.shards.len != pins.len) return error.ArtifactShardCountMismatch;
+        const scratch = try self.allocator.alloc(u8, 4 * 1024 * 1024);
+        defer self.allocator.free(scratch);
+        for (self.shards, pins, 0..) |shard, pin, i| {
+            if (stop.load(.acquire)) return error.Cancelled;
+            std.debug.print("Qwen4Exp: verifying shard {d}/{d} ({d} bytes)\n", .{ i + 1, pins.len, pin.bytes });
+            var reader = try c_file.RangeReader.open(self.allocator, shard.path orelse return error.MissingShardPath, true);
+            defer reader.deinit();
+            try @import("../util/artifact_verification.zig").verify(&reader, pin, scratch, stop);
+        }
+    }
+
     fn integer(view: gguf_mod.metadata.View, key: []const u8) ?u64 {
         return view.getU64(key) orelse if (view.getI64(key)) |n| std.math.cast(u64, n) else null;
     }

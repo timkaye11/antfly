@@ -23,11 +23,13 @@ import os
 import time
 from pathlib import Path
 
-from benchmark import swapouts
 from chat import Session, command, process_budget
+from evidence import swap_snapshot
 
 
 def main():
+    if not __debug__:
+        raise RuntimeError("qualification requires Python assertions")
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--binary", type=Path, required=True)
     p.add_argument("--model", type=Path, required=True)
@@ -36,17 +38,21 @@ def main():
     p.add_argument("--cache-mb", type=int, default=1536)
     p.add_argument("--mode", choices=("both", "raw", "chat"), default="both")
     p.add_argument("--combined-budget-mb", type=int)
+    p.add_argument("--soak-turns", type=int, default=8)
     a = p.parse_args()
     try:
         budget = process_budget(a.family, a.combined_budget_mb)
     except ValueError as error:
         p.error(str(error))
-    a.output.mkdir(parents=True, exist_ok=True)
+    if not 4 <= a.soak_turns <= 100:
+        p.error("soak-turns must be 4..100")
+    a.output.mkdir(parents=True, exist_ok=False)
     report_path = a.output / "summary.json"
     if report_path.exists():
         raise FileExistsError(report_path)
     env = {k: v for k, v in os.environ.items() if not k.startswith("ANTFLY_QWEN")}
     report = {
+        "passed": False,
         "family": a.family,
         "binary_sha256": hashlib.sha256(a.binary.read_bytes()).hexdigest(),
         "combined_budget_mb": budget,
@@ -54,7 +60,9 @@ def main():
         "commands": {},
         "cases": {},
     }
-    before = swapouts()
+    before = swap_snapshot()
+    report["swap_before"] = before
+    report_path.write_text(json.dumps(report, indent=2) + "\n")
     for raw in (True, False) if a.mode == "both" else (a.mode == "raw",):
         mode = "raw" if raw else "chat"
         with (a.output / f"{mode}.stderr").open("w") as err:
@@ -65,6 +73,10 @@ def main():
             report["commands"][mode] = cmd
             session = Session(cmd, stderr=err, env=env)
             report[f"{mode}_load_seconds"] = time.monotonic() - started
+            report[f"{mode}_identity"] = session.ready
+            if session.ready.get("hash_verified") is not True:
+                session.close()
+                raise AssertionError("session did not verify model artifact")
             try:
 
                 def run(name, request, session=session, mode=mode):
@@ -138,10 +150,74 @@ def main():
                 assert (
                     again[-1]["generated_token_ids"] == first[-1]["generated_token_ids"]
                 )
+                for name, bad in (
+                    ("unknown_field", {"unexpected": True}),
+                    ("wrong_type", {"prompt": 7}),
+                    ("empty", {"prompt": ""}),
+                    ("too_many_tokens", {"prompt": "x", "max_tokens": 4097}),
+                    ("context_overflow", {"prompt": " x" * 4096}),
+                ):
+                    invalid = run(name, bad)
+                    assert invalid[-1]["event"] == "error" and not invalid[-1]["fatal"]
+                session.process.stdin.write(b'{"prompt":\n')
+                session.process.stdin.flush()
+                malformed = session.read_event(time.monotonic() + 15)
+                report["cases"][f"{mode}_malformed_json"] = [malformed]
+                assert malformed["event"] == "error" and not malformed["fatal"]
+                unicode_result = run(
+                    "unicode",
+                    {"reset": True, "prompt": "Say café 東京 🌍", "max_tokens": 1},
+                )
+                assert unicode_result[-1]["event"] == "done"
+                assert (
+                    "".join(e["text"] for e in unicode_result if e["event"] == "delta")
+                    == unicode_result[-1]["text"]
+                )
+                footprints = []
+                for turn in range(a.soak_turns):
+                    result = run(
+                        f"soak_{turn}",
+                        {
+                            "reset": True,
+                            "prompt": "The capital of France is"
+                            if raw
+                            else "Reply with only the word hello.",
+                        },
+                    )
+                    done = result[-1]
+                    assert done["event"] == "done" and done["reused_tokens"] == 0
+                    assert (
+                        done["generated_token_ids"] == first[-1]["generated_token_ids"]
+                    )
+                    assert (
+                        "".join(e["text"] for e in result if e["event"] == "delta")
+                        == done["text"]
+                    )
+                    memory = done["process_memory"]
+                    assert (
+                        memory["available"]
+                        and 0 < memory["peak_footprint_bytes"] <= budget * 1024**2
+                    )
+                    footprints.append(memory["footprint_bytes"])
+                # Compare a fixed repeated workload after warmup, allowing bounded
+                # allocator/cache settling, not unbounded growth with turn count.
+                growth = max(footprints[2:]) - min(footprints[2:])
+                assert growth <= 128 * 1024**2, ("session footprint growth", growth)
+                report[f"{mode}_soak"] = {
+                    "turns": a.soak_turns,
+                    "footprints": footprints,
+                    "post_warmup_range_bytes": growth,
+                    "limit_bytes": 128 * 1024**2,
+                }
+
             finally:
                 session.close()
-    report["swapouts_delta"] = swapouts() - before
-    report["passed"] = report["swapouts_delta"] == 0
+    report["swap_after"] = swap_snapshot()
+    report["swap_delta"] = {
+        key: report["swap_after"][key] - before[key] for key in before
+    }
+    report["functional_checks_passed"] = True
+    report["passed"] = all(value == 0 for value in report["swap_delta"].values())
     (a.output / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
     assert report["passed"]
 

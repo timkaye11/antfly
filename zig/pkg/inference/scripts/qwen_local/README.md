@@ -58,10 +58,53 @@ python3 zig/pkg/inference/scripts/qwen_local/qualify_sessions.py \
 ```
 
 The shared benchmark includes chat, code, and document prompts. It records
-binary identity, commands, receipts, output, and system swapout deltas. The
-first generated token comes from prefill; decode throughput counts subsequent
-steps. OS and SSD cache state are uncontrolled. Short outputs measure latency
-and regression behavior, not answer quality or sustained throughput.
+binary identity, host, commands, receipts, output, and system swapin/swapout
+deltas. Use a new output directory for every run. It rejects missing or invalid
+receipts, invalid timings/counts, unavailable memory measurements, cap violations,
+any swap-counter change, and changed token IDs across repeated greedy runs.
+Failures and timeouts retain a partial summary with `benchmark_checks_passed=false`.
+Rebuild both runners before using the hardened harness. It requires runtime
+`hash_verified=true`; Flash also reports `sidecars_hash_verified=true`. Both
+runners hash their entire pinned GGUF artifacts before loading model weights.
+Flash verifies all four shards, including its metadata-only first shard. This
+adds a complete SSD read at startup; the chat client allows 600 seconds for
+verification and initialization. Keep installed artifacts unchanged during a run.
+
+`qualify_sessions.py` checks raw and templated chat, exact prefix reuse, reset
+parity, invalid requests, and eight fixed-workload reset/generate cycles per mode.
+It requires identical greedy IDs, matching streamed/final text, a measured memory
+cap, at most 128 MiB footprint variation after warmup, and zero swap-counter
+changes. These bounded cycles are a regression soak, not an hours-long endurance
+test.
+
+```sh
+python3 zig/pkg/inference/scripts/qwen_local/qualify_lifecycle.py \
+  --family flash --binary zig/zig-out/bin/antfly-qwen4exp \
+  --model "$QWEN_FLASH_FIRST_SHARD" --output /tmp/qwen-flash-lifecycle
+```
+
+The lifecycle campaign separately exercises SIGINT during artifact verification,
+prefill and decode, SIGTERM while waiting for stdin, oversized requests and a
+closed output pipe, plus a deliberately unwritable timing destination. It
+requires cancellation and session-fault exits within 15 seconds and retains
+each receipt/diagnostic. Session-fault input writes, response reads and process
+exit share one deadline; a full stdin pipe cannot block the supervisor. Startup
+and complete one-shot fault cases have a
+600-second deadline. A supervisor terminates, then kills, an unresponsive
+child; that case fails qualification. Functional results and swap cleanliness are
+reported separately. Runtime cancellation checks drain submitted Metal commands
+and read workers before releasing their buffers. A blocked operating-system
+read still depends on the storage driver's completion behavior.
+
+The first generated token comes from prefill. Effective decode throughput counts
+subsequent output tokens; executed decode steps separately include any final EOS
+check. OS and SSD cache state are uncontrolled. Short outputs measure latency
+and regression behavior, not answer quality or sustained throughput. The stricter
+checks apply to this shared benchmark, not retroactively to older experiment
+harnesses or historical JSON records.
+
+See the [competitive research and local production review](../../../../../docs/design/inference/history/qwen/qwen38-ssd-production-review-2026-10.md)
+for optimization priorities and the remaining release gates.
 
 ## Opt-in experiments
 

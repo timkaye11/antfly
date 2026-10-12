@@ -38,7 +38,7 @@ class Session:
         self.selector = selectors.DefaultSelector()
         self.selector.register(self.process.stdout, selectors.EVENT_READ)
         try:
-            self.ready = self.read_event(time.monotonic() + 180)
+            self.ready = self.read_event(time.monotonic() + 600)
             if self.ready.get("event") != "ready":
                 raise RuntimeError(self.ready)
         except BaseException:
@@ -89,8 +89,11 @@ class Session:
                         self.process.wait()
         finally:
             self.selector.close()
-            self.process.stdin.close()
-            self.process.stdout.close()
+            for stream in (self.process.stdin, self.process.stdout):
+                try:
+                    stream.close()
+                except BrokenPipeError:
+                    pass
 
 
 def process_budget(family, requested=None):

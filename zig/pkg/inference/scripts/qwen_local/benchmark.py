@@ -20,11 +20,19 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import subprocess
 import time
 from pathlib import Path
 
 from chat import process_budget
+from evidence import (
+    clean_swap_delta,
+    read_receipt,
+    swap_snapshot,
+    validate_receipt,
+    validate_repeat,
+)
 
 CASES = {
     "chat": "Explain why the sky is blue in two short sentences, then give one everyday example of light scattering.",
@@ -36,16 +44,8 @@ CASES = {
 
 
 def swapouts():
-    return int(
-        next(
-            x
-            for x in subprocess.check_output(["vm_stat"], text=True).splitlines()
-            if x.startswith("Swapouts:")
-        )
-        .split(":")[1]
-        .strip()
-        .rstrip(".")
-    )
+    # Retained for older experiment harnesses; this benchmark checks both counters.
+    return swap_snapshot()["swapouts"]
 
 
 def main():
@@ -72,14 +72,22 @@ def main():
         p.error("batch-linear, prefill-mps, and route traces require family flash")
     if not 1 <= a.rounds <= 10 or not 2 <= a.tokens <= 64:
         p.error("rounds must be 1..10 and tokens 2..64")
-    a.output.mkdir(parents=True, exist_ok=True)
+    a.output.mkdir(parents=True, exist_ok=False)
     report = {
+        "schema_version": 2,
+        "benchmark_checks_passed": False,
         "family": a.family,
+        "rounds_requested": a.rounds,
+        "repeated_greedy_check": a.rounds > 1,
         "binary_sha256": hashlib.sha256(a.binary.read_bytes()).hexdigest(),
         "model": str(a.model),
         "cases": [],
+        "host": {"platform": platform.platform(), "machine": platform.machine()},
+        "scope": "Local timing and repeated greedy-output checks; not independent parity or production qualification.",
         "cache_note": "Serial fresh processes; OS/device caches uncontrolled.",
     }
+    (a.output / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
+    previous = {}
     for round_id in range(a.rounds):
         for name, prompt in CASES.items():
             dest = a.output / f"{round_id}-{name}"
@@ -123,31 +131,65 @@ def main():
                 env["ANTFLY_QWEN4EXP_PREFILL_MPS"] = "1"
             if a.trace and a.family == "flash":
                 env["ANTFLY_QWEN4EXP_ROUTE_TRACE"] = str(dest / "routes.u16")
-            before = swapouts()
+            before = swap_snapshot()
             start = time.monotonic()
-            with (dest / "stdout").open("w") as out, (dest / "stderr").open("w") as err:
-                result = subprocess.run(
-                    command, stdout=out, stderr=err, env=env, timeout=2400, check=False
-                )
             row = {
                 "round": round_id,
                 "case": name,
                 "prompt": prompt,
                 "command": command,
-                "exit_code": result.returncode,
-                "seconds": time.monotonic() - start,
-                "swapouts_delta": swapouts() - before,
+                "checks_passed": False,
+                "swap_before": before,
                 "receipt_path": str(receipt),
             }
-            if receipt.exists():
-                row["receipt"] = json.loads(receipt.read_text())
-            report["cases"].append(row)
-            (a.output / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
-            print(name, round_id, row["seconds"], row["swapouts_delta"], flush=True)
-            if result.returncode or row["swapouts_delta"]:
-                raise RuntimeError(
-                    "case failed or system swapouts increased; inspect report"
+            try:
+                with (
+                    (dest / "stdout").open("w") as out,
+                    (dest / "stderr").open("w") as err,
+                ):
+                    result = subprocess.run(
+                        command,
+                        stdout=out,
+                        stderr=err,
+                        env=env,
+                        timeout=2400,
+                        check=False,
+                    )
+                row["exit_code"] = result.returncode
+                row["swap_after"] = swap_snapshot()
+                for key in ("swapins", "swapouts"):
+                    row[f"{key}_delta"] = row["swap_after"][key] - before[key]
+                if result.returncode:
+                    raise RuntimeError(f"case exited with status {result.returncode}")
+                # A zero exit status without a complete valid receipt is a failure.
+                row["receipt"] = read_receipt(receipt)
+                row["metrics"] = validate_receipt(
+                    row["receipt"], a.family, budget, a.tokens
                 )
+                clean_swap_delta(before, row["swap_after"])
+                if name in previous:
+                    validate_repeat(previous[name], row["receipt"])
+                previous[name] = row["receipt"]
+                row["checks_passed"] = True
+            except BaseException as error:
+                # Preserve evidence even when the operator interrupts a run.
+                row["error"] = f"{type(error).__name__}: {error}"
+                raise
+            finally:
+                row["seconds"] = time.monotonic() - start
+                report["cases"].append(row)
+                (a.output / "summary.json").write_text(
+                    json.dumps(report, indent=2) + "\n"
+                )
+                print(
+                    name,
+                    round_id,
+                    row["seconds"],
+                    row.get("error", "checks passed"),
+                    flush=True,
+                )
+    report["benchmark_checks_passed"] = True
+    (a.output / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
 
 
 if __name__ == "__main__":

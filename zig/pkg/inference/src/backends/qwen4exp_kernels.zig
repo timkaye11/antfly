@@ -114,6 +114,7 @@ pub const Kernels = struct {
     pipeline: *mr.RawMetalGeneratedPipeline,
     dummy: Buffer,
     profile: Profile = .{},
+    cancelled: ?*const std.atomic.Value(bool) = null,
     batch_active: bool = false,
     batch_submitted: bool = false,
     batching_enabled: bool = true,
@@ -140,6 +141,7 @@ pub const Kernels = struct {
         };
     }
     pub fn beginBatch(self: *Kernels) !void {
+        if (self.cancelled) |stop| if (stop.load(.acquire)) return error.Cancelled;
         if (!self.batching_enabled) return;
         if (self.batch_active or self.batch_submitted) return error.Qwen4ExpNestedBatch;
         if (mr.termite_metal_decode_runtime_begin_frame(self.runtime) != 0) return error.MetalFrameBeginFailed;
@@ -199,6 +201,7 @@ pub const Kernels = struct {
         self.residency = null;
     }
     pub fn run(self: *Kernels, params: Params, inputs: []const Ref, output: Ref) !void {
+        if (self.cancelled) |stop| if (stop.load(.acquire)) return error.Cancelled;
         if (params.n == 0 or params.op > 32 or inputs.len > 7) return error.InvalidQwen4ExpDispatch;
         if ((params.op == 13 or params.op == 27) and params.n != 32) return error.InvalidQwen4ExpDispatch;
         if (params.op == 2 and (params.dim == 0 or params.n % 32 != 0)) return error.InvalidQwen4ExpDispatch;
@@ -265,6 +268,7 @@ pub const Kernels = struct {
         }
     }
     pub fn matvec(self: *Kernels, format: u32, weight_bytes: usize, input_dim: usize, output_dim: usize, weight: Ref, input: Ref, output: Ref) !void {
+        if (self.cancelled) |stop| if (stop.load(.acquire)) return error.Cancelled;
         if (input.bytes < input_dim * 4 or output.bytes < output_dim * 4 or weight.bytes < weight_bytes) return error.MetalBufferRange;
         if (format == 0 or format == 30) {
             return self.run(.{ .op = 6, .n = @intCast(output_dim * 32), .dim = @intCast(input_dim), .mode = format }, &.{ weight, input }, output);

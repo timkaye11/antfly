@@ -66,6 +66,7 @@ pub const Layer = struct {
     bytes: []u8,
     stride: usize,
     logical_bytes: usize,
+    cancelled: ?*const std.atomic.Value(bool) = null,
     leased: bool = false,
     stats: Stats = .{},
 
@@ -131,12 +132,17 @@ pub const Layer = struct {
         projection_offset: usize,
         partition: usize,
         bytes: u64 = 0,
+        cancelled: ?*const std.atomic.Value(bool) = null,
         failure: ?anyerror = null,
         fn run(lane: *@This()) void {
             const p = lane.projection;
             var cursor = lane.projection_offset;
             var ordinal: usize = 0;
             for (lane.experts, lane.repaired) |expert, miss| {
+                if (lane.cancelled) |stop| if (stop.load(.acquire)) {
+                    lane.failure = error.Cancelled;
+                    return;
+                };
                 if (!miss) continue;
                 const destination = cursor;
                 cursor += lane.stride;
@@ -175,6 +181,7 @@ pub const Layer = struct {
         pub fn begin(self: *Pending, owner: *Layer, experts: []const u32, staging: []u8, io: ?std.Io) !void {
             std.debug.assert(!self.active);
             if (owner.leased) return error.ExpertSlotsInUse;
+            if (owner.cancelled) |stop| if (stop.load(.acquire)) return error.Cancelled;
             var next = owner.directory;
             const route = try next.observeRoute(0, 512, experts);
             if (try std.math.mul(usize, route.miss_count, owner.stride) > staging.len) return error.ExpertStagingTooSmall;
@@ -185,6 +192,7 @@ pub const Layer = struct {
             for (&owner.projections, 0..) |*p, projection| {
                 for (0..2) |partition| self.lanes[projection * 2 + partition] = .{
                     .projection = p,
+                    .cancelled = owner.cancelled,
                     .experts = self.experts[0..experts.len],
                     .repaired = self.route.repaired[0..experts.len],
                     .staging = staging,
@@ -220,6 +228,7 @@ pub const Layer = struct {
             // Errors leave this transaction active so the caller drains GPU work
             // before abort releases the route's ownership.
             if (self.io) |io| try self.group.await(io);
+            if (self.owner.cancelled) |stop| if (stop.load(.acquire)) return error.Cancelled;
             for (self.lanes) |lane| if (lane.failure) |err| {
                 self.owner.stats.read_failures +|= 1;
                 return err;
@@ -366,12 +375,40 @@ test "Qwen4Exp pager holds leases and rolls back late short reads without corrup
     const before = layer.directory;
     const bytes = try a.dupe(u8, layer.bytes[0..layer.logical_bytes]);
     defer a.free(bytes);
+    var stop: std.atomic.Value(bool) = .init(false);
+    layer.cancelled = &stop;
+    try pending.begin(&layer, &.{ 10, 11, 12, 13, 14, 15, 16, 17, 18, 19 }, &staging, executor.io());
+    stop.store(true, .release);
+    try std.testing.expectError(error.Cancelled, pending.finish());
+    pending.abort();
+    try std.testing.expect(!layer.leased);
+    try std.testing.expectEqualDeep(before, layer.directory);
+    try std.testing.expectEqualSlices(u8, bytes, layer.bytes[0..layer.logical_bytes]);
+    try std.testing.expectError(error.Cancelled, layer.acquire(&route, &staging));
+    stop.store(false, .release);
     // Make the last projection fail after gate and up have been read.
     layer.projections[2].offset = data.len;
     try std.testing.expectError(error.RegionOutOfBounds, layer.acquireWithIo(&.{ 10, 11, 12, 13, 14, 15, 16, 17, 18, 19 }, &staging, executor.io()));
     try std.testing.expectEqualDeep(before, layer.directory);
     try std.testing.expectEqualSlices(u8, bytes, layer.bytes[0..layer.logical_bytes]);
     layer.projections[2].offset = 0;
+    // The cached file size cannot hide an actual short read after truncation.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "experts", .data = data[0..4] });
+    try std.testing.expectError(error.IncompleteRead, layer.acquireWithIo(&.{ 10, 11, 12, 13, 14, 15, 16, 17, 18, 19 }, &staging, executor.io()));
+    try std.testing.expect(!layer.leased);
+    try std.testing.expectEqualDeep(before, layer.directory);
+    try std.testing.expectEqualSlices(u8, bytes, layer.bytes[0..layer.logical_bytes]);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "experts", .data = &data });
+    // Simulate an unavailable read endpoint without touching the model volume.
+    {
+        const fd = layer.projections[2].reader.fd;
+        layer.projections[2].reader.fd = -1;
+        defer layer.projections[2].reader.fd = fd;
+        try std.testing.expectError(error.IncompleteRead, layer.acquireWithIo(&.{ 10, 11, 12, 13, 14, 15, 16, 17, 18, 19 }, &staging, executor.io()));
+        try std.testing.expect(!layer.leased);
+        try std.testing.expectEqualDeep(before, layer.directory);
+        try std.testing.expectEqualSlices(u8, bytes, layer.bytes[0..layer.logical_bytes]);
+    }
     lease = try layer.acquireWithIo(&.{ 10, 11, 12, 13, 14, 15, 16, 17, 18, 19 }, &staging, executor.io());
     defer lease.releaseAfterCompletion();
     try std.testing.expectEqualSlices(u8, &.{ 19, 19, 19, 19 }, lease.projection(9, 2));

@@ -1,0 +1,794 @@
+{
+  "date": "2026-10-11",
+  "target": "Reliable local single-owner text CLI/chat on the 16 GiB M4",
+  "production_qualified": false,
+  "scope_decision": "User requested bounded checks in this pass; full 4K independent parity remains an explicit release gate.",
+  "status": "bounded_checks_complete_release_gates_open",
+  "identity": {
+    "head": "732aad0bbcde28b61f8a505657d78559a4bde072",
+    "files": {
+      "zig/pkg/inference/scripts/qwen_local/benchmark.py": "6a0165bd0a13cf1984e0fe6bb3d9aafedef67d3602d33e56f8d9d5f60f1fc56d",
+      "zig/pkg/inference/scripts/qwen_local/chat.py": "b2ad7afbc99e0d9b801ee918abc9181c845bed0e8e2ff77394c9047f018ffcd6",
+      "zig/pkg/inference/scripts/qwen_local/qualify_sessions.py": "3a0ecdb5e3feb1c40f28e8bf58a9a00e5b248a7401236b7531dac7368c199e45",
+      "zig/pkg/inference/src/architectures/qwen4exp_runtime.zig": "4cf2610576c8de39e24a47e4e0c3f8b743f647486113b606f5eaf43e0e9902cb",
+      "zig/pkg/inference/src/backends/qwen4exp_kernels.zig": "2ac086ff4cfb475ba7283389252f360926911873841ad94080ad08ff33cebff2",
+      "zig/pkg/inference/src/local_text_session.zig": "dd43c729038f8a8ed7b527336f48e9c9276c128db0204a08a4b058523c0c33e4",
+      "zig/pkg/inference/src/models/qwen4exp.zig": "2a823592cea8d5c970b5b29f4f9796c92613906ab9428df3bcb541d4d0d48931",
+      "zig/pkg/inference/src/models/tensor_store.zig": "e73533d7fbdaf8faf05674723011ec3ff6cd2404f657d9d36b6c7897610c0cf4",
+      "zig/pkg/inference/src/native_qwen35_generate.zig": "a8380131084fee8a0bd72bc65fb90d74c89a0b812549a9b9f0629d2a68b701c8",
+      "zig/pkg/inference/src/native_qwen4exp_generate.zig": "936ca74b23b5b8a3c4dc5d08feb6eb7c50946b34f8039e42c28f183e3dc891bb",
+      "zig/pkg/inference/src/qwen35_streamed_test_root.zig": "e5e0dcd3436552143f8d2e743388f939003f4500010064edeb8ba7a4c7c703da",
+      "zig/pkg/inference/src/qwen4exp_test_root.zig": "d8a0e23f1a05aca50f8aa26134510587510573e78500489d9cd0a1ec0fa16a06",
+      "zig/pkg/inference/src/runtime/moe/qwen4exp_pager.zig": "cc1e9d98a4115ffe07d926642e752d2726324d96ef58b4d7c672507a2fdf4c33",
+      "zig/pkg/inference/src/util/c_file.zig": "6e01ba1ff7360c4f9abc84c4c87a6794687e44b5d6cd40a5096a9d8bd8acc98a",
+      "zig/pkg/inference/scripts/qwen_local/evidence.py": "a31ab975746e4b2cb1223c9adc2c45d50c0885c3cfd9de724cc870147d2deff2",
+      "zig/pkg/inference/scripts/qwen_local/qualify_lifecycle.py": "796be99d0e762929dd464e40458a5fc827f5af444bb0eaaa50c7dcfeadbc18f1",
+      "zig/pkg/inference/scripts/qwen_local/test_evidence.py": "c436b72f11b6279d8d502f2717ba6d84930f0d3997b65facb43ddc11de0b99a8",
+      "zig/pkg/inference/src/util/artifact_verification.zig": "d78af8b85ee6e738f37535685fdc16bf86d3072545ae18679adf363d77c07bf2",
+      "zig/pkg/inference/src/util/local_control.zig": "21ac15d239e3f5c444905bf0868be7efb076330656f68eab2a8aa5f476312100",
+      "zig/pkg/inference/src/util/verified_sidecar.zig": "f1dea5b20cf8cf9b4f05944e9e74324dbeb9cbf38b10096c7510c79bc4123c52"
+    },
+    "binaries": {
+      "zig/zig-out/bin/antfly-qwen35-streamed": "e7e517a86335ca250eeb79036d7b04a73494b0bfc4f70f3991b755ee23d24432",
+      "zig/zig-out/bin/antfly-qwen4exp": "d07f01fae3f50732560413b26c54c917803cbc6259352acabd3abc2d282bca3e"
+    }
+  },
+  "focused_tests": {
+    "metal": {
+      "27b": {
+        "passed": 26,
+        "skipped": 1
+      },
+      "flash": {
+        "passed": 42,
+        "skipped": 4
+      },
+      "log": "/tmp/qwen-release-final4-build.log",
+      "flash_with_installed_state_check": {
+        "passed": 43,
+        "skipped": 3,
+        "log": "/tmp/qwen-release-flash-state/test.log",
+        "note": "Includes the 42 focused tests already listed; do not double count."
+      }
+    },
+    "cpu": {
+      "27b": {
+        "passed": 22,
+        "skipped": 5
+      },
+      "flash": {
+        "passed": 29,
+        "skipped": 16
+      },
+      "log": "/tmp/qwen-release-campaign-v2/cpu-tests.log"
+    },
+    "python_evidence_tests": 7,
+    "workflow_scope_tests": 11
+  },
+  "campaign": "/tmp/qwen-release-campaign-v2/summary.json",
+  "remaining_release_gates": [
+    "Independent final-binary numerical matrix at chunk/QSA boundaries and near-limit 4K contexts; full 4K reference explicitly deferred by the user",
+    "Clean-swap qualification on the 16 GiB host; both swapin and swapout deltas must be zero",
+    "Extended session endurance beyond the eight reset/generate cycles per mode exercised here"
+  ],
+  "notes": [
+    "Installed-model skips in focused tests are not passes.",
+    "System swap activity in fault tests is reported separately from functional success.",
+    "No commit, push, remote CI dispatch, or release promotion.",
+    "Bounded functional success does not imply clean-memory qualification, endurance, answer quality, or a latency target.",
+    "Observed session footprints remained under configured process caps, but system-wide swap counters changed and do not identify the responsible process.",
+    "Small footprint increases during eight Flash repeat cycles do not prove or disprove a slow leak; retain the endurance gate."
+  ],
+  "hardware": {
+    "chip": "Apple M4",
+    "model": "Mac16,12",
+    "physical_bytes": 17179869184,
+    "macos": "26.5",
+    "storage": "/Volumes/Extreme, external APFS SSD"
+  },
+  "checks": {
+    "27b": {
+      "lifecycle": {
+        "evidence": "/tmp/qwen-release-final-v2-27b-lifecycle/summary.json",
+        "evidence_sha256": "6cbeac905490089e42f9c3de1735ded4c282e2e3b134ef3f0ea302633ad47d2e",
+        "binary_sha256": "e7e517a86335ca250eeb79036d7b04a73494b0bfc4f70f3991b755ee23d24432",
+        "passed": true,
+        "swap_delta": {
+          "swapins": 583,
+          "swapouts": 0
+        },
+        "clean_swap": false,
+        "functional_checks_passed": true,
+        "cases": [
+          {
+            "phase": "verification",
+            "passed": true,
+            "cancellation_seconds": 0.008875250001437962,
+            "exit_code": 1
+          },
+          {
+            "phase": "prefill",
+            "passed": true,
+            "cancellation_seconds": 0.07002841599751264,
+            "exit_code": 1
+          },
+          {
+            "phase": "decode",
+            "passed": true,
+            "cancellation_seconds": 0.07604250000440516,
+            "exit_code": 1
+          },
+          {
+            "phase": "idle",
+            "passed": true,
+            "exit_code": 1,
+            "exit_seconds": 0.175553040986415
+          },
+          {
+            "phase": "oversized",
+            "passed": true,
+            "exit_code": 1,
+            "exit_seconds": 0.041760334017453715
+          },
+          {
+            "phase": "broken-pipe",
+            "passed": true,
+            "exit_code": 1,
+            "exit_seconds": 0.07567575000575744
+          },
+          {
+            "phase": "stream-broken-pipe",
+            "passed": true,
+            "exit_code": 1
+          },
+          {
+            "phase": "receipt-write",
+            "passed": true,
+            "exit_code": 1
+          }
+        ]
+      },
+      "sessions": {
+        "evidence": "/tmp/qwen-release-final-v2-27b-sessions/summary.json",
+        "evidence_sha256": "ea2f29836c560f0a9a785566ccc235d787d85d5b090a00cc8c48c1b1a61f174d",
+        "binary_sha256": "e7e517a86335ca250eeb79036d7b04a73494b0bfc4f70f3991b755ee23d24432",
+        "passed": false,
+        "swap_delta": {
+          "swapins": 4030,
+          "swapouts": 18936
+        },
+        "clean_swap": false,
+        "functional_checks_passed": true,
+        "case_count": 42,
+        "soaks": {
+          "raw": {
+            "turns": 8,
+            "footprints": [
+              2677738088,
+              2677738088,
+              2677738088,
+              2677738088,
+              2677738088,
+              2677754472,
+              2677754472,
+              2677754472
+            ],
+            "post_warmup_range_bytes": 16384,
+            "limit_bytes": 134217728
+          },
+          "chat": {
+            "turns": 8,
+            "footprints": [
+              2844510992,
+              2844494608,
+              2844494608,
+              2844494608,
+              2844494608,
+              2844494608,
+              2844494608,
+              2844494608
+            ],
+            "post_warmup_range_bytes": 0,
+            "limit_bytes": 134217728
+          }
+        },
+        "max_peak_footprint_bytes": 2849049360,
+        "identities": {
+          "raw": {
+            "event": "ready",
+            "hash_verified": true,
+            "artifact_id": "322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482",
+            "model": "Qwen3.8-27B",
+            "context_size": 4096,
+            "prefill_chunk": 512,
+            "protocol": "qwen-local-jsonl-v1"
+          },
+          "chat": {
+            "event": "ready",
+            "hash_verified": true,
+            "artifact_id": "322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482",
+            "model": "Qwen3.8-27B",
+            "context_size": 4096,
+            "prefill_chunk": 512,
+            "protocol": "qwen-local-jsonl-v1"
+          }
+        }
+      },
+      "parity": {
+        "evidence": "/tmp/qwen-release-parity-27b/summary.json",
+        "evidence_sha256": "8d4e0565fe0dac118c30bf996a6270885367ed86eae0d56bfc99a06d63bbd20b",
+        "binary_sha256": "e7e517a86335ca250eeb79036d7b04a73494b0bfc4f70f3991b755ee23d24432",
+        "passed": false,
+        "swap_delta": {
+          "swapins": 703,
+          "swapouts": 0
+        },
+        "clean_swap": false,
+        "numerical_checks_passed": true,
+        "cases": [
+          {
+            "name": "short",
+            "passed": true,
+            "native_command": [
+              "/Users/timkaye/Documents/af/antfly/zig/zig-out/bin/antfly-qwen35-streamed",
+              "/Volumes/Extreme/antfly/models/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
+              "The capital of France is",
+              "--experimental-qwen35-streamed",
+              "--backend",
+              "metal",
+              "--speculation-policy",
+              "off",
+              "--disable-thinking",
+              "--max-tokens",
+              "2",
+              "--combined-budget-mb",
+              "4096",
+              "--raw-prompt",
+              "--ignore-eos",
+              "--json-timing",
+              "/tmp/qwen-release-parity-27b/short/native/receipt.json"
+            ],
+            "reference_script_sha256": "77c22f28fc8afe2ab437bc812f2cfe78b864ffba6c23d0e10da9c790e3620916",
+            "reference_command": [
+              "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3",
+              "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/scripts/qwen35_streamed/reference.py",
+              "/Volumes/Extreme/antfly/models/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
+              "--ggml-library",
+              "/tmp/antfly-qwen4exp-reference/build/bin/libggml-base.0.26.0.dylib",
+              "--ids",
+              "760,6511,314,9338,369",
+              "--steps",
+              "2",
+              "--output",
+              "/tmp/qwen-release-parity-27b/short/reference"
+            ],
+            "reference_receipt": {
+              "tokens": [
+                11751,
+                13
+              ],
+              "seconds": 59.08757983299438,
+              "bytes_read": 47255781152,
+              "max_rss_bytes": 336461824,
+              "reference": "ggml codecs + NumPy independent FP32 equations",
+              "model_sha256": "322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482",
+              "ggml_library_sha256": "5cde6f33b2cec66c9ee7717c78a51cb78fe5cba9d06fb1074d4918140ed1d899"
+            },
+            "comparisons": [
+              {
+                "relative_l2": 1.8978468662048878e-06,
+                "max_abs": 2.574920654296875e-05,
+                "argmax_equal": true,
+                "native_sha256": "844202d2d3071e50b3b07da7911f9e71718ff43b44d61674070389772dedd655",
+                "reference_sha256": "5154eaabe9f6d7fa3ec565e73216cf5ac7c6a4dee46d3d7f4f798f99324d9a38"
+              },
+              {
+                "relative_l2": 1.3286795029283657e-06,
+                "max_abs": 1.4781951904296875e-05,
+                "argmax_equal": true,
+                "native_sha256": "65643bedc1b7b0a7c21549c39b07d748b23a45d5a9d34e8d3753c8c6fee27bac",
+                "reference_sha256": "104f5c663ae20e9a6eabf66961abf527a9b185665e9e6607393b193af2a254cb"
+              }
+            ],
+            "seconds": 138.4185206250113
+          },
+          {
+            "name": "chunk128",
+            "passed": true,
+            "native_command": [
+              "/Users/timkaye/Documents/af/antfly/zig/zig-out/bin/antfly-qwen35-streamed",
+              "/Volumes/Extreme/antfly/models/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
+              " x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x",
+              "--experimental-qwen35-streamed",
+              "--backend",
+              "metal",
+              "--speculation-policy",
+              "off",
+              "--disable-thinking",
+              "--max-tokens",
+              "2",
+              "--combined-budget-mb",
+              "4096",
+              "--raw-prompt",
+              "--ignore-eos",
+              "--json-timing",
+              "/tmp/qwen-release-parity-27b/chunk128/native/receipt.json"
+            ],
+            "reference_script_sha256": "77c22f28fc8afe2ab437bc812f2cfe78b864ffba6c23d0e10da9c790e3620916",
+            "reference_command": [
+              "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3",
+              "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/scripts/qwen35_streamed/reference.py",
+              "/Volumes/Extreme/antfly/models/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
+              "--ggml-library",
+              "/tmp/antfly-qwen4exp-reference/build/bin/libggml-base.0.26.0.dylib",
+              "--ids",
+              "830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830,830",
+              "--steps",
+              "2",
+              "--output",
+              "/tmp/qwen-release-parity-27b/chunk128/reference"
+            ],
+            "reference_receipt": {
+              "tokens": [
+                830,
+                830
+              ],
+              "seconds": 72.9821517500095,
+              "bytes_read": 47256135392,
+              "max_rss_bytes": 478920704,
+              "reference": "ggml codecs + NumPy independent FP32 equations",
+              "model_sha256": "322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482",
+              "ggml_library_sha256": "5cde6f33b2cec66c9ee7717c78a51cb78fe5cba9d06fb1074d4918140ed1d899"
+            },
+            "comparisons": [
+              {
+                "relative_l2": 5.318633303170706e-06,
+                "max_abs": 0.00011172890663146973,
+                "argmax_equal": true,
+                "native_sha256": "9f5e337914cf0b7b9d82f5f80eb9f7b9e03551739a48488861b11f6502cbb953",
+                "reference_sha256": "47b6b1f939313f04c3c460acd25ae0b7530b8b77b89691725ff859a06d36fce7"
+              },
+              {
+                "relative_l2": 1.7807579664838167e-06,
+                "max_abs": 4.369020462036133e-05,
+                "argmax_equal": true,
+                "native_sha256": "29286cc348d3a4c8ad1bcdf8f4aec07ea10d7560721372cdce2e9f5e56f6cc20",
+                "reference_sha256": "b26b8d5d06198032b3a12fe95123668972188b2e85c1755732ffd24ddbe4b1f8"
+              }
+            ],
+            "seconds": 155.40791008298402
+          }
+        ]
+      }
+    },
+    "flash": {
+      "lifecycle": {
+        "evidence": "/tmp/qwen-release-final-v2-flash-lifecycle/summary.json",
+        "evidence_sha256": "6c4c38870536e177e3c3d54e2c9339d81d1d01abd84596104d8742a0be47be03",
+        "binary_sha256": "d07f01fae3f50732560413b26c54c917803cbc6259352acabd3abc2d282bca3e",
+        "passed": true,
+        "swap_delta": {
+          "swapins": 1628,
+          "swapouts": 26444
+        },
+        "clean_swap": false,
+        "functional_checks_passed": true,
+        "cases": [
+          {
+            "phase": "verification",
+            "passed": true,
+            "cancellation_seconds": 0.017847833019914106,
+            "exit_code": 1
+          },
+          {
+            "phase": "prefill",
+            "passed": true,
+            "cancellation_seconds": 0.13097645799280144,
+            "exit_code": 1
+          },
+          {
+            "phase": "decode",
+            "passed": true,
+            "cancellation_seconds": 0.08872850000625476,
+            "exit_code": 1
+          },
+          {
+            "phase": "idle",
+            "passed": true,
+            "exit_code": 1,
+            "exit_seconds": 0.2508527919999324
+          },
+          {
+            "phase": "oversized",
+            "passed": true,
+            "exit_code": 1,
+            "exit_seconds": 0.1551824170164764
+          },
+          {
+            "phase": "broken-pipe",
+            "passed": true,
+            "exit_code": 1,
+            "exit_seconds": 0.1487454590096604
+          },
+          {
+            "phase": "stream-broken-pipe",
+            "passed": true,
+            "exit_code": 1
+          },
+          {
+            "phase": "receipt-write",
+            "passed": true,
+            "exit_code": 1
+          }
+        ]
+      },
+      "sessions": {
+        "evidence": "/tmp/qwen-release-final-v2-flash-sessions/summary.json",
+        "evidence_sha256": "21369718fd3517feb904446ee40af9e29007892292b033cab4c4ccdd3829193e",
+        "binary_sha256": "d07f01fae3f50732560413b26c54c917803cbc6259352acabd3abc2d282bca3e",
+        "passed": false,
+        "swap_delta": {
+          "swapins": 12157,
+          "swapouts": 0
+        },
+        "clean_swap": false,
+        "functional_checks_passed": true,
+        "case_count": 42,
+        "soaks": {
+          "raw": {
+            "turns": 8,
+            "footprints": [
+              7175427976,
+              7175444360,
+              7175493512,
+              7175509896,
+              7175542664,
+              7175559048,
+              7175591816,
+              7175608200
+            ],
+            "post_warmup_range_bytes": 114688,
+            "limit_bytes": 134217728
+          },
+          "chat": {
+            "turns": 8,
+            "footprints": [
+              7179704176,
+              7179786096,
+              7179868016,
+              7179966320,
+              7180048240,
+              7180130160,
+              7180212080,
+              7180294000
+            ],
+            "post_warmup_range_bytes": 425984,
+            "limit_bytes": 134217728
+          }
+        },
+        "max_peak_footprint_bytes": 7180294000,
+        "identities": {
+          "raw": {
+            "event": "ready",
+            "hash_verified": true,
+            "artifact_id": "766911a6b7369840a91dbcd95f9f997acaab6cd6",
+            "model": "Qwen3.8-Flash-Next",
+            "context_size": 4096,
+            "prefill_chunk": 128,
+            "protocol": "qwen-local-jsonl-v1"
+          },
+          "chat": {
+            "event": "ready",
+            "hash_verified": true,
+            "artifact_id": "766911a6b7369840a91dbcd95f9f997acaab6cd6",
+            "model": "Qwen3.8-Flash-Next",
+            "context_size": 4096,
+            "prefill_chunk": 128,
+            "protocol": "qwen-local-jsonl-v1"
+          }
+        }
+      },
+      "parity": {
+        "evidence": "/tmp/qwen-release-parity-flash/summary.json",
+        "evidence_sha256": "67d10693589d2dec983413353c71b17a18d646449195158b67626df957feb852",
+        "binary_sha256": "d07f01fae3f50732560413b26c54c917803cbc6259352acabd3abc2d282bca3e",
+        "passed": false,
+        "swap_delta": {
+          "swapins": 4868,
+          "swapouts": 0
+        },
+        "clean_swap": false,
+        "numerical_checks_passed": true,
+        "cases": [
+          {
+            "name": "short",
+            "passed": true,
+            "native_command": [
+              "/Users/timkaye/Documents/af/antfly/zig/zig-out/bin/antfly-qwen4exp",
+              "/Volumes/Extreme/antfly/models/unsloth/Qwen3.8-Flash-Next-GGUF-UD-Q4_K_XL/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+              "The capital of France is",
+              "--experimental-qwen4exp",
+              "--backend",
+              "metal",
+              "--speculation-policy",
+              "off",
+              "--disable-thinking",
+              "--max-tokens",
+              "2",
+              "--combined-budget-mb",
+              "9216",
+              "--moe-cache-mb",
+              "1536",
+              "--raw-prompt",
+              "--ignore-eos",
+              "--json-timing",
+              "/tmp/qwen-release-parity-flash/short/native/receipt.json",
+              "--qwen4exp-logits-f32le",
+              "/tmp/qwen-release-parity-flash/short/native/logits.f32"
+            ],
+            "reference_binary_sha256": "636000a4b9f8647a7e2ffc1cc0a17ce43fac5900f06fa99c9907c92d998523c0",
+            "reference_source_sha256": "2834ea7351092a0ac2afe6b0e466f03b79686888ef3c111bf0166be4341ac724",
+            "reference_sources": [
+              {
+                "repo": "ggml-org/llama.cpp",
+                "revision": "6184e92c57dcd34de8a3e381d7641a5e75250d5f"
+              },
+              {
+                "repo": "huggingface/transformers",
+                "revision": "9c59c0c6733990bbf8b1be7cb93b97e57dc73c39"
+              }
+            ],
+            "source_archive_sha256": "8aa40d5e5daf66ccf9554ebfc202e04186b174aa381d7f4effa88efa2f4a13bb",
+            "reference_libraries": {
+              "libllama-common.0.6.0.dylib": "980a0328fd5d6973ad06b552dd38677e5991296321065efa627d542ef4a1eb55",
+              "libllama.0.6.0.dylib": "f3f9ee4e1a407e05e14a9bb338635120c64514929172237cd967583135fdc8e3",
+              "libggml-blas.0.26.0.dylib": "b2453b4c78d517484c614ddf9654665fed00d5ef8f05a35280b7d182d7a65a75",
+              "libggml-metal.0.26.0.dylib": "e8f7a480510f2453c73d5638620582a675358f822bc88ddcfb2b41b92aa59d6d",
+              "libggml-cpu.0.26.0.dylib": "a9aff2998a1d01d7f897b57f6e168ac2cff70a814d6ecf7693066b6a86cbde51",
+              "libggml.0.26.0.dylib": "0afe8d1b7ffb0bd8d5edf1e331082f0278e238474f71bb0ab0da9b249a314cb0",
+              "libllama-completion-impl.dylib": "3f450598ba4fc5ad74036bd0258175de928c4a2880dda83a27960fca7105404d",
+              "libggml-base.0.26.0.dylib": "5cde6f33b2cec66c9ee7717c78a51cb78fe5cba9d06fb1074d4918140ed1d899"
+            },
+            "reference_command": [
+              "/tmp/qwen-release-reference-flash",
+              "/Volumes/Extreme/antfly/models/unsloth/Qwen3.8-Flash-Next-GGUF-UD-Q4_K_XL/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+              "/tmp/qwen-release-parity-flash/short/reference/all-logits.f32",
+              "760",
+              "6511",
+              "314",
+              "9338",
+              "369",
+              "11751"
+            ],
+            "comparisons": [
+              {
+                "relative_l2": 7.44129375927053e-07,
+                "max_abs": 1.1682510375976562e-05,
+                "argmax_equal": true,
+                "native_sha256": "bbce1315178531104d69a4c3379d905658042e60850f902b032576896babec40",
+                "reference_sha256": "e60a0d1cdcb517f9066dffb4d2b150bc8f5f0ac12f92cc0be8f535dad84aea0f"
+              }
+            ],
+            "seconds": 209.8240344579972
+          }
+        ]
+      },
+      "state_continuation": {
+        "passed": false,
+        "scope": "16 teacher-forced tokens, native sequential versus chunks 8/4/4; full recurrent/KV/ngram state and token 17 continuation; not independent 4K parity",
+        "command": [
+          "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3",
+          "tools/run_bounded_zig_build.py",
+          "build",
+          "inference-test-qwen4exp",
+          "-j1",
+          "-Dmetal=true",
+          "-Doptimize=ReleaseFast",
+          "--summary",
+          "all"
+        ],
+        "cwd": "/Users/timkaye/Documents/af/antfly/zig",
+        "environment": {
+          "ANTFLY_QWEN4EXP_PREFILL_CHECK": "/Volumes/Extreme/antfly/models/unsloth/Qwen3.8-Flash-Next-GGUF-UD-Q4_K_XL/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+          "ANTFLY_QWEN4EXP_PREFILL_CHUNK": "128",
+          "ANTFLY_QWEN4EXP_TEST_CACHE_MB": "1536",
+          "ANTFLY_ZIG_MAX_RSS": "8589934592"
+        },
+        "binary_sha256": "d07f01fae3f50732560413b26c54c917803cbc6259352acabd3abc2d282bca3e",
+        "swap_before": {
+          "swapins": 5011102,
+          "swapouts": 6878479
+        },
+        "exit_code": 0,
+        "seconds": 73.57429550000234,
+        "swap_after": {
+          "swapins": 5076579,
+          "swapouts": 7238819
+        },
+        "swap_delta": {
+          "swapins": 65477,
+          "swapouts": 360340
+        },
+        "clean_swap": false,
+        "functional_checks_passed": true,
+        "test_log_sha256": "5433bcd079721b65f7689068a7d2c820aaddfc0f1b47b4e9206b3e0e860fcae5",
+        "evidence": "/tmp/qwen-release-flash-state/summary.json",
+        "evidence_sha256": "50d4860d873c854da554fc1e3f5e0b3ed21539b33d07358d913e106ab3e7e87d",
+        "relative_l2_limit": 0.0002,
+        "comparisons": [
+          {
+            "elements": 248320,
+            "relative_l2": 5.777315277521493e-07
+          },
+          {
+            "elements": 248320,
+            "relative_l2": 7.867794710926839e-07
+          },
+          {
+            "elements": 248320,
+            "relative_l2": 7.785313506892049e-07
+          },
+          {
+            "elements": 29964288,
+            "relative_l2": 6.020812070912383e-07
+          },
+          {
+            "elements": 248320,
+            "relative_l2": 8.918372871304192e-07
+          }
+        ]
+      }
+    }
+  },
+  "prior_failed_attempts": [
+    {
+      "evidence": "/tmp/qwen-release-final-27b-lifecycle/summary.json",
+      "finding": "One-shot broken pipe returned the right process error but a generic error receipt; corrected by requiring the receipt reason to match the propagated error.",
+      "superseded_by": "final-v2 lifecycle evidence"
+    }
+  ],
+  "parity_policy": {
+    "relative_l2_limit": 0.002,
+    "require_matching_argmax": true,
+    "logit_vector_elements": 248320,
+    "native_environment": "All inherited ANTFLY_QWEN* variables removed; 27B additionally sets ANTFLY_QWEN35_CAPTURE_DIR to native output directory and ANTFLY_QWEN35_CAPTURE_LOGITS_ONLY=1",
+    "reference_environment": "All inherited ANTFLY_QWEN* variables removed"
+  },
+  "corruption_fixture": {
+    "evidence": "/tmp/qwen-release-corrupt-artifact/summary.json",
+    "evidence_sha256": "8cac66ebcdebf96e2980a770f864cc6279b097d3875c0e76fed0742ca57c20a7",
+    "passed": true,
+    "original_metadata_sha256": "4448186216b3af4cc558bbce2c3213f01608f8f8b2e5267a9767971dd3ec8082",
+    "changed_metadata_sha256": "85f94d4405ad37fd4a6e7d7e480ae1c7b96dd93ea94cc034534adfc35c14e155",
+    "binary_sha256": "d07f01fae3f50732560413b26c54c917803cbc6259352acabd3abc2d282bca3e",
+    "command": [
+      "/Users/timkaye/Documents/af/antfly/zig/zig-out/bin/antfly-qwen4exp",
+      "/tmp/qwen-release-corrupt-artifact/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+      "Hello",
+      "--experimental-qwen4exp",
+      "--backend",
+      "metal",
+      "--speculation-policy",
+      "off",
+      "--disable-thinking",
+      "--max-tokens",
+      "1",
+      "--combined-budget-mb",
+      "9216",
+      "--moe-cache-mb",
+      "1536",
+      "--raw-prompt",
+      "--json-timing",
+      "/tmp/qwen-release-corrupt-artifact/receipt.json"
+    ],
+    "fixture": "copied first shard with same-size general.name mutation; original remaining shards read through symlinks",
+    "exit_code": 1,
+    "receipt": {
+      "architecture": "qwen4exp",
+      "experimental": true,
+      "finish_reason": "ArtifactHashMismatch",
+      "failure_stage": "artifact_verification",
+      "hash_verified": false,
+      "artifact_revision": "766911a6b7369840a91dbcd95f9f997acaab6cd6",
+      "process_memory": {
+        "cpu_available": false,
+        "user_cpu_ns": 0,
+        "system_cpu_ns": 0,
+        "available": true,
+        "resident_bytes": 50511872,
+        "peak_resident_bytes": 61571072,
+        "anonymous_bytes": 0,
+        "private_dirty_bytes": 0,
+        "footprint_bytes": 42320376,
+        "peak_footprint_bytes": 42369600,
+        "wired_bytes": 0,
+        "pageins": 13,
+        "malloc_available": false,
+        "malloc_allocated_bytes": 0,
+        "malloc_zone_bytes": 0
+      }
+    }
+  },
+  "bounded_functional_checks_passed": true,
+  "clean_memory_qualified": false,
+  "validation_logs": {
+    "/tmp/qwen-release-final4-build.log": "9e4d82b1accfd5880110bea7ab540bf0a61a666023936751e266cb3c6f6b44c3",
+    "/tmp/qwen-release-campaign-v2/cpu-tests.log": "7bbd6e3b2afdee7dde1813da6d2ed7225abacc3d90ae5d9bc63a7e45d0d6af89",
+    "/tmp/qwen-release-python-tests.log": "5db25808927d918025d8f82b8806a7aed5277efe567f7ba7acb5f3893b78f56c",
+    "/tmp/qwen-release-flash-state/test.log": "5433bcd079721b65f7689068a7d2c820aaddfc0f1b47b4e9206b3e0e860fcae5"
+  },
+  "static_checks": {
+    "zig_fmt": true,
+    "ruff": true,
+    "license_headers": true,
+    "git_diff_check": true
+  },
+  "post_qualification_review": {
+    "date": "2026-10-11",
+    "change": "Enforce one 15-second deadline across session fault input writes, response reads and process exit; use nonblocking writes and reap before closing a potentially full input pipe. Also normalize test formatting.",
+    "files": {
+      "zig/pkg/inference/scripts/qwen_local/qualify_lifecycle.py": {
+        "qualification_sha256": "796be99d0e762929dd464e40458a5fc827f5af444bb0eaaa50c7dcfeadbc18f1",
+        "review_sha256": "90978df9583ce43f06b3cedcd4bda570d5f3b958353c9efa499cd7f7bc3278ef"
+      },
+      "zig/pkg/inference/scripts/qwen_local/test_evidence.py": {
+        "qualification_sha256": "c436b72f11b6279d8d502f2717ba6d84930f0d3997b65facb43ddc11de0b99a8",
+        "review_sha256": "96294d479e133862e64298c4c5d1f54b4063822962a5a4b61e033301b6d09ac3"
+      }
+    },
+    "python_tests_passed": 8,
+    "runtime_sources_and_qualified_cli_binaries_changed": false,
+    "full_hardware_campaign_rerun": false,
+    "note": "The original hardware campaign identity remains intact above. Its measured exits were already below 0.251 seconds; review adds a regression for a stalled pipe and tightens future qualification.",
+    "transport_check": {
+      "evidence": "/tmp/qwen38-pr-prep-20261011/transport-check/summary.json",
+      "evidence_sha256": "39d12b3ed17bb8cb9184d2a841d8a985d812646531645e393b60e4e4f4b87748",
+      "binary_sha256": "1c2272956daf664036c37a297da67b1e37755787f13c90737dccc7f5d2d55305",
+      "functional_checks_passed": true,
+      "clean_swap": false,
+      "swap_delta": {
+        "swapins": 36,
+        "swapouts": 0
+      },
+      "cases": [
+        {
+          "phase": "idle",
+          "passed": true,
+          "exit_code": 1,
+          "exit_seconds": 0.1488311659777537
+        },
+        {
+          "phase": "oversized",
+          "passed": true,
+          "exit_code": 1,
+          "exit_seconds": 0.04932987500797026
+        },
+        {
+          "phase": "broken-pipe",
+          "passed": true,
+          "exit_code": 1,
+          "exit_seconds": 0.08635958400554955
+        }
+      ],
+      "scope": "Merged current-main 27B binary, updated shared supervisor; not a rerun of the full installed-model matrix."
+    },
+    "helper_lint_cleanup": {
+      "zig/pkg/inference/scripts/qwen4exp/benchmark.py": {
+        "before_sha256": "04ee9c731dad333a938fca85e39aa3464696ab5f452460d4f2f020247e55280f",
+        "after_sha256": "dda192ba6d12e9f08dd3b48bcdaa1879cf6cdd223539d886ba04ac87fbff0f84",
+        "executable": true
+      },
+      "zig/pkg/inference/scripts/qwen4exp/cache_replay.py": {
+        "before_sha256": "4940c69783c0b775dec8912c9327e54d742bd21fb0165882bb53b3d150df9970",
+        "after_sha256": "4940c69783c0b775dec8912c9327e54d742bd21fb0165882bb53b3d150df9970",
+        "executable": true
+      },
+      "zig/pkg/inference/scripts/qwen4exp/storage_probe.py": {
+        "before_sha256": "9860fe2858caadc1eea0596d6baff21237fc977bdbd22f8bcceb8793a66bedb0",
+        "after_sha256": "c9b0f27af546d6d5c7490f2c31bfde27b66534f6a0540ae6d9226ef2101952fb",
+        "executable": true
+      }
+    },
+    "helper_lint_note": "Normalize imports/regex alias, bind storage-probe block size explicitly, and make shebang scripts executable; no benchmark rerun or performance claim."
+  }
+}

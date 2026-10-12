@@ -18,8 +18,11 @@ const std = @import("std");
 const generation = @import("pipelines/generation.zig");
 const tokenizer_mod = @import("inference_tokenizer");
 const memory = @import("runtime/tier/memory.zig");
+const control = @import("util/local_control.zig");
 const platform = @import("antfly_platform");
 pub const Config = struct {
+    artifact_hash_verified: bool = false,
+    artifact_id: []const u8 = "unverified",
     prompt_lookup: usize = 0,
     context: usize,
     max_tokens: usize,
@@ -77,9 +80,19 @@ const Input = struct {
         var result: std.ArrayList(u8) = .empty;
         errdefer result.deinit(a);
         while (true) {
+            try control.check();
             if (self.at == self.end) {
+                // Signals may be delivered to an I/O worker. Poll in bounded
+                // intervals so an idle owner still observes cancellation.
+                var descriptors = [_]std.posix.pollfd{.{ .fd = 0, .events = std.posix.POLL.IN, .revents = 0 }};
+                if (try std.posix.poll(&descriptors, 100) == 0) continue;
+                try control.check();
                 const n = std.c.read(0, &self.buffer, self.buffer.len);
-                if (n < 0) return error.InputReadFailed;
+                if (n < 0) {
+                    try control.check();
+                    if (std.posix.errno(n) == .INTR) continue;
+                    return error.InputReadFailed;
+                }
                 if (n == 0) {
                     if (result.items.len == 0) {
                         result.deinit(a);
@@ -122,9 +135,12 @@ fn milliseconds(io: std.Io, start: std.Io.Timestamp) f64 {
 pub fn run(a: std.mem.Allocator, io: std.Io, decoder: anytype, controller: *memory.AdmissionController, tokenizer: tokenizer_mod.Tokenizer, template: ?*generation.ChatTemplate, config: Config) !void {
     var session: Session(@TypeOf(decoder)) = .{ .a = a, .io = io, .decoder = decoder, .controller = controller, .tokenizer = tokenizer, .template = template, .config = config };
     defer session.deinit();
-    try emit(a, .{ .event = "ready", .model = config.model, .context_size = config.context, .prefill_chunk = chunkSize(decoder), .protocol = "qwen-local-jsonl-v1" });
+    try emit(a, .{ .event = "ready", .hash_verified = config.artifact_hash_verified, .artifact_id = config.artifact_id, .model = config.model, .context_size = config.context, .prefill_chunk = chunkSize(decoder), .protocol = "qwen-local-jsonl-v1" });
     var input: Input = .{};
-    while (try input.line(a)) |line| {
+    while (input.line(a) catch |err| {
+        try emit(a, .{ .event = "error", .error_name = @errorName(err), .fatal = true });
+        return err;
+    }) |line| {
         defer a.free(line);
         if (std.mem.trim(u8, line, " \r\t").len == 0) continue;
         const request = std.json.parseFromSlice(Request, a, line, .{}) catch |err| {
@@ -135,7 +151,7 @@ pub fn run(a: std.mem.Allocator, io: std.Io, decoder: anytype, controller: *memo
         if (request.value.quit) break;
         session.turn(request.value) catch |err| {
             // Execution errors may leave partially advanced state. Fail closed.
-            const fatal = decoder.failed or session.executing;
+            const fatal = decoder.failed or session.executing or err == error.Cancelled or err == error.OutputWriteFailed;
             try emit(a, .{ .event = "error", .error_name = @errorName(err), .fatal = fatal });
             if (fatal) return err;
         };
@@ -190,6 +206,7 @@ fn Session(comptime D: type) type {
             if (ids.len == 0) return error.EmptyPrompt;
             if (ids.len > self.config.context - max_tokens) return error.PromptTooLong;
             for (ids) |id| if (id < 0 or id >= 248320) return error.InvalidSessionToken;
+            try control.check();
             self.executing = true;
             const begin = std.Io.Timestamp.now(self.io, .awake);
             const before_bytes = readBytes(self.decoder);
@@ -201,6 +218,7 @@ fn Session(comptime D: type) type {
             const reused = self.cached.items.len;
             var at = reused;
             while (at < ids.len) {
+                try control.check();
                 if (self.controller.isLiveHostUnderPressure()) return error.ResourceTemporarilyUnavailable;
                 const end = @min(ids.len, at + chunkSize(self.decoder));
                 self.next = try step(self.decoder, ids[at..end]);
@@ -215,6 +233,7 @@ fn Session(comptime D: type) type {
             var finish: []const u8 = "length";
             const decode_start = std.Io.Timestamp.now(self.io, .awake);
             while (output.items.len < max_tokens) {
+                try control.check();
                 if (self.controller.isLiveHostUnderPressure()) return error.ResourceTemporarilyUnavailable;
                 const next = self.next orelse return error.MissingSessionLogits;
                 if (!self.config.ignore_eos and std.mem.indexOfScalar(u32, self.config.eos, next) != null) {

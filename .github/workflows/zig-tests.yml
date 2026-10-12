@@ -648,6 +648,16 @@ jobs:
           scripts/run_model_contract_tests.py
           qwen3_embedding qwen3vl
 
+      - name: Run local Qwen benchmark evidence contracts
+        run: python3 -m unittest discover -s zig/pkg/inference/scripts/qwen_local -p 'test_*.py'
+
+      - name: Check local Qwen storage and lifecycle contracts
+        working-directory: zig
+        run: >-
+          python3 tools/run_bounded_zig_build.py build
+          inference-test-qwen35-streamed inference-test-qwen4exp
+          -j1 -Dmetal=false -Dcuda=false
+
       - name: Test reproducible release archive packaging
         run: python3 scripts/packaging/test_reproducible_tar.py
 
