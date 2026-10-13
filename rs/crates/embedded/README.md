@@ -120,6 +120,11 @@ detail.
 For typed decision requests and answer semantics, see the
 [decision guide](../../../docs/guides/decisions.md).
 
+Database failures copy the native diagnostic into the returned `Error`, so it
+survives subsequent calls. `Error` is `Clone` rather than `Copy`; use
+`error.kind()` when matching stable variants and `error.detail()` for the
+message. Equality and hashing compare the stable code, independent of detail.
+
 [`Inference`] opens the same embedded inference runtime on its own, with no
 database -- `Inference::open`/`open_default` (options: [`InferenceOptions`],
 covering models directory, resource budgets, and a per-call timeout) and
@@ -320,11 +325,25 @@ let rows = sqlx::query::<Antfly>("SELECT id,name FROM people")
 ```
 
 SQLx can open independent connections alongside a `Database` used for
-documents, search, or inference. Each path-opened SQLx connection owns a native
-handle and worker; its default busy timeout is five seconds. To use an existing
-handle and its settings, pass
+documents, search, or inference. Each path-opened SQLx connection owns a SQL
+session and borrows the process storage owner for its canonical file path and
+compatible open settings; its default busy timeout is five seconds. To use an
+existing handle and its settings, pass
 `AntflyConnectOptions::new(path).with_database(Arc::clone(&database))`.
 Connections never explicitly close a shared handle.
+
+Compatible independent connections share their catalog and index caches in
+process. An external commit or file replacement refreshes the shared generation
+under the kernel lease. Reclamation runs through the shared maintenance owner,
+so a foreground refresh does not publish an extra reclamation checkpoint.
+Connections with different storage settings retain separate owners and refresh
+after a different owner commits.
+To compare both modes with one and four connections, run the manual benchmark:
+
+```sh
+cargo test -p antfly-embedded --release --features libantfly,sqlx \
+  --test sql_scaling -- --ignored --nocapture
+```
 
 `AntflyPool`, transactions, nested savepoints, `query`, `query_as`, streaming,
 prepare/describe, and SQLSTATE database errors use native SQL sessions.

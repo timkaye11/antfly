@@ -2326,12 +2326,14 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"index_layout\":\"lsm") == null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"index_namespace\":\"__antfly_lite\"") != null);
     const format_version = blk: {
-        // Simulate the allocator's exclusive file lock. Handle status must
-        // remain available without opening a competing external reader.
-        var held = try std.Io.Dir.cwd().openFile(std.testing.io, src_path, .{ .mode = .read_write, .lock = .exclusive });
-        defer held.close(std.testing.io);
+        // Enter before taking the artificial lock: entry recovers SQL state
+        // and legitimately needs a read transaction. Storage status itself
+        // must remain available without opening a competing external reader.
         const guard = public.enterHandle(src_handle, .read) orelse return error.InvalidHandle;
         defer guard.leave();
+        try std.testing.expect(guard.entry_error == null);
+        var held = try std.Io.Dir.cwd().openFile(std.testing.io, src_path, .{ .mode = .read_write, .lock = .exclusive });
+        defer held.close(std.testing.io);
         break :blk guard.handle.owned_lite_backend.?.storageStatus().format_version.?;
     };
     const expected_format_version = try std.fmt.allocPrint(alloc, "\"format_version\":{d}", .{format_version});
@@ -3858,7 +3860,7 @@ test "capi aggregate hits rejects stale identity generation before aggregation m
     const current_request = try std.fmt.allocPrint(alloc, request_template, .{current_generation});
     defer alloc.free(current_request);
     var current_out: capi.Buffer = .{};
-    try std.testing.expectEqual(capi.ErrorCode.internal, antfly_db_aggregate_hits_json(
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_aggregate_hits_json(
         handle_id,
         .{ .ptr = current_request.ptr, .len = current_request.len },
         &current_out,
@@ -3882,6 +3884,7 @@ test "capi aggregate hits rejects stale identity generation before aggregation m
         .{ .ptr = stale_request.ptr, .len = stale_request.len },
         &stale_out,
     ));
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(capi.lastErrorDetail()), "IdentityReadGenerationChanged") != null);
 }
 
 test "capi request paths trigger readable lease hook" {

@@ -3085,6 +3085,14 @@ components:
       type: object
       description: Information about a model including its capabilities
       properties:
+        qualified_limits:
+          type: object
+          additionalProperties: true
+          description: |
+            Pull-time qualified request profiles for this exact artifact,
+            including backend, supported features and min/max geometry.
+            Runtime admission revalidates artifact identity and resource limits.
+            Omitted for artifacts without a qualification receipt.
         capabilities:
           type: array
           items:
@@ -3423,7 +3431,7 @@ components:
           $ref: '#/components/schemas/GenerateResponseFormat'
           description: |
             Structured output control. OpenAI-compatible entry point for requesting JSON output.
-            `{"type":"json_object"}` is supported directly. `{"type":"json_schema"}` is compiled into a native constrained-decoding grammar on the native backend and is rejected on ONNX backends.
+            `{"type":"json_object"}` is supported directly. `{"type":"json_schema"}` is compiled into a native constrained-decoding grammar on the native backend.
         grammar:
           type: string
           description: |
@@ -3910,7 +3918,6 @@ components:
       enum:
         - auto
         - native
-        - onnx
         - metal
         - cuda
         - xla
@@ -3946,7 +3953,6 @@ components:
 
         Backends:
         - `native` - Native CPU backend
-        - `onnx` - ONNX Runtime backend
         - `metal` - Apple Metal backend
         - `cuda` - NVIDIA CUDA backend
         - `xla` - PJRT/XLA compiled backend
@@ -3957,7 +3963,7 @@ components:
         - `cuda` - NVIDIA CUDA GPU
         - `tpu` - Google TPU (used by XLA)
         - `cpu` - Force CPU only
-      pattern: '^(native|onnx|metal|cuda|xla|webgpu|wasm)(:(auto|cuda|tpu|cpu))?$'
+      pattern: '^(native|metal|cuda|xla|webgpu|wasm)(:(auto|cuda|tpu|cpu))?$'
     ModelRef:
       type: object
       additionalProperties: false
@@ -4249,10 +4255,6 @@ components:
           type: boolean
           description: Whether the native CPU backend is built into this runtime
           example: true
-        onnx:
-          type: boolean
-          description: Whether the ONNX Runtime backend is built into this runtime
-          example: false
         metal:
           type: boolean
           description: Whether the Metal backend is built into this runtime
