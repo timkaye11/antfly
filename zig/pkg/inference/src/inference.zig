@@ -256,6 +256,7 @@ test {
     if (build_options.enable_metal) {
         _ = backends.metal_kv_storage;
         _ = metal_runtime;
+        _ = @import("backends/metal_quant_reduce_test.zig");
         _ = native_compute.metal;
     }
     if (build_options.enable_cuda) {

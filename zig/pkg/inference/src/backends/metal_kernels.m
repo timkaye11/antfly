@@ -20496,11 +20496,14 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
             }
             break;
         case TERMITE_METAL_QUANT_FORMAT_Q5_0:
-            if (descriptor->rows == 1 && runtime->q5_0_reduce_pipeline != nil) {
+            if (descriptor->rows == 1 && runtime->q5_0_reduce_pipeline != nil &&
+                runtime->q5_0_reduce_pipeline.maxTotalThreadsPerThreadgroup >= 128u) {
                 pipeline = runtime->q5_0_reduce_pipeline;
                 use_reduce = YES;
                 reduce_shmem_floats = 64u;
                 reduce_threadgroups = MTLSizeMake((descriptor->out_dim + 1u) / 2u, descriptor->rows, 1);
+                // The reduction kernel partitions input blocks across four SIMD groups.
+                reduce_threads = MTLSizeMake(128, 1, 1);
             } else {
                 pipeline = pipeline != nil ? pipeline : runtime->q5_0_pipeline;
             }
@@ -20661,11 +20664,14 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
             }
             break;
         case TERMITE_METAL_QUANT_FORMAT_Q8_1:
-            if (descriptor->rows == 1 && runtime->q8_1_reduce_pipeline != nil) {
+            if (descriptor->rows == 1 && runtime->q8_1_reduce_pipeline != nil &&
+                runtime->q8_1_reduce_pipeline.maxTotalThreadsPerThreadgroup >= 128u) {
                 pipeline = runtime->q8_1_reduce_pipeline;
                 use_reduce = YES;
                 reduce_shmem_floats = 64u;
                 reduce_threadgroups = MTLSizeMake((descriptor->out_dim + 1u) / 2u, descriptor->rows, 1);
+                // The reduction kernel partitions input blocks across four SIMD groups.
+                reduce_threads = MTLSizeMake(128, 1, 1);
             } else {
                 pipeline = pipeline != nil ? pipeline : runtime->q8_1_pipeline;
             }
@@ -20681,31 +20687,40 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
             }
             break;
         case TERMITE_METAL_QUANT_FORMAT_IQ4_NL:
-            if (descriptor->rows == 1 && runtime->iq4_nl_reduce_pipeline != nil) {
+            if (descriptor->rows == 1 && runtime->iq4_nl_reduce_pipeline != nil &&
+                runtime->iq4_nl_reduce_pipeline.maxTotalThreadsPerThreadgroup >= 128u) {
                 pipeline = runtime->iq4_nl_reduce_pipeline;
                 use_reduce = YES;
                 reduce_shmem_floats = 64u;
                 reduce_threadgroups = MTLSizeMake((descriptor->out_dim + 1u) / 2u, descriptor->rows, 1);
+                // The reduction kernel partitions input blocks across four SIMD groups.
+                reduce_threads = MTLSizeMake(128, 1, 1);
             } else {
                 pipeline = pipeline != nil ? pipeline : runtime->iq4_nl_pipeline;
             }
             break;
         case TERMITE_METAL_QUANT_FORMAT_IQ4_XS:
-            if (descriptor->rows == 1 && runtime->iq4_xs_reduce_pipeline != nil) {
+            if (descriptor->rows == 1 && runtime->iq4_xs_reduce_pipeline != nil &&
+                runtime->iq4_xs_reduce_pipeline.maxTotalThreadsPerThreadgroup >= 128u) {
                 pipeline = runtime->iq4_xs_reduce_pipeline;
                 use_reduce = YES;
                 reduce_shmem_floats = 64u;
                 reduce_threadgroups = MTLSizeMake((descriptor->out_dim + 1u) / 2u, descriptor->rows, 1);
+                // The reduction kernel partitions input blocks across four SIMD groups.
+                reduce_threads = MTLSizeMake(128, 1, 1);
             } else {
                 pipeline = pipeline != nil ? pipeline : runtime->iq4_xs_pipeline;
             }
             break;
         case TERMITE_METAL_QUANT_FORMAT_MXFP4:
-            if (descriptor->rows == 1 && runtime->mxfp4_reduce_pipeline != nil) {
+            if (descriptor->rows == 1 && runtime->mxfp4_reduce_pipeline != nil &&
+                runtime->mxfp4_reduce_pipeline.maxTotalThreadsPerThreadgroup >= 128u) {
                 pipeline = runtime->mxfp4_reduce_pipeline;
                 use_reduce = YES;
                 reduce_shmem_floats = 64u;
                 reduce_threadgroups = MTLSizeMake((descriptor->out_dim + 1u) / 2u, descriptor->rows, 1);
+                // The reduction kernel partitions input blocks across four SIMD groups.
+                reduce_threads = MTLSizeMake(128, 1, 1);
             } else {
                 pipeline = pipeline != nil ? pipeline : runtime->mxfp4_pipeline;
             }

@@ -25,6 +25,7 @@ from pathlib import Path
 
 from chat import Session, command, process_budget
 from evidence import swap_snapshot
+from machine_profile import MIB, explicit_mb
 
 
 def main():
@@ -35,13 +36,22 @@ def main():
     p.add_argument("--model", type=Path, required=True)
     p.add_argument("--family", choices=("27b", "flash"), required=True)
     p.add_argument("--output", type=Path, required=True)
-    p.add_argument("--cache-mb", type=int, default=1536)
+    p.add_argument(
+        "--cache-mb",
+        type=int,
+        help="Flash expert cache in MiB (default: derived by the runner)",
+    )
     p.add_argument("--mode", choices=("both", "raw", "chat"), default="both")
-    p.add_argument("--combined-budget-mb", type=int)
+    p.add_argument(
+        "--combined-budget-mb",
+        type=int,
+        help="Process cap in MiB (default: derived by the runner)",
+    )
     p.add_argument("--soak-turns", type=int, default=8)
     a = p.parse_args()
     try:
         budget = process_budget(a.family, a.combined_budget_mb)
+        cache = explicit_mb("expert cache", a.cache_mb)
     except ValueError as error:
         p.error(str(error))
     if not 4 <= a.soak_turns <= 100:
@@ -56,6 +66,7 @@ def main():
         "family": a.family,
         "binary_sha256": hashlib.sha256(a.binary.read_bytes()).hexdigest(),
         "combined_budget_mb": budget,
+        "cache_mb": cache,
         "environment_note": "Inherited ANTFLY_QWEN toggles removed",
         "commands": {},
         "cases": {},
@@ -67,8 +78,16 @@ def main():
         mode = "raw" if raw else "chat"
         with (a.output / f"{mode}.stderr").open("w") as err:
             started = time.monotonic()
+            # Qualification always hashes every artifact byte in this process.
             cmd = command(
-                a.binary, a.model, a.family, 2, a.cache_mb, raw, combined_mb=budget
+                a.binary,
+                a.model,
+                a.family,
+                2,
+                cache,
+                raw,
+                combined_mb=budget,
+                verify="full",
             )
             report["commands"][mode] = cmd
             session = Session(cmd, stderr=err, env=env)
@@ -77,6 +96,16 @@ def main():
             if session.ready.get("hash_verified") is not True:
                 session.close()
                 raise AssertionError("session did not verify model artifact")
+            # The runner reports the cap it enforces; an explicit request
+            # must come back unchanged.
+            limit = session.ready.get("process_cap_bytes")
+            context = session.ready.get("context_size")
+            if type(limit) is not int or limit <= 0 or type(context) is not int:
+                session.close()
+                raise AssertionError("session did not report its admitted limits")
+            if budget is not None and limit != budget * MIB:
+                session.close()
+                raise AssertionError("runner enforced a different process cap")
             try:
 
                 def run(name, request, session=session, mode=mode):
@@ -119,8 +148,7 @@ def main():
                         "".join(e["text"] for e in result if e["event"] == "delta")
                         == result[-1]["text"]
                     )
-                    assert result[-1]["position"] <= 4096
-                    limit = budget * 1024**2
+                    assert result[-1]["position"] <= context
                     assert result[-1]["process_memory"]["peak_footprint_bytes"] < limit
                 if raw:
                     cold = run("reset_parity", {"reset": True, "prompt": prompt})
@@ -154,8 +182,8 @@ def main():
                     ("unknown_field", {"unexpected": True}),
                     ("wrong_type", {"prompt": 7}),
                     ("empty", {"prompt": ""}),
-                    ("too_many_tokens", {"prompt": "x", "max_tokens": 4097}),
-                    ("context_overflow", {"prompt": " x" * 4096}),
+                    ("too_many_tokens", {"prompt": "x", "max_tokens": context + 1}),
+                    ("context_overflow", {"prompt": " x" * context}),
                 ):
                     invalid = run(name, bad)
                     assert invalid[-1]["event"] == "error" and not invalid[-1]["fatal"]
@@ -164,6 +192,47 @@ def main():
                 malformed = session.read_event(time.monotonic() + 15)
                 report["cases"][f"{mode}_malformed_json"] = [malformed]
                 assert malformed["event"] == "error" and not malformed["fatal"]
+                # Stopping a reply must keep the session, the loaded model and
+                # deterministic output: the next turn matches the first one.
+                session.send(
+                    {
+                        "reset": True,
+                        "prompt": "The capital of France is"
+                        if raw
+                        else "Count from one to one hundred in words.",
+                        "max_tokens": 48,
+                    }
+                )
+                early = session.collect(until=lambda event: event["event"] == "delta")
+                assert early[-1]["event"] == "delta", early[-1]
+                session.cancel()
+                stopped = session.collect()
+                report["cases"][f"{mode}_cancel"] = stopped
+                done = stopped[-1]
+                assert done["event"] == "done", done
+                assert done["finish_reason"] == "cancelled", done
+                assert 1 <= len(done["generated_token_ids"]) < 48
+                assert (
+                    "".join(e["text"] for e in stopped if e["event"] == "delta")
+                    == done["text"]
+                )
+                resumed = run(
+                    "after_cancel",
+                    {
+                        "reset": True,
+                        "prompt": "The capital of France is"
+                        if raw
+                        else "Reply with only the word hello.",
+                    },
+                )
+                assert resumed[-1]["event"] == "done"
+                assert (
+                    resumed[-1]["generated_token_ids"]
+                    == first[-1]["generated_token_ids"]
+                )
+                # A cancel with nothing to stop is ignored without a reply,
+                # so it cannot desynchronise the next request.
+                session.cancel()
                 unicode_result = run(
                     "unicode",
                     {"reset": True, "prompt": "Say café 東京 🌍", "max_tokens": 1},
@@ -196,7 +265,7 @@ def main():
                     memory = done["process_memory"]
                     assert (
                         memory["available"]
-                        and 0 < memory["peak_footprint_bytes"] <= budget * 1024**2
+                        and 0 < memory["peak_footprint_bytes"] <= limit
                     )
                     footprints.append(memory["footprint_bytes"])
                 # Compare a fixed repeated workload after warmup, allowing bounded

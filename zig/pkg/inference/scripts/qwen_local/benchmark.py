@@ -33,6 +33,14 @@ from evidence import (
     validate_receipt,
     validate_repeat,
 )
+from machine_profile import (
+    FLAGS,
+    MAX_CONTEXT,
+    VERIFY_MODES,
+    budget_arguments,
+    explicit_mb,
+    physical_memory_bytes,
+)
 
 CASES = {
     "chat": "Explain why the sky is blue in two short sentences, then give one everyday example of light scattering.",
@@ -59,19 +67,42 @@ def main():
     p.add_argument("--chunk", type=int)
     p.add_argument("--trace", action="store_true")
     p.add_argument("--stream", action="store_true")
-    p.add_argument("--cache-mb", type=int, default=1536)
-    p.add_argument("--combined-budget-mb", type=int)
+    p.add_argument(
+        "--cache-mb",
+        type=int,
+        help="Flash expert cache in MiB (default: derived by the runner)",
+    )
+    p.add_argument(
+        "--combined-budget-mb",
+        type=int,
+        help="Process cap in MiB (default: derived by the runner)",
+    )
+    p.add_argument("--context", type=int, default=MAX_CONTEXT)
+    p.add_argument(
+        "--verify",
+        choices=VERIFY_MODES,
+        default="stamp",
+        help="stamp hashes once per host and install; full hashes in every process",
+    )
+    p.add_argument("--timeout", type=float, default=2400)
     p.add_argument("--batch-linear", action="store_true")
     p.add_argument("--prefill-mps", action="store_true")
     a = p.parse_args()
     try:
         budget = process_budget(a.family, a.combined_budget_mb)
+        cache = explicit_mb("expert cache", a.cache_mb)
     except ValueError as error:
         p.error(str(error))
-    if a.family != "flash" and (a.batch_linear or a.prefill_mps or a.trace):
-        p.error("batch-linear, prefill-mps, and route traces require family flash")
-    if not 1 <= a.rounds <= 10 or not 2 <= a.tokens <= 64:
-        p.error("rounds must be 1..10 and tokens 2..64")
+    if a.family != "flash" and (
+        a.batch_linear or a.prefill_mps or a.trace or cache is not None
+    ):
+        p.error(
+            "batch-linear, prefill-mps, route traces and cache-mb require family flash"
+        )
+    if not 1 <= a.context <= MAX_CONTEXT:
+        p.error(f"context must be 1..{MAX_CONTEXT}")
+    if not 1 <= a.rounds <= 10 or not 2 <= a.tokens < a.context:
+        p.error("rounds must be 1..10 and tokens 2..context-1")
     a.output.mkdir(parents=True, exist_ok=False)
     report = {
         "schema_version": 2,
@@ -82,7 +113,17 @@ def main():
         "binary_sha256": hashlib.sha256(a.binary.read_bytes()).hexdigest(),
         "model": str(a.model),
         "cases": [],
-        "host": {"platform": platform.platform(), "machine": platform.machine()},
+        "host": {
+            "platform": platform.platform(),
+            "machine": platform.machine(),
+            "physical_memory_bytes": physical_memory_bytes(),
+        },
+        "requested": {
+            "combined_budget_mb": budget,
+            "cache_mb": cache,
+            "context": a.context,
+            "verify": a.verify,
+        },
         "scope": "Local timing and repeated greedy-output checks; not independent parity or production qualification.",
         "cache_note": "Serial fresh processes; OS/device caches uncontrolled.",
     }
@@ -99,24 +140,20 @@ def main():
                 str(a.binary.resolve()),
                 str(a.model),
                 prompt,
-                "--experimental-qwen35-streamed"
-                if a.family == "27b"
-                else "--experimental-qwen4exp",
+                FLAGS[a.family],
                 "--backend",
                 "metal",
                 "--speculation-policy",
                 "off",
                 "--context-size",
-                "4096",
+                str(a.context),
                 "--max-tokens",
                 str(a.tokens),
                 "--disable-thinking",
                 "--json-timing",
                 str(receipt),
             ]
-            command += ["--combined-budget-mb", str(budget)]
-            if a.family == "flash":
-                command += ["--moe-cache-mb", str(a.cache_mb)]
+            command += budget_arguments(a.family, cache, budget, a.verify)
             if a.stream:
                 command += ["--stream"]
             if a.chunk is not None:
@@ -152,7 +189,7 @@ def main():
                         stdout=out,
                         stderr=err,
                         env=env,
-                        timeout=2400,
+                        timeout=a.timeout,
                         check=False,
                     )
                 row["exit_code"] = result.returncode
@@ -164,7 +201,13 @@ def main():
                 # A zero exit status without a complete valid receipt is a failure.
                 row["receipt"] = read_receipt(receipt)
                 row["metrics"] = validate_receipt(
-                    row["receipt"], a.family, budget, a.tokens
+                    row["receipt"],
+                    a.family,
+                    budget,
+                    a.tokens,
+                    context=a.context,
+                    verify=a.verify,
+                    cache_mb=cache,
                 )
                 clean_swap_delta(before, row["swap_after"])
                 if name in previous:

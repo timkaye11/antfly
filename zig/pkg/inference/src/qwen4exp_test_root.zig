@@ -17,6 +17,7 @@ test {
     _ = @import("util/artifact_verification.zig");
     _ = @import("util/local_control.zig");
     _ = @import("util/verified_sidecar.zig");
+    _ = @import("runtime/machine_profile.zig");
     _ = @import("local_text_session.zig");
     _ = @import("native_generate.zig");
     _ = @import("native_qwen4exp_generate.zig");

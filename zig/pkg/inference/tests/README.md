@@ -49,7 +49,11 @@ GGUF geometry recorded in `../scripts/qwen4exp/artifact.json`. It uses Metal
 numerical kernels, a bounded cache of encoded expert projections, and uncached
 range reads for misses, ngram rows, and the single input embedding row.
 A route lease pins all selected experts
-until GPU completion. Failed reads preserve the previous cache contents.
+until GPU completion. Failed reads preserve the previous cache contents; a
+transient device error is retried in place (three attempts) before the
+transaction fails. Lease and transaction invariants are checked in release
+builds. Every weight range is read through the descriptors the artifact was
+verified through.
 This is one-sequence eager greedy generation, with a 4096-token maximum;
 HTTP serving, vision, MTP, sequence batching and other geometries are unsupported.
 Metal commands for each attention branch and shared/router computation run in
@@ -79,21 +83,34 @@ zig-out/bin/antfly-qwen4exp "$QWEN_GGUF" 'Hello' \
   --print-timing --print-token-ids --json-timing /tmp/qwen4exp-run.json
 ```
 
+Add `--dry-run` to print the memory plan and machine profile without verifying
+or loading weights. `--verify stamp` accepts an earlier full hash of the same
+unchanged files instead of reading all 111 GB again; the default `full` hashes
+every byte (see `../scripts/qwen_local/README.md`).
+
 The same arguments are accepted by `antfly inference generate`. The focused
 binary shares that parser and implementation. The tokenizer sidecars must be
 beside the shard directory or beside the shard itself. Use `--raw-prompt` for
 tokenizer-only input without the artifact's chat template.
 
-The 10 GiB process cap is also clamped to Metal's recommended working set.
-Explicit budgets retain live pressure checks. Default expert storage is 2 GiB,
-ngram storage 64 MiB, and I/O staging 64 MiB; tokenizer parsing and caches have
-a separate 512 MiB allocation ceiling included in admission. These budgets do
-not promise admission while other applications consume the machine's memory.
-For a larger expert cache, use `--moe-cache-mb 3584` with the same
-`--combined-budget-mb 10240`. Admission still preserves the emergency reserve;
-a 4096 MiB expert cache does not fit that envelope with context 4096.
-Receipts report process footprint (the relevant macOS counter), cache hits,
-misses, bytes read and load/prefill/decode times. Decode throughput is
+Without `--combined-budget-mb` and `--moe-cache-mb` the process cap and the
+expert cache are derived from physical memory and Metal's recommended working
+set (`src/runtime/machine_profile.zig`; `--dry-run` prints the plan). Explicit
+values are validated, never clamped: a plan that does not fit its cap together
+with the 512 MiB admission reserve, a cap above physical memory, a cache budget beyond full residency (512 slots per
+layer) and GPU-visible bytes above Metal's working set are errors. Metal's
+working set bounds GPU-visible bytes only, not the process cap. Ngram storage
+is 64 MiB and I/O staging 64 MiB; tokenizer parsing and caches have a separate
+512 MiB allocation ceiling included in admission. These budgets do not promise
+admission while other applications consume the machine's memory. On a 16 GiB
+host, `--moe-cache-mb 3584 --combined-budget-mb 10240` is the largest explicit
+pair that fits; a 4096 MiB expert cache does not fit that envelope with
+context 4096.
+Receipts report the enforced cap and allocated cache (`process_cap_bytes`,
+`expert_cache_bytes`, `expert_slot_counts`, each with its `*_source`), the
+verification mode and outcome, process footprint (the relevant macOS counter),
+cache hits, misses, absorbed read retries, bytes read and load/prefill/decode
+times. Decode throughput is
 `decode_steps * 1000 / decode_ms`; the first generated token comes from prefill.
 `metal_command_batching` records the submission mode used for that run.
 
@@ -139,7 +156,10 @@ Performance experiments also support:
   `[position,48,10]` route trace. `scripts/qwen4exp/cache_replay.py` compares the
   existing measured policy with per-layer and global byte-budget LRU. It replays
   layer-major prefill acquisitions when enabled; predicted read savings are not
-  runtime speed measurements.
+  runtime speed measurements. Sessions write the trace when they end.
+  `scripts/qwen4exp/record_routes.py` records chat, code, document and
+  multi-turn traces, and `cache_replay.py --manifest` sweeps cache sizes across
+  replacement and allocation policies (see `scripts/qwen_local/README.md`).
 
 Receipts include build mode, actual feature switches, per-phase expert I/O,
 per-decode-step timings and time until the first token is ready. That last metric
@@ -232,11 +252,16 @@ head and FP32 recurrent/KV state resident, reads embedding rows on demand, and
 alternates two 288 MiB layer buffers using uncached `pread`. Only the 64 trunk
 layers execute; the artifact's extra MTP layer is excluded. A slot cannot be
 reused until its GPU work completes. Read failures and cancellation invalidate
-state and drain outstanding work.
+state and drain outstanding work. Cancellation, memory pressure and transient
+read errors leave the loaded head usable: before the first layer runs the
+sequence is untouched, afterwards `reset` restores an empty one. The same
+classification applies to the Flash decoder, where it also keeps the expert
+cache.
 
 The exact UD-Q4_K_M GGUF and tokenizer sidecars are SHA-256 pinned in
 `../scripts/qwen35_streamed/artifact.json`. Startup verifies the entire GGUF in
-bounded reads. `--dry-run` only validates the inventory and memory plan and
+bounded reads (`--verify stamp` accepts an earlier full pass on this host while
+the file is unchanged). `--dry-run` only validates the inventory and memory plan and
 explicitly reports `hash_verified=false`. It does not initialize Metal or load
 weights. Supported scope is local text, eager Metal on unified memory, one
 sequence, greedy sampling, and at most 4096 total prompt/output tokens. HTTP,
@@ -262,7 +287,10 @@ quantization. The same opt-in flags are accepted by the general native generate
 entry point.
 
 At context 4096 and the default 512-token chunk, the conservative admission
-plan is 3,478,392,832 bytes within a 4 GiB cap, retaining at least 512 MiB spare. This includes a 512 MiB bounded
+plan is 3,478,392,832 bytes. Without `--combined-budget-mb` the cap is derived
+as that plan plus 768 MiB (4,283,699,200 bytes); an explicit cap must hold the
+plan plus 512 MiB and may now exceed 4 GiB, which only loosens the bound while
+the runner still streams through two layer buffers. This includes a 512 MiB bounded
 vocabulary allocator, both encoded layer buffers, a 995 MiB encoded output head,
 FP32 recurrent/conv and KV caches, activation buffers, the 34 MiB dequant tile,
 a 2 MiB compact tile-result buffer, a page-rounded 2 KiB IQ3 codebook, and
@@ -273,8 +301,10 @@ tiles and MPS GEMM with compact-result scatter, including Q3_K, Q8_0, Q4_K,
 Q5_K, Q6_K, and IQ4_NL. Tile reuse follows GPU command order without a CPU
 completion wait per tile. Layer-buffer reuse still requires completion.
 Decode and small prompts retain packed GPU operations, including the dedicated
-wide-row IQ4_NL kernel. The generic single-row IQ4_NL kernel under-dispatches wide matrices
-in this checkout. Prefill defaults to 512 tokens per layer load and permits up to 1024; packed small-batch projections dispatch at most 32 rows. Decode reads
+wide-row IQ4_NL kernel. The generic single-row reduce kernels for IQ4_NL,
+IQ4_XS, Q5_0, Q8_1 and MXFP4 used to be dispatched with half the SIMD groups
+they stripe over and dropped half of every row wider than 512; they now get
+all four, and `metal_quant_reduce_test.zig` covers widths through 2048. Prefill defaults to 512 tokens per layer load and permits up to 1024; packed small-batch projections dispatch at most 32 rows. Decode reads
 14,344,308,736 trunk-weight bytes per token. Receipt byte counts describe completed application read ranges, not
 physical SSD traffic.
 

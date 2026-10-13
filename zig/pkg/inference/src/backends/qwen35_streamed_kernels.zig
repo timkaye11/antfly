@@ -130,8 +130,8 @@ pub const Kernels = struct {
         } else if (self.gpu_dequant and (kind.raw() == 21 or kind.raw() == 23)) {
             try self.run(.{ .op = 5, .mode = kind.raw(), .n = @intCast(rows * output_dim * 32), .dim = @intCast(input_dim), .groups = @intCast(output_dim) }, &.{ weight, input, self.quant_grid.ref() }, output);
         } else if (kind.raw() == 20) {
-            // Generic IQ4_NL MMV dispatch underfills the shader's four SIMD
-            // groups on wide rows. Own this bounded path and test wide shapes.
+            // This bounded path predates the generic IQ4_NL reduce dispatch
+            // being given all four SIMD groups; wide shapes are tested here.
             try self.run(.{ .op = 7, .n = @intCast(rows * output_dim * 32), .dim = @intCast(input_dim), .groups = @intCast(output_dim) }, &.{ weight, input }, output);
         } else if (kind.raw() == 0) {
             try self.run(.{ .op = 6, .n = @intCast(rows * output_dim * 32), .dim = @intCast(input_dim), .groups = @intCast(output_dim), .stride = @intCast(output_dim) }, &.{ weight, input }, output);

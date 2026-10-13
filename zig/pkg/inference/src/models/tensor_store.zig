@@ -26,6 +26,7 @@ const manifest_mod = @import("manifest.zig");
 const weight_source_mod = @import("weight_source.zig");
 const DType = @import("../backends/tensor.zig").DType;
 const gguf_mod = @import("../gguf/root.zig");
+const verification = @import("../util/artifact_verification.zig");
 const c_file = if (builtin.os.tag == .freestanding) struct {
     pub const MmapRegion = struct {
         data: []u8 = &.{},
@@ -46,6 +47,11 @@ const c_file = if (builtin.os.tag == .freestanding) struct {
     pub fn readRegion(_: std.mem.Allocator, _: []const u8, _: u64, _: usize) ![]u8 {
         return error.UnsupportedOnFreestanding;
     }
+
+    // Split stores never bind range readers without a filesystem.
+    pub const RangeReader = struct {
+        pub fn deinit(_: *RangeReader) void {}
+    };
 } else @import("../util/c_file.zig");
 
 pub const StoreKind = enum {
@@ -1039,6 +1045,8 @@ pub const SplitGgufStore = struct {
     shards: []*GgufStore,
     owners: std.StringHashMapUnmanaged(*GgufStore) = .empty,
     combined: gguf_mod.format.File,
+    /// One uncached positional reader per shard, opened by bindReaders.
+    readers: []c_file.RangeReader = &.{},
 
     const vtable = TensorStore.VTable{
         .kind = @ptrCast(&kindImpl),
@@ -1116,20 +1124,50 @@ pub const SplitGgufStore = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    /// Verify the exact ordered shards backing this store, including metadata-only files.
-    pub fn verifyShardIdentity(store: TensorStore, pins: []const @import("../util/artifact_verification.zig").Identity, stop: *const std.atomic.Value(bool)) !void {
+    /// Open the descriptors that verification and every later range read
+    /// share. Each must name the same file object the shard's metadata was
+    /// parsed from, so a path replaced after parsing is rejected instead of
+    /// being hashed or read in place of the parsed file.
+    pub fn bindReaders(store: TensorStore) !void {
+        if (store.vtable != &vtable) return error.ExpectedSplitGguf;
+        const self: *SplitGgufStore = @ptrCast(@alignCast(store.ptr));
+        if (self.readers.len != 0) return;
+        const readers = try self.allocator.alloc(c_file.RangeReader, self.shards.len);
+        errdefer self.allocator.free(readers);
+        var opened: usize = 0;
+        errdefer for (readers[0..opened]) |*reader| reader.deinit();
+        for (self.shards, readers) |shard, *reader| {
+            reader.* = try c_file.RangeReader.open(self.allocator, shard.path orelse return error.MissingShardPath, true);
+            opened += 1;
+            const mapping = shard.mmap_region orelse return error.MissingShardPath;
+            if (!try reader.sameFile(mapping.fd)) return error.ArtifactChangedDuringOpen;
+        }
+        self.readers = readers;
+    }
+
+    /// Bound reader owning `name`. Offsets from describeTensorRange are local to it.
+    pub fn tensorReader(store: TensorStore, name: []const u8) !*const c_file.RangeReader {
+        if (store.vtable != &vtable) return error.ExpectedSplitGguf;
+        const self: *SplitGgufStore = @ptrCast(@alignCast(store.ptr));
+        if (self.readers.len == 0) return error.ShardReadersNotBound;
+        const shard = try self.owner(name);
+        for (self.shards, self.readers) |candidate, *reader| if (candidate == shard) return reader;
+        return error.TensorNotFound;
+    }
+
+    /// Verify the exact ordered shards backing this store, including
+    /// metadata-only files, through the bound readers.
+    pub fn verifyShardIdentity(store: TensorStore, pins: []const verification.Identity, artifact_id: []const u8, mode: verification.Mode, stamp_dir: ?[]const u8, stop: *const std.atomic.Value(bool)) !verification.Outcome {
         if (store.vtable != &vtable) return error.ExpectedSplitGguf;
         const self: *SplitGgufStore = @ptrCast(@alignCast(store.ptr));
         if (self.shards.len != pins.len) return error.ArtifactShardCountMismatch;
-        const scratch = try self.allocator.alloc(u8, 4 * 1024 * 1024);
-        defer self.allocator.free(scratch);
-        for (self.shards, pins, 0..) |shard, pin, i| {
-            if (stop.load(.acquire)) return error.Cancelled;
-            std.debug.print("Qwen4Exp: verifying shard {d}/{d} ({d} bytes)\n", .{ i + 1, pins.len, pin.bytes });
-            var reader = try c_file.RangeReader.open(self.allocator, shard.path orelse return error.MissingShardPath, true);
-            defer reader.deinit();
-            try @import("../util/artifact_verification.zig").verify(&reader, pin, scratch, stop);
+        if (self.readers.len != self.shards.len) return error.ShardReadersNotBound;
+        const files = try self.allocator.alloc(verification.File, pins.len);
+        defer self.allocator.free(files);
+        for (files, self.shards, self.readers, pins) |*file, shard, *reader, pin| {
+            file.* = .{ .reader = reader, .path = shard.path orelse return error.MissingShardPath, .pin = pin };
         }
+        return verification.verifyFiles(self.allocator, files, artifact_id, mode, stamp_dir, stop);
     }
 
     fn integer(view: gguf_mod.metadata.View, key: []const u8) ?u64 {
@@ -1181,6 +1219,8 @@ pub const SplitGgufStore = struct {
     }
     fn deinitSelf(self: *SplitGgufStore) void {
         const allocator = self.allocator;
+        for (self.readers) |*reader| reader.deinit();
+        if (self.readers.len != 0) allocator.free(self.readers);
         self.owners.deinit(allocator);
         allocator.free(self.combined.tensors);
         for (self.shards) |shard| shard.tensorStore().deinit();

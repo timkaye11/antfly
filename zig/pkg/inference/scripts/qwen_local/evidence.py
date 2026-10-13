@@ -24,6 +24,8 @@ import math
 import re
 import subprocess
 
+from machine_profile import MAX_CONTEXT, MIB, VERIFY_MODES
+
 
 def read_receipt(path):
     def reject_nonfinite(value):
@@ -53,7 +55,22 @@ def clean_swap_delta(before, after):
     return delta
 
 
-def validate_receipt(receipt, family, budget_mb, token_limit):
+def validate_receipt(
+    receipt,
+    family,
+    budget_mb,
+    token_limit,
+    context=MAX_CONTEXT,
+    verify="full",
+    cache_mb=None,
+):
+    """Check one receipt against what the harness asked for.
+
+    `budget_mb` and `cache_mb` are the explicit overrides passed to the runner,
+    or None when it derived them; the admitted values are then read from the
+    receipt. `verify` is the weakest artifact verification the caller accepts.
+    """
+
     def require(condition, message):
         if not condition:
             raise ValueError(message)
@@ -75,7 +92,8 @@ def validate_receipt(receipt, family, budget_mb, token_limit):
     require(
         receipt.get("failure_stage") is None, "receipt contains an execution failure"
     )
-    require(receipt.get("context_size") == 4096, "unexpected context size")
+    require(verify in VERIFY_MODES, "unknown verification mode")
+    require(receipt.get("context_size") == context, "unexpected context size")
     prompt, generated = (
         receipt.get("prompt_token_ids"),
         receipt.get("generated_token_ids"),
@@ -90,7 +108,7 @@ def validate_receipt(receipt, family, budget_mb, token_limit):
         "need at least two generated tokens to benchmark decode",
     )
     require(
-        len(prompt) + token_limit <= 4096, "prompt exceeds requested context budget"
+        len(prompt) + token_limit <= context, "prompt exceeds requested context budget"
     )
     require(
         type(receipt.get("generated_tokens")) is int
@@ -127,7 +145,28 @@ def validate_receipt(receipt, family, budget_mb, token_limit):
         < 1,
         "first-token timing mismatch",
     )
-    cap = budget_mb * 1024**2
+    # Receipts name the cap the runner actually enforced. An explicit request
+    # must come back unchanged; a derived one must say that it was derived.
+    reported = receipt.get("process_cap_bytes", receipt.get("cap_bytes"))
+    if budget_mb is None:
+        require(
+            integer(reported) and reported > 0, "missing derived process cap in receipt"
+        )
+        require(
+            receipt.get("process_cap_source") == "derived",
+            "process cap was not derived by the runner",
+        )
+        cap = reported
+    else:
+        cap = budget_mb * MIB
+        require(
+            reported is None or reported == cap,
+            "runner enforced a different process cap than requested",
+        )
+        require(
+            receipt.get("process_cap_source") in (None, "explicit"),
+            "explicit process cap reported as derived",
+        )
     admitted = receipt.get("admitted_bytes")
     require(integer(admitted) and 0 < admitted <= cap, "invalid memory admission")
     memory = receipt.get("process_memory")
@@ -140,7 +179,23 @@ def validate_receipt(receipt, family, budget_mb, token_limit):
         integer(peak) and 0 < peak <= cap,
         "missing peak footprint or memory cap exceeded",
     )
-    require(receipt.get("hash_verified") is True, "artifact hash not verified")
+    hashed = receipt.get("hash_verified") is True
+    stamped = receipt.get("stamp_verified") is True
+    require(not (hashed and stamped), "ambiguous artifact verification")
+    if verify == "full":
+        require(hashed, "artifact hash not verified")
+        require(
+            receipt.get("verification_mode") in (None, "full"),
+            "artifact verified in a weaker mode than required",
+        )
+    else:
+        # A stamp-mode run still hashes when no valid stamp exists, and says so.
+        require(hashed or stamped, "artifact neither hashed nor stamp verified")
+        require(
+            hashed or receipt.get("verification_mode") == "stamp",
+            "stamp accepted outside stamp mode",
+        )
+    cache_bytes = None
     if family == "27b":
         require(receipt.get("prompt_lookup") == 0, "unexpected speculative decoding")
         require(
@@ -154,7 +209,42 @@ def validate_receipt(receipt, family, budget_mb, token_limit):
             receipt.get("sidecars_hash_verified") is True,
             "Flash tokenizer and generation sidecars not verified",
         )
+        # The cache is reported as allocated, never as requested.
+        cache_bytes = receipt.get("expert_cache_bytes")
+        if cache_bytes is not None or cache_mb is not None:
+            counts, strides = (
+                receipt.get("expert_slot_counts"),
+                receipt.get("expert_strides"),
+            )
+            require(
+                isinstance(counts, list)
+                and isinstance(strides, list)
+                and len(counts) == len(strides) == 48
+                and all(integer(x) and x >= 10 for x in counts)
+                and all(integer(x) and x > 0 for x in strides),
+                "invalid expert slot inventory",
+            )
+            require(
+                integer(cache_bytes)
+                and cache_bytes == sum(a * b for a, b in zip(counts, strides)),
+                "expert cache bytes do not match the slot inventory",
+            )
+            require(cache_bytes < admitted, "expert cache exceeds admitted memory")
+            if cache_mb is None:
+                require(
+                    receipt.get("expert_cache_source") == "derived",
+                    "expert cache was not derived by the runner",
+                )
+            else:
+                require(
+                    receipt.get("expert_cache_source") == "explicit"
+                    and cache_bytes <= cache_mb * MIB,
+                    "runner allocated a different expert cache than requested",
+                )
     return {
+        "process_cap_bytes": cap,
+        "expert_cache_bytes": cache_bytes,
+        "verification": "hash" if hashed else "stamp",
         "effective_decode_tokens_per_second": (len(generated) - 1)
         * 1000
         / receipt["decode_ms"],

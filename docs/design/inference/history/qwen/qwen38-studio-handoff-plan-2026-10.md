@@ -334,3 +334,124 @@ Ranked by expected payoff at high hit rate:
 4. **Throughput targets**: proposed as relative gates (≥0.9× llama.cpp Metal
    for 27B; Flash measured against its own all-hit ceiling and the Phase 0.5
    replay) until Studio measurements exist.
+
+## 7. Phase 0 status
+
+Implemented on the 16 GiB M4 on 2026-10-13, on top of `638bbbd52d`. Phases 1–7
+need the Studio and are untouched. Figures below are from this host with other
+applications open: system swap counters moved during every model run, so they
+are functional results, not clean-memory or timing evidence.
+
+| Item | State | What changed | Check |
+| --- | --- | --- | --- |
+| 0.1 F1 | done | 128-thread dispatch for the Q5_0, Q8_1, IQ4_NL, IQ4_XS and MXFP4 `1x_reduce` kernels, with a fallback to the scalar kernel if the pipeline cannot take 128 threads. Audit: Q8_K, Q4_1 and Q5_K stripe over two SIMD groups and were already correct, as is the pair encoder. | New `backends/metal_quant_reduce_test.zig`: 11 formats × widths 256/512/1024/2048, single-row reduce and three-row batch kernels against the CPU codec. On the unfixed kernels it fails at Q5_0, width 1024 (−1.874 against −2.613); 256 and 512 pass, as predicted. |
+| 0.2 Machine profile | done | `runtime/machine_profile.zig` derives the process cap, Flash expert cache and context limit; the 10 GiB and 4 GiB literals and the 128-slot cap are gone; slot indices are 16-bit for arenas wider than 254 slots (A4B keeps bytes); token histories are context-sized; out-of-range budgets are errors. `--dry-run` works for both runners. Harness caps removed from `chat.py`, `evidence.py`, both `benchmark.py`; receipts are checked against the enforced values. | The Air derives a 10.0 GiB cap with a 3.71 GB cache (24–25 slots, 4.8%) for Flash and a 3.99 GiB cap for 27B. Unit tests cover 512 slots per layer and a 48 GB host. |
+| 0.3 Robustness | done, one option open | `RangeReader.read` keeps the errno class and retries EINTR on Darwin; expert, n-gram and embedding reads retry transient errors three times; lease and transaction invariants are release checks; lane layout follows `read_lane_count`. Both decoders separate terminal failure from "sequence needs reset" and run their pressure/cancel checks before anything is mutated; a single token is never interrupted for pressure or a request cancel, only a multi-token chunk is. Sessions gained `{"cancel":true}` and non-fatal, classified `error` events. | Fault-injection tests for retry, exhaustion and rollback; session input and recovery tests; session qualification below. **Not done:** shrinking the expert cache under pressure (the plan marks it optional; it belongs with the Phase 3 allocation rework). |
+| 0.4 Verification | done | Flash hashes and reads through one descriptor per shard, each checked against the parsed file's identity. `--verify full\|stamp`; receipts record mode and outcome; qualification harnesses force `full`. | Stamp test covers fallback, replacement and corruption. Startup with a valid stamp: Flash 173.8 s → 7.2 s, 27B 29.5 s → 1.7 s. |
+| 0.5 Go/no-go | done: go | `record_routes.py`, and `cache_replay.py --manifest` with seven policies and a budget sweep. | Replay model tests; the replay reproduces the three one-shot runs' measured hits and misses exactly. Results in §7.1. |
+| 0.6 Handoff kit | done except the copy | `verify_install.py` and the "Handoff to another Mac" section of `scripts/qwen_local/README.md` (pinned and non-portable items, bring-up order). | The copy itself and the commit are operator steps. |
+
+Token IDs after the change match the checked-in M4 records for the chat
+benchmark prompt: Flash `[29108, 4009, 1100, 9872, 303, 660, 17425, 430]`
+(1536 MiB cache, derived 8.04 GiB cap, full and stamp verification) and 27B
+`[29108, 4009, 5435, 660]` (derived cap). Focused suites: Metal 27B 36 passed /
+1 skipped, Flash 52 / 4; CPU-only 27B 31 / 6, Flash 39 / 16; Python 24 passed.
+
+`qualify_sessions.py --family flash --cache-mb 1536` (full verification, derived
+cap) passed all 46 functional cases in raw and chat mode, with the recorded
+IDs (`[11751, 13]`, `[21047, 13]`, `[14556]`, `[17981, 27450]`), exact prefix
+reuse, reset parity, the new cancel case, and a post-warmup footprint range of
+128 KiB / 400 KiB over eight cycles. Its clean-swap condition failed (148,609
+swapins, 173,231 swapouts in the window), as every run on this loaded host did.
+That campaign ran one build before the last two changes (explicit caps must
+hold the admission reserve; a single token is never interrupted). On the final
+binaries: a reply cancelled during decode ended with
+`finish_reason: "cancelled"`, `state_reset: false`, and the next turn reused all
+22 consumed tokens; `qualify_lifecycle.py --family 27b` passed all eight phases
+(longest cooperative exit 0.15 s) and the Flash prefill, decode and idle phases
+passed; 27B prompt lookup, one-shot and in a session, accepted 6 of 6 proposals
+with no replay, as in the M4 record; and all four route recordings in §7.1
+completed, the session extending one sequence across five turns.
+
+Two things the implementation found that the review did not:
+
+- **A derived cap must be tight.** The admission controller treats a cap that
+  exceeds current availability as a dynamic-pressure envelope and reserves the
+  node headroom again inside it, which no realistic Flash plan survives. A
+  derived cap is therefore the plan plus 768 MiB, and the 256 MiB of that for
+  the process's own pre-admission footprint is needed: without it the 27B plan
+  was refused by 20 MB.
+- **`errdefer |err|` no longer parses in Zig 0.17**, so the failure
+  classification wraps the token and chunk bodies instead of capturing in an
+  `errdefer`.
+
+F1 is isolated so it can go to `main` separately: the `metal_kernels.m`
+dispatch hunks (plus the same hunk for Q5_1, which `main` does not have yet),
+`metal_quant_reduce_test.zig`, and its import in `inference.zig`. That
+combination was checked to apply to `main` at `b467a7f19f`.
+
+### 7.1 Hit rate versus cache size (Phase 0.5)
+
+Routes were recorded on the Air with the final Phase 0 binary at a 1536 MiB
+cache (routes do not depend on cache size): chat, code and document prompts
+with 519 decoded tokens each, and a five-turn chat session with 545. The
+summary, with per-workload results for every budget and policy, is
+[`route-replay-m4.json`](../../../../../zig/pkg/inference/scripts/qwen4exp/route-replay-m4.json).
+Each run starts with an empty cache, so first touches are counted as misses.
+
+The recordings themselves measured 0.61–0.78 tok/s, 854–1004 MB read per
+decoded token and a 33–44% hit rate at 10–11 slots per layer. Replaying the
+runtime's policy at those slot counts reproduces the measured prefill and
+decode hits and misses exactly for all three one-shot runs, so the model of
+acquisitions matches the executor.
+
+Predicted decode megabytes read per token, mean of the four workloads (hit
+rate in parentheses). All-miss is 1504 MB per token.
+
+| Cache | Runtime (per-layer LFU-decay) | Per-layer LRU | Global LRU | Expert-keyed LFU with ghosts | Same, weighted slots | Belady per layer | Belady global |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1.6 GB | 940 (37.7%) | 949 | 958 | 934 | 932 | 908 | 676 |
+| 4 GB | 709 (53.0%) | 708 | 733 | 669 | 671 | 481 | 424 |
+| 8 GB | 509 (66.3%) | 502 | 503 | 466 | 462 | 279 | 246 |
+| 12 GB | 371 (75.5%) | 370 | 354 | 339 | 329 | 182 | 156 |
+| 20 GB | 202 (86.7%) | 201 | 177 | 187 | 171 | 90 | 76 |
+| 30 GB | 105 (93.1%) | 97 | 81 (94.6%) | 96 | 84 (94.4%) | 50 | 43 (97.2%) |
+| 36 GB | 67 (95.6%) | 66 | 55 | 68 | 59 | 41 | 36 |
+
+At 30 GB by workload (runtime policy / global LRU / weighted / Belady global):
+chat 55 / 42 / 45 / 32, code 122 / 97 / 99 / 51, document 142 / 98 / 110 / 38,
+session 99 / 89 / 81 / 49 MB per token. Over the second half of each decode the
+means are 113 / 84 / 85 / 33.
+
+What this decides:
+
+- **Go.** 39% residency turns a 1.5 GB all-miss token into roughly 0.1 GB with
+  the policy the runtime already has: about 0.12 s of read service per token on
+  the USB SSD and a few hundredths of a second on NVMe. That is from a cold
+  cache over about 500 tokens; a warmed cache can only do better.
+- **Residency is not the whole answer.** In 500 to 1,700 tokens each workload
+  touched 280–418 of the 512 experts per layer on average, so no policy removes
+  the first-touch misses. Online policies at 30 GB are still about twice the
+  offline bound, which is the headroom prefetch and a persisted hotness profile
+  (Phase 3.3–3.4) can go after.
+- **Policy for Phase 3.** The equal per-layer split wastes slots: layers need
+  between 84 and 358 slots at 30 GB when allocated from the other workloads'
+  miss curves. From 12 GB up, a global LRU pool and weighted per-layer slots
+  with expert-keyed, ghost-remembering LFU both beat the runtime policy, by
+  20–23% at 30 GB. Below 8 GB the order reverses for the global pool, which is
+  the worst choice on the Air, where expert-keyed LFU with ghosts leads.
+  Phase 3.1 should therefore implement expert-keyed frequency with ghost
+  history and weighted per-layer allocation: it is first or second among the
+  online policies at every budget from 1.6 to 36 GB and does not regress the
+  Air. A shared LRU pool is slightly better at 30 GB and above and is the
+  simpler alternative if the Studio is the only target.
+- **Frequency alone misleads on long shifts.** On the code workload the
+  runtime's slot-keyed LFU is the worst online policy at 30 GB and gets worse
+  in the second half (160 MB per token against 137 for plain per-layer LRU):
+  it keeps experts that were hot for the previous part of the answer.
+
+Limits: four prompts on one host, about 500 decoded tokens each, greedy decoding,
+thinking disabled; bytes are application read ranges of whole experts, and the
+weighted allocation is calibrated leave-one-out on the other three workloads.
+The Studio should repeat the recording at its derived cache and compare its
+measured hit rate with these predictions (Phase 3 exit).

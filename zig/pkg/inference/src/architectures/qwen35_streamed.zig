@@ -19,7 +19,8 @@ const model = @import("../models/qwen35_streamed.zig");
 const gpu = @import("../backends/qwen35_streamed_kernels.zig");
 const pager = @import("../runtime/dense_weight_pager.zig");
 const memory = @import("../runtime/tier/memory.zig");
-const mr = @import("../backends/metal_runtime.zig");
+const profile = @import("../runtime/machine_profile.zig");
+const control = @import("../util/local_control.zig");
 const gguf = @import("../gguf/root.zig");
 const MiB = model.MiB;
 // Include page rounding and driver temporaries beyond the explicit buffers.
@@ -31,38 +32,53 @@ fn scratchBytes(context: usize, chunk: usize) usize {
 }
 
 pub const checkpoint_bytes = 48 * (48 * 128 * 128 + 3 * 10240) * 4;
+pub const PlanRequest = struct {
+    context: usize,
+    chunk: usize,
+    /// Reserve the recurrent-state checkpoint that prompt lookup restores from.
+    lookup: bool = false,
+    /// Zero derives the process envelope from the finished plan.
+    cap_bytes: usize = 0,
+};
 pub const Plan = struct {
     lookup: bool = false,
     context: usize,
     chunk: usize,
     cap: usize,
+    cap_source: profile.Source,
+    host: profile.Host,
     amounts: memory.AdmissionAmounts,
-    pub fn inspect(source: *const model.Source, context: usize, chunk: usize, cap: usize) !Plan {
-        if (chunk == 0 or chunk > gpu.max_chunk or cap == 0 or cap > 4096 * MiB) return error.UnsupportedQwen35Budget;
+    pub fn inspect(source: *const model.Source, host: profile.Host, request: PlanRequest) !Plan {
+        if (request.chunk == 0 or request.chunk > gpu.max_chunk) return error.UnsupportedQwen35Budget;
+        if (request.context == 0 or request.context > profile.max_context) return error.UnsupportedQwen35Context;
         const head = try model.byteLen(try source.tensor("output.weight"));
-        const state = try model.stateBytes(context);
-        const p: Plan = .{ .context = context, .chunk = chunk, .cap = cap, .amounts = .{
+        const state = try model.stateBytes(request.context);
+        const amounts: memory.AdmissionAmounts = .{
             .backend_weight_bytes = head + 2 * model.layer_buffer_bytes + MiB,
             .backend_kv_bytes = state + 2 * MiB,
-            .backend_scratch_bytes = scratchBytes(context, chunk),
-            .host_scratch_bytes = 768 * MiB,
-        } };
-        if (p.total() + 512 * MiB > cap) return error.Qwen35MemoryBudgetExceeded;
-        return p;
+            .backend_scratch_bytes = scratchBytes(request.context, request.chunk),
+            .host_scratch_bytes = 768 * MiB + @as(usize, if (request.lookup) checkpoint_bytes else 0),
+        };
+        // Explicit and derived envelopes alike keep the admission reserve
+        // beyond the plan; a larger explicit cap only loosens the bound.
+        const resolved = profile.envelope(host, request.cap_bytes, amounts.hostTotalBytes() + amounts.backendTotalBytes(), profile.admission_reserve_bytes) catch |err| return profileError(err);
+        profile.checkBackend(host, amounts.backendTotalBytes(), @max(head, model.layer_buffer_bytes)) catch |err| return profileError(err);
+        return .{ .lookup = request.lookup, .context = request.context, .chunk = request.chunk, .cap = resolved.cap_bytes, .cap_source = resolved.source, .host = host, .amounts = amounts };
     }
-    pub fn enableLookup(self: *Plan) !void {
-        self.amounts.host_scratch_bytes += checkpoint_bytes;
-        if (self.total() + 512 * MiB > self.cap) return error.Qwen35MemoryBudgetExceeded;
-        self.lookup = true;
+    fn profileError(err: profile.Error) anyerror {
+        return switch (err) {
+            error.MemoryBudgetExceeded => error.Qwen35MemoryBudgetExceeded,
+            error.MetalWorkingSetExceeded => error.Qwen35MetalWorkingSetExceeded,
+            error.MetalBufferTooLarge => error.Qwen35MetalBufferTooLarge,
+            else => err,
+        };
     }
     pub fn total(self: Plan) usize {
         return self.amounts.hostTotalBytes() + self.amounts.backendTotalBytes();
     }
     pub fn acquire(self: Plan, controller: *memory.AdmissionController) !memory.AdmissionLease {
         if (comptime !@import("build_options").enable_metal) return error.MetalNotEnabled;
-        var info: mr.MetalDeviceInfo = .{};
-        if (mr.termite_metal_device_info_get(&info) != 0 or info.has_unified_memory == 0) return error.UnifiedMetalDeviceRequired;
-        if (self.cap > info.recommended_max_working_set_size) return error.Qwen35MemoryBudgetExceeded;
+        if (self.host.metal_working_set_bytes == 0) return error.UnifiedMetalDeviceRequired;
         controller.configureProcessMemoryLimit(self.cap, .explicit);
         return controller.tryAcquire(.gpu, .{ .host_limit_bytes = self.cap, .backend_limit_bytes = self.cap, .combined_limit_bytes = self.cap }, self.amounts, true);
     }
@@ -99,7 +115,13 @@ pub const Decoder = struct {
     logits: ?gpu.Buffer = null,
     position: usize = 0,
     current_layer: usize = 0,
+    /// Terminal: the GPU or artifact can no longer be trusted.
     failed: bool = false,
+    /// Sequence state is partially advanced but the head, slots and GPU
+    /// pipeline are intact; reset() restores an empty sequence.
+    needs_reset: bool = false,
+    /// The call in progress spans several tokens (see checkInside).
+    interruptible: bool = false,
     io: ?std.Io = null,
     embedding_bytes_read: u64 = 0,
     read_wait_ns: u64 = 0,
@@ -172,11 +194,44 @@ pub const Decoder = struct {
         }
         return b;
     }
+    /// Boundary check: process cancellation, live memory pressure and the cap.
     pub fn check(self: *Decoder) !void {
-        if (self.cancelled.load(.acquire)) return error.Cancelled;
+        try self.checkInsideToken();
         if (self.controller.isLiveHostUnderPressure()) return error.ResourceTemporarilyUnavailable;
+    }
+    /// A single token is never interrupted for a request cancel or a pressure
+    /// blip: it completes, and its owner checks at the token boundary with
+    /// the sequence still intact. Only process cancellation and a breached
+    /// cap stop it.
+    fn checkInsideToken(self: *Decoder) !void {
+        if (self.cancelled.load(.acquire)) return error.Cancelled;
         const p = @import("antfly_platform").process_memory.pressureSnapshot();
         if (p.available and p.footprint_bytes > self.plan.cap) return error.Qwen35MemoryBudgetExceeded;
+    }
+    /// Inside a multi-token chunk a request cancel or memory pressure may
+    /// also stop the work, at the price of the sequence.
+    fn checkInside(self: *Decoder) !void {
+        if (!self.interruptible) return self.checkInsideToken();
+        try control.checkRequest();
+        try self.check();
+    }
+    /// Failures after which the loaded head and GPU pipeline remain usable:
+    /// submitted batches are drained and both slots emptied before they
+    /// surface. A truncated artifact or any Metal error is not among them.
+    pub fn recoverable(err: anyerror) bool {
+        return switch (err) {
+            error.RequestCancelled, error.ResourceTemporarilyUnavailable, error.InputOutput, error.ReadTimedOut, error.ReadFailed => true,
+            else => false,
+        };
+    }
+    fn noteFailure(self: *Decoder, err: anyerror, mutated: bool) void {
+        if (!recoverable(err)) {
+            self.failed = true;
+        } else if (mutated) self.needs_reset = true;
+    }
+    fn ready(self: *const Decoder) !void {
+        if (self.failed) return error.Qwen35StateInvalid;
+        if (self.needs_reset) return error.Qwen35StateNeedsReset;
     }
     fn deinitContents(self: *Decoder) void {
         if (self.checkpoint) |bytes| self.allocator.free(bytes);
@@ -210,7 +265,7 @@ pub const Decoder = struct {
         return self.buffers[l % 2].?.ref().slice(@intCast(t.data_offset - slot.span.offset), try model.byteLen(t));
     }
     fn mm(self: *Decoder, l: usize, name: []const u8, rows: usize, input: gpu.Ref, out: gpu.Ref) !void {
-        try self.check();
+        try self.checkInside();
         const t = try self.source.layerTensor(l, name);
         const w = try self.weight(l, name);
         const raw = self.buffers[l % 2].?.bytes[w.offset..][0..w.bytes];
@@ -272,7 +327,8 @@ pub const Decoder = struct {
         return self.verifyDraft(inputs[0 .. count + 1]);
     }
     pub fn verifyDraft(self: *Decoder, inputs: []const i32) !Advance {
-        if (!self.plan.lookup or self.failed or self.position > self.plan.context or inputs.len < 2 or inputs.len > 5 or inputs.len > self.plan.chunk or inputs.len > self.plan.context - self.position) return error.InvalidPromptLookup;
+        try self.ready();
+        if (!self.plan.lookup or self.position > self.plan.context or inputs.len < 2 or inputs.len > 5 or inputs.len > self.plan.chunk or inputs.len > self.plan.context - self.position) return error.InvalidPromptLookup;
         const count = inputs.len - 1;
         for (inputs) |token| if (token < 0 or token >= 248320) return error.InvalidQwen35Token;
         const old_position = self.position;
@@ -313,6 +369,8 @@ pub const Decoder = struct {
         @memcpy(result.accepted[0..accepted], inputs[1..][0..accepted]);
         return result;
     }
+    /// Start an empty sequence. This also clears a recoverable failure that
+    /// stopped inside a chunk; a terminal failure still requires a new decoder.
     pub fn reset(self: *Decoder) !void {
         if (self.failed) return error.Qwen35StateInvalid;
         try self.kernels.endBatch();
@@ -323,16 +381,25 @@ pub const Decoder = struct {
         }
         self.position = 0;
         self.current_layer = 0;
+        self.needs_reset = false;
     }
     pub fn prefill(self: *Decoder, tokens: []const i32) !u32 {
-        if (self.failed) return error.Qwen35StateInvalid;
+        try self.ready();
         if (tokens.len == 0 or tokens.len > self.plan.chunk or tokens.len > self.plan.context - self.position) return error.UnsupportedQwen35Context;
         for (tokens) |t| if (t < 0 or t >= 248320) return error.InvalidQwen35Token;
-        errdefer {
-            self.failed = true;
+        var mutated = false;
+        return self.prefillUnguarded(tokens, &mutated) catch |err| {
+            self.noteFailure(err, mutated);
             self.kernels.core.cancelBatch();
             for (&self.slots) |*slot| slot.drain();
-        }
+            return err;
+        };
+    }
+    fn prefillUnguarded(self: *Decoder, tokens: []const i32, mutated: *bool) !u32 {
+        // Until the first layer executes, only scratch and a layer slot are
+        // written: a pressure blip, a cancellation or an unreadable range
+        // leaves the sequence exactly where the previous call left it.
+        self.interruptible = tokens.len > 1;
         try self.check();
         const embedding = try self.source.tensor("token_embd.weight");
         const row_bytes = (try model.byteLen(embedding)) / 248320;
@@ -346,7 +413,7 @@ pub const Decoder = struct {
         try self.slots[0].begin(&self.source.reader, 0, self.source.layers[0], self.io, self.cancelled);
         for (0..64) |l| {
             self.current_layer = l;
-            try self.check();
+            try self.checkInside();
             var slot = &self.slots[l % 2];
             const read_tick = if (self.kernels.profile_enabled) gpu.Profile.now() else 0;
             try slot.finish();
@@ -365,12 +432,14 @@ pub const Decoder = struct {
                 try self.mm(l, "attn_k.weight", tokens.len, self.normed.?.ref(), self.projections[1].?.ref());
                 try self.mm(l, "attn_v.weight", tokens.len, self.normed.?.ref(), self.projections[2].?.ref());
             }
+            // Recurrent and KV updates are encoded from here on.
+            mutated.* = true;
             for (0..tokens.len) |i| {
                 if (model.isLinear(l)) try self.linear(l, i) else try self.attention(l, i, self.position + i);
                 // Bound command queue size while retaining one layer load per chunk.
                 if ((i + 1) % 8 == 0) {
                     try self.kernels.endBatch();
-                    try self.check();
+                    try self.checkInside();
                     try self.kernels.core.beginBatch();
                 }
             }
@@ -408,7 +477,9 @@ pub const Decoder = struct {
         const token = std.mem.readInt(u32, self.scratch[1].?.bytes[0..4], .little);
         if (token >= 248320) return error.Qwen35NonFiniteLogits;
         self.position += tokens.len;
-        try self.check();
+        // The call is complete and consistent. Pressure is the next call's
+        // boundary check, so this result still reaches the caller.
+        try self.checkInsideToken();
         return token;
     }
 };
@@ -454,13 +525,12 @@ test "Qwen35 installed draft verification restores rejected recurrence and prese
     const a = std.testing.allocator;
     var source = try model.Source.open(a, std.mem.span(path));
     defer source.deinit();
-    var plan = try Plan.inspect(&source, 32, 512, 4096 * MiB);
-    try plan.enableLookup();
+    const plan = try Plan.inspect(&source, try profile.Host.detect(), .{ .context = 32, .chunk = 512, .lookup = true, .cap_bytes = 4096 * MiB });
     var controller: memory.AdmissionController = .{};
     var admission = try plan.acquire(&controller);
     defer admission.release();
     var cancelled: std.atomic.Value(bool) = .init(false);
-    try source.verify(&cancelled);
+    try source.verify(std.mem.span(path), .full, null, &cancelled);
     var executor = std.Io.Threaded.init(a, .{ .async_limit = .limited(1), .concurrent_limit = .limited(1), .stack_size = 256 * 1024 });
     defer executor.deinit();
     const decoder = try Decoder.create(a, &source, plan, &controller, &cancelled);
@@ -489,4 +559,36 @@ test "Qwen35 installed draft verification restores rejected recurrence and prese
     for (reference, decoder.logits.?.floats()) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.001);
     try std.testing.expectEqual(@as(usize, 1), decoder.lookup_stats.replays);
     try std.testing.expectEqual(@as(usize, 1), decoder.lookup_stats.accepted);
+}
+
+test "Qwen35 streamed plan derives its envelope and accepts caps above the old 4 GiB limit" {
+    // Only the head size comes from the artifact; a synthetic source keeps
+    // this a CPU-only contract test.
+    var dimensions = [_]u64{ 5120, 248320 };
+    var tensors = [_]gguf.format.TensorInfo{.{ .name = "output.weight", .dimensions = &dimensions, .tensor_type = .{ .known = .Q6_K }, .offset = 0, .data_offset = 0 }};
+    var source: model.Source = undefined;
+    source.file.tensors = &tensors;
+    const air: profile.Host = .{ .physical_bytes = 16 * 1024 * MiB, .metal_working_set_bytes = 11453251584 };
+    const derived = try Plan.inspect(&source, air, .{ .context = 4096, .chunk = 512 });
+    try std.testing.expectEqual(profile.Source.derived, derived.cap_source);
+    try std.testing.expectEqual(derived.total() + profile.derived_headroom_bytes, derived.cap);
+    try std.testing.expect(derived.cap <= 4096 * MiB);
+    const lookup = try Plan.inspect(&source, air, .{ .context = 4096, .chunk = 512, .lookup = true });
+    try std.testing.expectEqual(derived.cap + checkpoint_bytes, lookup.cap);
+    // The historical explicit cap still admits; a tighter one still fails closed.
+    const explicit = try Plan.inspect(&source, air, .{ .context = 4096, .chunk = 512, .cap_bytes = 4096 * MiB });
+    try std.testing.expectEqual(@as(usize, 4096 * MiB), explicit.cap);
+    try std.testing.expectEqual(profile.Source.explicit, explicit.cap_source);
+    try std.testing.expectError(error.Qwen35MemoryBudgetExceeded, Plan.inspect(&source, air, .{ .context = 4096, .chunk = 512, .cap_bytes = 2048 * MiB }));
+    // A larger host may raise the cap; nothing clamps or rejects it at 4 GiB.
+    const studio: profile.Host = .{ .physical_bytes = 48 * 1024 * MiB, .metal_working_set_bytes = 36 * 1024 * MiB };
+    try std.testing.expectEqual(@as(usize, 20 * 1024 * MiB), (try Plan.inspect(&source, studio, .{ .context = 4096, .chunk = 1024, .cap_bytes = 20 * 1024 * MiB })).cap);
+    try std.testing.expectError(error.ProcessCapExceedsPhysicalMemory, Plan.inspect(&source, air, .{ .context = 4096, .chunk = 512, .cap_bytes = 20 * 1024 * MiB }));
+    try std.testing.expectError(error.UnsupportedQwen35Context, Plan.inspect(&source, air, .{ .context = profile.max_context + 1, .chunk = 512 }));
+    try std.testing.expectError(error.UnsupportedQwen35Budget, Plan.inspect(&source, air, .{ .context = 4096, .chunk = gpu.max_chunk + 1 }));
+}
+
+test "Qwen35 decoder keeps the loaded model for cancellation pressure and transient reads only" {
+    for ([_]anyerror{ error.RequestCancelled, error.ResourceTemporarilyUnavailable, error.InputOutput, error.ReadTimedOut, error.ReadFailed }) |err| try std.testing.expect(Decoder.recoverable(err));
+    for ([_]anyerror{ error.Cancelled, error.IncompleteRead, error.NotOpenForReading, error.NoDevice, error.Qwen35MemoryBudgetExceeded, error.Qwen35NonFiniteLogits, error.StaleStreamedLease, error.OutOfMemory }) |err| try std.testing.expect(!Decoder.recoverable(err));
 }

@@ -26,52 +26,106 @@ const gpu = @import("../backends/qwen4exp_kernels.zig");
 const mr = @import("../backends/metal_runtime.zig");
 pub const pager = @import("../runtime/moe/qwen4exp_pager.zig");
 const memory = @import("../runtime/tier/memory.zig");
+const profile = @import("../runtime/machine_profile.zig");
 extern fn termite_metal_qwen4exp_alias(runtime: *mr.RawMetalDecodeRuntime, data: [*]u8, bytes: usize) ?*anyopaque;
 extern fn termite_metal_buffer_release(handle: *anyopaque) void;
 const MiB = 1024 * 1024;
 
+pub const PlanRequest = struct {
+    context: usize,
+    /// Zero derives the largest expert cache the envelope admits.
+    cache_bytes: usize = 0,
+    /// Zero derives the process envelope from the finished plan.
+    cap_bytes: usize = 0,
+};
+
 pub const Plan = struct {
     cfg: model.Config,
-    slots: [48]u8,
+    slots: [48]u16,
     context: usize,
     amounts: memory.AdmissionAmounts,
-    pub fn inspect(store: store_mod.TensorStore, context: usize, cache_bytes: usize) !Plan {
+    host: profile.Host,
+    envelope: profile.Envelope,
+    /// Bytes of expert slots actually planned, never the requested budget.
+    cache_bytes: usize,
+    cache_source: profile.Source,
+    pub fn inspect(store: store_mod.TensorStore, host: profile.Host, request: PlanRequest) !Plan {
+        if (request.context == 0 or request.context > profile.max_context) return error.UnsupportedQwen4ExpContext;
         const file = store.ggufFile() orelse return error.NotGguf;
         const cfg = try model.Config.fromGguf(file);
-        const state = try cfg.stateBytes(context);
+        const state = try cfg.stateBytes(request.context);
         const inventory = try model.Inventory.inspect(file, cfg);
         try model.Inventory.validateRequired(file, cfg);
-        const slots = try inventory.cacheSlots(cache_bytes, 10);
         var weights: usize = 0;
+        var largest: usize = 0;
         for (file.tensors) |tensor| {
             if (isPagedWeight(tensor.name)) continue;
-            weights = try std.math.add(usize, weights, try rounded(@intCast(gguf.tensor_types.byteLen(tensor.tensor_type, tensor.dimensions).?)));
+            const bytes = try rounded(@intCast(gguf.tensor_types.byteLen(tensor.tensor_type, tensor.dimensions).?));
+            weights = try std.math.add(usize, weights, bytes);
+            largest = @max(largest, bytes);
         }
         weights = try std.math.add(usize, weights, try rounded(embedding_row_bytes));
-        for (slots, inventory.per_expert_bytes) |count, stride| weights = try std.math.add(usize, weights, try rounded(count * stride));
+        var amounts: memory.AdmissionAmounts = .{
+            .backend_weight_bytes = weights,
+            .backend_kv_bytes = state + 48 * 4 * std.heap.pageSize(),
+            // Includes all scratch pages, Metal runtime overhead, metadata and tokenizer.
+            .backend_scratch_bytes = 64 * MiB,
+            .host_scratch_bytes = 64 * MiB + 64 * MiB + 768 * MiB + pager.read_executor_bytes,
+        };
+        // Each layer's slots are one page-rounded allocation.
+        const rounding = 48 * std.heap.pageSize();
+        const cache_source: profile.Source = if (request.cache_bytes != 0) .explicit else .derived;
+        const budget = if (request.cache_bytes != 0) request.cache_bytes else blk: {
+            const fixed_backend = amounts.backendTotalBytes() + rounding;
+            const available = profile.cacheBudget(host, request.cap_bytes, amounts.hostTotalBytes() + fixed_backend, fixed_backend) catch |err| return profileError(err);
+            break :blk @min(available, try inventory.cacheBytes(cfg.experts));
+        };
+        const slots = inventory.cacheSlots(budget, cfg.top_k, cfg.experts) catch |err| return switch (err) {
+            // A derived budget below one route means this host cannot hold the model.
+            error.InvalidQwen4ExpCacheBudget => if (cache_source == .derived) error.Qwen4ExpMemoryBudgetExceeded else err,
+            else => err,
+        };
+        var cache_bytes: usize = 0;
+        for (slots, inventory.per_expert_bytes) |count, stride| {
+            const bytes = try rounded(@as(usize, count) * stride);
+            cache_bytes += @as(usize, count) * stride;
+            largest = @max(largest, bytes);
+            amounts.backend_weight_bytes = try std.math.add(usize, amounts.backend_weight_bytes, bytes);
+        }
+        // An explicit cap must hold the admission reserve too: a plan the
+        // controller can never admit is rejected here, where a dry run sees it.
+        const resolved = profile.envelope(host, request.cap_bytes, amounts.hostTotalBytes() + amounts.backendTotalBytes(), profile.admission_reserve_bytes) catch |err| return profileError(err);
+        profile.checkBackend(host, amounts.backendTotalBytes(), largest) catch |err| return profileError(err);
         return .{
             .cfg = cfg,
             .slots = slots,
-            .context = context,
-            .amounts = .{
-                .backend_weight_bytes = weights,
-                .backend_kv_bytes = state + 48 * 4 * std.heap.pageSize(),
-                // Includes all scratch pages, Metal runtime overhead, metadata and tokenizer.
-                .backend_scratch_bytes = 64 * MiB,
-                .host_scratch_bytes = 64 * MiB + 64 * MiB + 768 * MiB + pager.read_executor_bytes,
-            },
+            .context = request.context,
+            .amounts = amounts,
+            .host = host,
+            .envelope = resolved,
+            .cache_bytes = cache_bytes,
+            .cache_source = cache_source,
+        };
+    }
+    fn profileError(err: profile.Error) anyerror {
+        return switch (err) {
+            error.MemoryBudgetExceeded => error.Qwen4ExpMemoryBudgetExceeded,
+            error.MetalWorkingSetExceeded => error.Qwen4ExpMetalWorkingSetExceeded,
+            error.MetalBufferTooLarge => error.Qwen4ExpMetalBufferTooLarge,
+            else => err,
         };
     }
     pub fn total(self: Plan) usize {
         return self.amounts.hostTotalBytes() + self.amounts.backendTotalBytes();
     }
-    pub fn acquire(self: Plan, controller: *memory.AdmissionController, requested_limit: usize) !memory.AdmissionLease {
+    pub fn acquire(self: Plan, controller: *memory.AdmissionController) !memory.AdmissionLease {
         if (comptime !options.enable_metal) return error.MetalNotEnabled;
-        var info: mr.MetalDeviceInfo = .{};
-        if (mr.termite_metal_device_info_get(&info) != 0 or info.has_unified_memory == 0) return error.UnifiedMetalDeviceRequired;
-        const cap = @min(@min(if (requested_limit == 0) 10 * 1024 * MiB else requested_limit, 10 * 1024 * MiB), info.recommended_max_working_set_size);
-        if (cap == 0 or self.total() > cap) return error.Qwen4ExpMemoryBudgetExceeded;
-        controller.configureProcessMemoryLimit(cap, if (requested_limit != 0) .explicit else .automatic);
+        if (self.host.metal_working_set_bytes == 0) return error.UnifiedMetalDeviceRequired;
+        const cap = self.envelope.cap_bytes;
+        // Derived or explicit, the envelope is this process's whole bound. A
+        // derived one already excludes the node headroom, so the controller
+        // must not reserve that headroom a second time inside it.
+        controller.configureProcessMemoryLimit(cap, .explicit);
         return controller.tryAcquire(.gpu, .{ .host_limit_bytes = cap, .backend_limit_bytes = cap, .combined_limit_bytes = cap }, self.amounts, true);
     }
 };
@@ -110,15 +164,21 @@ pub const Decoder = struct {
     scratch_count: usize = 0,
     ngrams: ?pager.NgramCache = null,
     ngram_bytes: ?gpu.Buffer = null,
-    embedding_reader: ?c_file.RangeReader = null,
+    /// Borrowed from the store, like every other weight range.
+    embedding_reader: ?*const c_file.RangeReader = null,
     embedding_offset: u64 = 0,
+    embedding_read_retries: u64 = 0,
     embedding_bytes: ?gpu.Buffer = null,
     ple_history: ?gpu.Buffer = null,
     logits: ?gpu.Buffer = null,
     staging: []u8 = &.{},
     ngram_state: model.NgramState,
     position: usize = 0,
+    /// Terminal: the GPU or model state can no longer be trusted.
     failed: bool = false,
+    /// Sequence state is partially advanced but the loaded weights, expert
+    /// cache and GPU pipeline are intact; reset() restores an empty sequence.
+    needs_reset: bool = false,
     controller: ?*memory.AdmissionController = null,
     read_io: ?std.Io = null,
     route_trace: ?[]u16 = null,
@@ -137,6 +197,8 @@ pub const Decoder = struct {
         errdefer self.deinitContents();
         self.kernels.cancelled = &control.cancelled;
         try control.check();
+        // Every range read below shares the descriptors the artifact was verified through.
+        try store_mod.SplitGgufStore.bindReaders(store);
         if (std.c.getenv("ANTFLY_QWEN4EXP_ROUTE_TRACE") != null) self.route_trace = try allocator.alloc(u16, plan.context * 48 * 10);
         if (std.c.getenv("ANTFLY_QWEN4EXP_PREFILL_CHUNK")) |value| {
             self.prefill_chunk = try std.fmt.parseInt(usize, std.mem.span(value), 10);
@@ -159,7 +221,7 @@ pub const Decoder = struct {
         {
             var range = (try store.describeTensorRange(allocator, "token_embd.weight")) orelse return error.MissingTensorRange;
             defer range.deinit(allocator);
-            self.embedding_reader = try c_file.RangeReader.open(allocator, range.path, true);
+            self.embedding_reader = try store_mod.SplitGgufStore.tensorReader(store, "token_embd.weight");
             const size = self.embedding_reader.?.size;
             if (range.byte_offset > size or range.byte_len > size - range.byte_offset) return error.RegionOutOfBounds;
             self.embedding_offset = range.byte_offset;
@@ -192,8 +254,7 @@ pub const Decoder = struct {
             defer range.deinit(allocator);
             var buffer = try gpu.Buffer.init(self.kernels.runtime, range.byte_len);
             errdefer buffer.deinit();
-            var reader = try c_file.RangeReader.open(allocator, range.path, true);
-            defer reader.deinit();
+            const reader = try store_mod.SplitGgufStore.tensorReader(store, tensor.name);
             try reader.read(range.byte_offset, buffer.bytes[0..range.byte_len]);
             const name = try allocator.dupe(u8, tensor.name);
             errdefer allocator.free(name);
@@ -242,7 +303,6 @@ pub const Decoder = struct {
         if (self.ngrams) |*cache| cache.deinit();
         if (self.ngram_bytes) |*buffer| buffer.deinit();
         if (self.embedding_bytes) |*buffer| buffer.deinit();
-        if (self.embedding_reader) |*reader| reader.deinit();
         if (self.ple_history) |*buffer| buffer.deinit();
         if (self.logits) |*buffer| buffer.deinit();
         self.allocator.free(self.staging);
@@ -267,12 +327,48 @@ pub const Decoder = struct {
             result.misses +|= layer.stats.misses;
             result.bytes_read +|= layer.stats.bytes_read;
             result.read_failures +|= layer.stats.read_failures;
+            result.read_retries +|= layer.stats.read_retries;
         }
         return result;
     }
+    pub fn expertCacheBytes(self: *const Decoder) usize {
+        var bytes: usize = 0;
+        for (self.layers) |layer| bytes += layer.slotCount() * layer.stride;
+        return bytes;
+    }
+    /// Boundary check: process cancellation and live memory pressure.
     pub fn check(self: *Decoder) !void {
         try control.check();
         if (self.controller) |controller| if (controller.isLiveHostUnderPressure()) return error.ResourceTemporarilyUnavailable;
+    }
+    /// Between the layers of a multi-token chunk a request cancel or memory
+    /// pressure may stop the work, at the price of the sequence. A single
+    /// token is never interrupted for them: it completes, and its owner
+    /// checks at the token boundary with the sequence still intact.
+    fn checkInsideChunk(self: *Decoder) !void {
+        try control.checkRequest();
+        try self.check();
+    }
+    /// Failures that leave the loaded model usable: expert reads roll back,
+    /// submitted batches are drained and leases released before they surface.
+    /// A truncated artifact, a revoked descriptor or any Metal error does not.
+    pub fn recoverable(err: anyerror) bool {
+        return switch (err) {
+            error.RequestCancelled, error.ResourceTemporarilyUnavailable, error.InputOutput, error.ReadTimedOut, error.ReadFailed => true,
+            else => false,
+        };
+    }
+    fn noteFailure(self: *Decoder, err: anyerror, mutated: bool) void {
+        if (!recoverable(err)) {
+            self.failed = true;
+        } else if (mutated) self.needs_reset = true;
+    }
+    fn ready(self: *const Decoder) !void {
+        if (self.failed) return error.Qwen4ExpStateInvalid;
+        if (self.needs_reset) return error.Qwen4ExpStateNeedsReset;
+    }
+    fn readEmbeddingRow(self: *Decoder, token: usize) !void {
+        try pager.readRetrying(self.embedding_reader.?, self.embedding_offset + @as(u64, token) * embedding_row_bytes, self.embedding_bytes.?.bytes[0..embedding_row_bytes], &control.cancelled, null, &self.embedding_read_retries);
     }
     fn s(self: *Decoder, index: usize) gpu.Ref {
         return self.scratch[index].ref();
@@ -420,7 +516,7 @@ pub const Decoder = struct {
                 if (grouped) try self.groupedExperts(l, resident_mask) else for (0..10) |route| {
                     if (pending.route.repaired[route]) continue;
                     var sources: [3][]const u8 = undefined;
-                    for (0..3) |projection| sources[projection] = pending.residentProjection(route, projection);
+                    for (0..3) |projection| sources[projection] = try pending.residentProjection(route, projection);
                     try self.expert(l, route, sources, try self.s(20).slice(route * 2560 * 4, 2560 * 4));
                 }
                 try self.kernels.submitBatch();
@@ -435,7 +531,7 @@ pub const Decoder = struct {
             if (grouped) try self.groupedExperts(l, 1023 ^ resident_mask) else for (0..10) |route| {
                 if (!lease.route.repaired[route]) continue;
                 var sources: [3][]const u8 = undefined;
-                for (0..3) |projection| sources[projection] = lease.projection(route, projection);
+                for (0..3) |projection| sources[projection] = try lease.projection(route, projection);
                 try self.expert(l, route, sources, try self.s(20).slice(route * 2560 * 4, 2560 * 4));
             }
             // Read completion never changes floating point reduction order.
@@ -451,7 +547,7 @@ pub const Decoder = struct {
             errdefer self.kernels.cancelBatch();
             for (0..10) |route| {
                 var sources: [3][]const u8 = undefined;
-                for (0..3) |projection| sources[projection] = lease.projection(route, projection);
+                for (0..3) |projection| sources[projection] = try lease.projection(route, projection);
                 try self.expert(l, route, sources, self.s(10));
                 try self.run(.{ .op = 14, .n = 2560, .index = @intCast(10 + route) }, &.{ self.s(10), self.s(18) }, self.s(19));
             }
@@ -549,19 +645,29 @@ pub const Decoder = struct {
     /// token order; routed experts are loaded once per union and use GEMMs.
     /// Only CPU copies/gathers occur on the host, never model arithmetic.
     pub fn prefillChunk(self: *Decoder, tokens: []const i32) !u32 {
-        if (self.failed) return error.Qwen4ExpStateInvalid;
+        try self.ready();
         if (tokens.len == 0 or tokens.len > self.prefill_chunk or self.position + tokens.len > self.plan.context) return error.Qwen4ExpContextOrTokenOutOfRange;
         for (tokens) |token| if (token < 0 or token >= 248320) return error.Qwen4ExpContextOrTokenOutOfRange;
-        errdefer self.failed = true;
-        errdefer self.kernels.cancelBatch();
+        var mutated = false;
+        return self.prefillChunkUnguarded(tokens, &mutated) catch |err| {
+            self.kernels.cancelBatch();
+            self.noteFailure(err, mutated);
+            return err;
+        };
+    }
+    fn prefillChunkUnguarded(self: *Decoder, tokens: []const i32, mutated: *bool) !u32 {
+        // Until the first layer runs, only scratch is written: a pressure
+        // blip, a cancellation or an unreadable embedding row leaves the
+        // sequence exactly where the previous call left it.
         try self.check();
         const base = self.position;
         for (tokens, 0..) |token, t| {
-            try self.embedding_reader.?.read(self.embedding_offset + @as(u64, @intCast(token)) * embedding_row_bytes, self.embedding_bytes.?.bytes[0..embedding_row_bytes]);
+            try self.readEmbeddingRow(@intCast(token));
             try self.run(.{ .op = 7, .n = 10240, .dim = 2560, .index = 0 }, &.{self.embedding_bytes.?.ref()}, try self.prefillRef(0, t * 10240 * 4, 10240 * 4));
         }
+        mutated.* = true;
         for (0..48) |l| {
-            try self.check();
+            try self.checkInsideChunk();
             const batched = self.batch_linear and self.plan.cfg.isLinear(l);
             if (batched) try self.prefillLinear(l, tokens, base);
             for (tokens, 0..) |token, t| {
@@ -631,7 +737,7 @@ pub const Decoder = struct {
                     while (batch_start < count) {
                         const batch_rows: usize = @min(32, count - batch_start);
                         for (self.layers[l].projections, 0..) |projection, p| {
-                            const source = lease.projection(lease_index, p);
+                            const source = try lease.projection(lease_index, p);
                             const weight = gpu.Ref{ .handle = self.layer_handles[l], .offset = @intFromPtr(source.ptr) - @intFromPtr(self.layers[l].bytes.ptr), .bytes = source.len };
                             try self.prefillMatmul(projection.format.raw(), weight, projection.input, projection.output, batch_rows, if (p == 2) self.s(9) else try self.prefillRef(6, batch_start * 2560 * 4, batch_rows * 2560 * 4), if (p == 2) try self.prefillRef(7, batch_start * 2560 * 4, batch_rows * 2560 * 4) else self.s(if (p == 0) 7 else 8));
                             if (p == 1) try self.run(.{ .op = 12, .n = @intCast(batch_rows * 640) }, &.{ self.s(7), self.s(8) }, self.s(9));
@@ -665,8 +771,9 @@ pub const Decoder = struct {
         self.position = base + tokens.len;
         return result;
     }
-    /// A failed token poisons the recurrent state: callers must destroy the
-    /// decoder rather than retrying from a partially advanced layer.
+    /// Start an empty sequence. This also clears a recoverable failure that
+    /// stopped inside a token; the expert cache and loaded weights are kept.
+    /// A terminal failure still requires destroying the decoder.
     pub fn reset(self: *Decoder) !void {
         if (self.failed) return error.Qwen4ExpStateInvalid;
         try self.kernels.endBatch();
@@ -676,6 +783,7 @@ pub const Decoder = struct {
         if (self.ple_history) |b| @memset(b.bytes, 0);
         self.ngram_state = model.NgramState.init(self.plan.cfg.eos);
         self.position = 0;
+        self.needs_reset = false;
     }
     pub fn step(self: *Decoder, token: u32) !u32 {
         return self.stepWithOutput(token, true);
@@ -684,18 +792,26 @@ pub const Decoder = struct {
         return self.stepWithOutput(token, last or std.c.getenv("ANTFLY_QWEN4EXP_DISABLE_PREFILL_HEAD_SKIP") != null);
     }
     fn stepWithOutput(self: *Decoder, token: u32, output: bool) !u32 {
-        if (self.failed) return error.Qwen4ExpStateInvalid;
+        try self.ready();
         if (self.position >= self.plan.context or token >= 248320) return error.Qwen4ExpContextOrTokenOutOfRange;
-        errdefer self.failed = true;
-        errdefer self.kernels.cancelBatch();
+        var mutated = false;
+        return self.stepUnguarded(token, output, &mutated) catch |err| {
+            self.kernels.cancelBatch();
+            self.noteFailure(err, mutated);
+            return err;
+        };
+    }
+    fn stepUnguarded(self: *Decoder, token: u32, output: bool, mutated: *bool) !u32 {
+        // See prefillChunkUnguarded: nothing before the first layer touches the sequence.
         try self.check();
         // Only one 2720-byte Q8 row is used. Keeping the entire 644 MiB table
         // resident wastes expert-cache capacity and Metal residency work.
-        try self.embedding_reader.?.read(self.embedding_offset + @as(u64, token) * embedding_row_bytes, self.embedding_bytes.?.bytes[0..embedding_row_bytes]);
+        try self.readEmbeddingRow(token);
         try self.run(.{ .op = 7, .n = 10240, .dim = 2560, .index = 0 }, &.{self.embedding_bytes.?.ref()}, self.s(0));
         try self.capture("embed", 0, self.s(0), 2560);
+        mutated.* = true;
         for (0..48) |l| {
-            try self.check();
+            try control.check();
             try self.kernels.beginBatch();
             if (l == 1) try self.ple(token);
             try self.hc(l, "hc_attn", true);
@@ -730,9 +846,9 @@ test "Qwen4Exp installed decoder performs native Metal generation" {
     const path = std.c.getenv("ANTFLY_QWEN4EXP_RUN_GGUF") orelse return error.SkipZigTest;
     const store = try store_mod.SplitGgufStore.open(std.testing.allocator, std.mem.span(path));
     defer store.deinit();
-    const plan = try Plan.inspect(store, 16, 2 * 1024 * MiB);
+    const plan = try Plan.inspect(store, try profile.Host.detect(), .{ .context = 16, .cache_bytes = 2 * 1024 * MiB, .cap_bytes = 10 * 1024 * MiB });
     var controller: memory.AdmissionController = .{};
-    var lease = try plan.acquire(&controller, 10 * 1024 * MiB);
+    var lease = try plan.acquire(&controller);
     defer lease.release();
     var executor = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .limited(pager.read_lane_count), .concurrent_limit = .limited(pager.read_lane_count), .stack_size = pager.read_stack_bytes });
     defer executor.deinit();
@@ -765,9 +881,9 @@ test "Qwen4Exp installed chunked prefill preserves complete recurrent state and 
     const store = try store_mod.SplitGgufStore.open(a, std.mem.span(path));
     defer store.deinit();
     const test_cache_mb = if (std.c.getenv("ANTFLY_QWEN4EXP_TEST_CACHE_MB")) |value| try std.fmt.parseInt(usize, std.mem.span(value), 10) else 2048;
-    const plan = try Plan.inspect(store, 32, test_cache_mb * MiB);
+    const plan = try Plan.inspect(store, try profile.Host.detect(), .{ .context = 32, .cache_bytes = test_cache_mb * MiB, .cap_bytes = 9 * 1024 * MiB });
     var controller: memory.AdmissionController = .{};
-    var admission = try plan.acquire(&controller, 9 * 1024 * MiB);
+    var admission = try plan.acquire(&controller);
     defer admission.release();
     var executor = std.Io.Threaded.init(a, .{ .async_limit = .limited(pager.read_lane_count), .concurrent_limit = .limited(pager.read_lane_count), .stack_size = pager.read_stack_bytes });
     defer executor.deinit();
@@ -830,7 +946,13 @@ test "Qwen4Exp installed chunked prefill preserves complete recurrent state and 
 }
 
 test "Qwen4Exp tiled prefill buffers fit the admitted scratch budget" {
-    var total: usize = 24 * 4096 * 24 * 4 + 512 * 6144 * 4 + 32 * 512 * 4;
+    var total: usize = 24 * profile.max_context * 24 * 4 + 512 * 6144 * 4 + 32 * 512 * 4;
     for (Decoder.prefill_widths) |width| total += width * 128 * 4;
     try std.testing.expect(total < 64 * MiB);
+}
+
+test "Qwen4Exp decoder keeps the loaded model for cancellation pressure and transient reads only" {
+    for ([_]anyerror{ error.RequestCancelled, error.ResourceTemporarilyUnavailable, error.InputOutput, error.ReadTimedOut, error.ReadFailed }) |err| try std.testing.expect(Decoder.recoverable(err));
+    // The artifact or the GPU can no longer be trusted after these.
+    for ([_]anyerror{ error.Cancelled, error.IncompleteRead, error.NotOpenForReading, error.NoDevice, error.MetalFrameSyncFailed, error.Qwen4ExpNonFiniteLogits, error.Qwen4ExpInvalidRoute, error.OutOfMemory }) |err| try std.testing.expect(!Decoder.recoverable(err));
 }

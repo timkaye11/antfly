@@ -25,15 +25,23 @@ const generation = @import("pipelines/generation.zig");
 const hf = @import("inference_hf_tokenizer");
 const control = @import("util/local_control.zig");
 const model = @import("models/qwen4exp.zig");
+const profile = @import("runtime/machine_profile.zig");
+const verification = @import("util/artifact_verification.zig");
 const platform = @import("antfly_platform");
 
 pub const Options = struct {
     model: []const u8,
     prompt: []const u8,
     max_tokens: usize = 128,
-    context: usize = 4096,
-    cache_mb: usize = 2048,
+    context: usize = profile.max_context,
+    /// Zero derives the largest expert cache the machine profile admits.
+    cache_mb: usize = 0,
+    /// Zero derives the process envelope from the finished plan.
     combined_mb: usize = 0,
+    verify: verification.Mode = .full,
+    /// Report the memory plan and machine profile, then exit without
+    /// verifying or loading weights.
+    dry_run: bool = false,
     stream: bool = false,
     session: bool = false,
     raw: bool = false,
@@ -50,14 +58,14 @@ pub const Options = struct {
     logits_path: ?[]const u8 = null,
 };
 
-const RunStatus = struct { stage: []const u8 = "arguments", hash_verified: bool = false };
+const RunStatus = struct { stage: []const u8 = "arguments", verification: verification.Outcome = .{} };
 pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options) !void {
     var guard = control.Guard.init();
     defer guard.deinit();
     var status: RunStatus = .{};
     runInner(a, io, opts, &status) catch |failure| {
         if (opts.json_path) |p| {
-            const report = .{ .architecture = "qwen4exp", .experimental = true, .finish_reason = @errorName(failure), .failure_stage = status.stage, .hash_verified = status.hash_verified, .artifact_revision = model.artifact_revision, .process_memory = platform.process_memory.pressureSnapshot() };
+            const report = .{ .architecture = "qwen4exp", .experimental = true, .finish_reason = @errorName(failure), .failure_stage = status.stage, .hash_verified = status.verification.hashed, .stamp_verified = status.verification.stamp_accepted, .verification_mode = @tagName(opts.verify), .artifact_revision = model.artifact_revision, .process_memory = platform.process_memory.pressureSnapshot() };
             if (std.json.Stringify.valueAlloc(a, report, .{ .whitespace = .indent_2 })) |json| {
                 defer a.free(json);
                 std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = json }) catch |err| std.log.err("failure receipt: {s}", .{@errorName(err)});
@@ -67,7 +75,7 @@ pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options) !void {
     };
 }
 fn runInner(a: std.mem.Allocator, io: std.Io, opts: Options, status: *RunStatus) !void {
-    if (opts.context == 0 or opts.context > 4096 or opts.max_tokens == 0 or opts.max_tokens > opts.context) return error.UnsupportedQwen4ExpContext;
+    if (opts.context == 0 or opts.context > profile.max_context or opts.max_tokens == 0 or opts.max_tokens > opts.context) return error.UnsupportedQwen4ExpContext;
     const start = std.Io.Timestamp.now(io, .awake);
     // A shard path is unambiguous, including the metadata-only first shard.
     const path = if (std.mem.endsWith(u8, opts.model, ".gguf")) try a.dupe(u8, opts.model) else blk: {
@@ -79,14 +87,52 @@ fn runInner(a: std.mem.Allocator, io: std.Io, opts: Options, status: *RunStatus)
     status.stage = "inventory";
     const store = try store_mod.SplitGgufStore.open(a, path);
     defer store.deinit();
-    const plan = try decoder_mod.Plan.inspect(store, opts.context, try std.math.mul(usize, opts.cache_mb, 1024 * 1024));
+    const host = try profile.Host.detect();
+    const plan = try decoder_mod.Plan.inspect(store, host, .{
+        .context = opts.context,
+        .cache_bytes = try std.math.mul(usize, opts.cache_mb, profile.MiB),
+        .cap_bytes = try std.math.mul(usize, opts.combined_mb, profile.MiB),
+    });
+    if (opts.dry_run) {
+        const inventory = try model.Inventory.inspect(store.ggufFile().?, plan.cfg);
+        var counts: [48]usize = undefined;
+        for (plan.slots, &counts) |count, *out| out.* = count;
+        const report = .{
+            .model = "Qwen3.8-Flash-Next",
+            .architecture = "qwen4exp",
+            .artifact_revision = model.artifact_revision,
+            .hash_verified = false,
+            .context = plan.context,
+            .amounts = plan.amounts,
+            .admitted_bytes = plan.total(),
+            .process_cap_bytes = plan.envelope.cap_bytes,
+            .process_cap_source = @tagName(plan.envelope.source),
+            .machine_profile = profile.report(host, plan.envelope),
+            .expert_cache_bytes = plan.cache_bytes,
+            .expert_cache_source = @tagName(plan.cache_source),
+            .expert_slot_counts = counts,
+            .expert_strides = inventory.per_expert_bytes,
+            .experts_per_layer = plan.cfg.experts,
+            .resident_expert_fraction = @as(f64, @floatFromInt(plan.cache_bytes)) / @as(f64, @floatFromInt(try inventory.cacheBytes(plan.cfg.experts))),
+        };
+        const json = try std.json.Stringify.valueAlloc(a, report, .{ .whitespace = .indent_2 });
+        defer a.free(json);
+        try @import("local_text_session.zig").writeStdout(json);
+        try @import("local_text_session.zig").writeStdout("\n");
+        if (opts.json_path) |p| try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = json });
+        return;
+    }
     var controller: memory.AdmissionController = .{};
     status.stage = "admission";
-    var lease = try plan.acquire(&controller, try std.math.mul(usize, opts.combined_mb, 1024 * 1024));
+    var lease = try plan.acquire(&controller);
     defer lease.release();
     status.stage = "artifact_verification";
-    try store_mod.SplitGgufStore.verifyShardIdentity(store, &model.artifact_shards, &control.cancelled);
-    status.hash_verified = true;
+    // Hashing and every later weight read share these descriptors.
+    try store_mod.SplitGgufStore.bindReaders(store);
+    const stamp_dir = verification.defaultStampDir(a);
+    defer if (stamp_dir) |dir| a.free(dir);
+    std.debug.print("Qwen4Exp: verifying {d} artifact shards ({s})\n", .{ model.artifact_shards.len, @tagName(opts.verify) });
+    status.verification = try store_mod.SplitGgufStore.verifyShardIdentity(store, &model.artifact_shards, model.artifact_revision, opts.verify, stamp_dir, &control.cancelled);
     status.stage = "tokenizer";
     var sidecar_dir = std.fs.path.dirname(path) orelse ".";
     if (!c_file.fileExistsInDir(a, sidecar_dir, "tokenizer.json")) sidecar_dir = std.fs.path.dirname(sidecar_dir) orelse return error.MissingQwen4ExpTokenizer;
@@ -127,7 +173,7 @@ fn runInner(a: std.mem.Allocator, io: std.Io, opts: Options, status: *RunStatus)
     if (opts.print_prompt) std.debug.print("{s}\n", .{prompt});
     if (opts.print_prompt_ids) std.debug.print("prompt_token_ids={any}\n", .{prompt_ids});
     if (opts.print_template) std.debug.print("chat_template={}\n", .{template != null});
-    std.debug.print("experimental qwen4exp: context={d}, expert_cache_mb={d}, admitted_bytes={d}\n", .{ opts.context, opts.cache_mb, plan.total() });
+    std.debug.print("experimental qwen4exp: context={d}, expert_cache_bytes={d} ({s}), process_cap_bytes={d} ({s}), admitted_bytes={d}\n", .{ opts.context, plan.cache_bytes, @tagName(plan.cache_source), plan.envelope.cap_bytes, @tagName(plan.envelope.source), plan.total() });
     // Command-scoped execution owner. Bounded worker stacks plus executor
     // bookkeeping are reserved in Plan before any workers can be scheduled.
     const reader = decoder_mod.pager;
@@ -140,17 +186,25 @@ fn runInner(a: std.mem.Allocator, io: std.Io, opts: Options, status: *RunStatus)
     decoder.controller = &controller;
     status.stage = if (opts.session) "session" else "prefill";
     if (std.c.getenv("ANTFLY_QWEN4EXP_DISABLE_PARALLEL_READS") == null) decoder.read_io = read_executor.io();
-    if (opts.session) return @import("local_text_session.zig").run(a, io, decoder, &controller, tokenizer.tokenizer(), if (template) |*t| t else null, .{
-        .context = opts.context,
-        .max_tokens = opts.max_tokens,
-        .raw = opts.raw,
-        .thinking = opts.enable_thinking,
-        .eos = config.value.eos_token_id,
-        .ignore_eos = opts.ignore_eos,
-        .model = "Qwen3.8-Flash-Next",
-        .artifact_hash_verified = status.hash_verified,
-        .artifact_id = model.artifact_revision,
-    });
+    if (opts.session) {
+        const result = @import("local_text_session.zig").run(a, io, decoder, &controller, tokenizer.tokenizer(), if (template) |*t| t else null, .{
+            .context = opts.context,
+            .max_tokens = opts.max_tokens,
+            .raw = opts.raw,
+            .thinking = opts.enable_thinking,
+            .eos = config.value.eos_token_id,
+            .ignore_eos = opts.ignore_eos,
+            .model = "Qwen3.8-Flash-Next",
+            .artifact_hash_verified = status.verification.hashed,
+            .artifact_stamp_verified = status.verification.stamp_accepted,
+            .verification_mode = @tagName(status.verification.mode),
+            .artifact_id = model.artifact_revision,
+            .process_cap_bytes = plan.envelope.cap_bytes,
+        });
+        // The trace covers the sequence the decoder holds when the session ends.
+        writeRouteTrace(io, decoder) catch |err| std.log.err("route trace: {s}", .{@errorName(err)});
+        return result;
+    }
     const loaded = std.Io.Timestamp.now(io, .awake);
     const loaded_profile = decoder.kernels.profile;
     std.debug.print("Qwen4Exp: prefilling {d} tokens\n", .{prompt_ids.len});
@@ -209,9 +263,7 @@ fn runInner(a: std.mem.Allocator, io: std.Io, opts: Options, status: *RunStatus)
     }
     status.stage = "output";
     const finished = std.Io.Timestamp.now(io, .awake);
-    if (std.c.getenv("ANTFLY_QWEN4EXP_ROUTE_TRACE")) |p| {
-        if (decoder.route_trace) |trace| try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = std.mem.span(p), .data = std.mem.sliceAsBytes(trace[0 .. decoder.position * 48 * 10]) });
-    }
+    try writeRouteTrace(io, decoder);
     const text = try tokenizer.tokenizer().decode(a, output.items);
     defer a.free(text);
     try @import("local_text_session.zig").writeStdout(text[if (opts.stream) printed else 0..]);
@@ -233,21 +285,27 @@ fn runInner(a: std.mem.Allocator, io: std.Io, opts: Options, status: *RunStatus)
         misses += layer.stats.misses;
         bytes += layer.stats.bytes_read;
     }
-    const receipt = .{ .hash_verified = status.hash_verified, .artifact_revision = model.artifact_revision, .artifact_shards = model.artifact_shards, .sidecars_hash_verified = true, .prefill_mps = decoder.prefill_tile != null, .batch_linear = decoder.batch_linear, .prefill_chunk = decoder.prefill_chunk, .prefill_read_group = 10, .expert_slot_counts = blk: {
+    const receipt = .{ .hash_verified = status.verification.hashed, .stamp_verified = status.verification.stamp_accepted, .verification_mode = @tagName(status.verification.mode), .process_cap_bytes = plan.envelope.cap_bytes, .process_cap_source = @tagName(plan.envelope.source), .machine_profile = profile.report(plan.host, plan.envelope), .expert_cache_bytes = decoder.expertCacheBytes(), .expert_cache_source = @tagName(plan.cache_source), .expert_cache_requested_mb = if (opts.cache_mb == 0) @as(?usize, null) else opts.cache_mb, .expert_read_retries = decoder.pagingStats().read_retries, .artifact_revision = model.artifact_revision, .artifact_shards = model.artifact_shards, .sidecars_hash_verified = true, .prefill_mps = decoder.prefill_tile != null, .batch_linear = decoder.batch_linear, .prefill_chunk = decoder.prefill_chunk, .prefill_read_group = 10, .expert_slot_counts = blk: {
         var counts: [48]usize = undefined;
-        for (plan.slots, 0..) |count, i| counts[i] = count;
+        for (decoder.layers, 0..) |layer, i| counts[i] = layer.slotCount();
         break :blk counts;
     }, .expert_strides = blk: {
         var strides: [48]usize = undefined;
         for (decoder.layers, 0..) |layer, i| strides[i] = layer.stride;
         break :blk strides;
-    }, .grouped_experts = decoder.overlapEnabled() and std.c.getenv("ANTFLY_QWEN4EXP_GROUPED_EXPERTS") != null, .build_mode = @tagName(@import("builtin").mode), .io_overlap = decoder.overlapEnabled(), .prefill_head_skip = std.c.getenv("ANTFLY_QWEN4EXP_DISABLE_PREFILL_HEAD_SKIP") == null, .prefill_expert_io = prefilled_paging, .decode_expert_io = decoder.pagingStats().since(prefilled_paging), .decode_token_ms = token_ms[0..timed_steps], .first_token_ready_ms = ms(start, prefilled), .architecture = "qwen4exp", .experimental = true, .backend = "metal", .metal_command_batching = decoder.kernels.batching_enabled, .metal_residency = decoder.kernels.residency != null, .parallel_expert_reads = decoder.read_io != null, .expert_read_lanes = if (decoder.read_io != null) reader.read_lane_count else 1, .expert_cache_mb = opts.cache_mb, .decode_steps = decoder.position - prompt_ids.len, .context_size = opts.context, .prompt_tokens = prompt_ids.len, .generated_tokens = output.items.len, .load_ms = ms(start, loaded), .prefill_ms = ms(loaded, prefilled), .decode_ms = ms(prefilled, finished), .prefill_profile = prefilled_profile.since(loaded_profile), .decode_profile = decoder.kernels.profile.since(prefilled_profile), .admitted_bytes = plan.total(), .expert_hits = hits, .expert_misses = misses, .expert_bytes_read = bytes, .ngram_bytes_read = decoder.ngrams.?.stats.bytes_read, .tokenizer_live_bytes = tokenizer_allocator.live, .tokenizer_peak_bytes = tokenizer_allocator.peak, .process_memory = platform.process_memory.pressureSnapshot(), .finish_reason = reason, .prompt_token_ids = prompt_ids, .generated_token_ids = output.items };
+    }, .grouped_experts = decoder.overlapEnabled() and std.c.getenv("ANTFLY_QWEN4EXP_GROUPED_EXPERTS") != null, .build_mode = @tagName(@import("builtin").mode), .io_overlap = decoder.overlapEnabled(), .prefill_head_skip = std.c.getenv("ANTFLY_QWEN4EXP_DISABLE_PREFILL_HEAD_SKIP") == null, .prefill_expert_io = prefilled_paging, .decode_expert_io = decoder.pagingStats().since(prefilled_paging), .decode_token_ms = token_ms[0..timed_steps], .first_token_ready_ms = ms(start, prefilled), .architecture = "qwen4exp", .experimental = true, .backend = "metal", .metal_command_batching = decoder.kernels.batching_enabled, .metal_residency = decoder.kernels.residency != null, .parallel_expert_reads = decoder.read_io != null, .expert_read_lanes = if (decoder.read_io != null) reader.read_lane_count else 1, .decode_steps = decoder.position - prompt_ids.len, .context_size = opts.context, .prompt_tokens = prompt_ids.len, .generated_tokens = output.items.len, .load_ms = ms(start, loaded), .prefill_ms = ms(loaded, prefilled), .decode_ms = ms(prefilled, finished), .prefill_profile = prefilled_profile.since(loaded_profile), .decode_profile = decoder.kernels.profile.since(prefilled_profile), .admitted_bytes = plan.total(), .expert_hits = hits, .expert_misses = misses, .expert_bytes_read = bytes, .ngram_bytes_read = decoder.ngrams.?.stats.bytes_read, .tokenizer_live_bytes = tokenizer_allocator.live, .tokenizer_peak_bytes = tokenizer_allocator.peak, .process_memory = platform.process_memory.pressureSnapshot(), .finish_reason = reason, .prompt_token_ids = prompt_ids, .generated_token_ids = output.items };
     if (opts.print_timing) std.debug.print("load_ms={d:.2} prefill_ms={d:.2} decode_ms={d:.2} expert_hits={d} expert_misses={d} expert_bytes_read={d}\n", .{ receipt.load_ms, receipt.prefill_ms, receipt.decode_ms, hits, misses, bytes });
     if (opts.json_path) |p| {
         const json = try std.json.Stringify.valueAlloc(a, receipt, .{ .whitespace = .indent_2 });
         defer a.free(json);
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = json });
     }
+}
+
+fn writeRouteTrace(io: std.Io, decoder: *decoder_mod.Decoder) !void {
+    const path = std.c.getenv("ANTFLY_QWEN4EXP_ROUTE_TRACE") orelse return;
+    const trace = decoder.route_trace orelse return;
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = std.mem.span(path), .data = std.mem.sliceAsBytes(trace[0 .. decoder.position * 48 * 10]) });
 }
 
 test "Qwen4Exp installed CLI uses exact tokenizer and emits bounded receipts" {
@@ -259,6 +317,7 @@ test "Qwen4Exp installed CLI uses exact tokenizer and emits bounded receipts" {
         .raw = true,
         .max_tokens = 2,
         .context = 4096,
+        .cache_mb = 2048,
         .combined_mb = 10240,
         .print_ids = true,
         .print_prompt_ids = true,

@@ -24,17 +24,24 @@ import subprocess
 import time
 from pathlib import Path
 
+from machine_profile import FLAGS, VERIFY_MODES, budget_arguments, explicit_mb
+
 
 class Session:
-    def __init__(self, command, stderr=None, env=None):
+    def __init__(self, command, stderr=None, env=None, detach=False):
+        # A detached child does not receive the terminal's Ctrl-C, so the
+        # client can turn it into a request cancel instead of losing the model.
         self.process = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=stderr,
             env=env,
+            start_new_session=detach,
         )
         self.buffer = b""
+        self.started = None
+        self.events = []
         self.selector = selectors.DefaultSelector()
         self.selector.register(self.process.stdout, selectors.EVENT_READ)
         try:
@@ -59,19 +66,33 @@ class Session:
         line, self.buffer = self.buffer.split(b"\n", 1)
         return json.loads(line)
 
-    def request(self, request, on_text=None):
-        started = time.monotonic()
+    def send(self, request):
+        self.started = time.monotonic()
+        self.events = []
         self.process.stdin.write((json.dumps(request) + "\n").encode())
         self.process.stdin.flush()
-        events = []
+
+    def cancel(self):
+        """Stop the request in flight. Its own `done` event is the reply."""
+        self.process.stdin.write(b'{"cancel":true}\n')
+        self.process.stdin.flush()
+
+    def collect(self, on_text=None, until=None):
+        """Read events for the request in flight; safe to resume if interrupted."""
         while True:
-            event = self.read_event(started + 2400)
-            event["observed_seconds"] = time.monotonic() - started
-            events.append(event)
+            event = self.read_event(self.started + 2400)
+            event["observed_seconds"] = time.monotonic() - self.started
+            self.events.append(event)
             if event["event"] == "delta" and on_text:
                 on_text(event["text"])
-            if event["event"] in {"done", "error", "reset"}:
-                return events
+            if event["event"] in {"done", "error", "reset"} or (
+                until is not None and until(event)
+            ):
+                return self.events
+
+    def request(self, request, on_text=None):
+        self.send(request)
+        return self.collect(on_text)
 
     def close(self):
         try:
@@ -97,25 +118,25 @@ class Session:
 
 
 def process_budget(family, requested=None):
-    budget = (
-        requested if requested is not None else (9216 if family == "flash" else 4096)
-    )
-    maximum = 10240 if family == "flash" else 4096
-    if not 1 <= budget <= maximum:
-        raise ValueError(f"{family} process budget must be 1..{maximum} MiB")
-    return budget
+    """An explicit process cap in MiB, or None to let the runner derive one."""
+    return explicit_mb(f"{family} process budget", requested)
 
 
 def command(
-    binary, model, family, max_tokens=64, cache_mb=1536, raw=False, combined_mb=None
+    binary,
+    model,
+    family,
+    max_tokens=64,
+    cache_mb=None,
+    raw=False,
+    combined_mb=None,
+    verify=None,
 ):
     result = [
         str(Path(binary).resolve()),
         str(model),
         "-",
-        "--experimental-qwen35-streamed"
-        if family == "27b"
-        else "--experimental-qwen4exp",
+        FLAGS[family],
         "--backend",
         "metal",
         "--speculation-policy",
@@ -125,9 +146,12 @@ def command(
         "--max-tokens",
         str(max_tokens),
     ]
-    result += ["--combined-budget-mb", str(process_budget(family, combined_mb))]
-    if family == "flash":
-        result += ["--moe-cache-mb", str(cache_mb)]
+    result += budget_arguments(
+        family,
+        cache_mb if family == "flash" else None,
+        process_budget(family, combined_mb),
+        verify,
+    )
     if raw:
         result += ["--raw-prompt"]
     return result
@@ -139,37 +163,68 @@ def main():
     p.add_argument("--model", type=Path, required=True)
     p.add_argument("--family", choices=("27b", "flash"), required=True)
     p.add_argument("--max-tokens", type=int, default=64)
-    p.add_argument("--cache-mb", type=int, default=1536)
+    p.add_argument(
+        "--cache-mb",
+        type=int,
+        help="Flash expert cache in MiB (default: derived from the machine profile)",
+    )
     p.add_argument(
         "--combined-budget-mb",
         type=int,
-        help="Process cap in MiB (Flash default 9216, maximum 10240; 27B maximum 4096)",
+        help="Process cap in MiB (default: derived from the machine profile)",
+    )
+    p.add_argument(
+        "--verify",
+        choices=VERIFY_MODES,
+        default="stamp",
+        help="stamp reuses an earlier full hash while the files are unchanged",
     )
     a = p.parse_args()
     try:
         budget = process_budget(a.family, a.combined_budget_mb)
+        cache = explicit_mb("expert cache", a.cache_mb)
     except ValueError as error:
         p.error(str(error))
     session = Session(
         command(
-            a.binary, a.model, a.family, a.max_tokens, a.cache_mb, combined_mb=budget
-        )
+            a.binary,
+            a.model,
+            a.family,
+            a.max_tokens,
+            cache,
+            combined_mb=budget,
+            verify=a.verify,
+        ),
+        detach=True,
     )
-    print("Ready. /reset starts a new conversation; /quit exits.")
+    ready = session.ready
+    print(
+        f"Ready ({ready.get('verification_mode')} verification, "
+        f"{ready.get('process_cap_bytes', 0) / 1024**3:.2f} GiB process cap). "
+        "/reset starts a new conversation; /quit exits; Ctrl-C stops a reply."
+    )
     try:
         while True:
             prompt = input("You: ")
             if prompt == "/quit":
                 break
             request = {"reset": True} if prompt == "/reset" else {"prompt": prompt}
-            events = session.request(
-                request, lambda text: print(text, end="", flush=True)
-            )
+            session.send(request)
+            while True:
+                try:
+                    events = session.collect(
+                        lambda text: print(text, end="", flush=True)
+                    )
+                    break
+                except KeyboardInterrupt:
+                    # Keep the loaded model: stop this reply, not the session.
+                    session.cancel()
             print()
             last = events[-1]
             if last["event"] == "done":
+                state = "; conversation state reset" if last.get("state_reset") else ""
                 print(
-                    f"[reused {last['reused_tokens']} tokens; prefilled {last['prefilled_tokens']}; {last['prefill_ms'] / 1000:.2f}s prefill]"
+                    f"[{last['finish_reason']}; reused {last['reused_tokens']} tokens; prefilled {last['prefilled_tokens']}; {last['prefill_ms'] / 1000:.2f}s prefill{state}]"
                 )
             else:
                 print(last)

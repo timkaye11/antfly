@@ -28,8 +28,9 @@ import subprocess
 import time
 from pathlib import Path
 
-from chat import Session, command
+from chat import Session, command, process_budget
 from evidence import swap_snapshot
+from machine_profile import explicit_mb
 
 
 def require(condition, message):
@@ -113,7 +114,23 @@ def main():
             "receipt-write",
         ],
     )
+    p.add_argument(
+        "--cache-mb",
+        type=int,
+        default=1536,
+        help="Flash expert cache in MiB; lifecycle checks need only a small one",
+    )
+    p.add_argument(
+        "--combined-budget-mb",
+        type=int,
+        help="Process cap in MiB (default: derived by the runner)",
+    )
     a = p.parse_args()
+    try:
+        budget = process_budget(a.family, a.combined_budget_mb)
+        cache = explicit_mb("expert cache", a.cache_mb)
+    except ValueError as error:
+        p.error(str(error))
     a.output.mkdir(parents=True, exist_ok=False)
     env = {k: v for k, v in os.environ.items() if not k.startswith("ANTFLY_QWEN")}
     report = {
@@ -129,7 +146,17 @@ def main():
         row = {"phase": phase, "passed": False}
         started = time.monotonic()
         try:
-            cmd = command(a.binary, a.model, a.family, 32, 1536, True)
+            # Full verification: the SIGINT-during-hashing case needs the pass.
+            cmd = command(
+                a.binary,
+                a.model,
+                a.family,
+                32,
+                cache,
+                True,
+                combined_mb=budget,
+                verify="full",
+            )
             row["command"] = cmd.copy()
             stderr = a.output / f"{phase}.stderr"
             with stderr.open("w") as err:

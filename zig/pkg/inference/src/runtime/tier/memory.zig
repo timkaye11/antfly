@@ -1474,7 +1474,7 @@ fn liveHostBytes(amounts: AdmissionAmounts) !usize {
 /// container or smaller machine can use at least half of its effective memory.
 /// A fixed multi-GiB floor cannot be applied after cgroup constraints: when the
 /// effective total is below that floor, every positive admission is impossible.
-fn liveHostMemoryHeadroom(total_bytes: usize) usize {
+pub fn liveHostMemoryHeadroom(total_bytes: usize) usize {
     const preferred = clampBytes(@max(total_bytes / 4, gib(6)), gib(4), gib(24));
     return @min(preferred, total_bytes / 2);
 }

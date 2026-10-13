@@ -17,11 +17,13 @@ test {
     _ = @import("util/artifact_verification.zig");
     _ = @import("util/local_control.zig");
     _ = @import("util/verified_sidecar.zig");
+    _ = @import("runtime/machine_profile.zig");
     _ = @import("local_text_session.zig");
     _ = @import("native_generate.zig");
     _ = @import("native_qwen35_generate.zig");
     _ = @import("models/qwen35_streamed.zig");
     _ = @import("runtime/dense_weight_pager.zig");
     _ = @import("backends/qwen35_streamed_kernels.zig");
+    _ = @import("backends/metal_quant_reduce_test.zig");
     _ = @import("architectures/qwen35_streamed.zig");
 }

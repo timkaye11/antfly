@@ -21,14 +21,18 @@ const memory = @import("runtime/tier/memory.zig");
 const c_file = @import("util/c_file.zig");
 const generation = @import("pipelines/generation.zig");
 const hf = @import("inference_hf_tokenizer");
+const profile = @import("runtime/machine_profile.zig");
+const verification = @import("util/artifact_verification.zig");
 const platform = @import("antfly_platform");
 pub const Options = struct {
     model: []const u8,
     prompt: []const u8,
     max_tokens: usize = 128,
-    context: usize = 4096,
+    context: usize = profile.max_context,
     chunk: usize = 512,
-    combined_mb: usize = 4096,
+    /// Zero derives the process envelope from the finished plan.
+    combined_mb: usize = 0,
+    verify: verification.Mode = .full,
     dry_run: bool = false,
     stream: bool = false,
     session: bool = false,
@@ -58,7 +62,7 @@ fn writeStdout(bytes: []const u8) !void {
 fn elapsed(io: std.Io, start: std.Io.Timestamp) f64 {
     return @as(f64, @floatFromInt(std.Io.Timestamp.durationTo(start, std.Io.Timestamp.now(io, .awake)).nanoseconds)) / 1e6;
 }
-const RunStatus = struct { receipt_written: bool = false, receipt_reason: []const u8 = "", hash_verified: bool = false, stage: []const u8 = "arguments" };
+const RunStatus = struct { receipt_written: bool = false, receipt_reason: []const u8 = "", verification: verification.Outcome = .{}, stage: []const u8 = "arguments" };
 pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options) !void {
     var guard = control.Guard.init();
     defer guard.deinit();
@@ -67,7 +71,7 @@ pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options) !void {
         // Preserve a detailed execution failure, but replace a success receipt
         // if streaming output or another unanticipated operation failed.
         if (!status.receipt_written or !std.mem.eql(u8, status.receipt_reason, @errorName(failure))) if (opts.json_path) |p| {
-            const report = .{ .model = "Qwen3.8-27B", .experimental = true, .execution = "streamed_layers", .sha256 = model.artifact_sha256, .hash_verified = status.hash_verified, .finish_reason = @errorName(failure), .failure_stage = status.stage, .process_memory = platform.process_memory.pressureSnapshot() };
+            const report = .{ .model = "Qwen3.8-27B", .experimental = true, .execution = "streamed_layers", .sha256 = model.artifact_sha256, .hash_verified = status.verification.hashed, .stamp_verified = status.verification.stamp_accepted, .verification_mode = @tagName(opts.verify), .finish_reason = @errorName(failure), .failure_stage = status.stage, .process_memory = platform.process_memory.pressureSnapshot() };
             if (std.json.Stringify.valueAlloc(a, report, .{ .whitespace = .indent_2 })) |json| {
                 defer a.free(json);
                 std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = json }) catch {};
@@ -78,16 +82,22 @@ pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options) !void {
     if (opts.json_path != null and !opts.session and !opts.dry_run and !status.receipt_written) return error.ReceiptWriteFailed;
 }
 fn runInner(a: std.mem.Allocator, io: std.Io, opts: Options, status: *RunStatus) !void {
-    if (opts.context == 0 or opts.context > 4096 or opts.max_tokens == 0 or opts.max_tokens > opts.context) return error.UnsupportedQwen35Context;
+    if (opts.context == 0 or opts.context > profile.max_context or opts.max_tokens == 0 or opts.max_tokens > opts.context) return error.UnsupportedQwen35Context;
     const start = std.Io.Timestamp.now(io, .awake);
     const path = opts.model;
     status.stage = "inventory";
     var source = try model.Source.open(a, path);
     defer source.deinit();
-    var plan = try decoder_mod.Plan.inspect(&source, opts.context, opts.chunk, try std.math.mul(usize, opts.combined_mb, model.MiB));
-    if (opts.prompt_lookup > 0) try plan.enableLookup();
+    const host = try profile.Host.detect();
+    const plan = try decoder_mod.Plan.inspect(&source, host, .{
+        .context = opts.context,
+        .chunk = opts.chunk,
+        .lookup = opts.prompt_lookup > 0,
+        .cap_bytes = try std.math.mul(usize, opts.combined_mb, model.MiB),
+    });
+    const envelope: profile.Envelope = .{ .cap_bytes = plan.cap, .source = plan.cap_source };
     if (opts.dry_run) {
-        const report = .{ .model = "Qwen3.8-27B", .architecture = "qwen35", .sha256 = model.artifact_sha256, .hash_verified = false, .file_bytes = source.reader.size, .main_layers = 64, .excluded_mtp_layers = 1, .context = plan.context, .prefill_chunk = plan.chunk, .amounts = plan.amounts, .admitted_bytes = plan.total(), .cap_bytes = plan.cap, .layer_spans = source.layers };
+        const report = .{ .model = "Qwen3.8-27B", .architecture = "qwen35", .sha256 = model.artifact_sha256, .hash_verified = false, .file_bytes = source.reader.size, .main_layers = 64, .excluded_mtp_layers = 1, .context = plan.context, .prefill_chunk = plan.chunk, .amounts = plan.amounts, .admitted_bytes = plan.total(), .cap_bytes = plan.cap, .process_cap_bytes = plan.cap, .process_cap_source = @tagName(plan.cap_source), .machine_profile = profile.report(host, envelope), .layer_spans = source.layers };
         const json = try std.json.Stringify.valueAlloc(a, report, .{ .whitespace = .indent_2 });
         defer a.free(json);
         try writeStdout(json);
@@ -99,10 +109,12 @@ fn runInner(a: std.mem.Allocator, io: std.Io, opts: Options, status: *RunStatus)
     status.stage = "admission";
     var admission = try plan.acquire(&controller);
     defer admission.release();
-    std.debug.print("Qwen3.8-27B: verifying exact artifact with bounded reads...\n", .{});
+    std.debug.print("Qwen3.8-27B: verifying exact artifact with bounded reads ({s})...\n", .{@tagName(opts.verify)});
     status.stage = "artifact_verification";
-    try source.verify(cancelled);
-    status.hash_verified = true;
+    const stamp_dir = verification.defaultStampDir(a);
+    defer if (stamp_dir) |dir| a.free(dir);
+    try source.verify(path, opts.verify, stamp_dir, cancelled);
+    status.verification = source.verification;
     status.stage = "tokenizer";
     var sidecar_dir = std.fs.path.dirname(path) orelse ".";
     if (!c_file.fileExistsInDir(a, sidecar_dir, "tokenizer.json")) sidecar_dir = std.fs.path.dirname(sidecar_dir) orelse return error.MissingQwen35Tokenizer;
@@ -159,8 +171,11 @@ fn runInner(a: std.mem.Allocator, io: std.Io, opts: Options, status: *RunStatus)
         .eos = config.value.eos_token_id,
         .ignore_eos = opts.ignore_eos,
         .model = "Qwen3.8-27B",
-        .artifact_hash_verified = source.verified,
+        .artifact_hash_verified = source.verification.hashed,
+        .artifact_stamp_verified = source.verification.stamp_accepted,
+        .verification_mode = @tagName(source.verification.mode),
         .artifact_id = model.artifact_sha256,
+        .process_cap_bytes = plan.cap,
         .prompt_lookup = opts.prompt_lookup,
     });
     const load_ms = elapsed(io, start);
@@ -185,7 +200,9 @@ fn runInner(a: std.mem.Allocator, io: std.Io, opts: Options, status: *RunStatus)
             .experimental = true,
             .build_mode = @tagName(@import("builtin").mode),
             .sha256 = model.artifact_sha256,
-            .hash_verified = source.verified,
+            .hash_verified = source.verification.hashed,
+            .stamp_verified = source.verification.stamp_accepted,
+            .verification_mode = @tagName(source.verification.mode),
             .backend = "metal",
             .cpu_weight_dequantization = !decoder.kernels.gpu_dequant,
             .context_size = plan.context,
@@ -193,6 +210,9 @@ fn runInner(a: std.mem.Allocator, io: std.Io, opts: Options, status: *RunStatus)
             .io_overlap = decoder.io != null,
             .admitted_bytes = plan.total(),
             .cap_bytes = plan.cap,
+            .process_cap_bytes = plan.cap,
+            .process_cap_source = @tagName(plan.cap_source),
+            .machine_profile = profile.report(host, envelope),
             .load_ms = load_ms,
             .prefill_ms = prefill_ms,
             .decode_ms = decode_ms,
@@ -265,6 +285,10 @@ fn runInner(a: std.mem.Allocator, io: std.Io, opts: Options, status: *RunStatus)
     std.debug.print("Qwen35: decoding\n", .{});
     const decode_start = std.Io.Timestamp.now(io, .awake);
     defer decode_ms = elapsed(io, decode_start);
+    // Sized from the admitted context, never from a fixed sequence limit.
+    var history: std.ArrayList(i32) = .empty;
+    defer history.deinit(a);
+    if (opts.prompt_lookup > 0) try history.ensureTotalCapacity(a, opts.context);
     var printed: usize = 0;
     while (output.items.len < opts.max_tokens) {
         if (!opts.ignore_eos and std.mem.indexOfScalar(u32, config.value.eos_token_id, next) != null) {
@@ -288,10 +312,10 @@ fn runInner(a: std.mem.Allocator, io: std.Io, opts: Options, status: *RunStatus)
         }
         const tick = std.Io.Timestamp.now(io, .awake);
         if (opts.prompt_lookup > 0) {
-            var history: [4096]i32 = undefined;
-            @memcpy(history[0..prompt_ids.len], prompt_ids);
-            @memcpy(history[prompt_ids.len..][0..output.items.len], output.items);
-            const advance = decoder.advancePromptLookup(history[0 .. prompt_ids.len + output.items.len], @min(opts.prompt_lookup, opts.max_tokens - output.items.len), if (opts.ignore_eos) &.{} else config.value.eos_token_id) catch |err| {
+            history.clearRetainingCapacity();
+            try history.appendSlice(a, prompt_ids);
+            try history.appendSlice(a, output.items);
+            const advance = decoder.advancePromptLookup(history.items, @min(opts.prompt_lookup, opts.max_tokens - output.items.len), if (opts.ignore_eos) &.{} else config.value.eos_token_id) catch |err| {
                 reason = @errorName(err);
                 return err;
             };

@@ -31,7 +31,6 @@ pub const max_experts: usize = 128;
 pub const max_slots: usize = 128;
 pub const max_route_width: usize = 8;
 pub const invalid_expert: u16 = std.math.maxInt(u16);
-pub const invalid_slot: u8 = std.math.maxInt(u8);
 const use_count_decay_interval: u64 = 1024;
 
 pub const ArenaError = error{
@@ -53,11 +52,16 @@ pub const Geometry = struct {
 
 pub fn ArenaTypes(comptime geometry: Geometry) type {
     if (geometry.layers == 0 or geometry.experts == 0 or geometry.experts >= invalid_expert or
-        geometry.slots == 0 or geometry.slots >= invalid_slot or geometry.route_width == 0 or
+        geometry.slots == 0 or geometry.slots >= std.math.maxInt(u16) or geometry.route_width == 0 or
         geometry.route_width > geometry.slots) @compileError("invalid expert arena geometry");
     return struct {
+        /// Geometries within the A4B bound keep their byte-sized slot indices;
+        /// only a wider arena pays for 16-bit ones.
+        pub const Slot = if (geometry.slots < std.math.maxInt(u8)) u8 else u16;
+        pub const invalid_slot: Slot = std.math.maxInt(Slot);
+
         pub const RouteObservation = struct {
-            route_slots: [geometry.route_width]u8 = @as([geometry.route_width]u8, @splat(invalid_slot)),
+            route_slots: [geometry.route_width]Slot = @as([geometry.route_width]Slot, @splat(invalid_slot)),
             /// True when this route entry was absent (or reverse-map-invalid) before
             /// observeRoute repaired the directory. Arena owners use this to upload
             /// exactly the slots whose weight bytes changed.
@@ -67,7 +71,7 @@ pub fn ArenaTypes(comptime geometry: Geometry) type {
             miss_count: usize = 0,
             all_hit_before_update: bool = false,
 
-            pub fn slots(self: *const RouteObservation) []const u8 {
+            pub fn slots(self: *const RouteObservation) []const Slot {
                 return self.route_slots[0..self.count];
             }
         };
@@ -75,7 +79,7 @@ pub fn ArenaTypes(comptime geometry: Geometry) type {
         pub const DirectorySnapshot = struct {
             epoch: u64,
             expert_for_slot: [geometry.slots]u16,
-            slot_for_expert: [geometry.experts]u8,
+            slot_for_expert: [geometry.experts]Slot,
             use_count: [geometry.slots]u64,
             last_access_epoch: [geometry.slots]u64,
             layer_observation_count: u64,
@@ -86,12 +90,12 @@ pub fn ArenaTypes(comptime geometry: Geometry) type {
         /// and rollback as one transaction.
         pub const Directory = struct {
             const Self = @This();
-            active_slots: u8,
+            active_slots: Slot,
             epoch: u64 = 0,
             expert_for_slot: [geometry.layers][geometry.slots]u16 =
                 @as([geometry.layers][geometry.slots]u16, @splat(@as([geometry.slots]u16, @splat(invalid_expert)))),
-            slot_for_expert: [geometry.layers][geometry.experts]u8 =
-                @as([geometry.layers][geometry.experts]u8, @splat(@as([geometry.experts]u8, @splat(invalid_slot)))),
+            slot_for_expert: [geometry.layers][geometry.experts]Slot =
+                @as([geometry.layers][geometry.experts]Slot, @splat(@as([geometry.experts]Slot, @splat(invalid_slot)))),
             use_count: [geometry.layers][geometry.slots]u64 =
                 @as([geometry.layers][geometry.slots]u64, @splat(@as([geometry.slots]u64, @splat(0)))),
             last_access_epoch: [geometry.layers][geometry.slots]u64 =
@@ -277,7 +281,7 @@ pub fn ArenaTypes(comptime geometry: Geometry) type {
 }
 
 pub const ExpertSlotArena = ArenaTypes(.{}).Directory;
-pub const Qwen4ExpArena = ArenaTypes(.{ .layers = 48, .experts = 512, .route_width = 10 }).Directory;
+pub const Qwen4ExpArena = ArenaTypes(.{ .layers = 48, .experts = 512, .slots = 512, .route_width = 10 }).Directory;
 
 pub const Observation = ArenaTypes(.{}).RouteObservation;
 pub const LayerSnapshot = ArenaTypes(.{}).DirectorySnapshot;
@@ -377,4 +381,32 @@ test "Qwen4Exp expert slot arena supports layer 47 and expert 511 transactionall
     try std.testing.expect((try arena.observeRoute(47, 512, &first)).all_hit_before_update);
     try std.testing.expectError(error.LayerOutOfRange, arena.observeRoute(48, 512, &first));
     try std.testing.expectError(error.ExpertOutOfRange, arena.observeRoute(47, 512, &.{512}));
+}
+
+test "Qwen4Exp expert slot arena addresses every expert beyond byte-sized slot indices" {
+    const types = ArenaTypes(.{ .layers = 1, .experts = 512, .slots = 512, .route_width = 10 });
+    try std.testing.expectEqual(u16, types.Slot);
+    try std.testing.expectEqual(u8, ArenaTypes(.{}).Slot);
+    try std.testing.expectError(error.InvalidCapacity, types.Directory.init(513));
+    var arena = try types.Directory.init(512);
+    var route: [10]u32 = undefined;
+    // Fill every slot once; slot 255 would alias the byte-sized invalid marker.
+    for (0..52) |group| {
+        for (&route, 0..) |*expert, i| expert.* = @intCast((group * 10 + i) % 512);
+        const observed = try arena.observeRoute(0, 512, &route);
+        try std.testing.expectEqual(@as(usize, if (group == 51) 2 else 10), observed.miss_count);
+    }
+    try std.testing.expect(arena.layerIsFullyPopulated(0));
+    var seen: [512]bool = @splat(false);
+    for (0..512) |expert| {
+        const slot = arena.slot_for_expert[0][expert];
+        try std.testing.expect(slot < 512 and !seen[slot]);
+        seen[slot] = true;
+        try std.testing.expectEqual(@as(u16, @intCast(expert)), arena.expert_for_slot[0][slot]);
+    }
+    // Full residency never evicts: every later route is a proven all-hit.
+    for (&route, 0..) |*expert, i| expert.* = @intCast(250 + i);
+    const warm = try arena.observeRoute(0, 512, &route);
+    try std.testing.expect(warm.all_hit_before_update);
+    for (warm.slots()) |slot| try std.testing.expect(slot >= 250 and slot < 260);
 }

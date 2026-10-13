@@ -150,7 +150,7 @@ pub fn create(ctx: Context) Suite {
         .name = "qwen35_streamed-tests",
         .max_rss = 4 * 1024 * 1024 * 1024,
         .root_module = qwen35_streamed_module,
-        .filters = if (main_test_filters.len != 0) main_test_filters else &.{"Qwen35"},
+        .filters = if (main_test_filters.len != 0) main_test_filters else &.{ "Qwen35", "metal quant reduce" },
         .test_runner = runtime_filter_test_runner,
     });
     const run_qwen35_streamed_tests = ctx.addRunArtifact(qwen35_streamed_tests);

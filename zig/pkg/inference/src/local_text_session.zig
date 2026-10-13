@@ -22,7 +22,11 @@ const control = @import("util/local_control.zig");
 const platform = @import("antfly_platform");
 pub const Config = struct {
     artifact_hash_verified: bool = false,
+    /// A stamp from an earlier full pass on this host was accepted instead.
+    artifact_stamp_verified: bool = false,
+    verification_mode: []const u8 = "full",
     artifact_id: []const u8 = "unverified",
+    process_cap_bytes: usize = 0,
     prompt_lookup: usize = 0,
     context: usize,
     max_tokens: usize,
@@ -32,7 +36,7 @@ pub const Config = struct {
     ignore_eos: bool,
     model: []const u8,
 };
-const Request = struct { prompt: []const u8 = "", max_tokens: ?usize = null, reset: bool = false, quit: bool = false };
+const Request = struct { prompt: []const u8 = "", max_tokens: ?usize = null, reset: bool = false, quit: bool = false, cancel: bool = false };
 pub fn writeStdout(bytes: []const u8) !void {
     var offset: usize = 0;
     while (offset < bytes.len) {
@@ -72,43 +76,92 @@ fn emit(a: std.mem.Allocator, value: anytype) !void {
     try writeStdout(json);
     try writeStdout("\n");
 }
-const Input = struct {
-    buffer: [8192]u8 = undefined,
-    at: usize = 0,
-    end: usize = 0,
-    fn line(self: *Input, a: std.mem.Allocator) !?[]u8 {
-        var result: std.ArrayList(u8) = .empty;
-        errdefer result.deinit(a);
+/// True when `line` is exactly a cancel request. Anything else, including
+/// malformed JSON, stays queued for the ordinary request path to report.
+pub fn isCancelRequest(a: std.mem.Allocator, line: []const u8) bool {
+    const parsed = std.json.parseFromSlice(Request, a, line, .{}) catch return false;
+    defer parsed.deinit();
+    const r = parsed.value;
+    return r.cancel and r.prompt.len == 0 and r.max_tokens == null and !r.reset and !r.quit;
+}
+/// Buffered request lines. Between turns the owner blocks here; while a turn
+/// executes, `pollCancel` reads without blocking so a queued cancel is seen.
+pub const Input = struct {
+    a: std.mem.Allocator,
+    fd: std.posix.fd_t = 0,
+    pending: std.ArrayList(u8) = .empty,
+    eof: bool = false,
+    /// The first queued line was inspected and is not a cancel request.
+    head_inspected: bool = false,
+    pub const max_request_bytes = 1024 * 1024;
+
+    pub fn deinit(self: *Input) void {
+        self.pending.deinit(self.a);
+    }
+    /// Read what the descriptor offers within `timeout_ms`; false if nothing arrived.
+    fn fill(self: *Input, timeout_ms: i32) !bool {
+        if (self.eof) return false;
+        // Signals may be delivered to an I/O worker. Poll in bounded
+        // intervals so an idle owner still observes cancellation.
+        var descriptors = [_]std.posix.pollfd{.{ .fd = self.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        if (try std.posix.poll(&descriptors, timeout_ms) == 0) return false;
+        var buffer: [8192]u8 = undefined;
+        const n = std.c.read(self.fd, &buffer, buffer.len);
+        if (n < 0) {
+            if (std.posix.errno(n) == .INTR) return false;
+            return error.InputReadFailed;
+        }
+        if (n == 0) {
+            self.eof = true;
+            return false;
+        }
+        try self.pending.appendSlice(self.a, buffer[0..@intCast(n)]);
+        return true;
+    }
+    fn drop(self: *Input, consumed: usize) void {
+        const rest = self.pending.items.len - consumed;
+        std.mem.copyForwards(u8, self.pending.items[0..rest], self.pending.items[consumed..]);
+        self.pending.shrinkRetainingCapacity(rest);
+        self.head_inspected = false;
+    }
+    fn take(self: *Input, len: usize, consumed: usize) ![]u8 {
+        const owned = try self.a.dupe(u8, self.pending.items[0..len]);
+        self.drop(consumed);
+        return owned;
+    }
+    pub fn line(self: *Input) !?[]u8 {
         while (true) {
             try control.check();
-            if (self.at == self.end) {
-                // Signals may be delivered to an I/O worker. Poll in bounded
-                // intervals so an idle owner still observes cancellation.
-                var descriptors = [_]std.posix.pollfd{.{ .fd = 0, .events = std.posix.POLL.IN, .revents = 0 }};
-                if (try std.posix.poll(&descriptors, 100) == 0) continue;
-                try control.check();
-                const n = std.c.read(0, &self.buffer, self.buffer.len);
-                if (n < 0) {
-                    try control.check();
-                    if (std.posix.errno(n) == .INTR) continue;
-                    return error.InputReadFailed;
-                }
-                if (n == 0) {
-                    if (result.items.len == 0) {
-                        result.deinit(a);
-                        return null;
-                    }
-                    return try result.toOwnedSlice(a);
-                }
-                self.at = 0;
-                self.end = @intCast(n);
+            if (std.mem.indexOfScalar(u8, self.pending.items, '\n')) |end| {
+                if (end > max_request_bytes) return error.SessionRequestTooLarge;
+                return try self.take(end, end + 1);
             }
-            const byte = self.buffer[self.at];
-            self.at += 1;
-            if (byte == '\n') return try result.toOwnedSlice(a);
-            if (result.items.len == 1024 * 1024) return error.SessionRequestTooLarge;
-            try result.append(a, byte);
+            if (self.pending.items.len > max_request_bytes) return error.SessionRequestTooLarge;
+            if (self.eof) {
+                if (self.pending.items.len == 0) return null;
+                return try self.take(self.pending.items.len, self.pending.items.len);
+            }
+            _ = try self.fill(100);
         }
+    }
+    /// Consume a cancel request if it is the next queued line. Never blocks
+    /// and never discards any other request.
+    pub fn pollCancel(self: *Input) bool {
+        while (self.pending.items.len <= max_request_bytes) {
+            if (!(self.fill(0) catch return false)) break;
+        }
+        if (self.head_inspected) return false;
+        const end = std.mem.indexOfScalar(u8, self.pending.items, '\n') orelse return false;
+        if (end <= max_request_bytes and isCancelRequest(self.a, self.pending.items[0..end])) {
+            self.drop(end + 1);
+            return true;
+        }
+        self.head_inspected = true;
+        return false;
+    }
+    fn pollHook(context: *anyopaque) void {
+        const self: *Input = @ptrCast(@alignCast(context));
+        if (self.pollCancel()) control.request_cancelled.store(true, .release);
     }
 };
 pub fn exactPrefix(cached: []const i32, prompt: []const i32) bool {
@@ -132,12 +185,28 @@ fn readBytes(decoder: anytype) u64 {
 fn milliseconds(io: std.Io, start: std.Io.Timestamp) f64 {
     return @as(f64, @floatFromInt(std.Io.Timestamp.durationTo(start, std.Io.Timestamp.now(io, .awake)).nanoseconds)) / 1e6;
 }
+fn cancelRequested() bool {
+    control.checkRequest() catch return true;
+    return false;
+}
+/// How a failed turn leaves the session.
+pub const Recovery = enum {
+    /// The process must exit: state or output can no longer be trusted.
+    fatal,
+    /// Nothing was consumed; the cached prefix is still exact.
+    kept,
+    /// Sequence state was cleared. The loaded model and its caches remain.
+    reset,
+};
 pub fn run(a: std.mem.Allocator, io: std.Io, decoder: anytype, controller: *memory.AdmissionController, tokenizer: tokenizer_mod.Tokenizer, template: ?*generation.ChatTemplate, config: Config) !void {
     var session: Session(@TypeOf(decoder)) = .{ .a = a, .io = io, .decoder = decoder, .controller = controller, .tokenizer = tokenizer, .template = template, .config = config };
     defer session.deinit();
-    try emit(a, .{ .event = "ready", .hash_verified = config.artifact_hash_verified, .artifact_id = config.artifact_id, .model = config.model, .context_size = config.context, .prefill_chunk = chunkSize(decoder), .protocol = "qwen-local-jsonl-v1" });
-    var input: Input = .{};
-    while (input.line(a) catch |err| {
+    try emit(a, .{ .event = "ready", .hash_verified = config.artifact_hash_verified, .stamp_verified = config.artifact_stamp_verified, .verification_mode = config.verification_mode, .artifact_id = config.artifact_id, .model = config.model, .context_size = config.context, .prefill_chunk = chunkSize(decoder), .process_cap_bytes = config.process_cap_bytes, .protocol = "qwen-local-jsonl-v2" });
+    var input: Input = .{ .a = a };
+    defer input.deinit();
+    control.request_poll = .{ .context = &input, .call = Input.pollHook };
+    defer control.request_poll = null;
+    while (input.line() catch |err| {
         try emit(a, .{ .event = "error", .error_name = @errorName(err), .fatal = true });
         return err;
     }) |line| {
@@ -149,17 +218,20 @@ pub fn run(a: std.mem.Allocator, io: std.Io, decoder: anytype, controller: *memo
         };
         defer request.deinit();
         if (request.value.quit) break;
+        // A cancel that arrives after its turn finished has nothing to stop.
+        // It gets no event, so every other request keeps exactly one reply.
+        if (request.value.cancel) continue;
         session.turn(request.value) catch |err| {
-            // Execution errors may leave partially advanced state. Fail closed.
-            const fatal = decoder.failed or session.executing or err == error.Cancelled or err == error.OutputWriteFailed;
-            try emit(a, .{ .event = "error", .error_name = @errorName(err), .fatal = fatal });
-            if (fatal) return err;
+            const recovery = session.recover(err);
+            try emit(a, .{ .event = "error", .error_name = @errorName(err), .fatal = recovery == .fatal, .state_reset = recovery == .reset, .retryable = recovery != .fatal and @TypeOf(decoder.*).recoverable(err) });
+            if (recovery == .fatal) return err;
         };
     }
 }
 fn Session(comptime D: type) type {
     return struct {
         const Self = @This();
+        const Decoder = @typeInfo(D).pointer.child;
         a: std.mem.Allocator,
         io: std.Io,
         decoder: D,
@@ -168,7 +240,9 @@ fn Session(comptime D: type) type {
         template: ?*generation.ChatTemplate,
         config: Config,
         history: std.ArrayList(generation.Message) = .empty,
+        /// Exactly the tokens the decoder has consumed.
         cached: std.ArrayList(i32) = .empty,
+        /// The decoder's prediction after `cached`.
         next: ?u32 = null,
         executing: bool = false,
         fn clearHistory(self: *Self) void {
@@ -180,14 +254,32 @@ fn Session(comptime D: type) type {
             self.history.deinit(self.a);
             self.cached.deinit(self.a);
         }
+        fn clearSequence(self: *Self) !void {
+            try self.decoder.reset();
+            self.cached.clearRetainingCapacity();
+            self.next = null;
+        }
+        /// Classify a failed turn. Execution errors used to end the process
+        /// unconditionally; a decoder that reports its state intact, or
+        /// restorable by reset, now keeps the loaded model alive.
+        fn recover(self: *Self, err: anyerror) Recovery {
+            const executing = self.executing;
+            self.executing = false;
+            control.request_cancelled.store(false, .release);
+            if (self.decoder.failed) return .fatal;
+            // Rejected before execution began: nothing was touched.
+            if (!executing) return .kept;
+            if (!Decoder.recoverable(err)) return .fatal;
+            if (!self.decoder.needs_reset) return .kept;
+            self.clearSequence() catch return .fatal;
+            return .reset;
+        }
         fn turn(self: *Self, request: Request) !void {
             const max_tokens = request.max_tokens orelse self.config.max_tokens;
             if (max_tokens == 0 or max_tokens > self.config.context) return error.InvalidSessionTokenLimit;
             if (request.reset) {
-                try self.decoder.reset();
+                try self.clearSequence();
                 self.clearHistory();
-                self.cached.clearRetainingCapacity();
-                self.next = null;
             }
             if (request.prompt.len == 0) {
                 if (!request.reset) return error.EmptyPrompt;
@@ -207,24 +299,38 @@ fn Session(comptime D: type) type {
             if (ids.len > self.config.context - max_tokens) return error.PromptTooLong;
             for (ids) |id| if (id < 0 or id >= 248320) return error.InvalidSessionToken;
             try control.check();
+            // A cancel belongs to the turn it interrupts, never to the next one.
+            control.request_cancelled.store(false, .release);
             self.executing = true;
             const begin = std.Io.Timestamp.now(self.io, .awake);
             const before_bytes = readBytes(self.decoder);
-            if (!exactPrefix(self.cached.items, ids)) {
-                try self.decoder.reset();
-                self.cached.clearRetainingCapacity();
-                self.next = null;
-            }
+            if (!exactPrefix(self.cached.items, ids)) try self.clearSequence();
             const reused = self.cached.items.len;
+            // Every step either completes with `cached` and `next` updated
+            // together or leaves both untouched, so a stopped turn never
+            // desynchronises the session from the decoder.
+            try self.cached.ensureTotalCapacity(self.a, ids.len + max_tokens);
+            var cancelled = false;
             var at = reused;
             while (at < ids.len) {
                 try control.check();
+                if (cancelRequested()) {
+                    cancelled = true;
+                    break;
+                }
                 if (self.controller.isLiveHostUnderPressure()) return error.ResourceTemporarilyUnavailable;
                 const end = @min(ids.len, at + chunkSize(self.decoder));
-                self.next = try step(self.decoder, ids[at..end]);
-                try self.cached.appendSlice(self.a, ids[at..end]);
+                self.next = step(self.decoder, ids[at..end]) catch |err| switch (err) {
+                    error.RequestCancelled => {
+                        cancelled = true;
+                        break;
+                    },
+                    else => return err,
+                };
+                self.cached.appendSliceAssumeCapacity(ids[at..end]);
                 at = end;
             }
+            const prefilled = at - reused;
             const prefill_ms = milliseconds(self.io, begin);
             const prefill_bytes = readBytes(self.decoder) - before_bytes;
             var output: std.ArrayList(i32) = .empty;
@@ -232,9 +338,12 @@ fn Session(comptime D: type) type {
             var printed: usize = 0;
             var finish: []const u8 = "length";
             const decode_start = std.Io.Timestamp.now(self.io, .awake);
-            while (output.items.len < max_tokens) {
+            while (!cancelled and output.items.len < max_tokens) {
                 try control.check();
-                if (self.controller.isLiveHostUnderPressure()) return error.ResourceTemporarilyUnavailable;
+                if (cancelRequested()) {
+                    cancelled = true;
+                    break;
+                }
                 const next = self.next orelse return error.MissingSessionLogits;
                 if (!self.config.ignore_eos and std.mem.indexOfScalar(u32, self.config.eos, next) != null) {
                     finish = "stop";
@@ -250,15 +359,19 @@ fn Session(comptime D: type) type {
                 }
                 if (output.items.len == max_tokens) break;
                 if (self.controller.isLiveHostUnderPressure()) return error.ResourceTemporarilyUnavailable;
-                if (comptime @hasDecl(@TypeOf(self.decoder.*), "advancePromptLookup")) {
+                if (comptime @hasDecl(Decoder, "advancePromptLookup")) {
                     if (self.config.prompt_lookup > 0) {
-                        var history: [4096]i32 = undefined;
-                        @memcpy(history[0..self.cached.items.len], self.cached.items);
-                        history[self.cached.items.len] = @intCast(next);
-                        const advance = try self.decoder.advancePromptLookup(history[0 .. self.cached.items.len + 1], @min(self.config.prompt_lookup, max_tokens - output.items.len), if (self.config.ignore_eos) &.{} else self.config.eos);
+                        // The pending token is the last history entry; the
+                        // consumed prefix is exactly `cached`.
+                        self.cached.appendAssumeCapacity(@intCast(next));
+                        const advance = self.decoder.advancePromptLookup(self.cached.items, @min(self.config.prompt_lookup, max_tokens - output.items.len), if (self.config.ignore_eos) &.{} else self.config.eos) catch |err| {
+                            _ = self.cached.pop();
+                            if (err != error.RequestCancelled) return err;
+                            cancelled = true;
+                            break;
+                        };
                         self.next = advance.next;
-                        try self.cached.append(self.a, @intCast(next));
-                        try self.cached.appendSlice(self.a, advance.accepted[0..advance.count]);
+                        self.cached.appendSliceAssumeCapacity(advance.accepted[0..advance.count]);
                         try output.appendSlice(self.a, advance.accepted[0..advance.count]);
                         const accepted_text = try self.tokenizer.decode(self.a, output.items);
                         defer self.a.free(accepted_text);
@@ -270,15 +383,32 @@ fn Session(comptime D: type) type {
                         continue;
                     }
                 }
-                self.next = try step(self.decoder, &.{@intCast(next)});
-                try self.cached.append(self.a, @intCast(next));
+                self.next = step(self.decoder, &.{@intCast(next)}) catch |err| switch (err) {
+                    error.RequestCancelled => {
+                        cancelled = true;
+                        break;
+                    },
+                    else => return err,
+                };
+                self.cached.appendAssumeCapacity(@intCast(next));
+            }
+            // A cancel that landed inside a token leaves a partially advanced
+            // sequence: clear it, keep the model and what was already emitted.
+            var state_reset = false;
+            if (cancelled) {
+                finish = "cancelled";
+                if (self.decoder.needs_reset) {
+                    try self.clearSequence();
+                    state_reset = true;
+                }
             }
             const text = try self.tokenizer.decode(self.a, output.items);
             defer self.a.free(text);
             const printable = try validText(self.a, text);
             defer self.a.free(printable);
             if (printable.len > printed) try emit(self.a, .{ .event = "delta", .text = printable[printed..] });
-            if (self.template != null) {
+            // A turn cancelled before any output is dropped from the conversation.
+            if (self.template != null and (!cancelled or output.items.len > 0)) {
                 const user = try self.a.dupe(u8, request.prompt);
                 errdefer self.a.free(user);
                 const assistant = try self.a.dupe(u8, printable);
@@ -287,7 +417,8 @@ fn Session(comptime D: type) type {
                 self.history.appendAssumeCapacity(.{ .role = "user", .content = user });
                 self.history.appendAssumeCapacity(.{ .role = "assistant", .content = assistant });
             }
-            try emit(self.a, .{ .event = "done", .text = printable, .generated_token_ids = output.items, .finish_reason = finish, .prompt_tokens = ids.len, .reused_tokens = reused, .prefilled_tokens = ids.len - reused, .position = self.decoder.position, .prefill_ms = prefill_ms, .decode_ms = milliseconds(self.io, decode_start), .first_token_ready_ms = prefill_ms, .prefill_bytes_read = prefill_bytes, .decode_bytes_read = readBytes(self.decoder) - before_bytes - prefill_bytes, .process_memory = platform.process_memory.pressureSnapshot() });
+            try emit(self.a, .{ .event = "done", .text = printable, .generated_token_ids = output.items, .finish_reason = finish, .state_reset = state_reset, .prompt_tokens = ids.len, .reused_tokens = reused, .prefilled_tokens = prefilled, .position = self.decoder.position, .prefill_ms = prefill_ms, .decode_ms = milliseconds(self.io, decode_start), .first_token_ready_ms = prefill_ms, .prefill_bytes_read = prefill_bytes, .decode_bytes_read = readBytes(self.decoder) - before_bytes - prefill_bytes, .process_memory = platform.process_memory.pressureSnapshot() });
+            control.request_cancelled.store(false, .release);
             self.executing = false;
         }
     };
@@ -306,4 +437,117 @@ test "Qwen35 Qwen4Exp session final text replaces incomplete and invalid UTF8" {
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.unicode.utf8ValidateSlice(text));
     try std.testing.expectEqualStrings("a\xef\xbf\xbd\xef\xbf\xbd", text);
+}
+
+test "Qwen35 Qwen4Exp session input queues requests and consumes only a leading cancel" {
+    const a = std.testing.allocator;
+    var pipe: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&pipe));
+    defer _ = std.c.close(pipe[0]);
+    var write_open = true;
+    defer if (write_open) {
+        _ = std.c.close(pipe[1]);
+    };
+    const send = struct {
+        fn all(fd: std.posix.fd_t, bytes: []const u8) !void {
+            try std.testing.expectEqual(@as(isize, @intCast(bytes.len)), std.c.write(fd, bytes.ptr, bytes.len));
+        }
+    }.all;
+    var input: Input = .{ .a = a, .fd = pipe[0] };
+    defer input.deinit();
+    try std.testing.expect(!input.pollCancel());
+    // A queued prompt is never mistaken for, or discarded by, a cancel probe.
+    try send(pipe[1], "{\"prompt\":\"next\"}\n{\"cancel\":true}\n");
+    try std.testing.expect(!input.pollCancel());
+    try std.testing.expect(!input.pollCancel());
+    const first = (try input.line()).?;
+    defer a.free(first);
+    try std.testing.expectEqualStrings("{\"prompt\":\"next\"}", first);
+    // Now the cancel leads the queue: it is consumed exactly once.
+    try std.testing.expect(input.pollCancel());
+    try std.testing.expect(!input.pollCancel());
+    // A partial line is not a request yet; ambiguous lines stay queued.
+    try send(pipe[1], "{\"cancel\":tr");
+    try std.testing.expect(!input.pollCancel());
+    try send(pipe[1], "ue,\"reset\":true}\n{\"cancel\":true}");
+    try std.testing.expect(!input.pollCancel());
+    const mixed = (try input.line()).?;
+    defer a.free(mixed);
+    try std.testing.expectEqualStrings("{\"cancel\":true,\"reset\":true}", mixed);
+    try std.testing.expect(!isCancelRequest(a, mixed));
+    try std.testing.expect(isCancelRequest(a, "{\"cancel\":true}"));
+    try std.testing.expect(!isCancelRequest(a, "{\"cancel\":false}"));
+    try std.testing.expect(!isCancelRequest(a, "{\"cancel\":true"));
+    // End of input still delivers the unterminated final line, then stops.
+    _ = std.c.close(pipe[1]);
+    write_open = false;
+    const last = (try input.line()).?;
+    defer a.free(last);
+    try std.testing.expectEqualStrings("{\"cancel\":true}", last);
+    try std.testing.expectEqual(@as(?[]u8, null), try input.line());
+}
+
+test "Qwen35 Qwen4Exp session input bounds a request line while probing for cancel" {
+    const a = std.testing.allocator;
+    var pipe: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&pipe));
+    defer _ = std.c.close(pipe[0]);
+    defer _ = std.c.close(pipe[1]);
+    var input: Input = .{ .a = a, .fd = pipe[0] };
+    defer input.deinit();
+    const chunk: [4096]u8 = @splat('x');
+    var sent: usize = 0;
+    while (sent <= Input.max_request_bytes) : (sent += chunk.len) {
+        try std.testing.expectEqual(@as(isize, chunk.len), std.c.write(pipe[1], &chunk, chunk.len));
+        try std.testing.expect(!input.pollCancel());
+    }
+    try std.testing.expectError(error.SessionRequestTooLarge, input.line());
+}
+
+const FakeDecoder = struct {
+    failed: bool = false,
+    needs_reset: bool = false,
+    position: usize = 0,
+    resets: usize = 0,
+    fn recoverable(err: anyerror) bool {
+        return err == error.RequestCancelled or err == error.ResourceTemporarilyUnavailable or err == error.InputOutput;
+    }
+    fn reset(self: *FakeDecoder) !void {
+        if (self.failed) return error.StateInvalid;
+        self.needs_reset = false;
+        self.position = 0;
+        self.resets += 1;
+    }
+};
+test "Qwen35 Qwen4Exp session keeps the model after recoverable turn failures and fails closed otherwise" {
+    const a = std.testing.allocator;
+    var decoder: FakeDecoder = .{};
+    var controller: memory.AdmissionController = .{};
+    var session: Session(*FakeDecoder) = .{ .a = a, .io = std.testing.io, .decoder = &decoder, .controller = &controller, .tokenizer = undefined, .template = null, .config = undefined };
+    defer session.deinit();
+    try session.cached.appendSlice(a, &.{ 1, 2, 3 });
+    session.next = 7;
+    // Rejected before execution: nothing to recover, whatever the error.
+    try std.testing.expectEqual(Recovery.kept, session.recover(error.PromptTooLong));
+    // Pressure at a token boundary: the consumed prefix stays reusable.
+    session.executing = true;
+    try std.testing.expectEqual(Recovery.kept, session.recover(error.ResourceTemporarilyUnavailable));
+    try std.testing.expectEqual(@as(usize, 3), session.cached.items.len);
+    try std.testing.expectEqual(@as(?u32, 7), session.next);
+    try std.testing.expect(!session.executing);
+    // A transient read inside a token: sequence cleared, model kept.
+    session.executing = true;
+    decoder.needs_reset = true;
+    try std.testing.expectEqual(Recovery.reset, session.recover(error.InputOutput));
+    try std.testing.expectEqual(@as(usize, 0), session.cached.items.len);
+    try std.testing.expectEqual(@as(?u32, null), session.next);
+    try std.testing.expectEqual(@as(usize, 1), decoder.resets);
+    // Unclassified execution errors and a poisoned decoder still end the session.
+    session.executing = true;
+    try std.testing.expectEqual(Recovery.fatal, session.recover(error.OutputWriteFailed));
+    session.executing = true;
+    try std.testing.expectEqual(Recovery.fatal, session.recover(error.Cancelled));
+    session.executing = true;
+    decoder.failed = true;
+    try std.testing.expectEqual(Recovery.fatal, session.recover(error.InputOutput));
 }

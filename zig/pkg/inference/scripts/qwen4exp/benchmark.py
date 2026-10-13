@@ -97,7 +97,22 @@ def main():
     parser.add_argument("--rounds", type=int, default=4)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--context", type=int, default=4096)
-    parser.add_argument("--cache-mb", type=int, default=3584)
+    parser.add_argument(
+        "--cache-mb",
+        type=int,
+        help="Expert cache in MiB (default: derived by the runner's machine profile)",
+    )
+    parser.add_argument(
+        "--combined-budget-mb",
+        type=int,
+        help="Process cap in MiB (default: derived by the runner's machine profile)",
+    )
+    parser.add_argument(
+        "--verify",
+        choices=("full", "stamp"),
+        default="stamp",
+        help="stamp hashes the artifact once per host instead of in every sample",
+    )
     parser.add_argument("--timeout", type=float, default=7200)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument(
@@ -184,16 +199,20 @@ def main():
                     "--disable-thinking",
                     "--context-size",
                     str(args.context),
-                    "--moe-cache-mb",
-                    str(args.cache_mb),
-                    "--combined-budget-mb",
-                    "10240",
+                    "--verify",
+                    args.verify,
                     "--max-tokens",
                     str(case.get("max_tokens", args.max_tokens)),
                     "--json-timing",
                     str(receipt.resolve()),
                     "--print-token-ids",
                 ]
+                # Unset budgets are derived by the runner and read back from
+                # the receipt (process_cap_bytes, expert_cache_bytes).
+                if args.cache_mb is not None:
+                    argv += ["--moe-cache-mb", str(args.cache_mb)]
+                if args.combined_budget_mb is not None:
+                    argv += ["--combined-budget-mb", str(args.combined_budget_mb)]
                 before = host()
                 started = time.monotonic()
                 sample = {

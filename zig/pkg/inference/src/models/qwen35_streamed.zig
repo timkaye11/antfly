@@ -17,6 +17,7 @@
 const std = @import("std");
 const gguf = @import("../gguf/root.zig");
 const c_file = @import("../util/c_file.zig");
+const verification = @import("../util/artifact_verification.zig");
 pub const MiB = 1024 * 1024;
 pub const layer_count = 64;
 pub const layer_buffer_bytes = 288 * MiB;
@@ -28,7 +29,10 @@ pub const Source = struct {
     reader: c_file.RangeReader,
     file: gguf.format.File,
     layers: [64]Span,
+    /// The artifact digest holds for this descriptor: hashed by this process
+    /// or vouched for by an accepted stamp (see `verification`).
     verified: bool = false,
+    verification: verification.Outcome = .{},
 
     pub fn open(a: std.mem.Allocator, path: []const u8) !Source {
         var reader = try c_file.RangeReader.open(a, path, true);
@@ -55,20 +59,15 @@ pub const Source = struct {
         var buf: [96]u8 = undefined;
         return self.tensor(try std.fmt.bufPrint(&buf, "blk.{d}.{s}", .{ layer, suffix }));
     }
-    pub fn verify(self: *Source, cancelled: *const std.atomic.Value(bool)) !void {
-        const buf = try self.allocator.alloc(u8, 4 * MiB);
-        defer self.allocator.free(buf);
-        var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        var offset: u64 = 0;
-        while (offset < self.reader.size) {
-            if (cancelled.load(.acquire)) return error.Cancelled;
-            const n: usize = @intCast(@min(buf.len, self.reader.size - offset));
-            try self.reader.read(offset, buf[0..n]);
-            hash.update(buf[0..n]);
-            offset += n;
-        }
-        const actual = std.fmt.bytesToHex(hash.finalResult(), .lower);
-        if (!std.mem.eql(u8, &actual, artifact_sha256)) return error.Qwen35ArtifactHashMismatch;
+    /// Verify through the descriptor every later range read uses. `path` only
+    /// keys the optional stamp.
+    pub fn verify(self: *Source, path: []const u8, mode: verification.Mode, stamp_dir: ?[]const u8, cancelled: *const std.atomic.Value(bool)) !void {
+        const files = [_]verification.File{.{ .reader = &self.reader, .path = path, .pin = .{ .bytes = artifact_bytes, .sha256 = artifact_sha256 } }};
+        self.verification = verification.verifyFiles(self.allocator, &files, artifact_sha256, mode, stamp_dir, cancelled) catch |err| return switch (err) {
+            error.ArtifactHashMismatch => error.Qwen35ArtifactHashMismatch,
+            error.ArtifactSizeMismatch => error.Qwen35ArtifactSizeMismatch,
+            else => err,
+        };
         self.verified = true;
     }
 };
@@ -78,9 +77,12 @@ pub fn byteLen(t: *const gguf.format.TensorInfo) !usize {
 pub fn isLinear(layer: usize) bool {
     return (layer + 1) % 4 != 0;
 }
+/// State for `context` positions. The admitted context limit belongs to the
+/// runtime's machine profile, not to this arithmetic.
 pub fn stateBytes(context: usize) !usize {
-    if (context == 0 or context > 4096) return error.UnsupportedQwen35Context;
-    return 48 * (48 * 128 * 128 + 3 * 10240) * 4 + 16 * context * 2 * 1024 * 4;
+    if (context == 0) return error.UnsupportedQwen35Context;
+    const attention = std.math.mul(usize, context, 16 * 2 * 1024 * 4) catch return error.UnsupportedQwen35Context;
+    return std.math.add(usize, 48 * (48 * 128 * 128 + 3 * 10240) * 4, attention) catch error.UnsupportedQwen35Context;
 }
 fn integer(v: gguf.metadata.View, key: []const u8) !u64 {
     return v.getU64(key) orelse return error.MissingQwen35Metadata;
@@ -163,6 +165,8 @@ pub fn inspect(file: *const gguf.format.File) ![64]Span {
 }
 test "Qwen35 streamed state accounts for 48 recurrent and 16 full attention layers" {
     try std.testing.expectEqual(@as(usize, 693764096), try stateBytes(4096));
-    try std.testing.expectError(error.UnsupportedQwen35Context, stateBytes(4097));
+    // Twice the context adds exactly the attention layers' share again.
+    try std.testing.expectEqual(@as(usize, 693764096 + 16 * 4096 * 2 * 1024 * 4), try stateBytes(8192));
+    try std.testing.expectError(error.UnsupportedQwen35Context, stateBytes(std.math.maxInt(usize)));
     try std.testing.expectError(error.UnsupportedQwen35Context, stateBytes(0));
 }

@@ -37,6 +37,8 @@ const gpt_mod = @import("models/gpt.zig");
 const runtime = @import("runtime/root.zig");
 const c_file = @import("util/c_file.zig");
 const native_backend_choice = @import("native_backend_choice.zig");
+const machine_profile = @import("runtime/machine_profile.zig");
+const artifact_verification = @import("util/artifact_verification.zig");
 const native_run_artifact = @import("native_run_artifact.zig");
 const compiled_artifact = @import("compiled_artifact.zig");
 const metal_generated_quant_stats = @import("metal_generated_quant_stats.zig");
@@ -92,10 +94,13 @@ const Options = struct {
     local_session: bool = false,
     prompt_lookup: usize = 0,
     moe_cache_explicit: bool = false,
-    qwen4exp_context: usize = 4096,
-    qwen4exp_cache_mb: usize = 2048,
+    qwen4exp_context: usize = machine_profile.max_context,
+    /// Zero derives the expert cache from the machine profile.
+    qwen4exp_cache_mb: usize = 0,
     qwen4exp_logit_path: ?[]const u8 = null,
     qwen4exp_options_explicit: bool = false,
+    qwen_verify: artifact_verification.Mode = .full,
+    qwen_verify_explicit: bool = false,
     model_dir: []const u8,
     prompt: []const u8,
     image_paths: [8][]const u8 = @splat(""),
@@ -342,7 +347,8 @@ fn runValidatedQwen35Streamed(allocator: std.mem.Allocator, io: std.Io, opts: Op
         .context = opts.qwen4exp_context,
         .prompt_lookup = opts.prompt_lookup,
         .chunk = if (opts.prefill_chunk_size == 0) 512 else opts.prefill_chunk_size,
-        .combined_mb = if (opts.combined_budget_mb == 0) 4096 else opts.combined_budget_mb,
+        .combined_mb = opts.combined_budget_mb,
+        .verify = opts.qwen_verify,
         .dry_run = opts.qwen35_dry_run,
         .stream = opts.stream,
         .raw = opts.raw_prompt or opts.no_chat_template,
@@ -381,6 +387,8 @@ fn runQwen4Exp(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
         .stream = opts.stream,
         .cache_mb = opts.qwen4exp_cache_mb,
         .combined_mb = opts.combined_budget_mb,
+        .verify = opts.qwen_verify,
+        .dry_run = opts.qwen35_dry_run,
         .raw = opts.raw_prompt or opts.no_chat_template,
         .enable_thinking = if (opts.local_session) false else opts.enable_thinking,
         .ignore_eos = opts.ignore_eos,
@@ -405,9 +413,10 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     if (opts.prompt_lookup > 0 and !opts.experimental_qwen35_streamed) return error.Qwen35OptInRequired;
     if (opts.local_session and !opts.experimental_qwen35_streamed and !opts.experimental_qwen4exp) return error.QwenLocalSessionOptInRequired;
     if (opts.experimental_qwen35_streamed) return runQwen35Streamed(allocator, io, opts);
-    if (opts.qwen35_dry_run) return error.Qwen35OptInRequired;
     if (opts.experimental_qwen4exp) return runQwen4Exp(allocator, io, opts);
+    if (opts.qwen35_dry_run) return error.Qwen35OptInRequired;
     if (opts.qwen4exp_options_explicit) return error.Qwen4ExpOptInRequired;
+    if (opts.qwen_verify_explicit) return error.QwenLocalVerifyOptInRequired;
     const jit_config = try validateKernelJitOptions(io, opts);
     try validateCacheCompactionOption(opts.cache_compaction_ratio);
     try native_backend_choice.validate(opts.backend);
@@ -7972,12 +7981,12 @@ fn validateDraftTokenizerCompatibility(
 fn validateQwen4ExpOptions(opts: Options) !void {
     if (opts.local_session and opts.enable_thinking == true) return error.UnsupportedLocalSessionThinking;
     if (opts.prompt_lookup != 0) return error.UnsupportedQwen4ExpOption;
-    if (opts.local_session and (!std.mem.eql(u8, opts.prompt, "-") or opts.json_timing_path != null or opts.qwen4exp_logit_path != null)) return error.InvalidLocalSessionOptions;
-    if (opts.experimental_qwen35_streamed or opts.qwen35_dry_run) return error.ConflictingExperimentalModes;
+    if (opts.local_session and (!std.mem.eql(u8, opts.prompt, "-") or opts.json_timing_path != null or opts.qwen4exp_logit_path != null or opts.qwen35_dry_run)) return error.InvalidLocalSessionOptions;
+    if (opts.experimental_qwen35_streamed) return error.ConflictingExperimentalModes;
     if (opts.backend != .metal or (opts.mode != null and opts.mode != .eager)) return error.Qwen4ExpRequiresEagerMetal;
     if (opts.speculation_policy != .off or opts.draft_model != null) return error.Qwen4ExpRequiresSpeculationOff;
     if (opts.image_count > 0 or opts.audio_count > 0 or opts.server_url != null or opts.require_server) return error.Qwen4ExpRequiresLocalText;
-    if (opts.max_tokens <= 0 or opts.qwen4exp_context == 0 or opts.qwen4exp_context > 4096) return error.UnsupportedQwen4ExpContext;
+    if (opts.max_tokens <= 0 or opts.qwen4exp_context == 0 or opts.qwen4exp_context > machine_profile.max_context) return error.UnsupportedQwen4ExpContext;
     if (opts.temperature != 0 or opts.top_k != 0 or opts.top_p != 0 or opts.repetition_penalty != 1) return error.Qwen4ExpGreedyOnly;
     if (opts.host_budget_mb != 0 or opts.backend_budget_mb != 0 or opts.kv_budget_mb != 0 or opts.scratch_budget_mb != 0 or
         opts.a4b_options_explicit or opts.kernel_jit_options_explicit or opts.kernel_jit_mode_explicit or opts.kernel_jit_profile_out != null or opts.kernel_jit.qualified_profile_path != null or
@@ -8021,6 +8030,11 @@ fn parseArgs(args: []const []const u8) !Options {
             if (std.mem.eql(u8, arg, "--context-size")) opts.qwen4exp_context = n else opts.qwen4exp_cache_mb = n;
             opts.qwen4exp_options_explicit = true;
             if (std.mem.eql(u8, arg, "--moe-cache-mb")) opts.moe_cache_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--verify")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArguments;
+            opts.qwen_verify = std.meta.stringToEnum(artifact_verification.Mode, args[i]) orelse return error.InvalidArtifactVerificationMode;
+            opts.qwen_verify_explicit = true;
         } else if (std.mem.eql(u8, arg, "--qwen4exp-logits-f32le")) {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
@@ -8682,7 +8696,7 @@ fn metalEagerDenseMaxBytes() u64 {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path]... [--audio path] [--backend auto|onnx|native|metal|cuda|xla|webgpu] [--experimental-qwen35-streamed --dry-run] [--session] [--prompt-lookup 0..4] [--experimental-qwen4exp --context-size N --moe-cache-mb N --qwen4exp-logits-f32le path] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--a4b-residency-mode auto|streamed|resident] [--a4b-memory-budget-mb N] [--a4b-load-strategy auto|pipeline|legacy] [--a4b-load-workers N] [--a4b-load-staging-mb N] [--a4b-prepared-pack auto|off|required] [--a4b-drop-host-cache-after-load] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--enable-thinking|--disable-thinking] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--qwen3vl-parity-json path] [--qwen3vl-parity-patch-f32le path] [--qwen3vl-parity-logits-f32le path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
+        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path]... [--audio path] [--backend auto|onnx|native|metal|cuda|xla|webgpu] [--experimental-qwen35-streamed] [--dry-run] [--session] [--prompt-lookup 0..4] [--experimental-qwen4exp --context-size N --moe-cache-mb N --qwen4exp-logits-f32le path] [--verify full|stamp] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--a4b-residency-mode auto|streamed|resident] [--a4b-memory-budget-mb N] [--a4b-load-strategy auto|pipeline|legacy] [--a4b-load-workers N] [--a4b-load-staging-mb N] [--a4b-prepared-pack auto|off|required] [--a4b-drop-host-cache-after-load] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--enable-thinking|--disable-thinking] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--qwen3vl-parity-json path] [--qwen3vl-parity-patch-f32le path] [--qwen3vl-parity-logits-f32le path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
         \\  With --server or ANTFLY_INFERENCE_SERVER_URL, sends the request to an already-running inference server.
         \\  --stream prints generated text incrementally as token deltas arrive.
@@ -9849,6 +9863,18 @@ test "Qwen4Exp CLI requires explicit local Metal eager opt-in and speculation of
     invalid = a;
     invalid.temperature = 0.7;
     try std.testing.expectError(error.Qwen4ExpGreedyOnly, validateQwen4ExpOptions(invalid));
+    invalid = a;
+    invalid.qwen4exp_context = machine_profile.max_context + 1;
+    try std.testing.expectError(error.UnsupportedQwen4ExpContext, validateQwen4ExpOptions(invalid));
+    // Unset budgets are derived by the machine profile, not defaulted here.
+    const derived = try parseArgs(&.{ "model.gguf", "hello", "--experimental-qwen4exp", "--backend", "metal", "--speculation-policy", "off" });
+    try std.testing.expectEqual(@as(usize, 0), derived.qwen4exp_cache_mb);
+    try std.testing.expectEqual(@as(usize, 0), derived.combined_budget_mb);
+    try std.testing.expectEqual(artifact_verification.Mode.full, derived.qwen_verify);
+    const stamped = try parseArgs(&.{ "model.gguf", "hello", "--experimental-qwen4exp", "--backend", "metal", "--speculation-policy", "off", "--verify", "stamp" });
+    try std.testing.expectEqual(artifact_verification.Mode.stamp, stamped.qwen_verify);
+    try validateQwen4ExpOptions(stamped);
+    try std.testing.expectError(error.InvalidArtifactVerificationMode, parseArgs(&.{ "model.gguf", "hello", "--verify", "never" }));
 }
 
 test "Qwen35 CLI validates streamed text limits and rejects MoE options" {

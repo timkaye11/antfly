@@ -129,16 +129,18 @@ pub const Config = struct {
         return (layer + 1) % c.full_interval != 0;
     }
 
+    /// State for `context` positions. The admitted context limit belongs to
+    /// the runtime's machine profile, not to this arithmetic.
     pub fn stateBytes(c: Config, context: usize) !usize {
         try c.validate();
-        if (context == 0 or context > 4096) return error.UnsupportedQwen4ExpContext;
+        if (context == 0) return error.UnsupportedQwen4ExpContext;
         const attention_layers = c.layers / c.full_interval;
         const linear_layers = c.layers - attention_layers;
         const linear = linear_layers * (c.linear_heads * c.linear_dim * c.linear_dim +
             c.conv_kernel * (2 * c.linear_key_heads + c.linear_heads) * c.linear_dim);
-        const attention = attention_layers * context * (2 * c.kv_heads * c.head_dim + c.index_dim * 2);
+        const attention = std.math.mul(usize, attention_layers * (2 * c.kv_heads * c.head_dim + c.index_dim * 2), context) catch return error.UnsupportedQwen4ExpContext;
         const ple = (c.ple_kernel - 1) * 3 * c.hc_count * c.hidden;
-        return (linear + attention + ple) * @sizeOf(f32);
+        return std.math.mul(usize, linear + attention + ple, @sizeOf(f32)) catch error.UnsupportedQwen4ExpContext;
     }
 };
 
@@ -242,19 +244,29 @@ pub const Inventory = struct {
         if (file.tensors.len != 1224) return error.UnsupportedQwen4ExpTensorInventory;
     }
 
-    pub fn cacheSlots(self: Inventory, budget: usize, top_k: usize) ![max_layers]u8 {
-        if (top_k == 0 or top_k > 128) return error.InvalidQwen4ExpCacheBudget;
-        var slots: [max_layers]u8 = @splat(std.math.cast(u8, top_k) orelse return error.InvalidQwen4ExpCacheBudget);
-        var used: usize = 0;
+    /// Bytes that hold `count` experts of every layer.
+    pub fn cacheBytes(self: Inventory, count: usize) !usize {
+        var total: usize = 0;
         for (self.per_expert_bytes) |bytes| {
             if (bytes == 0) return error.MissingQwen4ExpExpertProjection;
-            used = try std.math.add(usize, used, try std.math.mul(usize, bytes, top_k));
+            total = try std.math.add(usize, total, try std.math.mul(usize, bytes, count));
         }
+        return total;
+    }
+
+    /// Whole slots per layer within `budget`, at least one route and at most
+    /// every expert. A budget beyond full residency cannot be honoured and is
+    /// rejected rather than truncated; callers report the bytes actually used.
+    pub fn cacheSlots(self: Inventory, budget: usize, top_k: usize, experts: usize) ![max_layers]u16 {
+        if (top_k == 0 or top_k > experts or experts > std.math.maxInt(u16)) return error.InvalidQwen4ExpCacheBudget;
+        var used = try self.cacheBytes(top_k);
         if (used > budget) return error.InvalidQwen4ExpCacheBudget;
+        if (budget > try self.cacheBytes(experts)) return error.Qwen4ExpCacheBudgetExceedsExperts;
+        var slots: [max_layers]u16 = @splat(@intCast(top_k));
         while (true) {
             var progress = false;
             for (&slots, self.per_expert_bytes) |*count, bytes| {
-                if (count.* >= 128 or bytes > budget - used) continue;
+                if (count.* >= experts or bytes > budget - used) continue;
                 count.* += 1;
                 used += bytes;
                 progress = true;
@@ -327,14 +339,27 @@ test "Qwen4Exp cache sizing fits mixed expert strides and rejects undersized bud
     var inventory: Inventory = .{};
     inventory.per_expert_bytes = @splat(3 * 1024 * 1024);
     inventory.per_expert_bytes[47] = 4 * 1024 * 1024;
-    const slots = try inventory.cacheSlots(2 * 1024 * 1024 * 1024, 10);
+    const slots = try inventory.cacheSlots(2 * 1024 * 1024 * 1024, 10, 512);
     var bytes: usize = 0;
     for (slots, inventory.per_expert_bytes) |count, stride| {
         try std.testing.expect(count >= 10);
         bytes += count * stride;
     }
     try std.testing.expect(bytes <= 2 * 1024 * 1024 * 1024);
-    try std.testing.expectError(error.InvalidQwen4ExpCacheBudget, inventory.cacheSlots(1024, 10));
+    try std.testing.expectError(error.InvalidQwen4ExpCacheBudget, inventory.cacheSlots(1024, 10, 512));
+    // A 48 GB host's budget passes the old 128-slot ceiling without truncation.
+    const large: usize = 30 * 1024 * 1024 * 1024;
+    const many = try inventory.cacheSlots(large, 10, 512);
+    var large_bytes: usize = 0;
+    for (many, inventory.per_expert_bytes) |count, stride| {
+        try std.testing.expect(count > 128 and count <= 512);
+        large_bytes += count * stride;
+    }
+    try std.testing.expect(large_bytes <= large and large - large_bytes < 4 * 1024 * 1024);
+    // Full residency is exact; anything beyond it is an error, not a clamp.
+    const full = try inventory.cacheBytes(512);
+    for (try inventory.cacheSlots(full, 10, 512)) |count| try std.testing.expectEqual(@as(u16, 512), count);
+    try std.testing.expectError(error.Qwen4ExpCacheBudgetExceedsExperts, inventory.cacheSlots(full + 1, 10, 512));
 }
 
 test "Qwen4Exp installed split GGUF inventory uses bounded metadata reads" {
@@ -345,7 +370,7 @@ test "Qwen4Exp installed split GGUF inventory uses bounded metadata reads" {
     const cfg = try Config.fromGguf(file);
     const inventory = try Inventory.inspect(file, cfg);
     try Inventory.validateRequired(file, cfg);
-    const slots = try inventory.cacheSlots(2 * 1024 * 1024 * 1024, cfg.top_k);
+    const slots = try inventory.cacheSlots(2 * 1024 * 1024 * 1024, cfg.top_k, cfg.experts);
     try std.testing.expectEqual(@as(usize, 1224), file.tensors.len);
     try std.testing.expectEqual(@as(usize, 5_505_584_640), inventory.resident_bytes);
     try std.testing.expectEqual(@as(usize, 28_800_138_240), inventory.ngram_bytes);

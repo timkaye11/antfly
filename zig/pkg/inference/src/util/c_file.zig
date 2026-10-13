@@ -370,22 +370,60 @@ pub fn fileIdentity(allocator: std.mem.Allocator, path: []const u8) !FileIdentit
     return fileIdentityFromFd(allocator, fd);
 }
 
-fn fileIdentityFromFd(allocator: std.mem.Allocator, fd: std.posix.fd_t) !FileIdentity {
-    if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
-    const linux = std.os.linux;
-    var statx = std.mem.zeroes(linux.Statx);
-    while (true) {
-        switch (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{
-            .SIZE = true,
-            .INO = true,
-            .MTIME = true,
-        }, &statx))) {
-            .SUCCESS => break,
-            .INTR => continue,
-            else => return error.StatFailed,
+const FileStat = struct {
+    size: u64,
+    inode: u64,
+    mtime_seconds: i64,
+    mtime_nanoseconds: u32,
+    device_major: u32,
+    device_minor: u32,
+};
+
+fn fileStatFromFd(fd: std.posix.fd_t) !FileStat {
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var statx = std.mem.zeroes(linux.Statx);
+        while (true) {
+            switch (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{
+                .SIZE = true,
+                .INO = true,
+                .MTIME = true,
+            }, &statx))) {
+                .SUCCESS => break,
+                .INTR => continue,
+                else => return error.StatFailed,
+            }
         }
+        if (!statx.mask.SIZE or !statx.mask.INO or !statx.mask.MTIME) return error.StatFailed;
+        return .{
+            .size = statx.size,
+            .inode = statx.ino,
+            .mtime_seconds = statx.mtime.sec,
+            .mtime_nanoseconds = statx.mtime.nsec,
+            .device_major = statx.dev_major,
+            .device_minor = statx.dev_minor,
+        };
     }
-    if (!statx.mask.SIZE or !statx.mask.INO or !statx.mask.MTIME) return error.StatFailed;
+    if (comptime builtin.os.tag.isDarwin() and builtin.link_libc) {
+        var stat_buf: c.struct_stat = undefined;
+        if (c.fstat(fd, &stat_buf) != 0) return error.StatFailed;
+        const modified = stat_buf.mtime();
+        // Darwin dev_t packs an 8-bit major above a 24-bit minor.
+        const device: u32 = @bitCast(stat_buf.dev);
+        return .{
+            .size = std.math.cast(u64, stat_buf.size) orelse return error.StatFailed,
+            .inode = stat_buf.ino,
+            .mtime_seconds = modified.sec,
+            .mtime_nanoseconds = std.math.cast(u32, modified.nsec) orelse return error.StatFailed,
+            .device_major = device >> 24,
+            .device_minor = device & 0xffffff,
+        };
+    }
+    return error.UnsupportedPlatform;
+}
+
+fn fileIdentityFromFd(allocator: std.mem.Allocator, fd: std.posix.fd_t) !FileIdentity {
+    const statx = try fileStatFromFd(fd);
     const sample_bytes: usize = @intCast(@min(statx.size, file_identity_sample_bytes));
     const sample = try allocator.alloc(u8, sample_bytes);
     defer allocator.free(sample);
@@ -412,11 +450,11 @@ fn fileIdentityFromFd(allocator: std.mem.Allocator, fd: std.posix.fd_t) !FileIde
     hasher.final(&quick_fingerprint);
     return .{
         .size = statx.size,
-        .inode = statx.ino,
-        .mtime_seconds = statx.mtime.sec,
-        .mtime_nanoseconds = statx.mtime.nsec,
-        .device_major = statx.dev_major,
-        .device_minor = statx.dev_minor,
+        .inode = statx.inode,
+        .mtime_seconds = statx.mtime_seconds,
+        .mtime_nanoseconds = statx.mtime_nanoseconds,
+        .device_major = statx.device_major,
+        .device_minor = statx.device_minor,
         .quick_fingerprint_sha256 = quick_fingerprint,
     };
 }
@@ -501,11 +539,84 @@ pub const RangeReader = struct {
         return @intCast(try fileSizeFromFd(self.fd));
     }
 
+    /// Exact positional read. A short read is IncompleteRead; an OS failure
+    /// keeps its class so owners can tell a transient device error from a
+    /// truncated or revoked file.
     pub fn read(self: *const RangeReader, offset: u64, destination: []u8) !void {
         if (offset > self.size or destination.len > self.size - offset) return error.RegionOutOfBounds;
-        try readRegionFromFd(self.fd, destination, offset);
+        var total: usize = 0;
+        while (total < destination.len) {
+            switch (preadRetryingInterrupts(self.fd, destination[total..], try std.math.add(u64, offset, total))) {
+                .bytes => |n| {
+                    if (n == 0) return error.IncompleteRead;
+                    total += n;
+                },
+                .failed => |code| return switch (code) {
+                    .IO => error.InputOutput,
+                    .NXIO, .NODEV => error.NoDevice,
+                    .BADF => error.NotOpenForReading,
+                    .TIMEDOUT => error.ReadTimedOut,
+                    else => error.ReadFailed,
+                },
+            }
+        }
+    }
+
+    /// Local identity of the open file: stat fields plus a sampled content
+    /// fingerprint, never a substitute for a full digest.
+    pub fn identity(self: *const RangeReader, allocator: std.mem.Allocator) !FileIdentity {
+        return fileIdentityFromFd(allocator, self.fd);
+    }
+
+    /// Whether two descriptors name the same file object, so bytes hashed
+    /// through one are the bytes read through the other.
+    pub fn sameFile(self: *const RangeReader, other_fd: std.posix.fd_t) !bool {
+        const mine = try fileStatFromFd(self.fd);
+        const theirs = try fileStatFromFd(other_fd);
+        return mine.inode == theirs.inode and mine.device_major == theirs.device_major and
+            mine.device_minor == theirs.device_minor and mine.size == theirs.size;
     }
 };
+
+/// Read failures that can clear without operator action: a bus reset, a slow
+/// network volume, or an unclassified errno. Truncation, a missing device and
+/// a revoked descriptor cannot.
+pub fn isTransientReadError(err: anyerror) bool {
+    return err == error.InputOutput or err == error.ReadTimedOut or err == error.ReadFailed;
+}
+
+/// Replace `path` with `bytes` through a sibling temporary file and rename,
+/// creating missing parent directories. Readers see the old or new content.
+pub fn writeFileAtomic(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) !void {
+    if (!comptime builtin.link_libc) return error.UnsupportedPlatform;
+    if (std.fs.path.dirname(path)) |parent| {
+        var end: usize = 1;
+        while (end <= parent.len) : (end += 1) {
+            if (end != parent.len and parent[end] != '/') continue;
+            const prefix = try allocator.dupeSentinel(u8, parent[0..end], 0);
+            defer allocator.free(prefix);
+            // An existing component is fine; a real failure surfaces at open.
+            _ = c.mkdir(prefix.ptr, 0o700);
+        }
+    }
+    const temporary = try std.fmt.allocPrintSentinel(allocator, "{s}.tmp.{d}", .{ path, c.getpid() }, 0);
+    defer allocator.free(temporary);
+    const target = try allocator.dupeSentinel(u8, path, 0);
+    defer allocator.free(target);
+    const fd = c.open(temporary.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c.mode_t, 0o600));
+    if (fd < 0) return error.CreateFailed;
+    var published = false;
+    defer if (!published) {
+        _ = c.unlink(temporary.ptr);
+    };
+    writeAllAt(@intCast(fd), bytes, 0) catch |err| {
+        closeFd(@intCast(fd));
+        return err;
+    };
+    closeFd(@intCast(fd));
+    if (std.c.rename(temporary.ptr, target.ptr) != 0) return error.RenameFailed;
+    published = true;
+}
 
 fn readRegionFromFd(fd: std.posix.fd_t, buf: []u8, offset: u64) !void {
     var total: usize = 0;
@@ -741,25 +852,41 @@ fn closeFd(fd: std.posix.fd_t) void {
     }
 }
 
-fn readAt(fd: std.posix.fd_t, buf: []u8, offset: u64) !usize {
+const PreadOutcome = union(enum) { bytes: usize, failed: std.posix.E };
+
+/// One positional read. EINTR transfers no data and is retried on every
+/// platform; any other errno is returned to the caller unflattened.
+fn preadRetryingInterrupts(fd: std.posix.fd_t, buf: []u8, offset: u64) PreadOutcome {
     // Prefer the raw Linux syscall even in libc-linked builds so the hot
     // prefetch/read path can distinguish and retry EINTR deterministically.
     if (builtin.os.tag == .linux) {
         while (true) {
             const rc = std.os.linux.pread(fd, buf.ptr, buf.len, @intCast(offset));
             switch (std.os.linux.errno(rc)) {
-                .SUCCESS => return @intCast(rc),
+                .SUCCESS => return .{ .bytes = @intCast(rc) },
                 .INTR => continue,
-                else => return error.ReadFailed,
+                else => |code| return .{ .failed = code },
             }
         }
     }
     if (comptime builtin.link_libc) {
-        const n = c.pread(fd, buf.ptr, buf.len, @intCast(offset));
-        if (n < 0) return error.ReadFailed;
-        return @intCast(n);
+        while (true) {
+            const n = c.pread(fd, buf.ptr, buf.len, @intCast(offset));
+            if (n >= 0) return .{ .bytes = @intCast(n) };
+            switch (std.posix.errno(n)) {
+                .INTR => continue,
+                else => |code| return .{ .failed = code },
+            }
+        }
     }
-    return error.ReadFailed;
+    return .{ .failed = .NOSYS };
+}
+
+fn readAt(fd: std.posix.fd_t, buf: []u8, offset: u64) !usize {
+    return switch (preadRetryingInterrupts(fd, buf, offset)) {
+        .bytes => |n| n,
+        .failed => error.ReadFailed,
+    };
 }
 
 fn writeAllAt(fd: std.posix.fd_t, bytes: []const u8, offset: u64) !void {

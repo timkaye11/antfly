@@ -1,0 +1,529 @@
+{
+ "schema": 1,
+ "purpose": "Phase 0.5 go/no-go: predicted Flash expert I/O versus cache size and policy",
+ "plan": "docs/design/inference/history/qwen/qwen38-studio-handoff-plan-2026-10.md",
+ "date": "2026-10-13",
+ "scope": "Offline replay of recorded expert routes. Bytes are application read ranges of whole experts; nothing here is measured throughput at these cache sizes. The recording runs are functional only: system swap counters moved during them.",
+ "host": {"platform": "macOS-26.5-arm64-arm-64bit", "machine": "arm64", "physical_memory_bytes": 17179869184, "model": "Mac16,12", "chip": "Apple M4"},
+ "source": {"commit": "638bbbd52df724036a4d06b52e7cd0f9d400244d", "branch": "qwen38-flash-next-metal", "working_tree": "uncommitted Phase 0 changes on top of the commit"},
+ "binary_sha256": "be827643620fa70dfca7be0db0ddd2686b1688cb260236f538dc65d95827467a",
+ "recording": {
+  "tool": "scripts/qwen4exp/record_routes.py",
+  "requested": {"cache_mb": 1536, "combined_budget_mb": null, "verify": "stamp"},
+  "plan": {"admitted_bytes": 7828054016, "process_cap_bytes": 8633360384, "process_cap_source": "derived", "expert_cache_bytes": 1607577600, "expert_cache_source": "explicit", "machine_profile": {"host_physical_bytes": 17179869184, "machine_cap_bytes": 10737418240, "metal_recommended_working_set_bytes": 12713115648, "metal_max_buffer_bytes": 9534832640, "process_cap_bytes": 8633360384, "process_cap_source": "derived", "max_context": 4096}},
+  "expert_slots_per_layer": [10, 11],
+  "swap_before": {"swapins": 309944, "swapouts": 624955},
+  "swap_after": {"swapins": 400833, "swapouts": 661977},
+  "raw_traces": "Not kept in the repository; each trace is identified by its SHA-256 below. Re-record with record_routes.py.",
+  "workloads": [
+   {"name": "chat", "decode_tokens": 519, "seconds": 722.1979260420003, "trace_bytes": 575040, "trace_sha256": "aeff32ab008dae5a11b5ea816ed8e867b1ff46508bcdeaa9d8c3547c1675c09d", "prompt_tokens": 80, "generated_tokens": 520, "finish_reason": "length", "prefill_ms": 49933.222834, "decode_ms": 665325.409166, "decode_tokens_per_second": 0.780069410922661, "measured_prefill_expert_io": {"hits": 0, "misses": 8211, "bytes_read": 25751244800, "read_failures": 0, "read_retries": 0}, "measured_decode_expert_io": {"hits": 108357, "misses": 140763, "bytes_read": 443020595200, "read_failures": 0, "read_retries": 0}, "measured_decode_mb_per_token": 853.604229672447, "expert_cache_bytes": 1607577600, "process_cap_bytes": 8633360384, "verification_mode": "stamp", "peak_footprint_bytes": 6882252656},
+   {"name": "code", "decode_tokens": 519, "seconds": 787.5189393750006, "trace_bytes": 585600, "trace_sha256": "b54846450aea8501ff540eddc493dc79057c23b99a9540ede836478cb3e3e570", "prompt_tokens": 91, "generated_tokens": 520, "finish_reason": "length", "prefill_ms": 52290.968125, "decode_ms": 728157.218792, "decode_tokens_per_second": 0.7127581607458509, "measured_prefill_expert_io": {"hits": 0, "misses": 8151, "bytes_read": 25571635200, "read_failures": 0, "read_retries": 0}, "measured_decode_expert_io": {"hits": 90923, "misses": 158197, "bytes_read": 496767897600, "read_failures": 0, "read_retries": 0}, "measured_decode_mb_per_token": 957.1635791907514, "expert_cache_bytes": 1607577600, "process_cap_bytes": 8633360384, "verification_mode": "stamp", "peak_footprint_bytes": 6881564504},
+   {"name": "document", "decode_tokens": 519, "seconds": 1520.143418875, "trace_bytes": 1605120, "trace_sha256": "d517eb27b9fe41ff47849bbc99f23a88fbe12c9c9cf14a89aa64600e0ac1cc48", "prompt_tokens": 1153, "generated_tokens": 520, "finish_reason": "length", "prefill_ms": 662623.971042, "decode_ms": 850526.025166, "decode_tokens_per_second": 0.6102106045475858, "measured_prefill_expert_io": {"hits": 19, "misses": 98668, "bytes_read": 309068697600, "read_failures": 0, "read_retries": 0}, "measured_decode_expert_io": {"hits": 83136, "misses": 165984, "bytes_read": 521084416000, "read_failures": 0, "read_retries": 0}, "measured_decode_mb_per_token": 1004.0162157996147, "expert_cache_bytes": 1607577600, "process_cap_bytes": 8633360384, "verification_mode": "stamp", "peak_footprint_bytes": 6892033904},
+   {
+    "name": "session",
+    "decode_tokens": 545,
+    "seconds": 919.5896314169995,
+    "trace_bytes": 716160,
+    "trace_sha256": "192b5b4f0cf4ee7a2a932041fabac8a9ff8654fa318c5cda2be53a11150aa0ff",
+    "turns": [
+     {"prompt_tokens": 42, "reused_tokens": 0, "prefilled_tokens": 42, "position": 151, "finish_reason": "length", "prefill_ms": 33017.327209, "decode_ms": 144919.158833, "generated_tokens": 110},
+     {"prompt_tokens": 193, "reused_tokens": 151, "prefilled_tokens": 42, "position": 302, "finish_reason": "length", "prefill_ms": 33470.421333, "decode_ms": 143540.500208, "generated_tokens": 110},
+     {"prompt_tokens": 340, "reused_tokens": 302, "prefilled_tokens": 38, "position": 449, "finish_reason": "length", "prefill_ms": 32210.974167, "decode_ms": 157233.314625, "generated_tokens": 110},
+     {"prompt_tokens": 486, "reused_tokens": 449, "prefilled_tokens": 37, "position": 595, "finish_reason": "length", "prefill_ms": 31489.064958, "decode_ms": 154664.425958, "generated_tokens": 110},
+     {"prompt_tokens": 637, "reused_tokens": 595, "prefilled_tokens": 42, "position": 746, "finish_reason": "length", "prefill_ms": 34024.036584, "decode_ms": 147485.668125, "generated_tokens": 110}
+    ]
+   }
+  ]
+ },
+ "replay": {
+  "tool": "scripts/qwen4exp/cache_replay.py --manifest",
+  "policies": {"lfu_decay_slots": "the runtime: equal slots per layer, slot-keyed LFU with halving decay", "lru_per_layer": "equal slots per layer, LRU", "lru_global": "one byte pool for all layers, LRU", "lfu_ghost": "equal slots per layer, expert-keyed LFU that remembers evicted experts", "lfu_ghost_weighted": "lfu_ghost with slots allocated from the other workloads' LRU miss curves", "belady_per_layer": "offline bound, equal slots per layer", "belady_global": "offline bound, one byte pool"},
+  "warm_definition": "second half of each workload's decode tokens",
+  "budgets_gb": [1.6, 2, 3, 4, 6, 8, 12, 16, 20, 24, 30, 36],
+  "workloads": {
+   "chat": {
+    "decode_tokens": 519,
+    "warm_decode_tokens": 260,
+    "prefill_tokens": 80,
+    "distinct_experts_per_layer": {"min": 142, "mean": 280.375, "max": 380},
+    "all_miss_bytes_per_token": 1504256000,
+    "results": {
+     "1.6": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.4329, "bytes_per_token": 856827166.1}, "decode_warm": {"hit_rate": 0.4373, "bytes_per_token": 850195298.5}, "prefill_bytes": 25751244800, "slots_min_max": [10, 11]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.4254, "bytes_per_token": 867893666.3}, "decode_warm": {"hit_rate": 0.4303, "bytes_per_token": 860495556.9}, "prefill_bytes": 25751244800, "slots_min_max": [10, 11]},
+      "lru_global": {"decode": {"hit_rate": 0.4192, "bytes_per_token": 877202990.4}, "decode_warm": {"hit_rate": 0.4241, "bytes_per_token": 869771421.5}, "prefill_bytes": 25751244800, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.4384, "bytes_per_token": 848519546.8}, "decode_warm": {"hit_rate": 0.4433, "bytes_per_token": 841043101.5}, "prefill_bytes": 25751244800, "slots_min_max": [10, 11]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.4389, "bytes_per_token": 848060423.9}, "decode_warm": {"hit_rate": 0.4441, "bytes_per_token": 840315667.7}, "prefill_bytes": 25751244800, "slots_min_max": [10, 12]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.4528, "bytes_per_token": 826928141.8}, "decode_warm": {"hit_rate": 0.4569, "bytes_per_token": 820712369.2}, "prefill_bytes": 25751244800, "slots_min_max": [10, 11]},
+      "belady_global": {"decode": {"hit_rate": 0.5933, "bytes_per_token": 614610719.1}, "decode_warm": {"hit_rate": 0.5933, "bytes_per_token": 614621735.4}, "prefill_bytes": 25751244800, "slots_min_max": null}
+     },
+     "2": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.4796, "bytes_per_token": 786459030.4}, "decode_warm": {"hit_rate": 0.4841, "bytes_per_token": 779681083.1}, "prefill_bytes": 25751244800, "slots_min_max": [13, 14]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.4567, "bytes_per_token": 821114031.6}, "decode_warm": {"hit_rate": 0.4601, "bytes_per_token": 815979520.0}, "prefill_bytes": 25751244800, "slots_min_max": [13, 14]},
+      "lru_global": {"decode": {"hit_rate": 0.4194, "bytes_per_token": 876857119.1}, "decode_warm": {"hit_rate": 0.4241, "bytes_per_token": 869743852.3}, "prefill_bytes": 25751244800, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.4949, "bytes_per_token": 763327284.8}, "decode_warm": {"hit_rate": 0.5014, "bytes_per_token": 753517095.4}, "prefill_bytes": 25751244800, "slots_min_max": [13, 14]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.4955, "bytes_per_token": 762937809.6}, "decode_warm": {"hit_rate": 0.5019, "bytes_per_token": 753343409.2}, "prefill_bytes": 25751244800, "slots_min_max": [10, 18]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.5467, "bytes_per_token": 685279741.0}, "decode_warm": {"hit_rate": 0.5485, "bytes_per_token": 682568467.7}, "prefill_bytes": 25751244800, "slots_min_max": [13, 14]},
+      "belady_global": {"decode": {"hit_rate": 0.6353, "bytes_per_token": 551123311.0}, "decode_warm": {"hit_rate": 0.6344, "bytes_per_token": 552479113.8}, "prefill_bytes": 25751244800, "slots_min_max": null}
+     },
+     "3": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.5514, "bytes_per_token": 678528641.2}, "decode_warm": {"hit_rate": 0.5571, "bytes_per_token": 669821243.1}, "prefill_bytes": 25751244800, "slots_min_max": [19, 20]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.5308, "bytes_per_token": 710025421.2}, "decode_warm": {"hit_rate": 0.5302, "bytes_per_token": 710911606.2}, "prefill_bytes": 25751244800, "slots_min_max": [19, 20]},
+      "lru_global": {"decode": {"hit_rate": 0.5041, "bytes_per_token": 749544521.0}, "decode_warm": {"hit_rate": 0.5031, "bytes_per_token": 751181193.8}, "prefill_bytes": 25751244800, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.5724, "bytes_per_token": 646709863.6}, "decode_warm": {"hit_rate": 0.5811, "bytes_per_token": 633435372.3}, "prefill_bytes": 25751244800, "slots_min_max": [19, 20]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.569, "bytes_per_token": 651853342.6}, "decode_warm": {"hit_rate": 0.5773, "bytes_per_token": 639457280.0}, "prefill_bytes": 25751244800, "slots_min_max": [10, 24]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.6575, "bytes_per_token": 518394376.9}, "decode_warm": {"hit_rate": 0.6569, "bytes_per_token": 519255433.8}, "prefill_bytes": 25751244800, "slots_min_max": [19, 20]},
+      "belady_global": {"decode": {"hit_rate": 0.7089, "bytes_per_token": 439633781.9}, "decode_warm": {"hit_rate": 0.7084, "bytes_per_token": 440497624.6}, "prefill_bytes": 25751244800, "slots_min_max": null}
+     },
+     "4": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.5978, "bytes_per_token": 608321701.7}, "decode_warm": {"hit_rate": 0.6031, "bytes_per_token": 600363716.9}, "prefill_bytes": 25751244800, "slots_min_max": [26, 27]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.5805, "bytes_per_token": 634960104.8}, "decode_warm": {"hit_rate": 0.5792, "bytes_per_token": 636883889.2}, "prefill_bytes": 25751244800, "slots_min_max": [26, 27]},
+      "lru_global": {"decode": {"hit_rate": 0.5688, "bytes_per_token": 651688595.0}, "decode_warm": {"hit_rate": 0.5655, "bytes_per_token": 656773120.0}, "prefill_bytes": 25751244800, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.6251, "bytes_per_token": 566909089.8}, "decode_warm": {"hit_rate": 0.6368, "bytes_per_token": 549318892.3}, "prefill_bytes": 25751244800, "slots_min_max": [26, 27]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.6215, "bytes_per_token": 571629354.9}, "decode_warm": {"hit_rate": 0.6317, "bytes_per_token": 556314387.7}, "prefill_bytes": 25751244800, "slots_min_max": [10, 36]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.7196, "bytes_per_token": 424307520.6}, "decode_warm": {"hit_rate": 0.718, "bytes_per_token": 426840221.5}, "prefill_bytes": 25751244800, "slots_min_max": [26, 27]},
+      "belady_global": {"decode": {"hit_rate": 0.7575, "bytes_per_token": 366125971.5}, "decode_warm": {"hit_rate": 0.7562, "bytes_per_token": 368184320.0}, "prefill_bytes": 25751244800, "slots_min_max": null}
+     },
+     "6": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.6679, "bytes_per_token": 502372229.7}, "decode_warm": {"hit_rate": 0.676, "bytes_per_token": 490243938.5}, "prefill_bytes": 25751244800, "slots_min_max": [39, 40]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.6541, "bytes_per_token": 523668667.4}, "decode_warm": {"hit_rate": 0.6518, "bytes_per_token": 527272566.2}, "prefill_bytes": 25751244800, "slots_min_max": [39, 40]},
+      "lru_global": {"decode": {"hit_rate": 0.6531, "bytes_per_token": 524110033.1}, "decode_warm": {"hit_rate": 0.6509, "bytes_per_token": 527598670.8}, "prefill_bytes": 25751244800, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.7016, "bytes_per_token": 451251348.0}, "decode_warm": {"hit_rate": 0.7158, "bytes_per_token": 429842510.8}, "prefill_bytes": 25751244800, "slots_min_max": [39, 40]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.7024, "bytes_per_token": 449581971.5}, "decode_warm": {"hit_rate": 0.7156, "bytes_per_token": 429570756.9}, "prefill_bytes": 25751244800, "slots_min_max": [14, 56]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.7958, "bytes_per_token": 309059773.4}, "decode_warm": {"hit_rate": 0.793, "bytes_per_token": 313424344.6}, "prefill_bytes": 25751244800, "slots_min_max": [39, 40]},
+      "belady_global": {"decode": {"hit_rate": 0.8244, "bytes_per_token": 264891240.1}, "decode_warm": {"hit_rate": 0.8214, "bytes_per_token": 269452209.2}, "prefill_bytes": 25751244800, "slots_min_max": null}
+     },
+     "8": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.7232, "bytes_per_token": 418674928.7}, "decode_warm": {"hit_rate": 0.7321, "bytes_per_token": 405387421.5}, "prefill_bytes": 25751244800, "slots_min_max": [53, 54]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.7102, "bytes_per_token": 438627736.4}, "decode_warm": {"hit_rate": 0.7072, "bytes_per_token": 443267938.5}, "prefill_bytes": 25751244800, "slots_min_max": [53, 54]},
+      "lru_global": {"decode": {"hit_rate": 0.7182, "bytes_per_token": 425513828.1}, "decode_warm": {"hit_rate": 0.7134, "bytes_per_token": 432934596.9}, "prefill_bytes": 25751244800, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.7577, "bytes_per_token": 366518406.2}, "decode_warm": {"hit_rate": 0.7717, "bytes_per_token": 345378264.6}, "prefill_bytes": 25751244800, "slots_min_max": [53, 54]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.7644, "bytes_per_token": 355341613.9}, "decode_warm": {"hit_rate": 0.7779, "bytes_per_token": 335146929.2}, "prefill_bytes": 25751244800, "slots_min_max": [38, 76]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.8449, "bytes_per_token": 234696853.9}, "decode_warm": {"hit_rate": 0.8415, "bytes_per_token": 239857427.7}, "prefill_bytes": 25751244800, "slots_min_max": [53, 54]},
+      "belady_global": {"decode": {"hit_rate": 0.8703, "bytes_per_token": 195555785.7}, "decode_warm": {"hit_rate": 0.8676, "bytes_per_token": 199643372.3}, "prefill_bytes": 25751244800, "slots_min_max": null}
+     },
+     "12": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.811, "bytes_per_token": 285846739.1}, "decode_warm": {"hit_rate": 0.8197, "bytes_per_token": 272833378.5}, "prefill_bytes": 25751244800, "slots_min_max": [79, 80]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.7965, "bytes_per_token": 308060238.9}, "decode_warm": {"hit_rate": 0.7935, "bytes_per_token": 312635864.6}, "prefill_bytes": 25751244800, "slots_min_max": [79, 80]},
+      "lru_global": {"decode": {"hit_rate": 0.8178, "bytes_per_token": 274835089.0}, "decode_warm": {"hit_rate": 0.8197, "bytes_per_token": 272109489.2}, "prefill_bytes": 25751244800, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.8349, "bytes_per_token": 249669154.5}, "decode_warm": {"hit_rate": 0.8472, "bytes_per_token": 231236135.4}, "prefill_bytes": 25751244800, "slots_min_max": [79, 80]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.8495, "bytes_per_token": 227067166.1}, "decode_warm": {"hit_rate": 0.8621, "bytes_per_token": 208177624.6}, "prefill_bytes": 25751244800, "slots_min_max": [46, 170]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.9046, "bytes_per_token": 144293240.8}, "decode_warm": {"hit_rate": 0.9013, "bytes_per_token": 149430350.8}, "prefill_bytes": 25751244800, "slots_min_max": [79, 80]},
+      "belady_global": {"decode": {"hit_rate": 0.9257, "bytes_per_token": 111926948.7}, "decode_warm": {"hit_rate": 0.9232, "bytes_per_token": 115640320.0}, "prefill_bytes": 25751244800, "slots_min_max": null}
+     },
+     "16": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.8699, "bytes_per_token": 196850879.4}, "decode_warm": {"hit_rate": 0.8785, "bytes_per_token": 183866683.1}, "prefill_bytes": 25751244800, "slots_min_max": [106, 107]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.8588, "bytes_per_token": 213699921.4}, "decode_warm": {"hit_rate": 0.8586, "bytes_per_token": 214055778.5}, "prefill_bytes": 25751244800, "slots_min_max": [106, 107]},
+      "lru_global": {"decode": {"hit_rate": 0.883, "bytes_per_token": 176350951.8}, "decode_warm": {"hit_rate": 0.8839, "bytes_per_token": 174988209.2}, "prefill_bytes": 25751244800, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.8858, "bytes_per_token": 172672443.9}, "decode_warm": {"hit_rate": 0.8971, "bytes_per_token": 155593649.2}, "prefill_bytes": 25751244800, "slots_min_max": [106, 107]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.9039, "bytes_per_token": 144806424.7}, "decode_warm": {"hit_rate": 0.9142, "bytes_per_token": 129355618.5}, "prefill_bytes": 25751244800, "slots_min_max": [58, 212]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.9383, "bytes_per_token": 93232931.0}, "decode_warm": {"hit_rate": 0.9372, "bytes_per_token": 95084701.5}, "prefill_bytes": 25751244800, "slots_min_max": [106, 107]},
+      "belady_global": {"decode": {"hit_rate": 0.9536, "bytes_per_token": 69842719.1}, "decode_warm": {"hit_rate": 0.9523, "bytes_per_token": 71818240.0}, "prefill_bytes": 25751244800, "slots_min_max": null}
+     },
+     "20": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.9115, "bytes_per_token": 134046335.3}, "decode_warm": {"hit_rate": 0.9193, "bytes_per_token": 122213218.5}, "prefill_bytes": 25751244800, "slots_min_max": [132, 133]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.9024, "bytes_per_token": 147681319.5}, "decode_warm": {"hit_rate": 0.9041, "bytes_per_token": 145153969.2}, "prefill_bytes": 25751244800, "slots_min_max": [132, 133]},
+      "lru_global": {"decode": {"hit_rate": 0.9261, "bytes_per_token": 111357928.3}, "decode_warm": {"hit_rate": 0.9289, "bytes_per_token": 107020603.1}, "prefill_bytes": 25751244800, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.9205, "bytes_per_token": 120179915.2}, "decode_warm": {"hit_rate": 0.9299, "bytes_per_token": 106010387.7}, "prefill_bytes": 25751244800, "slots_min_max": [132, 133]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.9346, "bytes_per_token": 98382526.4}, "decode_warm": {"hit_rate": 0.9435, "bytes_per_token": 84976246.2}, "prefill_bytes": 25751244800, "slots_min_max": [78, 244]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.9583, "bytes_per_token": 63028877.1}, "decode_warm": {"hit_rate": 0.9602, "bytes_per_token": 60215926.2}, "prefill_bytes": 25751244800, "slots_min_max": [132, 133]},
+      "belady_global": {"decode": {"hit_rate": 0.9697, "bytes_per_token": 45561094.4}, "decode_warm": {"hit_rate": 0.9721, "bytes_per_token": 41954067.7}, "prefill_bytes": 25751244800, "slots_min_max": null}
+     },
+     "24": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.9389, "bytes_per_token": 92313106.7}, "decode_warm": {"hit_rate": 0.9461, "bytes_per_token": 81467076.9}, "prefill_bytes": 25751244800, "slots_min_max": [159, 160]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.9333, "bytes_per_token": 100893990.0}, "decode_warm": {"hit_rate": 0.9361, "bytes_per_token": 96701833.8}, "prefill_bytes": 25751244800, "slots_min_max": [159, 160]},
+      "lru_global": {"decode": {"hit_rate": 0.951, "bytes_per_token": 73879133.7}, "decode_warm": {"hit_rate": 0.9577, "bytes_per_token": 63732578.5}, "prefill_bytes": 25751244800, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.9439, "bytes_per_token": 84677302.5}, "decode_warm": {"hit_rate": 0.9524, "bytes_per_token": 71964750.8}, "prefill_bytes": 25751244800, "slots_min_max": [159, 160]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.9536, "bytes_per_token": 69772874.0}, "decode_warm": {"hit_rate": 0.9614, "bytes_per_token": 57974547.7}, "prefill_bytes": 25751244800, "slots_min_max": [90, 308]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.9696, "bytes_per_token": 45943861.3}, "decode_warm": {"hit_rate": 0.9746, "bytes_per_token": 38325956.9}, "prefill_bytes": 25751244800, "slots_min_max": [159, 160]},
+      "belady_global": {"decode": {"hit_rate": 0.9765, "bytes_per_token": 35411853.6}, "decode_warm": {"hit_rate": 0.9839, "bytes_per_token": 24197907.7}, "prefill_bytes": 25751244800, "slots_min_max": null}
+     },
+     "30": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.9633, "bytes_per_token": 55346904.0}, "decode_warm": {"hit_rate": 0.9708, "bytes_per_token": 43981193.8}, "prefill_bytes": 25751244800, "slots_min_max": [199, 200]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.9617, "bytes_per_token": 57783984.6}, "decode_warm": {"hit_rate": 0.9679, "bytes_per_token": 48532086.2}, "prefill_bytes": 25751244800, "slots_min_max": [199, 200]},
+      "lru_global": {"decode": {"hit_rate": 0.9723, "bytes_per_token": 41718430.8}, "decode_warm": {"hit_rate": 0.9812, "bytes_per_token": 28289181.5}, "prefill_bytes": 25751244800, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.9646, "bytes_per_token": 53382954.9}, "decode_warm": {"hit_rate": 0.9728, "bytes_per_token": 41084061.5}, "prefill_bytes": 25751244800, "slots_min_max": [199, 200]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.9701, "bytes_per_token": 44958532.6}, "decode_warm": {"hit_rate": 0.9779, "bytes_per_token": 33172086.2}, "prefill_bytes": 25751244800, "slots_min_max": [118, 348]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.9768, "bytes_per_token": 35023167.6}, "decode_warm": {"hit_rate": 0.9852, "bytes_per_token": 22323200.0}, "prefill_bytes": 25751244800, "slots_min_max": [199, 200]},
+      "belady_global": {"decode": {"hit_rate": 0.9789, "bytes_per_token": 31742224.3}, "decode_warm": {"hit_rate": 0.9888, "bytes_per_token": 16872763.1}, "prefill_bytes": 25751244800, "slots_min_max": null}
+     },
+     "36": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.9737, "bytes_per_token": 39559349.5}, "decode_warm": {"hit_rate": 0.9822, "bytes_per_token": 26876455.4}, "prefill_bytes": 25751244800, "slots_min_max": [239, 240]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.9736, "bytes_per_token": 39728437.8}, "decode_warm": {"hit_rate": 0.9821, "bytes_per_token": 27040295.4}, "prefill_bytes": 25751244800, "slots_min_max": [239, 240]},
+      "lru_global": {"decode": {"hit_rate": 0.9777, "bytes_per_token": 33647377.3}, "decode_warm": {"hit_rate": 0.9865, "bytes_per_token": 20325612.3}, "prefill_bytes": 25751244800, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.9742, "bytes_per_token": 38827751.8}, "decode_warm": {"hit_rate": 0.983, "bytes_per_token": 25549587.7}, "prefill_bytes": 25751244800, "slots_min_max": [239, 240]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.9768, "bytes_per_token": 34966147.2}, "decode_warm": {"hit_rate": 0.9856, "bytes_per_token": 21585132.3}, "prefill_bytes": 25751244800, "slots_min_max": [142, 384]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.9786, "bytes_per_token": 32257183.8}, "decode_warm": {"hit_rate": 0.9881, "bytes_per_token": 17841624.6}, "prefill_bytes": 25751244800, "slots_min_max": [239, 240]},
+      "belady_global": {"decode": {"hit_rate": 0.9789, "bytes_per_token": 31742224.3}, "decode_warm": {"hit_rate": 0.9888, "bytes_per_token": 16872763.1}, "prefill_bytes": 25751244800, "slots_min_max": null}
+     }
+    },
+    "model_check": {
+     "prefill": {"measured": [0, 8211], "replayed": [0, 8211]},
+     "decode": {"measured": [108357, 140763], "replayed": [108357, 140763]},
+     "exact": true
+    }
+   },
+   "code": {
+    "decode_tokens": 519,
+    "warm_decode_tokens": 260,
+    "prefill_tokens": 91,
+    "distinct_experts_per_layer": {"min": 229, "mean": 332.4583333333333, "max": 440},
+    "all_miss_bytes_per_token": 1504256000,
+    "results": {
+     "1.6": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.3633, "bytes_per_token": 959797567.6}, "decode_warm": {"hit_rate": 0.3439, "bytes_per_token": 988781489.2}, "prefill_bytes": 25571635200, "slots_min_max": [10, 11]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.3575, "bytes_per_token": 968437049.7}, "decode_warm": {"hit_rate": 0.3385, "bytes_per_token": 996884086.2}, "prefill_bytes": 25571635200, "slots_min_max": [10, 11]},
+      "lru_global": {"decode": {"hit_rate": 0.3515, "bytes_per_token": 977408591.9}, "decode_warm": {"hit_rate": 0.3328, "bytes_per_token": 1005419913.8}, "prefill_bytes": 25571635200, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.3677, "bytes_per_token": 953179252.4}, "decode_warm": {"hit_rate": 0.3474, "bytes_per_token": 983457870.8}, "prefill_bytes": 25571635200, "slots_min_max": [10, 11]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.3689, "bytes_per_token": 951567882.9}, "decode_warm": {"hit_rate": 0.349, "bytes_per_token": 981324406.2}, "prefill_bytes": 25571635200, "slots_min_max": [10, 12]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.3858, "bytes_per_token": 926180969.6}, "decode_warm": {"hit_rate": 0.3667, "bytes_per_token": 954752787.7}, "prefill_bytes": 25571635200, "slots_min_max": [10, 11]},
+      "belady_global": {"decode": {"hit_rate": 0.5452, "bytes_per_token": 686389370.3}, "decode_warm": {"hit_rate": 0.5305, "bytes_per_token": 708610363.1}, "prefill_bytes": 25571635200, "slots_min_max": null}
+     },
+     "2": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.4021, "bytes_per_token": 901268963.4}, "decode_warm": {"hit_rate": 0.3784, "bytes_per_token": 936679187.7}, "prefill_bytes": 25571635200, "slots_min_max": [13, 14]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.3888, "bytes_per_token": 921501151.4}, "decode_warm": {"hit_rate": 0.3685, "bytes_per_token": 951921821.5}, "prefill_bytes": 25571635200, "slots_min_max": [13, 14]},
+      "lru_global": {"decode": {"hit_rate": 0.3516, "bytes_per_token": 977309940.7}, "decode_warm": {"hit_rate": 0.3328, "bytes_per_token": 1005419913.8}, "prefill_bytes": 25571635200, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.4162, "bytes_per_token": 880235727.2}, "decode_warm": {"hit_rate": 0.3914, "bytes_per_token": 917386633.8}, "prefill_bytes": 25571635200, "slots_min_max": [13, 14]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.4185, "bytes_per_token": 877312493.3}, "decode_warm": {"hit_rate": 0.3945, "bytes_per_token": 913119704.6}, "prefill_bytes": 25571635200, "slots_min_max": [10, 16]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.484, "bytes_per_token": 778275711.8}, "decode_warm": {"hit_rate": 0.4647, "bytes_per_token": 807195569.2}, "prefill_bytes": 25571635200, "slots_min_max": [13, 14]},
+      "belady_global": {"decode": {"hit_rate": 0.5835, "bytes_per_token": 628590982.7}, "decode_warm": {"hit_rate": 0.5686, "bytes_per_token": 651143483.1}, "prefill_bytes": 25571635200, "slots_min_max": null}
+     },
+     "3": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.468, "bytes_per_token": 802537014.3}, "decode_warm": {"hit_rate": 0.4379, "bytes_per_token": 847803076.9}, "prefill_bytes": 25571635200, "slots_min_max": [19, 20]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.4703, "bytes_per_token": 799472511.8}, "decode_warm": {"hit_rate": 0.4508, "bytes_per_token": 828724775.4}, "prefill_bytes": 25571635200, "slots_min_max": [19, 20]},
+      "lru_global": {"decode": {"hit_rate": 0.4464, "bytes_per_token": 835116393.1}, "decode_warm": {"hit_rate": 0.429, "bytes_per_token": 861243864.6}, "prefill_bytes": 25571635200, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.4862, "bytes_per_token": 775022982.7}, "decode_warm": {"hit_rate": 0.4549, "bytes_per_token": 822122732.3}, "prefill_bytes": 25571635200, "slots_min_max": [19, 20]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.4873, "bytes_per_token": 773592736.8}, "decode_warm": {"hit_rate": 0.456, "bytes_per_token": 820604849.2}, "prefill_bytes": 25571635200, "slots_min_max": [10, 26]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.6027, "bytes_per_token": 599975608.5}, "decode_warm": {"hit_rate": 0.5835, "bytes_per_token": 628825009.2}, "prefill_bytes": 25571635200, "slots_min_max": [19, 20]},
+      "belady_global": {"decode": {"hit_rate": 0.6555, "bytes_per_token": 519945569.2}, "decode_warm": {"hit_rate": 0.6363, "bytes_per_token": 548964430.8}, "prefill_bytes": 25571635200, "slots_min_max": null}
+     },
+     "4": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.5124, "bytes_per_token": 735642191.9}, "decode_warm": {"hit_rate": 0.4787, "bytes_per_token": 786237833.8}, "prefill_bytes": 25571635200, "slots_min_max": [26, 27]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.5212, "bytes_per_token": 723006150.3}, "decode_warm": {"hit_rate": 0.5002, "bytes_per_token": 754446178.5}, "prefill_bytes": 25571635200, "slots_min_max": [26, 27]},
+      "lru_global": {"decode": {"hit_rate": 0.5056, "bytes_per_token": 745885940.7}, "decode_warm": {"hit_rate": 0.4848, "bytes_per_token": 777188430.8}, "prefill_bytes": 25571635200, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.5361, "bytes_per_token": 699898278.2}, "decode_warm": {"hit_rate": 0.5025, "bytes_per_token": 750392713.8}, "prefill_bytes": 25571635200, "slots_min_max": [26, 27]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.5351, "bytes_per_token": 701124118.7}, "decode_warm": {"hit_rate": 0.5018, "bytes_per_token": 751264689.2}, "prefill_bytes": 25571635200, "slots_min_max": [10, 38]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.6708, "bytes_per_token": 497332137.2}, "decode_warm": {"hit_rate": 0.651, "bytes_per_token": 527131175.4}, "prefill_bytes": 25571635200, "slots_min_max": [26, 27]},
+      "belady_global": {"decode": {"hit_rate": 0.7096, "bytes_per_token": 438185976.1}, "decode_warm": {"hit_rate": 0.6901, "bytes_per_token": 467689156.9}, "prefill_bytes": 25571635200, "slots_min_max": null}
+     },
+     "6": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.5831, "bytes_per_token": 629246618.9}, "decode_warm": {"hit_rate": 0.545, "bytes_per_token": 686501415.4}, "prefill_bytes": 25571635200, "slots_min_max": [39, 40]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.5957, "bytes_per_token": 610811659.3}, "decode_warm": {"hit_rate": 0.5714, "bytes_per_token": 647486227.7}, "prefill_bytes": 25571635200, "slots_min_max": [39, 40]},
+      "lru_global": {"decode": {"hit_rate": 0.5855, "bytes_per_token": 625448151.1}, "decode_warm": {"hit_rate": 0.5595, "bytes_per_token": 664842240.0}, "prefill_bytes": 25571635200, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.6108, "bytes_per_token": 587362453.9}, "decode_warm": {"hit_rate": 0.5749, "bytes_per_token": 641490313.8}, "prefill_bytes": 25571635200, "slots_min_max": [39, 40]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.6078, "bytes_per_token": 590901074.4}, "decode_warm": {"hit_rate": 0.5711, "bytes_per_token": 646125489.2}, "prefill_bytes": 25571635200, "slots_min_max": [14, 70]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.7566, "bytes_per_token": 367850395.4}, "decode_warm": {"hit_rate": 0.7371, "bytes_per_token": 397225747.7}, "prefill_bytes": 25571635200, "slots_min_max": [39, 40]},
+      "belady_global": {"decode": {"hit_rate": 0.7819, "bytes_per_token": 328860263.6}, "decode_warm": {"hit_rate": 0.7641, "bytes_per_token": 355694670.8}, "prefill_bytes": 25571635200, "slots_min_max": null}
+     },
+     "8": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.6373, "bytes_per_token": 547573444.3}, "decode_warm": {"hit_rate": 0.5949, "bytes_per_token": 611371323.1}, "prefill_bytes": 25571635200, "slots_min_max": [53, 54]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.6567, "bytes_per_token": 518871257.0}, "decode_warm": {"hit_rate": 0.6332, "bytes_per_token": 554473156.9}, "prefill_bytes": 25571635200, "slots_min_max": [53, 54]},
+      "lru_global": {"decode": {"hit_rate": 0.652, "bytes_per_token": 525127719.5}, "decode_warm": {"hit_rate": 0.6261, "bytes_per_token": 564300012.3}, "prefill_bytes": 25571635200, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.6652, "bytes_per_token": 505305723.3}, "decode_warm": {"hit_rate": 0.6282, "bytes_per_token": 561050387.7}, "prefill_bytes": 25571635200, "slots_min_max": [53, 54]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.6626, "bytes_per_token": 508261314.8}, "decode_warm": {"hit_rate": 0.6235, "bytes_per_token": 567099864.6}, "prefill_bytes": 25571635200, "slots_min_max": [32, 86]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.8096, "bytes_per_token": 287779317.1}, "decode_warm": {"hit_rate": 0.7906, "bytes_per_token": 316315963.1}, "prefill_bytes": 25571635200, "slots_min_max": [53, 54]},
+      "belady_global": {"decode": {"hit_rate": 0.8284, "bytes_per_token": 258636158.8}, "decode_warm": {"hit_rate": 0.8089, "bytes_per_token": 288083889.2}, "prefill_bytes": 25571635200, "slots_min_max": null}
+     },
+     "12": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.7222, "bytes_per_token": 419675252.4}, "decode_warm": {"hit_rate": 0.678, "bytes_per_token": 486298387.7}, "prefill_bytes": 25571635200, "slots_min_max": [79, 80]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.7513, "bytes_per_token": 376066663.6}, "decode_warm": {"hit_rate": 0.7303, "bytes_per_token": 407850141.5}, "prefill_bytes": 25571635200, "slots_min_max": [79, 80]},
+      "lru_global": {"decode": {"hit_rate": 0.7647, "bytes_per_token": 354790153.4}, "decode_warm": {"hit_rate": 0.7441, "bytes_per_token": 385866830.8}, "prefill_bytes": 25571635200, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.7473, "bytes_per_token": 381559762.6}, "decode_warm": {"hit_rate": 0.71, "bytes_per_token": 437845464.6}, "prefill_bytes": 25571635200, "slots_min_max": [79, 80]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.7461, "bytes_per_token": 382321942.2}, "decode_warm": {"hit_rate": 0.7036, "bytes_per_token": 446211938.5}, "prefill_bytes": 25571635200, "slots_min_max": [38, 148]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.8729, "bytes_per_token": 192096875.5}, "decode_warm": {"hit_rate": 0.855, "bytes_per_token": 219152541.5}, "prefill_bytes": 25571635200, "slots_min_max": [79, 80]},
+      "belady_global": {"decode": {"hit_rate": 0.8847, "bytes_per_token": 173853299.4}, "decode_warm": {"hit_rate": 0.8657, "bytes_per_token": 202465673.8}, "prefill_bytes": 25571635200, "slots_min_max": null}
+     },
+     "16": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.7868, "bytes_per_token": 322162238.2}, "decode_warm": {"hit_rate": 0.7435, "bytes_per_token": 387656467.7}, "prefill_bytes": 25571635200, "slots_min_max": [106, 107]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.8152, "bytes_per_token": 279201985.4}, "decode_warm": {"hit_rate": 0.7934, "bytes_per_token": 312145920.0}, "prefill_bytes": 25571635200, "slots_min_max": [106, 107]},
+      "lru_global": {"decode": {"hit_rate": 0.8229, "bytes_per_token": 266990538.7}, "decode_warm": {"hit_rate": 0.7985, "bytes_per_token": 303809378.5}, "prefill_bytes": 25571635200, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.807, "bytes_per_token": 291495312.5}, "decode_warm": {"hit_rate": 0.7714, "bytes_per_token": 345201821.5}, "prefill_bytes": 25571635200, "slots_min_max": [106, 107]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.811, "bytes_per_token": 284495611.6}, "decode_warm": {"hit_rate": 0.7707, "bytes_per_token": 345225846.2}, "prefill_bytes": 25571635200, "slots_min_max": [46, 212]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.9104, "bytes_per_token": 135402395.4}, "decode_warm": {"hit_rate": 0.894, "bytes_per_token": 160218584.6}, "prefill_bytes": 25571635200, "slots_min_max": [106, 107]},
+      "belady_global": {"decode": {"hit_rate": 0.92, "bytes_per_token": 120560117.1}, "decode_warm": {"hit_rate": 0.9019, "bytes_per_token": 147834880.0}, "prefill_bytes": 25571635200, "slots_min_max": null}
+     },
+     "20": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.8376, "bytes_per_token": 245397949.9}, "decode_warm": {"hit_rate": 0.798, "bytes_per_token": 305203200.0}, "prefill_bytes": 25571635200, "slots_min_max": [132, 133]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.859, "bytes_per_token": 213172729.1}, "decode_warm": {"hit_rate": 0.8377, "bytes_per_token": 245387815.4}, "prefill_bytes": 25571635200, "slots_min_max": [132, 133]},
+      "lru_global": {"decode": {"hit_rate": 0.8647, "bytes_per_token": 204053407.3}, "decode_warm": {"hit_rate": 0.842, "bytes_per_token": 238167433.8}, "prefill_bytes": 25571635200, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.8533, "bytes_per_token": 221672126.4}, "decode_warm": {"hit_rate": 0.8214, "bytes_per_token": 269755864.6}, "prefill_bytes": 25571635200, "slots_min_max": [132, 133]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.8606, "bytes_per_token": 210061071.3}, "decode_warm": {"hit_rate": 0.8253, "bytes_per_token": 263197932.3}, "prefill_bytes": 25571635200, "slots_min_max": [60, 252]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.9338, "bytes_per_token": 100141280.9}, "decode_warm": {"hit_rate": 0.9204, "bytes_per_token": 120421612.3}, "prefill_bytes": 25571635200, "slots_min_max": [132, 133]},
+      "belady_global": {"decode": {"hit_rate": 0.9412, "bytes_per_token": 88666759.2}, "decode_warm": {"hit_rate": 0.9269, "bytes_per_token": 110015803.1}, "prefill_bytes": 25571635200, "slots_min_max": null}
+     },
+     "24": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.8764, "bytes_per_token": 186765169.9}, "decode_warm": {"hit_rate": 0.841, "bytes_per_token": 240174080.0}, "prefill_bytes": 25571635200, "slots_min_max": [159, 160]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.8917, "bytes_per_token": 163857559.9}, "decode_warm": {"hit_rate": 0.8711, "bytes_per_token": 194912098.5}, "prefill_bytes": 25571635200, "slots_min_max": [159, 160]},
+      "lru_global": {"decode": {"hit_rate": 0.8953, "bytes_per_token": 157917768.0}, "decode_warm": {"hit_rate": 0.8717, "bytes_per_token": 193367827.7}, "prefill_bytes": 25571635200, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.8883, "bytes_per_token": 168818928.7}, "decode_warm": {"hit_rate": 0.8613, "bytes_per_token": 209537575.4}, "prefill_bytes": 25571635200, "slots_min_max": [159, 160]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.8966, "bytes_per_token": 155673254.7}, "decode_warm": {"hit_rate": 0.8675, "bytes_per_token": 199479532.3}, "prefill_bytes": 25571635200, "slots_min_max": [78, 306]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.9487, "bytes_per_token": 77467079.8}, "decode_warm": {"hit_rate": 0.9394, "bytes_per_token": 91576320.0}, "prefill_bytes": 25571635200, "slots_min_max": [159, 160]},
+      "belady_global": {"decode": {"hit_rate": 0.9555, "bytes_per_token": 67045956.1}, "decode_warm": {"hit_rate": 0.9454, "bytes_per_token": 82137403.1}, "prefill_bytes": 25571635200, "slots_min_max": null}
+     },
+     "30": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.9191, "bytes_per_token": 122299141.4}, "decode_warm": {"hit_rate": 0.8943, "bytes_per_token": 159744000.0}, "prefill_bytes": 25571635200, "slots_min_max": [199, 200]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.9271, "bytes_per_token": 110264477.8}, "decode_warm": {"hit_rate": 0.9095, "bytes_per_token": 136876504.6}, "prefill_bytes": 25571635200, "slots_min_max": [199, 200]},
+      "lru_global": {"decode": {"hit_rate": 0.936, "bytes_per_token": 96519793.4}, "decode_warm": {"hit_rate": 0.9152, "bytes_per_token": 127805833.8}, "prefill_bytes": 25571635200, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.9261, "bytes_per_token": 111733592.3}, "decode_warm": {"hit_rate": 0.9065, "bytes_per_token": 141267101.5}, "prefill_bytes": 25571635200, "slots_min_max": [199, 200]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.9341, "bytes_per_token": 99268809.2}, "decode_warm": {"hit_rate": 0.9139, "bytes_per_token": 129497403.1}, "prefill_bytes": 25571635200, "slots_min_max": [84, 332]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.9612, "bytes_per_token": 58638896.3}, "decode_warm": {"hit_rate": 0.9585, "bytes_per_token": 62620356.9}, "prefill_bytes": 25571635200, "slots_min_max": [199, 200]},
+      "belady_global": {"decode": {"hit_rate": 0.9663, "bytes_per_token": 50719963.0}, "decode_warm": {"hit_rate": 0.967, "bytes_per_token": 49548209.2}, "prefill_bytes": 25571635200, "slots_min_max": null}
+     },
+     "36": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.9452, "bytes_per_token": 82845348.7}, "decode_warm": {"hit_rate": 0.9317, "bytes_per_token": 103326326.2}, "prefill_bytes": 25571635200, "slots_min_max": [239, 240]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.949, "bytes_per_token": 77136400.8}, "decode_warm": {"hit_rate": 0.9384, "bytes_per_token": 93150916.9}, "prefill_bytes": 25571635200, "slots_min_max": [239, 240]},
+      "lru_global": {"decode": {"hit_rate": 0.9571, "bytes_per_token": 64544160.3}, "decode_warm": {"hit_rate": 0.9491, "bytes_per_token": 76610560.0}, "prefill_bytes": 25571635200, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.9483, "bytes_per_token": 78052279.0}, "decode_warm": {"hit_rate": 0.9373, "bytes_per_token": 94751113.8}, "prefill_bytes": 25571635200, "slots_min_max": [239, 240]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.9557, "bytes_per_token": 66814717.5}, "decode_warm": {"hit_rate": 0.9472, "bytes_per_token": 79478153.8}, "prefill_bytes": 25571635200, "slots_min_max": [134, 384]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.9662, "bytes_per_token": 50996581.1}, "decode_warm": {"hit_rate": 0.9673, "bytes_per_token": 49273304.6}, "prefill_bytes": 25571635200, "slots_min_max": [239, 240]},
+      "belady_global": {"decode": {"hit_rate": 0.9687, "bytes_per_token": 47213305.6}, "decode_warm": {"hit_rate": 0.9717, "bytes_per_token": 42548381.5}, "prefill_bytes": 25571635200, "slots_min_max": null}
+     }
+    },
+    "model_check": {
+     "prefill": {"measured": [0, 8151], "replayed": [0, 8151]},
+     "decode": {"measured": [90923, 158197], "replayed": [90923, 158197]},
+     "exact": true
+    }
+   },
+   "document": {
+    "decode_tokens": 519,
+    "warm_decode_tokens": 260,
+    "prefill_tokens": 1153,
+    "distinct_experts_per_layer": {"min": 365, "mean": 417.6458333333333, "max": 459},
+    "all_miss_bytes_per_token": 1504256000,
+    "results": {
+     "1.6": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.3319, "bytes_per_token": 1006806073.2}, "decode_warm": {"hit_rate": 0.3294, "bytes_per_token": 1010582055.4}, "prefill_bytes": 309071769600, "slots_min_max": [10, 11]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.3273, "bytes_per_token": 1013726261.3}, "decode_warm": {"hit_rate": 0.325, "bytes_per_token": 1017275864.6}, "prefill_bytes": 309062553600, "slots_min_max": [10, 11]},
+      "lru_global": {"decode": {"hit_rate": 0.3222, "bytes_per_token": 1021224940.3}, "decode_warm": {"hit_rate": 0.32, "bytes_per_token": 1024593920.0}, "prefill_bytes": 309124505600, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.3361, "bytes_per_token": 1000443264.7}, "decode_warm": {"hit_rate": 0.3327, "bytes_per_token": 1005625895.4}, "prefill_bytes": 309072281600, "slots_min_max": [10, 11]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.3384, "bytes_per_token": 997388824.7}, "decode_warm": {"hit_rate": 0.3355, "bytes_per_token": 1001802043.1}, "prefill_bytes": 309066137600, "slots_min_max": [10, 12]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.354, "bytes_per_token": 973810583.4}, "decode_warm": {"hit_rate": 0.3517, "bytes_per_token": 977343803.1}, "prefill_bytes": 308108185600, "slots_min_max": [10, 11]},
+      "belady_global": {"decode": {"hit_rate": 0.5101, "bytes_per_token": 738571936.8}, "decode_warm": {"hit_rate": 0.5076, "bytes_per_token": 742561083.1}, "prefill_bytes": 295055257600, "slots_min_max": null}
+     },
+     "2": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.3687, "bytes_per_token": 951362293.6}, "decode_warm": {"hit_rate": 0.3635, "bytes_per_token": 959229636.9}, "prefill_bytes": 309059481600, "slots_min_max": [13, 14]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.3534, "bytes_per_token": 974482003.9}, "decode_warm": {"hit_rate": 0.3513, "bytes_per_token": 977728196.9}, "prefill_bytes": 309050265600, "slots_min_max": [13, 14]},
+      "lru_global": {"decode": {"hit_rate": 0.3222, "bytes_per_token": 1021224940.3}, "decode_warm": {"hit_rate": 0.32, "bytes_per_token": 1024593920.0}, "prefill_bytes": 309117337600, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.381, "bytes_per_token": 932763573.0}, "decode_warm": {"hit_rate": 0.3746, "bytes_per_token": 942371840.0}, "prefill_bytes": 309059993600, "slots_min_max": [13, 14]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.3841, "bytes_per_token": 928706244.3}, "decode_warm": {"hit_rate": 0.3774, "bytes_per_token": 938739790.8}, "prefill_bytes": 309056921600, "slots_min_max": [10, 16]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.4493, "bytes_per_token": 830165678.6}, "decode_warm": {"hit_rate": 0.4467, "bytes_per_token": 834139372.3}, "prefill_bytes": 304112947200, "slots_min_max": [13, 14]},
+      "belady_global": {"decode": {"hit_rate": 0.5521, "bytes_per_token": 675302350.7}, "decode_warm": {"hit_rate": 0.5497, "bytes_per_token": 678893489.2}, "prefill_bytes": 291827302400, "slots_min_max": null}
+     },
+     "3": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.4314, "bytes_per_token": 857016773.8}, "decode_warm": {"hit_rate": 0.4246, "bytes_per_token": 867479236.9}, "prefill_bytes": 309025689600, "slots_min_max": [19, 20]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.425, "bytes_per_token": 867350295.2}, "decode_warm": {"hit_rate": 0.4227, "bytes_per_token": 870871433.8}, "prefill_bytes": 309025689600, "slots_min_max": [19, 20]},
+      "lru_global": {"decode": {"hit_rate": 0.3989, "bytes_per_token": 906168773.8}, "decode_warm": {"hit_rate": 0.3964, "bytes_per_token": 910045341.5}, "prefill_bytes": 309068697600, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.4541, "bytes_per_token": 822903959.9}, "decode_warm": {"hit_rate": 0.4438, "bytes_per_token": 838443716.9}, "prefill_bytes": 309026201600, "slots_min_max": [19, 20]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.4548, "bytes_per_token": 821910147.2}, "decode_warm": {"hit_rate": 0.4444, "bytes_per_token": 837455163.1}, "prefill_bytes": 309023129600, "slots_min_max": [10, 24]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.574, "bytes_per_token": 642754343.0}, "decode_warm": {"hit_rate": 0.5702, "bytes_per_token": 648481476.9}, "prefill_bytes": 294945996800, "slots_min_max": [19, 20]},
+      "belady_global": {"decode": {"hit_rate": 0.6304, "bytes_per_token": 557155637.8}, "decode_warm": {"hit_rate": 0.6264, "bytes_per_token": 563287827.7}, "prefill_bytes": 283819827200, "slots_min_max": null}
+     },
+     "4": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.4814, "bytes_per_token": 781751392.7}, "decode_warm": {"hit_rate": 0.4723, "bytes_per_token": 795654301.5}, "prefill_bytes": 309000089600, "slots_min_max": [26, 27]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.4793, "bytes_per_token": 785632530.3}, "decode_warm": {"hit_rate": 0.4771, "bytes_per_token": 789136541.5}, "prefill_bytes": 308993945600, "slots_min_max": [26, 27]},
+      "lru_global": {"decode": {"hit_rate": 0.4567, "bytes_per_token": 819172969.6}, "decode_warm": {"hit_rate": 0.4562, "bytes_per_token": 820068824.6}, "prefill_bytes": 309028761600, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.5076, "bytes_per_token": 742265045.1}, "decode_warm": {"hit_rate": 0.4964, "bytes_per_token": 759240073.8}, "prefill_bytes": 309001625600, "slots_min_max": [26, 27]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.5073, "bytes_per_token": 742477539.9}, "decode_warm": {"hit_rate": 0.4956, "bytes_per_token": 760133316.9}, "prefill_bytes": 308992409600, "slots_min_max": [12, 36]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.6446, "bytes_per_token": 536363110.6}, "decode_warm": {"hit_rate": 0.6397, "bytes_per_token": 543698313.8}, "prefill_bytes": 285943808000, "slots_min_max": [26, 27]},
+      "belady_global": {"decode": {"hit_rate": 0.6823, "bytes_per_token": 479018518.7}, "decode_warm": {"hit_rate": 0.6769, "bytes_per_token": 487133341.5}, "prefill_bytes": 275822899200, "slots_min_max": null}
+     },
+     "6": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.5596, "bytes_per_token": 664119244.7}, "decode_warm": {"hit_rate": 0.5487, "bytes_per_token": 680713452.3}, "prefill_bytes": 308944281600, "slots_min_max": [39, 40]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.5689, "bytes_per_token": 650672092.5}, "decode_warm": {"hit_rate": 0.5652, "bytes_per_token": 656356824.6}, "prefill_bytes": 308944281600, "slots_min_max": [39, 40]},
+      "lru_global": {"decode": {"hit_rate": 0.5605, "bytes_per_token": 662806985.7}, "decode_warm": {"hit_rate": 0.5562, "bytes_per_token": 669346658.5}, "prefill_bytes": 308948889600, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.5906, "bytes_per_token": 617284168.0}, "decode_warm": {"hit_rate": 0.5794, "bytes_per_token": 634165956.9}, "prefill_bytes": 308863385600, "slots_min_max": [39, 40]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.5898, "bytes_per_token": 617611690.2}, "decode_warm": {"hit_rate": 0.5791, "bytes_per_token": 633897353.8}, "prefill_bytes": 308266905600, "slots_min_max": [14, 70]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.7291, "bytes_per_token": 408941206.9}, "decode_warm": {"hit_rate": 0.7236, "bytes_per_token": 417283544.6}, "prefill_bytes": 267952332800, "slots_min_max": [39, 40]},
+      "belady_global": {"decode": {"hit_rate": 0.7557, "bytes_per_token": 368307939.9}, "decode_warm": {"hit_rate": 0.7482, "bytes_per_token": 379605070.8}, "prefill_bytes": 259818496000, "slots_min_max": null}
+     },
+     "8": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.6245, "bytes_per_token": 566069173.0}, "decode_warm": {"hit_rate": 0.6128, "bytes_per_token": 583967507.7}, "prefill_bytes": 308885913600, "slots_min_max": [53, 54]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.6299, "bytes_per_token": 558572467.1}, "decode_warm": {"hit_rate": 0.6238, "bytes_per_token": 567902916.9}, "prefill_bytes": 308892057600, "slots_min_max": [53, 54]},
+      "lru_global": {"decode": {"hit_rate": 0.6222, "bytes_per_token": 569557678.6}, "decode_warm": {"hit_rate": 0.6172, "bytes_per_token": 577205956.9}, "prefill_bytes": 308865945600, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.6524, "bytes_per_token": 523905233.1}, "decode_warm": {"hit_rate": 0.6432, "bytes_per_token": 537958793.8}, "prefill_bytes": 308634521600, "slots_min_max": [53, 54]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.6536, "bytes_per_token": 521063879.8}, "decode_warm": {"hit_rate": 0.6442, "bytes_per_token": 535310178.5}, "prefill_bytes": 307243929600, "slots_min_max": [32, 80]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.7843, "bytes_per_token": 325532559.5}, "decode_warm": {"hit_rate": 0.7785, "bytes_per_token": 334339938.5}, "prefill_bytes": 249964851200, "slots_min_max": [53, 54]},
+      "belady_global": {"decode": {"hit_rate": 0.8067, "bytes_per_token": 291303731.8}, "decode_warm": {"hit_rate": 0.7985, "bytes_per_token": 303790867.7}, "prefill_bytes": 243823206400, "slots_min_max": null}
+     },
+     "12": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.7294, "bytes_per_token": 408270181.1}, "decode_warm": {"hit_rate": 0.7181, "bytes_per_token": 425347150.8}, "prefill_bytes": 308735078400, "slots_min_max": [79, 80]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.7187, "bytes_per_token": 424843591.5}, "decode_warm": {"hit_rate": 0.7103, "bytes_per_token": 437535113.8}, "prefill_bytes": 308738150400, "slots_min_max": [79, 80]},
+      "lru_global": {"decode": {"hit_rate": 0.7191, "bytes_per_token": 423581644.7}, "decode_warm": {"hit_rate": 0.7095, "bytes_per_token": 438096344.6}, "prefill_bytes": 308709273600, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.7437, "bytes_per_token": 386550332.2}, "decode_warm": {"hit_rate": 0.741, "bytes_per_token": 390597710.8}, "prefill_bytes": 303271833600, "slots_min_max": [79, 80]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.7453, "bytes_per_token": 382774159.5}, "decode_warm": {"hit_rate": 0.7403, "bytes_per_token": 390327926.2}, "prefill_bytes": 300471705600, "slots_min_max": [38, 149]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.8569, "bytes_per_token": 216029274.8}, "decode_warm": {"hit_rate": 0.8514, "bytes_per_token": 224365489.2}, "prefill_bytes": 215969075200, "slots_min_max": [79, 80]},
+      "belady_global": {"decode": {"hit_rate": 0.8746, "bytes_per_token": 188878082.5}, "decode_warm": {"hit_rate": 0.866, "bytes_per_token": 201872147.7}, "prefill_bytes": 211822694400, "slots_min_max": null}
+     },
+     "16": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.8, "bytes_per_token": 301876581.1}, "decode_warm": {"hit_rate": 0.7927, "bytes_per_token": 313093907.7}, "prefill_bytes": 308614246400, "slots_min_max": [106, 107]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.7879, "bytes_per_token": 320321208.5}, "decode_warm": {"hit_rate": 0.7802, "bytes_per_token": 332164726.2}, "prefill_bytes": 308629094400, "slots_min_max": [106, 107]},
+      "lru_global": {"decode": {"hit_rate": 0.8057, "bytes_per_token": 292853937.6}, "decode_warm": {"hit_rate": 0.7909, "bytes_per_token": 315171840.0}, "prefill_bytes": 308551065600, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.8069, "bytes_per_token": 291442040.8}, "decode_warm": {"hit_rate": 0.8086, "bytes_per_token": 288808960.0}, "prefill_bytes": 283278745600, "slots_min_max": [106, 107]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.8124, "bytes_per_token": 281930284.4}, "decode_warm": {"hit_rate": 0.8114, "bytes_per_token": 283395544.6}, "prefill_bytes": 281026867200, "slots_min_max": [48, 208]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.9024, "bytes_per_token": 147358927.2}, "decode_warm": {"hit_rate": 0.8972, "bytes_per_token": 155238400.0}, "prefill_bytes": 183972761600, "slots_min_max": [106, 107]},
+      "belady_global": {"decode": {"hit_rate": 0.9155, "bytes_per_token": 127228547.2}, "decode_warm": {"hit_rate": 0.908, "bytes_per_token": 138631876.9}, "prefill_bytes": 179820544000, "slots_min_max": null}
+     },
+     "20": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.8487, "bytes_per_token": 228784092.5}, "decode_warm": {"hit_rate": 0.8461, "bytes_per_token": 232860750.8}, "prefill_bytes": 307987046400, "slots_min_max": [132, 133]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.8429, "bytes_per_token": 237322555.7}, "decode_warm": {"hit_rate": 0.8379, "bytes_per_token": 244965218.5}, "prefill_bytes": 308329062400, "slots_min_max": [132, 133]},
+      "lru_global": {"decode": {"hit_rate": 0.8566, "bytes_per_token": 216050978.0}, "decode_warm": {"hit_rate": 0.8499, "bytes_per_token": 226237440.0}, "prefill_bytes": 308412825600, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.8513, "bytes_per_token": 224603055.1}, "decode_warm": {"hit_rate": 0.8564, "bytes_per_token": 217082092.3}, "prefill_bytes": 251955200000, "slots_min_max": [132, 133]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.8588, "bytes_per_token": 212425149.9}, "decode_warm": {"hit_rate": 0.8631, "bytes_per_token": 206019741.5}, "prefill_bytes": 244376576000, "slots_min_max": [68, 244]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.9313, "bytes_per_token": 103759611.6}, "decode_warm": {"hit_rate": 0.9277, "bytes_per_token": 109258436.9}, "prefill_bytes": 152320204800, "slots_min_max": [132, 133]},
+      "belady_global": {"decode": {"hit_rate": 0.9422, "bytes_per_token": 87090312.1}, "decode_warm": {"hit_rate": 0.9381, "bytes_per_token": 93202116.9}, "prefill_bytes": 147823104000, "slots_min_max": null}
+     },
+     "24": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.871, "bytes_per_token": 194875289.4}, "decode_warm": {"hit_rate": 0.874, "bytes_per_token": 190558916.9}, "prefill_bytes": 293642444800, "slots_min_max": [159, 160]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.8822, "bytes_per_token": 178012633.5}, "decode_warm": {"hit_rate": 0.8802, "bytes_per_token": 181155840.0}, "prefill_bytes": 302861004800, "slots_min_max": [159, 160]},
+      "lru_global": {"decode": {"hit_rate": 0.8927, "bytes_per_token": 161731822.7}, "decode_warm": {"hit_rate": 0.8912, "bytes_per_token": 163856147.7}, "prefill_bytes": 308256153600, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.8844, "bytes_per_token": 174669737.2}, "decode_warm": {"hit_rate": 0.8926, "bytes_per_token": 162518252.3}, "prefill_bytes": 216330444800, "slots_min_max": [159, 160]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.8936, "bytes_per_token": 159771425.0}, "decode_warm": {"hit_rate": 0.9021, "bytes_per_token": 147131864.6}, "prefill_bytes": 209360793600, "slots_min_max": [80, 308]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.9505, "bytes_per_token": 74813558.4}, "decode_warm": {"hit_rate": 0.9494, "bytes_per_token": 76532578.5}, "prefill_bytes": 122948403200, "slots_min_max": [159, 160]},
+      "belady_global": {"decode": {"hit_rate": 0.9581, "bytes_per_token": 63038544.9}, "decode_warm": {"hit_rate": 0.9586, "bytes_per_token": 62297796.9}, "prefill_bytes": 116922163200, "slots_min_max": null}
+     },
+     "30": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.9054, "bytes_per_token": 142421629.3}, "decode_warm": {"hit_rate": 0.907, "bytes_per_token": 140115495.4}, "prefill_bytes": 232849612800, "slots_min_max": [199, 200]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.9241, "bytes_per_token": 114780732.2}, "decode_warm": {"hit_rate": 0.9271, "bytes_per_token": 110274560.0}, "prefill_bytes": 278531891200, "slots_min_max": [199, 200]},
+      "lru_global": {"decode": {"hit_rate": 0.9352, "bytes_per_token": 97807192.3}, "decode_warm": {"hit_rate": 0.9421, "bytes_per_token": 87241255.4}, "prefill_bytes": 308025753600, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.9184, "bytes_per_token": 123208903.3}, "decode_warm": {"hit_rate": 0.9273, "bytes_per_token": 109958695.4}, "prefill_bytes": 159217868800, "slots_min_max": [199, 200]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.9271, "bytes_per_token": 109664283.6}, "decode_warm": {"hit_rate": 0.9364, "bytes_per_token": 95831040.0}, "prefill_bytes": 159401164800, "slots_min_max": [96, 358]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.9686, "bytes_per_token": 47440006.2}, "decode_warm": {"hit_rate": 0.9703, "bytes_per_token": 44961083.1}, "prefill_bytes": 88699084800, "slots_min_max": [199, 200]},
+      "belady_global": {"decode": {"hit_rate": 0.9745, "bytes_per_token": 38463926.0}, "decode_warm": {"hit_rate": 0.9771, "bytes_per_token": 34555273.8}, "prefill_bytes": 83412992000, "slots_min_max": null}
+     },
+     "36": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.9516, "bytes_per_token": 73398307.5}, "decode_warm": {"hit_rate": 0.9464, "bytes_per_token": 81435175.4}, "prefill_bytes": 143012044800, "slots_min_max": [239, 240]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.9504, "bytes_per_token": 74935688.6}, "decode_warm": {"hit_rate": 0.9564, "bytes_per_token": 65987741.5}, "prefill_bytes": 151803289600, "slots_min_max": [239, 240]},
+      "lru_global": {"decode": {"hit_rate": 0.9571, "bytes_per_token": 64790591.1}, "decode_warm": {"hit_rate": 0.9667, "bytes_per_token": 50178363.1}, "prefill_bytes": 117073920000, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.9423, "bytes_per_token": 86967590.0}, "decode_warm": {"hit_rate": 0.9503, "bytes_per_token": 75092676.9}, "prefill_bytes": 107960627200, "slots_min_max": [239, 240]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.9499, "bytes_per_token": 75214871.7}, "decode_warm": {"hit_rate": 0.957, "bytes_per_token": 64645513.8}, "prefill_bytes": 118260940800, "slots_min_max": [132, 380]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.9802, "bytes_per_token": 29968869.4}, "decode_warm": {"hit_rate": 0.9836, "bytes_per_token": 24868233.8}, "prefill_bytes": 69577728000, "slots_min_max": [239, 240]},
+      "belady_global": {"decode": {"hit_rate": 0.9846, "bytes_per_token": 23236118.7}, "decode_warm": {"hit_rate": 0.991, "bytes_per_token": 13706633.8}, "prefill_bytes": 66985984000, "slots_min_max": null}
+     }
+    },
+    "model_check": {
+     "prefill": {"measured": [19, 98668], "replayed": [19, 98668]},
+     "decode": {"measured": [83136, 165984], "replayed": [83136, 165984]},
+     "exact": true
+    }
+   },
+   "session": {
+    "decode_tokens": 545,
+    "warm_decode_tokens": 273,
+    "prefill_tokens": 201,
+    "distinct_experts_per_layer": {"min": 199, "mean": 328.4375, "max": 439},
+    "all_miss_bytes_per_token": 1504256000,
+    "results": {
+     "1.6": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.3782, "bytes_per_token": 937348932.1}, "decode_warm": {"hit_rate": 0.374, "bytes_per_token": 943599120.9}, "prefill_bytes": 95244595200, "slots_min_max": [10, 11]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.3732, "bytes_per_token": 944881438.5}, "decode_warm": {"hit_rate": 0.3693, "bytes_per_token": 950685350.9}, "prefill_bytes": 95572889600, "slots_min_max": [10, 11]},
+      "lru_global": {"decode": {"hit_rate": 0.3666, "bytes_per_token": 954705262.4}, "decode_warm": {"hit_rate": 0.3634, "bytes_per_token": 959482373.6}, "prefill_bytes": 95954739200, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.3816, "bytes_per_token": 932277595.6}, "decode_warm": {"hit_rate": 0.3772, "bytes_per_token": 938889096.0}, "prefill_bytes": 95256883200, "slots_min_max": [10, 11]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.3838, "bytes_per_token": 929265344.6}, "decode_warm": {"hit_rate": 0.3799, "bytes_per_token": 935163311.4}, "prefill_bytes": 95231897600, "slots_min_max": [10, 12]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.401, "bytes_per_token": 903205578.0}, "decode_warm": {"hit_rate": 0.3969, "bytes_per_token": 909442156.8}, "prefill_bytes": 95101440000, "slots_min_max": [10, 11]},
+      "belady_global": {"decode": {"hit_rate": 0.5596, "bytes_per_token": 664388298.0}, "decode_warm": {"hit_rate": 0.5553, "bytes_per_token": 670936427.8}, "prefill_bytes": 89687040000, "slots_min_max": null}
+     },
+     "2": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.4183, "bytes_per_token": 876892535.8}, "decode_warm": {"hit_rate": 0.4124, "bytes_per_token": 885959548.7}, "prefill_bytes": 93861478400, "slots_min_max": [13, 14]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.4057, "bytes_per_token": 896080229.0}, "decode_warm": {"hit_rate": 0.4011, "bytes_per_token": 903044594.9}, "prefill_bytes": 95412633600, "slots_min_max": [13, 14]},
+      "lru_global": {"decode": {"hit_rate": 0.3669, "bytes_per_token": 954197959.6}, "decode_warm": {"hit_rate": 0.3639, "bytes_per_token": 958745318.7}, "prefill_bytes": 95890227200, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.4306, "bytes_per_token": 858455462.8}, "decode_warm": {"hit_rate": 0.4251, "bytes_per_token": 866837005.1}, "prefill_bytes": 93855129600, "slots_min_max": [13, 14]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.4317, "bytes_per_token": 857365137.6}, "decode_warm": {"hit_rate": 0.4266, "bytes_per_token": 864946543.6}, "prefill_bytes": 93842432000, "slots_min_max": [10, 18]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.502, "bytes_per_token": 750992957.1}, "decode_warm": {"hit_rate": 0.498, "bytes_per_token": 757139223.4}, "prefill_bytes": 93191372800, "slots_min_max": [13, 14]},
+      "belady_global": {"decode": {"hit_rate": 0.6035, "bytes_per_token": 598218921.1}, "decode_warm": {"hit_rate": 0.5993, "bytes_per_token": 604582728.2}, "prefill_bytes": 88081612800, "slots_min_max": null}
+     },
+     "3": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.4808, "bytes_per_token": 783026495.4}, "decode_warm": {"hit_rate": 0.471, "bytes_per_token": 797870417.6}, "prefill_bytes": 90902323200, "slots_min_max": [19, 20]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.4896, "bytes_per_token": 770243781.3}, "decode_warm": {"hit_rate": 0.4858, "bytes_per_token": 776010080.6}, "prefill_bytes": 94974464000, "slots_min_max": [19, 20]},
+      "lru_global": {"decode": {"hit_rate": 0.4614, "bytes_per_token": 812215004.8}, "decode_warm": {"hit_rate": 0.4566, "bytes_per_token": 819348161.2}, "prefill_bytes": 95580569600, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.5059, "bytes_per_token": 745348744.2}, "decode_warm": {"hit_rate": 0.4996, "bytes_per_token": 755018830.8}, "prefill_bytes": 90689126400, "slots_min_max": [19, 20]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.5047, "bytes_per_token": 747246244.4}, "decode_warm": {"hit_rate": 0.4987, "bytes_per_token": 756316272.5}, "prefill_bytes": 90725785600, "slots_min_max": [10, 26]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.6246, "bytes_per_token": 566772162.9}, "decode_warm": {"hit_rate": 0.6205, "bytes_per_token": 573102417.6}, "prefill_bytes": 88818278400, "slots_min_max": [19, 20]},
+      "belady_global": {"decode": {"hit_rate": 0.678, "bytes_per_token": 485932529.9}, "decode_warm": {"hit_rate": 0.6733, "bytes_per_token": 493022241.8}, "prefill_bytes": 84089139200, "slots_min_max": null}
+     },
+     "4": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.5286, "bytes_per_token": 711113511.9}, "decode_warm": {"hit_rate": 0.516, "bytes_per_token": 730300671.1}, "prefill_bytes": 88107827200, "slots_min_max": [26, 27]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.5433, "bytes_per_token": 689481746.8}, "decode_warm": {"hit_rate": 0.5411, "bytes_per_token": 692863906.2}, "prefill_bytes": 94312550400, "slots_min_max": [26, 27]},
+      "lru_global": {"decode": {"hit_rate": 0.5262, "bytes_per_token": 714667825.3}, "decode_warm": {"hit_rate": 0.5229, "bytes_per_token": 719693831.5}, "prefill_bytes": 94956851200, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.5583, "bytes_per_token": 666432916.0}, "decode_warm": {"hit_rate": 0.5501, "bytes_per_token": 678909749.5}, "prefill_bytes": 87799910400, "slots_min_max": [26, 27]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.5557, "bytes_per_token": 669959985.3}, "decode_warm": {"hit_rate": 0.5486, "bytes_per_token": 680860225.6}, "prefill_bytes": 87868620800, "slots_min_max": [10, 38]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.6902, "bytes_per_token": 467795892.8}, "decode_warm": {"hit_rate": 0.6836, "bytes_per_token": 477802901.1}, "prefill_bytes": 84595097600, "slots_min_max": [26, 27]},
+      "belady_global": {"decode": {"hit_rate": 0.7271, "bytes_per_token": 411818040.4}, "decode_warm": {"hit_rate": 0.7182, "bytes_per_token": 425231941.4}, "prefill_bytes": 80424652800, "slots_min_max": null}
+     },
+     "6": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.6069, "bytes_per_token": 593130110.8}, "decode_warm": {"hit_rate": 0.5921, "bytes_per_token": 615764958.2}, "prefill_bytes": 82755993600, "slots_min_max": [39, 40]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.6196, "bytes_per_token": 574603978.0}, "decode_warm": {"hit_rate": 0.6174, "bytes_per_token": 577919718.7}, "prefill_bytes": 92537958400, "slots_min_max": [39, 40]},
+      "lru_global": {"decode": {"hit_rate": 0.6119, "bytes_per_token": 585435079.6}, "decode_warm": {"hit_rate": 0.61, "bytes_per_token": 588456791.2}, "prefill_bytes": 93228339200, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.6343, "bytes_per_token": 551910071.2}, "decode_warm": {"hit_rate": 0.6252, "bytes_per_token": 565804635.9}, "prefill_bytes": 82477875200, "slots_min_max": [39, 40]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.6347, "bytes_per_token": 550743274.9}, "decode_warm": {"hit_rate": 0.6248, "bytes_per_token": 565866150.9}, "prefill_bytes": 82336051200, "slots_min_max": [14, 64]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.7703, "bytes_per_token": 347025520.7}, "decode_warm": {"hit_rate": 0.7603, "bytes_per_token": 362209805.1}, "prefill_bytes": 77092556800, "slots_min_max": [39, 40]},
+      "belady_global": {"decode": {"hit_rate": 0.7956, "bytes_per_token": 308462620.2}, "decode_warm": {"hit_rate": 0.7834, "bytes_per_token": 326897934.1}, "prefill_bytes": 74793164800, "slots_min_max": null}
+     },
+     "8": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.666, "bytes_per_token": 504188852.8}, "decode_warm": {"hit_rate": 0.648, "bytes_per_token": 531484131.9}, "prefill_bytes": 77645004800, "slots_min_max": [53, 54]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.6734, "bytes_per_token": 493231677.1}, "decode_warm": {"hit_rate": 0.6678, "bytes_per_token": 501791507.7}, "prefill_bytes": 90127360000, "slots_min_max": [53, 54]},
+      "lru_global": {"decode": {"hit_rate": 0.6738, "bytes_per_token": 491931854.7}, "decode_warm": {"hit_rate": 0.6674, "bytes_per_token": 501769002.2}, "prefill_bytes": 90943488000, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.6904, "bytes_per_token": 467283329.2}, "decode_warm": {"hit_rate": 0.6791, "bytes_per_token": 484529793.4}, "prefill_bytes": 77393817600, "slots_min_max": [53, 54]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.6933, "bytes_per_token": 462014896.1}, "decode_warm": {"hit_rate": 0.6805, "bytes_per_token": 481350517.2}, "prefill_bytes": 77144166400, "slots_min_max": [34, 104]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.8218, "bytes_per_token": 269267282.2}, "decode_warm": {"hit_rate": 0.8122, "bytes_per_token": 283808539.2}, "prefill_bytes": 70620467200, "slots_min_max": [53, 54]},
+      "belady_global": {"decode": {"hit_rate": 0.8423, "bytes_per_token": 237888728.1}, "decode_warm": {"hit_rate": 0.8336, "bytes_per_token": 251037538.5}, "prefill_bytes": 68722688000, "slots_min_max": null}
+     },
+     "12": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.7559, "bytes_per_token": 368722483.7}, "decode_warm": {"hit_rate": 0.7348, "bytes_per_token": 400727208.8}, "prefill_bytes": 68488396800, "slots_min_max": [79, 80]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.7556, "bytes_per_token": 369351539.1}, "decode_warm": {"hit_rate": 0.7405, "bytes_per_token": 392213380.2}, "prefill_bytes": 83786547200, "slots_min_max": [79, 80]},
+      "lru_global": {"decode": {"hit_rate": 0.7593, "bytes_per_token": 363054220.9}, "decode_warm": {"hit_rate": 0.7382, "bytes_per_token": 395079454.9}, "prefill_bytes": 85314969600, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.7764, "bytes_per_token": 337625952.3}, "decode_warm": {"hit_rate": 0.7625, "bytes_per_token": 358706449.8}, "prefill_bytes": 68010086400, "slots_min_max": [79, 80]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.7836, "bytes_per_token": 325706028.6}, "decode_warm": {"hit_rate": 0.7666, "bytes_per_token": 351625096.0}, "prefill_bytes": 67167232000, "slots_min_max": [40, 156]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.8842, "bytes_per_token": 174985817.2}, "decode_warm": {"hit_rate": 0.8773, "bytes_per_token": 185527044.7}, "prefill_bytes": 60242432000, "slots_min_max": [79, 80]},
+      "belady_global": {"decode": {"hit_rate": 0.9015, "bytes_per_token": 148510438.2}, "decode_warm": {"hit_rate": 0.8947, "bytes_per_token": 158867786.1}, "prefill_bytes": 59244339200, "slots_min_max": null}
+     },
+     "16": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.8211, "bytes_per_token": 270170656.9}, "decode_warm": {"hit_rate": 0.7994, "bytes_per_token": 303097623.4}, "prefill_bytes": 60448460800, "slots_min_max": [106, 107]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.818, "bytes_per_token": 275066880.0}, "decode_warm": {"hit_rate": 0.8019, "bytes_per_token": 299544381.0}, "prefill_bytes": 75407667200, "slots_min_max": [106, 107]},
+      "lru_global": {"decode": {"hit_rate": 0.8355, "bytes_per_token": 248415823.9}, "decode_warm": {"hit_rate": 0.8191, "bytes_per_token": 273279343.6}, "prefill_bytes": 77242470400, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.8378, "bytes_per_token": 244880675.2}, "decode_warm": {"hit_rate": 0.8233, "bytes_per_token": 266987932.6}, "prefill_bytes": 59874099200, "slots_min_max": [106, 107]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.8485, "bytes_per_token": 228044612.1}, "decode_warm": {"hit_rate": 0.8308, "bytes_per_token": 254864972.9}, "prefill_bytes": 59138560000, "slots_min_max": [58, 188]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.9187, "bytes_per_token": 122879060.6}, "decode_warm": {"hit_rate": 0.9151, "bytes_per_token": 128345084.2}, "prefill_bytes": 50963251200, "slots_min_max": [106, 107]},
+      "belady_global": {"decode": {"hit_rate": 0.9321, "bytes_per_token": 102304551.9}, "decode_warm": {"hit_rate": 0.9264, "bytes_per_token": 111087120.9}, "prefill_bytes": 51089817600, "slots_min_max": null}
+     },
+     "20": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.869, "bytes_per_token": 197931684.4}, "decode_warm": {"hit_rate": 0.8505, "bytes_per_token": 226004676.9}, "prefill_bytes": 53203251200, "slots_min_max": [132, 133]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.8647, "bytes_per_token": 204556306.8}, "decode_warm": {"hit_rate": 0.8514, "bytes_per_token": 224859147.3}, "prefill_bytes": 66379059200, "slots_min_max": [132, 133]},
+      "lru_global": {"decode": {"hit_rate": 0.8823, "bytes_per_token": 177631119.3}, "decode_warm": {"hit_rate": 0.869, "bytes_per_token": 197894189.0}, "prefill_bytes": 66034176000, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.8804, "bytes_per_token": 180691658.0}, "decode_warm": {"hit_rate": 0.8681, "bytes_per_token": 199354045.4}, "prefill_bytes": 52810137600, "slots_min_max": [132, 133]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.8923, "bytes_per_token": 162101454.7}, "decode_warm": {"hit_rate": 0.8788, "bytes_per_token": 182802379.5}, "prefill_bytes": 52292915200, "slots_min_max": [72, 238]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.9383, "bytes_per_token": 93177799.6}, "decode_warm": {"hit_rate": 0.9397, "bytes_per_token": 91217394.9}, "prefill_bytes": 42717184000, "slots_min_max": [132, 133]},
+      "belady_global": {"decode": {"hit_rate": 0.9463, "bytes_per_token": 80910279.6}, "decode_warm": {"hit_rate": 0.9516, "bytes_per_token": 72988319.4}, "prefill_bytes": 40013926400, "slots_min_max": null}
+     },
+     "24": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.9027, "bytes_per_token": 147095251.4}, "decode_warm": {"hit_rate": 0.8889, "bytes_per_token": 168065406.6}, "prefill_bytes": 47402905600, "slots_min_max": [159, 160]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.8973, "bytes_per_token": 155250988.6}, "decode_warm": {"hit_rate": 0.8875, "bytes_per_token": 170204928.9}, "prefill_bytes": 57192652800, "slots_min_max": [159, 160]},
+      "lru_global": {"decode": {"hit_rate": 0.9118, "bytes_per_token": 133061002.6}, "decode_warm": {"hit_rate": 0.9044, "bytes_per_token": 144358868.9}, "prefill_bytes": 56118476800, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.9097, "bytes_per_token": 136438699.4}, "decode_warm": {"hit_rate": 0.9007, "bytes_per_token": 150309321.6}, "prefill_bytes": 46607974400, "slots_min_max": [159, 160]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.9205, "bytes_per_token": 119838062.4}, "decode_warm": {"hit_rate": 0.9142, "bytes_per_token": 129479736.3}, "prefill_bytes": 46403993600, "slots_min_max": [84, 294]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.9506, "bytes_per_token": 74599997.1}, "decode_warm": {"hit_rate": 0.9543, "bytes_per_token": 69223900.4}, "prefill_bytes": 35739340800, "slots_min_max": [159, 160]},
+      "belady_global": {"decode": {"hit_rate": 0.9568, "bytes_per_token": 65117945.0}, "decode_warm": {"hit_rate": 0.9615, "bytes_per_token": 58069052.0}, "prefill_bytes": 32660684800, "slots_min_max": null}
+     },
+     "30": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.9345, "bytes_per_token": 98980403.7}, "decode_warm": {"hit_rate": 0.9283, "bytes_per_token": 108696287.2}, "prefill_bytes": 38875750400, "slots_min_max": [199, 200]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.9307, "bytes_per_token": 104735095.8}, "decode_warm": {"hit_rate": 0.927, "bytes_per_token": 110483223.4}, "prefill_bytes": 44085350400, "slots_min_max": [199, 200]},
+      "lru_global": {"decode": {"hit_rate": 0.9408, "bytes_per_token": 89212195.2}, "decode_warm": {"hit_rate": 0.9379, "bytes_per_token": 93733134.1}, "prefill_bytes": 46282035200, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.9371, "bytes_per_token": 95111938.3}, "decode_warm": {"hit_rate": 0.9342, "bytes_per_token": 99662956.8}, "prefill_bytes": 37504716800, "slots_min_max": [199, 200]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.9459, "bytes_per_token": 81458730.3}, "decode_warm": {"hit_rate": 0.9471, "bytes_per_token": 79852870.3}, "prefill_bytes": 36799180800, "slots_min_max": [118, 346]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.9616, "bytes_per_token": 57981510.5}, "decode_warm": {"hit_rate": 0.9703, "bytes_per_token": 44833945.8}, "prefill_bytes": 29156147200, "slots_min_max": [199, 200]},
+      "belady_global": {"decode": {"hit_rate": 0.9672, "bytes_per_token": 49380286.2}, "decode_warm": {"hit_rate": 0.9784, "bytes_per_token": 32564700.4}, "prefill_bytes": 27266764800, "slots_min_max": null}
+     },
+     "36": {
+      "lfu_decay_slots": {"decode": {"hit_rate": 0.9522, "bytes_per_token": 72341184.6}, "decode_warm": {"hit_rate": 0.9534, "bytes_per_token": 70720140.7}, "prefill_bytes": 31676928000, "slots_min_max": [239, 240]},
+      "lru_per_layer": {"decode": {"hit_rate": 0.952, "bytes_per_token": 72595023.9}, "decode_warm": {"hit_rate": 0.9554, "bytes_per_token": 67459094.5}, "prefill_bytes": 33816064000, "slots_min_max": [239, 240]},
+      "lru_global": {"decode": {"hit_rate": 0.9625, "bytes_per_token": 56453589.7}, "decode_warm": {"hit_rate": 0.9709, "bytes_per_token": 43799068.1}, "prefill_bytes": 28624896000, "slots_min_max": null},
+      "lfu_ghost": {"decode": {"hit_rate": 0.9537, "bytes_per_token": 69938636.3}, "decode_warm": {"hit_rate": 0.9569, "bytes_per_token": 65344328.2}, "prefill_bytes": 30844723200, "slots_min_max": [239, 240]},
+      "lfu_ghost_weighted": {"decode": {"hit_rate": 0.9609, "bytes_per_token": 58801086.2}, "decode_warm": {"hit_rate": 0.9685, "bytes_per_token": 47348934.8}, "prefill_bytes": 28986982400, "slots_min_max": [152, 388]},
+      "belady_per_layer": {"decode": {"hit_rate": 0.9675, "bytes_per_token": 49100142.4}, "decode_warm": {"hit_rate": 0.9797, "bytes_per_token": 30719249.8}, "prefill_bytes": 26565222400, "slots_min_max": [239, 240]},
+      "belady_global": {"decode": {"hit_rate": 0.9712, "bytes_per_token": 43404447.7}, "decode_warm": {"hit_rate": 0.9863, "bytes_per_token": 20634912.8}, "prefill_bytes": 25789235200, "slots_min_max": null}
+     }
+    }
+   }
+  }
+ }
+}
