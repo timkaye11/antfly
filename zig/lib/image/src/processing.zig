@@ -642,7 +642,7 @@ fn sampleBicubic(
     return std.math.clamp(accum, 0.0, 255.0);
 }
 
-const BicubicAxis = struct {
+pub const BicubicAxis = struct {
     allocator: std.mem.Allocator,
     starts: []usize,
     offsets: []usize,
@@ -659,7 +659,7 @@ const BicubicAxis = struct {
 /// Build Pillow-compatible antialiased bicubic coefficients. Downsampling
 /// widens the cubic support by the reduction factor and renormalizes the
 /// surviving in-bounds taps instead of clamping out-of-bounds samples.
-fn buildPillowBicubicAxis(
+pub fn buildPillowBicubicAxis(
     allocator: std.mem.Allocator,
     source_size: usize,
     target_size: usize,
@@ -679,6 +679,7 @@ fn buildPillowBicubicAxis(
     const filter_scale = @max(scale, 1.0);
     const support = 2.0 * filter_scale;
     for (0..target_size) |target| {
+        if (target & 63 == 0) try @import("work_control.zig").check();
         const center = (@as(f64, @floatFromInt(target)) + 0.5) * scale;
         var first: isize = @intFromFloat(center - support + 0.5);
         var last: isize = @intFromFloat(center + support + 0.5);

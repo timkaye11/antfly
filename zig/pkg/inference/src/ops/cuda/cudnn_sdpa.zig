@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Optional cuDNN 9 fused SDPA for the official EmbeddingGemma2 vision tower.
+//! Optional cuDNN 9 fused SDPA for official EmbeddingGemma2 text and vision.
 //! The ABI is loaded dynamically so ordinary CUDA installations do not gain
 //! a link-time cuDNN dependency.
 const std = @import("std");
@@ -41,6 +41,28 @@ const Table = struct {
 
 pub const Layout = struct { dims: [4]i64, strides: [4]i64 };
 
+/// Per-row valid lengths for binary masks with a nonempty contiguous prefix.
+/// Interior holes and left padding need the general masked attention kernels.
+pub fn rightPaddedLengths(mask: []const i64, batch: usize, sequence: usize, lengths: []i32) bool {
+    if (batch == 0 or sequence == 0 or sequence > std.math.maxInt(i32) or lengths.len != batch) return false;
+    const elements = std.math.mul(usize, batch, sequence) catch return false;
+    if (mask.len != elements) return false;
+    for (0..batch) |b| {
+        var count: usize = 0;
+        var padding = false;
+        for (mask[b * sequence ..][0..sequence]) |value| {
+            if (value == 0) {
+                padding = true;
+            } else if (value == 1 and !padding) {
+                count += 1;
+            } else return false;
+        }
+        if (count == 0) return false;
+        lengths[b] = @intCast(count);
+    }
+    return true;
+}
+
 pub fn bshdLayout(batch: usize, heads: usize, sequence: usize, dim: usize) !Layout {
     if (batch == 0 or heads == 0 or sequence == 0 or dim == 0) return error.InvalidShape;
     const hd = try std.math.mul(usize, heads, dim);
@@ -61,6 +83,8 @@ const Plan = struct {
     v: Desc = null,
     o: Desc = null,
     scale: Desc = null,
+    seq_len_q: Desc = null,
+    seq_len_kv: Desc = null,
     left_bound: Desc = null,
     right_bound: Desc = null,
     negative_inf: Desc = null,
@@ -83,7 +107,7 @@ const Plan = struct {
         for (&self.scores) |*d| {
             if (d.* != null) _ = f.destroy_desc(d.*);
         }
-        inline for (.{ "negative_inf", "right_bound", "left_bound", "scale", "o", "v", "k", "q" }) |field| {
+        inline for (.{ "negative_inf", "right_bound", "left_bound", "seq_len_kv", "seq_len_q", "scale", "o", "v", "k", "q" }) |field| {
             if (@field(self, field) != null) _ = f.destroy_desc(@field(self, field));
         }
         self.* = .{};
@@ -98,17 +122,18 @@ pub const Key = struct {
     dim: usize = 0,
     scale: f32 = 1,
     local_window_radius: usize = 0,
+    padding_mask: bool = false,
 
     fn eql(a: Key, b: Key) bool {
         return a.batch == b.batch and a.q_heads == b.q_heads and a.kv_heads == b.kv_heads and
-            a.sequence == b.sequence and a.dim == b.dim and a.local_window_radius == b.local_window_radius and
+            a.sequence == b.sequence and a.dim == b.dim and a.local_window_radius == b.local_window_radius and a.padding_mask == b.padding_mask and
             @as(u32, @bitCast(a.scale)) == @as(u32, @bitCast(b.scale));
     }
 };
 
 fn keyFingerprint(key: Key) usize {
     var value: usize = key.batch;
-    inline for (.{ key.q_heads, key.kv_heads, key.sequence, key.dim, key.local_window_radius, @as(usize, @intCast(@as(u32, @bitCast(key.scale)))) }) |part|
+    inline for (.{ key.q_heads, key.kv_heads, key.sequence, key.dim, key.local_window_radius, @as(usize, @intFromBool(key.padding_mask)), @as(usize, @intCast(@as(u32, @bitCast(key.scale)))) }) |part|
         value = (value ^ part) *% 0x9e3779b1;
     return value;
 }
@@ -178,29 +203,43 @@ pub const Module = struct {
     }
 
     pub fn execute(self: *Module, sequence: usize, q: usize, k: usize, v: usize, o: usize, workspace: usize) !bool {
-        const result = try self.executeFor(.{ .batch = 1, .q_heads = 12, .kv_heads = 12, .sequence = sequence, .dim = 64, .scale = 0.125 }, q, k, v, o, workspace);
+        const result = try self.executeFor(.{ .batch = 1, .q_heads = 12, .kv_heads = 12, .sequence = sequence, .dim = 64, .scale = 0.125 }, q, k, v, o, workspace, 0);
         if (result) self.stats_.vision_executes += 1;
         return result;
     }
 
     pub fn executeText(self: *Module, key: Key, q: usize, k: usize, v: usize, o: usize, workspace: usize) !bool {
-        const result = try self.executeFor(key, q, k, v, o, workspace);
+        const result = try self.executeFor(key, q, k, v, o, workspace, 0);
         if (result) self.stats_.text_executes += 1;
         return result;
     }
 
-    fn executeFor(self: *Module, key: Key, q: usize, k: usize, v: usize, o: usize, workspace: usize) !bool {
+    pub fn executeTextPadded(self: *Module, key: Key, q: usize, k: usize, v: usize, o: usize, workspace: usize, lengths: usize) !bool {
+        const result = try self.executeFor(key, q, k, v, o, workspace, lengths);
+        if (result) self.stats_.text_executes += 1;
+        return result;
+    }
+
+    fn executeFor(self: *Module, key: Key, q: usize, k: usize, v: usize, o: usize, workspace: usize, lengths: usize) !bool {
+        if (key.padding_mask != (lengths != 0)) return error.InvalidShape;
         const entry = try self.getPlan(key) orelse return false;
         var variant: Desc = null;
         try check(self.f.create_desc(.variant_pack, &variant));
         defer _ = self.f.destroy_desc(variant);
-        var ids = [_]i64{ 1, 2, 3, 4, 5, 6, 7, 8 };
+        var ids = [_]i64{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
         var scale = key.scale;
         var left: i32 = @intCast(key.local_window_radius + 1);
         var right: i32 = @intCast(key.local_window_radius);
         var negative_inf: f32 = -std.math.inf(f32);
-        var pointers = [_]?*anyopaque{ @ptrFromInt(q), @ptrFromInt(k), @ptrFromInt(v), @ptrFromInt(o), @ptrCast(&scale), @ptrCast(&left), @ptrCast(&right), @ptrCast(&negative_inf) };
-        const binding_count: usize = if (key.local_window_radius == 0) 5 else 8;
+        var pointers = [_]?*anyopaque{ @ptrFromInt(q), @ptrFromInt(k), @ptrFromInt(v), @ptrFromInt(o), @ptrCast(&scale), @ptrCast(&left), @ptrCast(&right), @ptrCast(&negative_inf), null, null };
+        var binding_count: usize = if (key.local_window_radius == 0) 5 else 8;
+        if (key.padding_mask) {
+            ids[binding_count] = 9;
+            ids[binding_count + 1] = 10;
+            pointers[binding_count] = @ptrFromInt(lengths);
+            pointers[binding_count + 1] = @ptrFromInt(lengths);
+            binding_count += 2;
+        }
         var workspace_ptr: ?*anyopaque = if (workspace == 0) null else @ptrFromInt(workspace);
         try check(self.f.set(variant, 1000, .int64, @intCast(binding_count), @ptrCast(&ids)));
         try check(self.f.set(variant, 1001, .void_ptr, @intCast(binding_count), @ptrCast(&pointers)));
@@ -251,6 +290,11 @@ pub const Module = struct {
         try self.tensor(&p.v, 3, kv_layout, 9, false);
         try self.tensor(&p.o, 4, q_layout, 9, false);
         try self.tensor(&p.scale, 5, .{ .dims = .{ 1, 1, 1, 1 }, .strides = .{ 1, 1, 1, 1 } }, 0, true);
+        if (p.key.padding_mask) {
+            const length_layout: Layout = .{ .dims = .{ @intCast(p.key.batch), 1, 1, 1 }, .strides = .{ 1, 1, 1, 1 } };
+            try self.tensor(&p.seq_len_q, 9, length_layout, 4, false);
+            try self.tensor(&p.seq_len_kv, 10, length_layout, 4, false);
+        }
         if (p.key.local_window_radius != 0) {
             const scalar_layout: Layout = .{ .dims = .{ 1, 1, 1, 1 }, .strides = .{ 1, 1, 1, 1 } };
             try self.tensor(&p.left_bound, 6, scalar_layout, 4, true);
@@ -282,6 +326,12 @@ pub const Module = struct {
         inline for (.{ .{ 2800, "q" }, .{ 2801, "k" }, .{ 2802, "v" }, .{ 2803, "o" }, .{ 2805, "scale" } }) |item| {
             var d = @field(p, item[1]);
             try check(self.f.set(p.operation, item[0], .backend_descriptor, 1, @ptrCast(&d)));
+        }
+        if (p.key.padding_mask) {
+            inline for (.{ .{ 2809, "seq_len_q" }, .{ 2810, "seq_len_kv" } }) |item| {
+                var d = @field(p, item[1]);
+                try check(self.f.set(p.operation, item[0], .backend_descriptor, 1, @ptrCast(&d)));
+            }
         }
         if (p.key.local_window_radius != 0) {
             var subgraph = p.subgraph;
@@ -378,8 +428,9 @@ pub const Module = struct {
 
 fn eligible(key: Key, version: usize) bool {
     if (key.batch == 0 or key.batch > 32 or key.sequence == 0 or !std.math.isFinite(key.scale)) return false;
+    if (key.padding_mask and version < 91500) return false;
     const scale_bits: u32 = @bitCast(key.scale);
-    const vision = key.local_window_radius == 0 and key.batch == 1 and key.q_heads == 12 and key.kv_heads == 12 and
+    const vision = !key.padding_mask and key.local_window_radius == 0 and key.batch == 1 and key.q_heads == 12 and key.kv_heads == 12 and
         key.dim == 64 and key.sequence <= 3136 and scale_bits == @as(u32, @bitCast(@as(f32, 0.125)));
     const text_base = key.q_heads == 4 and key.kv_heads == 2 and key.dim == 256 and
         scale_bits == @as(u32, @bitCast(@as(f32, 1.0)));
@@ -425,4 +476,39 @@ test "cuDNN keys isolate local windows and enforce qualified shapes" {
     band.sequence = 8193;
     try std.testing.expect(!eligible(band, 92400));
     try std.testing.expect(eligible(.{ .batch = 1, .q_heads = 12, .kv_heads = 12, .sequence = 2394, .dim = 64, .scale = 0.125 }, 91300));
+}
+
+test "cuDNN padding lengths reject masks that cannot be represented by prefixes" {
+    var lengths: [2]i32 = undefined;
+    try std.testing.expect(rightPaddedLengths(&.{ 1, 1, 1, 1, 1, 0, 0, 0 }, 2, 4, &lengths));
+    try std.testing.expectEqual([2]i32{ 4, 1 }, lengths);
+    try std.testing.expect(!rightPaddedLengths(&.{ 0, 1, 1, 1, 1, 1, 0, 0 }, 2, 4, &lengths));
+    try std.testing.expect(!rightPaddedLengths(&.{ 1, 0, 1, 0, 1, 1, 0, 0 }, 2, 4, &lengths));
+    try std.testing.expect(!rightPaddedLengths(&.{ 1, 1, 0, 0, 0, 0, 0, 0 }, 2, 4, &lengths));
+    try std.testing.expect(!rightPaddedLengths(&.{ 1, 2, 0, 0, 1, 1, 0, 0 }, 2, 4, &lengths));
+    try std.testing.expect(!rightPaddedLengths(&.{ 1, 1, 0, 0, 1, 1, -1, 0 }, 2, 4, &lengths));
+}
+
+test "cuDNN padding lengths validate input and output dimensions" {
+    var lengths: [2]i32 = undefined;
+    try std.testing.expect(!rightPaddedLengths(&.{ 1, 1, 0 }, 2, 2, &lengths));
+    try std.testing.expect(!rightPaddedLengths(&.{ 1, 1, 0, 0 }, 2, 2, lengths[0..1]));
+    try std.testing.expect(!rightPaddedLengths(&.{}, 0, 0, &lengths));
+    try std.testing.expect(!rightPaddedLengths(&.{}, 2, std.math.maxInt(usize), &lengths));
+}
+
+test "cuDNN padded and unpadded plans have separate version-qualified keys" {
+    const plain = Key{ .batch = 8, .q_heads = 4, .kv_heads = 2, .sequence = 512, .dim = 256, .scale = 1 };
+    var padded = plain;
+    padded.padding_mask = true;
+    try std.testing.expect(!plain.eql(padded));
+    try std.testing.expect(keyFingerprint(plain) != keyFingerprint(padded));
+    try std.testing.expect(eligible(plain, 91300));
+    try std.testing.expect(!eligible(padded, 91400));
+    try std.testing.expect(eligible(padded, 91500));
+    padded.sequence = 8192;
+    padded.local_window_radius = 512;
+    try std.testing.expect(!eligible(padded, 92000));
+    try std.testing.expect(eligible(padded, 92400));
+    try std.testing.expect(!eligible(.{ .batch = 1, .q_heads = 12, .kv_heads = 12, .sequence = 512, .dim = 64, .scale = 0.125, .padding_mask = true }, 92400));
 }

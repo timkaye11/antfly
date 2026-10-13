@@ -338,4 +338,3 @@ def load_json(path: Path) -> dict:
     if not isinstance(value, dict):
         raise ValueError(f"{path} must contain a JSON object")
     return value
-

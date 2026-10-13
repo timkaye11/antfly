@@ -21,25 +21,33 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 import selectors
+import signal
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.request
+import urllib.error
 
 from contract import cosine, render_text, validate_oracle
 from pytorch_worker import ATTENTION_MODES, COMPILE_MODES
 
 MIN_COSINE = 0.999
+DEFAULT_ATTENTION_MODES = ("eager", "sdpa")
 
 
 def post(url: str, body: dict, timeout: float) -> tuple[dict, float]:
     request = urllib.request.Request(url, json.dumps(body).encode(), {"Content-Type": "application/json"}, method="POST")
     started = time.perf_counter()
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        payload = json.loads(response.read())
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(64 * 1024).decode('utf-8', errors='replace')
+        raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
     return payload, time.perf_counter() - started
 
 
@@ -54,9 +62,21 @@ def readiness_line(process: subprocess.Popen, timeout: float) -> str:
     selector = selectors.DefaultSelector()
     try:
         selector.register(process.stdout, selectors.EVENT_READ)
-        if not selector.select(timeout):
-            raise TimeoutError(f"worker did not become ready within {timeout:.0f}s")
-        return process.stdout.readline()
+        deadline = time.monotonic() + timeout
+        pending = bytearray()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not selector.select(remaining):
+                raise TimeoutError(f"worker did not become ready within {timeout:.0f}s")
+            chunk = os.read(process.stdout.fileno(), 4096)
+            if not chunk:
+                return pending.decode('utf-8')
+            pending.extend(chunk)
+            if len(pending) > 64 * 1024:
+                raise ValueError('worker readiness line exceeds 64 KiB')
+            newline = pending.find(b'\n')
+            if newline >= 0:
+                return pending[:newline + 1].decode('utf-8')
     finally:
         selector.close()
 
@@ -67,9 +87,25 @@ def failure_status(message: str, timed_out: bool = False) -> tuple[str, bool | N
         return "inconclusive_timeout", None
     if "does not support" in lower or "unsupported attention" in lower:
         return "unsupported", False
-    if "outofmemory" in lower or "out of resource" in lower or "hardware limit" in lower:
+    if "outofmemory" in lower or "out of memory" in lower or "out of resource" in lower or "hardware limit" in lower:
         return "failed_hardware", True
     return "failed_runtime", True
+
+
+def selection_complete(results: list[dict], *, include_flex: bool = False) -> bool:
+    attention_modes = ATTENTION_MODES if include_flex else DEFAULT_ATTENTION_MODES
+    expected = {(attention, mode) for attention in attention_modes for mode in COMPILE_MODES}
+    conclusive = {"qualified", "failed_parity", "unsupported", "failed_hardware"}
+    return (len(results) == len(expected)
+            and {(row['attention'], row['compile']) for row in results} == expected
+            and all(row.get('status') in conclusive for row in results))
+
+
+def write_checkpoint(path, report):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + '.tmp')
+    temporary.write_text(json.dumps(report, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+    temporary.replace(path)
 
 
 def expanded_tokens(processor, text: str, task_type: str) -> int:
@@ -129,8 +165,11 @@ def main() -> int:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--tokens", type=int, default=128)
     parser.add_argument("--corpus", choices=("natural_text", "source_code", "heterogeneous_padding"), default="natural_text")
+    parser.add_argument("--case", choices=("text", "image", "audio", "mixed_ordered"), default="text")
     parser.add_argument("--task-type", default="RETRIEVAL_DOCUMENT")
     parser.add_argument("--torch-threads", type=int, choices=(1, 2, 8), default=1)
+    parser.add_argument("--include-flex-attention", action="store_true",
+                        help="Include optional FlexAttention diagnostic configurations")
     parser.add_argument("--candidate-url", required=True, help="native endpoint used to validate the exact timed cell")
     parser.add_argument("--candidate-model", default="embeddinggemma-2", help="model name served by the native endpoint")
     parser.add_argument("--timeout", type=float, default=600.0)
@@ -142,9 +181,15 @@ def main() -> int:
     oracle = json.loads(args.oracle.read_text(encoding="utf-8"))
     validate_oracle(oracle)
     text_cases = [case for case in oracle["cases"] if all(part["type"] == "text" for part in case["parts"])]
-    from transformers import EmbeddingGemma2Processor
-    processor = EmbeddingGemma2Processor.from_pretrained(args.model, local_files_only=True)
-    cell_inputs = exact_cell_inputs(processor, args.corpus, args.batch_size, args.tokens, args.task_type)
+    if args.case == "text":
+        from transformers import EmbeddingGemma2Processor
+        processor = EmbeddingGemma2Processor.from_pretrained(args.model, local_files_only=True)
+        cell_inputs = exact_cell_inputs(processor, args.corpus, args.batch_size, args.tokens, args.task_type)
+    else:
+        from qualify_endpoint import request_input
+        media_case = next(case for case in oracle["cases"] if case["id"] == args.case)
+        cell_inputs = [request_input(media_case) for _ in range(args.batch_size)]
+        args.task_type = media_case["task_type"]
     cell_body = {"model": args.candidate_model, "input": cell_inputs, "task_type": args.task_type}
     candidate_payload, _ = post(args.candidate_url, cell_body, args.timeout)
     if candidate_payload.get("backend") != "cuda":
@@ -153,8 +198,10 @@ def main() -> int:
     worker_script = Path(__file__).with_name("pytorch_worker.py")
     url = f"http://127.0.0.1:{args.port}/v1/embeddings"
     results = []
-    for attention in ATTENTION_MODES:
+    attention_modes = ATTENTION_MODES if args.include_flex_attention else DEFAULT_ATTENTION_MODES
+    for attention in attention_modes:
         for compile_mode in COMPILE_MODES:
+            print(json.dumps({'event': 'configuration_begin', 'attention': attention, 'compile': compile_mode}), file=sys.stderr, flush=True)
             command = [
                 str(args.python), str(worker_script), "--model", str(args.model), "--port", str(args.port),
                 "--attention", attention, "--compile", compile_mode, "--warmup", str(args.warmup),
@@ -162,7 +209,7 @@ def main() -> int:
             ]
             with tempfile.NamedTemporaryFile(prefix=f"embeddinggemma2-{attention}-{compile_mode}-", suffix=".log", delete=False) as stderr_file:
                 stderr_path = Path(stderr_file.name)
-                process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=stderr_file)
+                process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=stderr_file, start_new_session=True)
             try:
                 line = readiness_line(process, args.timeout)
                 if not line:
@@ -184,6 +231,8 @@ def main() -> int:
                 cell_parity_valid = finite and bool(paired_cosines) and min(paired_cosines) >= MIN_COSINE
                 timings = []
                 if valid and cell_parity_valid:
+                    for _ in range(args.warmup):
+                        post(url, cell_body, args.timeout)
                     for _ in range(args.iterations):
                         _, elapsed = post(url, cell_body, args.timeout)
                         timings.append(elapsed)
@@ -198,7 +247,7 @@ def main() -> int:
                     "paired_cell_minimum_cosine": min(paired_cosines) if paired_cosines else None,
                     "paired_cell_parity_valid": cell_parity_valid,
                     "latency_ms": {"p50": percentile(timings, 0.5) * 1000, "p95": percentile(timings, 0.95) * 1000} if timings else None,
-                    "runtime": ready.get("runtime"),
+                    "runtime": cell_payload.get("runtime", ready.get("runtime")),
                     "warmup": ready.get("warmup"),
                     "stderr_log": str(stderr_path),
                 })
@@ -209,21 +258,31 @@ def main() -> int:
                 status, supported = failure_status(excerpt, isinstance(exc, TimeoutError))
                 results.append({"attention": attention, "compile": compile_mode, "status": status, "supported": supported, "error": excerpt, "stderr_log": str(stderr_path)})
             finally:
-                process.terminate()
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
                 try:
                     process.wait(timeout=30)
                 except subprocess.TimeoutExpired:
-                    process.kill()
+                    os.killpg(process.pid, signal.SIGKILL)
                     process.wait()
+                print(json.dumps({'event': 'configuration_end', **results[-1]}), file=sys.stderr, flush=True)
+                if args.report:
+                    write_checkpoint(args.report, {'schema': 'antfly.embedding_gemma2.pytorch_baseline_selection.v1',
+                        'pass': False, 'complete': False, 'configurations': results,
+                        'attention_modes': list(attention_modes),
+                        'include_flex_attention': args.include_flex_attention})
 
     valid = [row for row in results if row.get("parity_valid") and row.get("paired_cell_parity_valid") and row.get("latency_ms")]
     selected = min(valid, key=lambda row: row["latency_ms"]["p50"]) if valid else None
-    report = {"schema": "antfly.embedding_gemma2.pytorch_baseline_selection.v1", "pass": selected is not None, "minimum_cosine": MIN_COSINE, "workload": {"batch_size": args.batch_size, "expanded_tokens": args.tokens, "corpus": args.corpus, "task_type": args.task_type}, "candidate_url": args.candidate_url, "candidate_model": args.candidate_model, "candidate_backend": candidate_payload.get("backend"), "selected": selected, "configurations": results}
+    complete = selection_complete(results, include_flex=args.include_flex_attention)
+    report = {"schema": "antfly.embedding_gemma2.pytorch_baseline_selection.v1", "pass": selected is not None and complete, "complete": complete, "minimum_cosine": MIN_COSINE, "workload": {"case": args.case, "batch_size": args.batch_size, "expanded_tokens": args.tokens if args.case == "text" else None, "corpus": args.corpus if args.case == "text" else None, "task_type": args.task_type, "cell_warmup": args.warmup}, "candidate_url": args.candidate_url, "candidate_model": args.candidate_model, "candidate_backend": candidate_payload.get("backend"), "selected": selected, "configurations": results}
+    report.update(attention_modes=list(attention_modes), include_flex_attention=args.include_flex_attention)
     if args.report:
-        args.report.parent.mkdir(parents=True, exist_ok=True)
-        args.report.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        write_checkpoint(args.report, report)
     print(json.dumps(report, sort_keys=True))
-    return 0 if selected else 1
+    return 0 if report['pass'] else 1
 
 
 if __name__ == "__main__":

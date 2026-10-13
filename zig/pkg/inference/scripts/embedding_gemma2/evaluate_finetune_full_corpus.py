@@ -10,16 +10,21 @@ embedding matrix.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import statistics
+import sqlite3
+import tempfile
 import urllib.request
 from pathlib import Path
 from typing import Callable, Iterable, Iterator
 
-from finetune_contract import (BASE_WEIGHT_SHA256, MRL_DIMENSIONS, QUALITY_SEEDS, REQUIRED_QUALITY_CELLS,
+from finetune_contract import (BASE_WEIGHT_SHA256 as BASE_WEIGHT_SHA256, MRL_DIMENSIONS, QUALITY_SEEDS, REQUIRED_QUALITY_CELLS,
                                file_sha256, load_json, validate_candidate_artifacts, validate_official_corpus,
                                validate_official_source_manifest)
+from contract import PROMPTS
+from qualify_finetune_quality import validate_reviewed_inventory
 
 try:  # NumPy makes the full official corpus practical; tests and small fixtures need no dependency.
     import numpy as _np
@@ -78,6 +83,54 @@ def document_text(row: dict) -> str:
     return f"title: {title} | text: {text}"
 
 
+def document_input(row: dict) -> str | dict:
+    # A title belongs in the group metadata. Putting it in the body makes the
+    # serving frontend prepend a second document prompt.
+    document_text(row)  # Validate body and optional title.
+    text = row.get("text", row.get("contents"))
+    title = row.get("title")
+    return {"title": title, "content": [{"type": "text", "text": text}]} if title else text
+
+
+class TextInputLimiter:
+    """Apply identical bounded text preprocessing to base and adapted models."""
+
+    def __init__(self, tokenizer, query_cap=128, document_cap=512):
+        self.tokenizer = tokenizer
+        self.query_cap, self.document_cap = query_cap, document_cap
+        self.truncated = 0
+
+    def length(self, text):
+        return len(self.tokenizer.encode(text, add_special_tokens=False)) + 2
+
+    def __call__(self, value, task):
+        title = value.get("title") if isinstance(value, dict) else None
+        text = value["content"][0]["text"] if isinstance(value, dict) else value
+        cap = self.document_cap if task == "RETRIEVAL_DOCUMENT" else self.query_cap
+        prefix = f"title: {title} | text: " if title else PROMPTS[task]
+        changed = False
+        # Retain the document prompt even when an unusually long title alone
+        # exceeds the cap. All corpus rows remain in the ranking universe.
+        while self.length(prefix) > cap:
+            if not title:
+                raise ValueError("token cap is shorter than the required prompt")
+            title = title[:len(title) // 2]
+            prefix = f"title: {title or 'none'} | text: "
+            changed = True
+        if self.length(prefix + text) > cap:
+            encoded = self.tokenizer(prefix + text, add_special_tokens=False, return_offsets_mapping=True)
+            end = encoded['offset_mapping'][cap - 3][1]
+            text = text[:max(0, end - len(prefix))]
+            # Retokenization at the new boundary can alter a final token.
+            while self.length(prefix + text) > cap:
+                text = text[:-1]
+            changed = True
+        self.truncated += changed
+        if title:
+            return {"title": title, "content": [{"type": "text", "text": text}]}
+        return text
+
+
 def truncate_normalize(vectors: list[list[float]], dimension: int) -> list[list[float]]:
     result = []
     for vector in vectors:
@@ -104,20 +157,51 @@ def similarities(queries: list[list[float]], documents: list[list[float]]) -> li
             for query in queries]
 
 
+def embedding_identity(directory: Path, *, weights_digest: str | None = None) -> str:
+    """Match the native identity of the exact bundle and embedding recipe."""
+    digest = hashlib.sha256(b"embeddinggemma2-f32-mean-v1")
+    names = ("config.json", "tokenizer.json", "tokenizer_config.json", "processor_config.json",
+             "config_sentence_transformers.json", "1_Pooling/config.json", "weights")
+    for name in names:
+        value = weights_digest if name == "weights" and weights_digest else file_sha256(
+            directory / ("model.safetensors" if name == "weights" else name))
+        digest.update(name.encode() + b"\0" + bytes.fromhex(value))
+    return digest.hexdigest()
+
+
 class HttpEmbedder:
-    def __init__(self, url: str, model: str, timeout: float):
+    def __init__(self, url: str, model: str, timeout: float, *, limiter=None, batch_size=32,
+                 expected_identity: str | None = None):
         self.url, self.model, self.timeout = url, model, timeout
         self.provenance: set[str] = set()
+        self.limiter, self.batch_size = limiter, batch_size
+        self.expected_identity = expected_identity
+        if not 1 <= batch_size <= 32:
+            raise ValueError("embedding batch size must be between 1 and 32")
 
-    def __call__(self, texts: list[str], task_type: str) -> list[list[float]]:
+    def __call__(self, texts: list[str | dict], task_type: str) -> list[list[float]]:
+        vectors = []
+        for chunk in batches(texts, self.batch_size):
+            values = [self.limiter(value, task_type) for value in chunk] if self.limiter else chunk
+            if any(isinstance(value, dict) for value in values):
+                values = [value if isinstance(value, dict) else {"content": [{"type": "text", "text": value}]} for value in values]
+            vectors.extend(self._request(values, task_type))
+        return vectors
+
+    def _request(self, texts, task_type):
         # Omitting `dimensions` is deliberate: MRL is performed locally from
         # the endpoint's full 768-vector result.
-        body = json.dumps({"model": self.model, "input": texts, "task_type": task_type}).encode()
+        fields = {"model": self.model, "input": texts, "task_type": task_type}
+        if self.expected_identity is not None:
+            fields["model_identity"] = self.expected_identity
+        body = json.dumps(fields).encode()
         request = urllib.request.Request(self.url, body, {"Content-Type": "application/json"})
         with urllib.request.urlopen(request, timeout=self.timeout) as response:
             payload = json.load(response)
         if payload.get("backend") != "cuda":
             raise ValueError("full-corpus evidence requires endpoint backend=cuda")
+        if self.expected_identity is not None and payload.get("model_identity") != self.expected_identity:
+            raise ValueError("quality endpoint model identity differs from the authenticated bundle")
         self.provenance.add(payload["backend"])
         rows = sorted(payload.get("data", []), key=lambda row: row.get("index", -1))
         if [row.get("index") for row in rows] != list(range(len(texts))):
@@ -173,20 +257,25 @@ def metrics(ranked: list[str], grades: dict[str, float]) -> dict[str, float]:
 
 
 def count_unique(path: Path) -> int:
-    seen: set[str] = set()
-    for row in jsonl(path):
-        item_id = record_id(row)
-        if item_id in seen:
-            raise ValueError(f"duplicate ID {item_id!r} in {path}")
-        seen.add(item_id)
-    if not seen:
-        raise ValueError(f"{path} is empty")
-    return len(seen)
+    # An 8.8-million-ID Python set would exceed the intended memory bound.
+    with tempfile.TemporaryDirectory(prefix="eg2-corpus-inventory-") as directory:
+        with sqlite3.connect(str(Path(directory) / "ids.sqlite")) as db:
+            db.execute("CREATE TABLE ids (id TEXT PRIMARY KEY) WITHOUT ROWID")
+            count = 0
+            for rows in batches(jsonl(path), 4096):
+                try:
+                    db.executemany("INSERT INTO ids VALUES (?)", [(record_id(row),) for row in rows])
+                except sqlite3.IntegrityError as error:
+                    raise ValueError(f"duplicate ID in {path}") from error
+                count += len(rows)
+            if not count:
+                raise ValueError(f"{path} is empty")
+            return count
 
 
 def evaluate(*, corpus: Path, queries: Path, qrels: Path, base_embed: Callable,
              candidate_embed: Callable, dimension: int, query_chunk_size: int,
-             corpus_chunk_size: int) -> tuple[list[str], dict, dict, int]:
+             corpus_chunk_size: int, query_task="RETRIEVAL_QUERY") -> tuple[list[str], dict, dict, int]:
     query_ids: list[str] = []
     base_arrays = {name: [] for name in METRICS}
     candidate_arrays = {name: [] for name in METRICS}
@@ -197,8 +286,8 @@ def evaluate(*, corpus: Path, queries: Path, qrels: Path, base_embed: Callable,
             raise ValueError("query IDs must be globally unique")
         texts = [query_text(row) for row in query_rows]
         grades = load_qrels(qrels, set(ids))
-        base_queries = truncate_normalize(base_embed(texts, "RETRIEVAL_QUERY"), dimension)
-        candidate_queries = truncate_normalize(candidate_embed(texts, "RETRIEVAL_QUERY"), dimension)
+        base_queries = truncate_normalize(base_embed(texts, query_task), dimension)
+        candidate_queries = truncate_normalize(candidate_embed(texts, query_task), dimension)
         base_top, candidate_top = TopK(len(ids)), TopK(len(ids))
         seen_docs: set[str] = set()
         for corpus_rows in batches(jsonl(corpus), corpus_chunk_size):
@@ -206,7 +295,7 @@ def evaluate(*, corpus: Path, queries: Path, qrels: Path, base_embed: Callable,
             if len(doc_ids) != len(set(doc_ids)) or seen_docs.intersection(doc_ids):
                 raise ValueError("corpus IDs must be globally unique")
             seen_docs.update(doc_ids)
-            doc_texts = [document_text(row) for row in corpus_rows]
+            doc_texts = [document_input(row) for row in corpus_rows]
             base_docs = truncate_normalize(base_embed(doc_texts, "RETRIEVAL_DOCUMENT"), dimension)
             candidate_docs = truncate_normalize(candidate_embed(doc_texts, "RETRIEVAL_DOCUMENT"), dimension)
             base_top.add(similarities(base_queries, base_docs), doc_ids)
@@ -238,7 +327,9 @@ def command_evaluate(args: argparse.Namespace) -> int:
     corpus_count, query_count = count_unique(args.corpus), count_unique(args.queries)
     if (corpus_count, query_count) != (args.expected_corpus_count, args.expected_query_count):
         raise ValueError("actual corpus/query counts differ from the pinned contract")
-    official = validate_official_source_manifest(load_json(args.source_manifest))[key]
+    inventories = validate_official_source_manifest(load_json(args.source_manifest))
+    validate_reviewed_inventory(inventories)
+    official = inventories[key]
     actual = {"corpus_sha256": file_sha256(args.corpus), "queries_sha256": file_sha256(args.queries),
               "qrels_sha256": file_sha256(args.qrels), "corpus_count": corpus_count,
               "query_count": query_count}
@@ -255,12 +346,22 @@ def command_evaluate(args: argparse.Namespace) -> int:
     if (candidate_artifacts["candidate_bundle_manifest_sha256"]!=evidence_artifacts["bundle_manifest"]["sha256"]
             or candidate_artifacts["candidate_model_sha256"]!=evidence_artifacts["model"]["sha256"]):
         raise ValueError("candidate export artifacts differ from their provenance")
-    base = HttpEmbedder(args.base_url, args.base_model, args.timeout)
-    candidate = HttpEmbedder(args.candidate_url, args.candidate_model, args.timeout)
+    from transformers import AutoTokenizer
+    from finetune_reference import TOKENIZER_SHA256
+    if file_sha256(args.processor_dir / "tokenizer.json") != TOKENIZER_SHA256:
+        raise ValueError("quality preprocessing tokenizer differs from the pinned contract")
+    tokenizer = AutoTokenizer.from_pretrained(args.processor_dir, local_files_only=True)
+    if file_sha256(args.processor_dir / "model.safetensors") != BASE_WEIGHT_SHA256:
+        raise ValueError("quality base endpoint bundle differs from the pinned weights")
+    base = HttpEmbedder(args.base_url, args.base_model, args.timeout, limiter=TextInputLimiter(tokenizer),
+                        expected_identity=embedding_identity(args.processor_dir, weights_digest=BASE_WEIGHT_SHA256))
+    candidate = HttpEmbedder(args.candidate_url, args.candidate_model, args.timeout, limiter=TextInputLimiter(tokenizer),
+                             expected_identity=embedding_identity(model.parent, weights_digest=evidence_artifacts['model']['sha256']))
     ids, base_values, candidate_values, passes = evaluate(
         corpus=args.corpus, queries=args.queries, qrels=args.qrels, base_embed=base,
         candidate_embed=candidate, dimension=args.dimension,
-        query_chunk_size=args.query_chunk_size, corpus_chunk_size=args.corpus_chunk_size)
+        query_chunk_size=args.query_chunk_size, corpus_chunk_size=args.corpus_chunk_size,
+        query_task="CODE_RETRIEVAL" if args.dataset == "codesearchnet" else "RETRIEVAL_QUERY")
     if len(ids) != query_count or base.provenance != {"cuda"} or candidate.provenance != {"cuda"}:
         raise ValueError("incomplete queries or missing CUDA endpoint provenance")
     cell = {"schema": "antfly.embedding_gemma2.finetune_quality_cell.v1",
@@ -273,8 +374,12 @@ def command_evaluate(args: argparse.Namespace) -> int:
             "official_corpus": official,
             "execution": {"base_url": args.base_url, "candidate_url": args.candidate_url,
                           "base_model": args.base_model, "candidate_model": args.candidate_model,
+                          "base_identity": base.expected_identity, "candidate_identity": candidate.expected_identity,
                           "backend": "cuda", "query_chunk_size": args.query_chunk_size,
                           "corpus_chunk_size": args.corpus_chunk_size, "corpus_passes": passes,
+                          "query_task": "CODE_RETRIEVAL" if args.dataset == "codesearchnet" else "RETRIEVAL_QUERY",
+                          "text_preprocessing": "retain-rendered-text-prefix-with-bos-eos-v1",
+                          "query_cap": 128, "document_cap": 512,
                           "full_vector_dimension": 768, "mrl": "truncate-then-l2-normalize"},
             "artifacts": evidence_artifacts}
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -300,6 +405,7 @@ def command_merge(args: argparse.Namespace) -> int:
     if any(c.get("qualification_scope") != "official-full-corpus" for c in cells):
         raise ValueError("bounded or synthetic cells cannot claim official evidence")
     source_inventories = validate_official_source_manifest(load_json(args.source_manifest))
+    validate_reviewed_inventory(source_inventories)
     contracts = {}
     for cell in cells:
         key = (cell["dataset"], cell.get("language"), cell["role"])
@@ -373,7 +479,7 @@ def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     commands = root.add_subparsers(dest="command", required=True)
     run = commands.add_parser("evaluate")
-    for name in ("corpus", "queries", "qrels", "bundle-manifest", "checkpoint", "prepared-manifest", "training-source-manifest", "source-manifest", "output"):
+    for name in ("corpus", "queries", "qrels", "bundle-manifest", "checkpoint", "prepared-manifest", "training-source-manifest", "source-manifest", "processor-dir", "output"):
         run.add_argument("--" + name, type=Path, required=True)
     run.add_argument("--dataset", required=True); run.add_argument("--language")
     run.add_argument("--role", choices=("target", "retention"), required=True)

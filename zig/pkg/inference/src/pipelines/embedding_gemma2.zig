@@ -31,7 +31,12 @@ fn partBytes(part: Part) []const u8 {
     };
 }
 pub const Group = struct { title: ?[]const u8 = null, content: []const Part };
-pub const Options = struct { task_type: []const u8 = "RETRIEVAL_DOCUMENT", dimensions: usize = 768 };
+pub const Options = struct {
+    task_type: []const u8 = "RETRIEVAL_DOCUMENT",
+    dimensions: usize = 768,
+    /// Expanded input limit, including prompts, wrappers, and media tokens.
+    max_tokens: usize = encoder.max_tokens,
+};
 pub const Result = struct { vector: []f32, input_tokens: usize };
 
 const SoftTokens = struct { id: i64, embeddings: []f32, tokens: usize };
@@ -56,7 +61,7 @@ pub fn embed(out: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
 
 fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, group: Group, options: Options, lock: ?*std.atomic.Mutex, control: ?Control) !Result {
     const cfg = factory.getEmbeddingGemma2Config(session) orelse return error.UnsupportedEmbeddingGemma2Backend;
-    try validateGroup(group, options);
+    try validateGroupContent(group, options, session.backend() == .cuda);
     if (session.backend() == .cuda) return embedCudaGroup(a, session, tokenizer, group, options, lock, control);
     var input_bytes: usize = 0;
     for (group.content) |part| {
@@ -71,7 +76,7 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
     try effective.check();
     // Reserve the maximum encoder sequence and a bounded media preprocessing
     // working set before decoding or allocating any projected soft tokens.
-    var permit = try session.admit(.{ .batch = 1, .sequence = 8192, .input_bytes = input_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = if (session.backend() == .metal) 768 * 1024 * 1024 else 512 * 1024 * 1024, .output_bytes = 8192 * 768 * @sizeOf(f32) });
+    var permit = try session.admit(.{ .batch = 1, .sequence = options.max_tokens, .input_bytes = input_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = if (session.backend() == .metal) 768 * 1024 * 1024 else 512 * 1024 * 1024, .output_bytes = options.max_tokens * 768 * @sizeOf(f32) });
     defer permit.deinit();
     if (lock) |mutex| try effective.lock(mutex);
     defer if (lock) |mutex| mutex.unlock();
@@ -115,7 +120,7 @@ fn embedCudaGroup(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, 
     const prefix = if (group.title) |title| try std.fmt.allocPrint(a, "title: {s} | text: ", .{title}) else try a.dupe(u8, try encoder.taskPrefix(options.task_type));
     defer a.free(prefix);
     var pipeline = embedding.EmbeddingPipeline.init(a, session, tokenizer, .{
-        .max_length = 8192,
+        .max_length = options.max_tokens,
         .strict_max_length = true,
         .reject_truncation = true,
         .normalize = true,
@@ -203,7 +208,7 @@ fn prepareGroup(a: std.mem.Allocator, cb: *const @import("../ops/ops.zig").Compu
                 errdefer a.free(projected.embeddings);
                 if (projected.tokens == 0 or projected.embeddings.len != projected.tokens * 512) return error.InvalidTensorShape;
                 media_tokens = std.math.add(usize, media_tokens, projected.tokens) catch return error.EmbeddingInputTooLong;
-                if (media_tokens > 8192) return error.EmbeddingInputTooLong;
+                if (media_tokens > options.max_tokens) return error.EmbeddingInputTooLong;
                 try rendered.appendSlice(a, if (is_image) "<|image>" else "<|audio>");
                 for (0..projected.tokens) |_| try rendered.appendSlice(a, if (is_image) "<|image|>" else "<|audio|>");
                 try rendered.appendSlice(a, if (is_image) "<image|>" else "<audio|>");
@@ -211,11 +216,11 @@ fn prepareGroup(a: std.mem.Allocator, cb: *const @import("../ops/ops.zig").Compu
             },
         }
     }
-    var tokens = try tokenizer.encodeForModel(a, rendered.items, 8193);
+    var tokens = try tokenizer.encodeForModel(a, rendered.items, options.max_tokens + 1);
     defer tokens.deinit();
     var count: usize = 0;
     for (tokens.attention_mask) |m| count += @intFromBool(m != 0);
-    if (count == 0 or count > 8192) return error.EmbeddingInputTooLong;
+    if (count == 0 or count > options.max_tokens) return error.EmbeddingInputTooLong;
     const ids = try a.alloc(i64, count);
     errdefer a.free(ids);
     const mask = try a.alloc(i64, count);
@@ -280,6 +285,7 @@ pub fn embedRasters(out: std.mem.Allocator, session: Session, tokenizer: Tokeniz
     const cfg = factory.getEmbeddingGemma2Config(session) orelse return error.UnsupportedEmbeddingGemma2Backend;
     if (!cfg.vision) return error.NoVisionSession;
     if (!encoder.validDimension(options.dimensions)) return error.InvalidEmbeddingDimensions;
+    if (options.max_tokens == 0 or options.max_tokens > encoder.max_tokens) return error.InvalidEmbeddingTokenLimit;
     _ = try encoder.taskPrefix(options.task_type);
     const vectors = try out.alloc([]f32, rasters.len);
     var initialized: usize = 0;
@@ -319,7 +325,8 @@ fn embedRasterCohort(a: std.mem.Allocator, session: Session, tokenizer: Tokenize
     }
     // Image soft tokens are capped at 280. Reserve a conservative 512-token
     // row before projection; a cohort occupies at most 2048 padded slots.
-    var permit = try session.admit(.{ .batch = rasters.len, .sequence = raster_max_sequence, .input_bytes = input_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = if (session.backend() == .metal) 768 * 1024 * 1024 else 512 * 1024 * 1024, .output_bytes = rasters.len * raster_max_sequence * 768 * @sizeOf(f32) });
+    const max_sequence = @min(raster_max_sequence, options.max_tokens);
+    var permit = try session.admit(.{ .batch = rasters.len, .sequence = max_sequence, .input_bytes = input_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = if (session.backend() == .metal) 768 * 1024 * 1024 else 512 * 1024 * 1024, .output_bytes = rasters.len * max_sequence * 768 * @sizeOf(f32) });
     defer permit.deinit();
     if (lock) |mutex| try control.lock(mutex);
     defer if (lock) |mutex| mutex.unlock();
@@ -418,12 +425,23 @@ fn poolBatch(a: std.mem.Allocator, values: []const f32, mask: []const i64, batch
 
 /// Validation independent of model loading, shared by HTTP and linked APIs.
 pub fn validateGroup(group: Group, options: Options) !void {
+    // Preflight validates the layout before a session is acquired. The
+    // execution path additionally checks the active backend's capabilities.
+    return validateGroupContent(group, options, true);
+}
+
+fn validateGroupContent(group: Group, options: Options, allow_manual_markers: bool) !void {
     _ = try encoder.taskPrefix(options.task_type);
     if (!encoder.validDimension(options.dimensions)) return error.InvalidEmbeddingDimensions;
+    if (options.max_tokens == 0 or options.max_tokens > encoder.max_tokens) return error.InvalidEmbeddingTokenLimit;
     if (group.content.len == 0 or group.content.len > 64) return error.InvalidEmbeddingGroup;
     var has_text = false;
     var bytes: usize = 0;
     var raster_bytes: usize = 0;
+    var images: usize = 0;
+    var audios: usize = 0;
+    var image_markers: usize = 0;
+    var audio_markers: usize = 0;
     for (group.content) |part| {
         const value = partBytes(part);
         if (part == .raster) {
@@ -431,15 +449,51 @@ pub fn validateGroup(group: Group, options: Options) !void {
             try @import("image.zig").DecodeLimits.inference_default.validate(part.raster.width, part.raster.height);
         }
         if (value.len == 0) return error.EmptyEmbeddingInput;
+        switch (part) {
+            .image, .raster => images += 1,
+            .audio => audios += 1,
+            .text => {},
+        }
         if (part == .raster) raster_bytes = std.math.add(usize, raster_bytes, value.len) catch return error.ResourceLimitExceeded else bytes = std.math.add(usize, bytes, value.len) catch return error.ResourceLimitExceeded;
         if (part == .text) {
             has_text = true;
             if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8;
-            for ([_][]const u8{ "<|image", "<image|>", "<|audio", "<audio|>", "<|video|>" }) |marker| if (std.mem.indexOf(u8, value, marker) != null) return error.InvalidEmbeddingGroup;
+            var remaining = value;
+            while (std.mem.indexOfScalar(u8, remaining, '<')) |at| {
+                const tail = remaining[at..];
+                if (allow_manual_markers and std.mem.startsWith(u8, tail, "<|image|>")) {
+                    image_markers += 1;
+                    remaining = tail["<|image|>".len..];
+                    continue;
+                }
+                if (allow_manual_markers and std.mem.startsWith(u8, tail, "<|audio|>")) {
+                    audio_markers += 1;
+                    remaining = tail["<|audio|>".len..];
+                    continue;
+                }
+                for ([_][]const u8{ "<|image", "<image|>", "<|audio", "<audio|>", "<|video|>" }) |marker| if (std.mem.startsWith(u8, tail, marker)) return error.InvalidEmbeddingGroup;
+                remaining = tail[1..];
+            }
         }
     }
+    // The resident CUDA frontend expands explicit placeholders itself. Once
+    // any is present, every supplied media item must be referenced exactly
+    // once; generated wrapper tokens remain forbidden in caller text.
+    if (image_markers + audio_markers > 0 and (image_markers != images or audio_markers != audios)) return error.MediaPlaceholderMismatch;
     if (bytes > 64 * 1024 * 1024 or raster_bytes > 512 * 1024 * 1024) return error.ResourceLimitExceeded;
     if (group.title) |title| if (!has_text or !std.mem.eql(u8, options.task_type, "RETRIEVAL_DOCUMENT") or !std.unicode.utf8ValidateSlice(title) or title.len > 8192 or std.mem.indexOf(u8, title, "<") != null) return error.InvalidEmbeddingTitle;
+}
+
+test "embeddinggemma2 CUDA groups admit complete manual media layouts and reject malformed ones" {
+    try validateGroupContent(.{ .content = &.{ .{ .text = "before <|image|> after" }, .{ .image = "image" } } }, .{}, true);
+    try validateGroupContent(.{ .content = &.{ .{ .text = "<|audio|> then <|image|>" }, .{ .image = "image" }, .{ .audio = "audio" } } }, .{}, true);
+    try std.testing.expectError(error.MediaPlaceholderMismatch, validateGroupContent(.{ .content = &.{.{ .text = "<|image|>" }} }, .{}, true));
+    try std.testing.expectError(error.MediaPlaceholderMismatch, validateGroupContent(.{ .content = &.{ .{ .text = "<|image|><|image|>" }, .{ .image = "image" } } }, .{}, true));
+    try std.testing.expectError(error.MediaPlaceholderMismatch, validateGroupContent(.{ .content = &.{ .{ .text = "<|image|>" }, .{ .image = "image" }, .{ .audio = "audio" } } }, .{}, true));
+    for ([_][]const u8{ "<|image>", "<image|>", "<|audio>", "<audio|>", "<|video|>" }) |marker|
+        try std.testing.expectError(error.InvalidEmbeddingGroup, validateGroupContent(.{ .content = &.{ .{ .text = marker }, .{ .image = "image" } } }, .{}, true));
+    try validateGroup(.{ .content = &.{ .{ .text = "<|image|>" }, .{ .image = "image" } } }, .{});
+    try std.testing.expectError(error.InvalidEmbeddingGroup, validateGroupContent(.{ .content = &.{ .{ .text = "<|image|>" }, .{ .image = "image" } } }, .{}, false));
 }
 
 /// Encoder benchmark and serving share this boundary: prepared IDs/mask through
@@ -485,6 +539,38 @@ pub fn preparedText(cb: *const @import("../ops/ops.zig").ComputeBackend, a: std.
         for (vector, values[row * 768 ..][0..dimensions]) |*dest, value| dest.* += value / @as(f32, @floatFromInt(count));
     }
     return scoring.centroid(a, &.{vector}, dimensions);
+}
+
+test "embeddinggemma2 grouped tokenization rejects overflow without truncating" {
+    const Mock = struct {
+        tokens: usize,
+        fn encode(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, max_length: usize) !@import("inference_tokenizer").EncodeResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const count = @min(self.tokens, max_length);
+            const ids = try a.alloc(i32, count);
+            errdefer a.free(ids);
+            const mask = try a.alloc(i32, count);
+            @memset(ids, 3);
+            @memset(mask, 1);
+            return .{ .ids = ids, .attention_mask = mask, .allocator = a };
+        }
+    };
+    var mock = Mock{ .tokens = 512 };
+    var vtable: Tokenizer.VTable = undefined;
+    vtable.encodeForModel = Mock.encode;
+    const tokenizer = Tokenizer{ .ptr = &mock, .vtable = &vtable };
+    const cb: ComputeBackend = undefined; // Text-only preparation does not invoke compute.
+    const group = Group{ .content = &.{.{ .text = "document" }} };
+    const options = Options{ .max_tokens = 512 };
+    const prepared = try prepareGroup(std.testing.allocator, &cb, tokenizer, group, options, .{});
+    defer prepared.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 512), prepared.ids.len);
+    for ([_]usize{ 513, 8192, 16384 }) |count| {
+        mock.tokens = count;
+        try std.testing.expectError(error.EmbeddingInputTooLong, prepareGroup(std.testing.allocator, &cb, tokenizer, group, options, .{}));
+    }
+    try std.testing.expectError(error.InvalidEmbeddingTokenLimit, validateGroup(group, .{ .max_tokens = 0 }));
+    try std.testing.expectError(error.InvalidEmbeddingTokenLimit, validateGroup(group, .{ .max_tokens = encoder.max_tokens + 1 }));
 }
 
 test "embeddinggemma2 raster batches bound padding and avoid singleton tails" {

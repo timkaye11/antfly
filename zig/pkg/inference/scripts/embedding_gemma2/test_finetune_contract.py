@@ -29,8 +29,8 @@ from finetune_contract import BASE_WEIGHT_SHA256, PERFORMANCE_CELLS, file_sha256
 from finetune_reference import TOKENIZER_SHA256, PreparedDataset, batch_indices, learning_rate, pad_ids, shuffle_epoch, sliced_inputs
 from benchmark_finetune_paired import reference_source_digest, validate_report_provenance
 from qualify_finetune_numeric import compare_array, reviewed_targets, validate_bf16_provenance, validate_resume
-from qualify_finetune_quality import OFFICIAL_SOURCE_CONTRACTS, bootstrap_delta, main as quality_main
-from prepare_training_dataset import add_train_only_negatives, decontaminate
+from qualify_finetune_quality import OFFICIAL_COUNTS, OFFICIAL_FILES, OFFICIAL_SOURCE_CONTRACTS, bootstrap_delta, main as quality_main, validate_reviewed_inventory
+from prepare_training_dataset import add_train_only_negatives, codesearch_records, decontaminate
 
 
 def manifest():
@@ -45,13 +45,14 @@ def manifest():
     }
 
 
-def official_quality_fixture(query_count=1):
+def official_quality_fixture(query_count=None):
     digest="a"*64
     contracts=[];inventories=[];sources=[]
     for key,identity in OFFICIAL_SOURCE_CONTRACTS.items():
         dataset,language,role=key
         corpus={**identity,"corpus_sha256":digest,"queries_sha256":digest,"qrels_sha256":digest,
-                "corpus_count":100,"query_count":query_count}
+                "corpus_count":OFFICIAL_COUNTS[key][0],"query_count":OFFICIAL_COUNTS[key][1] if query_count is None else query_count}
+        corpus.update(dict(zip(('corpus_sha256', 'queries_sha256', 'qrels_sha256'), OFFICIAL_FILES[key], strict=True)))
         contracts.append({"dataset":dataset,"language":language,"role":role,
                           "fixture_scope":"official-full-corpus","official_corpus":corpus})
         inventories.append({"dataset":dataset,"language":language,"role":role,"official_corpus":corpus})
@@ -77,6 +78,32 @@ def official_quality_fixture(query_count=1):
 
 
 class ContractTests(unittest.TestCase):
+    def test_code_identity_handles_repeated_names_urls_and_source_order(self):
+        rows = [{"func_name": "main", "url": "shared", "repository_name": "repo",
+                 "code": code, "docstring": query} for code, query in
+                (("def main(): return 1", "first"), ("def main(): return 2", "second"),
+                 ("def main(): return 1", "another query"))]
+        records = codesearch_records(rows, "python", "train")
+        self.assertEqual(len({row['query_id'] for row in records}), 3)
+        self.assertNotEqual(records[0]['positive']['id'], records[1]['positive']['id'])
+        self.assertEqual(records[0]['positive']['id'], records[2]['positive']['id'])
+        self.assertEqual(records, list(reversed(codesearch_records(list(reversed(rows)), 'python', 'train'))))
+
+    def test_reviewed_official_counts_cannot_be_self_declared(self):
+        _, public = official_quality_fixture()
+        inventory = {(row['dataset'], row['language'], row['role']): row['official_corpus']
+                     for row in public['official_inventories']}
+        validate_reviewed_inventory(inventory)
+        for field in ('corpus_count', 'query_count'):
+            original = inventory[("msmarco", None, "target")][field]
+            inventory[("msmarco", None, "target")][field] = 100
+            with self.assertRaisesRegex(ValueError, "reviewed official corpus/query counts"):
+                validate_reviewed_inventory(inventory)
+            inventory[("msmarco", None, "target")][field] = original
+        inventory[("msmarco", None, "target")]['qrels_sha256'] = 'a' * 64
+        with self.assertRaisesRegex(ValueError, 'reviewed official corpus/query/qrel bytes'):
+            validate_reviewed_inventory(inventory)
+
     def test_dataset_split_and_miner_contract(self):
         self.assertEqual(validate_dataset_manifest(manifest())["miner_corpus"], 1)
         value = manifest(); value["splits"]["heldout_content_sha256"] = ["a" * 64]
@@ -126,7 +153,7 @@ class ContractTests(unittest.TestCase):
 
     def test_unequal_length_microbatches_trim_to_their_active_width(self):
         try:
-            import torch
+            __import__("torch")
         except ImportError:
             self.skipTest("torch is optional for model-free contract tests")
         encoded=pad_ids([[1,2,3,4,5],[1,2],[1,2,3],[1]],"cpu")
@@ -291,7 +318,7 @@ class ContractTests(unittest.TestCase):
                 digest_by_name[model.name]=value["provenance"]["candidates_by_seed"][str(seed)]["candidate_model_sha256"]
             candidate_validator=lambda **kwargs:value["provenance"]["candidates_by_seed"][str(kwargs["seed"])]
             with mock.patch.object(sys,"argv",argv),mock.patch("qualify_finetune_quality.file_sha256",side_effect=lambda path:digest_by_name[path.name]),mock.patch("qualify_finetune_quality.validate_candidate_artifacts",side_effect=candidate_validator):
-                with self.assertRaisesRegex(ValueError,"cover the declared official query corpus"):quality_main()
+                with self.assertRaisesRegex(ValueError,"reviewed official corpus/query counts"):quality_main()
 
     def test_quality_gate_requires_corpus_source_in_authenticated_provenance(self):
         value,public=official_quality_fixture();value["provenance"]["public_sources"]=value["provenance"]["public_sources"][1:]
@@ -338,6 +365,20 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(len(accepted),1)
         self.assertEqual(accepted[0]["query_id"],"a")
         self.assertEqual(accepted[0]["known_positive_ids"],["d1","d2"])
+
+    def test_discarded_duplicate_queries_reserve_heldout_groups_and_content(self):
+        def row(name, split, query, body, group):
+            return {'query_id': name, 'query': query, 'split': split, 'group_id': group,
+                    'positive': {'id': name+'-doc', 'text': body}, 'known_positive_ids': [name+'-doc']}
+        for body, group in [('unique training body', 'repo-b'), ('alternate heldout body', 'repo-c')]:
+            with self.subTest(body=body, group=group):
+                records = [row('a', 'test', 'duplicate query', 'first heldout body', 'repo-a'),
+                           row('b', 'test', 'duplicate query', 'alternate heldout body', 'repo-b'),
+                           row('train', 'train', 'unique training query', body, group)]
+                accepted, hashes = decontaminate(records)
+                self.assertEqual([record['query_id'] for record in accepted], ['a'])
+                self.assertEqual(accepted[0]['known_positive_ids'], ['a-doc', 'b-doc'])
+                self.assertFalse(hashes['train'])
 
 
 if __name__ == "__main__":

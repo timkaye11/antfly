@@ -22,6 +22,8 @@ import io
 import json
 import math
 from pathlib import Path
+import sys
+import urllib.error
 import urllib.request
 
 from contract import PROMPTS, cosine
@@ -63,6 +65,9 @@ def cases(processor):
     rows.append(("split-text", "RETRIEVAL_QUERY", {"content": [{"type": "text", "text": "first "}, {"type": "text", "text": "second"}]}))
     rows.append(("manual-image-marker", "RETRIEVAL_DOCUMENT", {"content": [{"type": "text", "text": "before <|image|> after"}, image]}))
     rows.append(("manual-audio-marker", "RETRIEVAL_DOCUMENT", {"content": [{"type": "text", "text": "before <|audio|> after"}, audio]}))
+    rows.append(("manual-mixed-reordered", "RETRIEVAL_DOCUMENT", {"content": [{"type": "text", "text": "before <|audio|> then <|image|> after"}, image, audio]}))
+    rows.append(("document-title", "RETRIEVAL_DOCUMENT", {"title": "Ant colony behavior", "content": [text]}))
+    rows.append(("document-empty-title", "RETRIEVAL_DOCUMENT", {"title": "", "content": [text]}))
     for task in PROMPTS:
         rows.append((f"task-{task.lower()}", task, exact_cell_inputs(processor, "natural_text", 1, 128, task)[0]))
     return rows
@@ -79,12 +84,19 @@ def main():
     processor = EmbeddingGemma2Processor.from_pretrained(args.processor_dir, local_files_only=True)
     for name, task, value in cases(processor):
         body = {"model": args.model, "input": value, "task_type": task}
-        native, reference = post(args.antfly_url, body, args.timeout), post(args.pytorch_url, body, args.timeout)
-        a, b = native["data"][0]["embedding"], reference["data"][0]["embedding"]
-        norm = math.sqrt(sum(x*x for x in a))
-        results.append({"case": name, "cosine": cosine(a, b), "norm": norm, "backend": native.get("backend"), "usage": native.get("usage")})
-    report = {"schema": "antfly.embedding_gemma2.extended_matrix.v1", "minimum_cosine": min(row["cosine"] for row in results),
-              "pass": all(row["cosine"] >= .999 and abs(row["norm"]-1) <= 1e-3 and row["backend"] == "cuda" for row in results), "rows": results}
+        try:
+            native, reference = post(args.antfly_url, body, args.timeout), post(args.pytorch_url, body, args.timeout)
+            a, b = native["data"][0]["embedding"], reference["data"][0]["embedding"]
+            norm = math.sqrt(sum(x*x for x in a))
+            similarity = cosine(a, b)
+            results.append({"case": name, "cosine": similarity, "norm": norm, "backend": native.get("backend"), "usage": native.get("usage"),
+                            "pass": similarity >= .999 and abs(norm-1) <= 1e-3 and native.get("backend") == "cuda"})
+        except urllib.error.HTTPError as error:
+            results.append({"case": name, "pass": False, "http_status": error.code, "error": error.read().decode(errors="replace")})
+        print(json.dumps(results[-1], sort_keys=True), file=sys.stderr, flush=True)
+    similarities = [row["cosine"] for row in results if "cosine" in row]
+    report = {"schema": "antfly.embedding_gemma2.extended_matrix.v1", "minimum_cosine": min(similarities) if similarities else None,
+              "pass": bool(results) and all(row["pass"] for row in results), "rows": results}
     args.report.parent.mkdir(parents=True, exist_ok=True); args.report.write_text(json.dumps(report, indent=2, sort_keys=True)+"\n")
     print(json.dumps(report, sort_keys=True)); return 0 if report["pass"] else 1
 

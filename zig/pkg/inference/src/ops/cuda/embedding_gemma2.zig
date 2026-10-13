@@ -70,6 +70,8 @@ pub const Module = struct {
     audio_clamp: driver.CUfunction,
     audio_glu_rows: driver.CUfunction,
     audio_depthwise_conv: driver.CUfunction,
+    pillow_horizontal: driver.CUfunction,
+    pillow_vertical_patches: driver.CUfunction,
     rms_norm: driver.CUfunction,
     training_rms_norm: driver.CUfunction,
     rms_norm_input_vjp: driver.CUfunction,
@@ -128,6 +130,8 @@ pub const Module = struct {
             .audio_clamp = try function(ctx, m, "termite_gemma4_audio_clamp_f32"),
             .audio_glu_rows = try function(ctx, m, "termite_gemma4_audio_glu_rows_f32"),
             .audio_depthwise_conv = try function(ctx, m, "termite_gemma4_audio_depthwise_causal_conv1d_f32"),
+            .pillow_horizontal = try function(ctx, m, "termite_embedding_gemma2_pillow_horizontal_rgb8"),
+            .pillow_vertical_patches = try function(ctx, m, "termite_embedding_gemma2_pillow_vertical_patches_f32"),
             .rms_norm = try function(ctx, m, "termite_embedding_gemma2_rms_norm_bf16"),
             .training_rms_norm = try function(ctx, m, "termite_embedding_gemma2_training_rms_norm_bf16"),
             .rms_norm_input_vjp = try function(ctx, m, "termite_embedding_gemma2_rms_norm_input_vjp_f32"),
@@ -193,6 +197,54 @@ pub const Module = struct {
     }
     pub fn noteAttentionLaunch(self: *Module) void {
         self.stats_.attention_launches += 1;
+    }
+
+    // Coefficient indices are produced by the shared CPU Pillow plan, never
+    // caller-provided device data. Validate all backing spans before launch.
+    pub fn launchPillowHorizontal(self: *Module, ctx: *Context, out: Buffer, input: Buffer, starts: Buffer, offsets: Buffer, weights: Buffer, source_width: u32, source_height: u32, target_width: u32, source_stride: u64, precision_bits: u32) !void {
+        if (source_width == 0 or source_height == 0 or target_width == 0 or precision_bits == 0 or precision_bits > 31) return error.InvalidEmbeddingGemma2Shape;
+        const count = try std.math.mul(usize, try std.math.mul(usize, source_height, target_width), 3);
+        if (count > std.math.maxInt(u32)) return error.InvalidEmbeddingGemma2Shape;
+        const row_bytes = try std.math.mul(usize, source_width, 3);
+        if (source_stride < row_bytes or weights.len % @sizeOf(i32) != 0) return error.InvalidEmbeddingGemma2Shape;
+        try require(input, try std.math.add(usize, try std.math.mul(usize, source_height - 1, @intCast(source_stride)), row_bytes));
+        try require(weights, @sizeOf(i32));
+        try require(out, count);
+        try require(starts, try std.math.mul(usize, target_width, 8));
+        try require(offsets, try std.math.mul(usize, @as(usize, target_width) + 1, 8));
+        var op = out.ptr;
+        var ip = input.ptr;
+        var sp = starts.ptr;
+        var fp = offsets.ptr;
+        var wp = weights.ptr;
+        var h = source_height;
+        var w = target_width;
+        var stride = source_stride;
+        var bits = precision_bits;
+        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&ip), @ptrCast(&sp), @ptrCast(&fp), @ptrCast(&wp), @ptrCast(&h), @ptrCast(&w), @ptrCast(&stride), @ptrCast(&bits) };
+        try self.launch1d(ctx, self.pillow_horizontal, &args, @intCast(count));
+    }
+
+    pub fn launchPillowVerticalPatches(self: *Module, ctx: *Context, out: Buffer, horizontal: Buffer, starts: Buffer, offsets: Buffer, weights: Buffer, source_height: u32, target_width: u32, target_height: u32, precision_bits: u32) !void {
+        if (source_height == 0 or target_width == 0 or target_height == 0 or target_width % 16 != 0 or target_height % 16 != 0 or precision_bits == 0 or precision_bits > 31 or weights.len % @sizeOf(i32) != 0) return error.InvalidEmbeddingGemma2Shape;
+        const count = try std.math.mul(usize, try std.math.mul(usize, target_width, target_height), 3);
+        if (count > std.math.maxInt(u32)) return error.InvalidEmbeddingGemma2Shape;
+        try require(out, try std.math.mul(usize, count, @sizeOf(f32)));
+        try require(horizontal, try std.math.mul(usize, try std.math.mul(usize, source_height, target_width), 3));
+        try require(weights, @sizeOf(i32));
+        try require(starts, try std.math.mul(usize, target_height, 8));
+        try require(offsets, try std.math.mul(usize, @as(usize, target_height) + 1, 8));
+        var op = out.ptr;
+        var hp = horizontal.ptr;
+        var sp = starts.ptr;
+        var fp = offsets.ptr;
+        var wp = weights.ptr;
+        var w = target_width;
+        var h = target_height;
+        var patch: u32 = 16;
+        var bits = precision_bits;
+        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&hp), @ptrCast(&sp), @ptrCast(&fp), @ptrCast(&wp), @ptrCast(&w), @ptrCast(&h), @ptrCast(&patch), @ptrCast(&bits) };
+        try self.launch1d(ctx, self.pillow_vertical_patches, &args, @intCast(count));
     }
 
     pub fn launchAudioAttention(self: *Module, ctx: *Context, out: Buffer, q: Buffer, k: Buffer, v: Buffer, rel: Buffer, scales: Buffer, valid: Buffer, p: @import("../ops.zig").Gemma4AudioLocalAttentionParams) !void {

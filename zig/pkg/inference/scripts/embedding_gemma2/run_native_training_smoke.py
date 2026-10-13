@@ -9,7 +9,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import subprocess
 import threading
 import time
@@ -222,10 +221,12 @@ def main() -> int:
         write_config(config, configs[name], outputs[name])
 
     runs = {}
-    runs["uninterrupted"] = run_native(args.binary, configs["uninterrupted"], [], args.work_dir / "uninterrupted.log")
+    # The stop limit counts steps in this invocation, including after resume.
+    # Bound the smoke independently of the full dataset/epoch schedule.
+    runs["uninterrupted"] = run_native(args.binary, configs["uninterrupted"], ["--stop-after-steps", "2"], args.work_dir / "uninterrupted.log")
     runs["stopped"] = run_native(args.binary, configs["stopped"], ["--stop-after-steps", "1"], args.work_dir / "stopped.log")
     first_checkpoint = outputs["stopped"] / "checkpoint-00000001"
-    runs["resumed"] = run_native(args.binary, configs["resumed"], ["--resume-from", str(first_checkpoint)], args.work_dir / "resumed.log")
+    runs["resumed"] = run_native(args.binary, configs["resumed"], ["--resume-from", str(first_checkpoint), "--stop-after-steps", "1"], args.work_dir / "resumed.log")
 
     uninterrupted = checkpoint_summary(outputs["uninterrupted"] / "checkpoint-00000002")
     resumed = checkpoint_summary(outputs["resumed"] / "checkpoint-00000002")

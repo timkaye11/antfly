@@ -2357,6 +2357,9 @@ pub const ComputeBackend = struct {
         /// output are token-major F32 `[sequence, 768]`. A backend may decline
         /// before queueing work; errors after submission must propagate.
         runEmbeddingGemma2VisionTower: ?*const fn (ctx: *anyopaque, input: CT, sequence: usize, grid_x: usize, grid_y: usize) anyerror!?CT = null,
+        /// Exact Pillow RGB8 resize and official 16x16 patch packing. Returns
+        /// F32 `[patch_count, 768]` scaled pixels; decline before queueing work.
+        preprocessEmbeddingGemma2ImagePatches: ?*const fn (ctx: *anyopaque, rgb: []const u8, width: u32, height: u32, stride: usize, target_width: u32, target_height: u32) anyerror!?CT = null,
 
         /// Optional bidirectional attention with no mask. This is equivalent
         /// to scaledDotProductAttention with an all-ones mask, but lets
@@ -4218,6 +4221,11 @@ pub const ComputeBackend = struct {
     pub fn runEmbeddingGemma2VisionTower(self: *const ComputeBackend, input: CT, sequence: usize, grid_x: usize, grid_y: usize) !?CT {
         const op = self.vtable.runEmbeddingGemma2VisionTower orelse return null;
         return op(self.ptr, input, sequence, grid_x, grid_y);
+    }
+
+    pub fn preprocessEmbeddingGemma2ImagePatches(self: *const ComputeBackend, rgb: []const u8, width: u32, height: u32, stride: usize, target_width: u32, target_height: u32) !?CT {
+        const op = self.vtable.preprocessEmbeddingGemma2ImagePatches orelse return null;
+        return op(self.ptr, rgb, width, height, stride, target_width, target_height);
     }
 
     /// Token-major `Q [queries, heads*head_dim]` attending to `K`/`V`

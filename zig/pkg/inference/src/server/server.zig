@@ -7280,7 +7280,7 @@ pub const Node = struct {
                 const resident_embedding_gemma2 = model.manifest.embedding_style == .embedding_gemma2 and model.session.backend() == .cuda;
                 const request_prefix = try denseEmbeddingTextPrefix(attempt.allocator, model, attempt.task_type, attempt.instruction);
                 defer if (request_prefix.owned) |owned| attempt.allocator.free(owned);
-                const max_input_tokens = if (model.session.backend() == .cuda and model.manifest.embedding_style == .embedding_gemma2) 0 else try maxParsedDenseEmbedTextTokens(attempt.allocator, attempt.io, model.getTokenizer(), attempt.parsed, request_prefix.prefix);
+                const max_input_tokens = if (resident_embedding_gemma2) 0 else try maxParsedDenseEmbedTextTokens(attempt.allocator, attempt.io, model.getTokenizer(), attempt.parsed, request_prefix.prefix);
                 try validateDenseEmbedExecutorInvocation(
                     attempt.executor_contract,
                     &model.manifest,
@@ -7300,7 +7300,7 @@ pub const Node = struct {
                 var pipeline = try prepareInitialDenseEmbeddingPipeline(model, attempt.allocator, attempt.parsed, attempt.control);
                 pipeline.execution_control = attempt.control;
                 pipeline.config.max_audio_decode_working_bytes = attempt.audio_decode_working_bytes;
-                if (resident_embedding_gemma2) {
+                if (model.manifest.embedding_style == .embedding_gemma2) {
                     pipeline.config.max_length = narrowedEmbeddingGemma2InputLimit(
                         pipeline.config.max_length,
                         attempt.executor_contract.batch.max_input_tokens_per_item,
@@ -11088,6 +11088,9 @@ pub const Node = struct {
                 if (isDenseEmbedRequestAbort(err)) return inferenceFailureResponse(ctx, err);
                 if (isInferenceExecutorContractError(err)) return inferenceExecutorContractFailureResponse(ctx, err);
                 if (err == error.EmbeddingInputTooLong) return ctx.status(413).json(.{ .@"error" = "INPUT_TOO_LONG", .message = embedRequestOptionErrorMessage(err) });
+                if (groupedEmbeddingInputFailure(err)) |failure| {
+                    return ctx.status(failure.status).json(.{ .@"error" = failure.code, .message = failure.message });
+                }
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) });
             };
         }
@@ -11348,7 +11351,7 @@ pub const Node = struct {
                     }
                 }
                 const active_contract = try resolvedInferenceExecutorContract(attempt.node, "embed", &model.manifest);
-                if (resident_embedding_gemma2) {
+                if (model.manifest.embedding_style == .embedding_gemma2) {
                     pipeline.config.max_length = narrowedEmbeddingGemma2InputLimit(
                         pipeline.config.max_length,
                         active_contract.batch.max_input_tokens_per_item,
@@ -20116,6 +20119,9 @@ pub const Node = struct {
         defer handle.release();
         const loaded = handle.get();
         try loaded.verifyEmbeddingIdentity();
+        const active_contract = try resolvedInferenceExecutorContract(self, "embed", &loaded.manifest);
+        const active_options = try groupedEmbeddingOptions(&loaded.manifest, active_contract, options);
+        for (groups) |group| try validateEmbeddingGroupContract(active_contract, group, groups.len);
         const vectors = try out.alloc([]f32, groups.len);
         var count: usize = 0;
         errdefer {
@@ -20123,7 +20129,7 @@ pub const Node = struct {
             out.free(vectors);
         }
         for (groups, vectors) |group, *vector| {
-            const result = try grouped.embed(out, loaded.session, loaded.getTokenizer(), group, options, loaded.embeddingExecutionLock(), control);
+            const result = try grouped.embed(out, loaded.session, loaded.getTokenizer(), group, active_options, loaded.embeddingExecutionLock(), control);
             vector.* = result.vector;
             count += 1;
         }
@@ -20174,11 +20180,23 @@ pub const Node = struct {
         var handle = try self.model_manager.acquireFromDirWithControl(path, control);
         defer handle.release();
         const loaded = handle.get();
-        if (request.model_identity) |expected| if (!std.mem.eql(u8, expected, &loaded.embedding_identity.?)) return error.EmbeddingIdentityMismatch;
+        if (request.model_identity) |expected| {
+            const actual = loaded.embedding_identity orelse return error.EmbeddingIdentityMismatch;
+            if (!std.mem.eql(u8, expected, &actual)) return error.EmbeddingIdentityMismatch;
+        }
         try loaded.verifyEmbeddingIdentity();
+        const active_contract = try resolvedInferenceExecutorContract(self, "embed", &loaded.manifest);
+        const active_options = try groupedEmbeddingOptions(&loaded.manifest, active_contract, .{
+            .task_type = @tagName(request.task_type orelse .RETRIEVAL_DOCUMENT),
+            .dimensions = if (request.dimensions) |dim| @intCast(dim) else 768,
+        });
+        try validateInferenceExecutorInvocation(active_contract, .{ .item_count = raw_groups.len });
         for (groups, 0..) |maybe_group, index| {
             const group = maybe_group orelse continue;
-            const result = grouped.embed(a, loaded.session, loaded.getTokenizer(), group, .{ .task_type = @tagName(request.task_type orelse .RETRIEVAL_DOCUMENT), .dimensions = if (request.dimensions) |dim| @intCast(dim) else 768 }, loaded.embeddingExecutionLock(), control) catch |err| {
+            const result = group_result: {
+                validateEmbeddingGroupContract(active_contract, group, groups.len) catch |err| break :group_result @as(anyerror!grouped.Result, err);
+                break :group_result grouped.embed(a, loaded.session, loaded.getTokenizer(), group, active_options, loaded.embeddingExecutionLock(), control);
+            } catch |err| {
                 if (request.error_policy == .fail_fast or isDenseEmbedRequestAbort(err)) return err;
                 try errors.append(a, embedItemFailure(index, err, "embedding"));
                 continue;
@@ -20197,6 +20215,7 @@ pub const Node = struct {
         const dense = try a.alloc([]const f32, vectors.len);
         for (dense, vectors) |*dest, vector| dest.* = vector.?;
         var response = try buildEmbedDenseResponse(a, request.model, dense, if (request.dimensions) |dim| @intCast(dim) else null, true, input_tokens);
+        response.backend = @tagName(loaded.session.backend());
         response.model_identity = if (loaded.embedding_identity) |*identity| identity else null;
         return ctx.json(response);
     }
@@ -31237,10 +31256,57 @@ fn narrowedEmbeddingGemma2InputLimit(model_limit: usize, executor_limit: ?usize)
     return if (executor_limit) |limit| @min(model_limit, limit) else model_limit;
 }
 
+fn groupedEmbeddingOptions(manifest: *const manifest_mod.ModelManifest, contract: ResolvedInferenceExecutorContract, requested: @import("../pipelines/embedding_gemma2.zig").Options) !@import("../pipelines/embedding_gemma2.zig").Options {
+    if (manifest.embedding_style != .embedding_gemma2) return error.UnsupportedEmbeddingProvider;
+    var options = requested;
+    options.max_tokens = @min(options.max_tokens, narrowedEmbeddingGemma2InputLimit(manifest.maxTextSequenceLength(), contract.batch.max_input_tokens_per_item));
+    return options;
+}
+
 test "EmbeddingGemma2 strict frontend honors narrower executor token limits" {
     try std.testing.expectEqual(@as(usize, 8192), narrowedEmbeddingGemma2InputLimit(8192, null));
     try std.testing.expectEqual(@as(usize, 8192), narrowedEmbeddingGemma2InputLimit(8192, 16_384));
     try std.testing.expectEqual(@as(usize, 512), narrowedEmbeddingGemma2InputLimit(8192, 512));
+}
+
+test "EmbeddingGemma2 grouped frontend rechecks loaded manifest limits and modalities" {
+    var node = try Node.init(std.testing.allocator, .{});
+    defer node.deinit();
+    var inputs = [_][]const u8{"text"};
+    var capabilities = [_][]const u8{"inference.limits.max_input_tokens_per_item=512"};
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .embedder,
+        .embedding_style = .embedding_gemma2,
+        .max_position_embeddings = 8192,
+        .inputs = &inputs,
+        .capabilities = &capabilities,
+    };
+    const contract = try resolvedInferenceExecutorContract(&node, "embed", &manifest);
+    const options = try groupedEmbeddingOptions(&manifest, contract, .{});
+    try std.testing.expectEqual(@as(usize, 512), options.max_tokens);
+    try std.testing.expectEqual(@as(usize, 256), (try groupedEmbeddingOptions(&manifest, contract, .{ .max_tokens = 256 })).max_tokens);
+    try validateEmbeddingGroupContract(contract, .{ .content = &.{.{ .text = "document" }} }, 1);
+    try std.testing.expectError(error.UnsupportedInferenceModality, validateEmbeddingGroupContract(contract, .{ .content = &.{.{ .audio = "audio" }} }, 1));
+    manifest.max_position_embeddings = 128;
+    try std.testing.expectEqual(@as(usize, 128), (try groupedEmbeddingOptions(&manifest, contract, .{})).max_tokens);
+    manifest.embedding_style = .none;
+    try std.testing.expectError(error.UnsupportedEmbeddingProvider, groupedEmbeddingOptions(&manifest, contract, .{}));
+}
+
+test "EmbeddingGemma2 grouped overflow is a nonretryable input error" {
+    const failure = embedItemFailure(1, error.EmbeddingSequenceTooLong, "embedding");
+    try std.testing.expectEqualStrings("INPUT_TOO_LONG", failure.code);
+    try std.testing.expectEqual(@as(u16, 400), failure.status);
+    try std.testing.expectEqual(@as(i64, 1), failure.index);
+    try std.testing.expect(!failure.retryable);
+    const host_failure = embedItemFailure(1, error.EmbeddingInputTooLong, "embedding");
+    try std.testing.expectEqualStrings("INPUT_TOO_LONG", host_failure.code);
+    try std.testing.expectEqual(@as(u16, 413), host_failure.status);
+    const modality_failure = embedItemFailure(1, error.UnsupportedInferenceModality, "input");
+    try std.testing.expectEqualStrings("UNSUPPORTED_MODALITY", modality_failure.code);
+    try std.testing.expectEqual(@as(u16, 400), modality_failure.status);
+    try std.testing.expect(!modality_failure.retryable);
 }
 
 test "EmbeddingGemma2 grouped attachments keep global uniqueness" {
@@ -32391,6 +32457,24 @@ fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
     };
 }
 
+/// Ordered groups can reject corrupt image headers during parsing, before
+/// inference. Preserve the same permanent image error as the execution path.
+fn groupedEmbeddingInputFailure(err: anyerror) ?EmbedDenseInputFailure {
+    if (err == error.ImageDecodeFailed or isEmbeddingInputContractError(err))
+        return embedDenseInputFailure(err);
+    return null;
+}
+
+test "EmbeddingGemma2 grouped image parse failures keep permanent image errors" {
+    const image = groupedEmbeddingInputFailure(error.ImageDecodeFailed).?;
+    try std.testing.expectEqual(@as(u16, 400), image.status);
+    try std.testing.expectEqualStrings("INVALID_IMAGE", image.code);
+    const audio = groupedEmbeddingInputFailure(error.InvalidAudioSamples).?;
+    try std.testing.expectEqualStrings("INVALID_AUDIO", audio.code);
+    try std.testing.expect(groupedEmbeddingInputFailure(error.OutOfMemory) == null);
+    try std.testing.expect(groupedEmbeddingInputFailure(error.InvalidEmbeddingGroup) == null);
+}
+
 fn embedDenseInputFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
     if (isTransientInferenceCapacityError(err)) {
         return modelResourceBusyResponse(ctx);
@@ -32461,6 +32545,23 @@ const DenseEmbedPartialResult = struct {
 };
 
 fn embedItemFailure(index: usize, err: anyerror, stage: []const u8) EmbedItemError {
+    if (isInferenceExecutorContractError(err)) {
+        const failure = generateExecutorContractError(err);
+        return .{ .index = @intCast(index), .code = failure.batch.code, .message = failure.batch.message, .stage = stage, .retryable = failure.batch.retryable, .status = failure.status };
+    }
+    if (err == error.EmbeddingInputTooLong) return .{
+        .index = @intCast(index),
+        .code = "INPUT_TOO_LONG",
+        .message = embedRequestOptionErrorMessage(err),
+        .stage = stage,
+        .retryable = false,
+        .status = 413,
+    };
+    if (isEmbeddingInputContractError(err)) {
+        var failure = embedInputItemFailure(index, err);
+        failure.stage = stage;
+        return failure;
+    }
     if (isEmbedRequestOptionError(err)) return .{
         .index = @intCast(index),
         .code = "INVALID_REQUEST",

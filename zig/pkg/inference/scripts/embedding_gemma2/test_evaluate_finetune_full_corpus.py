@@ -3,6 +3,7 @@ import json
 import math
 import tempfile
 import unittest
+from unittest.mock import patch
 from argparse import Namespace
 from pathlib import Path
 
@@ -22,7 +23,7 @@ class FakeEmbedder:
 
     def __call__(self, texts, task):
         self.calls.append((list(texts), task))
-        return [self.vectors[text] for text in texts]
+        return [self.vectors[f"title: {text['title']} | text: {text['content'][0]['text']}" if isinstance(text, dict) else text] for text in texts]
 
 
 class FullCorpusTest(unittest.TestCase):
@@ -73,7 +74,7 @@ class FullCorpusTest(unittest.TestCase):
             self.assertEqual(base_values, candidate_values)
             self.assertTrue(all(len(texts) <= (2 if task == "RETRIEVAL_DOCUMENT" else 2) for texts, task in base.calls))
             self.assertEqual(sum(task == "RETRIEVAL_DOCUMENT" for _, task in base.calls), 6)
-            self.assertEqual(base.calls[1][0][0], "title: T | text: doc0")
+            self.assertEqual(base.calls[1][0][0], {"title": "T", "content": [{"type": "text", "text": "doc0"}]})
 
     def test_full_vector_is_required_and_mrl_is_renormalized(self):
         with self.assertRaisesRegex(ValueError, "full 768"):
@@ -101,6 +102,7 @@ class FullCorpusTest(unittest.TestCase):
                 subject.evaluate(corpus=corpus, queries=queries, qrels=qrels, base_embed=embedder,
                     candidate_embed=embedder, dimension=128, query_chunk_size=1, corpus_chunk_size=1)
 
+    @patch.object(subject, "validate_reviewed_inventory", lambda inventory: None)
     def test_merge_accepts_only_complete_cells_with_exact_artifacts_and_cuda(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -68,13 +68,20 @@ def codesearch_records(rows: list[dict], language: str, split: str) -> list[dict
         code = (row.get("whole_func_string") or row.get("code") or row.get("func_code_string") or "").strip()
         if not query or not code:
             continue
-        source_id = str(row.get("url") or row.get("func_name") or index)
-        identifier = f"codesearchnet:{language}:{split}:{hashlib.sha256(source_id.encode()).hexdigest()[:20]}"
-        repository = str(row.get("repository_name") or row.get("repo") or source_id)
+        source_id = str(row.get("url") or row.get("func_name") or "")
+        repository = str(row.get("repository_name") or row.get("repo") or source_id or "unknown")
+        # Function names and source URLs may identify several different
+        # functions. Bind each document ID to its actual source and code;
+        # keep the query identity separate from the document identity.
+        identity = {"repository": repository, "source": source_id,
+                    "path": str(row.get("func_path_in_repository") or row.get("path") or ""),
+                    "code": code}
+        document_id = f"codesearchnet:{language}:{split}:{canonical_hash(identity)}:code"
+        identifier = f"codesearchnet:{language}:{split}:{canonical_hash({**identity, 'query': query})}"
         group = f"codesearchnet:{language}:repo:{hashlib.sha256(repository.encode()).hexdigest()[:20]}"
         records.append({"query": query, "query_id": identifier, "group_id": group,
-                        "positive": document(identifier + ":code", code), "negatives": [],
-                        "known_positive_ids": [identifier + ":code"], "task": "code_retrieval", "split": split})
+                        "positive": document(document_id, code), "negatives": [],
+                        "known_positive_ids": [document_id], "task": "code_retrieval", "split": split})
     return records
 
 
@@ -114,30 +121,41 @@ def add_train_only_negatives(records: list[dict], seed: int) -> None:
 def add_frozen_base_negatives(records: list[dict], model_dir: str, batch_size: int) -> None:
     """Mine the highest-cosine admissible train positive with a frozen local model."""
     from sentence_transformers import SentenceTransformer
+    from contract import render_text
+    from evaluate_finetune_full_corpus import TextInputLimiter
+    from mine_finetune_negatives import choose_negative, cohort
     train = [record for record in records if record["split"] == "train"]
-    candidates = sorted(train, key=lambda record: record["positive"]["id"])
-    if len(candidates) < 2:
+    if len(train) < 2:
         raise ValueError("frozen-base mining needs at least two train records")
     model = SentenceTransformer(model_dir, local_files_only=True)
-    queries = model.encode([record["query"] for record in train], batch_size=batch_size,
-                           convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False)
-    documents = model.encode([record["positive"]["text"] for record in candidates], batch_size=batch_size,
-                             convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False)
-    for row_index, record in enumerate(train):
-        if record["negatives"]:  # Preserve source-provided MS MARCO mined negatives.
-            continue
-        ranked = sorted(((float(queries[row_index] @ documents[index]), candidate)
-                         for index, candidate in enumerate(candidates)),
-                        key=lambda value: (-value[0], value[1]["positive"]["id"]))
-        for _, candidate_record in ranked:
-            candidate = candidate_record["positive"]
-            if (candidate_record["group_id"] != record["group_id"] and
-                    candidate["id"] not in record["known_positive_ids"] and
-                    normalized_content_hash(candidate["text"]) != normalized_content_hash(record["positive"]["text"])):
-                record["negatives"] = [candidate]
-                break
-        if not record["negatives"]:
-            raise ValueError("training record has no admissible frozen-base hard negative")
+    limiter = TextInputLimiter(model.tokenizer)
+    known = {}
+    for record in train:
+        known.setdefault(normalized_content_hash(record['query']), set()).update(
+            [record['positive']['id'], *record['known_positive_ids']])
+    for group in sorted({cohort(record) for record in train if not record['negatives']}):
+        members = [record for record in train if cohort(record) == group]
+        pending = [record for record in members if not record['negatives']]
+        candidates = sorted(members, key=lambda record: record['positive']['id'])
+        query_task = 'CODE_RETRIEVAL' if pending[0]['task'] == 'code_retrieval' else 'RETRIEVAL_QUERY'
+        # Render explicit prompts and disable SentenceTransformer's defaults.
+        # Mine against the same text caps that native preparation will admit.
+        query_texts = [render_text(limiter(record['query'], query_task), query_task) for record in pending]
+        document_texts = []
+        for record in candidates:
+            document = record['positive']
+            value = limiter({'title': document.get('title'),
+                             'content': [{'type': 'text', 'text': document['text']}]}, 'RETRIEVAL_DOCUMENT')
+            document_texts.append(f"title: {value['title']} | text: {value['content'][0]['text']}"
+                                  if isinstance(value, dict) else render_text(value, 'RETRIEVAL_DOCUMENT'))
+        options = dict(batch_size=batch_size, prompt='', convert_to_numpy=True,
+                       normalize_embeddings=True, show_progress_bar=False)
+        queries = model.encode(query_texts, **options)
+        documents = model.encode(document_texts, **options)
+        for record, query in zip(pending, queries):
+            scores = [float(query @ document) for document in documents]
+            negative, _ = choose_negative(record, candidates, scores, known[normalized_content_hash(record['query'])])
+            record['negatives'] = [negative]
 
 
 def field(row: dict, *names: str):
@@ -176,7 +194,35 @@ def beir_records(corpus_rows: list[dict], query_rows: list[dict], qrel_rows: lis
     return records
 
 
+def expand_positive_aliases(records: list[dict], *, positive_hashes: dict | None = None) -> None:
+    """Exclude every same-split ID for known-positive document content.
+
+    Streaming collectors may supply hashes for positive IDs whose duplicate
+    query rows were discarded. Never infer positive aliases across splits.
+    """
+    hashes = dict(positive_hashes or {})
+    content_ids = {}
+    for record in records:
+        split, document = record['split'], record['positive']
+        key = (split, document['id'])
+        digest = normalized_content_hash(document['text'])
+        if key in hashes and hashes[key] != digest:
+            raise ValueError('Positive document ID binds different content within a split')
+        hashes[key] = digest
+        content_ids.setdefault((split, digest), set()).add(document['id'])
+    for record in records:
+        split = record['split']
+        positives = {record['positive']['id'], *record['known_positive_ids']}
+        for identifier in tuple(positives):
+            digest = hashes.get((split, identifier))
+            if digest is not None:
+                positives.update(content_ids.get((split, digest), ()))
+        record['known_positive_ids'] = sorted(positives)
+
+
 def decontaminate(records: list[dict]) -> tuple[list[dict], dict[str, list[str]]]:
+    # Preserve content aliases before duplicate queries discard positive rows.
+    expand_positive_aliases(records)
     priority = {"train": 0, "validation": 1, "test": 2}
     accepted, claimed, claimed_groups, same_split_queries = [], {}, {}, {}
     for record in sorted(records, key=lambda value: (-priority[value["split"]], value["query_id"])):
@@ -187,14 +233,16 @@ def decontaminate(records: list[dict]) -> tuple[list[dict], dict[str, list[str]]
         hashes = {normalized_content_hash(record["query"]), normalized_content_hash(record["positive"]["text"])}
         if any(digest in claimed and claimed[digest] != split for digest in hashes):
             continue
+        # A duplicate query still owns its repository and alternate positive
+        # content, even though only one query row survives in the dataset.
+        for digest in hashes:
+            claimed[digest] = split
+        claimed_groups[group] = split
         query_key = (split, normalized_content_hash(record["query"]))
         if query_key in same_split_queries:
             retained = same_split_queries[query_key]
             retained["known_positive_ids"] = sorted(set(retained["known_positive_ids"] + record["known_positive_ids"] + [record["positive"]["id"]]))
             continue
-        for digest in hashes:
-            claimed[digest] = split
-        claimed_groups[group] = split
         accepted.append(record)
         same_split_queries[query_key] = record
     accepted.sort(key=lambda value: (priority[value["split"]], value["query_id"]))

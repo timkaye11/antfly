@@ -1367,7 +1367,13 @@ fn encodeSingleImageView(
     decoded: image.ImageU8,
 ) !EncodedImage {
     const geometry = targetGeometry(cfg, decoded.width, decoded.height);
-    const pixel_values = try image.preprocessImageViewRectScaledWithResample(
+    try decoded.validate();
+    const prepared_patches = if (store.huggingface and cb.kind() == .cuda and decoded.format == .rgb8 and cfg.patch_size == 16)
+        try cb.preprocessEmbeddingGemma2ImagePatches(decoded.data, decoded.width, decoded.height, try decoded.rowStride(), @intCast(geometry.width), @intCast(geometry.height))
+    else
+        null;
+    defer if (prepared_patches) |tensor| cb.free(tensor);
+    const pixel_values = if (prepared_patches == null) try image.preprocessImageViewRectScaledWithResample(
         allocator,
         decoded,
         @intCast(geometry.width),
@@ -1376,16 +1382,21 @@ fn encodeSingleImageView(
         cfg.image_std,
         1.0 / 255.0,
         if (store.gguf == null) (if (cb.kind() == .cuda) .pillow_bicubic else .torchvision_bicubic) else .bilinear,
-    );
-    defer allocator.free(pixel_values);
+    ) else null;
+    defer if (pixel_values) |values| allocator.free(values);
 
     const hidden_shape = [_]i32{ @intCast(geometry.grid_x * geometry.grid_y), @intCast(cfg.vision_hidden) };
     var hidden = if (store.huggingface and cb.kind() == .cuda) blk: {
-        const patches = try patchEmbedHuggingFaceCt(cb, allocator, store, cfg, pixel_values, geometry);
+        const patches = if (prepared_patches) |pixels| fast: {
+            const count = geometry.grid_x * geometry.grid_y;
+            const dim = cfg.patch_size * cfg.patch_size * 3;
+            const weight = try projectorLinearWeightCt(cb, allocator, store, "v.patch_embd.weight", dim, cfg.vision_hidden);
+            break :fast try cb.linearNoBias(pixels, weight, count, dim, cfg.vision_hidden);
+        } else try patchEmbedHuggingFaceCt(cb, allocator, store, cfg, pixel_values.?, geometry);
         defer cb.free(patches);
         break :blk try addHuggingFacePositionEmbeddingsCt(cb, allocator, store, cfg, patches, geometry);
     } else blk: {
-        const patches = try patchEmbed(cb, allocator, store, cfg, pixel_values, geometry);
+        const patches = try patchEmbed(cb, allocator, store, cfg, pixel_values.?, geometry);
         defer allocator.free(patches);
         const positioned = try addPositionEmbeddings(allocator, store, cfg, patches, geometry);
         defer allocator.free(positioned);

@@ -97,8 +97,12 @@ def main() -> int:
     bad_image = {"type": "media", "mime_type": "image/png", "data": base64.b64encode(b"not a png").decode()}
     bad_audio = {"type": "media", "mime_type": "audio/wav", "data": base64.b64encode(b"not a wav").decode()}
     # Two corrupt images in the same group must produce one indexed failure.
-    inputs = ["first valid sibling", {"content": [bad_image, bad_image]},
-              {"content": [bad_audio]}, "missing media <|image|>", "last valid sibling"]
+    # A grouped batch contains ordered content objects throughout; mixing
+    # strings and groups would exercise unsupported request shapes instead.
+    inputs = [{"content": [{"type": "text", "text": "first valid sibling"}]},
+              {"content": [bad_image, bad_image]}, {"content": [bad_audio]},
+              {"content": [{"type": "text", "text": "missing media <|image|>"}]},
+              {"content": [{"type": "text", "text": "last valid sibling"}]}]
     status, partial = post(args.url, {"model": args.model, "input": inputs, "error_policy": "per_item"}, args.timeout)
     data = sorted(partial.get("data", []), key=lambda row: row["index"])
     errors = sorted(partial.get("errors", []), key=lambda row: row["index"])

@@ -1032,7 +1032,11 @@ fn createNativeSessionForCudaUpload(allocator: std.mem.Allocator, model_path: []
         const owned_key = try allocator.dupe(u8, key);
         var key_owned = true;
         defer if (key_owned) allocator.free(owned_key);
-        if (shouldLazyLoadWeight(store.kind(), arch_config, key)) {
+        // CUDA transfers the resident inventory and closes this host session.
+        // EmbeddingGemma 2's CPU lazy weights must be materialized here so its
+        // encoder and media towers remain available after that handoff.
+        const cuda_embedding_gemma2_upload = retain_gliner_q8 and arch_config == .embedding_gemma2;
+        if (!cuda_embedding_gemma2_upload and shouldLazyLoadWeight(store.kind(), arch_config, key)) {
             if (lazy_weights.contains(key)) {
                 continue;
             }

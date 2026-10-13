@@ -1508,7 +1508,7 @@ pub const EmbeddingPipeline = struct {
     pub fn embedBorrowedRastersReported(self: *EmbeddingPipeline, rasters: []const antfly_image.BorrowedRasterAttachment) anyerror!ImageBatchResult {
         if (rasters.len == 0) return .{ .vectors = try self.allocator.alloc([]f32, 0), .execution = .serial };
         if (!self.config.resident_embedding_gemma2 and session_factory.getEmbeddingGemma2Config(self.session) != null) {
-            const result = try @import("embedding_gemma2.zig").embedRasters(self.allocator, self.session, self.tok, rasters, .{}, self.execution_lock, self.execution_control);
+            const result = try @import("embedding_gemma2.zig").embedRasters(self.allocator, self.session, self.tok, rasters, .{ .max_tokens = @min(self.config.max_length, 8192) }, self.execution_lock, self.execution_control);
             return .{ .vectors = result.vectors, .execution = result.execution };
         }
         const vectors = self.embedBorrowedRastersBatch(rasters) catch |err| {
@@ -1879,7 +1879,7 @@ pub const EmbeddingPipeline = struct {
         for (media, 0..) |bytes, index| {
             if (item_errors) |errors| errors[index] = null;
             const part: grouped.Part = if (images) .{ .image = bytes } else .{ .audio = bytes };
-            const result = grouped.embed(self.allocator, self.session, self.tok, .{ .content = &.{part} }, .{}, self.execution_lock, self.execution_control) catch |err| {
+            const result = grouped.embed(self.allocator, self.session, self.tok, .{ .content = &.{part} }, .{ .max_tokens = @min(self.config.max_length, 8192) }, self.execution_lock, self.execution_control) catch |err| {
                 if (item_errors) |errors| {
                     if (err == error.OutOfMemory or err == error.Cancelled or err == error.Canceled or err == error.Timeout or err == error.DeadlineExceeded) return err;
                     errors[index] = err;
@@ -1995,7 +1995,7 @@ pub const EmbeddingPipeline = struct {
             // bounded decoder, downmix, resample and HF processor as HTTP.
             const encoded = try audio.wav.encodeInterleaved(std.heap.smp_allocator, clip.samples, channels, .{ .audio_format = 3, .sample_rate = clip.sample_rate, .bits_per_sample = 32 });
             defer std.heap.smp_allocator.free(encoded);
-            const result = try @import("embedding_gemma2.zig").embed(self.allocator, self.session, self.tok, .{ .content = &.{.{ .audio = encoded }} }, .{}, self.execution_lock, self.execution_control);
+            const result = try @import("embedding_gemma2.zig").embed(self.allocator, self.session, self.tok, .{ .content = &.{.{ .audio = encoded }} }, .{ .max_tokens = @min(self.config.max_length, 8192) }, self.execution_lock, self.execution_control);
             vector.* = result.vector;
             initialized += 1;
         }

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "embedding_gemma2_training_rope.cuh"
+
 // EmbeddingGemma 2's encoder deliberately has its own kernels.  Decoder
 // attention is causal and applies a sqrt(head_dim) scale; neither property is
 // valid here.  Values are BF16 in memory and all reductions remain FP32.
@@ -14,6 +16,63 @@ __device__ __forceinline__ float eg2_warp_sum(float x) {
 __device__ __forceinline__ float eg2_warp_max(float x) {
     for (int d = 16; d; d >>= 1) x = fmaxf(x, __shfl_down_sync(0xffffffffu, x, d));
     return x;
+}
+
+// Pillow's RGB8 bicubic resize materializes quantized horizontal pixels.
+// The CPU supplies its exact integer coefficient plan; both passes retain
+// the signed 64-bit accumulation and rounding before clipping to RGB8.
+extern "C" __global__ void termite_embedding_gemma2_pillow_horizontal_rgb8(
+    unsigned char* out, const unsigned char* input,
+    const unsigned long long* starts, const unsigned long long* offsets,
+    const int* weights, unsigned int source_height, unsigned int target_width,
+    unsigned long long source_stride, unsigned int precision_bits) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t count = (size_t)source_height * target_width * 3;
+    if (i >= count) return;
+    const unsigned int channel = i % 3;
+    const size_t pixel = i / 3;
+    const unsigned int x = pixel % target_width;
+    const unsigned int y = pixel / target_width;
+    long long value = 1ll << (precision_bits - 1);
+    const unsigned long long begin = offsets[x], end = offsets[x + 1];
+    for (unsigned long long tap = begin; tap < end; ++tap) {
+        const size_t source = (size_t)y * source_stride + (starts[x] + tap - begin) * 3 + channel;
+        value += (long long)input[source] * weights[tap];
+    }
+    value >>= precision_bits;
+    out[i] = (unsigned char)(value < 0 ? 0 : value > 255 ? 255 : value);
+}
+
+// Write scaled, patch-major F32 pixels directly, avoiding the CPU CHW
+// normalization, scaling, and patch-packing passes. The explicit rounding
+// matches 2 * (RGB8 * float32(1/255) - 0.5) before the BF16 projection.
+extern "C" __global__ void termite_embedding_gemma2_pillow_vertical_patches_f32(
+    float* out, const unsigned char* horizontal,
+    const unsigned long long* starts, const unsigned long long* offsets,
+    const int* weights, unsigned int target_width, unsigned int target_height,
+    unsigned int patch_size, unsigned int precision_bits) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t count = (size_t)target_width * target_height * 3;
+    if (i >= count) return;
+    const unsigned int patch_dim = patch_size * patch_size * 3;
+    const size_t patch = i / patch_dim;
+    const unsigned int within = i % patch_dim;
+    const unsigned int channel = within % 3;
+    const unsigned int pixel = within / 3;
+    const unsigned int grid_x = target_width / patch_size;
+    const unsigned int x = (patch % grid_x) * patch_size + pixel % patch_size;
+    const unsigned int y = (patch / grid_x) * patch_size + pixel / patch_size;
+    long long value = 1ll << (precision_bits - 1);
+    const unsigned long long begin = offsets[y], end = offsets[y + 1];
+    const size_t row_bytes = (size_t)target_width * 3;
+    for (unsigned long long tap = begin; tap < end; ++tap) {
+        const size_t source = (starts[y] + tap - begin) * row_bytes + (size_t)x * 3 + channel;
+        value += (long long)horizontal[source] * weights[tap];
+    }
+    value >>= precision_bits;
+    const float sample = (float)(value < 0 ? 0 : value > 255 ? 255 : value);
+    const float rescaled = __fmul_rn(sample, 1.0f / 255.0f);
+    out[i] = __fmul_rn(2.0f, __fsub_rn(rescaled, 0.5f));
 }
 
 // Gemma4/EmbeddingGemma2 audio local attention. Q/K/V/relative inputs and
@@ -301,7 +360,7 @@ extern "C" __global__ void termite_embedding_gemma2_training_rope_bf16(
     if (pair >= pairs || bs >= batch * seq || head >= q_heads) return;
     unsigned int b = bs / seq, pos = bs % seq;
     if (mask && mask[(size_t)b * seq + pos] == 0) return;
-    float angle = ((float)pos / rope_scale) * powf(theta, -(2.0f * pair) / (float)dim);
+    float angle = __fmul_rn((float)pos / rope_scale, eg2_training_rope_inverse_frequency(theta, dim, pair));
     float sf, cf; sincosf(angle, &sf, &cf);
     __nv_bfloat16 s = __float2bfloat16_rn(sf), c = __float2bfloat16_rn(cf);
 #define EG2_TRAINING_ROPE_ONE(base) do { \
@@ -333,7 +392,7 @@ extern "C" __global__ void termite_embedding_gemma2_training_rope_vjp_f32(
     if (pair >= pairs || bs >= batch * seq || head >= q_heads) return;
     unsigned int b = bs / seq, pos = bs % seq;
     bool valid = !mask || mask[(size_t)b * seq + pos] != 0;
-    float angle = ((float)pos / rope_scale) * powf(theta, -(2.0f * pair) / (float)dim);
+    float angle = __fmul_rn((float)pos / rope_scale, eg2_training_rope_inverse_frequency(theta, dim, pair));
     float sf, cf; sincosf(angle, &sf, &cf);
     __nv_bfloat16 s = __float2bfloat16_rn(sf), c = __float2bfloat16_rn(cf);
 #define EG2_TRAINING_ROPE_VJP_ONE(out, in) do { \
@@ -1338,8 +1397,12 @@ extern "C" __global__ void termite_gemma4_audio_depthwise_causal_conv1d_f32(
         const size_t padded_time = (size_t)time + kernel;
         if (padded_time < left_pad) continue;
         const size_t source_time = padded_time - left_pad;
-        sum += input[(size_t)source_time * dim + channel] *
-            weight[(size_t)kernel * dim + channel];
+        // Preserve the separate FP32 multiply/add rounding of the host
+        // convolution. FMA contraction changes near-cancelling activations
+        // enough to cross later BF16 rounding boundaries in the audio tower.
+        const float product = __fmul_rn(input[(size_t)source_time * dim + channel],
+            weight[(size_t)kernel * dim + channel]);
+        sum = __fadd_rn(sum, product);
     }
     out[i] = sum;
 }

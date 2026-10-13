@@ -44,13 +44,23 @@ def main() -> int:
     from transformers import AutoProcessor
 
     processor = AutoProcessor.from_pretrained(args.processor_dir, local_files_only=True)
-    image_uri, _ = data_uris()
+    image_uri, audio_uri = data_uris()
     image = {"type": "image_url", "image_url": {"url": image_uri}}
+    audio = {"type": "media", "mime_type": "audio/wav", "data": audio_uri.split(",", 1)[1]}
+    text512 = exact_length_text(processor, 512, "RETRIEVAL_DOCUMENT")
+    text513 = exact_length_text(processor, 513, "RETRIEVAL_DOCUMENT")
+    grouped512 = {"content": [{"type": "text", "text": text512}]}
+    grouped513 = {"content": [{"type": "text", "text": text513}]}
     cases = (
-        ("text512", exact_length_text(processor, 512, "RETRIEVAL_DOCUMENT"), 200, 512),
-        ("text513", exact_length_text(processor, 513, "RETRIEVAL_DOCUMENT"), 400, None),
+        ("text512", text512, 200, 512),
+        ("text513", text513, 400, None),
+        ("grouped_text512", grouped512, 200, 512),
+        ("grouped_text513", grouped513, 400, None),
+        ("grouped_batch_text512", [grouped512], 200, 512),
+        ("grouped_batch_text513", [grouped513], 400, None),
         ("image270", {"content": [image]}, 200, 270),
         ("images538", {"content": [image, image]}, 400, None),
+        ("audio29", {"content": [audio]}, 200, 29),
     )
     gates = []
     for case, content, expected_status, expected_tokens in cases:
@@ -77,6 +87,30 @@ def main() -> int:
             "expected_status": expected_status, "error": payload.get("error"),
             "usage": payload.get("usage"), "backend": payload.get("backend"),
         })
+    status, payload = request(args.url, {
+        "model": args.model,
+        "input": [grouped512, grouped513],
+        "task_type": "RETRIEVAL_DOCUMENT",
+        "error_policy": "per_item",
+    }, args.timeout)
+    rows = payload.get("data", [])
+    errors = payload.get("errors", [])
+    vector = rows[0].get("embedding", []) if len(rows) == 1 else []
+    norm = math.sqrt(sum(value * value for value in vector))
+    passed = (
+        status == 200 and payload.get("backend") == "cuda"
+        and payload.get("usage", {}).get("prompt_tokens") == 512
+        and len(rows) == 1 and rows[0].get("index") == 0
+        and len(vector) == 768 and all(math.isfinite(value) for value in vector)
+        and abs(norm - 1) <= 1e-3
+        and len(errors) == 1 and errors[0].get("index") == 1
+        and errors[0].get("code") == "INPUT_TOO_LONG"
+        and errors[0].get("status") == 400 and errors[0].get("retryable") is False
+    )
+    gates.append({
+        "case": "grouped_per_item512_513", "pass": passed, "status": status,
+        "errors": errors, "usage": payload.get("usage"), "backend": payload.get("backend"),
+    })
     report = {
         "schema": "antfly.embedding_gemma2.input_cap.v1",
         "pass": all(gate["pass"] for gate in gates),

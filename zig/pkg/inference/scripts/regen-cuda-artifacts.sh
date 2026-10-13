@@ -199,6 +199,8 @@ trap 'rm -f "$tmp_ptx" "$tmp_fatbin" "$tmp_sm89"' EXIT
 
 required_symbols=(
   termite_embedding_gemma2_lookup_bf16
+  termite_embedding_gemma2_pillow_horizontal_rgb8
+  termite_embedding_gemma2_pillow_vertical_patches_f32
   termite_gemma4_audio_local_attention_f32
   termite_gemma4_audio_clamp_f32
   termite_gemma4_audio_glu_rows_f32

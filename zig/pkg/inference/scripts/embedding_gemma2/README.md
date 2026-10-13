@@ -35,6 +35,11 @@ $REF_PY -m pip install \
   -r zig/pkg/inference/scripts/embedding_gemma2/requirements.txt
 ```
 
+The reference worker preserves ordered requests by splitting batches only on
+typed CUDA out-of-memory errors, including compiler wrappers. It remembers
+smaller batch limits for repeated shapes; unrelated errors and single-row OOM
+still propagate. Its runtime reports this policy explicitly.
+
 The explicit `torch==2.14.0` constraint in `requirements.txt` accepts the
 installed `+cu130` local build and prevents torchvision or another transitive
 dependency from replacing it. Generate the pinned oracle with that environment:
@@ -80,7 +85,7 @@ zig/pkg/inference/zig-out/bin/antfly-inference run \
   --models-dir .models \
   --preload-model embedder:cuda:google/embeddinggemma-2:bf16-safetensors-bundle-v1 \
   --host 127.0.0.1 --port 18090 \
-  --host-budget-mb 8192 --backend-budget-mb 12000 \
+  --host-budget-mb 8192 --backend-budget-mb 20000 \
   --combined-budget-mb 22000 --scratch-budget-mb 8192
 ```
 
@@ -135,13 +140,77 @@ PYTHONPATH=/tmp/antfly-embeddinggemma2/python-overlay \
   --iterations 10 --report /tmp/embeddinggemma2-pytorch-selection.json
 ```
 
-The selector evaluates every supported attention/compile pair and requires a
+The selector evaluates six reference configurations by default: eager and SDPA,
+each with compilation disabled, `default`, and `max-autotune`. FlexAttention is
+an optional benchmark diagnostic, enabled with `--include-flex-attention`; our
+native CUDA implementation does not depend on it. The selector requires a
 minimum cosine of 0.999 across all text oracle cases and the exact native
 candidate cell before considering its latency. `--candidate-url` and
 `--candidate-model` make that CUDA provenance check mandatory. Worker and
 paired benchmark warmups are reported explicitly.
 
-## Current qualification status (2026-10-08, NVIDIA L4)
+The L4 dispatcher uses fused cuDNN attention for fully valid 512-token rows,
+including batch size 1. In 100 fresh pairs per workload against the fastest
+qualified eager/SDPA reference, the three previously failing B1/S512 cases now
+measure CUDA p50 `13.290/12.069/13.332 ms` versus compiled PyTorch
+`14.688/13.647/15.031 ms` for natural text, source code and the B1 padding fixture.
+All three pass accuracy and stricter mean/tail speed targets. Larger batches and
+the full release qualification remain separate; see [the production review](PRODUCTION_REVIEW.md).
+Right-padded rows use per-row sequence lengths with cuDNN 9.15 or newer.
+Masks with holes or left padding, and unavailable cuDNN, retain the general
+masked kernels. The padding change passes five CPU contracts and twelve L4
+component differentials, including changed-length plan reuse; its end-to-end
+qualification is still running.
+
+Generate the padding goldens outside the repository and run the standalone
+component differential from the repository root:
+
+```sh
+python zig/pkg/inference/scripts/embedding_gemma2/generate_cudnn_padding_goldens.py \
+  --output-dir /tmp/embeddinggemma2-padding-goldens
+zig build-exe zig/pkg/inference/src/ops/cuda/cudnn_padding_differential.zig \
+  -lc -O ReleaseFast -femit-bin=/tmp/embeddinggemma2-padding-diff
+/tmp/embeddinggemma2-padding-diff /tmp/embeddinggemma2-padding-goldens
+```
+
+The CUDA image preprocessing path uses the shared CPU Pillow integer coefficient
+plan and preserves its RGB8 rounding in both resize passes. It writes scaled
+16×16 patches directly on the device. Set
+`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_IMAGE_PREPROCESS=false` to compare the
+existing CPU path. Unsupported source sizes decline before device submission.
+The permanent differential generates its goldens outside the repository and
+checks every output float bit, including padded source rows, extreme aspect
+ratios, upsampling, and downsampling. From `zig/pkg/inference`:
+
+```sh
+zig build-exe -O ReleaseFast -target x86_64-linux-gnu -mcpu baseline \
+  --dep processing -Mroot=scripts/embedding_gemma2/image_resize_differential.zig \
+  -Mprocessing=../../lib/image/src/processing.zig -lc \
+  -femit-bin=/tmp/embeddinggemma2-image-goldens
+/tmp/embeddinggemma2-image-goldens /tmp/embeddinggemma2-image-cases
+nvcc -O3 -arch=sm_89 scripts/embedding_gemma2/image_resize_differential.cu \
+  -o /tmp/embeddinggemma2-image-differential
+/tmp/embeddinggemma2-image-differential /tmp/embeddinggemma2-image-cases
+```
+
+Training uses the official reference's CPU-initialized FP32 RoPE frequency bits
+in both the forward and backward CUDA kernels. Device `powf` recomputation can
+change BF16 rounding and amplify differences on longer documents. Check the
+384 checked-in constants against the pinned PyTorch/Transformers environment:
+
+```sh
+python scripts/embedding_gemma2/generate_training_rope_frequencies.py \
+  --model ../../../.models/embeddinggemma-2
+```
+
+This coefficient check and the image differential are component checks. Fresh
+end-to-end numerical and paired-performance gates still determine qualification.
+
+## Earlier qualification snapshot (2026-10-08, NVIDIA L4)
+
+See [`PRODUCTION_REVIEW.md`](PRODUCTION_REVIEW.md) for the current merged-branch
+L4 qualification, including the new image speed pass, corrected training
+numerics, and outstanding quality confidence gates.
 
 The final tested binary is the stripped ReleaseFast SM89 build with SHA-256
 `bda59bbadd9fdc2d1af83abb2312d751eb8df780a54140bc75b676d76f1f73b9`.
@@ -220,6 +289,13 @@ license and snapshot digest. `validate_finetune_dataset.py` rejects normalized
 content overlap across train, validation and held-out splits, mining outside
 the training corpus, and known positives reused as negatives. Hard-negative
 mining therefore runs only over the immutable training split.
+Before merging duplicate queries, preparation expands known positives to all
+same-split document IDs with identical normalized content. Streaming collectors
+retain the content hashes of discarded positive IDs so their retained aliases
+remain excluded from negative mining. Conflicting content for one document ID
+is rejected.
+Discarded duplicate queries still reserve their repository and alternate
+positive content against lower-priority splits, preserving held-out precedence.
 
 `prepare_training_dataset.py` materializes a bounded functional public fixture
 from revision-pinned MS MARCO triplets, CodeSearchNet Python/Go, and the BEIR
@@ -296,6 +372,9 @@ antfly-inference finetune eval run embeddinggemma2-retrieval \
 For public datasets, `--source-manifest` copies and hashes the exact validated
 multi-source manifest into the prepared bundle. Native preparation checks
 record content and train positive/negative inventories against that manifest.
+Source inventories have an inclusive 64 MiB limit; prepared shard manifests
+remain bounded at 16 MiB. Oversized inventories return `SourceManifestTooLarge`,
+and the copied source bytes are authenticated again when opening prepared data.
 Opening prepared data verifies the bound copy before training; the prepared
 manifest hash carries this identity through checkpoint, resume, and export.
 Custom datasets may omit it, but cannot qualify as official public-source
@@ -318,8 +397,21 @@ reject image and audio requests. Reindex downstream corpora after changing from 
 base model to the tuned model; embeddings from those identities must not be
 mixed.
 
+`verify_finetune_export.py --base BASE --checkpoint CHECKPOINT --bundle BUNDLE
+--report REPORT` independently checks all 169 merged targets against PyTorch's
+FP32 merge and BF16 rounding, preserves all untouched base tensor bytes, compares
+the 338 FP32 adapter tensors with the checkpoint, and reloads them through PEFT.
+It binds the base, checkpoint, export provenance, and merged weight digests.
+Passing this functional check does not establish retrieval quality.
+
 `qualify_finetune_numeric.py` gates a tiny FP32 gradient case and at least two
 real BF16 optimizer steps, including resume-state equivalence.
+`cuda_training_numeric_differential.py --artifact SM89_CUBIN --report REPORT`
+loads the deployed SM89 artifact directly and checks FP32 contrastive loss,
+MRL normalization and attention softmax with their adjoints against CPU PyTorch
+autograd. It includes production candidate counts, all four dimensions, partial
+and fully masked rows, local attention and invalid targets. These primitive
+checks complement the full-encoder BF16 gate; they make no timing claim.
 For numeric parity, `--trace-tensors-dir` writes embeddings, every adapter
 gradient, and post-step FP32 adapter masters to bounded SafeTensors files; the
 JSON report references those tensors instead of expanding them into text.
@@ -328,14 +420,70 @@ matching checkpoint/resume report; its two state hashes are then included in
 the native and reference numeric inputs.
 `qualify_finetune_quality.py` requires seeds 17/29/43 and every MRL dimension
 for MS MARCO, CodeSearchNet Python/Go, BEIR SciFact and NFCorpus.
-`evaluate_finetune_full_corpus.py evaluate` produces one official dataset,
-dimension, and seed cell from authenticated corpus/query/qrels JSONL files
-and separate native CUDA endpoints for the frozen base and tuned candidate.
-It retains bounded vector chunks and exact top-100 rankings, making one full
-corpus pass per query chunk. This trades additional embedding work for memory.
-Titles use the same document formatting as preparation; MRL truncation and
-normalization start from the full 768-vector. Query IDs, graded nDCG@10,
-MRR@10, Recall@100, and artifact provenance are preserved per query.
+`materialize_official_retrieval_sources.py --output-dir /tmp/eg2-official`
+downloads every required file from the pinned public snapshots, verifies its
+Hub digest, and writes the complete canonical corpus/query/qrels inventories.
+The promotion gate independently pins both row counts and converted file
+hashes. Keep these large artifacts outside the repository.
+
+Before preparing qualification training shards, run
+`exclude_official_evaluation.py` with `--input`, `--manifest`, `--official-dir`,
+and a new `--output-dir`. It removes training rows that match any official
+held-out query or CodeSearchNet test function, including code negatives, and
+rebuilds the split and mining inventories. MS MARCO keeps its shared document
+corpus. The derived manifest records verified input hashes and every exclusion.
+
+`mine_finetune_negatives.py --input INPUT --manifest MANIFEST --model-dir BASE
+--url NATIVE_URL --output-dir NEW_OUTPUT` mines code negatives with the pinned
+frozen base served on native CUDA. It authenticates model identity, applies the
+code-query/document prompts and 128/512 token caps, and restricts candidates to
+same-language training positives. Repository peers, known positives, identical
+code bodies and nontraining splits are excluded; MS MARCO's provided negatives
+are preserved. Run evaluation/development exclusions first, then prepare native
+shards with the emitted training-source manifest. Preserve the mining receipt
+and input hashes. Use development data to select recipes; reserve the complete
+official test inventories for the unchanged release gate.
+
+Optional `--relative-margin 0.05` requires a mined negative's frozen-teacher
+cosine to be at most `positive_cosine - abs(positive_cosine) * 0.05`.
+This filters candidates too close to the positive, following the
+[Sentence Transformers mining convention](https://www.sbert.net/docs/package_reference/util/hard_negatives.html).
+The receipt records both scores and the margin policy. Mining fails if an anchor
+has no admissible negative; explicit `--drop-unmineable` instead removes that
+training anchor and records its ID, positive score and cutoff. Validation/test
+rows and source-provided retrieval negatives remain unchanged. Evaluate this
+recipe change on independent development data before held-out qualification.
+
+`select_finetune_recipe.py --input DEVELOPMENT_METRICS --validation-manifest
+FULL_DEVELOPMENT_MANIFEST --report RECIPE_SUMMARY` rejects candidates unless
+every Python/Go language, MRL dimension and metric clears the paired confidence
+lower bound of zero, and every SciFact/NFCorpus retention bound clears `-0.01`.
+All 48 distinct development metric cells are required; a positive macro average
+cannot hide a failing cell. The manifest must bind complete eligible development
+queries after training/test exclusions, complete source corpora and unchanged
+corpus/query/qrel bytes. Sampled development queries cannot select the final
+recipe. Exit code 1 means an evaluated candidate failed selection. Eligibility
+only allows subsequent held-out evaluation; the separate three-seed, sixty-cell
+official quality gate remains required for production promotion.
+
+`evaluate_finetune_matrix.py` produces all twelve dimension/seed cells for
+one official role in a single corpus pass. It retains query matrices and
+exact top-100 rankings, discarding each bounded document chunk after scoring
+all four models at every MRL dimension. Scoring uses float64 and resolves
+ties by document ID. Its `--models` JSON maps `base`, `17`, `29`, and `43` to
+objects containing `url` and `model`; each seed also supplies `checkpoint`
+and `bundle_manifest` paths. All endpoints must serve native CUDA. Each request
+binds the authenticated bundle's exact model identity and rejects a missing or
+mismatched identity in the response.
+
+Document titles remain group metadata, avoiding a duplicated prompt; code
+queries use `CODE_RETRIEVAL`. The pinned tokenizer bounds rendered query and
+document text to 128/512 tokens including BOS/EOS; truncation counts and the
+preprocessing policy are recorded. Every corpus row and judged query remains
+in the evaluation. MRL normalization starts from full 768-vectors. Graded
+nDCG@10, MRR@10, Recall@100, paired query IDs, and artifact provenance are
+preserved per query. The older `evaluate_finetune_full_corpus.py evaluate`
+command remains available for one cell, with a corpus pass per query chunk.
 
 The official evaluation manifest uses schema
 `antfly.embedding_gemma2.official_retrieval_sources.v1` and exact immutable
@@ -343,6 +491,10 @@ corpus/query/qrels inventories for all five reviewed roles. It is distinct
 from the training-source manifest bound into prepared shards. The `merge`
 subcommand requires all 60 cells and per-seed checkpoint/model artifacts;
 the quality gate then checks their hashes and exact paired query coverage.
+The paired bootstrap uses the reviewed seed and 5,000 draws. Metrics with the
+same query count share draw multiplicities; repeating each sampled difference
+with `math.fsum` preserves the original bounds and full-query denominator while
+avoiding repeated resampling for every metric. Release thresholds are unchanged.
 Use `--help` on each subcommand for artifact and endpoint arguments. The
 performance gate similarly requires the measured native binary, its source
 manifest, and the reference source directory; bare passing report assertions
@@ -362,6 +514,14 @@ ratio lower 95% bound of 0.90, p95 ratio at most 1.10, 20 GiB device memory,
 and 8 GiB host memory.
 
 The seven production cells are frozen rather than supplied ad hoc:
+
+`prepare_finetune_performance.py` generates all seven job files and four shared
+prepared datasets from a public training JSONL source, a job template, the native
+preparation tool, and a shared initial adapter. It repeats text to fill the active
+token caps and assigns distinct document bodies to every positive/negative.
+These controlled fixtures are performance data and are never retrieval-quality
+evidence. The paired collector independently audits every measured batch's active
+lengths and candidate counts before granting timed steps.
 
 | Logical batch | Microbatch | Query cap | Document cap | Negatives | Rank | Alpha |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -426,7 +586,7 @@ passes one additional check, and the Python harness suite passes all 55 tests.
 The current compact evidence index is
 [`results/finetune-l4-2026-10-09-draft.json`](results/finetune-l4-2026-10-09-draft.json).
 Historical development results remain in the October 8 index. Official
-full-corpus quality for all three seeds, the seven-cell 100-pair performance
-qualification, and numerical measurement on secondary GPU architectures
-remain unrun. The implementation remains unqualified for production until
-those required gates pass.
+full-corpus quality for all three seeds and the seven-cell 100-pair performance
+qualification remain unrun. Current qualification is scoped to L4/SM89;
+other GPU architectures remain unmeasured and outside this scope. The
+implementation remains unqualified for production until the L4 gates pass.

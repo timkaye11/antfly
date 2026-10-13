@@ -13,6 +13,9 @@ const index_magic = "EG2IDX1\x00";
 const index_header_bytes = 16;
 const index_entry_bytes = 56;
 pub const max_record_bytes = 1024 * 1024;
+// Source inventories include query/content hashes and mined negative pairs.
+// They can exceed the much smaller prepared shard manifest at ordinary scale.
+pub const max_source_manifest_bytes = 64 * 1024 * 1024;
 pub const Split = enum(u8) { train, validation, @"test" };
 pub const Task = enum { retrieval, code_retrieval };
 
@@ -111,6 +114,20 @@ pub fn hashFile(io: std.Io, file: std.Io.File, maximum: u64) ![32]u8 {
         offset += n;
     }
     return hash.finalResult();
+}
+
+fn readSourceManifest(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) ![]u8 {
+    const file = try dir.openFile(io, path, .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.kind != .file) return error.InvalidSourceManifest;
+    if (stat.size > max_source_manifest_bytes) return error.SourceManifestTooLarge;
+    // readFileAlloc's limit is exclusive. Retain a bound if the file grows
+    // between the size check and the read.
+    return dir.readFileAlloc(io, path, a, .limited(max_source_manifest_bytes + 1)) catch |err| switch (err) {
+        error.StreamTooLong => error.SourceManifestTooLarge,
+        else => return err,
+    };
 }
 
 const SourceInventory = struct {
@@ -454,7 +471,7 @@ pub fn prepare(a: std.mem.Allocator, io: std.Io, source_path: []const u8, output
     defer if (source_inventory) |*inventory| inventory.deinit();
     var source_manifest_sha: ?[32]u8 = null;
     if (options.source_manifest_path) |path| {
-        const bytes = try cwd.readFileAlloc(io, path, a, .limited(16 * 1024 * 1024));
+        const bytes = try readSourceManifest(a, io, cwd, path);
         source_manifest_bytes = bytes;
         source_inventory = try parseSourceInventory(a, bytes);
         source_manifest_sha = sha256(bytes);
@@ -462,7 +479,7 @@ pub fn prepare(a: std.mem.Allocator, io: std.Io, source_path: []const u8, output
         defer copy.close(io);
         try copy.writePositionalAll(io, bytes, 0);
         try copy.sync(io);
-        if (!std.mem.eql(u8, &source_manifest_sha.?, &(try hashFile(io, copy, 16 * 1024 * 1024)))) return error.SourceManifestChangedDuringPreparation;
+        if (!std.mem.eql(u8, &source_manifest_sha.?, &(try hashFile(io, copy, max_source_manifest_bytes)))) return error.SourceManifestChangedDuringPreparation;
     }
     const source = try cwd.openFile(io, source_path, .{});
     defer source.close(io);
@@ -623,7 +640,7 @@ pub const Dataset = struct {
         _ = try decodeDigest(m.source_sha256);
         if (m.source_manifest_sha256) |expected_hex| {
             const expected = try decodeDigest(expected_hex);
-            const source_manifest = try dir.readFileAlloc(io, "source-manifest.json", a, .limited(16 * 1024 * 1024));
+            const source_manifest = try readSourceManifest(a, io, dir, "source-manifest.json");
             defer a.free(source_manifest);
             if (!std.mem.eql(u8, &expected, &sha256(source_manifest))) return error.SourceManifestDigestMismatch;
             var inventory = try parseSourceInventory(a, source_manifest);
@@ -794,6 +811,9 @@ test "EG2 source manifest binds exact bytes and declared record inventory" {
         },
         .miner = .{ .corpus_ids = &.{ "p1", "n1" }, .negative_pairs = &.{&.{ "q1", "n1" }} },
     }, .{ .whitespace = .indent_2 }, &manifest_json.writer);
+    // Exercise preparation, exact-byte copying, reopen and tamper detection
+    // with an inventory larger than the former 16 MiB ceiling.
+    try manifest_json.writer.splatByteAll(' ', 16 * 1024 * 1024);
     try manifest_json.writer.writeByte('\n');
     const manifest_file = try tmp.dir.createFile(io, "dataset_manifest.json", .{});
     defer manifest_file.close(io);
@@ -806,7 +826,7 @@ test "EG2 source manifest binds exact bytes and declared record inventory" {
     dataset.deinit();
     const copied_path = try std.fs.path.join(a, &.{ output, "source-manifest.json" });
     defer a.free(copied_path);
-    const copied = try std.Io.Dir.cwd().readFileAlloc(io, copied_path, a, .limited(16 * 1024 * 1024));
+    const copied = try readSourceManifest(a, io, std.Io.Dir.cwd(), copied_path);
     defer a.free(copied);
     try std.testing.expectEqualStrings(manifest_json.written(), copied);
     const unrelated_source = try std.fs.path.join(a, &.{ directory, "unrelated.jsonl" });
@@ -825,6 +845,21 @@ test "EG2 source manifest binds exact bytes and declared record inventory" {
     defer corrupt.close(io);
     try corrupt.writePositionalAll(io, " ", copied.len - 1);
     try std.testing.expectError(error.SourceManifestDigestMismatch, Dataset.open(a, io, output));
+}
+
+test "EG2 source inventories enforce the inclusive bounded size limit" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io, "inventory.json", .{});
+    defer file.close(io);
+    try file.setLength(io, max_source_manifest_bytes);
+    const bytes = try readSourceManifest(a, io, tmp.dir, "inventory.json");
+    defer a.free(bytes);
+    try std.testing.expectEqual(max_source_manifest_bytes, bytes.len);
+    try file.setLength(io, max_source_manifest_bytes + 1);
+    try std.testing.expectError(error.SourceManifestTooLarge, readSourceManifest(a, io, tmp.dir, "inventory.json"));
 }
 
 test "EG2 data refuses false negatives and split leakage" {

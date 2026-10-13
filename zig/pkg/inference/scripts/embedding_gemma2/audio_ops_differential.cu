@@ -147,15 +147,33 @@ int main(int argc, char** argv) {
         for (unsigned tap = 0; tap < kernel; ++tap) {
             if (time + tap < kernel - 1) continue;
             const unsigned source_time = time + tap - (kernel - 1);
-            expected += input[size_t(source_time) * dim + channel] * weight[size_t(tap) * dim + channel];
+            const volatile float product = input[size_t(source_time) * dim + channel] * weight[size_t(tap) * dim + channel];
+            expected += product;
         }
         if (!compare_value(output[size_t(time) * dim + channel], expected, &max_error)) return 9;
     }
-    if (max_error > 2e-7) return 9;
+    if (max_error != 0.0) return 9;
+    // The coefficients are representable in BF16, while the activation is
+    // FP32. A contracted FMA produces b*2^-20; separate rounding produces
+    // exactly 2^-20. Exercise this cancellation at every channel.
+    const float b = 1.0078125f;
+    for (size_t i = 0; i < count; ++i) input[i] = 0.0f;
+    for (size_t i = 0; i < size_t(kernel) * dim; ++i) weight[i] = 0.0f;
+    for (unsigned channel = 0; channel < dim; ++channel) {
+        input[channel] = -b;
+        input[dim + channel] = 1.0f + std::ldexp(1.0f, -20);
+        weight[size_t(kernel - 2) * dim + channel] = 1.0f;
+        weight[size_t(kernel - 1) * dim + channel] = b;
+    }
+    CUDA(cudaMemcpy(device_input, input, count * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA(cudaMemcpy(device_weight, weight, size_t(kernel) * dim * sizeof(float), cudaMemcpyHostToDevice));
+    launch_conv(&params); CUDA(cudaMemcpy(output, device_output, count * sizeof(float), cudaMemcpyDeviceToHost));
+    for (unsigned channel = 0; channel < dim; ++channel)
+        if (output[dim + channel] != std::ldexp(1.0f, -20)) return 10;
     CUDA(cudaGetLastError());
-    std::printf("kernel=%u clamp_ms=%.8g glu_ms=%.8g conv_ms=%.8g max_conv_error=%.9g\n",
+    std::printf("kernel=%u clamp_ms=%.8g glu_ms=%.8g conv_ms=%.8g max_conv_error=%.9g cancellation_channels=%u\n",
         kernel, time_ms(launch_clamp, &params), time_ms(launch_glu, &params),
-        time_ms(launch_conv, &params), max_error);
+        time_ms(launch_conv, &params), max_error, dim);
     cudaFree(device_input); cudaFree(device_weight); cudaFree(device_output);
     std::free(input); std::free(weight); std::free(output);
     return 0;

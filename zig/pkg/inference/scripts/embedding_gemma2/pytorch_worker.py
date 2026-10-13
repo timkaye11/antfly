@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import gc
 import hashlib
 import io
 import json
@@ -35,6 +36,43 @@ from contract import MAX_TOKENS, MODEL_ID, REVISION, WEIGHT_BYTES, WEIGHT_SHA256
 
 ATTENTION_MODES = ("eager", "sdpa", "flex_attention")
 COMPILE_MODES = ("none", "default", "max-autotune")
+
+
+def cuda_oom(error, oom_type):
+    """Recognize typed CUDA OOMs, including compiler wrappers, without guessing."""
+    seen = set()
+    while error is not None and id(error) not in seen:
+        if isinstance(error, oom_type):
+            return True
+        seen.add(id(error))
+        error = error.__cause__ or error.__context__
+    return False
+
+
+def error_payload(error, oom_type):
+    error_type = 'OutOfMemoryError' if cuda_oom(error, oom_type) else type(error).__name__
+    return {'error': str(error), 'error_type': error_type}
+
+
+def resource_bounded_batch(items, run_batch, oom_type, release, caps, key):
+    """Preserve ordered requests while adapting only on confirmed CUDA OOM."""
+    cap = caps.get(key, len(items))
+    if len(items) <= cap:
+        try:
+            return run_batch(items)
+        except Exception as error:
+            if len(items) == 1 or not cuda_oom(error, oom_type):
+                raise
+        # Leave the exception scope before clearing the allocator: its
+        # traceback otherwise retains failed-forward CUDA tensors.
+        cap = max(1, len(items) // 2)
+        caps[key] = cap
+        release()
+    vectors = []
+    for start in range(0, len(items), cap):
+        vectors.extend(resource_bounded_batch(items[start:start + cap], run_batch,
+                                             oom_type, release, caps, key))
+    return vectors
 
 
 class Worker:
@@ -79,6 +117,7 @@ class Worker:
         if compile_mode != "none":
             self.model = torch.compile(self.model, mode=compile_mode)
         self.lock = threading.Lock()
+        self.batch_caps = {}
 
         props = torch.cuda.get_device_properties(0)
         try:
@@ -112,6 +151,8 @@ class Worker:
             "total_memory_bytes": props.total_memory,
             "torch_cpu_threads": torch.get_num_threads(),
             "torch_interop_threads": torch.get_num_interop_threads(),
+            "batch_policy": "ordered_split_on_typed_cuda_oom",
+            "cuda_oom_retries": 0,
         }
 
     @staticmethod
@@ -121,13 +162,18 @@ class Worker:
 
     @classmethod
     def _prepare_group(cls, value, task_type: str):
-        import numpy as np
-        from PIL import Image
-
         if isinstance(value, str):
             return render_text(value, task_type), [], []
         if not isinstance(value, dict) or not isinstance(value.get("content"), list):
             raise ValueError("input must be text or an ordered content group")
+        prefix = render_text("", task_type)
+        title = value.get('title')
+        if title is not None:
+            if (not isinstance(title, str) or task_type != 'RETRIEVAL_DOCUMENT'
+                    or len(title.encode('utf-8')) > 8192 or '<' in title
+                    or not any(isinstance(part, dict) and part.get('type') == 'text' for part in value['content'])):
+                raise ValueError('invalid document title')
+            prefix = f'title: {title} | text: '
         manual_media = any(
             isinstance(part, dict) and part.get("type") == "text" and
             ("<|image|>" in part.get("text", "") or "<|audio|>" in part.get("text", ""))
@@ -140,9 +186,10 @@ class Worker:
                 raise ValueError("content parts must be objects")
             kind = part.get("type")
             if kind == "text" and isinstance(part.get("text"), str):
-                text += render_text(part["text"], task_type) if not prefixed else part["text"]
+                text += prefix + part["text"] if not prefixed else part["text"]
                 prefixed = True
             elif kind == "image_url":
+                from PIL import Image
                 source = part.get("image_url")
                 source = source.get("url") if isinstance(source, dict) else source
                 if not isinstance(source, str):
@@ -199,6 +246,23 @@ class Worker:
         if not isinstance(inputs, list) or not inputs:
             raise ValueError("input must be non-empty")
         groups = [self._prepare_group(value, task_type) for value in inputs]
+        key = (task_type, max(len(group[0]) for group in groups),
+               any(group[1] for group in groups), any(group[2] for group in groups))
+
+        def release():
+            self.runtime['cuda_oom_retries'] += 1
+            gc.collect()
+            self.torch.cuda.empty_cache()
+
+        with self.lock, self.torch.inference_mode():
+            vectors = resource_bounded_batch(groups, self._embed_groups,
+                                            self.torch.cuda.OutOfMemoryError,
+                                            release, self.batch_caps, key)
+        if dimensions is not None:
+            vectors = [truncate_and_normalize(vector, dimensions) for vector in vectors]
+        return vectors
+
+    def _embed_groups(self, groups):
         kwargs = {"text": [group[0] for group in groups], "padding": True, "truncation": False, "return_tensors": "pt"}
         if any(group[1] for group in groups):
             kwargs["images"] = [group[1] for group in groups]
@@ -208,18 +272,14 @@ class Worker:
         if int(encoded["attention_mask"].sum(-1).max()) > MAX_TOKENS:
             raise ValueError("expanded input exceeds 8192 tokens")
         encoded = {key: value.to("cuda") for key, value in encoded.items()}
-        with self.lock, self.torch.inference_mode():
-            states = self.model(**encoded).last_hidden_state.float()
-            mask = encoded["attention_mask"].unsqueeze(-1).to(states.dtype)
-            vectors = self.torch.nn.functional.normalize(
-                (states * mask).sum(1) / mask.sum(1).clamp_min(1), p=2, dim=-1
-            )
-            if not bool(self.torch.isfinite(vectors).all()) or bool((self.torch.linalg.vector_norm(vectors, dim=-1) == 0).any()):
-                raise RuntimeError("model produced a non-finite or zero-norm embedding")
-            vectors = vectors.cpu().tolist()
-        if dimensions is not None:
-            vectors = [truncate_and_normalize(vector, dimensions) for vector in vectors]
-        return vectors
+        states = self.model(**encoded).last_hidden_state.float()
+        mask = encoded["attention_mask"].unsqueeze(-1).to(states.dtype)
+        vectors = self.torch.nn.functional.normalize(
+            (states * mask).sum(1) / mask.sum(1).clamp_min(1), p=2, dim=-1
+        )
+        if not bool(self.torch.isfinite(vectors).all()) or bool((self.torch.linalg.vector_norm(vectors, dim=-1) == 0).any()):
+            raise RuntimeError("model produced a non-finite or zero-norm embedding")
+        return vectors.cpu().tolist()
 
 
 def handler(worker: Worker):
@@ -233,7 +293,7 @@ def handler(worker: Worker):
                 data = json.dumps(payload).encode()
                 self.send_response(200)
             except Exception as exc:
-                data = json.dumps({"error": str(exc)}).encode()
+                data = json.dumps(error_payload(exc, worker.torch.cuda.OutOfMemoryError)).encode()
                 self.send_response(400)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
