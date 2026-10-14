@@ -385,6 +385,35 @@ Two things the implementation found that the review did not:
   classification wraps the token and chunk bodies instead of capturing in an
   `errdefer`.
 
+A code review of the branch after Phase 0 led to these changes:
+
+- The Q5_1 reduce kernel, which now also serves batched rows, has the same
+  128-thread capacity guard as Q5_0. The Flash dispatch width is a whole
+  number of 32-lane SIMD groups. Residency sets are skipped below macOS 15
+  instead of failing.
+- A non-final prefill chunk skips Flash's output head
+  (`ANTFLY_QWEN4EXP_DISABLE_PREFILL_HEAD_SKIP` restores it). Sparse-attention
+  scoring and top-k are skipped while selection would keep every block (up
+  to 2048 positions). 27B projections no longer scan tensor names or take a
+  memory snapshot each.
+- A session `cancel` is found anywhere in the input queue. Streamed deltas no
+  longer stall on invalid UTF-8.
+- A Metal-less build of the 27B runner links. `GgufStore` again reports no
+  tensor ranges through the generic interface; only split stores report
+  them. `writeFileAtomic` uses an exclusive per-call temporary and fsyncs
+  it. `benchmark.py --chunk` reaches Flash through its environment variable.
+- Shared code: one sidecar loader, one failure classification and one
+  option validator now serve both runners. Checked-in evidence no longer
+  holds local paths.
+
+On the resulting binaries, the focused suites pass (Metal 27B 37 / 1, Flash
+53 / 4; CPU-only 32 / 6, 40 / 16; Python 25) and both runners link without
+Metal. With a 1536 MiB Flash cache, the chat prompt gives the recorded IDs for
+both models, and Flash's final prefill logits are bitwise identical to the
+Phase 0 binary's. The 356-token document prompt, prefilled in three chunks,
+gives the recorded `[8160, 369, 279, 11782]`. A Flash session cancelled
+during decode kept its state, and the next turn reused all 22 tokens.
+
 F1 is isolated so it can go to `main` separately: the `metal_kernels.m`
 dispatch hunks (plus the same hunk for Q5_1, which `main` does not have yet),
 `metal_quant_reduce_test.zig`, and its import in `inference.zig`. That

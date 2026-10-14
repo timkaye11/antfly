@@ -230,8 +230,8 @@
             "name": "short",
             "passed": true,
             "native_command": [
-              "/Users/timkaye/Documents/af/antfly/zig/zig-out/bin/antfly-qwen35-streamed",
-              "/Volumes/Extreme/antfly/models/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
+              "zig/zig-out/bin/antfly-qwen35-streamed",
+              "<models>/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
               "The capital of France is",
               "--experimental-qwen35-streamed",
               "--backend",
@@ -251,8 +251,8 @@
             "reference_script_sha256": "77c22f28fc8afe2ab437bc812f2cfe78b864ffba6c23d0e10da9c790e3620916",
             "reference_command": [
               "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3",
-              "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/scripts/qwen35_streamed/reference.py",
-              "/Volumes/Extreme/antfly/models/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
+              "zig/pkg/inference/scripts/qwen35_streamed/reference.py",
+              "<models>/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
               "--ggml-library",
               "/tmp/antfly-qwen4exp-reference/build/bin/libggml-base.0.26.0.dylib",
               "--ids",
@@ -296,8 +296,8 @@
             "name": "chunk128",
             "passed": true,
             "native_command": [
-              "/Users/timkaye/Documents/af/antfly/zig/zig-out/bin/antfly-qwen35-streamed",
-              "/Volumes/Extreme/antfly/models/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
+              "zig/zig-out/bin/antfly-qwen35-streamed",
+              "<models>/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
               " x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x",
               "--experimental-qwen35-streamed",
               "--backend",
@@ -317,8 +317,8 @@
             "reference_script_sha256": "77c22f28fc8afe2ab437bc812f2cfe78b864ffba6c23d0e10da9c790e3620916",
             "reference_command": [
               "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3",
-              "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/scripts/qwen35_streamed/reference.py",
-              "/Volumes/Extreme/antfly/models/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
+              "zig/pkg/inference/scripts/qwen35_streamed/reference.py",
+              "<models>/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
               "--ggml-library",
               "/tmp/antfly-qwen4exp-reference/build/bin/libggml-base.0.26.0.dylib",
               "--ids",
@@ -504,8 +504,8 @@
             "name": "short",
             "passed": true,
             "native_command": [
-              "/Users/timkaye/Documents/af/antfly/zig/zig-out/bin/antfly-qwen4exp",
-              "/Volumes/Extreme/antfly/models/unsloth/Qwen3.8-Flash-Next-GGUF-UD-Q4_K_XL/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+              "zig/zig-out/bin/antfly-qwen4exp",
+              "<models>/unsloth/Qwen3.8-Flash-Next-GGUF-UD-Q4_K_XL/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
               "The capital of France is",
               "--experimental-qwen4exp",
               "--backend",
@@ -551,7 +551,7 @@
             },
             "reference_command": [
               "/tmp/qwen-release-reference-flash",
-              "/Volumes/Extreme/antfly/models/unsloth/Qwen3.8-Flash-Next-GGUF-UD-Q4_K_XL/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+              "<models>/unsloth/Qwen3.8-Flash-Next-GGUF-UD-Q4_K_XL/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
               "/tmp/qwen-release-parity-flash/short/reference/all-logits.f32",
               "760",
               "6511",
@@ -587,9 +587,9 @@
           "--summary",
           "all"
         ],
-        "cwd": "/Users/timkaye/Documents/af/antfly/zig",
+        "cwd": "zig",
         "environment": {
-          "ANTFLY_QWEN4EXP_PREFILL_CHECK": "/Volumes/Extreme/antfly/models/unsloth/Qwen3.8-Flash-Next-GGUF-UD-Q4_K_XL/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+          "ANTFLY_QWEN4EXP_PREFILL_CHECK": "<models>/unsloth/Qwen3.8-Flash-Next-GGUF-UD-Q4_K_XL/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
           "ANTFLY_QWEN4EXP_PREFILL_CHUNK": "128",
           "ANTFLY_QWEN4EXP_TEST_CACHE_MB": "1536",
           "ANTFLY_ZIG_MAX_RSS": "8589934592"
@@ -662,7 +662,7 @@
     "changed_metadata_sha256": "85f94d4405ad37fd4a6e7d7e480ae1c7b96dd93ea94cc034534adfc35c14e155",
     "binary_sha256": "d07f01fae3f50732560413b26c54c917803cbc6259352acabd3abc2d282bca3e",
     "command": [
-      "/Users/timkaye/Documents/af/antfly/zig/zig-out/bin/antfly-qwen4exp",
+      "zig/zig-out/bin/antfly-qwen4exp",
       "/tmp/qwen-release-corrupt-artifact/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
       "Hello",
       "--experimental-qwen4exp",

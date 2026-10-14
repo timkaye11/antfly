@@ -90,11 +90,11 @@ fn shouldSkipAutoMtpDraftLoad(opts: Options, draft_cfg: gpt_mod.Config) bool {
 const Options = struct {
     experimental_qwen4exp: bool = false,
     experimental_qwen35_streamed: bool = false,
-    qwen35_dry_run: bool = false,
+    local_dry_run: bool = false,
     local_session: bool = false,
     prompt_lookup: usize = 0,
     moe_cache_explicit: bool = false,
-    qwen4exp_context: usize = machine_profile.max_context,
+    local_context: usize = machine_profile.max_context,
     /// Zero derives the expert cache from the machine profile.
     qwen4exp_cache_mb: usize = 0,
     qwen4exp_logit_path: ?[]const u8 = null,
@@ -312,31 +312,17 @@ pub fn qwen35StreamedMain(allocator: std.mem.Allocator, io: std.Io, args: []cons
     return runQwen35Streamed(allocator, io, opts);
 }
 fn runQwen35Streamed(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
-    if (opts.experimental_qwen4exp or opts.moe_cache_explicit or opts.qwen4exp_logit_path != null) return error.ConflictingExperimentalModes;
     try validateQwen35Options(opts);
     return runValidatedQwen35Streamed(allocator, io, opts);
 }
 fn validateQwen35Options(opts: Options) !void {
-    if (opts.prompt_lookup > 4 or (opts.local_session and opts.qwen35_dry_run)) return error.UnsupportedQwen35Option;
+    if (opts.prompt_lookup > 4 or (opts.local_session and opts.local_dry_run)) return error.UnsupportedQwen35Option;
+    // Prompt lookup is this runner's only speculation, and must be forced.
     if (opts.prompt_lookup > 0 and opts.speculation_policy != .force) return error.Qwen35PromptLookupRequiresForce;
+    if (opts.prompt_lookup == 0 and opts.speculation_policy != .off) return error.Qwen35RequiresSpeculationOff;
     if (opts.experimental_qwen4exp or opts.moe_cache_explicit or opts.qwen4exp_logit_path != null) return error.ConflictingExperimentalModes;
     if (opts.prefill_chunk_size > 1024) return error.UnsupportedQwen35Chunk;
-    var check = opts;
-    check.prompt_lookup = 0;
-    if (opts.prompt_lookup > 0) check.speculation_policy = .off;
-    check.experimental_qwen35_streamed = false;
-    check.qwen35_dry_run = false;
-    check.prefill_chunk_size = 0;
-    check.stream = false;
-    validateQwen4ExpOptions(check) catch |err| return switch (err) {
-        error.Qwen4ExpRequiresEagerMetal => error.Qwen35RequiresEagerMetal,
-        error.Qwen4ExpRequiresSpeculationOff => error.Qwen35RequiresSpeculationOff,
-        error.Qwen4ExpRequiresLocalText => error.Qwen35RequiresLocalText,
-        error.UnsupportedQwen4ExpContext => error.UnsupportedQwen35Context,
-        error.Qwen4ExpGreedyOnly => error.Qwen35GreedyOnly,
-        error.UnsupportedQwen4ExpOption => error.UnsupportedQwen35Option,
-        else => err,
-    };
+    try validateLocalQwenOptions(opts, .qwen35);
 }
 fn runValidatedQwen35Streamed(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
     return @import("native_qwen35_generate.zig").run(allocator, io, .{
@@ -344,12 +330,12 @@ fn runValidatedQwen35Streamed(allocator: std.mem.Allocator, io: std.Io, opts: Op
         .prompt = opts.prompt,
         .session = opts.local_session,
         .max_tokens = @intCast(opts.max_tokens),
-        .context = opts.qwen4exp_context,
+        .context = opts.local_context,
         .prompt_lookup = opts.prompt_lookup,
         .chunk = if (opts.prefill_chunk_size == 0) 512 else opts.prefill_chunk_size,
         .combined_mb = opts.combined_budget_mb,
         .verify = opts.qwen_verify,
-        .dry_run = opts.qwen35_dry_run,
+        .dry_run = opts.local_dry_run,
         .stream = opts.stream,
         .raw = opts.raw_prompt or opts.no_chat_template,
         .enable_thinking = opts.enable_thinking orelse false,
@@ -383,12 +369,12 @@ fn runQwen4Exp(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
         .prompt = opts.prompt,
         .session = opts.local_session,
         .max_tokens = @intCast(opts.max_tokens),
-        .context = opts.qwen4exp_context,
+        .context = opts.local_context,
         .stream = opts.stream,
         .cache_mb = opts.qwen4exp_cache_mb,
         .combined_mb = opts.combined_budget_mb,
         .verify = opts.qwen_verify,
-        .dry_run = opts.qwen35_dry_run,
+        .dry_run = opts.local_dry_run,
         .raw = opts.raw_prompt or opts.no_chat_template,
         .enable_thinking = if (opts.local_session) false else opts.enable_thinking,
         .ignore_eos = opts.ignore_eos,
@@ -414,7 +400,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     if (opts.local_session and !opts.experimental_qwen35_streamed and !opts.experimental_qwen4exp) return error.QwenLocalSessionOptInRequired;
     if (opts.experimental_qwen35_streamed) return runQwen35Streamed(allocator, io, opts);
     if (opts.experimental_qwen4exp) return runQwen4Exp(allocator, io, opts);
-    if (opts.qwen35_dry_run) return error.Qwen35OptInRequired;
+    if (opts.local_dry_run) return error.Qwen35OptInRequired;
     if (opts.qwen4exp_options_explicit) return error.Qwen4ExpOptInRequired;
     if (opts.qwen_verify_explicit) return error.QwenLocalVerifyOptInRequired;
     const jit_config = try validateKernelJitOptions(io, opts);
@@ -7979,22 +7965,35 @@ fn validateDraftTokenizerCompatibility(
 }
 
 fn validateQwen4ExpOptions(opts: Options) !void {
-    if (opts.local_session and opts.enable_thinking == true) return error.UnsupportedLocalSessionThinking;
-    if (opts.prompt_lookup != 0) return error.UnsupportedQwen4ExpOption;
-    if (opts.local_session and (!std.mem.eql(u8, opts.prompt, "-") or opts.json_timing_path != null or opts.qwen4exp_logit_path != null or opts.qwen35_dry_run)) return error.InvalidLocalSessionOptions;
     if (opts.experimental_qwen35_streamed) return error.ConflictingExperimentalModes;
-    if (opts.backend != .metal or (opts.mode != null and opts.mode != .eager)) return error.Qwen4ExpRequiresEagerMetal;
-    if (opts.speculation_policy != .off or opts.draft_model != null) return error.Qwen4ExpRequiresSpeculationOff;
-    if (opts.image_count > 0 or opts.audio_count > 0 or opts.server_url != null or opts.require_server) return error.Qwen4ExpRequiresLocalText;
-    if (opts.max_tokens <= 0 or opts.qwen4exp_context == 0 or opts.qwen4exp_context > machine_profile.max_context) return error.UnsupportedQwen4ExpContext;
-    if (opts.temperature != 0 or opts.top_k != 0 or opts.top_p != 0 or opts.repetition_penalty != 1) return error.Qwen4ExpGreedyOnly;
+    // Flash prefill chunking is an environment setting, not this option.
+    if (opts.prompt_lookup != 0 or opts.prefill_chunk_size > 1) return error.UnsupportedQwen4ExpOption;
+    if (opts.local_session and opts.qwen4exp_logit_path != null) return error.InvalidLocalSessionOptions;
+    if (opts.speculation_policy != .off) return error.Qwen4ExpRequiresSpeculationOff;
+    try validateLocalQwenOptions(opts, .qwen4exp);
+}
+
+const LocalQwen = enum { qwen35, qwen4exp };
+
+/// Checks both local Qwen runners share, each reported under the runner's
+/// own error names. Speculation policy, prompt lookup, prefill chunks and
+/// mode conflicts differ per runner and are checked by the callers first.
+fn validateLocalQwenOptions(opts: Options, comptime runner: LocalQwen) !void {
+    const q35 = runner == .qwen35;
+    if (opts.local_session and opts.enable_thinking == true) return error.UnsupportedLocalSessionThinking;
+    if (opts.local_session and (!std.mem.eql(u8, opts.prompt, "-") or opts.json_timing_path != null or opts.local_dry_run)) return error.InvalidLocalSessionOptions;
+    if (opts.backend != .metal or (opts.mode != null and opts.mode != .eager)) return if (q35) error.Qwen35RequiresEagerMetal else error.Qwen4ExpRequiresEagerMetal;
+    if (opts.draft_model != null) return if (q35) error.Qwen35RequiresSpeculationOff else error.Qwen4ExpRequiresSpeculationOff;
+    if (opts.image_count > 0 or opts.audio_count > 0 or opts.server_url != null or opts.require_server) return if (q35) error.Qwen35RequiresLocalText else error.Qwen4ExpRequiresLocalText;
+    if (opts.max_tokens <= 0 or opts.local_context == 0 or opts.local_context > machine_profile.max_context) return if (q35) error.UnsupportedQwen35Context else error.UnsupportedQwen4ExpContext;
+    if (opts.temperature != 0 or opts.top_k != 0 or opts.top_p != 0 or opts.repetition_penalty != 1) return if (q35) error.Qwen35GreedyOnly else error.Qwen4ExpGreedyOnly;
     if (opts.host_budget_mb != 0 or opts.backend_budget_mb != 0 or opts.kv_budget_mb != 0 or opts.scratch_budget_mb != 0 or
         opts.a4b_options_explicit or opts.kernel_jit_options_explicit or opts.kernel_jit_mode_explicit or opts.kernel_jit_profile_out != null or opts.kernel_jit.qualified_profile_path != null or
         opts.kernel_jit_draft_profile_out != null or opts.kernel_jit_draft_qualified_profile != null or
         opts.cache_dtype != null or opts.cache_compaction_ratio != null or opts.compiled_target != null or opts.artifact_dir != null or
         opts.raw_decode_bench or opts.debug_mtp or opts.debug_gemma4_target or opts.disable_gemma_embedding_scale or
         opts.qwen3vl_parity_json_path != null or opts.qwen3vl_parity_patch_path != null or opts.qwen3vl_parity_logits_path != null or
-        opts.prefill_chunk_size > 1 or opts.speculation_calibration != .none) return error.UnsupportedQwen4ExpOption;
+        opts.speculation_calibration != .none) return if (q35) error.UnsupportedQwen35Option else error.UnsupportedQwen4ExpOption;
 }
 
 fn parseArgs(args: []const []const u8) !Options {
@@ -8022,12 +8021,12 @@ fn parseArgs(args: []const []const u8) !Options {
         } else if (std.mem.eql(u8, arg, "--experimental-qwen35-streamed")) {
             opts.experimental_qwen35_streamed = true;
         } else if (std.mem.eql(u8, arg, "--dry-run")) {
-            opts.qwen35_dry_run = true;
+            opts.local_dry_run = true;
         } else if (std.mem.eql(u8, arg, "--context-size") or std.mem.eql(u8, arg, "--moe-cache-mb")) {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
             const n = try std.fmt.parseInt(usize, args[i], 10);
-            if (std.mem.eql(u8, arg, "--context-size")) opts.qwen4exp_context = n else opts.qwen4exp_cache_mb = n;
+            if (std.mem.eql(u8, arg, "--context-size")) opts.local_context = n else opts.qwen4exp_cache_mb = n;
             opts.qwen4exp_options_explicit = true;
             if (std.mem.eql(u8, arg, "--moe-cache-mb")) opts.moe_cache_explicit = true;
         } else if (std.mem.eql(u8, arg, "--verify")) {
@@ -9864,8 +9863,11 @@ test "Qwen4Exp CLI requires explicit local Metal eager opt-in and speculation of
     invalid.temperature = 0.7;
     try std.testing.expectError(error.Qwen4ExpGreedyOnly, validateQwen4ExpOptions(invalid));
     invalid = a;
-    invalid.qwen4exp_context = machine_profile.max_context + 1;
+    invalid.local_context = machine_profile.max_context + 1;
     try std.testing.expectError(error.UnsupportedQwen4ExpContext, validateQwen4ExpOptions(invalid));
+    invalid = a;
+    invalid.prefill_chunk_size = 128;
+    try std.testing.expectError(error.UnsupportedQwen4ExpOption, validateQwen4ExpOptions(invalid));
     // Unset budgets are derived by the machine profile, not defaulted here.
     const derived = try parseArgs(&.{ "model.gguf", "hello", "--experimental-qwen4exp", "--backend", "metal", "--speculation-policy", "off" });
     try std.testing.expectEqual(@as(usize, 0), derived.qwen4exp_cache_mb);
@@ -9901,6 +9903,19 @@ test "Qwen35 CLI validates streamed text limits and rejects MoE options" {
     bad = a;
     bad.image_count = 1;
     try std.testing.expectError(error.Qwen35RequiresLocalText, validateQwen35Options(bad));
+    // Shared checks report under this runner's names.
+    bad = a;
+    bad.speculation_policy = .auto;
+    try std.testing.expectError(error.Qwen35RequiresSpeculationOff, validateQwen35Options(bad));
+    bad = a;
+    bad.draft_model = "draft.gguf";
+    try std.testing.expectError(error.Qwen35RequiresSpeculationOff, validateQwen35Options(bad));
+    bad = a;
+    bad.local_context = 0;
+    try std.testing.expectError(error.UnsupportedQwen35Context, validateQwen35Options(bad));
+    bad = a;
+    bad.cache_dtype = "f16";
+    try std.testing.expectError(error.UnsupportedQwen35Option, validateQwen35Options(bad));
 }
 
 test "Qwen35 Qwen4Exp sessions require stdin mode and reject ambiguous receipts" {

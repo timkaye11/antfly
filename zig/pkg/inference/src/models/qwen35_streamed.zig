@@ -28,6 +28,9 @@ pub const Source = struct {
     allocator: std.mem.Allocator,
     reader: c_file.RangeReader,
     file: gguf.format.File,
+    /// Tensor name to index in `file.tensors`; names are owned by `file`.
+    /// Execution resolves weights by name for every projection.
+    index: std.StringHashMapUnmanaged(u32),
     layers: [64]Span,
     /// The artifact digest holds for this descriptor: hashed by this process
     /// or vouched for by an accepted stamp (see `verification`).
@@ -45,15 +48,21 @@ pub const Source = struct {
         var file = try gguf.format.parseStructure(a, header);
         errdefer file.deinit(a);
         try gguf.format.validateTensorDataRanges(&file, @intCast(reader.size));
-        return .{ .allocator = a, .reader = reader, .file = file, .layers = try inspect(&file) };
+        const layers = try inspect(&file);
+        var index: std.StringHashMapUnmanaged(u32) = .empty;
+        errdefer index.deinit(a);
+        // `inspect` rejected duplicate names and bounded the count.
+        try index.ensureTotalCapacity(a, @intCast(file.tensors.len));
+        for (file.tensors, 0..) |t, i| index.putAssumeCapacityNoClobber(t.name, @intCast(i));
+        return .{ .allocator = a, .reader = reader, .file = file, .index = index, .layers = layers };
     }
     pub fn deinit(self: *Source) void {
+        self.index.deinit(self.allocator);
         self.file.deinit(self.allocator);
         self.reader.deinit();
     }
     pub fn tensor(self: *const Source, name: []const u8) !*const gguf.format.TensorInfo {
-        for (self.file.tensors) |*t| if (std.mem.eql(u8, t.name, name)) return t;
-        return error.MissingQwen35Tensor;
+        return &self.file.tensors[self.index.get(name) orelse return error.MissingQwen35Tensor];
     }
     pub fn layerTensor(self: *const Source, layer: usize, suffix: []const u8) !*const gguf.format.TensorInfo {
         var buf: [96]u8 = undefined;

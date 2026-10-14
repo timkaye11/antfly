@@ -17,12 +17,13 @@
 const std = @import("std");
 const options = @import("build_options");
 const mr = @import("metal_runtime.zig");
-extern fn termite_metal_qwen4exp_alias(runtime: *mr.RawMetalDecodeRuntime, data: [*]u8, bytes: usize) ?*anyopaque;
-extern fn termite_metal_buffer_release(handle: *anyopaque) void;
-extern fn termite_metal_qwen4exp_prepare_linear(runtime: *mr.RawMetalDecodeRuntime, handle: *anyopaque, format: u32, offset: usize, bytes: usize, input: usize, output: usize) c_int;
+pub extern fn termite_metal_qwen4exp_alias(runtime: *mr.RawMetalDecodeRuntime, data: [*]u8, bytes: usize) ?*anyopaque;
+pub extern fn termite_metal_buffer_release(handle: *anyopaque) void;
+pub extern fn termite_metal_qwen4exp_prepare_linear(runtime: *mr.RawMetalDecodeRuntime, handle: *anyopaque, format: u32, offset: usize, bytes: usize, input: usize, output: usize) c_int;
 extern fn termite_metal_qwen4exp_apply_linear(runtime: *mr.RawMetalDecodeRuntime, format: u32, input: *anyopaque, input_offset: usize, rows: usize, input_dim: usize, output_dim: usize, output: *anyopaque, output_offset: usize) c_int;
 extern fn termite_metal_qwen4exp_residency_create(runtime: *mr.RawMetalDecodeRuntime, handles: [*]const *anyopaque, count: usize, admitted_bytes: usize) ?*anyopaque;
 extern fn termite_metal_qwen4exp_residency_release(runtime: *mr.RawMetalDecodeRuntime, handle: *anyopaque) void;
+extern fn termite_metal_qwen4exp_residency_supported() c_int;
 
 pub const Params = extern struct {
     op: u32,
@@ -109,6 +110,7 @@ pub const Profile = struct {
     }
 };
 
+var residency_notice = std.atomic.Value(bool).init(false);
 pub const Kernels = struct {
     runtime: *mr.RawMetalDecodeRuntime,
     pipeline: *mr.RawMetalGeneratedPipeline,
@@ -191,8 +193,15 @@ pub const Kernels = struct {
         self.dummy.deinit();
         self.* = undefined;
     }
+    /// Pin the admitted allocations in one residency set. Residency sets need
+    /// macOS 15; earlier systems run without one (receipts record
+    /// `metal_residency`), but a failure where they exist is an error.
     pub fn makeResident(self: *Kernels, handles: []const *anyopaque, admitted_bytes: usize) !void {
         if (self.residency != null or self.batch_active) return error.InvalidResidencyState;
+        if (termite_metal_qwen4exp_residency_supported() == 0) {
+            if (!residency_notice.swap(true, .monotonic)) std.log.warn("Metal residency sets need macOS 15; running without one", .{});
+            return;
+        }
         self.residency = termite_metal_qwen4exp_residency_create(self.runtime, handles.ptr, handles.len, admitted_bytes) orelse return error.Qwen4ExpResidencyUnavailable;
     }
     pub fn releaseResidency(self: *Kernels) void {
@@ -415,7 +424,7 @@ test "Qwen4Exp batch preserves quantized slot offsets and scratch dependencies a
     const first = try weights.ref().slice(0, encoded_bytes);
     const second = try weights.ref().slice(encoded_bytes, encoded_bytes);
     const allocations = [_]*anyopaque{ weights.handle, input.handle, scratch.handle, output.handle };
-    try std.testing.expectError(error.Qwen4ExpResidencyUnavailable, kernels.makeResident(&allocations, 1));
+    if (termite_metal_qwen4exp_residency_supported() != 0) try std.testing.expectError(error.Qwen4ExpResidencyUnavailable, kernels.makeResident(&allocations, 1));
     try kernels.makeResident(&allocations, weights.bytes.len + input.bytes.len + scratch.bytes.len + output.bytes.len);
     defer kernels.releaseResidency();
     for (0..2) |_| {
@@ -533,6 +542,15 @@ test "Qwen4Exp QSA selects 512 blocks with causal incomplete tails through conte
             if (block < blocks and block + 512 < blocks) {
                 try std.testing.expectEqual(-std.math.inf(f32), scores.floats()[i]);
             } else try std.testing.expectEqual(@as(f32, 0), scores.floats()[i]);
+        }
+        if (blocks <= 512) {
+            // Selection kept every block, so the unmasked mode the runtime
+            // uses below 513 blocks scores identically, whatever the mask.
+            const masked = try std.testing.allocator.dupe(f32, scores.floats()[0 .. 24 * tokens]);
+            defer std.testing.allocator.free(masked);
+            @memset(mask.floats(), 0);
+            try kernels.run(.{ .op = 24, .n = 24 * tokens, .position = tokens - 1, .mode = 1 }, &.{ query.ref(), keys.ref(), mask.ref() }, scores.ref());
+            try std.testing.expectEqualSlices(f32, masked, scores.floats()[0 .. 24 * tokens]);
         }
     }
 }

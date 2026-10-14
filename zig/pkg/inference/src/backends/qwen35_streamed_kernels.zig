@@ -27,7 +27,6 @@ pub const tile_rows = 512;
 pub const quant_grid_bytes = gguf.quant_codec.iq3_s_grid.len * @sizeOf(u32);
 pub const tile_bytes = tile_rows * 17408 * 4;
 pub const tile_result_bytes = max_chunk * tile_rows * 4;
-extern fn termite_metal_qwen4exp_prepare_linear(runtime: *mr.RawMetalDecodeRuntime, handle: *anyopaque, format: u32, offset: usize, bytes: usize, input: usize, output: usize) c_int;
 pub const Kernels = struct {
     core: shared.Kernels,
     tile: Buffer,
@@ -98,7 +97,7 @@ pub const Kernels = struct {
         const own_tiled = self.gpu_dequant and (kind.raw() == 11 or kind.raw() == 21 or kind.raw() == 23);
         if (quant) |q| {
             // Rebind every dispatch; slot 0 aliases the current encoded bytes and owns no copy.
-            if (termite_metal_qwen4exp_prepare_linear(self.core.runtime, weight.handle, @backingInt(q), weight.offset, weight.bytes, input_dim, output_dim) != 0) return error.Qwen35QuantPrepareFailed;
+            if (shared.termite_metal_qwen4exp_prepare_linear(self.core.runtime, weight.handle, @backingInt(q), weight.offset, weight.bytes, input_dim, output_dim) != 0) return error.Qwen35QuantPrepareFailed;
             var row: usize = 0;
             while (row < rows) {
                 const count = @min(32, rows - row);
@@ -109,7 +108,7 @@ pub const Kernels = struct {
             // GPU commands own the staging tile until completion. Each tile is
             // decoded once and reused across the prompt by FP32 matrix GEMM.
             if (tiled_quant) |q| {
-                if (termite_metal_qwen4exp_prepare_linear(self.core.runtime, weight.handle, @backingInt(q), weight.offset, weight.bytes, input_dim, output_dim) != 0) return error.Qwen35QuantPrepareFailed;
+                if (shared.termite_metal_qwen4exp_prepare_linear(self.core.runtime, weight.handle, @backingInt(q), weight.offset, weight.bytes, input_dim, output_dim) != 0) return error.Qwen35QuantPrepareFailed;
             }
             var start: usize = 0;
             while (start < output_dim) {

@@ -115,8 +115,8 @@
       {
         "variant": "cpu",
         "command": [
-          "/Users/timkaye/Documents/af/antfly/zig/zig-out/bin/antfly-qwen35-streamed",
-          "/Volumes/Extreme/antfly/models/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
+          "zig/zig-out/bin/antfly-qwen35-streamed",
+          "<models>/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
           "Explain why the sky is blue in two short sentences, then give one everyday example of light scattering.",
           "--experimental-qwen35-streamed",
           "--backend",
@@ -257,8 +257,8 @@
       {
         "variant": "gpu",
         "command": [
-          "/Users/timkaye/Documents/af/antfly/zig/zig-out/bin/antfly-qwen35-streamed",
-          "/Volumes/Extreme/antfly/models/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
+          "zig/zig-out/bin/antfly-qwen35-streamed",
+          "<models>/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
           "Explain why the sky is blue in two short sentences, then give one everyday example of light scattering.",
           "--experimental-qwen35-streamed",
           "--backend",
@@ -397,8 +397,8 @@
       {
         "variant": "gpu",
         "command": [
-          "/Users/timkaye/Documents/af/antfly/zig/zig-out/bin/antfly-qwen35-streamed",
-          "/Volumes/Extreme/antfly/models/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
+          "zig/zig-out/bin/antfly-qwen35-streamed",
+          "<models>/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
           "Explain why the sky is blue in two short sentences, then give one everyday example of light scattering.",
           "--experimental-qwen35-streamed",
           "--backend",
@@ -537,8 +537,8 @@
       {
         "variant": "cpu",
         "command": [
-          "/Users/timkaye/Documents/af/antfly/zig/zig-out/bin/antfly-qwen35-streamed",
-          "/Volumes/Extreme/antfly/models/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
+          "zig/zig-out/bin/antfly-qwen35-streamed",
+          "<models>/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
           "Explain why the sky is blue in two short sentences, then give one everyday example of light scattering.",
           "--experimental-qwen35-streamed",
           "--backend",
@@ -700,8 +700,8 @@
       "cpu": {
         "run": {
           "command": [
-            "/Users/timkaye/Documents/af/antfly/zig/zig-out/bin/antfly-qwen35-streamed",
-            "/Volumes/Extreme/antfly/models/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
+            "zig/zig-out/bin/antfly-qwen35-streamed",
+            "<models>/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
             "Explain why the sky is blue in two short sentences, then give one everyday example of light scattering.",
             "--experimental-qwen35-streamed",
             "--backend",
@@ -846,8 +846,8 @@
       "gpu": {
         "run": {
           "command": [
-            "/Users/timkaye/Documents/af/antfly/zig/zig-out/bin/antfly-qwen35-streamed",
-            "/Volumes/Extreme/antfly/models/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
+            "zig/zig-out/bin/antfly-qwen35-streamed",
+            "<models>/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
             "Explain why the sky is blue in two short sentences, then give one everyday example of light scattering.",
             "--experimental-qwen35-streamed",
             "--backend",
@@ -1000,8 +1000,8 @@
       {
         "variant": "cpu",
         "command": [
-          "/Users/timkaye/Documents/af/antfly/zig/zig-out/bin/antfly-qwen35-streamed",
-          "/Volumes/Extreme/antfly/models/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
+          "zig/zig-out/bin/antfly-qwen35-streamed",
+          "<models>/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
           "Summarize the decisions and unresolved questions in these meeting notes in three bullets. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. ",
           "--experimental-qwen35-streamed",
           "--backend",
@@ -1463,8 +1463,8 @@
       {
         "variant": "gpu",
         "command": [
-          "/Users/timkaye/Documents/af/antfly/zig/zig-out/bin/antfly-qwen35-streamed",
-          "/Volumes/Extreme/antfly/models/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
+          "zig/zig-out/bin/antfly-qwen35-streamed",
+          "<models>/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
           "Summarize the decisions and unresolved questions in these meeting notes in three bullets. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. ",
           "--experimental-qwen35-streamed",
           "--backend",
@@ -1949,8 +1949,8 @@
       {
         "variant": "gpu",
         "command": [
-          "/Users/timkaye/Documents/af/antfly/zig/zig-out/bin/antfly-qwen35-streamed",
-          "/Volumes/Extreme/antfly/models/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
+          "zig/zig-out/bin/antfly-qwen35-streamed",
+          "<models>/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
           "Summarize the decisions and unresolved questions in these meeting notes in three bullets. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. ",
           "--experimental-qwen35-streamed",
           "--backend",
@@ -2408,8 +2408,8 @@
       {
         "variant": "cpu",
         "command": [
-          "/Users/timkaye/Documents/af/antfly/zig/zig-out/bin/antfly-qwen35-streamed",
-          "/Volumes/Extreme/antfly/models/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
+          "zig/zig-out/bin/antfly-qwen35-streamed",
+          "<models>/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf",
           "Summarize the decisions and unresolved questions in these meeting notes in three bullets. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. The team agreed to keep the service on the current hardware, measure latency before changing cache sizes, and preserve output correctness. The budget is fixed. Ownership of the next benchmark and the rollout date remain undecided. ",
           "--experimental-qwen35-streamed",
           "--backend",
@@ -2882,7 +2882,7 @@
     "run": {
       "command": [
         "/tmp/qwen38-gpu-dequant-20261010/baseline-flash",
-        "/Volumes/Extreme/antfly/models/unsloth/Qwen3.8-Flash-Next-GGUF-UD-Q4_K_XL/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+        "<models>/unsloth/Qwen3.8-Flash-Next-GGUF-UD-Q4_K_XL/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
         "Explain why the sky is blue in two short sentences, then give one everyday example of light scattering.",
         "--experimental-qwen4exp",
         "--backend",

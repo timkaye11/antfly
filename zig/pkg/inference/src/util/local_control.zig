@@ -33,6 +33,17 @@ pub fn checkRequest() !void {
     if (request_poll) |poll| poll.call(poll.context);
     if (request_cancelled.load(.acquire)) return error.RequestCancelled;
 }
+/// Execution failures after which a local runner keeps its loaded weights,
+/// caches and GPU pipeline: reads roll back and submitted work is drained
+/// before they surface. A truncated or revoked artifact, a Metal failure and
+/// process cancellation are not among them. Shared so the two decoders cannot
+/// disagree about which failures a session survives.
+pub fn recoverableExecutionError(err: anyerror) bool {
+    return switch (err) {
+        error.RequestCancelled, error.ResourceTemporarilyUnavailable, error.InputOutput, error.ReadTimedOut, error.ReadFailed => true,
+        else => false,
+    };
+}
 pub const Guard = struct {
     previous: [3]std.posix.Sigaction,
     const signals = [_]std.posix.SIG{ .INT, .TERM, .PIPE };

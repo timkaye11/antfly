@@ -45,6 +45,31 @@ pub fn writeStdout(bytes: []const u8) !void {
         offset += @intCast(n);
     }
 }
+/// Bytes that can be emitted now without being revised later: complete
+/// sequences, plus invalid bytes, which become U+FFFD whatever follows. Only a
+/// trailing sequence that may still complete is held back, so streaming never
+/// stalls on bad output.
+pub fn settledUtf8Prefix(bytes: []const u8) usize {
+    var at: usize = 0;
+    while (at < bytes.len) {
+        const n = std.unicode.utf8ByteSequenceLength(bytes[at]) catch {
+            at += 1;
+            continue;
+        };
+        if (n > bytes.len - at) {
+            // Wait only while every byte present could still belong to it.
+            for (bytes[at + 1 ..]) |byte| {
+                if (byte & 0xc0 != 0x80) break;
+            } else return at;
+            at += 1;
+            continue;
+        }
+        if (std.unicode.utf8Decode(bytes[at..][0..n])) |_| {
+            at += n;
+        } else |_| at += 1;
+    }
+    return at;
+}
 pub fn completeUtf8Prefix(bytes: []const u8) usize {
     var at: usize = 0;
     while (at < bytes.len) {
@@ -91,8 +116,9 @@ pub const Input = struct {
     fd: std.posix.fd_t = 0,
     pending: std.ArrayList(u8) = .empty,
     eof: bool = false,
-    /// The first queued line was inspected and is not a cancel request.
-    head_inspected: bool = false,
+    /// Queued bytes before this offset are complete lines already known not
+    /// to be cancel requests.
+    inspected: usize = 0,
     pub const max_request_bytes = 1024 * 1024;
 
     pub fn deinit(self: *Input) void {
@@ -122,7 +148,7 @@ pub const Input = struct {
         const rest = self.pending.items.len - consumed;
         std.mem.copyForwards(u8, self.pending.items[0..rest], self.pending.items[consumed..]);
         self.pending.shrinkRetainingCapacity(rest);
-        self.head_inspected = false;
+        self.inspected -|= consumed;
     }
     fn take(self: *Input, len: usize, consumed: usize) ![]u8 {
         const owned = try self.a.dupe(u8, self.pending.items[0..len]);
@@ -144,19 +170,25 @@ pub const Input = struct {
             _ = try self.fill(100);
         }
     }
-    /// Consume a cancel request if it is the next queued line. Never blocks
-    /// and never discards any other request.
+    /// Consume a queued cancel request, wherever it sits in the queue: it
+    /// stops the request executing now, never one still queued. Other lines
+    /// keep their order. Never blocks.
     pub fn pollCancel(self: *Input) bool {
         while (self.pending.items.len <= max_request_bytes) {
             if (!(self.fill(0) catch return false)) break;
         }
-        if (self.head_inspected) return false;
-        const end = std.mem.indexOfScalar(u8, self.pending.items, '\n') orelse return false;
-        if (end <= max_request_bytes and isCancelRequest(self.a, self.pending.items[0..end])) {
-            self.drop(end + 1);
-            return true;
+        var start = self.inspected;
+        while (std.mem.indexOfScalarPos(u8, self.pending.items, start, '\n')) |end| {
+            if (end - start <= max_request_bytes and isCancelRequest(self.a, self.pending.items[start..end])) {
+                const rest = self.pending.items.len - (end + 1);
+                std.mem.copyForwards(u8, self.pending.items[start..][0..rest], self.pending.items[end + 1 ..]);
+                self.pending.shrinkRetainingCapacity(start + rest);
+                return true;
+            }
+            start = end + 1;
+            // Lines already checked are not parsed again on the next poll.
+            self.inspected = start;
         }
-        self.head_inspected = true;
         return false;
     }
     fn pollHook(context: *anyopaque) void {
@@ -167,12 +199,18 @@ pub const Input = struct {
 pub fn exactPrefix(cached: []const i32, prompt: []const i32) bool {
     return cached.len <= prompt.len and std.mem.eql(i32, cached, prompt[0..cached.len]);
 }
-fn step(decoder: anytype, ids: []const i32) !u32 {
-    if (comptime @hasDecl(@TypeOf(decoder.*), "prefill")) return decoder.prefill(ids);
-    if (decoder.prefill_chunk > 0 and ids.len > 1) return decoder.prefillChunk(ids);
+/// `final` marks the call that consumes the last prompt token. Only its
+/// prediction is used, so a decoder may skip the output head before it; the
+/// result is then null.
+fn step(decoder: anytype, ids: []const i32, final: bool) !?u32 {
+    if (comptime @hasDecl(@TypeOf(decoder.*), "prefill")) return try decoder.prefill(ids);
+    if (decoder.prefill_chunk > 0 and ids.len > 1) {
+        const next = try decoder.prefillChunk(ids, final);
+        return if (final) next else null;
+    }
     var next: u32 = 0;
-    for (ids, 0..) |id, i| next = try decoder.prefillToken(@intCast(id), i + 1 == ids.len);
-    return next;
+    for (ids, 0..) |id, i| next = try decoder.prefillToken(@intCast(id), final and i + 1 == ids.len);
+    return if (final) next else null;
 }
 fn chunkSize(decoder: anytype) usize {
     if (comptime @hasDecl(@TypeOf(decoder.*), "prefill")) return decoder.plan.chunk;
@@ -254,6 +292,19 @@ fn Session(comptime D: type) type {
             self.history.deinit(self.a);
             self.cached.deinit(self.a);
         }
+        /// Stream the newly settled part of the decoded output. `printed` is a
+        /// raw byte offset; invalid bytes reach the client as U+FFFD exactly as
+        /// they appear in the final text.
+        fn emitSettled(self: *Self, ids: []const i32, printed: *usize) !void {
+            const text = try self.tokenizer.decode(self.a, ids);
+            defer self.a.free(text);
+            const end = settledUtf8Prefix(text);
+            if (end <= printed.*) return;
+            const piece = try validText(self.a, text[printed.*..end]);
+            defer self.a.free(piece);
+            try emit(self.a, .{ .event = "delta", .text = piece });
+            printed.* = end;
+        }
         fn clearSequence(self: *Self) !void {
             try self.decoder.reset();
             self.cached.clearRetainingCapacity();
@@ -304,7 +355,9 @@ fn Session(comptime D: type) type {
             self.executing = true;
             const begin = std.Io.Timestamp.now(self.io, .awake);
             const before_bytes = readBytes(self.decoder);
-            if (!exactPrefix(self.cached.items, ids)) try self.clearSequence();
+            // A prefix stopped before its final chunk has no prediction; it is
+            // reusable only by a prompt that extends it.
+            if (!exactPrefix(self.cached.items, ids) or (self.next == null and self.cached.items.len == ids.len)) try self.clearSequence();
             const reused = self.cached.items.len;
             // Every step either completes with `cached` and `next` updated
             // together or leaves both untouched, so a stopped turn never
@@ -320,7 +373,7 @@ fn Session(comptime D: type) type {
                 }
                 if (self.controller.isLiveHostUnderPressure()) return error.ResourceTemporarilyUnavailable;
                 const end = @min(ids.len, at + chunkSize(self.decoder));
-                self.next = step(self.decoder, ids[at..end]) catch |err| switch (err) {
+                self.next = step(self.decoder, ids[at..end], end == ids.len) catch |err| switch (err) {
                     error.RequestCancelled => {
                         cancelled = true;
                         break;
@@ -350,13 +403,7 @@ fn Session(comptime D: type) type {
                     break;
                 }
                 try output.append(self.a, @intCast(next));
-                const text = try self.tokenizer.decode(self.a, output.items);
-                defer self.a.free(text);
-                const end = completeUtf8Prefix(text);
-                if (end > printed) {
-                    try emit(self.a, .{ .event = "delta", .text = text[printed..end] });
-                    printed = end;
-                }
+                try self.emitSettled(output.items, &printed);
                 if (output.items.len == max_tokens) break;
                 if (self.controller.isLiveHostUnderPressure()) return error.ResourceTemporarilyUnavailable;
                 if (comptime @hasDecl(Decoder, "advancePromptLookup")) {
@@ -373,17 +420,11 @@ fn Session(comptime D: type) type {
                         self.next = advance.next;
                         self.cached.appendSliceAssumeCapacity(advance.accepted[0..advance.count]);
                         try output.appendSlice(self.a, advance.accepted[0..advance.count]);
-                        const accepted_text = try self.tokenizer.decode(self.a, output.items);
-                        defer self.a.free(accepted_text);
-                        const accepted_end = completeUtf8Prefix(accepted_text);
-                        if (accepted_end > printed) {
-                            try emit(self.a, .{ .event = "delta", .text = accepted_text[printed..accepted_end] });
-                            printed = accepted_end;
-                        }
+                        try self.emitSettled(output.items, &printed);
                         continue;
                     }
                 }
-                self.next = step(self.decoder, &.{@intCast(next)}) catch |err| switch (err) {
+                self.next = step(self.decoder, &.{@intCast(next)}, true) catch |err| switch (err) {
                     error.RequestCancelled => {
                         cancelled = true;
                         break;
@@ -406,7 +447,13 @@ fn Session(comptime D: type) type {
             defer self.a.free(text);
             const printable = try validText(self.a, text);
             defer self.a.free(printable);
-            if (printable.len > printed) try emit(self.a, .{ .event = "delta", .text = printable[printed..] });
+            // Deltas so far are validText of settled raw prefixes; the tail
+            // completes the same concatenation as `printable`.
+            if (printed < text.len) {
+                const tail = try validText(self.a, text[printed..]);
+                defer self.a.free(tail);
+                try emit(self.a, .{ .event = "delta", .text = tail });
+            }
             // A turn cancelled before any output is dropped from the conversation.
             if (self.template != null and (!cancelled or output.items.len > 0)) {
                 const user = try self.a.dupe(u8, request.prompt);
@@ -439,7 +486,7 @@ test "Qwen35 Qwen4Exp session final text replaces incomplete and invalid UTF8" {
     try std.testing.expectEqualStrings("a\xef\xbf\xbd\xef\xbf\xbd", text);
 }
 
-test "Qwen35 Qwen4Exp session input queues requests and consumes only a leading cancel" {
+test "Qwen35 Qwen4Exp session input queues requests and consumes a cancel queued behind them" {
     const a = std.testing.allocator;
     var pipe: [2]std.posix.fd_t = undefined;
     try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&pipe));
@@ -456,16 +503,23 @@ test "Qwen35 Qwen4Exp session input queues requests and consumes only a leading 
     var input: Input = .{ .a = a, .fd = pipe[0] };
     defer input.deinit();
     try std.testing.expect(!input.pollCancel());
-    // A queued prompt is never mistaken for, or discarded by, a cancel probe.
+    // A cancel queued behind the next request stops the executing one: it is
+    // consumed exactly once and the queued request keeps its place.
     try send(pipe[1], "{\"prompt\":\"next\"}\n{\"cancel\":true}\n");
-    try std.testing.expect(!input.pollCancel());
+    try std.testing.expect(input.pollCancel());
     try std.testing.expect(!input.pollCancel());
     const first = (try input.line()).?;
     defer a.free(first);
     try std.testing.expectEqualStrings("{\"prompt\":\"next\"}", first);
-    // Now the cancel leads the queue: it is consumed exactly once.
-    try std.testing.expect(input.pollCancel());
     try std.testing.expect(!input.pollCancel());
+    // Several queued requests around a cancel all survive in order.
+    try send(pipe[1], "{\"prompt\":\"a\"}\n{\"prompt\":\"b\"}\n{\"cancel\":true}\n{\"prompt\":\"c\"}\n");
+    try std.testing.expect(input.pollCancel());
+    for ([_][]const u8{ "{\"prompt\":\"a\"}", "{\"prompt\":\"b\"}", "{\"prompt\":\"c\"}" }) |want| {
+        const got = (try input.line()).?;
+        defer a.free(got);
+        try std.testing.expectEqualStrings(want, got);
+    }
     // A partial line is not a request yet; ambiguous lines stay queued.
     try send(pipe[1], "{\"cancel\":tr");
     try std.testing.expect(!input.pollCancel());
@@ -550,4 +604,34 @@ test "Qwen35 Qwen4Exp session keeps the model after recoverable turn failures an
     session.executing = true;
     decoder.failed = true;
     try std.testing.expectEqual(Recovery.fatal, session.recover(error.InputOutput));
+}
+
+test "Qwen35 Qwen4Exp streaming settles invalid bytes and matches the final text" {
+    try std.testing.expectEqual(@as(usize, 1), settledUtf8Prefix("a\xe2\x82"));
+    try std.testing.expectEqual(@as(usize, 4), settledUtf8Prefix("a\xe2\x82\xac"));
+    // An invalid byte never holds back what follows it.
+    try std.testing.expectEqual(@as(usize, 3), settledUtf8Prefix("a\xffb"));
+    try std.testing.expectEqual(@as(usize, 3), settledUtf8Prefix("\xe2ab"));
+    try std.testing.expectEqual(@as(usize, 5), settledUtf8Prefix("\xc3\x28xyz"));
+    // Streaming the settled prefixes token by token reproduces validText.
+    const a = std.testing.allocator;
+    const full = "ok \xff caf\xc3\xa9 \xe2\x82\xac \xe2(x \xf0\x9f\x8c\x8d";
+    var streamed: std.ArrayList(u8) = .empty;
+    defer streamed.deinit(a);
+    var printed: usize = 0;
+    for (1..full.len + 1) |n| {
+        const end = settledUtf8Prefix(full[0..n]);
+        if (end <= printed) continue;
+        const piece = try validText(a, full[printed..end]);
+        defer a.free(piece);
+        try streamed.appendSlice(a, piece);
+        printed = end;
+    }
+    const tail = try validText(a, full[printed..]);
+    defer a.free(tail);
+    try streamed.appendSlice(a, tail);
+    const expected = try validText(a, full);
+    defer a.free(expected);
+    try std.testing.expectEqualStrings(expected, streamed.items);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(streamed.items));
 }

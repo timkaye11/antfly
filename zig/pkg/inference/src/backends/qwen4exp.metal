@@ -225,7 +225,7 @@ kernel void qwen4exp_eager(
     case 24: { // QK attention scores, cache in sequence order
         uint tokens=p.position+1, h=id/tokens, t=id%tokens;
         uint blocks=tokens/4;
-        if(t/4<blocks && c[t/4]==0) {o[id]=-INFINITY;break;}
+        if(p.mode==0 && t/4<blocks && c[t/4]==0) {o[id]=-INFINITY;break;} // mode 1: every block kept
         float dot=0;for(uint j=0;j<256;++j) dot+=a[h*256+j]*b[t*512+(h/12)*256+j];
         o[id]=dot*0.0625f; break;
     }

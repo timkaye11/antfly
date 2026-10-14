@@ -186,6 +186,22 @@ class EvidenceTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     validate_receipt(data, "27b", 4096, 4)
 
+    def test_benchmark_chunk_reaches_each_runner_its_own_way(self):
+        self.assertEqual(
+            benchmark.chunk_settings("27b", 1024),
+            (["--prefill-chunk-size", "1024"], {}),
+        )
+        # Flash rejects the CLI option; its chunk is an environment setting.
+        for chunk in (0, 2, 128):
+            self.assertEqual(
+                benchmark.chunk_settings("flash", chunk),
+                ([], {"ANTFLY_QWEN4EXP_PREFILL_CHUNK": str(chunk)}),
+            )
+        self.assertEqual(benchmark.chunk_settings("flash", None), ([], {}))
+        for family, chunk in (("flash", 1), ("flash", 129), ("27b", 1025), ("27b", -1)):
+            with self.assertRaises(ValueError):
+                benchmark.chunk_settings(family, chunk)
+
     def test_context_limit_mirrors_the_runtime_machine_profile(self):
         inference = Path(__file__).resolve().parents[2]
         source = (inference / "src/runtime/machine_profile.zig").read_text()

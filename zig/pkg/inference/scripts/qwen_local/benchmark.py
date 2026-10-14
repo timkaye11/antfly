@@ -51,6 +51,24 @@ CASES = {
 }
 
 
+def chunk_settings(family, chunk):
+    """A prefill chunk request as (arguments, environment) for one runner.
+
+    The 27B runner takes `--prefill-chunk-size` (0 keeps its default of 512);
+    Flash rejects that option and reads ANTFLY_QWEN4EXP_PREFILL_CHUNK, where 0
+    prefills token by token.
+    """
+    if chunk is None:
+        return [], {}
+    if family == "flash":
+        if chunk != 0 and not 2 <= chunk <= 128:
+            raise ValueError("flash chunk must be 0 (token by token) or 2..128")
+        return [], {"ANTFLY_QWEN4EXP_PREFILL_CHUNK": str(chunk)}
+    if not 0 <= chunk <= 1024:
+        raise ValueError("27b chunk must be 0..1024")
+    return ["--prefill-chunk-size", str(chunk)], {}
+
+
 def swapouts():
     # Retained for older experiment harnesses; this benchmark checks both counters.
     return swap_snapshot()["swapouts"]
@@ -91,6 +109,7 @@ def main():
     try:
         budget = process_budget(a.family, a.combined_budget_mb)
         cache = explicit_mb("expert cache", a.cache_mb)
+        chunk_args, chunk_env = chunk_settings(a.family, a.chunk)
     except ValueError as error:
         p.error(str(error))
     if a.family != "flash" and (
@@ -156,12 +175,12 @@ def main():
             command += budget_arguments(a.family, cache, budget, a.verify)
             if a.stream:
                 command += ["--stream"]
-            if a.chunk is not None:
-                command += ["--prefill-chunk-size", str(a.chunk)]
+            command += chunk_args
             env = os.environ.copy()
             for key in list(env):
                 if key.startswith(("ANTFLY_QWEN35_", "ANTFLY_QWEN4EXP_")):
                     env.pop(key)
+            env |= chunk_env
             if a.batch_linear:
                 env["ANTFLY_QWEN4EXP_BATCH_LINEAR"] = "1"
             if a.prefill_mps:

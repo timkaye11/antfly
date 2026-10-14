@@ -281,7 +281,6 @@ pub fn ArenaTypes(comptime geometry: Geometry) type {
 }
 
 pub const ExpertSlotArena = ArenaTypes(.{}).Directory;
-pub const Qwen4ExpArena = ArenaTypes(.{ .layers = 48, .experts = 512, .slots = 512, .route_width = 10 }).Directory;
 
 pub const Observation = ArenaTypes(.{}).RouteObservation;
 pub const LayerSnapshot = ArenaTypes(.{}).DirectorySnapshot;
@@ -369,6 +368,9 @@ test "expert slot arena only checkpoints after every requested layer is full" {
 }
 
 test "Qwen4Exp expert slot arena supports layer 47 and expert 511 transactionally" {
+    // The Qwen4Exp pager instantiates single-layer arenas; this pins the
+    // generic limits at the full model shape.
+    const Qwen4ExpArena = ArenaTypes(.{ .layers = 48, .experts = 512, .slots = 512, .route_width = 10 }).Directory;
     var arena = try Qwen4ExpArena.init(10);
     const first = [_]u32{ 502, 503, 504, 505, 506, 507, 508, 509, 510, 511 };
     const cold = try arena.observeRoute(47, 512, &first);

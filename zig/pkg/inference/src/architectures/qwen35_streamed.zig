@@ -215,15 +215,9 @@ pub const Decoder = struct {
         try control.checkRequest();
         try self.check();
     }
-    /// Failures after which the loaded head and GPU pipeline remain usable:
-    /// submitted batches are drained and both slots emptied before they
-    /// surface. A truncated artifact or any Metal error is not among them.
-    pub fn recoverable(err: anyerror) bool {
-        return switch (err) {
-            error.RequestCancelled, error.ResourceTemporarilyUnavailable, error.InputOutput, error.ReadTimedOut, error.ReadFailed => true,
-            else => false,
-        };
-    }
+    /// Submitted batches are drained and both slots emptied before a
+    /// recoverable failure surfaces.
+    pub const recoverable = control.recoverableExecutionError;
     fn noteFailure(self: *Decoder, err: anyerror, mutated: bool) void {
         if (!recoverable(err)) {
             self.failed = true;
@@ -264,8 +258,9 @@ pub const Decoder = struct {
         if (slot.state != .gpu or slot.layer != l or t.data_offset < slot.span.offset) return error.InvalidStreamedSlotState;
         return self.buffers[l % 2].?.ref().slice(@intCast(t.data_offset - slot.span.offset), try model.byteLen(t));
     }
+    /// Encodes only; cancellation and the memory cap are checked per layer
+    /// and every eight positions, not per projection.
     fn mm(self: *Decoder, l: usize, name: []const u8, rows: usize, input: gpu.Ref, out: gpu.Ref) !void {
-        try self.checkInside();
         const t = try self.source.layerTensor(l, name);
         const w = try self.weight(l, name);
         const raw = self.buffers[l % 2].?.bytes[w.offset..][0..w.bytes];
@@ -568,6 +563,9 @@ test "Qwen35 streamed plan derives its envelope and accepts caps above the old 4
     var tensors = [_]gguf.format.TensorInfo{.{ .name = "output.weight", .dimensions = &dimensions, .tensor_type = .{ .known = .Q6_K }, .offset = 0, .data_offset = 0 }};
     var source: model.Source = undefined;
     source.file.tensors = &tensors;
+    source.index = .empty;
+    defer source.index.deinit(std.testing.allocator);
+    try source.index.put(std.testing.allocator, "output.weight", 0);
     const air: profile.Host = .{ .physical_bytes = 16 * 1024 * MiB, .metal_working_set_bytes = 11453251584 };
     const derived = try Plan.inspect(&source, air, .{ .context = 4096, .chunk = 512 });
     try std.testing.expectEqual(profile.Source.derived, derived.cap_source);

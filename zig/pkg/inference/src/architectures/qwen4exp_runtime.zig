@@ -27,8 +27,6 @@ const mr = @import("../backends/metal_runtime.zig");
 pub const pager = @import("../runtime/moe/qwen4exp_pager.zig");
 const memory = @import("../runtime/tier/memory.zig");
 const profile = @import("../runtime/machine_profile.zig");
-extern fn termite_metal_qwen4exp_alias(runtime: *mr.RawMetalDecodeRuntime, data: [*]u8, bytes: usize) ?*anyopaque;
-extern fn termite_metal_buffer_release(handle: *anyopaque) void;
 const MiB = 1024 * 1024;
 
 pub const PlanRequest = struct {
@@ -237,7 +235,7 @@ pub const Decoder = struct {
             try control.check();
             self.layers[layer] = try pager.Layer.init(allocator, store, layer, plan.slots[layer]);
             self.layers[layer].cancelled = &control.cancelled;
-            self.layer_handles[layer] = termite_metal_qwen4exp_alias(self.kernels.runtime, self.layers[layer].bytes.ptr, self.layers[layer].bytes.len) orelse {
+            self.layer_handles[layer] = gpu.termite_metal_qwen4exp_alias(self.kernels.runtime, self.layers[layer].bytes.ptr, self.layers[layer].bytes.len) orelse {
                 self.layers[layer].deinit();
                 return error.MetalBufferAllocationFailed;
             };
@@ -295,7 +293,7 @@ pub const Decoder = struct {
         }
         self.weights.deinit(self.allocator);
         for (0..self.layer_count) |layer| {
-            termite_metal_buffer_release(self.layer_handles[layer]);
+            gpu.termite_metal_buffer_release(self.layer_handles[layer]);
             self.layers[layer].deinit();
         }
         for (&self.states) |*state| state.deinit();
@@ -349,15 +347,7 @@ pub const Decoder = struct {
         try control.checkRequest();
         try self.check();
     }
-    /// Failures that leave the loaded model usable: expert reads roll back,
-    /// submitted batches are drained and leases released before they surface.
-    /// A truncated artifact, a revoked descriptor or any Metal error does not.
-    pub fn recoverable(err: anyerror) bool {
-        return switch (err) {
-            error.RequestCancelled, error.ResourceTemporarilyUnavailable, error.InputOutput, error.ReadTimedOut, error.ReadFailed => true,
-            else => false,
-        };
-    }
+    pub const recoverable = control.recoverableExecutionError;
     fn noteFailure(self: *Decoder, err: anyerror, mutated: bool) void {
         if (!recoverable(err)) {
             self.failed = true;
@@ -467,9 +457,18 @@ pub const Decoder = struct {
             try self.rope(self.s(9), self.s(8), 128, 128, self.position - 3);
             try self.run(.{ .op = 20, .n = 128, .dim = 128, .position = pos / 4 }, &.{self.s(8)}, self.states[l].ref(3));
         }
-        if ((pos + 1) / 4 > 0) try self.run(.{ .op = 22, .n = (pos + 1) / 4 }, &.{ self.s(11), self.states[l].ref(3) }, self.s(12));
-        try self.run(.{ .op = 23, .n = 1, .position = pos }, &.{self.s(12)}, self.s(13));
-        try self.run(.{ .op = 24, .n = 24 * (pos + 1), .position = pos }, &.{ self.s(7), self.states[l].ref(0), self.s(13) }, self.s(14));
+        // Selection keeps index_budget tokens' worth of compressed blocks. Up
+        // to that many blocks it keeps every one, so the scoring pass and the
+        // single-thread top-k are skipped and attention reads no mask (mode 1).
+        // The mask would also exclude blocks whose index score is NaN, but a
+        // NaN there already means non-finite logits.
+        const blocks = (pos + 1) / self.plan.cfg.compress_ratio;
+        const prune = blocks > self.plan.cfg.index_budget / self.plan.cfg.compress_ratio;
+        if (prune) {
+            try self.run(.{ .op = 22, .n = @intCast(blocks) }, &.{ self.s(11), self.states[l].ref(3) }, self.s(12));
+            try self.run(.{ .op = 23, .n = 1, .position = pos }, &.{self.s(12)}, self.s(13));
+        }
+        try self.run(.{ .op = 24, .n = 24 * (pos + 1), .position = pos, .mode = @intFromBool(!prune) }, &.{ self.s(7), self.states[l].ref(0), self.s(13) }, self.s(14));
         try self.run(.{ .op = 25, .n = 24, .position = pos }, &.{self.s(14)}, self.s(15));
         try self.run(.{ .op = 26, .n = 6144, .position = pos }, &.{ self.s(15), self.states[l].ref(1), self.s(10) }, self.s(16));
         try self.mm(l, "attn_output.weight", self.s(16), self.s(6));
@@ -644,18 +643,21 @@ pub const Decoder = struct {
     /// Layer-major bounded prefill. Attention/recurrent updates retain causal
     /// token order; routed experts are loaded once per union and use GEMMs.
     /// Only CPU copies/gathers occur on the host, never model arithmetic.
-    pub fn prefillChunk(self: *Decoder, tokens: []const i32) !u32 {
+    /// `output` asks for the prediction after the chunk. Callers pass false
+    /// for every chunk but a prompt's last, whose result alone is used; the
+    /// output head is then skipped and 0 returned.
+    pub fn prefillChunk(self: *Decoder, tokens: []const i32, output: bool) !u32 {
         try self.ready();
         if (tokens.len == 0 or tokens.len > self.prefill_chunk or self.position + tokens.len > self.plan.context) return error.Qwen4ExpContextOrTokenOutOfRange;
         for (tokens) |token| if (token < 0 or token >= 248320) return error.Qwen4ExpContextOrTokenOutOfRange;
         var mutated = false;
-        return self.prefillChunkUnguarded(tokens, &mutated) catch |err| {
+        return self.prefillChunkUnguarded(tokens, output or std.c.getenv("ANTFLY_QWEN4EXP_DISABLE_PREFILL_HEAD_SKIP") != null, &mutated) catch |err| {
             self.kernels.cancelBatch();
             self.noteFailure(err, mutated);
             return err;
         };
     }
-    fn prefillChunkUnguarded(self: *Decoder, tokens: []const i32, mutated: *bool) !u32 {
+    fn prefillChunkUnguarded(self: *Decoder, tokens: []const i32, output: bool, mutated: *bool) !u32 {
         // Until the first layer runs, only scratch is written: a pressure
         // blip, a cancellation or an unreadable embedding row leaves the
         // sequence exactly where the previous call left it.
@@ -760,6 +762,10 @@ pub const Decoder = struct {
                 try self.kernels.endProfiledBatch(.experts);
                 @memcpy(self.prefillBytes(0)[t * 10240 * 4 ..][0 .. 10240 * 4], self.scratch[0].bytes[0 .. 10240 * 4]);
             }
+        }
+        if (!output) {
+            self.position = base + tokens.len;
+            return 0;
         }
         try self.kernels.beginBatch();
         try self.hc(null, "", false);
@@ -931,7 +937,7 @@ test "Qwen4Exp installed chunked prefill preserves complete recurrent state and 
         defer decoder.deinit();
         decoder.read_io = executor.io();
         for ([_]usize{ 0, 8, 12 }, [_]usize{ 8, 12, 16 }, 0..) |start, end, i| {
-            _ = try decoder.prefillChunk(tokens[start..end]);
+            _ = try decoder.prefillChunk(tokens[start..end], true);
             try check.compare(decoder.logits.?.floats(), expected.items[i * 248320 ..][0..248320]);
         }
         try std.testing.expectEqualDeep(ngram_expected, decoder.ngram_state);

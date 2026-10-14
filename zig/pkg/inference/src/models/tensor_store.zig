@@ -486,7 +486,16 @@ pub const GgufStore = struct {
         };
     }
 
-    fn describeTensorRangeImpl(self: *GgufStore, allocator: std.mem.Allocator, name: []const u8) !?TensorRangeRef {
+    /// Through the generic interface a GGUF store has no file ranges: callers
+    /// of `describeTensorRange` treat a range as dense bytes. Split stores,
+    /// whose callers read `gguf_type`, use `tensorRange` instead.
+    fn describeTensorRangeImpl(_: *GgufStore, _: std.mem.Allocator, _: []const u8) !?TensorRangeRef {
+        return null;
+    }
+
+    /// The encoded bytes of `name` in this file. Quantized tensors report
+    /// dtype u8 and their `gguf_type`.
+    fn tensorRange(self: *GgufStore, allocator: std.mem.Allocator, name: []const u8) !?TensorRangeRef {
         const path = self.path orelse return null;
         const tensor = gguf_mod.tensor_catalog.Catalog.init(&self.parsed).find(name) orelse return error.TensorNotFound;
         const bytes = gguf_mod.tensor_types.byteLen(tensor.tensor_type, tensor.dimensions) orelse return error.UnsupportedTensorType;
@@ -1190,7 +1199,7 @@ pub const SplitGgufStore = struct {
         return (try self.owner(name)).describeTensorImpl(allocator, name);
     }
     fn describeTensorRangeImpl(self: *SplitGgufStore, allocator: std.mem.Allocator, name: []const u8) !?TensorRangeRef {
-        return (try self.owner(name)).describeTensorRangeImpl(allocator, name);
+        return (try self.owner(name)).tensorRange(allocator, name);
     }
     fn loadTensorRefImpl(self: *SplitGgufStore, ref: *const LazyTensorRef) !weight_source_mod.LoadedWeight {
         return ggufGetTensorRef(try self.owner(ref.source_name orelse ref.name), ref);

@@ -18,9 +18,8 @@ const std = @import("std");
 const model = @import("models/qwen35_streamed.zig");
 const decoder_mod = @import("architectures/qwen35_streamed.zig");
 const memory = @import("runtime/tier/memory.zig");
-const c_file = @import("util/c_file.zig");
-const generation = @import("pipelines/generation.zig");
-const hf = @import("inference_hf_tokenizer");
+const qwen_sidecars = @import("qwen_local_sidecars.zig");
+const session_mod = @import("local_text_session.zig");
 const profile = @import("runtime/machine_profile.zig");
 const verification = @import("util/artifact_verification.zig");
 const platform = @import("antfly_platform");
@@ -51,14 +50,6 @@ pub const Options = struct {
 };
 const control = @import("util/local_control.zig");
 const cancelled = &control.cancelled;
-fn writeStdout(bytes: []const u8) !void {
-    var offset: usize = 0;
-    while (offset < bytes.len) {
-        const n = std.c.write(1, bytes.ptr + offset, bytes.len - offset);
-        if (n <= 0) return error.OutputWriteFailed;
-        offset += @intCast(n);
-    }
-}
 fn elapsed(io: std.Io, start: std.Io.Timestamp) f64 {
     return @as(f64, @floatFromInt(std.Io.Timestamp.durationTo(start, std.Io.Timestamp.now(io, .awake)).nanoseconds)) / 1e6;
 }
@@ -100,11 +91,14 @@ fn runInner(a: std.mem.Allocator, io: std.Io, opts: Options, status: *RunStatus)
         const report = .{ .model = "Qwen3.8-27B", .architecture = "qwen35", .sha256 = model.artifact_sha256, .hash_verified = false, .file_bytes = source.reader.size, .main_layers = 64, .excluded_mtp_layers = 1, .context = plan.context, .prefill_chunk = plan.chunk, .amounts = plan.amounts, .admitted_bytes = plan.total(), .cap_bytes = plan.cap, .process_cap_bytes = plan.cap, .process_cap_source = @tagName(plan.cap_source), .machine_profile = profile.report(host, envelope), .layer_spans = source.layers };
         const json = try std.json.Stringify.valueAlloc(a, report, .{ .whitespace = .indent_2 });
         defer a.free(json);
-        try writeStdout(json);
-        try writeStdout("\n");
+        try session_mod.writeStdout(json);
+        try session_mod.writeStdout("\n");
         if (opts.json_path) |p| try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = json });
         return;
     }
+    // Everything below drives Metal. Without this the compiler analyses the
+    // decoder in non-Metal builds and the link fails on its kernel symbols.
+    if (comptime !@import("build_options").enable_metal) return error.MetalNotEnabled;
     var controller: memory.AdmissionController = .{};
     status.stage = "admission";
     var admission = try plan.acquire(&controller);
@@ -116,42 +110,23 @@ fn runInner(a: std.mem.Allocator, io: std.Io, opts: Options, status: *RunStatus)
     try source.verify(path, opts.verify, stamp_dir, cancelled);
     status.verification = source.verification;
     status.stage = "tokenizer";
-    var sidecar_dir = std.fs.path.dirname(path) orelse ".";
-    if (!c_file.fileExistsInDir(a, sidecar_dir, "tokenizer.json")) sidecar_dir = std.fs.path.dirname(sidecar_dir) orelse return error.MissingQwen35Tokenizer;
-    // Bound tokenizer parsing, vocabulary and caches independently of the
-    // caller's allocator (debug allocation metadata can otherwise dwarf the
-    // vocabulary). This allocation is included in Plan's host allowance.
-    var tokenizer_allocator = @import("runtime/bounded_allocator.zig").BoundedAllocator{
-        .backing = std.heap.c_allocator,
-        .limit = 512 * 1024 * 1024,
+    var sidecars: qwen_sidecars.Sidecars = .{};
+    sidecars.load(a, path, opts.raw) catch |err| return switch (err) {
+        error.SidecarSizeMismatch => error.Qwen35SidecarSizeMismatch,
+        error.SidecarHashMismatch => error.Qwen35SidecarHashMismatch,
+        error.MissingQwenTokenizer => error.MissingQwen35Tokenizer,
+        else => err,
     };
-    defer std.debug.assert(tokenizer_allocator.live == 0);
-    const tokenizer = blk: {
-        const bytes = try readSidecar(a, sidecar_dir, "tokenizer.json", 12809320, "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3");
-        defer a.free(bytes);
-        break :blk try hf.HfTokenizer.loadFromBytes(tokenizer_allocator.allocator(), bytes);
-    };
-    defer tokenizer.deinitSelf();
-    const template_bytes = try readSidecar(a, sidecar_dir, "tokenizer_config.json", 17928, "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27");
-    defer a.free(template_bytes);
-    const template_config = try std.json.parseFromSlice(struct { chat_template: []const u8, bos_token: ?[]const u8 = null, eos_token: ?[]const u8 = null, unk_token: ?[]const u8 = null, pad_token: ?[]const u8 = null }, a, template_bytes, .{ .ignore_unknown_fields = true });
-    defer template_config.deinit();
-    const tc = template_config.value;
-    var template: ?generation.ChatTemplate = null;
-    defer if (template) |*t| t.deinit();
-    if (!opts.raw) template = try generation.ChatTemplate.init(a, tc.chat_template, tc.bos_token orelse "", tc.eos_token orelse "", tc.unk_token orelse "", tc.pad_token orelse "");
-    const prompt = if (template) |*t| try t.applyWithOptions(a, &.{.{ .role = "user", .content = opts.prompt }}, .{ .enable_thinking = @as(?bool, opts.enable_thinking) }) else try a.dupe(u8, opts.prompt);
+    defer sidecars.deinit();
+    const tokenizer = sidecars.tokenizer();
+    const template = sidecars.chatTemplate();
+    const prompt = if (template) |t| try t.applyWithOptions(a, &.{.{ .role = "user", .content = opts.prompt }}, .{ .enable_thinking = @as(?bool, opts.enable_thinking) }) else try a.dupe(u8, opts.prompt);
     defer a.free(prompt);
-    const prompt_ids = try tokenizer.tokenizer().encode(a, prompt);
+    const prompt_ids = try tokenizer.encode(a, prompt);
     defer a.free(prompt_ids);
     if (prompt_ids.len == 0) return error.EmptyPrompt;
     if (!opts.session and prompt_ids.len > opts.context - opts.max_tokens) return error.PromptTooLong;
     for (prompt_ids) |id| if (id < 0 or id >= 248320) return error.InvalidQwen35Token;
-    // EOS is a generation-sidecar contract, separate from the ngram reset token.
-    const generation_bytes = try readSidecar(a, sidecar_dir, "generation_config.json", 202, "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e");
-    defer a.free(generation_bytes);
-    const config = try std.json.parseFromSlice(struct { eos_token_id: []const u32 }, a, generation_bytes, .{ .ignore_unknown_fields = true });
-    defer config.deinit();
     if (opts.print_prompt) std.debug.print("{s}\n", .{prompt});
     if (opts.print_prompt_ids) std.debug.print("prompt_token_ids={any}\n", .{prompt_ids});
     if (opts.print_template) std.debug.print("chat_template={}\n", .{template != null});
@@ -163,12 +138,12 @@ fn runInner(a: std.mem.Allocator, io: std.Io, opts: Options, status: *RunStatus)
     defer decoder.deinit();
     if (std.c.getenv("ANTFLY_QWEN35_DISABLE_IO_OVERLAP") == null) decoder.io = executor.io();
     if (opts.session) status.stage = "session";
-    if (opts.session) return @import("local_text_session.zig").run(a, io, decoder, &controller, tokenizer.tokenizer(), if (template) |*t| t else null, .{
+    if (opts.session) return session_mod.run(a, io, decoder, &controller, tokenizer, template, .{
         .context = opts.context,
         .max_tokens = opts.max_tokens,
         .raw = opts.raw,
         .thinking = opts.enable_thinking,
-        .eos = config.value.eos_token_id,
+        .eos = sidecars.eos(),
         .ignore_eos = opts.ignore_eos,
         .model = "Qwen3.8-27B",
         .artifact_hash_verified = source.verification.hashed,
@@ -291,18 +266,18 @@ fn runInner(a: std.mem.Allocator, io: std.Io, opts: Options, status: *RunStatus)
     if (opts.prompt_lookup > 0) try history.ensureTotalCapacity(a, opts.context);
     var printed: usize = 0;
     while (output.items.len < opts.max_tokens) {
-        if (!opts.ignore_eos and std.mem.indexOfScalar(u32, config.value.eos_token_id, next) != null) {
+        if (!opts.ignore_eos and std.mem.indexOfScalar(u32, sidecars.eos(), next) != null) {
             reason = "stop";
             break;
         }
         try output.append(a, @intCast(next));
         if (opts.stream) {
-            const text = try tokenizer.tokenizer().decode(a, output.items);
+            const text = try tokenizer.decode(a, output.items);
             defer a.free(text);
             // The byte-level decoder returns raw bytes; retain incomplete tails.
-            const end = printed + completeUtf8Prefix(text[printed..]);
+            const end = printed + session_mod.settledUtf8Prefix(text[printed..]);
             if (end > printed) {
-                try writeStdout(text[printed..end]);
+                try session_mod.writeStdout(text[printed..end]);
                 printed = end;
             }
         }
@@ -315,17 +290,17 @@ fn runInner(a: std.mem.Allocator, io: std.Io, opts: Options, status: *RunStatus)
             history.clearRetainingCapacity();
             try history.appendSlice(a, prompt_ids);
             try history.appendSlice(a, output.items);
-            const advance = decoder.advancePromptLookup(history.items, @min(opts.prompt_lookup, opts.max_tokens - output.items.len), if (opts.ignore_eos) &.{} else config.value.eos_token_id) catch |err| {
+            const advance = decoder.advancePromptLookup(history.items, @min(opts.prompt_lookup, opts.max_tokens - output.items.len), if (opts.ignore_eos) &.{} else sidecars.eos()) catch |err| {
                 reason = @errorName(err);
                 return err;
             };
             next = advance.next;
             try output.appendSlice(a, advance.accepted[0..advance.count]);
             if (opts.stream and advance.count > 0) {
-                const accepted_text = try tokenizer.tokenizer().decode(a, output.items);
+                const accepted_text = try tokenizer.decode(a, output.items);
                 defer a.free(accepted_text);
-                const end = printed + completeUtf8Prefix(accepted_text[printed..]);
-                try writeStdout(accepted_text[printed..end]);
+                const end = printed + session_mod.settledUtf8Prefix(accepted_text[printed..]);
+                try session_mod.writeStdout(accepted_text[printed..end]);
                 printed = end;
             }
             if (output.items.len == opts.max_tokens) reason = "length";
@@ -338,41 +313,17 @@ fn runInner(a: std.mem.Allocator, io: std.Io, opts: Options, status: *RunStatus)
         try step_ms.append(a, elapsed(io, tick));
     }
     status.stage = "output";
-    const text = try tokenizer.tokenizer().decode(a, output.items);
+    const text = try tokenizer.decode(a, output.items);
     defer a.free(text);
-    try writeStdout(text[if (opts.stream) printed else 0..]);
-    try writeStdout("\n");
+    try session_mod.writeStdout(text[if (opts.stream) printed else 0..]);
+    try session_mod.writeStdout("\n");
     if (opts.print_ids) std.debug.print("token_ids={any}\n", .{output.items});
     if (opts.print_count) std.debug.print("prompt_tokens={d} generated_tokens={d}\n", .{ prompt_ids.len, output.items.len });
     if (opts.print_finish) std.debug.print("finish_reason={s}\n", .{reason});
 }
 
-fn readSidecar(a: std.mem.Allocator, dir: []const u8, name: []const u8, size: usize, expected: []const u8) ![]u8 {
-    return @import("util/verified_sidecar.zig").read(a, dir, name, size, expected) catch |err| switch (err) {
-        error.SidecarSizeMismatch => error.Qwen35SidecarSizeMismatch,
-        error.SidecarHashMismatch => error.Qwen35SidecarHashMismatch,
-        else => err,
-    };
-}
-
-fn completeUtf8Prefix(bytes: []const u8) usize {
-    var at: usize = 0;
-    while (at < bytes.len) {
-        const n = std.unicode.utf8ByteSequenceLength(bytes[at]) catch {
-            at += 1;
-            continue;
-        };
-        if (bytes.len - at < n) return at;
-        _ = std.unicode.utf8Decode(bytes[at..][0..n]) catch {
-            at += 1;
-            continue;
-        };
-        at += n;
-    }
-    return at;
-}
 test "Qwen35 streaming holds incomplete UTF8 but emits complete replacement characters" {
-    try std.testing.expectEqual(@as(usize, 1), completeUtf8Prefix("a\xe2\x82"));
-    try std.testing.expectEqual(@as(usize, 4), completeUtf8Prefix("a\xe2\x82\xac"));
-    try std.testing.expectEqual(@as(usize, 3), completeUtf8Prefix("\xef\xbf\xbd"));
+    try std.testing.expectEqual(@as(usize, 1), session_mod.settledUtf8Prefix("a\xe2\x82"));
+    try std.testing.expectEqual(@as(usize, 4), session_mod.settledUtf8Prefix("a\xe2\x82\xac"));
+    try std.testing.expectEqual(@as(usize, 3), session_mod.settledUtf8Prefix("\xef\xbf\xbd"));
 }

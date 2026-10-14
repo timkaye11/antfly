@@ -84,6 +84,7 @@ const PosixC = struct {
 
     pub const close = std.c.close;
     pub const fstat = std.c.fstat;
+    pub const fsync = std.c.fsync;
     pub const ftruncate = std.c.ftruncate;
     pub const getcwd = std.c.getcwd;
     pub const getpid = std.c.getpid;
@@ -585,8 +586,14 @@ pub fn isTransientReadError(err: anyerror) bool {
     return err == error.InputOutput or err == error.ReadTimedOut or err == error.ReadFailed;
 }
 
+var atomic_write_counter: std.atomic.Value(u64) = .init(0);
+
 /// Replace `path` with `bytes` through a sibling temporary file and rename,
 /// creating missing parent directories. Readers see the old or new content.
+/// Each call writes its own exclusively created temporary, so concurrent
+/// writers never share one; the last rename wins. Contents reach the disk
+/// before the rename, but the directory is not synced: after a power loss
+/// the old file may reappear.
 pub fn writeFileAtomic(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) !void {
     if (!comptime builtin.link_libc) return error.UnsupportedPlatform;
     if (std.fs.path.dirname(path)) |parent| {
@@ -599,11 +606,13 @@ pub fn writeFileAtomic(allocator: std.mem.Allocator, path: []const u8, bytes: []
             _ = c.mkdir(prefix.ptr, 0o700);
         }
     }
-    const temporary = try std.fmt.allocPrintSentinel(allocator, "{s}.tmp.{d}", .{ path, c.getpid() }, 0);
+    const nonce = atomic_write_counter.fetchAdd(1, .monotonic);
+    const temporary = try std.fmt.allocPrintSentinel(allocator, "{s}.tmp.{d}.{d}", .{ path, c.getpid(), nonce }, 0);
     defer allocator.free(temporary);
     const target = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(target);
-    const fd = c.open(temporary.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c.mode_t, 0o600));
+    // O_EXCL also refuses a planted symlink at the temporary name.
+    const fd = c.open(temporary.ptr, c.O_WRONLY | c.O_CREAT | c.O_EXCL, @as(c.mode_t, 0o600));
     if (fd < 0) return error.CreateFailed;
     var published = false;
     defer if (!published) {
@@ -613,6 +622,10 @@ pub fn writeFileAtomic(allocator: std.mem.Allocator, path: []const u8, bytes: []
         closeFd(@intCast(fd));
         return err;
     };
+    if (c.fsync(fd) != 0) {
+        closeFd(@intCast(fd));
+        return error.SyncFailed;
+    }
     closeFd(@intCast(fd));
     if (std.c.rename(temporary.ptr, target.ptr) != 0) return error.RenameFailed;
     published = true;

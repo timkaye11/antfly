@@ -3707,6 +3707,11 @@ void *termite_metal_qwen4exp_alias(termite_metal_decode_runtime *runtime, void *
 
 // Only bounded, already-admitted allocations are allowed here, never a model
 // mmap. Keep the same allocation identities resident across small decode frames.
+int termite_metal_qwen4exp_residency_supported(void) {
+    if (@available(macOS 15.0, *)) return 1;
+    return 0;
+}
+
 void *termite_metal_qwen4exp_residency_create(
     termite_metal_decode_runtime *runtime, void *const *handles, size_t count,
     size_t admitted_bytes
@@ -3760,6 +3765,10 @@ int termite_metal_qwen4exp_dispatch(
         handles == NULL || offsets == NULL || lengths == NULL || params == NULL ||
         count != 8 || params_bytes != 48 || threads == 0 ||
         generated->device != runtime->device) return -1;
+    // Row ops give each output row one 32-lane SIMD group (row = id / 32 and
+    // lane = id % 32), so a group must never straddle threadgroups.
+    const size_t width = MIN((size_t)256, generated->pipeline.maxTotalThreadsPerThreadgroup) / 32 * 32;
+    if (generated->pipeline.threadExecutionWidth != 32 || width == 0) return -5;
     @autoreleasepool {
         for (size_t i = 0; i < count; ++i) {
             id<MTLBuffer> b = (__bridge id<MTLBuffer>)handles[i];
@@ -3777,7 +3786,6 @@ int termite_metal_qwen4exp_dispatch(
             [enc setBuffer:(__bridge id<MTLBuffer>)handles[i] offset:offsets[i] atIndex:i];
         }
         [enc setBytes:params length:params_bytes atIndex:8];
-        const size_t width = MIN((size_t)256, generated->pipeline.maxTotalThreadsPerThreadgroup);
         [enc dispatchThreads:MTLSizeMake(threads, 1, 1) threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
         [enc endEncoding];
         if (batched) return 0;
@@ -20509,7 +20517,8 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
             }
             break;
         case TERMITE_METAL_QUANT_FORMAT_Q5_1:
-            if (vector_reduction_rows && runtime->q5_1_reduce_pipeline != nil) {
+            if (vector_reduction_rows && runtime->q5_1_reduce_pipeline != nil &&
+                runtime->q5_1_reduce_pipeline.maxTotalThreadsPerThreadgroup >= 128u) {
                 pipeline = runtime->q5_1_reduce_pipeline;
                 use_reduce = YES;
                 reduce_shmem_floats = 64u;

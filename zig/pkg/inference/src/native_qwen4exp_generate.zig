@@ -19,10 +19,8 @@ const decoder_mod = @import("architectures/qwen4exp_runtime.zig");
 const store_mod = @import("models/tensor_store.zig");
 const manifest_mod = @import("models/manifest.zig");
 const memory = @import("runtime/tier/memory.zig");
-const c_file = @import("util/c_file.zig");
-const sidecar = @import("util/verified_sidecar.zig");
-const generation = @import("pipelines/generation.zig");
-const hf = @import("inference_hf_tokenizer");
+const qwen_sidecars = @import("qwen_local_sidecars.zig");
+const session_mod = @import("local_text_session.zig");
 const control = @import("util/local_control.zig");
 const model = @import("models/qwen4exp.zig");
 const profile = @import("runtime/machine_profile.zig");
@@ -117,8 +115,8 @@ fn runInner(a: std.mem.Allocator, io: std.Io, opts: Options, status: *RunStatus)
         };
         const json = try std.json.Stringify.valueAlloc(a, report, .{ .whitespace = .indent_2 });
         defer a.free(json);
-        try @import("local_text_session.zig").writeStdout(json);
-        try @import("local_text_session.zig").writeStdout("\n");
+        try session_mod.writeStdout(json);
+        try session_mod.writeStdout("\n");
         if (opts.json_path) |p| try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = json });
         return;
     }
@@ -134,42 +132,21 @@ fn runInner(a: std.mem.Allocator, io: std.Io, opts: Options, status: *RunStatus)
     std.debug.print("Qwen4Exp: verifying {d} artifact shards ({s})\n", .{ model.artifact_shards.len, @tagName(opts.verify) });
     status.verification = try store_mod.SplitGgufStore.verifyShardIdentity(store, &model.artifact_shards, model.artifact_revision, opts.verify, stamp_dir, &control.cancelled);
     status.stage = "tokenizer";
-    var sidecar_dir = std.fs.path.dirname(path) orelse ".";
-    if (!c_file.fileExistsInDir(a, sidecar_dir, "tokenizer.json")) sidecar_dir = std.fs.path.dirname(sidecar_dir) orelse return error.MissingQwen4ExpTokenizer;
-    // Bound tokenizer parsing, vocabulary and caches independently of the
-    // caller's allocator (debug allocation metadata can otherwise dwarf the
-    // vocabulary). This allocation is included in Plan's host allowance.
-    var tokenizer_allocator = @import("runtime/bounded_allocator.zig").BoundedAllocator{
-        .backing = std.heap.c_allocator,
-        .limit = 512 * 1024 * 1024,
+    var sidecars: qwen_sidecars.Sidecars = .{};
+    sidecars.load(a, path, opts.raw) catch |err| return switch (err) {
+        error.MissingQwenTokenizer => error.MissingQwen4ExpTokenizer,
+        else => err,
     };
-    defer std.debug.assert(tokenizer_allocator.live == 0);
-    const tokenizer = blk: {
-        const bytes = try sidecar.read(a, sidecar_dir, "tokenizer.json", 12809320, "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3");
-        defer a.free(bytes);
-        break :blk try hf.HfTokenizer.loadFromBytes(tokenizer_allocator.allocator(), bytes);
-    };
-    defer tokenizer.deinitSelf();
-    const template_bytes = try sidecar.read(a, sidecar_dir, "tokenizer_config.json", 17928, "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27");
-    defer a.free(template_bytes);
-    const template_config = try std.json.parseFromSlice(struct { chat_template: []const u8, bos_token: ?[]const u8 = null, eos_token: ?[]const u8 = null, unk_token: ?[]const u8 = null, pad_token: ?[]const u8 = null }, a, template_bytes, .{ .ignore_unknown_fields = true });
-    defer template_config.deinit();
-    const tc = template_config.value;
-    var template: ?generation.ChatTemplate = null;
-    defer if (template) |*t| t.deinit();
-    if (!opts.raw) template = try generation.ChatTemplate.init(a, tc.chat_template, tc.bos_token orelse "", tc.eos_token orelse "", tc.unk_token orelse "", tc.pad_token orelse "");
-    const prompt = if (template) |*t| try t.applyWithOptions(a, &.{.{ .role = "user", .content = opts.prompt }}, .{ .enable_thinking = opts.enable_thinking }) else try a.dupe(u8, opts.prompt);
+    defer sidecars.deinit();
+    const tokenizer = sidecars.tokenizer();
+    const template = sidecars.chatTemplate();
+    const prompt = if (template) |t| try t.applyWithOptions(a, &.{.{ .role = "user", .content = opts.prompt }}, .{ .enable_thinking = opts.enable_thinking }) else try a.dupe(u8, opts.prompt);
     defer a.free(prompt);
-    const prompt_ids = try tokenizer.tokenizer().encode(a, prompt);
+    const prompt_ids = try tokenizer.encode(a, prompt);
     defer a.free(prompt_ids);
     if (prompt_ids.len == 0) return error.EmptyPrompt;
     if (!opts.session and prompt_ids.len > opts.context - opts.max_tokens) return error.PromptTooLong;
     for (prompt_ids) |id| if (id < 0 or id >= 248320) return error.InvalidQwen4ExpToken;
-    // EOS is a generation-sidecar contract, separate from the ngram reset token.
-    const generation_bytes = try sidecar.read(a, sidecar_dir, "generation_config.json", 202, "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e");
-    defer a.free(generation_bytes);
-    const config = try std.json.parseFromSlice(struct { eos_token_id: []const u32 }, a, generation_bytes, .{ .ignore_unknown_fields = true });
-    defer config.deinit();
     if (opts.print_prompt) std.debug.print("{s}\n", .{prompt});
     if (opts.print_prompt_ids) std.debug.print("prompt_token_ids={any}\n", .{prompt_ids});
     if (opts.print_template) std.debug.print("chat_template={}\n", .{template != null});
@@ -187,12 +164,12 @@ fn runInner(a: std.mem.Allocator, io: std.Io, opts: Options, status: *RunStatus)
     status.stage = if (opts.session) "session" else "prefill";
     if (std.c.getenv("ANTFLY_QWEN4EXP_DISABLE_PARALLEL_READS") == null) decoder.read_io = read_executor.io();
     if (opts.session) {
-        const result = @import("local_text_session.zig").run(a, io, decoder, &controller, tokenizer.tokenizer(), if (template) |*t| t else null, .{
+        const result = session_mod.run(a, io, decoder, &controller, tokenizer, template, .{
             .context = opts.context,
             .max_tokens = opts.max_tokens,
             .raw = opts.raw,
             .thinking = opts.enable_thinking,
-            .eos = config.value.eos_token_id,
+            .eos = sidecars.eos(),
             .ignore_eos = opts.ignore_eos,
             .model = "Qwen3.8-Flash-Next",
             .artifact_hash_verified = status.verification.hashed,
@@ -214,7 +191,8 @@ fn runInner(a: std.mem.Allocator, io: std.Io, opts: Options, status: *RunStatus)
         while (offset < prompt_ids.len) {
             if (controller.isLiveHostUnderPressure()) return error.ResourceTemporarilyUnavailable;
             const end = @min(prompt_ids.len, offset + decoder.prefill_chunk);
-            next = try decoder.prefillChunk(prompt_ids[offset..end]);
+            // Only the last chunk's prediction is used.
+            next = try decoder.prefillChunk(prompt_ids[offset..end], end == prompt_ids.len);
             offset = end;
         }
     } else for (prompt_ids, 0..) |id, i| {
@@ -235,18 +213,18 @@ fn runInner(a: std.mem.Allocator, io: std.Io, opts: Options, status: *RunStatus)
     var printed: usize = 0;
     while (output.items.len < opts.max_tokens) {
         try control.check();
-        const eos = std.mem.indexOfScalar(u32, config.value.eos_token_id, next) != null;
+        const eos = std.mem.indexOfScalar(u32, sidecars.eos(), next) != null;
         if (eos and !opts.ignore_eos) {
             reason = "stop";
             break;
         }
         try output.append(a, @intCast(next));
         if (opts.stream) {
-            const text = try tokenizer.tokenizer().decode(a, output.items);
+            const text = try tokenizer.decode(a, output.items);
             defer a.free(text);
-            const end = @import("local_text_session.zig").completeUtf8Prefix(text);
+            const end = session_mod.settledUtf8Prefix(text);
             if (end > printed) {
-                try @import("local_text_session.zig").writeStdout(text[printed..end]);
+                try session_mod.writeStdout(text[printed..end]);
                 printed = end;
             }
         }
@@ -264,10 +242,10 @@ fn runInner(a: std.mem.Allocator, io: std.Io, opts: Options, status: *RunStatus)
     status.stage = "output";
     const finished = std.Io.Timestamp.now(io, .awake);
     try writeRouteTrace(io, decoder);
-    const text = try tokenizer.tokenizer().decode(a, output.items);
+    const text = try tokenizer.decode(a, output.items);
     defer a.free(text);
-    try @import("local_text_session.zig").writeStdout(text[if (opts.stream) printed else 0..]);
-    try @import("local_text_session.zig").writeStdout("\n");
+    try session_mod.writeStdout(text[if (opts.stream) printed else 0..]);
+    try session_mod.writeStdout("\n");
     if (opts.print_ids) std.debug.print("token_ids={any}\n", .{output.items});
     if (opts.print_count) std.debug.print("prompt_tokens={d} generated_tokens={d}\n", .{ prompt_ids.len, output.items.len });
     if (opts.print_finish) std.debug.print("finish_reason={s}\n", .{reason});
@@ -293,7 +271,7 @@ fn runInner(a: std.mem.Allocator, io: std.Io, opts: Options, status: *RunStatus)
         var strides: [48]usize = undefined;
         for (decoder.layers, 0..) |layer, i| strides[i] = layer.stride;
         break :blk strides;
-    }, .grouped_experts = decoder.overlapEnabled() and std.c.getenv("ANTFLY_QWEN4EXP_GROUPED_EXPERTS") != null, .build_mode = @tagName(@import("builtin").mode), .io_overlap = decoder.overlapEnabled(), .prefill_head_skip = std.c.getenv("ANTFLY_QWEN4EXP_DISABLE_PREFILL_HEAD_SKIP") == null, .prefill_expert_io = prefilled_paging, .decode_expert_io = decoder.pagingStats().since(prefilled_paging), .decode_token_ms = token_ms[0..timed_steps], .first_token_ready_ms = ms(start, prefilled), .architecture = "qwen4exp", .experimental = true, .backend = "metal", .metal_command_batching = decoder.kernels.batching_enabled, .metal_residency = decoder.kernels.residency != null, .parallel_expert_reads = decoder.read_io != null, .expert_read_lanes = if (decoder.read_io != null) reader.read_lane_count else 1, .decode_steps = decoder.position - prompt_ids.len, .context_size = opts.context, .prompt_tokens = prompt_ids.len, .generated_tokens = output.items.len, .load_ms = ms(start, loaded), .prefill_ms = ms(loaded, prefilled), .decode_ms = ms(prefilled, finished), .prefill_profile = prefilled_profile.since(loaded_profile), .decode_profile = decoder.kernels.profile.since(prefilled_profile), .admitted_bytes = plan.total(), .expert_hits = hits, .expert_misses = misses, .expert_bytes_read = bytes, .ngram_bytes_read = decoder.ngrams.?.stats.bytes_read, .tokenizer_live_bytes = tokenizer_allocator.live, .tokenizer_peak_bytes = tokenizer_allocator.peak, .process_memory = platform.process_memory.pressureSnapshot(), .finish_reason = reason, .prompt_token_ids = prompt_ids, .generated_token_ids = output.items };
+    }, .grouped_experts = decoder.overlapEnabled() and std.c.getenv("ANTFLY_QWEN4EXP_GROUPED_EXPERTS") != null, .build_mode = @tagName(@import("builtin").mode), .io_overlap = decoder.overlapEnabled(), .prefill_head_skip = std.c.getenv("ANTFLY_QWEN4EXP_DISABLE_PREFILL_HEAD_SKIP") == null, .prefill_expert_io = prefilled_paging, .decode_expert_io = decoder.pagingStats().since(prefilled_paging), .decode_token_ms = token_ms[0..timed_steps], .first_token_ready_ms = ms(start, prefilled), .architecture = "qwen4exp", .experimental = true, .backend = "metal", .metal_command_batching = decoder.kernels.batching_enabled, .metal_residency = decoder.kernels.residency != null, .parallel_expert_reads = decoder.read_io != null, .expert_read_lanes = if (decoder.read_io != null) reader.read_lane_count else 1, .decode_steps = decoder.position - prompt_ids.len, .context_size = opts.context, .prompt_tokens = prompt_ids.len, .generated_tokens = output.items.len, .load_ms = ms(start, loaded), .prefill_ms = ms(loaded, prefilled), .decode_ms = ms(prefilled, finished), .prefill_profile = prefilled_profile.since(loaded_profile), .decode_profile = decoder.kernels.profile.since(prefilled_profile), .admitted_bytes = plan.total(), .expert_hits = hits, .expert_misses = misses, .expert_bytes_read = bytes, .ngram_bytes_read = decoder.ngrams.?.stats.bytes_read, .tokenizer_live_bytes = sidecars.tokenizer_allocator.live, .tokenizer_peak_bytes = sidecars.tokenizer_allocator.peak, .process_memory = platform.process_memory.pressureSnapshot(), .finish_reason = reason, .prompt_token_ids = prompt_ids, .generated_token_ids = output.items };
     if (opts.print_timing) std.debug.print("load_ms={d:.2} prefill_ms={d:.2} decode_ms={d:.2} expert_hits={d} expert_misses={d} expert_bytes_read={d}\n", .{ receipt.load_ms, receipt.prefill_ms, receipt.decode_ms, hits, misses, bytes });
     if (opts.json_path) |p| {
         const json = try std.json.Stringify.valueAlloc(a, receipt, .{ .whitespace = .indent_2 });

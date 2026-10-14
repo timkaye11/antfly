@@ -7,8 +7,9 @@ and builds serial on the 16 GiB machine.
 ## Persistent terminal chat
 
 ```sh
-QWEN_27B_GGUF=/Volumes/Extreme/antfly/models/unsloth/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf
-QWEN_FLASH_FIRST_SHARD=/Volumes/Extreme/antfly/models/unsloth/Qwen3.8-Flash-Next-GGUF-UD-Q4_K_XL/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
+MODELS=/Volumes/Extreme/antfly/models/unsloth  # wherever the models were copied
+QWEN_27B_GGUF=$MODELS/Qwen3.8-27B-GGUF-UD-Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf
+QWEN_FLASH_FIRST_SHARD=$MODELS/Qwen3.8-Flash-Next-GGUF-UD-Q4_K_XL/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
 
 python3 zig/pkg/inference/scripts/qwen_local/chat.py \
   --family 27b --binary zig/zig-out/bin/antfly-qwen35-streamed \
@@ -40,12 +41,15 @@ The native protocol (`qwen-local-jsonl-v2`) uses positional prompt `-` with
 JSON events; diagnostics go to stderr. `ready` reports the verification mode
 and outcome, the context size and `process_cap_bytes`. `done` includes consumed
 position, exact reused/prefilled token counts, timings, read bytes, token IDs,
-and process memory. There is no HTTP endpoint or concurrent request support.
+and process memory. Concatenated `delta` text equals the final text: a delta
+holds back only a UTF-8 sequence that may still complete, and invalid bytes
+arrive as U+FFFD. There is no HTTP endpoint or concurrent request support.
 
 Every request line except `cancel` gets exactly one terminal event. A `cancel`
-stops the request that is executing: that request ends with `done` and
-`finish_reason: "cancelled"`, carrying whatever text was already produced. A
-cancel with nothing to stop is ignored without a reply. A decode token always
+stops the request that is executing, even when other requests were queued
+before it: that request ends with `done` and `finish_reason: "cancelled"`,
+carrying whatever text was already produced, and the queued requests then run
+in order. A cancel with nothing to stop is ignored without a reply. A decode token always
 completes, so a cancelled reply stops at the next token boundary with the
 conversation state intact and the following turn reuses the prefix. A cancel
 during a multi-token prefill chunk is honoured between layers; the sequence
@@ -413,7 +417,8 @@ requalification:**
   `artifact_sha256`). `test_evidence.py` checks the Flash pins against the
   manifest.
 - Sidecar sizes and digests for `tokenizer.json`, `tokenizer_config.json` and
-  `generation_config.json`, in both `native_qwen*_generate.zig` files.
+  `generation_config.json`, shared by both models, in
+  `src/qwen_local_sidecars.zig`.
 - Vocabulary size 248320 and the exact tensor inventories and geometries
   (`Inventory.validateRequired`, `models/qwen35_streamed.zig` `inspect`).
 - The Qwen pre-tokenizer Split pattern is matched by exact string in

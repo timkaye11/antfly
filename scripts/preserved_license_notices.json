@@ -35,6 +35,9 @@
   "zig/lib/tokenizer/src/unicode_classes.zig": {
     "file": "LICENSES/third-party/Unicode-V3.txt"
   },
+  "zig/lib/tokenizer/src/unicode_marks.zig": {
+    "file": "LICENSES/third-party/Unicode-V3.txt"
+  },
   "zig/lib/tokenizer/src/unicode_nfc_data.zig": {
     "file": "LICENSES/third-party/Unicode-V3.txt"
   },
