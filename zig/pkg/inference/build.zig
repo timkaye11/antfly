@@ -298,6 +298,9 @@ pub fn build(b: *std.Build) void {
     const inference_internal_mod = runtime_graph.inference_internal_mod;
 
     const exe = @import("build/commands.zig").addCommands(workflow_ctx, true);
+    const compile_check = b.addExecutable(.{ .name = "antfly-inference-check", .root_module = exe.root_module });
+    b.step("check", "Type-check the inference executable without emitting a binary").dependOn(&compile_check.step);
+
     exe.root_module.strip = strip;
     const kernel_jit_package_exe = b.addExecutable(.{
         .name = "antfly-kernel-jit-package",
@@ -1072,6 +1075,16 @@ pub fn build(b: *std.Build) void {
     const run_embeddinggemma2_bench = b.addRunArtifact(embeddinggemma2_bench);
     run_embeddinggemma2_bench.addPassthruArgs();
     b.step("bench-embeddinggemma2", "Run the synchronized prepared-text encoder benchmark").dependOn(&run_embeddinggemma2_bench.step);
+
+    const gemma4_video_bench = b.addExecutable(.{
+        .name = "antfly-gemma4-video-bench",
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/bench/gemma4_video.zig"), .target = target, .optimize = optimize }),
+    });
+    gemma4_video_bench.root_module.addImport("build_options", build_options_mod);
+    gemma4_video_bench.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.identities.addImports(gemma4_video_bench.root_module);
+    gemma4_video_bench.root_module.link_libc = true;
+    b.step("build-gemma4-video-bench", "Build the GPU video decode and projector benchmark").dependOn(&b.addInstallArtifact(gemma4_video_bench, .{}).step);
 
     const gemma4_image_bench = b.addExecutable(.{
         .name = "antfly-gemma4-image-bench",

@@ -21,7 +21,7 @@ const projector = internal.architectures.gemma4_projector;
 const pipeline = internal.pipelines.embedding_gemma2;
 const Bounded = internal.runtime.bounded_allocator.BoundedAllocator;
 const Memory = if (@import("build_options").enable_metal) internal.metal_runtime.RawRuntimeMemoryStats else struct {};
-const Sample = struct { seconds: f64, host_peak_bytes: usize, device_peak_bytes: u64, download_bytes: u64, device_readbacks: u64, gpu_frame_ns: u128, frame_submits: u64, frame_wait_ns: u128, media: pipeline.MediaTimings, memory: Memory };
+const Sample = struct { seconds: f64, host_peak_bytes: usize, device_peak_bytes: ?u64, download_bytes: u64, device_readbacks: u64, gpu_frame_ns: u128, frame_submits: u64, frame_wait_ns: u128, media: pipeline.MediaTimings, memory: Memory };
 const Report = struct { max_projector_batch: ?usize, image: []const u8, batch: usize, scope: []const u8, projected_tokens: usize, samples: []Sample, p50_seconds: f64, p95_seconds: f64, images_per_second: f64, output: []f32 };
 fn now() !u64 {
     var ts: std.posix.timespec = undefined;
@@ -65,9 +65,11 @@ pub fn main(init: std.process.Init) !void {
     if (!std.mem.eql(u8, scope, "projector") and !std.mem.eql(u8, scope, "image") and !std.mem.eql(u8, scope, "embedding") and !std.mem.eql(u8, scope, "encoded-embedding")) return error.InvalidScope;
     const embedding_scope = std.mem.eql(u8, scope, "embedding") or std.mem.eql(u8, scope, "encoded-embedding");
     const metal = std.mem.eql(u8, backend, "metal");
-    if (!metal and !std.mem.eql(u8, backend, "native")) return error.InvalidBackend;
+    const cuda = std.mem.eql(u8, backend, "cuda");
+    if (!metal and !cuda and !std.mem.eql(u8, backend, "native")) return error.InvalidBackend;
     const load_started = try now();
-    const session = if (metal) try factory.createMetalSession(a, model orelse return error.MissingModel) else try factory.createNativeSession(a, model orelse return error.MissingModel);
+    const model_path = model orelse return error.MissingModel;
+    const session = if (metal) try factory.createMetalSession(a, model_path) else if (cuda) try factory.createCudaSession(a, model_path) else try factory.createNativeSession(a, model_path);
     defer session.close();
     if (!metal) factory.attachIo(session, init.io);
     const load_seconds = @as(f64, @floatFromInt(try now() - load_started)) / std.time.ns_per_s;
@@ -96,6 +98,7 @@ pub fn main(init: std.process.Init) !void {
                 defer if (optional_cb) |*backend_cb| backend_cb.deinit();
                 const cb = if (optional_cb) |*backend_cb| backend_cb else null;
                 const before = if (cb) |backend_cb| backend_cb.debugTimingSnapshot().provider else internal.ops.NativeQuantTimingStats{};
+                const cuda_before = if (cb) |backend_cb| backend_cb.trainingRuntimeStats() else internal.ops.TrainingRuntimeStats{};
                 var values = std.ArrayList(f32).empty;
                 defer values.deinit(workspace);
                 var media: pipeline.MediaTimings = .{};
@@ -127,7 +130,7 @@ pub fn main(init: std.process.Init) !void {
                         defer for (result.vectors) |vector| workspace.free(vector);
                         for (result.vectors) |vector| try values.appendSlice(workspace, vector);
                     } else for (images[0..batch]) |encoded| {
-                        const result = try pipeline.embed(workspace, session, tokenizer, .{ .content = &.{.{ .image = encoded }} }, .{}, null, null);
+                        const result = try pipeline.embed(workspace, session, tokenizer, .{ .content = &.{.{ .image = encoded }} }, .{ .timings = &media }, null, null);
                         defer workspace.free(result.vector);
                         try values.appendSlice(workspace, result.vector);
                     }
@@ -152,7 +155,7 @@ pub fn main(init: std.process.Init) !void {
                         defer for (result.vectors) |vector| workspace.free(vector);
                         for (result.vectors) |vector| try values.appendSlice(workspace, vector);
                     } else for (rasters[0..batch]) |raster| {
-                        const result = try pipeline.embed(workspace, session, tokenizer, .{ .content = &.{.{ .raster = raster }} }, .{}, null, null);
+                        const result = try pipeline.embed(workspace, session, tokenizer, .{ .content = &.{.{ .raster = raster }} }, .{ .timings = &media }, null, null);
                         defer workspace.free(result.vector);
                         try values.appendSlice(workspace, result.vector);
                     }
@@ -165,6 +168,7 @@ pub fn main(init: std.process.Init) !void {
                 }
                 const elapsed = try now() - started;
                 const after = if (cb) |backend_cb| backend_cb.debugTimingSnapshot().provider else internal.ops.NativeQuantTimingStats{};
+                const cuda_after = if (cb) |backend_cb| backend_cb.trainingRuntimeStats() else internal.ops.TrainingRuntimeStats{};
                 var memory: Memory = .{};
                 if (comptime @import("build_options").enable_metal) {
                     if (metal and cb != null) {
@@ -172,7 +176,18 @@ pub fn main(init: std.process.Init) !void {
                         memory = internal.metal_runtime.runtimeMemorySnapshot(compute.provider_impl.raw_decode_runtime);
                     }
                 }
-                if (iteration >= warmups) samples[iteration - warmups] = .{ .seconds = @as(f64, @floatFromInt(elapsed)) / std.time.ns_per_s, .host_peak_bytes = bounded.peak, .device_peak_bytes = after.metal_tensor_device_owned_peak_live_bytes, .download_bytes = after.metal_tensor_host_mirror_download_bytes - before.metal_tensor_host_mirror_download_bytes, .device_readbacks = after.metal_tensor_to_host_device_calls - before.metal_tensor_to_host_device_calls, .gpu_frame_ns = if (cb == null) media.gpu_frame_ns else after.decoder_runtime_frame_gpu_nanos -| before.decoder_runtime_frame_gpu_nanos, .frame_submits = if (cb == null) media.frame_submits else after.decoder_runtime_frame_submits -| before.decoder_runtime_frame_submits, .frame_wait_ns = if (cb == null) media.frame_wait_ns else after.decoder_runtime_frame_wait_nanos -| before.decoder_runtime_frame_wait_nanos, .media = media, .memory = memory };
+                if (iteration >= warmups) samples[iteration - warmups] = .{
+                    .seconds = @as(f64, @floatFromInt(elapsed)) / std.time.ns_per_s,
+                    .host_peak_bytes = bounded.peak,
+                    .device_peak_bytes = if (cb == null) media.device_owned_peak_bytes else if (cuda) null else after.metal_tensor_device_owned_peak_live_bytes,
+                    .download_bytes = if (cb == null) media.download_bytes orelse 0 else if (cuda) cuda_after.d2h_bytes - cuda_before.d2h_bytes else after.metal_tensor_host_mirror_download_bytes - before.metal_tensor_host_mirror_download_bytes,
+                    .device_readbacks = if (cb == null) media.readbacks orelse 0 else if (cuda) cuda_after.download_events - cuda_before.download_events else after.metal_tensor_to_host_device_calls - before.metal_tensor_to_host_device_calls,
+                    .gpu_frame_ns = if (cb == null) media.gpu_frame_ns else after.decoder_runtime_frame_gpu_nanos -| before.decoder_runtime_frame_gpu_nanos,
+                    .frame_submits = if (cb == null) media.frame_submits else after.decoder_runtime_frame_submits -| before.decoder_runtime_frame_submits,
+                    .frame_wait_ns = if (cb == null) media.frame_wait_ns else after.decoder_runtime_frame_wait_nanos -| before.decoder_runtime_frame_wait_nanos,
+                    .media = media,
+                    .memory = memory,
+                };
                 if (iteration + 1 == warmups + iterations) saved = try out.dupe(f32, values.items);
             }
             if (bounded.live != 0) return error.WorkspaceLeak;

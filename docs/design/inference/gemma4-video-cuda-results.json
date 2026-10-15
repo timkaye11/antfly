@@ -1,0 +1,300 @@
+{
+  "schema_version": 1,
+  "measurement_date": "2026-10-14",
+  "hardware": {
+    "gpu": "NVIDIA L4",
+    "driver": "580.159.03",
+    "build": "Zig 0.17.0, Debug, CUDA sm89, stripped executable"
+  },
+  "scope": "Local six-second synthetic clip; before is the initial video implementation in this worktree, not main (main has no video route). No serving throughput or semantic-accuracy claim.",
+  "model": {
+    "repository": "google/gemma-4-E4B-it-qat-q4_0-gguf",
+    "revision": "4b4a2c1d584be7264f87aac328a1bc739ce81b6c",
+    "weights_sha256": "676c35070db6dbe52f93e9c864ee0fba4eddea94b9c875d9cb10daff453fbaee",
+    "projector_sha256": "7498a37cb619e55f2fcf87eb931f56e99389ed6d432e4c5c66110694c0d65578"
+  },
+  "fixture": {
+    "file": "closed.mp4",
+    "source": "zig/pkg/inference/src/testdata/video/closed.mp4",
+    "sha256": "3b5a5e12bf9831002e1f45d3d0b2ed8676632a884b526c098f15bcd18cb06efc"
+  },
+  "generation": {
+    "prompt": "Describe what is visible in this video.",
+    "temperature": 0,
+    "disable_thinking": true,
+    "max_tokens": 96,
+    "finish_reason": "length",
+    "before_timing_ms": {
+      "load_model": 46769,
+      "prompt_prep": 21,
+      "scheduler": 3,
+      "backend_setup": 7,
+      "decode_setup": 40,
+      "generate": 104904,
+      "total": 151747,
+      "prompt_format_inner": 0,
+      "tokenize_inner": 4,
+      "multimodal_prepare_inner": 89385,
+      "runtime_prepare_inner": 0,
+      "prefill_inner": 10266,
+      "decode_inner": 5244,
+      "text_decode_inner": 0,
+      "total_inner": 104899
+    },
+    "after_timing_ms": {
+      "load_model": 39225,
+      "prompt_prep": 35,
+      "scheduler": 15,
+      "backend_setup": 10,
+      "decode_setup": 43,
+      "generate": 26700,
+      "total": 66030,
+      "prompt_format_inner": 0,
+      "tokenize_inner": 3,
+      "multimodal_prepare_inner": 11297,
+      "runtime_prepare_inner": 0,
+      "prefill_inner": 10149,
+      "decode_inner": 5247,
+      "text_decode_inner": 0,
+      "total_inner": 26696
+    },
+    "before_d2h_bytes": 3663855996,
+    "after_d2h_bytes": 1048956,
+    "transfer_scope": "Generation totals include final logits/token IDs; zero-readback guarantee applies to video projection."
+  },
+  "projector": {
+    "video": "src/testdata/video/closed.mp4",
+    "gpu": "NVIDIA L4",
+    "scope": "decode-through-projector",
+    "warmups": 1,
+    "p50_seconds": 8.41179385,
+    "p95_seconds": 9.164846534,
+    "samples": [
+      {
+        "seconds": 8.552723193,
+        "decoded_frames": 60,
+        "selected_frames": 6,
+        "d2h_bytes": 0,
+        "h2d_bytes": 372312032
+      },
+      {
+        "seconds": 7.894065636,
+        "decoded_frames": 60,
+        "selected_frames": 6,
+        "d2h_bytes": 0,
+        "h2d_bytes": 372312032
+      },
+      {
+        "seconds": 8.41179385,
+        "decoded_frames": 60,
+        "selected_frames": 6,
+        "d2h_bytes": 0,
+        "h2d_bytes": 372312032
+      },
+      {
+        "seconds": 9.164846534,
+        "decoded_frames": 60,
+        "selected_frames": 6,
+        "d2h_bytes": 0,
+        "h2d_bytes": 372312032
+      },
+      {
+        "seconds": 8.024263027,
+        "decoded_frames": 60,
+        "selected_frames": 6,
+        "d2h_bytes": 0,
+        "h2d_bytes": 372312032
+      }
+    ]
+  },
+  "preprocess_only": {
+    "video": "src/testdata/video/closed.mp4",
+    "gpu": "NVIDIA L4",
+    "scope": "decode-through-patches",
+    "warmups": 1,
+    "p50_seconds": 0.012166897,
+    "p95_seconds": 0.01406889,
+    "samples": [
+      {
+        "seconds": 0.013642788,
+        "decoded_frames": 60,
+        "selected_frames": 6,
+        "d2h_bytes": 0,
+        "h2d_bytes": 0
+      },
+      {
+        "seconds": 0.012166897,
+        "decoded_frames": 60,
+        "selected_frames": 6,
+        "d2h_bytes": 0,
+        "h2d_bytes": 0
+      },
+      {
+        "seconds": 0.013185273,
+        "decoded_frames": 60,
+        "selected_frames": 6,
+        "d2h_bytes": 0,
+        "h2d_bytes": 0
+      },
+      {
+        "seconds": 0.011829255,
+        "decoded_frames": 60,
+        "selected_frames": 6,
+        "d2h_bytes": 0,
+        "h2d_bytes": 0
+      },
+      {
+        "seconds": 0.012743072,
+        "decoded_frames": 60,
+        "selected_frames": 6,
+        "d2h_bytes": 0,
+        "h2d_bytes": 0
+      },
+      {
+        "seconds": 0.01430747,
+        "decoded_frames": 60,
+        "selected_frames": 6,
+        "d2h_bytes": 0,
+        "h2d_bytes": 0
+      },
+      {
+        "seconds": 0.012793627,
+        "decoded_frames": 60,
+        "selected_frames": 6,
+        "d2h_bytes": 0,
+        "h2d_bytes": 0
+      },
+      {
+        "seconds": 0.013673861,
+        "decoded_frames": 60,
+        "selected_frames": 6,
+        "d2h_bytes": 0,
+        "h2d_bytes": 0
+      },
+      {
+        "seconds": 0.009502343,
+        "decoded_frames": 60,
+        "selected_frames": 6,
+        "d2h_bytes": 0,
+        "h2d_bytes": 0
+      },
+      {
+        "seconds": 0.008196549,
+        "decoded_frames": 60,
+        "selected_frames": 6,
+        "d2h_bytes": 0,
+        "h2d_bytes": 0
+      },
+      {
+        "seconds": 0.008666804,
+        "decoded_frames": 60,
+        "selected_frames": 6,
+        "d2h_bytes": 0,
+        "h2d_bytes": 0
+      },
+      {
+        "seconds": 0.009612623,
+        "decoded_frames": 60,
+        "selected_frames": 6,
+        "d2h_bytes": 0,
+        "h2d_bytes": 0
+      },
+      {
+        "seconds": 0.008191418,
+        "decoded_frames": 60,
+        "selected_frames": 6,
+        "d2h_bytes": 0,
+        "h2d_bytes": 0
+      },
+      {
+        "seconds": 0.008252266,
+        "decoded_frames": 60,
+        "selected_frames": 6,
+        "d2h_bytes": 0,
+        "h2d_bytes": 0
+      },
+      {
+        "seconds": 0.008259954,
+        "decoded_frames": 60,
+        "selected_frames": 6,
+        "d2h_bytes": 0,
+        "h2d_bytes": 0
+      },
+      {
+        "seconds": 0.01406889,
+        "decoded_frames": 60,
+        "selected_frames": 6,
+        "d2h_bytes": 0,
+        "h2d_bytes": 0
+      },
+      {
+        "seconds": 0.011831369,
+        "decoded_frames": 60,
+        "selected_frames": 6,
+        "d2h_bytes": 0,
+        "h2d_bytes": 0
+      },
+      {
+        "seconds": 0.013710622,
+        "decoded_frames": 60,
+        "selected_frames": 6,
+        "d2h_bytes": 0,
+        "h2d_bytes": 0
+      },
+      {
+        "seconds": 0.013228514,
+        "decoded_frames": 60,
+        "selected_frames": 6,
+        "d2h_bytes": 0,
+        "h2d_bytes": 0
+      },
+      {
+        "seconds": 0.013331466,
+        "decoded_frames": 60,
+        "selected_frames": 6,
+        "d2h_bytes": 0,
+        "h2d_bytes": 0
+      }
+    ]
+  },
+  "limitations": [
+    "Five warm projector samples and one end-to-end generation per variant; rerun on representative clips.",
+    "Projector H2D includes request-local weights and metadata. NVDEC internal packet transfers are outside tensor counters.",
+    "Full EmbeddingGemma2 CUDA model execution remains blocked by the base architecture support gate; shared primitive tests are not end-to-end qualification.",
+    "Metal changes are covered by existing tests but were not run on this Linux host."
+  ],
+  "review_validation": {
+    "date": "2026-10-15",
+    "cuda_regressions_passed": 29,
+    "metal_tests_skipped": 5,
+    "media_unit_tests_passed": 11,
+    "nvdec_fake_driver_callbacks": "passed",
+    "cuda_executable_build": "27/27 build steps",
+    "cpu_semantic_check": "14/14 build steps",
+    "reviewed_executable_sha256": "ff54c4fab7231d1102391ec853de0ba19a288150a3357b86c2d046e26b3cce06",
+    "real_generation": {
+      "tokens": 96,
+      "finish_reason": "length",
+      "timing_ms": {
+        "load_model": 44083,
+        "prompt_prep": 21,
+        "scheduler": 12,
+        "backend_setup": 19,
+        "decode_setup": 63,
+        "generate": 20806,
+        "total": 65006,
+        "prompt_format_inner": 0,
+        "tokenize_inner": 7,
+        "multimodal_prepare_inner": 12982,
+        "runtime_prepare_inner": 0,
+        "prefill_inner": 1993,
+        "decode_inner": 5823,
+        "text_decode_inner": 1,
+        "total_inner": 20806
+      }
+    },
+    "nvdec_edit_and_cancellation_recovery": "passed on L4 after final test additions",
+    "apache_source_boundary": "passed, 2045 source files",
+    "licenses": "changed source headers and all bundled upstream notices passed"
+  }
+}

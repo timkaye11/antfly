@@ -106,13 +106,42 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
     try effective.check();
     // Reserve the maximum encoder sequence and a bounded media preprocessing
     // working set before decoding or allocating any projected soft tokens.
-    var permit = try session.admit(.{ .batch = 1, .sequence = 8192, .input_bytes = input_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = if (session.backend() == .metal) 768 * 1024 * 1024 else 512 * 1024 * 1024, .output_bytes = 8192 * 768 * @sizeOf(f32) });
+    const resident_image = singleImageGroup(group) and options.resident_images and (session.backend() == .metal or session.backend() == .cuda);
+    const encoder_workspace: usize = if (session.backend() == .metal) 768 * 1024 * 1024 else 512 * 1024 * 1024;
+    var permit = try session.admit(.{ .batch = 1, .sequence = if (resident_image) raster_max_sequence else 8192, .input_bytes = input_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = encoder_workspace + (if (resident_image) @as(usize, 768 * 1024 * 1024) else 0), .output_bytes = (if (resident_image) @as(usize, raster_max_sequence) else 8192) * 768 * @sizeOf(f32) });
     defer permit.deinit();
     if (lock) |mutex| try effective.lock(mutex);
     defer if (lock) |mutex| mutex.unlock();
     var managed = try factory.getManagedComputeBackend(session, a, null, control);
     defer managed.deinit();
     const cb = &managed.backend;
+    if (singleImageGroup(group) and residentImagesEnabled(cb, options)) {
+        const before = MediaTransferSnapshot.init(cb);
+        defer observeResidentTransfers(cb, before, options);
+        const image_scope = @import("antfly_image").work_control.Scope.enter(effective.imageWorkControl());
+        defer image_scope.deinit();
+        const preprocess_started = mediaNow();
+        var image = switch (group.content[0]) {
+            .image => |bytes| try projector.prepareEmbeddingGemma2Image(a, bytes),
+            .raster => |raster| try projector.prepareEmbeddingGemma2Raster(a, raster),
+            else => unreachable,
+        };
+        defer image.deinit();
+        if (options.timings) |t| t.preprocess_ns += mediaNow() - preprocess_started;
+        const vision_started = mediaNow();
+        var projected = try projector.encodePreparedEmbeddingGemma2ImagesResident(cb, a, &.{image}, .{});
+        defer projected.deinit();
+        if (options.timings) |t| {
+            t.vision_ns += mediaNow() - vision_started;
+            t.resident_cohorts += 1;
+        }
+        var counts: [1]usize = undefined;
+        const vectors = try runResidentMediaBatch(a, cb, cfg, tokenizer, &projected, options, false, &counts);
+        defer a.free(vectors);
+        errdefer a.free(vectors[0]);
+        try effective.check();
+        return .{ .vector = vectors[0], .input_tokens = counts[0] };
+    }
     const prepared = try prepareGroup(a, cb, tokenizer, group, options, effective);
     defer prepared.deinit(a);
     const count = prepared.ids.len;
@@ -135,6 +164,10 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
     errdefer a.free(vectors[0]);
     try effective.check();
     return .{ .vector = vectors[0], .input_tokens = count };
+}
+
+fn singleImageGroup(group: Group) bool {
+    return group.content.len == 1 and (group.content[0] == .image or group.content[0] == .raster);
 }
 
 const PreparedGroup = struct {
@@ -477,7 +510,7 @@ fn consumePreparedAudios(out: std.mem.Allocator, slot: *@import("audio_preparati
     var managed = try factory.getManagedComputeBackend(slot.session, a, null, slot.control);
     defer managed.deinit();
     const cb = &managed.backend;
-    const before = cb.debugTimingSnapshot().provider;
+    const before = MediaTransferSnapshot.init(cb);
     defer observeResidentTransfers(cb, before, options);
     var order: [4]usize = undefined;
     for (order[0..slot.retained], 0..) |*index, n| index.* = n;
@@ -526,7 +559,7 @@ fn consumePreparedAudios(out: std.mem.Allocator, slot: *@import("audio_preparati
             t.resident_cohorts += 1;
         }
         var projected = projector.ResidentProjectedImages{ .allocator = a, .backend = cb, .embeddings = joined.?, .tokens_per_image = lengths, .hidden_size = 512, .batches_executed = count, .max_batch_executed = 1 };
-        const result = try runResidentMediaBatch(a, cb, cfg, tokenizer, &projected, options, true);
+        const result = try runResidentMediaBatch(a, cb, cfg, tokenizer, &projected, options, true, null);
         defer {
             for (result) |vector| a.free(vector);
             a.free(result);
@@ -788,7 +821,7 @@ fn consumePreparedMedia(slot: *PreparationSlot, tokenizer: Tokenizer, cfg: encod
     defer permit.deinit();
     var managed = try factory.getManagedComputeBackend(session, a, null, control);
     defer managed.deinit();
-    const transfer_before = managed.backend.debugTimingSnapshot().provider;
+    const transfer_before = MediaTransferSnapshot.init(&managed.backend);
     defer observeResidentTransfers(&managed.backend, transfer_before, options);
     const vision_started = mediaNow();
     if (residentImagesEnabled(&managed.backend, options)) {
@@ -879,7 +912,7 @@ fn embedImageCohort(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer
     defer permit.deinit();
     var managed = try factory.getManagedComputeBackend(session, a, null, control);
     defer managed.deinit();
-    const transfer_before = managed.backend.debugTimingSnapshot().provider;
+    const transfer_before = MediaTransferSnapshot.init(&managed.backend);
     defer observeResidentTransfers(&managed.backend, transfer_before, options);
     if (residentImagesEnabled(&managed.backend, options)) {
         if (options.timings) |t| t.resident_cohorts += 1;
@@ -937,7 +970,7 @@ fn embedRasterCohort(a: std.mem.Allocator, session: Session, tokenizer: Tokenize
     defer permit.deinit();
     var managed = try factory.getManagedComputeBackend(session, a, null, control);
     defer managed.deinit();
-    const transfer_before = managed.backend.debugTimingSnapshot().provider;
+    const transfer_before = MediaTransferSnapshot.init(&managed.backend);
     defer observeResidentTransfers(&managed.backend, transfer_before, options);
     const image_scope = @import("antfly_image").work_control.Scope.enter(control.imageWorkControl());
     defer image_scope.deinit();
@@ -994,16 +1027,29 @@ fn embedRasterCohort(a: std.mem.Allocator, session: Session, tokenizer: Tokenize
     return vectors;
 }
 
-fn observeResidentTransfers(cb: *const ComputeBackend, before: @import("../ops/ops.zig").NativeQuantTimingStats, options: Options) void {
+const MediaTransferSnapshot = struct {
+    metal: @import("../ops/ops.zig").NativeQuantTimingStats,
+    cuda: @import("../ops/ops.zig").TrainingRuntimeStats,
+
+    fn init(cb: *const ComputeBackend) MediaTransferSnapshot {
+        return .{ .metal = cb.debugTimingSnapshot().provider, .cuda = cb.trainingRuntimeStats() };
+    }
+};
+
+fn observeResidentTransfers(cb: *const ComputeBackend, before: MediaTransferSnapshot, options: Options) void {
     if (options.timings) |t| {
         const after = cb.debugTimingSnapshot().provider;
         if (cb.kind() == .metal) {
-            t.gpu_frame_ns += after.decoder_runtime_frame_gpu_nanos -| before.decoder_runtime_frame_gpu_nanos;
-            t.frame_submits += after.decoder_runtime_frame_submits -| before.decoder_runtime_frame_submits;
-            t.frame_wait_ns += after.decoder_runtime_frame_wait_nanos -| before.decoder_runtime_frame_wait_nanos;
-            t.download_bytes = (t.download_bytes orelse 0) + after.metal_tensor_host_mirror_download_bytes - before.metal_tensor_host_mirror_download_bytes;
-            t.readbacks = (t.readbacks orelse 0) + after.metal_tensor_to_host_device_calls - before.metal_tensor_to_host_device_calls;
+            t.gpu_frame_ns += after.decoder_runtime_frame_gpu_nanos -| before.metal.decoder_runtime_frame_gpu_nanos;
+            t.frame_submits += after.decoder_runtime_frame_submits -| before.metal.decoder_runtime_frame_submits;
+            t.frame_wait_ns += after.decoder_runtime_frame_wait_nanos -| before.metal.decoder_runtime_frame_wait_nanos;
+            t.download_bytes = (t.download_bytes orelse 0) + after.metal_tensor_host_mirror_download_bytes - before.metal.metal_tensor_host_mirror_download_bytes;
+            t.readbacks = (t.readbacks orelse 0) + after.metal_tensor_to_host_device_calls - before.metal.metal_tensor_to_host_device_calls;
             t.device_owned_peak_bytes = @max(t.device_owned_peak_bytes orelse 0, after.metal_tensor_device_owned_peak_live_bytes);
+        } else if (cb.kind() == .cuda) {
+            const runtime = cb.trainingRuntimeStats();
+            t.download_bytes = (t.download_bytes orelse 0) + runtime.d2h_bytes - before.cuda.d2h_bytes;
+            t.readbacks = (t.readbacks orelse 0) + runtime.download_events - before.cuda.download_events;
         }
     }
 }
@@ -1011,14 +1057,15 @@ fn observeResidentTransfers(cb: *const ComputeBackend, before: @import("../ops/o
 /// Tokenization stays on CPU; projected pixels and prompt embedding rows stay
 /// on their creating backend through the encoder. Padding never pools into a row.
 fn runResidentImageBatch(a: std.mem.Allocator, cb: *const ComputeBackend, cfg: encoder.Config, tokenizer: Tokenizer, projected: *const projector.ResidentProjectedImages, options: Options) ![][]f32 {
-    return runResidentMediaBatch(a, cb, cfg, tokenizer, projected, options, false);
+    return runResidentMediaBatch(a, cb, cfg, tokenizer, projected, options, false, null);
 }
-fn runResidentMediaBatch(a: std.mem.Allocator, cb: *const ComputeBackend, cfg: encoder.Config, tokenizer: Tokenizer, projected: *const projector.ResidentProjectedImages, options: Options, is_audio: bool) ![][]f32 {
+fn runResidentMediaBatch(a: std.mem.Allocator, cb: *const ComputeBackend, cfg: encoder.Config, tokenizer: Tokenizer, projected: *const projector.ResidentProjectedImages, options: Options, is_audio: bool, input_tokens: ?[]usize) ![][]f32 {
     const max_sequence: usize = if (is_audio) 1024 else raster_max_sequence;
     const marker: i64 = if (is_audio) 258881 else 258880;
     const started = mediaNow();
     const batch = projected.tokens_per_image.len;
     if (batch == 0 or batch > raster_max_batch or projected.hidden_size != 512) return error.InvalidInputShape;
+    if (input_tokens) |counts| if (counts.len != batch) return error.InvalidInputShape;
     var tokens: [raster_max_batch]PreparedGroup = undefined;
     var initialized: usize = 0;
     defer for (tokens[0..initialized]) |row| row.deinit(a);
@@ -1040,6 +1087,7 @@ fn runResidentMediaBatch(a: std.mem.Allocator, cb: *const ComputeBackend, cfg: e
         for (ids, encoded.ids[0..length]) |*dest, id| dest.* = id;
         for (mask, encoded.attention_mask[0..length]) |*dest, m| dest.* = m;
         tokens[initialized] = .{ .ids = ids, .mask = mask, .embeddings = null };
+        if (input_tokens) |counts| counts[initialized] = length;
         initialized += 1;
     }
     const batch_inputs = try packResidentMediaRows(a, cb, tokens[0..initialized], projected.embeddings, projected.tokens_per_image, marker, max_sequence);
@@ -1137,7 +1185,12 @@ fn poolResidentBatch(a: std.mem.Allocator, cb: *const ComputeBackend, output: @i
             if (count == 0) return error.EmptyEmbeddingInput;
             const active = (try cb.takeRows(row, indexes[0..count], count, 768)) orelse return error.ResidentImageOperationUnavailable;
             defer cb.free(active);
-            break :blk try cb.primReduceMean(active, &.{0}, &.{ @intCast(count), 768 });
+            const mean = try cb.primReduceMean(active, &.{0}, &.{ @intCast(count), 768 });
+            if (dimensions == 768) break :blk mean;
+            defer cb.free(mean);
+            // Apply Matryoshka truncation before the download, matching the
+            // fused masked-mean path's final-vector-only transfer contract.
+            break :blk try cb.sliceLastDim(mean, 0, dimensions);
         };
         defer cb.free(pooled);
         const values = try cb.toFloat32(pooled, a);
@@ -1426,6 +1479,7 @@ fn checkResidentPooling(cb: ComputeBackend, _: ComputeBackend) !void {
     }
     const after = @import("../ops/media_residency_test.zig").Transfers.snapshot(cb);
     if (cb.kind() == .metal) try std.testing.expectEqual(@as(u64, 2 * 128 * 4), after.downloads - before.downloads);
+    if (cb.kind() == .cuda) try std.testing.expectEqual(@as(u64, 2 * 128 * 4), after.cuda_bytes - before.cuda_bytes);
     try std.testing.expectApproxEqAbs(@as(f32, 0.6), vectors[0][0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, -0.6), vectors[1][0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.8), vectors[1][1], 1e-6);

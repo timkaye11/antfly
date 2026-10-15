@@ -100,3 +100,67 @@ Diagnostics/probes are excluded from timing; sampled RSS and Metal allocations
 overlap and cannot be added. Frozen-runtime gates remain historical after merges.
 All OCR experiments stay opt-in. Replicate gains on idle hosts and representative,
 manually checked pages/audio before broader promotion; Apple generation is unmeasured.
+
+## CUDA image residency and video follow-up, October 14–15
+
+The [CUDA video results](../../gemma4-video-cuda-results.json) retain the model
+and fixture hashes, timing scopes, and individual warm samples. On an NVIDIA
+L4, the six-second synthetic clip's preparation fell from 89.385 to 11.297 s;
+generation excluding model loading fell from 104.904 to 26.700 s. These compare
+the initial and optimized video implementations in the same worktree. Main had
+no corresponding video route. Model loading was 39.225 s in the optimized run.
+Both generation runs stopped at the requested 96-token cap; they are smoke
+tests, not a video-description accuracy benchmark.
+
+NVDEC maps only the selected presentation timestamps. A CUDA kernel performs
+NV12 conversion, resize, normalization, and patch packing before the resident
+projector and prompt handoff. Position gathers, QAT clamps, and vision attention
+stay on device. F16/BF16 projector weights upload compactly and widen exactly to
+F32 on device; activation precision is unchanged. Request-scoped weight caches
+retain each weight across frames. Compatible decoder surfaces survive successful
+requests; errors discard them, and cancellation is polled during demux and decode.
+
+Five warm decode-through-projector runs had a median of 8.412 s and a p95 of
+9.165 s, with zero intermediate tensor readbacks. Each request still uploaded
+372,312,032 bytes of weights/metadata. Decode-through-patches alone had a
+12.17 ms median, which excludes model projection and generation. NVDEC internal
+packet transfers are not tensor-counter events. Full generation downloads final
+logits/token IDs and therefore does not have zero total readbacks.
+
+Reproduce from `zig/pkg/inference`, using the repository's Zig version and
+worktree-local caches:
+
+```bash
+export ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-cache/global"
+export ZIG_LOCAL_CACHE_DIR="$PWD/.zig-cache"
+zig build test-video-media -Dcuda=false -j1
+zig build test -Dcuda=true -Dcuda-artifacts=sm89 \
+  -Dtest-filter='video ' -Dtest-filter='gemma4 image batching' \
+  -Dtest-filter='gemma4 resident position' \
+  -Dtest-filter='embeddinggemma2 resident' -j1
+zig build test -Dcuda=false -Dtest-filter='video CLI' -j1
+zig build -Dcuda=true -Dcuda-artifacts=sm89 -Dstrip=true -j1
+zig build build-gemma4-video-bench -Dcuda=true -Dcuda-artifacts=sm89 -j1
+zig-out/bin/antfly-gemma4-video-bench \
+  src/testdata/video/closed.mp4 .zig-cache/video-projector.json 5 /models/gemma4/mmproj.gguf
+zig-out/bin/antfly-inference generate /models/gemma4 \
+  'Describe what is visible in this video.' \
+  --video src/testdata/video/closed.mp4 --backend cuda \
+  --max-tokens 96 --temperature 0 --disable-thinking \
+  --print-timing --json-timing .zig-cache/video-generation.json
+```
+
+CPU tests cover bounded demux, allocation failures, every fixture truncation and
+single-byte corruption, edit-list sampling, timestamp overflow, and fake-driver
+decoder callback failures/reuse. CUDA tests cover NVDEC presentation ordering,
+cancellation/recovery, CPU/GPU pixel and projector parity, both position layouts,
+attention across frame boundaries, QAT clamps, and all 65,536 F16/BF16 bit patterns.
+Transfer guards reject intermediate projector exports. The embedded PTX is checked
+against its source hash; regenerate it with `tools/cuda/generate_video_ptx.py`
+using NVRTC 11.8, without requiring a GPU.
+
+Shared EmbeddingGemma2 packing/pooling improvements do not remove the base CUDA
+architecture gate: full-model EmbeddingGemma2 CUDA remains unsupported here.
+Metal regression execution requires a separate Mac; this campaign ran on Linux.
+The supported local video envelope and runtime dependencies are documented in
+the [inference guide](../../../../guides/inference.mdx#local-gemma4-video-prompts).

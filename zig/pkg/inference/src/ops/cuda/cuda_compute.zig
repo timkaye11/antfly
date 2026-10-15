@@ -2165,6 +2165,7 @@ pub const CudaCompute = struct {
     resident_training_cache: bool = false,
     allocator: std.mem.Allocator,
     ctx: context_mod.CudaContext,
+    scalar_clamp_kernel: @import("scalar_clamp.zig").Kernel = .{},
     kernels: kernels_mod.KernelModule,
     resident_weights: std.StringHashMapUnmanaged(CudaTensor) = .{},
     /// Diagnostic boundary compute mirrors. Original artifact tensors retain
@@ -2502,6 +2503,7 @@ pub const CudaCompute = struct {
     }
 
     pub fn deinit(self: *CudaCompute) void {
+        self.scalar_clamp_kernel.deinit(&self.ctx);
         self.dispatch_stats.printIfEnabled(self.q4_route_census_enabled);
         self.dispatch_stats.deinit(self.allocator);
         deinitProfilePool(self);
@@ -3673,6 +3675,29 @@ pub const CudaCompute = struct {
             .owns_shape = false,
             .owned_by_tensor = false,
         });
+    }
+
+    /// Upload compact F16/BF16 weights and widen exactly on device. The caller owns
+    /// the returned F32 tensor; the source can be released when this returns.
+    pub fn upload16BitAsF32(self: *CudaCompute, tensor: *const tensor_mod.Tensor) !CT {
+        if (tensor.dtype != .f16 and tensor.dtype != .bf16) return error.UnsupportedTensorType;
+        // GGUF maps default to random access. This upload consumes the whole
+        // weight, so allow readahead for its exact span instead of 4 KiB faults.
+        if (tensor.mmap_source_bytes != null) c_file.MmapRegion.adviseBytesSequential(tensor.data);
+        const count = try elementCountFromShape(tensor.shape);
+        if (tensor.data.len != try checkedMul(count, @sizeOf(u16))) return error.InvalidShape;
+        const shape = try dupeShape(self.allocator, tensor.shape);
+        errdefer self.allocator.free(shape);
+        var compact = try allocDeviceBuffer(self, tensor.data.len);
+        defer releaseDeviceBuffer(self, &compact);
+        var device = try allocDeviceBuffer(self, try checkedMul(count, @sizeOf(f32)));
+        errdefer device.free(&self.ctx);
+        try copyFromHostTracked(self, compact, tensor.data);
+        // Finish the host copy before its borrowed backing bytes may disappear.
+        try synchronizeAndDrainDeferredDeviceFrees(self);
+        try self.scalar_clamp_kernel.widen16Bit(&self.ctx, compact.ptr, device.ptr, count, tensor.dtype == .bf16);
+        self.stats.launch_elementwise += 1;
+        return createTensor(self, device, shape, count);
     }
 
     /// Attach only encoder projection mirrors, after authenticating and
@@ -11005,6 +11030,10 @@ fn tensorDTypeOp(_: *anyopaque, tensor: CT) anyerror!tensor_mod.DType {
     return tensorFromCt(tensor).dtype;
 }
 
+fn tensorShapeMatchesOp(_: *anyopaque, tensor: CT, shape: []const i64) anyerror!?bool {
+    return std.mem.eql(i64, tensorFromCt(tensor).shape, shape);
+}
+
 fn tensorShapeOp(_: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror![]i64 {
     return allocator.dupe(i64, tensorFromCt(tensor).shape);
 }
@@ -18082,6 +18111,19 @@ fn multiplyScalar(ctx: *anyopaque, input: CT, scale: f32) anyerror!?CT {
     return createTensor(self, device, shape, input_tensor.elem_count);
 }
 
+fn clampScalar(ctx: *anyopaque, input: CT, lower: ?f32, upper: ?f32) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const tensor = tensorFromCt(input);
+    try ensureF32(tensor);
+    const shape = try dupeShape(self.allocator, tensor.shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, tensor.elem_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    try self.scalar_clamp_kernel.launch(&self.ctx, tensor.buffer.ptr, device.ptr, tensor.elem_count, lower, upper);
+    self.stats.launch_elementwise += 1;
+    return createTensor(self, device, shape, tensor.elem_count);
+}
+
 fn addScalar(ctx: *anyopaque, input: CT, value: f32) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input_tensor = tensorFromCt(input);
@@ -18824,7 +18866,9 @@ fn sdpaLaunch(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: ?[]const i64,
 }
 
 fn sdpa(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn_bias_ct: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
-    return sdpaLaunch(ctx, q_ct, k_ct, v_ct, mask, attn_bias_ct, batch, seq_len, num_heads, head_dim);
+    // The shared attention API uses an empty slice for unmasked vision
+    // cohorts. Passing it as a present mask rejects every nonempty image.
+    return sdpaLaunch(ctx, q_ct, k_ct, v_ct, if (mask.len == 0) null else mask, attn_bias_ct, batch, seq_len, num_heads, head_dim);
 }
 
 fn sdpaFull(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, attn_bias_ct: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!?CT {
@@ -18874,6 +18918,32 @@ fn sdpaQwen3VlVision(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, batch: usize
         self.allocator.free(shape);
         return sdpaLaunch(ctx, q_ct, k_ct, v_ct, null, null, batch, seq_len, num_heads, head_dim);
     }
+    self.stats.launch_attention += 1;
+    return createTensor(self, device, shape, count);
+}
+
+fn sdpaGemma4Vision(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    // Reuse the full-precision encoder kernel's warp-reduced scores. The
+    // generic >512-patch path recomputes every QK dot for each output channel.
+    if (batch == 0 or num_heads == 0 or seq_len == 0 or seq_len > 8192 or
+        (head_dim != 64 and head_dim != 128) or self.kernels.gliner_encoder_attention_f32 == null)
+        return sdpaLaunch(ctx, q_ct, k_ct, v_ct, null, null, batch, seq_len, num_heads, head_dim);
+    const q = tensorFromCt(q_ct);
+    const k = tensorFromCt(k_ct);
+    const v = tensorFromCt(v_ct);
+    try ensureF32(q);
+    try ensureF32(k);
+    try ensureF32(v);
+    const count = try checkedMul(try checkedMul(batch, seq_len), try checkedMul(num_heads, head_dim));
+    try ensureCount(q, count);
+    try ensureCount(k, count);
+    try ensureCount(v, count);
+    const shape = try dupeShape(self.allocator, q.shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    try self.kernels.launchGlinerEncoderAttentionF32(&self.ctx, device, q.buffer, k.buffer, v.buffer, .{}, batch, seq_len, num_heads, head_dim, seq_len);
     self.stats.launch_attention += 1;
     return createTensor(self, device, shape, count);
 }
@@ -23620,6 +23690,7 @@ const vtable = ops.ComputeBackend.VTable{
     .runMoeBlock = &runA4bMoeBlockOp,
     .runAttentionOutputResidual = &runAttentionOutputResidualOp,
     .multiplyScalar = &multiplyScalar,
+    .clampScalar = &clampScalar,
     .addScalar = &addScalar,
     .siluMultiply = &siluMultiply,
     .activationMultiply = &activationMultiply,
@@ -23667,6 +23738,7 @@ const vtable = ops.ComputeBackend.VTable{
     .packedGegluExact = &packedGegluExact,
     .splitQkvRope = &splitQkvRope,
     .scaledDotProductAttentionQwen3VlVision = &sdpaQwen3VlVision,
+    .scaledDotProductAttentionGemma4Vision = &sdpaGemma4Vision,
     .scaledDotProductAttentionFull = &sdpaFull,
     .causalSelfAttention = &causalSelfAttention,
     .crossAttention = &crossAttention,
@@ -23700,6 +23772,7 @@ const vtable = ops.ComputeBackend.VTable{
     .copyTensorFromBackend = &copyTensorFromBackendOp,
     .tensorDType = &tensorDTypeOp,
     .tensorShape = &tensorShapeOp,
+    .tensorShapeMatches = &tensorShapeMatchesOp,
     .evalTensor = &evalTensorOp,
     .debertaTrainingAttentionV1 = &gliner25.debertaTrainingAttentionV1,
     .debertaTrainingAttentionBackwardV1 = &gliner25.debertaTrainingAttentionBackwardV1,
