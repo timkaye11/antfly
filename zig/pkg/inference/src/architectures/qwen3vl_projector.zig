@@ -200,12 +200,31 @@ fn estimateAdmissionForImageDimensions(
     var backend_scratch = try admissionAdd(qkv_rows, rope_and_outputs);
     backend_scratch = try admissionAdd(backend_scratch, @max(attention_scores, ffn_intermediates));
     backend_scratch = try admissionAdd(backend_scratch, merge_intermediates);
+    // Generation can retain all final/DeepStack outputs on-device. Include
+    // old and joined multi-image buffers until concatenation completes.
+    backend_scratch = try admissionAdd(backend_scratch, projected_outputs);
+    backend_scratch = try admissionAdd(backend_scratch, deepstack_outputs);
 
     return .{
         .visual_tokens = total_visual_tokens,
         .host_scratch_bytes = host_scratch,
         .backend_scratch_bytes = backend_scratch,
     };
+}
+
+fn residentFeaturesEnabled(cb: *const ComputeBackend) bool {
+    return cb.kind() == .metal and
+        !platform.env.getenvBool("TERMITE_QWEN3VL_DISABLE_RESIDENT_FEATURES");
+}
+
+fn retainFeature(cb: *const ComputeBackend, tensor: CT, rows: usize, dim: usize) !CT {
+    return try cb.cloneTensorShape(tensor, &.{ @intCast(rows), @intCast(dim) }) orelse
+        error.UnsupportedResidentQwenVision;
+}
+
+fn appendFeature(cb: *const ComputeBackend, allocator: std.mem.Allocator, previous: ?CT, next: CT, rows: usize, next_rows: usize, dim: usize) !CT {
+    if (previous) |tensor| return cb.concatRows2D(allocator, tensor, next, rows, next_rows, dim);
+    return retainFeature(cb, next, next_rows, dim);
 }
 
 pub const ProjectedImages = struct {
@@ -218,8 +237,16 @@ pub const ProjectedImages = struct {
     preprocess_spatial_patches: []f32,
     hidden_size: usize,
     deepstack_layer_count: usize,
+    device_backend: ?ComputeBackend = null,
+    device_embeddings: ?CT = null,
+    device_deepstack: []CT = &.{},
 
     pub fn deinit(self: *ProjectedImages) void {
+        if (self.device_backend) |cb| {
+            if (self.device_embeddings) |tensor| cb.free(tensor);
+            for (self.device_deepstack) |tensor| cb.free(tensor);
+        }
+        self.allocator.free(self.device_deepstack);
         self.allocator.free(self.embeddings);
         self.allocator.free(self.deepstack_embeddings);
         self.allocator.free(self.tokens_per_image);
@@ -266,10 +293,14 @@ pub const PreparedPrompt = struct {
     deepstack_embeddings: []f32,
     deepstack_layer_count: usize,
 
+    device_deepstack: []CT = &.{},
+
     pub fn deinit(self: *PreparedPrompt, cb: *const ComputeBackend) void {
         self.allocator.free(self.token_ids);
         if (self.input_embeddings) |embeddings| cb.free(embeddings);
         self.plan.deinit();
+        for (self.device_deepstack) |tensor| cb.free(tensor);
+        self.allocator.free(self.device_deepstack);
         self.allocator.free(self.deepstack_embeddings);
     }
 };
@@ -608,6 +639,16 @@ pub const Geometry = struct {
     }
 };
 
+pub fn encodeProjectedImagesForGeneration(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    projector_path: []const u8,
+    images: []const []const u8,
+    limits: Limits,
+) !ProjectedImages {
+    return encodeProjectedImagesQualified(cb, allocator, projector_path, images, limits, false, residentFeaturesEnabled(cb));
+}
+
 pub fn encodeProjectedImages(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -615,7 +656,7 @@ pub fn encodeProjectedImages(
     images: []const []const u8,
     limits: Limits,
 ) !ProjectedImages {
-    return encodeProjectedImagesQualified(cb, allocator, projector_path, images, limits, false);
+    return encodeProjectedImagesQualified(cb, allocator, projector_path, images, limits, false, false);
 }
 
 pub fn encodeProjectedImagesForQualification(
@@ -625,7 +666,7 @@ pub fn encodeProjectedImagesForQualification(
     images: []const []const u8,
     limits: Limits,
 ) !ProjectedImages {
-    return encodeProjectedImagesQualified(cb, allocator, projector_path, images, limits, true);
+    return encodeProjectedImagesQualified(cb, allocator, projector_path, images, limits, true, false);
 }
 
 fn encodeProjectedImagesQualified(
@@ -635,11 +676,12 @@ fn encodeProjectedImagesQualified(
     images: []const []const u8,
     limits: Limits,
     collect_preprocess_evidence: bool,
+    keep_device: bool,
 ) !ProjectedImages {
     try cb.checkExecutionControl();
     var store = try tensor_store_mod.GgufStore.initAbsolute(allocator, projector_path);
     defer store.tensorStore().deinit();
-    return encodeProjectedImagesFromStoreQualified(cb, allocator, store, images, limits, collect_preprocess_evidence);
+    return encodeProjectedImagesFromStoreQualified(cb, allocator, store, images, limits, collect_preprocess_evidence, keep_device);
 }
 
 pub fn encodeProjectedImagesFromStore(
@@ -649,7 +691,7 @@ pub fn encodeProjectedImagesFromStore(
     images: []const []const u8,
     limits: Limits,
 ) !ProjectedImages {
-    return encodeProjectedImagesFromStoreQualified(cb, allocator, store, images, limits, false);
+    return encodeProjectedImagesFromStoreQualified(cb, allocator, store, images, limits, false, false);
 }
 
 fn encodeProjectedImagesFromStoreQualified(
@@ -659,17 +701,28 @@ fn encodeProjectedImagesFromStoreQualified(
     images: []const []const u8,
     limits: Limits,
     collect_preprocess_evidence: bool,
+    keep_device: bool,
 ) !ProjectedImages {
     const cfg = try parseConfig(&store.parsed);
     var weights = WeightCache.initGguf(allocator, cb, store);
     defer weights.deinit();
-    return encodeProjectedImagesFromWeightsQualified(cb, allocator, &weights, cfg, images, limits, collect_preprocess_evidence);
+    return encodeProjectedImagesFromWeightsQualified(cb, allocator, &weights, cfg, images, limits, collect_preprocess_evidence, keep_device);
 }
 
 /// Run the upstream integrated safetensors vision tower whose weights already
 /// reside on the model compute backend. This is the BF16 counterpart of the
 /// split GGUF projector path and deliberately shares the exact preprocessing,
 /// M-RoPE, DeepStack, and decoder-injection graph.
+pub fn encodeProjectedImagesResidentForGeneration(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: gpt_config.Config,
+    images: []const []const u8,
+    limits: Limits,
+) !ProjectedImages {
+    return encodeProjectedImagesResidentQualified(cb, allocator, config, images, limits, false, residentFeaturesEnabled(cb));
+}
+
 pub fn encodeProjectedImagesResident(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -677,7 +730,7 @@ pub fn encodeProjectedImagesResident(
     images: []const []const u8,
     limits: Limits,
 ) !ProjectedImages {
-    return encodeProjectedImagesResidentQualified(cb, allocator, config, images, limits, false);
+    return encodeProjectedImagesResidentQualified(cb, allocator, config, images, limits, false, false);
 }
 
 pub fn encodeProjectedImagesResidentForQualification(
@@ -687,7 +740,7 @@ pub fn encodeProjectedImagesResidentForQualification(
     images: []const []const u8,
     limits: Limits,
 ) !ProjectedImages {
-    return encodeProjectedImagesResidentQualified(cb, allocator, config, images, limits, true);
+    return encodeProjectedImagesResidentQualified(cb, allocator, config, images, limits, true, false);
 }
 
 fn encodeProjectedImagesResidentQualified(
@@ -697,11 +750,12 @@ fn encodeProjectedImagesResidentQualified(
     images: []const []const u8,
     limits: Limits,
     collect_preprocess_evidence: bool,
+    keep_device: bool,
 ) !ProjectedImages {
     const cfg = try configFromResidentModel(config);
     var weights = WeightCache.initResident(allocator, cb, cfg);
     defer weights.deinit();
-    return encodeProjectedImagesFromWeightsQualified(cb, allocator, &weights, cfg, images, limits, collect_preprocess_evidence);
+    return encodeProjectedImagesFromWeightsQualified(cb, allocator, &weights, cfg, images, limits, collect_preprocess_evidence, keep_device);
 }
 
 fn encodeProjectedImagesFromWeightsQualified(
@@ -712,9 +766,18 @@ fn encodeProjectedImagesFromWeightsQualified(
     images: []const []const u8,
     limits: Limits,
     collect_preprocess_evidence: bool,
+    keep_device: bool,
 ) !ProjectedImages {
     try limits.validate();
     if (images.len == 0 or images.len > limits.max_images) return error.ImageLimitExceeded;
+    var device_embeddings: ?CT = null;
+    errdefer if (device_embeddings) |tensor| cb.free(tensor);
+    var device_deepstack = std.ArrayListUnmanaged(CT).empty;
+    errdefer {
+        for (device_deepstack.items) |tensor| cb.free(tensor);
+        device_deepstack.deinit(allocator);
+    }
+    var device_rows: usize = 0;
     var embeddings = std.ArrayListUnmanaged(f32).empty;
     errdefer embeddings.deinit(allocator);
     var per_image_deepstack = std.ArrayListUnmanaged([]f32).empty;
@@ -733,9 +796,25 @@ fn encodeProjectedImagesFromWeightsQualified(
 
     for (images) |bytes| {
         try cb.checkExecutionControl();
-        var encoded = try encodeSingleImage(cb, allocator, weights, cfg, bytes, limits, collect_preprocess_evidence);
+        var encoded = try encodeSingleImage(cb, allocator, weights, cfg, bytes, limits, collect_preprocess_evidence, keep_device);
         defer encoded.deinit(allocator);
         try cb.checkExecutionControl();
+        if (keep_device) {
+            const next = try appendFeature(cb, allocator, device_embeddings, encoded.device_embeddings.?, device_rows, encoded.tokens, cfg.text_hidden);
+            if (device_embeddings) |old| cb.free(old);
+            device_embeddings = next;
+            for (encoded.device_deepstack, 0..) |feature, tap| {
+                if (device_rows == 0) {
+                    try device_deepstack.ensureUnusedCapacity(allocator, 1);
+                    device_deepstack.appendAssumeCapacity(try retainFeature(cb, feature, encoded.tokens, cfg.text_hidden));
+                } else {
+                    const joined = try appendFeature(cb, allocator, device_deepstack.items[tap], feature, device_rows, encoded.tokens, cfg.text_hidden);
+                    cb.free(device_deepstack.items[tap]);
+                    device_deepstack.items[tap] = joined;
+                }
+            }
+            device_rows += encoded.tokens;
+        }
         try embeddings.appendSlice(allocator, encoded.embeddings);
         // Reserve the list slot before duplicating the feature payload so a
         // failed list growth cannot orphan a large per-image allocation.
@@ -754,10 +833,10 @@ fn encodeProjectedImagesFromWeightsQualified(
     for (tokens_per_image.items) |count| total_tokens = std.math.add(usize, total_tokens, count) catch return error.VisionAdmissionExceeded;
     const feature_stride = std.math.mul(usize, total_tokens, cfg.text_hidden) catch return error.VisionAdmissionExceeded;
     const deepstack_len = std.math.mul(usize, feature_stride, cfg.deepstack_len) catch return error.VisionAdmissionExceeded;
-    const deepstack = try allocator.alloc(f32, deepstack_len);
+    const deepstack = try allocator.alloc(f32, if (keep_device) 0 else deepstack_len);
     errdefer allocator.free(deepstack);
     var image_token_offset: usize = 0;
-    for (per_image_deepstack.items, tokens_per_image.items) |features, token_count| {
+    if (!keep_device) for (per_image_deepstack.items, tokens_per_image.items) |features, token_count| {
         const image_stride = std.math.mul(usize, token_count, cfg.text_hidden) catch return error.InvalidTensorShape;
         const expected_image_features = std.math.mul(usize, image_stride, cfg.deepstack_len) catch return error.InvalidTensorShape;
         if (features.len != expected_image_features) return error.InvalidTensorShape;
@@ -767,7 +846,7 @@ fn encodeProjectedImagesFromWeightsQualified(
             @memcpy(deepstack[dst..][0..image_stride], features[src..][0..image_stride]);
         }
         image_token_offset += token_count;
-    }
+    };
 
     const owned_embeddings = try embeddings.toOwnedSlice(allocator);
     errdefer allocator.free(owned_embeddings);
@@ -782,6 +861,9 @@ fn encodeProjectedImagesFromWeightsQualified(
 
     return .{
         .allocator = allocator,
+        .device_backend = if (keep_device) cb.* else null,
+        .device_embeddings = device_embeddings,
+        .device_deepstack = try device_deepstack.toOwnedSlice(allocator),
         .embeddings = owned_embeddings,
         .deepstack_embeddings = deepstack,
         .tokens_per_image = owned_tokens_per_image,
@@ -851,8 +933,10 @@ pub fn prepareExpandedPromptEmbeddings(
     const base = try cb.embeddingLookup(embedding_weight, ids.items, ids.items.len, config.hidden_size);
     defer cb.free(base);
     const hidden_size: usize = @intCast(config.hidden_size);
-    if (projected.embeddings.len != visual_tokens * hidden_size) return error.ImageTokenLengthMismatch;
-    const input_embeddings = if (cb.vtable.concatRows2D != null and cb.vtable.takeRows != null and cb.vtable.multiplyScalar != null)
+    if (projected.device_embeddings == null and projected.embeddings.len != visual_tokens * hidden_size) return error.ImageTokenLengthMismatch;
+    const input_embeddings = if (projected.device_embeddings) |visual|
+        try assembleVisualPromptDeviceTensor(cb, allocator, base, visual, visual_tokens, plan.visual_token_mask, hidden_size, config.tokenEmbeddingScale())
+    else if (cb.vtable.concatRows2D != null and cb.vtable.takeRows != null and cb.vtable.multiplyScalar != null)
         try assembleVisualPromptTensor(cb, allocator, base, projected.embeddings, plan.visual_token_mask, hidden_size, config.tokenEmbeddingScale())
     else blk: {
         const host = try cb.toFloat32(base, allocator);
@@ -875,7 +959,19 @@ pub fn prepareExpandedPromptEmbeddings(
     errdefer cb.free(input_embeddings);
     const visual_feature_stride = std.math.mul(usize, visual_tokens, hidden_size) catch return error.RequestTooLarge;
     const expected_deepstack = std.math.mul(usize, visual_feature_stride, projected.deepstack_layer_count) catch return error.RequestTooLarge;
-    if (projected.deepstack_embeddings.len != expected_deepstack) return error.InvalidTensorShape;
+    if (projected.device_embeddings != null) {
+        if (projected.device_deepstack.len != projected.deepstack_layer_count) return error.InvalidTensorShape;
+    } else if (projected.deepstack_embeddings.len != expected_deepstack) return error.InvalidTensorShape;
+    const device_deepstack = try allocator.alloc(CT, projected.device_deepstack.len);
+    var retained: usize = 0;
+    errdefer {
+        for (device_deepstack[0..retained]) |tensor| cb.free(tensor);
+        allocator.free(device_deepstack);
+    }
+    for (projected.device_deepstack, device_deepstack) |source, *target| {
+        target.* = try retainFeature(cb, source, visual_tokens, hidden_size);
+        retained += 1;
+    }
     const token_ids = try ids.toOwnedSlice(allocator);
     errdefer allocator.free(token_ids);
     const deepstack_embeddings = try allocator.dupe(f32, projected.deepstack_embeddings);
@@ -884,6 +980,7 @@ pub fn prepareExpandedPromptEmbeddings(
         .allocator = allocator,
         .token_ids = token_ids,
         .input_embeddings = input_embeddings,
+        .device_deepstack = device_deepstack,
         .plan = plan,
         .deepstack_embeddings = deepstack_embeddings,
         .deepstack_layer_count = projected.deepstack_layer_count,
@@ -898,7 +995,16 @@ const EncodedImage = struct {
     preprocess_evidence: ?PreprocessEvidence,
     preprocess_spatial_patches: ?[]f32,
 
+    device_backend: ?ComputeBackend = null,
+    device_embeddings: ?CT = null,
+    device_deepstack: []CT = &.{},
+
     pub fn deinit(self: *EncodedImage, allocator: std.mem.Allocator) void {
+        if (self.device_backend) |cb| {
+            if (self.device_embeddings) |tensor| cb.free(tensor);
+            for (self.device_deepstack) |tensor| cb.free(tensor);
+        }
+        allocator.free(self.device_deepstack);
         allocator.free(self.embeddings);
         allocator.free(self.deepstack);
         if (self.preprocess_spatial_patches) |patches| allocator.free(patches);
@@ -913,6 +1019,7 @@ fn encodeSingleImage(
     bytes: []const u8,
     limits: Limits,
     collect_preprocess_evidence: bool,
+    keep_device: bool,
 ) !EncodedImage {
     var zig017_return_error: ?anyerror = null;
     const profile = qwen3VlProfileEnabled();
@@ -1103,6 +1210,11 @@ fn encodeSingleImage(
     });
     defer allocator.free(positions);
     const positions_ns = profileLap(profile, &stage_started_at);
+    var device_deepstack = std.ArrayListUnmanaged(CT).empty;
+    errdefer {
+        for (device_deepstack.items) |tensor| cb.free(tensor);
+        device_deepstack.deinit(allocator);
+    }
     var deepstack = std.ArrayListUnmanaged(f32).empty;
     errdefer deepstack.deinit(allocator);
     const vision_trace_layer = if (collect_preprocess_evidence)
@@ -1151,15 +1263,20 @@ fn encodeSingleImage(
                 return zig017_err;
             });
             defer cb.free(feature);
-            const host = (cb.toFloat32(feature, allocator) catch |zig017_err| {
-                zig017_return_error = zig017_err;
-                return zig017_err;
-            });
-            defer allocator.free(host);
-            (deepstack.appendSlice(allocator, host) catch |zig017_err| {
-                zig017_return_error = zig017_err;
-                return zig017_err;
-            });
+            if (keep_device) {
+                try device_deepstack.ensureUnusedCapacity(allocator, 1);
+                device_deepstack.appendAssumeCapacity(try retainFeature(cb, feature, geometry.tokenCount(), cfg.text_hidden));
+            } else {
+                const host = (cb.toFloat32(feature, allocator) catch |zig017_err| {
+                    zig017_return_error = zig017_err;
+                    return zig017_err;
+                });
+                defer allocator.free(host);
+                (deepstack.appendSlice(allocator, host) catch |zig017_err| {
+                    zig017_return_error = zig017_err;
+                    return zig017_err;
+                });
+            }
             if (profile) deepstack_ns +|= monotonicNowNs() -| tap_started_at;
             next_tap += 1;
         }
@@ -1194,7 +1311,7 @@ fn encodeSingleImage(
     cb.free(hidden);
     hidden = projected;
     failed_stage = "final_download";
-    const embeddings = (cb.toFloat32(projected, allocator) catch |zig017_err| {
+    const embeddings = if (keep_device) try allocator.alloc(f32, 0) else (cb.toFloat32(projected, allocator) catch |zig017_err| {
         zig017_return_error = zig017_err;
         return zig017_err;
     });
@@ -1222,7 +1339,12 @@ fn encodeSingleImage(
             },
         );
     }
+    const device_embeddings = if (keep_device) try retainFeature(cb, projected, geometry.tokenCount(), cfg.text_hidden) else null;
+    errdefer if (device_embeddings) |tensor| cb.free(tensor);
     return .{
+        .device_backend = if (keep_device) cb.* else null,
+        .device_embeddings = device_embeddings,
+        .device_deepstack = try device_deepstack.toOwnedSlice(allocator),
         .embeddings = embeddings,
         .deepstack = owned_deepstack,
         .tokens = geometry.tokenCount(),
@@ -1680,11 +1802,16 @@ fn visionPositions(allocator: std.mem.Allocator, geometry: Geometry, merge: usiz
 
 fn assembleVisualPromptTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, base: CT, visual: []const f32, mask: []const bool, dim: usize, scale: f32) !CT {
     if (dim == 0 or visual.len % dim != 0) return error.InvalidTensorShape;
-    const scaled = try cb.multiplyScalar(base, scale) orelse return error.UnsupportedResidentQwenVision;
-    defer cb.free(scaled);
     const images = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(visual, &.{ @intCast(visual.len / dim), @intCast(dim) }));
     defer cb.free(images);
-    const source = try cb.concatRows2D(allocator, scaled, images, mask.len, visual.len / dim, dim);
+    return assembleVisualPromptDeviceTensor(cb, allocator, base, images, visual.len / dim, mask, dim, scale);
+}
+
+fn assembleVisualPromptDeviceTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, base: CT, images: CT, visual_rows: usize, mask: []const bool, dim: usize, scale: f32) !CT {
+    if (dim == 0) return error.InvalidTensorShape;
+    const scaled = try cb.multiplyScalar(base, scale) orelse return error.UnsupportedResidentQwenVision;
+    defer cb.free(scaled);
+    const source = try cb.concatRows2D(allocator, scaled, images, mask.len, visual_rows, dim);
     defer cb.free(source);
     const ids = try allocator.alloc(u32, mask.len);
     defer allocator.free(ids);
@@ -1693,7 +1820,7 @@ fn assembleVisualPromptTensor(cb: *const ComputeBackend, allocator: std.mem.Allo
         ids[row] = @intCast(if (is_visual) mask.len + visual_row else row);
         if (is_visual) visual_row += 1;
     }
-    if (visual_row != visual.len / dim) return error.ImageTokenLengthMismatch;
+    if (visual_row != visual_rows) return error.ImageTokenLengthMismatch;
     return try cb.takeRows(source, ids, mask.len, dim) orelse error.UnsupportedResidentQwenVision;
 }
 
@@ -2265,4 +2392,32 @@ test "media residency Qwen3 VL positions and prompt Metal parity" {
 test "media residency Qwen3 VL positions and prompt CUDA parity" {
     const fixture = @import("../ops/media_residency_test.zig");
     try fixture.onCuda(fixture.noWeights, checkQwen3Residency);
+}
+
+fn checkResidentFeatureHandoff(cb: ComputeBackend, _: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const fixture = @import("../ops/media_residency_test.zig");
+    const first = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 10, 11 }, &.{ 1, 2 }));
+    const retained = try retainFeature(&cb, first, 1, 2);
+    defer cb.free(retained);
+    cb.free(first); // The projected image can die before its prompt consumer.
+    const second = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 20, 21, 30, 31 }, &.{ 2, 2 }));
+    defer cb.free(second);
+    const base = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 }, &.{ 5, 2 }));
+    defer cb.free(base);
+    const before = fixture.Transfers.snapshot(cb);
+    const joined = try appendFeature(&cb, a, retained, second, 1, 2, 2);
+    defer cb.free(joined);
+    const prompt = try assembleVisualPromptDeviceTensor(&cb, a, base, joined, 3, &.{ false, true, false, true, true }, 2, 2);
+    defer cb.free(prompt);
+    try before.expectUnchanged(cb);
+    const values = try cb.toFloat32(prompt, a);
+    defer a.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 2, 4, 10, 11, 10, 12, 20, 21, 30, 31 }, values);
+    try std.testing.expectError(error.ImageTokenLengthMismatch, assembleVisualPromptDeviceTensor(&cb, a, base, joined, 3, &.{ false, true, false, false, true }, 2, 2));
+}
+
+test "Qwen3-VL resident feature handoff retains ownership and multi-image order" {
+    const fixture = @import("../ops/media_residency_test.zig");
+    try fixture.onMetal(fixture.noWeights, checkResidentFeatureHandoff);
 }

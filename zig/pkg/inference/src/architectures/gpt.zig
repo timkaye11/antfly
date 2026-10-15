@@ -618,6 +618,7 @@ pub const DecodeContext = struct {
     /// on cached one-token decode steps.
     qwen3vl_visual_mask: ?[]const bool = null,
     qwen3vl_deepstack_embeddings: ?[]const f32 = null,
+    qwen3vl_device_deepstack: ?[]const CT = null,
     qwen3vl_deepstack_layer_count: usize = 0,
 
     pub fn usesPagedKv(self: DecodeContext) bool {
@@ -7436,11 +7437,11 @@ fn applyQwen3VlDeepstack(
     if (config.family != .qwen3_vl) return null;
     const dc = decode_context orelse return null;
     const mask = dc.qwen3vl_visual_mask orelse {
-        if (dc.qwen3vl_deepstack_embeddings != null or dc.qwen3vl_deepstack_layer_count != 0)
+        if (dc.qwen3vl_deepstack_embeddings != null or dc.qwen3vl_device_deepstack != null or dc.qwen3vl_deepstack_layer_count != 0)
             return error.InvalidDeepstackContext;
         return null;
     };
-    const features = dc.qwen3vl_deepstack_embeddings orelse return error.InvalidDeepstackContext;
+
     if (isDecodeStep(decode_context)) return error.DeepstackProvidedDuringDecode;
     if (mask.len != total_rows or dc.qwen3vl_deepstack_layer_count == 0 or
         dc.qwen3vl_deepstack_layer_count > @as(usize, config.vision_deepstack_visual_indexes_len))
@@ -7458,6 +7459,33 @@ fn applyQwen3VlDeepstack(
     const feature_stride = std.math.mul(usize, visual_rows, hidden_size) catch return error.InvalidDeepstackContext;
     const expected = std.math.mul(usize, feature_stride, dc.qwen3vl_deepstack_layer_count) catch
         return error.InvalidDeepstackContext;
+    if (dc.qwen3vl_device_deepstack) |device_features| {
+        if (device_features.len != dc.qwen3vl_deepstack_layer_count) return error.InvalidDeepstackContext;
+        const feature = device_features[layer];
+        if (!(try cb.tensorShapeMatches(feature, &.{ @intCast(visual_rows), @intCast(hidden_size) }) orelse false))
+            return error.InvalidDeepstackContext;
+        // Preserve finite-value rejection without downloading the feature payload.
+        const summary = try cb.residentTrainingValidate(&.{.{ .tensor = feature, .elem_count = feature_stride }}, .{ .max_tensors = 1, .max_total_elements = feature_stride });
+        if (!summary.finite) return error.NonFiniteDeepstackFeature;
+        const zeros = try allocator.alloc(f32, hidden_size);
+        defer allocator.free(zeros);
+        @memset(zeros, 0);
+        const zero = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(zeros, &.{ 1, @intCast(hidden_size) }));
+        defer cb.free(zero);
+        const source = try cb.concatRows2D(allocator, zero, feature, 1, visual_rows, hidden_size);
+        defer cb.free(source);
+        const ids = try allocator.alloc(u32, total_rows);
+        defer allocator.free(ids);
+        var visual_index: u32 = 0;
+        for (mask, ids) |is_visual, *id| {
+            if (is_visual) visual_index += 1;
+            id.* = if (is_visual) visual_index else 0;
+        }
+        const update = try cb.takeRows(source, ids, total_rows, hidden_size) orelse return error.UnsupportedResidentQwenVision;
+        defer cb.free(update);
+        return cb.add(hidden, update);
+    }
+    const features = dc.qwen3vl_deepstack_embeddings orelse return error.InvalidDeepstackContext;
     if (features.len != expected) return error.InvalidDeepstackContext;
     const dense_len = std.math.mul(usize, total_rows, hidden_size) catch return error.InvalidDeepstackContext;
     const dense = try allocator.alloc(f32, dense_len);
@@ -12505,4 +12533,34 @@ pub fn getLmHeadWeight(cb: *const ComputeBackend, config: Config) !CT {
         return try getEmbeddingWeight(cb, config);
     }
     return cb.getWeight("lm_head.weight") catch try getEmbeddingWeight(cb, config);
+}
+
+fn checkQwenResidentDeepstack(cb: ComputeBackend, _: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const fixture = @import("../ops/media_residency_test.zig");
+    const hidden = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 1, 2, 10, 20, 100, 200 }, &.{ 3, 2 }));
+    defer cb.free(hidden);
+    const feature = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 0.5, -1.0 }, &.{ 1, 2 }));
+    defer cb.free(feature);
+    const config = Config{ .family = .qwen3_vl, .hidden_size = 2, .vision_deepstack_visual_indexes_len = 1 };
+    var dc = DecodeContext{ .total_sequence_len = 3, .query_sequence_len = 3, .kv_sequence_len = 3, .qwen3vl_visual_mask = &.{ false, true, false }, .qwen3vl_device_deepstack = &.{feature}, .qwen3vl_deepstack_layer_count = 1 };
+    const before = fixture.Transfers.snapshot(cb);
+    const result = (try applyQwen3VlDeepstack(&cb, a, config, hidden, 3, 0, &dc)).?;
+    defer cb.free(result);
+    try before.expectUnchanged(cb); // Validation reads bounded scalars, not tensor mirrors.
+    const values = try cb.toFloat32(result, a);
+    defer a.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 10.5, 19, 100, 200 }, values);
+    dc.qwen3vl_visual_mask = &.{ true, true, false };
+    try std.testing.expectError(error.InvalidDeepstackContext, applyQwen3VlDeepstack(&cb, a, config, hidden, 3, 0, &dc));
+    dc.qwen3vl_visual_mask = &.{ false, true, false };
+    const bad = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ std.math.nan(f32), 1 }, &.{ 1, 2 }));
+    defer cb.free(bad);
+    dc.qwen3vl_device_deepstack = &.{bad};
+    try std.testing.expectError(error.NonFiniteDeepstackFeature, applyQwen3VlDeepstack(&cb, a, config, hidden, 3, 0, &dc));
+}
+
+test "Qwen3-VL resident DeepStack preserves masked addition and finite checks" {
+    const fixture = @import("../ops/media_residency_test.zig");
+    try fixture.onMetal(fixture.noWeights, checkQwenResidentDeepstack);
 }

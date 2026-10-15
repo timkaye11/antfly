@@ -164,6 +164,48 @@ A complete opt-in qualification profile enables all of the above together;
 qualification and performance reports must record the full environment and
 assert the expected dispatch/success counts and zero fallbacks.
 
+### Profiling residency and synchronization
+
+Set `TERMITE_QWEN3VL_PROFILE=1` together with
+`TERMITE_SERVER_GENERATE_TIMING=1` on the inference server. In addition to the
+projector's per-stage timings, `qwen3vl_metal_phase` reports counter deltas for
+multimodal preparation, runtime preparation, prefill, and decode. It includes
+Metal frame submissions, frame wait/GPU time, tensor host-mirror download
+bytes, device-tensor host accesses, and current runtime/quantized-weight
+storage sizes. The snapshots add no GPU fences, but share backend counters;
+serialize requests when attributing counters to a particular image. Timings
+and counters cover different scopes and must not be added together.
+
+Metal generation retains the final image embeddings and all DeepStack taps
+as owned device tensors through prompt assembly and decoder injection. The
+handoff retains buffer references across projector teardown; multi-image
+concatenation and visual-row gathering stay on-device. DeepStack finite-value
+validation reads only bounded scalar summaries. Admission includes retained
+feature buffers and temporary concatenation overlap. Set
+`TERMITE_QWEN3VL_DISABLE_RESIDENT_FEATURES=1` to restore the host handoff.
+Qualification exports, reranking, and other backends retain the host-output
+contract.
+
+This is not end-to-end residency: image decoding and preprocessing still use
+the CPU, and standard paged prefill maintains host K/V shadows for cache
+rebuilding. Greedy decode can avoid large tensor downloads while still
+synchronizing the CPU with the GPU many times per token; token-result and
+validation-summary reads are not all counted by the tensor host-mirror
+counters.
+
+For a serialized experiment, the existing opt-in
+`TERMITE_METAL_ENABLE_ACTIVE_PAGED_SLOT_ATTENTION_DEFERRED=1` keeps supported
+paged attention on the active frame when producer and consumer use the same
+Metal runtime. The ordinary path flushes after attention. On a local M4 test
+with the 2B Q4_K_M/Q8_0 bundle and a 1280x960 image, the opt-in reduced decode
+from 29 frame submissions per token to one while preserving both 61-token
+and 217-token captions. This is diagnostic evidence, not general model or
+concurrency qualification: the server used ReleaseSmall on a host with existing swap.
+Check exact output, frame counts, memory pressure, and repeated timings before
+promoting it to a default. The matching disable flag restores the synchronous
+path. This setting does not remove the prefill K/V host copies and
+does not require the experimental prepared-prefill flags above.
+
 ## Local qualification workflow
 
 `scripts/qwen3vl/requirements-qwen3vl-oracle.txt` freezes the independent
