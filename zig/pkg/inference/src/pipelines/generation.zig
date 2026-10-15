@@ -451,7 +451,31 @@ pub fn kvPoolConfig(
         .num_kv_heads = config.maxKvHeads(),
         .head_dim = config.maxHeadDim(),
         .sliding_window_size = config.kvPoolSlidingWindowSize(force_sliding_trim),
+        // Qwen's ordinary Metal serving path uses device KV plus retained
+        // prefill tensors. Keep host storage for other backends/formats and
+        // explicit rollback/debug configurations.
+        .store_cpu_bytes = !(build_options.enable_metal and backend == .metal and config.isQwen3Vl() and
+            (dtype == .f16 or dtype == .f32) and
+            !platform.env.getenvBool("TERMITE_METAL_DISABLE_RESIDENT_PREFILL_KV_SHADOW") and
+            !platform.env.getenvBool("TERMITE_METAL_DISABLE_DEVICE_KV_WRITE_HOOK")),
     };
+}
+
+test "Qwen3-VL KV pools retain host fallback outside qualified Metal formats" {
+    const qwen = gpt_mod.Config{ .family = .qwen3_vl, .num_hidden_layers = 28, .num_key_value_heads = 8, .attention_head_dim = 128 };
+    if (build_options.enable_metal and
+        !platform.env.getenvBool("TERMITE_METAL_DISABLE_RESIDENT_PREFILL_KV_SHADOW") and
+        !platform.env.getenvBool("TERMITE_METAL_DISABLE_DEVICE_KV_WRITE_HOOK"))
+    {
+        try std.testing.expect(!kvPoolConfig(.metal, .f16, qwen, false).store_cpu_bytes);
+        try std.testing.expect(!kvPoolConfig(.metal, .f32, qwen, false).store_cpu_bytes);
+    }
+    try std.testing.expect(kvPoolConfig(.native, .f32, qwen, false).store_cpu_bytes);
+    try std.testing.expect(kvPoolConfig(.cuda, .f16, qwen, false).store_cpu_bytes);
+    try std.testing.expect(kvPoolConfig(.metal, .bf16, qwen, false).store_cpu_bytes);
+    var ordinary = qwen;
+    ordinary.family = .qwen3;
+    try std.testing.expect(kvPoolConfig(.metal, .f16, ordinary, false).store_cpu_bytes);
 }
 
 /// Parsed chat template for rendering messages via Jinja2.

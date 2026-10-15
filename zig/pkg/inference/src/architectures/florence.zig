@@ -676,6 +676,16 @@ pub fn encoderForwardTensor(
     try control_cb.checkExecutionControl();
     const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
     const profile = readProfileEnabled();
+    const transfers_before = cb.debugTimingSnapshot().provider;
+    defer if (profile and cb.kind() == .metal) {
+        const after = cb.debugTimingSnapshot().provider;
+        std.log.info("florence_metal_phase: phase=encoder batch={d} tensor_download_bytes={d} tensor_device_readbacks={d} frame_submits={d}", .{
+            batch,
+            after.metal_tensor_host_mirror_download_bytes -| transfers_before.metal_tensor_host_mirror_download_bytes,
+            after.metal_tensor_to_host_device_calls -| transfers_before.metal_tensor_to_host_device_calls,
+            after.decoder_runtime_frame_submits -| transfers_before.decoder_runtime_frame_submits,
+        });
+    };
     if (debug_cuda_session) std.log.info("florence: encoder forward start batch={d} prompt_seq={d}", .{ batch, prompt_seq_len });
     const vision_start = nowNs();
     if (try visionEncoderForwardTensorTail(control_cb, allocator, config, pixel_values, batch)) |image_tensor| {
@@ -1601,8 +1611,8 @@ fn visionEncoderForwardTensorTail(
 }
 
 fn useDeviceVisionTail(cb: *const ComputeBackend, config: Config, batch: usize) bool {
-    return cb.kind() == .cuda and
-        batch == 1 and
+    return (cb.kind() == .metal or (cb.kind() == .cuda and batch == 1)) and
+        batch > 0 and
         !florenceDeviceVisionTailDisabled() and
         config.image_feature_source_count == 2 and
         config.image_feature_sources[0] == .spatial_avg_pool and
@@ -1627,16 +1637,21 @@ fn finishVisionTailTensor(
     const concat_start = nowNs();
     const temporal_w = tryOptionalWeight(cb, "visual_temporal_embed.pos_idx_to_embed") catch null;
 
-    const sourced = (try cb.florenceVisionTailSources(
-        tokens,
-        try cb.getWeight("image_pos_embed.row_embeddings.weight"),
-        try cb.getWeight("image_pos_embed.column_embeddings.weight"),
-        temporal_w,
-        batch,
-        height,
-        width,
-        vision_dim,
-    )) orelse return null;
+    var frame_active = try beginFlorenceMetalFrame(cb, .prefill);
+    errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
+    const sourced = if (cb.kind() == .metal)
+        try visionTailSourcesTensor(cb, allocator, tokens, batch, height, width, vision_dim)
+    else
+        (try cb.florenceVisionTailSources(
+            tokens,
+            try cb.getWeight("image_pos_embed.row_embeddings.weight"),
+            try cb.getWeight("image_pos_embed.column_embeddings.weight"),
+            temporal_w,
+            batch,
+            height,
+            width,
+            vision_dim,
+        )) orelse return null;
     var sourced_owned = true;
     errdefer if (sourced_owned) cb.free(sourced);
     if (profile) logFlorenceProfile("vision_device_tail_sources", concat_start);
@@ -1667,7 +1682,59 @@ fn finishVisionTailTensor(
     if (profile) logFlorenceProfile("vision_image_proj_norm", norm_start);
     if (debug_cuda_session) std.log.info("florence: image proj norm done", .{});
 
+    errdefer cb.free(normed);
+    if (frame_active) {
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        frame_active = false;
+    }
     return .{ .features = normed, .seq_len = token_count + 1 };
+}
+
+/// Compose existing resident gather, concat, add and reduction primitives.
+/// Only small position indices live on the CPU; image feature payloads never do.
+fn visionTailSourcesTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    tokens: CT,
+    batch: usize,
+    height: usize,
+    width: usize,
+    dim: usize,
+) !CT {
+    if (batch == 0 or height == 0 or width == 0 or dim < 2) return error.InvalidInputShape;
+    const count = try std.math.mul(usize, height, width);
+    const rows = try std.math.mul(usize, batch, count);
+    const row_ids = try allocator.alloc(i64, rows);
+    defer allocator.free(row_ids);
+    const col_ids = try allocator.alloc(i64, rows);
+    defer allocator.free(col_ids);
+    for (0..rows) |i| {
+        row_ids[i] = @intCast((i % count) / width);
+        col_ids[i] = @intCast(i % width);
+    }
+    const row_dim = dim / 2;
+    const col_dim = dim - row_dim;
+    const row = try cb.embeddingLookup(try cb.getWeight("image_pos_embed.row_embeddings.weight"), row_ids, rows, row_dim);
+    defer cb.free(row);
+    const col = try cb.embeddingLookup(try cb.getWeight("image_pos_embed.column_embeddings.weight"), col_ids, rows, col_dim);
+    defer cb.free(col);
+    const pos = try cb.concat(col, row, rows, col_dim, row_dim);
+    defer cb.free(pos);
+    const positioned = try cb.add(tokens, pos);
+    defer cb.free(positioned);
+    const temporal_weight = try tryOptionalWeight(cb, "visual_temporal_embed.pos_idx_to_embed");
+    const temporal = if (temporal_weight) |weight| try cb.embeddingLookup(weight, &.{0}, 1, dim) else null;
+    defer if (temporal) |value| cb.free(value);
+    const features = if (temporal) |value| try cb.add(positioned, value) else try cb.sliceRows2D(allocator, positioned, 0, rows, dim);
+    defer cb.free(features);
+    const shape = [_]i64{ @intCast(batch), @intCast(count), @intCast(dim) };
+    const feature_grid = try cb.primReshape(features, &shape);
+    defer cb.free(feature_grid);
+    const pooled = try cb.primReduceMean(feature_grid, &.{1}, &shape);
+    defer cb.free(pooled);
+    const combined = try cb.primConcatPrim(pooled, feature_grid, 1, &.{ @intCast(batch), 1, @intCast(dim) }, &shape);
+    defer cb.free(combined);
+    return cb.primReshape(combined, &.{ @intCast(batch * (count + 1)), @intCast(dim) });
 }
 
 fn projectImageFeaturesTensor(
@@ -1679,6 +1746,17 @@ fn projectImageFeaturesTensor(
     config: Config,
 ) !CT {
     const proj_weight = try cb.getWeight("image_projection");
+    if (cb.kind() == .metal) {
+        // Gather the immutable [vision, output] table on-device. This also
+        // converts GGUF F16/quantized weights through the shared GPU lookup,
+        // without downloading a transpose to prepare a dynamic linear slot.
+        const ids = try allocator.alloc(i64, vision_dim);
+        defer allocator.free(ids);
+        for (ids, 0..) |*id, i| id.* = @intCast(i);
+        const dense_weight = try cb.embeddingLookup(proj_weight, ids, vision_dim, config.projection_dim);
+        defer cb.free(dense_weight);
+        return cb.primDotGeneral(input, dense_weight, &.{ @intCast(rows), @intCast(vision_dim) }, &.{ @intCast(vision_dim), @intCast(config.projection_dim) }, &.{1}, &.{0}, &.{}, &.{});
+    }
     if (try cb.florenceProjectImageFeatures(input, proj_weight, rows, vision_dim, config.projection_dim)) |projected| {
         return projected;
     }
@@ -2734,15 +2812,18 @@ fn applyEncoderImagePromptEmbeddingsTensor(
     prompt_input_ids: []const i64,
     prompt_seq_len: usize,
 ) !CT {
-    if (batch != 1) return error.UnsupportedShape;
+    if (batch == 0 or prompt_input_ids.len != batch * prompt_seq_len) return error.InvalidInputShape;
     const d_model: usize = config.d_model;
     const total_seq = image.seq_len + prompt_seq_len;
 
     const merged = if (prompt_seq_len > 0) blk: {
         const prompt_embeddings = try cb.embeddingLookup(try promptEmbedWeight(cb), prompt_input_ids, batch * prompt_seq_len, d_model);
         defer cb.free(prompt_embeddings);
-        break :blk try cb.concatRows2D(allocator, image.features, prompt_embeddings, image.seq_len, prompt_seq_len, d_model);
-    } else try cb.sliceRows2D(allocator, image.features, 0, image.seq_len, d_model);
+        if (batch == 1) break :blk try cb.concatRows2D(allocator, image.features, prompt_embeddings, image.seq_len, prompt_seq_len, d_model);
+        const combined = try cb.primConcatPrim(image.features, prompt_embeddings, 1, &.{ @intCast(batch), @intCast(image.seq_len), @intCast(d_model) }, &.{ @intCast(batch), @intCast(prompt_seq_len), @intCast(d_model) });
+        defer cb.free(combined);
+        break :blk try cb.primReshape(combined, &.{ @intCast(batch * total_seq), @intCast(d_model) });
+    } else try cb.sliceRows2D(allocator, image.features, 0, batch * image.seq_len, d_model);
 
     return applyEncoderEmbeddingsTensor(cb, allocator, merged, config, batch, total_seq);
 }
@@ -4109,4 +4190,101 @@ fn nsToMs(ns: u64) f64 {
 
 fn fmtAlloc(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) ![]u8 {
     return std.fmt.allocPrint(allocator, fmt, args);
+}
+
+fn populateResidentVisionTailTest(store: *@import("../ops/native_compute.zig").WeightStore) !void {
+    const put = @import("../ops/media_residency_test.zig").putWeight;
+    try put(store, "image_pos_embed.row_embeddings.weight", &.{ 4, 3 }, null);
+    try put(store, "image_pos_embed.column_embeddings.weight", &.{ 4, 4 }, null);
+    try put(store, "visual_temporal_embed.pos_idx_to_embed", &.{ 1, 7 }, null);
+    try put(store, "image_projection", &.{ 7, 4 }, null);
+    try put(store, "image_proj_norm.weight", &.{4}, 1);
+    try put(store, "image_proj_norm.bias", &.{4}, 0);
+    try put(store, "language_model.model.shared.weight", &.{ 8, 4 }, null);
+    try put(store, "language_model.model.encoder.embed_positions.weight", &.{ 32, 4 }, null);
+    try put(store, "language_model.model.encoder.layernorm_embedding.weight", &.{4}, 1);
+    try put(store, "language_model.model.encoder.layernorm_embedding.bias", &.{4}, 0);
+}
+
+fn checkResidentVisionTail(cb: ComputeBackend, reference: ComputeBackend) !void {
+    const allocator = std.testing.allocator;
+    const media = @import("../ops/media_residency_test.zig");
+    var test_phase: []const u8 = "sources";
+    errdefer std.debug.print("Florence resident test failed in {s}\n", .{test_phase});
+    for ([_]usize{ 1, 2 }) |batch| {
+        const height = 2;
+        const width = 3;
+        const dim = 7;
+        const count = height * width;
+        const data = try allocator.alloc(f32, batch * count * dim);
+        defer allocator.free(data);
+        for (data, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 31)) * 0.07 - 1;
+        const tokens = try cb.fromFloat32Shape(data, &.{ @intCast(batch * count), dim });
+        defer cb.free(tokens);
+        const host = try allocator.dupe(f32, data);
+        defer allocator.free(host);
+        try add2dPositionalEmbedding(&reference, allocator, host, batch, count, dim, height, width);
+        try addTemporalEmbedding(&reference, allocator, host, batch, count, dim);
+        const config = Config{ .dim_embed = .{ 2, 2, 2, dim }, .projection_dim = 4, .d_model = 4 };
+        const expected_sources = try imageFeatureSourceConcat(allocator, config, host, batch, count, dim);
+        defer allocator.free(expected_sources.data);
+        var frame_active = try beginFlorenceMetalFrame(&cb, .prefill);
+        errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
+        const before = media.Transfers.snapshot(cb);
+        const sources = try visionTailSourcesTensor(&cb, allocator, tokens, batch, height, width, dim);
+        defer cb.free(sources);
+        if (frame_active) {
+            try cb.decoderRuntimeSubmitAndWaitFrame();
+            frame_active = false;
+        }
+        try before.expectUnchanged(cb);
+        const actual = try cb.toFloat32(sources, allocator);
+        defer allocator.free(actual);
+        try std.testing.expectEqual(expected_sources.data.len, actual.len);
+        for (expected_sources.data, actual) |a, b| try std.testing.expectApproxEqAbs(a, b, 2e-6);
+
+        test_phase = "projection";
+        const tail_before = media.Transfers.snapshot(cb);
+        const tail = (try finishVisionTailTensor(&cb, allocator, config, tokens, batch, height, width)) orelse return error.MissingInputs;
+        defer cb.free(tail.features);
+        try tail_before.expectUnchanged(cb);
+        const projected = try projectImageFeaturesData(&reference, allocator, expected_sources.data, batch * (count + 1), dim, config);
+        defer allocator.free(projected);
+        const expected = try backendLayerNormData(&reference, allocator, projected, batch * (count + 1), 4, try reference.getWeight("image_proj_norm.weight"), try reference.getWeight("image_proj_norm.bias"), 1e-5);
+        defer allocator.free(expected);
+        const tail_host = try cb.toFloat32(tail.features, allocator);
+        defer allocator.free(tail_host);
+        for (expected, tail_host) |a, b| try std.testing.expectApproxEqAbs(a, b, 2e-4);
+
+        for ([_]usize{ 0, 2 }) |prompt_len| {
+            const ids = try allocator.alloc(i64, batch * prompt_len);
+            defer allocator.free(ids);
+            for (ids, 0..) |*id, i| id.* = @intCast(i + 1);
+            test_phase = "embeddings";
+            const embeddings_before = media.Transfers.snapshot(cb);
+            const embedded = try applyEncoderImagePromptEmbeddingsTensor(&cb, allocator, tail, config, batch, ids, prompt_len);
+            defer cb.free(embedded);
+            try embeddings_before.expectUnchanged(cb);
+            const merged = try allocator.alloc(f32, batch * (count + 1 + prompt_len) * 4);
+            defer allocator.free(merged);
+            const prompt = if (ids.len > 0) try tokenEmbeddingsData(&reference, allocator, try promptEmbedWeight(&reference), ids, ids.len, 4) else try allocator.alloc(f32, 0);
+            defer allocator.free(prompt);
+            for (0..batch) |b| {
+                const dst = b * (count + 1 + prompt_len) * 4;
+                @memcpy(merged[dst..][0 .. (count + 1) * 4], expected[b * (count + 1) * 4 ..][0 .. (count + 1) * 4]);
+                @memcpy(merged[dst + (count + 1) * 4 ..][0 .. prompt_len * 4], prompt[b * prompt_len * 4 ..][0 .. prompt_len * 4]);
+            }
+            const expected_emb = try applyEncoderEmbeddings(&reference, allocator, merged, config, batch, count + 1 + prompt_len);
+            defer reference.free(expected_emb);
+            const expected_host = try reference.toFloat32(expected_emb, allocator);
+            defer allocator.free(expected_host);
+            const embedded_host = try cb.toFloat32(embedded, allocator);
+            defer allocator.free(embedded_host);
+            for (expected_host, embedded_host) |a, b| try std.testing.expectApproxEqAbs(a, b, 3e-4);
+        }
+    }
+}
+
+test "Florence resident Metal vision tail and batched prompt assembly match host" {
+    try @import("../ops/media_residency_test.zig").onMetal(populateResidentVisionTailTest, checkResidentVisionTail);
 }

@@ -194,6 +194,42 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     test_step.dependOn(&cuda_artifact_source_policy_check.step);
     test_step.dependOn(&run_quant_kernel_metal_runtime_check_tests.step);
     test_step.dependOn(&run_tests.step);
+    // A separate compile-time subset keeps Qwen residency qualification
+    // bounded without lowering the reservation of the full inference suite.
+    const qwen_metal_tests = b.addTest(.{
+        .name = "qwen3vl-metal-tests",
+        .max_rss = 9 * 1024 * 1024 * 1024,
+        .root_module = suite.tests.root_module,
+        .filters = &.{
+            "Qwen3-VL KV pools",
+            "Qwen3-VL resident",
+            "Qwen3-VL prompt",
+            "Qwen3-VL DeepStack",
+            "Qwen3-VL admission",
+            "Qwen3-VL projector cancellation",
+            "media residency Qwen3 VL positions and prompt Metal",
+            "metal active paged-slot",
+            "deferred paged-slot",
+            "metal_compute: resident prefill",
+            "metal_compute: metal kv geometric growth",
+            "metal_compute: paged decode attention matches native on metal device",
+        },
+        .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple },
+    });
+    const run_qwen_metal_tests = ctx.addRunArtifact(qwen_metal_tests);
+    run_qwen_metal_tests.setEnvironmentVariable("TERMITE_REQUIRE_METAL_TESTS", "1");
+    ctx.step("test-qwen3vl-metal", "Require Metal and validate Qwen3-VL resident ownership and attention").dependOn(&run_qwen_metal_tests.step);
+    const florence_metal_tests = b.addTest(.{
+        .name = "florence-metal-tests",
+        .max_rss = 9 * 1024 * 1024 * 1024,
+        .root_module = suite.tests.root_module,
+        .filters = &.{ "Florence", "florence", "metal_compute: non-last-axis reduce sum and mean stay resident" },
+        .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple },
+    });
+    const run_florence_metal_tests = ctx.addRunArtifact(florence_metal_tests);
+    run_florence_metal_tests.setEnvironmentVariable("TERMITE_REQUIRE_METAL_TESTS", "1");
+    run_florence_metal_tests.setEnvironmentVariable("TERMITE_FLORENCE2_METAL_REQUIRE_CONV3X3", "1");
+    ctx.step("test-florence-metal", "Validate Florence resident vision and decoder on Metal").dependOn(&run_florence_metal_tests.step);
     const laya_cuda_tests = b.addTest(.{
         .name = "laya-cuda-tests",
         .max_rss = 9 * 1024 * 1024 * 1024,

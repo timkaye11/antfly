@@ -206,7 +206,13 @@ def _validate_managed_install(
     receipt = load_json(receipt_path)
     if receipt.get("version") != 2:
         raise QualificationError("qualification requires a version-2 managed receipt")
-    if receipt.get("source") != expected_source:
+    source = receipt.get("source")
+    # Current receipts also record optional revision/format provenance. Keep
+    # exact owner/name/variant (and any caller-supplied pins) as the identity
+    # gate while retaining the complete source object in the evidence.
+    if not isinstance(source, dict) or any(
+        source.get(key) != value for key, value in expected_source.items()
+    ):
         raise QualificationError(
             f"managed source mismatch: expected {expected_source}, got {receipt.get('source')}"
         )
@@ -268,10 +274,15 @@ def _validate_managed_install(
             }
         )
 
+    # Serving may write hash memo sidecars beside receipted artifacts. Never
+    # trust their contents: the loop above independently hashes every artifact.
+    hash_memos = {f"{name}.antfly-sha256-cache" for name in seen}
     actual_files = {
         str(path.relative_to(root))
         for path in root.rglob("*")
-        if path.is_file() and path.name != RECEIPT_NAME
+        if path.is_file()
+        and path.name != RECEIPT_NAME
+        and str(path.relative_to(root)) not in hash_memos
     }
     if actual_files != seen:
         raise QualificationError(

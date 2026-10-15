@@ -8495,6 +8495,8 @@ pub fn applyPreparedAttention(
     decode_context: ?*const DecodeContext,
 ) !CT {
     var attention = attentionContext(seq_len, decode_context);
+    attention.allow_deferred_completion = config.isQwen3Vl();
+    attention.retain_prefill_kv_on_device = config.isQwen3Vl();
     attention.layer_index = kv_layer_index;
     attention.skip_kv_write = skip_kv_write;
     attention.sliding_window = if (config.layerUsesSlidingAttention(layer)) config.sliding_window else 0;
@@ -8617,6 +8619,8 @@ fn applyAttentionWithSink(
     decode_context: ?*const DecodeContext,
 ) !CT {
     var attention = attentionContext(seq_len, decode_context);
+    attention.allow_deferred_completion = config.isQwen3Vl();
+    attention.retain_prefill_kv_on_device = config.isQwen3Vl();
     attention.layer_index = kv_layer_index;
     attention.skip_kv_write = skip_kv_write;
     attention.sliding_window = if (config.layerUsesSlidingAttention(layer)) config.sliding_window else 0;

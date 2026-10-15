@@ -2669,6 +2669,16 @@ pub fn estimateGptGenerationForKvPolicy(
             return error.ResourceLimitExceeded;
         kv_bytes = std.math.add(usize, kv_bytes, layer_bytes) catch
             return error.ResourceLimitExceeded;
+        // Qwen3-VL retains immutable FP32 prefill K/V operation outputs for
+        // lazy cache rebuilding, in addition to the packed device KV pages.
+        // Reserve the full prompt even when chunking retains a smaller span;
+        // the rollback path keeps this conservative admission envelope.
+        if (backend == .metal and config.family == .qwen3_vl) {
+            const shadow_bytes = checkedProduct(&.{ prompt_tokens, pool_kv_heads, pool_head_dim, 2, @sizeOf(f32) }) catch
+                return error.ResourceLimitExceeded;
+            kv_bytes = std.math.add(usize, kv_bytes, shadow_bytes) catch
+                return error.ResourceLimitExceeded;
+        }
     }
 
     const scratch_rows = @min(@max(prompt_tokens, 1), @max(prefill_chunk_size, 1));
@@ -3944,6 +3954,26 @@ test "run budget enforces combined host and backend total" {
     _ = try budget.tryReserveWeight(.host, 60);
     try std.testing.expectError(error.MemoryBudgetExceeded, budget.tryReserveWeight(.backend, 50));
     try std.testing.expectEqual(DenialLimit.combined_total, budget.last_denial.?.limit);
+}
+
+test "Qwen3-VL admission reserves resident prefill KV shadows" {
+    var cfg = gpt_mod.Config{
+        .family = .qwen3_vl,
+        .hidden_size = 2048,
+        .num_hidden_layers = 28,
+        .num_attention_heads = 16,
+        .num_key_value_heads = 8,
+        .attention_head_dim = 128,
+        .vocab_size = 151936,
+    };
+    const resident = try estimateGptGeneration(.metal, .f16, cfg, 540, 64, 128);
+    const native = try estimateGptGeneration(.native, .f16, cfg, 540, 64, 128);
+    cfg.family = .qwen3;
+    const ordinary = try estimateGptGeneration(.metal, .f16, cfg, 540, 64, 128);
+    try std.testing.expectEqual(@as(usize, 28 * 540 * 8 * 128 * 2 * 4), resident.kv_bytes - ordinary.kv_bytes);
+    try std.testing.expectEqual(native.kv_bytes, (try estimateGptGeneration(.native, .f16, cfg, 540, 64, 128)).kv_bytes);
+    var budget = RunBudget.init(.{ .kv_limit_bytes = resident.kv_bytes - 1 });
+    try std.testing.expectError(error.MemoryBudgetExceeded, budget.reserveEstimate(resident));
 }
 
 test "gpt generation estimate accounts for sliding window and page alignment" {

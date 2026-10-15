@@ -956,6 +956,11 @@ pub const AttentionContext = struct {
     kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null,
     kv_batch: ?[]const KvBatchView = null,
     layer_index: usize = 0,
+    /// The caller permits a qualified backend to defer attention completion
+    /// to its enclosing frame. Producers and consumers must share a runtime.
+    allow_deferred_completion: bool = false,
+    /// Admission includes the full FP32 prefill span retained for lazy rebuild.
+    retain_prefill_kv_on_device: bool = false,
     /// When true, skip writing K/V to the cache (shared KV layers read from a donor layer).
     skip_kv_write: bool = false,
     /// Optional attention-sink metadata for models that prepend per-head sinks

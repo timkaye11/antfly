@@ -44270,6 +44270,95 @@ test "metal native decoder runtime florence channel attention matches host" {
     }
 }
 
+test "metal native Florence tiled downsampling convolution matches host and stays resident" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const Shape = struct { batch: usize, height: usize, width: usize, ic: usize, oc: usize };
+    for ([_]Shape{
+        .{ .batch = 2, .height = 9, .width = 11, .ic = 17, .oc = 5 },
+        .{ .batch = 1, .height = 8, .width = 8, .ic = 96, .oc = 192 },
+        .{ .batch = 2, .height = 1, .width = 1, .ic = 16, .oc = 3 },
+        .{ .batch = 1, .height = 7, .width = 7, .ic = 3, .oc = 5 },
+    }) |shape| {
+        const oh = (shape.height + 1) / 2;
+        const ow = (shape.width + 1) / 2;
+        const data = try a.alloc(f32, shape.batch * shape.ic * shape.height * shape.width);
+        defer a.free(data);
+        const weights = try a.alloc(f32, shape.oc * shape.ic * 9);
+        defer a.free(weights);
+        const biases = try a.alloc(f32, shape.oc);
+        defer a.free(biases);
+        var prng = std.Random.DefaultPrng.init(42);
+        for (data) |*v| v.* = prng.random().float(f32) - 0.5;
+        for (weights) |*v| v.* = (prng.random().float(f32) - 0.5) * 0.1;
+        for (biases) |*v| v.* = prng.random().float(f32) - 0.5;
+        var input = try testDeviceTensorFromSlice(runtime, data, &.{ @intCast(shape.batch), @intCast(shape.ic), @intCast(shape.height), @intCast(shape.width) });
+        defer input.deinit();
+        var weight = try testDeviceTensorFromSlice(runtime, weights, &.{ @intCast(shape.oc), @intCast(shape.ic), 3, 3 });
+        defer weight.deinit();
+        var bias = try testDeviceTensorFromSlice(runtime, biases, &.{@intCast(shape.oc)});
+        defer bias.deinit();
+        const expected = try a.alloc(f32, shape.batch * shape.oc * oh * ow);
+        defer a.free(expected);
+        for ([_]bool{ false, true }) |with_bias| {
+            for (0..shape.batch) |b| for (0..shape.oc) |oc| for (0..oh) |y| {
+                for (0..ow) |x| {
+                    var sum: f32 = if (with_bias) biases[oc] else 0;
+                    for (0..shape.ic) |ic| for (0..3) |kh| {
+                        const iy = @as(isize, @intCast(y * 2 + kh)) - 1;
+                        if (iy < 0 or iy >= shape.height) continue;
+                        for (0..3) |kw| {
+                            const ix = @as(isize, @intCast(x * 2 + kw)) - 1;
+                            if (ix < 0 or ix >= shape.width) continue;
+                            sum += data[((b * shape.ic + ic) * shape.height + @as(usize, @intCast(iy))) * shape.width + @as(usize, @intCast(ix))] * weights[(oc * shape.ic + ic) * 9 + kh * 3 + kw];
+                        }
+                    };
+                    expected[((b * shape.oc + oc) * oh + y) * ow + x] = sum;
+                }
+            };
+            for ([_]bool{ false, true }) |framed| {
+                const before = metal_tensor.memoryStatsSnapshot();
+                if (framed) try beginFrame(runtime);
+                errdefer if (framed) cancelFrame(runtime) catch {};
+                var output = (try decoderRuntimeConv2dF32Device(&provider, .{
+                    .input = input,
+                    .weight = weight,
+                    .bias = if (with_bias) @as(?MetalTensor, bias) else null,
+                    .batch = shape.batch,
+                    .in_channels = shape.ic,
+                    .out_channels = shape.oc,
+                    .height = shape.height,
+                    .width = shape.width,
+                    .kernel_h = @as(usize, 3),
+                    .kernel_w = @as(usize, 3),
+                    .stride_h = @as(usize, 2),
+                    .stride_w = @as(usize, 2),
+                    .padding_h = @as(usize, 1),
+                    .padding_w = @as(usize, 1),
+                    .groups = @as(usize, 1),
+                })) orelse return error.UnexpectedNull;
+                defer output.deinit();
+                try std.testing.expect(output.isDevice());
+                if (framed) {
+                    try submitFrame(runtime);
+                    try waitFrame(runtime);
+                }
+                const after = metal_tensor.memoryStatsSnapshot();
+                try std.testing.expectEqual(before.host_mirror_download_bytes, after.host_mirror_download_bytes);
+                try std.testing.expectEqual(before.to_host_device_calls, after.to_host_device_calls);
+                const actual = try output.toHostSlice();
+                try std.testing.expectEqual(expected.len, actual.len);
+                for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-5);
+            }
+        }
+    }
+}
+
 test "metal native embeddinggemma2 BF16 and F32 shared slots preserve copies cancellation and rejected replacement" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;

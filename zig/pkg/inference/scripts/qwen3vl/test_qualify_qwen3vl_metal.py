@@ -74,12 +74,40 @@ class ManagedBundleTests(unittest.TestCase):
             )
             self.assertEqual(3, len(evidence["artifacts"]))
 
+    def test_source_provenance_does_not_change_pinned_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            self.make_bundle(root)
+            path = root / qualify.RECEIPT_NAME
+            receipt = json.loads(path.read_text())
+            receipt["source"].update(
+                requested_revision=None, resolved_revision=None, selected_format=None
+            )
+            write_json(path, receipt)
+            self.assertEqual(
+                receipt["source"], qualify.validate_managed_bundle(root)["source"]
+            )
+            receipt["source"]["variant"] = "different-quantization"
+            write_json(path, receipt)
+            with self.assertRaisesRegex(qualify.QualificationError, "source mismatch"):
+                qualify.validate_managed_bundle(root)
+
     def test_tamper_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             self.make_bundle(root)
             (root / "decoder.gguf").write_bytes(b"tampered")
             with self.assertRaisesRegex(qualify.QualificationError, "size mismatch"):
+                qualify.validate_managed_bundle(root)
+
+    def test_serving_hash_memos_are_ignored_but_artifacts_are_rehashed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            self.make_bundle(root)
+            (root / "decoder.gguf.antfly-sha256-cache").write_text("untrusted cache")
+            self.assertEqual(3, len(qualify.validate_managed_bundle(root)["artifacts"]))
+            (root / "decoder.gguf").write_bytes(b"decodEr")
+            with self.assertRaisesRegex(qualify.QualificationError, "SHA-256 mismatch"):
                 qualify.validate_managed_bundle(root)
 
     def test_unreceipted_file_fails_closed(self) -> None:

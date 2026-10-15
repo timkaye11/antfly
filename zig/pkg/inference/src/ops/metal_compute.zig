@@ -391,16 +391,16 @@ test "metal donated-slot on-frame attention defaults off" {
 }
 
 fn activePagedSlotAttentionDeferredPolicy(
-    a4b_runtime: bool,
+    qualified_runtime: bool,
     enable_requested: bool,
     disable_requested: bool,
 ) bool {
-    return !disable_requested and (a4b_runtime or enable_requested);
+    return !disable_requested and (qualified_runtime or enable_requested);
 }
 
-fn activePagedSlotAttentionDeferredEnabled(a4b_runtime: bool) bool {
+fn activePagedSlotAttentionDeferredEnabled(qualified_runtime: bool) bool {
     return activePagedSlotAttentionDeferredPolicy(
-        a4b_runtime,
+        qualified_runtime,
         getenvBool("TERMITE_METAL_ENABLE_ACTIVE_PAGED_SLOT_ATTENTION_DEFERRED"),
         getenvBool("TERMITE_METAL_DISABLE_ACTIVE_PAGED_SLOT_ATTENTION_DEFERRED"),
     );
@@ -17487,6 +17487,42 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         );
     }
 
+    /// Preserve the full prefill span for cache rebuilds without materializing
+    /// host mirrors. K/V are immutable operation outputs; retained device
+    /// references keep them alive after the layer's temporary tensors die.
+    /// Rebuild consumers may still request host rows lazily.
+    fn retainBackendKvLayerCache(
+        self: *MetalCompute,
+        key: BackendKvCacheKey,
+        k: MetalTensor,
+        v: MetalTensor,
+        tokens: usize,
+        position_offset: usize,
+        row_width: usize,
+        block_signature: u64,
+    ) !void {
+        const elements = std.math.mul(usize, tokens, row_width) catch return error.InvalidPagedKvShape;
+        if (elements == 0 or !k.isDevice() or !v.isDevice() or k.dtype != .f32 or v.dtype != .f32 or
+            k.elemCount() != elements or v.elemCount() != elements) return error.InvalidPagedKvShape;
+        var retained_k = try k.retainedCopy();
+        errdefer retained_k.deinit();
+        var retained_v = try v.retainedCopy();
+        errdefer retained_v.deinit();
+        // Allocate before replacing a live entry so failure preserves it.
+        const entry = try self.backend_kv_cache.getOrPut(self.allocator, key);
+        if (entry.found_existing) entry.value_ptr.deinit();
+        self.backend_kv_write_serial +%= 1;
+        entry.value_ptr.* = .{
+            .k = retained_k,
+            .v = retained_v,
+            .row_width = row_width,
+            .token_count = tokens,
+            .position_offset = position_offset,
+            .block_signature = block_signature,
+            .write_serial = self.backend_kv_write_serial,
+        };
+    }
+
     fn updateBackendKvLayerCache(
         self: *MetalCompute,
         key: BackendKvCacheKey,
@@ -18982,6 +19018,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     .layer_index = attention.layer_index,
                     .attention_sink = attention.attention_sink,
                     .skip_kv_write = attention.skip_kv_write,
+                    .allow_deferred_completion = attention.allow_deferred_completion,
+                    .retain_prefill_kv_on_device = attention.retain_prefill_kv_on_device,
                 } else blk: {
                     var item = attention;
                     item.kv_batch = null;
@@ -19079,7 +19117,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                                 .kv_position_offset = attention.kv_position_offset,
                                 .sliding_window = attention.sliding_window,
                             };
-                            if (activePagedSlotAttentionDeferredEnabled(self.data.a4b_inference != null)) {
+                            if (activePagedSlotAttentionDeferredEnabled(self.data.a4b_inference != null or attention.allow_deferred_completion)) {
                                 if (try metal_runtime.decoderRuntimeApplyPagedKvAttentionSlotOnActiveFrame(
                                     self.provider_impl,
                                     slot_request,
@@ -19347,7 +19385,21 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     attention.kv_sequence_len == attention.query_sequence_len and
                     attention.kv_cache != null and
                     attention.kv_storage != null;
-                if (!device_written or attention.kv_manager != null or shadow_device_prefill_for_rebuild) {
+                const retain_device_shadow = shadow_device_prefill_for_rebuild and
+                    attention.retain_prefill_kv_on_device and
+                    // The server carries a manager alongside device storage.
+                    // Storage is authoritative when present; only its explicit
+                    // CPU-shadow policy requires materializing host rows.
+                    !(try attentionKvSource(attention)).kv_storage.config.store_cpu_bytes and
+                    !getenvBool("TERMITE_METAL_DISABLE_RESIDENT_PREFILL_KV_SHADOW");
+                if (retain_device_shadow) {
+                    const source = try attentionKvSource(attention);
+                    try self.retainBackendKvLayerCache(.{
+                        .source_ptr_id = source.ptr_id,
+                        .sequence_id = attention.kv_cache.?.sequence_id,
+                        .layer_index = attention.layer_index,
+                    }, k_mt, v_mt, attention.kv_sequence_len, attention.kv_position_offset, h_kv, attentionBlockSignature(attention));
+                } else if (!device_written or attention.kv_manager != null or shadow_device_prefill_for_rebuild) {
                     const k_host_for_cache = try hostSliceForBuf(k_buf);
                     const v_host_for_cache = try hostSliceForBuf(v_buf);
                     if (!device_written or attention.kv_manager != null) {
@@ -34032,14 +34084,13 @@ test "metal_compute: metal kv geometric growth preserves f32 pages inside and ou
     try std.testing.expectEqualSlices(f32, native_rows.v, metal_rows.v);
 }
 
-test "metal_compute: paged decode attention matches native on metal device f32 cache across pages" {
+fn checkPagedDecodeDeviceParity(comptime head_dim: usize, comptime framed: bool) !void {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     const num_heads: usize = 4;
     const num_kv_heads: usize = 1;
-    const head_dim: usize = 16;
     const hidden_q = num_heads * head_dim;
     const hidden_kv = num_kv_heads * head_dim;
     const prior_tokens: usize = 10;
@@ -34181,6 +34232,48 @@ test "metal_compute: paged decode attention matches native on metal device f32 c
         .layer_index = 0,
     };
 
+    if (framed) {
+        var prefill_q: [prior_tokens * hidden_q]f32 = undefined;
+        for (0..prior_tokens) |row| @memcpy(prefill_q[row * hidden_q ..][0..hidden_q], &q_data);
+        const pq = try metal_cb.ensureDeviceResidentOwned(try metal_cb.fromFloat32Shape(&prefill_q, &.{ prior_tokens, hidden_q }));
+        defer metal_cb.free(pq);
+        const pk = try metal_cb.ensureDeviceResidentOwned(try metal_cb.fromFloat32Shape(&prior_k, &prior_shape));
+        defer metal_cb.free(pk);
+        const pv = try metal_cb.ensureDeviceResidentOwned(try metal_cb.fromFloat32Shape(&prior_v, &prior_shape));
+        defer metal_cb.free(pv);
+        var prefill = metal_attention;
+        prefill.mode = .paged_prefill;
+        prefill.total_sequence_len = prior_tokens;
+        prefill.query_sequence_len = prior_tokens;
+        prefill.kv_sequence_len = prior_tokens;
+        // Production generation carries both pointers. Device storage takes
+        // precedence over the manager, including the host-shadow decision.
+        prefill.kv_manager = &native_manager;
+        prefill.retain_prefill_kv_on_device = true;
+        const transfers = @import("media_residency_test.zig").Transfers.snapshot(metal_cb);
+        const result = try metal_cb.gqaPagedAttention(pq, pk, pv, null, prefill, 1, num_heads, num_kv_heads, head_dim);
+        defer metal_cb.free(result);
+        try transfers.expectUnchanged(metal_cb);
+        const nq = try native_cb.fromFloat32Shape(&prefill_q, &.{ prior_tokens, hidden_q });
+        defer native_cb.free(nq);
+        const nk = try native_cb.fromFloat32Shape(&prior_k, &prior_shape);
+        defer native_cb.free(nk);
+        const nv = try native_cb.fromFloat32Shape(&prior_v, &prior_shape);
+        defer native_cb.free(nv);
+        var reference = native_attention;
+        reference.mode = .paged_prefill;
+        reference.total_sequence_len = prior_tokens;
+        reference.query_sequence_len = prior_tokens;
+        reference.kv_sequence_len = prior_tokens;
+        const expected_ct = try native_cb.gqaPagedAttention(nq, nk, nv, null, reference, 1, num_heads, num_kv_heads, head_dim);
+        defer native_cb.free(expected_ct);
+        const expected = try native_cb.toFloat32(expected_ct, allocator);
+        defer allocator.free(expected);
+        const actual = try metal_cb.toFloat32(result, allocator);
+        defer allocator.free(actual);
+        for (expected, actual) |e, v| try std.testing.expectApproxEqAbs(e, v, 1e-4);
+    }
+
     const metal_out = try metal_cb.gqaPagedAttention(metal_q, metal_k, metal_v, null, metal_attention, 1, num_heads, num_kv_heads, head_dim);
     defer metal_cb.free(metal_out);
     const native_out = try native_cb.gqaPagedAttention(native_q, native_k, native_v, null, native_attention, 1, num_heads, num_kv_heads, head_dim);
@@ -34196,6 +34289,29 @@ test "metal_compute: paged decode attention matches native on metal device f32 c
         try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
     }
 
+    // Both policies must match native across a page boundary. The qualified
+    // path leaves work on the producer frame until its owner completes it.
+    if (framed) for ([_]bool{ false, true }) |deferred| {
+        const device_q = try metal_cb.ensureDeviceResidentOwned(try metal_cb.fromFloat32Shape(&q_data, &q_shape));
+        defer metal_cb.free(device_q);
+        const device_k = try metal_cb.ensureDeviceResidentOwned(try metal_cb.fromFloat32Shape(&suffix_k, &kv_shape));
+        defer metal_cb.free(device_k);
+        const device_v = try metal_cb.ensureDeviceResidentOwned(try metal_cb.fromFloat32Shape(&suffix_v, &kv_shape));
+        defer metal_cb.free(device_v);
+        var framed_attention = metal_attention;
+        framed_attention.allow_deferred_completion = deferred;
+        try std.testing.expect(try metal_cb.decoderRuntimeBeginFrame());
+        errdefer metal_cb.decoderRuntimeCancelFrame() catch {};
+        const before = metal_cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits;
+        const framed_result = try metal_cb.gqaPagedAttention(device_q, device_k, device_v, null, framed_attention, 1, num_heads, num_kv_heads, head_dim);
+        defer metal_cb.free(framed_result);
+        if (deferred) try std.testing.expectEqual(before, metal_cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits);
+        try metal_cb.decoderRuntimeSubmitAndWaitFrame();
+        const actual = try metal_cb.toFloat32(framed_result, allocator);
+        defer allocator.free(actual);
+        for (native_data, actual) |expected, value| try std.testing.expectApproxEqAbs(expected, value, 1e-4);
+    };
+
     try native_manager.writeLayerKvSuffix(native_seq, 0, total_tokens, 1, &suffix_k, &suffix_v);
     const metal_rows = try metal_storage.gatherLayerKv(allocator, metal_seq, 0, total_tokens);
     defer allocator.free(metal_rows.k);
@@ -34205,6 +34321,14 @@ test "metal_compute: paged decode attention matches native on metal device f32 c
     defer allocator.free(native_rows.v);
     try std.testing.expectEqualSlices(f32, native_rows.k, metal_rows.k);
     try std.testing.expectEqualSlices(f32, native_rows.v, metal_rows.v);
+}
+
+test "metal_compute: paged decode attention matches native on metal device f32 cache across pages" {
+    try checkPagedDecodeDeviceParity(16, false);
+}
+
+test "metal_compute: paged decode attention matches native on metal device deferred Qwen frames" {
+    try checkPagedDecodeDeviceParity(128, true);
 }
 
 test "metal_compute: paged decode attention matches native on Gemma qLen1 f32 cache shape" {
@@ -42696,4 +42820,40 @@ test "Metal OCR canonical quantized head frame matches singleton logits and supp
         try std.testing.expectEqual(before.frame_submit_count + 1, metal_runtime.runtimeMemorySnapshot(runtime).frame_submit_count);
         try std.testing.expect(!metal_runtime.hasActiveFrame(runtime));
     }
+}
+
+fn checkResidentPrefillShadow(cb: ops.ComputeBackend, _: ops.ComputeBackend) !void {
+    const fixture = @import("media_residency_test.zig");
+    const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+    const a = std.testing.allocator;
+    const key: MetalCompute.BackendKvCacheKey = .{ .source_ptr_id = 1, .sequence_id = 1, .layer_index = 0 };
+    const k = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 }));
+    const v = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 5, 6, 7, 8 }, &.{ 2, 2 }));
+    {
+        defer cb.free(k);
+        defer cb.free(v);
+        var km = try self.ownedDeviceMetalTensorFromCt(k);
+        defer km.deinit();
+        var vm = try self.ownedDeviceMetalTensorFromCt(v);
+        defer vm.deinit();
+        const before = fixture.Transfers.snapshot(cb);
+        try self.retainBackendKvLayerCache(key, km, vm, 2, 7, 2, 99);
+        try before.expectUnchanged(cb);
+        // Invalid replacement leaves the previous cache usable.
+        try std.testing.expectError(error.InvalidPagedKvShape, self.retainBackendKvLayerCache(key, km, vm, 3, 7, 2, 99));
+    }
+    const entry = self.backend_kv_cache.getPtr(key).?;
+    try std.testing.expect(MetalCompute.backendEntryMatches(entry, 2, 7, 2, 99));
+    try std.testing.expect(!MetalCompute.backendEntryMatches(entry, 2, 7, 2, 100));
+    const k_host = try a.dupe(f32, try entry.k.toHostSlice());
+    defer a.free(k_host);
+    const v_host = try a.dupe(f32, try entry.v.toHostSlice());
+    defer a.free(v_host);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, k_host);
+    try std.testing.expectEqualSlices(f32, &.{ 5, 6, 7, 8 }, v_host);
+}
+
+test "metal_compute: resident prefill shadow preserves ownership and lazy rebuild" {
+    const fixture = @import("media_residency_test.zig");
+    try fixture.onMetal(fixture.noWeights, checkResidentPrefillShadow);
 }

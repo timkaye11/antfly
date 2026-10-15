@@ -1159,6 +1159,7 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> conv1d_im2col_f32_pipeline;
     id<MTLComputePipelineState> layer_norm_add_sum_rows_pipeline;
     id<MTLComputePipelineState> conv2d_f32_pipeline;
+    id<MTLComputePipelineState> conv3x3_stride2_f32_pipeline;
     id<MTLComputePipelineState> layer_norm_pipeline;
     id<MTLComputePipelineState> layer_norm_rows_pipeline;
     id<MTLComputePipelineState> layer_norm_add_pipeline;
@@ -13150,6 +13151,36 @@ static NSString *termite_metal_shader_source(void) {
            "    uint total = p.batch * p.out_channels * p.out_h * p.out_w; if (gid >= total || p.groups == 0u) return; uint ow = gid % p.out_w; uint tmp0 = gid / p.out_w; uint oh = tmp0 % p.out_h; uint tmp1 = tmp0 / p.out_h; uint oc = tmp1 % p.out_channels; uint b = tmp1 / p.out_channels; uint oc_per_group = p.out_channels / p.groups; uint ic_per_group = p.in_channels / p.groups; uint group = oc / oc_per_group; uint ic_start = group * ic_per_group; float acc = p.has_bias != 0u ? bias[oc] : 0.0f;\n"
            "    for (uint local_ic = 0u; local_ic < ic_per_group; ++local_ic) { uint ic = ic_start + local_ic; for (uint kh = 0u; kh < p.kernel_h; ++kh) { int ih = int(oh * p.stride_h + kh) - int(p.padding_h); if (ih < 0 || uint(ih) >= p.height) continue; for (uint kw = 0u; kw < p.kernel_w; ++kw) { int iw = int(ow * p.stride_w + kw) - int(p.padding_w); if (iw < 0 || uint(iw) >= p.width) continue; uint in_idx = ((b * p.in_channels + ic) * p.height + uint(ih)) * p.width + uint(iw); uint w_idx = ((oc * ic_per_group + local_ic) * p.kernel_h + kh) * p.kernel_w + kw; acc += input[in_idx] * weight[w_idx]; } } }\n"
            "    output[gid] = acc;\n"
+           "}\n"
+           "kernel void termite_conv3x3_stride2_f32(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_conv2d_f32_params &p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    // Four adjacent output pixels share weights and index arithmetic. Keep the\n"
+           "    // original channel/kernel accumulation order and precise FP32 arithmetic.\n"
+           "    uint tiles = (p.out_w + 3u) / 4u;\n"
+           "    uint total = p.batch * p.out_channels * p.out_h * tiles; if (gid >= total) return;\n"
+           "    uint ow = (gid % tiles) * 4u; uint t = gid / tiles; uint oh = t % p.out_h;\n"
+           "    t /= p.out_h; uint oc = t % p.out_channels; uint b = t / p.out_channels;\n"
+           "    float4 acc = float4(p.has_bias != 0u ? bias[oc] : 0.0f);\n"
+           "    for (uint ic = 0u; ic < p.in_channels; ++ic) {\n"
+           "        #pragma unroll\n"
+           "        for (uint kh = 0u; kh < 3u; ++kh) {\n"
+           "            int ih = int(oh * 2u + kh) - 1; if (ih < 0 || uint(ih) >= p.height) continue;\n"
+           "            uint base = ((b * p.in_channels + ic) * p.height + uint(ih)) * p.width;\n"
+           "            #pragma unroll\n"
+           "            for (uint kw = 0u; kw < 3u; ++kw) {\n"
+           "                int iw = int(ow * 2u + kw) - 1;\n"
+           "                float w = weight[(oc * p.in_channels + ic) * 9u + kh * 3u + kw];\n"
+           "                if (iw >= 0 && uint(iw) < p.width) acc.x += input[base + uint(iw)] * w;\n"
+           "                if (iw + 2 >= 0 && uint(iw + 2) < p.width) acc.y += input[base + uint(iw + 2)] * w;\n"
+           "                if (iw + 4 >= 0 && uint(iw + 4) < p.width) acc.z += input[base + uint(iw + 4)] * w;\n"
+           "                if (iw + 6 >= 0 && uint(iw + 6) < p.width) acc.w += input[base + uint(iw + 6)] * w;\n"
+           "            }\n"
+           "        }\n"
+           "    }\n"
+           "    uint dst = ((b * p.out_channels + oc) * p.out_h + oh) * p.out_w + ow;\n"
+           "    output[dst] = acc.x;\n"
+           "    if (ow + 1u < p.out_w) output[dst + 1u] = acc.y;\n"
+           "    if (ow + 2u < p.out_w) output[dst + 2u] = acc.z;\n"
+           "    if (ow + 3u < p.out_w) output[dst + 3u] = acc.w;\n"
            "}\n"
            "kernel void termite_encode_int8_per_head(device const float *in [[buffer(0)]], device uchar *out [[buffer(1)]], constant termite_metal_encode_key_params &p [[buffer(2)]], uint2 gid [[thread_position_in_grid]], uint2 tid [[thread_position_in_threadgroup]], uint2 tg_size [[threads_per_threadgroup]]) {\n"
            "    uint head_dim = p.head_dim; uint num_kv_heads = p.num_kv_heads; uint total_heads = p.rows * num_kv_heads; if (gid.y >= total_heads) return;\n"
@@ -28256,6 +28287,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->conv1d_im2col_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_conv1d_im2col_f32");
         runtime->layer_norm_add_sum_rows_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_add_layer_norm_sum_rows");
         runtime->conv2d_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_conv2d_f32");
+        runtime->conv3x3_stride2_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_conv3x3_stride2_f32");
         runtime->layer_norm_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_layer_norm_1x");
         runtime->layer_norm_rows_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_layer_norm_rows");
         runtime->layer_norm_add_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_add_layer_norm_1x");
@@ -29209,6 +29241,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->conv1d_im2col_f32_pipeline = nil;
     runtime->layer_norm_add_sum_rows_pipeline = nil;
     runtime->conv2d_f32_pipeline = nil;
+    runtime->conv3x3_stride2_f32_pipeline = nil;
     runtime->layer_norm_pipeline = nil;
     runtime->layer_norm_rows_pipeline = nil;
     runtime->layer_norm_add_pipeline = nil;
@@ -51328,14 +51361,24 @@ int termite_metal_decode_runtime_conv2d_f32_device(
         if (command_buffer == nil) return -13;
         id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
         if (encoder == nil) return -14;
-        [encoder setComputePipelineState:runtime->conv2d_f32_pipeline];
+        const BOOL conv3x3_shape = groups == 1 && in_channels >= 16 &&
+            kernel_h == 3 && kernel_w == 3 && stride_h == 2 && stride_w == 2 && padding_h == 1 && padding_w == 1;
+        const BOOL use_conv3x3 = conv3x3_shape && runtime->conv3x3_stride2_f32_pipeline != nil &&
+            !termite_metal_env_flag_enabled(getenv("TERMITE_FLORENCE2_METAL_DISABLE_CONV3X3"));
+        if (conv3x3_shape && !use_conv3x3 && termite_metal_env_flag_enabled(getenv("TERMITE_FLORENCE2_METAL_REQUIRE_CONV3X3"))) {
+            [encoder endEncoding];
+            return -16;
+        }
+        id<MTLComputePipelineState> pipeline = use_conv3x3 ? runtime->conv3x3_stride2_f32_pipeline : runtime->conv2d_f32_pipeline;
+        const size_t threads = use_conv3x3 ? batch * out_channels * out_h * ((out_w + 3u) / 4u) : total;
+        [encoder setComputePipelineState:pipeline];
         [encoder setBuffer:input_buffer offset:input_offset atIndex:0];
         [encoder setBuffer:weight_buffer offset:weight_offset atIndex:1];
         [encoder setBuffer:bias_buffer offset:bias_offset atIndex:2];
         [encoder setBuffer:output_buffer offset:output_offset atIndex:3];
         [encoder setBytes:&params length:sizeof(params) atIndex:4];
-        [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->conv2d_f32_pipeline, total), 1, 1)];
+        [encoder dispatchThreads:MTLSizeMake(threads, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(pipeline, threads), 1, 1)];
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -15);
     }

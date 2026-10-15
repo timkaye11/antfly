@@ -186,25 +186,69 @@ feature buffers and temporary concatenation overlap. Set
 Qualification exports, reranking, and other backends retain the host-output
 contract.
 
-This is not end-to-end residency: image decoding and preprocessing still use
-the CPU, and standard paged prefill maintains host K/V shadows for cache
-rebuilding. Greedy decode can avoid large tensor downloads while still
-synchronizing the CPU with the GPU many times per token; token-result and
-validation-summary reads are not all counted by the tensor host-mirror
-counters.
+Qwen3-VL Metal generation uses device-only F16/F32 KV pools. Paged prefill
+retains immutable FP32 K/V device buffers for lazy cache rebuilding instead
+of eagerly materializing host shadows. Other KV formats keep their host
+fallback. Admission
+reserves the full retained prompt span in addition to packed KV pages.
+`TERMITE_METAL_DISABLE_RESIDENT_PREFILL_KV_SHADOW=1` restores the host shadow
+without reducing that conservative memory reservation.
 
-For a serialized experiment, the existing opt-in
-`TERMITE_METAL_ENABLE_ACTIVE_PAGED_SLOT_ATTENTION_DEFERRED=1` keeps supported
-paged attention on the active frame when producer and consumer use the same
-Metal runtime. The ordinary path flushes after attention. On a local M4 test
-with the 2B Q4_K_M/Q8_0 bundle and a 1280x960 image, the opt-in reduced decode
-from 29 frame submissions per token to one while preserving both 61-token
-and 217-token captions. This is diagnostic evidence, not general model or
-concurrency qualification: the server used ReleaseSmall on a host with existing swap.
-Check exact output, frame counts, memory pressure, and repeated timings before
-promoting it to a default. The matching disable flag restores the synchronous
-path. This setting does not remove the prefill K/V host copies and
-does not require the experimental prepared-prefill flags above.
+Qwen3-VL also keeps supported paged decode attention on the active frame when
+producer and consumer use the same Metal runtime. The frame owner performs
+completion instead of synchronizing after each attention layer.
+`TERMITE_METAL_DISABLE_ACTIVE_PAGED_SLOT_ATTENTION_DEFERRED=1` restores the
+synchronous path. Other architectures keep their existing policy. These
+defaults do not require the experimental prepared-prefill flags above.
+
+Image decoding and preprocessing still use the CPU. Greedy sampling and
+finite-value validation read bounded results; those reads are not all counted
+by tensor host-mirror counters. Residency evidence therefore requires both
+payload readback counters and frame submission counts.
+
+`scripts/qwen3vl/qualify_qwen3vl_residency.py` compares two HTTP server binaries
+serially in alternating order, verifies artifact hashes and exact output/token
+parity, and checks image-feature/KV readbacks and decode frame counts. It also
+checks fixture OCR content, complete streaming output, malformed input,
+concurrent requests, and recovery after a disconnect. A median latency
+regression over five percent fails by default.
+Run it inside `scripts/benchmark_resources.py` so the client and server workers
+share a bounded, monitored process group. Existing swap, independent oracle
+parity, other model sizes, and sustained deployment traffic remain separate
+qualification boundaries. `--baseline-rollback` compares the candidate with
+all three residency changes disabled using the same binary.
+
+From the repository root, after building and saving both server binaries:
+
+```sh
+python3 zig/pkg/inference/scripts/benchmark_resources.py \
+  --output .zig-cache/qwen-qualification/resources.json \
+  --timeout 1200 --max-rss-mib 8192 --min-free-percent 15 \
+  --max-swap-growth-mib 0 -- \
+  python3 zig/pkg/inference/scripts/qwen3vl/qualify_qwen3vl_residency.py \
+    --baseline /path/to/baseline-server \
+    --candidate zig/zig-out/bin/antfly-inference-http-server \
+    --model-dir /path/to/managed-qwen3vl-2b-bundle \
+    --output .zig-cache/qwen-qualification/comparison.json \
+    --rounds 2 --iters 3
+```
+
+The focused `inference-test-qwen3vl-metal` build target requires a real Metal
+device and covers retained ownership, prompt/DeepStack assembly, prefill and
+deferred decode parity, and admission. Use the bounded Zig build wrapper and
+the worktree's own caches. This subset supplements the full inference suite.
+
+The 2026-10-15 local qualification campaign recorded five paired samples per
+case on an M4 with the pinned 2B bundle. Reports remain local or CI artifacts.
+Image-request medians improved by 1.49–2.11x with exact response/token parity.
+Image preparation and decode had zero tensor payload readbacks; image prefill
+read only the final 607,744-byte vocabulary row. Decode used one frame per
+completion token instead of 29. Streaming, concurrent requests, malformed
+input, disconnect recovery, and same-binary rollback checks passed. The
+original JPEG photo also preserved its complete 217-token description in a
+single paired rollback probe (31.8 to 14.9 seconds). Existing host swap and
+ReleaseSmall serving builds limit these timing claims; full CI, other model
+sizes, and deployment-hardware soak remain separate gates.
 
 ## Local qualification workflow
 
