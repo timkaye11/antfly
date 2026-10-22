@@ -22,13 +22,14 @@ from antfly.native_kv import (
 )
 
 
-def fixture(payload_size=40, outcome="compacted"):
+def fixture(payload_size=40, outcome="compacted", version=2, encoding="f32"):
     payload = struct.pack("<Q", 12) + b"x" * payload_size
-    header = struct.pack("<8sIIQ", b"ANTFLYKV", 2, 0, len(payload)) + bytes(range(128))
+    header = struct.pack("<8sIIQ", b"ANTFLYKV", version, int(encoding == "fp8"), len(payload)) + bytes(range(128))
     checkpoint = header + payload + hashlib.sha256(header + payload).digest()
     metadata = {
         "version": "attention_match_v1",
-        "wire_version": 2,
+        "wire_version": version,
+        "encoding": encoding,
         "model": "gemma",
         "outcome": outcome,
         "logical_tokens": 12,
@@ -37,6 +38,10 @@ def fixture(payload_size=40, outcome="compacted"):
         "validated_heads": 2 if outcome == "compacted" else 0,
         "preserved_heads": 6,
     }
+    if encoding == "fp8":
+        metadata.update(
+            fp8_heads=1 if outcome == "compacted" else 0, fp8_fallback_heads=1 if outcome == "compacted" else 0
+        )
     encoded = json.dumps(metadata).encode()
     frame = struct.pack("<8sQIIIIQ", b"AFATT001", len(encoded), 1, 0, len(CHECKPOINT_MIME), 0, len(checkpoint))
     return frame + encoded + CHECKPOINT_MIME + checkpoint, checkpoint, metadata
@@ -265,3 +270,63 @@ def test_chunk_reader_skips_empty_chunks_and_retains_partial_reads():
     assert reader.read(2) == b"c"
     assert reader.read(2) == b"d"
     assert reader.read(2) == b""
+
+
+@pytest.mark.parametrize("encoding", ["f16", "fp8"])
+def test_v3_encoding_streams_and_checks_metadata(tmp_path, encoding):
+    frame, checkpoint, metadata = fixture(version=3, encoding=encoding)
+    destination = tmp_path / "v3.kv"
+    saved = receive_checkpoint(io.BytesIO(frame), destination, "gemma")
+    assert saved.metadata["encoding"] == encoding
+    assert destination.read_bytes() == checkpoint
+    with destination.open("rb") as source:
+        length, chunks = checkpoint_upload(source, {"model": "gemma"})
+        uploaded = b"".join(chunks)
+    assert len(uploaded) == length
+    assert uploaded.endswith(checkpoint)
+    wrong = frame.replace(b'"wire_version": 3', b'"wire_version": 2', 1)
+    with pytest.raises(ValueError):
+        receive_checkpoint(io.BytesIO(wrong), destination, "gemma")
+    assert destination.read_bytes() == checkpoint
+    wrong = frame.replace(
+        b'"encoding": "' + encoding.encode() + b'"',
+        b'"encoding": "' + (b"fp8" if encoding == "f16" else b"f16") + b'"',
+        1,
+    )
+    with pytest.raises(ValueError, match="wire encoding"):
+        receive_checkpoint(io.BytesIO(wrong), destination, "gemma")
+
+
+@pytest.mark.parametrize("encoding", ["f32", "f16", "fp8"])
+def test_checkpoint_encoding_option_reaches_transport(tmp_path, encoding):
+    frame, _, _ = fixture(version=2 if encoding == "f32" else 3, encoding=encoding)
+
+    def handler(request):
+        assert request.headers["X-Antfly-KV-Encoding"] == encoding
+        return httpx.Response(200, headers={"Content-Type": CONTENT_TYPE}, stream=Stream(frame))
+
+    client = client_with_transport(handler)
+    saved = client.prepare_native_kv_checkpoint(
+        InferenceGenerateRequest(model="gemma", messages=[]), tmp_path / "saved.kv", encoding=encoding
+    )
+    assert saved.metadata["encoding"] == encoding
+    with pytest.raises(ValueError, match="encoding"):
+        client.prepare_native_kv_checkpoint(
+            InferenceGenerateRequest(model="gemma", messages=[]), tmp_path / "saved.kv", encoding="unknown"
+        )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("fp8_heads", -1), ("fp8_heads", True), ("fp8_heads", 3), ("fp8_fallback_heads", None), ("fp8_fallback_heads", 0)],
+)
+def test_invalid_fp8_accounting_does_not_replace_saved_file(tmp_path, field, value):
+    frame, checkpoint, metadata = fixture(version=3, encoding="fp8")
+    destination = tmp_path / "saved.kv"
+    receive_checkpoint(io.BytesIO(frame), destination, "gemma")
+    metadata[field] = value
+    encoded = json.dumps(metadata).encode()
+    header = struct.pack("<8sQIIIIQ", b"AFATT001", len(encoded), 1, 0, len(CHECKPOINT_MIME), 0, len(checkpoint))
+    with pytest.raises(ValueError, match="wire encoding"):
+        receive_checkpoint(io.BytesIO(header + encoded + CHECKPOINT_MIME + checkpoint), destination, "gemma")
+    assert destination.read_bytes() == checkpoint

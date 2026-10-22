@@ -83,6 +83,7 @@ def main():
     parser.add_argument('--port', type=int, default=8516)
     parser.add_argument('--timeout', type=float, default=1800)
     parser.add_argument('--blocks', type=int, default=20)
+    parser.add_argument('--encoding', choices=['f32', 'f16', 'fp8'], default='f16')
     args = parser.parse_args()
     if args.blocks < 20: parser.error('fewer than 20 blocks cannot satisfy the sustained gate')
     if not math.isfinite(args.timeout) or args.timeout <= 0: parser.error('invalid timeout')
@@ -91,7 +92,7 @@ def main():
     if args.output.exists() or args.checkpoint.exists(): raise FileExistsError(args.output)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     evidence = {'passed': False, 'production_ready': False, 'scope': __doc__,
-                'server_kind': args.server_kind, 'source': git_provenance(REPO),
+                'server_kind': args.server_kind, 'encoding': args.encoding, 'source': git_provenance(REPO),
                 'binary_sha256': sha256_file(args.server),
                 'reference_sha256': sha256_file(args.reference),
                 'reference_checkpoint_sha256': sha256_file(args.reference_checkpoint),
@@ -109,6 +110,10 @@ def main():
             if len(matches) != 1: raise AssertionError(f'missing/ambiguous reference: {kind}')
             return matches[0]
         prepared = prior_result('prepare')
+        if prepared['metadata'].get('encoding', 'f32') != args.encoding:
+            raise AssertionError('reference encoding differs from stress campaign')
+        if args.encoding == 'fp8' and prepared['metadata'].get('fp8_heads', 0) < 1:
+            raise AssertionError('FP8 stress requires actually quantized state')
         if prepared['file_sha256'] != evidence['reference_checkpoint_sha256']:
             raise AssertionError('reference checkpoint changed')
         if prepared['metadata']['logical_tokens'] != 8189:

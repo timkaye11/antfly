@@ -24,16 +24,33 @@ open. Numerical validation alone does not establish answer quality.
    regularized value fitting. Store mass adjustments as attention-logit biases.
    Validate complete heads after rounding to serving precision, requiring
    relative mass error and normalized output RMSE at most 0.05.
-5. Preserve heads whose numerical fits are rejected. Accept the complete
+5. On numerical rejection, retry the affected head from its immutable source at
+   3:1 and then 2:1 eligible-row retention. The error limits stay unchanged; use
+   the first accepted fit and preserve the original head if all attempts fail.
+   OOM, cancellation and invalid inputs never trigger a retention retry. Accept the complete
    candidate only if actual global device bytes, including metadata, improve
    by at least 1.5x. Otherwise export the original exact state with the explicit
    outcome `unchanged_insufficient_savings`. Cancellation, OOM and invalid
    inputs remain errors.
-6. Export wire-version-2 state: model/tokenizer/template/layout identities,
+6. Export wire-version-3 state by default (legacy V2 remains available): model/tokenizer/template/layout identities,
    tokens, logical positions, donor mappings, exact and fitted KV, coverage,
    biases and continuation logits. Resume validates the complete transfer and
    exact rendered-token prefix, uploads independently owned state, and evaluates
    only appended input. An unchanged prompt uses saved next-token logits.
+
+The V3 disk codec stores exact f16 K/V by default, retaining f32 biases/logits
+and full integer metadata. Explicit `X-Antfly-KV-Encoding: fp8` requests try
+E4M3FN with separate power-of-two key/value scales for each fitted historical
+head range. The fitter tests dequantized values against the original whole head
+on held-out consumer queries, with the same 5% mass/output limits. Only accepted
+ranges replace the candidate values; failures retain the validated f16 fit.
+Protected prefix/recent rows, local windows and insufficient-savings fallbacks
+remain exact. This storage optimization does not change resident GPU precision
+or global-device savings. It is experimental until broader answer-quality checks
+include quantized fresh-question continuations. V1/V2 decoding remains supported;
+`f32` export selects V2 for older clients. Decoding budgets expanded host state
+independently of compressed wire bytes and publishes only after checksum and
+semantic validation.
 
 The checkpoint stays immutable and supports a fresh process with matching
 identity. Physical compaction preserves logical positions; it does not enlarge
@@ -42,10 +59,12 @@ and the full prompt plus reserved output must fit the window.
 
 The fitting planner and HTTP admission use the same geometry-derived allocation
 bound: original state, worst-case candidate, task metadata and the largest
-workspace for each of four fit workers. Fitting has a 3,840 MiB host ceiling,
+workspace for each admitted fit worker, including the largest 2:1 retry.
+Up to four workers fit concurrently; the planner reduces this to three at
+32K on the designated model. Fitting has a 3,840 MiB host ceiling,
 with 128 MiB additional preparation allowance. Whole-head validation is limited
-to one worker at a time. For the designated 32K fixture, the total reservation
-is 4,049,665,584 bytes; this is an allocation bound, not measured RSS.
+to one worker at a time. The reservation is recomputed from geometry, including per-head codec metadata;
+this allocation bound is separate from measured RSS.
 
 During upload, admission reserves bounded host memory before acquiring GPU
 execution resources. Transfer ownership holds that lease through destruction.
@@ -116,6 +135,101 @@ reproduces the 8K reference checkpoint byte for byte and restores its correct
 answer. Its digest is
 `5b09989a64944c79c14990b9d7bea167dc45509323527452ce038825b7a63c8a`.
 The complete standalone campaign has not been repeated on the merged candidate.
+
+## Checkpoint disk encoding
+
+V3 FP16 was round-tripped against both saved public reference checkpoints. All
+K/V values, biases, positions, coverage, tokens and continuation logits matched
+exactly, including their floating-point representations.
+
+| Reference | V2 FP32 bytes | V3 FP16 bytes | File reduction |
+| --- | ---: | ---: | ---: |
+| 8K | 201,728,532 | 101,995,796 | 49.44% |
+| 32K | 555,662,840 | 279,871,736 | 49.63% |
+
+The CUDA inference-server candidate
+`adbc7eecff99a76147c586d4f7afad82232d99daf2ece537b60155b00cc3498c`
+also restored both V2 and V3 FP16 references at 8K and 32K, producing identical
+answers and attesting saved-prefix reuse. Default HTTP and Python SDK exports
+produced identical V3 FP16 files. These checks used the inference server, not
+the complete standalone deployment.
+
+The FP8 readiness follow-up replaces scalar searches and power calls with
+constant-time IEEE exponent/mantissa conversion. An independent arithmetic
+oracle checks every FP16 bit pattern at all 17 supported scales, plus both
+neighbors of every FP32 rounding midpoint. The existing 8K FP8 file remains
+byte-identical after decode/re-export. Core codec, checkpoint, solver and engine
+checks passed (70 tests), as did the Python SDK checks (46 tests). SDK metadata
+validation requires consistent accepted/fallback FP8 head counts before atomic
+file replacement.
+
+The optimized codec passed CUDA inference-server public roundtrips at 8K and
+32K. Each accepted five FP8 heads, retained FP16 for one rejected attempt and
+preserved two uncompacted global heads. Protected rows and local windows remain
+FP16. These are disk savings beyond the lossless FP16 encoding, not additional
+device-memory savings:
+
+| Workload | FP16 file | FP8 file | Additional disk saving | Export/write phase | Warm restore |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 8,189 tokens | 97.27 MiB | 89.93 MiB | 7.55% | 3.07–3.10 s | p50 1.826 s; p95 1.858 s; max 1.961 s |
+| 32,752 tokens | 266.91 MiB | 229.58 MiB | 13.98% | 9.79 s | 4.76–4.99 s; roundtrip observations only |
+
+The 8K percentiles use five warmups and 100 measured SSE restores, all with
+identical continuation and token accounting. They describe portable restore,
+not full replay or llama.cpp parity. The 8K final candidate is
+`595d485ee23c9d9c1d71d00e793f006819ff2cdeaa12510a4360353aa6300194`.
+Its complete first preparation took 102.61 s including ingestion and cold
+identity work; fitting took 8.79–9.17 s separately. Export/write previously
+took about 10.4 s before the codec optimization. The 1,437-token appended
+continuation took 8.62 s. Public and SDK exports retained the same file digest
+`39bc695d64ab02d00d1bd92d2a7764dbc0755b1ab4e187dc9361329f822c3273`.
+
+Both sizes passed fresh-process restore, streaming, checksum/prefix rejection
+and recovery. The 32K run also passed context-limit rejection and recovery,
+with 2.0855x global-device savings and peak host/GPU memory of 7.34/12.46 GiB.
+It used the preceding optimized candidate
+`3f50aaca791b674546b559e737d52759a74cb35c0b1fa1bd5cdf8f91c5ec410d`;
+the final native-code change adds physical CUDA OOM logging without changing
+the codec or allocation error contract.
+
+The final candidate passed physical GPU OOM/recovery, overlapping uploads and
+streaming disconnect/recovery. The OOM test requires a fresh physical driver
+failure log, so a quota rejection cannot falsely pass; after external pressure
+was released, the same worker restored without retry. Streaming disconnect
+released ownership in 11 ms. Partial-upload, prefill, fitting and export
+cancellation passed on the preceding optimized candidate. These checks do not
+qualify OOM during live cache replacement, sustained/repeated-cycle operation,
+or the complete standalone deployment.
+
+Local evidence is under `.cache/fp8-readiness/`: `final-8k.json`,
+`public-32k.json`, `restore-100.json`, `oom-fixed.json`, `concurrency.json`,
+`sse-abort.json`, and `qualify_native_cancellation.json`. Earlier codec evidence
+remains under `.cache/kv-codec/`. The historical performance table above still
+describes V2.
+
+For FP8 quality runs, pass `--encoding fp8` to
+`qualify_native_checkpoint_quality.py`. Each case compares full KV, a separately
+prepared FP16 checkpoint, and FP8 on the same fresh question. Reports distinguish
+model baseline failures, compaction regressions, additional FP8 regressions,
+and actual quantization coverage by category. Exact and FP16 fallbacks cannot
+count as FP8 coverage; an improvement on another case cannot hide a quantized
+case's regression. The frozen suite and existing quality thresholds are unchanged.
+The public roundtrip, preparation sampling, and sustained runners also accept
+`--encoding fp8`; cancellation uses the encoding of its qualified reference.
+
+FP8 remains experimental. A final-candidate pilot of four frozen archive-only
+cases (`v2-fact-04`, `v2-code-05`, `v2-instruction-06`, `v2-tool_call-07`) completed
+without infrastructure errors, but all four used `unchanged_insufficient_savings`
+with zero FP8 heads. Full KV, separately prepared FP16 and FP8-requested restores
+all scored 3/4 with identical answers; `v2-code-05` returned 15 instead of 29 in
+every path. This is fallback evidence, **not FP8 answer-quality qualification**.
+See `quality-pilot-8k.json`. The full 64-case paired suite has not passed.
+The separate `fp8_noninferiority` report requires the full sample counts,
+critical-case count, actual FP8 coverage in every category and no new failures
+versus FP16; it does not relax the whole-system release gate or forgive missing
+quantization coverage. Improving archive-only fitting coverage remains necessary
+before those quality gates, final sustained testing and standalone qualification
+can close. The 5% numerical error and 1.5x public savings thresholds remain intact.
 
 ## Answer quality
 
@@ -217,10 +331,15 @@ scripts and shipped artifacts remain required.
 | Latency | Matched full-replay p50 at most 1.25x and p95 at most 1.5x llama.cpp; at least five warmups and 100 samples per designated workload |
 | Reliability | 1,000 mixed requests, 100 compactions and 20 successive real-model compaction cycles; no corrupt state, leaked admission or unbounded growth |
 
-First measure per-head rejection causes and evaluate bounded fit/retention
-alternatives for archive-only prefixes. Full-prefix replay alone did not help.
+Bounded per-head retention retries are implemented. Captured archive-only
+inputs now validate seven of eight heads (six FP8, one FP16 fallback), compared
+with three before retries, under the unchanged numerical gates. This numerical
+diagnostic does not qualify answer quality or public installation. Its engine
+checks passed 74 tests, including retry cancellation, allocation failures,
+parallel determinism and exact host-budget boundaries. Public quality and
+standalone qualification must use the successor binary.
 Keep baseline reasoning/format failures separate from compaction regressions.
-Freeze a successor before the remaining 48 quality cases and complete matrix,
+Freeze the successor before the complete 64-case paired quality suite and matrix,
 then broaden histories and 32K coverage. Final-candidate sustained testing,
 live-replacement failure checks, matched latency and merged standalone
 requalification remain open. Historical 10 s/30 s compaction targets were

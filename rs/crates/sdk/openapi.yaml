@@ -12471,7 +12471,8 @@ paths:
 
         one application/vnd.antfly.kv-checkpoint attachment. The checkpoint is
 
-        a V2 binary file containing original token positions, fitted global KV,
+        a V3 binary file by default (V2 when f32 is requested), containing original token positions, fitted
+        global KV,
 
         exact local KV, saved next-token logits, loaded-model fingerprints and
 
@@ -12494,6 +12495,20 @@ paths:
 
         concurrent native checkpoint work and returns a retryable response when busy.
       operationId: prepareNativeKvCheckpoint
+      parameters:
+        - in: header
+          name: X-Antfly-KV-Encoding
+          description: Disk encoding. f16 is lossless for the supported cache; fp8 is experimental and
+            applies only to fitted historical heads passing combined error validation, with f16 fallback.
+            f32 exports legacy V2.
+          required: false
+          schema:
+            type: string
+            enum:
+              - f32
+              - f16
+              - fp8
+            default: f16
       requestBody:
         required: true
         content:

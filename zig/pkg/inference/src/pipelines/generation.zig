@@ -747,7 +747,7 @@ pub const NativeCheckpointPrepare = struct {
     pub const collection_options: runtime.kv.attention_match_queries.Options = .{ .samples_per_consumer = 320 };
     pub const max_repeat_tokens: usize = 512;
 
-    pub const HostPlan = struct { fit_bytes: usize, reservation_bytes: usize, source_bytes: usize, head_workspace_bytes: usize };
+    pub const HostPlan = struct { fit_bytes: usize, reservation_bytes: usize, source_bytes: usize, head_workspace_bytes: usize, workers: usize };
 
     pub fn fittingOptions() runtime.kv.attention_match_engine.Options {
         return .{
@@ -755,6 +755,7 @@ pub const NativeCheckpointPrepare = struct {
             .checkpoint_limits = .{ .max_file_bytes = 2 * 1024 * 1024 * 1024, .max_state_bytes = 2 * 1024 * 1024 * 1024 },
             .prefix_rows = 128,
             .chunk_rows = 1024,
+            .min_retention_divisor = 2,
             .validation = .whole_head,
             .fit = .{ .target_rows = 1, .selection = .residual_omp, .mass_solver = .active_set },
         };
@@ -772,7 +773,9 @@ pub const NativeCheckpointPrepare = struct {
         const engine = runtime.kv.attention_match_engine;
         const snapshot = runtime.kv.attention_match_snapshot;
         const Fitter = @import("../ops/cuda/attention_match_fit.zig").Fitter;
-        const options = fittingOptions();
+        var options = fittingOptions();
+        // Reserve for the largest bounded retry, even when 4:1 succeeds.
+        options.retention_divisor = options.min_retention_divisor.?;
         var donors: [256]snapshot.Donor = undefined;
         var mapping: [256]u32 = undefined;
         var count: usize = 0;
@@ -820,13 +823,19 @@ pub const NativeCheckpointPrepare = struct {
             if (workspace.solver_bytes > options.fit.max_workspace_bytes) return error.CompactionWorkspaceLimit;
             maximum = @max(maximum, workspace.bytes);
         }
-        const fit_bytes = try engine.parallelHostBytes(source_bytes, heads, maximum, fit_workers);
+        const resident = try engine.parallelResidentBytes(source_bytes, heads);
+        if (resident > max_transient_host_bytes) return error.CompactionWorkspaceLimit;
+        const workers = if (maximum == 0) fit_workers else @min(fit_workers, (max_transient_host_bytes - resident) / maximum);
+        if (workers == 0) return error.CompactionWorkspaceLimit;
+        const fit_bytes = try engine.parallelHostBytes(source_bytes, heads, maximum, workers);
         if (fit_bytes > max_transient_host_bytes) return error.CompactionWorkspaceLimit;
-        return .{ .fit_bytes = fit_bytes, .reservation_bytes = try std.math.add(usize, fit_bytes, auxiliary_host_bytes), .source_bytes = source_bytes, .head_workspace_bytes = maximum };
+        return .{ .fit_bytes = fit_bytes, .reservation_bytes = try std.math.add(usize, fit_bytes, auxiliary_host_bytes), .source_bytes = source_bytes, .head_workspace_bytes = maximum, .workers = workers };
     }
 
     planned_fit_host_bytes: ?usize = null,
+    planned_fit_workers: ?usize = null,
 
+    encoding: runtime.kv.attention_match_checkpoint.Encoding = .f16,
     minimum_savings_ratio: f64 = 1.5,
     validation_workers: usize = 1,
     result: ?Result = null,
@@ -874,6 +883,10 @@ test "native checkpoint exact host plan sizes Gemma4 E4B and preserves the relea
     try std.testing.expect(small.fit_bytes < large.fit_bytes);
     try std.testing.expect(large.fit_bytes < boundary.fit_bytes);
     try std.testing.expect(boundary.fit_bytes <= NativeCheckpointPrepare.max_transient_host_bytes);
+    try std.testing.expectEqual(@as(usize, 4), small.workers);
+    try std.testing.expect(large.workers > 0 and large.workers < NativeCheckpointPrepare.fit_workers);
+    // Another worst-case retry worker would exceed the unchanged ceiling.
+    try std.testing.expect(large.fit_bytes + large.head_workspace_bytes > NativeCheckpointPrepare.max_transient_host_bytes);
     // The live-host capacity observed in the failed campaign remains unchanged.
     try std.testing.expect(large.reservation_bytes < 4_153_092_096);
     try std.testing.expectEqual(large.fit_bytes + NativeCheckpointPrepare.auxiliary_host_bytes, large.reservation_bytes);
@@ -882,7 +895,7 @@ test "native checkpoint exact host plan sizes Gemma4 E4B and preserves the relea
     var wider = config;
     wider.num_key_value_heads = 4;
     try std.testing.expectError(error.KvCheckpointLimit, NativeCheckpointPrepare.hostPlan(wider, 32752));
-    std.debug.print("native_checkpoint_host_plan_fixture tokens=32752 source_bytes={d} head_workspace_bytes={d} fit_bytes={d} reservation_bytes={d}\n", .{ large.source_bytes, large.head_workspace_bytes, large.fit_bytes, large.reservation_bytes });
+    std.debug.print("native_checkpoint_host_plan_fixture tokens=32752 source_bytes={d} head_workspace_bytes={d} fit_bytes={d} reservation_bytes={d} workers={d}\n", .{ large.source_bytes, large.head_workspace_bytes, large.fit_bytes, large.reservation_bytes, large.workers });
 }
 
 /// The pipeline retires decoded host arrays after successful GPU restoration.
@@ -4009,6 +4022,8 @@ pub const NativeGenerationPipeline = struct {
         /// the complete cloned/replayed prefix. Queries still come from a real
         /// forward at future positions. Null preserves full-repeat semantics.
         max_repeat_tokens: ?usize = null,
+        /// Select prefix-wide study passages within the same repeat budget.
+        representative_repeat: bool = false,
         max_source_tokens: usize = 32768,
         /// Additional shadow KV capacity, including growth copies. Activations
         /// still use the backend's observed request allocation budget.
@@ -4264,6 +4279,10 @@ pub const NativeGenerationPipeline = struct {
             if (admitted != plan.fit_bytes) return error.InvalidNativeCheckpointRequest;
         }
         request.planned_fit_host_bytes = plan.fit_bytes;
+        if (request.planned_fit_workers) |admitted| {
+            if (admitted != plan.workers) return error.InvalidNativeCheckpointRequest;
+        }
+        request.planned_fit_workers = plan.workers;
         const started = mtpProfileTimestamp(true, self.io);
         var queries = try self.collectAttentionMatchQueries(tokens, source, .{
             .prefix_mode = .clone,
@@ -4271,6 +4290,7 @@ pub const NativeGenerationPipeline = struct {
             .collection = NativeCheckpointPrepare.collection_options,
             .chunk_size = 256,
             .max_repeat_tokens = NativeCheckpointPrepare.max_repeat_tokens,
+            .representative_repeat = true,
         });
         defer queries.deinit();
         const query_ns = mtpProfileElapsedNs(true, self.io, started);
@@ -4335,7 +4355,7 @@ pub const NativeGenerationPipeline = struct {
         const cooperative_fit = probe_options.prepare_request != null or platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_COOPERATIVE");
         if (cooperative_fit and !cuda_fit) return error.UnsupportedCompactionQueryRoute;
         const worker_text = platform.env.getenv("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_WORKERS") orelse "1";
-        const fit_workers = if (probe_options.prepare_request != null) NativeCheckpointPrepare.fit_workers else try std.fmt.parseInt(usize, worker_text, 10);
+        const fit_workers = if (probe_options.prepare_request) |request| request.planned_fit_workers orelse return error.InvalidNativeCheckpointRequest else try std.fmt.parseInt(usize, worker_text, 10);
         if (fit_workers == 0 or fit_workers > 4 or (fit_workers > 1 and !cooperative_fit)) return error.UnsupportedCompactionQueryRoute;
         const old_device_limit = compute.ctx.device_allocations.snapshot().limit;
         try compute.ctx.device_allocations.setLimit(@min(old_device_limit, 18 * 1024 * 1024 * 1024));
@@ -4357,7 +4377,10 @@ pub const NativeGenerationPipeline = struct {
                 fit_backend.* = fitter.backend();
             }
         }
-        var fit_options: engine.Options = if (probe_options.prepare_request != null) NativeCheckpointPrepare.fittingOptions() else .{};
+        const diagnostic_encoding: checkpoint.Encoding = if (probe_options.prepare_request != null) .f32 else std.meta.stringToEnum(checkpoint.Encoding, platform.env.getenv("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_ENCODING") orelse "f32") orelse return error.InvalidCompactionProbe;
+        const native_policy = probe_options.prepare_request != null or platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_NATIVE_POLICY");
+        var fit_options: engine.Options = if (native_policy) NativeCheckpointPrepare.fittingOptions() else .{};
+        fit_options.fp8_checkpoint = if (probe_options.prepare_request) |request| request.encoding == .fp8 else diagnostic_encoding == .fp8;
         fit_options.stats = &stats;
         fit_options.storage_precision = .f16;
         fit_options.checkpoint_limits = limits;
@@ -4457,12 +4480,12 @@ pub const NativeGenerationPipeline = struct {
         phase = "export";
         const export_started = mtpProfileTimestamp(true, self.io);
         var sink: AttentionMatchProbeSink = .{};
-        const exported = try checkpoint.exportV2(candidate.state, limits, &sink, control);
+        const exported = try checkpoint.exportEncoded(candidate.state, limits, diagnostic_encoding, &sink, control);
         if (exported.bytes != sink.bytes) return error.InvalidKvCheckpoint;
         if (probe_options.checkpoint_roundtrip) {
             // Exercise actual bytes, decoder and independently owned imported
             // arrays before replacing the previous cycle's live binding.
-            const encoded = try checkpoint.encodeV2WithControl(self.allocator, candidate.state, limits, control);
+            const encoded = try checkpoint.encodeWithEncoding(self.allocator, candidate.state, limits, diagnostic_encoding, control);
             defer self.allocator.free(encoded);
             var file_digest: [32]u8 = undefined;
             var file_hash = std.crypto.hash.sha2.Sha256.init(.{});
@@ -4497,7 +4520,17 @@ pub const NativeGenerationPipeline = struct {
             install_ns = mtpProfileElapsedNs(true, self.io, install_started);
         }
         const digest = exported.file_sha256;
-        std.log.info("{s} source_tokens={d} snapshot_ns={d} fit_ns={d} export_ns={d} upload_ns={d} total_ns={d} source_host_bytes={d} candidate_host_bytes={d} candidate_device_bytes={d} export_bytes={d} completed_chunks={d} max_nnls_sweeps={d} export_sha256={s} export_version=2 validated_heads={d} max_head_mass_error={d} max_head_output_rmse={d} residual_fit={d} preserved_heads={d} source_global_bytes={d} candidate_global_bytes={d} actual_global_savings_ratio={d} cuda_fit={d} diagnostic_only=1 installed={d} install_ns={d} cooperative_fit={d} cooperative_launches={d} cooperative_restarts={d} fit_workers={d} workspace_reuses={d} host_workspace_limit_bytes={d}", .{
+        // Keep the complete diagnostic on one line without exceeding the
+        // standard formatter's 32-argument limit.
+        var codec_log_buffer: [256]u8 = undefined;
+        const codec_log = try std.fmt.bufPrint(&codec_log_buffer, "export_version={d} fp8_heads={d} fp8_fallback_heads={d} min_retention_divisor={d} retention_retries={d}", .{
+            @as(u32, if (diagnostic_encoding == .f32) 2 else 3),
+            stats.fp8_heads,
+            stats.fp8_fallback_heads,
+            fit_options.min_retention_divisor orelse fit_options.retention_divisor,
+            stats.retention_retries,
+        });
+        std.log.info("{s} source_tokens={d} snapshot_ns={d} fit_ns={d} export_ns={d} upload_ns={d} total_ns={d} source_host_bytes={d} candidate_host_bytes={d} candidate_device_bytes={d} export_bytes={d} completed_chunks={d} max_nnls_sweeps={d} export_sha256={s} validated_heads={d} max_head_mass_error={d} max_head_output_rmse={d} residual_fit={d} preserved_heads={d} source_global_bytes={d} candidate_global_bytes={d} actual_global_savings_ratio={d} cuda_fit={d} diagnostic_only=1 installed={d} install_ns={d} cooperative_fit={d} cooperative_launches={d} cooperative_restarts={d} fit_workers={d} workspace_reuses={d} host_workspace_limit_bytes={d} {s}", .{
             if (probe_options.cycle != null) @as([]const u8, "attention_match_cycle_fit") else "attention_match_fit",
             tokens.len,
             snapshot_ns,
@@ -4529,6 +4562,7 @@ pub const NativeGenerationPipeline = struct {
             executed_workers,
             workspace_reuses,
             fit_host_bytes,
+            codec_log,
         });
         return stats;
     }
@@ -4707,6 +4741,7 @@ pub const NativeGenerationPipeline = struct {
                 .stats = &query_stats,
                 .collection = .{ .samples_per_consumer = 320 },
                 .max_repeat_tokens = 512,
+                .representative_repeat = platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_NATIVE_POLICY"),
             });
             defer queries.deinit();
             if (cycle > 0 and query_stats.ragged_repeat_calls == 0) return error.UnsupportedCompactionQueryRoute;
@@ -4867,7 +4902,12 @@ pub const NativeGenerationPipeline = struct {
             options.chunk_size == 0 or options.chunk_size > 512 or
             options.chunk_size > options.collection.max_capture_rows or self.gpt_config.num_hidden_layers > 256)
             return error.CompactionQueryLimit;
-        const repeat_tokens = source_tokens[source_tokens.len - @min(source_tokens.len, options.max_repeat_tokens orelse source_tokens.len) ..];
+        const study = if (options.representative_repeat)
+            try queries.studyTokens(self.allocator, source_tokens, options.max_repeat_tokens orelse source_tokens.len)
+        else
+            null;
+        defer if (study) |tokens| self.allocator.free(tokens);
+        const repeat_tokens = study orelse source_tokens[source_tokens.len - @min(source_tokens.len, options.max_repeat_tokens orelse source_tokens.len) ..];
         if (repeat_tokens.len < 2) return error.CompactionQueryLimit;
         for (source_tokens) |token| if (token < 0 or token >= self.gpt_config.vocab_size) return error.InvalidCompactionQueries;
 
@@ -5854,6 +5894,7 @@ pub const NativeGenerationPipeline = struct {
             const repeat_chunk_size = platform.env.getenvUsize("ANTFLY_INFERENCE_ATTENTION_MATCH_REPEAT_CHUNK_SIZE") orelse 256;
             const suffix_limit = platform.env.getenvUsize("ANTFLY_INFERENCE_ATTENTION_MATCH_REFERENCE_SUFFIX_TOKENS") orelse 0;
             const max_repeat_tokens: ?usize = if (suffix_limit == 0) null else suffix_limit;
+            const representative_repeat = platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_NATIVE_POLICY");
             if (query_samples < 2 or query_samples > 320 or (repeat_chunk_size != 256 and repeat_chunk_size != 512)) return error.CompactionQueryLimit;
             var query_stats = AttentionMatchQueryStats{};
             var queries = try self.collectAttentionMatchQueries(token_ids[0..seq_len], decode_state, .{
@@ -5863,6 +5904,7 @@ pub const NativeGenerationPipeline = struct {
                 .collection = .{ .samples_per_consumer = query_samples },
                 .chunk_size = repeat_chunk_size,
                 .max_repeat_tokens = max_repeat_tokens,
+                .representative_repeat = representative_repeat,
             });
             defer queries.deinit();
             const query_elapsed_ns = mtpProfileElapsedNs(true, self.io, started);
@@ -5871,7 +5913,7 @@ pub const NativeGenerationPipeline = struct {
             if (verify_clone) {
                 if (!std.mem.eql(u8, prefix_mode, "clone")) return error.UnsupportedCompactionQueryRoute;
                 const reference_started = mtpProfileTimestamp(true, self.io);
-                var reference = try self.collectAttentionMatchQueries(token_ids[0..seq_len], decode_state, .{ .prefix_mode = .replay, .repeat_mode = repeat_mode, .collection = .{ .samples_per_consumer = query_samples }, .chunk_size = repeat_chunk_size, .max_repeat_tokens = max_repeat_tokens });
+                var reference = try self.collectAttentionMatchQueries(token_ids[0..seq_len], decode_state, .{ .prefix_mode = .replay, .repeat_mode = repeat_mode, .collection = .{ .samples_per_consumer = query_samples }, .chunk_size = repeat_chunk_size, .max_repeat_tokens = max_repeat_tokens, .representative_repeat = representative_repeat });
                 defer reference.deinit();
                 reference_ns = mtpProfileElapsedNs(true, self.io, reference_started);
                 if (!std.mem.eql(u64, queries.train_positions, reference.train_positions) or
@@ -5884,7 +5926,7 @@ pub const NativeGenerationPipeline = struct {
             if (verify_repeat) {
                 if (repeat_mode == .reference) return error.UnsupportedCompactionQueryRoute;
                 const reference_started = mtpProfileTimestamp(true, self.io);
-                var reference = try self.collectAttentionMatchQueries(token_ids[0..seq_len], decode_state, .{ .collection = .{ .samples_per_consumer = query_samples }, .chunk_size = repeat_chunk_size, .max_repeat_tokens = max_repeat_tokens });
+                var reference = try self.collectAttentionMatchQueries(token_ids[0..seq_len], decode_state, .{ .collection = .{ .samples_per_consumer = query_samples }, .chunk_size = repeat_chunk_size, .max_repeat_tokens = max_repeat_tokens, .representative_repeat = representative_repeat });
                 reference_ns += mtpProfileElapsedNs(true, self.io, reference_started);
                 defer reference.deinit();
                 agreement = try queries.compare(&reference);

@@ -1,5 +1,6 @@
-"""Matched Antfly full replay or portable restore on the production standalone host.
+"""Matched Antfly full replay or portable restore on the selected server host.
 
+Standalone is the default; inference-only runs do not qualify standalone parity.
 Use the same verified checkpoints/token fixtures as qualify_matched_llama.py.
 Full prompt replay can be compared with llama replay. Portable checkpoint restore
 and llama resident reuse are different operations and must not be called parity.
@@ -83,6 +84,7 @@ def validate_observation(row,expected,logical_tokens,mode):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--server',type=Path,required=True)
+    parser.add_argument('--server-kind',choices=['inference','standalone'],default='standalone')
     parser.add_argument('--models-dir',type=Path,default=Path('.models'))
     parser.add_argument('--model',default='google/gemma-4-E4B-it-qat-q4_0-gguf')
     parser.add_argument('--reference',type=Path,required=True)
@@ -95,7 +97,7 @@ def main():
     parser.add_argument('--smoke',action='store_true')
     parser.add_argument('--port',type=int,default=8524)
     parser.add_argument('--timeout',type=float,default=1800)
-    args=parser.parse_args();args.server_kind='standalone'
+    args=parser.parse_args()
     args.generation_timing=True
     if args.warmups<0 or args.samples<1 or not math.isfinite(args.timeout) or args.timeout<=0:
         parser.error('invalid sampling counts or timeout')
@@ -104,7 +106,7 @@ def main():
     if args.output.exists():raise FileExistsError(args.output)
     args.output.parent.mkdir(parents=True,exist_ok=True)
     evidence={'passed':False,'production_ready':False,'generation_latency_gate_qualified':False,
-              'scope':__doc__,'mode':args.mode,'size':args.size,'smoke':args.smoke,
+              'scope':__doc__,'mode':args.mode,'size':args.size,'smoke':args.smoke,'server_kind':args.server_kind,
               'warmups_requested':args.warmups,'samples_requested':args.samples,'observations':[],
               'source':git_provenance(ROOT),'binary_sha256':sha256_file(args.server),
               'reference_sha256':sha256_file(args.reference),'runner_sha256':sha256_file(Path(__file__))}

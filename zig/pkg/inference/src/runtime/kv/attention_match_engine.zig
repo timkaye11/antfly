@@ -30,6 +30,10 @@ pub const Options = struct {
     /// Optional diagnostics survive a rejected candidate; never authorize it.
     stats: ?*Stats = null,
     retention_divisor: usize = 4,
+    /// On numerical rejection, retry with successively more retained rows down
+    /// to this divisor. Every attempt uses the original source and the same
+    /// whole-head error limits; admission must reserve the largest attempt.
+    min_retention_divisor: ?usize = null,
     /// Reject by default. Explicit fallback preserves the original head only
     /// for a rejected numerical fit; cancellation, OOM and corrupt input fail.
     rejected_head_policy: enum { reject, preserve_original } = .reject,
@@ -38,8 +42,11 @@ pub const Options = struct {
     min_global_savings_ratio: ?f64 = null,
     source_has_metadata: bool = false,
     /// Round fitted K/V to the serving precision BEFORE held-out validation.
-    /// Portable checkpoints still represent these exact rounded values as f32.
+    /// In-memory checkpoint state represents these exact rounded values as f32.
     storage_precision: enum { f32, f16 } = .f32,
+    /// Experimental disk encoding. Validate decoded FP8 against the original
+    /// whole head; rejected FP8 attempts retain the already validated f16 fit.
+    fp8_checkpoint: bool = false,
     recent_rows: usize = 2048,
     /// Preserve these initial logical positions exactly, including across cycles.
     prefix_rows: usize = 0,
@@ -71,6 +78,9 @@ pub const Stats = struct {
     validating_head: bool = false,
     validated_heads: usize = 0,
     preserved_heads: usize = 0,
+    retention_retries: usize = 0,
+    fp8_heads: usize = 0,
+    fp8_fallback_heads: usize = 0,
     convergence_fallbacks: usize = 0,
     source_global_bytes: usize = 0,
     candidate_global_bytes: usize = 0,
@@ -339,7 +349,7 @@ fn compactHead(allocator: std.mem.Allocator, source: checkpoint.State, donor_ind
     @memcpy(keys[out * d ..], original.keys[old_rows * d ..]);
     @memcpy(values[out * d ..], original.values[old_rows * d ..]);
     std.debug.assert(out + remaining == target_rows);
-    const result: checkpoint.Head = .{ .dim = d, .compacted_until = original.coverage_ends[old_rows - 1], .positions = positions, .coverage_ends = ends, .keys = keys, .values = values, .bias = biases };
+    var result: checkpoint.Head = .{ .dim = d, .compacted_until = original.coverage_ends[old_rows - 1], .positions = positions, .coverage_ends = ends, .keys = keys, .values = values, .bias = biases };
     if (options.validation == .whole_head) {
         // Bound simultaneous whole-head FP64 conversions at long contexts.
         // Chunk fitting still runs on all independently owned workers.
@@ -370,6 +380,12 @@ fn compactHead(allocator: std.mem.Allocator, source: checkpoint.State, donor_ind
         var cfg = options.fit;
         if (options.stats) |stats| cfg.metrics = &stats.rounded_fit;
         try validateRounded(allocator, h, compact, heldout, cfg);
+        if (options.fp8_checkpoint) {
+            const accepted = try quantizeCheckpointHead(allocator, h, compact, &result, prefix, out, heldout, cfg);
+            if (options.stats) |stats| {
+                if (accepted) stats.fp8_heads += 1 else stats.fp8_fallback_heads += 1;
+            }
+        }
         if (options.stats) |stats| {
             stats.validated_heads += 1;
             stats.max_head_mass_error = @max(stats.max_head_mass_error, stats.rounded_fit.max_relative_mass_error);
@@ -377,6 +393,41 @@ fn compactHead(allocator: std.mem.Allocator, source: checkpoint.State, donor_ind
         }
     }
     return result;
+}
+
+fn quantizeCheckpointHead(allocator: std.mem.Allocator, original: solver.Head, compact: solver.Head, result: *checkpoint.Head, first: usize, end: usize, queries: []const f64, cfg: solver.Config) !bool {
+    const codec = checkpoint.codec;
+    const begin_element = first * result.dim;
+    const end_element = end * result.dim;
+    const keys = @constCast(compact.keys[begin_element..end_element]);
+    const values = @constCast(compact.values[begin_element..end_element]);
+    const key_scale = codec.scaleFor(keys);
+    const value_scale = codec.scaleFor(values);
+    var offset: usize = 0;
+    while (offset < keys.len) {
+        try cfg.control.check();
+        const count = @min(@as(usize, 4096), keys.len - offset);
+        codec.round(keys[offset..][0..count], key_scale) catch return false;
+        codec.round(values[offset..][0..count], value_scale) catch return false;
+        offset += count;
+    }
+    var metrics: solver.Metrics = .{};
+    var validation = cfg;
+    validation.metrics = &metrics;
+    validateRounded(allocator, original, compact, queries, validation) catch |err| {
+        if (err == error.CompactionFitRejected) return false;
+        return err;
+    };
+    // Publication happens only after combined fitting + quantization passes.
+    // The unmodified f32 arrays retain the f16 fallback until this point.
+    for (keys, values, begin_element..) |k, v, i| {
+        if (i % 4096 == 0) try cfg.control.check();
+        @constCast(result.keys)[i] = @floatCast(k);
+        @constCast(result.values)[i] = @floatCast(v);
+    }
+    result.fp8 = .{ .first_row = @intCast(first), .rows = @intCast(end - first), .key_scale = key_scale, .value_scale = value_scale };
+    if (cfg.metrics) |out_metrics| out_metrics.* = metrics;
+    return true;
 }
 
 fn validateRounded(allocator: std.mem.Allocator, original: solver.Head, compact: solver.Head, queries: []const f64, cfg: solver.Config) !void {
@@ -429,22 +480,32 @@ pub fn prepareParallel(source: checkpoint.State, batches: []const ReferenceBatch
 fn preparedHead(allocator: std.mem.Allocator, source: checkpoint.State, donor_index: usize, head_index: usize, batches: []const ReferenceBatch, layout: Layout, options: Options, resident: usize, validation_gate: ?*HeadValidationGate) !checkpoint.Head {
     try options.fit.control.check();
     const donor = source.donors[donor_index];
-    const replacement = if (donor.window == 0)
-        compactHead(allocator, source, donor_index, head_index, batches, layout, options, resident, validation_gate) catch |err| fallback: {
-            if (options.rejected_head_policy != .preserve_original or
-                (err != error.CompactionFitRejected and err != error.MassFitDidNotConverge)) return err;
+    const replacement = if (donor.window == 0) attempt: {
+        var attempt_options = options;
+        while (true) {
             try options.fit.control.check();
-            if (options.stats) |stats| {
-                stats.preserved_heads += 1;
-                if (err == error.MassFitDidNotConverge) stats.convergence_fallbacks += 1;
-                const metrics = if (stats.validating_storage) stats.rounded_fit else stats.last_fit;
-                stats.max_rejected_mass_error = @max(stats.max_rejected_mass_error, metrics.max_relative_mass_error);
-                stats.max_rejected_output_rmse = @max(stats.max_rejected_output_rmse, metrics.relative_output_rmse);
-            }
-            break :fallback null;
+            break :attempt compactHead(allocator, source, donor_index, head_index, batches, layout, attempt_options, resident, validation_gate) catch |err| {
+                if (err != error.CompactionFitRejected and err != error.MassFitDidNotConverge) return err;
+                try options.fit.control.check();
+                if (options.stats) |stats| {
+                    const metrics = if (stats.validating_storage) stats.rounded_fit else stats.last_fit;
+                    stats.max_rejected_mass_error = @max(stats.max_rejected_mass_error, metrics.max_relative_mass_error);
+                    stats.max_rejected_output_rmse = @max(stats.max_rejected_output_rmse, metrics.relative_output_rmse);
+                }
+                if (attempt_options.retention_divisor > (options.min_retention_divisor orelse options.retention_divisor)) {
+                    attempt_options.retention_divisor -= 1;
+                    if (options.stats) |stats| stats.retention_retries += 1;
+                    continue;
+                }
+                if (options.rejected_head_policy != .preserve_original) return err;
+                if (options.stats) |stats| {
+                    stats.preserved_heads += 1;
+                    if (err == error.MassFitDidNotConverge) stats.convergence_fallbacks += 1;
+                }
+                break :attempt null;
+            };
         }
-    else
-        null;
+    } else null;
     return replacement orelse try checkpoint.cloneHead(allocator, donor.heads[head_index]);
 }
 
@@ -555,7 +616,7 @@ fn mergeStats(total: *Stats, part: Stats) void {
     total.rounded_fit = part.rounded_fit;
     total.validating_storage = part.validating_storage;
     total.validating_head = part.validating_head;
-    inline for (.{ "attempted_chunks", "completed_chunks", "validated_heads", "preserved_heads", "convergence_fallbacks" }) |field|
+    inline for (.{ "attempted_chunks", "completed_chunks", "validated_heads", "preserved_heads", "retention_retries", "convergence_fallbacks", "fp8_heads", "fp8_fallback_heads" }) |field|
         @field(total, field) += @field(part, field);
     inline for (.{ "max_nnls_sweeps", "max_rejected_mass_error", "max_rejected_output_rmse", "max_head_mass_error", "max_head_output_rmse" }) |field|
         @field(total, field) = @max(@field(total, field), @field(part, field));
@@ -620,6 +681,10 @@ fn prepareWithBackends(allocator: std.mem.Allocator, source: checkpoint.State, b
     try options.fit.control.check();
     try source.validateWithControl(options.checkpoint_limits, options.fit.control);
     if (options.max_parallel_validations == 0 or options.max_parallel_validations > 4) return error.InvalidFitConfig;
+    if (options.fp8_checkpoint and (options.storage_precision != .f16 or options.validation != .whole_head)) return error.InvalidFitConfig;
+    if (options.min_retention_divisor) |minimum| {
+        if (minimum < 2 or minimum > options.retention_divisor or options.validation != .whole_head) return error.InvalidFitConfig;
+    }
     if (options.chunk_rows < 2 or options.retention_divisor < 2 or options.retention_divisor > 4 or options.max_queries_per_consumer == 0)
         return error.InvalidFitConfig;
     if (options.min_global_savings_ratio) |minimum| {
@@ -1109,4 +1174,144 @@ test "attention_match one-permit validation gate releases cancellation reservati
 test "attention_match validation concurrency rejects unbounded configurations" {
     const batches = batchesFixture();
     for ([_]usize{ 0, 5 }) |maximum| try std.testing.expectError(error.InvalidFitConfig, prepare(std.testing.allocator, state, &batches, layout_fixture, .{ .max_parallel_validations = maximum }));
+}
+
+fn fp8EngineAllocationFailures(a: std.mem.Allocator) !void {
+    const batches = batchesFixture();
+    var stats: Stats = .{};
+    var result = try prepare(a, state, &batches, layout_fixture, .{ .stats = &stats, .recent_rows = 1, .prefix_rows = 1, .validation = .whole_head, .storage_precision = .f16, .fp8_checkpoint = true });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), stats.fp8_heads);
+    const head = result.state.donors[0].heads[0];
+    try std.testing.expectEqual(@as(u32, 1), head.fp8.first_row);
+    try std.testing.expectEqual(@as(u32, 1), head.fp8.rows);
+    try std.testing.expectEqual(global.keys[0], head.keys[0]);
+    try std.testing.expectEqual(global.values[0], head.values[0]);
+    try std.testing.expectEqual(@as(f32, 8), head.values[head.values.len - 1]);
+    try std.testing.expectEqualSlices(f32, local.values, result.state.donors[1].heads[0].values);
+    try std.testing.expectEqual(@as(u32, 0), result.state.donors[1].heads[0].fp8.rows);
+    const bytes = try checkpoint.encodeWithEncoding(a, result.state, .{}, .fp8, .{});
+    defer a.free(bytes);
+    var restored = try checkpoint.decode(a, bytes, identity, .{});
+    defer restored.deinit();
+    try std.testing.expectEqualSlices(f32, head.values, restored.state.donors[0].heads[0].values);
+}
+
+test "attention_match FP8 validates all consumers and preserves protected rows under allocation failure" {
+    try fp8EngineAllocationFailures(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, fp8EngineAllocationFailures, .{});
+}
+
+test "attention_match FP8 rejection measures combined error and keeps the f16 candidate" {
+    const original: solver.Head = .{ .dim = 1, .rows = 1, .scale = 1, .keys = &.{0}, .values = &.{1.099609375}, .bias = &.{0} };
+    var keys64 = [_]f64{0};
+    var values64 = [_]f64{1.0625};
+    const compact: solver.Head = .{ .dim = 1, .rows = 1, .scale = 1, .keys = &keys64, .values = &values64, .bias = &.{0} };
+    var keys = [_]f32{0};
+    var values = [_]f32{1.0625};
+    var result: checkpoint.Head = .{ .dim = 1, .compacted_until = 1, .positions = &.{0}, .coverage_ends = &.{1}, .keys = &keys, .values = &values, .bias = &.{0} };
+    const cfg: solver.Config = .{ .target_rows = 1 };
+    try validateRounded(std.testing.allocator, original, compact, &.{0}, cfg);
+    try std.testing.expect(!try quantizeCheckpointHead(std.testing.allocator, original, compact, &result, 0, 1, &.{0}, cfg));
+    try std.testing.expectEqual(@as(f32, 1.0625), values[0]);
+    try std.testing.expectEqual(@as(u32, 0), result.fp8.rows);
+}
+
+test "attention_match FP8 requires serving half precision and whole-head validation" {
+    const batches = batchesFixture();
+    try std.testing.expectError(error.InvalidFitConfig, prepare(std.testing.allocator, state, &batches, layout_fixture, .{ .fp8_checkpoint = true }));
+    try std.testing.expectError(error.InvalidFitConfig, prepare(std.testing.allocator, state, &batches, layout_fixture, .{ .fp8_checkpoint = true, .storage_precision = .f16 }));
+}
+
+fn retryBatches() [8]ReferenceBatch {
+    var batches = batchesFixture();
+    for (&batches) |*batch| {
+        batch.train = &.{ -1, 1 };
+        batch.heldout = &.{ -0.5, 0.5 };
+        batch.train_positions = &.{ 4, 5 };
+        batch.heldout_positions = &.{ 6, 7 };
+    }
+    return batches;
+}
+
+fn retryOptions() Options {
+    return .{ .recent_rows = 0, .chunk_rows = 4, .validation = .whole_head, .min_retention_divisor = 2, .rejected_head_policy = .preserve_original, .storage_precision = .f16, .fp8_checkpoint = true, .fit = .{ .target_rows = 1, .selection = .residual_omp, .mass_solver = .active_set } };
+}
+
+fn retentionRetryAllocationFailures(a: std.mem.Allocator) !void {
+    const source = rejectedFixture();
+    const batches = retryBatches();
+    var stats: Stats = .{};
+    var options = retryOptions();
+    options.stats = &stats;
+    var result = try prepare(a, source, &batches, layout_fixture, options);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), stats.retention_retries);
+    try std.testing.expectEqual(@as(usize, 2), stats.validated_heads);
+    try std.testing.expectEqual(@as(usize, 0), stats.preserved_heads);
+    try std.testing.expectEqual(@as(usize, 2), result.state.donors[0].heads[0].positions.len);
+    try std.testing.expect(stats.max_rejected_mass_error > 0.05);
+    try std.testing.expect(stats.max_head_mass_error <= 0.05);
+    try std.testing.expect(stats.max_head_output_rmse <= 0.05);
+    try std.testing.expectEqualSlices(f32, &.{ -1, -1, 1, 1 }, source.donors[0].heads[0].keys);
+    try std.testing.expectEqualSlices(f32, local.values, result.state.donors[1].heads[0].values);
+}
+
+test "attention_match bounded retention retries preserve error gates and unwind allocations" {
+    try retentionRetryAllocationFailures(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, retentionRetryAllocationFailures, .{});
+}
+
+test "attention_match retention retry cancellation cannot preserve or publish a failed head" {
+    const Cancel = struct {
+        fn check(raw: ?*anyopaque) !void {
+            const stats: *Stats = @ptrCast(@alignCast(raw.?));
+            if (stats.retention_retries != 0) return error.CompactionCancelled;
+        }
+    };
+    var stats: Stats = .{};
+    var options = retryOptions();
+    options.stats = &stats;
+    options.fit.control = .{ .context = &stats, .check_fn = Cancel.check };
+    const batches = retryBatches();
+    try std.testing.expectError(error.CompactionCancelled, prepare(std.testing.allocator, rejectedFixture(), &batches, layout_fixture, options));
+    try std.testing.expectEqual(@as(usize, 0), stats.validated_heads);
+    try std.testing.expectEqual(@as(usize, 0), stats.preserved_heads);
+}
+
+test "attention_match retention retries obey parallel admission and match serial results" {
+    const source = rejectedFixture();
+    const batches = retryBatches();
+    var options = retryOptions();
+    var serial = try prepare(std.testing.allocator, source, &batches, layout_fixture, options);
+    defer serial.deinit();
+    const expected = try checkpoint.encodeWithEncoding(std.testing.allocator, serial.state, .{}, .fp8, .{});
+    defer std.testing.allocator.free(expected);
+    const backends: [4]solver.Backend = @splat(ParallelTestBackend.backend);
+    options.fit.backend = ParallelTestBackend.backend;
+    var planned = options;
+    planned.retention_divisor = 2;
+    const workspace = try headWorkspaceBytes(4, 2, 4, 8, 8, 1, planned);
+    for (2..5) |workers| {
+        var stats: Stats = .{};
+        options.stats = &stats;
+        options.max_transient_host_bytes = try parallelHostBytes(try source.residentBytes(), 2, workspace.bytes, workers);
+        var result = try prepareParallel(source, &batches, layout_fixture, options, backends[0..workers]);
+        defer result.deinit();
+        const actual = try checkpoint.encodeWithEncoding(std.testing.allocator, result.state, .{}, .fp8, .{});
+        defer std.testing.allocator.free(actual);
+        try std.testing.expectEqualSlices(u8, expected, actual);
+        try std.testing.expectEqual(@as(usize, 1), stats.retention_retries);
+        options.max_transient_host_bytes -= 1;
+        try std.testing.expectError(error.CompactionWorkspaceLimit, prepareParallel(source, &batches, layout_fixture, options, backends[0..workers]));
+    }
+}
+
+test "attention_match retention retry configuration is bounded and requires whole-head validation" {
+    const batches = batchesFixture();
+    for ([_]usize{ 0, 1, 5 }) |minimum| {
+        try std.testing.expectError(error.InvalidFitConfig, prepare(std.testing.allocator, state, &batches, layout_fixture, .{ .min_retention_divisor = minimum, .validation = .whole_head }));
+    }
+    try std.testing.expectError(error.InvalidFitConfig, prepare(std.testing.allocator, state, &batches, layout_fixture, .{ .min_retention_divisor = 2 }));
+    try std.testing.expectError(error.InvalidFitConfig, prepare(std.testing.allocator, state, &batches, layout_fixture, .{ .retention_divisor = 2, .min_retention_divisor = 3, .validation = .whole_head }));
 }

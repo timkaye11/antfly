@@ -115,6 +115,27 @@ response contains metadata and one binary checkpoint in an `AFATT001` attachment
 envelope. Use the [Python SDK streaming helpers](../../../py/packages/sdk/README.md#native-kv-checkpoints-under-qualification)
 to validate and save the checkpoint without buffering the whole response.
 
+Checkpoint export defaults to V3 `f16` storage: K/V values occupy two bytes on
+disk and restore exactly to the supported f16 serving cache. Positions, coverage,
+biases and continuation logits retain their original precision. Set the
+`X-Antfly-KV-Encoding` request header to select:
+
+| Encoding | Wire version | Behavior |
+| --- | --- | --- |
+| `f16` (default) | 3 | Lossless storage of the supported f16 cache; halves K/V payload bytes versus V2. |
+| `fp8` (experimental, opt-in) | 3 | E4M3FN for fitted historical ranges that pass whole-head validation after dequantization; rejected attempts keep the validated f16 fit. |
+| `f32` | 2 | Legacy export for older readers. |
+
+FP8 uses independent power-of-two K/V scales per accepted head. Protected prefix
+and recent rows and all local windows remain exact f16; attention biases remain
+f32. `fp8_heads` and `fp8_fallback_heads` report accepted and rejected FP8 attempts
+on a successfully compacted checkpoint. An insufficient-savings fallback stays
+entirely exact, even when FP8 was requested. Restore automatically detects the
+wire encoding and expands to f16 serving state; GPU memory savings are unchanged.
+Older SDKs/readers need V2 export or an upgrade. File-size savings exclude unchanged
+metadata and scales. FP8 numerical acceptance does not establish broad answer
+quality; benchmark fresh-question continuations before enabling it in production.
+
 Resume sends that checkpoint with the complete messages and the same tool/template
 options. Their rendered tokens must extend the saved token prefix exactly. The
 server evaluates only the appended suffix; an unchanged prompt resumes from the

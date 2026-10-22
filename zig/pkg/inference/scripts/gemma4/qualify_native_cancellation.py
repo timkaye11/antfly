@@ -158,6 +158,9 @@ def main():
         exports=[r['result'] for r in reference['exporter']['requests'] if r['kind']=='prepare']
         if len(exports)!=1: raise AssertionError('ambiguous checkpoint reference')
         prepared=exports[0]
+        encoding=prepared['metadata'].get('encoding','f32')
+        if encoding not in ('f32','f16','fp8'): raise AssertionError('unsupported reference encoding')
+        evidence['encoding']=encoding
         if prepared['file_sha256']!=evidence['checkpoint_sha256']: raise AssertionError('checkpoint changed')
         body=copy.deepcopy(next(iter(requests(args.model,'f16',[args.padding_lines],False,'fact'))))
         body.pop('context_management');body.pop('cache_dtype')
@@ -185,7 +188,7 @@ def main():
                         publish()
                         request_started=time.monotonic()
                         connection.request('POST','/ai/v1/chat/context/checkpoint',json.dumps(body).encode(),
-                                           {'Content-Type':'application/json'})
+                                           {'Content-Type':'application/json','X-Antfly-KV-Encoding':encoding})
                         if kind=='prefill':
                             case['active_route_marker']=wait_prefill_route(log,offset,30)
                         elif kind=='fitting':

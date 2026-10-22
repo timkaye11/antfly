@@ -106,7 +106,10 @@ request = InferenceGenerateRequest.from_dict({
     "temperature": 0,
     "chat_template_kwargs": {"enable_thinking": False},
 })
-checkpoint = client.prepare_native_kv_checkpoint(request, "history.kv")
+checkpoint = client.prepare_native_kv_checkpoint(request, "history.kv")  # lossless f16 storage
+# Experimental fitted-history FP8 with validated f16 fallback:
+# checkpoint = client.prepare_native_kv_checkpoint(request, "history-fp8.kv", encoding="fp8")
+# Use encoding="f32" for legacy V2 readers.
 print(checkpoint.metadata["outcome"], checkpoint.metadata["global_savings_ratio"])
 
 # The server can be restarted before this call, using the same model revision.

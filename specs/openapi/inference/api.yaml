@@ -76,7 +76,7 @@ paths:
 
         The response is an AFATT001 envelope: JSON metadata followed by exactly
         one application/vnd.antfly.kv-checkpoint attachment. The checkpoint is
-        a V2 binary file containing original token positions, fitted global KV,
+        a V3 binary file by default (V2 when f32 is requested), containing original token positions, fitted global KV,
         exact local KV, saved next-token logits, loaded-model fingerprints and
         an integrity digest. It is usable only with the same model revision,
         tokenizer, chat template and KV layout. Metadata reports the actual
@@ -89,6 +89,15 @@ paths:
         limited to 2 MiB and the checkpoint to 2 GiB. Capacity admission bounds
         concurrent native checkpoint work and returns a retryable response when busy.
       operationId: prepareNativeKvCheckpoint
+      parameters:
+        - in: header
+          name: X-Antfly-KV-Encoding
+          description: Disk encoding. f16 is lossless for the supported cache; fp8 is experimental and applies only to fitted historical heads passing combined error validation, with f16 fallback. f32 exports legacy V2.
+          required: false
+          schema:
+            type: string
+            enum: [f32, f16, fp8]
+            default: f16
       requestBody:
         required: true
         content:
@@ -1657,7 +1666,19 @@ components:
           enum: [attention_match_v1]
         wire_version:
           type: integer
-          enum: [2]
+          enum: [2, 3]
+        encoding:
+          type: string
+          enum: [f32, f16, fp8]
+          description: V2 uses f32; V3 uses f16 or mixed validated FP8/f16 storage. Resident GPU precision remains f16.
+        fp8_heads:
+          type: integer
+          minimum: 0
+          description: Heads whose decoded FP8 fitted history passed whole-head validation against the original cache.
+        fp8_fallback_heads:
+          type: integer
+          minimum: 0
+          description: Validated fitted heads retained in f16 after a rejected FP8 attempt.
         model:
           type: string
         outcome:

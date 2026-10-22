@@ -108,7 +108,7 @@ def wait_server_ready(process, log_path, port, timeout=120):
         message = log_path.read_text()
         if process.poll() is not None or "AddressInUse" in message or "InferenceWorkerExited" in message:
             raise RuntimeError(f"server startup failed; see {log_path}")
-        if f"listening on 127.0.0.1:{port}" in message:
+        if re.search(rf"listening on (?:http://)?127\.0\.0\.1:{port}(?:\s|$)", message):
             try:
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=1) as response:
                     if response.status == 200:
@@ -301,7 +301,7 @@ def validate_fit_evidence(rows, requests, minimum_savings=None, cuda_required=Fa
             raise AssertionError("missing fitting allocation evidence")
 
 
-def validate_cycle_evidence(rows, fits, summaries, requests, cycles, append_tokens, answer_tokens, minimum_savings, first_minimum_savings=None, workers=4, host_workspace_bytes=2 * 1024 ** 3):
+def validate_cycle_evidence(rows, fits, summaries, requests, cycles, append_tokens, answer_tokens, minimum_savings, first_minimum_savings=None, workers=4, host_workspace_bytes=2 * 1024 ** 3, encoding="f32", native_policy=False):
     if len(rows) != cycles * len(requests) or len(fits) != len(rows) or len(summaries) != len(requests):
         raise AssertionError("missing real-model cycle evidence")
     for request_index, request in enumerate(requests):
@@ -340,7 +340,14 @@ def validate_cycle_evidence(rows, fits, summaries, requests, cycles, append_toke
             validate_fit_evidence([fit], [{"response": {"usage": {"prompt_tokens": source_length}}}],
                                   minimum_savings=required, cuda_required=True, install_required=True,
                                   cooperative_required=True, workers_required=workers,
-                                  host_workspace_required=host_workspace_bytes, export_version_required=2)
+                                  host_workspace_required=host_workspace_bytes, export_version_required=2 if encoding == "f32" else 3)
+            if native_policy and fit.get("min_retention_divisor") != 2:
+                raise AssertionError("cycle did not exercise the production retention policy")
+            if encoding == "fp8":
+                counts = [fit.get(key) for key in ("fp8_heads", "fp8_fallback_heads")]
+                if (any(type(count) is not int or count < 0 for count in counts) or counts[0] < 1 or
+                        sum(counts) != fit.get("validated_heads")):
+                    raise AssertionError("cycle did not exercise validated FP8 state")
             previous_length = row["logical_tokens"]
             previous_revision = revision
             total_matches += matches
@@ -453,6 +460,8 @@ def run_server(args, probe, evidence, label=None):
         "ANTFLY_INFERENCE_ATTENTION_MATCH_CYCLE_APPEND": str(getattr(args, "cycle_append_tokens", 1024)),
         "ANTFLY_INFERENCE_ATTENTION_MATCH_CYCLE_ANSWER": str(getattr(args, "cycle_answer_tokens", 16)),
         "ANTFLY_INFERENCE_ATTENTION_MATCH_CYCLE_MIN_SAVINGS": str(getattr(args, "cycle_min_savings_ratio", 1.000001)),
+        "ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_ENCODING": getattr(args, "fit_encoding", "f32") if probe else "f32",
+        "ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_NATIVE_POLICY": str(int(probe and getattr(args, "fit_native_policy", False))),
         "ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_WORKERS": str(getattr(args, "fit_workers", 1) if probe else 1),
         "ANTFLY_INFERENCE_ATTENTION_MATCH_VALIDATION_WORKERS": str(getattr(args, "validation_workers", 2) if probe else 2),
         "ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_HOST_BYTES": str((getattr(args, "fit_host_mib", 2048) if probe else 2048) * 1024 * 1024),
@@ -481,7 +490,7 @@ def run_server(args, probe, evidence, label=None):
     environment.update(overrides)
     command = [
         "bash", str(Path(__file__).with_name("with_gemma4_qat_cuda_tuning.sh")),
-        str(args.server.resolve()), "run", "--host", "127.0.0.1", "--port", str(port),
+        str(args.server.resolve()), *(["inference"] if getattr(args, "server_kind", "inference") == "antfly-inference" else []), "run", "--host", "127.0.0.1", "--port", str(port),
         "--models-dir", str(args.models_dir.resolve()), "--max-concurrent-requests", "1",
         "--host-budget-mb", "8192", "--backend-budget-mb", "18432", "--combined-budget-mb", "26624",
         "--kv-budget-mb", "4096",
@@ -576,7 +585,7 @@ def run_server(args, probe, evidence, label=None):
     if probe and getattr(args, "fit_probe", False):
         if record["fit_rejections"]:
             raise AssertionError("fitting candidate rejected")
-        validate_fit_evidence(record["fit_probes"], record["requests"], getattr(args, "fit_min_savings_ratio", None), getattr(args, "fit_cuda", False), getattr(args, "fit_install", False), getattr(args, "fit_cooperative", False), getattr(args, "fit_workers", 1), getattr(args, "fit_host_mib", 2048) * 1024 * 1024, export_version_required=2)
+        validate_fit_evidence(record["fit_probes"], record["requests"], getattr(args, "fit_min_savings_ratio", None), getattr(args, "fit_cuda", False), getattr(args, "fit_install", False), getattr(args, "fit_cooperative", False), getattr(args, "fit_workers", 1), getattr(args, "fit_host_mib", 2048) * 1024 * 1024, export_version_required=2 if getattr(args, "fit_encoding", "f32") == "f32" else 3)
         if getattr(args, "fit_install", False):
             validate_serving_evidence(record["serving"], record["requests"])
     if probe and getattr(args, "verify_restore", False):
@@ -593,7 +602,7 @@ def run_server(args, probe, evidence, label=None):
         validate_cycle_evidence(record["cycles"], record["cycle_fits"], record["cycle_summaries"], record["requests"],
                                 args.fit_cycles, args.cycle_append_tokens, args.cycle_answer_tokens,
                                 args.cycle_min_savings_ratio, args.fit_min_savings_ratio,
-                                args.fit_workers, args.fit_host_mib * 1024 * 1024)
+                                args.fit_workers, args.fit_host_mib * 1024 * 1024, args.fit_encoding, args.fit_native_policy)
     captures = record["captures"]
     record["prefill_profiles_us"] = [
         {key: int(value) for key, value in re.findall(r"(\w+)=(\d+)", match[1])}
@@ -734,6 +743,7 @@ def performance_schedule(candidate, reference, repetitions):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server", type=Path, required=True)
+    parser.add_argument("--server-kind", choices=("inference", "antfly-inference"), default="inference", help="private inference diagnostic entry point; neither mode qualifies the standalone listener")
     parser.add_argument("--compare-server", type=Path, help="performance only: compare a saved baseline binary, including the same repeat route")
     parser.add_argument("--models-dir", type=Path, required=True)
     parser.add_argument("--model", default="google/gemma-4-E4B-it-qat-q4_0-gguf")
@@ -755,6 +765,8 @@ def main():
     parser.add_argument("--verify-restore", action="store_true", help="Compare a fresh imported cache with an independent fitted clone, without prefix replay")
     parser.add_argument("--verify-clone", action="store_true", help="also collect replay queries in the same request and require bitwise equality")
     parser.add_argument("--fit-probe", action="store_true", help="diagnostic snapshot, f16-rounded fitting, bounded export and upload")
+    parser.add_argument("--fit-encoding", choices=("f32", "f16", "fp8"), default="f32", help="checkpoint wire encoding used by private fit/cycle round trips")
+    parser.add_argument("--fit-native-policy", action="store_true", help="use production bounded retention retries and numerical validation")
     parser.add_argument("--fit-workers", type=int, choices=(1, 2, 3, 4), default=1, help="independent native fitting streams with an aggregate memory limit")
     parser.add_argument("--validation-workers", type=int, choices=(1, 2, 3, 4), default=2, help="bound concurrent whole-head validation independently of fit streams")
     parser.add_argument("--fit-host-mib", type=int, default=2048, help="Aggregate fitting host-workspace limit in MiB (maximum 4096); sampled process RSS is qualified separately")
@@ -783,6 +795,8 @@ def main():
         parser.error("--reference-suffix-tokens must be between 2 and 32768")
     if args.fit_probe and (args.mode == "performance" or args.dtype != "f16"):
         parser.error("--fit-probe requires f16 and correctness/profile mode; it does not qualify repeat-only performance")
+    if (args.fit_encoding != "f32" or args.fit_native_policy) and not args.fit_probe:
+        parser.error("encoding/native-policy diagnostics require --fit-probe")
     if args.fit_cuda and not (args.fit_probe and args.fit_residual):
         parser.error("--fit-cuda requires --fit-probe and --fit-residual")
     if args.fit_workers > 1 and not args.fit_cooperative:
