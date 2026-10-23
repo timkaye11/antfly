@@ -31,8 +31,23 @@ from .client_generated.models import (
     CreateGraphIndexRequestType,
     CreateRelationalIndexRequest,
     CreateRelationalIndexRequestType,
+    CurationOrigin,
+    CurationOriginOrigin,
+    CurationProposal,
+    CurationProposalAction,
+    CurationProposalDecisionRequest,
+    CurationProposalDecisionResult,
+    CurationProposalOptions,
+    CurationProposalOptionsAbsorbed,
+    CurationProposalPage,
+    CurationProposalRequest,
+    CurationProposalRequestAction,
+    CurationProposalState,
     DerivedCoveragePolicy,
     DistanceMetric,
+    EntityDistinctRequest,
+    EntitySuppressRequest,
+    EntitySuppressRequestAbsorbed,
     IndexMaintenanceOwnerProof,
     IndexMaintenanceRequest,
     IndexMaintenanceResponse,
@@ -128,7 +143,25 @@ __version__ = "0.2.0"
 from .read_requirements import read_after_write
 
 __all__ = [
+<<<<<<< HEAD
     "NativeKvCheckpoint",
+=======
+    "CurationOriginOrigin",
+    "CurationProposalAction",
+    "CurationProposalState",
+    "CurationProposalRequestAction",
+    "CurationProposalOptionsAbsorbed",
+    "EntitySuppressRequestAbsorbed",
+    "CurationOrigin",
+    "CurationProposal",
+    "CurationProposalRequest",
+    "CurationProposalOptions",
+    "CurationProposalDecisionRequest",
+    "CurationProposalDecisionResult",
+    "CurationProposalPage",
+    "EntitySuppressRequest",
+    "EntityDistinctRequest",
+>>>>>>> main
     "read_after_write",
     "SQLExecutionError",
     "SQLArrayColumnSchema",
@@ -262,7 +295,7 @@ from .client_generated.models import (
     ResolverUnmergeRequest,
     ResolverWait,
 )
-from .resolvers import EntityOperations, ResolverOperations
+from .resolvers import CurationProposalOperations, EntityOperations, ResolverOperations
 
 __all__ += [
     "EntityCurationResult",
@@ -286,5 +319,6 @@ __all__ += [
     "ResolverUnmergeRequest",
     "ResolverWait",
     "ResolverOperations",
+    "CurationProposalOperations",
     "EntityOperations",
 ]

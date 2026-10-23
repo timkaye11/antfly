@@ -128,6 +128,7 @@ pub const Router = struct {
         return self.addWithOptions(method, pattern, handler, null, null, .raw);
     }
 
+<<<<<<< HEAD
     pub fn addStreamingRawWithBodyLimit(self: *Self, method: types.Method, pattern: []const u8, handler: anytype, max_body_size: usize) !void {
         return self.addWithOptions(method, pattern, handler, null, max_body_size, .raw);
     }
@@ -135,6 +136,10 @@ pub const Router = struct {
     /// Bounded raw streaming with borrowed route-owned context.
     pub fn addStreamingRawWithDataAndBodyLimit(self: *Self, method: types.Method, pattern: []const u8, handler: anytype, data: *anyopaque, max_body_size: usize) !void {
         return self.addWithOptions(method, pattern, handler, data, max_body_size, .raw);
+=======
+    pub fn addStreamingRawWithData(self: *Self, method: types.Method, pattern: []const u8, handler: anytype, data: *anyopaque) !void {
+        return self.addWithOptions(method, pattern, handler, data, null, .raw);
+>>>>>>> main
     }
 
     fn addWithOptions(

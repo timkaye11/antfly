@@ -1728,6 +1728,7 @@ pub const Server = struct {
         try self.router.addStreamingRaw(method, path, handler);
     }
 
+<<<<<<< HEAD
     /// Explicitly bounded raw streaming. The separate configured stream
     /// ceiling permits large uploads without changing buffered-body limits.
     pub fn routeStreamingRawWithBodyLimit(self: *Self, method: types.Method, path: []const u8, max_body_size: usize, handler: anytype) !void {
@@ -1737,6 +1738,10 @@ pub const Server = struct {
     /// Bounded raw streaming without losing route-owned context.
     pub fn routeStreamingRawWithDataAndBodyLimit(self: *Self, method: types.Method, path: []const u8, handler: anytype, data: *anyopaque, max_body_size: usize) !void {
         try self.router.addStreamingRawWithDataAndBodyLimit(method, path, handler, data, max_body_size);
+=======
+    pub fn routeStreamingRawWithData(self: *Self, method: types.Method, path: []const u8, handler: anytype, data: *anyopaque) !void {
+        try self.router.addStreamingRawWithData(method, path, handler, data);
+>>>>>>> main
     }
 
     /// Registers a route with borrowed opaque data copied into Context.

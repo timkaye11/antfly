@@ -74,6 +74,7 @@ pub const Outbound = struct {
         return @intFromBool(context.isCancellationRequested());
     }
 
+<<<<<<< HEAD
     fn readBodyChunk(raw: ?*anyopaque, dest: [*]u8, capacity: usize, count: *usize) callconv(.c) abi.CallbackStatus {
         count.* = 0;
         const self: *Outbound = @ptrCast(@alignCast(raw orelse return .failed));
@@ -82,6 +83,13 @@ pub const Outbound = struct {
         const n = reader.read(dest[0..capacity]) catch |err| return callbackStatusAfterIo(self.context, err);
         if (n > capacity) return .failed;
         count.* = n;
+=======
+    fn readBodyChunk(raw: ?*anyopaque, dest: [*]u8, capacity: usize, out: *usize) callconv(.c) abi.CallbackStatus {
+        const self: *Outbound = @ptrCast(@alignCast(raw orelse return .failed));
+        if (self.context.isCancellationRequested()) return .canceled;
+        var reader = self.context.requestBodyReader();
+        out.* = reader.read(dest[0..capacity]) catch |err| return callbackStatusAfterIo(self.context, err);
+>>>>>>> main
         return .ok;
     }
 
@@ -161,6 +169,7 @@ pub fn installInbound(
 fn inboundReadBodyChunk(raw: ?*anyopaque, dest: []u8) !usize {
     const source: *const abi.RequestBodySource = @ptrCast(@alignCast(raw orelse return error.BodySourceUnavailable));
     var count: usize = 0;
+<<<<<<< HEAD
     switch (source.read.?(source.context, dest.ptr, dest.len, &count)) {
         .ok => {},
         .failed => return error.BodyReadFailed,
@@ -171,6 +180,10 @@ fn inboundReadBodyChunk(raw: ?*anyopaque, dest: []u8) !usize {
         .end_of_stream => return error.EndOfStream,
     }
     if (count > dest.len) return error.InvalidBodyReadCount;
+=======
+    try callbackResult(source.read.?(source.context, dest.ptr, dest.len, &count));
+    if (count > dest.len) return error.BodyReadFailed;
+>>>>>>> main
     return count;
 }
 
@@ -536,6 +549,7 @@ test "outbound callbacks prefer cancellation that arrives during transport IO" {
     try std.testing.expectEqual(.canceled, stream_sink.close.?(stream_sink.context));
 }
 
+<<<<<<< HEAD
 test "linked incremental body reads cross both adapters without materializing the upload" {
     const std = @import("std");
     const State = struct {
@@ -641,4 +655,47 @@ test "linked incremental-only source is installed without a whole-body fallback"
     try std.testing.expectEqual(@as(usize, 13), total);
     try std.testing.expect(request.body == null);
     try std.testing.expectError(error.BodySourceUnavailable, context.body());
+=======
+test "runtime HTTP body source preserves incremental reads without materializing" {
+    const std = @import("std");
+    const Source = struct {
+        offset: usize = 0,
+        fn all(_: ?*anyopaque) !?[]const u8 {
+            return error.UnexpectedMaterialization;
+        }
+        fn read(raw: ?*anyopaque, dest: []u8) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const bytes = "audio";
+            const n = @min(dest.len, bytes.len - self.offset);
+            @memcpy(dest[0..n], bytes[self.offset..][0..n]);
+            self.offset += n;
+            return n;
+        }
+    };
+    const a = std.testing.allocator;
+    var request = try httpx.Request.init(a, .POST, "http://localhost/stream");
+    defer request.deinit();
+    var outer = httpx.Context.init(a, std.testing.io, &request);
+    defer outer.deinit();
+    var source: Source = .{};
+    outer.body_delegate = .{ .ptr = &source, .read_all = Source.all, .read = Source.read, .streaming = true };
+    var transport = Outbound{ .context = &outer };
+    const body_source = transport.bodySource();
+    var inner_request = try httpx.Request.init(a, .POST, "http://localhost/stream");
+    defer inner_request.deinit();
+    var inner = httpx.Context.init(a, std.testing.io, &inner_request);
+    defer inner.deinit();
+    const cancellation: abi.CancellationView = .{};
+    const stream: abi.StreamSink = .{};
+    installInbound(&inner, &cancellation, &body_source, &stream);
+    try std.testing.expect(inner.hasStreamingRequestBody());
+    var reader = inner.requestBodyReader();
+    var bytes: [3]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), try reader.read(&bytes));
+    try std.testing.expectEqualStrings("aud", &bytes);
+    try std.testing.expectEqual(@as(usize, 2), try reader.read(&bytes));
+    try std.testing.expectEqualStrings("io", bytes[0..2]);
+    try std.testing.expectEqual(@as(usize, 0), try reader.read(&bytes));
+    try std.testing.expect(inner.request.body == null);
+>>>>>>> main
 }

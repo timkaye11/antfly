@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! SQL adapter to the existing authenticated catalog and relational row APIs.
 const std = @import("std");
@@ -177,6 +177,7 @@ pub const Adapter = struct {
                     .secret_store = self.server.cfg.secret_store,
                     .antfly_provider = self.server.antfly_provider,
                     .antfly_url = config.inference.api_url,
+                    .antfly_api_key = config.inference.api_key,
                 };
             }
         }
@@ -198,6 +199,7 @@ pub const Adapter = struct {
         const previous_provider = self.decision_provider;
         defer self.decision_provider = previous_provider;
         decision_runtime = try self.decisionRuntime();
+        defer if (decision_runtime) |*active| active.deinit();
         if (decision_runtime) |*active| self.decision_provider = active.provider();
         if (self.policy_proofs != null) return zig017_failure: {
             zig017_return_error = error.InvalidSqlBackendResponse;
@@ -594,7 +596,9 @@ pub const Adapter = struct {
         var snapshot = (try self.server.source.adminSnapshot()) orelse return error.IntegrityCatalogUnavailable;
         defer self.server.source.freeAdminSnapshot(&snapshot);
         const writes = try @import("antfly_local_sources").sql_mutation_images.writes(db_types.BatchWrite, alloc, mutations);
-        const previous = if (self.staged) |staged| try staged.distributedTables(alloc) else &.{};
+        const previous_view = if (self.staged) |staged| try staged.distributedTables(alloc) else null;
+        defer if (previous_view) |view| view.deinit();
+        const previous = if (previous_view) |view| view.tables else &.{};
         const owners = try integrity.resolveConflictTargetOwnersWithScratch(alloc, scratch_alloc, self.server.table_reads orelse return error.UnsupportedSqlExecution, snapshot.tables, snapshot.ranges, table.physical_name, table.schema_version, .{ .columns = target.columns, .expressions = keys, .predicate = predicates, .constraint_name = target.constraint_name }, writes, previous, self.context);
         try self.verify(alloc, table);
         const result = try alloc.alloc(catalog.ConflictOwner, owners.len);

@@ -88,13 +88,14 @@ test "template remote byte budget reads the reloadable config snapshot" {
         config: scraping.RemoteContentConfig,
         releases: usize = 0,
 
-        fn acquire(context: *anyopaque) anyerror!scraping.RemoteContentConfig.Snapshot {
+        fn acquire(context: *anyopaque, output: *scraping.RemoteContentConfig.Snapshot) callconv(.c) scraping.RemoteContentConfig.RemoteContentRuntime.AcquireStatus {
             const self: *@This() = @ptrCast(@alignCast(context));
-            return .{
+            output.* = .{
                 .config = &self.config,
                 .context = context,
                 .release_fn = release,
             };
+            return .ok;
         }
 
         fn release(context: *anyopaque) void {
@@ -246,7 +247,7 @@ pub fn renderJsonToPartsWithConfig(
     return try template_mod.textToParts(alloc, rendered);
 }
 
-fn validateRenderedTemplate(alloc: Allocator, rendered: []const u8) !void {
+pub fn validateRenderedTemplate(alloc: Allocator, rendered: []const u8) !void {
     const directives = try template_mod.parseErrorDirectives(alloc, rendered);
     defer template_mod.freeErrorDirectives(alloc, directives);
     if (directives.len == 0) return;
@@ -490,7 +491,7 @@ fn remotePdfHelperImpl(ctx: hbs.HelperContext) anyerror!hbs.Value {
 }
 
 fn credentialName(ctx: hbs.HelperContext) !?[]const u8 {
-    const value = ctx.hash.get("credentials") orelse return null;
+    const value = ctx.hash.get(template_mod.remote_credentials_argument) orelse return null;
     return switch (value) {
         .string => |text| if (text.len > 0) text else error.InvalidCredentialName,
         else => error.InvalidCredentialName,

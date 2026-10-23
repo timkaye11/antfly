@@ -11,7 +11,11 @@
  ],
  "counts": {
   "opKinds": 74,
+<<<<<<< HEAD
   "kernels": 535,
+=======
+  "kernels": 533,
+>>>>>>> main
   "routes": 25
  }
 }

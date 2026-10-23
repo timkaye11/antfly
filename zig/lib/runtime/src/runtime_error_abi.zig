@@ -46,6 +46,13 @@ test "document extraction failures retain terminal identity across callbacks" {
     }
 }
 
+test "metadata head races remain retryable across runtime callbacks" {
+    const transported = statusFromError(error.MetadataSnapshotHeadMismatch);
+    try std.testing.expectEqual(@backingInt(Code.retryable), transported.code);
+    try std.testing.expectEqual(error.MetadataSnapshotHeadMismatch, errorFromStatus(transported));
+    try std.testing.expect(errorHasStableDetail(error.MetadataSnapshotHeadMismatch));
+}
+
 pub const Code = enum(c_int) {
     ok = 0,
     out_of_memory,
@@ -873,6 +880,12 @@ pub const Detail = enum(c_int) {
     unsupported_constrained_schema,
     unsupported_generated_extraction_schema,
     resolver_curation_conflict,
+    value_verification_requires_scan,
+    value_verification_limit_exceeded,
+    invalid_embedding_identity,
+    graph_start_identity_required,
+    metadata_snapshot_head_mismatch,
+    inference_endpoint_access_denied,
 };
 
 pub const Status = extern struct {
@@ -951,6 +964,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.ChunkRequestFailed => status(.unavailable, .model_chunk_chunk_request_failed),
         error.ChunkUnitTooLarge => status(.invalid_argument, .model_chunk_chunk_unit_too_large),
         error.EmbeddingIdentityMismatch => status(.conflict, .model_chunk_embedding_identity_mismatch),
+        error.InvalidEmbeddingIdentity => status(.invalid_argument, .invalid_embedding_identity),
         error.EmptyEmbeddingInput => status(.invalid_argument, .model_chunk_empty_embedding_input),
         error.EmptyResponse => status(.unavailable, .model_chunk_empty_response),
         error.EmptySource => status(.invalid_argument, .model_chunk_empty_source),
@@ -1124,6 +1138,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.MissingSplitRuntime => status(.not_found, .missing_split_runtime),
         error.MissingMergeRuntime => status(.not_found, .missing_merge_runtime),
         error.MetadataSnapshotUnavailable => status(.retryable, .metadata_snapshot_unavailable),
+        error.MetadataSnapshotHeadMismatch => status(.retryable, .metadata_snapshot_head_mismatch),
         error.SplitSourceProjectionNotReady => status(.retryable, .split_source_projection_not_ready),
         error.SplitSourceProjectionAdvanced => status(.retryable, .split_source_projection_advanced),
         error.DurableRootIncarnationUnavailable => status(.retryable, .durable_root_incarnation_unavailable),
@@ -1405,6 +1420,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.TemporaryNameServerFailure => status(.retryable, .temporary_name_server_failure),
         error.NameServerFailure => status(.unavailable, .name_server_failure),
         error.QueryCandidateBudgetExceeded => status(.unavailable, .query_candidate_budget_exceeded),
+        error.ValueSearchRequiresScan => status(.unsupported, .value_verification_requires_scan),
+        error.ValueSearchLimitExceeded => status(.invalid_argument, .value_verification_limit_exceeded),
         error.DecisionLimitExceeded => status(.invalid_argument, .decision_limit_exceeded),
         error.GraphWorkBudgetExceeded => status(.invalid_argument, .graph_work_budget_exceeded),
         error.GraphMinWeightDomainViolation => status(.invalid_argument, .graph_min_weight_domain_violation),
@@ -1416,12 +1433,14 @@ pub fn statusFromError(err: anyerror) Status {
         // Preserve the append-only runtime detail code while the public error
         // name reflects that unsupported exact modes are not topology-specific.
         error.GraphQueryModeUnsupported => status(.unsupported, .graph_cross_range_mode_unsupported),
+        error.GraphStartIdentityRequired => status(.unsupported, .graph_start_identity_required),
         error.QueryEmbeddingInputTooLarge => status(.invalid_argument, .query_embedding_input_too_large),
         error.QueryEmbeddingOverloaded => status(.unavailable, .query_embedding_overloaded),
         error.EmbedRateLimited => status(.retryable, .embed_rate_limited),
         error.EmbedTransientFailure => status(.retryable, .embed_transient_failure),
         error.EmbedUpstreamFailure => status(.unavailable, .embed_upstream_failure),
         error.EmbeddingProbeUnavailable => status(.unavailable, .embedding_probe_unavailable),
+        error.InferenceEndpointAccessDenied => status(.forbidden, .inference_endpoint_access_denied),
         error.InvalidEmbeddingResponse => status(.invalid_argument, .invalid_embedding_response),
         error.InvalidEmbeddingDimensions => status(.invalid_argument, .invalid_embedding_dimensions),
         error.BackupAlreadyExists => status(.already_exists, .backup_already_exists),
@@ -1775,6 +1794,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .model_chunk_chunk_request_failed => "ChunkRequestFailed",
         .model_chunk_chunk_unit_too_large => "ChunkUnitTooLarge",
         .model_chunk_embedding_identity_mismatch => "EmbeddingIdentityMismatch",
+        .invalid_embedding_identity => "InvalidEmbeddingIdentity",
         .model_chunk_empty_embedding_input => "EmptyEmbeddingInput",
         .model_chunk_empty_response => "EmptyResponse",
         .model_chunk_empty_source => "EmptySource",
@@ -1977,6 +1997,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .missing_split_runtime => "MissingSplitRuntime",
         .missing_merge_runtime => "MissingMergeRuntime",
         .metadata_snapshot_unavailable => "MetadataSnapshotUnavailable",
+        .metadata_snapshot_head_mismatch => "MetadataSnapshotHeadMismatch",
         .split_source_projection_not_ready => "SplitSourceProjectionNotReady",
         .split_source_projection_advanced => "SplitSourceProjectionAdvanced",
         .durable_root_incarnation_unavailable => "DurableRootIncarnationUnavailable",
@@ -2273,6 +2294,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .temporary_name_server_failure => "TemporaryNameServerFailure",
         .name_server_failure => "NameServerFailure",
         .query_candidate_budget_exceeded => "QueryCandidateBudgetExceeded",
+        .value_verification_requires_scan => "ValueSearchRequiresScan",
+        .value_verification_limit_exceeded => "ValueSearchLimitExceeded",
         .decision_limit_exceeded => "DecisionLimitExceeded",
         .query_embedding_input_too_large => "QueryEmbeddingInputTooLarge",
         .query_embedding_overloaded => "QueryEmbeddingOverloaded",
@@ -2280,6 +2303,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .embed_transient_failure => "EmbedTransientFailure",
         .embed_upstream_failure => "EmbedUpstreamFailure",
         .embedding_probe_unavailable => "EmbeddingProbeUnavailable",
+        .inference_endpoint_access_denied => "InferenceEndpointAccessDenied",
         .invalid_embedding_response => "InvalidEmbeddingResponse",
         .invalid_embedding_dimensions => "InvalidEmbeddingDimensions",
         .backup_already_exists => "BackupAlreadyExists",
@@ -2467,6 +2491,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .graph_anchor_filter_requires_index => "GraphAnchorFilterRequiresIndex",
         .graph_match_operation_limit_exceeded => "GraphMatchOperationLimitExceeded",
         .graph_cross_range_mode_unsupported => "GraphQueryModeUnsupported",
+        .graph_start_identity_required => "GraphStartIdentityRequired",
         .graph_work_budget_exceeded => "GraphWorkBudgetExceeded",
         .graph_min_weight_domain_violation => "GraphMinWeightDomainViolation",
         .graph_max_weight_domain_violation => "GraphMaxWeightDomainViolation",
@@ -2822,6 +2847,7 @@ test "model-aware chunk failures preserve retry and source fencing semantics" {
         .{ .err = error.StaleChunkContinuation, .code = .conflict },
         .{ .err = error.SourceVersionChanged, .code = .conflict },
         .{ .err = error.EmbeddingIdentityMismatch, .code = .conflict },
+        .{ .err = error.InvalidEmbeddingIdentity, .code = .invalid_argument },
         .{ .err = error.IncompleteChunkCoverage, .code = .invalid_argument },
         .{ .err = error.ChunkOutputTooLarge, .code = .invalid_argument },
         .{ .err = error.MemoryBudgetExceeded, .code = .retryable },
@@ -2945,8 +2971,20 @@ test "merged runtime error details preserve main wire identifiers" {
     try std.testing.expectEqual(@as(c_int, 729), @backingInt(Detail.decision_limit_exceeded));
 }
 
+test "logical query work and scan policy failures retain their identities" {
+    for ([_]anyerror{ error.ValueSearchRequiresScan, error.ValueSearchLimitExceeded }) |err| {
+        try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+    }
+}
+
 test "resolver namespace rejection retains its conflict identity across runtime callbacks" {
     const value = statusFromError(error.ResolverCurationConflict);
     try std.testing.expectEqual(@backingInt(Code.conflict), value.code);
     try std.testing.expectEqual(error.ResolverCurationConflict, errorFromStatus(value));
+}
+
+test "graph start identity requirement retains its semantic identity" {
+    const value = statusFromError(error.GraphStartIdentityRequired);
+    try std.testing.expectEqual(@backingInt(Code.unsupported), value.code);
+    try std.testing.expectEqual(error.GraphStartIdentityRequired, errorFromStatus(value));
 }
