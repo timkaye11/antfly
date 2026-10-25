@@ -307,7 +307,7 @@ jobs:
       python_build: ${{ needs.release-plan.outputs.python_build }}
 
   package-embedded-zig-source:
-    if: ${{ needs.release-plan.outputs.build_contract_schema == '5' }}
+    if: ${{ fromJSON(needs.release-plan.outputs.build_contract_schema) >= 5 }}
     name: Package independently fetchable Apache Zig sources
     needs: release-plan
     runs-on: ubuntu-latest

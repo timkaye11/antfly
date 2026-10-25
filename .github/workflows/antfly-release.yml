@@ -256,7 +256,7 @@ jobs:
           python -m pip check
 
       - name: Download independently fetchable Apache Zig source
-        if: ${{ github.event_name == 'workflow_run' && steps.identity.outputs.build_contract_schema == '5' }}
+        if: ${{ github.event_name == 'workflow_run' && fromJSON(steps.identity.outputs.build_contract_schema) >= 5 }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: antfly-embedded-zig-source
@@ -277,7 +277,7 @@ jobs:
             --version "$RELEASE_VERSION" \
             --commit "$RELEASE_COMMIT"
           embedded_source_args=()
-          if [ "${{ steps.identity.outputs.build_contract_schema }}" = 5 ]; then
+          if [ "${{ steps.identity.outputs.build_contract_schema }}" -ge 5 ]; then
             embedded_source_args=(--embedded-source-dir dist/embedded-zig-source)
           fi
           python scripts/release/build_release_payload.py \

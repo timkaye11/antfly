@@ -366,6 +366,59 @@ class ReleasePromotionTests(unittest.TestCase):
                     schema,
                 )
 
+    def test_promotion_passes_required_source_package_to_payload_builder(self) -> None:
+        workflow = (
+            RELEASE_DIR.parents[1] / ".github/workflows/antfly-release.yml"
+        ).read_text()
+        step = workflow.split(
+            "      - name: Build the schema-versioned release payload\n", 1
+        )[1].split("\n      - name:", 1)[0]
+        script = textwrap.dedent(step.split("        run: |\n", 1)[1])
+        for schema in (1, 2, 3, 4, 5, 6):
+            with self.subTest(schema=schema), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                command = root / "python"
+                command.write_text(
+                    f"#!{sys.executable}\n"
+                    "import json, os, sys\n"
+                    "from pathlib import Path\n"
+                    "if sys.argv[1].endswith('build_release_payload.py'):\n"
+                    "    Path(os.environ['PAYLOAD_ARGS']).write_text(json.dumps(sys.argv[2:]))\n"
+                )
+                command.chmod(0o755)
+                arguments = root / "payload-args.json"
+                subprocess.run(
+                    [
+                        "bash",
+                        "-eo",
+                        "pipefail",
+                        "-c",
+                        script.replace(
+                            "${{ steps.identity.outputs.build_contract_schema }}",
+                            str(schema),
+                        ),
+                    ],
+                    check=True,
+                    env={
+                        **os.environ,
+                        "PATH": str(root) + os.pathsep + os.environ["PATH"],
+                        "PAYLOAD_ARGS": str(arguments),
+                        "RELEASE_TAG": "v0.3.0-rc.3",
+                        "RELEASE_VERSION": "0.3.0-rc.3",
+                        "RELEASE_COMMIT": COMMIT,
+                        "PROMOTION_CONTROLLER_COMMIT": "e" * 40,
+                    },
+                )
+                argv = json.loads(arguments.read_text())
+                if schema in (5, 6):
+                    self.assertIn("--embedded-source-dir", argv)
+                    self.assertEqual(
+                        argv[argv.index("--embedded-source-dir") + 1],
+                        "dist/embedded-zig-source",
+                    )
+                else:
+                    self.assertNotIn("--embedded-source-dir", argv)
+
     def test_release_source_snapshot_is_extracted_from_the_exact_commit(self) -> None:
         stage = load_module("stage_release_source_test", "stage_release_source.py")
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -1733,7 +1786,9 @@ class ReleasePromotionTests(unittest.TestCase):
         self.assert_release_ledger(4)
 
     def test_fetchable_source_release_ledger(self) -> None:
-        self.assert_release_ledger(5)
+        for schema in (5, 6):
+            with self.subTest(schema=schema):
+                self.assert_release_ledger(schema)
 
     def test_historical_pkgconfig_source_contract_is_preserved(self) -> None:
         contract = load_module(
