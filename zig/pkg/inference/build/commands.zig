@@ -75,7 +75,13 @@ pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile 
     // HTTP-only ReleaseSmall with Metal measured a 4.46 GiB build-tree
     // peak on an M4, under a 10 GiB watchdog with no additional swap.
     // Other optimization modes retain the broader Metal allowance.
-    const http_default_memory_gib: usize = if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal)
+    // Native GB10 stripped CUDA ReleaseFast measured 11,429,871,616 bytes.
+    // 14 GiB retains at least 25% headroom for this host/target profile.
+    const native_arm64_cuda_http_release = ctx.b.graph.host.result.os.tag == .linux and
+        ctx.b.graph.host.result.cpu.arch == .aarch64 and ctx.target.result.os.tag == .linux and
+        ctx.target.result.cpu.arch == .aarch64 and ctx.target.result.abi == .gnu and
+        ctx.backend.enable_cuda and ctx.optimize == .fast and ctx.strip;
+    const http_default_memory_gib: usize = if (native_arm64_cuda_http_release) 14 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal)
         (if (ctx.optimize == .small) 10 else 14)
     else if (ctx.hasAccelerator()) 8 else 6;
     const http_compile_memory_mb: usize = if (native_cpu_http_release) 3840 else http_default_memory_gib * 1024;

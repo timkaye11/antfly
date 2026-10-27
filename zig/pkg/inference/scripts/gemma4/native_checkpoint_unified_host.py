@@ -237,6 +237,9 @@ def unified_server(args, label, evidence, scripts):
     data_dir = args.output.resolve().with_suffix(f".{label}.data")
     data_dir.mkdir(exist_ok=False)
     config = {
+        # The qualification listener is explicitly loopback-only. Public
+        # inference is an opt-in deployment policy on database API nodes.
+        "public_inference": {"enabled": True},
         "admission": {
             "inference": {
                 "max_concurrent_requests": qualification_admission_capacity(args)

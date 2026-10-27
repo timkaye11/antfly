@@ -20,6 +20,20 @@ const std = @import("std");
 const checkpoint = @import("attention_match_checkpoint.zig");
 const engine = @import("attention_match_engine.zig");
 
+/// SM121 has not passed the SM89 repeat kernel's bitwise-parity gate. Use
+/// ordinary model attention for its isolated query study, preserving the
+/// original fitting/held-out validation and publication policy.
+pub fn requiresReferenceRepeat(compute_major: i32, compute_minor: i32) bool {
+    return compute_major == 12 and compute_minor == 1;
+}
+
+test "attention match GB10 query study preserves reference attention" {
+    try std.testing.expect(requiresReferenceRepeat(12, 1));
+    try std.testing.expect(!requiresReferenceRepeat(8, 9));
+    try std.testing.expect(!requiresReferenceRepeat(12, 0));
+    try std.testing.expect(!requiresReferenceRepeat(9, 0));
+}
+
 /// Build a bounded self-study sequence from the saved prefix only. Repeating
 /// just its tail can calibrate exclusively on boilerplate and miss identifiers
 /// earlier in the history. Prefer contiguous windows containing infrequent

@@ -133,6 +133,23 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         };
         return gib * 1024 * 1024 * 1024;
     }
+    if (profile.host.os.tag == .linux and profile.host.cpu.arch == .aarch64 and
+        target.os.tag == .linux and target.cpu.arch == .aarch64 and target.abi == .gnu and
+        profile.optimize == .fast and !profile.sanitize_thread)
+    {
+        // Native GB10 Zig 0.17 ReleaseFast compilation measured CLI at
+        // 5,307,867,136 bytes, distributed at 21,629,059,072 bytes and
+        // storage at 21,701,996,544 bytes and serverless at 11,460,567,040
+        // bytes; API peaked at 36,999,655,424 bytes. Retain at least
+        // 25% headroom.
+        switch (unit) {
+            .api_kernel => return 44 * 1024 * 1024 * 1024,
+            .cli => return 7 * 1024 * 1024 * 1024,
+            .distributed, .storage_kernel => return 26 * 1024 * 1024 * 1024,
+            .serverless => return 14 * 1024 * 1024 * 1024,
+            else => {},
+        }
+    }
     return switch (unit) {
         // Claims conservatively cover clean production ReleaseFast
         // peaks measured for both aarch64-linux-musl and explicit

@@ -4359,9 +4359,14 @@ pub const NativeGenerationPipeline = struct {
         }
         request.planned_fit_workers = plan.workers;
         const started = mtpProfileTimestamp(true, self.io);
+        const reference_repeat = if (comptime build_options.enable_cuda) blk: {
+            const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
+            break :blk runtime.kv.attention_match_queries.requiresReferenceRepeat(compute.ctx.info.compute_major, compute.ctx.info.compute_minor);
+        } else false;
+        std.log.info("native_checkpoint_query_route repeat_mode={s}", .{if (reference_repeat) @as([]const u8, "reference") else "exact_split"});
         var queries = try self.collectAttentionMatchQueries(tokens, source, .{
             .prefix_mode = .clone,
-            .repeat_mode = .exact_split,
+            .repeat_mode = if (reference_repeat) .reference else .exact_split,
             .collection = NativeCheckpointPrepare.collection_options,
             .chunk_size = 256,
             .max_repeat_tokens = NativeCheckpointPrepare.max_repeat_tokens,

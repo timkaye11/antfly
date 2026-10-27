@@ -274,11 +274,17 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     });
     native_inference_mod.sanitize_thread = antfly_imports.sanitize_thread;
     antfly_imports.configureInference(b, native_inference_mod, link_libc);
+    const native_arm64_linux_release = b.graph.host.result.os.tag == .linux and
+        b.graph.host.result.cpu.arch == .aarch64 and target.result.os.tag == .linux and
+        target.result.cpu.arch == .aarch64 and target.result.abi == .gnu and optimize == .fast and
+        !antfly_imports.sanitize_thread;
     const native_inference = @import("shared_library.zig").addProviderArchive(
         b,
         native_inference_mod,
         "antfly-inference-core",
-        @import("shared_library.zig").inferenceCompileMaxRss(target.result.os.tag, antfly_imports.shared_inference_core, antfly_imports.darwin_release_memory),
+        // Native GB10 ReleaseFast peaked at 27,773,128,704 bytes;
+        // 34 GiB retains at least 25% compiler headroom.
+        if (native_arm64_linux_release) 34 * 1024 * 1024 * 1024 else @import("shared_library.zig").inferenceCompileMaxRss(target.result.os.tag, antfly_imports.shared_inference_core, antfly_imports.darwin_release_memory),
     );
     native_inference.link_function_sections = true;
     native_inference.link_data_sections = true;
@@ -301,7 +307,10 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         owner_options.addOption(bool, "shared_storage_core", true);
         owner_options.addOption(bool, "storage_engine_owner", true);
         capi_mod.addOptions("storage_engine_options", owner_options);
-        const owner = @import("shared_library.zig").addProviderArchive(b, capi_mod, "antfly-storage-engine", @as(u64, if (antfly_imports.darwin_shared_storage_sdk27) 14 else if (target.result.os.tag == .macos and !antfly_imports.darwin_release_memory) 24 else 16) * 1024 * 1024 * 1024);
+        // Native GB10 Zig 0.17 ReleaseFast peaked at 34,350,223,360 bytes.
+        // Reserve 40 GiB, retaining 25% headroom above the measured peak.
+        const storage_compile_gib: u64 = if (native_arm64_linux_release) 40 else if (antfly_imports.darwin_shared_storage_sdk27) 14 else if (target.result.os.tag == .macos and !antfly_imports.darwin_release_memory) 24 else 16;
+        const owner = @import("shared_library.zig").addProviderArchive(b, capi_mod, "antfly-storage-engine", storage_compile_gib * 1024 * 1024 * 1024);
         owner.link_function_sections = true;
         owner.link_data_sections = true;
         @import("source_owner.zig").registerStorageProvider(owner, b.allocator.dupe(*std.Build.Step.Compile, &.{ native_inference, native_enrichment }) catch @panic("OOM"));
