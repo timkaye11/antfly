@@ -4220,6 +4220,7 @@ fn ColumnWireResult(comptime T: type) type {
         req: db_mod.types.SearchRequest,
         projection: ?*const field_projection.Plan,
         scratch: *std.heap.ArenaAllocator,
+        column_projection: *@import("../storage/db/column_source.zig").ProjectionCache,
         alloc: std.mem.Allocator,
         failure: *?anyerror,
         plan: ?*ColumnWirePlan = null,
@@ -4284,7 +4285,8 @@ fn ColumnWireResult(comptime T: type) type {
                                         if (self.plan) |plan| {
                                             // Prepared descriptors live only until source() either
                                             // clones them into residency or writes them to the spool.
-                                            const prepared = source.prepare(self.scratch.allocator(), self.scratch, options) catch |err| {
+                                            // A single hit cannot amortize a schema-plan build.
+                                            const prepared = (if (self.hits.len > 1) self.column_projection.prepare(source, self.scratch.allocator(), self.scratch, options) else source.prepare(self.scratch.allocator(), self.scratch, options)) catch |err| {
                                                 self.failure.* = err;
                                                 return error.WriteFailed;
                                             };
@@ -4294,7 +4296,7 @@ fn ColumnWireResult(comptime T: type) type {
                                                 return error.WriteFailed;
                                             };
                                             w.endWriteRaw();
-                                        } else source.write(self.scratch, options, w) catch |err| {
+                                        } else (if (self.hits.len > 1) self.column_projection.write(source, self.scratch, options, w) else source.write(self.scratch, options, w)) catch |err| {
                                             if (err != error.WriteFailed) self.failure.* = err;
                                             return error.WriteFailed;
                                         };
@@ -4332,6 +4334,8 @@ fn encodeColumnWire(alloc: std.mem.Allocator, graph_wire: ?BorrowedGraphMap, req
     var failure: ?anyerror = null;
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
+    var column_projection = @import("../storage/db/column_source.zig").ProjectionCache.init(alloc);
+    defer column_projection.deinit();
     const options: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
     if (delivery) |sink| {
         var plan: ColumnWirePlan = undefined;
@@ -4356,7 +4360,7 @@ fn encodeColumnWire(alloc: std.mem.Allocator, graph_wire: ?BorrowedGraphMap, req
                 }
             };
         }
-        const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .graph_wire = graph_wire, .hits = hits, .req = req, .projection = projection, .scratch = &scratch, .alloc = alloc, .failure = &failure, .plan = &plan };
+        const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .graph_wire = graph_wire, .hits = hits, .req = req, .projection = projection, .scratch = &scratch, .column_projection = &column_projection, .alloc = alloc, .failure = &failure, .plan = &plan };
         std.json.Stringify.value(.{ .responses = &.{wrapped} }, options, &plan.writer) catch |err| return failure orelse (plan.failure orelse err);
         plan.writer.flush() catch |err| return plan.failure orelse err;
         // Every prepared fragment now belongs to residency or the spool.
@@ -4384,7 +4388,7 @@ fn encodeColumnWire(alloc: std.mem.Allocator, graph_wire: ?BorrowedGraphMap, req
         delivered.* = plan.length;
         return empty;
     }
-    const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .graph_wire = graph_wire, .hits = hits, .req = req, .projection = projection, .scratch = &scratch, .alloc = alloc, .failure = &failure };
+    const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .graph_wire = graph_wire, .hits = hits, .req = req, .projection = projection, .scratch = &scratch, .column_projection = &column_projection, .alloc = alloc, .failure = &failure };
     return std.json.Stringify.valueAlloc(alloc, .{ .responses = &.{wrapped} }, options) catch |err| return failure orelse err;
 }
 
@@ -10501,9 +10505,9 @@ fn parseLegacyPatternNodeFilter(
     errdefer freePatternNodeFilter(alloc, out);
     if (value.filter_prefix) |prefix| out.filter_prefix = try alloc.dupe(u8, prefix);
     if (value.filter_query) |filter_query| {
-        const parsed = try parseSupportedFullTextQuery(alloc, .{ .object = filter_query.map }, 10);
-        defer freeTextQuery(alloc, parsed);
-        out.filter_query_json = try encodePatternFilterQuery(alloc, parsed);
+        // Apply ordinary retrieval's bounded filter normalization, including
+        // structured scalar and array predicates, before graph admission.
+        out.filter_query_json = try normalizePublicStoredFilterQueryAlloc(alloc, @as(std.json.Value, .{ .object = filter_query.map }));
     }
     return out;
 }
@@ -17931,6 +17935,93 @@ fn consumerTests() type {
             try std.testing.expectEqualStrings("both", traverse.object.get("direction").?.string);
             const filter = traverse.object.get("filter") orelse return error.TestUnexpectedResult;
             try std.testing.expectEqualStrings("active", filter.object.get("term").?.string);
+        }
+
+        test "api query contract graph permission filters stop denied roots and intermediates" {
+            const a = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/db", .{tmp.sub_path});
+            defer a.free(path);
+            var db = try db_mod.DB.open(a, path, .{ .start_optional_runtimes = false, .start_index_workers = false });
+            defer db.close();
+            try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+            try db.addIndex(.{ .name = "ft", .kind = .full_text, .config_json = "{}" });
+            try db.batch(.{ .writes = &.{
+                .{ .key = "a", .value = "{\"allowed_plans\":[\"standard\",\"enterprise\"],\"allowed_regions\":[\"eu\"],\"_edges\":{\"g\":{\"links\":[{\"target\":\"denied\"},{\"target\":\"b\"}]}}}" },
+                .{ .key = "b", .value = "{\"allowed_plans\":[\"standard\"],\"allowed_regions\":[\"eu\"],\"_edges\":{\"g\":{\"links\":[{\"target\":\"c\"}]}}}" },
+                .{ .key = "c", .value = "{\"allowed_plans\":[\"standard\"],\"allowed_regions\":[\"eu\"]}" },
+                .{ .key = "denied", .value = "{\"allowed_plans\":[\"enterprise\"],\"allowed_regions\":[\"us\"],\"_edges\":{\"g\":{\"links\":[{\"target\":\"hidden_descendant\"}]}}}" },
+                .{ .key = "hidden_descendant", .value = "{\"allowed_plans\":[\"standard\"],\"allowed_regions\":[\"eu\"]}" },
+            }, .sync_level = .full_index });
+            for ([_][]const u8{
+                "{\"query\":\"+allowed_plans:standard +allowed_regions:eu\"}",
+                "{\"conjuncts\":[{\"term\":\"standard\",\"field\":\"allowed_plans\"},{\"term\":\"eu\",\"field\":\"allowed_regions\"}]}",
+            }) |filter| {
+                for ([_][]const u8{ "traverse", "neighbors", "shortest_path", "k_shortest_paths", "pattern" }) |kind| {
+                    const extra = if (std.mem.eql(u8, kind, "pattern"))
+                        ",\"pattern\":[{\"alias\":\"source\"},{\"alias\":\"target\",\"edge\":{\"types\":[\"links\"],\"direction\":\"out\"}}],\"return_aliases\":[\"source\",\"target\"]"
+                    else if (std.mem.eql(u8, kind, "shortest_path") or std.mem.eql(u8, kind, "k_shortest_paths"))
+                        ",\"target_nodes\":{\"keys\":[\"c\"]}"
+                    else
+                        "";
+                    const body = try std.mem.concat(a, u8, &.{ "{\"graph_searches\":{\"walk\":{\"type\":\"", kind, "\",\"index_name\":\"g\",\"start_nodes\":{\"keys\":[\"a\"]},\"params\":{\"max_depth\":4,\"include_paths\":true,\"node_filter\":{\"filter_query\":", filter, "}},\"include_documents\":true", extra, "}}}" });
+                    defer a.free(body);
+                    var owned = try parseQueryRequest(a, null, "docs", body);
+                    defer owned.deinit(a);
+                    var result = try db.search(a, owned.req);
+                    defer result.deinit();
+                    const graph = result.graph_results[0];
+                    try std.testing.expect(graph.total_hits > 0);
+                    var encoded = try encodeQueryResponses(a, "docs", owned.req, .{}, result);
+                    defer encoded.deinit(a);
+                    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "denied") == null);
+                    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "hidden_descendant") == null);
+                    if (std.mem.eql(u8, kind, "traverse") or std.mem.eql(u8, kind, "neighbors")) {
+                        const multi_body = try std.mem.replaceOwned(u8, a, body, "[\"a\"]", "[\"a\",\"b\",\"denied\"]");
+                        defer a.free(multi_body);
+                        var multi_req = try parseQueryRequest(a, null, "docs", multi_body);
+                        defer multi_req.deinit(a);
+                        var multi = try db.search(a, multi_req.req);
+                        defer multi.deinit();
+                        try std.testing.expectEqual(@as(usize, if (std.mem.eql(u8, kind, "traverse")) 3 else 2), multi.graph_results[0].nodes.len);
+                        try std.testing.expectEqual(@as(usize, 2), multi.graph_results[0].hits.len);
+                        for (multi.graph_results[0].nodes) |node| for (node.path.?) |key| {
+                            try std.testing.expect(!std.mem.eql(u8, key, "denied"));
+                            try std.testing.expect(!std.mem.eql(u8, key, "hidden_descendant"));
+                        };
+                    }
+                    // A denied root must not expose its allowed descendant.
+                    const denied_body = try std.mem.replaceOwned(u8, a, body, "[\"a\"]", "[\"denied\"]");
+                    defer a.free(denied_body);
+                    var denied = try parseQueryRequest(a, null, "docs", denied_body);
+                    defer denied.deinit(a);
+                    var denied_result = try db.search(a, denied.req);
+                    defer denied_result.deinit();
+                    try std.testing.expectEqual(@as(u32, 0), denied_result.graph_results[0].total_hits);
+                }
+            }
+        }
+
+        test "api query contract legacy graph node filters use retrieval validation" {
+            const a = std.testing.allocator;
+            const filters = [_][]const u8{
+                "{\"query\":\"+allowed_plans:standard +allowed_regions:eu\"}",
+                "{\"conjuncts\":[{\"term\":\"standard\",\"field\":\"allowed_plans\"},{\"term\":\"eu\",\"field\":\"allowed_regions\"}]}",
+                "{\"term\":{\"path\":\"allowed\",\"value\":true}}",
+            };
+            for (filters) |filter| {
+                const body = try std.fmt.allocPrint(a, "{{\"graph_searches\":{{\"walk\":{{\"type\":\"traverse\",\"index_name\":\"g\",\"start_nodes\":{{\"keys\":[\"a\"]}},\"params\":{{\"node_filter\":{{\"filter_query\":{s}}}}}}}}}}}", .{filter});
+                defer a.free(body);
+                var owned = try parseQueryRequest(a, null, "docs", body);
+                defer owned.deinit(a);
+                const expected = try normalizePublicStoredFilterQueryAlloc(a, .{ .bytes = filter });
+                defer a.free(expected);
+                try std.testing.expectEqualStrings(expected, owned.req.graph_queries[0].query.params.node_filter.filter_query_json.?);
+            }
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(a, null, "docs",
+                \\{"graph_searches":{"walk":{"type":"traverse","index_name":"g","start_nodes":{"keys":["a"]},"params":{"node_filter":{"filter_query":{"term":42,"field":"allowed_plans"}}}}}}
+            ));
         }
 
         test "api query contract preserves opaque legacy graph operation names" {

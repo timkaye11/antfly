@@ -1002,6 +1002,7 @@ fn artifactRepairRunRequestForShard(
         .repair_attempt_id = req.repair_attempt_id,
         .repair_job_created_at_ms = req.repair_job_created_at_ms,
         .repair_cancel_base_uri = req.repair_cancel_base_uri,
+        .operator_initiated = req.operator_initiated,
     };
 }
 
@@ -6994,6 +6995,9 @@ pub const ProvisionedTableWriteSource = struct {
     restore_open_options: backups_api.OpenOptions = .{},
     remote_content: ?*const scraping.RemoteContentConfig = null,
     dense_native_migration_policy_source: ?db_mod.DenseNativeMigrationPolicySource = null,
+    /// Set by the data server for Raft data groups: LEANN indexes replicate
+    /// leader-planned records instead of mutating graphs locally.
+    leann_replication: bool = false,
     resolution_candidate_source: ?db_mod.CandidateSource = null,
     entity_sink: ?db_mod.EntitySink = null,
     promotion_leadership_source: ?PromotionLeadershipSource = null,
@@ -12464,6 +12468,7 @@ pub const ProvisionedTableWriteSource = struct {
             effective_open_options.schema_json_before_index_load = prepared_open.?.schema_json;
             effective_open_options.inference_api_url = self.inference_api_url;
             effective_open_options.dense_native_migration_policy_source = cache.dense_native_migration_policy_source;
+            effective_open_options.leann_replication = self.leann_replication;
             effective_open_options.remote_capability_cache = self.remote_capability_cache;
             effective_open_options.replication_write_gate = self.replication_write_gate;
             effective_open_options.replication_async_effect_mirror = effective_hot_standby_mirror;
@@ -13846,6 +13851,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .{
                     .inference_api_url = self.inference_api_url,
                     .dense_native_migration_policy_source = self.dense_native_migration_policy_source,
+                    .leann_replication = self.leann_replication,
                     .schema_json_before_index_load = metadata.schema_json,
                     .replication_write_gate = self.replication_write_gate,
                     .replication_async_effect_mirror = effective_hot_standby_mirror,
@@ -14367,6 +14373,7 @@ pub const ProvisionedTableWriteSource = struct {
                     .{
                         .drain_resolver_backfill = false,
                         .dense_native_migration_policy_source = self.dense_native_migration_policy_source,
+                        .leann_replication = self.leann_replication,
                         .schema_json_before_index_load = metadata.schema_json,
                         .inference_api_url = self.inference_api_url,
                         .replication_write_gate = self.replication_write_gate,
@@ -24883,7 +24890,11 @@ pub const ProvisionedTableWriteSource = struct {
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             const group_result = try db.repairArtifactIssuesWithRequestOptions(alloc, req, effective_options);
-            if (group_result.scanned > 0) self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
+            // Deferred repair submits durable replay for the maintenance owner.
+            // Draining a transient writer here would execute providers while
+            // this request still owns the exclusive group-operation guard.
+            if (group_result.scanned > 0 and !effective_options.defer_durable_index_repair_execution)
+                self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
             break :blk group_result;
         };
         errdefer result.deinit(alloc);

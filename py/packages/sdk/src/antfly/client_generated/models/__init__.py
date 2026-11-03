@@ -314,6 +314,7 @@ from .decision_table_source_filter_query import DecisionTableSourceFilterQuery
 from .decision_table_source_mime_type import DecisionTableSourceMimeType
 from .decision_usage import DecisionUsage
 from .delete_artifact_enrichment_response_201 import DeleteArtifactEnrichmentResponse201
+from .dense_index_algorithm import DenseIndexAlgorithm
 from .dense_native_storage_phase import DenseNativeStoragePhase
 from .dense_repair_backpressure_error import DenseRepairBackpressureError
 from .dense_repair_backpressure_error_code import DenseRepairBackpressureErrorCode
@@ -1075,7 +1076,9 @@ from .inference_memory_config import InferenceMemoryConfig
 from .inference_model_backend import InferenceModelBackend
 from .inference_model_info import InferenceModelInfo
 from .inference_model_info_chunking_limits import InferenceModelInfoChunkingLimits
+from .inference_model_info_compatibility import InferenceModelInfoCompatibility
 from .inference_model_info_dense_output import InferenceModelInfoDenseOutput
+from .inference_model_info_error import InferenceModelInfoError
 from .inference_model_info_inference_capabilities import InferenceModelInfoInferenceCapabilities
 from .inference_model_info_qualified_limits import InferenceModelInfoQualifiedLimits
 from .inference_model_instance import InferenceModelInstance
@@ -1214,6 +1217,9 @@ from .lake_catalog_create_request_write_order import LakeCatalogCreateRequestWri
 from .lake_catalog_response import LakeCatalogResponse
 from .lake_catalog_response_metadata import LakeCatalogResponseMetadata
 from .lake_catalog_response_state import LakeCatalogResponseState
+from .leann_index_config import LeannIndexConfig
+from .leann_index_config_quantizer import LeannIndexConfigQuantizer
+from .leann_index_config_vector_storage import LeannIndexConfigVectorStorage
 from .legacy_graph_document_query import LegacyGraphDocumentQuery
 from .legacy_graph_node_selector import LegacyGraphNodeSelector
 from .legacy_graph_query import LegacyGraphQuery
@@ -2023,6 +2029,7 @@ from .provenance_origin_trace_type_0_kind import ProvenanceOriginTraceType0Kind
 from .prune_stats import PruneStats
 from .pruner import Pruner
 from .put_artifact_enrichment_response_201 import PutArtifactEnrichmentResponse201
+from .quantization_refine import QuantizationRefine
 from .query_admission_config import QueryAdmissionConfig
 from .query_builder_request import QueryBuilderRequest
 from .query_builder_request_constraints import QueryBuilderRequestConstraints
@@ -2140,6 +2147,7 @@ from .relational_unique_constraint import RelationalUniqueConstraint
 from .relational_unique_constraint_origin import RelationalUniqueConstraintOrigin
 from .rename_catalog_resource_request import RenameCatalogResourceRequest
 from .repair_issue_list_request import RepairIssueListRequest
+from .repair_remaining_failure import RepairRemainingFailure
 from .repair_run_request import RepairRunRequest
 from .repair_run_request_control import RepairRunRequestControl
 from .repair_target import RepairTarget
@@ -2844,6 +2852,7 @@ __all__ = (
     "DecisionTableSourceMimeType",
     "DecisionUsage",
     "DeleteArtifactEnrichmentResponse201",
+    "DenseIndexAlgorithm",
     "DenseNativeStoragePhase",
     "DenseRepairBackpressureError",
     "DenseRepairBackpressureErrorCode",
@@ -3597,7 +3606,9 @@ __all__ = (
     "InferenceModelBackend",
     "InferenceModelInfo",
     "InferenceModelInfoChunkingLimits",
+    "InferenceModelInfoCompatibility",
     "InferenceModelInfoDenseOutput",
+    "InferenceModelInfoError",
     "InferenceModelInfoInferenceCapabilities",
     "InferenceModelInfoQualifiedLimits",
     "InferenceModelInstance",
@@ -3736,6 +3747,9 @@ __all__ = (
     "LakeCatalogResponse",
     "LakeCatalogResponseMetadata",
     "LakeCatalogResponseState",
+    "LeannIndexConfig",
+    "LeannIndexConfigQuantizer",
+    "LeannIndexConfigVectorStorage",
     "LegacyGraphDocumentQuery",
     "LegacyGraphNodeSelector",
     "LegacyGraphQuery",
@@ -4329,6 +4343,7 @@ __all__ = (
     "Pruner",
     "PruneStats",
     "PutArtifactEnrichmentResponse201",
+    "QuantizationRefine",
     "QueryAdmissionConfig",
     "QueryBuilderRequest",
     "QueryBuilderRequestConstraints",
@@ -4446,6 +4461,7 @@ __all__ = (
     "RelationalUniqueConstraintOrigin",
     "RenameCatalogResourceRequest",
     "RepairIssueListRequest",
+    "RepairRemainingFailure",
     "RepairRunRequest",
     "RepairRunRequestControl",
     "RepairTarget",

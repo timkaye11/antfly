@@ -186,11 +186,22 @@ OCR and model-switching qualification for both 4B and 0.8B. Those checks establi
 runtime compatibility; corpus coverage and text quality still require a representative
 PDF pilot before backfill. Its native `/read` contract uses
 an image-only prompt; the extraction producer sends no prompt to readers.
-The profile requests at most 512 output tokens per page; truncated OCR returns
-an error instead of publishing incomplete text. Dense pages can need a separate
-larger-budget workflow and a separately qualified serving policy. Do not count
-failed or truncated pages as searchable. Use `zig/tools/qualify_reader_generator_pools.py`
-for native execution checks when changing the runtime or serving policy.
+The profile requests at most 2048 output tokens per page. A cached dense DOJ
+page exceeded the earlier 512-token allowance; both reader checkpoints completed
+it at 2048 and retained the checked page-tail text. This is a bounded sample,
+not a completeness guarantee for every page. The serving policy must permit
+`resources.inference.request_limits.max_output_tokens_per_item: 2048` and at
+least 12 `resources.inference.admission.max_work_units` for one image-only
+request. Keep request concurrency at one while qualifying the intended GPU and
+memory limits. The deployed 512-token/eight-unit policy needs a separately
+reviewed update before this profile can be used there.
+Truncated OCR returns an error instead of publishing incomplete text. Do not
+count failed or truncated pages as searchable. Complete the
+[release qualification](../../docs/design/inference/grepstein-release-qualification.md)
+before backfill or enrichment. `zig/tools/qualify_reader_generator_pools.py`
+uses a 512-token reader policy by default; pass
+`--reader-max-output-tokens 2048` to check the larger serving ceiling and its
+exact rejection boundary. Its synthetic pass does not establish corpus coverage.
 The LightOnOCR models return
 Markdown, including table structure, through the same native reader API.
 Set `ANTFLY_INFERENCE_URL` to a server-reachable inference root or `/ai/v1` URL;
@@ -413,3 +424,27 @@ index readiness, queue drain, and OCR spend before loading the full v1 set. Incr
 CPU/memory/disk through existing instance configuration and scale inference
 separately. Indexing large datasets and automatic large-corpus capacity selection
 are deferred; their raw originals can be preserved independently.
+
+### Investigating incomplete OCR
+
+A manifest's `merge_status: converged` reports artifact publication, not OCR
+success. Inspect `ocr_failed_count` on document artifact summaries and run
+`qualify` before declaring extraction complete. A nonempty text index can still
+contain embedded PDF text while OCR pages have failed. Failed OCR pages must not
+qualify for Antfly's unchanged-source fast path. Transient failures use the
+existing per-request retry budget and backoff; exhausted or terminal failures
+remain repair debt. Fix the reported cause before reprocessing those artifacts.
+
+Use the existing named-table artifact and repair APIs through the Cloud session
+or an instance-scoped key. Reprocessing an artifact preserves the source document;
+there is no need to delete its table or index. Keep native repair/reprocess job
+IDs and advance their bounded passes until complete; job creation alone is not
+proof that a repair finished. If an API response is uncertain, inspect the job or
+artifact generation before submitting the mutation again.
+
+Cloud global discovery and named-table requests must resolve the same live user
+permissions. A `401` on global discovery with working named-table requests is a
+proxy routing/authentication problem. A Cloudflare `403` with error `1010` is a
+separate transport rejection. Diagnostic clients should identify themselves with
+a descriptive application `User-Agent`, such as `antfly-cloud/grepstein-diagnostics`.
+Do not treat either response as evidence that OCR failed or that the GPU is busy.

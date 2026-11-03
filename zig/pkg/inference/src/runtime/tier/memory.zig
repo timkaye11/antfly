@@ -663,18 +663,59 @@ pub const AdmissionAmounts = struct {
         return std.math.add(usize, self.host_scratch_bytes, self.backend_scratch_bytes);
     }
 
-    pub fn fitsLimits(self: @This(), limits: Limits) !bool {
+    pub const LimitExceeded = struct {
+        limit: enum { host, backend, combined, scratch, kv },
+        requested_bytes: usize,
+        limit_bytes: usize,
+    };
+
+    /// Return the first constraint that prevents this request fitting alone.
+    /// Keep validation and operator diagnostics on the same checked arithmetic.
+    pub fn firstLimitExceeded(self: @This(), limits: Limits) !?LimitExceeded {
         const host = try self.hostTotalBytesChecked();
         const device = try self.backendTotalBytesChecked();
         const combined = try std.math.add(usize, host, device);
         const scratch = try self.scratchTotalBytesChecked();
         const kv = try self.kvTotalBytesChecked();
-        inline for (.{ .{ host, limits.host_limit_bytes }, .{ device, limits.backend_limit_bytes }, .{ combined, limits.combined_limit_bytes }, .{ scratch, limits.scratch_limit_bytes }, .{ kv, limits.kv_limit_bytes } }) |pair| {
-            if (pair[1] != 0 and pair[0] > pair[1]) return false;
+        inline for (.{
+            .{ .host, host, limits.host_limit_bytes },
+            .{ .backend, device, limits.backend_limit_bytes },
+            .{ .combined, combined, limits.combined_limit_bytes },
+            .{ .scratch, scratch, limits.scratch_limit_bytes },
+            .{ .kv, kv, limits.kv_limit_bytes },
+        }) |entry| {
+            if (entry[2] != 0 and entry[1] > entry[2]) return .{
+                .limit = entry[0],
+                .requested_bytes = entry[1],
+                .limit_bytes = entry[2],
+            };
         }
-        return true;
+        return null;
+    }
+
+    pub fn fitsLimits(self: @This(), limits: Limits) !bool {
+        return (try self.firstLimitExceeded(limits)) == null;
     }
 };
+
+test "admission amounts identify the blocking budget even when scratch fits" {
+    const amounts = AdmissionAmounts{ .host_scratch_bytes = 40, .backend_scratch_bytes = 50, .backend_kv_bytes = 10 };
+    const cases = [_]struct { limits: Limits, expected: AdmissionAmounts.LimitExceeded }{
+        .{ .limits = .{ .host_limit_bytes = 39 }, .expected = .{ .limit = .host, .requested_bytes = 40, .limit_bytes = 39 } },
+        .{ .limits = .{ .backend_limit_bytes = 59 }, .expected = .{ .limit = .backend, .requested_bytes = 60, .limit_bytes = 59 } },
+        .{ .limits = .{ .combined_limit_bytes = 99, .scratch_limit_bytes = 100 }, .expected = .{ .limit = .combined, .requested_bytes = 100, .limit_bytes = 99 } },
+        .{ .limits = .{ .scratch_limit_bytes = 89 }, .expected = .{ .limit = .scratch, .requested_bytes = 90, .limit_bytes = 89 } },
+        .{ .limits = .{ .kv_limit_bytes = 9 }, .expected = .{ .limit = .kv, .requested_bytes = 10, .limit_bytes = 9 } },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, (try amounts.firstLimitExceeded(case.limits)).?);
+        try std.testing.expect(!try amounts.fitsLimits(case.limits));
+    }
+    try std.testing.expect(try amounts.fitsLimits(.{}));
+    try std.testing.expect(try amounts.fitsLimits(.{ .host_limit_bytes = 40, .backend_limit_bytes = 60, .combined_limit_bytes = 100, .scratch_limit_bytes = 90, .kv_limit_bytes = 10 }));
+    const overflow = AdmissionAmounts{ .host_scratch_bytes = std.math.maxInt(usize), .backend_scratch_bytes = 1 };
+    try std.testing.expectError(error.Overflow, overflow.firstLimitExceeded(.{}));
+}
 
 /// Optional process-owner bridge for coordinating inference admission with a
 /// broader resource manager. The inference runtime remains independent of the
@@ -1652,8 +1693,11 @@ pub fn clampDiscreteDeviceLimits(limits: Limits, device_bytes: usize, process_li
     out.host_limit_bytes = intersectAdmissionLimit(out.host_limit_bytes, physical.host_limit_bytes);
     out.backend_limit_bytes = intersectAdmissionLimit(out.backend_limit_bytes, physical.backend_limit_bytes);
     out.combined_limit_bytes = intersectAdmissionLimit(out.combined_limit_bytes, out.host_limit_bytes +| out.backend_limit_bytes);
-    out.kv_limit_bytes = intersectAdmissionLimit(out.kv_limit_bytes, out.backend_limit_bytes);
-    out.scratch_limit_bytes = intersectAdmissionLimit(out.scratch_limit_bytes, out.backend_limit_bytes);
+    // KV and scratch account for both host and device allocations. Physical
+    // residency is bounded independently above; a small VRAM policy must not
+    // turn an admitted host staging buffer into a permanent size failure.
+    out.kv_limit_bytes = intersectAdmissionLimit(out.kv_limit_bytes, out.combined_limit_bytes);
+    out.scratch_limit_bytes = intersectAdmissionLimit(out.scratch_limit_bytes, out.combined_limit_bytes);
     return out;
 }
 
@@ -1663,8 +1707,8 @@ pub fn clampUnifiedDeviceLimits(limits: Limits, shared_bytes: usize) Limits {
     out.host_limit_bytes = intersectAdmissionLimit(out.host_limit_bytes, shared_bytes);
     out.backend_limit_bytes = intersectAdmissionLimit(out.backend_limit_bytes, shared_bytes);
     out.combined_limit_bytes = intersectAdmissionLimit(out.combined_limit_bytes, shared_bytes);
-    out.kv_limit_bytes = intersectAdmissionLimit(out.kv_limit_bytes, out.backend_limit_bytes);
-    out.scratch_limit_bytes = intersectAdmissionLimit(out.scratch_limit_bytes, out.backend_limit_bytes);
+    out.kv_limit_bytes = intersectAdmissionLimit(out.kv_limit_bytes, out.combined_limit_bytes);
+    out.scratch_limit_bytes = intersectAdmissionLimit(out.scratch_limit_bytes, out.combined_limit_bytes);
     return out;
 }
 
@@ -2726,6 +2770,28 @@ pub const GenerationKvCapacityPolicy = enum {
     split_swa_ring,
 };
 
+fn recurrentStateProduct(values: []const usize) EstimateError!usize {
+    return checkedProduct(values) catch error.ResourceLimitExceeded;
+}
+
+/// Persistent CUDA recurrent histories are page-owned, not shared decoder
+/// workspace. Serial generation and reader cohorts use this same envelope.
+pub fn gptRecurrentBackendStateBytes(backend: kv_pool.BackendKind, config: gpt_mod.Config) EstimateError!usize {
+    if (backend != .cuda or !config.qwen35_device_only_state or !config.isQwen35()) return 0;
+    const key_dim = try recurrentStateProduct(&.{ config.qwen35_linear_num_key_heads, config.qwen35_linear_key_head_dim });
+    const value_dim = try recurrentStateProduct(&.{ config.qwen35_linear_num_value_heads, config.qwen35_linear_value_head_dim });
+    const conv_dim = std.math.add(usize, try recurrentStateProduct(&.{ key_dim, 2 }), value_dim) catch return error.ResourceLimitExceeded;
+    const conv = try recurrentStateProduct(&.{ conv_dim, config.qwen35_linear_conv_kernel_dim, @sizeOf(f32) });
+    const recurrent = try recurrentStateProduct(&.{ config.qwen35_linear_num_value_heads, config.qwen35_linear_key_head_dim, config.qwen35_linear_value_head_dim, @sizeOf(f32) });
+    const side_weights = std.math.add(usize, try recurrentStateProduct(&.{ config.qwen35_linear_num_value_heads, 2 }), value_dim) catch return error.ResourceLimitExceeded;
+    const per_layer = std.math.add(usize, try recurrentStateProduct(&.{ conv, 3 }), std.math.add(usize, recurrent, try recurrentStateProduct(&.{ side_weights, @sizeOf(f32) })) catch return error.ResourceLimitExceeded) catch return error.ResourceLimitExceeded;
+    var total: usize = 0;
+    for (0..config.num_hidden_layers) |layer| if (config.layerUsesQwen35LinearAttention(layer)) {
+        total = std.math.add(usize, total, per_layer) catch return error.ResourceLimitExceeded;
+    };
+    return total;
+}
+
 pub fn estimateGptGeneration(
     backend: kv_pool.BackendKind,
     kv_dtype: kv_pool.KvDType,
@@ -2848,7 +2914,7 @@ pub fn estimateGptGenerationForKvPolicy(
     const scratch_bytes = std.math.add(
         usize,
         base_scratch_bytes,
-        cuda_deferred_activation_scratch,
+        std.math.add(usize, cuda_deferred_activation_scratch, try gptRecurrentBackendStateBytes(backend, config)) catch return error.ResourceLimitExceeded,
     ) catch return error.ResourceLimitExceeded;
 
     return .{
@@ -4923,4 +4989,51 @@ test "physical memory clamping bounds unspecified unlimited domains" {
     try std.testing.expectEqual(gib(16), unified.combined_limit_bytes);
     const tighter = clampDiscreteDeviceLimits(.{ .backend_limit_bytes = gib(4) }, gib(24), gib(16));
     try std.testing.expectEqual(gib(4), tighter.backend_limit_bytes);
+}
+
+test "LightOnOCR3 automatic CUDA recurrent state has serial admission and rollback" {
+    var cfg = try gpt_mod.parseConfig(std.testing.allocator, @embedFile("../../models/testdata/lightonocr3/config-4b.json"));
+    const host_state = try estimateGptGeneration(.cuda, .f16, cfg, 128, 64, 128);
+    cfg.qwen35_device_only_state = true;
+    const device_state = try estimateGptGeneration(.cuda, .f16, cfg, 128, 64, 128);
+    const retained = try gptRecurrentBackendStateBytes(.cuda, cfg);
+    try std.testing.expect(retained > 0);
+    try std.testing.expectEqual(host_state.scratch_bytes + retained, device_state.scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), try gptRecurrentBackendStateBytes(.native, cfg));
+    var budget = RunBudget.init(.{ .scratch_limit_bytes = host_state.scratch_bytes });
+    try std.testing.expectError(error.MemoryBudgetExceeded, budget.reserveEstimate(device_state));
+    try std.testing.expectEqual(@as(usize, 0), budget.backend_kv_bytes);
+    try std.testing.expectEqual(@as(usize, 0), budget.backend_scratch_bytes);
+    budget.limits.scratch_limit_bytes = device_state.scratch_bytes;
+    try budget.reserveEstimate(device_state);
+    budget.releaseEstimate(device_state);
+    try std.testing.expectEqual(@as(usize, 0), budget.backend_kv_bytes);
+    try std.testing.expectEqual(@as(usize, 0), budget.backend_scratch_bytes);
+}
+
+test "LightOnOCR3 physical CUDA clamping preserves host scratch and KV within combined limits" {
+    const requested = Limits{ .host_limit_bytes = mib(64), .backend_limit_bytes = mib(16), .combined_limit_bytes = mib(80), .kv_limit_bytes = mib(64), .scratch_limit_bytes = mib(64) };
+    const discrete = clampDiscreteDeviceLimits(requested, gib(24), gib(2));
+    const unified = clampUnifiedDeviceLimits(discrete, mib(80));
+    for ([_]Limits{ discrete, unified }) |limits| {
+        try std.testing.expectEqual(mib(64), limits.scratch_limit_bytes);
+        try std.testing.expectEqual(mib(64), limits.kv_limit_bytes);
+        var controller = AdmissionController{};
+        defer controller.deinit();
+        var scratch = try controller.tryAcquire(.gpu, limits, .{ .host_scratch_bytes = mib(48), .backend_scratch_bytes = mib(8) }, false);
+        scratch.release();
+        var kv = try controller.tryAcquire(.gpu, limits, .{ .host_kv_bytes = mib(48), .backend_kv_bytes = mib(8) }, false);
+        kv.release();
+        try std.testing.expectError(error.ResourceLimitExceeded, controller.tryAcquire(.gpu, limits, .{ .backend_scratch_bytes = mib(17) }, false));
+        try std.testing.expectEqualDeep(AdmissionAmounts{}, controller.snapshot());
+    }
+    const tighter = clampUnifiedDeviceLimits(discrete, mib(40));
+    try std.testing.expectEqual(mib(40), tighter.scratch_limit_bytes);
+    try std.testing.expectEqual(mib(40), tighter.kv_limit_bytes);
+    var controller = AdmissionController{};
+    defer controller.deinit();
+    try std.testing.expectError(error.ResourceLimitExceeded, controller.tryAcquire(.gpu, tighter, .{ .host_scratch_bytes = mib(33), .backend_scratch_bytes = mib(8) }, false));
+    var explicit = requested;
+    explicit.scratch_limit_bytes = mib(32);
+    try std.testing.expectEqual(mib(32), clampDiscreteDeviceLimits(explicit, gib(24), gib(2)).scratch_limit_bytes);
 }

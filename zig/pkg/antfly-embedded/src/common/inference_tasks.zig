@@ -46,8 +46,10 @@ pub const Executor = struct {
     provider_runtime: ?*managed.ProviderRuntime = null,
     source_table: []const u8 = "",
 
-    fn providerHttp(self: Executor, cloudflare: bool) !*httpx.Client {
-        if (cloudflare) if (self.provider_runtime) |runtime| return runtime.assetHttpClient();
+    fn providerHttp(self: Executor) !*httpx.Client {
+        // Media tasks can exceed embedding's 30-second I/O envelope regardless
+        // of provider. Invocation deadlines and cancellation remain authoritative.
+        if (self.provider_runtime) |runtime| return runtime.assetHttpClient();
         return self.http;
     }
 
@@ -368,7 +370,7 @@ pub const Executor = struct {
         const key = cfg.bearer_token orelse cfg.api_key orelse (if (uses_default) self.inference_api_key else null);
         if (key) |value| cfg.bearer_token = try secrets.resolveReferenceOwned(a, self.secret_store, value);
         cfg.api_key = null;
-        return transcribing.transcribeWithConfig(a, try self.providerHttp(cfg.provider == .cloudflare), cfg, request, .{
+        return transcribing.transcribeWithConfig(a, try self.providerHttp(), cfg, request, .{
             .timeout_ms = try self.context.remainingTimeoutMs(),
             .cancellation = if (self.context.cancellation) |v| httpx.CancellationToken.fromCallback(v.ptr, v.is_cancelled_fn) else null,
         });
@@ -379,14 +381,14 @@ pub const Executor = struct {
         var cfg = try (self.view.synthesizers orelse return error.ModelNotFound).getConfig(name);
         if (cfg.provider == .vertex) {
             if (cfg.api_key) |value| cfg.api_key = try secrets.resolveReferenceOwned(a, self.secret_store, value);
-            return synthesizing.synthesizeWithConfig(a, try self.providerHttp(cfg.provider == .cloudflare), cfg, request, .{ .timeout_ms = try self.context.remainingTimeoutMs(), .cancellation = if (self.context.cancellation) |v| httpx.CancellationToken.fromCallback(v.ptr, v.is_cancelled_fn) else null });
+            return synthesizing.synthesizeWithConfig(a, try self.providerHttp(), cfg, request, .{ .timeout_ms = try self.context.remainingTimeoutMs(), .cancellation = if (self.context.cancellation) |v| httpx.CancellationToken.fromCallback(v.ptr, v.is_cancelled_fn) else null });
         }
         var key = try secrets.SecretValue.initConfigOrEnv(a, cfg.api_key, if (cfg.provider == .cloudflare) "CLOUDFLARE_API_TOKEN" else if (cfg.provider == .elevenlabs) "ELEVENLABS_API_KEY" else "OPENAI_API_KEY");
         defer key.deinit(a);
         const resolved = try key.resolveOwned(a, self.secret_store);
         defer if (resolved) |value| a.free(value);
         cfg.api_key = resolved;
-        return synthesizing.synthesizeWithConfig(a, try self.providerHttp(cfg.provider == .cloudflare), cfg, request, .{
+        return synthesizing.synthesizeWithConfig(a, try self.providerHttp(), cfg, request, .{
             .timeout_ms = try self.context.remainingTimeoutMs(),
             .cancellation = if (self.context.cancellation) |v| httpx.CancellationToken.fromCallback(v.ptr, v.is_cancelled_fn) else null,
         });
@@ -399,7 +401,7 @@ pub const Executor = struct {
         if (cfg.provider == .antfly and cfg.resolvedUrl() == null and self.antfly_provider == null) if (self.inference_api_url) |endpoint| {
             cfg.api_url = try gateway.apiBaseAlloc(a, endpoint);
         };
-        if (cfg.provider == .apple) return readers.readWithConfigReported(a, try self.providerHttp(cfg.provider == .cloudflare), cfg, request, .{
+        if (cfg.provider == .apple) return readers.readWithConfigReported(a, try self.providerHttp(), cfg, request, .{
             .timeout_ms = try self.context.remainingTimeoutMs(),
             .cancellation = if (self.context.cancellation) |v| httpx.CancellationToken.fromCallback(v.ptr, v.is_cancelled_fn) else null,
         });
@@ -426,7 +428,7 @@ pub const Executor = struct {
                 return .{ .items = items, .execution = .{ .requested_items = items.len, .serial_items = items.len } };
             }
         };
-        return readers.readWithConfigReported(a, try self.providerHttp(cfg.provider == .cloudflare), cfg, request, .{
+        return readers.readWithConfigReported(a, try self.providerHttp(), cfg, request, .{
             .timeout_ms = try self.context.remainingTimeoutMs(),
             .cancellation = if (self.context.cancellation) |v| httpx.CancellationToken.fromCallback(v.ptr, v.is_cancelled_fn) else null,
         });
@@ -537,7 +539,7 @@ pub fn transcriptionRequest(a: std.mem.Allocator, cfg: transcribing.Config, requ
 
 pub fn validateChatConfig(cfg: generating.GeneratorConfig) !void {
     if (cfg.top_k != null and cfg.provider != .antfly and cfg.provider != .ollama and cfg.provider != .anthropic) return error.UnsupportedInferenceFeature;
-    if (cfg.reasoning_effort != null and cfg.provider != .openai) return error.UnsupportedInferenceFeature;
+    if (cfg.reasoning_effort != null and cfg.provider != .openai and cfg.provider != .ollama) return error.UnsupportedInferenceFeature;
 }
 
 pub fn chatBody(a: std.mem.Allocator, cfg: generating.GeneratorConfig, request: Json) ![]u8 {
@@ -625,6 +627,15 @@ fn openAiMessages(a: std.mem.Allocator, messages: Json) !Json {
                 try parts.array.append(part);
             }
             try message.object.put(a, "content", parts);
+        };
+        if (source.object.get("role")) |role| if (role == .string and std.mem.eql(u8, role.string, "assistant")) {
+            const content = source.object.get("content");
+            const calls = source.object.get("tool_calls");
+            const has_calls = if (calls) |value| value == .array and value.array.items.len > 0 else false;
+            if ((content == null or content.? == .null) and !has_calls) {
+                message.object = try message.object.clone(a);
+                try message.object.put(a, "content", .{ .string = "" });
+            }
         };
         try result.array.append(message);
     }
@@ -783,6 +794,36 @@ pub fn embeddingParts(a: std.mem.Allocator, input: Json) ![]@import("antfly_temp
     return parts;
 }
 
+test "provider registry gateway Ollama chat forwards reasoning and normalizes empty assistant turns" {
+    const a = std.testing.allocator;
+    const request = try std.json.parseFromSlice(Json, a,
+        \\{"messages":[{"role":"assistant"},{"role":"assistant","content":null,"tool_calls":[]},{"role":"assistant","tool_calls":[{"id":"call-1","type":"function","function":{"name":"search","arguments":"{}"}}]}]}
+    , .{});
+    defer request.deinit();
+    const cfg = generating.GeneratorConfig{
+        .provider = .ollama,
+        .model = "thinking-model",
+        .url = "http://localhost:11434/v1",
+        .reasoning_effort = .none,
+    };
+    try cfg.validate();
+    const body = try chatBody(a, cfg, request.value);
+    defer a.free(body);
+    const parsed = try std.json.parseFromSlice(Json, a, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("none", parsed.value.object.get("reasoning_effort").?.string);
+    try std.testing.expectEqual(@as(i64, generating.default_max_tokens), parsed.value.object.get("max_tokens").?.integer);
+    try std.testing.expect(!parsed.value.object.contains("max_completion_tokens"));
+    const turns = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expectEqualStrings("", turns[0].object.get("content").?.string);
+    try std.testing.expectEqualStrings("", turns[1].object.get("content").?.string);
+    try std.testing.expect(!turns[2].object.contains("content"));
+    try std.testing.expect(!request.value.object.get("messages").?.array.items[0].object.contains("content"));
+    var unsupported = cfg;
+    unsupported.provider = .openrouter;
+    try std.testing.expectError(error.UnsupportedInferenceFeature, validateChatConfig(unsupported));
+}
+
 test "provider registry gateway read aliases preserve documents retention and caller defaults" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -807,4 +848,20 @@ test "provider registry gateway read aliases preserve documents retention and ca
     const image = try std.json.parseFromSliceLeaky(Json, a, legacy, .{});
     try std.testing.expectEqualStrings("url", image.object.get("images").?.array.items[0].object.get("url").?.string);
     try std.testing.expectEqualStrings("caller", image.object.get("prompt").?.string);
+}
+
+test "provider registry media transport retains long task envelope without weakening embedding" {
+    var runtime = managed.ProviderRuntime.init(std.testing.allocator, std.testing.io);
+    defer runtime.deinit();
+    var ordinary = httpx.Client.initWithConfig(std.testing.allocator, std.testing.io, .{});
+    defer ordinary.deinit();
+    const executor = Executor{ .view = undefined, .http = &ordinary, .context = .{ .io = std.testing.io, .deadline_ns = null }, .provider_runtime = &runtime };
+    const media = try executor.providerHttp();
+    try std.testing.expect(media != &ordinary);
+    try std.testing.expectEqual(@as(u64, 300_000), media.config.timeouts.read_ms);
+    try std.testing.expectEqual(@as(u64, 300_000), media.config.timeouts.request_ms);
+    const embedding = try runtime.httpClient();
+    try std.testing.expectEqual(@as(u64, 30_000), embedding.config.timeouts.read_ms);
+    const borrowed = Executor{ .view = undefined, .http = &ordinary, .context = .{ .io = std.testing.io, .deadline_ns = null } };
+    try std.testing.expect((try borrowed.providerHttp()) == &ordinary);
 }

@@ -1331,15 +1331,120 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                     break
             assert time.monotonic() < deadline, index
             time.sleep(0.1)
-        if vector_kind:
-            # Keep the archive publication fixed while exercising incremental
-            # accepted cuts. The background writer otherwise drains the first
-            # batch before the second request, legitimately removing its rows
-            # from the recent overlay. Reads need the catalog head/records but
-            # only commits use the intent namespace.
-            intents = lake / "buckets/antfly/objects/metadata/antfly-catalog/intents"
-            intents.rename(intents.with_name("held-intents"))
-            intents.write_bytes(b"hold catalog publication for accepted-cut reuse")
+        # First establish a real WAL head and let its no-op update reach the
+        # published index. An empty suffix with no WAL head cannot be extended
+        # incrementally and would miss the regression seen after HN ingestion.
+        seeded = call(
+            "POST",
+            "/tables/wal_windows/lake/changes",
+            {
+                "batch_id": "published-seed",
+                "source": "e2e",
+                "epoch": "1",
+                "checkpoint": "0",
+                "key_fields": ["id"],
+                "changes": [
+                    {
+                        "op": "upsert",
+                        "row": {
+                            "id": 0,
+                            "body": "quasar ",
+                            **(
+                                {
+                                    "dense_native": "[1,0]",
+                                    "sparse_native": '{"1":1}',
+                                }
+                                if vector_kind
+                                else {}
+                            ),
+                        },
+                    }
+                ],
+            },
+        )
+        deadline = time.monotonic() + 120
+        while True:
+            response = requests.post(
+                server.api_url + "/tables/wal_windows/query",
+                json={
+                    "full_text_search": {"match": "quasar", "field": "body"},
+                    "read_requirements": {
+                        "visibility": "published",
+                        "after_write": seeded["read_receipt"],
+                        "wait_ms": 1000,
+                    },
+                    "limit": row_count,
+                },
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=120,
+            )
+            if response.ok:
+                break
+            assert response.status_code == 503 and time.monotonic() < deadline, (
+                response.text + server.debug_logs()
+            )
+            time.sleep(0.1)
+        # Keep the archive publication fixed while exercising incremental
+        # accepted cuts. Otherwise the background writer can drain a batch
+        # before its receipt is read, hiding an accepted-overlay regression.
+        # Reads need catalog head/records; only commits use the intent namespace.
+        intents = lake / "buckets/antfly/objects/metadata/antfly-catalog/intents"
+        intents.rename(intents.with_name("held-intents"))
+        intents.write_bytes(b"hold catalog publication for accepted-cut reuse")
+        # Cache an empty, unbound suffix before its first keyed write. The next
+        # receipt-constrained query must extend that cached cut immediately.
+        empty_request = {
+            "full_text_search": {"match": "quasar", "field": "body"},
+            "read_requirements": {"visibility": "accepted"},
+            "limit": row_count,
+        }
+        empty_cut = call("POST", "/tables/wal_windows/query", empty_request)
+        assert len(empty_cut["hits"]["hits"]) == row_count, empty_cut
+        # Reproduce HN's exact receipt check: replace an already published row
+        # with the same values, then immediately perform a metadata-only read.
+        # Text matching alone does not exercise lazy metadata membership.
+        unchanged = {
+            "id": 0,
+            "body": "quasar ",
+            **(
+                {"dense_native": "[1,0]", "sparse_native": '{"1":1}'}
+                if vector_kind
+                else {}
+            ),
+        }
+        noop = call(
+            "POST",
+            "/tables/wal_windows/lake/changes",
+            {
+                "batch_id": "unchanged-row",
+                "source": "e2e",
+                "epoch": "1",
+                "checkpoint": "noop-probe",
+                "expected_checkpoint": "0",
+                "key_fields": ["id"],
+                "changes": [{"op": "upsert", "row": unchanged}],
+            },
+        )
+        noop_query = {
+            "full_text_search": {"match_all": {}},
+            "filter_query": {"term": {"path": "/id", "value": 0}},
+            "fields": ["id", "body"],
+            "limit": 2,
+            "read_requirements": {
+                "visibility": "accepted",
+                "after_write": noop["read_receipt"],
+            },
+        }
+        visible = call("POST", "/tables/wal_windows/query", noop_query)
+        assert [h["_source"] for h in visible["hits"]["hits"]] == [
+            {"id": 0, "body": "quasar "}
+        ], visible
+        noop_query["remote_snapshot"] = visible["remote_snapshot"]
+        excluded_query = dict(noop_query, limit=row_count)
+        excluded_query["exclusion_query"] = excluded_query.pop("filter_query")
+        excluded = call("POST", "/tables/wal_windows/query", excluded_query)
+        assert len(excluded["hits"]["hits"]) == row_count - 1, excluded
+        assert all(h["_source"]["id"] != 0 for h in excluded["hits"]["hits"])
         vector_image = (
             {"dense_native": "[0,1]", "sparse_native": '{"2":2}'} if vector_kind else {}
         )
@@ -1351,6 +1456,7 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                 "source": "e2e",
                 "epoch": "1",
                 "checkpoint": "1",
+                "expected_checkpoint": "noop-probe",
                 "key_fields": ["id"],
                 "changes": [
                     {"op": "delete", "row": {"id": 1}},
@@ -1392,6 +1498,22 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
         assert rows[1000] == "quasar recent recent"
         assert all(h.get("_highlights") for h in hits), first
         pinned = dict(query, remote_snapshot=first["remote_snapshot"])
+        page = call(
+            "POST",
+            "/tables/wal_windows/query",
+            dict(pinned, limit=5, order_by=[{"field": "id"}]),
+        )
+        continuation = dict(
+            pinned,
+            limit=5,
+            order_by=[{"field": "id"}],
+            search_after=page["hits"]["hits"][-1]["_sort"],
+        )
+        next_page = call("POST", "/tables/wal_windows/query", continuation)
+        assert {h["_source"]["id"] for h in page["hits"]["hits"]}.isdisjoint(
+            h["_source"]["id"] for h in next_page["hits"]["hits"]
+        )
+        assert len(next_page["hits"]["hits"]) == 5, next_page
         hybrid_request = None
         hybrid_first = None
         if vector_kind:
@@ -1550,6 +1672,20 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
         for restart in (False, True):
             if restart:
                 server.restart()
+            # A newer accepted cut and a process restart must not alter this
+            # receipt's pinned no-op row or its lazy inclusion/exclusion result.
+            unchanged_cut = call("POST", "/tables/wal_windows/query", noop_query)
+            assert unchanged_cut["hits"] == visible["hits"]
+            excluded_cut = call("POST", "/tables/wal_windows/query", excluded_query)
+            assert excluded_cut["hits"] == excluded["hits"]
+            original = call(
+                "POST",
+                "/tables/wal_windows/query",
+                dict(empty_request, remote_snapshot=empty_cut["remote_snapshot"]),
+            )
+            assert original["hits"] == empty_cut["hits"]
+            resumed = call("POST", "/tables/wal_windows/query", continuation)
+            assert resumed["hits"] == next_page["hits"]
             if hybrid_request:
                 hybrid = call("POST", "/tables/wal_windows/query", hybrid_request)
                 assert hybrid["hits"] == hybrid_first["hits"]
