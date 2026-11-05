@@ -55,6 +55,12 @@ between backend support, interleaving configuration and row batching.
    later cooperative arrivals until existing work retires. Waiting requests
    own no generation KV or scratch. Admission leases issue distinct request
    identities; a backend never identifies an owner by an allocator address.
+   Active execution and waiting capacity are separate limits: node
+   `max_concurrent_requests=0` permits unlimited isolated native execution,
+   while cooperative CUDA retains its explicit active-owner cap. The zero
+   setting permits up to 64 queued requests behind an exclusive owner; finite
+   settings bound the queue to the smaller of the request limit and 64.
+   Unlimited active execution still respects FIFO exclusive-owner fences.
 2. An execution scope acquires the execution lane and model mutex, binds its
    request budget, and enters the backend owner. Setup, GPU steps and cleanup
    use this same object. Failed binding unwinds budget, mutex and lane together.
@@ -104,6 +110,12 @@ wrapper can release its primary context, it transfers its existing CUDA retain
 to quarantine whenever allocations remain. Owner metadata is reserved before
 allocating device memory, so this transfer cannot fail from host allocation
 pressure. Final wrapper cleanup also transfers its driver-library reference.
+`CudaContext.deinit` is the final ownership boundary for both resources. Loaded
+models defer that same finalizer until all `CudaCompute` host cleanup completes;
+the earlier `releaseResources` call does not authorize closing the driver
+directly. The model-free lifecycle suite exercises the actual compute teardown
+with both successful and failed frees, then verifies that reload releases the
+quarantined allocation, primary reference and driver-library owner together.
 
 A retry requires either the still-active retiring owner or a quarantined owner
 with an uninterrupted primary-context retain. A raw context handle alone is

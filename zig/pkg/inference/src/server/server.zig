@@ -6152,8 +6152,7 @@ pub const Node = struct {
         const direct_generation_slot = try model.generation_admission.acquire(
             direct_slot_control,
             backend_kind != .native,
-            self.config.max_concurrent_requests,
-            @min(@max(self.config.max_concurrent_requests, 1), 64),
+            runtime.scheduler.generation_admission.Limits.forRequests(self.config.max_concurrent_requests, null),
         );
         defer direct_generation_slot.release();
         const prompt_cache_requested = prompt_cache_key != null and
@@ -16392,8 +16391,10 @@ pub const Node = struct {
         const generation_slot = model.generation_admission.acquire(
             execution_control,
             !cooperative_cuda and !native_isolated,
-            if (cooperative_cuda) self.config.cooperative_execution.max_active_requests else self.config.max_concurrent_requests,
-            @min(@max(self.config.max_concurrent_requests, 1), 64),
+            runtime.scheduler.generation_admission.Limits.forRequests(
+                self.config.max_concurrent_requests,
+                if (cooperative_cuda) self.config.cooperative_execution.max_active_requests else null,
+            ),
         ) catch |err| {
             if (err == error.GenerationQueueFull) return modelResourceBusyResponse(ctx);
             return inferenceFailureResponse(ctx, err);
@@ -18786,8 +18787,7 @@ pub const Node = struct {
                 const batch_generation_slot = model.generation_admission.acquire(
                     httpInferenceExecutionControl(self, ctx),
                     execution_mode != .isolated_parallel,
-                    self.config.max_concurrent_requests,
-                    @min(@max(self.config.max_concurrent_requests, 1), 64),
+                    runtime.scheduler.generation_admission.Limits.forRequests(self.config.max_concurrent_requests, null),
                 ) catch |err| {
                     for (group_indices.items) |idx| {
                         results[idx].@"error" = .{
