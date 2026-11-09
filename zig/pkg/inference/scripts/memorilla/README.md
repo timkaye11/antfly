@@ -333,7 +333,7 @@ manifest. The verifier attempts decoder eviction during framing to prove that
 this borrow pins the model before an execution handle exists. It attests that
 the qualified strict FP32 projection policy actually ran; actual GEMM shapes,
 F32 KV, numerical tolerances and workspace ceilings remain unchanged. See the
-[native/Python latency comparison](../../../../../docs/design/inference/history/memorilla/2026-11-09-native-python-latency.md)
+[latency qualification](../../../../../docs/design/inference/memorilla-qualification.md#performance)
 for the two-pass timing results and library-matched Python control.
 
 This offline harness permits native calls in its own process. Production uses
@@ -436,7 +436,7 @@ The default fixture and scorer are development diagnostics, not a reproduction
 of published benchmark scores or a production release gate. Freeze new suites
 and expected answers before observing model outputs.
 
-The [2026-11-08 evaluation](../../../../../docs/design/inference/history/memorilla/2026-11-08-answer-quality.md)
+The [recorded QA assessment](../../../../../docs/design/inference/memorilla-qualification.md#answer-quality)
 completed native execution but scored zero of 22 factual cases correct; two
 missing-fact abstentions passed. That outcome blocks factual QA rollout even
 though the separate arithmetic and lifecycle checks passed.
@@ -531,11 +531,11 @@ recomputes features under the released BF16 policy; it does not qualify native
 BF16 arithmetic. Keep the CPU reference environment unchanged.
 
 Experimental reader adaptation is outside this serving PR. Its archived
-[assessment](../../../../../docs/design/inference/history/memorilla/2026-11-09-latent-operational-qualification.md)
+[assessment summary](../../../../../docs/design/inference/memorilla-qualification.md#answer-quality)
 remains a failed quality result; no candidate is promoted. The released reader
 and exact operational-fact tests remain the supported comparison.
 
-The [published-data diagnostic](../../../../../docs/design/inference/history/memorilla/2026-11-09-latent-published-qa.md)
+The [published-data diagnostic summary](../../../../../docs/design/inference/memorilla-qualification.md#answer-quality)
 records 20/32 normalized exact matches on a bounded released TriviaQA sample
 through the Python BF16 latent-only reference. This is separate from exact
 operational-fact qualification and does not execute the original vLLM engine.
@@ -565,7 +565,7 @@ vectors, the original reader/decoder implementation and two warm 24-case timing
 passes. It excludes ingestion, startup and tensor capture. Its BF16 profile is
 separate from the qualified native F32 profile.
 
-The [official engine and timing report](../../../../../docs/design/inference/history/memorilla/2026-11-09-vllm-engine-qualification.md)
+The [official engine and timing summary](../../../../../docs/design/inference/memorilla-qualification.md#performance)
 records the passing actual vLLM execution, matching QA accuracy, 52/56 matched
 BF16-control token sequences and all 56 prompt sequences. Warm medians are
 0.819 s native F32 and 0.823 s vLLM BF16 on this GB10 workload, effectively

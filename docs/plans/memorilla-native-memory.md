@@ -6,7 +6,7 @@ Gemma training remain unqualified or future work.
 
 The [serving guide](../design/inference/memorilla-serving.md) defines the API,
 configuration, resource limits and supported execution profile. The
-[PR integration record](../design/inference/history/memorilla/2026-11-09-pr-integration.md)
+[qualification summary](../design/inference/memorilla-qualification.md)
 collects the validation results and qualification limits. The
 [reference-tool guide](../../zig/pkg/inference/scripts/memorilla/README.md)
 documents checkpoint conversion, numerical verification and repeatable QA.

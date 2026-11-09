@@ -36,26 +36,12 @@ need separate numerical qualification. The recorded F16-KV gate failed; it
 must not inherit the F32 profile's status. Numerical agreement does not establish
 answer quality on a production corpus; evaluate that workload before rollout.
 
-The [latent operational QA comparison](history/memorilla/2026-11-09-latent-operational-qualification.md)
-reproduces the released reader's factual failures in Python CUDA and native
-CUDA with identical output IDs. Exact unseen names and codes remain an explicit
-quality gate; source-verified hybrid qualification does not satisfy that gate.
-The [published-data diagnostic](history/memorilla/2026-11-09-latent-published-qa.md)
-records 20/32 Python BF16 TriviaQA exact matches, distinguishing those operational
-failures from a claim that all latent-only QA fails. That diagnostic did not
-execute the original vLLM engine.
-The subsequent [official vLLM engine check](history/memorilla/2026-11-09-vllm-engine-qualification.md)
-executes the pinned vLLM 0.9.1 path: QA scores match the independent BF16 control,
-and fresh warm latency is 0.819 s native F32 versus 0.823 s vLLM BF16 on GB10.
-The small median difference does not establish a general speed advantage.
-The [PR integration record](history/memorilla/2026-11-09-pr-integration.md)
-checks the implementation after merging current main, with fresh native
-numerical, supervised HTTP, generated-client and lifecycle validation.
-The [reader residency performance report](history/memorilla/2026-11-09-native-performance.md)
-records the subsequent native latency improvement and cache lifecycle checks.
-The [native/Python latency comparison](history/memorilla/2026-11-09-native-python-latency.md)
-records tokenizer and metadata reuse, strict FP32 projection optimization, and
-the resulting narrow observed median win over both Python controls.
+The [qualification summary](memorilla-qualification.md) records the numerical,
+HTTP/lifecycle, answer-quality and performance checks. Exact unseen names and
+codes remain an unmet latent-only quality gate. The source-verified assessment
+supports its bounded workload; it does not satisfy that latent-only gate.
+Warm native latency is near parity with the Python controls, with no general
+speedup or bitwise native/vLLM generation claim.
 
 ## Install and configure
 
@@ -277,26 +263,13 @@ The server must have room to load the full managed pair. Add
 input-token ceiling; the normal question and framing fit, while a longer
 question must be rejected before GPU model loading.
 
-The [component qualification](history/memorilla/2026-11-07-native-qualification.md)
-and [production serving record](history/memorilla/2026-11-07-production-serving.md)
-document the passing numerical, managed execution and supervised HTTP checks.
-The serving record binds the tested binary to its source hashes and includes
-27 HTTP cases, concurrent isolation, deadline recovery, and model-file drift
-rejection and recovery. Qualification covers the pinned Stage3 composition with
-F32 arithmetic and F32 KV on GB10 (SM121). F16 KV remains unqualified.
+The [qualification summary](memorilla-qualification.md) records the passing
+component, managed execution, supervised HTTP and source-verified QA checks.
+The supported composition uses F32 arithmetic/F32 KV on GB10 (SM121); F16 KV
+remains unqualified. The 64-document/128-token resource check establishes
+lifecycle behavior for that fixture, not corpus accuracy or sustained throughput.
 
 Before enabling a deployment, evaluate representative answer quality and measure
-capacity and load for its actual workload. The 64-document/128-token composed
-resource test establishes lifecycle behavior for that fixture, not corpus
-quality or sustained throughput. The initial
-[raw-document quality diagnostic](history/memorilla/2026-11-08-answer-quality.md)
-completed native execution but answered none of 22 factual cases correctly in
-latent-only mode. The
-[resumed F32 qualification](history/memorilla/2026-11-08-resumed-qualification.md)
-passed 45 supervised source-verified development cases, 48 unseen held-out cases,
-24 repeated sanity cases, and 30 HTTP contract/recovery requests. Cold asset
-drift failed closed and recovered after restoration. These bounded diagnostics
-support the opt-in source-verified path; latent-only factual QA remains
-unqualified. The route remains disabled by default. See the
-[implementation plan](../../plans/memorilla-native-memory.md) for the later
-database and Gemma training work.
+capacity for its workload. The released reader's exact latent-only operational
+QA remains unqualified. Serving stays disabled by default; database collection
+integration and Gemma training remain [separate work](../../plans/memorilla-native-memory.md).
