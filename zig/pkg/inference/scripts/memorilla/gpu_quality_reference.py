@@ -42,7 +42,7 @@ from safetensors.torch import save_file
 from assets import verify_base_model
 from decoder_reference import DEFAULT_SYSTEM, prepare_prompt
 from encoder_reference import active_ids, normalize_features
-from exporter import read_json, sha256, validate_config, validate_tensors
+from exporter import sha256
 from quality_cases import DEFAULT_SUITE, load_suite, score_answer, score_suite
 from quality_eval import validate_store, document_key
 from reference import load_upstream
@@ -107,15 +107,6 @@ def released_cases(path, benchmark, source):
 
 
 def score_case(answer, case):
-    if "operational_answer" in case:
-
-        def canonical(text):
-            return " ".join(text.strip().rstrip(".").split()).casefold()
-
-        return {
-            "correct": canonical(answer) == canonical(case["operational_answer"]),
-            "metric": "operational_exact_match",
-        }
     if "benchmark_answer" not in case:
         return score_answer(answer, case)
 
@@ -129,68 +120,6 @@ def score_case(answer, case):
         "correct": normalise(answer) == normalise(case["benchmark_answer"]),
         "metric": "normalised_exact_match",
     }
-
-
-def candidate_proof(checkpoint, expected):
-    """Explicit unqualified candidate identity; never impersonate a release."""
-    config = validate_config(read_json(checkpoint / "config.json"), release=True)
-    actual = sha256(checkpoint / "memory.pt")
-    if len(expected) != 64 or actual != expected:
-        raise ValueError("candidate checkpoint digest differs")
-    weights = torch.load(
-        checkpoint / "memory.pt", map_location="cpu", weights_only=True, mmap=True
-    )
-    validate_tensors(weights, config, split=False, release=True)
-    return config, {
-        "kind": "unqualified-operational-candidate",
-        "memory_pt_sha256": actual,
-        "config_sha256": sha256(checkpoint / "config.json"),
-    }
-
-
-def operational_cases(path, split, development_receipt=None):
-    from train_operational_reader import validate_curriculum
-
-    rows = validate_curriculum(read_json(path))
-    if split == "test":
-        if development_receipt is None:
-            raise ValueError("final inference requires an exact development receipt")
-        receipt = read_json(development_receipt)
-        scores = receipt.get("scores", {})
-        expected = {r["id"]: r for r in rows if r["split"] == "dev"}
-        actual = receipt.get("results", [])
-        ids = [r.get("case_id") for r in actual]
-        answers_pass = (
-            len(ids) == len(expected)
-            and set(ids) == set(expected)
-            and all(
-                score_case(
-                    r.get("answer", ""),
-                    {"operational_answer": expected[r["case_id"]]["answer"]},
-                )["correct"]
-                for r in actual
-            )
-        )
-        if (
-            not receipt.get("completed")
-            or scores.get("total", 0) != 96
-            or scores.get("correct") != scores.get("total")
-            or not answers_pass
-            or receipt.get("protocol", {}).get("suite_sha256") != sha256(path)
-        ):
-            raise ValueError("development gate has not passed for this curriculum")
-    cases = [
-        {
-            "id": r["id"],
-            "question": r["question"],
-            "documents": r["documents"],
-            "family": r["family"],
-            "operational_answer": r["answer"],
-        }
-        for r in rows
-        if r["split"] == split
-    ]
-    return {"cases": cases}, cases
 
 
 @torch.inference_mode()
@@ -242,10 +171,6 @@ def main():
         p.add_argument("--" + name, type=Path, required=True)
     p.add_argument("--suite", type=Path, default=DEFAULT_SUITE)
     p.add_argument("--released-benchmark", choices=("factkg", "triviaqa"))
-    p.add_argument("--operational-curriculum", action="store_true")
-    p.add_argument("--split", choices=("dev", "test"), default="dev")
-    p.add_argument("--development-receipt", type=Path)
-    p.add_argument("--candidate-sha256")
     p.add_argument("--dtype", choices=("float32", "bfloat16"), default="float32")
     p.add_argument("--system", choices=("native", "upstream"), default="native")
     p.add_argument("--feature-store", type=Path)
@@ -272,13 +197,7 @@ def main():
             raise ValueError("source changed while archiving; no model was loaded")
     save(args.output / "source-manifest.json", source_hashes)
     system = DEFAULT_SYSTEM if args.system == "native" else SYSTEM
-    if args.operational_curriculum:
-        if args.released_benchmark or args.case_ids:
-            p.error("operational gates require a complete split")
-        suite, cases = operational_cases(
-            args.suite, args.split, args.development_receipt
-        )
-    elif args.released_benchmark:
+    if args.released_benchmark:
         suite, cases, system = released_cases(
             args.suite, args.released_benchmark, args.upstream_source
         )
@@ -294,21 +213,7 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     torch.set_float32_matmul_precision("highest")
-    config, proof = (
-        candidate_proof(args.checkpoint, args.candidate_sha256)
-        if args.candidate_sha256
-        else checkpoint_proof(args.checkpoint)
-    )
-    if args.operational_curriculum and args.split == "test":
-        development = read_json(args.development_receipt)
-        if (
-            development["protocol"]["checkpoint"] != proof
-            or development["protocol"]["dtype"] != args.dtype
-            or development["protocol"]["system"] != args.system
-        ):
-            raise ValueError(
-                "final model/precision/prompt differs from passed development run"
-            )
+    config, proof = checkpoint_proof(args.checkpoint)
     recipe = source_recipe(args.upstream_source)
     protocol = {
         "schema": "antfly.memorilla.gpu-quality-reference.v1",
@@ -319,7 +224,6 @@ def main():
         "system": args.system,
         "system_text": system,
         "released_benchmark": args.released_benchmark,
-        "operational_split": args.split if args.operational_curriculum else None,
         "suite_sha256": sha256(args.suite),
         "case_ids": [c["id"] for c in cases],
         "runner_sha256": sha256(Path(__file__)),
@@ -488,15 +392,7 @@ def main():
                 }
                 result["warmup_results" if repeat < 0 else "results"].append(row)
                 save(args.output / "result.json", result)
-    if args.operational_curriculum:
-        rows = result["results"][: len(cases)]
-        result["scores"] = {
-            "correct": sum(r["score"]["correct"] for r in rows),
-            "total": len(rows),
-            "gate_passed": all(r["score"]["correct"] for r in rows),
-            "scope": "synthetic disjoint operational worlds; not production qualification",
-        }
-    elif args.released_benchmark:
+    if args.released_benchmark:
         rows = result["results"][: len(cases)]
         result["scores"] = {
             "correct": sum(r["score"]["correct"] for r in rows),

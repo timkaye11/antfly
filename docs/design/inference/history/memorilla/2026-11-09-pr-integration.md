@@ -119,3 +119,24 @@ sequences agree. Native numerical compatibility does not establish exact
 latent-only factual QA quality. No adapted reader, native BF16 profile,
 database collection integration or Gemma training milestone is promoted by
 this PR. Serving remains disabled by default.
+
+## PR scope review
+
+After checkpoint `577ba520ae`, the serving PR removes experimental reader
+training/curriculum and candidate-only evaluation options, an unused causal
+probe, and the standalone reader-load/source-QA development executables. Their
+sources remain in Git history and the archived experimental evidence. The
+planning document now covers the shipped scope and remaining integration work.
+
+The captured 166 KB embedding response is replaced with generated full-width
+unit vectors in the transport regression, and an unused decoder-tokenizer dump
+is removed. Retained QA cases, scoring, tokenizer fixtures and model locks are
+unchanged. The local lock copy remains necessary
+for self-contained reference-source archives. Numerical verifiers, HTTP/QA
+checks and official Transformers/vLLM comparison tools are retained.
+
+The remaining Python suite passes 404 tests with no skips, including the
+compiled CPU verifier integrations. The build graph preserves all five numerical
+verifiers and drops the two development targets. The generated error inventory
+removes their unused error names. Serving and CUDA execution code is unchanged;
+this cleanup does not promote any new numerical or answer-quality profile.

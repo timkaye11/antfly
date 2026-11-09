@@ -185,12 +185,12 @@ The ignored evidence root is
 - `python-regression-tests-final.log`: 389 passing Python regression checks,
   excluding GPU-dependent native integration suites already qualified separately.
 
-The GPU reference, curriculum generator and trainer live under
-`zig/pkg/inference/scripts/memorilla/`. They make no implicit model downloads.
-Use a separate CUDA virtual environment so the existing CPU reference remains
-pinned. Run the trainer without `--run` to review its fixed protocol. The
-candidate's explicit SHA256 is required for independent GPU evaluation; its
-manifest cannot impersonate a released reader.
+The experimental curriculum generator, trainer and candidate-only evaluation
+options are retained in Git at `ca52a6565c` and in the archived run sources.
+They were removed from the serving PR during scope review. The released-reader
+GPU reference remains under `zig/pkg/inference/scripts/memorilla/`; it makes no
+implicit model downloads. Historical candidate manifests cannot impersonate a
+released reader, and no adaptation result is promoted by this PR.
 
 `validation.json` binds the receipts and records the completed assessment with
 `latent_factual_qa_qualified: false`, `candidate_promoted: false` and production

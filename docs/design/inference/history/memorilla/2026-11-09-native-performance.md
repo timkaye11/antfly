@@ -129,7 +129,9 @@ verifier; the shared runtime sources match the installed API binary.
 
 Build commands use the worktree's own Zig caches, `-Dcuda=true`,
 `-Doptimize=ReleaseFast`, `-Dinference-compile-memory-mb=32768` and `-j2`.
-The targets are `install`, `build-memorilla-composed-verify`,
-`build-memorilla-load-bench` and the existing filtered native test executable.
-The [checkpoint README](../../../../../zig/pkg/inference/scripts/memorilla/README.md)
-documents the composed numerical verifier and isolated load diagnostic.
+The historical targets were `install`, `build-memorilla-composed-verify`,
+`build-memorilla-load-bench` and the filtered native test executable. The
+one-off load profiler was removed during PR scope review; its source remains
+in this run's archived evidence and Git history. The
+[checkpoint README](../../../../../zig/pkg/inference/scripts/memorilla/README.md)
+documents the retained composed numerical verifier.

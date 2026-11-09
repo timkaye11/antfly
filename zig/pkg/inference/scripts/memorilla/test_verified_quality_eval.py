@@ -331,12 +331,18 @@ def test_policy_abstention_selects_source_path_flag():
         validate(actual)
 
 
-def test_actual_native_openai_embedding_response_and_direct_array_shape():
-    saved = json.loads(
-        (vq.HERE / "fixtures/native-embedding-response.json").read_text()
-    )
-    actual = saved["response"]
-    assert actual["object"] == "list"
+def test_openai_embedding_response_and_direct_array_shape():
+    # Exercise the full wire width; transport checks do not need captured model
+    # output. Distinct unit vectors make ordering and normalization explicit.
+    vectors = [[float(i == index) for i in range(2560)] for index in range(2)]
+    actual = {
+        "model_identity": vq.IDENTITY,
+        "object": "list",
+        "data": [
+            {"object": "embedding", "embedding": row, "index": index}
+            for index, row in enumerate(vectors)
+        ],
+    }
     rows = vq.producer_vectors(actual, 2)
     assert rows == [item["embedding"] for item in actual["data"]]
     assert (
