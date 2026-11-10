@@ -585,3 +585,109 @@ records the passing actual vLLM execution, matching QA accuracy, 52/56 matched
 BF16-control token sequences and all 56 prompt sequences. Warm medians are
 0.819 s native F32 and 0.823 s vLLM BF16 on this GB10 workload, effectively
 parity rather than an isolated-kernel or general speed claim.
+
+## Encoder LoRA research experiment
+
+`encoder_lora.py` compares a trainable reader with a frozen encoder against the
+same reader plus rank-8, alpha-16 encoder Q/V LoRA adapters. Both retain the
+released 16 learned memory slots and frozen Qwen3-8B weights. Gradients flow
+through Qwen into the reader and encoder adapters; source text never enters the
+decoder prompt. The small explicit LoRA implementation requires no PEFT package.
+
+This is a Python training experiment, not a qualified native profile. The tested
+training environment uses PyTorch 2.9.1+cu130 and Transformers 4.53.3. Base model
+files are read-only. Encoder and decoder use BF16 SDPA, trainable weights use
+FP32, and differentiable FP16-to-BF16 feature casts retain the storage bottleneck.
+Reader dropout is disabled in both arms. Do not interpret this as native BF16
+qualification or overwrite an existing retrieval index with adapted embeddings.
+Use a separate CUDA environment so the existing CPU oracle remains reproducible:
+
+```sh
+train_env=.benchmark-assets/memorilla/training-venv
+UV_CACHE_DIR=.zig-cache/memorilla-uv uv venv --python python3 "$train_env"
+UV_CACHE_DIR=.zig-cache/memorilla-uv uv pip install --python "$train_env/bin/python" \
+  --index-url https://download.pytorch.org/whl/cu130 torch==2.9.1
+UV_CACHE_DIR=.zig-cache/memorilla-uv uv pip install --python "$train_env/bin/python" \
+  -r zig/pkg/inference/scripts/memorilla/requirements-reference.txt
+```
+
+Use that environment's Python for the following commands. Generate fresh
+synthetic data before observing model outputs:
+
+```sh
+python zig/pkg/inference/scripts/memorilla/encoder_lora.py make-data \
+  --output .benchmark-results/memorilla/encoder-lora/data
+```
+
+The default corpus has 512 training, 32 development, 32 test and 32 additional
+unseen-phrasing examples. Entities, values, documents and counterfactual groups
+are disjoint across splits. Changing a code while holding its question fixed
+must change the answer; missing-fact controls reuse the positive question forms.
+The trainer reads only train/dev, leaving test and unseen-phrasing splits sealed.
+It reports exact case-sensitive code/name answers, abstentions and counterfactual
+pair accuracy separately. Generated datasets and checkpoints remain outside Git.
+
+Run each arm sequentially with identical arguments apart from arm/output:
+
+```sh
+python zig/pkg/inference/scripts/memorilla/encoder_lora.py train \
+  --arm reader-only \
+  --encoder /path/to/pinned/qwen3-embedding-4b \
+  --decoder /path/to/pinned/qwen3-8b \
+  --checkpoint /path/to/original/stage3 \
+  --upstream-source /path/to/pinned/memorilla \
+  --data .benchmark-results/memorilla/encoder-lora/data \
+  --output .benchmark-results/memorilla/encoder-lora/reader-only \
+  --steps 128 --accum 4 --eval-every 32
+```
+
+Repeat with `--arm encoder-lora` and a fresh output directory. The initial
+comparison fixes 128 optimizer steps, effective batch four, seed 23, reader
+learning rate 5e-5 and adapter learning rate 1e-4. A zero-effect frozen adapter
+architecture is retained in the control. Data order is determined by absolute
+microstep, so both arms see exactly the same examples in the same order.
+
+Use the same command plus `--resume` after interruption. `resume.pt` is flushed
+to disk before it atomically replaces the previous full checkpoint and includes
+reader/adapters, optimizer,
+step, RNG and protocol state. Resume rejects changed source, data or training
+budget. Exported candidate metadata explicitly remains unqualified. Frozen base
+parameter version/storage counters and gradient absence are checked during
+training; only reader and adapter tensors are exported.
+
+To extend a completed run, keep its output intact and use `--continue-from
+/path/to/completed/run --steps 512 --eval-every 128` with a fresh `--output` and
+the original arm, data, seed, accumulation and learning rates. The step budget is
+the total across both phases. Continuation restores the optimizer and RNG,
+records parent checkpoint/protocol hashes, and reproduces every final parent
+development answer before updating weights. Ordinary `--resume` still requires
+the same protocol, source and budget. Each new run archives its trainer source.
+
+`encoder_lora_eval.py` independently reloads one or two exported candidates.
+Pass the same model/source/data paths, a fresh `--output`, and repeated
+`--candidate /path/to/completed/run` arguments. It requires all 32 final
+development answers to reproduce exactly and evaluates a fixed 32-example
+training probe to distinguish failure to fit from failure to generalize. It
+provides no test/unseen-phrasing option during this development experiment.
+
+The initial matched 128-step pilot recovered 0/16 development codes and 0/8
+names with the reader-only control, versus 1/16 codes and 0/8 names with encoder
+LoRA. Both answered all eight missing-fact cases correctly, and neither solved
+any complete counterfactual code pair. Both also recovered zero exact facts on
+the training probe. All 32 development outputs per arm reproduced after export
+and reload. This is a small development signal, not reliable factual recall;
+test and unseen-phrasing splits remain unopened.
+
+Extending both arms to 512 total steps with restored optimizer state and the
+same examples yielded 0/16 codes, 0/8 names and 8/8 missing-fact answers in both
+arms. The single exact code at 128 steps was not sustained. Base asset proofs
+matched across all runs; frozen parameter checks passed throughout. These
+results do not qualify either research candidate for factual QA.
+
+The independent 512-step reload reproduced all 32 development answer texts per
+arm. On the fixed training probe, LoRA recovered 10/16 codes and 5/8 names,
+including 4/8 complete counterfactual code pairs; the control recovered 0/16
+codes and 2/8 names, with no complete pairs. Both got 8/8 missing-fact answers
+right. The adapters can learn training facts, but that improvement has not
+transferred to unseen development entities. Test and unseen-phrasing splits
+remain unevaluated; further training work must address generalization.
