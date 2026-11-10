@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import secrets
+import random
 import subprocess
 from pathlib import Path
 
@@ -49,6 +50,58 @@ from encoder_lora_corpus import inventories
 from gpu_quality_reference import generate
 from reference import load_upstream
 from released_reference import checkpoint_proof, source_recipe
+
+
+def prior_dataset_hashes(protocol):
+    hashes, seen = set(), set()
+    while "initialization" in protocol:
+        initial = protocol["initialization"]
+        directory = Path(initial["directory"])
+        if str(directory) in seen or len(seen) >= 8:
+            raise ValueError("invalid initialization lineage")
+        seen.add(str(directory))
+        if digest(directory / "candidate.json") != initial["candidate_sha256"]:
+            raise ValueError("initialization candidate lineage changed")
+        candidate = json.loads((directory / "candidate.json").read_text())
+        if digest(directory / "protocol.json") != candidate["protocol_sha256"]:
+            raise ValueError("initialization protocol lineage changed")
+        protocol = json.loads((directory / "protocol.json").read_text())
+        hashes.add(protocol["dataset_sha256"])
+    return hashes
+
+
+def qa_corpus(rows):
+    return [{k: v for k, v in r.items() if k != "reconstruction"} for r in rows]
+
+
+def training_exposures(protocol, count):
+    visits = [{"qa": 0, "reconstruction": 0} for _ in range(count)]
+    total = protocol["steps"] * protocol["gradient_accumulation"]
+    every = protocol.get("reconstruct_every", 0)
+    for epoch in range((total + count - 1) // count):
+        order = list(range(count))
+        random.Random(protocol["seed"] + epoch).shuffle(order)
+        for offset, index in enumerate(order[: min(count, total - epoch * count)]):
+            absolute = epoch * count + offset
+            task = "reconstruction" if every and absolute % every == every - 1 else "qa"
+            visits[index][task] += 1
+    return visits
+
+
+def select_training_probe(train, protocol):
+    visits = training_exposures(protocol, len(train))
+    groups = {}
+    for index, row in enumerate(train):
+        groups.setdefault(row["group"], []).append(index)
+    selected = sorted(
+        groups,
+        key=lambda g: (
+            -sum(sum(visits[i].values()) > 0 for i in groups[g]),
+            -sum(sum(visits[i].values()) for i in groups[g]),
+            g,
+        ),
+    )[:8]
+    return [r for r in train if r["group"] in selected]
 
 
 def fresh_challenge(seed, groups, train, dev):
@@ -107,13 +160,20 @@ def main():
     ):
         p.add_argument("--" + name, type=Path, required=True)
     p.add_argument("--candidate", type=Path, action="append", required=True)
+    p.add_argument("--candidate-data", type=Path, action="append")
+    p.add_argument("--prior-training-data", type=Path, action="append", default=[])
     p.add_argument("--fresh-groups", type=int, default=0)
     p.add_argument("--fresh-seed", type=int)
     args = p.parse_args()
     if not 0 <= args.fresh_groups <= 1000:
         p.error("fresh groups must be between zero and 1000")
-    if not 1 <= len(args.candidate) <= 2:
-        p.error("one or two candidates required")
+    if args.candidate_data is not None and len(args.candidate_data) != len(
+        args.candidate
+    ):
+        p.error("provide one candidate-data directory per candidate")
+    candidate_data = args.candidate_data or [args.data] * len(args.candidate)
+    if not 1 <= len(args.candidate) <= 3:
+        p.error("one to three candidates required")
     if subprocess.check_output(
         ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"], text=True
     ).strip():
@@ -131,7 +191,8 @@ def main():
     }
     save_json(args.output / "base-proofs.json", proofs)
     protocols = []
-    for directory in args.candidate:
+    canonical = {s: load_split(args.data, s) for s in ("train", "dev")}
+    for directory, data_directory in zip(args.candidate, candidate_data):
         candidate = json.loads((directory / "candidate.json").read_text())
         protocol = json.loads((directory / "protocol.json").read_text())
         if (
@@ -149,12 +210,19 @@ def main():
             if candidate[field] != digest(directory / file):
                 raise ValueError("candidate artifact changed")
         if (
-            protocol["dataset_sha256"] != digest(args.data / "manifest.json")
+            protocol["dataset_sha256"] != digest(data_directory / "manifest.json")
             or protocol["system_prompt"] != SYSTEM
         ):
             raise ValueError("candidate/data/prompt mismatch")
         if not json.loads((directory / "result.json").read_text())["completed"]:
             raise ValueError("candidate training did not complete")
+        if any(
+            qa_corpus(load_split(data_directory, split)) != qa_corpus(canonical[split])
+            for split in ("train", "dev")
+        ):
+            raise ValueError(
+                "candidate corpora have different QA facts or evaluation inputs"
+            )
         protocols.append(protocol)
     if any(
         (a["rank"], a["alpha"], a["seed"], a["precision"])
@@ -169,14 +237,29 @@ def main():
         raise ValueError("incompatible candidate protocols")
     dev = load_split(args.data, "dev")
     train = load_split(args.data, "train")
-    groups = list(dict.fromkeys(r["group"] for r in train))[:8]
-    train_probe = [r for r in train if r["group"] in groups]
+    train_probe = select_training_probe(train, protocols[0])
     fresh_rows = []
+    prior_rows, prior_hashes = [], set()
     if args.fresh_groups:
+        needed = set().union(*(prior_dataset_hashes(p) for p in protocols)) - {
+            p["dataset_sha256"] for p in protocols
+        }
+        for directory in args.prior_training_data:
+            value = digest(directory / "manifest.json")
+            if value not in needed:
+                raise ValueError(
+                    "prior training corpus is not in candidate initialization lineage"
+                )
+            prior_rows.extend(load_split(directory, "train"))
+            prior_hashes.add(value)
+        if needed != prior_hashes:
+            raise ValueError(
+                "fresh challenge requires --prior-training-data for every earlier training corpus"
+            )
         seed, fresh_rows = fresh_challenge(
             args.fresh_seed if args.fresh_seed is not None else secrets.randbits(63),
             args.fresh_groups,
-            train,
+            train + prior_rows,
             dev,
         )
         save_json(
@@ -191,6 +274,7 @@ def main():
                     digest(d / "protocol.json") for d in args.candidate
                 ],
                 "dataset_sha256": digest(args.data / "manifest.json"),
+                "prior_training_manifest_hashes": sorted(prior_hashes),
                 "cases": fresh_rows,
             },
         )
@@ -246,12 +330,17 @@ def main():
             .requires_grad_(False)
             .eval()
         )
+        exposures = {
+            r["id"]: v for r, v in zip(train, training_exposures(protocol, len(train)))
+        }
         entry = {
             "arm": protocol["arm"],
             "candidate": directory.name,
             "candidate_sha256": digest(directory / "candidate.json"),
             "reconstruct_every": protocol.get("reconstruct_every", 0),
             "protocol_sha256": digest(directory / "protocol.json"),
+            "training_data_manifest_sha256": protocol["dataset_sha256"],
+            "evaluation_data_manifest_sha256": digest(args.data / "manifest.json"),
             "splits": {},
         }
         result["candidates"].append(entry)
@@ -306,6 +395,9 @@ def main():
                             "expected": case["answer"],
                             "correct": output["answer"].strip() == case["answer"],
                             "finish_reason": output["finish_reason"],
+                            "training_exposure": exposures[case["id"]]
+                            if split == "train-probe"
+                            else None,
                         }
                     )
                     if case["category"] == "code":
@@ -324,6 +416,22 @@ def main():
                 if pairs
                 else None,
             }
+            if split == "train-probe":
+                summary["exposure_scores"] = {}
+                for label, predicate in [
+                    ("qa_seen", lambda v: v["qa"] > 0),
+                    (
+                        "reconstruction_only_seen",
+                        lambda v: v["qa"] == 0 and v["reconstruction"] > 0,
+                    ),
+                    ("unseen_row", lambda v: sum(v.values()) == 0),
+                ]:
+                    selected = [r for r in rows if predicate(r["training_exposure"])]
+                    selected_scores = scores(selected)
+                    summary["exposure_scores"][label] = {
+                        key: selected_scores[key]
+                        for key in ("total", "correct", "code", "name", "missing")
+                    }
             if split == "dev":
                 previous = json.loads((directory / "result.json").read_text())[
                     "evaluations"

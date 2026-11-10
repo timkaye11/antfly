@@ -663,7 +663,7 @@ records parent checkpoint/protocol hashes, and reproduces every final parent
 development answer before updating weights. Ordinary `--resume` still requires
 the same protocol, source and budget. Each new run archives its trainer source.
 
-`encoder_lora_eval.py` independently reloads one or two exported candidates.
+`encoder_lora_eval.py` independently reloads up to three exported candidates.
 Pass the same model/source/data paths, a fresh `--output`, and repeated
 `--candidate /path/to/completed/run` arguments. It requires all 32 final
 development answers to reproduce exactly and evaluates a fixed 32-example
@@ -734,3 +734,24 @@ training/development inventories and each other. These challenges are separate
 from the existing sealed qualification splits and cannot establish universal
 reliability. Saved-model development outputs must still reproduce before any
 post-freeze score is accepted.
+
+
+For a character-level reconstruction variant, add `--spell-values` when creating
+the expanded corpus. Only reconstruction prompts and targets change: QA facts,
+questions, documents, row order and development bytes remain identical. Present
+values are spelled with spaces between characters and `/` between name words;
+missing values retain `UNKNOWN`. The tested corpus's longest target is 36 tokens
+including EOS, within the fixed 64-token reconstruction budget.
+
+When comparing those variants, pass one `--candidate-data PATH` per candidate.
+Each candidate retains its original training-manifest hash requirement, and the
+evaluator additionally requires all QA inputs and labels to match the shared
+`--data` corpus exactly. Reconstruction targets may differ. Training-probe
+selection favors groups actually visited during the new phase; receipts separate
+QA exposure, reconstruction-only exposure and untouched rows, so a file's
+membership in the training corpus is not mistaken for having trained on it.
+
+Fresh challenges require `--prior-training-data PATH` for earlier corpora in the
+candidates' initialization lineage. Candidate/protocol hashes authenticate that
+lineage, and generated facts exclude entities, values and documents from both
+current and earlier training corpora. Existing qualification files stay sealed.

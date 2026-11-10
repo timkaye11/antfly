@@ -377,3 +377,96 @@ def test_continuation_rejects_reconstruction_or_initialization_changes():
             pass
         else:
             raise AssertionError("changed continuation " + key)
+
+
+def test_training_probe_records_actual_seen_qa_and_reconstruction_rows():
+    from encoder_lora_eval import training_exposures, select_training_probe
+
+    protocol = {
+        "seed": 23,
+        "steps": 9,
+        "gradient_accumulation": 4,
+        "reconstruct_every": 2,
+    }
+    visits = training_exposures(protocol, 32)
+    expected = [{"qa": 0, "reconstruction": 0} for _ in range(32)]
+    for absolute in range(36):
+        expected[order_index(23, absolute, 32)][
+            "reconstruction" if absolute % 2 else "qa"
+        ] += 1
+    assert visits == expected
+    train = data_rows(55, "train", 16)
+    a = select_training_probe(train, protocol)
+    b = select_training_probe(train, dict(protocol, reconstruct_every=0))
+    assert a == b and len(a) == 32
+
+
+def test_spelling_reconstruction_preserves_qa_and_exact_characters(tmp_path):
+    from encoder_lora_corpus import expanded_data
+
+    old = tmp_path / "old"
+    make_data(old, train_groups=2, eval_groups=2)
+    fields, spelled = tmp_path / "fields", tmp_path / "spelled"
+    expanded_data(fields, old, train_groups=16, fresh_dev_groups=4)
+    expanded_data(spelled, old, train_groups=16, fresh_dev_groups=4, spell_values=True)
+    assert load_split(fields, "dev") == load_split(spelled, "dev")
+    for a, b in zip(load_split(fields, "train"), load_split(spelled, "train")):
+        assert {k: v for k, v in a.items() if k != "reconstruction"} == {
+            k: v for k, v in b.items() if k != "reconstruction"
+        }
+        for plain, coded in zip(
+            a["reconstruction"]["answer"].splitlines(),
+            b["reconstruction"]["answer"].splitlines(),
+        ):
+            prefix, value = plain.split(": ", 1)
+            encoded = coded.split(": ", 1)[1]
+            decoded = (
+                encoded
+                if value == "UNKNOWN"
+                else encoded.replace(" / ", "|").replace(" ", "").replace("|", " ")
+            )
+            assert decoded == value
+
+
+def test_paired_corpus_comparison_requires_identical_qa_inputs_and_labels():
+    import copy
+    from encoder_lora_corpus import broaden, spell_targets
+    from encoder_lora_eval import qa_corpus
+
+    fields = broaden(data_rows(83, "train", 2))
+    spelled = spell_targets(copy.deepcopy(fields))
+    assert qa_corpus(fields) == qa_corpus(spelled)
+    for key in ["answer", "question"]:
+        changed = copy.deepcopy(spelled)
+        changed[0][key] += "changed"
+        assert qa_corpus(fields) != qa_corpus(changed)
+    changed = copy.deepcopy(spelled)
+    changed[0]["documents"][0] += "different fact"
+    assert qa_corpus(fields) != qa_corpus(changed)
+
+
+def test_fresh_challenge_tracks_and_authenticates_prior_training_lineage(tmp_path):
+    from encoder_lora_eval import prior_dataset_hashes
+    from encoder_lora import digest, save_json
+
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    save_json(parent / "protocol.json", {"dataset_sha256": "old-corpus"})
+    save_json(
+        parent / "candidate.json", {"protocol_sha256": digest(parent / "protocol.json")}
+    )
+    current = {
+        "initialization": {
+            "directory": str(parent),
+            "candidate_sha256": digest(parent / "candidate.json"),
+        }
+    }
+    assert prior_dataset_hashes(current) == {"old-corpus"}
+    assert prior_dataset_hashes({}) == set()
+    save_json(parent / "protocol.json", {"dataset_sha256": "substitution"})
+    try:
+        prior_dataset_hashes(current)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("changed lineage accepted")

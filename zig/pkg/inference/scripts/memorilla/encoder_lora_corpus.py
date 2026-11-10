@@ -86,15 +86,52 @@ def broaden(rows):
     return rows
 
 
+def spell_targets(rows):
+    for row in rows:
+        task = row["reconstruction"]
+        lines = task["answer"].splitlines()
+        if (
+            len(lines) != 2
+            or not lines[0].startswith("Name: ")
+            or not lines[1].startswith("Code: ")
+        ):
+            raise ValueError("invalid field reconstruction target")
+        name, code = lines[0][6:], lines[1][6:]
+
+        def spell(value, name_field=False):
+            if value == "UNKNOWN":
+                return value
+            return (
+                " / ".join(" ".join(word) for word in value.split(" "))
+                if name_field
+                else " ".join(value)
+            )
+
+        task["answer"] = "Name: " + spell(name, True) + "\nCode: " + spell(code)
+        task["question"] += (
+            " For each present field, spell its value with one space between characters. Separate words in a name with / . Keep UNKNOWN unspelled."
+        )
+    return rows
+
+
 def expanded_data(
-    output, development_from, seed=20261110, train_groups=4096, fresh_dev_groups=8
+    output,
+    development_from,
+    seed=20261110,
+    train_groups=4096,
+    fresh_dev_groups=8,
+    spell_values=False,
 ):
+    if not 1 <= train_groups <= 50000 or not 1 <= fresh_dev_groups <= 1000:
+        raise ValueError("bounded positive corpus sizes required")
     original = load_split(development_from, "dev")
     for row in original:
         row["cohort"] = "original-development"
     for attempt in range(128):
         effective = seed + attempt * 65537
         train = broaden(data_rows(effective, "train", train_groups))
+        if spell_values:
+            spell_targets(train)
         fresh = data_rows(effective, "newdev", fresh_dev_groups)
         if (
             disjoint(train, original)
@@ -110,7 +147,9 @@ def expanded_data(
     output.mkdir(parents=True, exist_ok=False)
     manifest = {
         "schema": SCHEMA,
-        "recipe": "expanded-field-reconstruction-v1",
+        "recipe": "expanded-field-spelling-v1"
+        if spell_values
+        else "expanded-field-reconstruction-v1",
         "seed": effective,
         "requested_seed": seed,
         "development_only": True,
@@ -140,8 +179,9 @@ def main():
     p.add_argument("--seed", type=int, default=20261110)
     p.add_argument("--train-groups", type=int, default=4096)
     p.add_argument("--fresh-dev-groups", type=int, default=8)
+    p.add_argument("--spell-values", action="store_true")
     args = p.parse_args()
-    if not 1 <= args.train_groups <= 100000 or not 1 <= args.fresh_dev_groups <= 1000:
+    if not 1 <= args.train_groups <= 50000 or not 1 <= args.fresh_dev_groups <= 1000:
         p.error("bounded positive corpus sizes required")
     print(
         expanded_data(
@@ -150,6 +190,7 @@ def main():
             args.seed,
             args.train_groups,
             args.fresh_dev_groups,
+            args.spell_values,
         )
     )
 
