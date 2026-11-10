@@ -39,6 +39,7 @@ from torch.nn import functional as F
 
 SYSTEM = "Answer using the supplied memory. Return only the complete exact name or code, preserving case, hyphens and leading zeros. If the requested fact is missing, return UNKNOWN."
 SCHEMA = "antfly.memorilla.encoder-lora-research.v1"
+RECONSTRUCTION_SYSTEM = "Reconstruct the requested record using the supplied memory. Preserve every character, capitalization, hyphen and leading zero. Use UNKNOWN for missing fields."
 
 
 def digest(path):
@@ -88,6 +89,13 @@ def continuation_contract(parent, current, completed_step):
         "rollout_qualified",
     ):
         if parent[field] != current[field]:
+            raise ValueError("continuation changes training contract: " + field)
+    for field, default in [
+        ("reconstruct_every", 0),
+        ("reconstruction_system", None),
+        ("initialization", None),
+    ]:
+        if parent.get(field, default) != current.get(field, default):
             raise ValueError("continuation changes training contract: " + field)
     if parent["versions"]["torch"] != current["versions"]["torch"]:
         raise ValueError("continuation changes PyTorch version")
@@ -319,6 +327,33 @@ def order_index(seed, absolute, count):
     return order[index]
 
 
+def reconstruction_task(case, absolute_microstep, every):
+    if every and absolute_microstep % every == every - 1:
+        task = case.get("reconstruction")
+        if not task or set(task) != {"question", "answer"}:
+            raise ValueError("scheduled reconstruction requires explicit field targets")
+        return task["question"], task["answer"], RECONSTRUCTION_SYSTEM, True
+    return case["question"], case["answer"], SYSTEM, False
+
+
+def candidate_proof(directory):
+    candidate = json.loads((directory / "candidate.json").read_text())
+    protocol = json.loads((directory / "protocol.json").read_text())
+    if candidate["rollout_qualified"] or candidate["memory_slots"] != 16:
+        raise ValueError("initialization must be an unqualified 16-slot candidate")
+    for field, file in [
+        ("reader_sha256", "reader.safetensors"),
+        ("encoder_lora_sha256", "encoder-lora.safetensors"),
+        ("protocol_sha256", "protocol.json"),
+        ("base_proofs_sha256", "base-proofs.json"),
+    ]:
+        if candidate[field] != digest(directory / file):
+            raise ValueError("initialization artifact changed: " + file)
+    if not json.loads((directory / "result.json").read_text())["completed"]:
+        raise ValueError("initialization run did not complete")
+    return protocol
+
+
 def teacher_inputs(prefix, embedding, target_ids):
     """Only answer positions contribute loss, including its terminating EOS."""
     if prefix.ndim != 2 or target_ids.ndim != 1 or target_ids.numel() < 1:
@@ -367,6 +402,17 @@ def scores(rows):
         ),
         "total": len(pairs),
     }
+    if any("cohort" in r for r in rows):
+        result["cohorts"] = {
+            cohort: scores(
+                [
+                    {k: v for k, v in r.items() if k != "cohort"}
+                    for r in rows
+                    if r.get("cohort") == cohort
+                ]
+            )
+            for cohort in sorted({r.get("cohort", "unspecified") for r in rows})
+        }
     return result
 
 
@@ -399,6 +445,8 @@ def main():
     train.add_argument("--seed", type=int, default=23)
     train.add_argument("--resume", action="store_true")
     train.add_argument("--continue-from", type=Path)
+    train.add_argument("--initialize-from", type=Path)
+    train.add_argument("--reconstruct-every", type=int, default=0)
     args = p.parse_args()
     if args.command == "make-data":
         if not 1 <= args.train_groups <= 100000 or not 1 <= args.eval_groups <= 10000:
@@ -429,6 +477,12 @@ def run(args):
         raise ValueError("invalid bounded training budget")
     if not 0 < args.reader_lr <= 1e-3 or not 0 < args.encoder_lr <= 1e-3:
         raise ValueError("invalid learning rate")
+    if args.reconstruct_every not in (0, 2, 3, 4):
+        raise ValueError("reconstruction cadence must be disabled or 2/3/4")
+    if args.initialize_from is not None and args.continue_from is not None:
+        raise ValueError(
+            "weight initialization and optimizer continuation are distinct"
+        )
     torch.set_num_threads(4)
     torch.manual_seed(args.seed)
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -467,8 +521,29 @@ def run(args):
         "versions": {"torch": str(torch.__version__)},
     }
     protocol["eval_every"] = args.eval_every
+    protocol["reconstruct_every"] = args.reconstruct_every
+    protocol["reconstruction_system"] = (
+        RECONSTRUCTION_SYSTEM if args.reconstruct_every else None
+    )
+    if args.initialize_from is not None:
+        initialization = args.initialize_from.resolve()
+        initial_protocol = candidate_proof(initialization)
+        if (
+            initial_protocol["rank"],
+            initial_protocol["alpha"],
+            initial_protocol["arm"],
+        ) != (args.rank, args.alpha, args.arm):
+            raise ValueError("initialization adapter contract differs")
+        protocol["initialization"] = {
+            "directory": str(initialization),
+            "candidate_sha256": digest(initialization / "candidate.json"),
+            "optimizer_reset": True,
+        }
+
     if args.resume:
         previous_protocol = json.loads((args.output / "protocol.json").read_text())
+        if "initialization" in previous_protocol and args.initialize_from is None:
+            protocol["initialization"] = previous_protocol["initialization"]
         if "continuation" in previous_protocol:
             protocol["continuation"] = previous_protocol["continuation"]
             if (
@@ -480,6 +555,8 @@ def run(args):
     elif args.continue_from is not None:
         parent = args.continue_from.resolve()
         parent_protocol = json.loads((parent / "protocol.json").read_text())
+        if "initialization" in parent_protocol:
+            protocol["initialization"] = parent_protocol["initialization"]
         parent_result = json.loads((parent / "result.json").read_text())
         if not parent_result["completed"]:
             raise ValueError("parent run did not complete")
@@ -511,7 +588,14 @@ def run(args):
         "upstream": source_recipe(args.upstream_source),
     }
     save_json(args.output / "base-proofs.json", proof)
+    if (
+        args.initialize_from is not None
+        and json.loads((args.initialize_from / "base-proofs.json").read_text()) != proof
+    ):
+        raise ValueError("initialization base assets differ")
     train_rows, dev_rows = load_split(args.data, "train"), load_split(args.data, "dev")
+    if args.reconstruct_every and any("reconstruction" not in r for r in train_rows):
+        raise ValueError("reconstruction fields missing from training data")
     if len({r["group"] for r in train_rows} & {r["group"] for r in dev_rows}):
         raise ValueError("train/dev group overlap")
     tokenizer_e = AutoTokenizer.from_pretrained(
@@ -565,6 +649,15 @@ def run(args):
     decoder.gradient_checkpointing_enable(
         gradient_checkpointing_kwargs={"use_reentrant": False}
     )
+    if args.initialize_from is not None and not args.resume:
+        from safetensors.torch import load_file
+
+        reader.load_state_dict(
+            load_file(str(args.initialize_from / "reader.safetensors"))
+        )
+        restore_adapters(
+            adapters, load_file(str(args.initialize_from / "encoder-lora.safetensors"))
+        )
     decoder.config.use_cache = False
     if decoder.config.vocab_size != 151936:
         raise ValueError("decoder vocabulary must remain unchanged")
@@ -630,7 +723,7 @@ def run(args):
         reader.train(training)
         decoder.train(training)
 
-    def prefix(case, training):
+    def prefix(case, training, decoder_question=None, system_prompt=SYSTEM):
         tokens = tokenizer_e(
             case["documents"] + [case["question"]], padding=True, return_tensors="pt"
         ).to("cuda")
@@ -660,8 +753,8 @@ def run(args):
             tokenizer_d,
             decoder.get_input_embeddings(),
             memories,
-            system_prompt=SYSTEM,
-            question=case["question"],
+            system_prompt=system_prompt,
+            question=case["question"] if decoder_question is None else decoder_question,
             device="cuda",
         )
         return embeds
@@ -678,6 +771,7 @@ def run(args):
                         "id": case["id"],
                         "group": case["group"],
                         "category": case["category"],
+                        "cohort": case.get("cohort", "development"),
                         "actual": answer["answer"],
                         "expected": case["answer"],
                         "correct": answer["answer"].strip() == case["answer"],
@@ -720,6 +814,22 @@ def run(args):
         if not args.resume:
             expected_rows = result["evaluations"][-1]["rows"] if start_step else None
             evaluate(start_step)
+            if args.initialize_from is not None:
+                previous = json.loads(
+                    (args.initialize_from / "result.json").read_text()
+                )["evaluations"][-1]["rows"]
+                expected = {r["id"]: r["actual"] for r in previous}
+                overlap = [
+                    r for r in result["evaluations"][-1]["rows"] if r["id"] in expected
+                ]
+                if len(overlap) != len(previous) or any(
+                    r["actual"] != expected[r["id"]] for r in overlap
+                ):
+                    raise ValueError(
+                        "initialized weights do not reproduce parent development answers"
+                    )
+                result["initialization_development_text_matches"] = len(overlap)
+                save_json(result_path, result)
             if expected_rows is not None:
                 previous_answers = {r["id"]: r["actual"] for r in expected_rows}
                 if any(
@@ -733,18 +843,22 @@ def run(args):
             modes(True)
             optimizer.zero_grad(set_to_none=True)
             started, total_loss = time.monotonic(), 0.0
+            qa_losses, reconstruction_losses, target_tokens = [], [], 0
             for micro in range(args.accum):
                 case = train_rows[
                     order_index(args.seed, step * args.accum + micro, len(train_rows))
                 ]
+                question, answer, system, reconstructing = reconstruction_task(
+                    case, step * args.accum + micro, args.reconstruct_every
+                )
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    embeddings = prefix(case, True)
-                    ids = tokenizer_d(
-                        case["answer"], add_special_tokens=False
-                    ).input_ids + [151645]
+                    embeddings = prefix(case, True, question, system)
+                    ids = tokenizer_d(answer, add_special_tokens=False).input_ids + [
+                        151645
+                    ]
                     target = torch.tensor(ids, device="cuda", dtype=torch.long)
-                    if target.numel() > 24:
-                        raise ValueError("answer exceeds experiment generation cap")
+                    if target.numel() > (64 if reconstructing else 24):
+                        raise ValueError("answer exceeds explicit training target cap")
                     inputs = teacher_inputs(
                         embeddings, decoder.get_input_embeddings(), target
                     )
@@ -754,7 +868,12 @@ def run(args):
                     loss = F.cross_entropy(output.logits[0].float(), target)
                 if not torch.isfinite(loss):
                     raise RuntimeError("nonfinite training loss")
-                total_loss += float(loss.detach()) / args.accum
+                loss_value = float(loss.detach())
+                (reconstruction_losses if reconstructing else qa_losses).append(
+                    loss_value
+                )
+                target_tokens += len(ids)
+                total_loss += loss_value / args.accum
                 (loss / args.accum).backward()
                 del embeddings, inputs, output, loss
             reader_grad = (
@@ -789,6 +908,14 @@ def run(args):
             row = {
                 "step": step + 1,
                 "loss": total_loss,
+                "qa_loss": sum(qa_losses) / len(qa_losses) if qa_losses else None,
+                "reconstruction_loss": sum(reconstruction_losses)
+                / len(reconstruction_losses)
+                if reconstruction_losses
+                else None,
+                "qa_examples": len(qa_losses),
+                "reconstruction_examples": len(reconstruction_losses),
+                "target_tokens": target_tokens,
                 "reader_grad_norm": reader_grad,
                 "encoder_lora_grad_norm": lora_grad,
                 "total_grad_norm": norm,

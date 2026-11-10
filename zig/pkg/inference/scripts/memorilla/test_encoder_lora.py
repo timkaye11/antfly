@@ -242,3 +242,138 @@ def test_continuation_preserves_optimizer_data_arm_and_absolute_step_contract():
             pass
         else:
             raise AssertionError("accepted inconsistent completed step")
+
+
+def test_reconstruction_targets_are_scheduled_without_changing_encoder_question():
+    from encoder_lora import reconstruction_task, SYSTEM, RECONSTRUCTION_SYSTEM
+    from encoder_lora_corpus import broaden
+
+    rows = broaden(data_rows(1047, "train", 4))
+    for index, case in enumerate(rows):
+        original = case["question"]
+        q, answer, system, aux = reconstruction_task(case, index, 2)
+        assert aux == bool(index % 2)
+        assert case["question"] == original
+        if aux:
+            assert system == RECONSTRUCTION_SYSTEM
+            assert q == case["reconstruction"]["question"]
+            name_line, code_line = answer.splitlines()
+            for field in (
+                name_line.removeprefix("Name: "),
+                code_line.removeprefix("Code: "),
+            ):
+                assert field == "UNKNOWN" or any(field in d for d in case["documents"])
+                if field != "UNKNOWN":
+                    assert field not in q
+        else:
+            assert (q, answer, system) == (original, case["answer"], SYSTEM)
+    assert reconstruction_task(rows[0], 1, 0)[-1] is False
+
+
+def test_expanded_corpus_preserves_original_dev_and_never_reads_old_test(tmp_path):
+    from encoder_lora_corpus import expanded_data, disjoint
+
+    old = tmp_path / "old"
+    make_data(old, train_groups=2, eval_groups=2)
+    expected = load_split(old, "dev")
+    (old / "test.json").unlink()
+    (old / "ood.json").unlink()
+    out = tmp_path / "new"
+    manifest = expanded_data(out, old, train_groups=32, fresh_dev_groups=4)
+    train, dev = load_split(out, "train"), load_split(out, "dev")
+    assert len(train) == 128 and len(dev) == 24
+    assert disjoint(train, dev)
+    assert [
+        {k: v for k, v in r.items() if k != "cohort"} for r in dev[: len(expected)]
+    ] == expected
+    assert all("reconstruction" in r for r in train)
+    assert all("reconstruction" not in r for r in dev)
+    assert manifest["old_qualification_splits_read"] is False
+    assert not (out / "test.json").exists()
+
+
+def test_cohort_scores_do_not_hide_original_development_failures():
+    rows = [
+        dict(r, actual="UNKNOWN", correct=False, cohort="old" if i < 4 else "fresh")
+        for i, r in enumerate(data_rows(71, "dev", 2))
+    ]
+    value = scores(rows)
+    assert value["total"] == 8
+    assert value["cohorts"]["old"]["total"] == value["cohorts"]["fresh"]["total"] == 4
+    assert value["cohorts"]["old"]["correct"] == 0
+
+
+def test_postfreeze_challenge_is_disjoint_and_contains_one_character_pairs():
+    from encoder_lora_eval import fresh_challenge
+    from encoder_lora_corpus import broaden, disjoint
+
+    train = broaden(data_rows(571, "train", 16))
+    dev = data_rows(571, "dev", 4)
+    seed, rows = fresh_challenge(8549, 8, train, dev)
+    assert (seed, rows) == fresh_challenge(8549, 8, train, dev)
+    assert len(rows) == 64
+    assert disjoint(rows, train) and disjoint(rows, dev)
+    assert {r["cohort"] for r in rows} == {"postfreeze", "postfreeze-phrasing"}
+    for i in range(0, len(rows), 4):
+        a, b = rows[i : i + 2]
+        assert a["question"] == b["question"]
+        assert sum(x != y for x, y in zip(a["answer"], b["answer"])) == 1
+        assert any(b["answer"] in d for d in b["documents"])
+
+
+def test_postfreeze_filters_colliding_groups_without_changing_seed():
+    from encoder_lora_eval import fresh_challenge
+    from encoder_lora_corpus import disjoint
+
+    seed = 90817
+    forbidden = data_rows(seed, "postfreeze", 16)[:4]
+    actual_seed, rows = fresh_challenge(seed, 8, forbidden, [])
+    assert actual_seed == seed
+    assert len(rows) == 64 and disjoint(rows, forbidden)
+    assert not any(r["id"].startswith("postfreeze:postfreeze-0000-") for r in rows)
+
+
+def test_continuation_rejects_reconstruction_or_initialization_changes():
+    from encoder_lora import continuation_contract
+
+    fields = [
+        "schema",
+        "arm",
+        "memory_slots",
+        "rank",
+        "alpha",
+        "target_modules",
+        "seed",
+        "gradient_accumulation",
+        "reader_lr",
+        "encoder_lr",
+        "dropout",
+        "precision",
+        "dataset_sha256",
+        "system_prompt",
+        "decoder_frozen",
+        "source_text_in_decoder",
+        "heldout_opened",
+        "rollout_qualified",
+    ]
+    parent = {k: k for k in fields}
+    parent.update(
+        steps=512,
+        versions={"torch": "pinned"},
+        reconstruct_every=2,
+        reconstruction_system="reconstruct",
+        initialization={"candidate": "fixed", "optimizer_reset": True},
+    )
+    child = dict(parent, steps=1024)
+    continuation_contract(parent, child, 512)
+    for key, value in [
+        ("reconstruct_every", 0),
+        ("reconstruction_system", "changed"),
+        ("initialization", None),
+    ]:
+        try:
+            continuation_contract(parent, dict(child, **{key: value}), 512)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("changed continuation " + key)

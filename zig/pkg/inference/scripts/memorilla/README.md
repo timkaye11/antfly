@@ -691,3 +691,46 @@ codes and 2/8 names, with no complete pairs. Both got 8/8 missing-fact answers
 right. The adapters can learn training facts, but that improvement has not
 transferred to unseen development entities. Test and unseen-phrasing splits
 remain unevaluated; further training work must address generalization.
+
+
+### Expanded corpus and exact-field reconstruction
+
+`encoder_lora_corpus.py` builds 16,384 training examples in 4,096 related groups,
+with six document templates, four question forms per fact type and alternating
+document order. It preserves the original development cases and adds eight
+fresh groups, yielding 64 development questions with separate cohort scores.
+Entities, complete answer values and documents remain disjoint between train
+and development. Existing test/unseen-phrasing files are never read or copied.
+
+```sh
+python zig/pkg/inference/scripts/memorilla/encoder_lora_corpus.py \
+  --development-from /path/to/original/pilot/data \
+  --output .benchmark-results/memorilla/encoder-lora-next/data
+```
+
+For the next matched experiment, both runs use the same completed encoder-LoRA
+candidate via `train --initialize-from /path/to/candidate`, the expanded data,
+512 steps, accumulation four and evaluation every 128 steps. Initialization
+verifies candidate tensor/protocol/base hashes, restores reader and adapters,
+and starts a fresh optimizer. Every original development answer must reproduce
+before training starts. This is distinct from `--continue-from`, which retains
+optimizer state and rejects changed data or objectives.
+
+Use `--reconstruct-every 0` for QA-only and `--reconstruct-every 2` for alternating
+QA and record reconstruction. The latter asks the decoder to reconstruct the
+exact name and code fields using the same 16 memory slots conditioned on the
+original QA query. Reconstruction labels are teacher-forced completion targets. They never enter
+encoder inputs or the decoder question/system prompt. The two tasks have separate prompt
+instructions and a fixed schedule by absolute microstep. Both runs process the
+same ordered rows and optimizer steps; their target token counts and task losses
+are recorded separately because reconstruction targets are longer.
+
+The evaluator accepts `--fresh-groups N` to generate two fresh challenge cohorts
+only after completed candidate hashes have been checked. Its optional
+`--fresh-seed` reproduces a receipt; otherwise a new random seed is recorded.
+One cohort uses familiar wording, the other different phrasing; code pairs
+differ in exactly one character. All generated groups are checked against the
+training/development inventories and each other. These challenges are separate
+from the existing sealed qualification splits and cannot establish universal
+reliability. Saved-model development outputs must still reproduce before any
+post-freeze score is accepted.

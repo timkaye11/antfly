@@ -16,8 +16,8 @@
 
 """Reload research candidates and distinguish training fit from dev generalization.
 
-Deliberately exposes no test/ood option: those splits stay sealed during pilot
-development. Neither expected answers nor category labels enter encoder inputs
+Existing test/ood splits stay sealed. Optional post-freeze challenges use fresh
+facts generated only after all candidate hashes have been checked. Neither expected answers nor category labels enter encoder inputs
 or decoder prompts. This is a Python research diagnostic, not serving promotion.
 """
 
@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import secrets
 import subprocess
 from pathlib import Path
 
@@ -36,6 +37,7 @@ from decoder_reference import prepare_prompt
 from encoder_reference import normalize_features
 from encoder_lora import (
     SYSTEM,
+    data_rows,
     digest,
     inject_lora,
     load_split,
@@ -43,9 +45,52 @@ from encoder_lora import (
     save_json,
     scores,
 )
+from encoder_lora_corpus import inventories
 from gpu_quality_reference import generate
 from reference import load_upstream
 from released_reference import checkpoint_proof, source_recipe
+
+
+def fresh_challenge(seed, groups, train, dev):
+    # Reject colliding groups individually so large qualification suites remain
+    # feasible even when training contains many thousands of invented entities.
+    for attempt in range(128):
+        effective = seed + attempt * 65537
+        reserved = [a | b for a, b in zip(inventories(train), inventories(dev))]
+        rows = []
+        complete = True
+        for label, source in [
+            ("postfreeze", "postfreeze"),
+            ("postfreeze-phrasing", "ood"),
+        ]:
+            pool = data_rows(effective, source, max(groups * 2, 16))
+            accepted = 0
+            for offset in range(0, len(pool), 4):
+                group = pool[offset : offset + 4]
+                first, second = group[:2]
+                old = second["answer"]
+                new = first["answer"][:-1] + str((int(first["answer"][-1]) + 1) % 10)
+                second["answer"] = new
+                second["documents"] = [d.replace(old, new) for d in second["documents"]]
+                own = inventories(group)
+                if any(a & b for a, b in zip(own, reserved)):
+                    continue
+                for a, b in zip(own, reserved):
+                    b.update(a)
+                for row in group:
+                    row["id"] = label + ":" + row["id"]
+                    row["group"] = label + ":" + row["group"]
+                    row["cohort"] = label
+                rows.extend(group)
+                accepted += 1
+                if accepted == groups:
+                    break
+            if accepted != groups:
+                complete = False
+                break
+        if complete:
+            return effective, rows
+    raise ValueError("could not generate disjoint post-freeze facts")
 
 
 def main():
@@ -62,7 +107,11 @@ def main():
     ):
         p.add_argument("--" + name, type=Path, required=True)
     p.add_argument("--candidate", type=Path, action="append", required=True)
+    p.add_argument("--fresh-groups", type=int, default=0)
+    p.add_argument("--fresh-seed", type=int)
     args = p.parse_args()
+    if not 0 <= args.fresh_groups <= 1000:
+        p.error("fresh groups must be between zero and 1000")
     if not 1 <= len(args.candidate) <= 2:
         p.error("one or two candidates required")
     if subprocess.check_output(
@@ -104,6 +153,8 @@ def main():
             or protocol["system_prompt"] != SYSTEM
         ):
             raise ValueError("candidate/data/prompt mismatch")
+        if not json.loads((directory / "result.json").read_text())["completed"]:
+            raise ValueError("candidate training did not complete")
         protocols.append(protocol)
     if any(
         (a["rank"], a["alpha"], a["seed"], a["precision"])
@@ -120,6 +171,29 @@ def main():
     train = load_split(args.data, "train")
     groups = list(dict.fromkeys(r["group"] for r in train))[:8]
     train_probe = [r for r in train if r["group"] in groups]
+    fresh_rows = []
+    if args.fresh_groups:
+        seed, fresh_rows = fresh_challenge(
+            args.fresh_seed if args.fresh_seed is not None else secrets.randbits(63),
+            args.fresh_groups,
+            train,
+            dev,
+        )
+        save_json(
+            args.output / "fresh-cases.json",
+            {
+                "seed": seed,
+                "generated_after_candidate_hash_checks": True,
+                "candidate_manifest_hashes": [
+                    digest(d / "candidate.json") for d in args.candidate
+                ],
+                "candidate_protocol_hashes": [
+                    digest(d / "protocol.json") for d in args.candidate
+                ],
+                "dataset_sha256": digest(args.data / "manifest.json"),
+                "cases": fresh_rows,
+            },
+        )
     enc_tok = AutoTokenizer.from_pretrained(args.encoder, local_files_only=True)
     enc_tok.padding_side = "right"
     dec_tok = AutoTokenizer.from_pretrained(args.decoder, local_files_only=True)
@@ -150,7 +224,9 @@ def main():
         "schema": "antfly.memorilla.encoder-lora-reload-audit.v1",
         "completed": False,
         "rollout_qualified": False,
-        "heldout_opened": False,
+        "heldout_opened": bool(fresh_rows),
+        "old_qualification_splits_opened": False,
+        "postfreeze_facts_generated": len(fresh_rows),
         "source_sha256": digest(Path(__file__)),
         "candidates": [],
     }
@@ -172,11 +248,16 @@ def main():
         )
         entry = {
             "arm": protocol["arm"],
+            "candidate": directory.name,
+            "candidate_sha256": digest(directory / "candidate.json"),
+            "reconstruct_every": protocol.get("reconstruct_every", 0),
             "protocol_sha256": digest(directory / "protocol.json"),
             "splits": {},
         }
         result["candidates"].append(entry)
-        for split, cases in [("dev", dev), ("train-probe", train_probe)]:
+        for split, cases in [("dev", dev), ("train-probe", train_probe)] + (
+            [("postfreeze", fresh_rows)] if fresh_rows else []
+        ):
             rows, code_vectors = [], {}
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
                 for case in cases:
@@ -220,6 +301,7 @@ def main():
                             "id": case["id"],
                             "group": case["group"],
                             "category": case["category"],
+                            "cohort": case.get("cohort", split),
                             "actual": output["answer"],
                             "expected": case["answer"],
                             "correct": output["answer"].strip() == case["answer"],
@@ -262,6 +344,7 @@ def main():
                 json.dumps(
                     {
                         "arm": entry["arm"],
+                        "candidate": entry["candidate"],
                         "split": split,
                         **summary["scores"],
                         "code_pair_embedding_cosine_mean": summary[
