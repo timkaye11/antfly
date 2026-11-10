@@ -71132,9 +71132,10 @@ components:
           minimum: 1
           maximum: 128
           default: 64
-          description: Maximum tokens for each answer candidate. Source-verified mode generates a memory
-            candidate and an independent source answer, plus at most one verifier call of eight tokens;
-            usage reports all phases. Every phase also respects profile and operator ceilings.
+          description: Maximum tokens for each answer candidate, including an optional source repair.
+            Source-verified mode generates a memory candidate and an independent source answer, with at
+            most one source repair and two verifier calls of eight tokens each; usage reports all phases.
+            Every phase also respects profile and operator ceilings.
         context_mode:
           type: string
           enum:
@@ -71176,7 +71177,7 @@ components:
           type: integer
           minimum: 0
           description: Source-verified mode only. Decoder prompt tokens across memory, independent source
-            answering and verification phases, regardless of the final answer path.
+            answering, bounded repair and verification phases, regardless of the final answer path.
         total_completion_tokens:
           type: integer
           minimum: 0
@@ -71185,7 +71186,9 @@ components:
         verification_calls:
           type: integer
           minimum: 0
-          maximum: 1
+          maximum: 2
+          description: At most one initial source check and one check of a bounded repair. Every generated
+            phase is included in total token usage.
         source_fallback_used:
           type: boolean
           description: Source-verified mode only. True when the final selection uses the source-answer

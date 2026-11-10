@@ -26,7 +26,7 @@ PATH = DEFAULT_SUITE.with_name("mixed_instruction_dev.json")
 def test_mixed_diagnostic_scope_and_unseen_entities():
     suite = json.loads(PATH.read_text())
     assert suite["development_only"] and suite["source_annotations_are_authored"]
-    assert not suite["release_gate"] and len(suite["cases"]) == 5
+    assert not suite["release_gate"] and len(suite["cases"]) == 7
     frozen_entities = {
         entity
         for case in json.loads(DEFAULT_SUITE.read_text())["cases"]
@@ -35,7 +35,7 @@ def test_mixed_diagnostic_scope_and_unseen_entities():
     assert not frozen_entities & {
         entity for case in suite["cases"] for entity in case["entities"]
     }
-    assert len({case["id"] for case in suite["cases"]}) == 5
+    assert len({case["id"] for case in suite["cases"]}) == 7
 
 
 def test_conflicting_fact_and_correction_share_documents_with_commands():

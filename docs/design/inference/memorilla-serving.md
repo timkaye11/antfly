@@ -187,7 +187,23 @@ row in the same order. Texts are bounded to 8192 UTF-8 bytes each and 32768 byte
 total, and the complete prompts must fit the operator and internal token limits.
 The server independently answers from document text without showing that call
 the memory candidate. It then checks the source answer using the same qualified
-decoder with fresh F32 KV. An exact completed `SUPPORTED` verdict is required.
+decoder with fresh F32 KV. Before that model check, the answer must have an exact,
+token-bounded occurrence in the original sources. Case, leading zeros, spelling
+and punctuation are preserved; partial identifiers do not provide evidence.
+This conservative path answers literal factual values. Derived or paraphrased
+answers without a matching source value produce `UNKNOWN`. Semantic relevance,
+complete names, corrections and conflicts still require the model check; a
+literal occurrence alone does not prove that the value answers the question.
+An exact completed `SUPPORTED` verdict is required.
+If the initial source answer receives a completed `UNSUPPORTED` verdict, the
+server permits one repair using only the original question and documents. Neither
+the memory proposal nor the rejected source answer is supplied to the repair.
+A changed repair must pass literal evidence and a fresh verifier call before publication.
+Malformed/truncated verdicts, missing literal evidence, repeated rejected values
+and unsuccessful repairs abstain. Cancellation, model errors and artifact drift
+still propagate as errors. Every phase keeps the caller/operator token limits;
+`usage.verification_calls` is bounded to two and all repair work is included in
+total prompt/completion usage. A repair adds latency only on the rejected path.
 The memory candidate can be published only when it agrees with that supported
 source answer after trimming boundary Unicode whitespace; case, punctuation,
 digits and internal spacing must match exactly. Otherwise the supported source
@@ -218,9 +234,10 @@ dated factual correction. The decoder still makes a model judgment: independent
 critic controls exposed false approvals, so an isolated support label cannot
 authorize the memory candidate.
 
-At most one memory candidate, one independent source answer and one verification
-call run. Answer candidates each obey `max_new_tokens`; the verifier is capped
-at eight tokens and narrowed by profile and operator ceilings. All calls share
+At most one memory candidate, one independent source answer, one source repair
+and two verification calls run. Answer candidates each obey `max_new_tokens`;
+each verifier call is capped at eight tokens and narrowed by profile and operator
+ceilings. All calls share
 the request deadline. Cancellation, identity failures and resource errors
 propagate; they do not become an apparently successful fallback.
 

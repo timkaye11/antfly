@@ -1402,7 +1402,7 @@ pub const MemorillaGenerateRequest = struct {
     document_embeddings: []const []const f32,
     /// Exact model_identity returned by the qualified encoder. Ordinary mixed-precision encoder identities are incompatible.
     encoder_execution_identity: []const u8,
-    /// Maximum tokens for each answer candidate. Source-verified mode generates a memory candidate and an independent source answer, plus at most one verifier call of eight tokens; usage reports all phases. Every phase also respects profile and operator ceilings.
+    /// Maximum tokens for each answer candidate, including an optional source repair. Source-verified mode generates a memory candidate and an independent source answer, with at most one source repair and two verifier calls of eight tokens each; usage reports all phases. Every phase also respects profile and operator ceilings.
     max_new_tokens: ?i64 = null,
     /// Latent uses stored features alone. Source-verified mode requires document_texts and explicitly checks or replaces the memory candidate using their contents.
     context_mode: ?[]const u8 = null,
@@ -1552,10 +1552,11 @@ pub const MemorillaGenerateUsage = struct {
     encoder_query_tokens: i64,
     prompt_tokens: i64,
     completion_tokens: i64,
-    /// Source-verified mode only. Decoder prompt tokens across memory, independent source answering and verification phases, regardless of the final answer path.
+    /// Source-verified mode only. Decoder prompt tokens across memory, independent source answering, bounded repair and verification phases, regardless of the final answer path.
     total_prompt_tokens: ?i64 = null,
     /// Source-verified mode only. Actual decoder output tokens across every phase, including discarded candidates and verifier labels.
     total_completion_tokens: ?i64 = null,
+    /// At most one initial source check and one check of a bounded repair. Every generated phase is included in total token usage.
     verification_calls: ?i64 = null,
     /// Source-verified mode only. True when the final selection uses the source-answer or abstention path, false for memory_verified. Independent source-answer work occurs even for memory_verified and is included in total token usage.
     source_fallback_used: ?bool = null,

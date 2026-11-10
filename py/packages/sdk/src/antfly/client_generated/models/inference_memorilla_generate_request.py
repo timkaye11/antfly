@@ -33,9 +33,10 @@ class InferenceMemorillaGenerateRequest:
             document_embeddings (list[list[float]]):
             encoder_execution_identity (str): Exact model_identity returned by the qualified encoder. Ordinary mixed-
                 precision encoder identities are incompatible.
-            max_new_tokens (int | Unset): Maximum tokens for each answer candidate. Source-verified mode generates a memory
-                candidate and an independent source answer, plus at most one verifier call of eight tokens; usage reports all
-                phases. Every phase also respects profile and operator ceilings. Default: 64.
+            max_new_tokens (int | Unset): Maximum tokens for each answer candidate, including an optional source repair.
+                Source-verified mode generates a memory candidate and an independent source answer, with at most one source
+                repair and two verifier calls of eight tokens each; usage reports all phases. Every phase also respects profile
+                and operator ceilings. Default: 64.
             context_mode (InferenceMemorillaGenerateRequestContextMode | Unset): Latent uses stored features alone. Source-
                 verified mode requires document_texts and explicitly checks or replaces the memory candidate using their
                 contents. Default: InferenceMemorillaGenerateRequestContextMode.LATENT.

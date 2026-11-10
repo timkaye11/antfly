@@ -284,7 +284,6 @@ def test_abstention_cannot_publish_an_answer_or_tokens(field, value):
     "field,value",
     [
         ("verification_calls", 3),
-        ("verification_calls", 2),
         ("verification_calls", 0),
         ("source_fallback_used", True),
         ("total_completion_tokens", 0),
@@ -322,6 +321,14 @@ def test_memory_publication_still_accounts_for_independent_source_work():
         invalid["usage"][key] = invalid["usage"][public_key]
         with pytest.raises(ValueError, match="usage"):
             validate(invalid)
+
+
+def test_bounded_source_repair_usage_can_report_two_verification_calls():
+    actual = response(["raw document"], path="source_fallback_verified")
+    actual["usage"]["verification_calls"] = 2
+    actual["usage"]["total_prompt_tokens"] += 50
+    actual["usage"]["total_completion_tokens"] += 4
+    validate(actual)
 
 
 def test_policy_abstention_selects_source_path_flag():
@@ -373,3 +380,71 @@ def test_entire_runner_handles_openai_embedding_producer(tmp_path):
     result = vq.run(arguments(tmp_path), OpenAIProducer())
     assert result["completed"] and result["execution_passed"]
     assert result["attempted_cases"] == {"v1": 24, "v2": 16}
+
+
+def diagnostic_arguments(tmp_path):
+    args = arguments(tmp_path, "diagnostic")
+    args.diagnostic_suite = vq.HERE / "fixtures/mixed_instruction_dev.json"
+    mock = NativeMock()
+    suite = json.loads(args.diagnostic_suite.read_text())
+    mock.index.update(
+        {(c["question"], tuple(c["documents"])): c for c in suite["cases"]}
+    )
+    return args, mock
+
+
+def test_diagnostic_exercises_all_authored_controls_without_sending_gold(tmp_path):
+    args, mock = diagnostic_arguments(tmp_path)
+    result = vq.run_diagnostic(args, mock)
+    assert (
+        result["completed"] and result["execution_passed"] and result["quality_passed"]
+    )
+    assert result["scores"] == {"total": 7, "correct": 7, "wrong_published": 0}
+    assert result["development_only"] and not result["rollout_qualified"]
+    # NativeMock rejects extra request fields, including gold/scoring metadata.
+    assert mock.generations == 7
+    with pytest.raises(ValueError, match="preserve previous"):
+        vq.run_diagnostic(args, mock)
+    with pytest.raises(ValueError, match="development receipt"):
+        vq.development_gate(args.output, {})
+
+
+@pytest.mark.parametrize("abstain_everything", [False, True])
+def test_diagnostic_rejects_wrong_published_values_and_blanket_abstention(
+    tmp_path, abstain_everything
+):
+    args, mock = diagnostic_arguments(tmp_path)
+    original = mock.post
+
+    def post(path, body):
+        if path == "memorilla/generate":
+            if abstain_everything:
+                return response(body["document_texts"], path="abstained")
+            if "bronze badge at Merrow Office" in body["question"]:
+                return response(
+                    body["document_texts"],
+                    answer="Rowan",
+                    path="source_fallback_verified",
+                )
+        return original(path, body)
+
+    mock.post = post
+    result = vq.run_diagnostic(args, mock)
+    assert result["execution_passed"] and not result["quality_passed"]
+    assert result["scores"]["wrong_published"] == (0 if abstain_everything else 1)
+    assert result["scores"]["correct"] < result["scores"]["total"]
+
+
+def test_diagnostic_rejects_release_marked_data_and_held_out_mode_before_http(tmp_path):
+    args, mock = diagnostic_arguments(tmp_path)
+    args.split = "test"
+    with pytest.raises(ValueError, match="development only"):
+        vq.run_diagnostic(args, mock)
+    args.split = "dev"
+    suite = json.loads(args.diagnostic_suite.read_text())
+    suite["release_gate"] = True
+    args.diagnostic_suite = tmp_path / "invalid.json"
+    args.diagnostic_suite.write_text(json.dumps(suite))
+    with pytest.raises(ValueError, match="authored development suite"):
+        vq.run_diagnostic(args, mock)
+    assert not mock.calls and not args.output.exists()

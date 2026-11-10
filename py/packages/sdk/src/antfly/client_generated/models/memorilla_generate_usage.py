@@ -18,10 +18,11 @@ class MemorillaGenerateUsage:
         prompt_tokens (int):
         completion_tokens (int):
         total_prompt_tokens (int | Unset): Source-verified mode only. Decoder prompt tokens across memory, independent
-            source answering and verification phases, regardless of the final answer path.
+            source answering, bounded repair and verification phases, regardless of the final answer path.
         total_completion_tokens (int | Unset): Source-verified mode only. Actual decoder output tokens across every
             phase, including discarded candidates and verifier labels.
-        verification_calls (int | Unset):
+        verification_calls (int | Unset): At most one initial source check and one check of a bounded repair. Every
+            generated phase is included in total token usage.
         source_fallback_used (bool | Unset): Source-verified mode only. True when the final selection uses the source-
             answer or abstention path, false for memory_verified. Independent source-answer work occurs even for
             memory_verified and is included in total token usage.

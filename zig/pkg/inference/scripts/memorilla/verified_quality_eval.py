@@ -159,7 +159,7 @@ def validate_response(
         or usage["completion_tokens"] != len(ids)
         or usage["total_prompt_tokens"] < usage["prompt_tokens"]
         or usage["total_completion_tokens"] < usage["completion_tokens"]
-        or not 0 <= usage["verification_calls"] <= 1
+        or not 0 <= usage["verification_calls"] <= 2
         or type(usage.get("source_fallback_used")) is not bool
         or usage["source_fallback_used"] != (path != "memory_verified")
         or usage["total_prompt_tokens"] <= usage["prompt_tokens"]
@@ -488,6 +488,134 @@ def run(args, client=None) -> dict:
     return record
 
 
+def run_diagnostic(args, client=None) -> dict:
+    """Run small authored development controls; never authorize held-out QA."""
+    if args.output.exists():
+        raise ValueError("preserve previous receipts; choose a new --output")
+    if args.split != "dev" or args.development_receipt is not None:
+        raise ValueError("diagnostic suites are development only")
+    if not 1 <= args.max_new_tokens <= 128 or not 1 <= args.timeout_ms <= 3_600_000:
+        raise ValueError("invalid verified evaluation bounds")
+    if len(args.module_sha256) != 64 or any(
+        c not in "0123456789abcdef" for c in args.module_sha256
+    ):
+        raise ValueError("module SHA256 must be lowercase hexadecimal")
+    suite = json.loads(args.diagnostic_suite.read_text())
+    cases = suite.get("cases", [])
+    if (
+        suite.get("schema") != "antfly.memorilla.mixed-instruction-dev.v1"
+        or suite.get("development_only") is not True
+        or suite.get("release_gate") is not False
+        or not 1 <= len(cases) <= 64
+        or len({c["id"] for c in cases}) != len(cases)
+        or any(
+            not c["question"].strip()
+            or not 1 <= len(c["documents"]) <= 64
+            or c["answer"]["mode"] not in {"entity", "abstention"}
+            or not c["answer"]["aliases"]
+            for c in cases
+        )
+    ):
+        raise ValueError("invalid authored development suite")
+    record = {
+        "schema": "antfly.memorilla.verified-diagnostic.v1",
+        "completed": False,
+        "execution_passed": False,
+        "quality_passed": False,
+        "rollout_qualified": False,
+        "development_only": True,
+        "suite_sha256": digest(args.diagnostic_suite),
+        "local_binary_sha256": digest(args.native_binary)
+        if args.native_binary
+        else None,
+        "binary_provenance": "Local file digest only; remote server build is not authenticated",
+        "runner_sha256": digest(Path(__file__)),
+        "results": [],
+        "events": [],
+        "answer_paths": {},
+    }
+
+    def checkpoint():
+        save(args.output, record)
+
+    client = client or Client(
+        args.base_url, args.timeout_ms, record["events"], checkpoint
+    )
+    checkpoint()
+    try:
+        texts = list(dict.fromkeys(d for c in cases for d in c["documents"]))
+        vectors = {}
+        for offset in range(0, len(texts), 4):
+            batch = texts[offset : offset + 4]
+            response = client.post(
+                "embed",
+                {
+                    "model": args.encoder,
+                    "input": batch,
+                    "task_type": "RETRIEVAL_DOCUMENT",
+                },
+            )
+            vectors.update(
+                zip(batch, producer_vectors(response, len(batch)), strict=True)
+            )
+        for case in cases:
+            # Gold values, annotations and expected verdicts stay outside requests.
+            response = client.post(
+                "memorilla/generate",
+                {
+                    "model": args.profile,
+                    "question": case["question"],
+                    "document_embeddings": [vectors[d] for d in case["documents"]],
+                    "encoder_execution_identity": IDENTITY,
+                    "max_new_tokens": args.max_new_tokens,
+                    "context_mode": "source_verified",
+                    "document_texts": case["documents"],
+                },
+            )
+            validate_response(
+                response,
+                profile=args.profile,
+                module_sha256=args.module_sha256,
+                documents=case["documents"],
+                maximum=args.max_new_tokens,
+            )
+            abstained = response["answer_path"] == "abstained"
+            correct = response["text"].strip() in case["answer"]["aliases"] and (
+                abstained == (case["answer"]["mode"] == "abstention")
+            )
+            record["results"].append(
+                {
+                    "case_id": case["id"],
+                    "correct": correct,
+                    "abstained": abstained,
+                    "response": response,
+                }
+            )
+            checkpoint()
+        rows = record["results"]
+        record["scores"] = {
+            "total": len(rows),
+            "correct": sum(r["correct"] for r in rows),
+            "wrong_published": sum(
+                not r["correct"] and not r["abstained"] for r in rows
+            ),
+        }
+        record["answer_paths"] = dict(
+            Counter(r["response"]["answer_path"] for r in rows)
+        )
+        record.update(
+            completed=True,
+            execution_passed=True,
+            quality_passed=all(r["correct"] for r in rows),
+        )
+    except Exception as exc:
+        record["error"] = {"type": type(exc).__name__, "message": str(exc)}
+        raise
+    finally:
+        checkpoint()
+    return record
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:18091")
@@ -500,8 +628,13 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--max-new-tokens", type=int, default=48)
     parser.add_argument("--timeout-ms", type=int, default=300000)
+    parser.add_argument(
+        "--diagnostic-suite",
+        type=Path,
+        help="Authored development controls; cannot serve as a held-out development receipt",
+    )
     args = parser.parse_args()
-    result = run(args)
+    result = run_diagnostic(args) if args.diagnostic_suite else run(args)
     print(
         json.dumps(
             {
@@ -509,10 +642,20 @@ def main() -> None:
                 "execution_passed": result["execution_passed"],
                 "answer_paths": result["answer_paths"],
                 "rollout_qualified": False,
+                **(
+                    {
+                        "quality_passed": result["quality_passed"],
+                        "scores": result["scores"],
+                    }
+                    if args.diagnostic_suite
+                    else {}
+                ),
             }
         )
     )
-    if not result["execution_passed"]:
+    if not result["execution_passed"] or (
+        args.diagnostic_suite and not result["quality_passed"]
+    ):
         raise SystemExit(1)
 
 

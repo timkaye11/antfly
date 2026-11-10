@@ -25,8 +25,10 @@ retrieval or a production corpus.
 - The serving qualification ran 114 focused CUDA tests with no skips and 127
   gateway tests with one model-dependent ASR skip, with no failures or leaks.
   After removing experimental development tools, the retained Python suite
-  passes 404 tests with no skips, including compiled CPU verifier integrations.
+  passes 408 tests with no skips, including compiled CPU verifier integrations.
   Generated-source, license, formatting and generated error-identity checks pass.
+- The source-reliability changes pass 64 focused native tests with CUDA available
+  and no skips, plus the generated Go, Python and TypeScript SDK checks.
 
 Mixed encoder arithmetic and F16 KV exceeded the frozen F32 numerical gates.
 They remain unqualified; a different reference precision does not erase those
@@ -40,10 +42,35 @@ The frozen Stage3 latent-only diagnostic scores **0/22 exact novel facts** and
 identical output sequences on all 24 cases. This blocks exact latent-only
 operational QA rollout even though numerical compatibility passes.
 
-The bounded source-verified assessment passes 45 development cases, 48 held-out
-cases and 24 repeated sanity cases. These checks support the exercised path;
+The revised source-verified assessment passes 40 frozen development cases,
+48 held-out factual cases and 24 repeated sanity cases. An independent audit
+confirms exact, case-sensitive source values or correct abstentions across all
+112 frozen-run answers, with zero wrong published answers.
+These checks support the exercised path;
 they do not establish production corpus accuracy, source truth or database
 authorization. Caller-supplied alignment remains explicit.
+
+The source reliability checks additionally require an exact, bounded occurrence
+of the answer in source text before semantic verification. A completed rejection
+permits one source-only repair and one fresh check. Invalid or truncated verdicts,
+missing literal evidence and unsuccessful repairs abstain. This is conservative
+extractive QA: paraphrases and derived values without an exact source occurrence
+are outside its supported answer boundary. The semantic check uses the same
+decoder and remains fallible; literal evidence is necessary, not proof of truth.
+
+The authored mixed-instruction development diagnostic is runnable through the
+existing verified evaluator. Its gold labels stay outside inference requests,
+exact names/codes are scored without case folding, and blanket abstention fails
+answerable cases. Its diagnostic receipt cannot authorize held-out evaluation.
+The revised native build passes all seven controls. The frozen development run
+also passes **40/40** with exact source values; all 40 answer texts match the
+Python F32 source-control run after trimming outer whitespace.
+
+A separate 16-case authored development challenge exposed two wrong published
+answers in the previous build: an injected name and an incomplete shared surname.
+The revised native path passes **16/16**, with **11/11 exact factual answers**,
+**5/5 correct abstentions**, and **zero wrong published answers**. This establishes
+the exercised regression boundary, not general production accuracy.
 
 Official vLLM 0.9.1 and its matched BF16 Transformers control both score 20/32
 on the bounded TriviaQA sample. All 56 prompt sequences and 52/56 output
@@ -67,6 +94,14 @@ excluded. The small median differences and intervals crossing zero support
 near parity, not a general speedup claim. Native/vLLM precision differs and
 40/48 output sequences match, so bitwise generation parity is not established.
 
+The revised source-verified HTTP path is a different workload. On the 16-case
+development challenge, the 15 warm requests have a **24.266 s median**; the two
+successfully repaired answers have a **38.173 s median**. These timings include
+serving integrity checks, independent source answering and model verification;
+document embedding production and database retrieval are excluded. The sample
+is small and has no matched Python HTTP comparison. The earlier ~0.82 s
+latent-only pipeline timing does not describe this reliability path.
+
 ## Reproduction and retained test data
 
 The [tool guide](../../../zig/pkg/inference/scripts/memorilla/README.md) documents
@@ -81,18 +116,23 @@ HTTP/QA checks and the Transformers/vLLM comparison runners.
   and injection controls. Its 5,311 lines are test inputs and labels, not run logs.
   Removing it would remove the default QA corpus and its regression coverage.
 
-Both fixtures, the frozen scorer and all other retained QA/template fixtures
-are unchanged. Model weights, environments and generated benchmark receipts
-are excluded from Git. Detailed dated records remain in Git at `7b0d1495d3`;
-the PR retains this consolidated summary instead of the session history folder.
+Both fixtures and the frozen scorers are unchanged. The five existing mixed-
+instruction development controls are preserved, with two observed regressions
+added for injected answers and incomplete names. Model weights, environments and
+generated benchmark receipts are excluded from Git. Detailed dated records remain
+in Git at `7b0d1495d3`; the PR retains this consolidated summary instead of the
+session history folder.
 
-Local integration receipts are under
-`.benchmark-results/memorilla/pr-preparation-20261109/`. Their
+Source-reliability receipts are under
+`.benchmark-results/memorilla/source-reliability-20261109/`. Their
 `validation-receipts.json` SHA256 is
-`27d1309c739a9b110810526ed7392c824df2812d22491243bf1b10e8837d7e83`.
+`386198a18c35d16700ba1e658b83ff37ca16cc4c27f7f312f61c89112118ec4d`.
 The tested CLI SHA256 is
-`9ba8cccc0ac78e4a677934a0dfa64d9774716402aceaa6957fe9a9c141b3effd`;
-the composed verifier SHA256 is
+`0c5f8873e3635c675cdc58bb9f496a3a6a642c83142f1bb1c27189e92a03de43`.
+Numerical and paired-engine receipts remain under
+`.benchmark-results/memorilla/pr-preparation-20261109/`; their validation
+manifest SHA256 is
+`27d1309c739a9b110810526ed7392c824df2812d22491243bf1b10e8837d7e83`.
+The unchanged composed-verifier SHA256 is
 `d58933c535fe3d4bf2432854f2875659c8316346b4f476218170012df829e559`.
-These receipts predate the scope cleanup; serving/CUDA execution sources were
-unchanged. Workload quality and capacity still require deployment evaluation.
+Workload quality and capacity still require deployment evaluation.

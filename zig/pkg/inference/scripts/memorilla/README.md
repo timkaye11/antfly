@@ -520,6 +520,21 @@ requests, timeout recovery, legacy compatibility and input/error bounds.
 
 The compact `fixtures/mixed_instruction_dev.json` regression covers response
 demands mixed with real facts, unresolved conflicts and dated corrections.
+It includes source-command and shared-surname failures found during native
+reliability testing. Run its seven authored development cases against a live
+server with the existing evaluator:
+
+```sh
+.venv/bin/python zig/pkg/inference/scripts/memorilla/verified_quality_eval.py \
+  --base-url http://127.0.0.1:18091 --profile memorilla-stage3 \
+  --diagnostic-suite zig/pkg/inference/scripts/memorilla/fixtures/mixed_instruction_dev.json \
+  --output .benchmark-results/memorilla/source-diagnostic.json
+```
+
+This mode uses exact answer values, rejects blanket abstention on answerable
+cases and reports wrong published answers. Gold labels stay outside requests.
+Its receipt cannot authorize held-out QA; the frozen v1/v2 development gate is
+unchanged. Use a fresh output path for each run.
 
 `gpu_quality_reference.py` runs the independent pinned reader and decoder on
 CUDA, with TF32 disabled for F32. It archives sources and identities, separates
