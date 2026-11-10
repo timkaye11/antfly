@@ -774,3 +774,34 @@ If that protocol is selected using development data, fresh challenges use the
 same readout protocol and retain both raw records and parsed answers. Direct QA
 results remain separate. This is a research-only structured fact lookup protocol,
 not a generic question parser or a production serving profile.
+
+
+### Balanced counterfactual batches
+
+The next corpus variant adds a second holder name for every site while
+preserving all 16,384 original QA rows and the exact development bytes:
+
+```sh
+python zig/pkg/inference/scripts/memorilla/encoder_lora_corpus.py \
+  --base-corpus .benchmark-results/memorilla/encoder-lora-next/data \
+  --output .benchmark-results/memorilla/encoder-lora-next/data-paired
+```
+
+This produces 20,480 training rows in 4,096 five-row groups. Name worlds keep
+the same question and change only the name in the source. Train with
+`--sampling counterfactual-group --accum 8 --reconstruct-every 0`. Each update
+contains code A/B, name A/B, two copies of the missing-fact control, and an
+alternating repeated code or name pair. Overall exposure is 37.5% codes, 37.5%
+names and 25% missing facts. Both conflicting values occur before the optimizer
+updates, so a question-only prediction cannot fit both worlds. This combined
+sampling/data experiment is distinct from the earlier fixed-budget objective
+comparison. The encoder LoRA, reader geometry, decoder weights and QA prompt
+policy remain the same. Training-exposure receipts understand both samplers.
+
+`--oracle-prefix-probe` is an explicit decoder-copy control, separate from every
+QA score: it inserts known answer embeddings into the 16 slots. `--oracle-only`
+skips QA evaluation and cannot open fresh qualification. The optional
+`--oracle-question copy-value` asks for copying the supplied value instead of
+answering the original entity-specific question. All such results carry
+`uses_gold_in_memory: true` and `counts_toward_qa: false`; they test prompt/frame
+behavior with supplied literal answers, not compression quality or factual QA.

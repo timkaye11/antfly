@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import re
 from pathlib import Path
 
@@ -179,15 +180,88 @@ def expanded_data(
     return manifest
 
 
+def name_counterfactual_data(output, base_corpus, seed=20261110):
+    train, dev = load_split(base_corpus, "train"), load_split(base_corpus, "dev")
+    groups = {}
+    for row in train:
+        groups.setdefault(row["group"], []).append(row)
+    if any(len(g) != 4 for g in groups.values()):
+        raise ValueError("base corpus must have four original rows per group")
+    reserved = set().union(*inventories(train + dev)[:2])
+    alternatives = iter(
+        data_rows(seed, "train-name-counterfactual", max(len(groups) * 2, 16))[2::4]
+    )
+    expanded = []
+    for group in groups.values():
+        owners = [r for r in group if r["category"] == "name"]
+        if len(owners) != 1:
+            raise ValueError("base group must have one owner question")
+        original = owners[0]
+        while True:
+            name = next(alternatives)["answer"]
+            if name not in reserved:
+                reserved.add(name)
+                break
+        other = copy.deepcopy(original)
+        other["id"] += "-b"
+        other["answer"] = name
+        other["entities"][2] = name
+        other["documents"] = [
+            d.replace(original["answer"], name) for d in other["documents"]
+        ]
+        if "reconstruction" in other:
+            if original["answer"] not in other["reconstruction"]["answer"]:
+                raise ValueError("use the unspelled field corpus as the base")
+            other["reconstruction"]["answer"] = other["reconstruction"][
+                "answer"
+            ].replace(original["answer"], name)
+        expanded.extend(group + [other])
+    if not disjoint(expanded, dev):
+        raise ValueError("expanded name worlds collide with development")
+    output.mkdir(parents=True, exist_ok=False)
+    manifest = {
+        "schema": SCHEMA,
+        "recipe": "paired-name-code-facts-v1",
+        "seed": seed,
+        "development_only": True,
+        "rollout_qualified": False,
+        "old_qualification_splits_read": False,
+        "source_manifest_sha256": digest(base_corpus / "manifest.json"),
+        "source_sha256": digest(Path(__file__)),
+        "source_rows_preserved": len(train),
+        "name_worlds_added": len(groups),
+        "files": {},
+    }
+    for split, rows in [("train", expanded), ("dev", dev)]:
+        path = output / (split + ".json")
+        save_json(path, {"schema": SCHEMA, "split": split, "cases": rows})
+        manifest["files"][split] = {
+            "sha256": digest(path),
+            "cases": len(rows),
+            "groups": len({r["group"] for r in rows}),
+        }
+    if (output / "dev.json").read_bytes() != (base_corpus / "dev.json").read_bytes():
+        raise ValueError("development bytes changed")
+    save_json(output / "manifest.json", manifest)
+    return manifest
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--output", type=Path, required=True)
-    p.add_argument("--development-from", type=Path, required=True)
+    source = p.add_mutually_exclusive_group(required=True)
+    source.add_argument("--development-from", type=Path)
+    source.add_argument("--base-corpus", type=Path)
     p.add_argument("--seed", type=int, default=20261110)
     p.add_argument("--train-groups", type=int, default=4096)
     p.add_argument("--fresh-dev-groups", type=int, default=8)
     p.add_argument("--spell-values", action="store_true")
     args = p.parse_args()
+    if args.base_corpus is not None:
+        if args.spell_values:
+            p.error("base-corpus mode expects unspelled field targets")
+        print(name_counterfactual_data(args.output, args.base_corpus, args.seed))
+        return
     if not 1 <= args.train_groups <= 50000 or not 1 <= args.fresh_dev_groups <= 1000:
         p.error("bounded positive corpus sizes required")
     print(

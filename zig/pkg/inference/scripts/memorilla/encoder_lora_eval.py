@@ -17,8 +17,9 @@
 """Reload research candidates and distinguish training fit from dev generalization.
 
 Existing test/ood splits stay sealed. Optional post-freeze challenges use fresh
-facts generated only after all candidate hashes have been checked. Neither expected answers nor category labels enter encoder inputs
-or decoder prompts. This is a Python research diagnostic, not serving promotion.
+facts generated only after all candidate hashes have been checked. QA inputs never use expected answers or category labels. An explicit optional
+oracle-prefix control uses gold answers, is labeled separately, and never counts
+toward QA accuracy or qualification. This is a Python research diagnostic, not serving promotion.
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ from decoder_reference import prepare_prompt
 from encoder_reference import normalize_features
 from encoder_lora import (
     SYSTEM,
+    CounterfactualGroupSampler,
     RECONSTRUCTION_SYSTEM,
     data_rows,
     digest,
@@ -53,6 +55,23 @@ from encoder_lora_corpus import inventories
 from gpu_quality_reference import generate
 from reference import load_upstream
 from released_reference import checkpoint_proof, source_recipe
+
+
+def literal_memory_ids(tokenizer, answer, kind):
+    text = " " + answer
+    if kind == "characters":
+        pieces = [tokenizer.encode(c, add_special_tokens=False) for c in text]
+        if any(len(p) != 1 for p in pieces):
+            raise ValueError("oracle character does not have a single token ID")
+        ids = [p[0] for p in pieces]
+    elif kind == "bpe":
+        ids = tokenizer.encode(text, add_special_tokens=False)
+    else:
+        raise ValueError("unknown oracle prefix representation")
+    pad = tokenizer.encode(" ", add_special_tokens=False)
+    if len(pad) != 1 or len(ids) > 16:
+        raise ValueError("oracle prefix does not fit exactly 16 slots")
+    return ids + pad * (16 - len(ids))
 
 
 def readout_prompt(question, format):
@@ -124,10 +143,18 @@ def qa_corpus(rows):
     return [{k: v for k, v in r.items() if k != "reconstruction"} for r in rows]
 
 
-def training_exposures(protocol, count):
+def training_exposures(protocol, count, train=None):
     visits = [{"qa": 0, "reconstruction": 0} for _ in range(count)]
     total = protocol["steps"] * protocol["gradient_accumulation"]
     every = protocol.get("reconstruct_every", 0)
+    if protocol.get("sampling", "row") == "counterfactual-group":
+        if train is None or len(train) != count:
+            raise ValueError("group exposure accounting needs the actual training rows")
+        sampler = CounterfactualGroupSampler(train, protocol["seed"])
+        for absolute in range(total):
+            task = "reconstruction" if every and absolute % every == every - 1 else "qa"
+            visits[sampler.index(absolute)][task] += 1
+        return visits
     for epoch in range((total + count - 1) // count):
         order = list(range(count))
         random.Random(protocol["seed"] + epoch).shuffle(order)
@@ -139,7 +166,7 @@ def training_exposures(protocol, count):
 
 
 def select_training_probe(train, protocol):
-    visits = training_exposures(protocol, len(train))
+    visits = training_exposures(protocol, len(train), train)
     groups = {}
     for index, row in enumerate(train):
         groups.setdefault(row["group"], []).append(index)
@@ -227,10 +254,19 @@ def main():
     p.add_argument("--candidate", type=Path, action="append", required=True)
     p.add_argument("--candidate-data", type=Path, action="append")
     p.add_argument("--prior-training-data", type=Path, action="append", default=[])
+    p.add_argument("--oracle-prefix-probe", action="store_true")
+    p.add_argument("--oracle-only", action="store_true")
+    p.add_argument(
+        "--oracle-question", choices=("original", "copy-value"), default="original"
+    )
     p.add_argument("--readout-format", choices=("fields", "spelled"))
     p.add_argument("--fresh-groups", type=int, default=0)
     p.add_argument("--fresh-seed", type=int)
     args = p.parse_args()
+    if args.oracle_only and (not args.oracle_prefix_probe or args.fresh_groups):
+        p.error(
+            "oracle-only requires the explicit control flag and cannot open fresh qualification"
+        )
     if not 0 <= args.fresh_groups <= 1000:
         p.error("fresh groups must be between zero and 1000")
     if args.candidate_data is not None and len(args.candidate_data) != len(
@@ -378,6 +414,9 @@ def main():
         "old_qualification_splits_opened": False,
         "postfreeze_facts_generated": len(fresh_rows),
         "readout_format": args.readout_format,
+        "oracle_prefix_probe": args.oracle_prefix_probe,
+        "oracle_only": args.oracle_only,
+        "oracle_question": args.oracle_question,
         "readout_scope": "Two declared name/code question forms; deterministic parsing, no correction, gold routing or fallback.",
         "source_sha256": digest(Path(__file__)),
         "candidates": [],
@@ -399,7 +438,8 @@ def main():
             .eval()
         )
         exposures = {
-            r["id"]: v for r, v in zip(train, training_exposures(protocol, len(train)))
+            r["id"]: v
+            for r, v in zip(train, training_exposures(protocol, len(train), train))
         }
         entry = {
             "arm": protocol["arm"],
@@ -412,11 +452,16 @@ def main():
             "splits": {},
         }
         result["candidates"].append(entry)
-        for split, cases in (
-            [("dev", dev), ("train-probe", train_probe)]
-            + ([("dev-readout", dev)] if args.readout_format else [])
-            + ([("postfreeze", fresh_rows)] if fresh_rows else [])
-        ):
+        plan = (
+            []
+            if args.oracle_only
+            else (
+                [("dev", dev), ("train-probe", train_probe)]
+                + ([("dev-readout", dev)] if args.readout_format else [])
+                + ([("postfreeze", fresh_rows)] if fresh_rows else [])
+            )
+        )
+        for split, cases in plan:
             rows, code_vectors = [], {}
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
                 for case in cases:
@@ -574,6 +619,64 @@ def main():
                 ),
                 flush=True,
             )
+        if args.oracle_prefix_probe:
+            # Explicit upper-bound control: gold answers enter these memory
+            # slots. These scores NEVER count as latent QA or qualification.
+            entry["oracle_prefix_controls"] = {}
+            control_cases = dev[:8] + dev[-8:]
+            for kind in ("characters", "bpe"):
+                control_rows = []
+                with (
+                    torch.inference_mode(),
+                    torch.autocast("cuda", dtype=torch.bfloat16),
+                ):
+                    for case in control_cases:
+                        ids = torch.tensor(
+                            literal_memory_ids(dec_tok, case["answer"], kind),
+                            device="cuda",
+                        )
+                        oracle = decoder.get_input_embeddings()(ids).float()
+                        _, embeds, _ = prepare_prompt(
+                            dec_tok,
+                            decoder.get_input_embeddings(),
+                            oracle,
+                            system_prompt=SYSTEM,
+                            question="What exact value is written in the memory? Return only that value."
+                            if args.oracle_question == "copy-value"
+                            else case["question"],
+                            device="cuda",
+                        )
+                        output = generate(decoder, dec_tok, embeds, 24)
+                        control_rows.append(
+                            {
+                                "id": case["id"],
+                                "group": case["group"],
+                                "category": case["category"],
+                                "expected": case["answer"],
+                                "actual": output["answer"],
+                                "correct": output["answer"].strip() == case["answer"],
+                                "finish_reason": output["finish_reason"],
+                            }
+                        )
+                entry["oracle_prefix_controls"][kind] = {
+                    "uses_gold_in_memory": True,
+                    "counts_toward_qa": False,
+                    "scores": scores(control_rows),
+                    "rows": control_rows,
+                }
+                save_json(args.output / "result.json", result)
+                print(
+                    json.dumps(
+                        {
+                            "event": "oracle-prefix-control",
+                            "representation": kind,
+                            "uses_gold_in_memory": True,
+                            "counts_toward_qa": False,
+                            "scores": scores(control_rows),
+                        }
+                    ),
+                    flush=True,
+                )
         del reader
     result["completed"] = True
     save_json(args.output / "result.json", result)

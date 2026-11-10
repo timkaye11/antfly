@@ -94,6 +94,8 @@ def continuation_contract(parent, current, completed_step):
         ("reconstruct_every", 0),
         ("reconstruction_system", None),
         ("initialization", None),
+        ("sampling", "row"),
+        ("sampling_recipe", None),
     ]:
         if parent.get(field, default) != current.get(field, default):
             raise ValueError("continuation changes training contract: " + field)
@@ -327,6 +329,49 @@ def order_index(seed, absolute, count):
     return order[index]
 
 
+class CounterfactualGroupSampler:
+    """Every eight-example batch contains both values for identical questions."""
+
+    def __init__(self, rows, seed):
+        grouped = {}
+        for index, row in enumerate(rows):
+            grouped.setdefault(row["group"], []).append(index)
+        self.groups, self.seed, self.orders = [], seed, {}
+        for indices in grouped.values():
+            code = [i for i in indices if rows[i]["category"] == "code"]
+            name = [i for i in indices if rows[i]["category"] == "name"]
+            missing = [i for i in indices if rows[i]["category"] == "missing"]
+            if len(code) != 2 or len(name) != 2 or len(missing) != 1:
+                raise ValueError(
+                    "group sampler requires two codes, two names and one missing row"
+                )
+            for pair in [code, name]:
+                a, b = [rows[i] for i in pair]
+                if a["question"] != b["question"] or a["answer"] == b["answer"]:
+                    raise ValueError(
+                        "counterfactual values must differ for identical questions"
+                    )
+            if rows[missing[0]]["answer"] != "UNKNOWN":
+                raise ValueError("invalid missing-fact target")
+            self.groups.append((code, name, missing[0]))
+
+    def index(self, absolute_microstep):
+        group_absolute, slot = divmod(absolute_microstep, 8)
+        epoch, offset = divmod(group_absolute, len(self.groups))
+        if epoch not in self.orders:
+            order = list(range(len(self.groups)))
+            random.Random(self.seed + epoch).shuffle(order)
+            self.orders[epoch] = order
+        code, name, missing = self.groups[self.orders[epoch][offset]]
+        layout = (
+            code
+            + name
+            + [missing, missing]
+            + (code if group_absolute % 2 == 0 else name)
+        )
+        return layout[slot]
+
+
 def reconstruction_task(case, absolute_microstep, every):
     if every and absolute_microstep % every == every - 1:
         task = case.get("reconstruction")
@@ -447,6 +492,9 @@ def main():
     train.add_argument("--continue-from", type=Path)
     train.add_argument("--initialize-from", type=Path)
     train.add_argument("--reconstruct-every", type=int, default=0)
+    train.add_argument(
+        "--sampling", choices=("row", "counterfactual-group"), default="row"
+    )
     args = p.parse_args()
     if args.command == "make-data":
         if not 1 <= args.train_groups <= 100000 or not 1 <= args.eval_groups <= 10000:
@@ -483,6 +531,8 @@ def run(args):
         raise ValueError(
             "weight initialization and optimizer continuation are distinct"
         )
+    if args.sampling == "counterfactual-group" and args.accum != 8:
+        raise ValueError("counterfactual-group sampling requires accumulation eight")
     torch.set_num_threads(4)
     torch.manual_seed(args.seed)
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -521,6 +571,12 @@ def run(args):
         "versions": {"torch": str(torch.__version__)},
     }
     protocol["eval_every"] = args.eval_every
+    protocol["sampling"] = args.sampling
+    protocol["sampling_recipe"] = (
+        "code-name-pairs-two-missing-repeat-pair-v1"
+        if args.sampling == "counterfactual-group"
+        else None
+    )
     protocol["reconstruct_every"] = args.reconstruct_every
     protocol["reconstruction_system"] = (
         RECONSTRUCTION_SYSTEM if args.reconstruct_every else None
@@ -598,6 +654,11 @@ def run(args):
         raise ValueError("reconstruction fields missing from training data")
     if len({r["group"] for r in train_rows} & {r["group"] for r in dev_rows}):
         raise ValueError("train/dev group overlap")
+    group_sampler = (
+        CounterfactualGroupSampler(train_rows, args.seed)
+        if args.sampling == "counterfactual-group"
+        else None
+    )
     tokenizer_e = AutoTokenizer.from_pretrained(
         args.encoder, local_files_only=True, trust_remote_code=False
     )
@@ -845,9 +906,13 @@ def run(args):
             started, total_loss = time.monotonic(), 0.0
             qa_losses, reconstruction_losses, target_tokens = [], [], 0
             for micro in range(args.accum):
-                case = train_rows[
-                    order_index(args.seed, step * args.accum + micro, len(train_rows))
-                ]
+                absolute_microstep = step * args.accum + micro
+                index = (
+                    group_sampler.index(absolute_microstep)
+                    if group_sampler is not None
+                    else order_index(args.seed, absolute_microstep, len(train_rows))
+                )
+                case = train_rows[index]
                 question, answer, system, reconstructing = reconstruction_task(
                     case, step * args.accum + micro, args.reconstruct_every
                 )

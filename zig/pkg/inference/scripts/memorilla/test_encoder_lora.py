@@ -514,3 +514,77 @@ def test_structured_readout_routes_only_from_public_question_and_preserves_bytes
         pass
     else:
         raise AssertionError("unrecognized question was routed using hidden labels")
+
+
+def test_oracle_memory_is_explicitly_bounded_and_has_no_silent_truncation():
+    from encoder_lora_eval import literal_memory_ids
+
+    class Tokenizer:
+        def encode(self, text, add_special_tokens=False):
+            return [ord(c) for c in text]
+
+    for kind in ["characters", "bpe"]:
+        ids = literal_memory_ids(Tokenizer(), "Kg9-009369", kind)
+        assert len(ids) == 16
+        assert "".join(chr(i) for i in ids).strip() == "Kg9-009369"
+        try:
+            literal_memory_ids(Tokenizer(), "x" * 16, kind)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("oracle silently truncated target")
+
+
+def test_name_worlds_preserve_original_cases_and_group_batches_require_context(
+    tmp_path,
+):
+    from encoder_lora_corpus import expanded_data, name_counterfactual_data, disjoint
+    from encoder_lora import CounterfactualGroupSampler
+    from encoder_lora_eval import training_exposures
+
+    old, base, paired = tmp_path / "old", tmp_path / "base", tmp_path / "paired"
+    make_data(old, train_groups=2, eval_groups=2)
+    expanded_data(base, old, train_groups=16, fresh_dev_groups=4)
+    name_counterfactual_data(paired, base)
+    original, rows = load_split(base, "train"), load_split(paired, "train")
+    assert len(rows) == 80 and disjoint(rows, load_split(paired, "dev"))
+    assert (base / "dev.json").read_bytes() == (paired / "dev.json").read_bytes()
+    by_id = {r["id"]: r for r in rows}
+    assert all(by_id[r["id"]] == r for r in original)
+    for group in {r["group"] for r in rows}:
+        a, b = [r for r in rows if r["group"] == group and r["category"] == "name"]
+        assert a["question"] == b["question"] and a["answer"] != b["answer"]
+        assert [d.replace(a["answer"], b["answer"]) for d in a["documents"]] == b[
+            "documents"
+        ]
+    sampler = CounterfactualGroupSampler(rows, 23)
+    for step in range(18):
+        batch = [rows[sampler.index(step * 8 + i)] for i in range(8)]
+        assert len({r["group"] for r in batch}) == 1
+        assert sum(r["category"] == "missing" for r in batch) == 2
+        for a, b in [(batch[0], batch[1]), (batch[2], batch[3])]:
+            assert a["question"] == b["question"] and a["answer"] != b["answer"]
+        assert all(
+            sampler.index(step * 8 + i)
+            == CounterfactualGroupSampler(rows, 23).index(step * 8 + i)
+            for i in range(8)
+        )
+    protocol = {
+        "steps": 3,
+        "gradient_accumulation": 8,
+        "seed": 23,
+        "reconstruct_every": 0,
+        "sampling": "counterfactual-group",
+    }
+    visits = training_exposures(protocol, len(rows), rows)
+    assert sum(v["qa"] for v in visits) == 24 and not any(
+        v["reconstruction"] for v in visits
+    )
+    for index, v in enumerate(visits):
+        assert v["qa"] == sum(sampler.index(i) == index for i in range(24))
+    try:
+        CounterfactualGroupSampler(original, 23)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unpaired name dataset accepted")
