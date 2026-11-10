@@ -28,6 +28,7 @@ import copy
 import json
 import secrets
 import random
+import re
 import subprocess
 from pathlib import Path
 
@@ -39,6 +40,7 @@ from decoder_reference import prepare_prompt
 from encoder_reference import normalize_features
 from encoder_lora import (
     SYSTEM,
+    RECONSTRUCTION_SYSTEM,
     data_rows,
     digest,
     inject_lora,
@@ -51,6 +53,53 @@ from encoder_lora_corpus import inventories
 from gpu_quality_reference import generate
 from reference import load_upstream
 from released_reference import checkpoint_proof, source_recipe
+
+
+def readout_prompt(question, format):
+    routes = [
+        ("What is the exact access code for ", "Code"),
+        ("Who holds the brass key at ", "Name"),
+    ]
+    for prefix, field in routes:
+        if question.startswith(prefix) and question.endswith("?"):
+            site = question[len(prefix) : -1]
+            if not site:
+                break
+            prompt = f"Reconstruct the brass-key record for {site}. Return exactly two lines: Name: followed by the holder's name; Code: followed by the access code. Use UNKNOWN for an absent field."
+            if format == "spelled":
+                prompt += " For each present field, spell its value with one space between characters. Separate words in a name with / . Keep UNKNOWN unspelled."
+            return field, prompt
+    raise ValueError(
+        "structured readout supports only the declared name/code question forms"
+    )
+
+
+def parse_readout(answer, field, format):
+    lines = answer.strip().splitlines()
+    if (
+        len(lines) != 2
+        or not lines[0].startswith("Name: ")
+        or not lines[1].startswith("Code: ")
+    ):
+        return None
+    values = {"Name": lines[0][6:].strip(), "Code": lines[1][6:].strip()}
+    value = values[field]
+    if value == "UNKNOWN":
+        return value
+    if format == "spelled":
+        parts = value.split(" / ") if field == "Name" else [value]
+        pattern = (
+            r"[A-Za-z-](?: [A-Za-z-])*"
+            if field == "Name"
+            else r"[A-Za-z0-9-](?: [A-Za-z0-9-])*"
+        )
+        if any(re.fullmatch(pattern, part) is None for part in parts):
+            return None
+        return (" " if field == "Name" else "").join(
+            part.replace(" ", "") for part in parts
+        )
+    pattern = r"[A-Za-z-]+(?: [A-Za-z-]+)*" if field == "Name" else r"[A-Za-z0-9-]+"
+    return value if re.fullmatch(pattern, value) else None
 
 
 def prior_dataset_hashes(protocol):
@@ -178,6 +227,7 @@ def main():
     p.add_argument("--candidate", type=Path, action="append", required=True)
     p.add_argument("--candidate-data", type=Path, action="append")
     p.add_argument("--prior-training-data", type=Path, action="append", default=[])
+    p.add_argument("--readout-format", choices=("fields", "spelled"))
     p.add_argument("--fresh-groups", type=int, default=0)
     p.add_argument("--fresh-seed", type=int)
     args = p.parse_args()
@@ -327,6 +377,8 @@ def main():
         "heldout_opened": bool(fresh_rows),
         "old_qualification_splits_opened": False,
         "postfreeze_facts_generated": len(fresh_rows),
+        "readout_format": args.readout_format,
+        "readout_scope": "Two declared name/code question forms; deterministic parsing, no correction, gold routing or fallback.",
         "source_sha256": digest(Path(__file__)),
         "candidates": [],
     }
@@ -360,8 +412,10 @@ def main():
             "splits": {},
         }
         result["candidates"].append(entry)
-        for split, cases in [("dev", dev), ("train-probe", train_probe)] + (
-            [("postfreeze", fresh_rows)] if fresh_rows else []
+        for split, cases in (
+            [("dev", dev), ("train-probe", train_probe)]
+            + ([("dev-readout", dev)] if args.readout_format else [])
+            + ([("postfreeze", fresh_rows)] if fresh_rows else [])
         ):
             rows, code_vectors = [], {}
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
@@ -392,24 +446,52 @@ def main():
                     )[0]
                     if tuple(memories.shape) != (16, 4096):
                         raise ValueError("candidate changed memory geometry")
+                    structured = args.readout_format is not None and split in (
+                        "dev-readout",
+                        "postfreeze",
+                    )
+                    field, decoder_question = (
+                        readout_prompt(case["question"], args.readout_format)
+                        if structured
+                        else (None, case["question"])
+                    )
                     _, embeds, _ = prepare_prompt(
                         dec_tok,
                         decoder.get_input_embeddings(),
                         memories,
-                        system_prompt=SYSTEM,
-                        question=case["question"],
+                        system_prompt=RECONSTRUCTION_SYSTEM if structured else SYSTEM,
+                        question=decoder_question,
                         device="cuda",
                     )
-                    output = generate(decoder, dec_tok, embeds, 24)
+                    output = generate(
+                        decoder, dec_tok, embeds, 64 if structured else 24
+                    )
+                    parsed = (
+                        (
+                            parse_readout(output["answer"], field, args.readout_format)
+                            if output["finish_reason"] == "eos"
+                            else None
+                        )
+                        if structured
+                        else output["answer"]
+                    )
+                    actual = parsed if parsed is not None else ""
                     rows.append(
                         {
                             "id": case["id"],
                             "group": case["group"],
                             "category": case["category"],
                             "cohort": case.get("cohort", split),
-                            "actual": output["answer"],
+                            "actual": actual,
+                            "raw_answer": output["answer"],
+                            "answer_format": args.readout_format
+                            if structured
+                            else "direct",
+                            "parse_valid": parsed is not None,
+                            "decoder_seconds": output["decoder_seconds"],
+                            "generated_tokens": len(output["token_ids"]),
                             "expected": case["answer"],
-                            "correct": output["answer"].strip() == case["answer"],
+                            "correct": actual.strip() == case["answer"],
                             "finish_reason": output["finish_reason"],
                             "training_exposure": exposures[case["id"]]
                             if split == "train-probe"

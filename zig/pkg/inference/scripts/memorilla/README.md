@@ -758,3 +758,19 @@ candidates' initialization lineage. Candidate/protocol hashes authenticate that
 lineage, and generated facts exclude entities, values and documents from both
 current and earlier training corpora, including codes seen only in source
 distractors. Existing qualification files stay sealed.
+
+
+`--readout-format spelled` adds a separately scored `dev-readout` diagnostic
+alongside unchanged direct QA and its mandatory saved-model reproduction check.
+The decoder reconstructs a record in the trained spelling format; a deterministic
+parser joins characters and selects the requested field using only the public
+question text. It supports the two original `access code for ...?` and
+`brass key at ...?` question forms. It never consults gold values, source text,
+entity annotations or category labels to route or correct an answer. Case,
+hyphens and leading zeros are preserved; malformed or non-EOS output fails.
+The reconstruction cap is 64 generated tokens versus 24 for direct QA.
+
+If that protocol is selected using development data, fresh challenges use the
+same readout protocol and retain both raw records and parsed answers. Direct QA
+results remain separate. This is a research-only structured fact lookup protocol,
+not a generic question parser or a production serving profile.

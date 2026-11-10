@@ -488,3 +488,29 @@ def test_fresh_value_exclusion_includes_codes_seen_only_in_distractors():
     fresh[0]["documents"][1] = fresh[0]["documents"][1].replace(old, code)
     assert all(r["answer"] != code for r in fresh)
     assert not disjoint(train, fresh)
+
+
+def test_structured_readout_routes_only_from_public_question_and_preserves_bytes():
+    from encoder_lora_eval import readout_prompt, parse_readout
+
+    field, q = readout_prompt(
+        "What is the exact access code for Example Depot?", "spelled"
+    )
+    assert field == "Code" and "Example Depot" in q
+    raw = "Name: K o m o d e / T u l o c o\nCode: K g 9 - 0 0 9 3 6 9"
+    assert parse_readout(raw, field, "spelled") == "Kg9-009369"
+    field, q = readout_prompt("Who holds the brass key at Example Depot?", "spelled")
+    assert field == "Name" and parse_readout(raw, field, "spelled") == "Komode Tuloco"
+    assert parse_readout("Name: UNKNOWN\nCode: UNKNOWN", field, "spelled") == "UNKNOWN"
+    assert parse_readout(raw + "\nextra explanation", field, "spelled") is None
+    assert parse_readout(raw.replace("K o m o d e", "Komode"), field, "spelled") is None
+    assert (
+        parse_readout("Name: Komode Tuloco\nCode: Kg9-009369", "Code", "fields")
+        == "Kg9-009369"
+    )
+    try:
+        readout_prompt("What is the weather?", "spelled")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unrecognized question was routed using hidden labels")
