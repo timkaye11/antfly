@@ -311,14 +311,19 @@ def test_postfreeze_challenge_is_disjoint_and_contains_one_character_pairs():
     dev = data_rows(571, "dev", 4)
     seed, rows = fresh_challenge(8549, 8, train, dev)
     assert (seed, rows) == fresh_challenge(8549, 8, train, dev)
-    assert len(rows) == 64
+    assert len(rows) == 80
     assert disjoint(rows, train) and disjoint(rows, dev)
     assert {r["cohort"] for r in rows} == {"postfreeze", "postfreeze-phrasing"}
-    for i in range(0, len(rows), 4):
-        a, b = rows[i : i + 2]
+    for group in {r["group"] for r in rows}:
+        a, b = [r for r in rows if r["group"] == group and r["category"] == "code"]
         assert a["question"] == b["question"]
         assert sum(x != y for x, y in zip(a["answer"], b["answer"])) == 1
         assert any(b["answer"] in d for d in b["documents"])
+        a, b = [r for r in rows if r["group"] == group and r["category"] == "name"]
+        assert a["question"] == b["question"] and a["answer"] != b["answer"]
+        assert [d.replace(a["answer"], b["answer"]) for d in a["documents"]] == b[
+            "documents"
+        ]
 
 
 def test_postfreeze_filters_colliding_groups_without_changing_seed():
@@ -329,7 +334,7 @@ def test_postfreeze_filters_colliding_groups_without_changing_seed():
     forbidden = data_rows(seed, "postfreeze", 16)[:4]
     actual_seed, rows = fresh_challenge(seed, 8, forbidden, [])
     assert actual_seed == seed
-    assert len(rows) == 64 and disjoint(rows, forbidden)
+    assert len(rows) == 80 and disjoint(rows, forbidden)
     assert not any(r["id"].startswith("postfreeze:postfreeze-0000-") for r in rows)
 
 

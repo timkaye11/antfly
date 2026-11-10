@@ -729,7 +729,9 @@ The evaluator accepts `--fresh-groups N` to generate two fresh challenge cohorts
 only after completed candidate hashes have been checked. Its optional
 `--fresh-seed` reproduces a receipt; otherwise a new random seed is recorded.
 One cohort uses familiar wording, the other different phrasing; code pairs
-differ in exactly one character. All generated groups are checked against the
+differ in exactly one character. Name pairs change only the holder while
+retaining the same question; both names must be recovered exactly. All
+generated groups are checked against the
 training/development inventories and each other. These challenges are separate
 from the existing sealed qualification splits and cannot establish universal
 reliability. Saved-model development outputs must still reproduce before any

@@ -24,6 +24,7 @@ or decoder prompts. This is a Python research diagnostic, not serving promotion.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import secrets
 import random
@@ -117,6 +118,9 @@ def fresh_challenge(seed, groups, train, dev):
             ("postfreeze-phrasing", "ood"),
         ]:
             pool = data_rows(effective, source, max(groups * 2, 16))
+            alternative_names = data_rows(
+                effective, "name-counterfactual-" + source, max(groups * 2, 16)
+            )
             accepted = 0
             for offset in range(0, len(pool), 4):
                 group = pool[offset : offset + 4]
@@ -125,6 +129,18 @@ def fresh_challenge(seed, groups, train, dev):
                 new = first["answer"][:-1] + str((int(first["answer"][-1]) + 1) % 10)
                 second["answer"] = new
                 second["documents"] = [d.replace(old, new) for d in second["documents"]]
+                alternative = copy.deepcopy(group[2])
+                previous_name = alternative["answer"]
+                alternative["answer"] = alternative_names[offset + 2]["answer"]
+                if alternative["answer"] in group[2]["entities"]:
+                    continue
+                alternative["documents"] = [
+                    d.replace(previous_name, alternative["answer"])
+                    for d in alternative["documents"]
+                ]
+                alternative["entities"][2] = alternative["answer"]
+                alternative["id"] += "-b"
+                group.append(alternative)
                 own = inventories(group)
                 if any(a & b for a, b in zip(own, reserved)):
                     continue
@@ -416,6 +432,20 @@ def main():
                 if pairs
                 else None,
             }
+            if split == "postfreeze":
+                summary["name_counterfactual_pairs"] = scores(
+                    [dict(r, category="code") for r in rows if r["category"] == "name"]
+                )["counterfactual_pairs"]
+                summary["name_pairs_by_cohort"] = {
+                    cohort: scores(
+                        [
+                            dict(r, category="code")
+                            for r in rows
+                            if r["category"] == "name" and r["cohort"] == cohort
+                        ]
+                    )["counterfactual_pairs"]
+                    for cohort in sorted({r["cohort"] for r in rows})
+                }
             if split == "train-probe":
                 summary["exposure_scores"] = {}
                 for label, predicate in [
