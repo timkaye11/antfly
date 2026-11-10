@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
 
 from encoder_lora import SCHEMA, data_rows, digest, load_split, save_json
@@ -27,7 +28,13 @@ from encoder_lora import SCHEMA, data_rows, digest, load_split, save_json
 def inventories(rows):
     return (
         {e for r in rows for e in r["entities"]},
-        {r["answer"] for r in rows if r["category"] != "missing"},
+        {r["answer"] for r in rows if r["category"] != "missing"}
+        | {
+            code
+            for r in rows
+            for doc in r["documents"]
+            for code in re.findall(r"\b[A-Z][a-z][2-9]-00[0-9]{4}\b", doc)
+        },
         {d for r in rows for d in r["documents"]},
     )
 

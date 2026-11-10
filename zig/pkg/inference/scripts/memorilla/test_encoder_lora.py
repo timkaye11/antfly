@@ -470,3 +470,16 @@ def test_fresh_challenge_tracks_and_authenticates_prior_training_lineage(tmp_pat
         pass
     else:
         raise AssertionError("changed lineage accepted")
+
+
+def test_fresh_value_exclusion_includes_codes_seen_only_in_distractors():
+    import re
+    from encoder_lora_corpus import disjoint
+
+    train, fresh = data_rows(731, "train", 2), data_rows(884, "postfreeze", 2)
+    assert disjoint(train, fresh)
+    code = train[0]["answer"]
+    old = re.search(r"[A-Z][a-z][2-9]-00[0-9]{4}", fresh[0]["documents"][1])[0]
+    fresh[0]["documents"][1] = fresh[0]["documents"][1].replace(old, code)
+    assert all(r["answer"] != code for r in fresh)
+    assert not disjoint(train, fresh)

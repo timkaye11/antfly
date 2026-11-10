@@ -754,4 +754,5 @@ membership in the training corpus is not mistaken for having trained on it.
 Fresh challenges require `--prior-training-data PATH` for earlier corpora in the
 candidates' initialization lineage. Candidate/protocol hashes authenticate that
 lineage, and generated facts exclude entities, values and documents from both
-current and earlier training corpora. Existing qualification files stay sealed.
+current and earlier training corpora, including codes seen only in source
+distractors. Existing qualification files stay sealed.
