@@ -798,6 +798,34 @@ sampling/data experiment is distinct from the earlier fixed-budget objective
 comparison. The encoder LoRA, reader geometry, decoder weights and QA prompt
 policy remain the same. Training-exposure receipts understand both samplers.
 
+Add `--phrasing-set v2` to either corpus command to train on ten document
+templates instead of six. All six familiar templates name the site first and
+introduce the holder with a fixed cue; readers trained on them recover 10-13/16
+fresh names under familiar phrasing but 0/16 under the held-out owner-first
+sentence, so they learned where a name sits rather than how to find one. The
+four added templates put the holder or the code first, use terse and list-style
+cues, and spell a missing field with dedicated wording that still says "not
+recorded". None reuses the held-out sentence's clauses. Entities, values,
+questions, row order, the distractor sentence and development bytes are
+unchanged, and every record still parses with `lexical_record_text`. The default
+`v1` regenerates existing corpora byte for byte; the manifest records
+`phrasing_set`.
+
+`--phrasing-set v3` replaces the fixed templates with a sentence grammar seeded
+by the group index: one of six field orders (name-site-code through
+code-name-site), eight holder verb phrases ("holds the brass key for", "has
+custody of the brass key of", ...), eight code phrases ("the access code is",
+"code on file:", "its door code reads", ...), four clause connectors and several
+one- or two-sentence layouts, including relative clauses ("{site}, where {owner}
+holds the brass key, opens with code ...") and mid-sentence sites. Missing fields
+get per-field wording that still says "not recorded". The grammar never emits
+either held-out clause or the held-out shape (holder, verb, site, then a
+relative clause carrying the code). `data-paired-v3` has 4,786 distinct
+site-sentence skeletons over 20,480 rows (2,120 among present-field rows), the
+longest document is 43 encoder tokens, and `row["template"]` stores the field
+order (0-5). Entities, values, questions, row order and development bytes are
+unchanged from `data-paired`.
+
 `--oracle-prefix-probe` is an explicit decoder-copy control, separate from every
 QA score: it inserts known answer embeddings into the 16 slots. `--oracle-only`
 skips QA evaluation and cannot open fresh qualification. The optional
@@ -805,3 +833,526 @@ skips QA evaluation and cannot open fresh qualification. The optional
 answering the original entity-specific question. All such results carry
 `uses_gold_in_memory: true` and `counts_toward_qa: false`; they test prompt/frame
 behavior with supplied literal answers, not compression quality or factual QA.
+
+### Token-level document features and lexical memory supervision
+
+Three development-only controls (results under
+`.benchmark-results/memorilla/encoder-lora-next/{ceiling-diagnostics,target-readability,encoder-probe}`)
+locate the exact-fact failure of the frozen-decoder recipe:
+
+- Placing the literal token embeddings of the source documents into the memory
+  frame answers 64/64 development cases, the same as text in the user turn. The
+  frame and the frozen decoder impose no readability penalty.
+- A bare or site-free value in the slots is answered UNKNOWN under the strict
+  prompt: the earlier oracle-copy result was abstention, not unreadability. A
+  labeled record bound to the asked site (`" {site} code {code}"` or
+  `" {site} key holder {owner}"`) fits 16 slots and is read 59/64.
+- A probe trained from the released single pooled vector per document recovers
+  0% of exact held-out codes, while per-token encoder states with a 16-query
+  attention reader recover 99.8% of codes and 83% of names. The trained encoder
+  LoRA had made the pooled vector a near-perfect bag of characters without
+  order, which is exactly the scrambled spellings the decoder produced.
+
+The trainer therefore has opt-in flags whose defaults leave every earlier run
+byte-identical:
+
+- `--document-features {pooled,tokens,chunks4,chunks8}` feeds the unchanged
+  reader every active document token (or K contiguous mean-pooled chunks) as
+  its own L2-normalized vector; the question stays last-token pooled. The
+  native pipeline already accepts up to 64 masked document vectors, so chunked
+  features are extra rows, not an architecture change.
+- `--lexical-loss-weight W --lexical-record {owner-code,asked-first,site-asked}`
+  adds a training-only pull of the 16 predicted memories toward the frozen
+  decoder's input embeddings of a canonical record (cosine plus a squared
+  log-norm ratio). The teacher never enters the decoder forward.
+- `--memory-scale-init lexical-target` rescales the reader's final projection
+  once so predicted memories match the embedding norm (the released reader
+  emits memories about 175 times larger), and trains that projection at the
+  reader learning rate times the same factor, which equals training the
+  unscaled module with a folded output scale.
+- `--lexical-warmup-steps N` runs the first N steps on the lexical objective
+  only, without decoder passes and with encoder adapters resting, before the
+  joint QA-plus-lexical phase.
+- `--memory-slots N` (default 16, allowed 16..64) trains an N-slot reader. The
+  released 16-slot checkpoint is still the required starting point; its learned
+  queries are expanded so the first 16 rows stay bit-identical and row `i >= 16`
+  copies row `i mod 16` plus Gaussian noise (std 0.01 times that row's std,
+  from a seeded generator separate from the global RNG). Lexical records then
+  pad to N tokens, the geometry checks, resume checkpoints, `candidate.json`,
+  the exporter and the evaluator all read N from `protocol.memory_slots`. A
+  16-slot candidate may initialize a wider run: its reader loads whole before
+  expansion, `initialization.parent_memory_slots` records the parent's count,
+  and the step-0 reproduction check only records the overlap, as for a changed
+  feature mode. Resume and continuation still require equal slot counts.
+
+Initialization from a candidate with a different feature mode is recorded as
+`initialization.parent_document_features` and only the overlap of reproduced
+development answers is reported, since the same weights see a new input
+geometry.
+
+Two further opt-in encoder controls keep the default byte-identical:
+
+- `--encoder-layer N` (1..36 for Qwen3-Embedding-4B; default the final
+  normalized state) feeds the reader `hidden_states[N]`, the un-normalized
+  output of layer N (`hidden_states[0]` is the embedding output, so N equal to
+  the layer count is the normalized final state). It applies to the training
+  forward, warmup batches, the warmup feature cache (whose manifest then carries
+  `encoder_layer`, so caches from different layers never mix) and the cache
+  self-check; the evaluator reads the layer from `protocol.encoder_layer`.
+  Resume and continuation require an equal layer. Initialization from a
+  candidate trained on another layer is allowed because reader and adapter
+  weights are layer-agnostic; it is recorded as
+  `initialization.parent_encoder_layer` and, as for a changed feature mode, the
+  step-0 check only records the overlap of reproduced development answers.
+- `--lora-targets q_proj,v_proj,o_proj,down_proj` (default `q_proj,v_proj`;
+  any of `q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj`) chooses the
+  encoder modules that receive rank-`--rank` adapters; `protocol.target_modules`
+  stores the list in canonical order and the evaluator injects exactly those.
+  A child run may initialize from a candidate with a subset of its targets: the
+  shared adapters restore whole and the added modules start at zero effect
+  (B = 0), so the parent's development answers must still reproduce;
+  `initialization.parent_target_modules` records the parent's list. Dropping a
+  parent target is refused, as is any other adapter geometry change.
+
+`--document-features tokens-dual --dual-layer N` (1..35 for Qwen3-Embedding-4B,
+with `--encoder-layer` left unset) gives the reader keys from two layers of one
+encoder forward: every active document token from the final normalized state
+(exactly the `tokens` rows) followed by every active document token from
+`hidden_states[N]`, each row L2-normalized through the same storage channel, so
+the key count doubles (about 70 per case) while the question query stays the
+final-layer pooled vector. The motivation is the layer trade-off above: final
+layer features bind a question to the right document across phrasings but
+spell names worse, layer-24 features spell better but bind worse (fresh facts
+31/80 against 41/80), and attention over both key sets lets the reader take
+binding from one and spelling from the other. The protocol records
+`dual_layer` (null unless set); resume and continuation require it equal; a
+changed mode or layer in an initialization parent is recorded
+(`initialization.parent_document_features`, `parent_dual_layer`) and relaxes the
+step-0 reproduction check to the overlap as for any input-geometry change. The
+warmup feature cache stores both layers' active-token rows per text and its
+manifest carries `document_features` and `dual_layer`, so dual caches never mix
+with single-layer ones; the evaluator reads the mode and layer from the
+protocol.
+
+Warmup findings (`warmup-sweep/`, `target-readability/noise_result.json`,
+`slot-diagnostics/`): the token cross-entropy objective learns the record
+characters at a reader learning rate of 2e-4 or below (`--lexical-objective
+token-ce`, temperature 0.05, 128 cases per step); 5e-4 oscillates near loss 4
+and 1e-3 diverges, while cosine regression toward embedding rows collapses onto
+the pad token. The frozen decoder reads gold records perturbed by random noise
+down to cosine 0.70 at 64/64, but an exact record whose trailing site is wrong
+is answered UNKNOWN on 48/48 facts, and a record whose nearest tokens are all
+correct is still refused while letter slots stay ambiguous between several
+real tokens. Site and name subword slots are the last to converge.
+`--lexical-warmup-cache DIR` encodes every distinct training text once so the
+warmup needs no encoder pass; `--lexical-warmup-batch N` processes N cases per
+microstep; `--joint-reader-lr` lowers the reader rate for the joint phase;
+`--lexical-warmup-schedule cosine` decays the warmup rate; `tokens-question`
+additionally exposes the question's token states as reader keys.
+`--lexical-name-weight W` (token-ce with the asked-site record) multiplies the
+asked name's value slots in the lexical loss, normalized to mean one, because
+name subwords are the last slots to converge. A letter-spelled name in memory is
+read back letter by letter and never joined by the frozen decoder, so spelling
+names is not a usable target.
+
+Development-only results of this recipe (frozen decoder, 16 slots, no source
+text in the decoder; `tokens-lexonly-4096` then `tokens-namew-1536`, evaluated
+independently by `encoder_lora_eval.py` with eight fresh post-freeze groups):
+
+| candidate | dev 64 | codes 32 | names 16 | pairs 16 | fresh facts 80 | fresh codes 32 | fresh names 32 |
+|---|---|---|---|---|---|---|---|
+| best pooled run (`paired-qa-256`) | 24 | 4 | 4 | 0 | not reached | | |
+| `tokens-lexonly-4096` | 41 | 23 | 2 | 10 | 38 | 21 | 1 |
+| `tokens-namew-1536` | 47 | 24 | 7 | 10 | 42 | 22 | 4 |
+| `tokens-namew2-3072` (name weight 4, 3072 more steps) | 53 | 31 | 6 | 15 | 41 | 21 | 4 |
+| `tokens-enc-128` (encoder adapters trained, 128 live steps) | 57 | 29 | 12 | 14 | 36 | 17 | 3 |
+| `tokens-enc-256` (same, 256 steps) | 53 | 29 | 8 | 14 | 39 | 18 | 5 |
+| `tokens-l24b-3072` (layer-24 features, 2048+3072 steps) | 48 | 27 | 5 | 12 | 31 | 12 | 3 |
+| `tokens-namew2-3072` with `--snap-memory all` | 57 | 30 | 11 | 15 | 50 | 26 | 8 |
+| `tokens-l24b-3072` with `--snap-memory all` | 51 | 27 | 8 | 13 | 35 | 14 | 5 |
+| `tokens-dual-3072` (final + layer-24 keys, 3072 steps) | 55 | 31 | 8 | 15 | 48 | 26 | 6 |
+| `tokens-dual-3072` with `--snap-memory all` | 57 | 30 | 11 | 15 | 52 | 26 | 10 |
+| `tokens-copy2-2048` (copy head + pointer loss, from dual) | 55 | 31 | 8 | 15 | 54 | 30 | 8 |
+| `tokens-copy2-2048` with `--snap-memory all` | 61 | 31 | 14 | 15 | 56 | 30 | 10 |
+| `tokens-copy2-2048` snapped, second seed 7331 | 61 | 31 | 14 | 15 | 57 | 28 | 13 |
+| `tokens-copy3-1536` (copy head, low rates) snapped, seed 20261110 | 61 | 32 | 13 | 16 | 56 | 28 | 12 |
+| `tokens-copy3-1536` snapped, seed 7331 | 61 | 32 | 13 | 16 | 59 | 30 | 13 |
+| `tokens-copy4-v2-3072` (ten-template corpus) snapped, seed 20261110 | 60 | 31 | 13 | 15 | 58 | 30 | 12 |
+| `tokens-copy4-v2-3072` snapped, seed 7331 | 60 | 31 | 13 | 15 | 60 | 30 | 14 |
+| `tokens-copy4-v2-3072` snapped, third seed 4242 | 60 | 31 | 13 | 15 | 55 | 29 | 10 |
+| `tokens-copy5-v3-3072` (grammar corpus, 4,786 skeletons) snapped, seeds 20261110 / 7331 / 4242 | 56 | 31 | 9 | 15 | 49 / 57 / 53 | 26 / 30 / 28 | 7 / 11 / 9 |
+| `tokens-copy6-prefix-2048` (document space prefix) snapped, seeds 20261110 / 7331 / 4242 | 61 | 32 | 13 | 16 | 53 / 59 / 55 | 28 / 30 / 29 | 9 / 13 / 10 |
+| `tokens-copy7-selfctx-2048` (self-context + pooled context) snapped, seed 20261110 | 59 | 32 | 11 | 16 | 43 | 17 | 10 (held-out 4/16) |
+| `tokens-copy7-selfctx-2048` snapped, seed 7331 | 59 | 32 | 11 | 16 | 58 | 26 | 16 (held-out 6/16) |
+| `tokens-copy7-selfctx-2048` snapped, seed 4242 | 59 | 32 | 11 | 16 | 54 | 24 | 14 (held-out 8/16) |
+| `tokens-copy8-tags-2048` (oracle tags at the reader rate + type-restricted copy) snapped, seed 20261110 | 57 | 32 | 9 | 16 | 53 | 28 | 9 (held-out 0/16) |
+| `tokens-copy8-tags-2048` snapped, seed 7331 | 57 | 32 | 9 | 16 | 60 | 30 | 14 (held-out 1/16) |
+| `tokens-copy8-tags-2048` snapped, seed 4242 | 57 | 32 | 9 | 16 | 56 | 29 | 11 (held-out 0/16) |
+| `tokens-copy9-pooledctx-2048` (pooled context only) snapped, seed 20261110 | 57 | 30 | 11 | 16 | 44 | 20 | 8 (held-out 0/16) |
+| `tokens-copy9-pooledctx-2048` snapped, seed 7331 | 57 | 30 | 11 | 16 | 54 | 27 | 11 (held-out 1/16) |
+| `tokens-copy11-selfonly-2048` (self-context only, special rows kept) snapped, seed 20261110 | 60 | 32 | 12 | 16 | 56 | 24 | 16 (held-out 6/16) |
+| `tokens-copy11-selfonly-2048` snapped, seed 7331 | 60 | 32 | 12 | 16 | 60 | 25 | 19 (held-out 10/16) |
+| `tokens-copy11-selfonly-2048` snapped, seed 4242 | 60 | 32 | 12 | 16 | 57 | 25 | 16 (held-out 8/16) |
+| `tokens-copy13-loop3-2048` (looped reader, 3 passes, from copy11) snapped, seed 20261110 | 59 | 30 | 13 | 16 | 58 | 26 | 16 (held-out 7/16) |
+| `tokens-copy13-loop3-2048` snapped, seed 7331 | 59 | 30 | 13 | 16 | 64 | 26 | 22 (held-out 12/16) |
+| `tokens-copy13-loop3-2048` snapped, seed 4242 | 59 | 30 | 13 | 16 | 54 | 22 | 16 (held-out 6/16) |
+| `tokens-copy13-loop3-2048` snapped + `--copy-unique-positions`, seed 20261110 | 61 | 30 | 15 | 16 | 66 | 27 | 23 (held-out 9/16) |
+| `tokens-copy13-loop3-2048` snapped + unique positions, seed 7331 | 61 | 30 | 15 | 16 | 69 | 26 | 27 (held-out 13/16) |
+| `tokens-copy13-loop3-2048` snapped + unique positions, seed 4242 | 61 | 30 | 15 | 16 | 61 | 24 | 21 (held-out 10/16) |
+| `tokens-copy13-loop3-2048` snapped + `--copy-contiguous-runs`, seed 20261110 | 64 | 32 | 16 | 16 | 75 | 32 | 27 (held-out 11/16) |
+| `tokens-copy13-loop3-2048` snapped + contiguous runs, seed 7331 | 64 | 32 | 16 | 16 | 77 | 30 | 31 (held-out 15/16) |
+| `tokens-copy13-loop3-2048` snapped + contiguous runs, seed 4242 | 64 | 32 | 16 | 16 | 76 | 30 | 30 (held-out 15/16) |
+| `tokens-copy13-loop3-2048` snapped + `--snap-blank-below 0.80`, seed 20261110 | 58 | 30 | 12 | 16 | 55 | 24 | 15 (held-out 7/16) |
+| `tokens-copy11-selfonly-2048` snapped + contiguous runs, seed 20261110 | 64 | 32 | 16 | 16 | 75 | 32 | 27 (held-out 11/16) |
+| `tokens-copy11-selfonly-2048` snapped + contiguous runs, seed 7331 | 64 | 32 | 16 | 16 | 77 | 30 | 31 (held-out 15/16) |
+| `tokens-copy11-selfonly-2048` snapped + contiguous runs, seed 4242 | 64 | 32 | 16 | 16 | 74 | 29 | 29 (held-out 15/16) |
+| `tokens-copy14-loop4-1024` (4 passes, from copy13) snapped, seeds 20261110 / 7331 | 60 | 32 | 12 | 16 | 60 / 69 | 27 / 28 | 17 / 25 |
+| `tokens-copy14-loop4-1024` snapped, seed 4242 | 60 | 32 | 12 | 16 | 59 | 25 | 18 (held-out 9/16) |
+| `tokens-copy4-v2-3072` snapped + contiguous runs, seed 20261110 | 64 | 32 | 16 | 16 | 68 | 32 | 20 (held-out 4/16) |
+| `tokens-copy4-v2-3072` snapped + contiguous runs, seed 7331 | 64 | 32 | 16 | 16 | 67 | 30 | 21 (held-out 5/16) |
+| `tokens-copy4-v2-3072` snapped + contiguous runs, seed 4242 | 64 | 32 | 16 | 16 | 65 | 30 | 19 (held-out 3/16) |
+| `tokens-copy14-loop4-1024` snapped + contiguous runs, seeds 20261110 / 7331 / 4242 | 64 | 32 | 16 | 16 | 74 / 77 / 75 | 32 / 30 / 30 | 26 / 31 / 29 (held-out 11 / 15 / 14) |
+
+Ten training templates (`--phrasing-set v2`) did not transfer to the held-out
+sentence: fresh names rose to 12/16 and 14/16 on familiar phrasing but stayed
+0/16 on the held-out form, where the memory smears subwords from both documents
+and garbles the site tokens even though the site is in the question.
+
+Root cause of the held-out-phrasing failure (`copy-attention-diag/`): the
+embedding encoder is causal, so a name that precedes the site and the holder cue
+has token states that are bit-identical whatever site follows; the
+question-conditioned reader cannot bind such a name to the asked site and drifts
+to the distractor's name, while codes, which always follow site and cue, copy
+perfectly from the same documents. Controlled variants: any form with site and
+cue before the name scores 19-20/21 name subwords, name-first forms 7-9/21.
+The document space prefix made sentence-initial names copyable but could not
+supply the missing right context.
+
+With the copy head, the remaining fresh-name gap is entirely the held-out
+phrasing: on the familiar-template cohort fresh names are 10/16 and 13/16 on the
+two seeds, while on the held-out template (owner named before the site) they are
+0/16 on both seeds with codes still 14/16. The reader has learned where names
+sit in the training phrasings rather than how to find a name; training phrasing
+variety is the next lever.
+
+A further name-weighted dual continuation (`tokens-dual2-3072`, weight 4) stays
+on the same plateau: snapped fresh facts 52/80 and 51/80 with 9 names on each
+seed. Regressing slot vectors onto token embeddings saturates near a third of
+unseen names; the copy head below targets that directly.
+
+On a second fresh seed (7331, snapped) the two best candidates are tied: the
+dual-layer reader 53/80 (26 codes, 11 names) and the final-layer name-weighted
+reader 54/80 (26 codes, 12 names). Across both seeds fresh names are 21/64 and
+20/64 respectively; the qualification bar in use is 16/32 fresh names snapped
+on both seeds with no increase in wrong values.
+
+Layer-24 features reached a comparable development score after a comparable
+budget but generalized worse to fresh facts (31/80, with the held-out-phrasing
+cohort at 8/40, i.e. only the missing-fact controls): the final layer's
+semantic features matter for binding the question to the right document even
+though layer 24 spells better in isolation.
+Training the rank-8 query/value adapters during the lexical phase lifted
+development names to 12/16 within 128 steps but left fresh names at 3-5/32, so
+the development set does not measure name generalization reliably.
+Longer name-weighted training lifts development scores but not fresh facts:
+fresh names stay at 4/32 while the training probe reaches 13/16 names, so the
+remaining name gap is generalization of subword copying, not optimization.
+Layer probe (`layer-probe/`): with the same attention probe, token states from
+encoder layer 24 of 36 recover 93% of held-out names exactly versus 83% from
+the final normalized state, with codes at 100% at every layer; layers 24 to 28
+are indistinguishable and the loss of spelling is concentrated in the last four
+layers. Intermediate layers carry about one massive-activation token per
+document (norm about 7,700 against a median near 100), so per-token
+normalization or a global scale is needed before attention. `--encoder-layer 24`
+selects that layer for training and evaluation.
+
+Every miss is an abstention; no wrong values were produced, and the sixteen
+missing-fact controls stay correct throughout. A joint phase that adds the QA
+cross-entropy through the frozen decoder destabilized the reader even at a
+1e-5 reader rate (gradient norms in the thousands), so these candidates were
+trained on the lexical objective alone. These remain research results on the
+synthetic depot corpus, not rollout qualification.
+
+Nearest-token snapping (`snap-test/`, on `tokens-namew2-3072`): replacing every
+predicted memory vector by the exact decoder input-embedding row nearest to it
+in cosine over the whole 151,936-row table, before the frozen decoder reads it,
+lifts development from 53 to 57/64 and fresh facts from 41 to 50/80, and cuts
+wrong values from 12 to 9 across both sets. Margin- or cosine-gated partial
+snapping was worse than snapping every slot, so `encoder_lora_eval.py
+--snap-memory all` applies the all-slots policy to every memory the decoder
+reads (development, training probe, structured readout and post-freeze; the
+oracle-prefix controls are literal rows already and are not touched). The result
+records `snap_memory` on the manifest and each candidate entry, and each row
+carries `snapped_text` (the decoded nearest tokens) and `snap_min_top1_cosine`;
+the development reload check is skipped because the stored reference was
+measured unsnapped. The default `none` leaves the evaluator unchanged. For
+serving, this is one matmul of the memories against the embedding table and an
+index into it, and the encoder and decoder share one token vocabulary, so the
+snapped ids are ordinary decoder token ids.
+
+Gated token copying (`--copy-head`, default off): the encoder and decoder
+tokenizers are the same 151,665-id vocabulary, so every value token a record
+needs (name subwords, code characters, site tokens) is literally present among
+the document token ids; only the label tokens (` code`, ` key`, ` holder`,
+` at`, ` UNKNOWN`, padding) are not. The remaining errors are name subwords the
+reader regenerates as a wrong neighbour token, so `CopyHead` lets a slot copy
+the exact decoder embedding of a document token instead of regenerating it. It
+is a small FP32 module applied after the reader: an identity-initialized query
+projection, cosine attention over the frozen decoder embeddings of the
+concatenated document token ids at temperature 0.05, and a per-slot sigmoid
+gate (bias -2, so a fresh head copies about 12% and mostly generates) mixing
+the copied row with the generated memory; label tokens are generated through
+the gate, value tokens are copied. The gated output is what the lexical loss
+and the frozen decoder read, so the token cross-entropy trains the head at the
+reader learning rate (it follows the warmup schedule and `--joint-reader-lr`).
+The decoder tokenizer tokenizes the documents and the encoder's ids are
+asserted equal at startup; a cached warmup (`--lexical-warmup-cache`) stores
+each text's ids in `ids.pt` and its manifest carries `copy_head`. The protocol
+records `copy_head` and `copy_head_temperature`, resume and continuation
+require them equal, each step logs `copy_gate_mean`, resume checkpoints and
+exported candidates carry the module (`copy-head.safetensors`,
+`candidate.copy_head_sha256`, verified by the candidate proof and the
+evaluator). A child with `--copy-head` may initialize from a parent without
+one (the head starts fresh and the step-0 reproduction check records the
+overlap, as for any input-geometry change); a child without the flag refuses a
+parent that has one. The evaluator applies the head identically when a
+candidate's protocol declares it, before `--snap-memory`, and records
+`copy_head` on the entry and `copy_gate_mean` per row. The serving cost is the
+document token ids plus one small attention over their embeddings.
+
+Pointer supervision (`--copy-pointer-weight W`, default 0 = off; needs
+`--copy-head` and the `token-ce` lexical objective; `W` within 0..10): the
+lexical cross-entropy alone does not train the head. The parent reader already
+fits the training records (CE about 0.003), so the gate feels no pressure to
+open and the copy attention never becomes selective; when the gate drifted open
+anyway, the unselective mixture degraded what the frozen decoder read (dev 57
+-> 19). The head is therefore supervised directly from what is known for every
+training case: the record's target id per slot and the case's document ids. A
+slot is copyable when its target id occurs among the (unpadded) document ids
+and is neither the space pad nor a label token (` code`, ` key holder`, ` at`,
+` UNKNOWN`, decided on the id so a label that happens to appear in a document
+is still generated). The pointer loss is `-log` of the copy mass on the
+matching positions (log-sum-exp over the matches minus log-sum-exp over all
+valid positions), averaged over copyable slots; the gate loss is BCE of the
+gate logit toward 1 on copyable and 0 on other slots, averaged over slots.
+`W * (pointer_loss + gate_loss)` joins the training loss next to the lexical
+term in both the batched warmup and the live/joint path (`CopyHead
+.forward_detailed` exposes the copy and gate logits; `forward` is unchanged).
+Each step row logs `pointer_loss`, `gate_loss` and `copyable_fraction` while
+it is on. `--copy-head-lr` (default the reader rate) gives the copy-head
+optimizer group its own rate, scaled by the warmup schedule like the others
+and kept through the joint phase (without it the head follows
+`--joint-reader-lr`). Both are recorded in the protocol (`copy_pointer_weight`,
+`copy_head_lr`) and resume/continuation require them equal.
+
+Document space prefix (`--document-space-prefix`, default off; protocol
+`document_space_prefix`, resume/continuation require it equal): the shared Qwen
+tokenizer segments a sentence-initial name differently from the same name
+mid-sentence. "Mujapo Manabo is entrusted..." tokenizes as `M`/`uj`/`apo`/
+` Man`/`abo` while the lexical record " key holder Mujapo Manabo at ..." has
+` Muj`/`apo`/` Man`/`abo`; the copy head copies decoder embeddings of document
+token ids, so the record's first subword ` Muj` is absent from an owner-first
+document and cannot be copied (0/16 names on the held-out phrasing cohort).
+With the flag, every document text (never the question or the lexical record)
+is prefixed with one space before tokenization, which restores the record's
+segmentation (" Mujapo Manabo is..." -> ` Muj`/`apo`/` Man`/`abo`/` is`). The
+prefix applies at the live encoder path, the warmup cache (keys are the
+prefixed texts and the manifest records `document_space_prefix`, so caches
+never mix), the copy sources, the shared-token-id assertion and the cache
+self-check. Initialization records `parent_document_space_prefix` when either
+side has it on and a changed prefix relaxes the step-0 reproduction check like
+any other input-geometry change. The evaluator reads the field per candidate,
+applies the same prefix at its encoder tokenization and copy sources only (the
+oracle controls and readout prompts are untouched), and records
+`document_space_prefix` on the entry.
+
+Document self-context and pooled context (`--document-self-context`,
+`--document-pooled-context`, both default off; protocol `document_self_context`,
+`document_pooled_context`, resume/continuation require them equal): the Qwen3
+embedding encoder is causal, so a document token's state depends only on the
+tokens to its left (`copy-attention-diag`: name-token states are bit-identical
+when only the later site changes). A name written before the site and holder
+cue of its sentence therefore has states that carry nothing about its site;
+the question-conditioned reader cannot bind it (0/16 held-out names, 7-9/21
+value slots on every owner-first form, including training template 6) and
+drifts to the distractor's name, while codes and sites that follow the cue
+copy perfectly (39/39). Both flags are index-time only and may be combined;
+the question stays pooled and unchanged, and the decoder still sees no text.
+Self-context doubles every (prefixed) document text for the encoder (`D + D`
+when the text starts with a space, else `D + " " + D`), asserts that the last
+`n` token ids of the doubled text equal the document's own ids
+(`self_context_tokens`; a sentence-initial word that re-segments falls back to
+the ids of `" " + D`, counted in `result.document_self_context_fallbacks`), and
+keeps only those last `n` states as the document's features
+(`select_last_rows`, right-padding aware), so every kept token has the whole
+document to its left. It applies at the live and batched encoder paths, the
+warmup cache (the second copy's states stored under the original text key;
+manifest `document_self_context`), the dual-layer pair from the same forward
+and the copy sources (the single ids the kept states stand for, one per kept
+row, covered by the shared-tokenizer assertion); the 128-token budget applies
+to the doubled text (documents are at most 43 tokens). Pooled context adds the
+document's own pooled, L2-normalized last-token vector to every token row
+before the row's normalization (`add_pooled_context`:
+`normalize(normalize(state) + pooled)`), per layer in `tokens-dual`, and is
+rejected with `pooled` features; the cached path derives it from the cached
+last row and the cache self-check covers it. Initialization records
+`parent_document_self_context` / `parent_document_pooled_context` when either
+side has one on, and a change relaxes the step-0 reproduction check like the
+space prefix. The evaluator reads both fields per candidate, mirrors them at
+its encoder, feature and copy-source sites, and records `document_self_context`,
+`document_pooled_context` (plus the fallback count) on the entry.
+
+Entity-type tags (`--entity-tags {none,oracle}`, default `none`; protocol
+`entity_tags`, resume/continuation require it equal) attack the same causal
+blind spot from the other side, GLiNER-style: instead of giving a name more
+left context, a bidirectional tagger would mark every entity span at index time
+and the reader and copy head would see each token's type next to its causal
+state, so a name written before its site and holder cue is still recognizably
+a person. The `oracle` mode is the ceiling measurement for that tagger: the
+types come from the case's public entity list (site, other site, owner,
+distractor), the access-code pattern and the literal "not recorded" marker
+(`oracle_entity_tags`: none / site / person / code / missing, one per document
+token through the fast tokenizer's offset mapping, never from the QA label), a
+learned zero-initialized FP32 table at the encoder width
+(`EntityTagEmbedding`, saved as `entity-tags.safetensors` with
+`entity_tags_sha256` in `candidate.json`, in resume checkpoints and in the
+exporter's averages) adds each token's type vector to its row after the pooled
+context and before the final normalization (a fresh table reproduces the
+untagged features bit-for-bit), the question row stays untyped, and the table
+trains at the reader rate and schedule. Tags apply at the live, batched and
+cached paths (`tags.pt` next to the cached states, manifest `entity_tags`) and
+in the evaluator (`entity_tags` on the entry). `--copy-restrict-by-type`
+(default off; protocol `copy_restrict_by_type`; needs the copy head, tags and a
+lexical record) additionally masks the copy head's attention on the record
+slots that hold the asked value (`lexical_value_slots`, from the record's
+offsets) to tokens of the asked field's type plus the "not recorded" marker
+(`copy_type_mask`: person tokens for a name question, code tokens for a code
+question), while label, site and pad slots keep every token; the pointer loss
+counts only matches inside the allowed set. Initialization records
+`parent_entity_tags` / `parent_copy_restrict_by_type` when either side is on;
+a child adding tags starts at zero and must reproduce the parent, dropping a
+parent's tags is refused, and only a changed restriction relaxes the step-0
+check. A real tagger trained on the oracle spans is the next step once the
+ceiling is known.
+
+The embedding encoder's tokenizer appends `<|endoftext|>` to every text, so a
+document has one more encoder state row than it has token ids: the first
+entity-tag run stopped at its cache check ("cached document states and entity
+tags differ"). `encoder_special_suffix` measures that count (1 for
+Qwen3-Embedding, 0 for the decoder tokenizer), `feature_row_tags` pads a
+document's id-aligned tags with the untyped type for those rows, and the copy
+head's type restriction keeps the id-aligned tags. The same count had been
+missing from the self-context keep: `tokens-copy7-selfctx-2048` kept the last
+`n` rows of the doubled document, which is the second copy minus its first
+token plus the end-of-text row, one row off the copy-source ids it was meant
+to stand for. `self_context_states` now takes the suffix and keeps the whole
+second copy plus the special rows; the protocol records
+`encoder_special_rows: true` for runs trained this way, the evaluator
+reproduces the count-only keep for earlier candidates, and a self-context
+parent trained without the flag cannot initialize a child (its features would
+move). Dual-layer copy caches already stored the extra row per text, so no
+cache needs rebuilding except self-context caches, whose manifest now carries
+the flag.
+
+Across the three fresh seeds the self-context candidate answers 10/16/14 of
+32 names (held-out phrasing 4/6/8 of 16) against 12/14/10 (held-out 0/0/0)
+for `tokens-copy4-v2-3072`, with fewer wrong names (7/8/7 against 14/7/16;
+the rest abstain) and every missing-fact control correct, but codes fall to
+17/26/24 of 32 from 30/30/29, almost entirely through abstentions on a
+blurred site subword. The context features buy name binding at the price of
+site precision; the entity-tag and pooled-context-only runs separate the two
+effects.
+
+The first oracle-tag run (`tokens-copy8-tags-2048`, tag table at the reader's
+rate) ends with its table at row norms 0.02-0.11 of a unit row, so it measures
+type-restricted copying rather than typing: fresh names 9/14/11 of 32
+(held-out phrasing 0/1/0) and codes 28/30/29 against 12/14/10 (0/0/0) and
+30/30/29 for `tokens-copy4-v2-3072`; the restricted copy gate on name
+questions falls to 0.56 from about 0.87, so the head copies less rather than
+more precisely. `--entity-tag-lr` gives the table its own rate for the
+retest.
+
+Looped readout (`--reader-loops {1..4}`, default 1; protocol `reader_loops`,
+with `--slot-refiner-lr` / protocol `slot_refiner_lr` for the refiner's own
+cosine-scheduled rate, default the reader's) runs the pinned reader forward
+`reader_pass` more than once. The reader fills its slots in one parallel
+shot, so nothing stops two slots from copying the same name subword or
+skipping one, which is the scrambled-name failure ("Galuna Sununa" for
+"Sunipo Galuna"). Between passes a `SlotRefiner` (LayerNorm, causal
+self-attention over the previous pass's final normalized slots, and a
+zero-initialized projection, saved as `slot-refiner.safetensors` and hashed
+as `slot_refiner_sha256`) adds its feedback to the learned queries, so slot
+`i` of the next pass conditions on what slots `<= i` held. The zero
+projection makes every added pass identical to the first, so a child adding
+loops to a loop-less parent reproduces it exactly at step 0; a parent's
+refiner restores into a child with at least as many loops, and fewer loops
+than the parent are refused. The evaluator and selector honor the field.
+
+Self-context alone (`tokens-copy11-selfonly-2048`, keeping the encoder's
+special rows) answers 16/19/16 of 32 fresh names across the three seeds
+(held-out phrasing 6/10/8 of 16) against 12/14/10 (0/0/0) for
+`tokens-copy4-v2-3072`, with every missing-fact control correct and snapped
+development 60/64; it is the first candidate to clear the 16-of-32 name bar
+on more than one seed. Codes settle at 24/25/25 of 32: the misses are a site
+slot misspelled next to a correct code (the decoder abstains on the site
+mismatch) or a code with its own prefix digit duplicated into a later digit
+slot ("Cn7-007452" for "Cn7-002452"), both readout failures of slots produced
+in one parallel pass, which the looped reader (`--reader-loops`) targets.
+
+The looped reader (`tokens-copy13-loop3-2048`: three shared passes with a
+zero-initialized causal slot refiner, continued from the self-context
+candidate) answers 16/22/16 fresh names (held-out phrasing 7/12/6) and
+26/26/22 codes across the three seeds against 16/19/16 (6/10/8) and
+24/25/25 for its parent: a clear gain on names on one seed and parity on the
+others, codes up on two seeds and down on the third, where the misses are
+again misspelled sites beside correct codes. Total 58/64/54 against
+56/60/57.
+
+Two inference-time rules on the copy head need no retraining.
+`--copy-unique-positions` (`copy_with_unique_positions`) forbids two copying
+slots from reading one document token position, re-pointing the less
+confident slot to its best unclaimed position: on the looped reader it lifts
+fresh names from 16/22/16 to 23/27/21 of 32 (held-out 9/13/10) and codes from
+26/26/22 to 27/26/24, fixing 16 names and 3 codes over the three seeds and
+breaking none, with development at 61/64. `--copy-contiguous-runs`
+(`copy_with_contiguous_runs`) is the stronger form, each run of copying slots
+reading one contiguous source span, aimed at digit swaps inside a code that
+uniqueness cannot catch. `--snap-blank-below` blanks low-confidence snapped
+slots to the pad token so that an uncertain value abstains instead of
+answering wrongly.
+
+Contiguous-span decoding is the largest single step of the series: on the
+looped reader it reaches 75/77/76 of 80 fresh facts with no wrong code on any
+seed (codes 32/30/30, names 27/31/30, held-out phrasing 11/15/15, development
+64/64 on every seed, every missing-fact control correct, counterfactual pairs
+16/15/15), fixing 15 codes and 17 names over the unique rule and breaking
+none. The eleven remaining misses are run-boundary errors: a name truncated
+by its last subword where the final slot's gate fell below the copy threshold,
+one name whose first subword was taken by the label slot, and code
+abstentions beside a truncated site. Blanking low-confidence slots
+(`--snap-blank-below 0.80`) is harmful (55/80 on the first seed) and was not
+pursued.
+
+Under contiguous-span decoding the looped reader no longer matters: the
+self-context candidate without it (`tokens-copy11-selfonly-2048`) scores
+75/77/74 against the looped reader's 75/77/76, producing identical snapped
+memory text on 77-79 of 80 cases per seed. The constrained decode resolves
+the slot-ordering errors the loop was trained to remove, so the simpler
+candidate is the deliverable.
+
+The same decode on the single-pass candidate `tokens-copy4-v2-3072` gives
+68/67/65 with held-out-phrasing names at 4/5/3 of 16 against copy11's
+75/77/74 and 11/15/15: constrained decoding repairs slot order for any
+copy-head candidate, but only self-context lets the causal encoder bind a
+name written before its site, so the deliverable needs both.
+
+Session summary (2026-11-11/12). Starting point `tokens-copy4-v2-3072`
+snapped: fresh 58/60/55 of 80, names 12/14/10 of 32, held-out phrasing
+0/0/0. Deliverable `tokens-copy11-selfonly-2048` with `--snap-memory all
+--copy-contiguous-runs`: fresh 75/77/74, codes 32/30/29 with no wrong code,
+names 27/31/29, held-out phrasing 11/15/15, development 64/64, every
+missing-fact control correct, counterfactual pairs 16/15/14. Two ingredients
+carry the gain, encoder self-context (binding) and contiguous-span decoding
+(readout); pooled context, entity tags (at any tag rate) and the looped
+reader (three or four passes) are harmful or redundant on top of them.
+Remaining misses are run-boundary errors at the copy gate, the next target.
