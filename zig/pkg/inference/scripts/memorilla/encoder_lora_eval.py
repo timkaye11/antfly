@@ -44,6 +44,8 @@ from encoder_lora import (
     DEFAULT_LORA_TARGETS,
     TRUNCATED_RECORDS,
     CopyHead,
+    complete_copied_words,
+    copy_excluded_ids,
     copy_with_contiguous_runs,
     copy_with_unique_positions,
     SlotRefiner,
@@ -73,6 +75,7 @@ from encoder_lora import (
     document_features,
     document_features_dual,
     document_token_embeddings,
+    document_token_ids,
     feature_channel,
     inject_lora,
     load_split,
@@ -331,6 +334,23 @@ def main():
     # With --copy-contiguous-runs: absorb a neighbouring non-copying slot whose
     # copy distribution peaks at the run's next contiguous position.
     p.add_argument("--copy-extend-runs", action="store_true")
+    # With --copy-contiguous-runs and --snap-memory all: complete each copied
+    # span to word boundaries of the source after snapping
+    # (``complete_copied_words``), shifting later slots into trailing pads.
+    p.add_argument("--copy-complete-words", action="store_true")
+    # With --copy-contiguous-runs: prefer a word-boundary-aligned span start
+    # within this log-probability margin of the best start (0 disables).
+    p.add_argument("--copy-boundary-margin", type=float, default=0.0)
+    # With --copy-contiguous-runs and --snap-memory all: a slot whose raw
+    # reader memory snaps to a record label or pad token never copies, so
+    # label slots split the value runs.
+    p.add_argument("--copy-label-split", action="store_true")
+    # With --copy-complete-words: an overflowing record drops its last copied
+    # span (the site) instead of truncating it.
+    p.add_argument("--copy-drop-overflow-run", action="store_true")
+    # With --copy-contiguous-runs: split a copying run where consecutive
+    # slots' argmax source positions jump by more than this (0 disables).
+    p.add_argument("--copy-split-jumps", type=int, default=0)
     p.add_argument(
         "--document-space-prefix",
         choices=("protocol", "on", "off"),
@@ -355,6 +375,20 @@ def main():
         p.error("choose one of --copy-unique-positions / --copy-contiguous-runs")
     if args.copy_extend_runs and not args.copy_contiguous_runs:
         p.error("--copy-extend-runs needs --copy-contiguous-runs")
+    if args.copy_boundary_margin and (
+        not args.copy_contiguous_runs or args.copy_boundary_margin < 0
+    ):
+        p.error("--copy-boundary-margin needs --copy-contiguous-runs and a value >= 0")
+    if args.copy_label_split and (
+        not args.copy_contiguous_runs or args.snap_memory != "all"
+    ):
+        p.error("--copy-label-split needs --copy-contiguous-runs and --snap-memory all")
+    if args.copy_drop_overflow_run and not args.copy_complete_words:
+        p.error("--copy-drop-overflow-run needs --copy-complete-words")
+    if args.copy_complete_words and (
+        not args.copy_contiguous_runs or args.snap_memory != "all"
+    ):
+        p.error("--copy-complete-words needs --copy-contiguous-runs and --snap-memory all")
     if args.oracle_only and (not args.oracle_prefix_probe or args.fresh_groups):
         p.error(
             "oracle-only requires the explicit control flag and cannot open fresh qualification"
@@ -383,7 +417,7 @@ def main():
         ).splitlines()
         if line.strip()
     )
-    if cotenant_mib > 16384:
+    if cotenant_mib > 40960:
         raise RuntimeError("GPU busy")
     args.output.mkdir(parents=True, exist_ok=False)
     torch.set_num_threads(4)
@@ -559,8 +593,9 @@ def main():
         if args.snap_memory == "all"
         else None
     )
+    label_token_ids = copy_excluded_ids(dec_tok) if args.copy_label_split else None
     blank_id = None
-    if args.snap_blank_below is not None:
+    if args.snap_blank_below is not None or args.copy_complete_words:
         pad = dec_tok.encode(" ", add_special_tokens=False)
         if len(pad) != 1:
             raise ValueError("record pad must be a single token")
@@ -599,6 +634,11 @@ def main():
         "copy_unique_positions": bool(args.copy_unique_positions),
         "copy_contiguous_runs": bool(args.copy_contiguous_runs),
         "copy_extend_runs": bool(args.copy_extend_runs),
+        "copy_complete_words": bool(args.copy_complete_words),
+        "copy_boundary_margin": args.copy_boundary_margin,
+        "copy_label_split": bool(args.copy_label_split),
+        "copy_drop_overflow_run": bool(args.copy_drop_overflow_run),
+        "copy_split_jumps": args.copy_split_jumps,
         "oracle_prefix_probe": args.oracle_prefix_probe,
         "oracle_only": args.oracle_only,
         "creates_derived_references": args.create_derived_reference,
@@ -819,6 +859,7 @@ def main():
                     if tuple(memories.shape) != (slots, 4096):
                         raise ValueError("candidate changed memory geometry")
                     copied = {}
+                    copy_spans = None
                     if copy_head is not None:
                         # Same gated copy as training, before any snapping;
                         # under self-context the sources are the single ids
@@ -854,14 +895,34 @@ def main():
                             )
                             copied = {"copy_reassigned_slots": reassigned}
                         elif args.copy_contiguous_runs:
-                            memories, gate, moved = copy_with_contiguous_runs(
+                            source_ids = (
+                                copy_ids
+                                if copy_ids is not None
+                                else document_token_ids(dec_tok, documents)
+                            )
+                            label_slots = None
+                            if args.copy_label_split:
+                                raw_ids = snapper(memories)[1]
+                                label_slots = [
+                                    int(i) in label_token_ids for i in raw_ids.tolist()
+                                ]
+                                copied["copy_label_slots"] = int(sum(label_slots))
+                            memories, gate, moved, copy_spans = copy_with_contiguous_runs(
                                 copy_head,
                                 memories,
                                 sources,
                                 slot_mask,
                                 extend=args.copy_extend_runs,
+                                return_spans=True,
+                                label_slots=label_slots,
+                                split_jumps=args.copy_split_jumps or None,
+                                boundary=(
+                                    (dec_tok, source_ids.tolist(), args.copy_boundary_margin)
+                                    if args.copy_boundary_margin
+                                    else None
+                                ),
                             )
-                            copied = {"copy_moved_slots": moved}
+                            copied["copy_moved_slots"] = moved
                         else:
                             memories, _, gate = copy_head(
                                 memories, sources, None, slot_mask
@@ -871,6 +932,27 @@ def main():
                     snap = {}
                     if snapper is not None:
                         memories, snap_ids, snap_top1 = snapper(memories)
+                        if args.copy_complete_words and copy_spans:
+                            completed, inserted = complete_copied_words(
+                                snap_ids.tolist(),
+                                copy_spans,
+                                source_ids.tolist(),
+                                dec_tok,
+                                blank_id,
+                                overflow=(
+                                    "drop-last-run"
+                                    if args.copy_drop_overflow_run
+                                    else "truncate"
+                                ),
+                            )
+                            snap_ids = torch.tensor(completed, device=snap_ids.device)
+                            memories = (
+                                decoder.get_input_embeddings()
+                                .weight[snap_ids]
+                                .detach()
+                                .to(memories.dtype)
+                            )
+                            copied["copy_completed_tokens"] = inserted
                         blanked = 0
                         if args.snap_blank_below is not None:
                             low = snap_top1 < args.snap_blank_below

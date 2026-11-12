@@ -1012,6 +1012,16 @@ independently by `encoder_lora_eval.py` with eight fresh post-freeze groups):
 | `tokens-copy4-v2-3072` snapped + contiguous runs, seed 7331 | 64 | 32 | 16 | 16 | 67 | 30 | 21 (held-out 5/16) |
 | `tokens-copy4-v2-3072` snapped + contiguous runs, seed 4242 | 64 | 32 | 16 | 16 | 65 | 30 | 19 (held-out 3/16) |
 | `tokens-copy14-loop4-1024` snapped + contiguous runs, seeds 20261110 / 7331 / 4242 | 64 | 32 | 16 | 16 | 74 / 77 / 75 | 32 / 30 / 30 | 26 / 31 / 29 (held-out 11 / 15 / 14) |
+| `tokens-copy11-selfonly-2048` snapped + contiguous runs + `--copy-extend-runs`, seeds 20261110 / 7331 | 64 | 32 | 16 | 16 | 75 / 77 | 32 / 30 | 27 / 31 (no change) |
+| `tokens-copy11-selfonly-2048` snapped + contiguous runs + `--copy-complete-words`, seed 20261110 | 64 | 32 | 16 | 16 | **80** | 32 | 32 (held-out 16/16) |
+| `tokens-copy11-selfonly-2048` snapped + contiguous runs + word completion, seed 7331 | 64 | 32 | 16 | 16 | 78 | 30 | 32 (held-out 16/16) |
+| `tokens-copy11-selfonly-2048` snapped + contiguous runs + word completion, seed 4242 | 64 | 32 | 16 | 16 | 77 | 29 | 32 (held-out 16/16) |
+| `tokens-copy11-selfonly-2048` snapped + contiguous runs + word completion, **16 fresh groups** (160 cases), seed 20261110 | 64 | 32 | 16 | 16 | 153/160 | 62/64 | 59/64 (held-out 28/32) |
+| same, 16 fresh groups, seed 7331 | 64 | 32 | 16 | 16 | 155/160 | 60/64 | 63/64 (held-out 31/32) |
+| same, 16 fresh groups, seed 4242 | 64 | 32 | 16 | 16 | 156/160 | 60/64 | 64/64 (held-out 32/32) |
+| `tokens-copy17-gate3-1024` (copy11 + gate weight 3, 1024 steps) snapped + contiguous runs + word completion, 16 fresh groups, seed 20261110 | 64 | 32 | 16 | 16 | 153/160 | 62/64 | 59/64 (0 wrong; held-out 28/32) |
+| same, seed 7331 | 64 | 32 | 16 | 16 | 153/160 | 60/64 | 61/64 (2 wrong; held-out 29/32) |
+| same, seed 4242 | 64 | 32 | 16 | 16 | 158/160 | 62/64 | 64/64 (held-out 32/32) |
 
 Ten training templates (`--phrasing-set v2`) did not transfer to the held-out
 sentence: fresh names rose to 12/16 and 14/16 on familiar phrasing but stayed
@@ -1356,3 +1366,50 @@ carry the gain, encoder self-context (binding) and contiguous-span decoding
 (readout); pooled context, entity tags (at any tag rate) and the looped
 reader (three or four passes) are harmful or redundant on top of them.
 Remaining misses are run-boundary errors at the copy gate, the next target.
+
+Word-boundary completion (`--copy-complete-words`, `complete_copied_words`)
+closes the run-boundary misses: after snapping, every copied span is extended
+through the source document until it starts and ends on a word boundary and
+later slots shift into the trailing pads. On `tokens-copy11-selfonly-2048`
+with contiguous-span decoding it reaches 80/78/77 of 80 fresh facts, names
+32/32 on every seed (held-out phrasing 16/16), codes 32/30/29 with no wrong
+answer, development 64/64. The five remaining misses are code abstentions
+only: one pair whose memory text is exactly right yet the frozen decoder
+declines, and sites truncated by the 16-slot budget, which the 24-slot
+continuation targets. Extending runs by a low-gate neighbour
+(`--copy-extend-runs`) changes nothing on two seeds and two names on the
+third.
+
+Wider fresh challenge (`--fresh-groups 16`, 160 cases per seed, 480 in all)
+for the deliverable: 153/155/156 of 160, 464/480 (96.7%), 5 wrong (four names
+on one seed where the " at" label slot's gate rose and glued the name and
+site runs into one span, one code with a doubled digit) and 11 abstentions
+(six sites cut by the 16-slot training record, two of the decoder declining
+a fully correct record, three mis-spanned sites); names 186/192, codes
+182/192, every control correct. Four further decoding rules were tried on
+this set and rejected: a boundary-aligned span preference (no change), a
+label-slot split keyed on the reader's raw memory (fragments value runs,
+144/160), a split at argmax jumps (98/160: per-slot positions are too noisy
+to carry structure), and dropping a cut site span (the dangling label makes
+the decoder abstain, 143/160). The remaining glued-label names and cut sites
+are training-side issues: a gate target that keeps label slots from copying,
+and a record format that fits long sites or omits the trailing " Depot".
+
+Training-side follow-ups. A code is ten decoder tokens, so " code {code} at
+{site}" with a four-token site and " Depot" is 17 tokens and the 16-slot
+record loses " Depot"; the `asked-site-bare` record drops the " code" label
+to fit, but the frozen decoder reads a label-less code as a missing fact
+(development codes 7/32 after 512 steps with the lexical loss converged), as
+the target-readability probe had already found for bare values, so that
+format is withdrawn and the six cut-site abstentions stand as a limit of the
+16-slot budget. `--copy-gate-weight` multiplies the gate BCE inside the
+pointer term for the rare label slot whose gate rises and glues two runs.
+
+The gate-weighted continuation (`tokens-copy17-gate3-1024`) scores 153/153/158
+on the wide challenge against copy11's 153/155/156 (464 each of 480): on one
+seed the four glued-label wrong names become abstentions, on another two
+new label-slot copies appear, and the third gains two codes. Wrong answers
+fall from five to two (codes 1 -> 0, names 4 -> 2) and abstentions rise from
+eleven to fourteen, so the weighting shifts the residual toward abstention
+without changing the total; both candidates are equivalent deliverables,
+copy17 the safer one where a wrong value costs more than a missing one.

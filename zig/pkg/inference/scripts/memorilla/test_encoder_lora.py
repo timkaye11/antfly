@@ -799,6 +799,7 @@ def test_continuation_rejects_document_feature_or_lexical_objective_changes():
         ("copy_head", True),
         ("copy_head_temperature", 0.05),
         ("copy_pointer_weight", 0.5),
+        ("copy_gate_weight", 3.0),
         ("copy_head_lr", 1e-4),
         ("entity_tag_lr", 5e-3),
         ("entity_tag_max_norm", 0.5),
@@ -870,6 +871,9 @@ def test_lexical_record_reads_holder_and_code_from_source_only(tmp_path):
             f" code {code} at {site}"
             if code_question
             else f" key holder {holder} at {site}"
+        )
+        assert lexical_record_text(case, "asked-site-bare") == (
+            f" {code} at {site}" if code_question else f" key holder {holder} at {site}"
         )
     try:
         lexical_record_text(original[0], "none")
@@ -3422,3 +3426,162 @@ def test_extended_runs_absorb_a_low_gate_slot_pointing_at_the_next_token():
     # Slot 4 (not contiguous) keeps its plain soft output.
     assert torch.equal(out[4], plain[4])
     assert torch.allclose(out[1], gates[1] * tokens[3] + (1 - gates[1]) * memories[1], atol=1e-6)
+
+
+def test_completed_words_extend_copied_spans_to_word_boundaries():
+    from encoder_lora import complete_copied_words, token_continues_word
+
+    class Tok:
+        words = {1: " key", 2: " holder", 3: " Kit", 4: "ima", 5: " Dab", 6: "oco", 7: " at",
+                 8: " Mo", 9: "zeba", 10: " Depot", 11: ".", 0: " ", 12: " code", 13: " N", 14: "q6", 15: "-00", 16: "1844"}
+
+        def decode(self, ids):
+            return "".join(self.words[i] for i in ids)
+
+    tok = Tok()
+    assert token_continues_word(tok, 4) and token_continues_word(tok, 16) and token_continues_word(tok, 15)
+    assert not token_continues_word(tok, 3) and not token_continues_word(tok, 11) and not token_continues_word(tok, 0)
+    # Source: " Kit ima  Dab oco  at  Mo zeba  Depot ."
+    source = [3, 4, 5, 6, 7, 8, 9, 10, 11]
+    # Record (10 slots): key holder [Kit ima Dab] at [zeba Depot] pad pad pad
+    record = [1, 2, 3, 4, 5, 7, 9, 10, 0, 0]
+    spans = [(2, 5, 0), (6, 8, 6)]
+    ids, inserted = complete_copied_words(record, spans, source, tok, 0)
+    assert ids == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] and inserted == 2
+    # Overflow drops trailing pads first, then the final tokens.
+    short = complete_copied_words(record[:9], spans, source, tok, 0)[0]
+    assert short == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    # Or, under drop-last-run, the whole last copied span goes instead.
+    dropped = complete_copied_words(
+        record[:9], spans, source, tok, 0, overflow="drop-last-run"
+    )[0]
+    assert dropped == [1, 2, 3, 4, 5, 6, 7, 0, 0]
+    # A full record whose last span is followed in the source by a new word
+    # (" Depot" after the site) drops that span under drop-last-run.
+    full_record = [12, 13, 14, 15, 16, 7, 8, 9]  # " code N q6 -00 1844 at Mo zeba" (8 slots, full)
+    full_source = [12, 13, 14, 15, 16, 7, 8, 9, 10, 11]
+    kept = complete_copied_words(full_record, [(1, 5, 1), (6, 8, 6)], full_source, tok, 0)[0]
+    assert kept == full_record
+    dropped_full = complete_copied_words(
+        full_record, [(1, 5, 1), (6, 8, 6)], full_source, tok, 0, overflow="drop-last-run"
+    )[0]
+    assert dropped_full == [12, 13, 14, 15, 16, 7, 0, 0]
+    # ...but not when the source continues with punctuation.
+    ends = complete_copied_words(
+        [12, 13, 14, 15, 16, 7, 8, 9], [(1, 5, 1), (6, 8, 6)], [12, 13, 14, 15, 16, 7, 8, 9, 11], tok, 0, overflow="drop-last-run"
+    )[0]
+    assert ends == [12, 13, 14, 15, 16, 7, 8, 9]
+    try:
+        complete_copied_words(record, spans, source, tok, 0, overflow="shrink")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("accepted an unknown overflow policy")
+    # A span already on word boundaries is unchanged.
+    same, n = complete_copied_words([1, 2, 3, 4, 0], [(2, 4, 0)], source, tok, 0)
+    assert same == [1, 2, 3, 4, 0] and n == 0
+    try:
+        complete_copied_words(record, [(2, 5, 8)], source, tok, 0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("accepted a span past the source end")
+
+
+def test_boundary_margin_prefers_a_word_aligned_span_within_the_margin():
+    from encoder_lora import CopyHead, copy_with_contiguous_runs
+
+    class Tok:
+        words = {0: " Hoh", 1: "ebo", 2: " at", 3: " Z", 4: "eh", 5: "isi"}
+
+        def decode(self, ids):
+            return "".join(self.words[i] for i in ids)
+
+    torch.manual_seed(8)
+    width = 16
+    tokens = torch.nn.functional.normalize(torch.randn(6, width), dim=-1)
+    head = CopyHead(width, 0.05)
+    # Two copying slots read a span of length 2; the memories point at
+    # positions 1,2 ("ebo"," at": off by one, mid-word start) with slightly
+    # higher confidence than the aligned 0,1 (" Hoh","ebo").
+    memories = torch.stack([0.6 * tokens[1] + 0.5 * tokens[0], 0.6 * tokens[2] + 0.5 * tokens[1]])
+    original = head.forward_detailed
+
+    def patched(m, t, token_mask=None, slot_mask=None):
+        out, logits, gl = original(m, t, token_mask, slot_mask)
+        return out, logits, torch.full_like(gl, 6.0)
+
+    head.forward_detailed = patched
+    _, _, _, spans = copy_with_contiguous_runs(head, memories, tokens, return_spans=True)
+    assert spans == [(0, 2, 1)]
+    _, _, _, aligned = copy_with_contiguous_runs(
+        head, memories, tokens, return_spans=True, boundary=(Tok(), list(range(6)), 50.0)
+    )
+    assert aligned == [(0, 2, 0)]
+    # A margin too small to reach the aligned start keeps the best start.
+    _, _, _, kept = copy_with_contiguous_runs(
+        head, memories, tokens, return_spans=True, boundary=(Tok(), list(range(6)), 1e-6)
+    )
+    assert kept == [(0, 2, 1)]
+
+
+def test_label_slots_split_copying_runs():
+    from encoder_lora import CopyHead, copy_with_contiguous_runs
+
+    torch.manual_seed(9)
+    width = 16
+    tokens = torch.nn.functional.normalize(torch.randn(8, width), dim=-1)
+    head = CopyHead(width, 0.05)
+    # Slots 0,1 read 2,3; slot 2 is a label slot with a high gate; slots 3,4
+    # read 6,7. Without the split the five slots form one run.
+    memories = torch.stack([tokens[2], tokens[3], tokens[0], tokens[6], tokens[7]])
+    original = head.forward_detailed
+
+    def patched(m, t, token_mask=None, slot_mask=None):
+        out, logits, gl = original(m, t, token_mask, slot_mask)
+        return out, logits, torch.full_like(gl, 6.0)
+
+    head.forward_detailed = patched
+    _, _, _, merged = copy_with_contiguous_runs(head, memories, tokens, return_spans=True)
+    assert len(merged) == 1 and merged[0][:2] == (0, 5)
+    _, _, _, split = copy_with_contiguous_runs(
+        head, memories, tokens, return_spans=True, label_slots=[False, False, True, False, False]
+    )
+    assert split == [(0, 2, 2), (3, 5, 6)]
+    try:
+        copy_with_contiguous_runs(head, memories, tokens, label_slots=[True])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("accepted a label mask of the wrong length")
+
+
+def test_split_jumps_separates_glued_runs_and_silences_the_label_between():
+    from encoder_lora import CopyHead, copy_with_contiguous_runs
+
+    torch.manual_seed(10)
+    width = 16
+    tokens = torch.nn.functional.normalize(torch.randn(12, width), dim=-1)
+    head = CopyHead(width, 0.05)
+    # Name slots 0,1 -> 2,3; glue slot 2 -> 9 (arbitrary); site slots 3,4 -> 6,7.
+    memories = torch.stack([tokens[2], tokens[3], tokens[9], tokens[6], tokens[7]])
+    original = head.forward_detailed
+
+    def patched(m, t, token_mask=None, slot_mask=None):
+        out, logits, gl = original(m, t, token_mask, slot_mask)
+        return out, logits, torch.full_like(gl, 6.0)
+
+    head.forward_detailed = patched
+    _, _, _, glued = copy_with_contiguous_runs(head, memories, tokens, return_spans=True)
+    assert len(glued) == 1
+    out, gate, _, split = copy_with_contiguous_runs(
+        head, memories, tokens, return_spans=True, split_jumps=2
+    )
+    assert split == [(0, 2, 2), (3, 5, 6)]
+    # The sandwiched glue slot keeps its plain soft output (it no longer copies).
+    plain = original(memories[None], tokens[None])[0][0]
+    assert torch.equal(out[2], plain[2])
+    # A duplicate inside a value (step 0) does not split the run.
+    dup = torch.stack([tokens[2], tokens[2], tokens[4]])
+    _, _, _, one = copy_with_contiguous_runs(head, dup, tokens, return_spans=True, split_jumps=2)
+    assert len(one) == 1

@@ -56,9 +56,16 @@ DOCUMENT_FEATURE_MODES = (
 )
 RELEASED_MEMORY_SLOTS = 16
 MAX_MEMORY_SLOTS = 64
-LEXICAL_RECORDS = ("none", "owner-code", "asked-first", "site-asked", "asked-site")
+LEXICAL_RECORDS = (
+    "none",
+    "owner-code",
+    "asked-first",
+    "site-asked",
+    "asked-site",
+    "asked-site-bare",
+)
 # Records whose asked field leads may drop trailing tokens beyond the slots.
-TRUNCATED_RECORDS = ("asked-first", "asked-site")
+TRUNCATED_RECORDS = ("asked-first", "asked-site", "asked-site-bare")
 LEXICAL_OBJECTIVES = ("cosine", "token-ce")
 # Canonical order for encoder adapter targets (attention, then MLP).
 LORA_TARGET_MODULES = (
@@ -168,6 +175,7 @@ def continuation_contract(parent, current, completed_step):
         ("copy_head", False),
         ("copy_head_temperature", None),
         ("copy_pointer_weight", 0),
+        ("copy_gate_weight", 1.0),
         ("copy_head_lr", None),
         ("entity_tag_lr", None),
         ("entity_tag_max_norm", None),
@@ -988,11 +996,16 @@ def lexical_record_text(case, record="owner-code"):
     if record not in LEXICAL_RECORDS[1:]:
         raise ValueError("unknown lexical record form")
     site, name_value, code_value = lexical_record_fields(case)
-    if record == "asked-site":
+    if record in ("asked-site", "asked-site-bare"):
         # Asked field first, so its tokens occupy fixed slots regardless of the
         # site's token count; the site binding trails (read 64/64 by the frozen
-        # decoder in target-readability).
+        # decoder in target-readability). ``asked-site-bare`` drops the " code"
+        # label: a code is ten decoder tokens, and with the label a site of
+        # four tokens plus " Depot" overflows the 16-slot record (17), so the
+        # trailing " Depot" was cut and the decoder read a mismatched site.
         if asked_field(case["question"]) == "code":
+            if record == "asked-site-bare":
+                return f" {code_value} at {site}"
             return f" code {code_value} at {site}"
         return f" key holder {name_value} at {site}"
     if record == "site-asked":
@@ -1367,7 +1380,16 @@ def copy_with_unique_positions(
 
 
 def copy_with_contiguous_runs(
-    copy_head, memories, token_embeddings, slot_mask=None, min_gate=0.5, extend=False
+    copy_head,
+    memories,
+    token_embeddings,
+    slot_mask=None,
+    min_gate=0.5,
+    extend=False,
+    return_spans=False,
+    boundary=None,
+    label_slots=None,
+    split_jumps=None,
 ):
     """Inference-time copy where each run of copying slots reads one contiguous
     source span.
@@ -1400,6 +1422,15 @@ def copy_with_contiguous_runs(
     log_probs = logits.log_softmax(dim=-1)
     argmax = log_probs.argmax(dim=-1)
     copying = [float(g) >= min_gate for g in gate]
+    if label_slots is not None:
+        # Slots whose own memory is a record label (" at", " key holder",
+        # " code", the pad) generate rather than copy whatever their gate
+        # says; a label slot with a high gate would otherwise glue the value
+        # runs on both sides into one span ("Cipapuu Ruzepu" for
+        # "Cipapu at Ruzepu").
+        if len(label_slots) != len(copying):
+            raise ValueError("label slot mask needs one flag per slot")
+        copying = [c and not bool(l) for c, l in zip(copying, label_slots)]
     runs, start = [], None
     for slot, flag in enumerate(copying + [False]):
         if flag and start is None:
@@ -1407,6 +1438,35 @@ def copy_with_contiguous_runs(
         elif not flag and start is not None:
             runs.append((start, slot))
             start = None
+    if split_jumps is not None and runs:
+        # Two values glued by a label slot whose gate rose above the threshold
+        # ("Cipapu at Ruzepu" read as one run) show up as a jump in the slots'
+        # argmax source positions: inside one value consecutive slots point
+        # at consecutive positions give or take a duplicate, across the glue
+        # they jump. Split a run where the step differs from +1 by more than
+        # ``split_jumps``; a single slot left between two runs is the label
+        # and stops copying.
+        pieces = []
+        for begin, end in runs:
+            cut = begin
+            for slot in range(begin + 1, end):
+                if abs(int(argmax[slot]) - int(argmax[slot - 1]) - 1) > split_jumps:
+                    pieces.append((cut, slot))
+                    cut = slot
+            pieces.append((cut, end))
+        runs = []
+        for index, (begin, end) in enumerate(pieces):
+            sandwiched = (
+                end - begin == 1
+                and index > 0
+                and index + 1 < len(pieces)
+                and pieces[index - 1][1] == begin
+                and pieces[index + 1][0] == end
+            )
+            if sandwiched:
+                copying[begin] = False
+            else:
+                runs.append((begin, end))
     positions = log_probs.shape[1]
     if extend and runs:
         # A run boundary is decided by the gate, which can fall under the
@@ -1449,7 +1509,7 @@ def copy_with_contiguous_runs(
         scored.append((begin, end, scores))
     scored.sort(key=lambda item: -float(item[2].max()))
     tokens = token_embeddings.detach().float()
-    taken, moved = set(), 0
+    taken, moved, spans = set(), 0, []
     for begin, end, scores in scored:
         length = end - begin
         order = torch.argsort(scores, descending=True).tolist()
@@ -1462,10 +1522,36 @@ def copy_with_contiguous_runs(
             ),
             None,
         )
+        if chosen is not None and boundary is not None:
+            # ``boundary`` = (tokenizer, source ids, margin): among the starts
+            # within ``margin`` log-probability of the best, prefer one whose
+            # span begins and ends on word boundaries of the source; a span
+            # that is off by one token ("ebo" of "Hohebo" read as "eb"+"obo")
+            # otherwise survives and word completion then lengthens the
+            # wrong answer instead of fixing it.
+            tokenizer, source_ids, margin = boundary
+            aligned = next(
+                (
+                    s
+                    for s in order
+                    if torch.isfinite(scores[s])
+                    and float(scores[chosen] - scores[s]) <= margin
+                    and not any(s + k in taken for k in range(length))
+                    and not token_continues_word(tokenizer, source_ids[s])
+                    and (
+                        s + length >= len(source_ids)
+                        or not token_continues_word(tokenizer, source_ids[s + length])
+                    )
+                ),
+                None,
+            )
+            if aligned is not None:
+                chosen = aligned
         if chosen is None:
             chosen = next((s for s in order if torch.isfinite(scores[s])), None)
         if chosen is None:
             continue
+        spans.append((begin, end, chosen))
         for k in range(length):
             slot, source = begin + k, chosen + k
             taken.add(source)
@@ -1473,7 +1559,90 @@ def copy_with_contiguous_runs(
                 moved += 1
             g = gate[slot] if slot not in forced else gate.new_ones(())
             output[slot] = g * tokens[source] + (1 - g) * memories[slot].float()
+    if return_spans:
+        return output, gate, moved, sorted(spans)
     return output, gate, moved
+
+
+def token_continues_word(tokenizer, token_id):
+    """Whether a decoder token continues the word before it: no leading space
+    and only letters, digits or hyphens (code pieces such as ``-00``)."""
+    text = tokenizer.decode([int(token_id)])
+    body = text.strip()
+    return bool(body) and not text.startswith(" ") and all(
+        c.isalnum() or c == "-" for c in body
+    )
+
+
+def token_starts_word(tokenizer, token_id):
+    """Whether a decoder token begins a new alphanumeric word (leading space,
+    letters or digits), as the " Depot" of a site after its name."""
+    text = tokenizer.decode([int(token_id)])
+    body = text.strip()
+    return text.startswith(" ") and bool(body) and body.isalnum()
+
+
+def complete_copied_words(
+    slot_ids, spans, source_ids, tokenizer, pad_id, overflow="truncate"
+):
+    """Snapped slot ids [S] -> ids [S] where every copied span starts and ends
+    on a word boundary of its source document.
+
+    ``spans`` are ``(begin, end, start)`` from ``copy_with_contiguous_runs``:
+    record slots ``begin:end`` read source positions ``start:start+end-begin``.
+    A span whose last source token is followed by word-continuing tokens (the
+    "oco" of "Daboco" after a run that stopped at "Dab") takes them; a span
+    whose first token itself continues a word (the "zeba" of " Mozeba") takes
+    the preceding tokens back to the word start. Later slots shift right into
+    the trailing pads; when the record overflows, trailing pads go first and
+    then the final tokens, as the training records were truncated; with
+    ``overflow="drop-last-run"`` an overflowing record instead loses its last
+    copied span entirely (the site after a long code or name), since the
+    decoder abstains on a truncated site but answers from a value whose site
+    is simply absent. The same policy drops the last span of a record that is
+    full (no pad left) when its source continues with a new word (" Depot"
+    after " Cibipu"): the training record was truncated there and the decoder
+    reads the shortened site as a mismatch. Returns ``(ids, inserted)``.
+    """
+    if overflow not in ("truncate", "drop-last-run"):
+        raise ValueError("unknown overflow policy")
+    slot_ids = [int(i) for i in slot_ids]
+    source_ids = [int(i) for i in source_ids]
+    size, cursor, inserted, pieces = len(slot_ids), 0, 0, []
+    last_run, last_source_end = None, None
+    for begin, end, start in sorted(spans):
+        if not 0 <= begin < end <= size or not 0 <= start <= len(source_ids) - (end - begin):
+            raise ValueError("copied span does not fit the record or the source")
+        pieces.extend(slot_ids[cursor:begin])
+        first, last = start, start + (end - begin)
+        while first > 0 and token_continues_word(tokenizer, source_ids[first]):
+            first -= 1
+            inserted += 1
+        while last < len(source_ids) and token_continues_word(tokenizer, source_ids[last]):
+            last += 1
+            inserted += 1
+        last_run = (len(pieces), len(pieces) + (last - first))
+        last_source_end = last
+        pieces.extend(source_ids[first:last])
+        cursor = end
+    pieces.extend(slot_ids[cursor:])
+    while len(pieces) > size and pieces and pieces[-1] == pad_id:
+        pieces.pop()
+    if overflow == "drop-last-run" and last_run is not None:
+        full = len(pieces) >= size and pad_id not in pieces[last_run[1] :]
+        continues = (
+            full
+            and last_source_end < len(source_ids)
+            and token_starts_word(tokenizer, source_ids[last_source_end])
+        )
+        if len(pieces) > size or continues:
+            pieces = pieces[: last_run[0]] + pieces[last_run[1] :]
+            while len(pieces) > size and pieces and pieces[-1] == pad_id:
+                pieces.pop()
+    while len(pieces) > size:
+        pieces.pop()
+    pieces.extend([pad_id] * (size - len(pieces)))
+    return pieces, inserted
 
 
 def copy_excluded_ids(tokenizer, labels=COPY_LABEL_TEXTS):
@@ -2188,6 +2357,9 @@ def main():
     train.add_argument("--dual-layer", type=int)
     train.add_argument("--copy-head", action="store_true")
     train.add_argument("--copy-pointer-weight", type=float, default=0.0)
+    # Multiplier on the gate BCE inside the pointer term; a label slot whose
+    # gate rose above 0.5 glued two value runs in 4 of 480 wide cases.
+    train.add_argument("--copy-gate-weight", type=float, default=1.0)
     train.add_argument("--copy-head-lr", type=float)
     train.add_argument("--entity-tag-lr", type=float)
     train.add_argument("--entity-tag-max-norm", type=float)
@@ -2318,7 +2490,8 @@ def run(args):
     if not 1.0 <= args.lexical_name_weight <= 8.0 or (
         args.lexical_name_weight != 1.0
         and (
-            args.lexical_objective != "token-ce" or args.lexical_record != "asked-site"
+            args.lexical_objective != "token-ce"
+            or args.lexical_record not in ("asked-site", "asked-site-bare")
         )
     ):
         raise ValueError(
@@ -2347,6 +2520,9 @@ def run(args):
     ):
         raise ValueError("copy head learning rate needs --copy-head and 0<lr<=1e-3")
     protocol["copy_pointer_weight"] = args.copy_pointer_weight
+    if not 0 < args.copy_gate_weight <= 10:
+        raise ValueError("copy gate weight must be within (0, 10]")
+    protocol["copy_gate_weight"] = args.copy_gate_weight
     protocol["copy_head_lr"] = args.copy_head_lr
     # The tag table is five rows; at the reader's rate it moves a few percent
     # of a unit row in 2048 steps (copy8: norms 0.02-0.11), so it may take its
@@ -3157,7 +3333,9 @@ def run(args):
         pointer_values.append(float(pointer_loss.detach()))
         gate_values.append(float(gate_loss.detach()))
         copyable_fractions.append(float(copyable.float().mean()))
-        return args.copy_pointer_weight * (pointer_loss + gate_loss)
+        return args.copy_pointer_weight * (
+            pointer_loss + args.copy_gate_weight * gate_loss
+        )
 
     def encode(tokens):
         """Encoder states for the configured source: one tensor, or the
