@@ -1411,5 +1411,159 @@ seed the four glued-label wrong names become abstentions, on another two
 new label-slot copies appear, and the third gains two codes. Wrong answers
 fall from five to two (codes 1 -> 0, names 4 -> 2) and abstentions rise from
 eleven to fourteen, so the weighting shifts the residual toward abstention
-without changing the total; both candidates are equivalent deliverables,
-copy17 the safer one where a wrong value costs more than a missing one.
+without changing the total; both candidates are equivalent on accuracy, and
+copy17 is the chosen deliverable because a wrong value costs more than a
+missing one in a retrieval setting. Decode it with `--snap-memory all
+--copy-contiguous-runs --copy-complete-words`.
+
+### Native export
+
+`encoder_lora_export.py` turns the chosen candidate into the three inputs the
+Zig port (`docs/plans/memorilla-copy17-native.md`, section 5.1) consumes,
+plus fixtures that record every boundary of the evaluator's own decode path.
+Nothing it writes is a release artifact; the copy head ships unchanged
+(`copy-head.safetensors`, three F32 tensors).
+
+```sh
+B=.benchmark-results/memorilla/encoder-lora-next
+A=/path/to/.benchmark-assets/memorilla
+S=zig/pkg/inference/scripts/memorilla/encoder_lora_export.py
+# Base encoder shards with W + (alpha/rank) * B @ A folded into every
+# layers.N.self_attn.{q,v}_proj.weight (FP32 merge, stored F32; every other
+# tensor and side file copied byte for byte, dot-files such as the source's
+# managed-download marker skipped because they bind the original shard
+# bytes). Writes merge.json with per-tensor max |delta|, then the managed
+# research sidecars described below. The source must be the released
+# catalog encoder (canonical model_manifest.json, base_models.json revision).
+python $S merge-encoder --candidate $B/tokens-copy17-gate3-1024 \
+  --encoder-f32 $A/managed-f32/encoder --output $B/lora-merged-encoder
+# Rewrite only the sidecars of an existing merged directory (shards are
+# hashed, never rewritten); --candidate is optional and cross-checked.
+python $S merge-encoder --output $B/lora-merged-encoder --sidecars-only
+# reader.safetensors -> non-release split-q/k/v bundle whose execution
+# contract declares encoder_pooling per-token-dual-layer-l2-normalized-v1
+# and which carries copy-head.safetensors, candidate.json and protocol.json
+# from the candidate, pinned in manifest.json `files`.
+python $S export-reader --candidate $B/tokens-copy17-gate3-1024 \
+  --output $B/lora-reader-bundle
+# Case lists: the 64 development cases and the evaluator's post-freeze
+# challenge (--fresh-groups 8 --fresh-seed 20261110 -> 80 cases).
+python $S dev-cases --data $B/data-paired-v2 --output $B/lora-ref-dev.json
+python $S fresh-cases --data $B/data-paired-v2 --groups 8 --seed 20261110 \
+  --prior-training-data $B/data-spelled --prior-training-data $B/data-paired \
+  --prior-training-data .benchmark-results/memorilla/encoder-lora-20261110/data \
+  --output $B/lora-ref-fresh.json
+# GPU: the evaluator's copy17 path (--snap-memory all --copy-contiguous-runs
+# --copy-complete-words) through the same helper functions, one fixture
+# directory per case list: reference.json + reference.safetensors with
+# <case>.{docs,query,memories,copy_output,gate,logits} in F32.
+python $S reference --candidate $B/tokens-copy17-gate3-1024 \
+  --cases $B/lora-ref-dev.json --output $B/lora-ref-dev --assets $A
+```
+
+`--assets` expands to `models/qwen3-embedding-4b`, `models/qwen3-8b`,
+`checkpoints/stage3` and `upstream`; `--encoder`, `--decoder`,
+`--checkpoint` and `--upstream-source` override each. The reference command
+waits for an idle GPU before loading. `test_encoder_lora_export.py` covers
+the merge bytes, the sidecar contents and `--sidecars-only` idempotence, the
+non-release bundle contract with its pins and the fixture round trip on
+synthetic tensors.
+
+Managed research sidecars (`merge-encoder` writes them after `merge.json`,
+in this order; `--sidecars-only` replaces them byte-deterministically):
+
+- `memorilla_lock.json`: `{"schema": "antfly.memorilla.research-encoder-lock.v1",
+  "candidate_sha256": <sha256 of candidate.json>, "base": {"model", "revision"}
+  (from `base_models.json`), "files": [{"path", "size_bytes", "sha256"}]}`
+  sorted by path over every regular non-dot file except the sidecars: the
+  two shards, `model.safetensors.index.json`, `merge.json`, `config.json`,
+  the tokenizer files and the sentence-transformers side files
+  (`1_Pooling/config.json`, `modules.json`, ...). Same `files` shape as the
+  v1 lock the Zig qualification code already verifies.
+- `model_manifest.json`: the catalog's canonical encoder manifest with
+  `"memorilla_profile":"qwen3_encoder_lora_research_f32_v1"` in place of
+  `qwen3_encoder_f32_v1`, byte for byte (`RESEARCH_ENCODER_MANIFEST`,
+  sha256 `44ada04c47c6e91784346ba7bcf7ae80b0aa55467870fab2077d4885af5625ae`).
+  The Zig research profile compares the file against this exact string; the
+  offline Qwen3 embedding reference session must learn the tag before it can
+  open the directory again.
+- `.antfly-download-complete.json`: version-1 managed receipt
+  (`registry/managed_receipt.zig`) whose `artifacts` pin every regular
+  non-dot file with `path`, `size` and `sha256`, including
+  `model_manifest.json`, `memorilla_lock.json` and `merge.json`; its `source`
+  block names the base model (`owner`, `name`), the research variant
+  `memorilla-encoder-lora-research-f32-v1`, the base revision and a `merge`
+  sub-block with the candidate, adapter, `merge.json` and lock digests.
+  Version 1 keeps `managedDownloadMatchesSource` from mistaking the
+  directory for a Hub download. The receipt is written last, so the
+  publication generation (sha256 of the receipt) covers every sidecar.
+
+The reader bundle holds `manifest.json`, `config.json`, `memory.safetensors`,
+`copy-head.safetensors`, `candidate.json` and `protocol.json`; all five data
+files are pinned in `manifest.json` `files` and `source.candidate_sha256`
+equals `files["candidate.json"].sha256`, which the Zig side cross-checks
+against the encoder lock's `candidate_sha256`. `exporter.load_bundle` verifies
+every pin; release bundles still carry exactly `config.json` and
+`memory.safetensors`.
+
+### Native verification of the research candidate
+
+`antfly-memorilla-lora-verify` runs the exported candidate end to end on CUDA
+in strict F32 and compares every stage with the fixtures above: document rows
+and query (features), reader memories, copy-head logits/gate/output, spans,
+snapped and completed ids, prompt ids, generated ids and the answer text.
+The merged encoder loads through the offline Qwen3 embedding reference
+session (its `model_manifest.json` carries the research profile tag
+`qwen3_encoder_lora_research_f32_v1`), the reader bundle through
+`Bundle.open(.., allow_synthetic = true)`, and the decoder through the
+managed F32 profile.
+
+```bash
+cd zig/pkg/inference
+ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-cache/global" ZIG_LOCAL_CACHE_DIR="$PWD/.zig-cache" \
+  zig build build-memorilla-lora-verify -Dcuda=true -Doptimize=ReleaseFast -j2
+B=../../../.benchmark-results/memorilla/encoder-lora-next
+./zig-out/bin/antfly-memorilla-lora-verify \
+  --candidate $B/tokens-copy17-gate3-1024 --reader-bundle $B/lora-reader-bundle \
+  --encoder $B/lora-merged-encoder --decoder <managed-f32 decoder dir> \
+  --reference $B/lora-ref-dev --output $B/lora-verify-dev-summary.json > $B/lora-verify-dev.jsonl
+```
+
+Flags: `--max-cases N`, `--skip-decoder`, `--reference-features` (feed the
+fixture rows to the reader; isolates reader/copy/decoder), `--reference-memories`
+(feed the fixture memories to the copy head), `--atol/--rtol` for the stage
+diagnostics. Output is JSON lines (`ready`, one `case` per fixture with stage
+statistics, id agreement flags and per-stage milliseconds, `complete`).
+
+Results on 2026-11-12: dev 64/64 identical answers to Python (all correct);
+fresh challenge 80 cases, 79 identical answers, Zig 78 correct against
+Python's 79 (one gate at the 0.5 threshold shortens a site run without
+changing the answer; one cut-site record decodes as UNKNOWN in F32 where the
+BF16 decoder returned the code). See `docs/plans/memorilla-copy17-native.md`.
+
+### Managed research profile verification
+
+`antfly-memorilla-lora-serve-verify` drives the actual managed service
+(`memorilla_research_service`, the same code the HTTP handler calls for a
+profile with `reader_kind: "encoder_lora_research"`) through a real
+`ModelManager` over the reference cases: the merged encoder loads as a
+managed research publication (receipt + `memorilla_lock.json` +
+`memorilla_profile: qwen3_encoder_lora_research_f32_v1`), the reader bundle
+through the research reader cache, and every request must refund its
+admission.
+
+```bash
+cd zig/pkg/inference
+zig build build-memorilla-lora-serve-verify -Dcuda=true -Doptimize=ReleaseFast -j2
+B=../../../.benchmark-results/memorilla/encoder-lora-next
+./zig-out/bin/antfly-memorilla-lora-serve-verify --encoder $B/lora-merged-encoder \
+  --decoder <managed-f32 decoder dir> --bundle $B/lora-reader-bundle \
+  --reference $B/lora-ref-dev --budget-gib 112 --output $B/lora-serve-dev-summary.json > $B/lora-serve-dev.jsonl
+```
+
+`--budget-gib` is the process cap; the shared unified admission limit is 75%
+of it and the two F32 models plus one request need about 73 GiB, so 96 GiB
+is not enough. Output is JSON lines (`ready`, `case` with answer agreement,
+identities, candidate/module digests and stage timestamps, `retained`,
+`complete`). The serving contract (config, request, response, limits) is in
+`docs/design/inference/memorilla-serving.md`, "Research profile".

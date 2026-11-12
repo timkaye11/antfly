@@ -23,6 +23,7 @@ const memory = @import("../runtime/root.zig").tier.memory;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const cuda = if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig") else struct {};
 const A = std.mem.Allocator;
+const this_module = @This();
 pub const parameter_bytes: usize = 776_495_104;
 
 pub fn weightPlan() memory.AdmissionAmounts {
@@ -75,6 +76,12 @@ fn requireRelease(bundle: *const module.Bundle) !void {
 }
 
 pub const Owner = struct {
+    /// The module providing `weightPlan`, `requireLimits`, `requireAdmission`
+    /// for `memorilla_reader_cache.ReaderCache(Owner)`.
+    pub const runtime = this_module;
+    /// Files whose identity the reader cache fences between requests.
+    pub const identity_files = [_][]const u8{ "manifest.json", "config.json", "memory.safetensors" };
+
     allocator: A,
     bundle: module.Bundle,
     compute: if (build_options.enable_cuda) *cuda.CudaCompute else void,

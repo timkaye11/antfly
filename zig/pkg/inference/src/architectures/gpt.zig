@@ -3458,6 +3458,49 @@ pub fn hiddenForward(
     return cb.toFloat32(hidden, allocator);
 }
 
+/// Host F32 hidden states with an optional intermediate-layer tap.
+/// `last_hidden_state` is the output after the final norm, `[batch, seq, H]`.
+/// `tap` is HF `hidden_states[k]`: the residual stream after 0-based decoder
+/// layer `k - 1`, before the final norm, same geometry. Null when no tap was
+/// requested.
+pub const TappedHidden = struct {
+    last_hidden_state: []f32,
+    tap: ?[]f32,
+
+    pub fn deinit(self: *TappedHidden, allocator: std.mem.Allocator) void {
+        allocator.free(self.last_hidden_state);
+        if (self.tap) |values| allocator.free(values);
+        self.* = undefined;
+    }
+};
+
+/// Resident variant of `TappedHidden`: the final hidden stays on the backend,
+/// the tap is already a host F32 copy (taken right after its layer ran).
+pub const TappedResident = struct {
+    hidden: CT,
+    tap: ?[]f32,
+};
+
+/// `hiddenForward` plus HF `hidden_states[tap_layer]` as a second host tensor.
+/// `tap_layer` must be in `1..=num_hidden_layers` (`0`, the embeddings, is not
+/// served); a null tap takes exactly the `hiddenForward` path.
+pub fn hiddenForwardTapped(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    tap_layer: ?usize,
+) !TappedHidden {
+    const resident = try hiddenForwardResidentWithOverridesTapped(cb, allocator, config, input_ids, batch, seq_len, decode_context, .{}, tap_layer);
+    defer cb.free(resident.hidden);
+    errdefer if (resident.tap) |values| allocator.free(values);
+    const last_hidden_state = try cb.toFloat32(resident.hidden, allocator);
+    return .{ .last_hidden_state = last_hidden_state, .tap = resident.tap };
+}
+
 pub fn hiddenForwardResident(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -4208,6 +4251,22 @@ pub fn hiddenForwardResidentWithOverrides(
     decode_context: ?*const DecodeContext,
     raw_overrides: Layer0DecoderOverrides,
 ) !CT {
+    const result = try hiddenForwardResidentWithOverridesTapped(cb, allocator, config, input_ids, batch, seq_len, decode_context, raw_overrides, null);
+    std.debug.assert(result.tap == null);
+    return result.hidden;
+}
+
+pub fn hiddenForwardResidentWithOverridesTapped(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    raw_overrides: Layer0DecoderOverrides,
+    tap_layer: ?usize,
+) !TappedResident {
     const hidden_size = config.hidden_size;
     const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
     const total = batch * query_seq_len;
@@ -4222,7 +4281,7 @@ pub fn hiddenForwardResidentWithOverrides(
     const ple_vectors = try computePleVectors(cb, allocator, config, input_ids, hidden, total);
     defer if (ple_vectors) |pv| cb.free(pv);
 
-    return hiddenForwardFromEmbeddingsResidentWithOverrides(cb, allocator, config, hidden, batch, seq_len, decode_context, ple_vectors, raw_overrides);
+    return hiddenForwardFromEmbeddingsResidentWithOverridesTapped(cb, allocator, config, hidden, batch, seq_len, decode_context, ple_vectors, raw_overrides, tap_layer);
 }
 
 pub fn hiddenForwardFromEmbeddings(
@@ -4264,11 +4323,36 @@ pub fn hiddenForwardFromEmbeddingsResidentWithOverrides(
     ple_vectors: ?CT,
     raw_overrides: Layer0DecoderOverrides,
 ) !CT {
+    const result = try hiddenForwardFromEmbeddingsResidentWithOverridesTapped(cb, allocator, config, hidden_input, batch, seq_len, decode_context, ple_vectors, raw_overrides, null);
+    std.debug.assert(result.tap == null);
+    return result.hidden;
+}
+
+/// `tap_layer` (HF `hidden_states[k]` index, `1..=num_hidden_layers`) copies
+/// the residual stream to host F32 right after decoder layer `k - 1` ran and
+/// before the final norm. Null performs no extra work and no allocation.
+pub fn hiddenForwardFromEmbeddingsResidentWithOverridesTapped(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden_input: CT,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    ple_vectors: ?CT,
+    raw_overrides: Layer0DecoderOverrides,
+    tap_layer: ?usize,
+) !TappedResident {
     const hidden_size = config.hidden_size;
     const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
     const total = batch * query_seq_len;
     var hidden = hidden_input;
     errdefer cb.free(hidden);
+    if (tap_layer) |k| {
+        if (k == 0 or k > config.num_hidden_layers) return error.InvalidHiddenStateTap;
+    }
+    var tap_host: ?[]f32 = null;
+    errdefer if (tap_host) |values| allocator.free(values);
 
     // 2. Position embeddings (absolute only)
     if (config.position_encoding == .absolute) {
@@ -4335,6 +4419,10 @@ pub fn hiddenForwardFromEmbeddingsResidentWithOverrides(
             cb.free(hidden);
             hidden = cloned_hidden;
         }
+        if (tap_layer) |k| {
+            // HF hidden_states[k]: output of 0-based layer k-1, pre final norm.
+            if (k == layer + 1) tap_host = try cb.toFloat32(hidden, allocator);
+        }
         if (shouldEvalDecoderLayer(eval_stride, layer, config.num_hidden_layers)) {
             try cb.evalTensor(hidden);
         }
@@ -4355,7 +4443,8 @@ pub fn hiddenForwardFromEmbeddingsResidentWithOverrides(
     if (final_hidden != hidden) cb.free(hidden);
     hidden = final_hidden;
 
-    return hidden;
+    if (tap_layer != null and tap_host == null) return error.InvalidHiddenStateTap;
+    return .{ .hidden = hidden, .tap = tap_host };
 }
 
 // --- Decoder block ---

@@ -139,9 +139,18 @@ test "Memorilla execution proof rejects reduced precision and every host fallbac
     }
 }
 
-pub const Profile = enum { qwen3_encoder_f32_v1, qwen3_decoder_f32_kv_f32_v1 };
+/// `qwen3_encoder_lora_research_f32_v1` is the research encoder: the released
+/// F32 shards with a LoRA merged offline. It is never promoted to qualified; it
+/// is a second, explicitly configured encoder kind failing closed on its own
+/// in-directory lock (`research_lock_file`).
+pub const Profile = enum { qwen3_encoder_f32_v1, qwen3_encoder_lora_research_f32_v1, qwen3_decoder_f32_kv_f32_v1 };
 pub const Role = enum { encoder, decoder };
 pub const lock_bytes = @embedFile("memorilla_v1_base_models.json");
+pub const research_lock_file = "memorilla_lock.json";
+pub const research_lock_schema = "antfly.memorilla.research-encoder-lock.v1";
+pub const research_lock_max_bytes: usize = 1024 * 1024;
+pub const research_receipt_file = ".antfly-download-complete.json";
+pub const research_merge_receipt_file = "merge.json";
 pub const max_text_tokens: usize = 256;
 pub const max_documents: usize = 64;
 pub const width: usize = 2560;
@@ -153,10 +162,12 @@ pub const decoder_weight_bytes: usize = 32_762_941_440;
 
 pub const ResidencyPlan = struct { peak: memory.AdmissionAmounts, resident: memory.AdmissionAmounts };
 
-pub fn residencyPlan(a: A, profile: Profile) !ResidencyPlan {
-    const source = try sourceBytes(a, profile);
+/// `directory` is read only for the research tag, whose lock lives next to
+/// its artifacts; the released tags keep their embedded lock.
+pub fn residencyPlan(a: A, profile: Profile, directory: []const u8) !ResidencyPlan {
+    const source = try sourceBytes(a, profile, directory);
     const backend = switch (profile) {
-        .qwen3_encoder_f32_v1 => encoder_weight_bytes,
+        .qwen3_encoder_f32_v1, .qwen3_encoder_lora_research_f32_v1 => encoder_weight_bytes,
         .qwen3_decoder_f32_kv_f32_v1 => decoder_weight_bytes,
     };
     // Retain a conservative charge for the complete clean source cache. The
@@ -164,7 +175,7 @@ pub fn residencyPlan(a: A, profile: Profile) !ResidencyPlan {
     const resident = memory.AdmissionAmounts{ .host_weight_bytes = source, .backend_weight_bytes = backend, .backend_scratch_bytes = cuda_kernel_workspace_bytes };
     var peak = resident;
     peak.host_scratch_bytes = switch (profile) {
-        .qwen3_encoder_f32_v1 => 2 * 1024 * 1024 * 1024,
+        .qwen3_encoder_f32_v1, .qwen3_encoder_lora_research_f32_v1 => 2 * 1024 * 1024 * 1024,
         .qwen3_decoder_f32_kv_f32_v1 => 3 * 1024 * 1024 * 1024,
     };
     return .{ .peak = peak, .resident = resident };
@@ -172,25 +183,45 @@ pub fn residencyPlan(a: A, profile: Profile) !ResidencyPlan {
 
 pub fn role(profile: Profile) Role {
     return switch (profile) {
-        .qwen3_encoder_f32_v1 => .encoder,
+        .qwen3_encoder_f32_v1, .qwen3_encoder_lora_research_f32_v1 => .encoder,
         .qwen3_decoder_f32_kv_f32_v1 => .decoder,
     };
+}
+
+pub fn isResearch(profile: Profile) bool {
+    return profile == .qwen3_encoder_lora_research_f32_v1;
 }
 
 /// Portable across install paths, distinct from a publication/lifetime pin.
 /// Changing source, recipe, arithmetic, role or measured device domain changes
 /// the producer identity and therefore cannot reuse another profile's vectors.
+///
+/// The research identity is fixed per tag. Its per-candidate pin (the merged
+/// shards, `candidate_sha256`) lives in the directory lock and is surfaced in
+/// responses as `candidate_sha256`, not folded into the identity: clients
+/// never produce vectors for this path (the encoder consumes texts), so the
+/// identity only needs to separate the research route from the released
+/// producer, and a fixed value lets the request contract pin it statically.
 pub fn executionIdentity(profile: Profile) [64]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("antfly.memorilla.execution.v1\x00");
     hash.update(@tagName(profile));
     hash.update("\x00");
-    hash.update(if (role(profile) == .encoder) catalog.encoder_manifest else catalog.decoder_manifest);
+    hash.update(canonicalManifest(profile));
     hash.update("\x00");
-    hash.update(lock_bytes);
+    if (isResearch(profile)) hash.update("research-lock-in-directory") else hash.update(lock_bytes);
     hash.update("\x00bf16-source/f32-resident/f32-activations\x00sm_121\x00");
     hash.update(question_recipe);
     return std.fmt.bytesToHex(hash.finalResult(), .lower);
+}
+
+/// Exact `model_manifest.json` bytes a directory must carry for `profile`.
+pub fn canonicalManifest(profile: Profile) []const u8 {
+    return switch (profile) {
+        .qwen3_encoder_f32_v1 => catalog.encoder_manifest,
+        .qwen3_encoder_lora_research_f32_v1 => catalog.research_encoder_manifest,
+        .qwen3_decoder_f32_kv_f32_v1 => catalog.decoder_manifest,
+    };
 }
 
 pub fn requireRecipe(profile: Profile, manifest: anytype) !void {
@@ -202,7 +233,7 @@ pub fn requireRecipe(profile: Profile, manifest: anytype) !void {
 pub fn requireRoleRecipe(profile: Profile, manifest: anytype) !void {
     if (manifest.memorilla_profile != profile) return error.UnsupportedMemorillaArtifact;
     switch (profile) {
-        .qwen3_encoder_f32_v1 => {
+        .qwen3_encoder_f32_v1, .qwen3_encoder_lora_research_f32_v1 => {
             if (manifest.model_type != .embedder or manifest.embedding_style != .qwen3_embedding or
                 manifest.pooling != .last or !manifest.normalize or manifest.embedding_trailing_eos_id != 151643 or
                 manifest.embedding_profile.task_contract != .profiled or
@@ -220,12 +251,117 @@ fn member(value: std.json.Value, key: []const u8) !std.json.Value {
     return value.object.get(key) orelse error.InvalidMemorillaSourceLock;
 }
 
+fn researchMember(value: std.json.Value, key: []const u8) !std.json.Value {
+    if (value != .object) return error.InvalidMemorillaResearchLock;
+    return value.object.get(key) orelse error.InvalidMemorillaResearchLock;
+}
+
 fn pinnedPath(entries: std.json.Value, name: []const u8) bool {
     for (entries.array.items) |entry| {
         const value = entry.object.get("path") orelse continue;
         if (value == .string and std.mem.eql(u8, value.string, name)) return true;
     }
     return false;
+}
+
+fn isLowerHex64(text: []const u8) bool {
+    if (text.len != 64) return false;
+    for (text) |c| if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'))) return false;
+    return true;
+}
+
+/// Paths every research lock must pin: the executor inputs selected by the
+/// manifest, and the merge receipt binding the shards to the adapter.
+pub const research_lock_required_paths = [_][]const u8{
+    "model.safetensors.index.json", "config.json", "tokenizer.json", "tokenizer_config.json", research_merge_receipt_file,
+};
+
+/// Validated `<directory>/memorilla_lock.json`. `files` is the pinned array
+/// (`{path, size_bytes, sha256}`), owned by `parsed`.
+pub const ResearchLock = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    files: std.json.Value,
+    candidate_sha256: [64]u8,
+
+    pub fn deinit(self: *ResearchLock) void {
+        self.parsed.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Reads and validates the research lock. Every shape error is
+/// `InvalidMemorillaResearchLock`; file IO errors pass through. The lock does
+/// not authenticate itself: `verifyArtifacts` proves the files it pins, and the
+/// generation fence and managed receipt pin the lock bytes themselves.
+pub fn loadResearchLock(a: A, directory: []const u8) !ResearchLock {
+    const path = try std.fs.path.join(a, &.{ directory, research_lock_file });
+    defer a.free(path);
+    const bytes = file.readFileMax(a, path, research_lock_max_bytes) catch |err| switch (err) {
+        error.FileTooLarge => return error.InvalidMemorillaResearchLock,
+        else => return err,
+    };
+    defer a.free(bytes);
+    var parsed = std.json.parseFromSlice(std.json.Value, a, bytes, .{}) catch return error.InvalidMemorillaResearchLock;
+    errdefer parsed.deinit();
+    const root = parsed.value;
+    const schema = try researchMember(root, "schema");
+    if (schema != .string or !std.mem.eql(u8, schema.string, research_lock_schema)) return error.InvalidMemorillaResearchLock;
+    const candidate = try researchMember(root, "candidate_sha256");
+    if (candidate != .string or !isLowerHex64(candidate.string)) return error.InvalidMemorillaResearchLock;
+    const base = try researchMember(root, "base");
+    const model = try researchMember(base, "model");
+    const revision = try researchMember(base, "revision");
+    if (model != .string or !std.mem.eql(u8, model.string, catalog.encoder_repo)) return error.InvalidMemorillaResearchLock;
+    if (revision != .string or !std.mem.eql(u8, revision.string, catalog.encoder_revision)) return error.InvalidMemorillaResearchLock;
+    const files = try researchMember(root, "files");
+    if (files != .array or files.array.items.len == 0) return error.InvalidMemorillaResearchLock;
+    for (files.array.items, 0..) |entry, index| {
+        const name = try researchMember(entry, "path");
+        const size = try researchMember(entry, "size_bytes");
+        const sha = try researchMember(entry, "sha256");
+        if (name != .string or size != .integer or size.integer <= 0 or sha != .string or !isLowerHex64(sha.string)) return error.InvalidMemorillaResearchLock;
+        const text = name.string;
+        if (text.len == 0 or std.fs.path.isAbsolute(text) or std.mem.indexOf(u8, text, "\\") != null or
+            std.mem.eql(u8, text, research_lock_file) or std.mem.eql(u8, text, "model_manifest.json") or std.mem.eql(u8, text, research_receipt_file))
+            return error.InvalidMemorillaResearchLock;
+        var components = std.mem.splitScalar(u8, text, '/');
+        while (components.next()) |component| {
+            if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return error.InvalidMemorillaResearchLock;
+        }
+        for (files.array.items[0..index]) |previous| {
+            const other = previous.object.get("path") orelse continue;
+            if (other == .string and std.mem.eql(u8, other.string, text)) return error.InvalidMemorillaResearchLock;
+        }
+    }
+    for (research_lock_required_paths) |required| if (!pinnedPath(files, required)) return error.InvalidMemorillaResearchLock;
+    var result = ResearchLock{ .parsed = parsed, .files = files, .candidate_sha256 = undefined };
+    @memcpy(&result.candidate_sha256, candidate.string);
+    return result;
+}
+
+/// The pinned file list of `profile`: the embedded v1 lock for the released
+/// tags, the directory lock for the research tag.
+const Lock = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    entries: std.json.Value,
+
+    fn deinit(self: *Lock) void {
+        self.parsed.deinit();
+        self.* = undefined;
+    }
+};
+
+fn loadLock(a: A, profile: Profile, directory: []const u8) !Lock {
+    if (isResearch(profile)) {
+        const research = try loadResearchLock(a, directory);
+        return .{ .parsed = research.parsed, .entries = research.files };
+    }
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, lock_bytes, .{});
+    errdefer parsed.deinit();
+    const model = try member(try member(parsed.value, "models"), @tagName(role(profile)));
+    const entries = try member(model, "files");
+    if (entries != .array) return error.InvalidMemorillaSourceLock;
+    return .{ .parsed = parsed, .entries = entries };
 }
 
 fn generationEntry(hash: *std.crypto.hash.sha2.Sha256, a: A, io: std.Io, directory: []const u8, name: []const u8, required: bool, directory_entry: bool, control: Control) !void {
@@ -259,11 +395,9 @@ fn generationEntry(hash: *std.crypto.hash.sha2.Sha256, a: A, io: std.Io, directo
 /// Cheap cache-generation fence for complete required and forbidden inventory.
 /// Full cryptographic validation remains mandatory on every cold construction.
 pub fn artifactGeneration(a: A, io: std.Io, directory: []const u8, profile: Profile, control: Control) ![32]u8 {
-    const parsed = try std.json.parseFromSlice(std.json.Value, a, lock_bytes, .{});
-    defer parsed.deinit();
-    const model = try member(try member(parsed.value, "models"), @tagName(role(profile)));
-    const entries = try member(model, "files");
-    if (entries != .array) return error.InvalidMemorillaSourceLock;
+    var lock = try loadLock(a, profile, directory);
+    defer lock.deinit();
+    const entries = lock.entries;
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("antfly.memorilla.artifact-generation.v1\x00");
     hash.update(&executionIdentity(profile));
@@ -273,6 +407,13 @@ pub fn artifactGeneration(a: A, io: std.Io, directory: []const u8, profile: Prof
         try generationEntry(&hash, a, io, directory, path.string, true, false, control);
     }
     try generationEntry(&hash, a, io, directory, "model_manifest.json", true, false, control);
+    if (isResearch(profile)) {
+        // The lock is the source inventory itself; the merge receipt and the
+        // managed receipt bind it to the candidate and the publication.
+        try generationEntry(&hash, a, io, directory, research_lock_file, true, false, control);
+        try generationEntry(&hash, a, io, directory, research_merge_receipt_file, true, false, control);
+        try generationEntry(&hash, a, io, directory, research_receipt_file, false, false, control);
+    }
     for (optional_paths) |path| {
         if (!pinnedPath(entries, path)) try generationEntry(&hash, a, io, directory, path, false, false, control);
     }
@@ -284,14 +425,11 @@ pub fn artifactGeneration(a: A, io: std.Io, directory: []const u8, profile: Prof
     return hash.finalResult();
 }
 
-pub fn sourceBytes(a: A, profile: Profile) !usize {
-    const parsed = try std.json.parseFromSlice(std.json.Value, a, lock_bytes, .{});
-    defer parsed.deinit();
-    const model = try member(try member(parsed.value, "models"), @tagName(role(profile)));
-    const entries = try member(model, "files");
-    if (entries != .array) return error.InvalidMemorillaSourceLock;
+pub fn sourceBytes(a: A, profile: Profile, directory: []const u8) !usize {
+    var lock = try loadLock(a, profile, directory);
+    defer lock.deinit();
     var total: usize = 0;
-    for (entries.array.items) |entry| {
+    for (lock.entries.array.items) |entry| {
         const n = try member(entry, "size_bytes");
         if (n != .integer or n.integer <= 0) return error.InvalidMemorillaSourceLock;
         total = try std.math.add(usize, total, @intCast(n.integer));
@@ -303,12 +441,9 @@ pub fn sourceBytes(a: A, profile: Profile) !usize {
 /// them. Managed publication verification fences substitution before execution.
 pub fn verifyArtifacts(a: A, directory: []const u8, profile: Profile, control: Control) !void {
     try control.check();
-    const parsed = try std.json.parseFromSlice(std.json.Value, a, lock_bytes, .{});
-    defer parsed.deinit();
-    const model = try member(try member(parsed.value, "models"), @tagName(role(profile)));
-    const entries = try member(model, "files");
-    if (entries != .array) return error.InvalidMemorillaSourceLock;
-    for (entries.array.items) |entry| {
+    var lock = try loadLock(a, profile, directory);
+    defer lock.deinit();
+    for (lock.entries.array.items) |entry| {
         try control.check();
         const name = try member(entry, "path");
         const size = try member(entry, "size_bytes");
@@ -333,6 +468,8 @@ pub fn verifyArtifacts(a: A, directory: []const u8, profile: Profile, control: C
             if (!std.mem.eql(u8, &std.fmt.bytesToHex(hash.finalResult(), .lower), expected.string))
                 return error.UnsupportedMemorillaArtifact;
         } else {
+            // Only the embedded v1 lock carries git blob pins; the research
+            // lock loader already required a sha256 on every entry.
             const expected = try member(entry, "git_blob_sha1");
             if (expected != .string) return error.InvalidMemorillaSourceLock;
             var hash = std.crypto.hash.Sha1.init(.{});
@@ -347,8 +484,7 @@ pub fn verifyArtifacts(a: A, directory: []const u8, profile: Profile, control: C
     defer a.free(manifest_path);
     const bytes = try file.readFileMax(a, manifest_path, 4096);
     defer a.free(bytes);
-    const canonical = if (role(profile) == .encoder) catalog.encoder_manifest else catalog.decoder_manifest;
-    if (!std.mem.eql(u8, bytes, canonical)) return error.UnsupportedMemorillaArtifact;
+    if (!std.mem.eql(u8, bytes, canonicalManifest(profile))) return error.UnsupportedMemorillaArtifact;
     try control.check();
 }
 
@@ -372,12 +508,11 @@ pub fn verifySelectedPaths(a: A, io: std.Io, directory: []const u8, manifest: an
     inline for (.{ "onnx_path", "safetensors_path", "gguf_path", "gguf_projector_path", "special_tokens_map_path", "preprocessor_config_path", "processor_config_path", "vocab_txt_path", "text_projection_path", "visual_projection_path", "visual_model_path", "audio_model_path", "audio_projection_path" }) |field| {
         if (@field(manifest, field) != null) return error.UnsupportedMemorillaArtifact;
     }
-    const parsed = try std.json.parseFromSlice(std.json.Value, a, lock_bytes, .{});
-    defer parsed.deinit();
     const profile = manifest.memorilla_profile orelse return error.UnsupportedMemorillaArtifact;
-    const entries = try member(try member(try member(parsed.value, "models"), @tagName(role(profile))), "files");
+    var lock = try loadLock(a, profile, directory);
+    defer lock.deinit();
     for (optional_paths) |name| {
-        if (pinnedPath(entries, name)) continue;
+        if (pinnedPath(lock.entries, name)) continue;
         const path = try std.fs.path.join(a, &.{ directory, name });
         defer a.free(path);
         _ = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
@@ -390,14 +525,34 @@ pub fn verifySelectedPaths(a: A, io: std.Io, directory: []const u8, manifest: an
 
 test "Memorilla qualified profiles retain distinct source roles and checked source bytes" {
     try std.testing.expectEqual(Role.encoder, role(.qwen3_encoder_f32_v1));
+    try std.testing.expectEqual(Role.encoder, role(.qwen3_encoder_lora_research_f32_v1));
     try std.testing.expectEqual(Role.decoder, role(.qwen3_decoder_f32_kv_f32_v1));
-    try std.testing.expect(try sourceBytes(std.testing.allocator, .qwen3_encoder_f32_v1) > 8_000_000_000);
-    try std.testing.expect(try sourceBytes(std.testing.allocator, .qwen3_decoder_f32_kv_f32_v1) > 16_000_000_000);
-    const encoder = try residencyPlan(std.testing.allocator, .qwen3_encoder_f32_v1);
-    const decoder = try residencyPlan(std.testing.allocator, .qwen3_decoder_f32_kv_f32_v1);
+    try std.testing.expect(try sourceBytes(std.testing.allocator, .qwen3_encoder_f32_v1, "/unused") > 8_000_000_000);
+    try std.testing.expect(try sourceBytes(std.testing.allocator, .qwen3_decoder_f32_kv_f32_v1, "/unused") > 16_000_000_000);
+    const encoder = try residencyPlan(std.testing.allocator, .qwen3_encoder_f32_v1, "/unused");
+    const decoder = try residencyPlan(std.testing.allocator, .qwen3_decoder_f32_kv_f32_v1, "/unused");
     try std.testing.expect(encoder.peak.host_scratch_bytes > 151665 * @as(usize, 2560) * 4);
     try std.testing.expect(decoder.peak.host_scratch_bytes > 151936 * @as(usize, 4096) * 4);
-    try std.testing.expectEqual(try sourceBytes(std.testing.allocator, .qwen3_encoder_f32_v1), encoder.resident.host_weight_bytes);
+    try std.testing.expectEqual(try sourceBytes(std.testing.allocator, .qwen3_encoder_f32_v1, "/unused"), encoder.resident.host_weight_bytes);
+    // The research tag reads its lock from the directory and fails closed without one.
+    try std.testing.expectError(error.FileNotFound, sourceBytes(std.testing.allocator, .qwen3_encoder_lora_research_f32_v1, "/nonexistent-memorilla-research-encoder"));
+    try std.testing.expectError(error.FileNotFound, residencyPlan(std.testing.allocator, .qwen3_encoder_lora_research_f32_v1, "/nonexistent-memorilla-research-encoder"));
+}
+
+test "Memorilla execution identities are fixed per tag and separate the research route" {
+    const released = executionIdentity(.qwen3_encoder_f32_v1);
+    const research = executionIdentity(.qwen3_encoder_lora_research_f32_v1);
+    const decoder = executionIdentity(.qwen3_decoder_f32_kv_f32_v1);
+    try std.testing.expect(!std.mem.eql(u8, &released, &research));
+    try std.testing.expect(!std.mem.eql(u8, &research, &decoder));
+    try std.testing.expectEqualSlices(u8, &research, &executionIdentity(.qwen3_encoder_lora_research_f32_v1));
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly.memorilla.execution.v1\x00qwen3_encoder_lora_research_f32_v1\x00");
+    hash.update(catalog.research_encoder_manifest);
+    hash.update("\x00research-lock-in-directory\x00bf16-source/f32-resident/f32-activations\x00sm_121\x00");
+    hash.update(question_recipe);
+    try std.testing.expectEqualSlices(u8, &std.fmt.bytesToHex(hash.finalResult(), .lower), &research);
+    try std.testing.expectEqualStrings(catalog.research_encoder_manifest, canonicalManifest(.qwen3_encoder_lora_research_f32_v1));
 }
 
 test "Memorilla artifact generation tracks optional addition removal and cancellation" {
@@ -432,4 +587,159 @@ test "Memorilla artifact generation tracks optional addition removal and cancell
     };
     try std.testing.expectError(error.Cancelled, artifactGeneration(a, io, directory, .qwen3_encoder_f32_v1, .{ .check_fn = Cancel.check }));
     try std.testing.expectError(error.Cancelled, verifyArtifacts(a, directory, .qwen3_encoder_f32_v1, .{ .check_fn = Cancel.check }));
+}
+
+const ResearchFixture = struct {
+    const File = struct { path: []const u8, data: []const u8 };
+    // Required executor inputs plus one shard and the three sidecars the v1
+    // lock also pins (permitted optional paths).
+    const files = [_]File{
+        .{ .path = "model.safetensors.index.json", .data = "{\"weight_map\":{}}" },
+        .{ .path = "config.json", .data = "{\"model_type\":\"qwen3\"}" },
+        .{ .path = "tokenizer.json", .data = "{\"version\":\"1.0\"}" },
+        .{ .path = "tokenizer_config.json", .data = "{}" },
+        .{ .path = "merge.json", .data = "{\"candidate_sha256\":\"ab\"}" },
+        .{ .path = "model-00001-of-00001.safetensors", .data = "merged-f32-shard-bytes" },
+        .{ .path = "1_Pooling/config.json", .data = "{\"pooling_mode_lasttoken\":true}" },
+        .{ .path = "modules.json", .data = "[]" },
+        .{ .path = "config_sentence_transformers.json", .data = "{}" },
+    };
+    const candidate = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn lockJson(a: A, size_delta: i64, schema: []const u8, revision: []const u8) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(a);
+        defer out.deinit();
+        const w = &out.writer;
+        try w.print("{{\"schema\":\"{s}\",\"candidate_sha256\":\"{s}\",\"base\":{{\"model\":\"{s}\",\"revision\":\"{s}\"}},\"files\":[", .{ schema, candidate, catalog.encoder_repo, revision });
+        for (files, 0..) |entry, index| {
+            var raw: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(entry.data, &raw, .{});
+            const size: i64 = @as(i64, @intCast(entry.data.len)) + (if (index == 0) size_delta else 0);
+            try w.print("{s}{{\"path\":\"{s}\",\"size_bytes\":{d},\"sha256\":\"{s}\"}}", .{ if (index == 0) "" else ",", entry.path, size, &std.fmt.bytesToHex(raw, .lower) });
+        }
+        try w.writeAll("]}\n");
+        return a.dupe(u8, out.written());
+    }
+
+    fn write(a: A, io: std.Io, dir: std.Io.Dir, lock: []const u8) !void {
+        try dir.createDirPath(io, "model/1_Pooling");
+        for (files) |entry| {
+            const path = try std.fs.path.join(a, &.{ "model", entry.path });
+            defer a.free(path);
+            try dir.writeFile(io, .{ .sub_path = path, .data = entry.data });
+        }
+        try dir.writeFile(io, .{ .sub_path = "model/model_manifest.json", .data = catalog.research_encoder_manifest });
+        try dir.writeFile(io, .{ .sub_path = "model/" ++ research_lock_file, .data = lock });
+    }
+};
+
+test "Memorilla research lock pins the merged directory and fails closed on every mismatch" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const good = try ResearchFixture.lockJson(a, 0, research_lock_schema, catalog.encoder_revision);
+    defer a.free(good);
+    try ResearchFixture.write(a, io, temp.dir, good);
+    const directory = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", temp.sub_path[0..], "model" });
+    defer a.free(directory);
+    const profile: Profile = .qwen3_encoder_lora_research_f32_v1;
+
+    var lock = try loadResearchLock(a, directory);
+    try std.testing.expectEqualStrings(ResearchFixture.candidate, &lock.candidate_sha256);
+    try std.testing.expectEqual(ResearchFixture.files.len, lock.files.array.items.len);
+    lock.deinit();
+    var expected_bytes: usize = 0;
+    for (ResearchFixture.files) |entry| expected_bytes += entry.data.len;
+    try std.testing.expectEqual(expected_bytes, try sourceBytes(a, profile, directory));
+    const plan = try residencyPlan(a, profile, directory);
+    try std.testing.expectEqual(expected_bytes, plan.resident.host_weight_bytes);
+    try std.testing.expectEqual(encoder_weight_bytes, plan.resident.backend_weight_bytes);
+    try verifyArtifacts(a, directory, profile, .{});
+    const generation = try artifactGeneration(a, io, directory, profile, .{});
+    try std.testing.expectEqualSlices(u8, &generation, &try artifactGeneration(a, io, directory, profile, .{}));
+
+    // The research manifest is required byte-for-byte; the v1 manifest in a
+    // research directory is a different profile.
+    try temp.dir.writeFile(io, .{ .sub_path = "model/model_manifest.json", .data = catalog.encoder_manifest });
+    try std.testing.expectError(error.UnsupportedMemorillaArtifact, verifyArtifacts(a, directory, profile, .{}));
+    try temp.dir.writeFile(io, .{ .sub_path = "model/model_manifest.json", .data = catalog.research_encoder_manifest });
+    // A replaced shard fails the hash; the lock, the merge receipt and the
+    // managed receipt all move the generation fence.
+    try temp.dir.writeFile(io, .{ .sub_path = "model/model-00001-of-00001.safetensors", .data = "merged-f32-shard-BYTES" });
+    try std.testing.expectError(error.UnsupportedMemorillaArtifact, verifyArtifacts(a, directory, profile, .{}));
+    try std.testing.expect(!std.mem.eql(u8, &generation, &try artifactGeneration(a, io, directory, profile, .{})));
+    try temp.dir.writeFile(io, .{ .sub_path = "model/model-00001-of-00001.safetensors", .data = "merged-f32-shard-bytes" });
+    try temp.dir.writeFile(io, .{ .sub_path = "model/" ++ research_receipt_file, .data = "{\"version\":1}" });
+    const with_receipt = try artifactGeneration(a, io, directory, profile, .{});
+    try std.testing.expect(!std.mem.eql(u8, &generation, &with_receipt));
+    try temp.dir.deleteFile(io, "model/" ++ research_receipt_file);
+    // Unpinned optional routes stay forbidden next to a research encoder.
+    try temp.dir.writeFile(io, .{ .sub_path = "model/adapter_config.json", .data = "{}" });
+    const Manifest = struct {
+        safetensors_index_path: ?[]const u8,
+        config_path: ?[]const u8,
+        tokenizer_json_path: ?[]const u8,
+        tokenizer_config_path: ?[]const u8,
+        model_manifest_path: ?[]const u8,
+        onnx_path: ?[]const u8 = null,
+        safetensors_path: ?[]const u8 = null,
+        gguf_path: ?[]const u8 = null,
+        gguf_projector_path: ?[]const u8 = null,
+        special_tokens_map_path: ?[]const u8 = null,
+        preprocessor_config_path: ?[]const u8 = null,
+        processor_config_path: ?[]const u8 = null,
+        vocab_txt_path: ?[]const u8 = null,
+        text_projection_path: ?[]const u8 = null,
+        visual_projection_path: ?[]const u8 = null,
+        visual_model_path: ?[]const u8 = null,
+        audio_model_path: ?[]const u8 = null,
+        audio_projection_path: ?[]const u8 = null,
+        memorilla_profile: ?Profile = .qwen3_encoder_lora_research_f32_v1,
+    };
+    var selected: [5][]const u8 = undefined;
+    inline for (.{ "model.safetensors.index.json", "config.json", "tokenizer.json", "tokenizer_config.json", "model_manifest.json" }, 0..) |name, i| selected[i] = try std.fs.path.join(a, &.{ directory, name });
+    defer for (selected) |path| a.free(path);
+    const manifest = Manifest{ .safetensors_index_path = selected[0], .config_path = selected[1], .tokenizer_json_path = selected[2], .tokenizer_config_path = selected[3], .model_manifest_path = selected[4] };
+    try std.testing.expectError(error.UnsupportedMemorillaArtifact, verifySelectedPaths(a, io, directory, manifest));
+    try temp.dir.deleteFile(io, "model/adapter_config.json");
+    try verifySelectedPaths(a, io, directory, manifest);
+
+    // Lock shape failures: wrong size, bad schema, wrong base revision,
+    // missing required path, oversized lock, absent lock.
+    const wrong_size = try ResearchFixture.lockJson(a, 1, research_lock_schema, catalog.encoder_revision);
+    defer a.free(wrong_size);
+    try temp.dir.writeFile(io, .{ .sub_path = "model/" ++ research_lock_file, .data = wrong_size });
+    try std.testing.expectError(error.UnsupportedMemorillaArtifact, verifyArtifacts(a, directory, profile, .{}));
+    const bad_schema = try ResearchFixture.lockJson(a, 0, "antfly.memorilla.research-encoder-lock.v0", catalog.encoder_revision);
+    defer a.free(bad_schema);
+    try temp.dir.writeFile(io, .{ .sub_path = "model/" ++ research_lock_file, .data = bad_schema });
+    try std.testing.expectError(error.InvalidMemorillaResearchLock, verifyArtifacts(a, directory, profile, .{}));
+    try std.testing.expectError(error.InvalidMemorillaResearchLock, artifactGeneration(a, io, directory, profile, .{}));
+    try std.testing.expectError(error.InvalidMemorillaResearchLock, sourceBytes(a, profile, directory));
+    try std.testing.expectError(error.InvalidMemorillaResearchLock, verifySelectedPaths(a, io, directory, manifest));
+    const wrong_base = try ResearchFixture.lockJson(a, 0, research_lock_schema, "0000000000000000000000000000000000000000");
+    defer a.free(wrong_base);
+    try temp.dir.writeFile(io, .{ .sub_path = "model/" ++ research_lock_file, .data = wrong_base });
+    try std.testing.expectError(error.InvalidMemorillaResearchLock, loadResearchLock(a, directory));
+    const missing_merge = try std.mem.replaceOwned(u8, a, good, "\"path\":\"merge.json\"", "\"path\":\"merge-receipt.json\"");
+    defer a.free(missing_merge);
+    try temp.dir.writeFile(io, .{ .sub_path = "model/" ++ research_lock_file, .data = missing_merge });
+    try std.testing.expectError(error.InvalidMemorillaResearchLock, loadResearchLock(a, directory));
+    const self_pin = try std.mem.replaceOwned(u8, a, good, "\"path\":\"modules.json\"", "\"path\":\"" ++ research_lock_file ++ "\"");
+    defer a.free(self_pin);
+    try temp.dir.writeFile(io, .{ .sub_path = "model/" ++ research_lock_file, .data = self_pin });
+    try std.testing.expectError(error.InvalidMemorillaResearchLock, loadResearchLock(a, directory));
+    const traversal = try std.mem.replaceOwned(u8, a, good, "\"path\":\"modules.json\"", "\"path\":\"../modules.json\"");
+    defer a.free(traversal);
+    try temp.dir.writeFile(io, .{ .sub_path = "model/" ++ research_lock_file, .data = traversal });
+    try std.testing.expectError(error.InvalidMemorillaResearchLock, loadResearchLock(a, directory));
+    const huge = try a.alloc(u8, research_lock_max_bytes + 1);
+    defer a.free(huge);
+    @memset(huge, ' ');
+    try temp.dir.writeFile(io, .{ .sub_path = "model/" ++ research_lock_file, .data = huge });
+    try std.testing.expectError(error.InvalidMemorillaResearchLock, loadResearchLock(a, directory));
+    try temp.dir.deleteFile(io, "model/" ++ research_lock_file);
+    try std.testing.expectError(error.FileNotFound, loadResearchLock(a, directory));
+    try std.testing.expectError(error.FileNotFound, artifactGeneration(a, io, directory, profile, .{}));
 }

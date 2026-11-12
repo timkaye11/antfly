@@ -163,6 +163,10 @@ test {
     _ = @import("server/memorilla_request.zig");
     _ = @import("pipelines/memorilla_grounding.zig");
     _ = @import("pipelines/memorilla_generation.zig");
+    _ = @import("pipelines/memorilla_copy.zig");
+    _ = @import("pipelines/memorilla_token_features.zig");
+    _ = @import("models/memorilla.zig");
+    _ = @import("server/memorilla_research_service.zig");
     _ = @import("documents/sources.zig");
     _ = @import("extractors/gliner_span_long_executor.zig");
     _ = @import("architectures/modern_bert.zig");

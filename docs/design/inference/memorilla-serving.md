@@ -260,6 +260,114 @@ operator-budget rejection is not retryable. Deadline and cancellation behavior
 uses the existing inference error contract. Deployment must retain supervised
 worker execution for native CUDA calls.
 
+## Research profile (encoder-LoRA candidate)
+
+A profile with `reader_kind: encoder_lora_research` serves the experimental
+encoder-LoRA copy candidate described in
+[the copy17 port plan](../../plans/memorilla-copy17-native.md). It is a second,
+explicitly configured profile kind. The released path above keeps every pin
+unchanged; the research path fails closed on its own artifact pins and nothing
+about it is qualified. Do not enable it on a shared deployment.
+
+The composition differs from a released profile in what the two paths point at:
+`encoder` is the merged research encoder directory exported by
+`encoder_lora_export.py merge-encoder` (its `model_manifest.json` carries the
+`qwen3_encoder_lora_research_f32_v1` profile and `memorilla_lock.json` pins
+every shard and sidecar), and `memory_module_path` is the research reader
+bundle from `export-reader` (`manifest.json` with `release: false`, the reader
+weights, the copy head, `candidate.json` and `protocol.json`). The decoder is
+the same managed qualified Qwen3-8B variant. At load, the encoder lock's
+`candidate_sha256`, the bundle's `source.candidate_sha256` and the hash of the
+bundle's `candidate.json` must agree.
+
+```json
+{
+  "inference": {
+    "memorilla": {
+      "enabled": true,
+      "profiles": [{
+        "name": "memorilla-copy17",
+        "reader_kind": "encoder_lora_research",
+        "encoder": "/srv/antfly/memorilla/lora-merged-encoder",
+        "decoder": "hf:Qwen/Qwen3-8B:memorilla-f32-safetensors-bundle-v1",
+        "memory_module_path": "/srv/antfly/memorilla/lora-reader-bundle",
+        "max_documents": 64,
+        "max_new_tokens": 64
+      }]
+    }
+  }
+}
+```
+
+Requests to a research profile supply document texts, not embeddings. The
+server encodes each text with the merged encoder (per-token hidden states,
+not a pooled vector), builds the token features, runs the research reader and
+copy head, and decodes with the qualified decoder. `document_embeddings` is
+rejected with 400, and `context_mode: source_verified` is rejected with 409
+because the verified path has not been built for this reader. One to 64 texts
+are accepted under the same per-text (8192 bytes) and total (32768 bytes)
+limits as source-verified mode; a count above 64 returns 413.
+`encoder_execution_identity` must equal the fixed research encoder identity
+(`executionIdentity(qwen3_encoder_lora_research_f32_v1)`), which differs from
+the released encoder identity; a released identity returns 409.
+
+```json
+{
+  "model": "memorilla-copy17",
+  "question": "Who owns the badge?",
+  "document_texts": [
+    "Badge owner: Alice Chen.",
+    "Launch window opens Tuesday."
+  ],
+  "encoder_execution_identity": "REPLACE_WITH_THE_RESEARCH_ENCODER_IDENTITY",
+  "max_new_tokens": 24
+}
+```
+
+The response has the latent shape with two differences: `context_source` is
+`supplied_documents`, and `candidate_sha256` names the candidate pinned by both
+the encoder lock and the reader bundle. `memory_tokens` is 16,
+`input_documents` is the text count, and `usage.encoder_query_tokens` reports
+the question's encoder tokens. `encoder_execution_identity`,
+`decoder_execution_identity` and `memory_module_sha256` are reported as for a
+released profile; `candidate_sha256` identifies the experiment, not a
+qualification status.
+
+The research path also applies an answer-format guard to the decoder text,
+reported in the optional `answer_guard` field (`accepted` or `rejected`). The
+research task answers are short exact facts: a name of one to a few words, a
+short code, or the literal `UNKNOWN`. The frozen decoder has no format
+constraint of its own and, when the copied record misses the fact, can echo its
+memory frame as prose. The guard trims the text and accepts the literal
+`UNKNOWN`; otherwise it rejects text that is empty, longer than 64 bytes, more
+than six whitespace-separated words, contains any control character (including
+a newline), contains the frame literal `Memory` as a standalone word or the
+`<|memory|>` marker, or contains bytes outside letters, digits, space, `-`,
+`.` and `'`. A rejected answer is published as `text: "UNKNOWN"` with
+`finish_reason: abstained`; `token_ids` and `usage.completion_tokens` keep what
+the decoder produced so the rejected output remains inspectable. The rules are
+general format rules, not corpus patterns, and they are serving policy for the
+research profile only; released profiles are unchanged.
+
+Caveats:
+
+- Experimental and unqualified. The candidate reached 64/64 on its dev
+  fixtures and 78/80 on fresh fixtures in the offline Zig tool, with two
+  divergences on records already known to sit at the decoder's acceptance
+  boundary. That is a research result, not a production QA gate.
+- Strict F32 only. Mean offline per-case timings on GB10 were roughly 620 ms
+  for the encoder (three rows of about 140 tokens through the generic CUDA
+  Qwen3 path), 19 ms reader, 9 ms copy head (host), 26 ms snap, and 1.3 to 1.8 s
+  for the decoder (about 100 prompt tokens, up to 24 new tokens, F32 KV). The
+  Python BF16 harness decoded the same answers in about 0.65 s; a BF16 serving
+  profile would need its own qualification.
+- Texts are caller-supplied inputs. Encoding them server-side removes the
+  text/vector pairing problem but establishes nothing about their truth,
+  authorization or coverage.
+- `source_verified` is not available; a request that asks for it returns 409
+  `INCOMPATIBLE_MEMORILLA_PROFILE` rather than silently falling back to the
+  latent answer.
+
 ## Evidence and remaining rollout gates
 
 The [HTTP smoke tool](../../../zig/pkg/inference/scripts/memorilla/http_smoke.py)

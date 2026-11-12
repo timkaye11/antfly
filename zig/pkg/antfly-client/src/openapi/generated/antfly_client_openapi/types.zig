@@ -37568,27 +37568,28 @@ pub const MediaOutputCoverageValues = struct {
     }
 };
 
-/// Generate a buffered answer over caller-supplied stored document embeddings. Features must be full-width normalized outputs of the configured encoder execution profile. The server applies the pinned FP16-storage/BF16-readout conversion. The identity pins compatibility; it does not authenticate the origin, authorization, or collection coverage of caller-supplied vectors. The first release supports greedy decoding with fresh F32 KV only. context_mode=source_verified generates an independent source answer and checks its support. A memory candidate requires exact agreement with that supported answer; otherwise the source answer or abstention is returned. This explicit mode does not establish source truth, authorization, or text/vector association cryptographically.
+/// Generate a buffered answer over caller-supplied stored document embeddings. Features must be full-width normalized outputs of the configured encoder execution profile. The server applies the pinned FP16-storage/BF16-readout conversion. The identity pins compatibility; it does not authenticate the origin, authorization, or collection coverage of caller-supplied vectors. The first release supports greedy decoding with fresh F32 KV only. context_mode=source_verified generates an independent source answer and checks its support. A memory candidate requires exact agreement with that supported answer; otherwise the source answer or abstention is returned. This explicit mode does not establish source truth, authorization, or text/vector association cryptographically. Profiles configured with reader_kind=encoder_lora_research instead take document_texts in latent mode and encode them server-side; they reject document_embeddings and source_verified.
 pub const MemorillaGenerateRequest = struct {
     /// Name from inference.memorilla.profiles. Requests cannot override the bound model assets or memory module.
     model: []const u8,
     /// A nonempty question admitted to the configured encoder's 256-token limit after canonical whitespace normalization.
     question: []const u8,
-    document_embeddings: []const []const f32,
-    /// Exact model_identity returned by the qualified encoder. Ordinary mixed-precision encoder identities are incompatible.
+    /// Required for released profiles (reader_kind=released), which read stored features; omitted and rejected for encoder_lora_research profiles, which encode document_texts themselves. Values must be numeric tokens.
+    document_embeddings: ?[]const []const f32 = null,
+    /// Exact model_identity returned by the configured encoder. For released profiles this is the qualified encoder identity; for encoder_lora_research profiles it is the fixed research encoder identity. Ordinary mixed-precision encoder identities are incompatible.
     encoder_execution_identity: []const u8,
     /// Maximum tokens for each answer candidate, including an optional source repair. Source-verified mode generates a memory candidate and an independent source answer, with at most one source repair and two verifier calls of eight tokens each; usage reports all phases. Every phase also respects profile and operator ceilings.
     max_new_tokens: ?i64 = null,
     /// Latent uses stored features alone. Source-verified mode requires document_texts and explicitly checks or replaces the memory candidate using their contents.
     context_mode: ?[]const u8 = null,
-    /// Required only for source_verified and rejected in latent mode. One nonblank UTF-8 source text per embedding row, in the same order; at most 8192 bytes each and 32768 source bytes total. The complete rendered prompt must fit the 1024-token internal bound and operator limits, without truncation. Pairing is asserted by the caller, not recomputed or authenticated.
+    /// Released profiles: required only for source_verified and rejected in latent mode. One nonblank UTF-8 source text per embedding row, in the same order; at most 8192 bytes each and 32768 source bytes total. The complete rendered prompt must fit the 1024-token internal bound and operator limits, without truncation. Pairing is asserted by the caller, not recomputed or authenticated. encoder_lora_research profiles: required in latent mode (1 to 64 texts, same per-text and total byte limits); the server encodes each text with the merged research encoder.
     document_texts: ?[]const []const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "model", "model", false },
         .{ "question", "question", false },
-        .{ "document_embeddings", "document_embeddings", false },
+        .{ "document_embeddings", "document_embeddings", true },
         .{ "encoder_execution_identity", "encoder_execution_identity", false },
         .{ "max_new_tokens", "max_new_tokens", true },
         .{ "context_mode", "context_mode", true },
@@ -37609,8 +37610,10 @@ pub const MemorillaGenerateRequest = struct {
         try jw.write(self.model);
         try jw.objectField("question");
         try jw.write(self.question);
-        try jw.objectField("document_embeddings");
-        try jw.write(self.document_embeddings);
+        if (self.document_embeddings) |value| {
+            try jw.objectField("document_embeddings");
+            try jw.write(value);
+        }
         try jw.objectField("encoder_execution_identity");
         try jw.write(self.encoder_execution_identity);
         if (self.max_new_tokens) |value| {
@@ -37633,12 +37636,17 @@ pub const MemorillaGenerateResponse = struct {
     model: []const u8,
     text: []const u8,
     token_ids: []const i64,
-    /// Abstained is a policy-produced UNKNOWN answer with empty token_ids and zero final completion tokens. Source-verified mode never publishes a truncated factual answer.
+    /// Abstained is a policy-produced UNKNOWN answer. In source-verified mode it has empty token_ids and zero final completion tokens, and that mode never publishes a truncated factual answer. On encoder_lora_research profiles it is produced by the answer-format guard (see answer_guard) and token_ids keep the decoder's output.
     finish_reason: []const u8,
     input_documents: i64,
     /// Memory slots used by the published answer. Sixteen for latent or approved memory answers; zero for a source-text fallback or policy abstention. Source-verified mode still evaluates an initial memory candidate.
     memory_tokens: i64,
+    /// supplied_documents is reported by encoder_lora_research profiles, which encoded caller-supplied texts server-side.
     context_source: []const u8,
+    /// encoder_lora_research profiles only. SHA256 of the research candidate.json pinned by both the merged encoder lock and the reader bundle; it identifies the experimental candidate, not a qualification status.
+    candidate_sha256: ?[]const u8 = null,
+    /// encoder_lora_research profiles only. Outcome of the answer-format guard applied to the decoder text. The research task answers are short exact facts (a name of a few words, a short code, or the literal UNKNOWN); text that is empty, longer than 64 bytes, more than six words, contains control characters, the memory frame literal Memory as a standalone word or the <|memory|> marker, or bytes outside letters, digits, space, hyphen, period and apostrophe is rejected. A rejected answer is published as text UNKNOWN with finish_reason abstained; token_ids keep what the decoder produced.
+    answer_guard: ?[]const u8 = null,
     /// Present in source-verified mode and identifies the actual published answer path.
     answer_path: ?[]const u8 = null,
     /// Model-supported means a completed verifier emitted the exact positive support label. It is a model judgment, not a formal entailment proof or a guarantee that caller-provided source facts are true.
@@ -37661,6 +37669,8 @@ pub const MemorillaGenerateResponse = struct {
         .{ "input_documents", "input_documents", false },
         .{ "memory_tokens", "memory_tokens", false },
         .{ "context_source", "context_source", false },
+        .{ "candidate_sha256", "candidate_sha256", true },
+        .{ "answer_guard", "answer_guard", true },
         .{ "answer_path", "answer_path", true },
         .{ "verification_status", "verification_status", true },
         .{ "source_alignment", "source_alignment", true },
@@ -37695,6 +37705,14 @@ pub const MemorillaGenerateResponse = struct {
         try jw.write(self.memory_tokens);
         try jw.objectField("context_source");
         try jw.write(self.context_source);
+        if (self.candidate_sha256) |value| {
+            try jw.objectField("candidate_sha256");
+            try jw.write(value);
+        }
+        if (self.answer_guard) |value| {
+            try jw.objectField("answer_guard");
+            try jw.write(value);
+        }
         if (self.answer_path) |value| {
             try jw.objectField("answer_path");
             try jw.write(value);
@@ -37783,15 +37801,17 @@ pub const MemorillaGenerateUsage = struct {
     }
 };
 
-/// An administrator-configured, immutable Memorilla model composition. Only the qualified Qwen3 F32 CUDA profiles are supported.
+/// An administrator-configured, immutable Memorilla model composition. Only the qualified Qwen3 F32 CUDA profiles are supported for the released reader kind. The encoder_lora_research kind serves the experimental encoder-LoRA copy candidate from its own locked artifacts; it is not qualified and must not be promoted or presented as such.
 pub const MemorillaProfileConfig = struct {
     name: []const u8,
-    /// Managed encoder reference using the qwen3_encoder_f32_v1 execution profile.
+    /// Managed encoder reference. For reader_kind=released this uses the qwen3_encoder_f32_v1 execution profile. For reader_kind=encoder_lora_research it is the merged research encoder directory exported by encoder_lora_export.py (manifest profile qwen3_encoder_lora_research_f32_v1 with its memorilla_lock.json).
     encoder: []const u8,
     /// Managed decoder reference using the qwen3_decoder_f32_kv_f32_v1 execution profile.
     decoder: []const u8,
-    /// Local exported released-checkpoint bundle directory. This path is configured by the administrator and cannot be supplied by an inference request.
+    /// Local reader bundle directory. For reader_kind=released this is an exported released-checkpoint bundle; for reader_kind=encoder_lora_research it is the research reader bundle (reader, copy head, candidate.json and protocol.json). This path is configured by the administrator and cannot be supplied by an inference request.
     memory_module_path: []const u8,
+    /// Which reader the composition serves. released consumes caller-supplied document embeddings and supports source_verified mode. encoder_lora_research encodes caller-supplied document_texts with the merged research encoder, rejects document_embeddings, does not support source_verified, and reports candidate_sha256.
+    reader_kind: ?[]const u8 = null,
     max_documents: ?i64 = null,
     max_new_tokens: ?i64 = null,
 
@@ -37801,6 +37821,7 @@ pub const MemorillaProfileConfig = struct {
         .{ "encoder", "encoder", false },
         .{ "decoder", "decoder", false },
         .{ "memory_module_path", "memory_module_path", false },
+        .{ "reader_kind", "reader_kind", true },
         .{ "max_documents", "max_documents", true },
         .{ "max_new_tokens", "max_new_tokens", true },
     };
@@ -37823,6 +37844,10 @@ pub const MemorillaProfileConfig = struct {
         try jw.write(self.decoder);
         try jw.objectField("memory_module_path");
         try jw.write(self.memory_module_path);
+        if (self.reader_kind) |value| {
+            try jw.objectField("reader_kind");
+            try jw.write(value);
+        }
         if (self.max_documents) |value| {
             try jw.objectField("max_documents");
             try jw.write(value);

@@ -2,6 +2,7 @@ from enum import StrEnum
 
 
 class InferenceMemorillaGenerateResponseContextSource(StrEnum):
+    SUPPLIED_DOCUMENTS = "supplied_documents"
     SUPPLIED_EMBEDDINGS = "supplied_embeddings"
     SUPPLIED_EMBEDDINGS_AND_DOCUMENTS = "supplied_embeddings_and_documents"
 

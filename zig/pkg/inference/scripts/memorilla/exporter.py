@@ -90,6 +90,12 @@ EXECUTION = {
     "enable_thinking": False,
     "soft_tokens": "input-embedding-rows",
 }
+# Encoder feature contracts a non-release bundle may declare instead of the
+# released pooled one; release bundles always carry ``EXECUTION`` unchanged.
+PER_TOKEN_DUAL_LAYER_POOLING = "per-token-dual-layer-l2-normalized-v1"
+ENCODER_POOLINGS = (EXECUTION["encoder_pooling"], PER_TOKEN_DUAL_LAYER_POOLING)
+# Files every bundle pins in ``manifest.json`` ``files``.
+BUNDLE_FILES = ("config.json", "memory.safetensors")
 
 
 def sha256(path: Path) -> str:
@@ -217,6 +223,32 @@ def validate_tensors(weights, config, *, split, release):
     return str(dtype).removeprefix("torch.")
 
 
+def execution_contract(encoder_pooling: str | None = None) -> dict:
+    """``EXECUTION`` with an alternate ``encoder_pooling`` (non-release only)."""
+    if encoder_pooling is None or encoder_pooling == EXECUTION["encoder_pooling"]:
+        return dict(EXECUTION)
+    if encoder_pooling not in ENCODER_POOLINGS:
+        raise ValueError("unsupported encoder pooling contract")
+    return {**EXECUTION, "encoder_pooling": encoder_pooling}
+
+
+def validate_execution(execution, release: bool) -> dict:
+    """Release bundles must carry ``EXECUTION`` exactly; a non-release bundle
+    may differ only in a listed ``encoder_pooling`` value."""
+    if execution == EXECUTION:
+        return dict(execution)
+    if (
+        release
+        or not isinstance(execution, dict)
+        or set(execution) != set(EXECUTION)
+        or execution.get("encoder_pooling") not in ENCODER_POOLINGS
+        or {k: v for k, v in execution.items() if k != "encoder_pooling"}
+        != {k: v for k, v in EXECUTION.items() if k != "encoder_pooling"}
+    ):
+        raise ValueError("unsupported execution contract")
+    return dict(execution)
+
+
 def split_projections(weights: dict) -> dict:
     result = {}
     for name, tensor in weights.items():
@@ -243,14 +275,22 @@ def load_bundle(bundle_dir: Path):
     manifest = read_json(bundle_dir / "manifest.json")
     if manifest.get("schema") != SCHEMA or type(manifest.get("release")) is not bool:
         raise ValueError("unsupported bundle manifest")
-    if manifest.get("execution") != EXECUTION:
-        raise ValueError("unsupported execution contract")
-    for filename in ("config.json", "memory.safetensors"):
-        info = manifest.get("files", {}).get(filename, {})
+    validate_execution(manifest.get("execution"), manifest["release"])
+    files = manifest.get("files")
+    if not isinstance(files, dict) or not set(BUNDLE_FILES) <= set(files):
+        raise ValueError("bundle manifest lacks its file pins")
+    # Every pinned file must verify, including the extra pins a non-release
+    # bundle may carry (research candidates pin their copy head and protocol).
+    for filename in sorted(files):
+        if "/" in filename or filename.startswith(".") or filename == "manifest.json":
+            raise ValueError(f"invalid bundle file pin: {filename}")
+        info = files[filename] if isinstance(files[filename], dict) else {}
         path = bundle_dir / filename
-        if info.get("size_bytes") != path.stat().st_size or info.get(
-            "sha256"
-        ) != sha256(path):
+        if (
+            not path.is_file()
+            or info.get("size_bytes") != path.stat().st_size
+            or info.get("sha256") != sha256(path)
+        ):
             raise ValueError(f"bundle checksum mismatch: {filename}")
     config = validate_config(read_json(bundle_dir / "config.json"), manifest["release"])
     if manifest.get("config") != config:
@@ -307,7 +347,6 @@ def export_checkpoint(
     release: bool = True,
 ) -> dict:
     import torch
-    from safetensors.torch import load_file, save_file
 
     checkpoint_dir, output_dir = Path(checkpoint_dir), Path(output_dir)
     if output_dir.exists():
@@ -326,6 +365,61 @@ def export_checkpoint(
     weights = torch.load(source, map_location="cpu", weights_only=True, mmap=True)
     validate_tensors(weights, config, split=False, release=release)
     converted = split_projections(weights)
+    return write_bundle(
+        converted,
+        config,
+        output_dir,
+        release=release,
+        source={
+            "model": MODEL if release else None,
+            "revision": REVISION if release else None,
+            "checkpoint": checkpoint,
+            "sha256": source_digest,
+            "config_sha256": sha256(checkpoint_dir / "config.json"),
+        },
+    )
+
+
+def write_bundle(
+    converted: dict,
+    config: dict,
+    output_dir: Path,
+    *,
+    release: bool,
+    source: dict,
+    encoder_pooling: str | None = None,
+    extra_files: dict[str, Path] | None = None,
+) -> dict:
+    """Publish split-projection tensors as a bundle directory atomically.
+
+    ``encoder_pooling`` selects a non-release execution contract (see
+    ``ENCODER_POOLINGS``); release bundles always carry ``EXECUTION``.
+    ``extra_files`` (``{name: source path}``, non-release only) are copied
+    into the bundle and pinned in ``files`` next to the config and weights.
+    """
+    import shutil
+
+    import torch
+    from safetensors.torch import load_file, save_file
+
+    output_dir = Path(output_dir)
+    if output_dir.exists():
+        raise ValueError("output already exists; choose a new bundle directory")
+    config = validate_config(config, release)
+    execution = execution_contract(encoder_pooling)
+    if release and execution != EXECUTION:
+        raise ValueError("release bundles use the released execution contract")
+    extra_files = dict(extra_files or {})
+    if extra_files and release:
+        raise ValueError("release bundles carry only their config and weights")
+    for name in extra_files:
+        if (
+            name in BUNDLE_FILES
+            or name == "manifest.json"
+            or "/" in name
+            or name.startswith(".")
+        ):
+            raise ValueError(f"invalid extra bundle file: {name}")
     dtype = validate_tensors(converted, config, split=True, release=release)
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(
@@ -344,19 +438,15 @@ def export_checkpoint(
                 tensor.view(torch.uint8), restored[name].view(torch.uint8)
             ):
                 raise ValueError(f"round-trip mismatch: {name}")
+        for name, source_path in extra_files.items():
+            shutil.copyfile(source_path, staging / name)
         manifest = {
             "schema": SCHEMA,
             "release": release,
             "config": config,
-            "execution": EXECUTION,
+            "execution": execution,
             "base_models": BASE_MODELS if release else None,
-            "source": {
-                "model": MODEL if release else None,
-                "revision": REVISION if release else None,
-                "checkpoint": checkpoint,
-                "sha256": source_digest,
-                "config_sha256": sha256(checkpoint_dir / "config.json"),
-            },
+            "source": source,
             "implementation": {
                 "repository": "snap-stanford/memorilla",
                 "revision": UPSTREAM_COMMIT,
@@ -374,7 +464,7 @@ def export_checkpoint(
                     "sha256": sha256(staging / name),
                     "size_bytes": (staging / name).stat().st_size,
                 }
-                for name in ("config.json", "memory.safetensors")
+                for name in (*BUNDLE_FILES, *sorted(extra_files))
             },
         }
         (staging / "manifest.json").write_text(

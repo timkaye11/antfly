@@ -24,15 +24,21 @@ class InferenceMemorillaGenerateRequest:
     supported answer; otherwise the source answer or abstention is returned.
     This explicit mode does not establish
     source truth, authorization, or text/vector association cryptographically.
+    Profiles configured with reader_kind=encoder_lora_research instead take
+    document_texts in latent mode and encode them server-side; they reject
+    document_embeddings and source_verified.
 
         Attributes:
             model (str): Name from inference.memorilla.profiles. Requests cannot override the bound model assets or memory
                 module.
             question (str): A nonempty question admitted to the configured encoder's 256-token limit after canonical
                 whitespace normalization.
-            document_embeddings (list[list[float]]):
-            encoder_execution_identity (str): Exact model_identity returned by the qualified encoder. Ordinary mixed-
-                precision encoder identities are incompatible.
+            encoder_execution_identity (str): Exact model_identity returned by the configured encoder. For released profiles
+                this is the qualified encoder identity; for encoder_lora_research profiles it is the fixed research encoder
+                identity. Ordinary mixed-precision encoder identities are incompatible.
+            document_embeddings (list[list[float]] | Unset): Required for released profiles (reader_kind=released), which
+                read stored features; omitted and rejected for encoder_lora_research profiles, which encode document_texts
+                themselves. Values must be numeric tokens.
             max_new_tokens (int | Unset): Maximum tokens for each answer candidate, including an optional source repair.
                 Source-verified mode generates a memory candidate and an independent source answer, with at most one source
                 repair and two verifier calls of eight tokens each; usage reports all phases. Every phase also respects profile
@@ -40,16 +46,21 @@ class InferenceMemorillaGenerateRequest:
             context_mode (InferenceMemorillaGenerateRequestContextMode | Unset): Latent uses stored features alone. Source-
                 verified mode requires document_texts and explicitly checks or replaces the memory candidate using their
                 contents. Default: InferenceMemorillaGenerateRequestContextMode.LATENT.
-            document_texts (list[str] | Unset): Required only for source_verified and rejected in latent mode. One nonblank
-                UTF-8 source text per embedding row, in the same order; at most 8192 bytes each and 32768 source bytes total.
-                The complete rendered prompt must fit the 1024-token internal bound and operator limits, without truncation.
-                Pairing is asserted by the caller, not recomputed or authenticated.
+            document_texts (list[str] | Unset): Released profiles: required only for source_verified and rejected in
+                latent mode. One nonblank UTF-8 source text per embedding row, in the
+                same order; at most 8192 bytes each and 32768 source bytes total. The
+                complete rendered prompt must fit the 1024-token internal bound and
+                operator limits, without truncation. Pairing is asserted by the
+                caller, not recomputed or authenticated.
+                encoder_lora_research profiles: required in latent mode (1 to 64
+                texts, same per-text and total byte limits); the server encodes
+                each text with the merged research encoder.
     """
 
     model: str
     question: str
-    document_embeddings: list[list[float]]
     encoder_execution_identity: str
+    document_embeddings: list[list[float]] | Unset = UNSET
     max_new_tokens: int | Unset = 64
     context_mode: InferenceMemorillaGenerateRequestContextMode | Unset = (
         InferenceMemorillaGenerateRequestContextMode.LATENT
@@ -61,13 +72,15 @@ class InferenceMemorillaGenerateRequest:
 
         question = self.question
 
-        document_embeddings = []
-        for document_embeddings_item_data in self.document_embeddings:
-            document_embeddings_item = document_embeddings_item_data
-
-            document_embeddings.append(document_embeddings_item)
-
         encoder_execution_identity = self.encoder_execution_identity
+
+        document_embeddings: list[list[float]] | Unset = UNSET
+        if not isinstance(self.document_embeddings, Unset):
+            document_embeddings = []
+            for document_embeddings_item_data in self.document_embeddings:
+                document_embeddings_item = document_embeddings_item_data
+
+                document_embeddings.append(document_embeddings_item)
 
         max_new_tokens = self.max_new_tokens
 
@@ -85,10 +98,11 @@ class InferenceMemorillaGenerateRequest:
             {
                 "model": model,
                 "question": question,
-                "document_embeddings": document_embeddings,
                 "encoder_execution_identity": encoder_execution_identity,
             }
         )
+        if document_embeddings is not UNSET:
+            field_dict["document_embeddings"] = document_embeddings
         if max_new_tokens is not UNSET:
             field_dict["max_new_tokens"] = max_new_tokens
         if context_mode is not UNSET:
@@ -105,14 +119,16 @@ class InferenceMemorillaGenerateRequest:
 
         question = d.pop("question")
 
-        document_embeddings = []
-        _document_embeddings = d.pop("document_embeddings")
-        for document_embeddings_item_data in _document_embeddings:
-            document_embeddings_item = cast(list[float], document_embeddings_item_data)
-
-            document_embeddings.append(document_embeddings_item)
-
         encoder_execution_identity = d.pop("encoder_execution_identity")
+
+        _document_embeddings = d.pop("document_embeddings", UNSET)
+        document_embeddings: list[list[float]] | Unset = UNSET
+        if _document_embeddings is not UNSET:
+            document_embeddings = []
+            for document_embeddings_item_data in _document_embeddings:
+                document_embeddings_item = cast(list[float], document_embeddings_item_data)
+
+                document_embeddings.append(document_embeddings_item)
 
         max_new_tokens = d.pop("max_new_tokens", UNSET)
 
@@ -128,8 +144,8 @@ class InferenceMemorillaGenerateRequest:
         inference_memorilla_generate_request = cls(
             model=model,
             question=question,
-            document_embeddings=document_embeddings,
             encoder_execution_identity=encoder_execution_identity,
+            document_embeddings=document_embeddings,
             max_new_tokens=max_new_tokens,
             context_mode=context_mode,
             document_texts=document_texts,

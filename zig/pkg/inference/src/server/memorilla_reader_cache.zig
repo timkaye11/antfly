@@ -15,8 +15,12 @@
 
 //! One leased reader per loaded decoder. A decoder handle must pin this cache
 //! throughout every borrow. Request tensors/KV never enter the retained entry.
+//! `ReaderCache(Owner)` is generic over the owner: `Owner.runtime` supplies
+//! `weightPlan`/`requireLimits`/`requireAdmission` and `Owner.identity_files`
+//! the pinned files whose drift retires the entry.
 const std = @import("std");
 const reader = @import("../models/memorilla_runtime.zig");
+const research = @import("../models/memorilla_research_runtime.zig");
 const memory = @import("../runtime/root.zig").tier.memory;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const A = std.mem.Allocator;
@@ -28,7 +32,8 @@ pub const Identity = struct {
 
 /// Crypto validation remains mandatory on misses. Hits fence replacement,
 /// mutation, symlink retargeting and directory changes without hashing 388 MB.
-pub fn identity(a: A, io: std.Io, directory: []const u8, control: Control) !Identity {
+/// `files` are the owner's pinned files; the directory itself is always fenced.
+pub fn identity(a: A, io: std.Io, directory: []const u8, files: []const []const u8, control: Control) !Identity {
     try control.check();
     const canonical = try std.Io.Dir.cwd().realPathFileAlloc(io, directory, a);
     defer a.free(canonical);
@@ -37,7 +42,8 @@ pub fn identity(a: A, io: std.Io, directory: []const u8, control: Control) !Iden
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("antfly.memorilla.reader-generation.v1\x00");
     hash.update(&path_hash);
-    for ([_][]const u8{ ".", "manifest.json", "config.json", "memory.safetensors" }) |name| {
+    for (0..files.len + 1) |index| {
+        const name: []const u8 = if (index == 0) "." else files[index - 1];
         try control.check();
         const path = try std.fs.path.join(a, &.{ directory, name });
         defer a.free(path);
@@ -60,10 +66,13 @@ pub fn identity(a: A, io: std.Io, directory: []const u8, control: Control) !Iden
 }
 
 pub const Cache = ReaderCache(reader.Owner);
+pub const ResearchCache = ReaderCache(research.Owner);
 
-fn ReaderCache(comptime Owner: type) type {
+pub fn ReaderCache(comptime Owner: type) type {
     return struct {
         const Self = @This();
+        const runtime = Owner.runtime;
+        const identity_files: []const []const u8 = &Owner.identity_files;
         const Entry = struct { owner: Owner, lease: memory.AdmissionLease, identity: Identity, invalid: bool = false };
         mutex: std.atomic.Mutex = .unlocked,
         entry: ?Entry = null,
@@ -85,7 +94,7 @@ fn ReaderCache(comptime Owner: type) type {
             /// Mark drift while borrowed, then retire only after request GPU
             /// scopes have drained and Handle.deinit releases the borrow.
             pub fn verify(self: *Handle, control: Control) !void {
-                const observed = identity(self.allocator, self.io, self.directory, control) catch |err| switch (err) {
+                const observed = identity(self.allocator, self.io, self.directory, identity_files, control) catch |err| switch (err) {
                     error.FileNotFound, error.NotDir => {
                         self.cache.entry.?.invalid = true;
                         return error.ModelArtifactsChanging;
@@ -121,7 +130,7 @@ fn ReaderCache(comptime Owner: type) type {
         }
 
         fn inspect(self: *Self, a: A, io: std.Io, directory: []const u8, limits: memory.Limits, control: Control) !Identity {
-            const observed = identity(a, io, directory, control) catch |err| switch (err) {
+            const observed = identity(a, io, directory, identity_files, control) catch |err| switch (err) {
                 error.FileNotFound, error.NotDir => {
                     if (self.entry != null) {
                         self.retire();
@@ -137,7 +146,7 @@ fn ReaderCache(comptime Owner: type) type {
                         self.retire();
                         return error.ModelArtifactsChanging;
                     }
-                    try reader.requireAdmission(&entry.lease, limits);
+                    try runtime.requireAdmission(&entry.lease, limits);
                 } else self.retire(); // A profile switch keeps only one reader.
             }
             return observed;
@@ -147,7 +156,7 @@ fn ReaderCache(comptime Owner: type) type {
         /// racing miss can reserve a temporary second lease, then reuse the
         /// winner and immediately refund its unused reservation.
         pub fn acquire(self: *Self, a: A, io: std.Io, manager: anytype, directory: []const u8, limits: memory.Limits, control: Control) !Handle {
-            try reader.requireLimits(limits);
+            try runtime.requireLimits(limits);
             try control.lock(&self.mutex);
             const first = self.inspect(a, io, directory, limits, control) catch |err| {
                 self.mutex.unlock();
@@ -155,7 +164,7 @@ fn ReaderCache(comptime Owner: type) type {
             };
             if (self.entry != null) return .{ .cache = self, .allocator = a, .io = io, .directory = directory };
             self.mutex.unlock();
-            var lease = try manager.acquireRunResourceAmounts(.gpu, limits, reader.weightPlan());
+            var lease = try manager.acquireRunResourceAmounts(.gpu, limits, runtime.weightPlan());
             var transferred = false;
             defer if (!transferred) lease.release();
             try control.lock(&self.mutex);
@@ -165,7 +174,7 @@ fn ReaderCache(comptime Owner: type) type {
             if (self.entry == null) {
                 var owner = try Owner.open(a, io, directory, &lease, limits, control);
                 errdefer owner.deinit();
-                const after = try identity(a, io, directory, control);
+                const after = try identity(a, io, directory, identity_files, control);
                 if (!std.meta.eql(before, after)) return error.ModelArtifactsChanging;
                 self.entry = .{ .owner = owner, .lease = lease, .identity = after };
                 transferred = true;
@@ -176,6 +185,8 @@ fn ReaderCache(comptime Owner: type) type {
 }
 
 const TestOwner = struct {
+    pub const runtime = reader;
+    pub const identity_files = reader.Owner.identity_files;
     controller: *memory.AdmissionController,
     var opened: usize = 0;
     var closed: usize = 0;
@@ -194,6 +205,26 @@ const TestOwner = struct {
 };
 
 const TestCache = ReaderCache(TestOwner);
+
+const ResearchTestOwner = struct {
+    pub const runtime = research;
+    pub const identity_files = research.Owner.identity_files;
+    controller: *memory.AdmissionController,
+    var opened: usize = 0;
+    var closed: usize = 0;
+
+    pub fn open(_: A, _: std.Io, _: []const u8, lease: *memory.AdmissionLease, limits: memory.Limits, _: Control) !ResearchTestOwner {
+        try research.requireAdmission(lease, limits);
+        opened += 1;
+        return .{ .controller = lease.controller.? };
+    }
+    pub fn deinit(self: *ResearchTestOwner) void {
+        std.debug.assert(self.controller.snapshot().backend_weight_bytes >= research.parameter_bytes);
+        closed += 1;
+    }
+};
+
+const ResearchTestCache = ReaderCache(ResearchTestOwner);
 const TestManager = struct {
     controller: memory.AdmissionController = .{},
     cache_mutex: *std.atomic.Mutex,
@@ -281,5 +312,60 @@ test "Memorilla reader cache retains bounded admission, fences drift and refunds
     _ = changed.owner();
     changed.deinit();
     try std.testing.expectEqual(@as(usize, 3), TestOwner.closed);
+    try std.testing.expectEqual(@as(usize, 0), manager.controller.snapshot().backend_weight_bytes);
+}
+
+test "Memorilla research reader cache fences every pinned research file with its own plan" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.createDir(io, "r", .default_dir);
+    for (research.Owner.identity_files) |name| {
+        const path = try std.fs.path.join(a, &.{ "r", name });
+        defer a.free(path);
+        try temp.dir.writeFile(io, .{ .sub_path = path, .data = "mock immutable bytes" });
+    }
+    const directory = try temp.dir.realPathFileAlloc(io, "r", a);
+    defer a.free(directory);
+    const limits = memory.Limits{ .host_limit_bytes = 4 << 30, .backend_limit_bytes = 4 << 30, .combined_limit_bytes = 6 << 30 };
+    var cache = ResearchTestCache{};
+    var manager = TestManager{ .cache_mutex = &cache.mutex };
+    defer manager.controller.deinit();
+    defer cache.deinit();
+    ResearchTestOwner.opened = 0;
+    ResearchTestOwner.closed = 0;
+
+    // The research plan reserves the reader on the device and the copy head
+    // (plus table norms) on the host; a released-plan lease is insufficient.
+    const released_plan = reader.weightPlan();
+    var short = try manager.controller.tryAcquire(.gpu, limits, released_plan, false);
+    try std.testing.expectError(error.MemorillaReaderAdmissionRequired, research.requireAdmission(&short, limits));
+    short.release();
+
+    var cold = try cache.acquire(a, io, &manager, directory, limits, .{});
+    try cold.verify(.{});
+    cold.deinit();
+    try std.testing.expectEqual(@as(usize, 1), ResearchTestOwner.opened);
+    try std.testing.expectEqual(research.parameter_bytes, manager.controller.snapshot().backend_weight_bytes);
+    try std.testing.expectEqual(research.weightPlan().host_weight_bytes, manager.controller.snapshot().host_weight_bytes);
+    var hit = try cache.acquire(a, io, &manager, directory, limits, .{});
+    hit.deinit();
+    try std.testing.expectEqual(@as(usize, 1), manager.admissions);
+
+    // Drift in a research-only pinned file retires the entry; the released
+    // identity list would not have noticed it.
+    const before = try identity(a, io, directory, &reader.Owner.identity_files, .{});
+    try temp.dir.writeFile(io, .{ .sub_path = "r/protocol.json", .data = "{\"system_prompt\":\"changed\"}" });
+    const after = try identity(a, io, directory, &reader.Owner.identity_files, .{});
+    try std.testing.expect(std.mem.eql(u8, &before.path, &after.path));
+    try std.testing.expectError(error.ModelArtifactsChanging, cache.acquire(a, io, &manager, directory, limits, .{}));
+    try std.testing.expectEqual(@as(usize, 1), ResearchTestOwner.closed);
+    try std.testing.expectEqual(@as(usize, 0), manager.controller.snapshot().backend_weight_bytes);
+    var reloaded = try cache.acquire(a, io, &manager, directory, limits, .{});
+    try temp.dir.writeFile(io, .{ .sub_path = "r/copy-head.safetensors", .data = "replaced copy head" });
+    try std.testing.expectError(error.ModelArtifactsChanging, reloaded.verify(.{}));
+    reloaded.deinit();
+    try std.testing.expectEqual(@as(usize, 2), ResearchTestOwner.closed);
     try std.testing.expectEqual(@as(usize, 0), manager.controller.snapshot().backend_weight_bytes);
 }

@@ -34,12 +34,21 @@ pub const CooperativeExecution = struct {
 };
 
 pub const MemorillaProfile = struct {
+    /// `released` serves the qualified released reader over caller-supplied
+    /// embeddings. `encoder_lora_research` serves the experimental
+    /// encoder-LoRA copy candidate: `encoder` is the merged research encoder
+    /// directory and `memory_module_path` the research reader bundle; requests
+    /// supply document texts and never embeddings. Research profiles are not
+    /// qualified and fail closed on their own artifact pins.
+    pub const ReaderKind = enum { released, encoder_lora_research };
+
     name: []const u8,
     encoder: []const u8,
     decoder: []const u8,
     memory_module_path: []const u8,
     max_documents: usize = 64,
     max_new_tokens: usize = 128,
+    reader_kind: ReaderKind = .released,
 };
 
 /// Named assets are operator policy; requests select a name and never supply
@@ -87,7 +96,7 @@ pub const Memorilla = struct {
             const decoder = try a.dupe(u8, source.decoder);
             errdefer a.free(decoder);
             const path = try a.dupe(u8, source.memory_module_path);
-            dest.* = .{ .name = name, .encoder = encoder, .decoder = decoder, .memory_module_path = path, .max_documents = source.max_documents, .max_new_tokens = source.max_new_tokens };
+            dest.* = .{ .name = name, .encoder = encoder, .decoder = decoder, .memory_module_path = path, .max_documents = source.max_documents, .max_new_tokens = source.max_new_tokens, .reader_kind = source.reader_kind };
             initialized += 1;
         }
         return .{ .enabled = self.enabled, .profiles = profiles };
@@ -124,18 +133,52 @@ test "Memorilla settings bind named compositions and reject ambiguous or oversiz
     try std.testing.expectError(error.InvalidMemorillaConfig, (Memorilla{ .profiles = &.{oversized} }).validate());
 }
 
+test "Memorilla profile reader kind defaults to released and parses research from JSON" {
+    const a = std.testing.allocator;
+    var released = try std.json.parseFromSlice(Memorilla, a,
+        \\{"enabled":true,"profiles":[{"name":"stage3","encoder":"encoder","decoder":"decoder","memory_module_path":"/models/stage3"}]}
+    , .{});
+    defer released.deinit();
+    try released.value.validate();
+    try std.testing.expect((try released.value.find("stage3")).reader_kind == .released);
+
+    var research = try std.json.parseFromSlice(Memorilla, a,
+        \\{"enabled":true,"profiles":[{"name":"copy17","encoder":"/models/lora-merged-encoder","decoder":"decoder","memory_module_path":"/models/lora-reader-bundle","reader_kind":"encoder_lora_research"}]}
+    , .{});
+    defer research.deinit();
+    try research.value.validate();
+    var owned = try research.value.clone(a);
+    defer owned.deinit(a);
+    const found = try owned.find("copy17");
+    try std.testing.expect(found.reader_kind == .encoder_lora_research);
+    try std.testing.expectEqualStrings("/models/lora-reader-bundle", found.memory_module_path);
+
+    for ([_][]const u8{
+        \\{"enabled":true,"profiles":[{"name":"x","encoder":"e","decoder":"d","memory_module_path":"/m","reader_kind":"bf16_research"}]}
+        ,
+        \\{"enabled":true,"profiles":[{"name":"x","encoder":"e","decoder":"d","memory_module_path":"/m","reader_kind":null}]}
+        ,
+    }) |body| {
+        if (std.json.parseFromSlice(Memorilla, a, body, .{})) |parsed| {
+            parsed.deinit();
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
+}
+
 test "Memorilla owned profile copies unwind every allocation failure" {
     const Check = struct {
         fn run(a: std.mem.Allocator) !void {
             const config = Memorilla{ .enabled = true, .profiles = &.{
                 .{ .name = "first", .encoder = "encoder-a", .decoder = "decoder-a", .memory_module_path = "/models/first" },
-                .{ .name = "second", .encoder = "encoder-b", .decoder = "decoder-b", .memory_module_path = "/models/second" },
+                .{ .name = "second", .encoder = "encoder-b", .decoder = "decoder-b", .memory_module_path = "/models/second", .reader_kind = .encoder_lora_research },
             } };
             var owned = try config.clone(a);
             defer owned.deinit(a);
             try std.testing.expect(owned.profiles.ptr != config.profiles.ptr);
             try std.testing.expect(owned.profiles[1].encoder.ptr != config.profiles[1].encoder.ptr);
             try std.testing.expectEqualStrings("decoder-b", (try owned.find("second")).decoder);
+            try std.testing.expect((try owned.find("second")).reader_kind == .encoder_lora_research);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});

@@ -49,6 +49,7 @@ pub const kernel_jit_profile_output = @import("kernel_jit_profile_output.zig");
 pub const server = struct {
     pub const model_manager = @import("server/model_manager.zig");
     pub const memorilla_service = @import("server/memorilla_service.zig");
+    pub const memorilla_research_service = @import("server/memorilla_research_service.zig");
     pub const source_decoder_service = @import("server/source_decoder_service.zig");
     pub const memorilla_verified_service = @import("server/memorilla_verified_service.zig");
 };
@@ -57,6 +58,8 @@ pub const pipelines = struct {
     pub const memorilla = @import("pipelines/memorilla.zig");
     pub const memorilla_encoder = @import("pipelines/memorilla_encoder.zig");
     pub const memorilla_generation = @import("pipelines/memorilla_generation.zig");
+    pub const memorilla_copy = @import("pipelines/memorilla_copy.zig");
+    pub const memorilla_token_features = @import("pipelines/memorilla_token_features.zig");
     pub const memorilla_grounding = @import("pipelines/memorilla_grounding.zig");
     pub const image = @import("pipelines/image.zig");
     pub const media_chunking = @import("pipelines/media_chunking.zig");
@@ -164,6 +167,7 @@ pub const models = struct {
     pub const memorilla = @import("models/memorilla.zig");
     pub const memorilla_qualification = @import("models/memorilla_qualification.zig");
     pub const memorilla_runtime = @import("models/memorilla_runtime.zig");
+    pub const memorilla_research_runtime = @import("models/memorilla_research_runtime.zig");
     pub const embedding_gemma2 = @import("models/embedding_gemma2.zig");
     pub const gliner_decide_qualification = @import("models/gliner_decide_qualification.zig");
     pub const gliner_specialty_qualification = @import("models/gliner_specialty_qualification.zig");
@@ -197,6 +201,8 @@ pub const gguf = struct {
 test "Memorilla production encoder declarations" {
     _ = models.memorilla_qualification;
     _ = models.memorilla_runtime;
+    _ = models.memorilla_research_runtime;
+    _ = @import("server/memorilla_reader_cache.zig");
     _ = pipelines.memorilla_encoder;
 }
 test "embeddinggemma2 video module declarations" {

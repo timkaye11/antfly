@@ -291,7 +291,7 @@ fn generateImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: P
     var features = try encoder.encodeQuestion(backing, &encoder_handle, canonical, limits, encoder_control);
     defer features.deinit();
     if (!std.mem.eql(u8, features.question_text, canonical)) return error.NonCanonicalMemorillaQuestion;
-    try encoder.requireProducer(features.producer, paths.encoder.publication.?);
+    try encoder.requireProducer(features.producer, paths.encoder.publication.?, encoder.v1_profile);
     if (options.question_features) |callback| try callback(options.context, &features);
     try notify(options, .question_encoded, manager);
     try control.check();

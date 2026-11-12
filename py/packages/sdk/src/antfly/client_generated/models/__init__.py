@@ -1135,6 +1135,7 @@ from .inference_media_content_part_type import InferenceMediaContentPartType
 from .inference_memorilla_generate_request import InferenceMemorillaGenerateRequest
 from .inference_memorilla_generate_request_context_mode import InferenceMemorillaGenerateRequestContextMode
 from .inference_memorilla_generate_response import InferenceMemorillaGenerateResponse
+from .inference_memorilla_generate_response_answer_guard import InferenceMemorillaGenerateResponseAnswerGuard
 from .inference_memorilla_generate_response_answer_path import InferenceMemorillaGenerateResponseAnswerPath
 from .inference_memorilla_generate_response_context_source import InferenceMemorillaGenerateResponseContextSource
 from .inference_memorilla_generate_response_finish_reason import InferenceMemorillaGenerateResponseFinishReason
@@ -1343,6 +1344,7 @@ from .media_output_coverage_values import MediaOutputCoverageValues
 from .memorilla_generate_request import MemorillaGenerateRequest
 from .memorilla_generate_request_context_mode import MemorillaGenerateRequestContextMode
 from .memorilla_generate_response import MemorillaGenerateResponse
+from .memorilla_generate_response_answer_guard import MemorillaGenerateResponseAnswerGuard
 from .memorilla_generate_response_answer_path import MemorillaGenerateResponseAnswerPath
 from .memorilla_generate_response_context_source import MemorillaGenerateResponseContextSource
 from .memorilla_generate_response_finish_reason import MemorillaGenerateResponseFinishReason
@@ -1351,6 +1353,7 @@ from .memorilla_generate_response_source_alignment import MemorillaGenerateRespo
 from .memorilla_generate_response_verification_status import MemorillaGenerateResponseVerificationStatus
 from .memorilla_generate_usage import MemorillaGenerateUsage
 from .memorilla_profile_config import MemorillaProfileConfig
+from .memorilla_profile_config_reader_kind import MemorillaProfileConfigReaderKind
 from .memorilla_runtime_config import MemorillaRuntimeConfig
 from .memory_access import MemoryAccess
 from .memory_assertion import MemoryAssertion
@@ -3841,6 +3844,7 @@ __all__ = (
     "InferenceMemorillaGenerateRequest",
     "InferenceMemorillaGenerateRequestContextMode",
     "InferenceMemorillaGenerateResponse",
+    "InferenceMemorillaGenerateResponseAnswerGuard",
     "InferenceMemorillaGenerateResponseAnswerPath",
     "InferenceMemorillaGenerateResponseContextSource",
     "InferenceMemorillaGenerateResponseFinishReason",
@@ -4047,6 +4051,7 @@ __all__ = (
     "MemorillaGenerateRequest",
     "MemorillaGenerateRequestContextMode",
     "MemorillaGenerateResponse",
+    "MemorillaGenerateResponseAnswerGuard",
     "MemorillaGenerateResponseAnswerPath",
     "MemorillaGenerateResponseContextSource",
     "MemorillaGenerateResponseFinishReason",
@@ -4055,6 +4060,7 @@ __all__ = (
     "MemorillaGenerateResponseVerificationStatus",
     "MemorillaGenerateUsage",
     "MemorillaProfileConfig",
+    "MemorillaProfileConfigReaderKind",
     "MemorillaRuntimeConfig",
     "MemoryAccess",
     "MemoryAssertion",

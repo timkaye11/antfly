@@ -2830,6 +2830,12 @@ fn resolutionModelRevision(a: std.mem.Allocator, io: std.Io, manifest: manifest_
             if (@field(manifest, field)) |path| try paths.append(alloc, path);
         }
     }
+    if (manifest.memorilla_profile) |profile| if (@import("../models/memorilla_qualification.zig").isResearch(profile)) {
+        // The research encoder's source lock lives next to its shards; the
+        // identity must move with it like with any other dependency.
+        const root = manifest.source_root orelse return error.UnsupportedMemorillaArtifact;
+        try paths.append(alloc, try std.fs.path.join(alloc, &.{ root, @import("../models/memorilla_qualification.zig").research_lock_file }));
+    };
     if (manifest.safetensors_index_path) |path| {
         const raw = try @import("../util/c_file.zig").readFile(alloc, path);
         const index = try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw, .{});
@@ -2867,7 +2873,10 @@ fn memorillaModelIdentity(base: [32]u8, profile: ?@import("../models/memorilla_q
     hash.update(&base);
     hash.update(@tagName(selected));
     hash.update("\x00");
-    hash.update(@import("../models/memorilla_qualification.zig").lock_bytes);
+    const qualified = @import("../models/memorilla_qualification.zig");
+    // The research lock is a directory artifact: resolutionModelRevision adds
+    // it to the hashed dependency paths, so `base` already carries its bytes.
+    if (qualified.isResearch(selected)) hash.update("research-lock-in-directory") else hash.update(qualified.lock_bytes);
     return hash.finalResult();
 }
 
@@ -2876,8 +2885,11 @@ test "Memorilla model identity binds execution profile while preserving legacy i
     try std.testing.expectEqualSlices(u8, &base, &memorillaModelIdentity(base, null));
     const encoder = memorillaModelIdentity(base, .qwen3_encoder_f32_v1);
     const decoder = memorillaModelIdentity(base, .qwen3_decoder_f32_kv_f32_v1);
+    const research = memorillaModelIdentity(base, .qwen3_encoder_lora_research_f32_v1);
     try std.testing.expect(!std.mem.eql(u8, &base, &encoder));
     try std.testing.expect(!std.mem.eql(u8, &encoder, &decoder));
+    try std.testing.expect(!std.mem.eql(u8, &encoder, &research));
+    try std.testing.expect(!std.mem.eql(u8, &decoder, &research));
     try std.testing.expectEqualSlices(u8, &encoder, &memorillaModelIdentity(base, .qwen3_encoder_f32_v1));
 }
 
@@ -3330,6 +3342,9 @@ pub const LoadedModel = struct {
     embedding_prototype_cache_lease: ?runtime.tier.memory.AdmissionLease = null,
     embedding_prototype_cache_mutex: std.atomic.Mutex = .unlocked,
     memorilla_reader_cache: @import("memorilla_reader_cache.zig").Cache = .{},
+    /// Research (encoder-LoRA) reader for the same decoder; the two caches
+    /// are independent so a research profile never evicts the released reader.
+    memorilla_research_reader_cache: @import("memorilla_reader_cache.zig").ResearchCache = .{},
     /// Last complete optional-session JIT snapshot. Metrics use it when a
     /// cold sidecar load owns embedding_session_lock, keeping scrapes bounded
     /// without racing publication of the optional session handles.
@@ -3960,10 +3975,11 @@ pub const LoadedModel = struct {
         const generic_encoder: ?session_factory.GenericEncoderArchConfig = session_factory.getGenericEncoderArchConfig(self.session) catch null;
         const resident_text_encoder = (self.session.backend() == .native and self.manifest.embedding_style == .embedding_gemma2) or
             ((self.session.backend() == .metal or self.session.backend() == .cuda) and session_factory.supportsResidentTextEncoder(self.session));
+        const memorilla_encoder = if (self.manifest.memorilla_profile) |profile| @import("../models/memorilla_qualification.zig").role(profile) == .encoder else false;
         var pipeline = EmbeddingPipeline.init(allocator, self.session, tok, .{
-            .max_length = if (self.manifest.memorilla_profile == .qwen3_encoder_f32_v1) @import("../models/memorilla_qualification.zig").max_text_tokens else self.manifest.maxTextSequenceLength(),
-            .batch_size = if (self.manifest.memorilla_profile == .qwen3_encoder_f32_v1) 4 else 32,
-            .reject_truncation = self.manifest.embedding_style == .embedding_gemma2 or self.manifest.memorilla_profile == .qwen3_encoder_f32_v1,
+            .max_length = if (memorilla_encoder) @import("../models/memorilla_qualification.zig").max_text_tokens else self.manifest.maxTextSequenceLength(),
+            .batch_size = if (memorilla_encoder) 4 else 32,
+            .reject_truncation = self.manifest.embedding_style == .embedding_gemma2 or memorilla_encoder,
             .normalize = self.manifest.normalize,
             .pooling = switch (self.manifest.pooling) {
                 .mean => .mean,
@@ -3987,7 +4003,7 @@ pub const LoadedModel = struct {
             .allow_image = self.manifest.inputs.len == 0 or model_caps.modelAcceptsInput(&self.manifest, "image"),
             .allow_video = self.manifest.embedding_style == .embedding_gemma2 and model_caps.modelAcceptsInput(&self.manifest, "video"),
             .allow_audio = self.manifest.inputs.len == 0 or model_caps.modelAcceptsInput(&self.manifest, "audio"),
-            .strict_max_length = self.manifest.embedding_style == .embedding_gemma2 or self.manifest.memorilla_profile == .qwen3_encoder_f32_v1,
+            .strict_max_length = self.manifest.embedding_style == .embedding_gemma2 or memorilla_encoder,
             .preprocess_io = self.executor_io,
             // Last-token pooling reads the EOS position; guarantee exactly
             // one trailing EOS regardless of tokenizer.json snapshot age.
@@ -4208,6 +4224,7 @@ pub const LoadedModel = struct {
             if (session) |component| close_scopes[index] = component.beginClose();
         }
         self.memorilla_reader_cache.deinit();
+        self.memorilla_research_reader_cache.deinit();
         self.native_generation_graph_cache.deinit();
         self.prompt_prefix_cache.deinit();
         self.session.close();
@@ -11897,7 +11914,7 @@ fn estimateBaseModelLoadAdmission(
         if (backend_runtime.backend != .cuda) return error.MemorillaRequiresCuda;
         const qualified = @import("../models/memorilla_qualification.zig");
         try qualified.requireRecipe(profile, man);
-        const amounts = try qualified.residencyPlan(man.allocator, profile);
+        const amounts = try qualified.residencyPlan(man.allocator, profile, model_path);
         return .{ .peak = amounts.peak, .resident = amounts.resident };
     }
     const weights = try estimateModelArtifactBytes(man);

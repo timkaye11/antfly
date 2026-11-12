@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 
+from ..models.inference_memorilla_generate_response_answer_guard import InferenceMemorillaGenerateResponseAnswerGuard
 from ..models.inference_memorilla_generate_response_answer_path import InferenceMemorillaGenerateResponseAnswerPath
 from ..models.inference_memorilla_generate_response_context_source import (
     InferenceMemorillaGenerateResponseContextSource,
@@ -33,18 +34,30 @@ class InferenceMemorillaGenerateResponse:
         model (str):
         text (str):
         token_ids (list[int]):
-        finish_reason (InferenceMemorillaGenerateResponseFinishReason): Abstained is a policy-produced UNKNOWN answer
-            with empty token_ids and zero final completion tokens. Source-verified mode never publishes a truncated factual
-            answer.
+        finish_reason (InferenceMemorillaGenerateResponseFinishReason): Abstained is a policy-produced UNKNOWN answer.
+            In source-verified mode it has empty token_ids and zero final completion tokens, and that mode never publishes a
+            truncated factual answer. On encoder_lora_research profiles it is produced by the answer-format guard (see
+            answer_guard) and token_ids keep the decoder's output.
         input_documents (int):
         memory_tokens (InferenceMemorillaGenerateResponseMemoryTokens): Memory slots used by the published answer.
             Sixteen for latent or approved memory answers; zero for a source-text fallback or policy abstention. Source-
             verified mode still evaluates an initial memory candidate.
-        context_source (InferenceMemorillaGenerateResponseContextSource):
+        context_source (InferenceMemorillaGenerateResponseContextSource): supplied_documents is reported by
+            encoder_lora_research profiles, which encoded caller-supplied texts server-side.
         encoder_execution_identity (str):
         decoder_execution_identity (str):
         memory_module_sha256 (str):
         usage (MemorillaGenerateUsage):
+        candidate_sha256 (str | Unset): encoder_lora_research profiles only. SHA256 of the research candidate.json
+            pinned by both the merged encoder lock and the reader bundle; it identifies the experimental candidate, not a
+            qualification status.
+        answer_guard (InferenceMemorillaGenerateResponseAnswerGuard | Unset): encoder_lora_research profiles only.
+            Outcome of the answer-format guard applied to the decoder text. The research task answers are short exact facts
+            (a name of a few words, a short code, or the literal UNKNOWN); text that is empty, longer than 64 bytes, more
+            than six words, contains control characters, the memory frame literal Memory as a standalone word or the
+            <|memory|> marker, or bytes outside letters, digits, space, hyphen, period and apostrophe is rejected. A
+            rejected answer is published as text UNKNOWN with finish_reason abstained; token_ids keep what the decoder
+            produced.
         answer_path (InferenceMemorillaGenerateResponseAnswerPath | Unset): Present in source-verified mode and
             identifies the actual published answer path.
         verification_status (InferenceMemorillaGenerateResponseVerificationStatus | Unset): Model-supported means a
@@ -67,6 +80,8 @@ class InferenceMemorillaGenerateResponse:
     decoder_execution_identity: str
     memory_module_sha256: str
     usage: MemorillaGenerateUsage
+    candidate_sha256: str | Unset = UNSET
+    answer_guard: InferenceMemorillaGenerateResponseAnswerGuard | Unset = UNSET
     answer_path: InferenceMemorillaGenerateResponseAnswerPath | Unset = UNSET
     verification_status: InferenceMemorillaGenerateResponseVerificationStatus | Unset = UNSET
     source_alignment: InferenceMemorillaGenerateResponseSourceAlignment | Unset = UNSET
@@ -94,6 +109,12 @@ class InferenceMemorillaGenerateResponse:
         memory_module_sha256 = self.memory_module_sha256
 
         usage = self.usage.to_dict()
+
+        candidate_sha256 = self.candidate_sha256
+
+        answer_guard: str | Unset = UNSET
+        if not isinstance(self.answer_guard, Unset):
+            answer_guard = self.answer_guard.value
 
         answer_path: str | Unset = UNSET
         if not isinstance(self.answer_path, Unset):
@@ -128,6 +149,10 @@ class InferenceMemorillaGenerateResponse:
                 "usage": usage,
             }
         )
+        if candidate_sha256 is not UNSET:
+            field_dict["candidate_sha256"] = candidate_sha256
+        if answer_guard is not UNSET:
+            field_dict["answer_guard"] = answer_guard
         if answer_path is not UNSET:
             field_dict["answer_path"] = answer_path
         if verification_status is not UNSET:
@@ -166,6 +191,15 @@ class InferenceMemorillaGenerateResponse:
 
         usage = MemorillaGenerateUsage.from_dict(d.pop("usage"))
 
+        candidate_sha256 = d.pop("candidate_sha256", UNSET)
+
+        _answer_guard = d.pop("answer_guard", UNSET)
+        answer_guard: InferenceMemorillaGenerateResponseAnswerGuard | Unset
+        if isinstance(_answer_guard, Unset):
+            answer_guard = UNSET
+        else:
+            answer_guard = InferenceMemorillaGenerateResponseAnswerGuard(_answer_guard)
+
         _answer_path = d.pop("answer_path", UNSET)
         answer_path: InferenceMemorillaGenerateResponseAnswerPath | Unset
         if isinstance(_answer_path, Unset):
@@ -201,6 +235,8 @@ class InferenceMemorillaGenerateResponse:
             decoder_execution_identity=decoder_execution_identity,
             memory_module_sha256=memory_module_sha256,
             usage=usage,
+            candidate_sha256=candidate_sha256,
+            answer_guard=answer_guard,
             answer_path=answer_path,
             verification_status=verification_status,
             source_alignment=source_alignment,

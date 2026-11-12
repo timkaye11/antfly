@@ -36,6 +36,14 @@ const decoder_artifacts = [_]base.Artifact{
 };
 pub const encoder_manifest = "{\"type\":\"embedder\",\"pooling\":\"last\",\"normalize\":true,\"embedding_style\":\"qwen3_embedding\",\"embedding_trailing_eos_id\":151643,\"memorilla_profile\":\"qwen3_encoder_f32_v1\",\"embedding_profile\":{\"task_contract\":\"profiled\",\"query\":{\"prefix\":\"\"},\"document\":{\"prefix\":\"\"}}}\n";
 pub const encoder_manifest_sha256 = "494f7e6793aef818a4f24c2fd37867f1ce50c50e69f79e8ca92036d221926735";
+/// Canonical manifest of a merged research encoder directory (the released
+/// encoder manifest with only the profile tag replaced). It is never a
+/// pullable catalog bundle; `encoder_lora_export.py merge-encoder` writes it
+/// next to a `memorilla_lock.json` that pins the merged shards.
+pub const research_encoder_manifest = "{\"type\":\"embedder\",\"pooling\":\"last\",\"normalize\":true,\"embedding_style\":\"qwen3_embedding\",\"embedding_trailing_eos_id\":151643,\"memorilla_profile\":\"qwen3_encoder_lora_research_f32_v1\",\"embedding_profile\":{\"task_contract\":\"profiled\",\"query\":{\"prefix\":\"\"},\"document\":{\"prefix\":\"\"}}}\n";
+pub const research_encoder_manifest_sha256 = "44ada04c47c6e91784346ba7bcf7ae80b0aa55467870fab2077d4885af5625ae";
+pub const encoder_repo = "Qwen/Qwen3-Embedding-4B";
+pub const encoder_revision = "5cf2132abc99cad020ac570b19d031efec650f2b";
 const encoder_artifacts = [_]base.Artifact{
     .{ .repo = "Qwen/Qwen3-Embedding-4B", .revision = "5cf2132abc99cad020ac570b19d031efec650f2b", .path = "1_Pooling/config.json", .size = 313, .sha256 = "0f0ed3380602b252fced3fab6d07c76752c32ffca818ccc61afaf17ae8edd96f" },
     .{ .repo = "Qwen/Qwen3-Embedding-4B", .revision = "5cf2132abc99cad020ac570b19d031efec650f2b", .path = "config.json", .size = 727, .sha256 = "78d2861cbbfd80eee05839200c5a3b7ed64c789f6c1cab4fbb84cc4eae33eaf5" },
@@ -68,7 +76,14 @@ test "Memorilla production F32 variants pin separate roles and complete source i
     try std.testing.expectEqual(@as(usize, 12), decoder.artifacts().len);
     try std.testing.expect(findBundleForHubRef("Qwen", "Qwen3-Embedding-0.6B", variant) == null);
     try std.testing.expect(!std.mem.eql(u8, encoder.id, decoder.id));
-    inline for (.{ .{ encoder_manifest, encoder_manifest_sha256 }, .{ decoder_manifest, decoder_manifest_sha256 } }) |pair| {
+    for (encoder_artifacts) |artifact| {
+        try std.testing.expectEqualStrings(encoder_repo, artifact.repo);
+        try std.testing.expectEqualStrings(encoder_revision, artifact.revision);
+    }
+    const research_expected = try std.mem.replaceOwned(u8, std.testing.allocator, encoder_manifest, "qwen3_encoder_f32_v1", "qwen3_encoder_lora_research_f32_v1");
+    defer std.testing.allocator.free(research_expected);
+    try std.testing.expectEqualStrings(research_expected, research_encoder_manifest);
+    inline for (.{ .{ encoder_manifest, encoder_manifest_sha256 }, .{ decoder_manifest, decoder_manifest_sha256 }, .{ research_encoder_manifest, research_encoder_manifest_sha256 } }) |pair| {
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(pair[0], &digest, .{});
         try std.testing.expectEqualStrings(pair[1], &std.fmt.bytesToHex(digest, .lower));

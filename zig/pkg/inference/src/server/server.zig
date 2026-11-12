@@ -75,6 +75,8 @@ const sparse_embedding_mod = @import("../pipelines/sparse_embedding.zig");
 const generation = @import("../pipelines/generation.zig");
 pub const memorilla_service = @import("memorilla_service.zig");
 const memorilla_verified_service = @import("memorilla_verified_service.zig");
+const memorilla_research_service = @import("memorilla_research_service.zig");
+const memorilla_qualification = @import("../models/memorilla_qualification.zig");
 const context_management = @import("context_management.zig");
 const native_kv_wire = @import("native_kv_wire.zig");
 const multimodal_reranker = @import("../pipelines/multimodal_reranker.zig");
@@ -15844,19 +15846,30 @@ pub const Node = struct {
             else => inferenceFailureResponse(ctx, err),
         };
         const max_new_tokens: usize = @intCast(request.max_new_tokens.value);
-        self.config.request_limits.validateItemCount(request.document_embeddings.len) catch |err| return memorillaFailureResponse(ctx, err, true);
+        // Released readers consume caller-supplied vectors; the research
+        // encoder-LoRA candidate encodes caller-supplied texts itself.
+        const embedding_rows = request.embeddingRows();
+        const research = profile.reader_kind == .encoder_lora_research;
+        const item_count = if (research) (if (request.document_texts.value) |texts| texts.len else 0) else embedding_rows.len;
+        self.config.request_limits.validateItemCount(item_count) catch |err| return memorillaFailureResponse(ctx, err, true);
         if (self.config.request_limits.max_output_tokens_per_item) |limit| if (max_new_tokens > limit)
             return memorillaFailureResponse(ctx, error.InferenceOutputTokensExceeded, true);
         const scratch = parsed.arena.allocator();
-        const documents = try scratch.alloc([]const f32, request.document_embeddings.len);
-        for (request.document_embeddings, documents) |row, *out| {
+        const documents = try scratch.alloc([]const f32, embedding_rows.len);
+        for (embedding_rows, documents) |row, *out| {
             const values = try scratch.alloc(f32, row.len);
             for (row, values) |number, *value| value.* = number.value;
             out.* = values;
         }
-        memorilla_service.validateInputs(profile, request.question, documents, request.encoder_execution_identity, max_new_tokens) catch |err|
-            return memorillaFailureResponse(ctx, err, true);
-        request.validateSourceContext() catch |err| return memorillaFailureResponse(ctx, err, true);
+        if (research) {
+            request.validateShape(profile.reader_kind) catch |err| return memorillaFailureResponse(ctx, err, true);
+            memorilla_research_service.validateInputs(profile, request.question, request.document_texts.value.?, request.encoder_execution_identity, max_new_tokens) catch |err|
+                return memorillaFailureResponse(ctx, err, true);
+        } else {
+            memorilla_service.validateInputs(profile, request.question, documents, request.encoder_execution_identity, max_new_tokens) catch |err|
+                return memorillaFailureResponse(ctx, err, true);
+            request.validateShape(profile.reader_kind) catch |err| return memorillaFailureResponse(ctx, err, true);
+        }
         const turn = self.memorilla_execution_lane.acquire(control) catch |err| return inferenceFailureResponse(ctx, err);
         defer turn.release();
         if (try self.acquireSlot(ctx)) |response| return response;
@@ -15869,6 +15882,31 @@ pub const Node = struct {
         const decoder = self.resolveModelSelection(ctx.io, profile.decoder, "generators") catch |err| return requestModelResolutionError(ctx, err);
         defer self.allocator.free(decoder.path);
         const limits = self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(.gpu));
+        if (research) {
+            var result = memorilla_research_service.generate(ctx.allocator, ctx.io, &self.model_manager, profile, .{ .encoder = encoder, .decoder = decoder }, request.question, request.document_texts.value.?, request.encoder_execution_identity, max_new_tokens, limits, self.config.request_limits, control, .{ .request_limits = self.config.request_limits }) catch |err|
+                return memorillaFailureResponse(ctx, err, false);
+            defer result.deinit();
+            control.check() catch |err| return inferenceFailureResponse(ctx, err);
+            return ctx.json(.{
+                .model = profile.name,
+                .text = result.generation.text,
+                .token_ids = result.generation.token_ids,
+                .finish_reason = researchFinishReason(result.generation.finish_reason),
+                .input_documents = result.document_count,
+                .memory_tokens = @as(usize, 16),
+                .context_source = "supplied_documents",
+                .answer_guard = @tagName(result.answer_guard),
+                .candidate_sha256 = @as([]const u8, &result.candidate_sha256),
+                .encoder_execution_identity = @as([]const u8, &result.encoder_execution_identity),
+                .decoder_execution_identity = @as([]const u8, &result.decoder_execution_identity),
+                .memory_module_sha256 = @as([]const u8, &result.module_sha256),
+                .usage = .{
+                    .encoder_query_tokens = result.question_tokens,
+                    .prompt_tokens = result.generation.prompt_tokens,
+                    .completion_tokens = result.generation.tokens_used,
+                },
+            });
+        }
         if (request.context_mode == .source_verified) {
             var verified = memorilla_verified_service.generate(ctx.allocator, ctx.io, &self.model_manager, profile, .{ .encoder = encoder, .decoder = decoder }, request.question, documents, request.document_texts.value.?, request.encoder_execution_identity, max_new_tokens, limits, self.config.request_limits, control) catch |err|
                 return memorillaFailureResponse(ctx, err, false);
@@ -31647,8 +31685,15 @@ fn memorillaFailureResponse(ctx: *httpx.Context, err: anyerror, input_preflight:
     if (err == error.MemorillaTextLimitExceeded or err == error.EmbeddingInputTooLong or err == error.EmbeddingSequenceTooLong or
         err == error.InferenceBatchTooLarge or err == error.InferenceInputTokensExceeded or err == error.InferenceOutputTokensExceeded or
         err == error.MemorillaPromptBudgetExceeded or err == error.MemorillaCollectionBudgetExceeded or
-        err == error.MemorillaSourceTextLimitExceeded)
+        err == error.MemorillaSourceTextLimitExceeded or err == error.MemorillaEncoderBoundExceeded)
         return ctx.status(413).json(.{ .@"error" = "MEMORILLA_INPUT_LIMIT", .message = @errorName(err) });
+    // Profile-kind mismatches are configuration facts, not input faults, so
+    // they keep their 409 mapping even during request preflight.
+    if (err == error.UnsupportedMemorillaProfile or err == error.SyntheticMemorillaBundleNotAllowed or
+        err == error.MemorillaCandidateMismatch or err == error.InvalidMemorillaResearchLock)
+        return ctx.status(409).json(.{ .@"error" = "INCOMPATIBLE_MEMORILLA_PROFILE", .message = @errorName(err) });
+    if (err == error.UnexpectedMemorillaEmbeddings)
+        return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "document_embeddings is not accepted by an encoder_lora_research profile; supply document_texts" });
     if (input_preflight) return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) });
     if (err == error.UnsupportedMemorillaArtifact or err == error.MemorillaManagedProducerRequired)
         return ctx.status(409).json(.{ .@"error" = "INCOMPATIBLE_MEMORILLA_PROFILE", .message = @errorName(err) });
@@ -32869,6 +32914,142 @@ test "Memorilla HTTP source context rejects invalid evidence before queue or mod
         try std.testing.expectEqual(case.status, response.status.code);
         try std.testing.expectEqual(@as(usize, 0), node.memorilla_execution_lane.acquisitions);
         try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    }
+}
+
+test "Memorilla HTTP research profile validates text shape before queue or model resolution" {
+    const a = std.testing.allocator;
+    const profile = platform.inference_settings.MemorillaProfile{
+        .name = "copy17",
+        .encoder = "/missing/lora-merged-encoder",
+        .decoder = "/missing/decoder",
+        .memory_module_path = "/missing/lora-reader-bundle",
+        .reader_kind = .encoder_lora_research,
+    };
+    var node = try Node.init(a, .{ .memorilla = .{ .enabled = true, .profiles = &.{profile} } });
+    defer node.deinit();
+    const identity = memorilla_qualification.executionIdentity(.qwen3_encoder_lora_research_f32_v1);
+    const released_identity = memorilla_qualification.executionIdentity(.qwen3_encoder_f32_v1);
+    var row: [2560]f32 = @splat(0);
+    row[0] = 1;
+    const rows = [_][]const f32{&row};
+    const long: [8193]u8 = @splat('x');
+    var many: [65][]const u8 = undefined;
+    for (&many) |*text| text.* = "A fact.";
+    const Case = struct { mode: []const u8 = "latent", texts: ?[]const []const u8, embeddings: ?[]const []const f32 = null, identity: []const u8, status: u16 };
+    const cases = [_]Case{
+        // latent without texts
+        .{ .texts = null, .identity = &identity, .status = 400 },
+        .{ .texts = &.{}, .identity = &identity, .status = 400 },
+        // embeddings are rejected for the research profile
+        .{ .texts = &.{"A fact."}, .embeddings = &rows, .identity = &identity, .status = 400 },
+        .{ .texts = null, .embeddings = &rows, .identity = &identity, .status = 400 },
+        // source_verified is unsupported for research readers
+        .{ .mode = "source_verified", .texts = &.{"A fact."}, .identity = &identity, .status = 409 },
+        // too many / oversized texts
+        .{ .texts = &many, .identity = &identity, .status = 413 },
+        .{ .texts = &.{&long}, .identity = &identity, .status = 413 },
+        .{ .texts = &.{" \t\n"}, .identity = &identity, .status = 400 },
+        // released encoder identity does not qualify as the research producer
+        .{ .texts = &.{"A fact."}, .identity = &released_identity, .status = 409 },
+    };
+    for (cases) |case| {
+        const body = try std.json.Stringify.valueAlloc(a, .{
+            .model = "copy17",
+            .question = "Who owns the badge?",
+            .document_embeddings = case.embeddings,
+            .encoder_execution_identity = case.identity,
+            .max_new_tokens = 8,
+            .context_mode = case.mode,
+            .document_texts = case.texts,
+        }, .{ .emit_null_optional_fields = false });
+        defer a.free(body);
+        var request = try httpx.Request.init(a, .POST, "/ai/v1/memorilla/generate");
+        defer request.deinit();
+        request.body = body;
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.generateMemorilla(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(case.status, response.status.code);
+        try std.testing.expectEqual(@as(usize, 0), node.memorilla_execution_lane.acquisitions);
+        try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    }
+}
+
+test "Memorilla HTTP released profile still requires embeddings when the field is omitted" {
+    const a = std.testing.allocator;
+    const profile = platform.inference_settings.MemorillaProfile{
+        .name = "p",
+        .encoder = "/missing/encoder",
+        .decoder = "/missing/decoder",
+        .memory_module_path = "/missing/module",
+    };
+    var node = try Node.init(a, .{ .memorilla = .{ .enabled = true, .profiles = &.{profile} } });
+    defer node.deinit();
+    const identity = memorilla_qualification.executionIdentity(.qwen3_encoder_f32_v1);
+    for ([_][]const u8{
+        \\{"model":"p","question":"q","encoder_execution_identity":"IDENTITY"}
+        ,
+        \\{"model":"p","question":"q","encoder_execution_identity":"IDENTITY","document_texts":["A fact."]}
+        ,
+        \\{"model":"p","question":"q","document_embeddings":[],"encoder_execution_identity":"IDENTITY"}
+        ,
+    }) |template| {
+        const body = try std.mem.replaceOwned(u8, a, template, "IDENTITY", &identity);
+        defer a.free(body);
+        var request = try httpx.Request.init(a, .POST, "/ai/v1/memorilla/generate");
+        defer request.deinit();
+        request.body = body;
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.generateMemorilla(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        try std.testing.expectEqual(@as(usize, 0), node.memorilla_execution_lane.acquisitions);
+        try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    }
+}
+
+/// Research profiles publish the decoder's own stop ("eos") or truncation
+/// ("length"), or "abstained" when the answer-format guard replaced the
+/// decoder text with UNKNOWN (memorilla_research_service.guardAnswer).
+fn researchFinishReason(finish_reason: []const u8) []const u8 {
+    if (std.mem.eql(u8, finish_reason, "abstained")) return "abstained";
+    if (std.mem.eql(u8, finish_reason, "stop")) return "eos";
+    return "length";
+}
+
+test "Memorilla HTTP research finish reason maps guard abstention and decoder stops" {
+    try std.testing.expectEqualStrings("eos", researchFinishReason("stop"));
+    try std.testing.expectEqualStrings("length", researchFinishReason("length"));
+    try std.testing.expectEqualStrings("abstained", researchFinishReason("abstained"));
+    try std.testing.expectEqualStrings("accepted", @tagName(memorilla_research_service.AnswerGuard.accepted));
+    try std.testing.expectEqualStrings("rejected", @tagName(memorilla_research_service.guardAnswer("Memory key holder with the brass key for Zehisi Depot  \nMemory")));
+}
+
+test "Memorilla failure responses map research profile faults" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { err: anyerror, preflight: bool, status: u16 }{
+        .{ .err = error.UnsupportedMemorillaProfile, .preflight = true, .status = 409 },
+        .{ .err = error.UnsupportedMemorillaProfile, .preflight = false, .status = 409 },
+        .{ .err = error.SyntheticMemorillaBundleNotAllowed, .preflight = false, .status = 409 },
+        .{ .err = error.MemorillaCandidateMismatch, .preflight = false, .status = 409 },
+        .{ .err = error.InvalidMemorillaResearchLock, .preflight = false, .status = 409 },
+        .{ .err = error.MemorillaEncoderBoundExceeded, .preflight = false, .status = 413 },
+        .{ .err = error.MemorillaCollectionBudgetExceeded, .preflight = true, .status = 413 },
+        .{ .err = error.UnexpectedMemorillaEmbeddings, .preflight = true, .status = 400 },
+        .{ .err = error.UnexpectedMemorillaEmbeddings, .preflight = false, .status = 400 },
+        .{ .err = error.MemorillaSourceContextRequired, .preflight = true, .status = 400 },
+    };
+    for (cases) |case| {
+        var request = try httpx.Request.init(a, .POST, "/ai/v1/memorilla/generate");
+        defer request.deinit();
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try memorillaFailureResponse(&ctx, case.err, case.preflight);
+        defer response.deinit();
+        try std.testing.expectEqual(case.status, response.status.code);
     }
 }
 
@@ -38650,8 +38831,15 @@ fn parseRequestedEmbeddingDimensions(dimensions: ?i64) !?usize {
     return @intCast(value);
 }
 
+/// Both the qualified encoder tag and the research encoder-LoRA tag pin the
+/// full-width, no-prefix recipe; the check is role based.
+fn isMemorillaEncoderManifest(manifest: *const manifest_mod.ModelManifest) bool {
+    const profile = manifest.memorilla_profile orelse return false;
+    return memorilla_qualification.role(profile) == .encoder;
+}
+
 fn validateQwen3EmbeddingDimensions(manifest: *const manifest_mod.ModelManifest, dimensions: ?usize) !void {
-    if (manifest.memorilla_profile == .qwen3_encoder_f32_v1) {
+    if (isMemorillaEncoderManifest(manifest)) {
         if (dimensions) |requested| if (requested != 2560) return error.InvalidMemorillaEmbeddingDimensions;
         return;
     }
@@ -39486,7 +39674,7 @@ fn applyDenseEmbeddingConfigRequestOptions(
     manifest: *const manifest_mod.ModelManifest,
     request: ParsedEmbedRequest,
 ) !?[]u8 {
-    if (manifest.memorilla_profile == .qwen3_encoder_f32_v1) {
+    if (isMemorillaEncoderManifest(manifest)) {
         if (request.instruction != null) return error.InstructionNotSupportedForModel;
         const task = request.task_type orelse .RETRIEVAL_DOCUMENT;
         if (task != .RETRIEVAL_DOCUMENT and task != .RETRIEVAL_QUERY) return error.UnsupportedEmbeddingTaskType;

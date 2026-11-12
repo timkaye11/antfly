@@ -129,6 +129,17 @@ def sync_detailed(
     for all internal generation and verification calls. A model support
     judgment is not a formal proof, and text/vector pairing is caller-supplied.
 
+    Profiles configured with reader_kind=encoder_lora_research serve the
+    experimental encoder-LoRA copy candidate. They take document_texts in
+    latent mode, encode them server-side with the merged research encoder,
+    reject document_embeddings (400) and source_verified (409), require the
+    fixed research encoder identity, and report context_source
+    supplied_documents with candidate_sha256. An answer-format guard
+    replaces decoder text that is not a short fact (a few words of
+    letters, digits, hyphen, period and apostrophe, or the literal
+    UNKNOWN) with UNKNOWN and finish_reason abstained, reported in
+    answer_guard. This path is not qualified.
+
     Args:
         body (InferenceMemorillaGenerateRequest): Generate a buffered answer over caller-supplied
             stored document embeddings.
@@ -142,6 +153,9 @@ def sync_detailed(
             supported answer; otherwise the source answer or abstention is returned.
             This explicit mode does not establish
             source truth, authorization, or text/vector association cryptographically.
+            Profiles configured with reader_kind=encoder_lora_research instead take
+            document_texts in latent mode and encode them server-side; they reject
+            document_embeddings and source_verified.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -186,6 +200,17 @@ def sync(
     for all internal generation and verification calls. A model support
     judgment is not a formal proof, and text/vector pairing is caller-supplied.
 
+    Profiles configured with reader_kind=encoder_lora_research serve the
+    experimental encoder-LoRA copy candidate. They take document_texts in
+    latent mode, encode them server-side with the merged research encoder,
+    reject document_embeddings (400) and source_verified (409), require the
+    fixed research encoder identity, and report context_source
+    supplied_documents with candidate_sha256. An answer-format guard
+    replaces decoder text that is not a short fact (a few words of
+    letters, digits, hyphen, period and apostrophe, or the literal
+    UNKNOWN) with UNKNOWN and finish_reason abstained, reported in
+    answer_guard. This path is not qualified.
+
     Args:
         body (InferenceMemorillaGenerateRequest): Generate a buffered answer over caller-supplied
             stored document embeddings.
@@ -199,6 +224,9 @@ def sync(
             supported answer; otherwise the source answer or abstention is returned.
             This explicit mode does not establish
             source truth, authorization, or text/vector association cryptographically.
+            Profiles configured with reader_kind=encoder_lora_research instead take
+            document_texts in latent mode and encode them server-side; they reject
+            document_embeddings and source_verified.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -238,6 +266,17 @@ async def asyncio_detailed(
     for all internal generation and verification calls. A model support
     judgment is not a formal proof, and text/vector pairing is caller-supplied.
 
+    Profiles configured with reader_kind=encoder_lora_research serve the
+    experimental encoder-LoRA copy candidate. They take document_texts in
+    latent mode, encode them server-side with the merged research encoder,
+    reject document_embeddings (400) and source_verified (409), require the
+    fixed research encoder identity, and report context_source
+    supplied_documents with candidate_sha256. An answer-format guard
+    replaces decoder text that is not a short fact (a few words of
+    letters, digits, hyphen, period and apostrophe, or the literal
+    UNKNOWN) with UNKNOWN and finish_reason abstained, reported in
+    answer_guard. This path is not qualified.
+
     Args:
         body (InferenceMemorillaGenerateRequest): Generate a buffered answer over caller-supplied
             stored document embeddings.
@@ -251,6 +290,9 @@ async def asyncio_detailed(
             supported answer; otherwise the source answer or abstention is returned.
             This explicit mode does not establish
             source truth, authorization, or text/vector association cryptographically.
+            Profiles configured with reader_kind=encoder_lora_research instead take
+            document_texts in latent mode and encode them server-side; they reject
+            document_embeddings and source_verified.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -293,6 +335,17 @@ async def asyncio(
     for all internal generation and verification calls. A model support
     judgment is not a formal proof, and text/vector pairing is caller-supplied.
 
+    Profiles configured with reader_kind=encoder_lora_research serve the
+    experimental encoder-LoRA copy candidate. They take document_texts in
+    latent mode, encode them server-side with the merged research encoder,
+    reject document_embeddings (400) and source_verified (409), require the
+    fixed research encoder identity, and report context_source
+    supplied_documents with candidate_sha256. An answer-format guard
+    replaces decoder text that is not a short fact (a few words of
+    letters, digits, hyphen, period and apostrophe, or the literal
+    UNKNOWN) with UNKNOWN and finish_reason abstained, reported in
+    answer_guard. This path is not qualified.
+
     Args:
         body (InferenceMemorillaGenerateRequest): Generate a buffered answer over caller-supplied
             stored document embeddings.
@@ -306,6 +359,9 @@ async def asyncio(
             supported answer; otherwise the source answer or abstention is returned.
             This explicit mode does not establish
             source truth, authorization, or text/vector association cryptographically.
+            Profiles configured with reader_kind=encoder_lora_research instead take
+            document_texts in latent mode and encode them server-side; they reject
+            document_embeddings and source_verified.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

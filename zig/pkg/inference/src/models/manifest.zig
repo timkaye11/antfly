@@ -477,7 +477,7 @@ pub const ModelManifest = struct {
     }
 
     pub fn maxTextSequenceLength(self: *const ModelManifest) usize {
-        if (self.memorilla_profile == .qwen3_encoder_f32_v1) return memorilla_qualification.max_text_tokens;
+        if (self.memorilla_profile) |profile| if (memorilla_qualification.role(profile) == .encoder) return memorilla_qualification.max_text_tokens;
         if (self.embedding_style == .embedding_gemma2)
             return @min(@as(usize, self.max_position_embeddings), embedding_gemma2.official_max_input_tokens);
         if (self.gliner_boundary_config) |config| return config.max_len;

@@ -2076,7 +2076,8 @@ fn createCudaSessionWithRequiredProfile(
     }
     if (required_profile_override == .qwen3_generation and architecture_profile != .qwen3_generation)
         return error.UnsupportedCudaArchitecture;
-    if (required_profile_override == .qwen3_embedding or model_manifest.memorilla_profile == .qwen3_encoder_f32_v1) {
+    const memorilla_encoder_profile = if (model_manifest.memorilla_profile) |profile| memorilla_qualification.role(profile) == .encoder else false;
+    if (required_profile_override == .qwen3_embedding or memorilla_encoder_profile) {
         if (architecture_profile != .qwen3_embedding) return error.UnsupportedCudaArchitecture;
         const cfg = switch (native_impl.arch_config) {
             .gpt => |value| value,
@@ -10570,7 +10571,9 @@ fn archRunManaged(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Al
 fn archRunAdmitted(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, amounts: ?runtime.tier.memory.AdmissionAmounts) ![]Tensor {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
     if (comptime build_options.enable_cuda) {
-        if (self.memorilla_profile == .qwen3_encoder_f32_v1) {
+        // Both encoder tags (released and research) run only under an
+        // explicit admitted device budget; the role decides, not the tag.
+        if (if (self.memorilla_profile) |profile| memorilla_qualification.role(profile) == .encoder else false) {
             const held = amounts orelse return error.MemorillaAdmissionRequired;
             if (held.backend_scratch_bytes == 0) return error.MemorillaAdmissionRequired;
             var physical = try self.backend_data.cuda.compute.beginMemorillaDeviceBudget(held.backend_scratch_bytes);
@@ -10702,6 +10705,65 @@ fn runModernBertGlinerDecision(
     const result = try allocator.alloc(Tensor, 1);
     result[0] = output;
     return result;
+}
+
+/// Run-input name that asks the `.gpt` hidden-state run for one intermediate
+/// layer in addition to `last_hidden_state`. The tensor holds the HF
+/// `hidden_states[k]` index as i64 (`[1]`, or `[batch, 1]` with every element
+/// equal when a run-admission plan needs a batch-divisible input). The tap is
+/// returned as `outputs[1]`, named by `gptHiddenStatesTapName`, with the same
+/// `[batch, seq, hidden]` F32 geometry as `outputs[0]`. Callers that account
+/// CUDA D2H bytes (`CudaRuntimeStats.d2h_bytes`) see one extra host readback
+/// of `batch * seq * hidden * 4` bytes per run.
+pub const gpt_hidden_states_tap_input = "hidden_states_tap";
+
+fn gptHiddenStatesTapRequest(inputs: []const Tensor) !?usize {
+    var found: ?usize = null;
+    for (inputs[1..]) |input| {
+        if (!std.mem.eql(u8, input.name, gpt_hidden_states_tap_input)) continue;
+        if (found != null) return error.DuplicateInputs;
+        if (input.dtype != .i64 or input.data.len == 0 or input.data.len % @sizeOf(i64) != 0 or !input.isAlignedFor(i64))
+            return error.InvalidHiddenStateTap;
+        const values = input.asInt64();
+        if (values[0] <= 0) return error.InvalidHiddenStateTap;
+        for (values[1..]) |value| if (value != values[0]) return error.InvalidHiddenStateTap;
+        found = @intCast(values[0]);
+    }
+    return found;
+}
+
+/// Static `hidden_states_<k>` names (`Tensor.name` is borrowed, never freed).
+pub fn gptHiddenStatesTapName(tap_layer: usize) []const u8 {
+    @setEvalBranchQuota(400_000);
+    inline for (1..129) |k| {
+        if (tap_layer == k) return std.fmt.comptimePrint("hidden_states_{d}", .{k});
+    }
+    return gpt_hidden_states_tap_input;
+}
+
+test "gpt hidden-state tap request reads one named i64 input" {
+    const a = std.testing.allocator;
+    var ids = try Tensor.initInt64(a, "input_ids", &.{ 1, 3 }, &.{ 1, 2, 3 });
+    defer ids.deinit();
+    try std.testing.expectEqual(@as(?usize, null), try gptHiddenStatesTapRequest(&.{ids}));
+    var tap = try Tensor.initInt64(a, gpt_hidden_states_tap_input, &.{1}, &.{24});
+    defer tap.deinit();
+    try std.testing.expectEqual(@as(?usize, 24), try gptHiddenStatesTapRequest(&.{ ids, tap }));
+    try std.testing.expectEqualStrings("hidden_states_24", gptHiddenStatesTapName(24));
+    try std.testing.expectEqualStrings("hidden_states_1", gptHiddenStatesTapName(1));
+    var wide = try Tensor.initInt64(a, gpt_hidden_states_tap_input, &.{ 2, 1 }, &.{ 24, 24 });
+    defer wide.deinit();
+    try std.testing.expectEqual(@as(?usize, 24), try gptHiddenStatesTapRequest(&.{ ids, wide }));
+    var mixed = try Tensor.initInt64(a, gpt_hidden_states_tap_input, &.{ 2, 1 }, &.{ 24, 23 });
+    defer mixed.deinit();
+    try std.testing.expectError(error.InvalidHiddenStateTap, gptHiddenStatesTapRequest(&.{ ids, mixed }));
+    var zero = try Tensor.initInt64(a, gpt_hidden_states_tap_input, &.{1}, &.{0});
+    defer zero.deinit();
+    try std.testing.expectError(error.InvalidHiddenStateTap, gptHiddenStatesTapRequest(&.{ ids, zero }));
+    var wrong = try Tensor.initFloat32(a, gpt_hidden_states_tap_input, &.{1}, &.{24});
+    defer wrong.deinit();
+    try std.testing.expectError(error.InvalidHiddenStateTap, gptHiddenStatesTapRequest(&.{ ids, wrong }));
+    try std.testing.expectError(error.DuplicateInputs, gptHiddenStatesTapRequest(&.{ ids, tap, tap }));
 }
 
 fn archRunImpl(
@@ -11057,11 +11119,26 @@ fn archRunImpl(
             }
 
             // Return hidden states (not logits) — used for embedding extraction.
+            const H = cfg.hidden_size;
+            const shape = [_]i64{ @intCast(batch), @intCast(seq_len), @intCast(H) };
+            if (try gptHiddenStatesTapRequest(inputs)) |tap_layer| {
+                var tapped = try gpt_arch.hiddenForwardTapped(&cb, allocator, cfg, input_ids, batch, seq_len, null, tap_layer);
+                defer tapped.deinit(allocator);
+                const tap = tapped.tap orelse return error.InvalidHiddenStateTap;
+
+                var output_tensor = try Tensor.initFloat32(allocator, "last_hidden_state", &shape, tapped.last_hidden_state);
+                errdefer output_tensor.deinit();
+                var tap_tensor = try Tensor.initFloat32(allocator, gptHiddenStatesTapName(tap_layer), &shape, tap);
+                errdefer tap_tensor.deinit();
+
+                const result = try allocator.alloc(Tensor, 2);
+                result[0] = output_tensor;
+                result[1] = tap_tensor;
+                return result;
+            }
             const hidden = try gpt_arch.hiddenForward(&cb, allocator, cfg, input_ids, batch, seq_len, null);
             defer allocator.free(hidden);
 
-            const H = cfg.hidden_size;
-            const shape = [_]i64{ @intCast(batch), @intCast(seq_len), @intCast(H) };
             var output_tensor = try Tensor.initFloat32(allocator, "last_hidden_state", &shape, hidden);
             errdefer output_tensor.deinit();
 

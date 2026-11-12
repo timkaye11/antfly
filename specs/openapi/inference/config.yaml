@@ -985,7 +985,12 @@ components:
       type: object
       additionalProperties: false
       required: [name, encoder, decoder, memory_module_path]
-      description: An administrator-configured, immutable Memorilla model composition. Only the qualified Qwen3 F32 CUDA profiles are supported.
+      description: |
+        An administrator-configured, immutable Memorilla model composition. Only
+        the qualified Qwen3 F32 CUDA profiles are supported for the released
+        reader kind. The encoder_lora_research kind serves the experimental
+        encoder-LoRA copy candidate from its own locked artifacts; it is not
+        qualified and must not be promoted or presented as such.
       properties:
         name:
           type: string
@@ -994,7 +999,12 @@ components:
         encoder:
           type: string
           minLength: 1
-          description: Managed encoder reference using the qwen3_encoder_f32_v1 execution profile.
+          description: |
+            Managed encoder reference. For reader_kind=released this uses the
+            qwen3_encoder_f32_v1 execution profile. For
+            reader_kind=encoder_lora_research it is the merged research encoder
+            directory exported by encoder_lora_export.py (manifest profile
+            qwen3_encoder_lora_research_f32_v1 with its memorilla_lock.json).
         decoder:
           type: string
           minLength: 1
@@ -1002,7 +1012,23 @@ components:
         memory_module_path:
           type: string
           minLength: 1
-          description: Local exported released-checkpoint bundle directory. This path is configured by the administrator and cannot be supplied by an inference request.
+          description: |
+            Local reader bundle directory. For reader_kind=released this is an
+            exported released-checkpoint bundle; for
+            reader_kind=encoder_lora_research it is the research reader bundle
+            (reader, copy head, candidate.json and protocol.json). This path is
+            configured by the administrator and cannot be supplied by an
+            inference request.
+        reader_kind:
+          type: string
+          enum: [released, encoder_lora_research]
+          default: released
+          description: |
+            Which reader the composition serves. released consumes
+            caller-supplied document embeddings and supports source_verified
+            mode. encoder_lora_research encodes caller-supplied document_texts
+            with the merged research encoder, rejects document_embeddings, does
+            not support source_verified, and reports candidate_sha256.
         max_documents:
           type: integer
           minimum: 1
@@ -1029,7 +1055,7 @@ components:
     MemorillaGenerateRequest:
       type: object
       additionalProperties: false
-      required: [model, question, document_embeddings, encoder_execution_identity]
+      required: [model, question, encoder_execution_identity]
       description: |
         Generate a buffered answer over caller-supplied stored document embeddings.
         Features must be full-width normalized outputs of the configured encoder
@@ -1042,6 +1068,9 @@ components:
         supported answer; otherwise the source answer or abstention is returned.
         This explicit mode does not establish
         source truth, authorization, or text/vector association cryptographically.
+        Profiles configured with reader_kind=encoder_lora_research instead take
+        document_texts in latent mode and encode them server-side; they reject
+        document_embeddings and source_verified.
       properties:
         model:
           type: string
@@ -1064,10 +1093,11 @@ components:
             items:
               type: number
               format: float
+          description: Required for released profiles (reader_kind=released), which read stored features; omitted and rejected for encoder_lora_research profiles, which encode document_texts themselves. Values must be numeric tokens.
         encoder_execution_identity:
           type: string
           pattern: '^[0-9a-f]{64}$'
-          description: Exact model_identity returned by the qualified encoder. Ordinary mixed-precision encoder identities are incompatible.
+          description: Exact model_identity returned by the configured encoder. For released profiles this is the qualified encoder identity; for encoder_lora_research profiles it is the fixed research encoder identity. Ordinary mixed-precision encoder identities are incompatible.
         max_new_tokens:
           type: integer
           minimum: 1
@@ -1087,7 +1117,16 @@ components:
             type: string
             minLength: 1
             maxLength: 8192
-          description: Required only for source_verified and rejected in latent mode. One nonblank UTF-8 source text per embedding row, in the same order; at most 8192 bytes each and 32768 source bytes total. The complete rendered prompt must fit the 1024-token internal bound and operator limits, without truncation. Pairing is asserted by the caller, not recomputed or authenticated.
+          description: |
+            Released profiles: required only for source_verified and rejected in
+            latent mode. One nonblank UTF-8 source text per embedding row, in the
+            same order; at most 8192 bytes each and 32768 source bytes total. The
+            complete rendered prompt must fit the 1024-token internal bound and
+            operator limits, without truncation. Pairing is asserted by the
+            caller, not recomputed or authenticated.
+            encoder_lora_research profiles: required in latent mode (1 to 64
+            texts, same per-text and total byte limits); the server encodes
+            each text with the merged research encoder.
     MemorillaGenerateUsage:
       type: object
       additionalProperties: false
@@ -1125,7 +1164,7 @@ components:
         finish_reason:
           type: string
           enum: [eos, length, abstained]
-          description: Abstained is a policy-produced UNKNOWN answer with empty token_ids and zero final completion tokens. Source-verified mode never publishes a truncated factual answer.
+          description: Abstained is a policy-produced UNKNOWN answer. In source-verified mode it has empty token_ids and zero final completion tokens, and that mode never publishes a truncated factual answer. On encoder_lora_research profiles it is produced by the answer-format guard (see answer_guard) and token_ids keep the decoder's output.
         input_documents: { type: integer, minimum: 1, maximum: 64 }
         memory_tokens:
           type: integer
@@ -1133,7 +1172,16 @@ components:
           description: Memory slots used by the published answer. Sixteen for latent or approved memory answers; zero for a source-text fallback or policy abstention. Source-verified mode still evaluates an initial memory candidate.
         context_source:
           type: string
-          enum: [supplied_embeddings, supplied_embeddings_and_documents]
+          enum: [supplied_embeddings, supplied_embeddings_and_documents, supplied_documents]
+          description: supplied_documents is reported by encoder_lora_research profiles, which encoded caller-supplied texts server-side.
+        candidate_sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: encoder_lora_research profiles only. SHA256 of the research candidate.json pinned by both the merged encoder lock and the reader bundle; it identifies the experimental candidate, not a qualification status.
+        answer_guard:
+          type: string
+          enum: [accepted, rejected]
+          description: encoder_lora_research profiles only. Outcome of the answer-format guard applied to the decoder text. The research task answers are short exact facts (a name of a few words, a short code, or the literal UNKNOWN); text that is empty, longer than 64 bytes, more than six words, contains control characters, the memory frame literal Memory as a standalone word or the <|memory|> marker, or bytes outside letters, digits, space, hyphen, period and apostrophe is rejected. A rejected answer is published as text UNKNOWN with finish_reason abstained; token_ids keep what the decoder produced.
         answer_path:
           type: string
           enum: [memory_verified, source_fallback_verified, abstained]
