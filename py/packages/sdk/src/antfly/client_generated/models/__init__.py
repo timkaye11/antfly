@@ -1140,6 +1140,7 @@ from .inference_memorilla_generate_response_answer_path import InferenceMemorill
 from .inference_memorilla_generate_response_context_source import InferenceMemorillaGenerateResponseContextSource
 from .inference_memorilla_generate_response_finish_reason import InferenceMemorillaGenerateResponseFinishReason
 from .inference_memorilla_generate_response_memory_tokens import InferenceMemorillaGenerateResponseMemoryTokens
+from .inference_memorilla_generate_response_record_gate import InferenceMemorillaGenerateResponseRecordGate
 from .inference_memorilla_generate_response_source_alignment import InferenceMemorillaGenerateResponseSourceAlignment
 from .inference_memorilla_generate_response_verification_status import (
     InferenceMemorillaGenerateResponseVerificationStatus,
@@ -1341,6 +1342,8 @@ from .media_content_part_type import MediaContentPartType
 from .media_output_config import MediaOutputConfig
 from .media_output_coverage_counts import MediaOutputCoverageCounts
 from .media_output_coverage_values import MediaOutputCoverageValues
+from .memorilla_citation import MemorillaCitation
+from .memorilla_citation_match import MemorillaCitationMatch
 from .memorilla_generate_request import MemorillaGenerateRequest
 from .memorilla_generate_request_context_mode import MemorillaGenerateRequestContextMode
 from .memorilla_generate_response import MemorillaGenerateResponse
@@ -1349,6 +1352,7 @@ from .memorilla_generate_response_answer_path import MemorillaGenerateResponseAn
 from .memorilla_generate_response_context_source import MemorillaGenerateResponseContextSource
 from .memorilla_generate_response_finish_reason import MemorillaGenerateResponseFinishReason
 from .memorilla_generate_response_memory_tokens import MemorillaGenerateResponseMemoryTokens
+from .memorilla_generate_response_record_gate import MemorillaGenerateResponseRecordGate
 from .memorilla_generate_response_source_alignment import MemorillaGenerateResponseSourceAlignment
 from .memorilla_generate_response_verification_status import MemorillaGenerateResponseVerificationStatus
 from .memorilla_generate_usage import MemorillaGenerateUsage
@@ -3849,6 +3853,7 @@ __all__ = (
     "InferenceMemorillaGenerateResponseContextSource",
     "InferenceMemorillaGenerateResponseFinishReason",
     "InferenceMemorillaGenerateResponseMemoryTokens",
+    "InferenceMemorillaGenerateResponseRecordGate",
     "InferenceMemorillaGenerateResponseSourceAlignment",
     "InferenceMemorillaGenerateResponseVerificationStatus",
     "InferenceMemoryConfig",
@@ -4048,6 +4053,8 @@ __all__ = (
     "MediaOutputConfig",
     "MediaOutputCoverageCounts",
     "MediaOutputCoverageValues",
+    "MemorillaCitation",
+    "MemorillaCitationMatch",
     "MemorillaGenerateRequest",
     "MemorillaGenerateRequestContextMode",
     "MemorillaGenerateResponse",
@@ -4056,6 +4063,7 @@ __all__ = (
     "MemorillaGenerateResponseContextSource",
     "MemorillaGenerateResponseFinishReason",
     "MemorillaGenerateResponseMemoryTokens",
+    "MemorillaGenerateResponseRecordGate",
     "MemorillaGenerateResponseSourceAlignment",
     "MemorillaGenerateResponseVerificationStatus",
     "MemorillaGenerateUsage",

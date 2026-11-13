@@ -17,7 +17,9 @@ class MemorillaProfileConfig:
     the qualified Qwen3 F32 CUDA profiles are supported for the released
     reader kind. The encoder_lora_research kind serves the experimental
     encoder-LoRA copy candidate from its own locked artifacts; it is not
-    qualified and must not be promoted or presented as such.
+    qualified and must not be promoted or presented as such. The
+    hybrid_research kind composes the released reader's soft memory with
+    the research candidate's exact record (also unqualified research).
 
         Attributes:
             name (str):
@@ -26,11 +28,18 @@ class MemorillaProfileConfig:
                 reader_kind=encoder_lora_research it is the merged research encoder
                 directory exported by encoder_lora_export.py (manifest profile
                 qwen3_encoder_lora_research_f32_v1 with its memorilla_lock.json).
+                For reader_kind=hybrid_research it is the stock managed
+                qwen3_encoder_f32_v1 encoder, used for both passes: pooled document
+                and question vectors without adapters, and per-token record
+                features with the hybrid bundle's encoder LoRA applied at run time.
             decoder (str): Managed decoder reference using the qwen3_decoder_f32_kv_f32_v1 execution profile.
             memory_module_path (str): Local reader bundle directory. For reader_kind=released this is an
                 exported released-checkpoint bundle; for
                 reader_kind=encoder_lora_research it is the research reader bundle
-                (reader, copy head, candidate.json and protocol.json). This path is
+                (reader, copy head, candidate.json and protocol.json); for
+                reader_kind=hybrid_research it is the hybrid research bundle, the
+                research bundle plus a pinned encoder-lora.safetensors whose digest
+                equals candidate.json encoder_lora_sha256. This path is
                 configured by the administrator and cannot be supplied by an
                 inference request.
             reader_kind (MemorillaProfileConfigReaderKind | Unset): Which reader the composition serves. released consumes
@@ -38,7 +47,17 @@ class MemorillaProfileConfig:
                 mode. encoder_lora_research encodes caller-supplied document_texts
                 with the merged research encoder, rejects document_embeddings, does
                 not support source_verified, and reports candidate_sha256.
+                hybrid_research takes the same document_texts requests and answers
+                general questions: 16 soft rows from the released reader
+                (released_memory_module_path) over pooled vectors, plus, when the
+                record gate opens, the research candidate's 16 exact record rows,
+                with the answer re-spelled from the record and its copied spans
+                cited.
                  Default: MemorillaProfileConfigReaderKind.RELEASED.
+            released_memory_module_path (str | Unset): Required for reader_kind=hybrid_research and rejected for every
+                other kind. Local released reader bundle directory (for example
+                the stage3 export) whose 16 soft rows open the hybrid memory.
+                Configured by the administrator only.
             max_documents (int | Unset):  Default: 64.
             max_new_tokens (int | Unset):  Default: 128.
     """
@@ -48,6 +67,7 @@ class MemorillaProfileConfig:
     decoder: str
     memory_module_path: str
     reader_kind: MemorillaProfileConfigReaderKind | Unset = MemorillaProfileConfigReaderKind.RELEASED
+    released_memory_module_path: str | Unset = UNSET
     max_documents: int | Unset = 64
     max_new_tokens: int | Unset = 128
 
@@ -63,6 +83,8 @@ class MemorillaProfileConfig:
         reader_kind: str | Unset = UNSET
         if not isinstance(self.reader_kind, Unset):
             reader_kind = self.reader_kind.value
+
+        released_memory_module_path = self.released_memory_module_path
 
         max_documents = self.max_documents
 
@@ -80,6 +102,8 @@ class MemorillaProfileConfig:
         )
         if reader_kind is not UNSET:
             field_dict["reader_kind"] = reader_kind
+        if released_memory_module_path is not UNSET:
+            field_dict["released_memory_module_path"] = released_memory_module_path
         if max_documents is not UNSET:
             field_dict["max_documents"] = max_documents
         if max_new_tokens is not UNSET:
@@ -105,6 +129,8 @@ class MemorillaProfileConfig:
         else:
             reader_kind = MemorillaProfileConfigReaderKind(_reader_kind)
 
+        released_memory_module_path = d.pop("released_memory_module_path", UNSET)
+
         max_documents = d.pop("max_documents", UNSET)
 
         max_new_tokens = d.pop("max_new_tokens", UNSET)
@@ -115,6 +141,7 @@ class MemorillaProfileConfig:
             decoder=decoder,
             memory_module_path=memory_module_path,
             reader_kind=reader_kind,
+            released_memory_module_path=released_memory_module_path,
             max_documents=max_documents,
             max_new_tokens=max_new_tokens,
         )

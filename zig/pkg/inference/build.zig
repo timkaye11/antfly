@@ -1180,6 +1180,22 @@ pub fn build(b: *std.Build) void {
     b.step("build-memorilla-lora-serve-verify", "Build managed research-profile service verifier over the reference cases")
         .dependOn(&b.addInstallArtifact(memorilla_lora_serve_verify, .{}).step);
 
+    const memorilla_lora_hybrid_verify = b.addExecutable(.{
+        .name = "antfly-memorilla-lora-hybrid-verify",
+        .max_rss = 48 * 1024 * 1024 * 1024,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/memorilla_lora_hybrid_verify.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    memorilla_lora_hybrid_verify.root_module.addImport("build_options", build_options_mod);
+    memorilla_lora_hybrid_verify.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.identities.addImports(memorilla_lora_hybrid_verify.root_module);
+    memorilla_lora_hybrid_verify.root_module.link_libc = true;
+    b.step("build-memorilla-lora-hybrid-verify", "Build managed hybrid-profile service verifier over the Python hybrid rows")
+        .dependOn(&b.addInstallArtifact(memorilla_lora_hybrid_verify, .{}).step);
+
     const source_decoder_verify = b.addExecutable(.{
         .name = "antfly-source-decoder-verify",
         .max_rss = 32 * 1024 * 1024 * 1024,

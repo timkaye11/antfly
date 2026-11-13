@@ -40,7 +40,14 @@ pub const MemorillaProfile = struct {
     /// directory and `memory_module_path` the research reader bundle; requests
     /// supply document texts and never embeddings. Research profiles are not
     /// qualified and fail closed on their own artifact pins.
-    pub const ReaderKind = enum { released, encoder_lora_research };
+    /// `hybrid_research` composes the released reader's 16 soft rows with the
+    /// research candidate's 16-row exact record over one resident encoder:
+    /// `encoder` is the stock managed `qwen3_encoder_f32_v1` encoder (pooled
+    /// pass without adapters, per-token pass with the bundle's encoder LoRA
+    /// applied at run time), `memory_module_path` the hybrid research bundle
+    /// (research reader, copy head and pinned `encoder-lora.safetensors`) and
+    /// `released_memory_module_path` the released reader bundle (stage3).
+    pub const ReaderKind = enum { released, encoder_lora_research, hybrid_research };
 
     name: []const u8,
     encoder: []const u8,
@@ -49,6 +56,9 @@ pub const MemorillaProfile = struct {
     max_documents: usize = 64,
     max_new_tokens: usize = 128,
     reader_kind: ReaderKind = .released,
+    /// `hybrid_research` only (required there, rejected otherwise): the
+    /// released reader bundle that produces the soft rows.
+    released_memory_module_path: ?[]const u8 = null,
 };
 
 /// Named assets are operator policy; requests select a name and never supply
@@ -70,6 +80,12 @@ pub const Memorilla = struct {
                 _ = std.unicode.Utf8View.init(text) catch return error.InvalidMemorillaConfig;
                 if (std.mem.indexOfScalar(u8, text, 0) != null) return error.InvalidMemorillaConfig;
             }
+            // The released soft half is part of the hybrid composition only.
+            if (profile.released_memory_module_path) |text| {
+                if (profile.reader_kind != .hybrid_research or text.len == 0 or text.len > 4096) return error.InvalidMemorillaConfig;
+                _ = std.unicode.Utf8View.init(text) catch return error.InvalidMemorillaConfig;
+                if (std.mem.indexOfScalar(u8, text, 0) != null) return error.InvalidMemorillaConfig;
+            } else if (profile.reader_kind == .hybrid_research) return error.InvalidMemorillaConfig;
             for (self.profiles[0..i]) |previous| if (std.mem.eql(u8, previous.name, profile.name)) return error.DuplicateMemorillaProfile;
         }
     }
@@ -96,7 +112,9 @@ pub const Memorilla = struct {
             const decoder = try a.dupe(u8, source.decoder);
             errdefer a.free(decoder);
             const path = try a.dupe(u8, source.memory_module_path);
-            dest.* = .{ .name = name, .encoder = encoder, .decoder = decoder, .memory_module_path = path, .max_documents = source.max_documents, .max_new_tokens = source.max_new_tokens, .reader_kind = source.reader_kind };
+            errdefer a.free(path);
+            const released_path: ?[]const u8 = if (source.released_memory_module_path) |text| try a.dupe(u8, text) else null;
+            dest.* = .{ .name = name, .encoder = encoder, .decoder = decoder, .memory_module_path = path, .max_documents = source.max_documents, .max_new_tokens = source.max_new_tokens, .reader_kind = source.reader_kind, .released_memory_module_path = released_path };
             initialized += 1;
         }
         return .{ .enabled = self.enabled, .profiles = profiles };
@@ -107,6 +125,7 @@ pub const Memorilla = struct {
         a.free(profile.encoder);
         a.free(profile.decoder);
         a.free(profile.memory_module_path);
+        if (profile.released_memory_module_path) |text| a.free(text);
     }
 
     /// Only call on an owned clone; Node configuration borrows its source.
@@ -166,12 +185,45 @@ test "Memorilla profile reader kind defaults to released and parses research fro
     }
 }
 
+test "Memorilla hybrid profile requires the released soft bundle and no other kind accepts it" {
+    const a = std.testing.allocator;
+    var hybrid = try std.json.parseFromSlice(Memorilla, a,
+        \\{"enabled":true,"profiles":[{"name":"hybrid","encoder":"/models/qwen3-embedding-4b","decoder":"decoder","memory_module_path":"/models/lora-hybrid-bundle","reader_kind":"hybrid_research","released_memory_module_path":"/models/stage3"}]}
+    , .{});
+    defer hybrid.deinit();
+    try hybrid.value.validate();
+    var owned = try hybrid.value.clone(a);
+    defer owned.deinit(a);
+    const found = try owned.find("hybrid");
+    try std.testing.expect(found.reader_kind == .hybrid_research);
+    try std.testing.expectEqualStrings("/models/stage3", found.released_memory_module_path.?);
+    try std.testing.expect(found.released_memory_module_path.?.ptr != hybrid.value.profiles[0].released_memory_module_path.?.ptr);
+
+    const base = MemorillaProfile{ .name = "h", .encoder = "e", .decoder = "d", .memory_module_path = "/m", .reader_kind = .hybrid_research };
+    // Hybrid without its soft half.
+    try std.testing.expectError(error.InvalidMemorillaConfig, (Memorilla{ .profiles = &.{base} }).validate());
+    var empty = base;
+    empty.released_memory_module_path = "";
+    try std.testing.expectError(error.InvalidMemorillaConfig, (Memorilla{ .profiles = &.{empty} }).validate());
+    var nul = base;
+    nul.released_memory_module_path = "/m\x00";
+    try std.testing.expectError(error.InvalidMemorillaConfig, (Memorilla{ .profiles = &.{nul} }).validate());
+    // Released and research profiles must not carry a soft-half path.
+    for ([_]MemorillaProfile.ReaderKind{ .released, .encoder_lora_research }) |kind| {
+        var other = base;
+        other.reader_kind = kind;
+        other.released_memory_module_path = "/models/stage3";
+        try std.testing.expectError(error.InvalidMemorillaConfig, (Memorilla{ .profiles = &.{other} }).validate());
+    }
+}
+
 test "Memorilla owned profile copies unwind every allocation failure" {
     const Check = struct {
         fn run(a: std.mem.Allocator) !void {
             const config = Memorilla{ .enabled = true, .profiles = &.{
                 .{ .name = "first", .encoder = "encoder-a", .decoder = "decoder-a", .memory_module_path = "/models/first" },
                 .{ .name = "second", .encoder = "encoder-b", .decoder = "decoder-b", .memory_module_path = "/models/second", .reader_kind = .encoder_lora_research },
+                .{ .name = "third", .encoder = "encoder-c", .decoder = "decoder-c", .memory_module_path = "/models/third", .reader_kind = .hybrid_research, .released_memory_module_path = "/models/stage3" },
             } };
             var owned = try config.clone(a);
             defer owned.deinit(a);
@@ -179,6 +231,7 @@ test "Memorilla owned profile copies unwind every allocation failure" {
             try std.testing.expect(owned.profiles[1].encoder.ptr != config.profiles[1].encoder.ptr);
             try std.testing.expectEqualStrings("decoder-b", (try owned.find("second")).decoder);
             try std.testing.expect((try owned.find("second")).reader_kind == .encoder_lora_research);
+            try std.testing.expectEqualStrings("/models/stage3", (try owned.find("third")).released_memory_module_path.?);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});

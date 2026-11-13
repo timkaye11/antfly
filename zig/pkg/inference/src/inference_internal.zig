@@ -50,6 +50,7 @@ pub const server = struct {
     pub const model_manager = @import("server/model_manager.zig");
     pub const memorilla_service = @import("server/memorilla_service.zig");
     pub const memorilla_research_service = @import("server/memorilla_research_service.zig");
+    pub const memorilla_hybrid_service = @import("server/memorilla_hybrid_service.zig");
     pub const source_decoder_service = @import("server/source_decoder_service.zig");
     pub const memorilla_verified_service = @import("server/memorilla_verified_service.zig");
 };
@@ -168,6 +169,7 @@ pub const models = struct {
     pub const memorilla_qualification = @import("models/memorilla_qualification.zig");
     pub const memorilla_runtime = @import("models/memorilla_runtime.zig");
     pub const memorilla_research_runtime = @import("models/memorilla_research_runtime.zig");
+    pub const memorilla_encoder_lora = @import("models/memorilla_encoder_lora.zig");
     pub const embedding_gemma2 = @import("models/embedding_gemma2.zig");
     pub const gliner_decide_qualification = @import("models/gliner_decide_qualification.zig");
     pub const gliner_specialty_qualification = @import("models/gliner_specialty_qualification.zig");

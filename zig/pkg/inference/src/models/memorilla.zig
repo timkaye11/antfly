@@ -133,7 +133,8 @@ fn validateRelease(manifest: std.json.Value) !void {
     try equalText(try member(implementation, "memory_py_sha256"), "09acdf9ec6b8be550bd90d01cd825365de5dde6d6e19eccf4ece436ed94626a7");
 }
 
-fn verifyFile(manifest: std.json.Value, name: []const u8, bytes: []const u8) !void {
+/// Size and sha256 of `bytes` must equal the manifest's `files.<name>` pin.
+pub fn verifyFile(manifest: std.json.Value, name: []const u8, bytes: []const u8) !void {
     const item = try member(try member(manifest, "files"), name);
     const size = try member(item, "size_bytes");
     if (size != .integer or size.integer < 0 or size.integer != bytes.len) return error.MemorillaArtifactMismatch;

@@ -24,9 +24,11 @@ class InferenceMemorillaGenerateRequest:
     supported answer; otherwise the source answer or abstention is returned.
     This explicit mode does not establish
     source truth, authorization, or text/vector association cryptographically.
-    Profiles configured with reader_kind=encoder_lora_research instead take
-    document_texts in latent mode and encode them server-side; they reject
-    document_embeddings and source_verified.
+    Profiles configured with reader_kind=encoder_lora_research or
+    hybrid_research instead take document_texts in latent mode and encode
+    them server-side (the hybrid computes the pooled document and question
+    vectors itself as well); they reject document_embeddings and
+    source_verified.
 
         Attributes:
             model (str): Name from inference.memorilla.profiles. Requests cannot override the bound model assets or memory
@@ -35,7 +37,8 @@ class InferenceMemorillaGenerateRequest:
                 whitespace normalization.
             encoder_execution_identity (str): Exact model_identity returned by the configured encoder. For released profiles
                 this is the qualified encoder identity; for encoder_lora_research profiles it is the fixed research encoder
-                identity. Ordinary mixed-precision encoder identities are incompatible.
+                identity; for hybrid_research profiles it is the qualified (stock) encoder identity, because both passes run on
+                the stock encoder. Ordinary mixed-precision encoder identities are incompatible.
             document_embeddings (list[list[float]] | Unset): Required for released profiles (reader_kind=released), which
                 read stored features; omitted and rejected for encoder_lora_research profiles, which encode document_texts
                 themselves. Values must be numeric tokens.
@@ -55,6 +58,12 @@ class InferenceMemorillaGenerateRequest:
                 encoder_lora_research profiles: required in latent mode (1 to 64
                 texts, same per-text and total byte limits); the server encodes
                 each text with the merged research encoder.
+                hybrid_research profiles: the same rules; the server pools each
+                text with the stock encoder (texts over its 256-token pooled limit
+                are split into sentence-greedy chunks of at most 128 tokens, one
+                soft-memory vector each, at most 64 vectors) and encodes the
+                per-token record batch with the run-time encoder LoRA (padded
+                batch rows of at most 1024 tokens).
     """
 
     model: str

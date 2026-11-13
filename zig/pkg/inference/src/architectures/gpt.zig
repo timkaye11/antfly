@@ -293,7 +293,123 @@ fn decoderOverrideLayerSlot(slots: [decoder_override_layer_capacity]?usize, laye
     return slots[layer];
 }
 
+/// Request-scoped low-rank adapters on the Qwen3 self-attention q/v
+/// projections (PEFT-style LoRA applied at run time; resident weights are
+/// never modified). For every layer `l` and projection `p` in {q, v}:
+/// `y = W_p x + scale * B_p (A_p x)` with `A_p [rank, hidden]` and
+/// `B_p [out_p, rank]`, added to the raw projection output before the Q/K head
+/// norms and RoPE, exactly where a merged weight `W_p + scale * B_p A_p` would
+/// act. The caller owns the device tensors and frees them after the run.
+pub const EncoderLora = struct {
+    rank: usize,
+    scale: f32,
+    /// One entry per decoder layer, `config.num_hidden_layers` long.
+    layers: []const Layer,
+
+    pub const Layer = struct { q_a: CT, q_b: CT, v_a: CT, v_b: CT };
+    pub const Projection = enum { q, v };
+
+    /// Elements of one layer in the packed host layout
+    /// `[q_A (rank x hidden), q_B (q_out x rank), v_A (rank x hidden), v_B (v_out x rank)]`
+    /// (row-major, PyTorch `[out, in]` orientation).
+    pub fn packedLayerElements(hidden: usize, q_out: usize, v_out: usize, rank: usize) !usize {
+        const down = try std.math.mul(usize, rank, hidden);
+        return std.math.add(usize, try std.math.mul(usize, down, 2), try std.math.mul(usize, try std.math.add(usize, q_out, v_out), rank));
+    }
+
+    /// Dense Qwen3 projection widths `(hidden, q_out, v_out)` of `config`.
+    pub fn projectionWidths(config: Config) [3]usize {
+        const head_dim: usize = config.headDim();
+        return .{ config.hidden_size, @as(usize, config.num_attention_heads) * head_dim, @as(usize, config.effectiveKVHeads()) * head_dim };
+    }
+
+    /// Adapter rank implied by a packed layer of `elements` values, or an
+    /// error when the size does not divide into whole rank-r adapters.
+    pub fn packedRank(config: Config, elements: usize) !usize {
+        const widths = projectionWidths(config);
+        const per_rank = 2 * widths[0] + widths[1] + widths[2];
+        if (elements == 0 or elements % per_rank != 0) return error.InvalidEncoderLora;
+        const rank = elements / per_rank;
+        if (rank > @min(widths[0], @min(widths[1], widths[2]))) return error.InvalidEncoderLora;
+        return rank;
+    }
+
+    /// `base + scale * B (A input)`. On success `base` is released (unless the
+    /// backend added in place) and the adapted projection is returned; on
+    /// error `base` stays owned by the caller.
+    pub fn adapt(self: *const EncoderLora, cb: *const ComputeBackend, layer: usize, projection: Projection, input: CT, base: CT, rows: usize, in_dim: usize, out_dim: usize) !CT {
+        if (layer >= self.layers.len or self.rank == 0 or !std.math.isFinite(self.scale)) return error.InvalidEncoderLora;
+        const entry = self.layers[layer];
+        const down_weight, const up_weight = switch (projection) {
+            .q => .{ entry.q_a, entry.q_b },
+            .v => .{ entry.v_a, entry.v_b },
+        };
+        const down = try cb.linearNoBias(input, down_weight, rows, in_dim, self.rank);
+        defer cb.free(down);
+        const up = try cb.linearNoBias(down, up_weight, rows, self.rank, out_dim);
+        defer cb.free(up);
+        const scaled = (try cb.multiplyScalar(up, self.scale)) orelse return error.UnsupportedEncoderLora;
+        defer if (scaled != up) cb.free(scaled);
+        const adapted = try cb.add(base, scaled);
+        if (adapted != base) cb.free(base);
+        return adapted;
+    }
+};
+
+/// Device copies of a packed adapter set, owned by one run.
+pub const OwnedEncoderLora = struct {
+    allocator: std.mem.Allocator,
+    layers: []EncoderLora.Layer,
+    lora: EncoderLora,
+
+    /// Uploads `layers x packedLayerElements` host values (see
+    /// `EncoderLora.packedLayerElements`) to `cb`. Values must be finite.
+    pub fn upload(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: Config, values: []const f32, layer_count: usize, scale: f32) !OwnedEncoderLora {
+        if (config.family != .qwen3 or layer_count != config.num_hidden_layers or layer_count == 0 or values.len % layer_count != 0) return error.UnsupportedEncoderLora;
+        if (!std.math.isFinite(scale)) return error.InvalidEncoderLora;
+        for (values) |value| if (!std.math.isFinite(value)) return error.InvalidEncoderLora;
+        const per_layer = values.len / layer_count;
+        const rank = try EncoderLora.packedRank(config, per_layer);
+        const widths = EncoderLora.projectionWidths(config);
+        const layers = try allocator.alloc(EncoderLora.Layer, layer_count);
+        errdefer allocator.free(layers);
+        var built: usize = 0;
+        errdefer for (layers[0..built]) |entry| freeLayer(cb, entry);
+        for (layers, 0..) |*entry, index| {
+            const packed_layer = values[index * per_layer ..][0..per_layer];
+            const down = rank * widths[0];
+            const q_up = widths[1] * rank;
+            const q_a = try cb.fromFloat32Shape(packed_layer[0..down], &.{ @intCast(rank), @intCast(widths[0]) });
+            errdefer cb.free(q_a);
+            const q_b = try cb.fromFloat32Shape(packed_layer[down..][0..q_up], &.{ @intCast(widths[1]), @intCast(rank) });
+            errdefer cb.free(q_b);
+            const v_a = try cb.fromFloat32Shape(packed_layer[down + q_up ..][0..down], &.{ @intCast(rank), @intCast(widths[0]) });
+            errdefer cb.free(v_a);
+            const v_b = try cb.fromFloat32Shape(packed_layer[2 * down + q_up ..][0 .. widths[2] * rank], &.{ @intCast(widths[2]), @intCast(rank) });
+            entry.* = .{ .q_a = q_a, .q_b = q_b, .v_a = v_a, .v_b = v_b };
+            built += 1;
+        }
+        return .{ .allocator = allocator, .layers = layers, .lora = .{ .rank = rank, .scale = scale, .layers = layers } };
+    }
+
+    fn freeLayer(cb: *const ComputeBackend, entry: EncoderLora.Layer) void {
+        cb.free(entry.q_a);
+        cb.free(entry.q_b);
+        cb.free(entry.v_a);
+        cb.free(entry.v_b);
+    }
+
+    pub fn deinit(self: *OwnedEncoderLora, cb: *const ComputeBackend) void {
+        for (self.layers) |entry| freeLayer(cb, entry);
+        self.allocator.free(self.layers);
+        self.* = undefined;
+    }
+};
+
 pub const Layer0DecoderOverrides = struct {
+    /// Run-scoped Qwen3 q/v adapters (`EncoderLora`); null on every ordinary
+    /// path. Only the eager split-projection route accepts them.
+    encoder_lora: ?*const EncoderLora = null,
     attn_norm: ?CT = null,
     fused_qkv: ?CT = null,
     q: ?CT = null,
@@ -3494,7 +3610,24 @@ pub fn hiddenForwardTapped(
     decode_context: ?*const DecodeContext,
     tap_layer: ?usize,
 ) !TappedHidden {
-    const resident = try hiddenForwardResidentWithOverridesTapped(cb, allocator, config, input_ids, batch, seq_len, decode_context, .{}, tap_layer);
+    return hiddenForwardTappedWithLora(cb, allocator, config, input_ids, batch, seq_len, decode_context, tap_layer, null);
+}
+
+/// `hiddenForwardTapped` with optional run-scoped q/v adapters (`EncoderLora`,
+/// one entry per layer). A null adapter set takes exactly the plain path.
+pub fn hiddenForwardTappedWithLora(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    tap_layer: ?usize,
+    lora: ?*const EncoderLora,
+) !TappedHidden {
+    if (lora) |set| if (config.family != .qwen3 or set.layers.len != config.num_hidden_layers) return error.UnsupportedEncoderLora;
+    const resident = try hiddenForwardResidentWithOverridesTapped(cb, allocator, config, input_ids, batch, seq_len, decode_context, .{ .encoder_lora = lora }, tap_layer);
     defer cb.free(resident.hidden);
     errdefer if (resident.tap) |values| allocator.free(values);
     const last_hidden_state = try cb.toFloat32(resident.hidden, allocator);
@@ -6696,7 +6829,7 @@ fn decoderBlockImpl(
         prepared_rope: bool = false,
         gate_sigmoid: bool = false,
     };
-    const projected: AttentionProjectionSet = if (fused_qkv_override_active) blk: {
+    var projected: AttentionProjectionSet = if (fused_qkv_override_active) blk: {
         const fused_qkv = layer0_fused_qkv_override.?;
         defer cb.free(fused_qkv);
         const q = try cb.sliceLastDim(fused_qkv, 0, q_dim);
@@ -6855,6 +6988,20 @@ fn decoderBlockImpl(
         };
         break :blk .{ .q = q, .q_gate = q_gate, .k = k, .v_omitted = v_omitted_local, .v = v_local };
     };
+    if (raw_overrides.encoder_lora) |lora| {
+        errdefer {
+            cb.free(projected.q);
+            if (projected.q_gate) |gate| cb.free(gate);
+            cb.free(projected.k);
+            if (!projected.v_omitted) cb.free(projected.v);
+        }
+        // Adapters act on raw dense Qwen3 projections only: no fused, gated,
+        // shared or pre-roped route may silently skip them.
+        if (config.family != .qwen3 or shares_kv or fused_qkv_override_active or fused_qkv_linear_slot_active or split_qkv_override_active or
+            projected.prepared_rope or projected.q_gate != null or projected.v_omitted) return error.UnsupportedEncoderLora;
+        projected.q = try lora.adapt(cb, layer, .q, normed, projected.q, total, hidden_size, q_dim);
+        projected.v = try lora.adapt(cb, layer, .v, normed, projected.v, total, hidden_size, kv_dim);
+    }
     const Q = projected.q;
     const K = projected.k;
     const V = projected.v;
@@ -15003,4 +15150,162 @@ test "LightOnOCR3 CUDA uncached hidden and logits forwards own admitted temporar
     try std.testing.expectError(error.ResourceLimitExceeded, forward(&cb, a, cfg, &ids, 1, ids.len, null));
     try std.testing.expectEqual(downloads, compute.stats.d2h_bytes);
     try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, controller.snapshot());
+}
+
+const EncoderLoraTestModel = struct {
+    const hidden: usize = 8;
+    const heads: usize = 2;
+    const kv_heads: usize = 1;
+    const head_dim: usize = 4;
+    const inter: usize = 16;
+    const vocab: usize = 16;
+    const layers: usize = 2;
+    const rank: usize = 2;
+    const scale: f32 = 2.0;
+    const q_dim = heads * head_dim;
+    const kv_dim = kv_heads * head_dim;
+
+    fn config() Config {
+        return .{ .family = .qwen3, .hidden_size = hidden, .intermediate_size = inter, .num_hidden_layers = layers, .num_attention_heads = heads, .num_key_value_heads = kv_heads, .attention_head_dim = head_dim, .vocab_size = vocab, .max_position_embeddings = 64, .norm_type = .rms_norm, .position_encoding = .rope, .activation = .silu };
+    }
+
+    /// Deterministic pseudo-random values in roughly [-amp, amp].
+    fn fill(values: []f32, seed: u32, amp: f32) void {
+        for (values, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i * 7 + seed * 131 + 1)) * 0.37) * amp;
+    }
+
+    fn adapter(which: EncoderLora.Projection, layer: usize, part: enum { a, b }, out: []f32) void {
+        fill(out, @intCast(1000 + layer * 10 + @as(usize, @intFromEnum(which)) * 4 + @as(usize, @intFromEnum(part))), 0.3);
+    }
+
+    /// `merged = true` stores `W + scale * B A` for q/v, the offline merge the
+    /// research encoder used; otherwise the stock W.
+    fn build(a: std.mem.Allocator, store: *native_compute_mod.WeightStore, merged: bool) !void {
+        var embed: [vocab * hidden]f32 = undefined;
+        fill(&embed, 1, 0.5);
+        try putDeepSeekV4TestWeight(a, store, "model.embed_tokens.weight", &.{ vocab, hidden }, &embed);
+        var norm: [hidden]f32 = undefined;
+        for (&norm, 0..) |*value, i| value.* = 1 + 0.05 * @as(f32, @floatFromInt(i));
+        try putDeepSeekV4TestWeight(a, store, "model.norm.weight", &.{hidden}, &norm);
+        var name: [128]u8 = undefined;
+        for (0..layers) |layer| {
+            const seed: u32 = @intCast(layer * 50);
+            try putDeepSeekV4TestWeight(a, store, try std.fmt.bufPrint(&name, "model.layers.{d}.input_layernorm.weight", .{layer}), &.{hidden}, &norm);
+            try putDeepSeekV4TestWeight(a, store, try std.fmt.bufPrint(&name, "model.layers.{d}.post_attention_layernorm.weight", .{layer}), &.{hidden}, &norm);
+            var head_norm: [head_dim]f32 = undefined;
+            for (&head_norm, 0..) |*value, i| value.* = 0.9 + 0.04 * @as(f32, @floatFromInt(i));
+            try putDeepSeekV4TestWeight(a, store, try std.fmt.bufPrint(&name, "model.layers.{d}.self_attn.q_norm.weight", .{layer}), &.{head_dim}, &head_norm);
+            try putDeepSeekV4TestWeight(a, store, try std.fmt.bufPrint(&name, "model.layers.{d}.self_attn.k_norm.weight", .{layer}), &.{head_dim}, &head_norm);
+            inline for (.{ .{ "q", q_dim, EncoderLora.Projection.q }, .{ "v", kv_dim, EncoderLora.Projection.v } }) |spec| {
+                var weight: [spec[1] * hidden]f32 = undefined;
+                fill(&weight, seed + @as(u32, if (spec[2] == .q) 2 else 3), 0.4);
+                if (merged) {
+                    var down: [rank * hidden]f32 = undefined;
+                    var up: [spec[1] * rank]f32 = undefined;
+                    adapter(spec[2], layer, .a, &down);
+                    adapter(spec[2], layer, .b, &up);
+                    for (0..spec[1]) |o| for (0..hidden) |i| {
+                        var delta: f32 = 0;
+                        for (0..rank) |r| delta += up[o * rank + r] * down[r * hidden + i];
+                        weight[o * hidden + i] += scale * delta;
+                    };
+                }
+                try putDeepSeekV4TestWeight(a, store, try std.fmt.bufPrint(&name, "model.layers.{d}.self_attn." ++ spec[0] ++ "_proj.weight", .{layer}), &.{ spec[1], hidden }, &weight);
+            }
+            var k: [kv_dim * hidden]f32 = undefined;
+            fill(&k, seed + 4, 0.4);
+            try putDeepSeekV4TestWeight(a, store, try std.fmt.bufPrint(&name, "model.layers.{d}.self_attn.k_proj.weight", .{layer}), &.{ kv_dim, hidden }, &k);
+            var o: [hidden * q_dim]f32 = undefined;
+            fill(&o, seed + 5, 0.3);
+            try putDeepSeekV4TestWeight(a, store, try std.fmt.bufPrint(&name, "model.layers.{d}.self_attn.o_proj.weight", .{layer}), &.{ hidden, q_dim }, &o);
+            var gate: [inter * hidden]f32 = undefined;
+            fill(&gate, seed + 6, 0.3);
+            try putDeepSeekV4TestWeight(a, store, try std.fmt.bufPrint(&name, "model.layers.{d}.mlp.gate_proj.weight", .{layer}), &.{ inter, hidden }, &gate);
+            var up_w: [inter * hidden]f32 = undefined;
+            fill(&up_w, seed + 7, 0.3);
+            try putDeepSeekV4TestWeight(a, store, try std.fmt.bufPrint(&name, "model.layers.{d}.mlp.up_proj.weight", .{layer}), &.{ inter, hidden }, &up_w);
+            var down_w: [hidden * inter]f32 = undefined;
+            fill(&down_w, seed + 8, 0.3);
+            try putDeepSeekV4TestWeight(a, store, try std.fmt.bufPrint(&name, "model.layers.{d}.mlp.down_proj.weight", .{layer}), &.{ hidden, inter }, &down_w);
+        }
+    }
+
+    fn maxRelativeError(actual: []const f32, expected: []const f32) f32 {
+        var worst: f32 = 0;
+        var scale_max: f32 = 0;
+        for (expected) |value| scale_max = @max(scale_max, @abs(value));
+        for (actual, expected) |got, want| worst = @max(worst, @abs(got - want));
+        return worst / @max(scale_max, 1e-12);
+    }
+};
+
+test "encoder LoRA at run time equals the merged q/v weights and leaves the plain forward unchanged" {
+    const a = std.testing.allocator;
+    const M = EncoderLoraTestModel;
+    const cfg = M.config();
+    var stock_store = native_compute_mod.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitDeepSeekV4TestWeightStore(a, &stock_store);
+    try M.build(a, &stock_store, false);
+    var merged_store = native_compute_mod.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitDeepSeekV4TestWeightStore(a, &merged_store);
+    try M.build(a, &merged_store, true);
+    var stock_compute = native_compute_mod.NativeCompute.init(a, &stock_store, null);
+    defer stock_compute.deinit();
+    const stock = stock_compute.computeBackend();
+    var merged_compute = native_compute_mod.NativeCompute.init(a, &merged_store, null);
+    defer merged_compute.deinit();
+    const merged = merged_compute.computeBackend();
+
+    // Two right-padded rows, as the per-token encoder batch is laid out.
+    const ids = [_]i64{ 1, 5, 9, 3, 2, 7, 4, 4, 11, 6 };
+    const batch: usize = 2;
+    const seq_len: usize = 5;
+
+    // Packed host layout per layer: q_A, q_B, v_A, v_B.
+    const per_layer = comptime EncoderLora.packedLayerElements(M.hidden, M.q_dim, M.kv_dim, M.rank) catch unreachable;
+    try std.testing.expectEqual(@as(usize, 2 * (2 * 8) + (8 + 4) * 2), per_layer);
+    try std.testing.expectEqual(M.rank, try EncoderLora.packedRank(cfg, per_layer));
+    try std.testing.expectError(error.InvalidEncoderLora, EncoderLora.packedRank(cfg, per_layer + 1));
+    try std.testing.expectError(error.InvalidEncoderLora, EncoderLora.packedRank(cfg, 0));
+    var packed_values: [M.layers * per_layer]f32 = undefined;
+    for (0..M.layers) |layer| {
+        const out = packed_values[layer * per_layer ..][0..per_layer];
+        const down = M.rank * M.hidden;
+        M.adapter(.q, layer, .a, out[0..down]);
+        M.adapter(.q, layer, .b, out[down..][0 .. M.q_dim * M.rank]);
+        M.adapter(.v, layer, .a, out[down + M.q_dim * M.rank ..][0..down]);
+        M.adapter(.v, layer, .b, out[2 * down + M.q_dim * M.rank ..][0 .. M.kv_dim * M.rank]);
+    }
+    var owned = try OwnedEncoderLora.upload(&stock, a, cfg, &packed_values, M.layers, M.scale);
+    defer owned.deinit(&stock);
+    const lora = owned.lora;
+    try std.testing.expectEqual(M.rank, lora.rank);
+    try std.testing.expectError(error.UnsupportedEncoderLora, OwnedEncoderLora.upload(&stock, a, cfg, &packed_values, 1, M.scale));
+    try std.testing.expectError(error.InvalidEncoderLora, OwnedEncoderLora.upload(&stock, a, cfg, packed_values[0 .. 2 * per_layer - 2], M.layers, M.scale));
+    var poisoned = packed_values;
+    poisoned[3] = std.math.nan(f32);
+    try std.testing.expectError(error.InvalidEncoderLora, OwnedEncoderLora.upload(&stock, a, cfg, &poisoned, M.layers, M.scale));
+
+    var adapted = try hiddenForwardTappedWithLora(&stock, a, cfg, &ids, batch, seq_len, null, 1, &lora);
+    defer adapted.deinit(a);
+    var reference = try hiddenForwardTapped(&merged, a, cfg, &ids, batch, seq_len, null, 1);
+    defer reference.deinit(a);
+    try std.testing.expect(M.maxRelativeError(adapted.last_hidden_state, reference.last_hidden_state) <= 1e-5);
+    try std.testing.expect(M.maxRelativeError(adapted.tap.?, reference.tap.?) <= 1e-5);
+
+    // No adapters: the tapped plain path equals the ordinary hidden forward
+    // bit for bit and differs from the adapted one.
+    var plain = try hiddenForwardTappedWithLora(&stock, a, cfg, &ids, batch, seq_len, null, 1, null);
+    defer plain.deinit(a);
+    const ordinary = try hiddenForward(&stock, a, cfg, &ids, batch, seq_len, null);
+    defer a.free(ordinary);
+    try std.testing.expectEqualSlices(f32, ordinary, plain.last_hidden_state);
+    try std.testing.expect(M.maxRelativeError(plain.last_hidden_state, adapted.last_hidden_state) > 1e-3);
+
+    // The adapter set must cover every layer of a dense Qwen3 model.
+    const short = EncoderLora{ .rank = M.rank, .scale = M.scale, .layers = owned.layers[0..1] };
+    try std.testing.expectError(error.UnsupportedEncoderLora, hiddenForwardTappedWithLora(&stock, a, cfg, &ids, batch, seq_len, null, 1, &short));
+    var other = cfg;
+    other.family = .llama;
+    try std.testing.expectError(error.UnsupportedEncoderLora, hiddenForwardTappedWithLora(&stock, a, other, &ids, batch, seq_len, null, 1, &lora));
 }

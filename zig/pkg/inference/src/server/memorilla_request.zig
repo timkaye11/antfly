@@ -77,14 +77,15 @@ pub const Request = struct {
     /// Profile-kind shape rules, checked before any lane, slot or model work.
     /// Released readers consume caller-supplied embeddings; the research
     /// encoder-LoRA candidate encodes caller-supplied texts itself and never
-    /// accepts vectors, and its source-verified mode is not implemented.
+    /// accepts vectors, and its source-verified mode is not implemented. The
+    /// hybrid profile takes the same texts (the server also pools them).
     pub fn validateShape(self: @This(), kind: ReaderKind) !void {
         switch (kind) {
             .released => {
                 if (self.embeddingRows().len == 0) return error.EmptyMemorillaCollection;
                 try self.validateSourceContext();
             },
-            .encoder_lora_research => {
+            .encoder_lora_research, .hybrid_research => {
                 if (self.document_embeddings.value != null) return error.UnexpectedMemorillaEmbeddings;
                 if (self.context_mode == .source_verified) return error.UnsupportedMemorillaProfile;
                 const texts = self.document_texts.value orelse return error.MemorillaSourceContextRequired;
@@ -189,6 +190,22 @@ test "Memorilla request shape separates released embeddings from research texts"
         \\{"model":"m","question":"q","encoder_execution_identity":"id","document_texts":[" \n\t"]}
         , .kind = .encoder_lora_research, .failure = error.InvalidMemorillaSourceText },
         .{ .body = "{\"model\":\"m\",\"question\":\"q\",\"encoder_execution_identity\":\"id\",\"document_texts\":[\"" ++ long ++ "\"]}", .kind = .encoder_lora_research, .failure = error.MemorillaSourceTextLimitExceeded },
+        // Hybrid: the research text rules, with the server pooling the texts.
+        .{ .body =
+        \\{"model":"m","question":"q","encoder_execution_identity":"id","document_texts":["A fact.","Another fact."]}
+        , .kind = .hybrid_research, .failure = null },
+        .{ .body =
+        \\{"model":"m","question":"q","encoder_execution_identity":"id"}
+        , .kind = .hybrid_research, .failure = error.MemorillaSourceContextRequired },
+        .{ .body =
+        \\{"model":"m","question":"q","document_embeddings":[[1]],"encoder_execution_identity":"id","document_texts":["A fact."]}
+        , .kind = .hybrid_research, .failure = error.UnexpectedMemorillaEmbeddings },
+        .{ .body =
+        \\{"model":"m","question":"q","encoder_execution_identity":"id","context_mode":"source_verified","document_texts":["A fact."]}
+        , .kind = .hybrid_research, .failure = error.UnsupportedMemorillaProfile },
+        .{ .body =
+        \\{"model":"m","question":"q","encoder_execution_identity":"id","document_texts":[" \n\t"]}
+        , .kind = .hybrid_research, .failure = error.InvalidMemorillaSourceText },
     };
     for (cases) |case| {
         var parsed = try std.json.parseFromSlice(Request, a, case.body, .{});

@@ -76,6 +76,7 @@ const generation = @import("../pipelines/generation.zig");
 pub const memorilla_service = @import("memorilla_service.zig");
 const memorilla_verified_service = @import("memorilla_verified_service.zig");
 const memorilla_research_service = @import("memorilla_research_service.zig");
+const memorilla_hybrid_service = @import("memorilla_hybrid_service.zig");
 const memorilla_qualification = @import("../models/memorilla_qualification.zig");
 const context_management = @import("context_management.zig");
 const native_kv_wire = @import("native_kv_wire.zig");
@@ -15847,10 +15848,12 @@ pub const Node = struct {
         };
         const max_new_tokens: usize = @intCast(request.max_new_tokens.value);
         // Released readers consume caller-supplied vectors; the research
-        // encoder-LoRA candidate encodes caller-supplied texts itself.
+        // encoder-LoRA candidate and the hybrid composition encode
+        // caller-supplied texts themselves.
         const embedding_rows = request.embeddingRows();
         const research = profile.reader_kind == .encoder_lora_research;
-        const item_count = if (research) (if (request.document_texts.value) |texts| texts.len else 0) else embedding_rows.len;
+        const hybrid = profile.reader_kind == .hybrid_research;
+        const item_count = if (research or hybrid) (if (request.document_texts.value) |texts| texts.len else 0) else embedding_rows.len;
         self.config.request_limits.validateItemCount(item_count) catch |err| return memorillaFailureResponse(ctx, err, true);
         if (self.config.request_limits.max_output_tokens_per_item) |limit| if (max_new_tokens > limit)
             return memorillaFailureResponse(ctx, error.InferenceOutputTokensExceeded, true);
@@ -15861,7 +15864,11 @@ pub const Node = struct {
             for (row, values) |number, *value| value.* = number.value;
             out.* = values;
         }
-        if (research) {
+        if (hybrid) {
+            request.validateShape(profile.reader_kind) catch |err| return memorillaFailureResponse(ctx, err, true);
+            memorilla_hybrid_service.validateInputs(profile, request.question, request.document_texts.value.?, request.encoder_execution_identity, max_new_tokens) catch |err|
+                return memorillaFailureResponse(ctx, err, true);
+        } else if (research) {
             request.validateShape(profile.reader_kind) catch |err| return memorillaFailureResponse(ctx, err, true);
             memorilla_research_service.validateInputs(profile, request.question, request.document_texts.value.?, request.encoder_execution_identity, max_new_tokens) catch |err|
                 return memorillaFailureResponse(ctx, err, true);
@@ -15882,30 +15889,21 @@ pub const Node = struct {
         const decoder = self.resolveModelSelection(ctx.io, profile.decoder, "generators") catch |err| return requestModelResolutionError(ctx, err);
         defer self.allocator.free(decoder.path);
         const limits = self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(.gpu));
+        if (hybrid) {
+            // One resident encoder serves both the pooled and the per-token
+            // (run-time LoRA) passes.
+            var result = memorilla_hybrid_service.generate(ctx.allocator, ctx.io, &self.model_manager, profile, .{ .encoder = encoder, .decoder = decoder }, request.question, request.document_texts.value.?, request.encoder_execution_identity, max_new_tokens, limits, self.config.request_limits, control, .{ .request_limits = self.config.request_limits }) catch |err|
+                return memorillaFailureResponse(ctx, err, false);
+            defer result.deinit();
+            control.check() catch |err| return inferenceFailureResponse(ctx, err);
+            return memorillaHybridResponse(ctx, scratch, profile.name, &result);
+        }
         if (research) {
             var result = memorilla_research_service.generate(ctx.allocator, ctx.io, &self.model_manager, profile, .{ .encoder = encoder, .decoder = decoder }, request.question, request.document_texts.value.?, request.encoder_execution_identity, max_new_tokens, limits, self.config.request_limits, control, .{ .request_limits = self.config.request_limits }) catch |err|
                 return memorillaFailureResponse(ctx, err, false);
             defer result.deinit();
             control.check() catch |err| return inferenceFailureResponse(ctx, err);
-            return ctx.json(.{
-                .model = profile.name,
-                .text = result.generation.text,
-                .token_ids = result.generation.token_ids,
-                .finish_reason = researchFinishReason(result.generation.finish_reason),
-                .input_documents = result.document_count,
-                .memory_tokens = @as(usize, 16),
-                .context_source = "supplied_documents",
-                .answer_guard = @tagName(result.answer_guard),
-                .candidate_sha256 = @as([]const u8, &result.candidate_sha256),
-                .encoder_execution_identity = @as([]const u8, &result.encoder_execution_identity),
-                .decoder_execution_identity = @as([]const u8, &result.decoder_execution_identity),
-                .memory_module_sha256 = @as([]const u8, &result.module_sha256),
-                .usage = .{
-                    .encoder_query_tokens = result.question_tokens,
-                    .prompt_tokens = result.generation.prompt_tokens,
-                    .completion_tokens = result.generation.tokens_used,
-                },
-            });
+            return memorillaResearchResponse(ctx, scratch, profile.name, &result);
         }
         if (request.context_mode == .source_verified) {
             var verified = memorilla_verified_service.generate(ctx.allocator, ctx.io, &self.model_manager, profile, .{ .encoder = encoder, .decoder = decoder }, request.question, documents, request.document_texts.value.?, request.encoder_execution_identity, max_new_tokens, limits, self.config.request_limits, control) catch |err|
@@ -31690,10 +31688,11 @@ fn memorillaFailureResponse(ctx: *httpx.Context, err: anyerror, input_preflight:
     // Profile-kind mismatches are configuration facts, not input faults, so
     // they keep their 409 mapping even during request preflight.
     if (err == error.UnsupportedMemorillaProfile or err == error.SyntheticMemorillaBundleNotAllowed or
-        err == error.MemorillaCandidateMismatch or err == error.InvalidMemorillaResearchLock)
+        err == error.MemorillaCandidateMismatch or err == error.InvalidMemorillaResearchLock or
+        err == error.InvalidMemorillaEncoderLora or err == error.UnsupportedEncoderLora or err == error.InvalidEncoderLora)
         return ctx.status(409).json(.{ .@"error" = "INCOMPATIBLE_MEMORILLA_PROFILE", .message = @errorName(err) });
     if (err == error.UnexpectedMemorillaEmbeddings)
-        return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "document_embeddings is not accepted by an encoder_lora_research profile; supply document_texts" });
+        return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "document_embeddings is not accepted by an encoder_lora_research or hybrid_research profile; supply document_texts" });
     if (input_preflight) return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) });
     if (err == error.UnsupportedMemorillaArtifact or err == error.MemorillaManagedProducerRequired)
         return ctx.status(409).json(.{ .@"error" = "INCOMPATIBLE_MEMORILLA_PROFILE", .message = @errorName(err) });
@@ -32977,6 +32976,71 @@ test "Memorilla HTTP research profile validates text shape before queue or model
     }
 }
 
+test "Memorilla HTTP hybrid profile validates text shape and the stock identity before queue or model resolution" {
+    const a = std.testing.allocator;
+    const profile = platform.inference_settings.MemorillaProfile{
+        .name = "hybrid",
+        .encoder = "/missing/qwen3-embedding-4b",
+        .decoder = "/missing/decoder",
+        .memory_module_path = "/missing/lora-hybrid-bundle",
+        .reader_kind = .hybrid_research,
+        .released_memory_module_path = "/missing/stage3",
+    };
+    var node = try Node.init(a, .{ .memorilla = .{ .enabled = true, .profiles = &.{profile} } });
+    defer node.deinit();
+    const identity = memorilla_qualification.executionIdentity(.qwen3_encoder_f32_v1);
+    const research_identity = memorilla_qualification.executionIdentity(.qwen3_encoder_lora_research_f32_v1);
+    var row: [2560]f32 = @splat(0);
+    row[0] = 1;
+    const rows = [_][]const f32{&row};
+    const long: [8193]u8 = @splat('x');
+    var many: [65][]const u8 = undefined;
+    for (&many) |*text| text.* = "A fact.";
+    const Case = struct { mode: []const u8 = "latent", texts: ?[]const []const u8, embeddings: ?[]const []const f32 = null, identity: []const u8, max_new_tokens: i64 = 8, status: u16 };
+    const cases = [_]Case{
+        // latent without texts
+        .{ .texts = null, .identity = &identity, .status = 400 },
+        .{ .texts = &.{}, .identity = &identity, .status = 400 },
+        // the server pools the texts itself; client vectors are rejected
+        .{ .texts = &.{"A fact."}, .embeddings = &rows, .identity = &identity, .status = 400 },
+        .{ .texts = null, .embeddings = &rows, .identity = &identity, .status = 400 },
+        // source_verified is unsupported for hybrid readers
+        .{ .mode = "source_verified", .texts = &.{"A fact."}, .identity = &identity, .status = 409 },
+        // too many / oversized / blank texts
+        .{ .texts = &many, .identity = &identity, .status = 413 },
+        .{ .texts = &.{&long}, .identity = &identity, .status = 413 },
+        .{ .texts = &.{" \t\n"}, .identity = &identity, .status = 400 },
+        // both passes run on the stock encoder: the merged research identity is wrong
+        .{ .texts = &.{"A fact."}, .identity = &research_identity, .status = 409 },
+        .{ .texts = &.{"A fact."}, .identity = &identity, .max_new_tokens = 129, .status = 400 },
+    };
+    for (cases) |case| {
+        const body = try std.json.Stringify.valueAlloc(a, .{
+            .model = "hybrid",
+            .question = "Who owns the badge?",
+            .document_embeddings = case.embeddings,
+            .encoder_execution_identity = case.identity,
+            .max_new_tokens = case.max_new_tokens,
+            .context_mode = case.mode,
+            .document_texts = case.texts,
+        }, .{ .emit_null_optional_fields = false });
+        defer a.free(body);
+        var request = try httpx.Request.init(a, .POST, "/ai/v1/memorilla/generate");
+        defer request.deinit();
+        request.body = body;
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.generateMemorilla(&ctx);
+        defer response.deinit();
+        std.testing.expectEqual(case.status, response.status.code) catch |err| {
+            std.debug.print("hybrid HTTP case {any} -> {d}: {s}\n", .{ case.texts != null, response.status.code, response.body orelse "" });
+            return err;
+        };
+        try std.testing.expectEqual(@as(usize, 0), node.memorilla_execution_lane.acquisitions);
+        try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    }
+}
+
 test "Memorilla HTTP released profile still requires embeddings when the field is omitted" {
     const a = std.testing.allocator;
     const profile = platform.inference_settings.MemorillaProfile{
@@ -33018,6 +33082,218 @@ fn researchFinishReason(finish_reason: []const u8) []const u8 {
     if (std.mem.eql(u8, finish_reason, "abstained")) return "abstained";
     if (std.mem.eql(u8, finish_reason, "stop")) return "eos";
     return "length";
+}
+
+/// A research citation as published (`MemorillaCitation`): the record slots
+/// stay internal.
+const MemorillaCitationJson = struct {
+    document_index: usize,
+    start: usize,
+    end: usize,
+    text: []const u8,
+    supports_answer: bool,
+    match: []const u8,
+};
+
+fn memorillaCitationsJson(allocator: std.mem.Allocator, citations: []const memorilla_research_service.Citation) ![]MemorillaCitationJson {
+    const out = try allocator.alloc(MemorillaCitationJson, citations.len);
+    for (citations, out) |citation, *view| view.* = .{
+        .document_index = citation.document_index,
+        .start = citation.start,
+        .end = citation.end,
+        .text = citation.text,
+        .supports_answer = citation.supports_answer,
+        .match = @tagName(citation.match),
+    };
+    return out;
+}
+
+/// Buffered response of an `encoder_lora_research` profile. `scratch` holds
+/// the citation views until the body is serialized.
+fn memorillaResearchResponse(ctx: *httpx.Context, scratch: std.mem.Allocator, model: []const u8, result: *const memorilla_research_service.OwnedResult) !httpx.Response {
+    return ctx.json(.{
+        .model = model,
+        .text = result.generation.text,
+        .token_ids = result.generation.token_ids,
+        .finish_reason = researchFinishReason(result.generation.finish_reason),
+        .input_documents = result.document_count,
+        .memory_tokens = @as(usize, 16),
+        .context_source = "supplied_documents",
+        .answer_guard = @tagName(result.answer_guard),
+        .citations = try memorillaCitationsJson(scratch, result.citations.items),
+        .citations_unavailable = result.citations.unavailable,
+        .candidate_sha256 = @as([]const u8, &result.candidate_sha256),
+        .encoder_execution_identity = @as([]const u8, &result.encoder_execution_identity),
+        .decoder_execution_identity = @as([]const u8, &result.decoder_execution_identity),
+        .memory_module_sha256 = @as([]const u8, &result.module_sha256),
+        .usage = .{
+            .encoder_query_tokens = result.question_tokens,
+            .prompt_tokens = result.generation.prompt_tokens,
+            .completion_tokens = result.generation.tokens_used,
+        },
+    });
+}
+
+/// Buffered response of a `hybrid_research` profile: the research fields plus
+/// the gate, the canonicalization flag, the row count and the soft reader
+/// digest. `scratch` holds the citation views until the body is serialized.
+fn memorillaHybridResponse(ctx: *httpx.Context, scratch: std.mem.Allocator, model: []const u8, result: *const memorilla_hybrid_service.OwnedResult) !httpx.Response {
+    return ctx.json(.{
+        .model = model,
+        .text = result.generation.text,
+        .token_ids = result.generation.token_ids,
+        .finish_reason = researchFinishReason(result.generation.finish_reason),
+        .input_documents = result.document_count,
+        .memory_tokens = result.memory_tokens,
+        .context_source = "supplied_documents",
+        .answer_guard = @tagName(result.answer_guard),
+        .record_gate = @tagName(result.record_gate),
+        .canonicalized = result.canonicalized,
+        .citations = try memorillaCitationsJson(scratch, result.citations.items),
+        .citations_unavailable = result.citations.unavailable,
+        .candidate_sha256 = @as([]const u8, &result.candidate_sha256),
+        .encoder_execution_identity = @as([]const u8, &result.encoder_execution_identity),
+        .decoder_execution_identity = @as([]const u8, &result.decoder_execution_identity),
+        .memory_module_sha256 = @as([]const u8, &result.module_sha256),
+        .soft_module_sha256 = @as([]const u8, &result.soft_module_sha256),
+        .usage = .{
+            .encoder_query_tokens = result.question_tokens,
+            .prompt_tokens = result.generation.prompt_tokens,
+            .completion_tokens = result.generation.tokens_used,
+        },
+    });
+}
+
+test "Memorilla HTTP hybrid response reports the gate rows canonicalization and both readers" {
+    const a = std.testing.allocator;
+    var cited = "Code Kq9-0012".*;
+    var items = [_]memorilla_hybrid_service.Citation{
+        .{ .document_index = 1, .start = 0, .end = 13, .text = &cited, .slots = .{ 4, 10 }, .supports_answer = true, .match = .case_insensitive },
+    };
+    var token_ids = [_]i32{ 42, 7 };
+    const identity: [64]u8 = @splat('a');
+    const soft: [64]u8 = @splat('b');
+    var result = memorilla_hybrid_service.OwnedResult{
+        .allocator = a,
+        .generation = .{ .text = "Kq9-0012", .token_ids = &token_ids, .prompt_tokens = 120, .tokens_used = 2, .finish_reason = "stop", .allocator = a },
+        .answer_guard = .accepted,
+        .record_gate = .open,
+        .canonicalized = true,
+        .memory_tokens = 32,
+        .encoder_execution_identity = identity,
+        .decoder_execution_identity = identity,
+        .module_sha256 = identity,
+        .soft_module_sha256 = soft,
+        .candidate_sha256 = identity,
+        .adapter_sha256 = identity,
+        .document_count = 2,
+        .soft_rows = 2,
+        .question_tokens = 9,
+        .citations = .{ .allocator = a, .items = &items, .unavailable = false },
+        .record_text = &.{},
+        .raw_text = &.{},
+        .min_snap_cosine = 0.9,
+        .response_lease = .{ .controller = null, .amounts = .{}, .amounts_by_backend = @splat(.{}), .retain_backend_class = null, .live_reserved_bytes = 0 },
+    };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    for ([_]memorilla_hybrid_service.RecordGate{ .open, .closed }) |gate| {
+        result.record_gate = gate;
+        result.memory_tokens = if (gate == .open) 32 else 16;
+        result.canonicalized = gate == .open;
+        result.citations.items = items[0..if (gate == .open) items.len else 0];
+        var request = try httpx.Request.init(a, .POST, "/ai/v1/memorilla/generate");
+        defer request.deinit();
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try memorillaHybridResponse(&ctx, arena.allocator(), "hybrid", &result);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+        defer parsed.deinit();
+        const fields = parsed.value.object;
+        try std.testing.expectEqualStrings("Kq9-0012", fields.get("text").?.string);
+        try std.testing.expectEqualStrings("eos", fields.get("finish_reason").?.string);
+        try std.testing.expectEqualStrings(@tagName(gate), fields.get("record_gate").?.string);
+        try std.testing.expectEqual(@as(i64, if (gate == .open) 32 else 16), fields.get("memory_tokens").?.integer);
+        try std.testing.expectEqual(gate == .open, fields.get("canonicalized").?.bool);
+        try std.testing.expectEqualStrings("supplied_documents", fields.get("context_source").?.string);
+        try std.testing.expectEqualStrings("accepted", fields.get("answer_guard").?.string);
+        try std.testing.expectEqualStrings(&soft, fields.get("soft_module_sha256").?.string);
+        try std.testing.expectEqualStrings(&identity, fields.get("memory_module_sha256").?.string);
+        const citations = fields.get("citations").?.array.items;
+        try std.testing.expectEqual(@as(usize, if (gate == .open) 1 else 0), citations.len);
+        if (gate == .open) {
+            try std.testing.expectEqualStrings("case_insensitive", citations[0].object.get("match").?.string);
+            try std.testing.expect(citations[0].object.get("slots") == null);
+        }
+    }
+}
+
+test "Memorilla HTTP research response publishes citations with byte offsets into document_texts" {
+    const a = std.testing.allocator;
+    const documents = [_][]const u8{ "Alice Chen holds the badge.", "Code Kq9-0012 opens it." };
+    var cited = "Code Kq9-0012".*;
+    var other = "Alice Chen".*;
+    var items = [_]memorilla_research_service.Citation{
+        .{ .document_index = 0, .start = 0, .end = 10, .text = &other, .slots = .{ 1, 3 }, .supports_answer = false, .match = .none },
+        .{ .document_index = 1, .start = 0, .end = 13, .text = &cited, .slots = .{ 4, 10 }, .supports_answer = true, .match = .exact },
+    };
+    var token_ids = [_]i32{ 42, 7 };
+    const identity: [64]u8 = @splat('a');
+    var result = memorilla_research_service.OwnedResult{
+        .generation = .{ .text = "Kq9-0012", .token_ids = &token_ids, .prompt_tokens = 90, .tokens_used = 2, .finish_reason = "stop", .allocator = a },
+        .answer_guard = .accepted,
+        .encoder_execution_identity = identity,
+        .decoder_execution_identity = identity,
+        .module_sha256 = identity,
+        .candidate_sha256 = identity,
+        .document_count = documents.len,
+        .question_tokens = 9,
+        .citations = .{ .allocator = a, .items = &items, .unavailable = false },
+        .response_lease = .{ .controller = null, .amounts = .{}, .amounts_by_backend = @splat(.{}), .retain_backend_class = null, .live_reserved_bytes = 0 },
+    };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    for ([_]bool{ false, true }) |unavailable| {
+        result.citations.unavailable = unavailable;
+        result.citations.items = items[0..if (unavailable) 0 else items.len];
+        var request = try httpx.Request.init(a, .POST, "/ai/v1/memorilla/generate");
+        defer request.deinit();
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try memorillaResearchResponse(&ctx, arena.allocator(), "copy17", &result);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+        defer parsed.deinit();
+        const fields = parsed.value.object;
+        try std.testing.expectEqualStrings("Kq9-0012", fields.get("text").?.string);
+        try std.testing.expectEqualStrings("eos", fields.get("finish_reason").?.string);
+        try std.testing.expectEqualStrings("supplied_documents", fields.get("context_source").?.string);
+        try std.testing.expectEqualStrings("accepted", fields.get("answer_guard").?.string);
+        try std.testing.expectEqual(unavailable, fields.get("citations_unavailable").?.bool);
+        const citations = fields.get("citations").?.array.items;
+        if (unavailable) {
+            try std.testing.expectEqual(@as(usize, 0), citations.len);
+            continue;
+        }
+        try std.testing.expectEqual(@as(usize, 2), citations.len);
+        for (citations) |entry| {
+            const citation = entry.object;
+            // Exactly the published fields; the record slots stay internal.
+            try std.testing.expectEqual(@as(usize, 6), citation.count());
+            const index: usize = @intCast(citation.get("document_index").?.integer);
+            const start: usize = @intCast(citation.get("start").?.integer);
+            const end: usize = @intCast(citation.get("end").?.integer);
+            try std.testing.expectEqualStrings(documents[index][start..end], citation.get("text").?.string);
+            try std.testing.expect(citation.get("supports_answer").? == .bool);
+        }
+        try std.testing.expectEqualStrings("exact", citations[1].object.get("match").?.string);
+        try std.testing.expect(citations[1].object.get("supports_answer").?.bool);
+        try std.testing.expectEqualStrings("none", citations[0].object.get("match").?.string);
+        try std.testing.expect(!citations[0].object.get("supports_answer").?.bool);
+    }
 }
 
 test "Memorilla HTTP research finish reason maps guard abstention and decoder stops" {

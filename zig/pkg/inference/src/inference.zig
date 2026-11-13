@@ -167,6 +167,8 @@ test {
     _ = @import("pipelines/memorilla_token_features.zig");
     _ = @import("models/memorilla.zig");
     _ = @import("server/memorilla_research_service.zig");
+    _ = @import("server/memorilla_hybrid_service.zig");
+    _ = @import("models/memorilla_encoder_lora.zig");
     _ = @import("documents/sources.zig");
     _ = @import("extractors/gliner_span_long_executor.zig");
     _ = @import("architectures/modern_bert.zig");

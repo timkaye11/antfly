@@ -10732,6 +10732,66 @@ fn gptHiddenStatesTapRequest(inputs: []const Tensor) !?usize {
     return found;
 }
 
+/// Run inputs that apply a request-scoped encoder LoRA to the Qwen3 q/v
+/// projections of the tapped hidden-state run (`gpt.EncoderLora`), without
+/// touching resident weights: `encoder_lora` is F32 `[num_layers, per_layer]`
+/// in the packed layout of `gpt.EncoderLora.packedLayerElements`, and
+/// `encoder_lora_scale` is F32 `[1]` (`alpha / rank`). Both or neither must
+/// be present, and only together with `hidden_states_tap`. The adapters are
+/// uploaded for the run and freed before it returns.
+pub const gpt_encoder_lora_input = "encoder_lora";
+pub const gpt_encoder_lora_scale_input = "encoder_lora_scale";
+
+const GptEncoderLoraRequest = struct { values: []const f32, layers: usize, scale: f32 };
+
+fn gptEncoderLoraRequest(inputs: []const Tensor) !?GptEncoderLoraRequest {
+    var values: ?Tensor = null;
+    var scale: ?Tensor = null;
+    for (inputs[1..]) |input| {
+        const target = if (std.mem.eql(u8, input.name, gpt_encoder_lora_input)) &values else if (std.mem.eql(u8, input.name, gpt_encoder_lora_scale_input)) &scale else continue;
+        if (target.* != null) return error.DuplicateInputs;
+        if (input.dtype != .f32 or input.data.len == 0 or input.data.len % @sizeOf(f32) != 0 or !input.isAlignedFor(f32)) return error.InvalidEncoderLora;
+        target.* = input;
+    }
+    if (values == null and scale == null) return null;
+    const packed_tensor = values orelse return error.InvalidEncoderLora;
+    const scale_tensor = scale orelse return error.InvalidEncoderLora;
+    if (packed_tensor.shape.len != 2 or packed_tensor.shape[0] <= 0 or packed_tensor.shape[1] <= 0) return error.InvalidEncoderLora;
+    const scale_values = scale_tensor.asFloat32();
+    if (scale_values.len != 1 or !std.math.isFinite(scale_values[0])) return error.InvalidEncoderLora;
+    const flat = packed_tensor.asFloat32();
+    const layers: usize = @intCast(packed_tensor.shape[0]);
+    if (flat.len != layers * @as(usize, @intCast(packed_tensor.shape[1]))) return error.InvalidEncoderLora;
+    return .{ .values = flat, .layers = layers, .scale = scale_values[0] };
+}
+
+test "gpt encoder LoRA request needs both named F32 inputs" {
+    const a = std.testing.allocator;
+    var ids = try Tensor.initInt64(a, "input_ids", &.{ 1, 2 }, &.{ 1, 2 });
+    defer ids.deinit();
+    try std.testing.expect((try gptEncoderLoraRequest(&.{ids})) == null);
+    var values = try Tensor.initFloat32(a, gpt_encoder_lora_input, &.{ 2, 3 }, &.{ 1, 2, 3, 4, 5, 6 });
+    defer values.deinit();
+    var scale = try Tensor.initFloat32(a, gpt_encoder_lora_scale_input, &.{1}, &.{2});
+    defer scale.deinit();
+    const request = (try gptEncoderLoraRequest(&.{ ids, values, scale })).?;
+    try std.testing.expectEqual(@as(usize, 2), request.layers);
+    try std.testing.expectEqual(@as(usize, 6), request.values.len);
+    try std.testing.expectEqual(@as(f32, 2), request.scale);
+    try std.testing.expectError(error.InvalidEncoderLora, gptEncoderLoraRequest(&.{ ids, values }));
+    try std.testing.expectError(error.InvalidEncoderLora, gptEncoderLoraRequest(&.{ ids, scale }));
+    try std.testing.expectError(error.DuplicateInputs, gptEncoderLoraRequest(&.{ ids, values, scale, values }));
+    var bad_scale = try Tensor.initFloat32(a, gpt_encoder_lora_scale_input, &.{1}, &.{std.math.inf(f32)});
+    defer bad_scale.deinit();
+    try std.testing.expectError(error.InvalidEncoderLora, gptEncoderLoraRequest(&.{ ids, values, bad_scale }));
+    var flat = try Tensor.initFloat32(a, gpt_encoder_lora_input, &.{6}, &.{ 1, 2, 3, 4, 5, 6 });
+    defer flat.deinit();
+    try std.testing.expectError(error.InvalidEncoderLora, gptEncoderLoraRequest(&.{ ids, flat, scale }));
+    var wrong = try Tensor.initInt64(a, gpt_encoder_lora_input, &.{ 1, 1 }, &.{1});
+    defer wrong.deinit();
+    try std.testing.expectError(error.InvalidEncoderLora, gptEncoderLoraRequest(&.{ ids, wrong, scale }));
+}
+
 /// Static `hidden_states_<k>` names (`Tensor.name` is borrowed, never freed).
 pub fn gptHiddenStatesTapName(tap_layer: usize) []const u8 {
     @setEvalBranchQuota(400_000);
@@ -11121,8 +11181,16 @@ fn archRunImpl(
             // Return hidden states (not logits) — used for embedding extraction.
             const H = cfg.hidden_size;
             const shape = [_]i64{ @intCast(batch), @intCast(seq_len), @intCast(H) };
+            const lora_request = try gptEncoderLoraRequest(inputs);
             if (try gptHiddenStatesTapRequest(inputs)) |tap_layer| {
-                var tapped = try gpt_arch.hiddenForwardTapped(&cb, allocator, cfg, input_ids, batch, seq_len, null, tap_layer);
+                // Request-scoped q/v adapters: uploaded for this run only and
+                // released before the outputs are returned.
+                var lora: ?gpt_arch.OwnedEncoderLora = if (lora_request) |request|
+                    try gpt_arch.OwnedEncoderLora.upload(&cb, allocator, cfg, request.values, request.layers, request.scale)
+                else
+                    null;
+                defer if (lora) |*owned| owned.deinit(&cb);
+                var tapped = try gpt_arch.hiddenForwardTappedWithLora(&cb, allocator, cfg, input_ids, batch, seq_len, null, tap_layer, if (lora) |*owned| &owned.lora else null);
                 defer tapped.deinit(allocator);
                 const tap = tapped.tap orelse return error.InvalidHiddenStateTap;
 
@@ -11136,6 +11204,8 @@ fn archRunImpl(
                 result[1] = tap_tensor;
                 return result;
             }
+            // Adapters ride only on the tapped per-token run.
+            if (lora_request != null) return error.UnsupportedEncoderLora;
             const hidden = try gpt_arch.hiddenForward(&cb, allocator, cfg, input_ids, batch, seq_len, null);
             defer allocator.free(hidden);
 

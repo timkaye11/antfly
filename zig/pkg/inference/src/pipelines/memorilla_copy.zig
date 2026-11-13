@@ -569,7 +569,14 @@ pub fn rowNorms(a: A, table: []const f32, rows: usize, width: usize) ![]f32 {
 /// `score / (max(|output|, eps) * max(|table|, eps))` per slot; the first
 /// maximum wins on ties, as `torch.max` does.
 pub fn snapIds(a: A, scores: []const f32, table_norms: []const f32, output_norms: []const f32, slots: usize, vocab: usize) ![]i32 {
+    return snapIdsWithCosines(a, scores, table_norms, output_norms, slots, vocab, null);
+}
+
+/// `snapIds` that also writes each slot's winning (top-1) cosine to
+/// `cosines` (`[slots]`), the evaluator's `snap_top1_cosines`.
+pub fn snapIdsWithCosines(a: A, scores: []const f32, table_norms: []const f32, output_norms: []const f32, slots: usize, vocab: usize, cosines: ?[]f32) ![]i32 {
     if (slots == 0 or vocab == 0 or scores.len != slots * vocab or table_norms.len != vocab or output_norms.len != slots) return error.InvalidCopyGeometry;
+    if (cosines) |out| if (out.len != slots) return error.InvalidCopyGeometry;
     const ids = try a.alloc(i32, slots);
     errdefer a.free(ids);
     const inv_table = try a.alloc(f32, vocab);
@@ -588,6 +595,7 @@ pub fn snapIds(a: A, scores: []const f32, table_norms: []const f32, output_norms
             }
         }
         id.* = @intCast(best);
+        if (cosines) |out| out[s] = best_cos;
     }
     return ids;
 }
@@ -674,15 +682,37 @@ pub fn tokenStartsWord(a: A, tokenizer: tok.Tokenizer, id: i32) !bool {
     return std.mem.startsWith(u8, text, " ") and body.len > 0 and allWordCodepoints(body, false);
 }
 
+/// Where one copy-head span landed after word completion.
+pub const CompletedSpan = struct {
+    /// The copy-head span (record slots and source start before extension).
+    span: Span,
+    /// Source positions `[first, last)` (indexes into `source_ids`) emitted
+    /// for the span: the run extended to whole words, then clipped to what
+    /// survived the overflow truncation (`first == last` when nothing did).
+    first: usize,
+    last: usize,
+    /// Positions `[slot_begin, slot_end)` of those ids in the completed
+    /// record; `slot_end - slot_begin == last - first`.
+    slot_begin: usize,
+    slot_end: usize,
+
+    pub fn emitted(self: CompletedSpan) usize {
+        return self.last - self.first;
+    }
+};
+
 pub const Completed = struct {
     allocator: A,
     /// `[slots]` token ids.
     ids: []i32,
     /// Source tokens added by word extension.
     inserted: usize,
+    /// One entry per input span, in record order (sorted like the walk).
+    spans: []CompletedSpan,
 
     pub fn deinit(self: *Completed) void {
         self.allocator.free(self.ids);
+        self.allocator.free(self.spans);
         self.* = undefined;
     }
 };
@@ -696,6 +726,10 @@ pub const Completed = struct {
 /// and padded with `pad_id`. Spans must satisfy `0 <= begin < end <= S` and
 /// `start + L <= T`; overlapping spans are not rejected (as in Python) and
 /// emit nothing for the already-consumed prefix.
+///
+/// `Completed.spans` reports, per span in walk order, the source range the
+/// span emitted after word extension and where those ids sit in the final
+/// record, clipped to what survived the truncation.
 pub fn completeCopiedWords(a: A, tokenizer: tok.Tokenizer, slot_ids: []const i32, spans: []const Span, source_ids: []const i32, pad_id: i32) !Completed {
     const size = slot_ids.len;
     const sorted = try a.dupe(Span, spans);
@@ -706,11 +740,13 @@ pub fn completeCopiedWords(a: A, tokenizer: tok.Tokenizer, slot_ids: []const i32
         if (span.length() > source_ids.len or span.start > source_ids.len - span.length()) return error.InvalidCopySpan;
     }
 
+    const tracked = try a.alloc(CompletedSpan, sorted.len);
+    errdefer a.free(tracked);
     var pieces = std.ArrayListUnmanaged(i32).empty;
     defer pieces.deinit(a);
     var cursor: usize = 0;
     var inserted: usize = 0;
-    for (sorted) |span| {
+    for (sorted, tracked) |span, *entry| {
         if (span.begin > cursor) try pieces.appendSlice(a, slot_ids[cursor..span.begin]);
         var first = span.start;
         var last = span.start + span.length();
@@ -722,14 +758,195 @@ pub fn completeCopiedWords(a: A, tokenizer: tok.Tokenizer, slot_ids: []const i32
             last += 1;
             inserted += 1;
         }
+        const slot_begin = pieces.items.len;
         try pieces.appendSlice(a, source_ids[first..last]);
+        entry.* = .{ .span = span, .first = first, .last = last, .slot_begin = slot_begin, .slot_end = slot_begin + (last - first) };
         cursor = span.end;
     }
     if (cursor < size) try pieces.appendSlice(a, slot_ids[cursor..]);
     while (pieces.items.len > size and pieces.items.len > 0 and pieces.items[pieces.items.len - 1] == pad_id) _ = pieces.pop();
     if (pieces.items.len > size) pieces.shrinkRetainingCapacity(size);
+    // Every id at or beyond `kept` was dropped (or is new padding).
+    const kept = pieces.items.len;
+    for (tracked) |*entry| {
+        const begin = @min(entry.slot_begin, kept);
+        const end = @min(entry.slot_end, kept);
+        entry.last = entry.first + (end - begin);
+        entry.slot_begin = begin;
+        entry.slot_end = end;
+    }
     while (pieces.items.len < size) try pieces.append(a, pad_id);
-    return .{ .allocator = a, .ids = try pieces.toOwnedSlice(a), .inserted = inserted };
+    return .{ .allocator = a, .ids = try pieces.toOwnedSlice(a), .inserted = inserted, .spans = tracked };
+}
+
+// --- Source citations ----------------------------------------------------------
+
+/// Provenance of one copy source: the caller document it was read from and
+/// its UTF-8 byte range `[start, end)` in that document's original text
+/// (before the space prefix). Source pieces that only cover the added prefix
+/// space have an empty range at the document start.
+pub const SourceRange = struct {
+    document: u32,
+    start: u32,
+    end: u32,
+};
+
+/// How the published answer occurs in a citation's text.
+pub const AnswerMatch = enum { exact, case_insensitive, none };
+
+/// One cited region of a caller document that the memory record copied.
+pub const Citation = struct {
+    document_index: usize,
+    /// UTF-8 byte offsets `[start, end)` into the caller's document text.
+    start: usize,
+    end: usize,
+    /// Owned copy of `documents[document_index][start..end]`.
+    text: []u8,
+    /// Completed-record slots `[begin, end)` covered by the cited spans (for
+    /// merged spans, the hull of their slots).
+    slots: [2]usize,
+    supports_answer: bool,
+    match: AnswerMatch,
+};
+
+pub const Citations = struct {
+    allocator: A,
+    /// Sorted by `(document_index, start)`; regions never overlap or touch.
+    items: []Citation,
+    /// The copy sources could not be mapped back to the caller's text (the
+    /// tokenizer pieces did not reproduce it byte for byte, or the map was
+    /// inconsistent with the spans); `items` is then empty.
+    unavailable: bool,
+
+    pub fn none(a: A, unavailable: bool) Citations {
+        return .{ .allocator = a, .items = &.{}, .unavailable = unavailable };
+    }
+
+    pub fn deinit(self: *Citations) void {
+        for (self.items) |item| self.allocator.free(item.text);
+        self.allocator.free(self.items);
+        self.* = undefined;
+    }
+};
+
+/// ASCII case-insensitive substring search.
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i..][0..needle.len], needle)) return true;
+    }
+    return false;
+}
+
+/// `exact` when `answer` occurs in `text`, `case_insensitive` when it occurs
+/// ignoring ASCII case, else `none` (also for a missing or empty answer).
+pub fn answerMatch(text: []const u8, answer: ?[]const u8) AnswerMatch {
+    const needle = answer orelse return .none;
+    if (needle.len == 0) return .none;
+    if (std.mem.indexOf(u8, text, needle) != null) return .exact;
+    if (containsIgnoreCase(text, needle)) return .case_insensitive;
+    return .none;
+}
+
+fn isUtf8Continuation(byte: u8) bool {
+    return byte & 0xC0 == 0x80;
+}
+
+const RawCitation = struct {
+    document: usize,
+    start: usize,
+    end: usize,
+    slot_begin: usize,
+    slot_end: usize,
+
+    fn lessThan(_: void, x: RawCitation, y: RawCitation) bool {
+        if (x.document != y.document) return x.document < y.document;
+        if (x.start != y.start) return x.start < y.start;
+        return x.end < y.end;
+    }
+};
+
+/// Citations for the spans of a completed record. `ranges` maps every copy
+/// source (the `source_ids` of `completeCopiedWords`) to its caller text, or
+/// is null when the map could not be built. Each span's emitted range is
+/// split per document (a run can cross from one document's sources into the
+/// next), regions of one document that touch or overlap are merged, widened
+/// to whole UTF-8 characters and trimmed of surrounding ASCII whitespace;
+/// regions with no text left are dropped. `answer` is the published answer
+/// (null when the service abstained); a citation supports it when the answer
+/// occurs in its text exactly or ignoring ASCII case. Inconsistent input
+/// (an index outside the map, a range outside its document) fails closed as
+/// `unavailable` rather than as an error.
+pub fn buildCitations(a: A, spans: []const CompletedSpan, ranges: ?[]const SourceRange, documents: []const []const u8, answer: ?[]const u8) !Citations {
+    const map = ranges orelse return Citations.none(a, true);
+    var raw = std.ArrayListUnmanaged(RawCitation).empty;
+    defer raw.deinit(a);
+    for (spans) |span| {
+        if (span.first > span.last or span.last > map.len or span.slot_begin > span.slot_end or
+            span.slot_end - span.slot_begin != span.last - span.first) return Citations.none(a, true);
+        var position = span.first;
+        while (position < span.last) {
+            const document = map[position].document;
+            const group_first = position;
+            while (position < span.last and map[position].document == document) position += 1;
+            if (document >= documents.len) return Citations.none(a, true);
+            const text = documents[document];
+            var start: usize = map[group_first].start;
+            var end: usize = map[group_first].end;
+            for (map[group_first..position]) |range| {
+                if (range.start > range.end or range.end > text.len) return Citations.none(a, true);
+                start = @min(start, range.start);
+                end = @max(end, range.end);
+            }
+            try raw.append(a, .{
+                .document = document,
+                .start = start,
+                .end = end,
+                .slot_begin = span.slot_begin + (group_first - span.first),
+                .slot_end = span.slot_begin + (position - span.first),
+            });
+        }
+    }
+    std.mem.sort(RawCitation, raw.items, {}, RawCitation.lessThan);
+
+    var out = std.ArrayListUnmanaged(Citation).empty;
+    errdefer {
+        for (out.items) |item| a.free(item.text);
+        out.deinit(a);
+    }
+    var index: usize = 0;
+    while (index < raw.items.len) {
+        var merged = raw.items[index];
+        index += 1;
+        while (index < raw.items.len and raw.items[index].document == merged.document and raw.items[index].start <= merged.end) : (index += 1) {
+            const next = raw.items[index];
+            merged.end = @max(merged.end, next.end);
+            merged.slot_begin = @min(merged.slot_begin, next.slot_begin);
+            merged.slot_end = @max(merged.slot_end, next.slot_end);
+        }
+        const text = documents[merged.document];
+        var start = merged.start;
+        var end = merged.end;
+        while (start > 0 and start < text.len and isUtf8Continuation(text[start])) start -= 1;
+        while (end < text.len and isUtf8Continuation(text[end])) end += 1;
+        while (start < end and std.ascii.isWhitespace(text[start])) start += 1;
+        while (end > start and std.ascii.isWhitespace(text[end - 1])) end -= 1;
+        if (start == end) continue;
+        const cited = text[start..end];
+        const match = answerMatch(cited, answer);
+        try out.ensureUnusedCapacity(a, 1);
+        out.appendAssumeCapacity(.{
+            .document_index = merged.document,
+            .start = start,
+            .end = end,
+            .text = try a.dupe(u8, cited),
+            .slots = .{ merged.slot_begin, merged.slot_end },
+            .supports_answer = match != .none,
+            .match = match,
+        });
+    }
+    return .{ .allocator = a, .items = try out.toOwnedSlice(a), .unavailable = false };
 }
 
 // --- Decode ------------------------------------------------------------------
@@ -742,11 +959,14 @@ pub const Decoded = struct {
     /// `[slots]` ids after word completion (equal to `snapped_ids` without spans).
     completed_ids: []i32,
     inserted: usize,
+    /// Per-span emitted source ranges (empty without spans).
+    completed_spans: []CompletedSpan,
 
     pub fn deinit(self: *Decoded) void {
         self.runs.deinit();
         self.allocator.free(self.snapped_ids);
         self.allocator.free(self.completed_ids);
+        self.allocator.free(self.completed_spans);
         self.* = undefined;
     }
 };
@@ -772,10 +992,10 @@ pub fn decodeWithIds(a: A, tokenizer: tok.Tokenizer, runs: Runs, snapped_ids: []
     errdefer a.free(snapped_ids);
     if (owned_runs.spans.len == 0) {
         const copy = try a.dupe(i32, snapped_ids);
-        return .{ .allocator = a, .runs = owned_runs, .snapped_ids = snapped_ids, .completed_ids = copy, .inserted = 0 };
+        return .{ .allocator = a, .runs = owned_runs, .snapped_ids = snapped_ids, .completed_ids = copy, .inserted = 0, .completed_spans = &.{} };
     }
     const completed = try completeCopiedWords(a, tokenizer, snapped_ids, owned_runs.spans, source_ids, pad_id);
-    return .{ .allocator = a, .runs = owned_runs, .snapped_ids = snapped_ids, .completed_ids = completed.ids, .inserted = completed.inserted };
+    return .{ .allocator = a, .runs = owned_runs, .snapped_ids = snapped_ids, .completed_ids = completed.ids, .inserted = completed.inserted, .completed_spans = completed.spans };
 }
 
 // --- Tests -------------------------------------------------------------------
@@ -1313,6 +1533,16 @@ test "memorilla copy snapping chooses the nearest table row by cosine" {
     defer a.free(snapped);
     try testing.expectEqualSlices(i32, ids, snapped);
     try testing.expectError(error.InvalidCopyGeometry, snapIds(a, &scores, norms, output_norms, 2, 4));
+    // The top-1 cosines the hybrid record gate reads.
+    var cosines: [3]f32 = undefined;
+    const with_cosines = try snapIdsWithCosines(a, &scores, norms, output_norms, 3, 4, &cosines);
+    defer a.free(with_cosines);
+    try testing.expectEqualSlices(i32, ids, with_cosines);
+    try testing.expectApproxEqAbs(@as(f32, 5) / @sqrt(@as(f32, 0.01 + 25)), cosines[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 6) / (@sqrt(@as(f32, 18.01)) * std.math.sqrt2), cosines[1], 1e-6);
+    try testing.expectEqual(@as(f32, 0), cosines[2]);
+    var short: [2]f32 = undefined;
+    try testing.expectError(error.InvalidCopyGeometry, snapIdsWithCosines(a, &scores, norms, output_norms, 3, 4, &short));
 }
 
 test "memorilla copy token continues word mirrors the Python predicate" {
@@ -1448,4 +1678,203 @@ test "memorilla copy decode chains runs snapping and word completion" {
     try testing.expectEqual(@as(usize, 0), passthrough.inserted);
 
     try testing.expectError(error.InvalidCopyGeometry, decode(a, tokenizer, &fwd, &memories, sources, source_ids[0..3], table_snapper.snapper(), default_min_gate, 4));
+}
+
+fn expectCompleted(expected: []const [4]usize, actual: []const CompletedSpan) !void {
+    try testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |e, x| {
+        try testing.expectEqual(e[0], x.first);
+        try testing.expectEqual(e[1], x.last);
+        try testing.expectEqual(e[2], x.slot_begin);
+        try testing.expectEqual(e[3], x.slot_end);
+    }
+}
+
+test "memorilla copy completed words report the emitted source range of every span" {
+    const a = testing.allocator;
+    var words = WordTokenizer{ .words = &python_words };
+    const tokenizer = words.handle();
+    // Source " Kit ima  Dab oco  at  Mo zeba  Depot ." as in the Python port.
+    const source = [_]i32{ 3, 4, 5, 6, 7, 8, 9, 10, 11 };
+    const record = [_]i32{ 1, 2, 3, 4, 5, 7, 9, 10, 0, 0 };
+    const spans = [_]Span{ .{ .begin = 2, .end = 5, .start = 0 }, .{ .begin = 6, .end = 8, .start = 6 } };
+    // Span 1 reads [0, 3) and grows forward over "oco" to [0, 4), emitted at
+    // record slots 2..6; slot 5 (" at") follows; span 2 reads [6, 8) and grows
+    // backward over " Mo" to [5, 8), emitted at slots 7..10.
+    var full = try completeCopiedWords(a, tokenizer, &record, &spans, &source, 0);
+    defer full.deinit();
+    try expectCompleted(&.{ .{ 0, 4, 2, 6 }, .{ 5, 8, 7, 10 } }, full.spans);
+    for (full.spans, &spans) |entry, span| {
+        try testing.expectEqual(span.begin, entry.span.begin);
+        try testing.expectEqualSlices(i32, source[entry.first..entry.last], full.ids[entry.slot_begin..entry.slot_end]);
+    }
+
+    // A nine-slot record truncates the second span's last token.
+    var short = try completeCopiedWords(a, tokenizer, record[0..9], &spans, &source, 0);
+    defer short.deinit();
+    try expectCompleted(&.{ .{ 0, 4, 2, 6 }, .{ 5, 7, 7, 9 } }, short.spans);
+    // Six slots: the first span's word extension pushes a one-slot second
+    // span (" Mo" "zeba" read from "zeba") out of the record entirely.
+    var tiny = try completeCopiedWords(a, tokenizer, &.{ 1, 2, 3, 4, 5, 7 }, &.{ spans[0], .{ .begin = 5, .end = 6, .start = 6 } }, &source, 0);
+    defer tiny.deinit();
+    try expectCompleted(&.{ .{ 0, 4, 2, 6 }, .{ 5, 5, 6, 6 } }, tiny.spans);
+    try testing.expectEqual(@as(usize, 0), tiny.spans[1].emitted());
+    // Five slots cut the first span after three of its four ids.
+    var cut = try completeCopiedWords(a, tokenizer, record[0..5], spans[0..1], &source, 0);
+    defer cut.deinit();
+    try expectCompleted(&.{.{ 0, 3, 2, 5 }}, cut.spans);
+
+    // Unsorted input spans are reported in record order.
+    const reversed = [_]Span{ spans[1], spans[0] };
+    var sorted = try completeCopiedWords(a, tokenizer, &record, &reversed, &source, 0);
+    defer sorted.deinit();
+    try expectCompleted(&.{ .{ 0, 4, 2, 6 }, .{ 5, 8, 7, 10 } }, sorted.spans);
+
+    // No spans, no entries.
+    var plain = try completeCopiedWords(a, tokenizer, &record, &.{}, &source, 0);
+    defer plain.deinit();
+    try testing.expectEqual(@as(usize, 0), plain.spans.len);
+}
+
+/// Two caller documents with hand-checked piece ranges (the space prefix is
+/// added to both, so each first piece covers it and starts at byte 0):
+/// D0 "Alice Chen holds the badge." -> " Alice" " Chen" " holds" " the" " badge" "."
+/// D1 "Code Kq9-0012 opens it." -> " Code" " K" "q9" "-00" "12" " opens" " it" "."
+const citation_documents = [_][]const u8{ "Alice Chen holds the badge.", "Code Kq9-0012 opens it." };
+const citation_ranges = [_]SourceRange{
+    .{ .document = 0, .start = 0, .end = 5 },   .{ .document = 0, .start = 5, .end = 10 },
+    .{ .document = 0, .start = 10, .end = 16 }, .{ .document = 0, .start = 16, .end = 20 },
+    .{ .document = 0, .start = 20, .end = 26 }, .{ .document = 0, .start = 26, .end = 27 },
+    .{ .document = 1, .start = 0, .end = 4 },   .{ .document = 1, .start = 4, .end = 6 },
+    .{ .document = 1, .start = 6, .end = 8 },   .{ .document = 1, .start = 8, .end = 11 },
+    .{ .document = 1, .start = 11, .end = 13 }, .{ .document = 1, .start = 13, .end = 19 },
+    .{ .document = 1, .start = 19, .end = 22 }, .{ .document = 1, .start = 22, .end = 23 },
+};
+
+fn completedSpan(first: usize, last: usize, slot_begin: usize) CompletedSpan {
+    return .{ .span = .{ .begin = slot_begin, .end = slot_begin + (last - first), .start = first }, .first = first, .last = last, .slot_begin = slot_begin, .slot_end = slot_begin + (last - first) };
+}
+
+fn expectCitation(document: usize, text: []const u8, slots: [2]usize, match: AnswerMatch, actual: Citation) !void {
+    try testing.expectEqual(document, actual.document_index);
+    try testing.expectEqualStrings(text, actual.text);
+    try testing.expectEqualStrings(text, citation_documents[document][actual.start..actual.end]);
+    try testing.expectEqual(slots, actual.slots);
+    try testing.expectEqual(match, actual.match);
+    try testing.expectEqual(match != .none, actual.supports_answer);
+}
+
+test "memorilla copy citations split at document boundaries and merge touching regions" {
+    const a = testing.allocator;
+    const spans = [_]CompletedSpan{
+        // " Alice Chen" at slots 1..3.
+        completedSpan(0, 2, 1),
+        // " holds" at slot 4: touches the first region in D0, merged.
+        completedSpan(2, 3, 4),
+        // "." " Code" " K" at slots 6..9: crosses from D0 into D1, split.
+        completedSpan(5, 8, 6),
+        // "q9" "-00" "12" at slots 10..13: touches " Code K" in D1, merged.
+        completedSpan(8, 11, 10),
+    };
+    var citations = try buildCitations(a, &spans, &citation_ranges, &citation_documents, "Kq9-0012");
+    defer citations.deinit();
+    try testing.expect(!citations.unavailable);
+    try testing.expectEqual(@as(usize, 3), citations.items.len);
+    try expectCitation(0, "Alice Chen holds", .{ 1, 5 }, .none, citations.items[0]);
+    try expectCitation(0, ".", .{ 6, 7 }, .none, citations.items[1]);
+    try expectCitation(1, "Code Kq9-0012", .{ 7, 13 }, .exact, citations.items[2]);
+    try testing.expectEqual(@as(usize, 26), citations.items[1].start);
+    try testing.expectEqual(@as(usize, 13), citations.items[2].end);
+
+    // Case-insensitive support, no answer, and an abstention.
+    var lower = try buildCitations(a, &spans, &citation_ranges, &citation_documents, "kq9-0012");
+    defer lower.deinit();
+    try expectCitation(1, "Code Kq9-0012", .{ 7, 13 }, .case_insensitive, lower.items[2]);
+    var abstained = try buildCitations(a, &spans, &citation_ranges, &citation_documents, null);
+    defer abstained.deinit();
+    for (abstained.items) |item| try testing.expect(!item.supports_answer and item.match == .none);
+    var empty_answer = try buildCitations(a, &spans, &citation_ranges, &citation_documents, "");
+    defer empty_answer.deinit();
+    for (empty_answer.items) |item| try testing.expect(!item.supports_answer);
+    var name = try buildCitations(a, &spans, &citation_ranges, &citation_documents, "Alice Chen");
+    defer name.deinit();
+    try expectCitation(0, "Alice Chen holds", .{ 1, 5 }, .exact, name.items[0]);
+    try expectCitation(1, "Code Kq9-0012", .{ 7, 13 }, .none, name.items[2]);
+}
+
+test "memorilla copy citations merge overlapping spans and skip empty or whitespace regions" {
+    const a = testing.allocator;
+    const spans = [_]CompletedSpan{
+        // Two spans read overlapping source ranges of D1 at different slots.
+        completedSpan(7, 10, 2),
+        completedSpan(9, 11, 9),
+        // A span truncated away entirely and one non-touching D0 region.
+        .{ .span = .{ .begin = 14, .end = 15, .start = 0 }, .first = 3, .last = 3, .slot_begin = 16, .slot_end = 16 },
+        completedSpan(4, 5, 12),
+    };
+    var citations = try buildCitations(a, &spans, &citation_ranges, &citation_documents, "Kq9-0012");
+    defer citations.deinit();
+    try testing.expectEqual(@as(usize, 2), citations.items.len);
+    try expectCitation(0, "badge", .{ 12, 13 }, .none, citations.items[0]);
+    try expectCitation(1, "Kq9-0012", .{ 2, 11 }, .exact, citations.items[1]);
+
+    // A region that only covers the added prefix space (empty range) or
+    // whitespace has no text and is dropped.
+    const blank_ranges = [_]SourceRange{ .{ .document = 0, .start = 0, .end = 0 }, .{ .document = 0, .start = 5, .end = 6 } };
+    var blank = try buildCitations(a, &.{ completedSpan(0, 1, 0), completedSpan(1, 2, 3) }, &blank_ranges, &citation_documents, null);
+    defer blank.deinit();
+    try testing.expectEqual(@as(usize, 0), blank.items.len);
+    try testing.expect(!blank.unavailable);
+}
+
+test "memorilla copy citations widen to whole UTF-8 characters" {
+    const a = testing.allocator;
+    // "Zoë": byte-level pieces " " "Z" "o" "\xc3" "\xab" with the prefix space.
+    const documents = [_][]const u8{"Zo\xc3\xab Ng"};
+    const ranges = [_]SourceRange{
+        .{ .document = 0, .start = 0, .end = 0 }, .{ .document = 0, .start = 0, .end = 1 },
+        .{ .document = 0, .start = 1, .end = 2 }, .{ .document = 0, .start = 2, .end = 3 },
+        .{ .document = 0, .start = 3, .end = 4 }, .{ .document = 0, .start = 4, .end = 7 },
+    };
+    // A span ending inside the two-byte character keeps the whole character.
+    var head = try buildCitations(a, &.{completedSpan(1, 4, 0)}, &ranges, &documents, "Zoë");
+    defer head.deinit();
+    try testing.expectEqual(@as(usize, 1), head.items.len);
+    try testing.expectEqualStrings("Zo\xc3\xab", head.items[0].text);
+    try testing.expectEqual(@as(usize, 4), head.items[0].end);
+    try testing.expectEqual(AnswerMatch.exact, head.items[0].match);
+    // A span starting at the continuation byte starts at the character.
+    var tail = try buildCitations(a, &.{completedSpan(4, 6, 0)}, &ranges, &documents, null);
+    defer tail.deinit();
+    try testing.expectEqualStrings("\xc3\xab Ng", tail.items[0].text);
+    try testing.expectEqual(@as(usize, 2), tail.items[0].start);
+    try testing.expect(std.unicode.utf8ValidateSlice(tail.items[0].text));
+}
+
+test "memorilla copy citations fail closed without a consistent source map" {
+    const a = testing.allocator;
+    const spans = [_]CompletedSpan{completedSpan(0, 2, 0)};
+    var missing = try buildCitations(a, &spans, null, &citation_documents, "Alice");
+    defer missing.deinit();
+    try testing.expect(missing.unavailable);
+    try testing.expectEqual(@as(usize, 0), missing.items.len);
+    // Span beyond the map, document beyond the request, range beyond the text.
+    var beyond = try buildCitations(a, &.{completedSpan(13, 15, 0)}, &citation_ranges, &citation_documents, null);
+    defer beyond.deinit();
+    try testing.expect(beyond.unavailable);
+    var no_document = try buildCitations(a, &spans, &.{ .{ .document = 2, .start = 0, .end = 1 }, .{ .document = 2, .start = 1, .end = 2 } }, &citation_documents, null);
+    defer no_document.deinit();
+    try testing.expect(no_document.unavailable);
+    var outside = try buildCitations(a, &spans, &.{ .{ .document = 1, .start = 0, .end = 4 }, .{ .document = 1, .start = 4, .end = 99 } }, &citation_documents, null);
+    defer outside.deinit();
+    try testing.expect(outside.unavailable);
+    // No spans: nothing to cite, and the map was available.
+    var nothing = try buildCitations(a, &.{}, &citation_ranges, &citation_documents, "Alice");
+    defer nothing.deinit();
+    try testing.expect(!nothing.unavailable and nothing.items.len == 0);
+
+    try testing.expectEqual(AnswerMatch.exact, answerMatch("code Kq9", "Kq9"));
+    try testing.expectEqual(AnswerMatch.case_insensitive, answerMatch("code KQ9", "kq9"));
+    try testing.expectEqual(AnswerMatch.none, answerMatch("code", "Kq9"));
+    try testing.expectEqual(AnswerMatch.none, answerMatch("Kq", "Kq9"));
 }

@@ -138,7 +138,9 @@ def sync_detailed(
     replaces decoder text that is not a short fact (a few words of
     letters, digits, hyphen, period and apostrophe, or the literal
     UNKNOWN) with UNKNOWN and finish_reason abstained, reported in
-    answer_guard. This path is not qualified.
+    answer_guard. Every span copied into the memory record is returned in
+    citations with its document_index and UTF-8 byte range [start, end)
+    in that document_texts entry. This path is not qualified.
 
     Args:
         body (InferenceMemorillaGenerateRequest): Generate a buffered answer over caller-supplied
@@ -153,9 +155,11 @@ def sync_detailed(
             supported answer; otherwise the source answer or abstention is returned.
             This explicit mode does not establish
             source truth, authorization, or text/vector association cryptographically.
-            Profiles configured with reader_kind=encoder_lora_research instead take
-            document_texts in latent mode and encode them server-side; they reject
-            document_embeddings and source_verified.
+            Profiles configured with reader_kind=encoder_lora_research or
+            hybrid_research instead take document_texts in latent mode and encode
+            them server-side (the hybrid computes the pooled document and question
+            vectors itself as well); they reject document_embeddings and
+            source_verified.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -209,7 +213,9 @@ def sync(
     replaces decoder text that is not a short fact (a few words of
     letters, digits, hyphen, period and apostrophe, or the literal
     UNKNOWN) with UNKNOWN and finish_reason abstained, reported in
-    answer_guard. This path is not qualified.
+    answer_guard. Every span copied into the memory record is returned in
+    citations with its document_index and UTF-8 byte range [start, end)
+    in that document_texts entry. This path is not qualified.
 
     Args:
         body (InferenceMemorillaGenerateRequest): Generate a buffered answer over caller-supplied
@@ -224,9 +230,11 @@ def sync(
             supported answer; otherwise the source answer or abstention is returned.
             This explicit mode does not establish
             source truth, authorization, or text/vector association cryptographically.
-            Profiles configured with reader_kind=encoder_lora_research instead take
-            document_texts in latent mode and encode them server-side; they reject
-            document_embeddings and source_verified.
+            Profiles configured with reader_kind=encoder_lora_research or
+            hybrid_research instead take document_texts in latent mode and encode
+            them server-side (the hybrid computes the pooled document and question
+            vectors itself as well); they reject document_embeddings and
+            source_verified.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -275,7 +283,9 @@ async def asyncio_detailed(
     replaces decoder text that is not a short fact (a few words of
     letters, digits, hyphen, period and apostrophe, or the literal
     UNKNOWN) with UNKNOWN and finish_reason abstained, reported in
-    answer_guard. This path is not qualified.
+    answer_guard. Every span copied into the memory record is returned in
+    citations with its document_index and UTF-8 byte range [start, end)
+    in that document_texts entry. This path is not qualified.
 
     Args:
         body (InferenceMemorillaGenerateRequest): Generate a buffered answer over caller-supplied
@@ -290,9 +300,11 @@ async def asyncio_detailed(
             supported answer; otherwise the source answer or abstention is returned.
             This explicit mode does not establish
             source truth, authorization, or text/vector association cryptographically.
-            Profiles configured with reader_kind=encoder_lora_research instead take
-            document_texts in latent mode and encode them server-side; they reject
-            document_embeddings and source_verified.
+            Profiles configured with reader_kind=encoder_lora_research or
+            hybrid_research instead take document_texts in latent mode and encode
+            them server-side (the hybrid computes the pooled document and question
+            vectors itself as well); they reject document_embeddings and
+            source_verified.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -344,7 +356,9 @@ async def asyncio(
     replaces decoder text that is not a short fact (a few words of
     letters, digits, hyphen, period and apostrophe, or the literal
     UNKNOWN) with UNKNOWN and finish_reason abstained, reported in
-    answer_guard. This path is not qualified.
+    answer_guard. Every span copied into the memory record is returned in
+    citations with its document_index and UTF-8 byte range [start, end)
+    in that document_texts entry. This path is not qualified.
 
     Args:
         body (InferenceMemorillaGenerateRequest): Generate a buffered answer over caller-supplied
@@ -359,9 +373,11 @@ async def asyncio(
             supported answer; otherwise the source answer or abstention is returned.
             This explicit mode does not establish
             source truth, authorization, or text/vector association cryptographically.
-            Profiles configured with reader_kind=encoder_lora_research instead take
-            document_texts in latent mode and encode them server-side; they reject
-            document_embeddings and source_verified.
+            Profiles configured with reader_kind=encoder_lora_research or
+            hybrid_research instead take document_texts in latent mode and encode
+            them server-side (the hybrid computes the pooled document and question
+            vectors itself as well); they reject document_embeddings and
+            source_verified.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

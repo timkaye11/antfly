@@ -582,3 +582,258 @@ Rerun of section 7 with the guard of 7.1 active (`lora-serve-wide-<seed>-guard.j
 The guard fired exactly once in 480 requests, on the frame-echo answer of
 `ood-0008-owner`, and rejected nothing else. 477 of 480 answers remain
 identical to Python. Latency unchanged (median 1.97 s, p90 2.53 s).
+
+## 8. Qwen hybrid memory: general soft recall plus exact records (started 2026-11-13)
+
+Goal: one memory that restates passages like Memorilla and recalls names and
+codes exactly like copy17. Observation: the released reader consumes pooled
+document vectors (general, soft), copy17 consumes per-token states (exact,
+snapped); pooled features cannot pinpoint codes (section 2 of the research
+notes), so the hybrid composes two readers rather than widening one.
+
+Design (no training for the first experiment):
+- Rows 1-16: the released Memorilla reader (stage3) over pooled
+  Qwen3-Embedding-4B vectors, injected as soft rows exactly as the released
+  profile does.
+- Rows 17-32: copy17's snapped record (16 real-token rows: contiguous runs,
+  word completion), or only its copying spans with the remainder dropped.
+- Decoder: stock Qwen3-8B, prompt = system text + "Memory" + 32 placeholder
+  slots + "Memory", question in the user turn; system text to be chosen by
+  measurement (released "helpful assistant" prompt vs copy17's exact-answer
+  prompt vs a merged one).
+
+Evaluation (Python first, `scripts/memorilla/qwen_hybrid_eval.py`): three
+arms (soft only, record only, hybrid) on (a) the depot dev and fresh sets
+(exact match), (b) squad_v2 / drop validation subsets (EM, F1), (c) an enwiki
+restatement sample (ROUGE-L against the passage). If the hybrid keeps copy17's
+exact accuracy and the released reader's free-form accuracy, the follow-ups
+are: a short decoder-in-the-loop fine-tune of the soft slots on Stage 2 data
+with the 32-slot frame if the extra rows perturb them, then the Zig service
+change (mixed soft/token rows through the existing injection path).
+
+### 7.4 Fallback trigger signals (2026-11-13, CPU analysis over the 480 wide cases)
+
+Per-slot gates and snap cosines from the Python fixtures joined with the
+guarded managed-service outcomes (462 correct, 1 wrong, 17 abstained):
+
+| trigger | flagged | wrong caught | abstentions caught | correct flagged |
+|---|---|---|---|---|
+| min copy-slot snap cosine < 0.85 | 10 | 0/1 | 5/17 | 5/462 |
+| min copy-slot snap cosine < 0.80 | 5 | 0/1 | 4/17 | 1/462 |
+| min snap cosine (all slots) < 0.80 | 45 | 1/1 | 6/17 | 38/462 |
+| gate within 0.1 of 0.5 | 12 | 0/1 | 5/17 | 7/462 |
+
+Reading: the one wrong answer (`ood-0007-owner`, a fence-sitting owner record)
+is only caught by the all-slot cosine at the price of flagging 8% of correct
+answers; the fence-case abstentions are caught cheaply by the copy-slot
+cosine (5 of 17 at one false positive per caught case); the remaining
+abstentions are cut-site records whose signals are clean (gates saturated,
+cosines 1.0) and whose only signal is the UNKNOWN itself. Practical routing:
+UNKNOWN -> full-context fallback (catches all 17 abstentions after the fact),
+copy-slot cosine < 0.85 -> fallback before decoding (catches the fence cases
+early), optional all-slot cosine < 0.80 for a precision-first deployment that
+accepts 8% extra slow-path traffic to remove the last wrong answer. Both
+cosines are available in the service (snap scores) and should be surfaced in
+the response alongside `answer_guard`.
+
+### 8.1 First hybrid results (2026-11-13, no training; `qwen_hybrid_eval.py`)
+
+| set | soft (released stage3) | record (copy17) | hybrid (16 soft + 16 record rows, merged prompt) |
+|---|---|---|---|
+| depot dev, exact (64) | 0 | 64 | 51 (62 case-insensitive) |
+| depot fresh, exact (80) | 0 | 79 | 69 (75 case-insensitive) |
+| squad_v2 val 200, EM / F1 | 0.230 / 0.377 | 0.050 / 0.091 (73% abstain) | 0.285 / 0.449 |
+
+The composition is additive on free-form QA: the hybrid beats both parts on
+squad because the record rows often hold the exact span under depot-style
+labels (" key holder in Medieval Latin, 9th century") that the record arm's
+prompt turns into UNKNOWN, while the soft rows and prompt keep the decoder
+answering. On exact facts the record text is complete and correct in every
+hybrid miss; the loss is surface form (case flips of code prefixes, a dropped
+prefix or first name), attributed to the merged system prompt diluting
+"preserving case" and to the soft rows beside the record. Abstention is intact
+(16/16 UNKNOWN on both depot sets, zero false abstentions; the hybrid even
+removed copy17's one false abstention). Pooled soft memory alone cannot carry
+codes (0/144 on depot). Pending: drop and enwiki arms; then prompt (`exact`),
+row order (record first) and `--record-rows spans` variants; then the short
+soft-slot fine-tune in the 32-row frame.
+
+### 8.2 Hybrid variants (2026-11-13, no training)
+
+| variant | depot dev exact (ci) | depot fresh exact (ci) | squad EM / F1 | drop F1_any |
+|---|---|---|---|---|
+| soft only | 0 (0) | 0 (0) | 0.230 / 0.377 | 0.246 |
+| record only (copy17) | 64 (64) | 79 (79) | 0.050 / 0.091 (73% abstain) | 0.009 |
+| hybrid, merged prompt, soft first (base) | 51 (62) | 69 (75) | 0.285 / 0.449 | 0.238 |
+| hybrid, exact prompt | 51 (62) | 66 (74) | 0.275 / 0.441 | 0.215 |
+| hybrid, record gated (clean span, cosine >= 0.85) | 51 (62) | 68 (74) | 0.290 / 0.453 | 0.233 |
+| hybrid, record rows first | 36 (40) | 52 (54) | 0.285 / 0.436 | 0.244 |
+| hybrid, span-only record rows | 20 (31) | 25 (29) | 0.295 / 0.458 | 0.250 |
+
+enwiki ROUGE-L F1 (50 passages): soft 0.068, record 0.061, hybrid 0.086; every
+arm emits one sentence (recall about 5%).
+
+Conclusions: the prompt wording is not the cause of the exact-recall loss
+(the exact prompt reproduces the misses one for one); the soft rows' presence
+is, and putting them after the record is worse; the record's label tokens are
+needed for the decoder to read it (span-only collapses depot). Gating the
+record on a clean copied span is neutral on depot and best on squad, but the
+0.85 threshold fires on 92% of squad and 87% of drop cases. Passage
+restatement is absent for the stage3 reader under stock Qwen3-8B in this frame;
+the stage1 checkpoint is the test of whether it exists at all.
+
+### 8.3 Answer canonicalization to the copied span (CPU re-scoring of the same outputs)
+
+Every hybrid depot miss had the exact text in the record. Re-scoring the base
+and gated hybrid outputs with a post-decode rule, "if the answer matches a
+record substring case-insensitively, or is the tail of a record word
+sequence, return the record's exact text", recovers the case flips with no
+regressions: dev 51 -> 62/64, fresh 69 -> 75/80 (gated 68 -> 74), 0 correct
+answers broken. The copy slots are the verbatim source and the decoder is
+the selector, so letting the record spell the answer is the principled fix;
+to be implemented as a decode rule in the evaluator and the service, with the
+answer guard, and checked on squad/drop for side effects.
+
+### 8.4 Production composition and the restatement check (2026-11-13 05:40Z)
+
+Gated hybrid with answer canonicalization (soft rows first, full record rows,
+merged prompt, record gate at cosine 0.85, canonicalize to the record span):
+
+| set | copy17 alone | soft alone | gated + canonicalized hybrid |
+|---|---|---|---|
+| depot dev exact (64) | 64 | 0 | 63 (12 answers canonicalized) |
+| depot fresh exact (80) | 79 | 0 | 78 (10 canonicalized) |
+| squad EM / F1 (200) | 0.050 / 0.091 | 0.230 / 0.377 | 0.290 / 0.453 |
+| drop F1_any (200) | 0.009 | 0.246 | 0.223 |
+
+Exact recall is back to within one case per set of copy17 while free-form QA
+gains +0.08 F1 over the released reader; drop (arithmetic) loses 0.02. This
+is the recommended no-training composition.
+
+Restatement: the released STAGE1 checkpoint restates passages (enwiki 50,
+soft arm): ROUGE-L F1 0.237 / P 0.248 / R 0.234, 141 generated tokens on
+average, paraphrased gist of the passage; stage3 gives 0.068 and one sentence.
+The capability exists in the released readers and is lost through the QA
+stages, which validates the Gemma Stage 1 objective and suggests testing the
+hybrid with stage1 (or stage2) soft slots instead of stage3.
+
+### 8.5 Soft half by released checkpoint (2026-11-13 08:20Z, gated + canonicalized hybrid)
+
+| soft half | depot dev | depot fresh | squad EM / F1 | drop F1_any | enwiki hybrid ROUGE-L (tokens) | enwiki soft-only ROUGE-L (tokens) |
+|---|---|---|---|---|---|---|
+| stage1 | 45/64 (7/16 missing abstained) | 45/80 | 0.000 / 0.038 | 0.064 | 0.230 (140) | 0.237 (141) |
+| stage2 | 55/64 (11/16) | 67/80 | 0.300 / 0.448 | 0.255 | 0.154 (67) | 0.166 |
+| stage3 | 63/64 (16/16) | 78/80 | 0.290 / 0.453 | 0.223 | 0.086 (24, base hybrid) | 0.068 (18) |
+
+The released readers are task-tuned: stage1 restates but makes the decoder
+ignore the question (QA collapses, abstention fails), stage3 answers but does
+not restate, stage2 sits between on every axis. Production hybrid keeps the
+stage3 soft half (exact + QA); passage restatement is a separate mode served
+by the stage1 reader when a request asks for it, and a single soft half that
+does both needs training (the decoder-in-the-loop tune of the soft slots, or
+the Gemma Stage 1 -> Stage 2 path with restatement kept in the mixture).
+
+### 8.6 Source citations on the research serving path (2026-11-13)
+
+The research response now returns, for every span the copy head copied into
+the 16-slot record, the document it came from and its exact UTF-8 byte range
+in the caller's text: `citations: [{document_index, start, end, text,
+supports_answer, match}]` and `citations_unavailable` (serving doc, "Research
+profile"). Mechanism:
+
+- Source map (`memorilla_token_features.sourceMap`): each document's
+  single-copy ids are decoded piece by piece (`tokenBytes`) and checked byte
+  for byte against the encoded text (the caller's text after the added space,
+  plus one more space on the `encode(" " + D)` fallback). A piece's cumulative
+  range, shifted back by the added spaces and clamped at 0, is its range in
+  the caller's text. If the pieces do not reproduce the text (NFC composing a
+  decomposed accent, a special token), there is no map: citations are
+  unavailable and the request still succeeds.
+- Spans (`memorilla_copy.completeCopiedWords`): `Completed.spans` reports, per
+  copy-head span, the source range emitted after word extension and its
+  record slots, clipped by the overflow truncation.
+- Citations (`memorilla_copy.buildCitations`): each emitted range is split
+  per document, because a contiguous run over the concatenated sources can
+  cross a document boundary. Regions of one document that touch or overlap
+  are merged, widened to whole UTF-8 characters and trimmed of whitespace.
+  `supports_answer` and `match` (`exact`, `case_insensitive`, `none`) compare
+  the published answer after the guard; UNKNOWN never counts as support.
+
+CPU replay over the Python reference receipts (real Qwen3 tokenizer, the
+reference copy-head spans, snapped ids and answers; word completion
+reproduces every reference record exactly; every citation equals its
+document bytes):
+
+| set | cases | mapped | citations | correct non-UNKNOWN answers with a supporting citation | supported but wrong |
+|---|---|---|---|---|---|
+| dev | 64 | 64 | 112 | 48/48 | 0 |
+| fresh | 80 | 80 | 143 | 63/63 | 0 |
+| wide 20261110 | 160 | 160 | 283 | 121/121 | 0 |
+| wide 4242 | 160 | 160 | 288 | 126/126 | 0 |
+| wide 7331 | 160 | 160 | 287 | 121/121 | 0 |
+
+Example (dev-0000-code-a, answer `Kg9-009369`): `{document_index 0, start
+95, end 105, text "Kg9-009369", supports_answer true, match exact}` from
+record slots 1..10, and `{document_index 0, start 23, end 35, text "Pipofo
+Depot", supports_answer false}` from slots 11..15.
+
+Managed service (`antfly-memorilla-lora-serve-verify`, first 8 dev cases,
+shared GPU): 8/8 answers correct and equal to the reference, 14 citations,
+0 mismatches against `document_texts[i][start..end]`, 0 unavailable, 6/6
+correct non-UNKNOWN answers with a supporting citation (the two UNKNOWN cases
+cite only the site name), admission refunded on every case.
+
+### 8.7 Hybrid serving in Zig: one encoder, run-time encoder LoRA (2026-11-13)
+
+The production composition of 8.4 (stage3 soft half, record gate at 0.85,
+merged prompt, soft rows first, canonicalization with the three-character
+tail minimum) is served by a third profile kind, `reader_kind:
+hybrid_research` (serving doc, "Hybrid research profile"). Design:
+
+- One resident encoder: the stock managed `qwen3_encoder_f32_v1`. The pooled
+  pass runs it unchanged; the per-token record pass applies copy17's encoder
+  LoRA to the q/v projections at run time (`gpt.EncoderLora`, `y = W x +
+  (alpha/rank) B (A x)` on the raw projection output before q/k norm and
+  RoPE). The adapters travel as two run inputs of the tapped hidden-state run
+  (`encoder_lora` F32 `[36, 2 * 8 * 2560 + (4096 + 1024) * 8]`,
+  `encoder_lora_scale` F32 `[1]`), are uploaded for the run and freed with it,
+  so the resident weights and their residency pins are untouched. Residency
+  drops from about 67 GB (two F32 encoders) to about 51 GB.
+- Artifacts: `memory_module_path` = the hybrid bundle (`export-reader
+  --include-encoder-lora`): the research bundle plus `encoder-lora.safetensors`
+  pinned in `manifest.json` and by `candidate.json` `encoder_lora_sha256`;
+  `protocol.json` `rank`/`alpha`/`target_modules`. `released_memory_module_path`
+  = the stage3 bundle. The merged research encoder is not used.
+  `encoder_execution_identity` is the stock encoder's.
+- Service (`src/server/memorilla_hybrid_service.zig`): adapter and prompt pins
+  before any model load; a tokenizer preflight on the stock encoder (question
+  tokens, pooled texts, the record batch rows); one admission covering the
+  larger decoder plan (32 rows, merged prompt) or the smaller (16 rows,
+  helpful prompt), copy/snap transients, the released reader over up to 64
+  pooled rows and the research reader over the exact per-token rows; pooled
+  pass; record pass with adapters (padded rows up to the evaluator's 1024
+  tokens, at most 16384 positions); released reader (`Cache`) borrowed and
+  retired first, then the research reader (`ResearchCache`), copy head, runs,
+  snapping (with the top-1 cosines), word completion; the gate on the
+  four-decimal cosines as the evaluator records them; on a closed gate the
+  32-row reservation is swapped in place for the 16-row plan; generation;
+  canonicalization (gate open), frame-echo guard, citations (gate open only).
+- Deviations from `qwen_hybrid_eval.py`: F32 throughout (the evaluator is
+  BF16, adapters in BF16); texts above the 256-token pooled limit are chunked
+  sentence-greedily at 128 tokens (the evaluator pools any length; no
+  verification text reaches the limit); a 16384-position cap on the record
+  batch; ASCII-only case folding in canonicalization; the frame-echo guard
+  (empty, control characters, `<|memory|>`, standalone `Memory`) is serving
+  policy the evaluator lacks.
+- Tests: native-backend equality of run-time LoRA and the merged q/v weights
+  (two-layer Qwen3, two padded rows, relative error <= 1e-5, plain forward
+  bit-identical), adapter file packing and pin checks, canonicalization on the
+  evaluator's 19 cases, the gate on the evaluator's cases, guard, chunker,
+  admission maximum, settings, request shape and HTTP validation branches.
+- Verification: `antfly-memorilla-lora-hybrid-verify` reads the Python
+  `gated-canon` rows (`hybrid-{depot-dev,depot-fresh,squad}.jsonl`) with case
+  files for the documents (depot `lora-ref-{dev,fresh}.json`; squad exported
+  to `.benchmark-results/memorilla/qwen-hybrid-serve/squad-cases.json` from
+  the same 200 validation rows) and reports per set agreement with the Python
+  answer and gate, exact (depot) or EM/F1 (squad), record-text agreement,
+  citation checks and latency.

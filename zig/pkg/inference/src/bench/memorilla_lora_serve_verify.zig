@@ -17,7 +17,8 @@
 //! through a real `ModelManager` over the Python reference cases and reports
 //! answer agreement, admission refunds and per-case latency. Companion to
 //! `memorilla_lora_verify` (stage-level parity) for milestone 2 of
-//! docs/plans/memorilla-copy17-native.md.
+//! docs/plans/memorilla-copy17-native.md. Every published citation is checked
+//! against the case's own documents (`documents[i][start..end] == text`).
 const std = @import("std");
 const inference = @import("inference_internal");
 const options_mod = @import("build_options");
@@ -136,10 +137,32 @@ const Summary = struct {
     answer_correct: usize = 0,
     reference_correct: usize = 0,
     admission_refunded: usize = 0,
+    citations: usize = 0,
+    /// Citations whose text is not exactly `documents[i][start..end]`.
+    citation_mismatches: usize = 0,
+    citations_unavailable_cases: usize = 0,
+    /// Cases with at least one citation that supports the published answer.
+    supported_cases: usize = 0,
+    /// Correct (non-UNKNOWN) answers with a supporting citation, out of
+    /// `correct_answered`.
+    correct_with_support: usize = 0,
+    correct_answered: usize = 0,
     cold_ms: f64 = 0,
     mean_warm_ms: f64 = 0,
     passed: bool = false,
 };
+
+/// Count of citations that do not reproduce their document bytes.
+fn citationMismatches(documents: []const []const u8, citations: []const service.Citation) usize {
+    var mismatches: usize = 0;
+    for (citations) |citation| {
+        const valid = citation.document_index < documents.len and citation.start < citation.end and
+            citation.end <= documents[citation.document_index].len and
+            std.mem.eql(u8, documents[citation.document_index][citation.start..citation.end], citation.text);
+        mismatches += @intFromBool(!valid);
+    }
+    return mismatches;
+}
 
 pub fn main(init: std.process.Init) !void {
     if (comptime !options_mod.enable_cuda) return error.CudaNotEnabled;
@@ -227,6 +250,17 @@ pub fn main(init: std.process.Init) !void {
         summary.answer_matches_reference += @intFromBool(matches);
         summary.answer_correct += @intFromBool(correct);
         summary.reference_correct += @intFromBool(reference_correct);
+        const citations = result.citations.items;
+        const mismatches = citationMismatches(case.documents, citations);
+        var supported = false;
+        for (citations) |citation| supported = supported or citation.supports_answer;
+        const answered = !std.mem.eql(u8, answer, service.unknown_answer);
+        summary.citations += citations.len;
+        summary.citation_mismatches += mismatches;
+        summary.citations_unavailable_cases += @intFromBool(result.citations.unavailable);
+        summary.supported_cases += @intFromBool(supported);
+        summary.correct_answered += @intFromBool(correct and answered);
+        summary.correct_with_support += @intFromBool(correct and answered and supported);
         if (index == 0) summary.cold_ms = total_ms else {
             warm_total += total_ms;
             warm_count += 1;
@@ -242,6 +276,10 @@ pub fn main(init: std.process.Init) !void {
             .answer_correct = correct,
             .reference_correct = reference_correct,
             .finish_reason = result.generation.finish_reason,
+            .citations = citations,
+            .citations_unavailable = result.citations.unavailable,
+            .citation_mismatches = mismatches,
+            .answer_supported = supported,
             .question_tokens = result.question_tokens,
             .candidate_sha256 = result.candidate_sha256[0..],
             .memory_module_sha256 = result.module_sha256[0..],
@@ -261,7 +299,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     summary.mean_warm_ms = if (warm_count == 0) 0 else warm_total / @as(f64, @floatFromInt(warm_count));
-    summary.passed = summary.errors == 0 and summary.admission_refunded == summary.cases;
+    summary.passed = summary.errors == 0 and summary.admission_refunded == summary.cases and summary.citation_mismatches == 0;
     try emit(a, io, .{ .event = "retained", .amounts = retained });
     try emit(a, io, summary);
     if (args.output.len > 0) {
@@ -270,6 +308,20 @@ pub fn main(init: std.process.Init) !void {
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = args.output, .data = json });
     }
     if (!summary.passed) return error.ResearchServiceVerificationFailed;
+}
+
+test "memorilla lora serve verify counts citations that do not reproduce their documents" {
+    var good = "Kq9".*;
+    var bad = "Kq8".*;
+    const documents = [_][]const u8{"Code Kq9 opens it."};
+    const citations = [_]service.Citation{
+        .{ .document_index = 0, .start = 5, .end = 8, .text = &good, .slots = .{ 0, 2 }, .supports_answer = true, .match = .exact },
+        .{ .document_index = 0, .start = 5, .end = 8, .text = &bad, .slots = .{ 0, 2 }, .supports_answer = false, .match = .none },
+        .{ .document_index = 1, .start = 0, .end = 3, .text = &good, .slots = .{ 0, 2 }, .supports_answer = true, .match = .exact },
+        .{ .document_index = 0, .start = 16, .end = 19, .text = &good, .slots = .{ 0, 2 }, .supports_answer = true, .match = .exact },
+    };
+    try std.testing.expectEqual(@as(usize, 0), citationMismatches(&documents, citations[0..1]));
+    try std.testing.expectEqual(@as(usize, 3), citationMismatches(&documents, &citations));
 }
 
 test "memorilla lora serve verify parses stage timings" {

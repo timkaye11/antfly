@@ -57,15 +57,17 @@ pub const slots: usize = 16;
 pub const max_rows_per_document: usize = 128;
 /// Reader scratch per uploaded row: the rows themselves, their norm, two
 /// cross-attention key/value projections and headroom (plan 5.5).
-const reader_scratch_per_row: usize = qualified.width * @sizeOf(f32) * 6;
+pub const reader_scratch_per_row: usize = qualified.width * @sizeOf(f32) * 6;
 /// Decoder-side transients for the copy/snap stages: source rows, the
 /// 16 x vocab score matrix and the completed memory rows.
-const decoder_copy_scratch_bytes: usize = 32 * 1024 * 1024;
+pub const decoder_copy_scratch_bytes: usize = 32 * 1024 * 1024;
 /// Host chunk for the one-time embedding-table norm computation.
 const table_norm_chunk_rows: usize = 8192;
 
 /// Outcome of the answer-format guard applied to the decoder's text.
 pub const AnswerGuard = enum { accepted, rejected };
+pub const Citation = copy.Citation;
+pub const Citations = copy.Citations;
 
 /// The literal abstention answer of the trained protocol.
 pub const unknown_answer: []const u8 = "UNKNOWN";
@@ -125,11 +127,21 @@ pub fn guardAnswer(text: []const u8) AnswerGuard {
 /// token ids stay as decoded so callers can see what the decoder produced;
 /// `finish_reason` is a static string in `GenerationResult` (its `deinit`
 /// frees only text, reasoning text and ids).
-fn abstainGeneration(result: *generation.GenerationResult) !void {
+pub fn abstainGeneration(result: *generation.GenerationResult) !void {
     const replacement = try result.allocator.dupe(u8, unknown_answer);
     result.allocator.free(result.text);
     result.text = replacement;
     result.finish_reason = "abstained";
+}
+
+/// The answer citations are checked against: the published text, trimmed,
+/// or null when the service abstained (guard rejection or the literal
+/// UNKNOWN).
+pub fn citedAnswer(text: []const u8, guard: AnswerGuard) ?[]const u8 {
+    if (guard == .rejected) return null;
+    const trimmed = std.mem.trim(u8, text, &std.ascii.whitespace);
+    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, unknown_answer)) return null;
+    return trimmed;
 }
 
 pub const OwnedResult = struct {
@@ -141,10 +153,15 @@ pub const OwnedResult = struct {
     candidate_sha256: [64]u8,
     document_count: usize,
     question_tokens: usize,
+    /// Where every span copied into the memory record came from in the
+    /// caller's `documents` (`copy.buildCitations`), checked against the
+    /// published answer after the guard.
+    citations: copy.Citations,
     response_lease: memory.AdmissionLease,
 
     pub fn deinit(self: *OwnedResult) void {
         self.generation.deinit();
+        self.citations.deinit();
         self.response_lease.release();
         self.* = undefined;
     }
@@ -184,7 +201,7 @@ fn mul(x: usize, y: usize) !usize {
 /// The system prompt is part of the candidate's trained prompt recipe. Read
 /// it from the bundle before any model loads so prompt budgets fail early;
 /// the opened reader must later report the same text.
-fn bundleSystemPrompt(a: A, bundle_directory: []const u8) ![]u8 {
+pub fn bundleSystemPrompt(a: A, bundle_directory: []const u8) ![]u8 {
     const path = try std.fs.path.join(a, &.{ bundle_directory, "protocol.json" });
     defer a.free(path);
     const bytes = try file.readFileMax(a, path, 256 * 1024);
@@ -252,18 +269,29 @@ fn ensureTableNorms(a: A, owner: *research.Owner, cb: *const ops.ComputeBackend,
 
 /// Everything the copy stages produce on the host; device transients are
 /// released inside `copyAndSnap` so generation starts from resident weights.
-const Snapped = struct {
+pub const Snapped = struct {
     a: A,
     completed_ids: []i32,
+    /// Per copy-head span: the emitted source range (indexes the copy ids)
+    /// and its record slots after word completion.
+    spans: []copy.CompletedSpan,
     rows: []f32,
+    /// The contiguous-run spans before word completion (record slots
+    /// `begin..end`), as the evaluator's `copy_with_contiguous_runs` reports.
+    copy_spans: []copy.Span,
+    /// `[slots]` top-1 snap cosine of every record slot before completion.
+    cosines: []f32,
 
-    fn deinit(self: *Snapped) void {
+    pub fn deinit(self: *Snapped) void {
         self.a.free(self.completed_ids);
+        self.a.free(self.spans);
         self.a.free(self.rows);
+        self.a.free(self.copy_spans);
+        self.a.free(self.cosines);
     }
 };
 
-fn copyAndSnap(a: A, owner: *research.Owner, decoder_cb: *const ops.ComputeBackend, config: gpt.Config, tokenizer: @import("inference_tokenizer").Tokenizer, memories: []const f32, copy_ids: []const u32, control: Control) !Snapped {
+pub fn copyAndSnap(a: A, owner: *research.Owner, decoder_cb: *const ops.ComputeBackend, config: gpt.Config, tokenizer: @import("inference_tokenizer").Tokenizer, memories: []const f32, copy_ids: []const u32, control: Control) !Snapped {
     const hidden = config.hidden_size;
     if (copy_ids.len == 0) return error.EmptyMemorillaCollection;
     const source_ids = try a.alloc(i32, copy_ids.len);
@@ -299,20 +327,21 @@ fn copyAndSnap(a: A, owner: *research.Owner, decoder_cb: *const ops.ComputeBacke
     defer a.free(scores);
     const output_norms = try copy.rowNorms(a, runs.output, slots, hidden);
     defer a.free(output_norms);
-    const snapped = try copy.snapIds(a, scores, norms, output_norms, slots, config.vocab_size);
+    const cosines = try a.alloc(f32, slots);
+    errdefer a.free(cosines);
+    const snapped = try copy.snapIdsWithCosines(a, scores, norms, output_norms, slots, config.vocab_size, cosines);
     defer a.free(snapped);
+    const copy_spans = try a.dupe(copy.Span, runs.spans);
+    errdefer a.free(copy_spans);
     try control.check();
     // The pad is the single-space token of the decoder vocabulary; the
     // trained records end in it.
     const pad = try tokenizer.encode(a, " ");
     defer a.free(pad);
     if (pad.len != 1 or pad[0] != copy.default_pad_id) return error.InvalidMemorillaTokenizer;
-    const completed_ids = blk: {
-        var completed = try copy.completeCopiedWords(a, tokenizer, snapped, runs.spans, source_ids, pad[0]);
-        defer completed.deinit();
-        break :blk try a.dupe(i32, completed.ids);
-    };
-    errdefer a.free(completed_ids);
+    var completed = try copy.completeCopiedWords(a, tokenizer, snapped, runs.spans, source_ids, pad[0]);
+    errdefer completed.deinit();
+    const completed_ids = completed.ids;
     const completed_wide = try a.alloc(i64, slots);
     defer a.free(completed_wide);
     for (completed_ids, completed_wide) |id, *w| {
@@ -326,7 +355,7 @@ fn copyAndSnap(a: A, owner: *research.Owner, decoder_cb: *const ops.ComputeBacke
     };
     errdefer a.free(rows);
     if (rows.len != slots * hidden) return error.UnexpectedEmbeddingTable;
-    return .{ .a = a, .completed_ids = completed_ids, .rows = rows };
+    return .{ .a = a, .completed_ids = completed_ids, .spans = completed.spans, .rows = rows, .copy_spans = copy_spans, .cosines = cosines };
 }
 
 fn generateImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: Profile, paths: Paths, question: []const u8, documents: []const []const u8, identity: []const u8, max_new_tokens: usize, limits: memory.Limits, control: Control, options: Options) !OwnedResult {
@@ -441,6 +470,9 @@ fn generateImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: P
         return error.CudaNotEnabled;
     defer reader_physical.deinit();
     try reader_scope.bind(reader_backend);
+    // Moved out of the copy stage so citations can be built after the guard.
+    var completed_spans: []copy.CompletedSpan = &.{};
+    defer backing.free(completed_spans);
     const output = blk: {
         defer {
             reader.releaseRequestResources() catch @panic("Memorilla research reader request cleanup failed; worker restart required");
@@ -487,6 +519,8 @@ fn generateImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: P
             break :blk3 result;
         };
         defer snapped.deinit();
+        completed_spans = snapped.spans;
+        snapped.spans = &.{};
         try control.check();
         const rows_ct = try reader_backend.fromFloat32Shape(snapped.rows, &.{ @intCast(slots), @intCast(config.hidden_size) });
         defer reader_backend.free(rows_ct);
@@ -500,6 +534,11 @@ fn generateImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: P
     // fact (plan 7.1) is published as an abstention, never as prose.
     const answer_guard = guardAnswer(result.text);
     if (answer_guard == .rejected) try abstainGeneration(&result);
+    // Citations: every copied span with its document and byte range in the
+    // caller's text. A source map that could not be built (tokenizer pieces
+    // not reproducing the text) leaves them unavailable, not the request.
+    var citations = try copy.buildCitations(a, completed_spans, features.features.sources, documents, citedAnswer(result.text, answer_guard));
+    errdefer citations.deinit();
     if (comptime @import("build_options").enable_cuda) {
         if (options.reader_physical_resources) |record| {
             const snapshot = reader.compute.ctx.device_allocations.snapshot();
@@ -525,6 +564,7 @@ fn generateImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: P
         .candidate_sha256 = candidate_sha256,
         .document_count = documents.len,
         .question_tokens = features.question_tokens,
+        .citations = citations,
         .response_lease = response_lease,
     };
 }
@@ -593,6 +633,17 @@ test "Memorilla research answer guard rejects frame echo and malformed answers" 
     // Lowercase "unknown" is a well-formed single word; only the exact literal
     // is treated as the abstention, the rest is ordinary accepted text.
     try std.testing.expectEqual(AnswerGuard.accepted, guardAnswer("unknown"));
+}
+
+test "Memorilla research citations check the published answer only" {
+    try std.testing.expectEqualStrings("Kq9-0012", citedAnswer(" Kq9-0012\n", .accepted).?);
+    try std.testing.expect(citedAnswer("UNKNOWN", .accepted) == null);
+    try std.testing.expect(citedAnswer(" UNKNOWN ", .accepted) == null);
+    try std.testing.expect(citedAnswer("", .accepted) == null);
+    // A rejected answer was replaced by UNKNOWN; nothing is cited as support.
+    try std.testing.expect(citedAnswer("Alice Chen", .rejected) == null);
+    // Lowercase "unknown" is ordinary accepted text (see the guard).
+    try std.testing.expectEqualStrings("unknown", citedAnswer("unknown", .accepted).?);
 }
 
 test "Memorilla research answer guard abstention replaces text and keeps ids" {

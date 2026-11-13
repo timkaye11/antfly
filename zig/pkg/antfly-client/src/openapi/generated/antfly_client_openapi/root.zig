@@ -768,6 +768,7 @@ pub const MediaContentPart = types.MediaContentPart;
 pub const MediaOutputConfig = types.MediaOutputConfig;
 pub const MediaOutputCoverageCounts = types.MediaOutputCoverageCounts;
 pub const MediaOutputCoverageValues = types.MediaOutputCoverageValues;
+pub const MemorillaCitation = types.MemorillaCitation;
 pub const MemorillaGenerateRequest = types.MemorillaGenerateRequest;
 pub const MemorillaGenerateResponse = types.MemorillaGenerateResponse;
 pub const MemorillaGenerateUsage = types.MemorillaGenerateUsage;

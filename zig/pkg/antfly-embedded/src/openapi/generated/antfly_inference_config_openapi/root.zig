@@ -44,6 +44,7 @@ pub const InferenceServerConfig = types.InferenceServerConfig;
 pub const KernelJitConfig = types.KernelJitConfig;
 pub const KernelJitMode = types.KernelJitMode;
 pub const MediaContentPart = types.MediaContentPart;
+pub const MemorillaCitation = types.MemorillaCitation;
 pub const MemorillaGenerateRequest = types.MemorillaGenerateRequest;
 pub const MemorillaGenerateResponse = types.MemorillaGenerateResponse;
 pub const MemorillaGenerateUsage = types.MemorillaGenerateUsage;

@@ -31,10 +31,15 @@
 //!    feature channel F32 -> FP16 (RNE) -> BF16 (RNE) -> F32; `docs` is the
 //!    final-layer rows followed by the layer-24 rows (`[2M, 2560]`), `query`
 //!    the question's last active final-layer row.
+//!
+//! Alongside the copy sources it records a source map: for every copy id the
+//! caller document it came from and its byte range in the caller's original
+//! text (`sourceMap`), so copied spans can be cited.
 const std = @import("std");
 const tok = @import("inference_tokenizer");
 const qualified = @import("../models/memorilla_qualification.zig");
 const encoder = @import("memorilla_encoder.zig");
+const copy = @import("memorilla_copy.zig");
 const A = std.mem.Allocator;
 
 pub const width: usize = qualified.width;
@@ -44,6 +49,10 @@ pub const eos_id: i32 = 151643;
 pub const pad_id: i32 = eos_id;
 /// The candidate was trained and evaluated under this encoder bound.
 pub const max_padded_length: usize = 128;
+/// The hybrid evaluator's padded batch bound (`qwen_hybrid_eval.py
+/// --encoder-max-length 1024`): general passages exceed 128 tokens under
+/// self-context doubling.
+pub const hybrid_max_padded_length: usize = 1024;
 /// HF `hidden_states[k]` index of the intermediate layer (0-based layer 23).
 pub const tap_layer: usize = 24;
 pub const normalize_eps: f32 = 1e-12;
@@ -108,12 +117,15 @@ pub const SelfContext = struct {
     counts: []usize,
     copy_ids: []u32,
     fallbacks: usize,
+    /// Per document: its copy ids came from `encode(" " + D)`.
+    fallback_flags: []bool,
 
     pub fn deinit(self: *SelfContext) void {
         for (self.texts) |text| self.a.free(text);
         self.a.free(self.texts);
         self.a.free(self.counts);
         self.a.free(self.copy_ids);
+        self.a.free(self.fallback_flags);
         self.* = undefined;
     }
 };
@@ -128,15 +140,18 @@ pub fn selfContextTokens(a: A, tokenizer: tok.Tokenizer, documents: []const []co
     }
     const counts = try a.alloc(usize, documents.len);
     errdefer a.free(counts);
+    const fallback_flags = try a.alloc(bool, documents.len);
+    errdefer a.free(fallback_flags);
     var copy_ids = std.ArrayListUnmanaged(u32).empty;
     errdefer copy_ids.deinit(a);
     var fallbacks: usize = 0;
-    for (documents, texts, counts) |document, *text, *count| {
+    for (documents, texts, counts, fallback_flags) |document, *text, *count, *flag| {
         const context = try selfContextDocument(a, tokenizer, document);
         defer a.free(context.single_ids);
         text.* = context.doubled;
         built += 1;
         count.* = context.single_ids.len;
+        flag.* = context.fallback;
         fallbacks += @intFromBool(context.fallback);
         try copy_ids.ensureUnusedCapacity(a, context.single_ids.len);
         for (context.single_ids) |id| copy_ids.appendAssumeCapacity(@intCast(id));
@@ -147,7 +162,72 @@ pub fn selfContextTokens(a: A, tokenizer: tok.Tokenizer, documents: []const []co
         .counts = counts,
         .copy_ids = try copy_ids.toOwnedSlice(a),
         .fallbacks = fallbacks,
+        .fallback_flags = fallback_flags,
     };
+}
+
+/// Maps one document's copy ids to byte ranges of the caller's `original`
+/// text. The ids are the encoding of `leading` spaces followed by `original`
+/// (the space prefix, plus one more on the `encode(" " + D)` fallback).
+/// Byte-level BPE is lossless, so the ids' token pieces must concatenate to
+/// exactly that text; each piece's cumulative byte range, shifted back by
+/// `leading` and clamped at 0, is its range in `original` (a piece covering
+/// only added spaces gets the empty range at the document start). Returns
+/// false, leaving `out` partly written, when the pieces do not reproduce the
+/// text byte for byte (for example a normalizer rewrote it) or a piece cannot
+/// be decoded; allocation failure is an error.
+pub fn mapDocumentSources(a: A, tokenizer: tok.Tokenizer, document: usize, original: []const u8, leading: usize, ids: []const u32, out: []copy.SourceRange) !bool {
+    std.debug.assert(out.len == ids.len);
+    const total = leading + original.len;
+    if (document > std.math.maxInt(u32) or total > std.math.maxInt(u32)) return false;
+    var cursor: usize = 0;
+    for (ids, out) |id, *range| {
+        if (id > std.math.maxInt(i32)) return false;
+        const piece = tokenizer.tokenBytes(a, @intCast(id)) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return false,
+        };
+        defer a.free(piece);
+        if (piece.len > total - cursor) return false;
+        for (piece, cursor..) |byte, at| {
+            const expected: u8 = if (at < leading) ' ' else original[at - leading];
+            if (byte != expected) return false;
+        }
+        const start = @max(cursor, leading) - leading;
+        cursor += piece.len;
+        const end = @max(cursor, leading) - leading;
+        range.* = .{ .document = @intCast(document), .start = @intCast(start), .end = @intCast(end) };
+    }
+    return cursor == total;
+}
+
+/// The source map of `context`: one `SourceRange` per copy id, in copy-id
+/// order. `originals` are the caller's texts and `encoded` the texts handed
+/// to `selfContextTokens` (each must end with its original; the bytes before
+/// it are the added space prefix). Returns null when any document's pieces
+/// do not reproduce its encoded text; citations are then unavailable while
+/// the request itself is unaffected.
+pub fn sourceMap(a: A, tokenizer: tok.Tokenizer, originals: []const []const u8, encoded: []const []const u8, context: *const SelfContext) !?[]copy.SourceRange {
+    if (originals.len != encoded.len or originals.len != context.counts.len) return error.InvalidMemorillaDocumentCount;
+    const ranges = try a.alloc(copy.SourceRange, context.copy_ids.len);
+    errdefer a.free(ranges);
+    var offset: usize = 0;
+    for (originals, encoded, context.counts, context.fallback_flags, 0..) |original, text, count, fallback, index| {
+        if (!std.mem.endsWith(u8, text, original)) {
+            a.free(ranges);
+            return null;
+        }
+        const leading = text.len - original.len + @intFromBool(fallback);
+        if (count > context.copy_ids.len - offset) return error.MemorillaSelfContextMismatch;
+        const ids = context.copy_ids[offset..][0..count];
+        if (!try mapDocumentSources(a, tokenizer, index, original, leading, ids, ranges[offset..][0..count])) {
+            a.free(ranges);
+            return null;
+        }
+        offset += count;
+    }
+    if (offset != context.copy_ids.len) return error.MemorillaSelfContextMismatch;
+    return ranges;
 }
 
 /// The encoder batch `[D1+D1, ..., Dn+Dn, question]`, EOS appended and right
@@ -163,6 +243,9 @@ pub const Batch = struct {
     counts: []usize,
     copy_ids: []u32,
     fallbacks: usize,
+    /// Source map parallel to `copy_ids` (`sourceMap`); null when the copy
+    /// sources could not be mapped back to the caller's texts.
+    sources: ?[]copy.SourceRange = null,
 
     pub fn documentCount(self: *const Batch) usize {
         return self.batch - 1;
@@ -173,6 +256,7 @@ pub const Batch = struct {
         self.a.free(self.active);
         self.a.free(self.counts);
         self.a.free(self.copy_ids);
+        if (self.sources) |sources| self.a.free(sources);
         self.* = undefined;
     }
 };
@@ -181,6 +265,13 @@ pub const Batch = struct {
 /// question gets no prefix and no instruction. `context` stays owned by the
 /// caller; its counts and copy ids are copied into the batch.
 pub fn assembleBatch(a: A, tokenizer: tok.Tokenizer, context: *const SelfContext, question: []const u8) !Batch {
+    return assembleBatchBounded(a, tokenizer, context, question, max_padded_length);
+}
+
+/// `assembleBatch` with an explicit padded-row bound (`<= bound` active
+/// tokens per row, EOS included).
+pub fn assembleBatchBounded(a: A, tokenizer: tok.Tokenizer, context: *const SelfContext, question: []const u8, bound: usize) !Batch {
+    if (bound == 0 or bound > hybrid_max_padded_length) return error.MemorillaEncoderBoundExceeded;
     const batch = context.texts.len + 1;
     const rows = try a.alloc([]i32, batch);
     var encoded: usize = 0;
@@ -196,7 +287,7 @@ pub fn assembleBatch(a: A, tokenizer: tok.Tokenizer, context: *const SelfContext
         rows[row] = try encodeIds(a, tokenizer, text);
         encoded += 1;
         active[row] = rows[row].len + 1;
-        if (active[row] > max_padded_length) return error.MemorillaEncoderBoundExceeded;
+        if (active[row] > bound) return error.MemorillaEncoderBoundExceeded;
         seq_len = @max(seq_len, active[row]);
     }
     if (std.mem.trim(u8, question, &std.ascii.whitespace).len == 0) return error.BlankMemorillaQuestion;
@@ -226,8 +317,14 @@ pub fn assembleBatch(a: A, tokenizer: tok.Tokenizer, context: *const SelfContext
     };
 }
 
-/// Prefix, self-context and batch assembly in one step (section 1.2 steps 1-3).
+/// Prefix, self-context and batch assembly in one step (section 1.2 steps
+/// 1-3), plus the source map of the copy ids into `documents`.
 pub fn prepare(a: A, tokenizer: tok.Tokenizer, documents: []const []const u8, question: []const u8) !Batch {
+    return prepareBounded(a, tokenizer, documents, question, max_padded_length);
+}
+
+/// `prepare` with an explicit padded-row bound (`assembleBatchBounded`).
+pub fn prepareBounded(a: A, tokenizer: tok.Tokenizer, documents: []const []const u8, question: []const u8, bound: usize) !Batch {
     if (documents.len == 0 or documents.len > qualified.max_documents) return error.InvalidMemorillaDocumentCount;
     const prefixed = try a.alloc([]u8, documents.len);
     var built: usize = 0;
@@ -241,7 +338,11 @@ pub fn prepare(a: A, tokenizer: tok.Tokenizer, documents: []const []const u8, qu
     }
     var context = try selfContextTokens(a, tokenizer, prefixed);
     defer context.deinit();
-    return assembleBatch(a, tokenizer, &context, question);
+    const sources = try sourceMap(a, tokenizer, documents, prefixed, &context);
+    errdefer if (sources) |owned| a.free(owned);
+    var batch = try assembleBatchBounded(a, tokenizer, &context, question, bound);
+    batch.sources = sources;
+    return batch;
 }
 
 /// Number of selected document rows `M = sum(n_i + 1)`.
@@ -334,12 +435,15 @@ pub const Features = struct {
     query: []f32,
     copy_ids: []u32,
     counts: []usize,
+    /// Source map parallel to `copy_ids`, or null (see `Batch.sources`).
+    sources: ?[]copy.SourceRange = null,
 
     pub fn deinit(self: *Features) void {
         self.a.free(self.docs);
         self.a.free(self.query);
         self.a.free(self.copy_ids);
         self.a.free(self.counts);
+        if (self.sources) |sources| self.a.free(sources);
         self.* = undefined;
     }
 };
@@ -370,6 +474,8 @@ pub fn featuresWithWidth(a: A, final: []const f32, tap: []const f32, batch: *con
     const copy_ids = try a.dupe(u32, batch.copy_ids);
     errdefer a.free(copy_ids);
     const counts = try a.dupe(usize, batch.counts);
+    errdefer a.free(counts);
+    const sources: ?[]copy.SourceRange = if (batch.sources) |map| try a.dupe(copy.SourceRange, map) else null;
     return .{
         .a = a,
         .docs = docs,
@@ -377,6 +483,7 @@ pub fn featuresWithWidth(a: A, final: []const f32, tap: []const f32, batch: *con
         .query = query,
         .copy_ids = copy_ids,
         .counts = counts,
+        .sources = sources,
     };
 }
 
@@ -447,6 +554,217 @@ const PositionTokenizer = struct {
     }
 };
 
+/// Lossless byte-level stand-in for the Qwen BPE: text splits into units of
+/// one optional leading space plus a run of non-space bytes (a space before
+/// another space, or a trailing space, is its own unit). ASCII units are
+/// interned as ids whose piece is the unit's bytes; a sentence-initial unit
+/// (text start, no leading space) gets a distinct id with the same bytes, so
+/// an unprefixed document takes the self-context fallback as with Qwen.
+/// Non-ASCII units become one token per byte, splitting multibyte UTF-8
+/// characters across pieces. `lowercase` imitates a normalizer that rewrites
+/// bytes, which the source map must detect.
+const PieceTokenizer = struct {
+    a: A,
+    units: std.ArrayListUnmanaged(Unit) = .empty,
+    lowercase: bool = false,
+
+    const Unit = struct { bytes: []u8, initial: bool };
+    const byte_base: i32 = 1_000_000;
+
+    fn deinitSelf(self: *PieceTokenizer) void {
+        for (self.units.items) |unit| self.a.free(unit.bytes);
+        self.units.deinit(self.a);
+    }
+
+    fn intern(self: *PieceTokenizer, bytes: []const u8, initial: bool) !i32 {
+        for (self.units.items, 0..) |unit, index| {
+            if (unit.initial == initial and std.mem.eql(u8, unit.bytes, bytes)) return @intCast(index);
+        }
+        const owned = try self.a.dupe(u8, bytes);
+        errdefer self.a.free(owned);
+        try self.units.append(self.a, .{ .bytes = owned, .initial = initial });
+        return @intCast(self.units.items.len - 1);
+    }
+
+    fn encode(raw: *anyopaque, a: A, text: []const u8) ![]i32 {
+        const self: *PieceTokenizer = @ptrCast(@alignCast(raw));
+        var ids = std.ArrayListUnmanaged(i32).empty;
+        errdefer ids.deinit(a);
+        var index: usize = 0;
+        while (index < text.len) {
+            var end = index;
+            if (text[end] == ' ') end += 1;
+            while (end < text.len and text[end] != ' ') end += 1;
+            const unit = text[index..end];
+            const ascii = for (unit) |byte| {
+                if (byte >= 0x80) break false;
+            } else true;
+            if (ascii) {
+                try ids.append(a, try self.intern(unit, index == 0 and unit[0] != ' '));
+            } else {
+                for (unit) |byte| try ids.append(a, byte_base + byte);
+            }
+            index = end;
+        }
+        return ids.toOwnedSlice(a);
+    }
+
+    fn append(raw: *anyopaque, a: A, text: []const u8, out: *std.ArrayListUnmanaged(i32)) !void {
+        const ids = try encode(raw, a, text);
+        defer a.free(ids);
+        try out.appendSlice(a, ids);
+    }
+
+    fn decode(raw: *anyopaque, a: A, ids: []const i32) ![]u8 {
+        const self: *PieceTokenizer = @ptrCast(@alignCast(raw));
+        var out = std.ArrayListUnmanaged(u8).empty;
+        errdefer out.deinit(a);
+        for (ids) |id| {
+            if (id >= byte_base) {
+                try out.append(a, @intCast(id - byte_base));
+            } else {
+                if (id < 0 or @as(usize, @intCast(id)) >= self.units.items.len) return error.UnknownToken;
+                try out.appendSlice(a, self.units.items[@intCast(id)].bytes);
+            }
+        }
+        if (self.lowercase) for (out.items) |*byte| {
+            byte.* = std.ascii.toLower(byte.*);
+        };
+        return out.toOwnedSlice(a);
+    }
+
+    fn size(_: *anyopaque) usize {
+        return 2_000_000;
+    }
+
+    fn handle(self: *PieceTokenizer) tok.Tokenizer {
+        return .{ .ptr = self, .vtable = &.{ .encode = encode, .encodeInto = append, .encodeForModel = WordTokenizer.unused, .encodeGeneration = WordTokenizer.unusedGeneration, .decode = decode, .specialTokens = WordTokenizer.specials, .vocabSize = size, .deinit = WordTokenizer.deinit } };
+    }
+};
+
+fn expectRanges(expected: []const [3]u32, actual: []const copy.SourceRange) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |e, x| {
+        try std.testing.expectEqual(e[0], x.document);
+        try std.testing.expectEqual(e[1], x.start);
+        try std.testing.expectEqual(e[2], x.end);
+    }
+}
+
+/// Each document's ranges tile its original text in order: concatenating
+/// the cited bytes of its copy ids reproduces the text exactly.
+fn expectTiles(documents: []const []const u8, sources: []const copy.SourceRange) !void {
+    var cursor: usize = 0;
+    var document: usize = 0;
+    for (sources) |range| {
+        if (range.document != document) {
+            try std.testing.expectEqual(documents[document].len, cursor);
+            try std.testing.expectEqual(document + 1, range.document);
+            document = range.document;
+            cursor = 0;
+        }
+        try std.testing.expectEqual(cursor, range.start);
+        cursor = range.end;
+    }
+    try std.testing.expectEqual(documents.len - 1, document);
+    try std.testing.expectEqual(documents[document].len, cursor);
+}
+
+test "memorilla token features source map round-trips prefixed, spaced and multibyte documents" {
+    const a = std.testing.allocator;
+    var pieces = PieceTokenizer{ .a = a };
+    defer pieces.deinitSelf();
+    const tokenizer = pieces.handle();
+    // D0 gets the space prefix; D1 already has it and splits "ë" into bytes.
+    const documents = [_][]const u8{ "Mujapo Depot code QX7.", " Zo\xc3\xab holds it" };
+    var batch = try prepare(a, tokenizer, &documents, "Which code?");
+    defer batch.deinit();
+    try std.testing.expectEqual(@as(usize, 0), batch.fallbacks);
+    const sources = batch.sources orelse return error.TestExpectedSourceMap;
+    try std.testing.expectEqual(batch.copy_ids.len, sources.len);
+    try expectRanges(&.{
+        // " Mujapo" covers the added space and starts at byte 0.
+        .{ 0, 0, 6 }, .{ 0, 6, 12 }, .{ 0, 12, 17 }, .{ 0, 17, 22 },
+        // " Zoë" as five byte pieces; "ë" = C3 AB spans two of them.
+        .{ 1, 0, 1 }, .{ 1, 1, 2 },  .{ 1, 2, 3 },   .{ 1, 3, 4 },
+        .{ 1, 4, 5 }, .{ 1, 5, 11 }, .{ 1, 11, 14 },
+    }, sources);
+    try expectTiles(&documents, sources);
+    try std.testing.expectEqualStrings("\xc3", documents[1][sources[7].start..sources[7].end]);
+    // Every piece outside the added prefix is exactly its cited bytes.
+    for (batch.copy_ids, sources, 0..) |id, range, index| {
+        const piece = try tokenizer.tokenBytes(a, @intCast(id));
+        defer a.free(piece);
+        const cited = documents[range.document][range.start..range.end];
+        if (index == 0) {
+            try std.testing.expectEqualStrings(" Mujapo", piece);
+            try std.testing.expectEqualStrings("Mujapo", cited);
+        } else try std.testing.expectEqualStrings(piece, cited);
+    }
+
+    // The reader features carry the same map.
+    const row_width: usize = 2;
+    const states = try a.alloc(f32, batch.batch * batch.seq_len * row_width);
+    defer a.free(states);
+    @memset(states, 1);
+    var result = try featuresWithWidth(a, states, states, &batch, row_width);
+    defer result.deinit();
+    try expectRanges(&.{ .{ 0, 0, 6 }, .{ 0, 6, 12 } }, result.sources.?[0..2]);
+    try std.testing.expectEqual(sources.len, result.sources.?.len);
+}
+
+test "memorilla token features source map follows the self-context fallback" {
+    const a = std.testing.allocator;
+    var pieces = PieceTokenizer{ .a = a };
+    defer pieces.deinitSelf();
+    const tokenizer = pieces.handle();
+    // Handed over unprefixed, "Mujapo Depot" re-segments mid-text and its copy
+    // ids come from encode(" " + D): one leading space more than the text.
+    const documents = [_][]const u8{ "Mujapo Depot", " Site code" };
+    var context = try selfContextTokens(a, tokenizer, &documents);
+    defer context.deinit();
+    try std.testing.expectEqualSlices(bool, &.{ true, false }, context.fallback_flags);
+    const sources = (try sourceMap(a, tokenizer, &documents, &documents, &context)) orelse return error.TestExpectedSourceMap;
+    defer a.free(sources);
+    try expectRanges(&.{ .{ 0, 0, 6 }, .{ 0, 6, 12 }, .{ 1, 0, 5 }, .{ 1, 5, 10 } }, sources);
+    try expectTiles(&documents, sources);
+
+    // Prefix plus fallback: two added spaces, the first piece is all prefix.
+    const ids = try tokenizer.encode(a, "  ab");
+    defer a.free(ids);
+    var wide: [2]u32 = undefined;
+    for (ids, &wide) |id, *w| w.* = @intCast(id);
+    var out: [2]copy.SourceRange = undefined;
+    try std.testing.expect(try mapDocumentSources(a, tokenizer, 3, "ab", 2, &wide, &out));
+    try expectRanges(&.{ .{ 3, 0, 0 }, .{ 3, 0, 2 } }, &out);
+    // Pieces that do not tile the text exactly are rejected.
+    try std.testing.expect(!try mapDocumentSources(a, tokenizer, 3, "ab", 1, &wide, &out));
+    try std.testing.expect(!try mapDocumentSources(a, tokenizer, 3, "abc", 2, &wide, &out));
+    try std.testing.expect(!try mapDocumentSources(a, tokenizer, 3, "ab", 2, wide[0..1], out[0..1]));
+    try std.testing.expect(!try mapDocumentSources(a, tokenizer, 3, "xb", 2, &wide, &out));
+    // An encoded text that does not end with its original has no map.
+    try std.testing.expect((try sourceMap(a, tokenizer, &.{ "Mujapo Depot", "other" }, &documents, &context)) == null);
+}
+
+test "memorilla token features source map fails closed when pieces rewrite the text" {
+    const a = std.testing.allocator;
+    var pieces = PieceTokenizer{ .a = a, .lowercase = true };
+    defer pieces.deinitSelf();
+    // A normalizer-like rewrite: the request still prepares, without a map.
+    var batch = try prepare(a, pieces.handle(), &.{ "Mujapo Depot", "code QX7" }, "Which code?");
+    defer batch.deinit();
+    try std.testing.expect(batch.sources == null);
+    try std.testing.expectEqual(@as(usize, 4), batch.copy_ids.len);
+    // Lowercase text survives the rewrite unchanged and maps.
+    var lower = try prepare(a, pieces.handle(), &.{"mujapo depot"}, "q");
+    defer lower.deinit();
+    try std.testing.expect(lower.sources != null);
+    // The word stand-in decodes every id to "", which never tiles a text.
+    var words = try prepare(a, WordTokenizer.handle(), &.{"a b"}, "q");
+    defer words.deinit();
+    try std.testing.expect(words.sources == null);
+}
+
 test "memorilla token features prefix each document with one space" {
     const a = std.testing.allocator;
     const prefixed = try prefixDocument(a, "Antfly stores versions.");
@@ -512,9 +830,9 @@ test "memorilla token features batch appends EOS, right pads and bounds the leng
     const hq = WordTokenizer.hash("q") + 100_000;
     const hr = WordTokenizer.hash("r");
     const expected = [_]i64{
-        ha,     hb,     ha,     hb,     eos_id,
-        hc,     hc,     eos_id, pad_id, pad_id,
-        hq,     hr,     eos_id, pad_id, pad_id,
+        ha, hb, ha,     hb,     eos_id,
+        hc, hc, eos_id, pad_id, pad_id,
+        hq, hr, eos_id, pad_id, pad_id,
     };
     try std.testing.expectEqualSlices(i64, &expected, batch.input_ids);
     try std.testing.expectEqualSlices(u32, &.{ @intCast(ha), @intCast(hb), @intCast(hc) }, batch.copy_ids);
@@ -530,6 +848,17 @@ test "memorilla token features batch appends EOS, right pads and bounds the leng
     defer fits.deinit();
     try std.testing.expectEqual(@as(usize, 127), fits.seq_len);
     try std.testing.expectError(error.BlankMemorillaQuestion, prepare(a, tokenizer, &.{"a"}, " "));
+    // The hybrid bound admits the 129-token row and still rejects 1025.
+    var wide = try prepareBounded(a, tokenizer, &.{long}, "q", hybrid_max_padded_length);
+    defer wide.deinit();
+    try std.testing.expectEqual(@as(usize, 129), wide.seq_len);
+    try std.testing.expectError(error.MemorillaEncoderBoundExceeded, prepareBounded(a, tokenizer, &.{long}, "q", 128));
+    try std.testing.expectError(error.MemorillaEncoderBoundExceeded, prepareBounded(a, tokenizer, &.{"a"}, "q", hybrid_max_padded_length + 1));
+    var huge_buf: [512 * 5]u8 = undefined;
+    var huge_len: usize = 0;
+    for (0..512) |index| huge_len += (try std.fmt.bufPrint(huge_buf[huge_len..], " w{d}", .{index})).len;
+    // 512 words doubled -> 1024 ids + EOS = 1025 > 1024.
+    try std.testing.expectError(error.MemorillaEncoderBoundExceeded, prepareBounded(a, tokenizer, &.{huge_buf[0..huge_len]}, "q", hybrid_max_padded_length));
 }
 
 test "memorilla token features select the last n_i + 1 rows per document and the question EOS row" {
@@ -669,4 +998,118 @@ test "memorilla token features agree with the Qwen3 encoder tokenizer" {
         if (row < 2) try std.testing.expect(batch.counts[row] + 1 <= length);
     }
     try std.testing.expectEqual(batch.counts[0] + batch.counts[1], batch.copy_ids.len);
+
+    // Source map: the real byte-level pieces tile every caller text, with
+    // multibyte characters and punctuation, and the first piece of a prefixed
+    // document starts at byte 0.
+    const texts = [_][]const u8{ "At Mujapo Depot the owner code is QX7.", " Site Rendal Yard, holder Zo\u{eb} \u{c5}ngstr\u{f6}m.", "Code Kq9-0012 opens the gate \u{2014} gate 3." };
+    var mapped = try prepare(a, tokenizer, &texts, "Which code belongs to Mujapo Depot?");
+    defer mapped.deinit();
+    const sources = mapped.sources orelse return error.TestExpectedSourceMap;
+    try std.testing.expectEqual(mapped.copy_ids.len, sources.len);
+    try expectTiles(&texts, sources);
+    try std.testing.expectEqual(@as(u32, 0), sources[0].start);
+    try std.testing.expectEqualStrings("At", texts[0][sources[0].start..sources[0].end]);
+    // NFC composes a decomposed accent, so the pieces no longer reproduce the
+    // supplied bytes: no map, the batch itself is unaffected.
+    var decomposed = try prepare(a, tokenizer, &.{"Zoe\u{301} holds the key."}, "Who holds the key?");
+    defer decomposed.deinit();
+    try std.testing.expect(decomposed.sources == null);
+    try std.testing.expect(decomposed.copy_ids.len > 0);
+}
+
+/// One case of an `encoder_lora_eval.py` reference receipt (only the fields
+/// the citation replay needs).
+const ReferenceCase = struct {
+    name: []const u8,
+    documents: []const []const u8,
+    question: []const u8,
+    answer: []const u8,
+    expected_answer: []const u8,
+    copy_ids: []const i64,
+    spans: []const [3]usize,
+    snapped_ids: []const i64,
+    completed_ids: []const i64,
+};
+
+fn narrowIds(a: A, ids: []const i64) ![]i32 {
+    const out = try a.alloc(i32, ids.len);
+    for (ids, out) |id, *o| o.* = @intCast(id);
+    return out;
+}
+
+test "memorilla token features cite the Python reference cases with the Qwen3 tokenizer" {
+    // CPU replay of the serving citation pipeline over reference receipts:
+    // the real tokenizer's source map, the Python copy-head spans and snapped
+    // ids, word completion (must reproduce the reference record) and
+    // citations checked against the case documents. Set
+    // ANTFLY_MEMORILLA_LORA_REFERENCE_DIRS to ':'-separated lora-ref-* dirs.
+    const platform = @import("antfly_platform");
+    const directory = platform.env.getenv("ANTFLY_MEMORILLA_ENCODER_MODEL_DIR") orelse return error.SkipZigTest;
+    const references = platform.env.getenv("ANTFLY_MEMORILLA_LORA_REFERENCE_DIRS") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const c_file = @import("../util/c_file.zig");
+    const path = try std.fs.path.join(a, &.{ directory, "tokenizer.json" });
+    defer a.free(path);
+    const bytes = try c_file.readFile(a, path);
+    defer a.free(bytes);
+    const hf = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, bytes);
+    defer hf.deinitSelf();
+    const tokenizer = hf.tokenizer();
+
+    var dirs = std.mem.tokenizeScalar(u8, references, ':');
+    while (dirs.next()) |reference_dir| {
+        const receipt_path = try std.fs.path.join(a, &.{ reference_dir, "reference.json" });
+        defer a.free(receipt_path);
+        const receipt = try c_file.readFile(a, receipt_path);
+        defer a.free(receipt);
+        var parsed = try std.json.parseFromSlice(struct { cases: []const ReferenceCase }, a, receipt, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        var unmapped: usize = 0;
+        var citation_count: usize = 0;
+        var supported_cases: usize = 0;
+        var correct_answered: usize = 0;
+        var correct_supported: usize = 0;
+        for (parsed.value.cases, 0..) |case, case_index| {
+            var batch = try prepare(a, tokenizer, case.documents, case.question);
+            defer batch.deinit();
+            try std.testing.expectEqual(case.copy_ids.len, batch.copy_ids.len);
+            for (case.copy_ids, batch.copy_ids) |expected, actual| try std.testing.expectEqual(expected, @as(i64, actual));
+            const sources = batch.sources orelse {
+                unmapped += 1;
+                continue;
+            };
+            try expectTiles(case.documents, sources);
+            const source_ids = try narrowIds(a, case.copy_ids);
+            defer a.free(source_ids);
+            const snapped = try narrowIds(a, case.snapped_ids);
+            defer a.free(snapped);
+            const spans = try a.alloc(copy.Span, case.spans.len);
+            defer a.free(spans);
+            for (case.spans, spans) |raw, *span| span.* = .{ .begin = raw[0], .end = raw[1], .start = raw[2] };
+            var completed = try copy.completeCopiedWords(a, tokenizer, snapped, spans, source_ids, copy.default_pad_id);
+            defer completed.deinit();
+            for (case.completed_ids, completed.ids) |expected, actual| try std.testing.expectEqual(expected, @as(i64, actual));
+            const answer = std.mem.trim(u8, case.answer, &std.ascii.whitespace);
+            const published: ?[]const u8 = if (std.mem.eql(u8, answer, "UNKNOWN")) null else answer;
+            var citations = try copy.buildCitations(a, completed.spans, sources, case.documents, published);
+            defer citations.deinit();
+            try std.testing.expect(!citations.unavailable);
+            var supported = false;
+            for (citations.items) |citation| {
+                try std.testing.expectEqualStrings(case.documents[citation.document_index][citation.start..citation.end], citation.text);
+                supported = supported or citation.supports_answer;
+            }
+            if (case_index == 0) for (citations.items) |citation| {
+                std.debug.print("  {s} answer={s}: document_index={d} start={d} end={d} text=\"{s}\" slots=[{d},{d}) supports_answer={} match={s}\n", .{ case.name, answer, citation.document_index, citation.start, citation.end, citation.text, citation.slots[0], citation.slots[1], citation.supports_answer, @tagName(citation.match) });
+            };
+            citation_count += citations.items.len;
+            supported_cases += @intFromBool(supported);
+            const correct = published != null and std.mem.eql(u8, answer, case.expected_answer);
+            correct_answered += @intFromBool(correct);
+            correct_supported += @intFromBool(correct and supported);
+        }
+        std.debug.print("citation replay {s}: cases={d} unmapped={d} citations={d} supported_cases={d} correct_answered={d} correct_with_support={d}\n", .{ std.fs.path.basename(reference_dir), parsed.value.cases.len, unmapped, citation_count, supported_cases, correct_answered, correct_supported });
+        try std.testing.expectEqual(@as(usize, 0), unmapped);
+    }
 }

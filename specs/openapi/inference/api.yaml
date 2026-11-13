@@ -618,7 +618,9 @@ paths:
         replaces decoder text that is not a short fact (a few words of
         letters, digits, hyphen, period and apostrophe, or the literal
         UNKNOWN) with UNKNOWN and finish_reason abstained, reported in
-        answer_guard. This path is not qualified.
+        answer_guard. Every span copied into the memory record is returned in
+        citations with its document_index and UTF-8 byte range [start, end)
+        in that document_texts entry. This path is not qualified.
       requestBody:
         required: true
         content:

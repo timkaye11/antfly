@@ -21,6 +21,8 @@ const factory = @import("../architectures/session_factory.zig");
 const qualified = @import("../models/memorilla_qualification.zig");
 const catalog = @import("../registry/memorilla_catalog.zig");
 const token_features = @import("memorilla_token_features.zig");
+const source_map = @import("memorilla_copy.zig");
+const encoder_lora = @import("../models/memorilla_encoder_lora.zig");
 const session_mod = @import("../backends/session.zig");
 const Tensor = @import("../backends/backends.zig").Tensor;
 const c_file = @import("../util/c_file.zig");
@@ -301,6 +303,9 @@ pub const TokenFeatures = struct {
     /// Active length of the question row (its ids plus EOS).
     question_tokens: usize,
     producer: Producer,
+    /// sha256 of the run-time encoder LoRA applied to this pass (hybrid
+    /// profile on the stock encoder); null for the merged research encoder.
+    adapter_sha256: ?[64]u8 = null,
     lease: memory.AdmissionLease,
 
     pub fn deinit(self: *TokenFeatures) void {
@@ -317,17 +322,24 @@ const padded_length: usize = token_features.max_padded_length;
 /// `documents` documents whose texts (plus the question) total `text_bytes`:
 /// both host output tensors at the padded ceiling, the `[2M, width]` feature
 /// rows plus the row-selection temporaries, the query, copy ids, the i64 ids
-/// and mask, the per-row i32 encodings, bookkeeping slices and the prefixed
-/// and doubled text copies.
+/// and mask, the per-row i32 encodings, bookkeeping slices, the prefixed
+/// and doubled text copies, and the citation source map (one SourceRange per
+/// copy id, held by both the batch and the features).
 pub fn tokenFeatureHostBytes(documents: usize, text_bytes: usize) !usize {
+    return tokenFeatureHostBytesBounded(documents, text_bytes, padded_length);
+}
+
+/// `tokenFeatureHostBytes` at an explicit padded-row bound.
+pub fn tokenFeatureHostBytesBounded(documents: usize, text_bytes: usize, bound: usize) !usize {
     if (documents == 0) return error.EmptyMemorillaCollection;
     const rows = try std.math.add(usize, documents, 1);
-    const positions = try std.math.mul(usize, rows, padded_length);
-    const document_positions = try std.math.mul(usize, documents, padded_length);
+    const positions = try std.math.mul(usize, rows, bound);
+    const document_positions = try std.math.mul(usize, documents, bound);
     var total = try std.math.mul(usize, positions, row_bytes * 2);
     total = try std.math.add(usize, total, try std.math.mul(usize, document_positions, row_bytes * 4));
     total = try std.math.add(usize, total, row_bytes);
     total = try std.math.add(usize, total, try std.math.mul(usize, document_positions, 2 * @sizeOf(u32)));
+    total = try std.math.add(usize, total, try std.math.mul(usize, document_positions, 2 * @sizeOf(source_map.SourceRange)));
     total = try std.math.add(usize, total, try std.math.mul(usize, positions, 2 * @sizeOf(i64) + @sizeOf(i32)));
     total = try std.math.add(usize, total, try std.math.mul(usize, rows, 4 * @sizeOf(usize) + @sizeOf([]const u8)));
     total = try std.math.add(usize, total, try std.math.mul(usize, text_bytes, 3));
@@ -341,15 +353,35 @@ pub fn tokenFeatureHostBytes(documents: usize, text_bytes: usize) !usize {
 /// The session's own admission turns `workspace_bytes` into the backend
 /// scratch that `archRunAdmitted` requires for a Memorilla encoder.
 pub fn tokenFeatureRunRequest(batch: usize, seq_len: usize) !session_mod.RunRequest {
+    return tokenFeatureRunRequestBounded(batch, seq_len, padded_length, null);
+}
+
+/// Run-time adapter footprint of one tapped run: the packed F32 adapters
+/// (host input and device copies) and the per-position low-rank and
+/// projection-width temporaries of one adapted projection.
+pub const RunAdapter = struct { bytes: usize, rank: usize, projection_width: usize };
+
+/// `tokenFeatureRunRequest` at an explicit padded-row bound, plus the
+/// adapter inputs and their device copies and temporaries when a run-time
+/// encoder LoRA rides on the run.
+pub fn tokenFeatureRunRequestBounded(batch: usize, seq_len: usize, bound: usize, adapter: ?RunAdapter) !session_mod.RunRequest {
     if (batch < 2) return error.InvalidMemorillaDocumentCount;
-    if (seq_len == 0 or seq_len > padded_length) return error.MemorillaEncoderBoundExceeded;
+    if (bound == 0 or bound > token_features.hybrid_max_padded_length or seq_len == 0 or seq_len > bound) return error.MemorillaEncoderBoundExceeded;
     const positions = try std.math.mul(usize, batch, seq_len);
+    var input_bytes = try std.math.add(usize, try std.math.mul(usize, positions, 2 * @sizeOf(i64)), @sizeOf(i64));
+    var workspace = try std.math.mul(usize, try std.math.mul(usize, batch, bound), row_bytes * 8);
+    if (adapter) |run| {
+        input_bytes = try std.math.add(usize, input_bytes, try std.math.add(usize, run.bytes, @sizeOf(f32)));
+        // Device adapters, then x A^T, B (x A^T), its scaled copy and the sum.
+        const per_position = try std.math.add(usize, run.rank, try std.math.mul(usize, run.projection_width, 3));
+        workspace = try std.math.add(usize, workspace, try std.math.add(usize, run.bytes, try std.math.mul(usize, positions, per_position * @sizeOf(f32))));
+    }
     return .{
         .batch = batch,
         .sequence = seq_len,
-        .input_bytes = try std.math.add(usize, try std.math.mul(usize, positions, 2 * @sizeOf(i64)), @sizeOf(i64)),
+        .input_bytes = input_bytes,
         .output_bytes = try std.math.mul(usize, positions, row_bytes * 2),
-        .workspace_bytes = try std.math.mul(usize, try std.math.mul(usize, batch, padded_length), row_bytes * 8),
+        .workspace_bytes = workspace,
     };
 }
 
@@ -360,6 +392,25 @@ pub fn tokenFeatureRunRequest(batch: usize, seq_len: usize) !session_mod.RunRequ
 /// managed publication, embedding identity before and after, embedding asset
 /// lease and execution lane, with the forward admitted through the session.
 pub fn encodeTokenFeatures(a: A, handle: *const manager.ModelHandle, documents: []const []const u8, question: []const u8, limits: memory.Limits, control: Control) !TokenFeatures {
+    return encodeTokenFeaturesImpl(a, handle, documents, question, limits, control, .{});
+}
+
+/// The hybrid profile's record pass: the same `tokens-dual` features, run on
+/// the stock `qwen3_encoder_f32_v1` encoder with the bundle's encoder LoRA
+/// applied to the q/v projections at run time (resident weights untouched)
+/// and the hybrid evaluator's 1024-token padded-row bound. The producer is
+/// the stock encoder's; `adapter_sha256` records the adapters applied.
+pub fn encodeHybridTokenFeatures(a: A, handle: *const manager.ModelHandle, documents: []const []const u8, question: []const u8, adapter: *const encoder_lora.Adapter, limits: memory.Limits, control: Control) !TokenFeatures {
+    return encodeTokenFeaturesImpl(a, handle, documents, question, limits, control, .{ .profile = v1_profile, .bound = token_features.hybrid_max_padded_length, .adapter = adapter });
+}
+
+const TokenOptions = struct {
+    profile: qualified.Profile = research_profile,
+    bound: usize = token_features.max_padded_length,
+    adapter: ?*const encoder_lora.Adapter = null,
+};
+
+fn encodeTokenFeaturesImpl(a: A, handle: *const manager.ModelHandle, documents: []const []const u8, question: []const u8, limits: memory.Limits, control: Control, options: TokenOptions) !TokenFeatures {
     try control.check();
     if (documents.len == 0) return error.EmptyMemorillaCollection;
     if (documents.len > qualified.max_documents or question.len > max_text_bytes) return error.MemorillaTextLimitExceeded;
@@ -373,8 +424,11 @@ pub fn encodeTokenFeatures(a: A, handle: *const manager.ModelHandle, documents: 
         if (std.mem.trim(u8, text, &std.ascii.whitespace).len == 0) return error.BlankMemorillaDocument;
         text_bytes += text.len;
     }
-    const host_bytes = try tokenFeatureHostBytes(documents.len, text_bytes);
-    const profile = research_profile;
+    // The adapter tensors are copied into one run input.
+    const adapter_bytes: usize = if (options.adapter) |adapter| adapter.bytes() else 0;
+    const host_bytes = try std.math.add(usize, try tokenFeatureHostBytesBounded(documents.len, text_bytes, options.bound), adapter_bytes);
+    const profile = options.profile;
+    if ((profile == v1_profile) != (options.adapter != null)) return error.IncompatibleMemorillaProducer;
     const backing = @import("antfly_platform").allocator.reclaimingScratch(a);
     var pin = handle.duplicate();
     defer pin.release();
@@ -398,7 +452,7 @@ pub fn encodeTokenFeatures(a: A, handle: *const manager.ModelHandle, documents: 
     const tokenizer = model.getTokenizer();
     const lane = try model.embedding_execution_lane.acquire(control);
     defer lane.release();
-    var batch = try token_features.prepare(backing, tokenizer, documents, question);
+    var batch = try token_features.prepareBounded(backing, tokenizer, documents, question, options.bound);
     defer batch.deinit();
     try control.check();
     const shape = [_]i64{ @intCast(batch.batch), @intCast(batch.seq_len) };
@@ -413,10 +467,24 @@ pub fn encodeTokenFeatures(a: A, handle: *const manager.ModelHandle, documents: 
     defer mask.deinit();
     var tap = try Tensor.initInt64(backing, factory.gpt_hidden_states_tap_input, &.{1}, &.{@intCast(token_features.tap_layer)});
     defer tap.deinit();
-    var permit = try model.session.admit(try tokenFeatureRunRequest(batch.batch, batch.seq_len));
+    var lora_values: ?Tensor = null;
+    defer if (lora_values) |*tensor| tensor.deinit();
+    var lora_scale: ?Tensor = null;
+    defer if (lora_scale) |*tensor| tensor.deinit();
+    var run_adapter: ?RunAdapter = null;
+    if (options.adapter) |adapter| {
+        if (adapter.layers == 0 or adapter.values.len % adapter.layers != 0) return error.InvalidMemorillaEncoderLora;
+        lora_values = try Tensor.initFloat32(backing, factory.gpt_encoder_lora_input, &.{ @intCast(adapter.layers), @intCast(adapter.values.len / adapter.layers) }, adapter.values);
+        lora_scale = try Tensor.initFloat32(backing, factory.gpt_encoder_lora_scale_input, &.{1}, &.{adapter.scale});
+        run_adapter = .{ .bytes = adapter.bytes(), .rank = adapter.rank, .projection_width = encoder_lora.qwen3_embedding_4b.q_out };
+    }
+    var permit = try model.session.admit(try tokenFeatureRunRequestBounded(batch.batch, batch.seq_len, options.bound, run_adapter));
     defer permit.deinit();
     try control.check();
-    const outputs = try permit.runWithControl(&.{ ids, mask, tap }, backing, control);
+    const outputs = if (options.adapter != null)
+        try permit.runWithControl(&.{ ids, mask, tap, lora_values.?, lora_scale.? }, backing, control)
+    else
+        try permit.runWithControl(&.{ ids, mask, tap }, backing, control);
     defer {
         for (outputs) |*output| output.deinit();
         backing.free(outputs);
@@ -429,7 +497,7 @@ pub fn encodeTokenFeatures(a: A, handle: *const manager.ModelHandle, documents: 
         return error.UnexpectedMemorillaEncoderOutputs;
     var features = try token_features.features(backing, outputs[0].asFloat32(), outputs[1].asFloat32(), &batch);
     errdefer features.deinit();
-    const source_lock = try researchSourceLockSha256(backing, model.model_dir);
+    const source_lock = if (profile == v1_profile) v1SourceLockSha256() else try researchSourceLockSha256(backing, model.model_dir);
     const recipe_hash = try recipeSha256(profile);
     try control.check();
     owns_lease = false;
@@ -438,6 +506,7 @@ pub fn encodeTokenFeatures(a: A, handle: *const manager.ModelHandle, documents: 
         .features = features,
         .question_tokens = batch.active[batch.batch - 1],
         .producer = .{ .profile = profile, .publication = publication, .identity = identity, .source_lock_sha256 = source_lock, .recipe_sha256 = recipe_hash },
+        .adapter_sha256 = if (options.adapter) |adapter| adapter.sha256 else null,
         .lease = lease,
     };
 }
@@ -492,7 +561,7 @@ test "Memorilla token-feature encoder rejects deadline collection and text limit
 test "Memorilla token-feature lease sizing covers outputs features inputs and text" {
     // rows = 2, positions = 256, document positions = 128, row = 10240 bytes:
     // 256*20480 + 128*40960 + 10240 + 128*8 + 256*20 + 2*48 + 3*10 + 2.
-    try std.testing.expectEqual(@as(usize, 10_502_272), try tokenFeatureHostBytes(1, 10));
+    try std.testing.expectEqual(@as(usize, 10_505_344), try tokenFeatureHostBytes(1, 10));
     try std.testing.expect(try tokenFeatureHostBytes(64, 0) > try tokenFeatureHostBytes(63, 8192 * 65));
     try std.testing.expectError(error.EmptyMemorillaCollection, tokenFeatureHostBytes(0, 0));
     try std.testing.expectError(error.Overflow, tokenFeatureHostBytes(std.math.maxInt(usize), 0));
@@ -506,6 +575,16 @@ test "Memorilla token-feature lease sizing covers outputs features inputs and te
     try std.testing.expectError(error.InvalidMemorillaDocumentCount, tokenFeatureRunRequest(1, 8));
     try std.testing.expectError(error.MemorillaEncoderBoundExceeded, tokenFeatureRunRequest(2, 129));
     try std.testing.expectError(error.MemorillaEncoderBoundExceeded, tokenFeatureRunRequest(2, 0));
+    // The hybrid bound with run-time adapters: inputs carry the packed
+    // adapters and scale, the workspace their device copies and temporaries.
+    const adapter = RunAdapter{ .bytes = 11_796_480, .rank = 8, .projection_width = 4096 };
+    const hybrid = try tokenFeatureRunRequestBounded(3, 300, token_features.hybrid_max_padded_length, adapter);
+    try std.testing.expectEqual(@as(usize, 900 * 16 + 8 + 11_796_480 + 4), hybrid.input_bytes);
+    try std.testing.expectEqual(@as(usize, 3 * 1024 * 2560 * 4 * 8 + 11_796_480 + 900 * (8 + 3 * 4096) * 4), hybrid.workspace_bytes);
+    try std.testing.expectEqual(@as(?usize, 900 * 2560 * 4 * 2), hybrid.output_bytes);
+    try std.testing.expectError(error.MemorillaEncoderBoundExceeded, tokenFeatureRunRequestBounded(3, 1025, token_features.hybrid_max_padded_length, adapter));
+    try std.testing.expectError(error.MemorillaEncoderBoundExceeded, tokenFeatureRunRequestBounded(3, 8, token_features.hybrid_max_padded_length + 1, null));
+    try std.testing.expect(try tokenFeatureHostBytesBounded(1, 10, 1024) > try tokenFeatureHostBytes(1, 10));
 }
 
 test "Memorilla producer check is profile specific" {

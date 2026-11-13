@@ -602,12 +602,21 @@ def merge_encoder(
 
 
 def export_reader(
-    candidate_dir: Path, output_dir: Path, *, config: dict | None = None
+    candidate_dir: Path,
+    output_dir: Path,
+    *,
+    config: dict | None = None,
+    include_encoder_lora: bool = False,
 ) -> dict:
     """``reader.safetensors`` -> non-release split-projection bundle whose
     execution contract declares per-token dual-layer encoder features and
     which carries the candidate's copy head, ``candidate.json`` and
-    ``protocol.json`` pinned in ``files`` (``BUNDLE_EXTRA_FILES``)."""
+    ``protocol.json`` pinned in ``files`` (``BUNDLE_EXTRA_FILES``).
+
+    ``include_encoder_lora`` also pins the candidate's ``encoder-lora.safetensors``
+    so a server can apply the adapters at run time to the stock encoder instead
+    of loading a second, merged encoder (the hybrid profile's one-encoder mode).
+    Its digest must equal ``candidate.json``'s ``encoder_lora_sha256``."""
     candidate_dir = Path(candidate_dir)
     candidate, protocol = load_candidate(candidate_dir)
     config = dict(RELEASE_CONFIG if config is None else config)
@@ -635,7 +644,11 @@ def export_reader(
             "protocol_sha256": digest(candidate_dir / "protocol.json"),
         },
         encoder_pooling=PER_TOKEN_DUAL_LAYER_POOLING,
-        extra_files={name: candidate_dir / name for name in BUNDLE_EXTRA_FILES},
+        extra_files={
+            name: candidate_dir / name
+            for name in BUNDLE_EXTRA_FILES
+            + (("encoder-lora.safetensors",) if include_encoder_lora else ())
+        },
     )
 
 
@@ -1169,6 +1182,11 @@ def main(argv=None):
     reader = sub.add_parser("export-reader")
     reader.add_argument("--candidate", type=Path, required=True)
     reader.add_argument("--output", type=Path, required=True)
+    reader.add_argument(
+        "--include-encoder-lora",
+        action="store_true",
+        help="also pin encoder-lora.safetensors for run-time adapter application",
+    )
     dev = sub.add_parser("dev-cases")
     dev.add_argument("--data", type=Path, required=True)
     dev.add_argument("--output", type=Path, required=True)
@@ -1221,7 +1239,9 @@ def main(argv=None):
             )
         )
     elif args.command == "export-reader":
-        manifest = export_reader(args.candidate, args.output)
+        manifest = export_reader(
+            args.candidate, args.output, include_encoder_lora=args.include_encoder_lora
+        )
         _, _, loaded = load_bundle(args.output)
         if loaded != manifest:
             raise ValueError("exported reader bundle does not reload identically")

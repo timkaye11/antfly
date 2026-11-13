@@ -349,6 +349,54 @@ the decoder produced so the rejected output remains inspectable. The rules are
 general format rules, not corpus patterns, and they are serving policy for the
 research profile only; released profiles are unchanged.
 
+A research response also says where every span copied into the memory record
+came from. `citations` lists one entry per contiguous cited region of a
+document: `document_index` into the request's `document_texts`, a byte range
+`[start, end)` into that text, and `text`, which is exactly those bytes. For
+the request above, an answer of `Alice Chen` copied from the first text would
+come back as:
+
+```json
+"citations": [
+  {"document_index": 0, "start": 13, "end": 23, "text": "Alice Chen",
+   "supports_answer": true, "match": "exact"}
+],
+"citations_unavailable": false
+```
+
+`start` and `end` are UTF-8 byte offsets, not character or UTF-16 offsets. A
+JavaScript client must slice the encoded bytes (for example from
+`TextEncoder`), not the string; in Python, slice `text.encode()` and decode the
+result. Offsets always fall on character boundaries.
+
+How the server finds the ranges: when it builds the copy sources it records,
+for every source token, the document it came from and the bytes its token
+piece covers. The Qwen3 tokenizer is byte-level BPE, so a document's pieces
+concatenate to exactly the text that was encoded: the caller's text after the
+one leading space the protocol adds (none if the text already starts with a
+space), plus one more space when the self-context fallback applied. The server
+checks that byte for byte and subtracts the added spaces; a piece that covers only an added space gets an empty range at the
+start of the document. Citations are built from the spans after word
+completion, so they cover the whole words the record received, not just the
+raw copied run. A copied run that crosses from one document's tokens into the
+next is split per document. Regions of one document that touch or overlap
+are merged, widened to whole UTF-8 characters and trimmed of surrounding
+whitespace. Entries are sorted by `document_index`, then `start`.
+
+`supports_answer` is true when the published answer, after the answer guard,
+occurs in `text`. `match` says how: `exact`, `case_insensitive` (ASCII case
+only), or `none`. It is always false when the answer is `UNKNOWN`, including
+a guard abstention. A citation shows what the record copied, not that the
+answer is right: the decoder can still answer from another slot, or abstain
+even when the fact was copied.
+
+The tokenizer applies NFC normalization. If a text is not already in NFC (a
+decomposed accent, for example), or anything else makes the pieces differ
+from the supplied bytes, the server cannot map tokens to offsets. It then
+returns `citations: []` and `citations_unavailable: true` and leaves the answer
+unchanged; the request does not fail. `citations` is also empty when nothing
+was copied. Released profiles never return either field.
+
 Caveats:
 
 - Experimental and unqualified. The candidate reached 64/64 on its dev
@@ -367,6 +415,191 @@ Caveats:
 - `source_verified` is not available; a request that asks for it returns 409
   `INCOMPATIBLE_MEMORILLA_PROFILE` rather than silently falling back to the
   latent answer.
+
+## Hybrid research profile (soft memory plus exact record)
+
+A profile with `reader_kind: hybrid_research` answers general questions over
+caller texts by composing two readers, as section 8 of
+[the copy17 port plan](../../plans/memorilla-copy17-native.md) describes: the
+released reader's 16 soft rows (general recall, pooled vectors) and the copy17
+candidate's 16-row exact record (names and codes copied token for token). It
+is the production composition the Python evaluator
+`qwen_hybrid_eval.py --record-gate --answer-canonicalize` measured (merged
+prompt, soft rows first, full record rows, record gate at cosine 0.85, answer
+canonicalization). Like the research profile it is experimental, unqualified
+and fails closed on its own pins.
+
+The hybrid keeps one resident encoder. `encoder` is the stock managed
+`qwen3_encoder_f32_v1` Qwen3-Embedding-4B, the same one a released profile
+uses; it serves both passes. The pooled (soft) pass runs it unchanged. The
+per-token (record) pass applies the candidate's encoder LoRA to the q and v
+projections of every layer at run time, `y = W x + (alpha / rank) * B (A x)`,
+added to the projection output before Qwen3's q/k head norms and RoPE. The
+adapters are request inputs uploaded with the run and freed after it; the
+resident weights and their 398-weight, byte-exact residency checks are never
+touched. `memory_module_path` is the hybrid bundle that
+`encoder_lora_export.py export-reader --include-encoder-lora` writes: the
+research bundle plus a pinned `encoder-lora.safetensors` (rank-8 F32 `A`/`B`
+pairs for `q_proj` and `v_proj` of all 36 layers). The new field
+`released_memory_module_path` names the released reader bundle that produces
+the soft rows (stage3; it is required for this kind and rejected for every
+other kind). The merged research encoder is not used.
+
+```json
+{
+  "inference": {
+    "memorilla": {
+      "enabled": true,
+      "profiles": [{
+        "name": "memorilla-hybrid",
+        "reader_kind": "hybrid_research",
+        "encoder": "hf:Qwen/Qwen3-Embedding-4B:memorilla-f32-safetensors-bundle-v1",
+        "decoder": "hf:Qwen/Qwen3-8B:memorilla-f32-safetensors-bundle-v1",
+        "memory_module_path": "/srv/antfly/memorilla/lora-hybrid-bundle",
+        "released_memory_module_path": "/srv/antfly/memorilla/bundles/stage3",
+        "max_documents": 64,
+        "max_new_tokens": 64
+      }]
+    }
+  }
+}
+```
+
+Pins checked before any model loads: the bundle's `manifest.json` pins the
+size and SHA-256 of `encoder-lora.safetensors`, `candidate.json` and
+`protocol.json`; `source.candidate_sha256` must be the hash of
+`candidate.json`; `candidate.json`'s `encoder_lora_sha256` must be the hash of
+the adapter file; `protocol.json` gives `rank`, `alpha` (scale `alpha / rank`,
+2.0 for copy17) and `target_modules` (`q_proj`, `v_proj`). The adapter file
+must hold exactly the 144 expected F32 tensors. When the research reader is
+opened from the same bundle, its manifest must be the one the adapters were
+verified against and its candidate the same. Any mismatch returns 409
+`INCOMPATIBLE_MEMORILLA_PROFILE` (`MemorillaCandidateMismatch`,
+`InvalidMemorillaEncoderLora`).
+
+Requests have the research shape: `document_texts` (1 to 64, the same
+per-text and total limits), no `document_embeddings` (400) and no
+`source_verified` (409). `encoder_execution_identity` must be the stock
+encoder's identity (`executionIdentity(qwen3_encoder_f32_v1)`), because both
+passes run on it; the research encoder identity returns 409. The server
+computes the pooled document vectors and the question vector itself.
+
+```json
+{
+  "model": "memorilla-hybrid",
+  "question": "In what country is Normandy located?",
+  "document_texts": [
+    "The Normans were the people who in the 10th and 11th centuries gave their name to Normandy, a region in France."
+  ],
+  "encoder_execution_identity": "REPLACE_WITH_THE_QUALIFIED_ENCODER_IDENTITY",
+  "max_new_tokens": 48
+}
+```
+
+What one request does:
+
+1. Pooled pass: every text (and the question) through the stock encoder,
+   last-token pooled, L2-normalized and sent through the FP16 then BF16
+   storage channel, as a released client would store it. A text longer than
+   the encoder's 256-token pooled limit, which the released path rejects, is
+   split into sentence-greedy chunks of at most 128 tokens, one vector each
+   (at most 64 vectors in total). The released reader turns the vectors into
+   16 soft rows.
+2. Record pass: the same encoder with the adapters, per-token `tokens-dual`
+   features of the self-context batch (padded rows of at most 1024 tokens, the
+   evaluator's bound for general passages; at most 16384 batch positions),
+   then the research reader, copy head, contiguous runs, snapping and word
+   completion: 16 record token ids, their copied spans and the source map.
+3. Record gate: open when at least one copied span snapped every one of its
+   slots at cosine 0.85 or more. Open: the system prompt is the released
+   helpful prompt followed by the candidate's exact-answer prompt
+   (`"You are a helpful assistant. " + protocol.system_prompt`) and the decoder
+   reads 32 memory rows, the 16 soft rows then the record's 16 embedding rows.
+   Closed (no copied span, or every span has a fence-sitting slot): the
+   helpful prompt and the 16 soft rows alone.
+4. Greedy decoding, then, when the gate was open, answer canonicalization: an
+   answer that occurs in the decoded record text case-insensitively on word
+   boundaries takes the record's spelling, and an answer that is the tail of
+   one to three record words (at least three characters, hyphens and spaces
+   ignored, starting inside a word only when it contains a digit) becomes that
+   word sequence. This repairs the case flips and dropped code prefixes the
+   soft rows induce (`WZ3-003545` to `Wz3-003545`, `3005601` to
+   `Te3-005601`). The published text is the stripped answer.
+
+The response has the research shape plus four fields: `record_gate` (`open`
+or `closed`), `memory_tokens` (32 or 16, the rows the decoder read),
+`canonicalized` (the text was re-spelled from the record) and
+`soft_module_sha256` (the released reader's weights; `memory_module_sha256`
+remains the research reader's). `candidate_sha256` names the candidate. An
+abbreviated response (token ids, identities and usage omitted):
+
+```json
+{
+  "model": "memorilla-hybrid",
+  "text": "France",
+  "finish_reason": "eos",
+  "input_documents": 1,
+  "memory_tokens": 32,
+  "context_source": "supplied_documents",
+  "answer_guard": "accepted",
+  "record_gate": "open",
+  "canonicalized": false,
+  "citations": [
+    {"document_index": 0, "start": 35, "end": 52, "text": "the 10th and 11th",
+     "supports_answer": false, "match": "none"}
+  ],
+  "citations_unavailable": false,
+  "candidate_sha256": "...",
+  "memory_module_sha256": "...",
+  "soft_module_sha256": "..."
+}
+```
+
+Answer guard: hybrid answers are general (a sentence, a list, a date), so
+only the frame-echo rules of the research guard apply. The trimmed text is
+rejected when it is empty, contains a control character (including a
+newline), contains the `<|memory|>` marker or contains the frame literal
+`Memory` as a standalone word; the literal `UNKNOWN` is accepted. There is no
+length, word-count or character-set limit. A rejection publishes `UNKNOWN`
+with `finish_reason: abstained` and keeps the decoder's `token_ids`. The
+Python evaluator has no guard; this is serving policy.
+
+Citations and what is citable: only the record half can be traced to source
+bytes. Citations are built exactly as on the research profile, from the
+record's copied spans after word completion, and `supports_answer` is
+evaluated on the published (canonicalized) answer. When the gate is closed the
+decoder never read the record, so `citations` is empty (and
+`citations_unavailable` false). Soft rows are a learned summary of pooled
+vectors and are never cited: an answer that came from the soft half (most
+free-form answers, for example `France` above, where the record copied a
+different span) has no supporting citation even when it is correct. A
+supporting citation shows that the answer text occurs in a copied region, not
+that it is right.
+
+Residency and admission: one encoder (16.1 GB F32), the decoder (32.8 GB F32)
+and both readers (0.78 GB each on the device, plus the 67 MB host copy head)
+stay resident, about 51 GB of weights. Each request admits, on top, the
+larger of the two decoder plans (32 rows under the merged prompt or 16 under
+the helpful prompt) plus 32 MiB of copy and snap transients, the released
+reader's scratch for up to 64 pooled rows, and the research reader's scratch
+for the exact number of per-token rows (computed by a tokenizer preflight
+before admission). The encoder passes admit their own run workspace,
+including the 11.8 MB of adapters and their per-position temporaries. The two
+reader caches are borrowed one after the other, never together.
+
+Differences from the Python evaluator, by design:
+
+- F32 everywhere; the evaluator runs the encoder, readers and decoder in BF16
+  and applies the adapters in BF16. Answers are compared case by case with
+  `antfly-memorilla-lora-hybrid-verify`.
+- Texts above the 256-token pooled limit are chunked; the evaluator pools any
+  length. The verification sets never reach the limit.
+- The record batch is capped at 16384 positions; the evaluator has no cap
+  (depot uses at most 219, squad 1525).
+- Canonicalization and SQuAD-style matching fold ASCII case only, and the
+  record text is decoded token by token with invalid UTF-8 pieces replaced by
+  U+FFFD, as the evaluator's per-token `decode` does for whole pieces.
+- The frame-echo guard (above) does not exist in the evaluator.
 
 ## Evidence and remaining rollout gates
 

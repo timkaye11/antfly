@@ -1567,3 +1567,434 @@ is not enough. Output is JSON lines (`ready`, `case` with answer agreement,
 identities, candidate/module digests and stage timestamps, `retained`,
 `complete`). The serving contract (config, request, response, limits) is in
 `docs/design/inference/memorilla-serving.md`, "Research profile".
+
+### EmbeddingGemma 2 / Gemma 4 pair
+
+`gemma_memory.py` moves the copy17 recipe to a bidirectional 512-wide encoder
+(EmbeddingGemma 2, BF16) and a frozen Gemma 4 E4B decoder that reads the
+snapped record as plain text; plan and step-1 probes are in
+`docs/plans/memorilla-gemma-pair.md`. It reuses the `encoder_lora.py` helpers
+(`CopyHead`, `copy_with_contiguous_runs`, `MemoryTokenSnapper`,
+`complete_copied_words`, the `asked-site` record, the token-CE lexical recipe,
+pointer and gate losses, the counterfactual-group sampler and the cosine
+schedule) and the pinned upstream `MemoryModule`, built fresh at
+`embedding_dim 512 / output_dim 2560 / 8 heads / 2 cross-attention blocks`.
+Schema `antfly.memorilla.gemma-pair-research.v1`; nothing here is a serving
+artifact. It needs transformers 5.x (tested 5.22.2 with torch 2.9.1+cu130).
+
+What differs from the Qwen trainer, all recorded in `protocol.json`:
+
+- Features: per-token rows of the text model's final RMS-normalized state
+  (512, before the 768 embedding projection, captured by a forward hook on
+  `language_model.norm`) plus the rows of `hidden_states[--tap-layer]`
+  (default 16 of 24, hook on `layers[tap-1]`), each L2-normalized through the
+  FP16->BF16 channel; final rows first, then tap rows, so the reader sees
+  `[1, 2M, 512]`. The tokenizer wraps `<bos> ids <eos>`; the BOS row is
+  dropped and the EOS row kept per document (`encoder_special_rows`).
+  Documents get the copy17 space prefix, no self-context (the encoder is
+  bidirectional). The question query is the mean of its final-norm rows over
+  the attention mask (the model's own pooling at 512).
+- Copy sources are the Gemma 4 input-embedding rows (2560) at the document
+  ids; both tokenizers are checked to agree on every training and evaluation
+  document (`shared_document_ids_checked`). Copy head temperature 0.05.
+- Record: `asked-site`, tokenized by the Gemma 4 tokenizer, padded with the
+  single space token (id 236743 in both vocabularies) to `--memory-slots`
+  (16, 24 or 32; default 24, since no decoder was trained on a 16-token
+  frame). Losses: lexical token-CE (tau 0.05, name weight 4) plus pointer and
+  gate losses (gate weight 3). Reader, copy head and encoder q/v LoRA
+  (rank 8, alpha 16) train together, live encoding every step (no feature
+  cache); AdamW, cosine schedule, grad clip 1.0, BF16 autocast for the
+  encoder, FP32 trainable weights. `--memory-scale-init lexical-target`
+  folds the teacher row norm into the fresh projection once.
+- Decoding: contiguous runs, snap every slot, complete copied words, then the
+  decoder reads `tokenizer.decode(ids)` inside one user turn of the Gemma 4
+  chat template: `SYSTEM + "\nMemory" + record_text + "Memory\n\n" +
+  question`, greedy, 24 new tokens, stop on the decoder's EOS ids
+  (`<eos>`, `<turn|>`). Scoring is the Qwen evaluator's exact match.
+
+```sh
+P=.venv-gemma/bin/python
+S=zig/pkg/inference/scripts/memorilla/gemma_memory.py
+B=.benchmark-results/memorilla/encoder-lora-next
+G=.benchmark-results/memorilla/gemma-pair
+# Decoder readability check: the plan's six records (expect 6/6).
+$P $S probe --output $G/probe/probe.json
+# Training (defaults: 2048 steps, batch 16 x accum 8, eval every 256,
+# tap 16, 24 slots, reader/copy-head lr 2e-4, LoRA lr 1e-4).
+$P $S train --data $B/data-paired-v2 --output $G/pair-tap16-slots24-2048
+# Development split (64 cases) and the wide fresh challenge, comparable to
+# copy17 when the same prior corpora are passed.
+$P $S eval --candidate $G/pair-tap16-slots24-2048 --output $G/eval-dev
+$P $S eval --candidate $G/pair-tap16-slots24-2048 --fresh-groups 16 \
+  --fresh-seed 20261110 --prior-training-data $B/data-spelled \
+  --prior-training-data $B/data-paired \
+  --prior-training-data .benchmark-results/memorilla/encoder-lora-20261110/data \
+  --output $G/eval-wide-seed20261110
+```
+
+`train` writes `protocol.json`, `result.json` (per-step losses, gate means,
+grad norms, step seconds, peak memory; dev evaluations with per-row answers
+and the snapped record of every case), `resume.pt` at every evaluation
+(`--resume` continues an identical protocol) and, on completion,
+`reader.safetensors`, `encoder-lora.safetensors`, `copy-head.safetensors` and
+`candidate.json` with their digests. `eval` verifies those digests and the
+base-model identities, then writes `result.json` with `scores` and per-row
+answers, record text, spans, gates and snap cosines. The encoder and decoder
+directories default to the local BF16 assets (`--encoder`, `--decoder`,
+`--upstream-source` override them); the trainer refuses a GPU that already
+runs a compute process unless `--allow-shared-gpu` is given. Tests:
+`test_gemma_memory.py` (CPU, fake tokenizers and small tensors).
+
+### Summarizing reader: soft slots through the frozen Gemma 4
+
+`gemma_soft_memory.py` is Memorilla's own training recipe on the
+EmbeddingGemma 2 / Gemma 4 E4B pair: the reader's memory slots are trained
+THROUGH the frozen decoder on Memorilla-Data (Stage 1 `enwiki`
+reconstruction, 1,979,809 passages; Stage 2 the ten-config QA/summarization
+mixture), with the copy17 copy head kept on a tail of COPY slots for exact
+strings. Schema `antfly.memorilla.gemma-soft-memory-research.v1`; it imports
+the encoder taps, feature assembly, reader builder and model loader from
+`gemma_memory.py` and the copy head, pointer losses, contiguous-run copying and
+snapper from `encoder_lora.py`. Nothing here is a serving artifact.
+
+Design decisions (all in `protocol.json`):
+
+- Data: parquet shards of
+  `.benchmark-assets/memorilla/data/memorilla-data/data/<config>/<split>-*.parquet`
+  read lazily one row group at a time (`ParquetSplit`); the epoch order is a
+  deterministic row-group-local shuffle per config, interleaved uniformly at
+  random across configs (`mixture_order(seed)`), so the data cursor in
+  `resume.pt` resumes on the identical sequence. `--datasets cfg[:cap],...`
+  overrides a recipe's configs. Documents get the copy17 space prefix, are cut
+  to `--doc-tokens` (256) encoder tokens, at most `--max-docs` (16) per
+  example (when there are more: top-k by cosine of the pooled final-norm
+  document vector to the pooled question, original order kept), and the
+  feature rows are capped at `--max-rows` (4096, both layers counted) by
+  dropping trailing documents and truncating the last kept one. Features are
+  exactly `gemma_memory.py`'s (final-norm 512 rows + layer-16 tap rows, L2 +
+  FP16->BF16 channel, mean-pooled question) and computed live; the encoder is
+  frozen unless `--encoder-lora` (rank 8 q/v).
+- Slots: `--memory-slots` (24) upstream `MemoryModule` queries; the first
+  `K - H` are SOFT (trained only by the decoder loss), the last
+  `H = --copy-slots` (8) are COPY slots with the `CopyHead`. When the answer
+  occurs verbatim as a token span of a document (space-prefixed then bare
+  tokenization, length <= H) the gate target is 1 on the span's slots
+  (left-aligned) and the pointer target the span positions; otherwise the
+  gate target is 0 and there is no pointer loss (Stage 1 passages never fit,
+  so the gate closes during Stage 1 and reopens on Stage 2 QA data). In
+  training the gate-mixed soft output feeds the decoder; at inference the
+  slots of a contiguous run (gate >= 0.5) snap to their nearest decoder token
+  and the other copy slots pass as soft rows.
+- Prompt: the Gemma 4 chat template DOES render a `system` role
+  (`<|turn>system\n...<turn|>`), so the upstream layout is kept: system =
+  `"You are a helpful assistant." + "\nMemory" + <|image|> * K + "Memory"`,
+  user = question, assistant = answer. The placeholder is the image soft
+  token `<|image|>` (id 258880, `config.image_token_id`): a single token that
+  Gemma 4 was trained to read soft rows at, whose per-layer (PLE) identity
+  the HF multimodal path takes from the pad token (id 0); the trainer mirrors
+  that. Labels cover the answer tokens plus the closing `<turn|>` (the
+  template's trailing newline is dropped); answers are cut to
+  `--max-answer-tokens` (256) and prompts longer than `--max-tokens` (1024)
+  are skipped (counted in `skipped`).
+- Injection: transformers 5.22's `Gemma4TextModel.forward` and
+  `Gemma4Model.forward` refuse `input_ids` together with `inputs_embeds`, so
+  the trainer computes `inputs_embeds = embed_tokens(input_ids)`
+  (`Gemma4TextScaledWordEmbedding`, rows already scaled by sqrt(2560); the
+  reader output lives in that space and `--memory-scale-init lexical-target`
+  rescales the fresh projection once to the mean scaled token norm, 56.5),
+  scatters the memory rows into the placeholder positions, and passes
+  `per_layer_inputs = get_per_layer_inputs(input_ids with placeholders ->
+  pad)` explicitly. The loss is the mean CE over labeled tokens, computed by
+  applying `lm_head` and the final logit softcap (30) only at labeled
+  positions. The decoder runs under gradient checkpointing in train mode
+  (dropout is 0); its parameters stay frozen (`assert_frozen`).
+- Optimization: AdamW (wd 0.01), lr 3e-4, linear warmup `--warmup-steps`
+  (500, clamped to a tenth of short runs) then cosine to 10%, grad clip 1.0,
+  `--batch` x `--accum` (4 x 32 = 128 effective), one epoch per recipe
+  (`--max-steps` caps smokes). Loss = CE + 1.0 pointer + 3.0 gate. Checkpoints
+  every `--save-every` (1000) steps, validation loss on the first 256 rows of
+  each config's validation split every `--eval-every` (2000) and at the end;
+  JSONL events (`start`, `memory-scale-init`, `step`, `evaluation`,
+  `checkpoint`, `completed`) on stdout with explicit flushes. Artifacts:
+  `protocol.json`, `result.json`, `resume.pt`, `reader.safetensors`,
+  `copy-head.safetensors` (`encoder-lora.safetensors` with `--encoder-lora`),
+  `candidate.json`.
+- Recipes: `--recipe stage1` (enwiki train), `--recipe stage2 --init DIR`
+  (the ten-config mixture from the Stage 1 candidate or an interrupted run's
+  `resume.pt`), `--recipe stage2-replay --init DIR` (the same ten configs plus
+  `enwiki:200000` restatement replay, plan section 5.1, about 13% of the
+  mixture; implies the three paper options below unless overridden and
+  records the mixture in `protocol.json`), `--recipe depot` (Stage-3 analog
+  on the depot corpus) is a stub that exits with a message.
+- Paper options (arXiv 2610.21375v3, plan section 6; all OFF by default so a
+  run started without them keeps a byte-identical `protocol.json`; the
+  protocol records them only when one is on or the recipe is a preset):
+  - `--chunking sentence128`: each space-prefixed document is cut into
+    sentence pieces (terminal punctuation plus closing quotes before
+    whitespace, or the last character before a line break; the pieces
+    concatenate back to the document) and packed sentence-greedily into
+    chunks of at most 128 encoder tokens (the paper's TriviaQA rule). A
+    sentence longer than 128 tokens is cut at 128 with its remainder left
+    open for the next sentences; chunk order is kept and chunks never span
+    documents. Replaces the `--doc-tokens` truncation (with the token stream
+    alone, chunks then go through the `--max-docs` selection like documents).
+  - `--reader-streams dual`: the reader keys become `[pooled rows; token
+    rows]`. Pooled rows: one per chunk for every chunk of the example, the
+    mean of its final-norm 512 states over the attention mask (the question
+    query's own pooling), L2 + feature channel; in training, above
+    `--max-chunks` (512) the lowest pooled cosines to the question are
+    dropped (counted in `chunks_dropped`); `eval` and `probe` read the whole
+    collection unless `--max-chunks` is given (a cap there turns the pooled
+    stream back into a hard top-k). Token rows: the existing final-norm + tap rows of the
+    top `--token-chunks` (8) chunks by that cosine, in rank order (ties by
+    chunk index), capped by `--max-rows`; copy sources and copy targets
+    cover exactly those chunks' tokens in that order. A trainable
+    `stream_type` table [2, 512] (zero init, FP32, own optimizer group) is
+    added to pooled (row 0) and token rows (row 1) before the reader and
+    saved as `stream-type.safetensors` (in `resume.pt` as `stream_type`).
+    Every slot reads the union of keys (`slot_routing: union`; the Zig
+    reader takes a per-key mask only, so no per-slot masks). One frozen
+    encoder pass over all chunks of a micro-batch (batches of
+    `--encoder-chunk-batch`, 64) gives both streams; only the running top
+    chunks' token states are kept, so memory stays bounded for NarrativeQA
+    books (~1,700-2,600 paragraphs). Not combinable with `--encoder-lora`
+    (the pooled store must stay on the frozen encoder). `--init` from a
+    Stage 1 run directory or candidate loads the reader and copy head and
+    zeroes the new `stream_type` (logged in the `init` event and
+    `init_new_tensors`).
+  - `--reader-dropout P`: dropout of the reader's attention weights,
+    residual attention output and feed-forward blocks, train mode only (the
+    paper's 0.1; legacy 0).
+  - Resume: `protocol.json` keeps the digest of the script that started the
+    run; resuming with a changed script is allowed when everything else is
+    identical and is recorded in `result.json` `script_resumes`. The script
+    that started `$G/stage1` (sha256 `908a1149...`) is kept at
+    `$G/stage1-script/gemma_soft_memory.908a1149.py`.
+- Evaluation (`eval`): `--configs` takes any Memorilla-Data config with a
+  validation split, plus `narrativeqa` (its test split with `--split auto`,
+  the paper's protocol) and `enwiki`. Greedy limits are the paper's: 64 new
+  tokens for QA (`--max-new-tokens`) and 512 for enwiki reconstruction
+  (`--long-form-new-tokens`). Metrics come from the hash-pinned upstream
+  `memorilla.metrics` (revision `d8f18891`, `metrics.py` sha256 `075d4942...`,
+  executed with the pinned `benchmarks.py` and literal constants of
+  `data.py`/`paths.py`, no upstream package import): `clean_generation` on
+  the prediction, then per row `exact_match`, `token_f1` (lower-cased
+  whitespace tokens, the paper's F1) and `rouge` (ROUGE-1/L F-measure with
+  Porter stemming), and corpus `bleu` (BLEU-1/4) per dataset; `squad_f1`
+  (SQuAD-normalized F1, this trainer's earlier metric) is kept alongside.
+  `.venv-gemma` has `rouge-score==0.1.2` and `nltk==3.10.4` for this
+  (installed with uv, cache in `zig/pkg/inference/.zig-cache/memorilla-uv`;
+  the same versions as `.venv-memorilla-score`). Without the upstream tree
+  or those packages the report's `metrics` field names the local fallback
+  (same EM and token F1, ROUGE without stemming, no BLEU). METEOR is not
+  computed (it needs the NLTK wordnet download). NarrativeQA adds ROUGE-L
+  and token F1 by question first word (who, which, what, why, how, where,
+  when, other: the paper's Figure 4a).
+  Dual-stream evaluation caches each collection's chunk ids and pooled rows
+  (one NarrativeQA book serves ~30 questions): in memory within a run and,
+  with `--feature-cache DIR`, as
+  `DIR/<key>/<config>/<split>/<collection_id>.safetensors` (pooled rows in
+  BF16, lossless after the feature channel; flat chunk ids plus offsets;
+  metadata with the documents digest, which must match). `<key>` digests the
+  chunking rule, chunk size, pooled-row recipe and the encoder's weights and
+  tokenizer sha256 (`key.json` beside the entries). Token rows of the top
+  chunks are recomputed per question (one small encoder batch).
+  `--noise-documents` replaces every reader key row and copy-source row with
+  Gaussian noise of the same per-row norm (the paper's sanity test; the copy
+  sources are noised too because they also carry the documents);
+  `--report-doc-tokens` reports document tokens per query (decoder side: the
+  K memory slots; the untruncated collection; the compression ratio). Each
+  dataset also reports chunks, pooled rows and token rows per query.
+
+```sh
+P=.venv-gemma/bin/python
+S=zig/pkg/inference/scripts/memorilla/gemma_soft_memory.py
+G=.benchmark-results/memorilla/gemma-soft
+export CUDA_CACHE_PATH=$PWD/zig/pkg/inference/.zig-cache/cuda-cache
+export TRITON_CACHE_DIR=$PWD/zig/pkg/inference/.zig-cache/triton-cache
+# Plumbing probe (fresh reader) or round trip of a trained candidate on one
+# enwiki validation passage: prints the generated text next to the passage.
+$P -u $S probe --config enwiki --index 0 --max-new-tokens 256 --output $G/probe.json
+$P -u $S probe --candidate $G/stage1 --config enwiki --index 0
+# 20-step smoke (step seconds, tokens per step, peak memory in the step events).
+$P -u $S train --recipe stage1 --batch 4 --accum 2 --max-steps 20 \
+  --eval-every 20 --save-every 20 --skip-initial-eval --output $G/smoke/stage1-b4a2
+# Stage 1 (one epoch of enwiki, effective batch 128) and Stage 2 from it.
+mkdir -p $G && setsid nohup $P -u $S train --recipe stage1 --batch 8 --accum 16 \
+  --output $G/stage1 > $G/stage1.log 2>&1 &
+setsid nohup $P -u $S train --recipe stage2 --init $G/stage1 --batch 8 --accum 16 \
+  --output $G/stage2 > $G/stage2.log 2>&1 &
+# Stage 2 with enwiki replay, sentence chunks, dual streams and reader
+# dropout 0.1 (the planned Stage 2; batch 4 x accum 32 = 128).
+setsid nohup $P -u $S train --recipe stage2-replay --init $G/stage1 --batch 4 \
+  --accum 32 --output $G/stage2-replay > $G/stage2-replay.log 2>&1 &
+# Resume an interrupted run (identical arguments plus --resume).
+# Exact match / token F1 (SQuAD style), ROUGE-1/L and validation loss, greedy
+# 64 tokens (512 for enwiki), hard copy slots snapped, 200 seeded rows per
+# config; NarrativeQA by question type; the noise-document sanity test.
+$P -u $S eval --candidate $G/stage2-replay \
+  --configs squad_v2,drop,triviaqa,narrativeqa,enwiki --limit 200 \
+  --report-doc-tokens --feature-cache $G/feature-cache --output $G/eval-stage2-replay
+$P -u $S eval --candidate $G/stage2-replay --configs squad_v2,narrativeqa \
+  --limit 200 --noise-documents --output $G/eval-stage2-replay-noise
+```
+
+Smoke (2026-11-13, GB10, BF16 decoder, `$G/smoke/`): batch 4 x accum 2 runs
+2.56 s per step of 8 enwiki examples (about 1,660 decoder tokens and 1,280
+encoder tokens per step, peak 21.7 GiB); batch 8 x accum 1 is slower on the
+same examples (3.07 s, peak 24.2 GiB: longer padding), so batch 4 is the
+setting to use. Per micro-batch of 4 the encoder takes ~5% of the time, the
+reader and copy head ~0, the decoder forward ~25% and the backward through
+the 42 frozen checkpointed layers ~70%: about 0.32 s per enwiki example, so
+one epoch of Stage 1 (1,979,809 examples, 15,468 steps of 128) is ~176 hours
+and Stage 2 (1.34 M examples with more documents and longer answers) likely
+150-220 hours; `--max-answer-tokens` and `--max-tokens` are the levers. A
+run killed after a checkpoint resumed on the identical examples
+(`$G/smoke/resume-b4a2`).
+
+Paper-options smoke (2026-11-13, GB10 shared with the running Stage 1 and a
+Qwen eval, `$G/smoke-stage2-dual`): `--recipe stage2-replay --init $G/stage1
+--batch 4 --accum 2 --max-steps 10 --validation-slice 8 --skip-initial-eval`
+loaded `resume.pt@1000` (the `init` event names `stream_type.weight` as the
+only new tensor) and trained 10 steps of 8 mixture examples at 2.8-11.3 s
+per step (median 3.9 s; shared GPU, so not comparable to the 2.56 s above),
+peak 20.4 GiB allocated. Per example: 6.3 chunks (max 19, none dropped) =
+6.3 pooled rows, 5.3 token chunks = 902 token rows, 516 encoder tokens; 9
+of 80 examples copyable. The full mixture is 1,543,993 examples (12,063
+steps of 128; enwiki 12.95%). Eval of that candidate (20 seeded rows each,
+`--report-doc-tokens`): NarrativeQA test reads 1,575 chunks per question on
+average (max 4,082), 991 token rows, a 68,926-token collection (max
+196,806) into 24 slots (2,872x). The first run capped the pooled stream at
+512 rows (484 kept, 21,821 chunks dropped) and took 729 s for 20 questions
+plus their validation loss, mostly encoder batches padded to the longest
+chunk and every question re-encoding its book. With the whole collection
+pooled (1,575 rows per question, none dropped), length-grouped encoder
+batches and the feature cache, the same 20 questions took 228 s with an
+empty cache (19 distinct books, so 19 pooled passes: 221.5 s answering
+including 64-token generation, 6.5 s validation loss from cached books) and
+63.7 s once cached (56.8 s answering, about 2.8 s per question; the 19
+books take 40 MB in `$G/feature-cache`). That run exposed a cold/warm
+difference (ROUGE-L 0.090 vs 0.101: miss-path token rows came from the
+streaming pass, hit-path ones from a re-encode in a different BF16 batch);
+with a cache every question now ranks from its pooled rows and re-encodes
+its top chunks, and 8 questions answered cold then warm gave 8 identical
+answers and the same validation loss (110.3 s cold for 8 distinct books,
+30.4 s warm). SQuAD v2: 2.2 chunks per question,
+41.5 s. Scores after 10 steps are meaningless (NarrativeQA ROUGE-L 0.09,
+SQuAD F1 0.24); `--noise-documents` ran on `squad_v2,enwiki`
+(`$G/smoke-stage2-dual/eval-noise`). Tests:
+`test_gemma_soft_memory.py` (CPU: parquet row groups, mixture order, document
+caps and selection, placeholder prompts and labels, copy targets, injection
+and PLE identity, masked loss, schedule, metrics, resume round trip; paper
+options: sentence splitting and greedy packing, chunk caps, pooled rows,
+dual-stream encoding through fake taps with copy targets restricted to the
+selected chunks, stream-type zero init and init from a Stage 1 `resume.pt`,
+reader dropout, the Stage 1 protocol reproduced byte for byte from the CLI
+defaults against `$G/stage1/protocol.json`, the stage2-replay mixture,
+question-type buckets, norm-matched noise rows, ROUGE fallback; evaluation:
+the feature cache's memory/disk round trip, documents digest and key
+separation, identical dual features for a cached and an uncached
+collection with only the top chunks re-encoded, the no-cap eval default,
+and the pinned upstream metrics against `rouge_score` with stemming,
+including refusal of an edited `metrics.py`).
+
+### Qwen hybrid memory: soft slots plus the exact record
+
+`qwen_hybrid_eval.py` runs the first experiment of section 8 of
+`docs/plans/memorilla-copy17-native.md`: the released Memorilla reader's 16
+soft slots (general recall) composed with copy17's 16 snapped record rows
+(exact names and codes), read by the stock frozen Qwen3-8B. No training; the
+three arms are selected with `--arms soft,record,hybrid` and share one model
+load (BF16 encoder with copy17's adapters, swapped out for the soft features,
+BF16 decoder, FP32 copy17 reader and copy head, BF16 stage3 reader):
+
+- `soft`: pooled last-token Qwen3-Embedding-4B vectors through the FP16 -> BF16
+  channel into the released stage3 reader; 16 soft rows under the released
+  helpful prompt (`--soft-system-prompt`).
+- `record`: copy17 exactly as `encoder_lora_eval.py --snap-memory all
+  --copy-contiguous-runs --copy-complete-words` (the helpers of
+  `encoder_lora_export.run_case` in the same order and precision); copy17's
+  exact-answer prompt. `--sanity-reference lora-ref-dev/reference.json`
+  compares every record answer to the stored reference and fails on a mismatch.
+- `hybrid`: 32 markers, rows 1-16 soft and 17-32 record (`--record-rows spans`
+  keeps only the copied, word-completed spans and pads with the space token);
+  `--system-prompt helpful|exact|merged` (default merged: helpful + exact);
+  `--row-order record-first` puts the record rows at positions 1-16;
+  `--record-gate` applies the plan's section 7.4 routing: the record rows are
+  included only when copy17 produced a copied span whose slots all snapped at
+  cosine >= `--record-gate-cosine` (0.85), otherwise the case gets the 16 soft
+  rows alone under the soft prompt (the summary counts how often the gate
+  fired). Injection is the same scatter-add delta for every row.
+  `--answer-canonicalize` re-spells a decoded answer from the record rows it
+  was read from (record casing for a word-aligned match; the full record word
+  sequence for a prefix-dropped tail such as "3005601" -> "Te3-005601"); rows
+  keep `answer_raw` next to the scored `answer`. `--released-checkpoint DIR`
+  reads the soft arm's reader from another released stage (stage1/stage2)
+  with that directory's `config.json`; copy17's stack stays verified against
+  stage3.
+
+Sets (`--sets`): `depot-dev`, `depot-fresh` (exact match, UNKNOWN as the
+abstention, plus a substring `contains` rate for verbose arms), `squad`,
+`drop` (the first `--qa-limit` validation rows of Memorilla-Data; SQuAD
+normalization, EM and token F1 against the stored answer; drop also reports
+`em_any`/`f1_any` over its comma-joined annotations) and `enwiki` (first
+`--enwiki-limit` validation rows; LCS ROUGE-L of a `--enwiki-max-new-tokens`
+restatement against the passage). Rows go to `<arm>-<set>.jsonl` with the
+record text and spans, a `summary-<set>.json` per set and `summary.json` for
+the run; `--resume` skips cases already in the JSONL files. The copy17 encoder
+batch bound is raised to `--encoder-max-length 1024` because squad/drop
+passages exceed the evaluator's 128 under self-context doubling.
+`test_qwen_hybrid_eval.py` covers the 32-marker prompt, span records, SQuAD
+normalization/EM/F1, ROUGE-L and the summaries on CPU.
+
+Results (2026-11-13, no training, shared GB10; rows in
+`.benchmark-results/memorilla/qwen-hybrid/`). The record arm reproduced all 64
+`lora-ref-dev` answers byte for byte. Depot numbers are exact matches with the
+case-insensitive count in parentheses; every arm below answered all 16 missing
+facts per depot set with UNKNOWN unless noted; "any" is the max over drop's
+comma-joined annotations.
+
+| arm | depot dev (64) | depot fresh (80) | squad EM / F1 (200) | drop EM / F1, any (200) | enwiki ROUGE-L F1, tokens (50) |
+|---|---|---|---|---|---|
+| soft (stage3) | 0 | 0 | 0.230 / 0.377 | 0.020 / 0.149, 0.220 / 0.246 | 0.068, 18 |
+| record (copy17) | 64 | 79 (1 false abstention) | 0.050 / 0.091 (abstains 73%) | 0.000 / 0.005 (abstains 96%) | 0.061, 19 |
+| hybrid (merged, soft-first, full rows) | 51 (62) | 69 (75) | 0.285 / 0.449 | 0.010 / 0.143, 0.210 / 0.238 | 0.086, 24 |
+
+Hybrid variants (stage3 soft half, depot dev / fresh exact, squad F1, drop any-F1):
+`--system-prompt exact` 51 / 66, 0.441, 0.215 (the same misses as the merged
+prompt, so the wording is not the cause); `--row-order record-first` 36 / 52,
+0.436, 0.244 (the decoder drops code prefixes when the record precedes the
+soft rows); `--record-rows spans` 20 / 25, 0.458, 0.250 (without the label
+tokens missing facts stop abstaining, 11 of 16, while QA improves);
+`--record-gate` 51 / 68, 0.453, 0.233 (the gate fires on 143/144 depot,
+184/200 squad and 173/200 drop cases; closed cases equal the soft arm). Every
+hybrid miss on depot carried a complete, correct record text: the soft rows
+disturb the surface form the decoder emits (case flips such as `WZ3-003545`,
+prefix drops such as `3005601` for `Te3-005601`), not retrieval.
+
+Production setting, `--record-gate --answer-canonicalize` (merged prompt,
+soft-first, full rows): depot dev 63/64, fresh 78/80 (remaining misses: a
+changed letter in `JESAVO DEGEBE`, and `Hokifu` for `Hidehi Hokifu`, a whole
+word the canonicalizer must not extend), 16/16 abstentions and no false
+abstention on both sets; squad EM 0.290 / F1 0.453; drop F1 0.135 (any
+0.195 / 0.223) before the three-character tail minimum, which removes the two
+bare-digit completions that cost that drop F1 (`4` -> `holder4`, `0` ->
+`12-10`) and keeps every depot fix.
+
+Soft half from another released stage (gated + canonicalized hybrid; enwiki
+hybrid / soft-only ROUGE-L F1 with mean generated tokens):
+
+| soft half | depot dev / fresh | missing abstained dev / fresh | squad EM / F1 | drop F1, any | enwiki hybrid | enwiki soft |
+|---|---|---|---|---|---|---|
+| stage1 | 45 / 45 | 7 / 4 of 16 | 0.000 / 0.038 | 0.044, 0.035 / 0.064 | 0.230, 140 tokens | 0.237, 141 tokens |
+| stage2 | 55 / 67 | 11 / 12 of 16 | 0.300 / 0.448 | 0.151, 0.235 / 0.255 | 0.154, 67 tokens | 0.166, 64 tokens |
+| stage3 | 63 / 78 | 16 / 16 of 16 | 0.290 / 0.453 | 0.135, 0.195 / 0.223 | 0.086, 24 tokens (ungated base) | 0.068, 18 tokens |
+
+The stage1 reader restates passages (140 tokens, ROUGE-L 0.23) but turns the
+hybrid into a restater everywhere (squad F1 0.038, depot abstention lost);
+stage2 sits in between on every column. Recommendation: the stage3 soft half
+with copy17's record, soft-first, merged prompt, record gate at 0.85 and
+answer canonicalization against the record rows; serve restatement requests
+through the stage1 reader as a separate mode rather than mixing it into the
+QA composition. The remaining surface-form perturbation is the target of the
+planned decoder-in-the-loop tune of the soft slots in the 32-slot frame.

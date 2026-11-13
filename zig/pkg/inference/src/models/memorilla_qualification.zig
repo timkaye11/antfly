@@ -33,7 +33,8 @@ pub const optional_paths = [_][]const u8{
     "model_i8-st.onnx",                    "model_i4.onnx",                  "model_quantized.onnx",                 "decoder_model_merged.onnx",         "decoder_model_merged_fp16.onnx",
     "decoder_model_merged_quantized.onnx", "decoder_model_merged_q4.onnx",   "decoder_model_merged_q4f16.onnx",      "encoder.onnx",
 };
-fn pythonWhitespace(cp: u21) bool {
+/// Python `str.isspace` code points (the `str.strip` default set).
+pub fn pythonWhitespace(cp: u21) bool {
     return switch (cp) {
         0x09...0x0d, 0x1c...0x20, 0x85, 0xa0, 0x1680, 0x2000...0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000 => true,
         else => false,

@@ -632,3 +632,27 @@ def test_case_files_round_trip_and_reject_dotted_names(tmp_path):
         export.read_cases(tmp_path / "plain.json")
     with pytest.raises(ValueError, match="duplicate"):
         export.write_cases(tmp_path / "dup.json", cases + cases[:1], split="dev")
+
+
+def test_export_reader_can_pin_encoder_lora_for_run_time_adapters(tmp_path):
+    candidate = tmp_path / "cand"
+    write_candidate(candidate)
+    output = tmp_path / "bundle"
+    manifest = export.export_reader(
+        candidate, output, config=CONFIG, include_encoder_lora=True
+    )
+    _, _, loaded = load_bundle(output)
+    assert loaded == manifest
+    lora = candidate / "encoder-lora.safetensors"
+    assert manifest["files"]["encoder-lora.safetensors"] == {
+        "sha256": exporter.sha256(lora),
+        "size_bytes": lora.stat().st_size,
+    }
+    assert (output / "encoder-lora.safetensors").read_bytes() == lora.read_bytes()
+    candidate_json = json.loads((output / "candidate.json").read_text())
+    assert (
+        candidate_json["encoder_lora_sha256"]
+        == manifest["files"]["encoder-lora.safetensors"]["sha256"]
+    )
+    default = export.export_reader(candidate, tmp_path / "plain", config=CONFIG)
+    assert "encoder-lora.safetensors" not in default["files"]
